@@ -39,4 +39,5 @@ struct GenerationConfig {
     float top_p             = 0.95f;
     float repetition_penalty = 1.0f;
     bool do_sample          = true;
+    int decode_chunk_size   = 1;    // greedy mode: host sync interval (1 = per token)
 };

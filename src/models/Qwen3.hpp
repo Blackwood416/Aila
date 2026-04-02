@@ -34,8 +34,10 @@ private:
 
     // Per-layer components
     struct TransformerLayer {
-        Linear q_proj, k_proj, v_proj, o_proj;
-        Linear gate_proj, up_proj, down_proj;
+        Linear q_proj, k_proj, v_proj;
+        Linear qkv_proj, o_proj;
+        Linear gate_proj, up_proj;
+        Linear gate_up_proj, down_proj;
         Tensor* input_ln_weight = nullptr;    // RMSNorm gamma [hidden_size]
         Tensor* post_attn_ln_weight = nullptr;
         Tensor* q_norm_weight = nullptr;       // Qwen3 QK-norm [head_dim]
@@ -47,6 +49,7 @@ private:
 
     // Layers
     std::vector<TransformerLayer> layers_;
+    std::vector<Tensor> fused_weights_;
 
     // Final norm
     Tensor* final_norm_weight_ = nullptr;  // [hidden_size]
@@ -62,15 +65,19 @@ private:
         Tensor hidden;       // [max_seq, hidden_size]
         Tensor residual;     // [max_seq, hidden_size]
         Tensor normed;       // [max_seq, hidden_size]
+        Tensor qkv;          // [max_seq, q_dim + kv_dim + kv_dim]
         Tensor q;            // [max_seq, num_heads * head_dim]
         Tensor k;            // [max_seq, num_kv_heads * head_dim]
         Tensor v;            // [max_seq, num_kv_heads * head_dim]
         Tensor attn_out;     // [max_seq, num_heads * head_dim]
+        Tensor gate_up;      // [max_seq, 2 * intermediate_size]
         Tensor gate;         // [max_seq, intermediate_size]
         Tensor up;           // [max_seq, intermediate_size]
         Tensor ffn_out;      // [max_seq, hidden_size]
         Tensor logits;       // [1, vocab_size]
+        Tensor decode_scores;// [num_heads, max_seq] for decode attention
         Tensor scores;       // [num_heads, max_seq, max_seq] for prefill attention
+        Tensor rope_freq;    // [head_dim/2] precomputed RoPE frequency table (f32)
     } buf_;
 
     int max_seq_len_ = 0;

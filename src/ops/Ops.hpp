@@ -42,6 +42,9 @@ private:
     dnnl::memory decode_weight_mem_;
     dnnl::memory decode_dst_mem_;
     bool decode_mem_inited_ = false;
+    void* decode_src_ptr_ = nullptr;
+    void* decode_weight_ptr_ = nullptr;
+    void* decode_dst_ptr_ = nullptr;
 
     void ensure_primitive(Context& ctx, int seq_len);
 
@@ -57,6 +60,9 @@ private:
         dnnl::memory weight_mem;
         dnnl::memory dst_mem;
         bool mem_inited = false;
+        void* src_ptr = nullptr;
+        void* weight_ptr = nullptr;
+        void* dst_ptr = nullptr;
     };
     std::unordered_map<int, CachedPrimitive> prim_cache_;
 };
@@ -103,6 +109,17 @@ namespace ops {
                        int seq_len, int start_pos,
                        int num_heads, int head_dim, int max_seq_len);
 
+    // Decode fused prep (seq_len=1):
+    // Q/K per-head RMSNorm + RoPE, and write K/V to cache at start_pos.
+    void decode_prepare_qkv(Context& ctx,
+                            Tensor& q, Tensor& k, Tensor& v,
+                            Tensor& rope_freq,
+                            Tensor& q_norm_weight, Tensor& k_norm_weight,
+                            Tensor& k_cache, Tensor& v_cache,
+                            int start_pos,
+                            int num_heads_q, int num_kv_heads, int head_dim,
+                            float eps, float theta);
+
     // GQA Attention (decode 模式, seq_len=1)
     // q:       [1, num_heads * head_dim]
     // k_cache: [num_kv_heads, cached_len, head_dim]
@@ -110,7 +127,7 @@ namespace ops {
     // output:  [1, num_heads * head_dim]
     void attention_decode(Context& ctx,
                           Tensor& q, Tensor& k_cache, Tensor& v_cache,
-                          Tensor& output,
+                          Tensor& output, Tensor& scores_buf,
                           int num_heads, int num_kv_heads, int head_dim,
                           int cached_len);
 
@@ -136,6 +153,16 @@ namespace ops {
 
     // 复制 tensor: dst = src
     void copy_tensor(Context& ctx, Tensor& src, Tensor& dst, int n);
+
+    // Split fused projection output:
+    // qkv: [seq_len, q_dim + kv_dim + kv_dim] -> q/k/v
+    void split_qkv(Context& ctx, Tensor& qkv, Tensor& q, Tensor& k, Tensor& v,
+                   int seq_len, int q_dim, int kv_dim);
+
+    // Split fused FFN projection output:
+    // gate_up: [seq_len, 2 * ff_dim] -> gate/up
+    void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
+                       int seq_len, int ff_dim);
 
     // Argmax: 返回 logits 中最大值索引 (旧版，带内部分配)
     int argmax(Context& ctx, Tensor& logits, int vocab_size);

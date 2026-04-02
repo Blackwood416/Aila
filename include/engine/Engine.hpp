@@ -9,6 +9,8 @@
 #include <functional>
 #include <chrono>
 #include <iostream>
+#include <algorithm>
+#include <vector>
 
 // ============================================================
 // Inference Engine: orchestrates loading, tokenization, inference
@@ -43,6 +45,31 @@ public:
 
         // 4. Initialize model
         model_.load(*ctx_, *weights_, config_, max_seq_len);
+
+        // 5. Warmup to amortize first-run JIT/primitive costs
+        {
+            model_.reset();
+            auto warmup_ids = tokenizer_.apply_chat_template(
+                "You are a helpful assistant.", "Warmup.");
+            int* warmup_token_ids = static_cast<int*>(
+                ctx_->alloc_device(warmup_ids.size() * sizeof(int)));
+            ctx_->memcpy_h2d_async(warmup_token_ids, warmup_ids.data(),
+                                   warmup_ids.size() * sizeof(int));
+
+            auto t_warmup_start = std::chrono::high_resolution_clock::now();
+            Tensor& warmup_logits = model_.forward(*ctx_, warmup_token_ids, static_cast<int>(warmup_ids.size()));
+            int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
+            ctx_->synchronize();
+            auto t_warmup_end = std::chrono::high_resolution_clock::now();
+
+            ctx_->free_device(warmup_argmax);
+            ctx_->free_device(warmup_token_ids);
+            model_.reset();
+
+            double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
+            std::cout << "[Warmup] Completed in " << warmup_ms << " ms" << std::endl;
+        }
 
         std::cout << "\n========================================" << std::endl;
         std::cout << "  Engine ready! Type your message." << std::endl;
@@ -83,64 +110,110 @@ public:
         ctx_->free_device(token_ids_device);
 
         // Allocate buffers on GPU for decode loop
-        int* single_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        int* argmax_result_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
 
         // Sample first token
         int next_token = 0;
         if (gen_config.do_sample) {
             next_token = ops::topk_sample(*ctx_, logits, config_.vocab_size,
                                           gen_config.temperature, gen_config.top_k);
-            ctx_->memcpy_h2d(argmax_result_device, &next_token, sizeof(int));
+            ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
         } else {
-            ops::argmax(*ctx_, logits, config_.vocab_size, argmax_result_device);
-            // 此时不进行同步 block 的 d2h.
+            ops::argmax(*ctx_, logits, config_.vocab_size, current_token_device);
         }
 
         // Decode loop (Asynchronous Pipeline)
         std::string output_text;
+        std::vector<int> host_tokens(static_cast<size_t>(gen_config.max_new_tokens));
+        std::vector<int> generated_token_ids;
+        generated_token_ids.reserve(static_cast<size_t>(gen_config.max_new_tokens));
+        bool streaming = (token_callback != nullptr);
+        bool use_chunked_greedy = (!gen_config.do_sample && gen_config.decode_chunk_size > 1);
+        int* generated_tokens_device = nullptr;
+        if (use_chunked_greedy) {
+            generated_tokens_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(gen_config.max_new_tokens + 1) * sizeof(int)));
+        }
+
         int generated_count = 0;
         auto t_decode_start = std::chrono::high_resolution_clock::now();
 
-        while (generated_count < gen_config.max_new_tokens) {
-            // 启动该轮的前向传播，且完全无需 CPU 等待！
-            // 此时 argmax_result_device 已经准备在 GPU 上
-            Tensor& logits_next = model_.forward(*ctx_, argmax_result_device, 1);
+        if (use_chunked_greedy) {
+            const int chunk_size = std::max(1, gen_config.decode_chunk_size);
+            bool eos_reached = false;
+            ctx_->queue().memcpy(generated_tokens_device, current_token_device, sizeof(int));
 
-            // 在 GPU 执行 next token 推理的同时，CPU 同步取回当前刚刚发射的 token
-            // 由于 SYCL In-order 队列，memcpy_d2h 会等待上一轮的 argmax 或上上轮的 forward 完成
-            // 而当前刚刚塞入的 forwarded 已经被注册到了 SYCL 后台
-            ctx_->memcpy_d2h(&next_token, argmax_result_device, sizeof(int));
+            while (generated_count < gen_config.max_new_tokens && !eos_reached) {
+                int chunk_begin = generated_count;
+                int chunk_end = std::min(gen_config.max_new_tokens, chunk_begin + chunk_size);
 
-            if (tokenizer_.is_eos(next_token)) {
-                break;
+                for (; generated_count < chunk_end; ++generated_count) {
+                    int* current_ptr = generated_tokens_device + generated_count;
+                    Tensor& logits_next = model_.forward(*ctx_, current_ptr, 1);
+                    ops::argmax(*ctx_, logits_next, config_.vocab_size,
+                                generated_tokens_device + generated_count + 1);
+                }
+
+                int copied = generated_count - chunk_begin;
+                auto copy_evt = ctx_->memcpy_d2h_async(host_tokens.data() + chunk_begin,
+                                                       generated_tokens_device + chunk_begin,
+                                                       static_cast<size_t>(copied) * sizeof(int));
+                copy_evt.wait();
+
+                for (int i = chunk_begin; i < generated_count; ++i) {
+                    int token_id = host_tokens[i];
+                    if (tokenizer_.is_eos(token_id)) {
+                        generated_count = i; // EOS token itself is not counted
+                        eos_reached = true;
+                        break;
+                    }
+
+                    if (streaming) {
+                        std::string token_text = tokenizer_.decode(token_id);
+                        output_text += token_text;
+                        token_callback(token_text);
+                    } else {
+                        generated_token_ids.push_back(token_id);
+                    }
+                }
+            }
+        } else {
+            while (generated_count < gen_config.max_new_tokens) {
+                Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
+
+                ctx_->memcpy_d2h(&next_token, current_token_device, sizeof(int));
+                if (tokenizer_.is_eos(next_token)) {
+                    break;
+                }
+
+                if (streaming) {
+                    std::string token_text = tokenizer_.decode(next_token);
+                    output_text += token_text;
+                    token_callback(token_text);
+                } else {
+                    generated_token_ids.push_back(next_token);
+                }
+                generated_count++;
+
+                if (gen_config.do_sample) {
+                    ctx_->synchronize();
+                    next_token = ops::topk_sample(*ctx_, logits_next, config_.vocab_size,
+                                                  gen_config.temperature, gen_config.top_k);
+                    ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
+                } else {
+                    ops::argmax(*ctx_, logits_next, config_.vocab_size, next_token_device);
+                }
+                std::swap(current_token_device, next_token_device);
             }
 
-            // Decode token to text and print on Host while GPU is crunching logits_next
-            std::string token_text = tokenizer_.decode(next_token);
-            output_text += token_text;
-            if (token_callback) {
-                token_callback(token_text);
-            }
-            generated_count++;
-
-            // 为下一轮准备 argmax (依然异步挂载)
-            if (gen_config.do_sample) {
-                // 等待上一轮的结果回传完毕，这里有同步损耗，但仅针对 top_k
-                ctx_->synchronize();
-                next_token = ops::topk_sample(*ctx_, logits_next, config_.vocab_size,
-                                              gen_config.temperature, gen_config.top_k);
-                ctx_->memcpy_h2d(argmax_result_device, &next_token, sizeof(int));
-            } else {
-                // argmax 异步挂载到队列
-                ops::argmax(*ctx_, logits_next, config_.vocab_size, argmax_result_device);
-            }
+            ctx_->synchronize();
         }
-
-        // flush stream
-        ctx_->synchronize();
-
-        ctx_->free_device(argmax_result_device);
+        if (generated_tokens_device) {
+            ctx_->free_device(generated_tokens_device);
+        }
+        ctx_->free_device(current_token_device);
+        ctx_->free_device(next_token_device);
 
         auto t_decode_end = std::chrono::high_resolution_clock::now();
         double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
@@ -149,6 +222,10 @@ public:
                   << decode_ms << " ms ("
                   << (generated_count > 0 ? generated_count / (decode_ms / 1000.0) : 0)
                   << " tok/s)" << std::endl;
+
+        if (!streaming && !generated_token_ids.empty()) {
+            output_text = tokenizer_.decode(generated_token_ids);
+        }
 
         return output_text;
     }

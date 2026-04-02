@@ -1,34 +1,78 @@
 #include "Ops.hpp"
 #include <sycl/sycl.hpp>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace ops {
 
-// ============================================================
-// SYCL Kernel: Attention Decode (seq_len=1, GQA) - Original
-// ============================================================
+namespace {
 
-void attention_decode(Context& ctx,
-                       Tensor& q, Tensor& k_cache, Tensor& v_cache,
-                       Tensor& output,
-                       int num_heads, int num_kv_heads, int head_dim,
-                       int cached_len) {
+inline int round_up(int x, int align) {
+    return ((x + align - 1) / align) * align;
+}
+
+int read_env_int(const char* name, int default_value) {
+#ifdef _WIN32
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) == 0 && value) {
+        int parsed = std::atoi(value);
+        free(value);
+        return parsed;
+    }
+    if (value) free(value);
+    return default_value;
+#else
+    const char* value = std::getenv(name);
+    return value ? std::atoi(value) : default_value;
+#endif
+}
+
+bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
+    if (!dev.has(sycl::aspect::ext_intel_matrix)) {
+        return false;
+    }
+
+    using matrix_type = sycl::ext::oneapi::experimental::matrix::matrix_type;
+    using sycl::ext::oneapi::experimental::info::device::matrix_combinations;
+    auto combos = dev.get_info<matrix_combinations>();
+    for (const auto& c : combos) {
+        bool m_ok = (static_cast<int>(c.msize) == 0) || (static_cast<int>(c.msize) == m);
+        if (m_ok &&
+            static_cast<int>(c.nsize) == n &&
+            static_cast<int>(c.ksize) == k &&
+            c.atype == matrix_type::bf16 &&
+            c.btype == matrix_type::bf16 &&
+            c.ctype == matrix_type::fp32 &&
+            c.dtype == matrix_type::fp32) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void attention_decode_baseline(Context& ctx,
+                               Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                               Tensor& output, Tensor& scores_buf,
+                               int num_heads, int num_kv_heads, int head_dim,
+                               int cached_len, int wg_size) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k_cache.data());
     bf16* v_ptr = static_cast<bf16*>(v_cache.data());
     bf16* o_ptr = static_cast<bf16*>(output.data());
+    (void)scores_buf;
 
     int heads_per_kv = num_heads / num_kv_heads;
     float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
     int max_seq_len = static_cast<int>(k_cache.shape(1));
-
-    int wg_size = 128; 
+    int padded_cached_len = round_up(cached_len, 32);
 
     ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> shared(sycl::range<1>(cached_len + wg_size), cgh);
+        sycl::local_accessor<float, 1> shared(sycl::range<1>(padded_cached_len), cgh);
         sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
 
         cgh.parallel_for(sycl::nd_range<1>(num_heads * wg_size, wg_size),
@@ -37,16 +81,29 @@ void attention_decode(Context& ctx,
                 int lid = item.get_local_id(0);
                 int kv_head = head / heads_per_kv;
 
-                if (lid < head_dim) {
-                    q_cache[lid] = static_cast<float>(q_ptr[head * head_dim + lid]);
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                int red_offset = cached_len; 
                 for (int t = lid; t < cached_len; t += wg_size) {
                     float sum = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        sum += q_cache[d] * static_cast<float>(k_ptr[kv_head * max_seq_len * head_dim + t * head_dim + d]);
+                    const bf16* k_row = k_ptr + kv_head * max_seq_len * head_dim + t * head_dim;
+                    if ((head_dim & 7) == 0) {
+                        for (int d = 0; d < head_dim; d += 8) {
+                            sum += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
+                            sum += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
+                            sum += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
+                            sum += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
+                            sum += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
+                            sum += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
+                            sum += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
+                            sum += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+                        }
+                    } else {
+                        for (int d = 0; d < head_dim; d++) {
+                            sum += q_cache[d] * static_cast<float>(k_row[d]);
+                        }
                     }
                     shared[t] = sum * scale;
                 }
@@ -56,42 +113,249 @@ void attention_decode(Context& ctx,
                 for (int t = lid; t < cached_len; t += wg_size) {
                     max_val = sycl::fmax(max_val, shared[t]);
                 }
-                shared[red_offset + lid] = max_val;
-                item.barrier(sycl::access::fence_space::local_space);
-                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
-                    if (lid < stride) shared[red_offset+lid] = sycl::fmax(shared[red_offset+lid], shared[red_offset+lid+stride]);
-                    item.barrier(sycl::access::fence_space::local_space);
-                }
-                max_val = shared[red_offset];
+                max_val = sycl::reduce_over_group(item.get_group(), max_val, sycl::maximum<float>());
 
                 float sum_val = 0.0f;
                 for (int t = lid; t < cached_len; t += wg_size) {
-                    float e = sycl::exp(shared[t] - max_val);
+                    float e = sycl::native::exp(shared[t] - max_val);
                     shared[t] = e;
                     sum_val += e;
                 }
-                shared[red_offset + lid] = sum_val;
-                item.barrier(sycl::access::fence_space::local_space);
-                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
-                    if (lid < stride) shared[red_offset+lid] += shared[red_offset+lid+stride];
-                    item.barrier(sycl::access::fence_space::local_space);
-                }
-                sum_val = shared[red_offset];
+                sum_val = sycl::reduce_over_group(item.get_group(), sum_val, sycl::plus<float>());
 
                 for (int t = lid; t < cached_len; t += wg_size) {
-                    shared[t] /= sum_val;
+                    float prob = shared[t] / sum_val;
+                    shared[t] = prob;
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                if (lid < head_dim) {
+                for (int d = lid; d < head_dim; d += wg_size) {
                     float acc = 0.0f;
                     for (int t = 0; t < cached_len; t++) {
-                        acc += shared[t] * static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim + t * head_dim + lid]);
+                        acc += shared[t] * static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim + t * head_dim + d]);
                     }
-                    o_ptr[head * head_dim + lid] = bf16(acc);
+                    o_ptr[head * head_dim + d] = bf16(acc);
                 }
             });
     });
+}
+
+template <int TM, int TN, int TK, int SG>
+void attention_decode_joint_matrix_tiled(Context& ctx,
+                                         Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                         Tensor& output, Tensor& scores_buf,
+                                         int num_heads, int num_kv_heads, int head_dim,
+                                         int cached_len, int wg_size) {
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* k_ptr = static_cast<bf16*>(k_cache.data());
+    bf16* v_ptr = static_cast<bf16*>(v_cache.data());
+    bf16* o_ptr = static_cast<bf16*>(output.data());
+    float* scores_ptr = static_cast<float*>(scores_buf.data());
+
+    int heads_per_kv = num_heads / num_kv_heads;
+    float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    int max_seq_len = static_cast<int>(k_cache.shape(1));
+    int num_tiles = (cached_len + TN - 1) / TN;
+    int padded_cached_len = round_up(cached_len, 32);
+
+    // Phase 1: QK^T via joint_matrix (writes unnormalized logits)
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> a_local(sycl::range<1>(TM * TK), cgh);
+        sycl::local_accessor<float, 1> c_local(sycl::range<1>(TM * TN), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_heads * num_tiles * SG, SG),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                int group = item.get_group(0);
+                int head = group / num_tiles;
+                int tile = group % num_tiles;
+                int t0 = tile * TN;
+                int lid = item.get_local_id(0);
+                int kv_head = head / heads_per_kv;
+                
+                joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                const bf16* q_head = q_ptr + head * head_dim;
+                const bf16* k_head_tile = k_ptr + kv_head * max_seq_len * head_dim + t0 * head_dim;
+
+                for (int kb = 0; kb < head_dim; kb += TK) {
+                    for (int i = lid; i < TM * TK; i += SG) {
+                        int c = i % TK;
+                        a_local[i] = q_head[kb + c];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    auto a_ptr = a_local.get_multi_ptr<sycl::access::decorated::no>();
+                    auto b_ptr = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                          sycl::access::decorated::no>(k_head_tile + kb);
+                    joint_matrix_load(sg, sub_a, a_ptr, TK);
+                    joint_matrix_load(sg, sub_b, b_ptr, head_dim);
+                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+                }
+
+                auto c_ptr = c_local.get_multi_ptr<sycl::access::decorated::no>();
+                joint_matrix_store(sg, sub_c, c_ptr, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                if (lid < TN) {
+                    int t = t0 + lid;
+                    if (t < cached_len) {
+                        scores_ptr[head * max_seq_len + t] = c_local[lid] * scale;
+                    }
+                }
+            });
+    });
+
+    // Phase 2: softmax + V accumulation
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> shared(sycl::range<1>(padded_cached_len), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(num_heads * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int head = item.get_group(0);
+                int lid = item.get_local_id(0);
+                int kv_head = head / heads_per_kv;
+                float* row = scores_ptr + head * max_seq_len;
+
+                for (int t = lid; t < cached_len; t += wg_size) {
+                    shared[t] = row[t];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float max_val = -1e30f;
+                for (int t = lid; t < cached_len; t += wg_size) {
+                    max_val = sycl::fmax(max_val, shared[t]);
+                }
+                max_val = sycl::reduce_over_group(item.get_group(), max_val, sycl::maximum<float>());
+
+                float sum_val = 0.0f;
+                for (int t = lid; t < cached_len; t += wg_size) {
+                    float e = sycl::native::exp(shared[t] - max_val);
+                    shared[t] = e;
+                    sum_val += e;
+                }
+                sum_val = sycl::reduce_over_group(item.get_group(), sum_val, sycl::plus<float>());
+
+                for (int t = lid; t < cached_len; t += wg_size) {
+                    float p = shared[t] / sum_val;
+                    shared[t] = p;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float acc = 0.0f;
+                    for (int t = 0; t < cached_len; t++) {
+                        acc += shared[t] * static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim + t * head_dim + d]);
+                    }
+                    o_ptr[head * head_dim + d] = bf16(acc);
+                }
+            });
+    });
+}
+
+void attention_decode_joint_matrix(Context& ctx,
+                                   Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                   Tensor& output, Tensor& scores_buf,
+                                   int num_heads, int num_kv_heads, int head_dim,
+                                   int cached_len, int tile_id, int wg_size) {
+    if (tile_id == 2) {
+        attention_decode_joint_matrix_tiled<8, 8, 16, 8>(
+            ctx, q, k_cache, v_cache, output, scores_buf,
+            num_heads, num_kv_heads, head_dim, cached_len, wg_size);
+    } else if (tile_id == 1) {
+        attention_decode_joint_matrix_tiled<32, 32, 16, 16>(
+            ctx, q, k_cache, v_cache, output, scores_buf,
+            num_heads, num_kv_heads, head_dim, cached_len, wg_size);
+    } else {
+        attention_decode_joint_matrix_tiled<1, 8, 16, 8>(
+            ctx, q, k_cache, v_cache, output, scores_buf,
+            num_heads, num_kv_heads, head_dim, cached_len, wg_size);
+    }
+}
+
+} // namespace
+
+// ============================================================
+// SYCL Kernel: Attention Decode (seq_len=1, GQA)
+// ============================================================
+
+void attention_decode(Context& ctx,
+                       Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                       Tensor& output, Tensor& scores_buf,
+                       int num_heads, int num_kv_heads, int head_dim,
+                       int cached_len) {
+    constexpr int JM0_M = 1;
+    constexpr int JM0_N = 8;
+    constexpr int JM0_K = 16;
+    constexpr int JM1_M = 32;
+    constexpr int JM1_N = 32;
+    constexpr int JM1_K = 16;
+    constexpr int JM2_M = 8;
+    constexpr int JM2_N = 8;
+    constexpr int JM2_K = 16;
+
+    // AILA_ATTN_JM:
+    //   0 (default): disabled
+    //   1: auto (run only when runtime-reported combination is supported)
+    //   2: force (skip capability gate, for debugging only)
+    static int jm_mode = -1;
+    static int jm_supported = -1;
+    static int jm_tile_id = -1;
+    static int decode_wg = -1;
+    static bool jm_log_once = false;
+    if (jm_mode < 0) {
+        jm_mode = read_env_int("AILA_ATTN_JM", 1);
+    }
+    if (decode_wg < 0) {
+        decode_wg = read_env_int("AILA_ATTN_DECODE_WG", 256);
+        if (decode_wg <= 0) decode_wg = 256;
+    }
+    if (jm_supported < 0) {
+        bool s0 = supports_jm_bf16_f32(ctx.queue().get_device(), JM0_M, JM0_N, JM0_K);
+        bool s1 = supports_jm_bf16_f32(ctx.queue().get_device(), JM1_M, JM1_N, JM1_K);
+        bool s2 = supports_jm_bf16_f32(ctx.queue().get_device(), JM2_M, JM2_N, JM2_K);
+        jm_supported = (s0 || s1 || s2) ? 1 : 0;
+
+        int force_tile = read_env_int("AILA_ATTN_JM_TILE", -1);
+        if (force_tile == 2 && s2) {
+            jm_tile_id = 2;
+        } else if (force_tile == 1 && s1) {
+            jm_tile_id = 1;
+        } else if (force_tile == 0 && s0) {
+            jm_tile_id = 0;
+        } else if (s0) {
+            // Default to the conservative tile first; larger tile can be forced via env for bring-up.
+            jm_tile_id = 0;
+        } else if (s2) {
+            jm_tile_id = 2;
+        } else if (s1) {
+            jm_tile_id = 1;
+        } else {
+            jm_tile_id = -1;
+        }
+    }
+
+    bool allow_jm = (jm_mode == 2) || (jm_mode == 1 && jm_supported == 1 && jm_tile_id >= 0);
+    if (!jm_log_once && jm_mode > 0) {
+        std::cout << "[JM] mode=" << jm_mode
+                  << ", supported=" << jm_supported
+                  << ", tile_id=" << jm_tile_id
+                  << (allow_jm ? " -> enabled" : " -> fallback baseline")
+                  << std::endl;
+        jm_log_once = true;
+    }
+    if (allow_jm && head_dim == 128 && cached_len > 0) {
+        attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
+                                      num_heads, num_kv_heads, head_dim, cached_len, jm_tile_id, decode_wg);
+        return;
+    }
+
+    attention_decode_baseline(ctx, q, k_cache, v_cache, output, scores_buf,
+                              num_heads, num_kv_heads, head_dim, cached_len, decode_wg);
 }
 
 // ============================================================

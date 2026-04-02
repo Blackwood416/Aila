@@ -68,6 +68,119 @@ void apply_rope(Context& ctx, Tensor& q, Tensor& k,
         });
 }
 
+void decode_prepare_qkv(Context& ctx,
+                        Tensor& q, Tensor& k, Tensor& v,
+                        Tensor& rope_freq,
+                        Tensor& q_norm_weight, Tensor& k_norm_weight,
+                        Tensor& k_cache, Tensor& v_cache,
+                        int start_pos,
+                        int num_heads_q, int num_kv_heads, int head_dim,
+                        float eps, float theta) {
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    float* rope_freq_ptr = static_cast<float*>(rope_freq.data());
+    bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
+    bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
+    bf16* k_cache_ptr = static_cast<bf16*>(k_cache.data());
+    bf16* v_cache_ptr = static_cast<bf16*>(v_cache.data());
+    int max_seq_len = static_cast<int>(k_cache.shape(1));
+    int half_dim = head_dim / 2;
+    int wg_size = 128;
+
+    (void)theta;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(num_heads_q * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int head = item.get_group(0);
+                int lid = item.get_local_id(0);
+
+                float sum_sq = 0.0f;
+                int q_base = head * head_dim;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(q_ptr[q_base + d]);
+                    sum_sq += x * x;
+                }
+                local_sum[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                float q_rms = sycl::sqrt(local_sum[0] / static_cast<float>(head_dim) + eps);
+
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(q_ptr[q_base + d]);
+                    float w = static_cast<float>(qn_ptr[d]);
+                    q_ptr[q_base + d] = bf16((x / q_rms) * w);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int d = lid; d < half_dim; d += wg_size) {
+                    float angle = static_cast<float>(start_pos) * rope_freq_ptr[d];
+                    float c = sycl::native::cos(angle);
+                    float s = sycl::native::sin(angle);
+
+                    float q0 = static_cast<float>(q_ptr[q_base + d]);
+                    float q1 = static_cast<float>(q_ptr[q_base + d + half_dim]);
+                    q_ptr[q_base + d] = bf16(q0 * c - q1 * s);
+                    q_ptr[q_base + d + half_dim] = bf16(q1 * c + q0 * s);
+                }
+
+                if (head >= num_kv_heads) {
+                    return;
+                }
+
+                item.barrier(sycl::access::fence_space::local_space);
+                sum_sq = 0.0f;
+                int kv_base = head * head_dim;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(k_ptr[kv_base + d]);
+                    sum_sq += x * x;
+                }
+                local_sum[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                float k_rms = sycl::sqrt(local_sum[0] / static_cast<float>(head_dim) + eps);
+
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float x = static_cast<float>(k_ptr[kv_base + d]);
+                    float w = static_cast<float>(kn_ptr[d]);
+                    k_ptr[kv_base + d] = bf16((x / k_rms) * w);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int d = lid; d < half_dim; d += wg_size) {
+                    float angle = static_cast<float>(start_pos) * rope_freq_ptr[d];
+                    float c = sycl::native::cos(angle);
+                    float s = sycl::native::sin(angle);
+
+                    float k0 = static_cast<float>(k_ptr[kv_base + d]);
+                    float k1 = static_cast<float>(k_ptr[kv_base + d + half_dim]);
+                    k_ptr[kv_base + d] = bf16(k0 * c - k1 * s);
+                    k_ptr[kv_base + d + half_dim] = bf16(k1 * c + k0 * s);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    k_cache_ptr[cache_base + d] = k_ptr[kv_base + d];
+                    v_cache_ptr[cache_base + d] = v_ptr[kv_base + d];
+                }
+            });
+    });
+}
+
 // ============================================================
 // SYCL Kernel: SwiGLU
 // output = silu(gate) * up = (gate * sigmoid(gate)) * up
@@ -90,7 +203,7 @@ void swiglu(Context& ctx, Tensor& gate, Tensor& up, Tensor& output, int n) {
             for (int k = 0; k < 8; ++k) {
                 float g = static_cast<float>(g_vec[k]);
                 float u = static_cast<float>(u_vec[k]);
-                float silu_g = g / (1.0f + sycl::exp(-g));
+                float silu_g = g / (1.0f + sycl::native::exp(-g));
                 o_vec[k] = bf16(silu_g * u);
             }
             o_ptr[i] = o_vec;
@@ -136,6 +249,54 @@ void copy_tensor(Context& ctx, Tensor& src, Tensor& dst, int n) {
     ctx.queue().parallel_for(sycl::range<1>(n8),
         [=](sycl::id<1> i) {
             d_ptr[i] = s_ptr[i];
+        });
+}
+
+void split_qkv(Context& ctx, Tensor& qkv, Tensor& q, Tensor& k, Tensor& v,
+               int seq_len, int q_dim, int kv_dim) {
+    bf16* src = static_cast<bf16*>(qkv.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    int total = q_dim + kv_dim + kv_dim;
+
+    ctx.queue().parallel_for(sycl::range<2>(seq_len, total),
+        [=](sycl::id<2> idx) {
+            int s = idx[0];
+            int c = idx[1];
+            int src_idx = s * total + c;
+
+            if (c < q_dim) {
+                q_ptr[s * q_dim + c] = src[src_idx];
+            } else if (c < q_dim + kv_dim) {
+                int kc = c - q_dim;
+                k_ptr[s * kv_dim + kc] = src[src_idx];
+            } else {
+                int vc = c - q_dim - kv_dim;
+                v_ptr[s * kv_dim + vc] = src[src_idx];
+            }
+        });
+}
+
+void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
+                   int seq_len, int ff_dim) {
+    bf16* src = static_cast<bf16*>(gate_up.data());
+    bf16* gate_ptr = static_cast<bf16*>(gate.data());
+    bf16* up_ptr = static_cast<bf16*>(up.data());
+    int total = ff_dim * 2;
+
+    ctx.queue().parallel_for(sycl::range<2>(seq_len, total),
+        [=](sycl::id<2> idx) {
+            int s = idx[0];
+            int c = idx[1];
+            int src_idx = s * total + c;
+
+            if (c < ff_dim) {
+                gate_ptr[s * ff_dim + c] = src[src_idx];
+            } else {
+                int uc = c - ff_dim;
+                up_ptr[s * ff_dim + uc] = src[src_idx];
+            }
         });
 }
 

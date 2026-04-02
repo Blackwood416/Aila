@@ -2,6 +2,7 @@
 #include "profile/Device.hpp"
 #include <iostream>
 #include <string>
+#include <cstdlib>
 
 int main(int argc, char** argv) {
     // Model directory (default or from command line)
@@ -24,6 +25,25 @@ int main(int argc, char** argv) {
     gen_config.temperature = 0.6f;
     gen_config.top_k = 20;
     gen_config.do_sample = false;
+    gen_config.decode_chunk_size = 12;
+#ifdef _WIN32
+    char* chunk_env = nullptr;
+    size_t chunk_len = 0;
+    if (_dupenv_s(&chunk_env, &chunk_len, "AILA_DECODE_CHUNK_SIZE") == 0 && chunk_env) {
+        int chunk = std::atoi(chunk_env);
+        if (chunk > 0) {
+            gen_config.decode_chunk_size = chunk;
+        }
+        free(chunk_env);
+    }
+#else
+    if (const char* chunk_env = std::getenv("AILA_DECODE_CHUNK_SIZE")) {
+        int chunk = std::atoi(chunk_env);
+        if (chunk > 0) {
+            gen_config.decode_chunk_size = chunk;
+        }
+    }
+#endif
 
     // Interactive loop
     std::string input;
@@ -48,11 +68,8 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "\nAila: ";
-        std::string response = engine.generate(input, gen_config,
-            [](const std::string& token) {
-                std::cout << token << std::flush;
-            });
-        std::cout << std::endl;
+        std::string response = engine.generate(input, gen_config, nullptr);
+        std::cout << response << std::endl;
     }
 
     std::cout << "Goodbye!" << std::endl;

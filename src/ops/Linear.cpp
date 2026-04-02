@@ -80,11 +80,23 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
                         dnnl::sycl_interop::memory_kind::usm, weight_->data());
             decode_dst_mem_ = dnnl::sycl_interop::make_memory(decode_dst_md_, ctx.engine(),
                         dnnl::sycl_interop::memory_kind::usm, output.data());
+            decode_src_ptr_ = input.data();
+            decode_weight_ptr_ = weight_->data();
+            decode_dst_ptr_ = output.data();
             decode_mem_inited_ = true;
         } else {
-            decode_src_mem_.set_data_handle(input.data());
-            decode_weight_mem_.set_data_handle(weight_->data());
-            decode_dst_mem_.set_data_handle(output.data());
+            if (decode_src_ptr_ != input.data()) {
+                decode_src_mem_.set_data_handle(input.data());
+                decode_src_ptr_ = input.data();
+            }
+            if (decode_weight_ptr_ != weight_->data()) {
+                decode_weight_mem_.set_data_handle(weight_->data());
+                decode_weight_ptr_ = weight_->data();
+            }
+            if (decode_dst_ptr_ != output.data()) {
+                decode_dst_mem_.set_data_handle(output.data());
+                decode_dst_ptr_ = output.data();
+            }
         }
 
         decode_prim_.execute(ctx.stream(), {
@@ -101,11 +113,23 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
                         dnnl::sycl_interop::memory_kind::usm, weight_->data());
             cp.dst_mem = dnnl::sycl_interop::make_memory(cp.dst_md, ctx.engine(),
                         dnnl::sycl_interop::memory_kind::usm, output.data());
+            cp.src_ptr = input.data();
+            cp.weight_ptr = weight_->data();
+            cp.dst_ptr = output.data();
             cp.mem_inited = true;
         } else {
-            cp.src_mem.set_data_handle(input.data());
-            cp.weight_mem.set_data_handle(weight_->data());
-            cp.dst_mem.set_data_handle(output.data());
+            if (cp.src_ptr != input.data()) {
+                cp.src_mem.set_data_handle(input.data());
+                cp.src_ptr = input.data();
+            }
+            if (cp.weight_ptr != weight_->data()) {
+                cp.weight_mem.set_data_handle(weight_->data());
+                cp.weight_ptr = weight_->data();
+            }
+            if (cp.dst_ptr != output.data()) {
+                cp.dst_mem.set_data_handle(output.data());
+                cp.dst_ptr = output.data();
+            }
         }
 
         cp.prim.execute(ctx.stream(), {
