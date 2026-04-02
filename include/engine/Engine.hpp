@@ -129,7 +129,9 @@ public:
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(gen_config.max_new_tokens));
         bool streaming = (token_callback != nullptr);
-        bool use_chunked_greedy = (!gen_config.do_sample && gen_config.decode_chunk_size > 1);
+        int effective_chunk_size = streaming ? std::max(1, gen_config.stream_chunk_size)
+                                             : std::max(1, gen_config.decode_chunk_size);
+        bool use_chunked_greedy = (!gen_config.do_sample && effective_chunk_size > 1);
         int* generated_tokens_device = nullptr;
         if (use_chunked_greedy) {
             generated_tokens_device = static_cast<int*>(
@@ -140,7 +142,7 @@ public:
         auto t_decode_start = std::chrono::high_resolution_clock::now();
 
         if (use_chunked_greedy) {
-            const int chunk_size = std::max(1, gen_config.decode_chunk_size);
+            const int chunk_size = effective_chunk_size;
             bool eos_reached = false;
             ctx_->queue().memcpy(generated_tokens_device, current_token_device, sizeof(int));
 
