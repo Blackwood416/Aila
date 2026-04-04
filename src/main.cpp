@@ -5,8 +5,10 @@
 #include <cstdlib>
 #include <sstream>
 #ifdef _WIN32
+#include <windows.h>
 #include <io.h>
 #include <stdio.h>
+#include <clocale>
 #else
 #include <unistd.h>
 #endif
@@ -39,9 +41,79 @@ bool detect_interactive_terminal() {
 #endif
 }
 
+#ifdef _WIN32
+bool is_valid_utf8(const std::string& s) {
+    int expected = 0;
+    for (unsigned char c : s) {
+        if (expected == 0) {
+            if ((c >> 7) == 0) continue;
+            if ((c >> 5) == 0x6) expected = 1;
+            else if ((c >> 4) == 0xE) expected = 2;
+            else if ((c >> 3) == 0x1E) expected = 3;
+            else return false;
+        } else {
+            if ((c >> 6) != 0x2) return false;
+            --expected;
+        }
+    }
+    return expected == 0;
+}
+
+std::string codepage_to_utf8(const std::string& text, UINT codepage) {
+    if (text.empty()) return text;
+    int wlen = MultiByteToWideChar(codepage, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (wlen <= 0) return text;
+
+    std::wstring wide(static_cast<size_t>(wlen), L'\0');
+    if (MultiByteToWideChar(codepage, 0, text.data(), static_cast<int>(text.size()),
+                            wide.data(), wlen) <= 0) {
+        return text;
+    }
+
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wlen, nullptr, 0, nullptr, nullptr);
+    if (u8len <= 0) return text;
+
+    std::string out(static_cast<size_t>(u8len), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, wide.data(), wlen, out.data(), u8len, nullptr, nullptr) <= 0) {
+        return text;
+    }
+    return out;
+}
+
+std::string normalize_input_for_model(const std::string& text) {
+    if (text.empty() || is_valid_utf8(text)) return text;
+
+    UINT cp = GetConsoleCP();
+    if (cp == 0) cp = GetACP();
+    std::string converted = codepage_to_utf8(text, cp);
+    if (is_valid_utf8(converted)) return converted;
+
+    converted = codepage_to_utf8(text, GetACP());
+    return converted;
+}
+
+void setup_console_utf8(bool interactive_terminal) {
+    if (!interactive_terminal) return;
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+    std::setlocale(LC_ALL, ".UTF-8");
+}
+#else
+std::string normalize_input_for_model(const std::string& text) {
+    return text;
+}
+
+void setup_console_utf8(bool interactive_terminal) {
+    (void)interactive_terminal;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
+    bool interactive_terminal = detect_interactive_terminal();
+    setup_console_utf8(interactive_terminal);
+
     // Model directory (default or from command line)
     CheckDevice();
     std::string model_dir = "E:\\RiderProjects\\Aila\\Qwen3-0.6B";
@@ -64,7 +136,7 @@ int main(int argc, char** argv) {
     gen_config.do_sample = false;
     gen_config.decode_chunk_size = 12;
     gen_config.stream_chunk_size = 4;
-    bool stream_output = detect_interactive_terminal();
+    bool stream_output = interactive_terminal;
     stream_output = read_env_flag("AILA_STREAM_OUTPUT", stream_output);
 #ifdef _WIN32
     char* chunk_env = nullptr;
@@ -155,14 +227,16 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        std::string model_input = normalize_input_for_model(input);
+
         std::cout << "\nAila: ";
         if (stream_output) {
-            engine.generate(input, gen_config, [](const std::string& token_text) {
+            engine.generate(model_input, gen_config, [](const std::string& token_text) {
                 std::cout << token_text << std::flush;
             });
             std::cout << std::endl;
         } else {
-            std::string response = engine.generate(input, gen_config, nullptr);
+            std::string response = engine.generate(model_input, gen_config, nullptr);
             std::cout << response << std::endl;
         }
     }
