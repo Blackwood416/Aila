@@ -40,6 +40,12 @@ public:
     // 判断是否为结束 token
     bool is_eos(int token_id) const;
 
+    // Lookup a special token ID by name (e.g. "</think>"). Returns -1 if not found.
+    int special_token_id(const std::string& name) const {
+        auto it = special_tokens_.find(name);
+        return (it != special_tokens_.end()) ? it->second : -1;
+    }
+
     int vocab_size() const { return static_cast<int>(id_to_token_.size()); }
     int im_start_id() const { return im_start_id_; }
     int im_end_id() const { return im_end_id_; }
