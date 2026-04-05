@@ -469,3 +469,76 @@ std::vector<int> Tokenizer::apply_chat_template(
 bool Tokenizer::is_eos(int token_id) const {
     return token_id == eos_id_ || token_id == eot_id_;
 }
+
+// ============================================================
+// Apply ChatML template (multi-turn)
+// ============================================================
+
+std::vector<int> Tokenizer::apply_chat_template(
+    const std::string& system_prompt,
+    const ChatHistory& history) const {
+
+    std::vector<int> ids;
+
+    // System prompt
+    if (!system_prompt.empty()) {
+        ids.push_back(im_start_id_);
+        auto sys_tokens = encode("system\n" + system_prompt);
+        ids.insert(ids.end(), sys_tokens.begin(), sys_tokens.end());
+        ids.push_back(im_end_id_);
+        auto nl = encode("\n");
+        ids.insert(ids.end(), nl.begin(), nl.end());
+    }
+
+    // All conversation turns
+    for (size_t i = 0; i < history.messages().size(); ++i) {
+        const auto& msg = history.messages()[i];
+        bool is_last_user = (msg.role == "user" && i == history.messages().size() - 1);
+
+        ids.push_back(im_start_id_);
+
+        if (msg.role == "user" || msg.role == "assistant") {
+            auto role_tokens = encode(msg.role + "\n" + msg.content);
+            ids.insert(ids.end(), role_tokens.begin(), role_tokens.end());
+        }
+
+        if (is_last_user) {
+            // Last user message: close user turn, open assistant turn
+            ids.push_back(im_end_id_);
+            auto nl = encode("\n");
+            ids.insert(ids.end(), nl.begin(), nl.end());
+            ids.push_back(im_start_id_);
+            auto asst_tokens = encode("assistant\n");
+            ids.insert(ids.end(), asst_tokens.begin(), asst_tokens.end());
+
+            // Check /no_think
+            std::string cleaned = msg.content;
+            auto rtrim = [](std::string& s) {
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+            };
+            rtrim(cleaned);
+            const std::string kNoThinkCmd = "/no_think";
+            if (cleaned.size() >= kNoThinkCmd.size()) {
+                size_t pos = cleaned.size() - kNoThinkCmd.size();
+                if (cleaned.compare(pos, kNoThinkCmd.size(), kNoThinkCmd) == 0) {
+                    auto end_think_it = special_tokens_.find("</think>");
+                    if (end_think_it != special_tokens_.end()) {
+                        auto nl_tokens = encode("\n");
+                        ids.push_back(end_think_it->second);
+                        ids.insert(ids.end(), nl_tokens.begin(), nl_tokens.end());
+                        auto direct_tokens = encode("Please answer directly and briefly.\n");
+                        ids.insert(ids.end(), direct_tokens.begin(), direct_tokens.end());
+                    }
+                }
+            }
+        } else {
+            // Completed turns: close with im_end
+            ids.push_back(im_end_id_);
+            auto nl = encode("\n");
+            ids.insert(ids.end(), nl.begin(), nl.end());
+        }
+    }
+
+    return ids;
+}
+

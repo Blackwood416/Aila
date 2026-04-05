@@ -48,6 +48,7 @@ set(LIB_SOURCES
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
+    src/bench/Benchmark.cpp
 )
 
 # CLI-only sources
@@ -69,6 +70,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/core)
 include_directories(${PROJECT_SOURCE_DIR}/src/ops)
 include_directories(${PROJECT_SOURCE_DIR}/src/memory)
 include_directories(${PROJECT_SOURCE_DIR}/src/models)
+include_directories(${PROJECT_SOURCE_DIR}/src/bench)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 # ============================================================

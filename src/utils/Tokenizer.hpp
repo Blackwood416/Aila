@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <utility>
+#include "engine/Types.hpp"
 
 // ============================================================
 // BPE Tokenizer for Qwen3
@@ -30,6 +31,11 @@ public:
     std::vector<int> apply_chat_template(
         const std::string& system_prompt,
         const std::string& user_message) const;
+
+    // Multi-turn: encode full conversation history
+    std::vector<int> apply_chat_template(
+        const std::string& system_prompt,
+        const ChatHistory& history) const;
 
     // 判断是否为结束 token
     bool is_eos(int token_id) const;

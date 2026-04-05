@@ -44,6 +44,8 @@ typedef struct AilaGenConfig {
     int   top_k;                /* default: 20     */
     float top_p;                /* default: 0.95   */
     float repetition_penalty;   /* default: 1.0    */
+    float presence_penalty;     /* default: 0.0    */
+    float frequency_penalty;    /* default: 0.0    */
     int   do_sample;            /* 0=greedy, 1=sampling */
     int   decode_chunk_size;    /* default: 1      */
     int   stream_chunk_size;    /* default: 1      */
@@ -139,5 +141,15 @@ AILA_API void aila_set_log_callback(AilaLogCallback callback, void* user_data);
  * @param level  0=Debug, 1=Info, 2=Warning, 3=Error
  */
 AILA_API void aila_set_log_level(int level);
+
+/**
+ * Reset conversation context (clear history and KV cache).
+ */
+AILA_API void aila_engine_reset_context(AilaEngine* engine);
+
+/**
+ * Get current context length in tokens.
+ */
+AILA_API int aila_engine_context_length(AilaEngine* engine);
 
 #endif /* AILA_API_H */

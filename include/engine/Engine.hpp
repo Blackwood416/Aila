@@ -88,11 +88,32 @@ public:
         return true;
     }
 
-    // Generate response from prompt
-    // token_callback is called for each generated token (streaming)
+    // ============================================================
+    // Context management
+    // ============================================================
+
+    void set_system_prompt(const std::string& prompt) { system_prompt_ = prompt; }
+    const std::string& system_prompt() const { return system_prompt_; }
+
+    void reset_context() {
+        history_.clear();
+        cached_token_count_ = 0;
+        model_.reset();
+        AILA_LOG_INFO("[Context] Conversation reset");
+    }
+
+    int context_length() const { return cached_token_count_; }
+    int max_context_length() const { return model_.max_seq_len(); }
+    const ChatHistory& history() const { return history_; }
+
+    // ============================================================
+    // Generate response (multi-turn with incremental prefill)
+    // ============================================================
     std::string generate(const std::string& user_message,
                          const GenerationConfig& gen_config = GenerationConfig(),
                          std::function<void(const std::string&)> token_callback = nullptr) {
+
+        // --- Think-suppression detection ---
         auto trim_copy = [](const std::string& s) -> std::string {
             std::string out = s;
             while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
@@ -135,19 +156,52 @@ public:
 
         bool no_think_requested = ends_with_no_think(user_message);
 
-        // Reset KV cache for new conversation
-        model_.reset();
+        // --- Add user message to history ---
+        history_.add_user(user_message);
 
-        // Tokenize with ChatML template.
-        auto input_ids = tokenizer_.apply_chat_template(
-            "You are a helpful assistant.", user_message);
+        // --- Encode full conversation with chat template ---
+        auto full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
 
-        AILA_LOG_INFO("[Generate] Prompt tokens: %zu", input_ids.size());
+        // --- Context overflow: truncate oldest messages ---
+        int max_ctx = model_.max_seq_len();
+        while (static_cast<int>(full_ids.size()) > max_ctx - 64 && history_.size() > 1) {
+            // Remove oldest pair(s)
+            history_.truncate_oldest(static_cast<int>(history_.size()) - 2);
+            full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
+            AILA_LOG_WARN("[Context] History truncated to fit context window (%zu messages remaining)",
+                          history_.size());
+        }
 
-        int available_decode_tokens = model_.max_seq_len() - static_cast<int>(input_ids.size());
+        int total_prompt_len = static_cast<int>(full_ids.size());
+
+        // --- Incremental prefill: determine what's new ---
+        int prefill_start = 0;
+        bool can_reuse_cache = (cached_token_count_ > 0 && cached_token_count_ < total_prompt_len);
+
+        if (can_reuse_cache) {
+            // Check if the cached prefix matches the new prompt
+            // The cached tokens are the first cached_token_count_ tokens;
+            // we assume they match if we didn't reset.
+            prefill_start = cached_token_count_;
+            AILA_LOG_INFO("[Generate] Incremental prefill: reusing %d cached tokens, prefilling %d new tokens",
+                          prefill_start, total_prompt_len - prefill_start);
+        } else {
+            // Full reset needed (first turn, or context was manually cleared)
+            if (cached_token_count_ > 0) {
+                model_.reset();
+            }
+            prefill_start = 0;
+            AILA_LOG_INFO("[Generate] Full prefill: %d tokens", total_prompt_len);
+        }
+
+        int new_tokens_to_prefill = total_prompt_len - prefill_start;
+
+        int available_decode_tokens = max_ctx - total_prompt_len;
         if (available_decode_tokens <= 0) {
-            AILA_LOG_ERROR("[Generate] Prompt exceeds context window (prompt=%zu, max_seq_len=%d)",
-                           input_ids.size(), model_.max_seq_len());
+            AILA_LOG_ERROR("[Generate] Prompt exceeds context window (prompt=%d, max_seq_len=%d)",
+                           total_prompt_len, max_ctx);
+            // Remove the user message we just added since we can't process it
+            history_.truncate_oldest(static_cast<int>(history_.size()) - 1);
             return "";
         }
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
@@ -156,41 +210,39 @@ public:
                           gen_config.max_new_tokens, max_new_tokens);
         }
 
-        // Upload token IDs to GPU (async, will be waited by first kernel)
-        int* token_ids_device = static_cast<int*>(ctx_->alloc_device(input_ids.size() * sizeof(int)));
-        ctx_->memcpy_h2d_async(token_ids_device, input_ids.data(), input_ids.size() * sizeof(int));
+        // --- Upload new tokens to GPU and prefill ---
+        int* token_ids_device = static_cast<int*>(
+            ctx_->alloc_device(static_cast<size_t>(new_tokens_to_prefill) * sizeof(int)));
+        ctx_->memcpy_h2d_async(token_ids_device,
+                               full_ids.data() + prefill_start,
+                               static_cast<size_t>(new_tokens_to_prefill) * sizeof(int));
 
-        // Prefill: process all prompt tokens at once
         auto t_start = std::chrono::high_resolution_clock::now();
-        Tensor& logits = model_.forward(*ctx_, token_ids_device, static_cast<int>(input_ids.size()));
+        Tensor& logits = model_.forward(*ctx_, token_ids_device, new_tokens_to_prefill);
         ctx_->synchronize();
         auto t_prefill = std::chrono::high_resolution_clock::now();
 
         double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-        AILA_LOG_INFO("[Generate] Prefill: %.2f ms (%.1f tok/s)",
-                      prefill_ms, input_ids.size() / (prefill_ms / 1000.0));
+        AILA_LOG_INFO("[Generate] Prefill: %d tokens in %.2f ms (%.1f tok/s)",
+                      new_tokens_to_prefill, prefill_ms,
+                      new_tokens_to_prefill / (prefill_ms / 1000.0));
 
         ctx_->free_device(token_ids_device);
 
-        // Allocate buffers on GPU for decode loop
+        // --- Decode loop ---
         int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
 
-        // Sample first token
-        int next_token = 0;
-        if (gen_config.do_sample) {
-            next_token = ops::topk_sample(*ctx_, logits, config_.vocab_size,
-                                          gen_config.temperature, gen_config.top_k);
-            ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
-        } else {
-            ops::argmax(*ctx_, logits, config_.vocab_size, current_token_device);
-        }
-
-        // Decode loop (Asynchronous Pipeline)
-        std::string output_text;
-        std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
+        // Collect generated tokens for penalty tracking
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
+
+        // Sample first token using unified sampler
+        int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                  gen_config, generated_token_ids);
+        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+
+        std::string output_text;
         bool streaming = (token_callback != nullptr);
         bool suppress_leading_think = no_think_requested;
         auto emit_stream_piece = [&](const std::string& piece) {
@@ -213,9 +265,13 @@ public:
             output_text += piece;
             token_callback(piece);
         };
+
+        // Determine chunking strategy
         int effective_chunk_size = streaming ? std::max(1, gen_config.stream_chunk_size)
                                              : std::max(1, gen_config.decode_chunk_size);
-        bool use_chunked_greedy = (!gen_config.do_sample && effective_chunk_size > 1);
+        bool use_chunked_greedy = (!gen_config.do_sample && !gen_config.has_penalties()
+                                   && effective_chunk_size > 1);
+
         int* generated_tokens_device = nullptr;
         if (use_chunked_greedy) {
             generated_tokens_device = static_cast<int*>(
@@ -223,9 +279,11 @@ public:
         }
 
         int generated_count = 0;
+        std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
         auto t_decode_start = std::chrono::high_resolution_clock::now();
 
         if (use_chunked_greedy) {
+            // Fast path: chunked greedy without penalties (fully async GPU)
             const int chunk_size = effective_chunk_size;
             bool eos_reached = false;
             ctx_->queue().memcpy(generated_tokens_device, current_token_device, sizeof(int));
@@ -255,15 +313,21 @@ public:
                         break;
                     }
 
+                    generated_token_ids.push_back(token_id);
+
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(token_id);
                         emit_stream_piece(token_text);
-                    } else {
-                        generated_token_ids.push_back(token_id);
                     }
                 }
             }
+
+            if (!streaming) {
+                // Collect all non-streamed token ids
+                // generated_token_ids already has them
+            }
         } else {
+            // Unified path: penalties + sampling (goes through CPU each step)
             while (generated_count < max_new_tokens) {
                 Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
 
@@ -272,27 +336,25 @@ public:
                     break;
                 }
 
+                generated_token_ids.push_back(next_token);
+
                 if (streaming) {
                     std::string token_text = tokenizer_.decode(next_token);
                     emit_stream_piece(token_text);
-                } else {
-                    generated_token_ids.push_back(next_token);
                 }
                 generated_count++;
 
-                if (gen_config.do_sample) {
-                    ctx_->synchronize();
-                    next_token = ops::topk_sample(*ctx_, logits_next, config_.vocab_size,
-                                                  gen_config.temperature, gen_config.top_k);
-                    ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
-                } else {
-                    ops::argmax(*ctx_, logits_next, config_.vocab_size, next_token_device);
-                }
+                // Unified sampling with penalties
+                ctx_->synchronize();
+                next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
+                                                      gen_config, generated_token_ids);
+                ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
                 std::swap(current_token_device, next_token_device);
             }
 
             ctx_->synchronize();
         }
+
         if (generated_tokens_device) {
             ctx_->free_device(generated_tokens_device);
         }
@@ -313,14 +375,74 @@ public:
             strip_leading_think_artifacts(output_text);
         }
 
+        // --- Update context state ---
+        // Cache now contains: all prefilled tokens + generated tokens
+        cached_token_count_ = total_prompt_len + generated_count;
+
+        // Add assistant response to history
+        history_.add_assistant(output_text);
+
         return output_text;
     }
 
+    // ============================================================
+    // Raw prefill for benchmark (no decode, no history)
+    // ============================================================
+    double benchmark_prefill(const std::vector<int>& token_ids) {
+        model_.reset();
+
+        int* device_ids = static_cast<int*>(ctx_->alloc_device(token_ids.size() * sizeof(int)));
+        ctx_->memcpy_h2d(device_ids, token_ids.data(), token_ids.size() * sizeof(int));
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        model_.forward(*ctx_, device_ids, static_cast<int>(token_ids.size()));
+        ctx_->synchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        ctx_->free_device(device_ids);
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
+    // Raw decode N tokens for benchmark (after prefill)
+    double benchmark_decode(int num_tokens) {
+        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+
+        // Start with argmax of last logits
+        // (assumes prefill was called before this)
+        Tensor& init_logits = model_.forward(*ctx_, current_token_device, 1);
+        ops::argmax(*ctx_, init_logits, config_.vocab_size, current_token_device);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < num_tokens; i++) {
+            Tensor& logits = model_.forward(*ctx_, current_token_device, 1);
+            ops::argmax(*ctx_, logits, config_.vocab_size, next_token_device);
+            std::swap(current_token_device, next_token_device);
+        }
+        ctx_->synchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        ctx_->free_device(current_token_device);
+        ctx_->free_device(next_token_device);
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
+    Qwen3Config& config() { return config_; }
+    const Qwen3Config& config() const { return config_; }
+    Tokenizer& tokenizer() { return tokenizer_; }
+    const Tokenizer& tokenizer() const { return tokenizer_; }
+    Qwen3Model& model() { return model_; }
+
 private:
     std::string model_dir_;
+    std::string system_prompt_ = "You are a helpful assistant.";
     Qwen3Config config_;
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
     Qwen3Model model_;
     Tokenizer tokenizer_;
+
+    // Multi-turn conversation state
+    ChatHistory history_;
+    int cached_token_count_ = 0;  // Number of tokens currently in KV cache
 };

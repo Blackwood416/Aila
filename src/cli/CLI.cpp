@@ -118,6 +118,13 @@ Options:
   --max-tokens <N>         Maximum new tokens (default: 1024)
   --decode-chunk <N>       Decode chunk size (default: 12)
   --stream-chunk <N>       Stream chunk size (default: 4)
+  --rep-penalty <F>        Repetition penalty (default: 1.0, >1.0 to penalize)
+  --pres-penalty <F>       Presence penalty (default: 0.0)
+  --freq-penalty <F>       Frequency penalty (default: 0.0)
+  --bench                  Run benchmark mode
+  --bench-pp <N>           Benchmark prompt length (default: 512)
+  --bench-tg <N>           Benchmark generation length (default: 128)
+  --bench-iters <N>        Benchmark iterations (default: 5)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -131,6 +138,8 @@ Environment Variables:
 Interactive Commands:
   /help                    Show available commands
   /quit, /exit             Exit the program
+  /clear                   Clear conversation history
+  /context                 Show context usage
   /greedy                  Switch to greedy decoding
   /sample                  Switch to sampling
   /stream_on               Enable streaming output
@@ -213,6 +222,34 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.stream_chunk_size = std::atoi(argv[++i]);
             continue;
         }
+        if (arg == "--rep-penalty" && i + 1 < argc) {
+            opts.repetition_penalty = static_cast<float>(std::atof(argv[++i]));
+            continue;
+        }
+        if (arg == "--pres-penalty" && i + 1 < argc) {
+            opts.presence_penalty = static_cast<float>(std::atof(argv[++i]));
+            continue;
+        }
+        if (arg == "--freq-penalty" && i + 1 < argc) {
+            opts.frequency_penalty = static_cast<float>(std::atof(argv[++i]));
+            continue;
+        }
+        if (arg == "--bench") {
+            opts.bench_mode = true;
+            continue;
+        }
+        if (arg == "--bench-pp" && i + 1 < argc) {
+            opts.bench_pp = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--bench-tg" && i + 1 < argc) {
+            opts.bench_tg = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--bench-iters" && i + 1 < argc) {
+            opts.bench_iters = std::atoi(argv[++i]);
+            continue;
+        }
         // Positional: treat first positional as model dir
         if (arg[0] != '-' && opts.model_dir.empty()) {
             opts.model_dir = arg;
@@ -269,7 +306,8 @@ void CommandRegistry::print_help() const {
     std::cout << std::endl;
 }
 
-CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output, bool& should_quit) {
+CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
+                                       bool& should_quit, InferenceEngine* engine) {
     CommandRegistry registry;
 
     registry.register_command("/quit", "Exit the program", [&](const std::string&) {
@@ -279,6 +317,23 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
 
     registry.register_command("/exit", "Exit the program", [&](const std::string&) {
         should_quit = true;
+        return true;
+    });
+
+    registry.register_command("/clear", "Clear conversation history", [&, engine](const std::string&) {
+        if (engine) engine->reset_context();
+        std::cout << "[Context] Conversation cleared" << std::endl;
+        return true;
+    });
+
+    registry.register_command("/context", "Show context usage", [&, engine](const std::string&) {
+        if (engine) {
+            std::cout << "\n[Context]" << std::endl;
+            std::cout << "  KV cache tokens:  " << engine->context_length()
+                      << " / " << engine->max_context_length() << std::endl;
+            std::cout << "  History turns:    " << engine->history().size() << std::endl;
+            std::cout << std::endl;
+        }
         return true;
     });
 
@@ -331,15 +386,23 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
-    registry.register_command("/config", "Show current configuration", [&](const std::string&) {
+    registry.register_command("/config", "Show current configuration", [&, engine](const std::string&) {
         std::cout << "\n[Configuration]" << std::endl;
-        std::cout << "  do_sample:        " << (gen_config.do_sample ? "true" : "false") << std::endl;
-        std::cout << "  temperature:      " << gen_config.temperature << std::endl;
-        std::cout << "  top_k:            " << gen_config.top_k << std::endl;
-        std::cout << "  max_new_tokens:   " << gen_config.max_new_tokens << std::endl;
-        std::cout << "  decode_chunk_size:" << gen_config.decode_chunk_size << std::endl;
-        std::cout << "  stream_chunk_size:" << gen_config.stream_chunk_size << std::endl;
-        std::cout << "  stream_output:    " << (stream_output ? "true" : "false") << std::endl;
+        std::cout << "  do_sample:          " << (gen_config.do_sample ? "true" : "false") << std::endl;
+        std::cout << "  temperature:        " << gen_config.temperature << std::endl;
+        std::cout << "  top_k:              " << gen_config.top_k << std::endl;
+        std::cout << "  max_new_tokens:     " << gen_config.max_new_tokens << std::endl;
+        std::cout << "  decode_chunk_size:  " << gen_config.decode_chunk_size << std::endl;
+        std::cout << "  stream_chunk_size:  " << gen_config.stream_chunk_size << std::endl;
+        std::cout << "  stream_output:      " << (stream_output ? "true" : "false") << std::endl;
+        std::cout << "  rep_penalty:        " << gen_config.repetition_penalty << std::endl;
+        std::cout << "  pres_penalty:       " << gen_config.presence_penalty << std::endl;
+        std::cout << "  freq_penalty:       " << gen_config.frequency_penalty << std::endl;
+        if (engine) {
+            std::cout << "  context_tokens:     " << engine->context_length()
+                      << " / " << engine->max_context_length() << std::endl;
+            std::cout << "  history_turns:      " << engine->history().size() << std::endl;
+        }
         std::cout << std::endl;
         return true;
     });
@@ -368,7 +431,7 @@ int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool 
     stream_output = aila::env::read_flag("AILA_STREAM_OUTPUT", stream_output);
 
     bool should_quit = false;
-    auto registry = build_default_commands(gen_config, stream_output, should_quit);
+    auto registry = build_default_commands(gen_config, stream_output, should_quit, &engine);
 
     std::string input;
     while (!should_quit) {

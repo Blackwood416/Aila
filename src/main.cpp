@@ -1,5 +1,6 @@
 #include "engine/Engine.hpp"
 #include "cli/CLI.hpp"
+#include "bench/Benchmark.hpp"
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include <iostream>
@@ -40,14 +41,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Benchmark mode
+    if (opts.bench_mode) {
+        BenchmarkConfig bench_cfg;
+        bench_cfg.prompt_length = opts.bench_pp;
+        bench_cfg.gen_length    = opts.bench_tg;
+        bench_cfg.bench_iters   = opts.bench_iters;
+        bench_cfg.warmup_iters  = 1;
+
+        auto result = run_benchmark(engine, bench_cfg);
+        print_benchmark_results(result);
+        return 0;
+    }
+
     // Build generation config from CLI options
     GenerationConfig gen_config;
-    gen_config.max_new_tokens   = opts.max_new_tokens;
-    gen_config.temperature      = opts.temperature;
-    gen_config.top_k            = opts.top_k;
-    gen_config.do_sample        = opts.do_sample;
+    gen_config.max_new_tokens    = opts.max_new_tokens;
+    gen_config.temperature       = opts.temperature;
+    gen_config.top_k             = opts.top_k;
+    gen_config.do_sample         = opts.do_sample;
     gen_config.decode_chunk_size = opts.decode_chunk_size;
     gen_config.stream_chunk_size = opts.stream_chunk_size;
+    gen_config.repetition_penalty = opts.repetition_penalty;
+    gen_config.presence_penalty   = opts.presence_penalty;
+    gen_config.frequency_penalty  = opts.frequency_penalty;
 
     // Run interactive loop
     return run_interactive(engine, gen_config, opts.stream_output);

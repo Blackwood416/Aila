@@ -174,6 +174,21 @@ namespace ops {
     int topk_sample(Context& ctx, Tensor& logits, int vocab_size,
                     float temperature, int top_k);
 
+    // Apply repetition/presence/frequency penalties to logits (CPU side).
+    // logits_f: float logits array on CPU (size = vocab_size)
+    // generated_ids: all tokens generated so far in this turn
+    void apply_penalties(float* logits_f, int vocab_size,
+                         const std::vector<int>& generated_ids,
+                         float repetition_penalty,
+                         float presence_penalty,
+                         float frequency_penalty);
+
+    // Unified sampling: D2H logits → penalties → temperature → top-k → sample/argmax
+    // Returns sampled token ID.
+    int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
+                           const GenerationConfig& gen_config,
+                           const std::vector<int>& generated_ids);
+
     // Physical transpose: dst = src^T
     // src: [R, C], dst: [C, R]
     void transpose(Context& ctx, Tensor& src, Tensor& dst);

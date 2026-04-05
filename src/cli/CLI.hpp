@@ -26,6 +26,17 @@ struct CLIOptions {
     bool show_help = false;        // -h, --help
     bool show_version = false;     // -v, --version
     bool explicit_stream = false;  // user explicitly set stream mode
+
+    // Penalty parameters
+    float repetition_penalty = 1.0f;  // --rep-penalty
+    float presence_penalty   = 0.0f;  // --pres-penalty
+    float frequency_penalty  = 0.0f;  // --freq-penalty
+
+    // Benchmark mode
+    bool bench_mode = false;       // --bench
+    int bench_pp = 512;            // --bench-pp
+    int bench_tg = 128;            // --bench-tg
+    int bench_iters = 5;           // --bench-iters
 };
 
 // Parse command-line arguments
@@ -65,7 +76,8 @@ private:
 };
 
 // Build the default interactive command set
-CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output, bool& should_quit);
+CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
+                                       bool& should_quit, InferenceEngine* engine = nullptr);
 
 // Run the interactive loop
 int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output);

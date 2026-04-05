@@ -23,14 +23,16 @@ static GenerationConfig to_cpp_config(const AilaGenConfig* c_config) {
     GenerationConfig cfg;
     if (!c_config) return cfg;
 
-    cfg.max_new_tokens    = c_config->max_new_tokens;
-    cfg.temperature       = c_config->temperature;
-    cfg.top_k             = c_config->top_k;
-    cfg.top_p             = c_config->top_p;
+    cfg.max_new_tokens     = c_config->max_new_tokens;
+    cfg.temperature        = c_config->temperature;
+    cfg.top_k              = c_config->top_k;
+    cfg.top_p              = c_config->top_p;
     cfg.repetition_penalty = c_config->repetition_penalty;
-    cfg.do_sample         = (c_config->do_sample != 0);
-    cfg.decode_chunk_size = c_config->decode_chunk_size;
-    cfg.stream_chunk_size = c_config->stream_chunk_size;
+    cfg.presence_penalty   = c_config->presence_penalty;
+    cfg.frequency_penalty  = c_config->frequency_penalty;
+    cfg.do_sample          = (c_config->do_sample != 0);
+    cfg.decode_chunk_size  = c_config->decode_chunk_size;
+    cfg.stream_chunk_size  = c_config->stream_chunk_size;
     return cfg;
 }
 
@@ -70,14 +72,16 @@ AILA_API void aila_engine_destroy(AilaEngine* engine) {
 
 AILA_API AilaGenConfig aila_default_gen_config(void) {
     AilaGenConfig cfg;
-    cfg.max_new_tokens    = 512;
-    cfg.temperature       = 0.6f;
-    cfg.top_k             = 20;
-    cfg.top_p             = 0.95f;
+    cfg.max_new_tokens     = 512;
+    cfg.temperature        = 0.6f;
+    cfg.top_k              = 20;
+    cfg.top_p              = 0.95f;
     cfg.repetition_penalty = 1.0f;
-    cfg.do_sample         = 1;
-    cfg.decode_chunk_size = 1;
-    cfg.stream_chunk_size = 1;
+    cfg.presence_penalty   = 0.0f;
+    cfg.frequency_penalty  = 0.0f;
+    cfg.do_sample          = 1;
+    cfg.decode_chunk_size  = 1;
+    cfg.stream_chunk_size  = 1;
     return cfg;
 }
 
@@ -141,4 +145,15 @@ AILA_API void aila_set_log_level(int level) {
     if (level >= 0 && level <= 3) {
         aila::set_log_level(static_cast<aila::LogLevel>(level));
     }
+}
+
+AILA_API void aila_engine_reset_context(AilaEngine* engine) {
+    if (engine) {
+        engine->engine.reset_context();
+    }
+}
+
+AILA_API int aila_engine_context_length(AilaEngine* engine) {
+    if (!engine) return 0;
+    return engine->engine.context_length();
 }
