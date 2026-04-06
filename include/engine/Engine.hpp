@@ -98,6 +98,7 @@ public:
     void reset_context() {
         history_.clear();
         cached_ids_.clear();
+        benchmark_seed_ready_ = false;
         model_.reset();
         AILA_LOG_INFO("[Context] Conversation reset");
     }
@@ -299,6 +300,66 @@ public:
         int generated_count = 0;
         std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
         auto t_decode_start = std::chrono::high_resolution_clock::now();
+        int last_token_seen = -1;
+        int same_token_run = 0;
+        auto check_loop_guard = [&](int token_id) -> bool {
+            if (token_id == last_token_seen) {
+                same_token_run++;
+            } else {
+                last_token_seen = token_id;
+                same_token_run = 1;
+            }
+            if (same_token_run >= 24) {
+                return true;
+            }
+
+            // Detect periodic n-gram loops (e.g., same phrase repeated).
+            if ((generated_token_ids.size() % 8) == 0 && generated_token_ids.size() >= 48) {
+                size_t n = generated_token_ids.size();
+                for (size_t p = 4; p <= 24; p += 4) {
+                    if (n < p * 4) continue;
+                    bool periodic = true;
+                    for (size_t i = 0; i < p; ++i) {
+                        int a = generated_token_ids[n - 1 - i];
+                        int b = generated_token_ids[n - 1 - p - i];
+                        int c = generated_token_ids[n - 1 - 2 * p - i];
+                        int d = generated_token_ids[n - 1 - 3 * p - i];
+                        if (!(a == b && b == c && c == d)) {
+                            periodic = false;
+                            break;
+                        }
+                    }
+                    if (periodic) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check low-diversity degeneration every 16 tokens
+            if ((generated_token_ids.size() % 16) != 0 || generated_token_ids.size() < 64) {
+                return false;
+            }
+            int unique_vals[16];
+            int unique_count = 0;
+            size_t start = generated_token_ids.size() - 64;
+            for (size_t i = start; i < generated_token_ids.size(); ++i) {
+                int v = generated_token_ids[i];
+                bool seen = false;
+                for (int u = 0; u < unique_count; ++u) {
+                    if (unique_vals[u] == v) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    if (unique_count >= 16) {
+                        return false;
+                    }
+                    unique_vals[unique_count++] = v;
+                }
+            }
+            return unique_count <= 4;
+        };
 
         if (use_chunked_greedy) {
             // Fast path: chunked greedy without penalties (fully async GPU)
@@ -333,6 +394,12 @@ public:
                     }
 
                     generated_token_ids.push_back(token_id);
+                    if (check_loop_guard(token_id)) {
+                        AILA_LOG_WARN("[Generate] Loop guard triggered in greedy decode (token=%d, run=%d), stopping early",
+                                      generated_count, same_token_run);
+                        eos_reached = true;
+                        break;
+                    }
 
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(token_id);
@@ -351,6 +418,11 @@ public:
                 }
 
                 generated_token_ids.push_back(next_token);
+                if (check_loop_guard(next_token)) {
+                    AILA_LOG_WARN("[Generate] Loop guard triggered in decode (token=%d, run=%d), stopping early",
+                                  generated_count, same_token_run);
+                    break;
+                }
 
                 if (streaming) {
                     std::string token_text = tokenizer_.decode(next_token);
@@ -428,14 +500,22 @@ public:
     double benchmark_prefill(const std::vector<int>& token_ids) {
         model_.reset();
         cached_ids_.clear();
+        benchmark_seed_ready_ = false;
 
         int* device_ids = static_cast<int*>(ctx_->alloc_device(token_ids.size() * sizeof(int)));
         ctx_->memcpy_h2d(device_ids, token_ids.data(), token_ids.size() * sizeof(int));
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        model_.forward(*ctx_, device_ids, static_cast<int>(token_ids.size()));
+        Tensor& logits = model_.forward(*ctx_, device_ids, static_cast<int>(token_ids.size()));
         ctx_->synchronize();
         auto t1 = std::chrono::high_resolution_clock::now();
+
+        // Prepare a valid decode seed token from prefill logits
+        int* bench_seed_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        ops::argmax(*ctx_, logits, config_.vocab_size, bench_seed_device);
+        ctx_->memcpy_d2h(&benchmark_seed_token_, bench_seed_device, sizeof(int));
+        ctx_->free_device(bench_seed_device);
+        benchmark_seed_ready_ = true;
 
         ctx_->free_device(device_ids);
         return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -443,12 +523,17 @@ public:
 
     // Raw decode N tokens for benchmark (after prefill)
     double benchmark_decode(int num_tokens) {
+        if (num_tokens <= 0) {
+            return 0.0;
+        }
+        if (!benchmark_seed_ready_) {
+            AILA_LOG_WARN("[Bench] benchmark_decode called without a valid prefill seed, using BOS token as fallback");
+            benchmark_seed_token_ = config_.bos_token_id;
+        }
+
         int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-
-        // Start with argmax of last logits
-        Tensor& init_logits = model_.forward(*ctx_, current_token_device, 1);
-        ops::argmax(*ctx_, init_logits, config_.vocab_size, current_token_device);
+        ctx_->memcpy_h2d(current_token_device, &benchmark_seed_token_, sizeof(int));
 
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < num_tokens; i++) {
@@ -458,6 +543,10 @@ public:
         }
         ctx_->synchronize();
         auto t1 = std::chrono::high_resolution_clock::now();
+
+        // Keep seed token deterministic for any subsequent decode benchmark calls.
+        ctx_->memcpy_d2h(&benchmark_seed_token_, current_token_device, sizeof(int));
+        benchmark_seed_ready_ = true;
 
         ctx_->free_device(current_token_device);
         ctx_->free_device(next_token_device);
@@ -484,4 +573,8 @@ private:
     // Exact token IDs currently stored in the KV cache.
     // This is the ground truth for incremental prefill.
     std::vector<int> cached_ids_;
+
+    // Benchmark decode seed (token after prefill argmax)
+    int benchmark_seed_token_ = -1;
+    bool benchmark_seed_ready_ = false;
 };

@@ -1,6 +1,7 @@
 #include "Ops.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <sycl/sycl.hpp>
@@ -46,6 +47,7 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                Tensor &v_cache, Tensor &output,
                                Tensor &scores_buf, int num_heads,
                                int num_kv_heads, int head_dim, int cached_len,
+                               int tail_start, int sink_len, int effective_len,
                                int wg_size) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
@@ -56,7 +58,7 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
   int heads_per_kv = num_heads / num_kv_heads;
   float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
   int max_seq_len = static_cast<int>(k_cache.shape(1));
-  int padded_cached_len = round_up(cached_len, 32);
+  int padded_cached_len = round_up(effective_len, 32);
 
   ctx.queue().submit([&](sycl::handler &cgh) {
     sycl::local_accessor<float, 1> shared(sycl::range<1>(padded_cached_len),
@@ -75,10 +77,11 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
           }
           item.barrier(sycl::access::fence_space::local_space);
 
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
+            int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
             float sum = 0.0f;
             const bf16 *k_row =
-                k_ptr + kv_head * max_seq_len * head_dim + t * head_dim;
+                k_ptr + kv_head * max_seq_len * head_dim + cache_t * head_dim;
             if ((head_dim & 7) == 0) {
               for (int d = 0; d < head_dim; d += 8) {
                 sum += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
@@ -100,14 +103,14 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
           item.barrier(sycl::access::fence_space::local_space);
 
           float max_val = -1e30f;
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             max_val = sycl::fmax(max_val, shared[t]);
           }
           max_val = sycl::reduce_over_group(item.get_group(), max_val,
                                             sycl::maximum<float>());
 
           float sum_val = 0.0f;
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             float e = sycl::native::exp(shared[t] - max_val);
             shared[t] = e;
             sum_val += e;
@@ -115,7 +118,7 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
           sum_val = sycl::reduce_over_group(item.get_group(), sum_val,
                                             sycl::plus<float>());
 
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             float prob = shared[t] / sum_val;
             shared[t] = prob;
           }
@@ -123,10 +126,11 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
 
           for (int d = lid; d < head_dim; d += wg_size) {
             float acc = 0.0f;
-            for (int t = 0; t < cached_len; t++) {
+            for (int t = 0; t < effective_len; t++) {
+              int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
               acc += shared[t] *
                      static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim +
-                                              t * head_dim + d]);
+                                              cache_t * head_dim + d]);
             }
             o_ptr[head * head_dim + d] = bf16(acc);
           }
@@ -140,7 +144,7 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
                                          Tensor &output, Tensor &scores_buf,
                                          int num_heads, int num_kv_heads,
                                          int head_dim, int cached_len,
-                                         int wg_size) {
+                                         int attn_start, int wg_size) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
   bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
@@ -150,8 +154,9 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
   int heads_per_kv = num_heads / num_kv_heads;
   float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
   int max_seq_len = static_cast<int>(k_cache.shape(1));
-  int num_tiles = (cached_len + TN - 1) / TN;
-  int padded_cached_len = round_up(cached_len, 32);
+  int effective_len = cached_len - attn_start;
+  int num_tiles = (effective_len + TN - 1) / TN;
+  int padded_cached_len = round_up(effective_len, 32);
 
   // Phase 1: QK^T via joint_matrix (writes unnormalized logits)
   ctx.queue().submit([&](sycl::handler &cgh) {
@@ -178,7 +183,8 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
 
           const bf16 *q_head = q_ptr + head * head_dim;
           const bf16 *k_head_tile =
-              k_ptr + kv_head * max_seq_len * head_dim + t0 * head_dim;
+              k_ptr + kv_head * max_seq_len * head_dim +
+              (attn_start + t0) * head_dim;
 
           for (int kb = 0; kb < head_dim; kb += TK) {
             for (int i = lid; i < TM * TK; i += SG) {
@@ -202,8 +208,9 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
 
           if (lid < TN) {
             int t = t0 + lid;
-            if (t < cached_len) {
-              scores_ptr[head * max_seq_len + t] = c_local[lid] * scale;
+            if (t < effective_len) {
+              int cache_t = attn_start + t;
+              scores_ptr[head * max_seq_len + cache_t] = c_local[lid] * scale;
             }
           }
         });
@@ -222,20 +229,21 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
           int kv_head = head / heads_per_kv;
           float *row = scores_ptr + head * max_seq_len;
 
-          for (int t = lid; t < cached_len; t += wg_size) {
-            shared[t] = row[t];
+          for (int t = lid; t < effective_len; t += wg_size) {
+            int cache_t = attn_start + t;
+            shared[t] = row[cache_t];
           }
           item.barrier(sycl::access::fence_space::local_space);
 
           float max_val = -1e30f;
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             max_val = sycl::fmax(max_val, shared[t]);
           }
           max_val = sycl::reduce_over_group(item.get_group(), max_val,
                                             sycl::maximum<float>());
 
           float sum_val = 0.0f;
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             float e = sycl::native::exp(shared[t] - max_val);
             shared[t] = e;
             sum_val += e;
@@ -243,7 +251,7 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
           sum_val = sycl::reduce_over_group(item.get_group(), sum_val,
                                             sycl::plus<float>());
 
-          for (int t = lid; t < cached_len; t += wg_size) {
+          for (int t = lid; t < effective_len; t += wg_size) {
             float p = shared[t] / sum_val;
             shared[t] = p;
           }
@@ -251,10 +259,11 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
 
           for (int d = lid; d < head_dim; d += wg_size) {
             float acc = 0.0f;
-            for (int t = 0; t < cached_len; t++) {
+            for (int t = 0; t < effective_len; t++) {
+              int cache_t = attn_start + t;
               acc += shared[t] *
                      static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim +
-                                              t * head_dim + d]);
+                                              cache_t * head_dim + d]);
             }
             o_ptr[head * head_dim + d] = bf16(acc);
           }
@@ -266,19 +275,20 @@ void attention_decode_joint_matrix(Context &ctx, Tensor &q, Tensor &k_cache,
                                    Tensor &v_cache, Tensor &output,
                                    Tensor &scores_buf, int num_heads,
                                    int num_kv_heads, int head_dim,
-                                   int cached_len, int tile_id, int wg_size) {
+                                   int cached_len, int attn_start, int tile_id,
+                                   int wg_size) {
   if (tile_id == 2) {
     attention_decode_joint_matrix_tiled<8, 8, 16, 8>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, wg_size);
+        head_dim, cached_len, attn_start, wg_size);
   } else if (tile_id == 1) {
     attention_decode_joint_matrix_tiled<32, 32, 16, 16>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, wg_size);
+        head_dim, cached_len, attn_start, wg_size);
   } else {
     attention_decode_joint_matrix_tiled<1, 8, 16, 8>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, wg_size);
+        head_dim, cached_len, attn_start, wg_size);
   }
 }
 
@@ -309,6 +319,9 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
   static int jm_supported = -1;
   static int jm_tile_id = -1;
   static int decode_wg = -1;
+  static int decode_window = -1;
+  static int decode_window_start = -1;
+  static int decode_sink = -1;
   static bool jm_log_once = false;
   if (jm_mode < 0) {
     jm_mode = read_env_int_local("AILA_ATTN_JM", 1);
@@ -317,6 +330,27 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 256);
     if (decode_wg <= 0)
       decode_wg = 256;
+  }
+  if (decode_window < 0) {
+    decode_window = read_env_int_local("AILA_ATTN_DECODE_WINDOW", 0);
+    if (decode_window < 0)
+      decode_window = 0;
+  }
+  if (decode_window_start < 0) {
+    decode_window_start =
+        read_env_int_local("AILA_ATTN_DECODE_WINDOW_START", -1);
+    if (decode_window_start < 0) {
+      decode_window_start = std::max(512, decode_window);
+    }
+  }
+  if (decode_sink < 0) {
+    decode_sink = read_env_int_local("AILA_ATTN_DECODE_SINK", -1);
+    if (decode_sink < 0) {
+      decode_sink = 0;
+    }
+    if (decode_sink < 0) {
+      decode_sink = 0;
+    }
   }
   if (jm_supported < 0) {
     bool s0 =
@@ -349,21 +383,45 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
 
   bool allow_jm =
       (jm_mode == 2) || (jm_mode == 1 && jm_supported == 1 && jm_tile_id >= 0);
+  bool apply_window = (decode_window > 0 && cached_len > decode_window_start);
+  int effective_window = cached_len;
+  if (apply_window) {
+    effective_window = std::min(cached_len, decode_window);
+  }
+  int tail_start = cached_len - effective_window;
+  int sink_len = 0;
+  if (apply_window && decode_sink > 0) {
+    sink_len = std::min(decode_sink, std::max(0, cached_len - effective_window));
+  }
+  int effective_len = effective_window + sink_len;
+
+  // If sink and tail overlap, fall back to full context contiguous view.
+  if (effective_len >= cached_len) {
+    tail_start = 0;
+    sink_len = 0;
+    effective_len = cached_len;
+  }
+
+  bool contiguous_mode = (sink_len == 0);
+  int attn_start = tail_start;
+
   if (!jm_log_once && jm_mode > 0) {
-    AILA_LOG_INFO("[JM] mode=%d, supported=%d, tile_id=%d %s", jm_mode,
-                  jm_supported, jm_tile_id,
+    AILA_LOG_INFO("[JM] mode=%d, supported=%d, tile_id=%d, decode_wg=%d, decode_window=%d, decode_window_start=%d, decode_sink=%d %s",
+                  jm_mode, jm_supported, jm_tile_id, decode_wg, decode_window,
+                  decode_window_start, decode_sink,
                   (allow_jm ? "-> enabled" : "-> fallback baseline"));
     jm_log_once = true;
   }
-  if (allow_jm && head_dim == 128 && cached_len > 0) {
+  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0) {
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
-                                  jm_tile_id, decode_wg);
+                                  attn_start, jm_tile_id, decode_wg);
     return;
   }
 
   attention_decode_baseline(ctx, q, k_cache, v_cache, output, scores_buf,
                             num_heads, num_kv_heads, head_dim, cached_len,
+                            tail_start, sink_len, effective_len,
                             decode_wg);
 }
 

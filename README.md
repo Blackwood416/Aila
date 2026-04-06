@@ -153,6 +153,12 @@ lib.aila_engine_destroy(engine)
 | `AILA_STREAM_OUTPUT` | auto | Force streaming (`1`) or non-streaming (`0`) |
 | `AILA_DECODE_CHUNK_SIZE` | `12` | Non-streaming greedy decode chunk size |
 | `AILA_STREAM_CHUNK_SIZE` | `4` | Streaming greedy decode chunk size |
+| `AILA_ATTN_JM` | `1` | Decode attention joint-matrix mode: `0` off, `1` auto, `2` force |
+| `AILA_ATTN_JM_TILE` | auto | Force joint-matrix tile id (`0/1/2`) |
+| `AILA_ATTN_DECODE_WG` | `256` | Decode attention work-group size |
+| `AILA_ATTN_DECODE_WINDOW` | `0` | Decode attention lookback window (`0` = full context) |
+| `AILA_ATTN_DECODE_WINDOW_START` | `auto` | Enable decode window only after context length exceeds threshold (auto = `max(512, window)`) |
+| `AILA_ATTN_DECODE_SINK` | `0` | Prefix sink tokens kept together with recent window in decode attention |
 
 ### Streaming Output
 
@@ -165,6 +171,19 @@ lib.aila_engine_destroy(engine)
 - Smaller `stream_chunk_size` → lower latency per visible token, but usually lower tok/s.
 - Larger `stream_chunk_size` → higher throughput, but less real-time display.
 - On Intel Arc A770, `stream_chunk_size=4` is a good default; `8` often gives higher peak throughput.
+
+### Long Decode Tuning
+
+- `AILA_ATTN_DECODE_WINDOW=0` keeps full-context decode attention (best quality).
+- Setting a positive value (for example `256`) restricts each decode step to recent tokens and can significantly improve long-output tok/s.
+- To reduce quality collapse on short prompts, window mode is gated by `AILA_ATTN_DECODE_WINDOW_START`.
+- To reduce multi-turn drift/repetition under small windows, decode can keep prefix sink tokens via `AILA_ATTN_DECODE_SINK`.
+- Greedy decode has a built-in loop guard to stop severe low-diversity repetition early.
+- Practical starting point for multi-turn chat on Arc A770:
+  `AILA_ATTN_DECODE_WINDOW=128`, `AILA_ATTN_DECODE_WINDOW_START=512`, `AILA_ATTN_DECODE_SINK=0`.
+- This is a quality/speed trade-off. For strict quality parity, keep `0`.
+- On Arc A770 (`pp=512, tg=512` benchmark), decode throughput in this project is typically:
+  `window=0` ~58 tok/s, `window=256` ~92 tok/s, `window=128` ~138 tok/s.
 
 ### Context Window / Memory
 
