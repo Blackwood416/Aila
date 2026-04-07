@@ -14,6 +14,11 @@ namespace ops {
 
 namespace {
 
+std::mt19937& sampling_rng() {
+    static thread_local std::mt19937 rng(42);
+    return rng;
+}
+
 struct TopCandidate {
     float logit;
     int id;
@@ -109,9 +114,8 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
         }
     }
 
-    static thread_local std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
+    float r = dist(sampling_rng());
 
     float cumsum = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
@@ -124,6 +128,10 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
 }
 
 } // namespace
+
+void set_sampling_seed(uint64_t seed) {
+    sampling_rng().seed(static_cast<uint32_t>(seed));
+}
 
 // ============================================================
 // SYCL Kernel: Argmax (GPU Side)

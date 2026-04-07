@@ -58,6 +58,15 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     AILA_LOG_INFO("========================================");
     AILA_LOG_INFO("  pp (prompt tokens):  %d", cfg.prompt_length);
     AILA_LOG_INFO("  tg (gen tokens):     %d", cfg.gen_length);
+    AILA_LOG_INFO("  decode mode:         %s", cfg.decode_do_sample ? "sampling" : "greedy");
+    if (cfg.decode_do_sample) {
+        AILA_LOG_INFO("  sampling params:     temp=%.3f top_k=%d top_p=%.3f seed=%llu fixed_seed=%s",
+                      cfg.decode_gen_config.temperature,
+                      cfg.decode_gen_config.top_k,
+                      cfg.decode_gen_config.top_p,
+                      static_cast<unsigned long long>(cfg.decode_gen_config.sampling_seed),
+                      cfg.decode_gen_config.use_fixed_seed ? "true" : "false");
+    }
     AILA_LOG_INFO("  warmup iterations:   %d", cfg.warmup_iters);
     AILA_LOG_INFO("  bench iterations:    %d", cfg.bench_iters);
     AILA_LOG_INFO("========================================");
@@ -70,7 +79,8 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     AILA_LOG_INFO("[Bench] Running %d warmup iteration(s)...", cfg.warmup_iters);
     for (int i = 0; i < cfg.warmup_iters; i++) {
         engine.benchmark_prefill(prompt);
-        engine.benchmark_decode(std::min(cfg.gen_length, 16));
+        engine.benchmark_decode(std::min(cfg.gen_length, 16),
+                                cfg.decode_do_sample ? &cfg.decode_gen_config : nullptr);
     }
     AILA_LOG_INFO("[Bench] Warmup complete");
 
@@ -94,7 +104,8 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     for (int i = 0; i < cfg.bench_iters; i++) {
         // Prefill first (not measured), then decode
         engine.benchmark_prefill(prompt);
-        double ms = engine.benchmark_decode(cfg.gen_length);
+        double ms = engine.benchmark_decode(cfg.gen_length,
+                                            cfg.decode_do_sample ? &cfg.decode_gen_config : nullptr);
         tg_times.push_back(ms);
         AILA_LOG_INFO("  tg iter %d: %.2f ms (%.1f tok/s)",
                       i + 1, ms, cfg.gen_length / (ms / 1000.0));
@@ -104,6 +115,7 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     BenchmarkResult result;
     result.prompt_tokens = actual_pp;
     result.gen_tokens = cfg.gen_length;
+    result.decode_do_sample = cfg.decode_do_sample;
 
     result.prefill_ms_avg = compute_mean(pp_times);
     result.prefill_ms_stddev = compute_stddev(pp_times, result.prefill_ms_avg);
@@ -124,6 +136,7 @@ void print_benchmark_results(const BenchmarkResult& r) {
     std::cout << "\n";
     std::cout << "========================================" << std::endl;
     std::cout << "  Benchmark Results" << std::endl;
+    std::cout << "  Decode mode: " << (r.decode_do_sample ? "sampling" : "greedy") << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Header

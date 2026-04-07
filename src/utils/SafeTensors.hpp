@@ -81,6 +81,11 @@ private:
 // 加载 safetensors 文件，所有权重上传到 GPU，返回 ModelWeights
 ModelWeights LoadSafetensors(const std::string& path, Context& ctx);
 
+// 从模型目录自动加载权重:
+// 1) 优先 model.safetensors
+// 2) 否则使用 model.safetensors.index.json + 分片 safetensors
+ModelWeights LoadModelWeightsFromDir(const std::string& model_dir, Context& ctx);
+
 // 内部工具函数
 std::vector<std::string> ParseHeader(const std::string& header,
                                      std::unordered_map<std::string, TensorMeta>& metadata);

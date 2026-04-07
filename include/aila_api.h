@@ -83,7 +83,7 @@ AILA_API AilaEngine* aila_engine_create(void);
 /**
  * Initialize the engine: loads model weights and tokenizer.
  * @param engine      Handle from aila_engine_create
- * @param model_dir   Path to model directory (containing model.safetensors, vocab.json, etc.)
+ * @param model_dir   Path to model directory (single-file or sharded safetensors + tokenizer files)
  * @param max_seq_len Maximum context window length (e.g. 4096)
  * @return 0 on success, non-zero on failure
  */

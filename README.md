@@ -12,10 +12,12 @@ A high-performance LLM inference engine built with **SYCL + oneDNN**, designed t
 
 ## Model Support
 
-Currently supports **Qwen3-0.6B** (BF16).
+Currently supports **Qwen3 BF16 family** (tested on 0.6B, and supports 4B-style sharded safetensors layout).
 
-Model architecture parameters are loaded from each model's `config.json` at runtime,
-so the engine can prepare for larger Qwen3 variants (for example 4B) without hardcoded shape edits.
+Model architecture parameters are loaded from each model's `config.json` at runtime.
+Model weights are auto-detected from either:
+- `model.safetensors` (single file), or
+- `model.safetensors.index.json` + `model-xxxxx-of-xxxxx.safetensors` shards.
 
 ## Verified Devices
 
@@ -77,14 +79,34 @@ Options:
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
   -p, --top-p <F>          Top-P (nucleus) sampling (default: 0.95)
+  --seed <N>               Sampling RNG seed (fixed-seed mode)
   --greedy                 Use greedy decoding
   --sample                 Use sampling (default)
   --stream / --no-stream   Force streaming output on/off
   --max-tokens <N>         Maximum new tokens (default: 1024)
   --decode-chunk <N>       Decode chunk size (default: 12)
   --stream-chunk <N>       Stream chunk size (default: 4)
+  --bench                  Run benchmark mode
+  --bench-pp <N>           Benchmark prompt length (default: 512)
+  --bench-tg <N>           Benchmark generation length (default: 128)
+  --bench-iters <N>        Benchmark iterations (default: 5)
+  --bench-warmup <N>       Benchmark warmup iterations (default: 1)
+  --bench-sample           Benchmark decode in sampling mode
+  --bench-greedy           Benchmark decode in greedy mode (default)
   -h, --help               Show help
   -v, --version            Show version
+```
+
+### Benchmark (Reproducible Sampling/Greedy)
+
+`bench.ps1` supports fixed-seed benchmark runs for both decode modes:
+
+```powershell
+# Greedy decode benchmark
+./bench.ps1 -ModelDir ..\Qwen3-0.6B -PromptTokens 512 -GenTokens 512 -BenchIters 6 -WarmupIters 1
+
+# Sampling decode benchmark (fixed seed)
+./bench.ps1 -ModelDir ..\Qwen3-0.6B -PromptTokens 512 -GenTokens 512 -BenchIters 6 -WarmupIters 1 -Sample -Seed 42 -Temperature 0.7 -TopK 15 -TopP 0.95
 ```
 
 ### Interactive Commands
@@ -95,6 +117,7 @@ Options:
 | `/config` | Show current configuration |
 | `/greedy` | Switch to greedy decoding |
 | `/sample` | Switch to sampling |
+| `/seed <N>` | Set sampling RNG seed and enable fixed-seed mode |
 | `/stream_on` | Enable streaming output |
 | `/stream_off` | Disable streaming output |
 | `/decode_chunk <N>` | Set decode chunk size |

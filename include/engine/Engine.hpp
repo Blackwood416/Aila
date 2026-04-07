@@ -42,8 +42,7 @@ public:
 
         // 3. Load model weights
         AILA_LOG_INFO("[3/3] Loading model weights...");
-        std::string safetensors_path = model_dir + "/model.safetensors";
-        weights_ = std::make_unique<ModelWeights>(LoadSafetensors(safetensors_path, *ctx_));
+        weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
 
         // 3.5 Load architecture config from config.json when available
         {
@@ -58,6 +57,11 @@ public:
             } else {
                 AILA_LOG_WARN("[Config] %s (using built-in defaults)", cfg_error.c_str());
             }
+        }
+        if (max_seq_len > config_.max_position_embeddings) {
+            AILA_LOG_WARN("[Config] max_seq_len=%d exceeds model max_position_embeddings=%d, clamping",
+                          max_seq_len, config_.max_position_embeddings);
+            max_seq_len = config_.max_position_embeddings;
         }
 
         // 4. Initialize model
@@ -269,6 +273,9 @@ public:
         generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
 
         // Sample first token using unified sampler
+        if (gen_config.do_sample && gen_config.use_fixed_seed) {
+            ops::set_sampling_seed(gen_config.sampling_seed);
+        }
         int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
                                                  gen_config, generated_token_ids);
 
@@ -536,7 +543,7 @@ public:
     }
 
     // Raw decode N tokens for benchmark (after prefill)
-    double benchmark_decode(int num_tokens) {
+    double benchmark_decode(int num_tokens, const GenerationConfig* decode_config = nullptr) {
         if (num_tokens <= 0) {
             return 0.0;
         }
@@ -545,14 +552,33 @@ public:
             benchmark_seed_token_ = config_.bos_token_id;
         }
 
+        GenerationConfig bench_gen_cfg;
+        bench_gen_cfg.do_sample = false;
+        if (decode_config) {
+            bench_gen_cfg = *decode_config;
+        }
+        if (bench_gen_cfg.do_sample && bench_gen_cfg.use_fixed_seed) {
+            ops::set_sampling_seed(bench_gen_cfg.sampling_seed);
+        }
+
         int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         ctx_->memcpy_h2d(current_token_device, &benchmark_seed_token_, sizeof(int));
 
+        std::vector<int> generated_token_ids;
+        generated_token_ids.reserve(static_cast<size_t>(num_tokens));
+
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < num_tokens; i++) {
             Tensor& logits = model_.forward(*ctx_, current_token_device, 1);
-            ops::argmax(*ctx_, logits, config_.vocab_size, next_token_device);
+            if (!bench_gen_cfg.do_sample) {
+                ops::argmax(*ctx_, logits, config_.vocab_size, next_token_device);
+            } else {
+                int sampled = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                      bench_gen_cfg, generated_token_ids);
+                generated_token_ids.push_back(sampled);
+                ctx_->memcpy_h2d(next_token_device, &sampled, sizeof(int));
+            }
             std::swap(current_token_device, next_token_device);
         }
         ctx_->synchronize();

@@ -202,6 +202,9 @@ namespace ops {
     int topk_sample(Context& ctx, Tensor& logits, int vocab_size,
                     float temperature, int top_k);
 
+    // Set sampling RNG seed for deterministic sampling runs.
+    void set_sampling_seed(uint64_t seed);
+
     // Apply repetition/presence/frequency penalties to logits (CPU side).
     // logits_f: float logits array on CPU (size = vocab_size)
     // generated_ids: all tokens generated so far in this turn

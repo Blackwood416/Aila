@@ -2,6 +2,10 @@
 #include "profile/Profiling.hpp"
 #include <stdexcept>
 #include <algorithm>
+#include <filesystem>
+#include <unordered_set>
+#include <fstream>
+#include <iterator>
 
 // ============================================================
 // ModelWeights 实现
@@ -211,4 +215,95 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
     }
 
     return weights;
+}
+
+namespace {
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return "";
+    }
+    return std::string((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+}
+
+std::vector<std::string> parse_sharded_safetensors_index(const std::string& index_path) {
+    std::string text = read_text_file(index_path);
+    if (text.empty()) {
+        throw std::runtime_error("Empty or unreadable safetensors index: " + index_path);
+    }
+
+    simdjson::dom::parser parser;
+    simdjson::dom::element root = parser.parse(text);
+
+    simdjson::dom::element weight_map_elem;
+    if (root.at_key("weight_map").get(weight_map_elem) != simdjson::SUCCESS) {
+        throw std::runtime_error("Invalid safetensors index: missing weight_map");
+    }
+
+    simdjson::dom::object weight_map;
+    if (weight_map_elem.get_object().get(weight_map) != simdjson::SUCCESS) {
+        throw std::runtime_error("Invalid safetensors index: weight_map is not an object");
+    }
+
+    std::unordered_set<std::string> unique_shards;
+    for (auto field : weight_map) {
+        std::string_view shard_sv;
+        if (field.value.get_string().get(shard_sv) == simdjson::SUCCESS) {
+            unique_shards.emplace(shard_sv);
+        }
+    }
+
+    std::vector<std::string> shards(unique_shards.begin(), unique_shards.end());
+    std::sort(shards.begin(), shards.end());
+    return shards;
+}
+
+} // namespace
+
+ModelWeights LoadModelWeightsFromDir(const std::string& model_dir, Context& ctx) {
+    namespace fs = std::filesystem;
+
+    fs::path dir(model_dir);
+    fs::path single = dir / "model.safetensors";
+    if (fs::exists(single)) {
+        AILA_LOG_INFO("[SafeTensors] Loading single-file weights: %s", single.string().c_str());
+        return LoadSafetensors(single.string(), ctx);
+    }
+
+    fs::path index = dir / "model.safetensors.index.json";
+    if (!fs::exists(index)) {
+        throw std::runtime_error("No model.safetensors or model.safetensors.index.json found in: " + model_dir);
+    }
+
+    auto shards = parse_sharded_safetensors_index(index.string());
+    if (shards.empty()) {
+        throw std::runtime_error("No shard entries found in: " + index.string());
+    }
+
+    AILA_LOG_INFO("[SafeTensors] Loading sharded weights from %zu shard(s)", shards.size());
+
+    ModelWeights merged;
+    for (const auto& shard_name : shards) {
+        fs::path shard_path = dir / shard_name;
+        if (!fs::exists(shard_path)) {
+            throw std::runtime_error("Missing safetensors shard: " + shard_path.string());
+        }
+
+        AILA_LOG_INFO("[SafeTensors] Loading shard: %s", shard_path.string().c_str());
+        ModelWeights shard_weights = LoadSafetensors(shard_path.string(), ctx);
+        auto tensor_names = shard_weights.names();
+
+        for (const auto& name : tensor_names) {
+            if (merged.has(name)) {
+                merged.replace(name, std::move(shard_weights.get(name)));
+            } else {
+                merged.put(name, std::move(shard_weights.get(name)));
+            }
+        }
+    }
+
+    AILA_LOG_INFO("[SafeTensors] Sharded load complete: %zu tensors", merged.size());
+    return merged;
 }

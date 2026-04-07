@@ -21,6 +21,8 @@ struct CLIOptions {
     int top_k = 15;                // -k, --top-k
     float top_p = 0.95f;           // --top-p
     bool do_sample = true;         // --greedy to disable sampling
+    uint64_t sampling_seed = 42;   // --seed
+    bool use_fixed_seed = false;   // seed enabled?
     bool stream_output = true;     // --stream / --no-stream (auto-detect)
     int decode_chunk_size = 12;    // --decode-chunk
     int stream_chunk_size = 4;     // --stream-chunk
@@ -38,6 +40,8 @@ struct CLIOptions {
     int bench_pp = 512;            // --bench-pp
     int bench_tg = 128;            // --bench-tg
     int bench_iters = 5;           // --bench-iters
+    int bench_warmup = 1;          // --bench-warmup
+    bool bench_sample = false;     // --bench-sample / --bench-greedy
 };
 
 // Parse command-line arguments

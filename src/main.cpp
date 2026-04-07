@@ -47,7 +47,18 @@ int main(int argc, char** argv) {
         bench_cfg.prompt_length = opts.bench_pp;
         bench_cfg.gen_length    = opts.bench_tg;
         bench_cfg.bench_iters   = opts.bench_iters;
-        bench_cfg.warmup_iters  = 1;
+        bench_cfg.warmup_iters  = opts.bench_warmup;
+        bench_cfg.decode_do_sample = opts.bench_sample;
+        bench_cfg.decode_gen_config.max_new_tokens = opts.bench_tg;
+        bench_cfg.decode_gen_config.temperature = opts.temperature;
+        bench_cfg.decode_gen_config.top_k = opts.top_k;
+        bench_cfg.decode_gen_config.top_p = opts.top_p;
+        bench_cfg.decode_gen_config.do_sample = opts.bench_sample;
+        bench_cfg.decode_gen_config.repetition_penalty = opts.repetition_penalty;
+        bench_cfg.decode_gen_config.presence_penalty = opts.presence_penalty;
+        bench_cfg.decode_gen_config.frequency_penalty = opts.frequency_penalty;
+        bench_cfg.decode_gen_config.sampling_seed = opts.sampling_seed;
+        bench_cfg.decode_gen_config.use_fixed_seed = opts.use_fixed_seed || opts.bench_sample;
 
         auto result = run_benchmark(engine, bench_cfg);
         print_benchmark_results(result);
@@ -61,6 +72,8 @@ int main(int argc, char** argv) {
     gen_config.top_k             = opts.top_k;
     gen_config.top_p             = opts.top_p;
     gen_config.do_sample         = opts.do_sample;
+    gen_config.sampling_seed     = opts.sampling_seed;
+    gen_config.use_fixed_seed    = opts.use_fixed_seed;
     gen_config.decode_chunk_size = opts.decode_chunk_size;
     gen_config.stream_chunk_size = opts.stream_chunk_size;
     gen_config.repetition_penalty = opts.repetition_penalty;

@@ -112,6 +112,7 @@ Options:
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
   -p, --top-p <F>          Top-P (nucleus) sampling (default: 0.95)
+  --seed <N>               Sampling RNG seed (enables fixed-seed mode)
   --greedy                 Use greedy decoding
   --sample                 Use sampling (default)
   --stream                 Force streaming output
@@ -126,6 +127,9 @@ Options:
   --bench-pp <N>           Benchmark prompt length (default: 512)
   --bench-tg <N>           Benchmark generation length (default: 128)
   --bench-iters <N>        Benchmark iterations (default: 5)
+  --bench-warmup <N>       Benchmark warmup iterations (default: 1)
+  --bench-sample           Benchmark decode in sampling mode
+  --bench-greedy           Benchmark decode in greedy mode (default)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -143,6 +147,7 @@ Interactive Commands:
   /context                 Show context usage
   /greedy                  Switch to greedy decoding
   /sample                  Switch to sampling
+  /seed <N>                Set sampling seed (fixed-seed mode)
   /stream_on               Enable streaming output
   /stream_off              Disable streaming output
   /decode_chunk <N>        Set decode chunk size
@@ -197,6 +202,16 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.top_p = static_cast<float>(std::atof(argv[++i]));
             if (opts.top_p <= 0.0f) opts.top_p = 1e-6f;
             if (opts.top_p > 1.0f) opts.top_p = 1.0f;
+            continue;
+        }
+        if (arg == "--seed" && i + 1 < argc) {
+            try {
+                opts.sampling_seed = static_cast<uint64_t>(std::stoull(argv[++i]));
+                opts.use_fixed_seed = true;
+            } catch (...) {
+                std::cerr << "Error: --seed must be an unsigned integer" << std::endl;
+                return false;
+            }
             continue;
         }
         if (arg == "--greedy") {
@@ -255,6 +270,18 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--bench-iters" && i + 1 < argc) {
             opts.bench_iters = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--bench-warmup" && i + 1 < argc) {
+            opts.bench_warmup = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--bench-sample") {
+            opts.bench_sample = true;
+            continue;
+        }
+        if (arg == "--bench-greedy") {
+            opts.bench_sample = false;
             continue;
         }
         // Positional: treat first positional as model dir
@@ -358,6 +385,20 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
+    registry.register_command("/seed", "Set sampling seed (fixed mode)", [&](const std::string& args) {
+        uint64_t v = 0;
+        std::istringstream iss(args);
+        if (iss >> v) {
+            gen_config.sampling_seed = v;
+            gen_config.use_fixed_seed = true;
+            std::cout << "[Config] sampling_seed=" << gen_config.sampling_seed
+                      << " (fixed-seed mode enabled)" << std::endl;
+        } else {
+            std::cout << "[Config] Usage: /seed <unsigned_int>" << std::endl;
+        }
+        return true;
+    });
+
     registry.register_command("/stream_on", "Enable streaming output", [&](const std::string&) {
         stream_output = true;
         std::cout << "[Config] Stream output enabled" << std::endl;
@@ -400,6 +441,8 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::cout << "  temperature:        " << gen_config.temperature << std::endl;
         std::cout << "  top_k:              " << gen_config.top_k << std::endl;
         std::cout << "  top_p:              " << gen_config.top_p << std::endl;
+        std::cout << "  fixed_seed:         " << (gen_config.use_fixed_seed ? "true" : "false") << std::endl;
+        std::cout << "  sampling_seed:      " << gen_config.sampling_seed << std::endl;
         std::cout << "  max_new_tokens:     " << gen_config.max_new_tokens << std::endl;
         std::cout << "  decode_chunk_size:  " << gen_config.decode_chunk_size << std::endl;
         std::cout << "  stream_chunk_size:  " << gen_config.stream_chunk_size << std::endl;

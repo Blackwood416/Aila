@@ -38,6 +38,8 @@ struct GenerationConfig {
     int top_k               = 20;
     float top_p             = 0.95f;
     bool do_sample          = true;
+    uint64_t sampling_seed  = 42;   // used when use_fixed_seed=true
+    bool use_fixed_seed     = false;
     int decode_chunk_size   = 1;    // greedy + non-streaming: host sync interval
     int stream_chunk_size   = 1;    // greedy + streaming: tokens per flush chunk
 
