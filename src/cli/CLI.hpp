@@ -19,7 +19,8 @@ struct CLIOptions {
     int max_new_tokens = 1024;     // --max-tokens
     float temperature = 0.7f;      // -t, --temperature
     int top_k = 15;                // -k, --top-k
-    bool do_sample = false;        // --sample (default greedy)
+    float top_p = 0.95f;           // --top-p
+    bool do_sample = true;         // --greedy to disable sampling
     bool stream_output = true;     // --stream / --no-stream (auto-detect)
     int decode_chunk_size = 12;    // --decode-chunk
     int stream_chunk_size = 4;     // --stream-chunk

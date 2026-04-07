@@ -6,10 +6,124 @@
 #include <random>
 #include <cmath>
 #include <unordered_map>
+#include <functional>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
 namespace ops {
+
+namespace {
+
+struct TopCandidate {
+    float logit;
+    int id;
+};
+
+struct MinHeapByLogit {
+    bool operator()(const TopCandidate& a, const TopCandidate& b) const {
+        // std::make_heap with this comparator forms a min-heap (front = smallest logit)
+        return a.logit > b.logit;
+    }
+};
+
+template <typename LogitGetter>
+int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_logit) {
+    if (vocab_size <= 0) return 0;
+
+    int k = top_k;
+    if (k <= 0 || k > vocab_size) k = vocab_size;
+
+    static thread_local std::vector<TopCandidate> heap;
+    static thread_local std::vector<TopCandidate> sorted;
+    static thread_local std::vector<float> probs;
+    heap.clear();
+    heap.reserve(static_cast<size_t>(k));
+
+    MinHeapByLogit cmp;
+    bool heap_ready = false;
+
+    for (int i = 0; i < vocab_size; ++i) {
+        float v = get_logit(i);
+        if (static_cast<int>(heap.size()) < k) {
+            heap.push_back({v, i});
+            if (static_cast<int>(heap.size()) == k) {
+                std::make_heap(heap.begin(), heap.end(), cmp);
+                heap_ready = true;
+            }
+        } else if (v > heap.front().logit) {
+            std::pop_heap(heap.begin(), heap.end(), cmp);
+            heap.back() = {v, i};
+            std::push_heap(heap.begin(), heap.end(), cmp);
+        }
+    }
+
+    if (!heap_ready && !heap.empty()) {
+        std::make_heap(heap.begin(), heap.end(), cmp);
+        heap_ready = true;
+    }
+    if (heap.empty()) return 0;
+
+    sorted = heap;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const TopCandidate& a, const TopCandidate& b) {
+                  return a.logit > b.logit;
+              });
+
+    float max_val = sorted[0].logit;
+    probs.resize(sorted.size());
+    float sum = 0.0f;
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        float p = std::exp(sorted[i].logit - max_val);
+        probs[i] = p;
+        sum += p;
+    }
+    if (sum <= 0.0f || !std::isfinite(sum)) {
+        return sorted[0].id;
+    }
+    for (float& p : probs) {
+        p /= sum;
+    }
+
+    float p_cut = std::clamp(top_p, 1e-6f, 1.0f);
+    size_t keep = probs.size();
+    if (p_cut < 0.999999f) {
+        float cdf = 0.0f;
+        keep = 0;
+        for (size_t i = 0; i < probs.size(); ++i) {
+            cdf += probs[i];
+            keep = i + 1;
+            if (cdf >= p_cut) {
+                break;
+            }
+        }
+        if (keep == 0) keep = 1;
+
+        float kept_sum = 0.0f;
+        for (size_t i = 0; i < keep; ++i) {
+            kept_sum += probs[i];
+        }
+        if (kept_sum > 0.0f) {
+            for (size_t i = 0; i < keep; ++i) {
+                probs[i] /= kept_sum;
+            }
+        }
+    }
+
+    static thread_local std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(rng);
+
+    float cumsum = 0.0f;
+    for (size_t i = 0; i < keep; ++i) {
+        cumsum += probs[i];
+        if (r <= cumsum) {
+            return sorted[i].id;
+        }
+    }
+    return sorted[keep - 1].id;
+}
+
+} // namespace
 
 // ============================================================
 // SYCL Kernel: Argmax (GPU Side)
@@ -107,42 +221,12 @@ int argmax(Context& ctx, Tensor& logits, int vocab_size) {
 
 int topk_sample(Context& ctx, Tensor& logits, int vocab_size,
                  float temperature, int top_k) {
-    std::vector<bf16> host_logits_bf16(vocab_size);
+    static thread_local std::vector<bf16> host_logits_bf16;
+    host_logits_bf16.resize(static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16.data(), logits.data(), vocab_size * sizeof(bf16));
-
-    std::vector<float> logits_f(vocab_size);
-    for (int i = 0; i < vocab_size; i++) {
-        logits_f[i] = static_cast<float>(host_logits_bf16[i]) / temperature;
-    }
-
-    std::vector<int> indices(vocab_size);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-        [&](int a, int b) { return logits_f[a] > logits_f[b]; });
-
-    float max_val = logits_f[indices[0]];
-    float sum = 0.0f;
-    std::vector<float> probs(top_k);
-    for (int i = 0; i < top_k; i++) {
-        probs[i] = std::exp(logits_f[indices[i]] - max_val);
-        sum += probs[i];
-    }
-    for (int i = 0; i < top_k; i++) {
-        probs[i] /= sum;
-    }
-
-    static std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-
-    float cumsum = 0.0f;
-    for (int i = 0; i < top_k; i++) {
-        cumsum += probs[i];
-        if (r <= cumsum) {
-            return indices[i];
-        }
-    }
-    return indices[top_k - 1];
+    float inv_temperature = 1.0f / std::max(temperature, 1e-6f);
+    return sample_topk_topp(vocab_size, top_k, 1.0f,
+                            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
 }
 
 // ============================================================
@@ -191,77 +275,48 @@ void apply_penalties(float* logits_f, int vocab_size,
 int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                        const GenerationConfig& gen_config,
                        const std::vector<int>& generated_ids) {
+    float inv_temperature = 1.0f / std::max(gen_config.temperature, 1e-6f);
+    int top_k = std::min(gen_config.top_k, vocab_size);
 
-    using bf16 = sycl::ext::oneapi::bfloat16;
-
-    // D2H: copy logits to CPU
-    std::vector<bf16> host_logits_bf16(vocab_size);
+    static thread_local std::vector<bf16> host_logits_bf16;
+    host_logits_bf16.resize(static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16.data(), logits.data(), vocab_size * sizeof(bf16));
-
-    std::vector<float> logits_f(vocab_size);
-    for (int i = 0; i < vocab_size; i++) {
-        logits_f[i] = static_cast<float>(host_logits_bf16[i]);
-    }
-
-    // Apply penalties
-    if (gen_config.has_penalties()) {
-        apply_penalties(logits_f.data(), vocab_size, generated_ids,
-                        gen_config.repetition_penalty,
-                        gen_config.presence_penalty,
-                        gen_config.frequency_penalty);
-    }
 
     if (!gen_config.do_sample) {
         // Greedy: CPU argmax
         int best_idx = 0;
-        float best_val = logits_f[0];
+        float best_val = static_cast<float>(host_logits_bf16[0]);
         for (int i = 1; i < vocab_size; i++) {
-            if (logits_f[i] > best_val) {
-                best_val = logits_f[i];
+            float v = static_cast<float>(host_logits_bf16[i]);
+            if (v > best_val) {
+                best_val = v;
                 best_idx = i;
             }
         }
         return best_idx;
     }
 
-    // Temperature scaling
-    float temperature = std::max(gen_config.temperature, 1e-6f);
+    // Fast path: sampling without penalties (CPU fallback)
+    if (!gen_config.has_penalties()) {
+        return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
+            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
+    }
+
+    // Generic path: penalties on CPU float logits
+    static thread_local std::vector<float> logits_f;
+    logits_f.resize(static_cast<size_t>(vocab_size));
     for (int i = 0; i < vocab_size; i++) {
-        logits_f[i] /= temperature;
+        logits_f[i] = static_cast<float>(host_logits_bf16[i]);
     }
-
-    // Top-k sampling
-    int top_k = std::min(gen_config.top_k, vocab_size);
-    if (top_k <= 0) top_k = vocab_size;
-
-    std::vector<int> indices(vocab_size);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-        [&](int a, int b) { return logits_f[a] > logits_f[b]; });
-
-    float max_val = logits_f[indices[0]];
-    float sum = 0.0f;
-    std::vector<float> probs(top_k);
-    for (int i = 0; i < top_k; i++) {
-        probs[i] = std::exp(logits_f[indices[i]] - max_val);
-        sum += probs[i];
+    apply_penalties(logits_f.data(), vocab_size, generated_ids,
+                    gen_config.repetition_penalty,
+                    gen_config.presence_penalty,
+                    gen_config.frequency_penalty);
+    for (int i = 0; i < vocab_size; ++i) {
+        logits_f[i] *= inv_temperature;
     }
-    for (int i = 0; i < top_k; i++) {
-        probs[i] /= sum;
-    }
-
-    static std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(rng);
-
-    float cumsum = 0.0f;
-    for (int i = 0; i < top_k; i++) {
-        cumsum += probs[i];
-        if (r <= cumsum) {
-            return indices[i];
-        }
-    }
-    return indices[top_k - 1];
+    return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
+        [&](int i) { return logits_f[i]; });
 }
 
 } // namespace ops

@@ -111,8 +111,9 @@ Options:
   -s, --max-seq <N>        Maximum sequence length (default: 4096, or AILA_MAX_SEQ_LEN)
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
-  --greedy                 Use greedy decoding (default)
-  --sample                 Use sampling
+  -p, --top-p <F>          Top-P (nucleus) sampling (default: 0.95)
+  --greedy                 Use greedy decoding
+  --sample                 Use sampling (default)
   --stream                 Force streaming output
   --no-stream              Force non-streaming output
   --max-tokens <N>         Maximum new tokens (default: 1024)
@@ -190,6 +191,12 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if ((arg == "-k" || arg == "--top-k") && i + 1 < argc) {
             opts.top_k = std::atoi(argv[++i]);
+            continue;
+        }
+        if ((arg == "-p" || arg == "--top-p") && i + 1 < argc) {
+            opts.top_p = static_cast<float>(std::atof(argv[++i]));
+            if (opts.top_p <= 0.0f) opts.top_p = 1e-6f;
+            if (opts.top_p > 1.0f) opts.top_p = 1.0f;
             continue;
         }
         if (arg == "--greedy") {
@@ -346,7 +353,8 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
     registry.register_command("/sample", "Switch to sampling", [&](const std::string&) {
         gen_config.do_sample = true;
         std::cout << "[Config] Switched to sampling (temp=" << gen_config.temperature
-                  << ", top_k=" << gen_config.top_k << ")" << std::endl;
+                  << ", top_k=" << gen_config.top_k
+                  << ", top_p=" << gen_config.top_p << ")" << std::endl;
         return true;
     });
 
@@ -391,6 +399,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::cout << "  do_sample:          " << (gen_config.do_sample ? "true" : "false") << std::endl;
         std::cout << "  temperature:        " << gen_config.temperature << std::endl;
         std::cout << "  top_k:              " << gen_config.top_k << std::endl;
+        std::cout << "  top_p:              " << gen_config.top_p << std::endl;
         std::cout << "  max_new_tokens:     " << gen_config.max_new_tokens << std::endl;
         std::cout << "  decode_chunk_size:  " << gen_config.decode_chunk_size << std::endl;
         std::cout << "  stream_chunk_size:  " << gen_config.stream_chunk_size << std::endl;

@@ -3,6 +3,7 @@
 #include "../src/core/Context.hpp"
 #include "../src/models/Qwen3.hpp"
 #include "../src/utils/Tokenizer.hpp"
+#include "../src/utils/ModelConfig.hpp"
 #include "../src/utils/SafeTensors.hpp"
 #include "../src/profile/Profiling.hpp"
 #include "Types.hpp"
@@ -43,6 +44,21 @@ public:
         AILA_LOG_INFO("[3/3] Loading model weights...");
         std::string safetensors_path = model_dir + "/model.safetensors";
         weights_ = std::make_unique<ModelWeights>(LoadSafetensors(safetensors_path, *ctx_));
+
+        // 3.5 Load architecture config from config.json when available
+        {
+            std::string cfg_error;
+            if (aila::modelcfg::load_qwen3_config_from_dir(model_dir, config_, &cfg_error)) {
+                AILA_LOG_INFO("[Config] Loaded model config from config.json");
+                AILA_LOG_INFO("[Config] hidden=%d layers=%d heads=%d kv_heads=%d head_dim=%d ffn=%d vocab=%d",
+                              config_.hidden_size, config_.num_hidden_layers,
+                              config_.num_attention_heads, config_.num_key_value_heads,
+                              config_.head_dim, config_.intermediate_size,
+                              config_.vocab_size);
+            } else {
+                AILA_LOG_WARN("[Config] %s (using built-in defaults)", cfg_error.c_str());
+            }
+        }
 
         // 4. Initialize model
         model_.load(*ctx_, *weights_, config_, max_seq_len);
@@ -248,18 +264,13 @@ public:
         ctx_->free_device(token_ids_device);
 
         // --- Decode loop ---
-        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-
         // Collect generated tokens for penalty tracking
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
 
         // Sample first token using unified sampler
         int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
-                                                  gen_config, generated_token_ids);
-
-        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+                                                 gen_config, generated_token_ids);
 
         std::string output_text;
         bool streaming = (token_callback != nullptr);
@@ -290,6 +301,9 @@ public:
                                              : std::max(1, gen_config.decode_chunk_size);
         bool use_chunked_greedy = (!gen_config.do_sample && !gen_config.has_penalties()
                                    && effective_chunk_size > 1);
+        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
 
         int* generated_tokens_device = nullptr;
         if (use_chunked_greedy) {
@@ -396,7 +410,7 @@ public:
                     generated_token_ids.push_back(token_id);
                     if (check_loop_guard(token_id)) {
                         AILA_LOG_WARN("[Generate] Loop guard triggered in greedy decode (token=%d, run=%d), stopping early",
-                                      generated_count, same_token_run);
+                                      token_id, same_token_run);
                         eos_reached = true;
                         break;
                     }
@@ -409,33 +423,33 @@ public:
             }
         } else {
             // Unified path: penalties + sampling (goes through CPU each step)
+            int current_token = next_token;
             while (generated_count < max_new_tokens) {
-                Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
-
-                ctx_->memcpy_d2h(&next_token, current_token_device, sizeof(int));
-                if (tokenizer_.is_eos(next_token)) {
+                if (tokenizer_.is_eos(current_token)) {
                     break;
                 }
 
-                generated_token_ids.push_back(next_token);
-                if (check_loop_guard(next_token)) {
+                generated_token_ids.push_back(current_token);
+                if (check_loop_guard(current_token)) {
                     AILA_LOG_WARN("[Generate] Loop guard triggered in decode (token=%d, run=%d), stopping early",
-                                  generated_count, same_token_run);
+                                  current_token, same_token_run);
                     break;
                 }
 
                 if (streaming) {
-                    std::string token_text = tokenizer_.decode(next_token);
+                    std::string token_text = tokenizer_.decode(current_token);
                     emit_stream_piece(token_text);
                 }
                 generated_count++;
 
+                Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
+
                 // Unified sampling with penalties
-                ctx_->synchronize();
                 next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
                                                       gen_config, generated_token_ids);
                 ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
                 std::swap(current_token_device, next_token_device);
+                current_token = next_token;
             }
 
             ctx_->synchronize();

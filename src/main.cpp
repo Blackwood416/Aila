@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
     gen_config.max_new_tokens    = opts.max_new_tokens;
     gen_config.temperature       = opts.temperature;
     gen_config.top_k             = opts.top_k;
+    gen_config.top_p             = opts.top_p;
     gen_config.do_sample         = opts.do_sample;
     gen_config.decode_chunk_size = opts.decode_chunk_size;
     gen_config.stream_chunk_size = opts.stream_chunk_size;

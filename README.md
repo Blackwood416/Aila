@@ -14,6 +14,9 @@ A high-performance LLM inference engine built with **SYCL + oneDNN**, designed t
 
 Currently supports **Qwen3-0.6B** (BF16).
 
+Model architecture parameters are loaded from each model's `config.json` at runtime,
+so the engine can prepare for larger Qwen3 variants (for example 4B) without hardcoded shape edits.
+
 ## Verified Devices
 
 | Device | VRAM | Status |
@@ -73,8 +76,9 @@ Options:
   -s, --max-seq <N>        Maximum sequence length (default: 4096)
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
-  --greedy                 Use greedy decoding (default)
-  --sample                 Use sampling
+  -p, --top-p <F>          Top-P (nucleus) sampling (default: 0.95)
+  --greedy                 Use greedy decoding
+  --sample                 Use sampling (default)
   --stream / --no-stream   Force streaming output on/off
   --max-tokens <N>         Maximum new tokens (default: 1024)
   --decode-chunk <N>       Decode chunk size (default: 12)

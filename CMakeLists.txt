@@ -43,6 +43,7 @@ set(LIB_SOURCES
     src/memory/KVCache.cpp
     src/models/Qwen3.cpp
     src/utils/Tokenizer.cpp
+    src/utils/ModelConfig.cpp
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
     src/profile/Device.cpp
