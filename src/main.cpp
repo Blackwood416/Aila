@@ -4,6 +4,8 @@
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 int main(int argc, char** argv) {
     // Parse command line arguments
@@ -79,6 +81,40 @@ int main(int argc, char** argv) {
     gen_config.repetition_penalty = opts.repetition_penalty;
     gen_config.presence_penalty   = opts.presence_penalty;
     gen_config.frequency_penalty  = opts.frequency_penalty;
+
+    // Single-shot messages JSON mode
+    if (!opts.messages_json_path.empty()) {
+        std::ifstream in(opts.messages_json_path, std::ios::binary);
+        if (!in.is_open()) {
+            AILA_LOG_ERROR("Failed to open messages JSON file: %s", opts.messages_json_path.c_str());
+            return 1;
+        }
+        std::string messages_json((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+
+        if (opts.stream_output) {
+            std::cout << "\nAila: ";
+            engine.generate_messages_json(messages_json, gen_config,
+                [](const std::string& token_text) {
+                    std::cout << token_text << std::flush;
+                });
+            if (engine.last_error_code() != EngineErrorCode::Ok) {
+                AILA_LOG_ERROR("messages-json generation failed: %s",
+                               engine.last_error_message().c_str());
+                return 2;
+            }
+            std::cout << std::endl;
+        } else {
+            std::string out = engine.generate_messages_json(messages_json, gen_config, nullptr);
+            if (engine.last_error_code() != EngineErrorCode::Ok) {
+                AILA_LOG_ERROR("messages-json generation failed: %s",
+                               engine.last_error_message().c_str());
+                return 2;
+            }
+            std::cout << out << std::endl;
+        }
+        return 0;
+    }
 
     // Run interactive loop
     return run_interactive(engine, gen_config, opts.stream_output);

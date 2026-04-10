@@ -1,0 +1,130 @@
+#pragma once
+
+#include "IModelBackend.hpp"
+#include "../ops/Ops.hpp"
+#include <vector>
+
+class Qwen35HybridTextBackend : public IModelBackend {
+public:
+    bool load(Context& ctx,
+              ModelWeights& weights,
+              const ModelSpec& spec,
+              int max_seq_len,
+              std::string* error_message) override;
+
+    Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
+    void reset() override;
+    void truncate_kv_cache(int new_len) override;
+    int max_seq_len() const override { return max_seq_len_; }
+    int vocab_size() const override { return cfg_.vocab_size; }
+    ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+
+private:
+    struct Layer {
+        bool is_linear = false;
+
+        Tensor* input_ln_weight = nullptr;
+        Tensor* post_attn_ln_weight = nullptr;
+
+        // full attention branch
+        Linear q_proj, k_proj, v_proj, o_proj;
+        Tensor* q_norm_weight = nullptr;
+        Tensor* k_norm_weight = nullptr;
+
+        // linear attention branch
+        Linear linear_qkv_proj, linear_z_proj, linear_o_proj;
+        Linear linear_a_proj, linear_b_proj;
+        Tensor* linear_norm_weight = nullptr; // f32
+        Tensor* linear_A_log = nullptr;       // f32
+        Tensor* linear_dt_bias = nullptr;     // bf16
+        Tensor* linear_conv1d_weight = nullptr; // bf16 [channels, 1, kernel]
+
+        // FFN
+        Linear gate_proj, up_proj, down_proj;
+
+        std::vector<float> host_linear_A_negexp;
+        std::vector<float> host_linear_dt_bias;
+        std::vector<float> host_linear_conv;      // [channels * kernel]
+        std::vector<float> host_linear_norm;      // [head_dim]
+    };
+
+    struct LayerCache {
+        Tensor k;
+        Tensor v;
+        // DeltaNet recurrent state S per head: [num_heads, key_dim, value_dim] (f32)
+        Tensor linear_state;
+        Tensor linear_conv_state; // [kernel-1, conv_channels] (f32)
+    };
+
+    struct Buffers {
+        Tensor hidden;
+        Tensor normed;
+        Tensor qkv;
+        Tensor q;
+        Tensor k;
+        Tensor v;
+        Tensor z;
+        Tensor a;
+        Tensor b;
+        Tensor attn_out;
+        Tensor gate;
+        Tensor up;
+        Tensor logits;
+        Tensor decode_scores;
+        Tensor scores;
+        Tensor incr_scores;
+    } buf_;
+
+    void ensure_runtime_buffers(Context& ctx, int seq_len);
+    void ensure_prefill_scores(Context& ctx, int seq_len);
+    void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
+    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache, int seq_len);
+    static float softplus(float x);
+    static float silu(float x);
+    static void head_l2_norm_inplace(std::vector<float>& x, int seq_len, int num_heads, int head_dim, float eps);
+    static void head_rms_norm_and_silu_gate(std::vector<float>& x,
+                                            const std::vector<float>& norm_weight,
+                                            const std::vector<float>& z,
+                                            int seq_len, int num_heads, int head_dim, float eps);
+
+    ModelSpec spec_{};
+    Qwen35TextConfig cfg_{};
+    Tensor* embed_weight_ = nullptr;
+    Tensor* final_norm_weight_ = nullptr;
+    Linear lm_head_;
+
+    std::vector<Layer> layers_;
+    std::vector<LayerCache> layer_caches_;
+    std::vector<Tensor> fused_weights_;
+
+    int max_seq_len_ = 0;
+    int current_len_ = 0;
+    int runtime_seq_capacity_ = 0;
+    int prefill_scores_capacity_ = 0;
+    int incr_prefill_seq_cap_ = 0;
+    int incr_prefill_total_cap_ = 0;
+
+    int full_q_heads_ = 0;
+    int full_kv_heads_ = 0;
+    int full_head_dim_ = 0;
+    int full_q_dim_ = 0;
+    int full_kv_dim_ = 0;
+    int full_q_proj_dim_ = 0;
+
+    int linear_q_heads_ = 0;
+    int linear_kv_heads_ = 0;
+    int linear_head_dim_ = 0;
+    int linear_q_dim_ = 0;
+    int linear_kv_dim_ = 0;
+    int linear_qkv_dim_ = 0;
+    int linear_z_dim_ = 0;
+    int linear_conv_kernel_dim_ = 4;
+    int linear_conv_channels_ = 0;
+
+    int hidden_size_ = 0;
+    int ff_dim_ = 0;
+    int max_attn_heads_ = 0;
+    int max_qkv_dim_ = 0;
+    int max_attn_dim_ = 0;
+    bool use_delta_linear_ = false;
+};

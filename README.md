@@ -12,12 +12,16 @@ A high-performance LLM inference engine built with **SYCL + oneDNN**, designed t
 
 ## Model Support
 
-Currently supports **Qwen3 BF16 family** (tested on 0.6B, and supports 4B-style sharded safetensors layout).
+Currently supports:
+- **Qwen3 BF16 family** (0.6B / 4B)
+- **Qwen3.5-0.8B hybrid text backend (phase-1)**
 
 Model architecture parameters are loaded from each model's `config.json` at runtime.
 Model weights are auto-detected from either:
 - `model.safetensors` (single file), or
 - `model.safetensors.index.json` + `model-xxxxx-of-xxxxx.safetensors` shards.
+
+For Qwen3.5-0.8B, text generation is enabled in phase-1. The linear-attention text path includes `in_proj_a/b`, depthwise `conv1d`, and recurrent state update logic (DeltaNet-style decode path). Vision/image inputs are parsed via message content parts but currently return a clear "vision backend not enabled" error until phase-2 vision kernels are enabled.
 
 ## Verified Devices
 
@@ -93,8 +97,24 @@ Options:
   --bench-warmup <N>       Benchmark warmup iterations (default: 1)
   --bench-sample           Benchmark decode in sampling mode
   --bench-greedy           Benchmark decode in greedy mode (default)
+  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file
   -h, --help               Show help
   -v, --version            Show version
+```
+
+Example `messages.json`:
+
+```json
+[
+  {"role": "system", "content": "You are a concise assistant."},
+  {"role": "user", "content": [{"type":"text","text":"请用一句话介绍你自己。"}]}
+]
+```
+
+Run:
+
+```powershell
+Aila.exe -m ./Qwen3.5-0.8B --messages-json ./messages.json --max-tokens 64 --greedy --no-stream
 ```
 
 ### Benchmark (Reproducible Sampling/Greedy)
@@ -128,6 +148,10 @@ Options:
 
 Aila exposes a stable C ABI through `aila_api.h`, suitable for any language with C FFI support:
 
+`aila_generate_messages` returns `NULL` on parse/template/runtime errors. Use
+`aila_last_error_code()` + `aila_last_error_message()` to inspect failures
+(including explicit vision-disabled errors for image/video content in text-only mode).
+
 ```c
 #include "aila_api.h"
 
@@ -140,6 +164,18 @@ AilaGenConfig config = aila_default_gen_config();
 char* response = aila_generate(engine, "Hello, who are you?", &config);
 printf("%s\n", response);
 aila_free_string(response);
+
+// OpenAI-style messages JSON generation
+const char* messages_json = "[{\"role\":\"user\",\"content\":\"你好\"}]";
+char* response2 = aila_generate_messages(engine, messages_json, &config);
+if (!response2) {
+    printf("messages error[%d]: %s\n",
+        aila_last_error_code(engine),
+        aila_last_error_message(engine));
+} else {
+    printf("%s\n", response2);
+    aila_free_string(response2);
+}
 
 // Streaming generation
 aila_generate_stream(engine, "Tell me a story", &config,
@@ -186,6 +222,7 @@ lib.aila_engine_destroy(engine)
 | `AILA_ATTN_DECODE_WINDOW` | `0` | Decode attention lookback window (`0` = full context) |
 | `AILA_ATTN_DECODE_WINDOW_START` | `auto` | Enable decode window only after context length exceeds threshold (auto = `max(512, window)`) |
 | `AILA_ATTN_DECODE_SINK` | `0` | Prefix sink tokens kept together with recent window in decode attention |
+| `AILA_Q35_LINEAR_DELTA` | `0` | Qwen3.5 linear layer mode: `0` legacy-attn approximation (default/stabler), `1` host DeltaNet recurrent path (experimental) |
 
 ### Streaming Output
 
@@ -211,6 +248,13 @@ lib.aila_engine_destroy(engine)
 - This is a quality/speed trade-off. For strict quality parity, keep `0`.
 - On Arc A770 (`pp=512, tg=512` benchmark), decode throughput in this project is typically:
   `window=0` ~58 tok/s, `window=256` ~92 tok/s, `window=128` ~138 tok/s.
+
+### Qwen3.5 Text Notes
+
+- Qwen3.5-0.8B can be repetition-prone under weak sampling constraints.
+- For `generate_messages` on Qwen3.5, Aila now applies anti-loop sampling defaults when values are left weak/default:
+  `temperature>=0.8`, `top_k>=40`, `repetition_penalty=1.12`, `presence_penalty=0.05`, `frequency_penalty=0.10`.
+- If you need strict raw behavior, explicitly pass your own sampling parameters.
 
 ### Context Window / Memory
 

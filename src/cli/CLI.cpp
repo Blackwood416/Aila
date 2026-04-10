@@ -130,6 +130,7 @@ Options:
   --bench-warmup <N>       Benchmark warmup iterations (default: 1)
   --bench-sample           Benchmark decode in sampling mode
   --bench-greedy           Benchmark decode in greedy mode (default)
+  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -282,6 +283,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--bench-greedy") {
             opts.bench_sample = false;
+            continue;
+        }
+        if (arg == "--messages-json" && i + 1 < argc) {
+            opts.messages_json_path = argv[++i];
             continue;
         }
         // Positional: treat first positional as model dir

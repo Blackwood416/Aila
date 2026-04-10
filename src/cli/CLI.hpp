@@ -42,6 +42,9 @@ struct CLIOptions {
     int bench_iters = 5;           // --bench-iters
     int bench_warmup = 1;          // --bench-warmup
     bool bench_sample = false;     // --bench-sample / --bench-greedy
+
+    // Single-shot messages JSON mode
+    std::string messages_json_path; // --messages-json
 };
 
 // Parse command-line arguments

@@ -42,10 +42,14 @@ set(LIB_SOURCES
     src/ops/Transpose.cpp
     src/memory/KVCache.cpp
     src/models/Qwen3.cpp
+    src/models/Qwen3DenseBackend.cpp
+    src/models/Qwen35HybridTextBackend.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
+    src/utils/ModelSpec.cpp
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
+    src/templates/TemplateRegistry.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp

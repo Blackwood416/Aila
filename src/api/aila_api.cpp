@@ -36,6 +36,18 @@ static GenerationConfig to_cpp_config(const AilaGenConfig* c_config) {
     return cfg;
 }
 
+static int to_c_error_code(EngineErrorCode code) {
+    switch (code) {
+        case EngineErrorCode::Ok: return AILA_OK;
+        case EngineErrorCode::InvalidArgument: return AILA_ERR_INVALID_ARGUMENT;
+        case EngineErrorCode::TemplateError: return AILA_ERR_TEMPLATE;
+        case EngineErrorCode::JsonParseError: return AILA_ERR_JSON_PARSE;
+        case EngineErrorCode::VisionNotEnabled: return AILA_ERR_VISION_NOT_ENABLED;
+        case EngineErrorCode::ContextOverflow: return AILA_ERR_CONTEXT_OVERFLOW;
+        default: return AILA_ERR_RUNTIME;
+    }
+}
+
 // ============================================================
 // API Implementation
 // ============================================================
@@ -91,6 +103,9 @@ AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaG
     try {
         GenerationConfig cfg = to_cpp_config(config);
         std::string result = engine->engine.generate(std::string(prompt), cfg, nullptr);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return nullptr;
+        }
 
         // Allocate and copy result
         char* out = static_cast<char*>(malloc(result.size() + 1));
@@ -102,6 +117,28 @@ AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaG
         return nullptr;
     } catch (...) {
         AILA_LOG_ERROR("[C-API] Generate failed: unknown exception");
+        return nullptr;
+    }
+}
+
+AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_json,
+                                      const AilaGenConfig* config) {
+    if (!engine || !messages_json) return nullptr;
+    try {
+        GenerationConfig cfg = to_cpp_config(config);
+        std::string result = engine->engine.generate_messages_json(std::string(messages_json), cfg, nullptr);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return nullptr;
+        }
+        char* out = static_cast<char*>(malloc(result.size() + 1));
+        if (!out) return nullptr;
+        memcpy(out, result.c_str(), result.size() + 1);
+        return out;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Generate messages failed: %s", e.what());
+        return nullptr;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Generate messages failed: unknown exception");
         return nullptr;
     }
 }
@@ -122,7 +159,9 @@ AILA_API int aila_generate_stream(AilaEngine* engine, const char* prompt,
                     if (ret != 0) aborted = true;
                 }
             });
-
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return -1;
+        }
         return aborted ? 1 : 0;
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[C-API] Stream generate failed: %s", e.what());
@@ -156,4 +195,15 @@ AILA_API void aila_engine_reset_context(AilaEngine* engine) {
 AILA_API int aila_engine_context_length(AilaEngine* engine) {
     if (!engine) return 0;
     return engine->engine.context_length();
+}
+
+AILA_API int aila_last_error_code(AilaEngine* engine) {
+    if (!engine) return AILA_ERR_INVALID_ARGUMENT;
+    return to_c_error_code(engine->engine.last_error_code());
+}
+
+AILA_API const char* aila_last_error_message(AilaEngine* engine) {
+    static const char* kEmpty = "";
+    if (!engine) return kEmpty;
+    return engine->engine.last_error_message().c_str();
 }

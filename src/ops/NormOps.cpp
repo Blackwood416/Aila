@@ -92,9 +92,15 @@ void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
 void head_rms_norm(Context& ctx, Tensor& x, Tensor& weight,
                     float eps, int seq_len, int num_heads, int head_dim) {
     bf16* x_ptr = static_cast<bf16*>(x.data());
-    bf16* w_ptr = static_cast<bf16*>(weight.data());
+    bf16* w_bf16_ptr = nullptr;
+    float* w_f32_ptr = nullptr;
+    if (weight.dtype() == dnnl::memory::data_type::f32) {
+        w_f32_ptr = static_cast<float*>(weight.data());
+    } else {
+        w_bf16_ptr = static_cast<bf16*>(weight.data());
+    }
 
-    int wg_size = 128; 
+    int wg_size = (head_dim > 128 ? 256 : 128);
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);
@@ -105,11 +111,12 @@ void head_rms_norm(Context& ctx, Tensor& x, Tensor& weight,
                 int lid = item.get_local_id(0);
                 int base = group_idx * head_dim;
 
-                float val = 0.0f;
-                if (lid < head_dim) {
-                    val = static_cast<float>(x_ptr[base + lid]);
+                float sum_sq = 0.0f;
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float val = static_cast<float>(x_ptr[base + d]);
+                    sum_sq += val * val;
                 }
-                local_sum[lid] = val * val;
+                local_sum[lid] = sum_sq;
                 item.barrier(sycl::access::fence_space::local_space);
 
                 for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
@@ -119,9 +126,10 @@ void head_rms_norm(Context& ctx, Tensor& x, Tensor& weight,
 
                 float rms = sycl::sqrt(local_sum[0] / static_cast<float>(head_dim) + eps);
 
-                if (lid < head_dim) {
-                    float w = static_cast<float>(w_ptr[lid]);
-                    x_ptr[base + lid] = bf16(val / rms * w);
+                for (int d = lid; d < head_dim; d += wg_size) {
+                    float val = static_cast<float>(x_ptr[base + d]);
+                    float w = w_f32_ptr ? w_f32_ptr[d] : static_cast<float>(w_bf16_ptr[d]);
+                    x_ptr[base + d] = bf16(val / rms * w);
                 }
             });
     });

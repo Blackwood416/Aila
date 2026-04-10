@@ -37,6 +37,16 @@
 /* -------------- Opaque handle -------------- */
 typedef struct AilaEngine AilaEngine;
 
+typedef enum AilaErrorCode {
+    AILA_OK = 0,
+    AILA_ERR_INVALID_ARGUMENT = 1,
+    AILA_ERR_TEMPLATE = 2,
+    AILA_ERR_JSON_PARSE = 3,
+    AILA_ERR_VISION_NOT_ENABLED = 4,
+    AILA_ERR_CONTEXT_OVERFLOW = 5,
+    AILA_ERR_RUNTIME = 6
+} AilaErrorCode;
+
 /* -------------- Generation configuration -------------- */
 typedef struct AilaGenConfig {
     int   max_new_tokens;       /* default: 512    */
@@ -111,6 +121,17 @@ AILA_API AilaGenConfig aila_default_gen_config(void);
 AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaGenConfig* config);
 
 /**
+ * Generate response from OpenAI-style messages JSON (blocking, non-streaming).
+ * @param engine         Initialized engine handle
+ * @param messages_json  UTF-8 JSON array string. Each item should contain role/content.
+ * @param config         Generation config (NULL for defaults)
+ * @return Newly allocated UTF-8 string. Caller must free with aila_free_string().
+ *         Returns NULL on error.
+ */
+AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_json,
+                                      const AilaGenConfig* config);
+
+/**
  * Generate response with streaming token callback.
  * @param engine     Initialized engine handle
  * @param prompt     User message (UTF-8 null-terminated)
@@ -151,5 +172,17 @@ AILA_API void aila_engine_reset_context(AilaEngine* engine);
  * Get current context length in tokens.
  */
 AILA_API int aila_engine_context_length(AilaEngine* engine);
+
+/**
+ * Get last error code on this engine.
+ * @return AILA_OK when last call succeeded.
+ */
+AILA_API int aila_last_error_code(AilaEngine* engine);
+
+/**
+ * Get last error message on this engine.
+ * The returned pointer is valid until next API call on the same engine.
+ */
+AILA_API const char* aila_last_error_message(AilaEngine* engine);
 
 #endif /* AILA_API_H */

@@ -100,6 +100,10 @@ namespace ops {
     void head_rms_norm(Context& ctx, Tensor& x, Tensor& weight,
                        float eps, int seq_len, int num_heads, int head_dim);
 
+    // output = sigmoid(gate) * input (element-wise)
+    void sigmoid_mul(Context& ctx, Tensor& input, Tensor& gate,
+                     Tensor& output, int n);
+
     // RoPE: 对 Q 和 K 施加旋转位置编码 (in-place)
     // q: [seq_len, num_heads_q * head_dim]
     // k: [seq_len, num_kv_heads * head_dim]
@@ -107,6 +111,14 @@ namespace ops {
                     int seq_len, int start_pos,
                     int num_heads_q, int num_kv_heads, int head_dim,
                     float theta);
+
+    // RoPE with explicit rotary dimension (must be even and <= head_dim).
+    void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
+                            int seq_len, int start_pos,
+                            int num_heads_q, int num_kv_heads, int head_dim,
+                            int rotary_dim,
+                            float theta,
+                            bool interleaved = false);
 
     // 将新 K/V 写到 cache 的指定位置
     // new_kv: [seq_len, num_kv_heads * head_dim]
@@ -191,6 +203,14 @@ namespace ops {
     // gate_up: [seq_len, 2 * ff_dim] -> gate/up
     void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
                        int seq_len, int ff_dim);
+
+    // Split gated attention Q projection output where per-head layout is
+    // [q_head | gate_head] and heads are packed consecutively:
+    // q_gate: [seq_len, num_heads * (2 * head_dim)]
+    //   -> q:    [seq_len, num_heads * head_dim]
+    //   -> gate: [seq_len, num_heads * head_dim]
+    void split_q_gate(Context& ctx, Tensor& q_gate, Tensor& q, Tensor& gate,
+                      int seq_len, int num_heads, int head_dim);
 
     // Argmax: 返回 logits 中最大值索引 (旧版，带内部分配)
     int argmax(Context& ctx, Tensor& logits, int vocab_size);

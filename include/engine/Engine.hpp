@@ -1,11 +1,17 @@
 #pragma once
 
 #include "../src/core/Context.hpp"
-#include "../src/models/Qwen3.hpp"
+#include "../src/models/IModelBackend.hpp"
+#include "../src/models/Qwen3DenseBackend.hpp"
+#include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/utils/Tokenizer.hpp"
 #include "../src/utils/ModelConfig.hpp"
+#include "../src/utils/ModelSpec.hpp"
 #include "../src/utils/SafeTensors.hpp"
+#include "../src/templates/TemplateRegistry.hpp"
 #include "../src/profile/Profiling.hpp"
+#include "../src/utils/EnvUtils.hpp"
+#include "simdjson.h"
 #include "Types.hpp"
 #include <string>
 #include <functional>
@@ -23,6 +29,7 @@ public:
 
     // Initialize: load model + tokenizer from model directory
     bool init(const std::string& model_dir, int max_seq_len = 4096) {
+        clear_error();
         model_dir_ = model_dir;
 
         AILA_LOG_INFO("========================================");
@@ -44,28 +51,62 @@ public:
         AILA_LOG_INFO("[3/3] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
 
-        // 3.5 Load architecture config from config.json when available
+        // 3.5 Load unified model spec
         {
-            std::string cfg_error;
-            if (aila::modelcfg::load_qwen3_config_from_dir(model_dir, config_, &cfg_error)) {
-                AILA_LOG_INFO("[Config] Loaded model config from config.json");
-                AILA_LOG_INFO("[Config] hidden=%d layers=%d heads=%d kv_heads=%d head_dim=%d ffn=%d vocab=%d",
-                              config_.hidden_size, config_.num_hidden_layers,
-                              config_.num_attention_heads, config_.num_key_value_heads,
-                              config_.head_dim, config_.intermediate_size,
-                              config_.vocab_size);
+            std::string spec_error;
+            if (!aila::modelspec::load_from_dir(model_dir, model_spec_, &spec_error)) {
+                AILA_LOG_WARN("[ModelSpec] %s (fallback to legacy qwen3 defaults)", spec_error.c_str());
+                model_spec_.family = ModelFamily::Qwen3Dense;
+                model_spec_.qwen3 = config_;
+            }
+
+            if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+                AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_5_hybrid text_hidden=%d layers=%d vocab=%d",
+                              model_spec_.model_type.c_str(),
+                              model_spec_.qwen35_text.hidden_size,
+                              model_spec_.qwen35_text.num_hidden_layers,
+                              model_spec_.qwen35_text.vocab_size);
+                config_.hidden_size = model_spec_.qwen35_text.hidden_size;
+                config_.num_hidden_layers = model_spec_.qwen35_text.num_hidden_layers;
+                config_.num_attention_heads = model_spec_.qwen35_text.num_attention_heads;
+                config_.num_key_value_heads = model_spec_.qwen35_text.num_key_value_heads;
+                config_.head_dim = model_spec_.qwen35_text.head_dim;
+                config_.intermediate_size = model_spec_.qwen35_text.intermediate_size;
+                config_.vocab_size = model_spec_.qwen35_text.vocab_size;
+                config_.max_position_embeddings = model_spec_.qwen35_text.max_position_embeddings;
+                config_.rope_theta = model_spec_.qwen35_text.rope.rope_theta;
+                config_.rms_norm_eps = model_spec_.qwen35_text.rms_norm_eps;
+                config_.tie_word_embeddings = model_spec_.qwen35_text.tie_word_embeddings;
+                config_.eos_token_id = model_spec_.qwen35_text.eos_token_id;
+                if (model_spec_.vision.enabled) {
+                    AILA_LOG_INFO("[ModelSpec] vision encoder found (phase-1 text backend keeps vision disabled)");
+                }
             } else {
-                AILA_LOG_WARN("[Config] %s (using built-in defaults)", cfg_error.c_str());
+                config_ = model_spec_.qwen3;
+                AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_dense hidden=%d layers=%d vocab=%d",
+                              model_spec_.model_type.empty() ? "qwen3" : model_spec_.model_type.c_str(),
+                              config_.hidden_size, config_.num_hidden_layers, config_.vocab_size);
             }
         }
+
         if (max_seq_len > config_.max_position_embeddings) {
             AILA_LOG_WARN("[Config] max_seq_len=%d exceeds model max_position_embeddings=%d, clamping",
                           max_seq_len, config_.max_position_embeddings);
             max_seq_len = config_.max_position_embeddings;
         }
 
-        // 4. Initialize model
-        model_.load(*ctx_, *weights_, config_, max_seq_len);
+        // 4. Initialize backend
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+            backend_ = std::make_unique<Qwen35HybridTextBackend>();
+        } else {
+            backend_ = std::make_unique<Qwen3DenseBackend>();
+        }
+        std::string backend_error;
+        if (!backend_->load(*ctx_, *weights_, model_spec_, max_seq_len, &backend_error)) {
+            AILA_LOG_ERROR("Failed to initialize model backend: %s", backend_error.c_str());
+            return false;
+        }
+
         auto to_mb = [](size_t bytes) -> double {
             return static_cast<double>(bytes) / (1024.0 * 1024.0);
         };
@@ -75,16 +116,26 @@ public:
 
         // 5. Warmup to amortize first-run JIT/primitive costs
         {
-            model_.reset();
-            auto warmup_ids = tokenizer_.apply_chat_template(
-                "You are a helpful assistant.", "Warmup.");
+            backend_->reset();
+            std::vector<Message> warmup_messages = {
+                Message{"system", {ContentPart{ContentType::Text, "You are a helpful assistant.", ""}}},
+                Message{"user", {ContentPart{ContentType::Text, "Warmup.", ""}}}
+            };
+            std::vector<int> warmup_ids;
+            std::string warmup_err;
+            if (!template_registry_.render(model_spec_.family, tokenizer_, warmup_messages,
+                                           vision_backend_enabled_, true, warmup_ids, &warmup_err)) {
+                AILA_LOG_WARN("[Warmup] Template render failed (%s), fallback to legacy tokenizer template",
+                              warmup_err.c_str());
+                warmup_ids = tokenizer_.apply_chat_template("You are a helpful assistant.", "Warmup.");
+            }
             int* warmup_token_ids = static_cast<int*>(
                 ctx_->alloc_device(warmup_ids.size() * sizeof(int)));
             ctx_->memcpy_h2d_async(warmup_token_ids, warmup_ids.data(),
                                    warmup_ids.size() * sizeof(int));
 
             auto t_warmup_start = std::chrono::high_resolution_clock::now();
-            Tensor& warmup_logits = model_.forward(*ctx_, warmup_token_ids, static_cast<int>(warmup_ids.size()));
+            Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, static_cast<int>(warmup_ids.size()));
             int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
             ctx_->synchronize();
@@ -92,7 +143,7 @@ public:
 
             ctx_->free_device(warmup_argmax);
             ctx_->free_device(warmup_token_ids);
-            model_.reset();
+            backend_->reset();
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
             AILA_LOG_INFO("[Warmup] Completed in %.2f ms", warmup_ms);
@@ -117,14 +168,15 @@ public:
 
     void reset_context() {
         history_.clear();
+        mm_history_.clear();
         cached_ids_.clear();
         benchmark_seed_ready_ = false;
-        model_.reset();
+        if (backend_) backend_->reset();
         AILA_LOG_INFO("[Context] Conversation reset");
     }
 
     int context_length() const { return static_cast<int>(cached_ids_.size()); }
-    int max_context_length() const { return model_.max_seq_len(); }
+    int max_context_length() const { return backend_ ? backend_->max_seq_len() : 0; }
     const ChatHistory& history() const { return history_; }
 
     // ============================================================
@@ -138,6 +190,23 @@ public:
     std::string generate(const std::string& user_message,
                          const GenerationConfig& gen_config = GenerationConfig(),
                          std::function<void(const std::string&)> token_callback = nullptr) {
+        clear_error();
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+            Message user_msg;
+            user_msg.role = "user";
+            user_msg.content.push_back(ContentPart{ContentType::Text, user_message, ""});
+            mm_history_.push_back(user_msg);
+            std::string out = generate_messages(mm_history_, gen_config, token_callback);
+            if (last_error_code_ != EngineErrorCode::Ok) {
+                mm_history_.pop_back();
+                return "";
+            }
+            Message assistant_msg;
+            assistant_msg.role = "assistant";
+            assistant_msg.content.push_back(ContentPart{ContentType::Text, out, ""});
+            mm_history_.push_back(assistant_msg);
+            return out;
+        }
 
         // --- Think-suppression detection ---
         auto trim_copy = [](const std::string& s) -> std::string {
@@ -201,11 +270,11 @@ public:
         // Truncate the physical KV cache inside the model to match the reusable prefix.
         // This is necessary because if we stripped <think> blocks, the sequence diverged,
         // and we cannot append new tokens to the end of the previous longer sequence.
-        model_.truncate_kv_cache(reusable_prefix);
+        if (backend_) backend_->truncate_kv_cache(reusable_prefix);
         cached_ids_.resize(reusable_prefix);
 
         // --- Context overflow: if too long, clear and rebuild from scratch ---
-        int max_ctx = model_.max_seq_len();
+        int max_ctx = backend_ ? backend_->max_seq_len() : 0;
         if (static_cast<int>(full_ids.size()) > max_ctx - 64) {
             // Truncate history until it fits
             while (static_cast<int>(full_ids.size()) > max_ctx - 64 && history_.size() > 1) {
@@ -215,7 +284,7 @@ public:
                               history_.size());
             }
             // Must do full prefill since we rebuilt from scratch
-            model_.reset();
+            if (backend_) backend_->reset();
             cached_ids_.clear();
             reusable_prefix = 0;
         }
@@ -238,6 +307,7 @@ public:
         if (available_decode_tokens <= 0) {
             AILA_LOG_ERROR("[Generate] Prompt exceeds context window (prompt=%d, max_seq_len=%d)",
                            total_prompt_len, max_ctx);
+            set_error(EngineErrorCode::ContextOverflow, "Prompt exceeds context window");
             // Remove the user message we just added since we can't process it
             history_.truncate_oldest(static_cast<int>(history_.size()) - 1);
             return "";
@@ -256,7 +326,7 @@ public:
                                static_cast<size_t>(new_tokens_to_prefill) * sizeof(int));
 
         auto t_start = std::chrono::high_resolution_clock::now();
-        Tensor& logits = model_.forward(*ctx_, token_ids_device, new_tokens_to_prefill);
+        Tensor& logits = backend_->forward(*ctx_, token_ids_device, new_tokens_to_prefill);
         ctx_->synchronize();
         auto t_prefill = std::chrono::high_resolution_clock::now();
 
@@ -394,7 +464,7 @@ public:
 
                 for (; generated_count < chunk_end; ++generated_count) {
                     int* current_ptr = generated_tokens_device + generated_count;
-                    Tensor& logits_next = model_.forward(*ctx_, current_ptr, 1);
+                    Tensor& logits_next = backend_->forward(*ctx_, current_ptr, 1);
                     ops::argmax(*ctx_, logits_next, config_.vocab_size,
                                 generated_tokens_device + generated_count + 1);
                 }
@@ -449,7 +519,7 @@ public:
                 }
                 generated_count++;
 
-                Tensor& logits_next = model_.forward(*ctx_, current_token_device, 1);
+                Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
 
                 // Unified sampling with penalties
                 next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
@@ -515,11 +585,225 @@ public:
         return output_text;
     }
 
+    std::string generate_messages(const std::vector<Message>& messages,
+                                  const GenerationConfig& gen_config = GenerationConfig(),
+                                  std::function<void(const std::string&)> token_callback = nullptr) {
+        clear_error();
+        if (!backend_) {
+            set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
+            return "";
+        }
+
+        GenerationConfig tuned_cfg = gen_config;
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid && tuned_cfg.do_sample) {
+            bool tuned = false;
+            if (tuned_cfg.repetition_penalty <= 1.0f) {
+                tuned_cfg.repetition_penalty = 1.12f;
+                tuned = true;
+            }
+            if (tuned_cfg.presence_penalty == 0.0f) {
+                tuned_cfg.presence_penalty = 0.05f;
+                tuned = true;
+            }
+            if (tuned_cfg.frequency_penalty == 0.0f) {
+                tuned_cfg.frequency_penalty = 0.10f;
+                tuned = true;
+            }
+            if (tuned_cfg.top_k < 30) {
+                tuned_cfg.top_k = 40;
+                tuned = true;
+            }
+            if (tuned_cfg.temperature < 0.75f) {
+                tuned_cfg.temperature = 0.80f;
+                tuned = true;
+            }
+            if (tuned) {
+                AILA_LOG_INFO("[Qwen3.5] Applied anti-loop sampling defaults "
+                              "(temp=%.2f top_k=%d rep=%.2f pres=%.2f freq=%.2f)",
+                              tuned_cfg.temperature, tuned_cfg.top_k,
+                              tuned_cfg.repetition_penalty,
+                              tuned_cfg.presence_penalty,
+                              tuned_cfg.frequency_penalty);
+            }
+        }
+
+        std::string tmpl_err;
+        std::vector<int> full_ids;
+        if (!template_registry_.render(model_spec_.family, tokenizer_, messages,
+                                       vision_backend_enabled_, true, full_ids, &tmpl_err)) {
+            AILA_LOG_ERROR("[GenerateMessages] Template render failed: %s", tmpl_err.c_str());
+            EngineErrorCode code = (tmpl_err.find("Vision content is not enabled") != std::string::npos)
+                                       ? EngineErrorCode::VisionNotEnabled
+                                       : EngineErrorCode::TemplateError;
+            set_error(code, tmpl_err);
+            return "";
+        }
+
+        int max_ctx = backend_->max_seq_len();
+        int total_prompt_len = static_cast<int>(full_ids.size());
+        bool debug_token_ids = aila::env::read_flag("AILA_DEBUG_TOKEN_IDS", false);
+        if (debug_token_ids) {
+            int show_n = std::min<int>(static_cast<int>(full_ids.size()), 64);
+            AILA_LOG_INFO("[DebugToken] prompt_tokens=%d (showing %d)", total_prompt_len, show_n);
+            for (int i = 0; i < show_n; ++i) {
+                int tid = full_ids[(size_t)i];
+                std::string piece = tokenizer_.decode(tid);
+                AILA_LOG_INFO("[DebugToken] prompt[%d]=%d text='%s'", i, tid, piece.c_str());
+            }
+        }
+        int available_decode_tokens = max_ctx - total_prompt_len;
+        if (available_decode_tokens <= 0) {
+            AILA_LOG_ERROR("[GenerateMessages] Prompt exceeds context window (prompt=%d max_seq=%d)",
+                           total_prompt_len, max_ctx);
+            set_error(EngineErrorCode::ContextOverflow, "Prompt exceeds context window");
+            return "";
+        }
+        int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
+
+        backend_->reset();
+        cached_ids_.clear();
+
+        auto t_start = std::chrono::high_resolution_clock::now();
+        Tensor* logits_ptr = nullptr;
+        bool tokenwise_prefill = (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
+                                 aila::env::read_flag("AILA_Q35_PREFILL_TOKENWISE", false);
+        if (!tokenwise_prefill) {
+            int* token_ids_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(full_ids.size()) * sizeof(int)));
+            ctx_->memcpy_h2d(token_ids_device, full_ids.data(),
+                             static_cast<size_t>(full_ids.size()) * sizeof(int));
+            logits_ptr = &backend_->forward(*ctx_, token_ids_device, static_cast<int>(full_ids.size()));
+            ctx_->free_device(token_ids_device);
+        } else {
+            AILA_LOG_INFO("[Qwen3.5] Tokenwise prefill enabled for debug");
+            int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            for (size_t i = 0; i < full_ids.size(); ++i) {
+                int tok = full_ids[i];
+                ctx_->memcpy_h2d(one_token_device, &tok, sizeof(int));
+                logits_ptr = &backend_->forward(*ctx_, one_token_device, 1);
+            }
+            ctx_->free_device(one_token_device);
+        }
+        Tensor& logits = *logits_ptr;
+
+        if (aila::env::read_flag("AILA_DEBUG_Q35_LOGITS", false)) {
+            int vocab = config_.vocab_size;
+            std::vector<float> host_logits((size_t)vocab, 0.0f);
+            if (logits.dtype() == dnnl::memory::data_type::f32) {
+                ctx_->memcpy_d2h(host_logits.data(), logits.data(),
+                                 host_logits.size() * sizeof(float));
+            } else {
+                using bf16 = sycl::ext::oneapi::bfloat16;
+                std::vector<bf16> tmp((size_t)vocab);
+                ctx_->memcpy_d2h(tmp.data(), logits.data(), tmp.size() * sizeof(bf16));
+                for (int i = 0; i < vocab; ++i) {
+                    host_logits[(size_t)i] = static_cast<float>(tmp[(size_t)i]);
+                }
+            }
+
+            std::vector<int> order((size_t)vocab);
+            for (int i = 0; i < vocab; ++i) order[(size_t)i] = i;
+            int topn = std::min(10, vocab);
+            std::partial_sort(order.begin(), order.begin() + topn, order.end(),
+                              [&](int a, int b) { return host_logits[(size_t)a] > host_logits[(size_t)b]; });
+
+            AILA_LOG_INFO("[DebugLogits] top-%d after prefill:", topn);
+            for (int i = 0; i < topn; ++i) {
+                int tid = order[(size_t)i];
+                std::string piece = tokenizer_.decode(tid);
+                AILA_LOG_INFO("  rank=%d id=%d logit=%.4f text='%s'",
+                              i + 1, tid, host_logits[(size_t)tid], piece.c_str());
+            }
+        }
+
+        std::vector<int> generated_token_ids;
+        generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
+
+        if (gen_config.do_sample && gen_config.use_fixed_seed) {
+            ops::set_sampling_seed(tuned_cfg.sampling_seed);
+        }
+        int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                 tuned_cfg, generated_token_ids);
+
+        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+
+        std::string output_text;
+        bool streaming = (token_callback != nullptr);
+        int same_token_run = 0;
+        int last_token = -1;
+
+        for (int i = 0; i < max_new_tokens; ++i) {
+            int current_token = next_token;
+            if (tokenizer_.is_eos(current_token)) break;
+
+            if (current_token == last_token) same_token_run++;
+            else {
+                same_token_run = 1;
+                last_token = current_token;
+            }
+            if (same_token_run >= 48) {
+                AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                              current_token, same_token_run);
+                break;
+            }
+
+            generated_token_ids.push_back(current_token);
+            if (debug_token_ids && i < 64) {
+                std::string piece = tokenizer_.decode(current_token);
+                AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                              i, current_token, piece.c_str());
+            }
+            if (streaming) {
+                std::string token_text = tokenizer_.decode(current_token);
+                output_text += token_text;
+                token_callback(token_text);
+            }
+
+            Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
+            next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
+                                                 tuned_cfg, generated_token_ids);
+            ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
+            std::swap(current_token_device, next_token_device);
+        }
+        ctx_->synchronize();
+        auto t_end = std::chrono::high_resolution_clock::now();
+        ctx_->free_device(current_token_device);
+        ctx_->free_device(next_token_device);
+
+        if (!streaming && !generated_token_ids.empty()) {
+            output_text = tokenizer_.decode(generated_token_ids);
+        }
+
+        double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        AILA_LOG_INFO("[GenerateMessages] Prompt=%d Generated=%zu in %.2f ms",
+                      total_prompt_len, generated_token_ids.size(), ms);
+
+        cached_ids_ = full_ids;
+        cached_ids_.insert(cached_ids_.end(), generated_token_ids.begin(), generated_token_ids.end());
+        return output_text;
+    }
+
+    std::string generate_messages_json(const std::string& messages_json,
+                                       const GenerationConfig& gen_config = GenerationConfig(),
+                                       std::function<void(const std::string&)> token_callback = nullptr) {
+        clear_error();
+        std::vector<Message> messages;
+        std::string parse_error;
+        if (!parse_messages_json(messages_json, messages, &parse_error)) {
+            AILA_LOG_ERROR("[GenerateMessages] Invalid messages JSON: %s", parse_error.c_str());
+            set_error(EngineErrorCode::JsonParseError, parse_error);
+            return "";
+        }
+        return generate_messages(messages, gen_config, token_callback);
+    }
+
     // ============================================================
     // Raw prefill for benchmark (no decode, no history)
     // ============================================================
     double benchmark_prefill(const std::vector<int>& token_ids) {
-        model_.reset();
+        if (backend_) backend_->reset();
         cached_ids_.clear();
         benchmark_seed_ready_ = false;
 
@@ -527,7 +811,7 @@ public:
         ctx_->memcpy_h2d(device_ids, token_ids.data(), token_ids.size() * sizeof(int));
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        Tensor& logits = model_.forward(*ctx_, device_ids, static_cast<int>(token_ids.size()));
+        Tensor& logits = backend_->forward(*ctx_, device_ids, static_cast<int>(token_ids.size()));
         ctx_->synchronize();
         auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -550,6 +834,9 @@ public:
         if (!benchmark_seed_ready_) {
             AILA_LOG_WARN("[Bench] benchmark_decode called without a valid prefill seed, using BOS token as fallback");
             benchmark_seed_token_ = config_.bos_token_id;
+            if (benchmark_seed_token_ < 0 || benchmark_seed_token_ >= config_.vocab_size) {
+                benchmark_seed_token_ = std::max(0, config_.eos_token_id);
+            }
         }
 
         GenerationConfig bench_gen_cfg;
@@ -570,7 +857,7 @@ public:
 
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < num_tokens; i++) {
-            Tensor& logits = model_.forward(*ctx_, current_token_device, 1);
+            Tensor& logits = backend_->forward(*ctx_, current_token_device, 1);
             if (!bench_gen_cfg.do_sample) {
                 ops::argmax(*ctx_, logits, config_.vocab_size, next_token_device);
             } else {
@@ -595,21 +882,189 @@ public:
 
     Qwen3Config& config() { return config_; }
     const Qwen3Config& config() const { return config_; }
+    const ModelSpec& model_spec() const { return model_spec_; }
     Tokenizer& tokenizer() { return tokenizer_; }
     const Tokenizer& tokenizer() const { return tokenizer_; }
-    Qwen3Model& model() { return model_; }
+    bool vision_enabled() const { return vision_backend_enabled_; }
+    EngineErrorCode last_error_code() const { return last_error_code_; }
+    const std::string& last_error_message() const { return last_error_message_; }
 
 private:
+    void clear_error() {
+        last_error_code_ = EngineErrorCode::Ok;
+        last_error_message_.clear();
+    }
+
+    void set_error(EngineErrorCode code, const std::string& message) {
+        last_error_code_ = code;
+        last_error_message_ = message;
+    }
+
+    bool parse_messages_json(const std::string& messages_json,
+                             std::vector<Message>& out_messages,
+                             std::string* error_message = nullptr) const {
+        auto set_error = [&](const std::string& msg) {
+            if (error_message) *error_message = msg;
+        };
+
+        out_messages.clear();
+        try {
+            simdjson::dom::parser parser;
+            simdjson::dom::element root = parser.parse(messages_json);
+            simdjson::dom::array arr;
+            if (root.get_array().get(arr) != simdjson::SUCCESS) {
+                set_error("messages root is not an array");
+                return false;
+            }
+
+            for (auto item : arr) {
+                simdjson::dom::object obj;
+                if (item.get_object().get(obj) != simdjson::SUCCESS) {
+                    set_error("message item is not an object");
+                    return false;
+                }
+
+                Message msg;
+                {
+                    simdjson::dom::element role_elem;
+                    if (obj.at_key("role").get(role_elem) != simdjson::SUCCESS) {
+                        set_error("message.role missing");
+                        return false;
+                    }
+                    std::string_view role_sv;
+                    if (role_elem.get_string().get(role_sv) != simdjson::SUCCESS) {
+                        set_error("message.role must be string");
+                        return false;
+                    }
+                    msg.role = std::string(role_sv);
+                }
+
+                simdjson::dom::element content_elem;
+                if (obj.at_key("content").get(content_elem) != simdjson::SUCCESS) {
+                    set_error("message.content missing");
+                    return false;
+                }
+
+                std::string_view content_str;
+                if (content_elem.get_string().get(content_str) == simdjson::SUCCESS) {
+                    msg.content.push_back(ContentPart{ContentType::Text, std::string(content_str), ""});
+                } else {
+                    simdjson::dom::array content_arr;
+                    if (content_elem.get_array().get(content_arr) != simdjson::SUCCESS) {
+                        set_error("message.content must be string or array");
+                        return false;
+                    }
+
+                    for (auto part_elem : content_arr) {
+                        simdjson::dom::object part_obj;
+                        if (part_elem.get_object().get(part_obj) != simdjson::SUCCESS) {
+                            set_error("content part must be object");
+                            return false;
+                        }
+
+                        simdjson::dom::element type_elem;
+                        if (part_obj.at_key("type").get(type_elem) != simdjson::SUCCESS) {
+                            set_error("content part.type missing");
+                            return false;
+                        }
+                        std::string_view type_sv;
+                        if (type_elem.get_string().get(type_sv) != simdjson::SUCCESS) {
+                            set_error("content part.type must be string");
+                            return false;
+                        }
+
+                        std::string type(type_sv);
+                        if (type == "text") {
+                            simdjson::dom::element text_elem;
+                            if (part_obj.at_key("text").get(text_elem) != simdjson::SUCCESS) {
+                                set_error("text content missing text field");
+                                return false;
+                            }
+                            std::string_view text_sv;
+                            if (text_elem.get_string().get(text_sv) != simdjson::SUCCESS) {
+                                set_error("text content.text must be string");
+                                return false;
+                            }
+                            msg.content.push_back(ContentPart{ContentType::Text, std::string(text_sv), ""});
+                        } else if (type == "image" || type == "image_url") {
+                            std::string uri;
+                            simdjson::dom::element image_url_elem;
+                            if (part_obj.at_key("image_url").get(image_url_elem) == simdjson::SUCCESS) {
+                                std::string_view image_url_sv;
+                                if (image_url_elem.get_string().get(image_url_sv) == simdjson::SUCCESS) {
+                                    uri = std::string(image_url_sv);
+                                } else {
+                                    simdjson::dom::object image_obj;
+                                    if (image_url_elem.get_object().get(image_obj) == simdjson::SUCCESS) {
+                                        simdjson::dom::element url_elem;
+                                        if (image_obj.at_key("url").get(url_elem) == simdjson::SUCCESS) {
+                                            std::string_view url_sv;
+                                            if (url_elem.get_string().get(url_sv) == simdjson::SUCCESS) {
+                                                uri = std::string(url_sv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (uri.empty()) {
+                                simdjson::dom::element image_elem;
+                                if (part_obj.at_key("image").get(image_elem) == simdjson::SUCCESS) {
+                                    std::string_view image_sv;
+                                    if (image_elem.get_string().get(image_sv) == simdjson::SUCCESS) {
+                                        uri = std::string(image_sv);
+                                    }
+                                }
+                            }
+                            msg.content.push_back(ContentPart{ContentType::Image, "", uri});
+                        } else if (type == "video" || type == "video_url") {
+                            std::string uri;
+                            simdjson::dom::element video_url_elem;
+                            if (part_obj.at_key("video_url").get(video_url_elem) == simdjson::SUCCESS) {
+                                std::string_view video_url_sv;
+                                if (video_url_elem.get_string().get(video_url_sv) == simdjson::SUCCESS) {
+                                    uri = std::string(video_url_sv);
+                                }
+                            }
+                            if (uri.empty()) {
+                                simdjson::dom::element video_elem;
+                                if (part_obj.at_key("video").get(video_elem) == simdjson::SUCCESS) {
+                                    std::string_view video_sv;
+                                    if (video_elem.get_string().get(video_sv) == simdjson::SUCCESS) {
+                                        uri = std::string(video_sv);
+                                    }
+                                }
+                            }
+                            msg.content.push_back(ContentPart{ContentType::Video, "", uri});
+                        } else {
+                            set_error("unknown content part type: " + type);
+                            return false;
+                        }
+                    }
+                }
+
+                out_messages.push_back(std::move(msg));
+            }
+            return true;
+        } catch (const std::exception& e) {
+            set_error(std::string("JSON parse failed: ") + e.what());
+            return false;
+        }
+    }
+
     std::string model_dir_;
     std::string system_prompt_ = "You are a helpful assistant.";
     Qwen3Config config_;
+    ModelSpec model_spec_;
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
-    Qwen3Model model_;
+    std::unique_ptr<IModelBackend> backend_;
+    aila::templating::TemplateRegistry template_registry_;
     Tokenizer tokenizer_;
+    bool vision_backend_enabled_ = false;
 
     // Multi-turn conversation state
     ChatHistory history_;
+    std::vector<Message> mm_history_;
     // Exact token IDs currently stored in the KV cache.
     // This is the ground truth for incremental prefill.
     std::vector<int> cached_ids_;
@@ -617,4 +1072,6 @@ private:
     // Benchmark decode seed (token after prefill argmax)
     int benchmark_seed_token_ = -1;
     bool benchmark_seed_ready_ = false;
+    EngineErrorCode last_error_code_ = EngineErrorCode::Ok;
+    std::string last_error_message_;
 };

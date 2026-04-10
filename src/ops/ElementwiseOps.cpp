@@ -1,5 +1,6 @@
 #include "Ops.hpp"
 #include <sycl/sycl.hpp>
+#include <algorithm>
 #include <cmath>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -29,15 +30,26 @@ void embedding_lookup(Context& ctx, Tensor& table,
 // SYCL Kernel: RoPE (Rotary Position Embedding)
 // ============================================================
 
-void apply_rope(Context& ctx, Tensor& q, Tensor& k,
-                 int seq_len, int start_pos,
-                 int num_heads_q, int num_kv_heads, int head_dim,
-                 float theta) {
+void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
+                        int seq_len, int start_pos,
+                        int num_heads_q, int num_kv_heads, int head_dim,
+                        int rotary_dim, float theta, bool interleaved) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k.data());
     int q_dim = num_heads_q * head_dim;
     int k_dim = num_kv_heads * head_dim;
-    int half_dim = head_dim / 2;
+    int rot = std::max(2, std::min(head_dim, rotary_dim));
+    if (rot & 1) --rot;
+    int half_dim = rot / 2;
+
+    // NOTE:
+    // Qwen3.5 "mrope_interleaved" does NOT mean GLM-style pairwise rotation
+    // on (2d, 2d+1). The actual attention rotation still uses rotate_half on
+    // [0..half_dim) and [half_dim..rotary_dim). The "interleaved" setting is
+    // about how RoPE frequencies are arranged before cos/sin generation.
+    // For text-only path (single position stream), this kernel keeps standard
+    // half-rotation semantics.
+    (void)interleaved;
 
     ctx.queue().parallel_for(sycl::range<2>(seq_len, num_heads_q * half_dim),
         [=](sycl::id<2> idx) {
@@ -47,23 +59,27 @@ void apply_rope(Context& ctx, Tensor& q, Tensor& k,
             int d = flat % half_dim;   
             int pos = start_pos + s;
 
-            float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(head_dim));
+            float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(rot));
             float angle = static_cast<float>(pos) * freq;
             float cos_val = sycl::cos(angle);
             float sin_val = sycl::sin(angle);
 
             int q_base = s * q_dim + h * head_dim;
-            float q0 = static_cast<float>(q_ptr[q_base + d]);
-            float q1 = static_cast<float>(q_ptr[q_base + d + half_dim]);
-            q_ptr[q_base + d]            = bf16(q0 * cos_val - q1 * sin_val);
-            q_ptr[q_base + d + half_dim] = bf16(q1 * cos_val + q0 * sin_val);
+            int q_i0 = d;
+            int q_i1 = d + half_dim;
+            float q0 = static_cast<float>(q_ptr[q_base + q_i0]);
+            float q1 = static_cast<float>(q_ptr[q_base + q_i1]);
+            q_ptr[q_base + q_i0] = bf16(q0 * cos_val - q1 * sin_val);
+            q_ptr[q_base + q_i1] = bf16(q1 * cos_val + q0 * sin_val);
 
             if (h < num_kv_heads) {
                 int k_base = s * k_dim + h * head_dim;
-                float k0 = static_cast<float>(k_ptr[k_base + d]);
-                float k1 = static_cast<float>(k_ptr[k_base + d + half_dim]);
-                k_ptr[k_base + d]            = bf16(k0 * cos_val - k1 * sin_val);
-                k_ptr[k_base + d + half_dim] = bf16(k1 * cos_val + k0 * sin_val);
+                int k_i0 = d;
+                int k_i1 = d + half_dim;
+                float k0 = static_cast<float>(k_ptr[k_base + k_i0]);
+                float k1 = static_cast<float>(k_ptr[k_base + k_i1]);
+                k_ptr[k_base + k_i0] = bf16(k0 * cos_val - k1 * sin_val);
+                k_ptr[k_base + k_i1] = bf16(k1 * cos_val + k0 * sin_val);
             }
         });
 }
@@ -321,6 +337,52 @@ void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
                 up_ptr[s * ff_dim + uc] = src[src_idx];
             }
         });
+}
+
+void split_q_gate(Context& ctx, Tensor& q_gate, Tensor& q, Tensor& gate,
+                  int seq_len, int num_heads, int head_dim) {
+    bf16* src = static_cast<bf16*>(q_gate.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* g_ptr = static_cast<bf16*>(gate.data());
+
+    int q_dim = num_heads * head_dim;
+    int packed_per_head = head_dim * 2;
+    int packed_total = num_heads * packed_per_head;
+
+    ctx.queue().parallel_for(sycl::range<3>(seq_len, num_heads, head_dim),
+        [=](sycl::id<3> idx) {
+            int s = idx[0];
+            int h = idx[1];
+            int d = idx[2];
+
+            int src_base = s * packed_total + h * packed_per_head;
+            int dst_base = s * q_dim + h * head_dim;
+
+            q_ptr[dst_base + d] = src[src_base + d];
+            g_ptr[dst_base + d] = src[src_base + head_dim + d];
+        });
+}
+
+void apply_rope(Context& ctx, Tensor& q, Tensor& k,
+                int seq_len, int start_pos,
+                int num_heads_q, int num_kv_heads, int head_dim,
+                float theta) {
+    apply_rope_partial(ctx, q, k, seq_len, start_pos,
+                       num_heads_q, num_kv_heads, head_dim, head_dim, theta, false);
+}
+
+void sigmoid_mul(Context& ctx, Tensor& input, Tensor& gate, Tensor& output, int n) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    bf16* g_ptr = static_cast<bf16*>(gate.data());
+    bf16* o_ptr = static_cast<bf16*>(output.data());
+
+    ctx.queue().parallel_for(sycl::range<1>(n), [=](sycl::id<1> idx) {
+        int i = idx[0];
+        float in_v = static_cast<float>(in_ptr[i]);
+        float g_v = static_cast<float>(g_ptr[i]);
+        float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+        o_ptr[i] = bf16(in_v * s);
+    });
 }
 
 } // namespace ops
