@@ -48,6 +48,7 @@ private:
 
         // linear attention branch
         Linear linear_qkv_proj, linear_z_proj, linear_o_proj;
+        Linear linear_all_proj;
         Linear linear_a_proj, linear_b_proj;
         Tensor* linear_norm_weight = nullptr; // f32
         Tensor* linear_A_log = nullptr;       // f32
@@ -78,6 +79,7 @@ private:
         Tensor hidden;
         Tensor normed;
         Tensor qkv;
+        Tensor linear_all;
         Tensor q;
         Tensor k;
         Tensor v;
@@ -98,7 +100,9 @@ private:
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
-    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache, int seq_len);
+    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                               Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
+                               int seq_len);
     static float softplus(float x);
     static float silu(float x);
     static void head_l2_norm_inplace(std::vector<float>& x, int seq_len, int num_heads, int head_dim, float eps);
@@ -138,6 +142,7 @@ private:
     int linear_q_dim_ = 0;
     int linear_kv_dim_ = 0;
     int linear_qkv_dim_ = 0;
+    int linear_all_dim_ = 0;
     int linear_z_dim_ = 0;
     int linear_conv_kernel_dim_ = 4;
     int linear_conv_channels_ = 0;
@@ -148,6 +153,25 @@ private:
     int max_qkv_dim_ = 0;
     int max_attn_dim_ = 0;
     bool use_delta_linear_ = false;
+
+    struct LinearDeltaScratch {
+        std::vector<sycl::ext::oneapi::bfloat16> h_qkv;
+        std::vector<sycl::ext::oneapi::bfloat16> h_z;
+        std::vector<sycl::ext::oneapi::bfloat16> h_a;
+        std::vector<sycl::ext::oneapi::bfloat16> h_b;
+        std::vector<float> conv_in;
+        std::vector<float> z;
+        std::vector<float> a;
+        std::vector<float> b;
+        std::vector<float> conv_out;
+        std::vector<float> q;
+        std::vector<float> k;
+        std::vector<float> v;
+        std::vector<float> out;
+        std::vector<float> sk;
+        std::vector<float> d;
+        std::vector<sycl::ext::oneapi::bfloat16> out_bf16;
+    } linear_delta_scratch_;
 
     std::vector<int> embed_override_positions_;
     std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;

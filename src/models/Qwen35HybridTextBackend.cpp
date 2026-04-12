@@ -69,6 +69,7 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
     buf_.hidden = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.normed = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_qkv_dim_});
+    buf_.linear_all = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)linear_all_dim_});
     buf_.q = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
     buf_.k = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
     buf_.v = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
@@ -153,6 +154,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_kv_dim_ = linear_kv_heads_ * cfg_.linear_value_head_dim;
     linear_qkv_dim_ = linear_q_dim_ + linear_q_dim_ + linear_kv_dim_;
     linear_z_dim_ = linear_kv_dim_;
+    linear_all_dim_ = linear_qkv_dim_ + linear_z_dim_ + 2 * linear_kv_heads_;
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
@@ -228,6 +230,42 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         return out;
     };
 
+    auto fuse_four_cols = [&](Tensor& a, Tensor& b, Tensor& c, Tensor& d) {
+        int64_t rows = a.shape(0);
+        int64_t a_cols = a.shape(1);
+        int64_t b_cols = b.shape(1);
+        int64_t c_cols = c.shape(1);
+        int64_t d_cols = d.shape(1);
+        int64_t total_cols = a_cols + b_cols + c_cols + d_cols;
+
+        Tensor out = Tensor::allocate(ctx, {rows, total_cols}, a.dtype());
+        bf16* a_ptr = static_cast<bf16*>(a.data());
+        bf16* b_ptr = static_cast<bf16*>(b.data());
+        bf16* c_ptr = static_cast<bf16*>(c.data());
+        bf16* d_ptr = static_cast<bf16*>(d.data());
+        bf16* o_ptr = static_cast<bf16*>(out.data());
+
+        ctx.queue().parallel_for(sycl::range<2>(rows, total_cols),
+            [=](sycl::id<2> idx) {
+                int r = idx[0];
+                int cidx = idx[1];
+                int64_t out_idx = static_cast<int64_t>(r) * total_cols + cidx;
+                if (cidx < a_cols) {
+                    o_ptr[out_idx] = a_ptr[static_cast<int64_t>(r) * a_cols + cidx];
+                } else if (cidx < a_cols + b_cols) {
+                    int bc = cidx - static_cast<int>(a_cols);
+                    o_ptr[out_idx] = b_ptr[static_cast<int64_t>(r) * b_cols + bc];
+                } else if (cidx < a_cols + b_cols + c_cols) {
+                    int cc = cidx - static_cast<int>(a_cols + b_cols);
+                    o_ptr[out_idx] = c_ptr[static_cast<int64_t>(r) * c_cols + cc];
+                } else {
+                    int dc = cidx - static_cast<int>(a_cols + b_cols + c_cols);
+                    o_ptr[out_idx] = d_ptr[static_cast<int64_t>(r) * d_cols + dc];
+                }
+            });
+        return out;
+    };
+
     auto fuse_two_cols = [&](Tensor& a, Tensor& b) {
         int64_t rows = a.shape(0);
         int64_t a_cols = a.shape(1);
@@ -282,6 +320,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.linear_o_proj.init(ctx, *o_w, linear_kv_dim_, hidden_size_, true);
             layer.linear_a_proj.init(ctx, *a_w, hidden_size_, linear_kv_heads_, true);
             layer.linear_b_proj.init(ctx, *b_w, hidden_size_, linear_kv_heads_, true);
+            fused_weights_.push_back(fuse_four_cols(*qkv_w, *z_w, *a_w, *b_w));
+            layer.linear_all_proj.init(ctx, fused_weights_.back(), hidden_size_, linear_all_dim_, true);
 
             layer.linear_norm_weight = &weights.get(prefix + "linear_attn.norm.weight");
             layer.linear_A_log = &weights.get(prefix + "linear_attn.A_log");
@@ -507,7 +547,10 @@ void Qwen35HybridTextBackend::clear_mrope_positions() {
     mrope_ctx_ = nullptr;
 }
 
-void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache, int seq_len) {
+void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                                                    Tensor& qkv_src, Tensor& z_src,
+                                                    Tensor& a_src, Tensor& b_src,
+                                                    int seq_len) {
     const int qkv_dim = linear_qkv_dim_;
     const int z_dim = linear_z_dim_;
     const int num_heads = linear_kv_heads_;
@@ -515,14 +558,15 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
     const int head_v_dim = cfg_.linear_value_head_dim;
     const int kernel = linear_conv_kernel_dim_;
 
-    std::vector<bf16> h_qkv((size_t)seq_len * qkv_dim);
-    std::vector<bf16> h_z((size_t)seq_len * z_dim);
-    std::vector<bf16> h_a((size_t)seq_len * num_heads);
-    std::vector<bf16> h_b((size_t)seq_len * num_heads);
-    ctx.memcpy_d2h(h_qkv.data(), buf_.qkv.data(), h_qkv.size() * sizeof(bf16));
-    ctx.memcpy_d2h(h_z.data(), buf_.z.data(), h_z.size() * sizeof(bf16));
-    ctx.memcpy_d2h(h_a.data(), buf_.a.data(), h_a.size() * sizeof(bf16));
-    ctx.memcpy_d2h(h_b.data(), buf_.b.data(), h_b.size() * sizeof(bf16));
+    auto& scratch = linear_delta_scratch_;
+    scratch.h_qkv.resize((size_t)seq_len * qkv_dim);
+    scratch.h_z.resize((size_t)seq_len * z_dim);
+    scratch.h_a.resize((size_t)seq_len * num_heads);
+    scratch.h_b.resize((size_t)seq_len * num_heads);
+    ctx.memcpy_d2h(scratch.h_qkv.data(), qkv_src.data(), scratch.h_qkv.size() * sizeof(bf16));
+    ctx.memcpy_d2h(scratch.h_z.data(), z_src.data(), scratch.h_z.size() * sizeof(bf16));
+    ctx.memcpy_d2h(scratch.h_a.data(), a_src.data(), scratch.h_a.size() * sizeof(bf16));
+    ctx.memcpy_d2h(scratch.h_b.data(), b_src.data(), scratch.h_b.size() * sizeof(bf16));
 
     std::vector<float>& h_conv_state = cache.host_linear_conv_state;
     if (h_conv_state.size() != (size_t)std::max(0, kernel - 1) * (size_t)linear_conv_channels_) {
@@ -534,19 +578,19 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
         state.assign((size_t)num_heads * (size_t)head_k_dim * (size_t)head_v_dim, 0.0f);
     }
 
-    std::vector<float> conv_in((size_t)seq_len * qkv_dim);
-    std::vector<float> z((size_t)seq_len * z_dim);
-    std::vector<float> a((size_t)seq_len * num_heads);
-    std::vector<float> b((size_t)seq_len * num_heads);
-    for (size_t i = 0; i < conv_in.size(); ++i) conv_in[i] = static_cast<float>(h_qkv[i]);
-    for (size_t i = 0; i < z.size(); ++i) z[i] = static_cast<float>(h_z[i]);
-    for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<float>(h_a[i]);
-    for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<float>(h_b[i]);
+    scratch.conv_in.resize((size_t)seq_len * qkv_dim);
+    scratch.z.resize((size_t)seq_len * z_dim);
+    scratch.a.resize((size_t)seq_len * num_heads);
+    scratch.b.resize((size_t)seq_len * num_heads);
+    for (size_t i = 0; i < scratch.conv_in.size(); ++i) scratch.conv_in[i] = static_cast<float>(scratch.h_qkv[i]);
+    for (size_t i = 0; i < scratch.z.size(); ++i) scratch.z[i] = static_cast<float>(scratch.h_z[i]);
+    for (size_t i = 0; i < scratch.a.size(); ++i) scratch.a[i] = static_cast<float>(scratch.h_a[i]);
+    for (size_t i = 0; i < scratch.b.size(); ++i) scratch.b[i] = static_cast<float>(scratch.h_b[i]);
 
-    std::vector<float> conv_out((size_t)seq_len * qkv_dim, 0.0f);
+    scratch.conv_out.assign((size_t)seq_len * qkv_dim, 0.0f);
     for (int t = 0; t < seq_len; ++t) {
-        const float* x_t = conv_in.data() + (size_t)t * qkv_dim;
-        float* y_t = conv_out.data() + (size_t)t * qkv_dim;
+        const float* x_t = scratch.conv_in.data() + (size_t)t * qkv_dim;
+        float* y_t = scratch.conv_out.data() + (size_t)t * qkv_dim;
         for (int c = 0; c < qkv_dim; ++c) {
             const float* w = layer.host_linear_conv.data() + (size_t)c * kernel;
             float v = 0.0f;
@@ -569,34 +613,34 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
         }
     }
 
-    std::vector<float> q((size_t)seq_len * linear_q_dim_);
-    std::vector<float> k((size_t)seq_len * linear_q_dim_);
-    std::vector<float> v((size_t)seq_len * linear_kv_dim_);
+    scratch.q.resize((size_t)seq_len * linear_q_dim_);
+    scratch.k.resize((size_t)seq_len * linear_q_dim_);
+    scratch.v.resize((size_t)seq_len * linear_kv_dim_);
     for (int t = 0; t < seq_len; ++t) {
-        const float* src = conv_out.data() + (size_t)t * qkv_dim;
-        std::memcpy(q.data() + (size_t)t * linear_q_dim_, src, (size_t)linear_q_dim_ * sizeof(float));
-        std::memcpy(k.data() + (size_t)t * linear_q_dim_, src + linear_q_dim_, (size_t)linear_q_dim_ * sizeof(float));
-        std::memcpy(v.data() + (size_t)t * linear_kv_dim_, src + linear_q_dim_ + linear_q_dim_,
+        const float* src = scratch.conv_out.data() + (size_t)t * qkv_dim;
+        std::memcpy(scratch.q.data() + (size_t)t * linear_q_dim_, src, (size_t)linear_q_dim_ * sizeof(float));
+        std::memcpy(scratch.k.data() + (size_t)t * linear_q_dim_, src + linear_q_dim_, (size_t)linear_q_dim_ * sizeof(float));
+        std::memcpy(scratch.v.data() + (size_t)t * linear_kv_dim_, src + linear_q_dim_ + linear_q_dim_,
                     (size_t)linear_kv_dim_ * sizeof(float));
     }
 
-    head_l2_norm_inplace(q, seq_len, linear_q_heads_, head_k_dim, cfg_.rms_norm_eps);
-    head_l2_norm_inplace(k, seq_len, linear_q_heads_, head_k_dim, cfg_.rms_norm_eps);
+    head_l2_norm_inplace(scratch.q, seq_len, linear_q_heads_, head_k_dim, cfg_.rms_norm_eps);
+    head_l2_norm_inplace(scratch.k, seq_len, linear_q_heads_, head_k_dim, cfg_.rms_norm_eps);
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
-    std::vector<float> out((size_t)seq_len * linear_kv_dim_, 0.0f);
-    std::vector<float> sk((size_t)head_v_dim);
-    std::vector<float> d((size_t)head_v_dim);
+    scratch.out.assign((size_t)seq_len * linear_kv_dim_, 0.0f);
+    scratch.sk.resize((size_t)head_v_dim);
+    scratch.d.resize((size_t)head_v_dim);
 
     for (int t = 0; t < seq_len; ++t) {
         for (int hv = 0; hv < num_heads; ++hv) {
             int hk = hv % std::max(1, linear_q_heads_);
-            const float* q_h = q.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
-            const float* k_h = k.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
-            const float* v_h = v.data() + (size_t)t * linear_kv_dim_ + (size_t)hv * head_v_dim;
+            const float* q_h = scratch.q.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
+            const float* k_h = scratch.k.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
+            const float* v_h = scratch.v.data() + (size_t)t * linear_kv_dim_ + (size_t)hv * head_v_dim;
 
-            float beta = 1.0f / (1.0f + std::exp(-b[(size_t)t * num_heads + hv]));
-            float alpha = a[(size_t)t * num_heads + hv];
+            float beta = 1.0f / (1.0f + std::exp(-scratch.b[(size_t)t * num_heads + hv]));
+            float alpha = scratch.a[(size_t)t * num_heads + hv];
             float g_pre = softplus(alpha + layer.host_linear_dt_bias[(size_t)hv]) *
                           layer.host_linear_A_negexp[(size_t)hv];
             float decay = std::exp(g_pre);
@@ -610,19 +654,19 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
                 for (int j = 0; j < head_k_dim; ++j) {
                     acc += S[(size_t)j * head_v_dim + dv] * k_h[j];
                 }
-                sk[(size_t)dv] = acc;
-                d[(size_t)dv] = (v_h[dv] - acc) * beta;
+                scratch.sk[(size_t)dv] = acc;
+                scratch.d[(size_t)dv] = (v_h[dv] - acc) * beta;
             }
 
             for (int j = 0; j < head_k_dim; ++j) {
                 float kj = k_h[j];
                 float* row = S + (size_t)j * head_v_dim;
                 for (int dv = 0; dv < head_v_dim; ++dv) {
-                    row[dv] += kj * d[(size_t)dv];
+                    row[dv] += kj * scratch.d[(size_t)dv];
                 }
             }
 
-            float* o_h = out.data() + (size_t)t * linear_kv_dim_ + (size_t)hv * head_v_dim;
+            float* o_h = scratch.out.data() + (size_t)t * linear_kv_dim_ + (size_t)hv * head_v_dim;
             for (int dv = 0; dv < head_v_dim; ++dv) {
                 float acc = 0.0f;
                 for (int j = 0; j < head_k_dim; ++j) {
@@ -633,12 +677,12 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
         }
     }
 
-    head_rms_norm_and_silu_gate(out, layer.host_linear_norm, z, seq_len, num_heads,
+    head_rms_norm_and_silu_gate(scratch.out, layer.host_linear_norm, scratch.z, seq_len, num_heads,
                                 head_v_dim, cfg_.rms_norm_eps);
 
-    std::vector<bf16> out_bf16(out.size());
-    for (size_t i = 0; i < out.size(); ++i) out_bf16[i] = bf16(out[i]);
-    ctx.memcpy_h2d(buf_.attn_out.data(), out_bf16.data(), out_bf16.size() * sizeof(bf16));
+    scratch.out_bf16.resize(scratch.out.size());
+    for (size_t i = 0; i < scratch.out.size(); ++i) scratch.out_bf16[i] = bf16(scratch.out[i]);
+    ctx.memcpy_h2d(buf_.attn_out.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
 }
 
 Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
@@ -718,11 +762,23 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
         if (layer.is_linear) {
             if (use_delta_linear_) {
-                layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
-                layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
-                layer.linear_a_proj.forward(ctx, buf_.normed, buf_.a, seq_len);
-                layer.linear_b_proj.forward(ctx, buf_.normed, buf_.b, seq_len);
-                run_linear_delta_host(ctx, layer, cache, seq_len);
+                if (seq_len == 1) {
+                    layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
+                    bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
+                    Tensor qkv_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)linear_qkv_dim_});
+                    Tensor z_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_, {1, (int64_t)linear_z_dim_});
+                    Tensor a_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_,
+                                                 {1, (int64_t)linear_kv_heads_});
+                    Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
+                                                 {1, (int64_t)linear_kv_heads_});
+                    run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, seq_len);
+                } else {
+                    layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
+                    layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
+                    layer.linear_a_proj.forward(ctx, buf_.normed, buf_.a, seq_len);
+                    layer.linear_b_proj.forward(ctx, buf_.normed, buf_.b, seq_len);
+                    run_linear_delta_host(ctx, layer, cache, buf_.qkv, buf_.z, buf_.a, buf_.b, seq_len);
+                }
             } else {
                 layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
                 ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v,
