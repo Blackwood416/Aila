@@ -2,4 +2,5 @@ llama.cpp/
 oneDNN/
 build/
 *.txt
+tmp/
 Qwen3*/

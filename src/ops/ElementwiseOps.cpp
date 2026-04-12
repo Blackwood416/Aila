@@ -33,7 +33,10 @@ void embedding_lookup(Context& ctx, Tensor& table,
 void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
                         int seq_len, int start_pos,
                         int num_heads_q, int num_kv_heads, int head_dim,
-                        int rotary_dim, float theta, bool interleaved) {
+                        int rotary_dim, float theta, bool interleaved,
+                        const int* pos_t, const int* pos_h, const int* pos_w,
+                        int prompt_pos_len, int text_pos_delta,
+                        int mrope_section_t, int mrope_section_h, int mrope_section_w) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k.data());
     int q_dim = num_heads_q * head_dim;
@@ -42,25 +45,40 @@ void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
     if (rot & 1) --rot;
     int half_dim = rot / 2;
 
-    // NOTE:
-    // Qwen3.5 "mrope_interleaved" does NOT mean GLM-style pairwise rotation
-    // on (2d, 2d+1). The actual attention rotation still uses rotate_half on
-    // [0..half_dim) and [half_dim..rotary_dim). The "interleaved" setting is
-    // about how RoPE frequencies are arranged before cos/sin generation.
-    // For text-only path (single position stream), this kernel keeps standard
-    // half-rotation semantics.
-    (void)interleaved;
-
     ctx.queue().parallel_for(sycl::range<2>(seq_len, num_heads_q * half_dim),
         [=](sycl::id<2> idx) {
             int s = idx[0];
             int flat = idx[1];
             int h = flat / half_dim;   
             int d = flat % half_dim;   
-            int pos = start_pos + s;
+            int global_pos = start_pos + s;
+            int pos_scalar = global_pos;
+            if (global_pos >= prompt_pos_len) {
+                pos_scalar = global_pos + text_pos_delta;
+            }
+
+            float position_value = static_cast<float>(pos_scalar);
+            if (interleaved && pos_t && pos_h && pos_w) {
+                int stream = 0;
+                if ((d % 3) == 1 && (d / 3) < mrope_section_h) {
+                    stream = 1;
+                } else if ((d % 3) == 2 && (d / 3) < mrope_section_w) {
+                    stream = 2;
+                } else {
+                    stream = 0;
+                }
+
+                int pos_index = global_pos;
+                int t_val = (pos_index < prompt_pos_len) ? pos_t[pos_index] : pos_scalar;
+                int h_val = (pos_index < prompt_pos_len) ? pos_h[pos_index] : pos_scalar;
+                int w_val = (pos_index < prompt_pos_len) ? pos_w[pos_index] : pos_scalar;
+                if (stream == 1) position_value = static_cast<float>(h_val);
+                else if (stream == 2) position_value = static_cast<float>(w_val);
+                else position_value = static_cast<float>(t_val);
+            }
 
             float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(rot));
-            float angle = static_cast<float>(pos) * freq;
+            float angle = position_value * freq;
             float cos_val = sycl::cos(angle);
             float sin_val = sycl::sin(angle);
 

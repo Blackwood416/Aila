@@ -660,45 +660,61 @@ bool Qwen35VisionEncoder::read_image_rgb(const std::string& uri,
 #endif
 }
 
-void Qwen35VisionEncoder::resize_rgb_bilinear(const std::vector<uint8_t>& src,
-                                              int src_w,
-                                              int src_h,
-                                              int dst_w,
-                                              int dst_h,
-                                              std::vector<uint8_t>& dst) {
+void Qwen35VisionEncoder::resize_rgb_bicubic(const std::vector<uint8_t>& src,
+                                             int src_w,
+                                             int src_h,
+                                             int dst_w,
+                                             int dst_h,
+                                             std::vector<uint8_t>& dst) {
     if (src_w == dst_w && src_h == dst_h) {
         dst = src;
         return;
     }
 
+    auto cubic_weight = [](float x) -> float {
+        constexpr float a = -0.5f;
+        x = std::fabs(x);
+        if (x <= 1.0f) {
+            return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+        }
+        if (x < 2.0f) {
+            return (((a * x - 5.0f * a) * x + 8.0f * a) * x) - 4.0f * a;
+        }
+        return 0.0f;
+    };
+
     dst.resize(static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h) * 3u);
-    const float x_ratio = static_cast<float>(src_w - 1) / static_cast<float>(dst_w);
-    const float y_ratio = static_cast<float>(src_h - 1) / static_cast<float>(dst_h);
+    const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
+    const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
 
     for (int y = 0; y < dst_h; ++y) {
-        const float py = y_ratio * static_cast<float>(y);
-        const int y0 = std::min(static_cast<int>(py), src_h - 2);
-        const float y_lerp = py - static_cast<float>(y0);
+        const float src_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
+        const int y_base = static_cast<int>(std::floor(src_y));
 
         for (int x = 0; x < dst_w; ++x) {
-            const float px = x_ratio * static_cast<float>(x);
-            const int x0 = std::min(static_cast<int>(px), src_w - 2);
-            const float x_lerp = px - static_cast<float>(x0);
-
-            const uint8_t* p00 = src.data() + (static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)) * 3u;
-            const uint8_t* p01 = src.data() + (static_cast<size_t>(y0) * static_cast<size_t>(src_w) + static_cast<size_t>(x0 + 1)) * 3u;
-            const uint8_t* p10 = src.data() + (static_cast<size_t>(y0 + 1) * static_cast<size_t>(src_w) + static_cast<size_t>(x0)) * 3u;
-            const uint8_t* p11 = src.data() + (static_cast<size_t>(y0 + 1) * static_cast<size_t>(src_w) + static_cast<size_t>(x0 + 1)) * 3u;
+            const float src_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
+            const int x_base = static_cast<int>(std::floor(src_x));
             uint8_t* q = dst.data() + (static_cast<size_t>(y) * static_cast<size_t>(dst_w) + static_cast<size_t>(x)) * 3u;
 
             for (int c = 0; c < 3; ++c) {
-                const float top =
-                    static_cast<float>(p00[c]) +
-                    (static_cast<float>(p01[c]) - static_cast<float>(p00[c])) * x_lerp;
-                const float bottom =
-                    static_cast<float>(p10[c]) +
-                    (static_cast<float>(p11[c]) - static_cast<float>(p10[c])) * x_lerp;
-                const float value = top + (bottom - top) * y_lerp;
+                float value = 0.0f;
+                float weight_sum = 0.0f;
+                for (int ky = -1; ky <= 2; ++ky) {
+                    const int sy = std::clamp(y_base + ky, 0, src_h - 1);
+                    const float wy = cubic_weight(src_y - static_cast<float>(y_base + ky));
+                    for (int kx = -1; kx <= 2; ++kx) {
+                        const int sx = std::clamp(x_base + kx, 0, src_w - 1);
+                        const float wx = cubic_weight(src_x - static_cast<float>(x_base + kx));
+                        const float w = wy * wx;
+                        const uint8_t* p = src.data() +
+                            (static_cast<size_t>(sy) * static_cast<size_t>(src_w) + static_cast<size_t>(sx)) * 3u;
+                        value += static_cast<float>(p[c]) * w;
+                        weight_sum += w;
+                    }
+                }
+                if (weight_sum != 0.0f) {
+                    value /= weight_sum;
+                }
                 q[c] = static_cast<uint8_t>(std::clamp<float>(std::round(value), 0.0f, 255.0f));
             }
         }
@@ -885,7 +901,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     }
 
     std::vector<uint8_t> resized_rgb;
-    resize_rgb_bilinear(src_rgb, src_w, src_h, target_w, target_h, resized_rgb);
+    resize_rgb_bicubic(src_rgb, src_w, src_h, target_w, target_h, resized_rgb);
 
     std::vector<float> chw(static_cast<size_t>(3) * static_cast<size_t>(target_h) * static_cast<size_t>(target_w));
     for (int y = 0; y < target_h; ++y) {
@@ -953,14 +969,22 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
             }
         } else {
             for (int y = 0; y < patch_grid_h; ++y) {
-                float fy = (static_cast<float>(y) + 0.5f) * static_cast<float>(base_side) / static_cast<float>(patch_grid_h) - 0.5f;
+                float fy = 0.0f;
+                if (patch_grid_h > 1) {
+                    fy = static_cast<float>(y) * static_cast<float>(base_side - 1) /
+                         static_cast<float>(patch_grid_h - 1);
+                }
                 int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, base_side - 1);
                 int y1 = std::clamp(y0 + 1, 0, base_side - 1);
                 float wy1 = fy - static_cast<float>(y0);
                 float wy0 = 1.0f - wy1;
 
                 for (int x = 0; x < patch_grid_w; ++x) {
-                    float fx = (static_cast<float>(x) + 0.5f) * static_cast<float>(base_side) / static_cast<float>(patch_grid_w) - 0.5f;
+                    float fx = 0.0f;
+                    if (patch_grid_w > 1) {
+                        fx = static_cast<float>(x) * static_cast<float>(base_side - 1) /
+                             static_cast<float>(patch_grid_w - 1);
+                    }
                     int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, base_side - 1);
                     int x1 = std::clamp(x0 + 1, 0, base_side - 1);
                     float wx1 = fx - static_cast<float>(x0);
@@ -1138,6 +1162,9 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                     merger_fc2_w_, merger_fc2_b_, out_hidden_size_, merger_out);
 
     out.token_count = out_tokens;
+    out.llm_grid_t = 1;
+    out.llm_grid_h = merged_h;
+    out.llm_grid_w = merged_w;
     out.embeddings.resize(static_cast<size_t>(out_tokens) * static_cast<size_t>(out_hidden_size_));
     for (size_t i = 0; i < merger_out.size(); ++i) {
         out.embeddings[i] = bf16(merger_out[i]);

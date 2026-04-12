@@ -16,6 +16,9 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 
 struct VisionEncodeResult {
     int token_count = 0;
+    int llm_grid_t = 1;
+    int llm_grid_h = 0;
+    int llm_grid_w = 0;
     std::vector<bf16> embeddings; // [token_count, out_hidden_size]
 };
 
@@ -88,12 +91,12 @@ private:
                                std::vector<uint8_t>& rgb,
                                std::string* error_message);
 
-    static void resize_rgb_bilinear(const std::vector<uint8_t>& src,
-                                    int src_w,
-                                    int src_h,
-                                    int dst_w,
-                                    int dst_h,
-                                    std::vector<uint8_t>& dst);
+    static void resize_rgb_bicubic(const std::vector<uint8_t>& src,
+                                   int src_w,
+                                   int src_h,
+                                   int dst_w,
+                                   int dst_h,
+                                   std::vector<uint8_t>& dst);
 
     static void choose_target_size(int src_w,
                                    int src_h,

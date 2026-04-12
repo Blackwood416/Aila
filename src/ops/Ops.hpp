@@ -118,7 +118,15 @@ namespace ops {
                             int num_heads_q, int num_kv_heads, int head_dim,
                             int rotary_dim,
                             float theta,
-                            bool interleaved = false);
+                            bool interleaved = false,
+                            const int* pos_t = nullptr,
+                            const int* pos_h = nullptr,
+                            const int* pos_w = nullptr,
+                            int prompt_pos_len = 0,
+                            int text_pos_delta = 0,
+                            int mrope_section_t = 0,
+                            int mrope_section_h = 0,
+                            int mrope_section_w = 0);
 
     // 将新 K/V 写到 cache 的指定位置
     // new_kv: [seq_len, num_kv_heads * head_dim]

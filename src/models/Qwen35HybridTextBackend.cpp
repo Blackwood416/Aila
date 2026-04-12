@@ -114,6 +114,10 @@ void Qwen35HybridTextBackend::ensure_incr_prefill_scores(Context& ctx, int seq_l
                   incr_prefill_seq_cap_, incr_prefill_total_cap_);
 }
 
+Qwen35HybridTextBackend::~Qwen35HybridTextBackend() {
+    clear_mrope_positions();
+}
+
 bool Qwen35HybridTextBackend::load(Context& ctx,
                                    ModelWeights& weights,
                                    const ModelSpec& spec,
@@ -387,6 +391,46 @@ void Qwen35HybridTextBackend::clear_embedding_overrides() {
     embed_override_positions_.clear();
     embed_override_values_.clear();
     embed_override_hidden_size_ = 0;
+}
+
+void Qwen35HybridTextBackend::set_mrope_positions(Context& ctx,
+                                                  const std::vector<int>& pos_t,
+                                                  const std::vector<int>& pos_h,
+                                                  const std::vector<int>& pos_w,
+                                                  int text_pos_delta) {
+    clear_mrope_positions();
+    if (pos_t.empty() || pos_h.empty() || pos_w.empty()) {
+        return;
+    }
+    if (pos_t.size() != pos_h.size() || pos_t.size() != pos_w.size()) {
+        return;
+    }
+
+    const size_t bytes = pos_t.size() * sizeof(int);
+    mrope_ctx_ = &ctx;
+    mrope_prompt_len_ = static_cast<int>(pos_t.size());
+    mrope_text_pos_delta_ = text_pos_delta;
+
+    mrope_pos_t_ = static_cast<int*>(ctx.alloc_device(bytes));
+    mrope_pos_h_ = static_cast<int*>(ctx.alloc_device(bytes));
+    mrope_pos_w_ = static_cast<int*>(ctx.alloc_device(bytes));
+    ctx.memcpy_h2d(mrope_pos_t_, pos_t.data(), bytes);
+    ctx.memcpy_h2d(mrope_pos_h_, pos_h.data(), bytes);
+    ctx.memcpy_h2d(mrope_pos_w_, pos_w.data(), bytes);
+}
+
+void Qwen35HybridTextBackend::clear_mrope_positions() {
+    if (mrope_ctx_) {
+        if (mrope_pos_t_) mrope_ctx_->free_device(mrope_pos_t_);
+        if (mrope_pos_h_) mrope_ctx_->free_device(mrope_pos_h_);
+        if (mrope_pos_w_) mrope_ctx_->free_device(mrope_pos_w_);
+    }
+    mrope_pos_t_ = nullptr;
+    mrope_pos_h_ = nullptr;
+    mrope_pos_w_ = nullptr;
+    mrope_prompt_len_ = 0;
+    mrope_text_pos_delta_ = 0;
+    mrope_ctx_ = nullptr;
 }
 
 void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache, int seq_len) {
@@ -676,7 +720,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             ops::apply_rope_partial(ctx, buf_.q, buf_.k, seq_len, start_pos,
                                     full_q_heads_, full_kv_heads_, full_head_dim_,
                                     full_rotary_dim, cfg_.rope.rope_theta,
-                                    cfg_.rope.mrope_interleaved);
+                                    cfg_.rope.mrope_interleaved,
+                                    mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+                                    mrope_prompt_len_, mrope_text_pos_delta_,
+                                    cfg_.rope.mrope_section[0],
+                                    cfg_.rope.mrope_section[1],
+                                    cfg_.rope.mrope_section[2]);
             if (debug_this_layer && seq_len > 0) {
                 char tag_q[64];
                 char tag_k[64];

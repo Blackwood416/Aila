@@ -7,6 +7,8 @@
 
 class Qwen35HybridTextBackend : public IModelBackend {
 public:
+    ~Qwen35HybridTextBackend() override;
+
     bool load(Context& ctx,
               ModelWeights& weights,
               const ModelSpec& spec,
@@ -24,6 +26,12 @@ public:
                                  const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
                                  int hidden_size);
     void clear_embedding_overrides();
+    void set_mrope_positions(Context& ctx,
+                             const std::vector<int>& pos_t,
+                             const std::vector<int>& pos_h,
+                             const std::vector<int>& pos_w,
+                             int text_pos_delta);
+    void clear_mrope_positions();
 
 private:
     struct Layer {
@@ -137,4 +145,11 @@ private:
     std::vector<int> embed_override_positions_;
     std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;
     int embed_override_hidden_size_ = 0;
+
+    Context* mrope_ctx_ = nullptr;
+    int* mrope_pos_t_ = nullptr;
+    int* mrope_pos_h_ = nullptr;
+    int* mrope_pos_w_ = nullptr;
+    int mrope_prompt_len_ = 0;
+    int mrope_text_pos_delta_ = 0;
 };

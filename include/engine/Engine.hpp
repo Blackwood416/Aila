@@ -702,6 +702,7 @@ public:
         }
         if (auto* q35_backend = dynamic_cast<Qwen35HybridTextBackend*>(backend_.get())) {
             q35_backend->clear_embedding_overrides();
+            q35_backend->clear_mrope_positions();
         }
 
         GenerationConfig tuned_cfg = gen_config;
@@ -742,6 +743,13 @@ public:
         render_messages.reserve(messages.size());
         std::vector<sycl::ext::oneapi::bfloat16> vision_embeddings_flat;
         size_t total_vision_tokens = 0;
+        struct VisionSegment {
+            int token_count = 0;
+            int llm_grid_t = 1;
+            int llm_grid_h = 0;
+            int llm_grid_w = 0;
+        };
+        std::vector<VisionSegment> vision_segments;
 
         for (const auto& m : messages) {
             Message out_msg;
@@ -795,6 +803,12 @@ public:
                     out_msg.content.push_back(std::move(ph));
 
                     total_vision_tokens += static_cast<size_t>(encoded.token_count);
+                    vision_segments.push_back(VisionSegment{
+                        encoded.token_count,
+                        encoded.llm_grid_t,
+                        encoded.llm_grid_h,
+                        encoded.llm_grid_w,
+                    });
                     vision_embeddings_flat.insert(
                         vision_embeddings_flat.end(),
                         encoded.embeddings.begin(),
@@ -851,7 +865,65 @@ public:
             }
 
             q35_backend->set_embedding_overrides(image_positions, vision_embeddings_flat, config_.hidden_size);
+            std::vector<int> pos_t(full_ids.size(), 0);
+            std::vector<int> pos_h(full_ids.size(), 0);
+            std::vector<int> pos_w(full_ids.size(), 0);
+            size_t next_segment = 0;
+            int current_pos = 0;
+            for (size_t i = 0; i < full_ids.size();) {
+                if (full_ids[i] != image_pad_id) {
+                    size_t j = i + 1;
+                    while (j < full_ids.size() && full_ids[j] != image_pad_id) ++j;
+                    for (size_t k = i; k < j; ++k) {
+                        int text_pos = current_pos + static_cast<int>(k - i);
+                        pos_t[k] = text_pos;
+                        pos_h[k] = text_pos;
+                        pos_w[k] = text_pos;
+                    }
+                    current_pos += static_cast<int>(j - i);
+                    i = j;
+                    continue;
+                }
+
+                size_t j = i + 1;
+                while (j < full_ids.size() && full_ids[j] == image_pad_id) ++j;
+                if (next_segment >= vision_segments.size()) {
+                    set_error(EngineErrorCode::RuntimeError,
+                              "Missing multimodal segment metadata for image tokens");
+                    return "";
+                }
+                const auto& seg = vision_segments[next_segment++];
+                const int seq_len = static_cast<int>(j - i);
+                const int grid_t = std::max(1, seg.llm_grid_t);
+                const int grid_h = std::max(1, seg.llm_grid_h);
+                const int grid_w = std::max(1, seg.llm_grid_w);
+                if (seq_len != seg.token_count || grid_t * grid_h * grid_w != seq_len) {
+                    set_error(EngineErrorCode::RuntimeError,
+                              "Vision grid metadata does not match rendered image token count");
+                    return "";
+                }
+                size_t out_idx = i;
+                for (int t = 0; t < grid_t; ++t) {
+                    for (int h = 0; h < grid_h; ++h) {
+                        for (int w = 0; w < grid_w; ++w) {
+                            pos_t[out_idx] = current_pos + t;
+                            pos_h[out_idx] = current_pos + h;
+                            pos_w[out_idx] = current_pos + w;
+                            ++out_idx;
+                        }
+                    }
+                }
+                current_pos += std::max({grid_t, grid_h, grid_w});
+                i = j;
+            }
+            int max_pos = 0;
+            for (size_t i = 0; i < full_ids.size(); ++i) {
+                max_pos = std::max(max_pos, std::max({pos_t[i], pos_h[i], pos_w[i]}));
+            }
+            const int text_pos_delta = max_pos + 1 - static_cast<int>(full_ids.size());
+            q35_backend->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, text_pos_delta);
             AILA_LOG_INFO("[Vision] Injecting %zu image embeddings into prompt", total_vision_tokens);
+            AILA_LOG_INFO("[Vision] Applied multimodal text RoPE positions (delta=%d)", text_pos_delta);
         }
 
         int max_ctx = backend_->max_seq_len();
