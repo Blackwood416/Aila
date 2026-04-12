@@ -1,10 +1,12 @@
 #include "Qwen35VisionEncoder.hpp"
 
 #include "core/Context.hpp"
+#include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include "simdjson.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +15,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -28,6 +31,50 @@ namespace {
 
 void set_error(std::string* err, const std::string& msg) {
     if (err) *err = msg;
+}
+
+int vision_cpu_threads() {
+    static int threads = []() {
+        int n = aila::env::read_int_raw("AILA_Q35_VISION_THREADS", 0);
+        if (n <= 0) n = static_cast<int>(std::thread::hardware_concurrency());
+        return std::max(1, n);
+    }();
+    return threads;
+}
+
+template <typename Fn>
+void parallel_for_1d(int begin, int end, int min_items_per_thread, const Fn& fn) {
+    const int total = end - begin;
+    if (total <= 0) return;
+
+    int threads = vision_cpu_threads();
+    if (threads <= 1 || total <= std::max(1, min_items_per_thread)) {
+        for (int i = begin; i < end; ++i) fn(i);
+        return;
+    }
+
+    threads = std::min(threads, std::max(1, total / std::max(1, min_items_per_thread)));
+    if (threads <= 1) {
+        for (int i = begin; i < end; ++i) fn(i);
+        return;
+    }
+
+    const int chunk = (total + threads - 1) / threads;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(threads - 1));
+
+    for (int t = 0; t < threads - 1; ++t) {
+        const int s = begin + t * chunk;
+        const int e = std::min(end, s + chunk);
+        workers.emplace_back([s, e, &fn]() {
+            for (int i = s; i < e; ++i) fn(i);
+        });
+    }
+
+    const int main_begin = begin + (threads - 1) * chunk;
+    for (int i = main_begin; i < end; ++i) fn(i);
+
+    for (auto& worker : workers) worker.join();
 }
 
 std::string read_file_text(const std::string& path) {
@@ -687,7 +734,7 @@ void Qwen35VisionEncoder::resize_rgb_bicubic(const std::vector<uint8_t>& src,
     const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
     const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
 
-    for (int y = 0; y < dst_h; ++y) {
+    parallel_for_1d(0, dst_h, 8, [&](int y) {
         const float src_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
         const int y_base = static_cast<int>(std::floor(src_y));
 
@@ -718,7 +765,7 @@ void Qwen35VisionEncoder::resize_rgb_bicubic(const std::vector<uint8_t>& src,
                 q[c] = static_cast<uint8_t>(std::clamp<float>(std::round(value), 0.0f, 255.0f));
             }
         }
-    }
+    });
 }
 
 void Qwen35VisionEncoder::choose_target_size(int src_w,
@@ -771,7 +818,7 @@ void Qwen35VisionEncoder::layer_norm_affine(const std::vector<float>& in,
                                             float eps,
                                             std::vector<float>& out) {
     out.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
-    for (int r = 0; r < rows; ++r) {
+    parallel_for_1d(0, rows, 4, [&](int r) {
         const float* x = in.data() + static_cast<size_t>(r) * static_cast<size_t>(cols);
         float mean = 0.0f;
         for (int c = 0; c < cols; ++c) mean += x[c];
@@ -791,7 +838,7 @@ void Qwen35VisionEncoder::layer_norm_affine(const std::vector<float>& in,
             float b = (beta.size() == static_cast<size_t>(cols)) ? beta[static_cast<size_t>(c)] : 0.0f;
             y[c] = (x[c] - mean) * inv * g + b;
         }
-    }
+    });
 }
 
 void Qwen35VisionEncoder::linear_rowmajor(const std::vector<float>& in,
@@ -802,7 +849,7 @@ void Qwen35VisionEncoder::linear_rowmajor(const std::vector<float>& in,
                                           int out_dim,
                                           std::vector<float>& out) {
     out.assign(static_cast<size_t>(rows) * static_cast<size_t>(out_dim), 0.0f);
-    for (int r = 0; r < rows; ++r) {
+    parallel_for_1d(0, rows, 1, [&](int r) {
         const float* x = in.data() + static_cast<size_t>(r) * static_cast<size_t>(in_dim);
         float* y = out.data() + static_cast<size_t>(r) * static_cast<size_t>(out_dim);
         for (int od = 0; od < out_dim; ++od) {
@@ -814,7 +861,7 @@ void Qwen35VisionEncoder::linear_rowmajor(const std::vector<float>& in,
             if (!bias.empty()) acc += bias[static_cast<size_t>(od)];
             y[od] = acc;
         }
-    }
+    });
 }
 
 void Qwen35VisionEncoder::gelu_tanh_inplace(std::vector<float>& x) {
@@ -844,6 +891,14 @@ void Qwen35VisionEncoder::softmax_inplace(std::vector<float>& x) {
 bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                                        VisionEncodeResult& out,
                                        std::string* error_message) const {
+    using clock = std::chrono::high_resolution_clock;
+    auto t_total_start = clock::now();
+    auto stage_start = t_total_start;
+    const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
+    auto stage_ms = [&](clock::time_point from) -> double {
+        return std::chrono::duration<double, std::milli>(clock::now() - from).count();
+    };
+
     out = VisionEncodeResult{};
     if (!loaded_) {
         set_error(error_message, "Vision encoder is not loaded");
@@ -856,6 +911,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     if (!read_image_rgb(uri, src_w, src_h, src_rgb, error_message)) {
         return false;
     }
+    const double decode_ms = stage_ms(stage_start);
 
     const int align = std::max(1, patch_size_ * merge_size_);
     int target_w = align;
@@ -901,10 +957,13 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     }
 
     std::vector<uint8_t> resized_rgb;
+    stage_start = clock::now();
     resize_rgb_bicubic(src_rgb, src_w, src_h, target_w, target_h, resized_rgb);
+    const double resize_ms = stage_ms(stage_start);
 
+    stage_start = clock::now();
     std::vector<float> chw(static_cast<size_t>(3) * static_cast<size_t>(target_h) * static_cast<size_t>(target_w));
-    for (int y = 0; y < target_h; ++y) {
+    parallel_for_1d(0, target_h, 8, [&](int y) {
         for (int x = 0; x < target_w; ++x) {
             const uint8_t* p = resized_rgb.data() + (static_cast<size_t>(y) * static_cast<size_t>(target_w) + static_cast<size_t>(x)) * 3u;
             float r = static_cast<float>(p[0]) / 255.0f;
@@ -914,7 +973,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
             chw[(1 * target_h + y) * target_w + x] = (g - image_mean_[1]) / image_std_[1];
             chw[(2 * target_h + y) * target_w + x] = (b - image_mean_[2]) / image_std_[2];
         }
-    }
+    });
 
     const int patch_grid_w = target_w / patch_size_;
     const int patch_grid_h = target_h / patch_size_;
@@ -927,26 +986,28 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     }
 
     std::vector<float> patch_rows(static_cast<size_t>(num_patches) * static_cast<size_t>(patch_dim));
-    for (int py = 0; py < patch_grid_h; ++py) {
-        for (int px = 0; px < patch_grid_w; ++px) {
-            const int row = py * patch_grid_w + px;
-            float* dst = patch_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(patch_dim);
-            int t = 0;
-            for (int c = 0; c < 3; ++c) {
-                for (int ky = 0; ky < patch_size_; ++ky) {
-                    int iy = py * patch_size_ + ky;
-                    for (int kx = 0; kx < patch_size_; ++kx) {
-                        int ix = px * patch_size_ + kx;
-                        dst[t++] = chw[(c * target_h + iy) * target_w + ix];
-                    }
+    parallel_for_1d(0, num_patches, 4, [&](int row) {
+        const int py = row / patch_grid_w;
+        const int px = row % patch_grid_w;
+        float* dst = patch_rows.data() + static_cast<size_t>(row) * static_cast<size_t>(patch_dim);
+        int t = 0;
+        for (int c = 0; c < 3; ++c) {
+            for (int ky = 0; ky < patch_size_; ++ky) {
+                int iy = py * patch_size_ + ky;
+                for (int kx = 0; kx < patch_size_; ++kx) {
+                    int ix = px * patch_size_ + kx;
+                    dst[t++] = chw[(c * target_h + iy) * target_w + ix];
                 }
             }
         }
-    }
+    });
+    const double prep_ms = stage_ms(stage_start);
 
+    stage_start = clock::now();
     std::vector<float> tokens;
     linear_rowmajor(patch_rows, num_patches, patch_dim,
                     patch_kernel_fused_, patch_bias_, hidden_size_, tokens);
+    const double patch_proj_ms = stage_ms(stage_start);
 
     const int pos_len = static_cast<int>(pos_embed_.size() / static_cast<size_t>(hidden_size_));
     if (pos_len <= 0) {
@@ -968,7 +1029,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                 for (int d = 0; d < hidden_size_; ++d) row[d] += pe[d];
             }
         } else {
-            for (int y = 0; y < patch_grid_h; ++y) {
+            parallel_for_1d(0, patch_grid_h, 2, [&](int y) {
                 float fy = 0.0f;
                 if (patch_grid_h > 1) {
                     fy = static_cast<float>(y) * static_cast<float>(base_side - 1) /
@@ -1008,10 +1069,12 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                         row[d] += v;
                     }
                 }
-            }
+            });
         }
     }
+    const double pos_embed_ms = stage_ms(stage_start);
 
+    stage_start = clock::now();
     std::vector<float> grouped_tokens;
     std::vector<int> pos_y;
     std::vector<int> pos_x;
@@ -1029,7 +1092,6 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     std::vector<float> ln2;
     std::vector<float> ffn1;
     std::vector<float> ffn2;
-    std::vector<float> probs(static_cast<size_t>(num_patches));
 
     for (const auto& b : blocks_) {
         layer_norm_affine(tokens, num_patches, hidden_size_,
@@ -1056,8 +1118,9 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
 
         attn_out.assign(static_cast<size_t>(num_patches) * static_cast<size_t>(hidden_size_), 0.0f);
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-        for (int h = 0; h < num_heads_; ++h) {
+        parallel_for_1d(0, num_heads_, 1, [&](int h) {
             int hd_off = h * head_dim_;
+            std::vector<float> probs(static_cast<size_t>(num_patches));
             for (int qi = 0; qi < num_patches; ++qi) {
                 float max_s = -std::numeric_limits<float>::max();
                 const float* qv = q.data() + static_cast<size_t>(qi) * static_cast<size_t>(hidden_size_) + hd_off;
@@ -1088,7 +1151,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
                     outv[d] = acc;
                 }
             }
-        }
+        });
 
         linear_rowmajor(attn_out, num_patches, hidden_size_,
                         b.proj_w, b.proj_b, hidden_size_, proj_out);
@@ -1107,7 +1170,9 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
             tokens[i] += ffn2[i];
         }
     }
+    const double blocks_ms = stage_ms(stage_start);
 
+    stage_start = clock::now();
     std::vector<float> tokens_for_merge;
     if (!merger_norm_w_.empty() && merger_norm_w_.size() == static_cast<size_t>(hidden_size_)) {
         layer_norm_affine(tokens, num_patches, hidden_size_,
@@ -1127,19 +1192,16 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     }
 
     std::vector<float> merged(static_cast<size_t>(out_tokens) * static_cast<size_t>(merger_in_dim));
-    for (int my = 0; my < merged_h; ++my) {
-        for (int mx = 0; mx < merged_w; ++mx) {
-            const int out_row = my * merged_w + mx;
-            float* dst = merged.data() + static_cast<size_t>(out_row) * static_cast<size_t>(merger_in_dim);
-            const int block_size = merge_size_ * merge_size_;
-            for (int block = 0; block < block_size; ++block) {
-                const int src_row = out_row * block_size + block;
-                const float* src = tokens_for_merge.data() + static_cast<size_t>(src_row) * static_cast<size_t>(hidden_size_);
-                std::memcpy(dst + static_cast<size_t>(block) * static_cast<size_t>(hidden_size_),
-                            src, static_cast<size_t>(hidden_size_) * sizeof(float));
-            }
+    parallel_for_1d(0, out_tokens, 2, [&](int out_row) {
+        float* dst = merged.data() + static_cast<size_t>(out_row) * static_cast<size_t>(merger_in_dim);
+        const int block_size = merge_size_ * merge_size_;
+        for (int block = 0; block < block_size; ++block) {
+            const int src_row = out_row * block_size + block;
+            const float* src = tokens_for_merge.data() + static_cast<size_t>(src_row) * static_cast<size_t>(hidden_size_);
+            std::memcpy(dst + static_cast<size_t>(block) * static_cast<size_t>(hidden_size_),
+                        src, static_cast<size_t>(hidden_size_) * sizeof(float));
         }
-    }
+    });
 
     std::vector<float> merger_normed;
     if (!merger_norm_w_.empty() && merger_norm_w_.size() == static_cast<size_t>(merger_in_dim)) {
@@ -1168,6 +1230,17 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     out.embeddings.resize(static_cast<size_t>(out_tokens) * static_cast<size_t>(out_hidden_size_));
     for (size_t i = 0; i < merger_out.size(); ++i) {
         out.embeddings[i] = bf16(merger_out[i]);
+    }
+
+    if (profile) {
+        const double merger_ms = stage_ms(stage_start);
+        const double total_ms = stage_ms(t_total_start);
+        AILA_LOG_INFO(
+            "[VisionProfile] file=%s src=%dx%d target=%dx%d llm=%dx%dx%d tokens=%d threads=%d "
+            "decode=%.2fms resize=%.2fms prep=%.2fms patch=%.2fms pos=%.2fms blocks=%.2fms merger=%.2fms total=%.2fms",
+            uri.c_str(), src_w, src_h, target_w, target_h, out.llm_grid_t, out.llm_grid_h, out.llm_grid_w,
+            out.token_count, vision_cpu_threads(), decode_ms, resize_ms, prep_ms, patch_proj_ms,
+            pos_embed_ms, blocks_ms, merger_ms, total_ms);
     }
     return true;
 }
