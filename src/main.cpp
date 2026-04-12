@@ -84,13 +84,23 @@ int main(int argc, char** argv) {
 
     // Single-shot messages JSON mode
     if (!opts.messages_json_path.empty()) {
-        std::ifstream in(opts.messages_json_path, std::ios::binary);
-        if (!in.is_open()) {
-            AILA_LOG_ERROR("Failed to open messages JSON file: %s", opts.messages_json_path.c_str());
+        std::string messages_json;
+        if (opts.messages_json_path == "-") {
+            messages_json.assign(std::istreambuf_iterator<char>(std::cin),
+                                 std::istreambuf_iterator<char>());
+        } else {
+            std::ifstream in(opts.messages_json_path, std::ios::binary);
+            if (!in.is_open()) {
+                AILA_LOG_ERROR("Failed to open messages JSON file: %s", opts.messages_json_path.c_str());
+                return 1;
+            }
+            messages_json.assign(std::istreambuf_iterator<char>(in),
+                                 std::istreambuf_iterator<char>());
+        }
+        if (messages_json.empty()) {
+            AILA_LOG_ERROR("Messages JSON input is empty");
             return 1;
         }
-        std::string messages_json((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
 
         if (opts.stream_output) {
             std::cout << "\nAila: ";

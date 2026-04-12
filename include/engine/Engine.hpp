@@ -1261,7 +1261,7 @@ private:
                         }
 
                         std::string type(type_sv);
-                        if (type == "text") {
+                        if (type == "text" || type == "input_text") {
                             simdjson::dom::element text_elem;
                             if (part_obj.at_key("text").get(text_elem) != simdjson::SUCCESS) {
                                 set_error("text content missing text field");
@@ -1273,7 +1273,7 @@ private:
                                 return false;
                             }
                             msg.content.push_back(ContentPart{ContentType::Text, std::string(text_sv), ""});
-                        } else if (type == "image" || type == "image_url") {
+                        } else if (type == "image" || type == "image_url" || type == "input_image") {
                             std::string uri;
                             simdjson::dom::element image_url_elem;
                             if (part_obj.at_key("image_url").get(image_url_elem) == simdjson::SUCCESS) {
@@ -1302,14 +1302,29 @@ private:
                                     }
                                 }
                             }
+                            if (uri.empty()) {
+                                set_error("image content missing image/image_url/url field");
+                                return false;
+                            }
                             msg.content.push_back(ContentPart{ContentType::Image, "", uri});
-                        } else if (type == "video" || type == "video_url") {
+                        } else if (type == "video" || type == "video_url" || type == "input_video") {
                             std::string uri;
                             simdjson::dom::element video_url_elem;
                             if (part_obj.at_key("video_url").get(video_url_elem) == simdjson::SUCCESS) {
                                 std::string_view video_url_sv;
                                 if (video_url_elem.get_string().get(video_url_sv) == simdjson::SUCCESS) {
                                     uri = std::string(video_url_sv);
+                                } else {
+                                    simdjson::dom::object video_obj;
+                                    if (video_url_elem.get_object().get(video_obj) == simdjson::SUCCESS) {
+                                        simdjson::dom::element url_elem;
+                                        if (video_obj.at_key("url").get(url_elem) == simdjson::SUCCESS) {
+                                            std::string_view url_sv;
+                                            if (url_elem.get_string().get(url_sv) == simdjson::SUCCESS) {
+                                                uri = std::string(url_sv);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if (uri.empty()) {
@@ -1320,6 +1335,10 @@ private:
                                         uri = std::string(video_sv);
                                     }
                                 }
+                            }
+                            if (uri.empty()) {
+                                set_error("video content missing video/video_url/url field");
+                                return false;
                             }
                             msg.content.push_back(ContentPart{ContentType::Video, "", uri});
                         } else {

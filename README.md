@@ -97,7 +97,7 @@ Options:
   --bench-warmup <N>       Benchmark warmup iterations (default: 1)
   --bench-sample           Benchmark decode in sampling mode
   --bench-greedy           Benchmark decode in greedy mode (default)
-  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file
+  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file (`-` = stdin)
   -h, --help               Show help
   -v, --version            Show version
 ```
@@ -110,6 +110,13 @@ Example `messages.json`:
   {"role": "user", "content": [{"type":"text","text":"请用一句话介绍你自己。"}]}
 ]
 ```
+
+Messages JSON compatibility notes:
+
+- `content[].type` accepts `text`, `image`, `video`, plus OpenAI-style aliases `input_text`, `input_image`, `input_video`.
+- Image parts may provide `image`, `image_url`, or `{"image_url":{"url":"..."}}`.
+- Video parts may provide `video`, `video_url`, or `{"video_url":{"url":"..."}}`.
+- `--messages-json -` reads the full JSON payload from `stdin`.
 
 Run:
 
@@ -148,6 +155,10 @@ Aila.exe -m ./Qwen3.5-0.8B --messages-json ./messages.json --max-tokens 64 --gre
 
 Aila exposes a stable C ABI through `aila_api.h`, suitable for any language with C FFI support:
 
+`aila_generate_messages` and `aila_generate_messages_stream` expose the same
+message-based path as the CLI. They return errors through
+`aila_last_error_code()` + `aila_last_error_message()`.
+
 `aila_generate_messages` returns `NULL` on parse/template/runtime errors. Use
 `aila_last_error_code()` + `aila_last_error_message()` to inspect failures
 (including explicit video-not-enabled errors and image encode/runtime failures).
@@ -182,6 +193,13 @@ aila_generate_stream(engine, "Tell me a story", &config,
     [](const char* token, void* ud) -> int {
         printf("%s", token);
         return 0;  // return non-zero to abort
+    }, NULL);
+
+// Streaming OpenAI-style messages JSON generation
+aila_generate_messages_stream(engine, messages_json, &config,
+    [](const char* token, void* ud) -> int {
+        printf("%s", token);
+        return 0;
     }, NULL);
 
 // Cleanup

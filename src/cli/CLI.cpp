@@ -130,7 +130,7 @@ Options:
   --bench-warmup <N>       Benchmark warmup iterations (default: 1)
   --bench-sample           Benchmark decode in sampling mode
   --bench-greedy           Benchmark decode in greedy mode (default)
-  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file
+  --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
   -h, --help               Show this help message
   -v, --version            Show version
 

@@ -2,6 +2,7 @@
 #include "engine/Engine.hpp"
 #include "profile/Profiling.hpp"
 #include <cstring>
+#include <functional>
 #include <string>
 
 // ============================================================
@@ -45,6 +46,27 @@ static int to_c_error_code(EngineErrorCode code) {
         case EngineErrorCode::VisionNotEnabled: return AILA_ERR_VISION_NOT_ENABLED;
         case EngineErrorCode::ContextOverflow: return AILA_ERR_CONTEXT_OVERFLOW;
         default: return AILA_ERR_RUNTIME;
+    }
+}
+
+static int run_streaming_call(AilaEngine* engine,
+                              AilaTokenCallback callback,
+                              void* user_data,
+                              const std::function<void(bool&)>& invoke) {
+    if (!engine || !callback) return -1;
+    try {
+        bool aborted = false;
+        invoke(aborted);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return -1;
+        }
+        return aborted ? 1 : 0;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Stream generate failed: %s", e.what());
+        return -1;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Stream generate failed: unknown exception");
+        return -1;
     }
 }
 
@@ -143,15 +165,30 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
     }
 }
 
+AILA_API int aila_generate_messages_stream(AilaEngine* engine, const char* messages_json,
+                                           const AilaGenConfig* config,
+                                           AilaTokenCallback callback, void* user_data) {
+    if (!engine || !messages_json || !callback) return -1;
+
+    GenerationConfig cfg = to_cpp_config(config);
+    return run_streaming_call(engine, callback, user_data, [&](bool& aborted) {
+        engine->engine.generate_messages_json(std::string(messages_json), cfg,
+            [&](const std::string& token_text) {
+                if (!aborted) {
+                    int ret = callback(token_text.c_str(), user_data);
+                    if (ret != 0) aborted = true;
+                }
+            });
+    });
+}
+
 AILA_API int aila_generate_stream(AilaEngine* engine, const char* prompt,
                                    const AilaGenConfig* config,
                                    AilaTokenCallback callback, void* user_data) {
     if (!engine || !prompt || !callback) return -1;
 
-    try {
-        GenerationConfig cfg = to_cpp_config(config);
-        bool aborted = false;
-
+    GenerationConfig cfg = to_cpp_config(config);
+    return run_streaming_call(engine, callback, user_data, [&](bool& aborted) {
         engine->engine.generate(std::string(prompt), cfg,
             [&](const std::string& token_text) {
                 if (!aborted) {
@@ -159,17 +196,7 @@ AILA_API int aila_generate_stream(AilaEngine* engine, const char* prompt,
                     if (ret != 0) aborted = true;
                 }
             });
-        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
-            return -1;
-        }
-        return aborted ? 1 : 0;
-    } catch (const std::exception& e) {
-        AILA_LOG_ERROR("[C-API] Stream generate failed: %s", e.what());
-        return -1;
-    } catch (...) {
-        AILA_LOG_ERROR("[C-API] Stream generate failed: unknown exception");
-        return -1;
-    }
+    });
 }
 
 AILA_API void aila_free_string(char* str) {

@@ -132,6 +132,19 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
                                       const AilaGenConfig* config);
 
 /**
+ * Generate response from OpenAI-style messages JSON with streaming token callback.
+ * @param engine         Initialized engine handle
+ * @param messages_json  UTF-8 JSON array string. Each item should contain role/content.
+ * @param config         Generation config (NULL for defaults)
+ * @param callback       Called for each generated token chunk
+ * @param user_data      Passed through to callback
+ * @return 0 on success, 1 when aborted by callback, non-zero on error
+ */
+AILA_API int aila_generate_messages_stream(AilaEngine* engine, const char* messages_json,
+                                           const AilaGenConfig* config,
+                                           AilaTokenCallback callback, void* user_data);
+
+/**
  * Generate response with streaming token callback.
  * @param engine     Initialized engine handle
  * @param prompt     User message (UTF-8 null-terminated)

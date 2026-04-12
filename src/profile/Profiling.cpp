@@ -13,13 +13,11 @@ namespace {
     void* g_log_user_data = nullptr;
     LogLevel g_min_level = LogLevel::Info;
 
-    // Default handler: route to stdout/stderr
+    // Default handler: route logs to stderr so CLI stdout stays usable
+    // for streamed/generated model text and shell piping.
     void default_log_handler(LogLevel level, const char* message) {
-        if (level >= LogLevel::Error) {
-            std::cerr << message << std::endl;
-        } else {
-            std::cout << message << std::endl;
-        }
+        (void)level;
+        std::cerr << message << std::endl;
     }
 } // namespace
 

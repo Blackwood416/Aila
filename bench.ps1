@@ -1,5 +1,5 @@
 param(
-    [string]$ModelDir = "..\Qwen3-0.6B",
+    [string]$ModelDir = "..\Qwen3.5-0.8B",
     [int]$PromptTokens = 512,
     [int]$GenTokens = 512,
     [int]$BenchIters = 5,
