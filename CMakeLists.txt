@@ -8,16 +8,16 @@ else()
         set(CMAKE_CXX_COMPILER "icpx")
 endif()
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-project (Aila CXX)
-
-# Set default build type to RelWithDebInfo if not specified
-if (NOT CMAKE_BUILD_TYPE)
-    message (STATUS "Default CMAKE_BUILD_TYPE not set using Release with Debug Info")
-    set (CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE
+# Set default build type to Release before project() initializes the toolchain.
+if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
+    message (STATUS "Default CMAKE_BUILD_TYPE not set using Release")
+    set (CMAKE_BUILD_TYPE "Release" CACHE
         STRING "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel"
         FORCE)
 endif()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+project (Aila CXX)
 
 if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl /Qstd=c++17 /EHsc -fsycl-device-code-split=per_kernel")

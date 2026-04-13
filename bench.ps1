@@ -74,6 +74,17 @@ try {
     $buildDir = Join-Path $root "build"
     $logPath = Join-Path $root "bench_log.txt"
     $mode = if ($Sample.IsPresent) { "sample" } else { "greedy" }
+    $cachePath = Join-Path $buildDir "CMakeCache.txt"
+
+    if (Test-Path $cachePath) {
+        $buildTypeLine = Select-String -Path $cachePath -Pattern '^CMAKE_BUILD_TYPE:STRING=' | Select-Object -First 1
+        if ($buildTypeLine) {
+            $buildType = ($buildTypeLine.Line -split '=', 2)[1]
+            if ($buildType -and $buildType -ne 'Release') {
+                Write-Host ":: warning: build dir is configured as $buildType; benchmark numbers may be much slower than Release ::" -ForegroundColor Yellow
+            }
+        }
+    }
 
     $header = "=== bench $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode model=$ModelDir pp=$PromptTokens tg=$GenTokens iters=$BenchIters warmup=$WarmupIters seed=$Seed temp=$Temperature topk=$TopK topp=$TopP ==="
     $header | Tee-Object -FilePath $logPath -Append | Out-Null
