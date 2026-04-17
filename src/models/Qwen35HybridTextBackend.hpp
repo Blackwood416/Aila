@@ -166,7 +166,6 @@ private:
     int max_qkv_dim_ = 0;
     int max_attn_dim_ = 0;
     bool use_delta_linear_ = false;
-    bool use_device_linear_decode_ = true;
 
     struct LinearDeltaScratch {
         std::vector<sycl::ext::oneapi::bfloat16> h_qkv;

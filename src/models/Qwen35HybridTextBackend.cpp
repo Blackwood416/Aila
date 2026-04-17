@@ -190,7 +190,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
-    use_device_linear_decode_ = true;
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -957,10 +956,7 @@ void Qwen35HybridTextBackend::debug_compare_linear_delta_decode(Context& ctx, in
     cache.host_linear_conv_state = orig_conv;
     cache.device_state_dirty = false;
 
-    bool prev_use_device = use_device_linear_decode_;
-    use_device_linear_decode_ = false;
     run_linear_delta_host(ctx, layer, cache, qkv_src, z_src, a_src, b_src, 1);
-    use_device_linear_decode_ = prev_use_device;
 
     std::vector<bf16> host_out((size_t)linear_kv_dim_);
     ctx.memcpy_d2h(host_out.data(), buf_.attn_out.data(), host_out.size() * sizeof(bf16));
@@ -1177,17 +1173,15 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
     for (size_t i = 0; i < scratch.out.size(); ++i) scratch.out_bf16[i] = bf16(scratch.out[i]);
     ctx.memcpy_h2d(buf_.attn_out.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
 
-    if (use_device_linear_decode_) {
-        if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
-            ctx.memcpy_h2d(cache.linear_state.data(), cache.host_linear_state.data(),
-                           cache.host_linear_state.size() * sizeof(float));
-        }
-        if (cache.linear_conv_state.valid() && !cache.host_linear_conv_state.empty()) {
-            ctx.memcpy_h2d(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
-                           cache.host_linear_conv_state.size() * sizeof(float));
-        }
-        cache.device_state_dirty = false;
+    if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
+        ctx.memcpy_h2d(cache.linear_state.data(), cache.host_linear_state.data(),
+                       cache.host_linear_state.size() * sizeof(float));
     }
+    if (cache.linear_conv_state.valid() && !cache.host_linear_conv_state.empty()) {
+        ctx.memcpy_h2d(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
+                       cache.host_linear_conv_state.size() * sizeof(float));
+    }
+    cache.device_state_dirty = false;
 }
 
 Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
