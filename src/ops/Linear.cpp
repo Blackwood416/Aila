@@ -32,9 +32,19 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     decode_dst_md_ = dnnl::memory::desc({1, out_features}, dnnl::memory::data_type::bf16,
                                          dnnl::memory::format_tag::ab);
 
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
     auto pd = dnnl::matmul::primitive_desc(ctx.engine(), decode_src_md_,
-                                            decode_weight_md_, decode_dst_md_);
+                                            decode_weight_md_, decode_dst_md_, attr);
     decode_prim_ = dnnl::matmul(pd);
+    size_t scratchpad_size = pd.scratchpad_desc().get_size();
+    if (scratchpad_size > 0) {
+        decode_scratchpad_ = Tensor::allocate(ctx,
+                                              {static_cast<int64_t>(scratchpad_size)},
+                                              dnnl::memory::data_type::u8);
+        decode_scratchpad_mem_ = decode_scratchpad_.make_dnnl_memory(pd.scratchpad_desc());
+    }
     decode_inited_ = true;
 }
 
@@ -59,14 +69,24 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
     auto dst_md = dnnl::memory::desc({seq_len, out_features_}, dnnl::memory::data_type::bf16,
                                       dnnl::memory::format_tag::ab);
 
-    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md);
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md, attr);
 
     CachedPrimitive cp;
     cp.prim = dnnl::matmul(pd);
     cp.src_md = src_md;
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
-    prim_cache_[seq_len] = cp;
+    size_t scratchpad_size = pd.scratchpad_desc().get_size();
+    if (scratchpad_size > 0) {
+        cp.scratchpad = Tensor::allocate(ctx,
+                                         {static_cast<int64_t>(scratchpad_size)},
+                                         dnnl::memory::data_type::u8);
+        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
+    }
+    prim_cache_.emplace(seq_len, std::move(cp));
 }
 
 void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
@@ -89,6 +109,9 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
                 {DNNL_ARG_WEIGHTS, decode_weight_mem_},
                 {DNNL_ARG_DST, decode_dst_mem_}
             };
+            if (decode_scratchpad_.valid()) {
+                decode_args_.emplace(DNNL_ARG_SCRATCHPAD, decode_scratchpad_mem_);
+            }
             decode_mem_inited_ = true;
         } else {
             if (decode_src_ptr_ != input.data()) {
@@ -126,6 +149,9 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
                 {DNNL_ARG_WEIGHTS, cp.weight_mem},
                 {DNNL_ARG_DST, cp.dst_mem}
             };
+            if (cp.scratchpad.valid()) {
+                cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
+            }
             cp.mem_inited = true;
         } else {
             if (cp.src_ptr != input.data()) {

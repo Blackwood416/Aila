@@ -41,6 +41,8 @@ private:
     dnnl::memory decode_src_mem_;
     dnnl::memory decode_weight_mem_;
     dnnl::memory decode_dst_mem_;
+    dnnl::memory decode_scratchpad_mem_;
+    Tensor decode_scratchpad_;
     bool decode_mem_inited_ = false;
     void* decode_src_ptr_ = nullptr;
     void* decode_weight_ptr_ = nullptr;
@@ -62,6 +64,8 @@ private:
         dnnl::memory src_mem;
         dnnl::memory weight_mem;
         dnnl::memory dst_mem;
+        dnnl::memory scratchpad_mem;
+        Tensor scratchpad;
         bool mem_inited = false;
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
