@@ -190,7 +190,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
-    use_device_linear_decode_ = aila::env::read_flag("AILA_Q35_LINEAR_DECODE_GPU", true);
+    use_device_linear_decode_ = true;
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -512,9 +512,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                   cfg_.num_hidden_layers, hidden_size_, cfg_.vocab_size);
     const char* linear_mode = "legacy-attn";
     if (use_delta_linear_) {
-        linear_mode = use_device_linear_decode_
-            ? "delta-prefill-gpu-iter/decode-gpu-ring"
-            : "delta-host";
+        linear_mode = "delta-prefill-gpu-iter/decode-gpu-ring";
     }
     AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback)",
                   linear_mode);
@@ -1189,8 +1187,6 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         throw std::runtime_error("Qwen35HybridTextBackend::forward: seq_len must be positive");
     }
     bool profile_decode = (seq_len == 1) && aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
-    bool compare_linear_decode = (seq_len == 1) && aila::env::read_flag("AILA_Q35_LINEAR_DECODE_COMPARE", false);
-    int compare_linear_decode_layer = aila::env::read_int_raw("AILA_Q35_LINEAR_DECODE_COMPARE_LAYER", -1);
     int profile_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
     std::array<double, static_cast<size_t>(DecodeStage::Count)> stage_ms{};
     auto time_stage = [&](DecodeStage stage, auto&& fn) {
@@ -1292,45 +1288,29 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                                                      {1, (int64_t)linear_kv_heads_});
                         Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
                                                      {1, (int64_t)linear_kv_heads_});
-                        bool do_compare = compare_linear_decode &&
-                            (compare_linear_decode_layer < 0 || compare_linear_decode_layer == i);
-                        if (use_device_linear_decode_ && do_compare) {
-                            debug_compare_linear_delta_decode(ctx, i, layer, cache,
-                                                              qkv_view, z_view, a_view, b_view);
-                        } else if (use_device_linear_decode_) {
-                            run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
-                        } else {
-                            run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, seq_len);
-                        }
+                        run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
                     });
                 } else {
                     layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                    if (use_device_linear_decode_) {
-                        bf16* fused_base = static_cast<bf16*>(buf_.linear_all.data());
-                        bf16* out_base = static_cast<bf16*>(buf_.attn_out.data());
-                        const int64_t fused_stride = buf_.linear_all.shape(1);
-                        const int64_t out_stride = buf_.attn_out.shape(1);
-                        for (int t = 0; t < seq_len; ++t) {
-                            bf16* row_ptr = fused_base + static_cast<size_t>(t) * fused_stride;
-                            Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)linear_qkv_dim_});
-                            Tensor z_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_,
-                                                         {1, (int64_t)linear_z_dim_});
-                            Tensor a_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_ + linear_z_dim_,
-                                                         {1, (int64_t)linear_kv_heads_});
-                            Tensor b_view = Tensor::view(ctx,
-                                                         row_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
-                                                         {1, (int64_t)linear_kv_heads_});
-                            Tensor out_view = Tensor::view(ctx,
-                                                           out_base + static_cast<size_t>(t) * out_stride,
-                                                           {1, (int64_t)linear_kv_dim_});
-                            run_linear_delta_decode_gpu(ctx, layer, cache,
-                                                        qkv_view, z_view, a_view, b_view, out_view);
-                        }
-                    } else {
-                        ops::split_linear_all(ctx, buf_.linear_all, buf_.qkv, buf_.z, buf_.a, buf_.b,
-                                              seq_len, linear_qkv_dim_, linear_z_dim_,
-                                              linear_kv_heads_, linear_kv_heads_);
-                        run_linear_delta_host(ctx, layer, cache, buf_.qkv, buf_.z, buf_.a, buf_.b, seq_len);
+                    bf16* fused_base = static_cast<bf16*>(buf_.linear_all.data());
+                    bf16* out_base = static_cast<bf16*>(buf_.attn_out.data());
+                    const int64_t fused_stride = buf_.linear_all.shape(1);
+                    const int64_t out_stride = buf_.attn_out.shape(1);
+                    for (int t = 0; t < seq_len; ++t) {
+                        bf16* row_ptr = fused_base + static_cast<size_t>(t) * fused_stride;
+                        Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)linear_qkv_dim_});
+                        Tensor z_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_,
+                                                     {1, (int64_t)linear_z_dim_});
+                        Tensor a_view = Tensor::view(ctx, row_ptr + linear_qkv_dim_ + linear_z_dim_,
+                                                     {1, (int64_t)linear_kv_heads_});
+                        Tensor b_view = Tensor::view(ctx,
+                                                     row_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
+                                                     {1, (int64_t)linear_kv_heads_});
+                        Tensor out_view = Tensor::view(ctx,
+                                                       out_base + static_cast<size_t>(t) * out_stride,
+                                                       {1, (int64_t)linear_kv_dim_});
+                        run_linear_delta_decode_gpu(ctx, layer, cache,
+                                                    qkv_view, z_view, a_view, b_view, out_view);
                     }
                 }
             } else {

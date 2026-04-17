@@ -120,11 +120,7 @@
       "autotune": {
         "enabled": false,
         "benchmarkCase": "greedy_main",
-        "objective": "decodeTokPerSec",
-        "envMatrix": {
-          "AILA_ATTN_DECODE_WG": [256, 512],
-          "AILA_ATTN_JM_TILE": [0, 1, 2]
-        }
+        "objective": "decodeTokPerSec"
       }
     }
   }
