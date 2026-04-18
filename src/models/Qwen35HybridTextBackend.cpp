@@ -1406,6 +1406,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     bool profile_decode = (seq_len == 1) && aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
     int profile_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
     std::array<double, static_cast<size_t>(DecodeStage::Count)> stage_ms{};
+    bool profile_host_only = profile_decode && aila::env::read_flag("AILA_PROFILE_Q35_HOST_ONLY", false);
     auto time_stage = [&](DecodeStage stage, auto&& fn) {
         if (!profile_decode) {
             fn();
@@ -1413,7 +1414,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
         auto t0 = std::chrono::high_resolution_clock::now();
         fn();
-        ctx.synchronize();
+        if (!profile_host_only) ctx.synchronize();
         auto t1 = std::chrono::high_resolution_clock::now();
         stage_ms[static_cast<size_t>(stage)] +=
             std::chrono::duration<double, std::milli>(t1 - t0).count();
