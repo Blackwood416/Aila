@@ -240,7 +240,7 @@ lib.aila_engine_destroy(engine)
 | `AILA_ATTN_DECODE_WINDOW` | `0` | Decode attention lookback window (`0` = full context) |
 | `AILA_ATTN_DECODE_WINDOW_START` | `auto` | Enable decode window only after context length exceeds threshold (auto = `max(512, window)`) |
 | `AILA_ATTN_DECODE_SINK` | `0` | Prefix sink tokens kept together with recent window in decode attention |
-| `AILA_Q35_LINEAR_DELTA` | `0` | Qwen3.5 linear layer mode: `0` legacy-attn approximation (default/stabler), `1` host DeltaNet recurrent path (experimental) |
+| `AILA_Q35_LINEAR_DELTA` | `1` | Qwen3.5 linear layer mode: `1` GPU DeltaNet recurrent path (default), `0` legacy-attn fallback |
 
 ### Streaming Output
 

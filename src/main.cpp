@@ -61,6 +61,8 @@ int main(int argc, char** argv) {
         bench_cfg.decode_gen_config.frequency_penalty = opts.frequency_penalty;
         bench_cfg.decode_gen_config.sampling_seed = opts.sampling_seed;
         bench_cfg.decode_gen_config.use_fixed_seed = opts.use_fixed_seed || opts.bench_sample;
+        bench_cfg.decode_gen_config.decode_chunk_size = opts.decode_chunk_size;
+        bench_cfg.decode_gen_config.stream_chunk_size = opts.stream_chunk_size;
 
         auto result = run_benchmark(engine, bench_cfg);
         print_benchmark_results(result);

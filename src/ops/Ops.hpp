@@ -287,6 +287,9 @@ namespace ops {
     // Set sampling RNG seed for deterministic sampling runs.
     void set_sampling_seed(uint64_t seed);
 
+    // Draw a single uniform random number in [0, 1) from the sampling RNG.
+    float next_sampling_uniform();
+
     // Apply repetition/presence/frequency penalties to logits (CPU side).
     // logits_f: float logits array on CPU (size = vocab_size)
     // generated_ids: all tokens generated so far in this turn
@@ -301,6 +304,16 @@ namespace ops {
     int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                            const GenerationConfig& gen_config,
                            const std::vector<int>& generated_ids);
+
+    // Check whether the current generation config can use the device-side
+    // no-penalty sampling fast path.
+    bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config);
+
+    // Device-side sampling for the no-penalty fast path. Writes sampled token ID
+    // to d_result without forcing a host synchronization.
+    void sample_with_config_device(Context& ctx, Tensor& logits, int vocab_size,
+                                   const GenerationConfig& gen_config,
+                                   float random_u, int* d_result);
 
     // Physical transpose: dst = src^T
     // src: [R, C], dst: [C, R]

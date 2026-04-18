@@ -449,12 +449,10 @@ public:
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(max_new_tokens));
 
-        // Sample first token using unified sampler
         if (gen_config.do_sample && gen_config.use_fixed_seed) {
             ops::set_sampling_seed(gen_config.sampling_seed);
         }
-        int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
-                                                 gen_config, generated_token_ids);
+        bool can_use_device_sample = ops::can_use_device_sampling(config_.vocab_size, gen_config);
 
         std::string output_text;
         bool streaming = (token_callback != nullptr);
@@ -483,20 +481,10 @@ public:
         // Determine chunking strategy
         int effective_chunk_size = streaming ? std::max(1, gen_config.stream_chunk_size)
                                              : std::max(1, gen_config.decode_chunk_size);
-        bool use_chunked_greedy = (!gen_config.do_sample && !gen_config.has_penalties()
-                                   && effective_chunk_size > 1);
-        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
-
-        int* generated_tokens_device = nullptr;
-        if (use_chunked_greedy) {
-            generated_tokens_device = static_cast<int*>(
-                ctx_->alloc_device(static_cast<size_t>(max_new_tokens + 1) * sizeof(int)));
-        }
+        bool use_chunked_fast_decode = (!gen_config.has_penalties()) &&
+                                       (!gen_config.do_sample || can_use_device_sample);
 
         int generated_count = 0;
-        std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
         auto t_decode_start = std::chrono::high_resolution_clock::now();
         int last_token_seen = -1;
         int same_token_run = 0;
@@ -559,43 +547,61 @@ public:
             return unique_count <= 4;
         };
 
-        if (use_chunked_greedy) {
-            // Fast path: chunked greedy without penalties (fully async GPU)
+        if (use_chunked_fast_decode) {
+            // Fast path: no-penalty decode stays on device and only flushes token IDs
+            // back to host in chunks for output handling / loop guards.
             const int chunk_size = effective_chunk_size;
-            bool eos_reached = false;
-            ctx_->queue().memcpy(generated_tokens_device, current_token_device, sizeof(int));
+            bool stop_decode = false;
+            int available_tokens = 1;
+            std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
+            int* generated_tokens_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(max_new_tokens + 1) * sizeof(int)));
+            if (gen_config.do_sample) {
+                ops::sample_with_config_device(*ctx_, logits, config_.vocab_size,
+                                               gen_config, ops::next_sampling_uniform(),
+                                               generated_tokens_device);
+            } else {
+                ops::argmax(*ctx_, logits, config_.vocab_size, generated_tokens_device);
+            }
 
-            while (generated_count < max_new_tokens && !eos_reached) {
+            while (generated_count < max_new_tokens && !stop_decode) {
                 int chunk_begin = generated_count;
                 int chunk_end = std::min(max_new_tokens, chunk_begin + chunk_size);
 
-                for (; generated_count < chunk_end; ++generated_count) {
-                    int* current_ptr = generated_tokens_device + generated_count;
+                while (available_tokens < chunk_end) {
+                    int current_index = available_tokens - 1;
+                    int* current_ptr = generated_tokens_device + current_index;
                     Tensor& logits_next = backend_->forward(*ctx_, current_ptr, 1);
-                    ops::argmax(*ctx_, logits_next, config_.vocab_size,
-                                generated_tokens_device + generated_count + 1);
+                    if (gen_config.do_sample) {
+                        ops::sample_with_config_device(*ctx_, logits_next, config_.vocab_size,
+                                                       gen_config, ops::next_sampling_uniform(),
+                                                       generated_tokens_device + available_tokens);
+                    } else {
+                        ops::argmax(*ctx_, logits_next, config_.vocab_size,
+                                    generated_tokens_device + available_tokens);
+                    }
+                    ++available_tokens;
                 }
 
-                int copied = generated_count - chunk_begin;
+                int copied = chunk_end - chunk_begin;
                 auto copy_evt = ctx_->memcpy_d2h_async(host_tokens.data() + chunk_begin,
                                                        generated_tokens_device + chunk_begin,
                                                        static_cast<size_t>(copied) * sizeof(int));
                 copy_evt.wait();
 
-                for (int i = chunk_begin; i < generated_count; ++i) {
+                for (int i = chunk_begin; i < chunk_end; ++i) {
                     int token_id = host_tokens[i];
                     if (tokenizer_.is_eos(token_id)) {
-
-                        generated_count = i;
-                        eos_reached = true;
+                        stop_decode = true;
                         break;
                     }
 
                     generated_token_ids.push_back(token_id);
+                    generated_count++;
                     if (check_loop_guard(token_id)) {
                         AILA_LOG_WARN("[Generate] Loop guard triggered in greedy decode (token=%d, run=%d), stopping early",
                                       token_id, same_token_run);
-                        eos_reached = true;
+                        stop_decode = true;
                         break;
                     }
 
@@ -605,8 +611,14 @@ public:
                     }
                 }
             }
+            ctx_->free_device(generated_tokens_device);
         } else {
             // Unified path: penalties + sampling (goes through CPU each step)
+            int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                     gen_config, generated_token_ids);
+            int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
             int current_token = next_token;
             while (generated_count < max_new_tokens) {
                 if (tokenizer_.is_eos(current_token)) {
@@ -625,6 +637,9 @@ public:
                     emit_stream_piece(token_text);
                 }
                 generated_count++;
+                if (generated_count >= max_new_tokens) {
+                    break;
+                }
 
                 Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
 
@@ -637,13 +652,9 @@ public:
             }
 
             ctx_->synchronize();
+            ctx_->free_device(current_token_device);
+            ctx_->free_device(next_token_device);
         }
-
-        if (generated_tokens_device) {
-            ctx_->free_device(generated_tokens_device);
-        }
-        ctx_->free_device(current_token_device);
-        ctx_->free_device(next_token_device);
 
         auto t_decode_end = std::chrono::high_resolution_clock::now();
         double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
@@ -1009,55 +1020,143 @@ public:
         if (gen_config.do_sample && gen_config.use_fixed_seed) {
             ops::set_sampling_seed(tuned_cfg.sampling_seed);
         }
-        int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
-                                                 tuned_cfg, generated_token_ids);
-
-        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-        ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+        bool can_use_device_sample = ops::can_use_device_sampling(config_.vocab_size, tuned_cfg);
 
         std::string output_text;
         bool streaming = (token_callback != nullptr);
+        int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
+                                             : std::max(1, tuned_cfg.decode_chunk_size);
+        bool use_chunked_fast_decode = (!tuned_cfg.has_penalties()) &&
+                                       (!tuned_cfg.do_sample || can_use_device_sample);
         int same_token_run = 0;
         int last_token = -1;
+        int generated_count = 0;
+        if (use_chunked_fast_decode) {
+            bool stop_decode = false;
+            int available_tokens = 1;
+            std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
+            int* generated_tokens_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(max_new_tokens + 1) * sizeof(int)));
+            if (tuned_cfg.do_sample) {
+                ops::sample_with_config_device(*ctx_, logits, config_.vocab_size,
+                                               tuned_cfg, ops::next_sampling_uniform(),
+                                               generated_tokens_device);
+            } else {
+                ops::argmax(*ctx_, logits, config_.vocab_size, generated_tokens_device);
+            }
 
-        for (int i = 0; i < max_new_tokens; ++i) {
+            while (generated_count < max_new_tokens && !stop_decode) {
+                int chunk_begin = generated_count;
+                int chunk_end = std::min(max_new_tokens, chunk_begin + effective_chunk_size);
+
+                while (available_tokens < chunk_end) {
+                    int current_index = available_tokens - 1;
+                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device + current_index, 1);
+                    if (tuned_cfg.do_sample) {
+                        ops::sample_with_config_device(*ctx_, logits_next, config_.vocab_size,
+                                                       tuned_cfg, ops::next_sampling_uniform(),
+                                                       generated_tokens_device + available_tokens);
+                    } else {
+                        ops::argmax(*ctx_, logits_next, config_.vocab_size,
+                                    generated_tokens_device + available_tokens);
+                    }
+                    ++available_tokens;
+                }
+
+                int copied = chunk_end - chunk_begin;
+                auto copy_evt = ctx_->memcpy_d2h_async(host_tokens.data() + chunk_begin,
+                                                       generated_tokens_device + chunk_begin,
+                                                       static_cast<size_t>(copied) * sizeof(int));
+                copy_evt.wait();
+
+                for (int i = chunk_begin; i < chunk_end; ++i) {
+                    int current_token = host_tokens[i];
+                    if (tokenizer_.is_eos(current_token)) {
+                        stop_decode = true;
+                        break;
+                    }
+
+                    if (current_token == last_token) same_token_run++;
+                    else {
+                        same_token_run = 1;
+                        last_token = current_token;
+                    }
+
+                    generated_token_ids.push_back(current_token);
+                    int step_index = generated_count;
+                    generated_count++;
+                    if (same_token_run >= 48) {
+                        AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                      current_token, same_token_run);
+                        stop_decode = true;
+                        break;
+                    }
+
+                    if (debug_token_ids && step_index < 64) {
+                        std::string piece = tokenizer_.decode(current_token);
+                        AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                      step_index, current_token, piece.c_str());
+                    }
+                    if (streaming) {
+                        std::string token_text = tokenizer_.decode(current_token);
+                        output_text += token_text;
+                        token_callback(token_text);
+                    }
+                }
+            }
+            ctx_->free_device(generated_tokens_device);
+        } else {
+            int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                     tuned_cfg, generated_token_ids);
+            int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+            ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+
             int current_token = next_token;
-            if (tokenizer_.is_eos(current_token)) break;
+            while (generated_count < max_new_tokens) {
+                if (tokenizer_.is_eos(current_token)) break;
 
-            if (current_token == last_token) same_token_run++;
-            else {
-                same_token_run = 1;
-                last_token = current_token;
-            }
-            if (same_token_run >= 48) {
-                AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
-                              current_token, same_token_run);
-                break;
-            }
+                if (current_token == last_token) same_token_run++;
+                else {
+                    same_token_run = 1;
+                    last_token = current_token;
+                }
 
-            generated_token_ids.push_back(current_token);
-            if (debug_token_ids && i < 64) {
-                std::string piece = tokenizer_.decode(current_token);
-                AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
-                              i, current_token, piece.c_str());
-            }
-            if (streaming) {
-                std::string token_text = tokenizer_.decode(current_token);
-                output_text += token_text;
-                token_callback(token_text);
-            }
+                generated_token_ids.push_back(current_token);
+                int step_index = generated_count;
+                generated_count++;
+                if (same_token_run >= 48) {
+                    AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                  current_token, same_token_run);
+                    break;
+                }
 
-            Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
-            next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
-                                                 tuned_cfg, generated_token_ids);
-            ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
-            std::swap(current_token_device, next_token_device);
+                if (debug_token_ids && step_index < 64) {
+                    std::string piece = tokenizer_.decode(current_token);
+                    AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                  step_index, current_token, piece.c_str());
+                }
+                if (streaming) {
+                    std::string token_text = tokenizer_.decode(current_token);
+                    output_text += token_text;
+                    token_callback(token_text);
+                }
+                if (generated_count >= max_new_tokens) {
+                    break;
+                }
+
+                Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
+                next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
+                                                     tuned_cfg, generated_token_ids);
+                ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
+                std::swap(current_token_device, next_token_device);
+                current_token = next_token;
+            }
+            ctx_->synchronize();
+            ctx_->free_device(current_token_device);
+            ctx_->free_device(next_token_device);
         }
-        ctx_->synchronize();
         auto t_end = std::chrono::high_resolution_clock::now();
-        ctx_->free_device(current_token_device);
-        ctx_->free_device(next_token_device);
 
         if (!streaming && !generated_token_ids.empty()) {
             output_text = tokenizer_.decode(generated_token_ids);
@@ -1135,6 +1234,34 @@ public:
             ops::set_sampling_seed(bench_gen_cfg.sampling_seed);
         }
 
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool can_use_device_sample = ops::can_use_device_sampling(config_.vocab_size, bench_gen_cfg);
+        bool use_fast_device_chain = (!bench_gen_cfg.has_penalties()) &&
+                                     (!bench_gen_cfg.do_sample || can_use_device_sample);
+        if (use_fast_device_chain) {
+            int* token_chain_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(num_tokens + 1) * sizeof(int)));
+            ctx_->memcpy_h2d(token_chain_device, &benchmark_seed_token_, sizeof(int));
+
+            for (int i = 0; i < num_tokens; i++) {
+                Tensor& logits = backend_->forward(*ctx_, token_chain_device + i, 1);
+                if (!bench_gen_cfg.do_sample) {
+                    ops::argmax(*ctx_, logits, config_.vocab_size, token_chain_device + i + 1);
+                } else {
+                    ops::sample_with_config_device(*ctx_, logits, config_.vocab_size,
+                                                   bench_gen_cfg, ops::next_sampling_uniform(),
+                                                   token_chain_device + i + 1);
+                }
+            }
+            ctx_->synchronize();
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            ctx_->memcpy_d2h(&benchmark_seed_token_, token_chain_device + num_tokens, sizeof(int));
+            benchmark_seed_ready_ = true;
+            ctx_->free_device(token_chain_device);
+            return std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
         int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
         ctx_->memcpy_h2d(current_token_device, &benchmark_seed_token_, sizeof(int));
@@ -1142,7 +1269,6 @@ public:
         std::vector<int> generated_token_ids;
         generated_token_ids.reserve(static_cast<size_t>(num_tokens));
 
-        auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < num_tokens; i++) {
             Tensor& logits = backend_->forward(*ctx_, current_token_device, 1);
             if (!bench_gen_cfg.do_sample) {

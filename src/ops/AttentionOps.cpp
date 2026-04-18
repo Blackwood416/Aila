@@ -327,9 +327,9 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     jm_mode = read_env_int_local("AILA_ATTN_JM", 1);
   }
   if (decode_wg < 0) {
-    decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 256);
+    decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 512);
     if (decode_wg <= 0)
-      decode_wg = 256;
+      decode_wg = 512;
   }
   if (decode_window < 0) {
     decode_window = read_env_int_local("AILA_ATTN_DECODE_WINDOW", 0);

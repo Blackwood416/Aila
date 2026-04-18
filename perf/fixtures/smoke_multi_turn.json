@@ -1,0 +1,18 @@
+[
+  {
+    "role": "system",
+    "content": "You are a concise assistant."
+  },
+  {
+    "role": "user",
+    "content": "我叫Alice，请记住。"
+  },
+  {
+    "role": "assistant",
+    "content": "好的，我记住了。"
+  },
+  {
+    "role": "user",
+    "content": "我叫什么？请简短回答。"
+  }
+]

@@ -1,5 +1,12 @@
 param(
-    [string]$ModelDir = "..\Qwen3.5-0.8B",
+    [string]$BuildDir = 'build',
+    [string]$PresetsFile = 'perf\presets.json',
+    [string]$Preset = '',
+    [string]$ModelAlias = '',
+    [string]$ModelDir = '..\Qwen3.5-0.8B',
+    [string]$OutputDir = '',
+    [string]$Phase = 'manual',
+    [string[]]$CaseNames = @(),
     [int]$PromptTokens = 512,
     [int]$GenTokens = 512,
     [int]$BenchIters = 5,
@@ -9,10 +16,13 @@ param(
     [int]$TopK = 15,
     [double]$TopP = 0.95,
     [UInt64]$Seed = 42,
+    [hashtable]$EnvOverrides = @{},
     [int]$WaitTimeoutSec = 3600
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+
+. (Join-Path $PSScriptRoot 'perf\PerfCommon.ps1')
 
 $mutexName = 'Global\AilaBenchSingleton'
 $mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -56,65 +66,193 @@ function Acquire-BenchMutex {
     }
 }
 
+function Resolve-ModelPathForBench {
+    param(
+        [string]$RepoRoot,
+        [string]$BuildDirPath,
+        [string]$InputPath
+    )
+
+    if ([System.IO.Path]::IsPathRooted($InputPath)) {
+        return [System.IO.Path]::GetFullPath($InputPath)
+    }
+
+    $repoCandidate = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $InputPath))
+    if (Test-Path -LiteralPath $repoCandidate) {
+        return $repoCandidate
+    }
+
+    $buildCandidate = [System.IO.Path]::GetFullPath((Join-Path $BuildDirPath $InputPath))
+    if (Test-Path -LiteralPath $buildCandidate) {
+        return $buildCandidate
+    }
+
+    return $repoCandidate
+}
+
+$repoRoot = Get-AilaRepoRoot
+$gitInfo = Get-AilaGitInfo -RepoRoot $repoRoot
+$buildDirPath = Resolve-AilaPath -RepoRoot $repoRoot -Path $BuildDir
+$buildMeta = Get-AilaBuildMetadata -BuildDir $buildDirPath
+
+if ($buildMeta.buildType -and $buildMeta.buildType -ne 'Release') {
+    Write-Host ":: warning: build dir is configured as $($buildMeta.buildType); benchmark numbers may be much slower than Release ::" -ForegroundColor Yellow
+}
+
+$cases = @()
+$resolvedModel = $null
+$config = $null
+
+if (-not [string]::IsNullOrWhiteSpace($Preset)) {
+    $config = Get-AilaPerfConfig -RepoRoot $repoRoot -PresetsFile $PresetsFile
+    $presetConfig = Get-AilaPreset -Config $config -PresetName $Preset
+
+    if ([string]::IsNullOrWhiteSpace($ModelAlias)) {
+        $ModelAlias = $presetConfig.anchorModel
+    }
+    $resolvedModel = Get-AilaModelInfo -Config $config -Alias $ModelAlias -RepoRoot $repoRoot
+
+    foreach ($case in $presetConfig.benchmarks) {
+        if ($CaseNames.Count -gt 0 -and ($CaseNames -notcontains $case.name)) {
+            continue
+        }
+        $cases += [pscustomobject]@{
+            name        = $case.name
+            promptTokens = [int]$case.promptTokens
+            genTokens   = [int]$case.genTokens
+            benchIters  = [int]$case.benchIters
+            warmupIters = [int]$case.warmupIters
+            mode        = $case.mode
+            temperature = [double]$case.temperature
+            topK        = [int]$case.topK
+            topP        = [double]$case.topP
+            seed        = [UInt64]$case.seed
+        }
+    }
+}
+else {
+    $resolvedModel = [pscustomobject]@{
+        alias      = if ([string]::IsNullOrWhiteSpace($ModelAlias)) { 'manual' } else { $ModelAlias }
+        path       = Resolve-ModelPathForBench -RepoRoot $repoRoot -BuildDirPath $buildDirPath -InputPath $ModelDir
+        maxSeqLen  = $null
+        description = 'Manual benchmark model'
+    }
+
+    $cases += [pscustomobject]@{
+        name        = if ($Sample.IsPresent) { 'manual_sample' } else { 'manual_greedy' }
+        promptTokens = $PromptTokens
+        genTokens   = $GenTokens
+        benchIters  = $BenchIters
+        warmupIters = $WarmupIters
+        mode        = if ($Sample.IsPresent) { 'sample' } else { 'greedy' }
+        temperature = $Temperature
+        topK        = $TopK
+        topP        = $TopP
+        seed        = $Seed
+    }
+}
+
+if ($cases.Count -eq 0) {
+    throw 'No benchmark cases selected.'
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $baseDir = New-AilaOutputDir -RepoRoot $repoRoot -OutputRoot 'tmp\perf' -Phase $Phase -ShortCommit $gitInfo.shortCommit
+    $OutputDir = $baseDir
+}
+else {
+    $OutputDir = Resolve-AilaPath -RepoRoot $repoRoot -Path $OutputDir
+}
+Ensure-AilaDirectory -Path $OutputDir
+Ensure-AilaDirectory -Path (Join-Path $OutputDir 'bench_logs')
+
+$globalLogPath = Join-Path $repoRoot 'bench_log.txt'
+Initialize-AilaOneApiEnvironment
+
+$hasMutex = Acquire-BenchMutex -Mutex $mutex -TimeoutSec $WaitTimeoutSec
+if (-not $hasMutex) {
+    throw "Timed out waiting for benchmark lock after $WaitTimeoutSec seconds."
+}
+
 try {
-    $hasMutex = Acquire-BenchMutex -Mutex $mutex -TimeoutSec $WaitTimeoutSec
-    if (-not $hasMutex) {
-        throw "Timed out waiting for benchmark lock after $WaitTimeoutSec seconds."
-    }
+    $caseResults = @()
+    foreach ($case in $cases) {
+        $header = "=== bench $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') case=$($case.name) preset=$Preset model=$($resolvedModel.alias) path=$($resolvedModel.path) pp=$($case.promptTokens) tg=$($case.genTokens) iters=$($case.benchIters) warmup=$($case.warmupIters) mode=$($case.mode) seed=$($case.seed) temp=$($case.temperature) topk=$($case.topK) topp=$($case.topP) ==="
+        Add-Content -LiteralPath $globalLogPath -Value $header -Encoding UTF8
 
-    cmd /c '"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" && set' |
-        ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-            }
-        }
-    Write-Host ':: oneAPI environment initialized ::' -ForegroundColor Green
-
-    $root = "e:\RiderProjects\Aila"
-    $buildDir = Join-Path $root "build"
-    $logPath = Join-Path $root "bench_log.txt"
-    $mode = if ($Sample.IsPresent) { "sample" } else { "greedy" }
-    $cachePath = Join-Path $buildDir "CMakeCache.txt"
-
-    if (Test-Path $cachePath) {
-        $buildTypeLine = Select-String -Path $cachePath -Pattern '^CMAKE_BUILD_TYPE:STRING=' | Select-Object -First 1
-        if ($buildTypeLine) {
-            $buildType = ($buildTypeLine.Line -split '=', 2)[1]
-            if ($buildType -and $buildType -ne 'Release') {
-                Write-Host ":: warning: build dir is configured as $buildType; benchmark numbers may be much slower than Release ::" -ForegroundColor Yellow
-            }
-        }
-    }
-
-    $header = "=== bench $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode model=$ModelDir pp=$PromptTokens tg=$GenTokens iters=$BenchIters warmup=$WarmupIters seed=$Seed temp=$Temperature topk=$TopK topp=$TopP ==="
-    $header | Tee-Object -FilePath $logPath -Append | Out-Null
-
-    Push-Location $buildDir
-    try {
+        $logPath = Join-Path (Join-Path $OutputDir 'bench_logs') ("{0}.log" -f $case.name)
         $args = @(
-            "-m", $ModelDir,
-            "--bench",
-            "--bench-pp", "$PromptTokens",
-            "--bench-tg", "$GenTokens",
-            "--bench-iters", "$BenchIters",
-            "--bench-warmup", "$WarmupIters",
-            "--seed", "$Seed",
-            "-t", "$Temperature",
-            "-k", "$TopK",
-            "-p", "$TopP"
+            '-m', $resolvedModel.path,
+            '--bench',
+            '--bench-pp', ([string]$case.promptTokens),
+            '--bench-tg', ([string]$case.genTokens),
+            '--bench-iters', ([string]$case.benchIters),
+            '--bench-warmup', ([string]$case.warmupIters),
+            '--seed', ([string]$case.seed),
+            '-t', ([string]$case.temperature),
+            '-k', ([string]$case.topK),
+            '-p', ([string]$case.topP)
         )
-
-        if ($Sample.IsPresent) {
-            $args += "--bench-sample"
-        } else {
-            $args += "--bench-greedy"
+        if ($case.mode -eq 'sample') {
+            $args += '--bench-sample'
+        }
+        else {
+            $args += '--bench-greedy'
         }
 
-        & .\Aila.exe @args | Tee-Object -FilePath $logPath -Append
+        $run = Invoke-AilaProcess -Executable '.\Aila.exe' -ArgumentList $args -WorkingDirectory $buildDirPath -LogPath $logPath -EnvOverrides $EnvOverrides
+        if ($run.exitCode -ne 0) {
+            throw "Benchmark case '$($case.name)' failed with exit code $($run.exitCode). See $logPath"
+        }
+
+        Add-Content -LiteralPath $globalLogPath -Value $run.outputText -Encoding UTF8
+        $parsed = Parse-AilaBenchmarkOutput -OutputText $run.outputText
+
+        $caseResults += [ordered]@{
+            name         = $case.name
+            mode         = $case.mode
+            promptTokens = $case.promptTokens
+            genTokens    = $case.genTokens
+            benchIters   = $case.benchIters
+            warmupIters  = $case.warmupIters
+            temperature  = $case.temperature
+            topK         = $case.topK
+            topP         = $case.topP
+            seed         = $case.seed
+            commandLine  = $run.commandLine
+            envOverrides = $EnvOverrides
+            prefill      = $parsed.prefill
+            decode       = $parsed.decode
+            rawLogPath   = $logPath
+        }
     }
-    finally {
-        Pop-Location
-    }
+
+    $benchJsonPath = Join-Path $OutputDir 'bench.json'
+    Write-AilaJsonFile -Path $benchJsonPath -Data ([ordered]@{
+        schemaVersion = 1
+        generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        phase         = $Phase
+        preset        = if ([string]::IsNullOrWhiteSpace($Preset)) { 'manual' } else { $Preset }
+        git           = [ordered]@{
+            shortCommit = $gitInfo.shortCommit
+            fullCommit  = $gitInfo.fullCommit
+            branch      = $gitInfo.branch
+        }
+        build         = [ordered]@{
+            buildDir   = $buildMeta.buildDir
+            buildType  = $buildMeta.buildType
+            compiler   = $buildMeta.compiler
+            generator  = $buildMeta.generator
+        }
+        model         = [ordered]@{
+            alias      = $resolvedModel.alias
+            path       = $resolvedModel.path
+            description = $resolvedModel.description
+        }
+        cases         = $caseResults
+    })
+
+    Write-Host (":: benchmark results written to {0} ::" -f $benchJsonPath) -ForegroundColor Green
 }
 finally {
     if ($hasMutex) {

@@ -139,8 +139,8 @@ struct GenerationConfig {
     bool do_sample          = true;
     uint64_t sampling_seed  = 42;   // used when use_fixed_seed=true
     bool use_fixed_seed     = false;
-    int decode_chunk_size   = 1;    // greedy + non-streaming: host sync interval
-    int stream_chunk_size   = 1;    // greedy + streaming: tokens per flush chunk
+    int decode_chunk_size   = 12;   // greedy + non-streaming: tokens per host sync chunk
+    int stream_chunk_size   = 4;    // greedy + streaming: tokens per flush chunk
 
     // Penalty parameters
     float repetition_penalty = 1.0f;   // > 1.0 penalizes repeated tokens multiplicatively

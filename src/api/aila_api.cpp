@@ -114,8 +114,8 @@ AILA_API AilaGenConfig aila_default_gen_config(void) {
     cfg.presence_penalty   = 0.0f;
     cfg.frequency_penalty  = 0.0f;
     cfg.do_sample          = 1;
-    cfg.decode_chunk_size  = 1;
-    cfg.stream_chunk_size  = 1;
+    cfg.decode_chunk_size  = 12;
+    cfg.stream_chunk_size  = 4;
     return cfg;
 }
 

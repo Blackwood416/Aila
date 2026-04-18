@@ -57,8 +57,8 @@ typedef struct AilaGenConfig {
     float presence_penalty;     /* default: 0.0    */
     float frequency_penalty;    /* default: 0.0    */
     int   do_sample;            /* 0=greedy, 1=sampling */
-    int   decode_chunk_size;    /* default: 1      */
-    int   stream_chunk_size;    /* default: 1      */
+    int   decode_chunk_size;    /* default: 12     */
+    int   stream_chunk_size;    /* default: 4      */
 } AilaGenConfig;
 
 /* -------------- Callback types -------------- */
