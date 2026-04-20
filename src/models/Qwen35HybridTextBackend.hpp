@@ -43,12 +43,14 @@ private:
         // full attention branch
         Linear q_proj, k_proj, v_proj, o_proj;
         Linear qkv_proj;
+        Tensor* o_weight_jm = nullptr; // bf16 [hidden, full_q_dim]
         Tensor* q_norm_weight = nullptr;
         Tensor* k_norm_weight = nullptr;
 
         // linear attention branch
         Linear linear_qkv_proj, linear_z_proj, linear_o_proj;
         Linear linear_all_proj;
+        Tensor* linear_o_weight_jm = nullptr; // bf16 [hidden, linear_kv_dim]
         Linear linear_a_proj, linear_b_proj;
         Tensor* linear_norm_weight = nullptr; // f32
         Tensor* linear_A_log = nullptr;       // f32
@@ -58,6 +60,10 @@ private:
         // FFN
         Linear gate_proj, up_proj, down_proj;
         Linear gate_up_proj;
+        Tensor* gate_up_weight = nullptr; // bf16 [hidden, 2 * ff_dim]
+        Tensor* down_weight = nullptr;    // bf16 [ff_dim, hidden]
+        Tensor* gate_up_weight_jm = nullptr; // bf16 [2 * ff_dim, hidden]
+        Tensor* down_weight_jm = nullptr;    // bf16 [hidden, ff_dim]
 
         std::vector<float> host_linear_A_negexp;
         std::vector<float> host_linear_dt_bias;
@@ -111,6 +117,15 @@ private:
                                      Tensor& out_dst);
     void run_linear_delta_prefill_gpu_batched(Context& ctx, Layer& layer, LayerCache& cache,
                                               Tensor& fused_all, Tensor& out_dst, int seq_len);
+    bool use_decode_jm_custom_path(int seq_len) const;
+    bool use_decode_ffn_custom_path(int seq_len) const;
+    void run_decode_ffn_gate_up_swiglu_custom(Context& ctx, const Layer& layer,
+                                              Tensor& input, Tensor& output);
+    void run_decode_ffn_down_custom(Context& ctx, const Layer& layer,
+                                    Tensor& input, Tensor& output);
+    void run_decode_jm_matvec_custom(Context& ctx, Tensor& input,
+                                     const Tensor& weight_jm,
+                                     int in_dim, int out_dim, Tensor& output);
     void debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
                                            Layer& layer, LayerCache& cache,
                                            Tensor& qkv_src, Tensor& z_src,
@@ -168,6 +183,7 @@ private:
     int max_qkv_dim_ = 0;
     int max_attn_dim_ = 0;
     bool use_delta_linear_ = false;
+    bool decode_ffn_custom_enabled_ = false;
 
     struct LinearDeltaScratch {
         std::vector<sycl::ext::oneapi::bfloat16> h_qkv;

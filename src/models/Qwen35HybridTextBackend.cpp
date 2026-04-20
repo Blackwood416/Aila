@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 int round_up_seq(int v, int granularity) {
@@ -45,6 +46,34 @@ struct DecodeProfileTotals {
         tokens = 0;
     }
 };
+
+bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
+    if (!dev.has(sycl::aspect::ext_intel_matrix)) {
+        return false;
+    }
+
+    using matrix_type = sycl::ext::oneapi::experimental::matrix::matrix_type;
+    using sycl::ext::oneapi::experimental::info::device::matrix_combinations;
+    auto combos = dev.get_info<matrix_combinations>();
+    for (const auto& c : combos) {
+        bool m_ok = (static_cast<int>(c.msize) == 0) || (static_cast<int>(c.msize) == m);
+        if (m_ok && static_cast<int>(c.nsize) == n &&
+            static_cast<int>(c.ksize) == k &&
+            c.atype == matrix_type::bf16 &&
+            c.btype == matrix_type::bf16 &&
+            c.ctype == matrix_type::fp32 &&
+            c.dtype == matrix_type::fp32) {
+            return true;
+        }
+    }
+    return false;
+}
+
+constexpr int kDecodeFfnHidden = 1024;
+constexpr int kDecodeFfnIntermediate = 3584;
+constexpr int kDecodeFfnTile = 8;
+constexpr int kDecodeFfnK = 16;
+constexpr int kDecodeFfnSubgroup = 8;
 }
 
 float Qwen35HybridTextBackend::softplus(float x) {
@@ -149,6 +178,123 @@ void Qwen35HybridTextBackend::ensure_incr_prefill_scores(Context& ctx, int seq_l
                   incr_prefill_seq_cap_, incr_prefill_total_cap_);
 }
 
+bool Qwen35HybridTextBackend::use_decode_ffn_custom_path(int seq_len) const {
+    return use_decode_jm_custom_path(seq_len);
+}
+
+bool Qwen35HybridTextBackend::use_decode_jm_custom_path(int seq_len) const {
+    return decode_ffn_custom_enabled_ && seq_len == 1;
+}
+
+void Qwen35HybridTextBackend::run_decode_ffn_gate_up_swiglu_custom(
+    Context& ctx, const Layer& layer, Tensor& input, Tensor& output) {
+    using vec8 = sycl::vec<bf16, 8>;
+    const bf16* input_ptr = static_cast<const bf16*>(input.data());
+    const bf16* weight_ptr = static_cast<const bf16*>(layer.gate_up_weight_jm->data());
+    bf16* output_ptr = static_cast<bf16*>(output.data());
+
+    constexpr int sg_size = kDecodeFfnSubgroup;
+    constexpr int ff_dim = kDecodeFfnIntermediate;
+    constexpr int hidden = kDecodeFfnHidden;
+    constexpr int vec_width = 8;
+    const int vec_chunks = hidden / vec_width;
+    const int tail_start = vec_chunks * vec_width;
+    const vec8* input_vec = reinterpret_cast<const vec8*>(input_ptr);
+    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(ff_dim * sg_size), sycl::range<1>(sg_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const int row = static_cast<int>(item.get_group(0));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const vec8* gate_row = weight_vec + row * vec_chunks;
+                const vec8* up_row = weight_vec + (ff_dim + row) * vec_chunks;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+
+                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
+                    vec8 in_v = input_vec[chunk];
+                    vec8 gate_v = gate_row[chunk];
+                    vec8 up_v = up_row[chunk];
+                    for (int i = 0; i < vec_width; ++i) {
+                        gate_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(gate_v[i]), gate_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(up_v[i]), up_acc);
+                    }
+                }
+
+                for (int k = tail_start + lane; k < hidden; k += sg_size) {
+                    const float in_v = static_cast<float>(input_ptr[k]);
+                    gate_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[row * hidden + k]), gate_acc);
+                    up_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[(ff_dim + row) * hidden + k]), up_acc);
+                }
+
+                gate_acc = sycl::reduce_over_group(sg, gate_acc, sycl::plus<float>());
+                up_acc = sycl::reduce_over_group(sg, up_acc, sycl::plus<float>());
+
+                if (lane == 0) {
+                    const float silu_gate = gate_acc / (1.0f + sycl::native::exp(-gate_acc));
+                    output_ptr[row] = bf16(silu_gate * up_acc);
+                }
+            });
+    });
+}
+
+void Qwen35HybridTextBackend::run_decode_ffn_down_custom(
+    Context& ctx, const Layer& layer, Tensor& input, Tensor& output) {
+    run_decode_jm_matvec_custom(ctx, input, *layer.down_weight_jm,
+                                kDecodeFfnIntermediate, kDecodeFfnHidden, output);
+}
+
+void Qwen35HybridTextBackend::run_decode_jm_matvec_custom(
+    Context& ctx, Tensor& input, const Tensor& weight_jm,
+    int in_dim, int out_dim, Tensor& output) {
+    using vec8 = sycl::vec<bf16, 8>;
+    const bf16* input_ptr = static_cast<const bf16*>(input.data());
+    const bf16* weight_ptr = static_cast<const bf16*>(weight_jm.data());
+    bf16* output_ptr = static_cast<bf16*>(output.data());
+
+    constexpr int sg_size = kDecodeFfnSubgroup;
+    constexpr int vec_width = 8;
+    const int vec_chunks = in_dim / vec_width;
+    const int tail_start = vec_chunks * vec_width;
+    const vec8* input_vec = reinterpret_cast<const vec8*>(input_ptr);
+    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(out_dim * sg_size), sycl::range<1>(sg_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const int row = static_cast<int>(item.get_group(0));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const vec8* weight_row = weight_vec + row * vec_chunks;
+                float acc = 0.0f;
+
+                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
+                    vec8 in_v = input_vec[chunk];
+                    vec8 w_v = weight_row[chunk];
+                    for (int i = 0; i < vec_width; ++i) {
+                        acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(w_v[i]), acc);
+                    }
+                }
+
+                for (int k = tail_start + lane; k < in_dim; k += sg_size) {
+                    acc = sycl::fma(static_cast<float>(input_ptr[k]),
+                                    static_cast<float>(weight_ptr[row * in_dim + k]),
+                                    acc);
+                }
+
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+                if (lane == 0) {
+                    output_ptr[row] = bf16(acc);
+                }
+            });
+    });
+}
+
 Qwen35HybridTextBackend::~Qwen35HybridTextBackend() {
     clear_mrope_positions();
 }
@@ -190,6 +336,9 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
+    decode_ffn_custom_enabled_ = (hidden_size_ == kDecodeFfnHidden &&
+                                  ff_dim_ == kDecodeFfnIntermediate &&
+                                  supports_jm_bf16_f32(ctx.queue().get_device(), 1, kDecodeFfnTile, kDecodeFfnK));
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -229,7 +378,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     fused_weights_.clear();
     layers_.resize(cfg_.num_hidden_layers);
     layer_caches_.resize(cfg_.num_hidden_layers);
-    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 3 + 1);
+    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 6 + 1);
 
     auto fuse_three_cols = [&](Tensor& a, Tensor& b, Tensor& c) {
         int64_t rows = a.shape(0);
@@ -354,6 +503,14 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.linear_b_proj.init(ctx, *b_w, hidden_size_, linear_kv_heads_, true);
             fused_weights_.push_back(fuse_four_cols(*qkv_w, *z_w, *a_w, *b_w));
             layer.linear_all_proj.init(ctx, fused_weights_.back(), hidden_size_, linear_all_dim_, true);
+            if (decode_ffn_custom_enabled_) {
+                Tensor linear_o_jm = Tensor::allocate(ctx,
+                                                      {(int64_t)hidden_size_, (int64_t)linear_kv_dim_},
+                                                      o_w->dtype());
+                ops::transpose(ctx, *o_w, linear_o_jm);
+                fused_weights_.push_back(std::move(linear_o_jm));
+                layer.linear_o_weight_jm = &fused_weights_.back();
+            }
 
             layer.linear_norm_weight = &weights.get(prefix + "linear_attn.norm.weight");
             layer.linear_A_log = &weights.get(prefix + "linear_attn.A_log");
@@ -450,6 +607,14 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
             layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
             layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
+            if (decode_ffn_custom_enabled_) {
+                Tensor o_jm = Tensor::allocate(ctx,
+                                               {(int64_t)hidden_size_, (int64_t)full_q_dim_},
+                                               o_w->dtype());
+                ops::transpose(ctx, *o_w, o_jm);
+                fused_weights_.push_back(std::move(o_jm));
+                layer.o_weight_jm = &fused_weights_.back();
+            }
             layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
             layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
 
@@ -472,8 +637,30 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         layer.gate_proj.init(ctx, *gate_w, hidden_size_, ff_dim_, true);
         layer.up_proj.init(ctx, *up_w, hidden_size_, ff_dim_, true);
         fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
+        layer.gate_up_weight = &fused_weights_.back();
         layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
+        layer.down_weight = down_w;
         layer.down_proj.init(ctx, *down_w, ff_dim_, hidden_size_, true);
+
+        if (decode_ffn_custom_enabled_) {
+            Tensor gate_up_jm = Tensor::allocate(ctx,
+                                                 {(int64_t)(2 * ff_dim_), (int64_t)hidden_size_},
+                                                 layer.gate_up_weight->dtype());
+            ops::transpose(ctx, *layer.gate_up_weight, gate_up_jm);
+            fused_weights_.push_back(std::move(gate_up_jm));
+            layer.gate_up_weight_jm = &fused_weights_.back();
+
+            Tensor down_jm = Tensor::allocate(ctx,
+                                              {(int64_t)hidden_size_, (int64_t)ff_dim_},
+                                              layer.down_weight->dtype());
+            ops::transpose(ctx, *layer.down_weight, down_jm);
+            fused_weights_.push_back(std::move(down_jm));
+            layer.down_weight_jm = &fused_weights_.back();
+        }
+    }
+
+    if (decode_ffn_custom_enabled_) {
+        ctx.synchronize();
     }
 
     final_norm_weight_ = plus_one_norm_weight("model.language_model.norm.weight");
@@ -1560,7 +1747,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * linear_kv_dim_);
             }
             time_stage(DecodeStage::LinearOProj, [&] {
-                layer.linear_o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
+                if (use_decode_jm_custom_path(seq_len) && layer.linear_o_weight_jm != nullptr) {
+                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.linear_o_weight_jm,
+                                                linear_kv_dim_, hidden_size_, buf_.gate);
+                } else {
+                    layer.linear_o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
+                }
             });
         } else {
             Tensor q_decode_view;
@@ -1704,7 +1896,12 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                 }
             }
             time_stage(DecodeStage::FullOProj, [&] {
-                layer.o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
+                if (use_decode_jm_custom_path(seq_len) && layer.o_weight_jm != nullptr) {
+                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.o_weight_jm,
+                                                full_q_dim_, hidden_size_, buf_.gate);
+                } else {
+                    layer.o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
+                }
             });
         }
         if (debug_this_layer && seq_len > 0) {
@@ -1726,21 +1923,33 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             log_row_stats(tag2, buf_.normed, dbg_row, hidden_size_);
         }
 
-        if (seq_len == 1) {
+        if (use_decode_ffn_custom_path(seq_len)) {
+            time_stage(DecodeStage::FfnProj, [&] {
+                run_decode_ffn_gate_up_swiglu_custom(ctx, layer, buf_.normed, buf_.gate);
+            });
+            time_stage(DecodeStage::FfnAct, [&] {
+            });
+            time_stage(DecodeStage::DownProj, [&] {
+                run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
+            });
+        } else if (seq_len == 1) {
             time_stage(DecodeStage::FfnProj, [&] {
                 layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
             });
             time_stage(DecodeStage::FfnAct, [&] {
                 ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
             });
+            time_stage(DecodeStage::DownProj, [&] {
+                layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
+            });
         } else {
             layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
             ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, ff_dim_);
             ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
+            time_stage(DecodeStage::DownProj, [&] {
+                layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
+            });
         }
-        time_stage(DecodeStage::DownProj, [&] {
-            layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
-        });
 
         time_stage(DecodeStage::PostMlpNorm, [&] {
             if (i < cfg_.num_hidden_layers - 1) {
