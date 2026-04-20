@@ -958,8 +958,34 @@ public:
         }
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
 
-        backend_->reset();
-        cached_ids_.clear();
+        int reusable_prefix = 0;
+        bool allow_incremental_prefill = (total_vision_tokens == 0);
+        if (allow_incremental_prefill) {
+            int max_possible_match = std::min(static_cast<int>(cached_ids_.size()),
+                                              static_cast<int>(full_ids.size()));
+            while (reusable_prefix < max_possible_match &&
+                   cached_ids_[reusable_prefix] == full_ids[reusable_prefix]) {
+                reusable_prefix++;
+            }
+        }
+        if (backend_) backend_->truncate_kv_cache(reusable_prefix);
+        cached_ids_.resize(reusable_prefix);
+
+        int prefill_start = reusable_prefix;
+        int new_tokens_to_prefill = total_prompt_len - prefill_start;
+        if (new_tokens_to_prefill <= 0) {
+            if (backend_) backend_->reset();
+            cached_ids_.clear();
+            prefill_start = 0;
+            new_tokens_to_prefill = total_prompt_len;
+        }
+
+        if (prefill_start > 0) {
+            AILA_LOG_INFO("[GenerateMessages] Incremental prefill: reusing %d cached tokens, prefilling %d new tokens",
+                          prefill_start, new_tokens_to_prefill);
+        } else {
+            AILA_LOG_INFO("[GenerateMessages] Full prefill: %d tokens", total_prompt_len);
+        }
 
         auto t_start = std::chrono::high_resolution_clock::now();
         Tensor* logits_ptr = nullptr;
@@ -967,16 +993,16 @@ public:
                                  aila::env::read_flag("AILA_Q35_PREFILL_TOKENWISE", false);
         if (!tokenwise_prefill) {
             int* token_ids_device = static_cast<int*>(
-                ctx_->alloc_device(static_cast<size_t>(full_ids.size()) * sizeof(int)));
-            ctx_->memcpy_h2d(token_ids_device, full_ids.data(),
-                             static_cast<size_t>(full_ids.size()) * sizeof(int));
-            logits_ptr = &backend_->forward(*ctx_, token_ids_device, static_cast<int>(full_ids.size()));
+                ctx_->alloc_device(static_cast<size_t>(new_tokens_to_prefill) * sizeof(int)));
+            ctx_->memcpy_h2d(token_ids_device, full_ids.data() + prefill_start,
+                             static_cast<size_t>(new_tokens_to_prefill) * sizeof(int));
+            logits_ptr = &backend_->forward(*ctx_, token_ids_device, new_tokens_to_prefill);
             ctx_->free_device(token_ids_device);
         } else {
             AILA_LOG_INFO("[Qwen3.5] Tokenwise prefill enabled for debug");
             int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-            for (size_t i = 0; i < full_ids.size(); ++i) {
-                int tok = full_ids[i];
+            for (int i = 0; i < new_tokens_to_prefill; ++i) {
+                int tok = full_ids[static_cast<size_t>(prefill_start + i)];
                 ctx_->memcpy_h2d(one_token_device, &tok, sizeof(int));
                 logits_ptr = &backend_->forward(*ctx_, one_token_device, 1);
             }
