@@ -103,6 +103,7 @@ private:
         Tensor up;
         Tensor logits;
         Tensor decode_scores;
+        Tensor decode_attn_partials;
         Tensor scores;
         Tensor incr_scores;
     } buf_;

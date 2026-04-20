@@ -198,7 +198,8 @@ namespace ops {
                           Tensor& q, Tensor& k_cache, Tensor& v_cache,
                           Tensor& output, Tensor& scores_buf,
                           int num_heads, int num_kv_heads, int head_dim,
-                          int cached_len);
+                          int cached_len,
+                          Tensor* exact_partials_buf = nullptr);
 
     // Prefill Attention (seq_len > 1, initial prefill with start_pos=0)
     // q: [seq_len, num_heads * head_dim]

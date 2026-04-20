@@ -707,6 +707,15 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     buf_.decode_scores = Tensor::allocate(
         ctx, {(int64_t)max_attn_heads_, (int64_t)max_seq_len_},
         dnnl::memory::data_type::f32);
+    if (full_head_dim_ == 256) {
+        constexpr int kDecodeExactTile = 128;
+        constexpr int kDecodeExactPartialStride = 272;
+        const int max_tiles = (max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile;
+        buf_.decode_attn_partials = Tensor::allocate(
+            ctx,
+            {(int64_t)max_attn_heads_, (int64_t)max_tiles, (int64_t)kDecodeExactPartialStride},
+            dnnl::memory::data_type::f32);
+    }
 
     AILA_LOG_INFO("[Qwen3.5] Hybrid text backend loaded: layers=%d hidden=%d vocab=%d",
                   cfg_.num_hidden_layers, hidden_size_, cfg_.vocab_size);
@@ -1893,7 +1902,8 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
             time_stage(DecodeStage::Attention, [&] {
                 if (seq_len == 1) {
                     ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
-                                          full_q_heads_, full_kv_heads_, full_head_dim_, cached_len);
+                                          full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
+                                          &buf_.decode_attn_partials);
                 } else if (start_pos == 0) {
                     ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,
                                            seq_len, full_q_heads_, full_kv_heads_, full_head_dim_);

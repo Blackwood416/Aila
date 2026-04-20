@@ -43,6 +43,13 @@ bool supports_jm_bf16_f32(const sycl::device &dev, int m, int n, int k) {
   return false;
 }
 
+constexpr int kDecodeExact256Tile = 128;
+constexpr int kDecodeExact256TileWg = 128;
+constexpr int kDecodeExact256MergeWg = 128;
+constexpr int kDecodeExact256MinLen = 1024;
+constexpr int kDecodeExact256PartialStride = 272;
+constexpr int kDecodeExact256PartialAccOffset = 16;
+
 void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                Tensor &v_cache, Tensor &output,
                                Tensor &scores_buf, int num_heads,
@@ -133,6 +140,160 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                               cache_t * head_dim + d]);
             }
             o_ptr[head * head_dim + d] = bf16(acc);
+          }
+        });
+  });
+}
+
+void attention_decode_exact_head256_partial_merge(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
+    int sink_len, int effective_len) {
+  bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
+  bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+  float *partials_ptr = static_cast<float *>(partials_buf.data());
+
+  constexpr int head_dim = 256;
+  constexpr int tile_t = kDecodeExact256Tile;
+  constexpr int tile_wg = kDecodeExact256TileWg;
+  constexpr int merge_wg = kDecodeExact256MergeWg;
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const int num_tiles = (effective_len + tile_t - 1) / tile_t;
+  const int max_tiles = static_cast<int>(partials_buf.shape(1));
+  (void)max_tiles;
+
+  // Phase 1: compute per-tile exact softmax stats and exp-weighted V partials.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
+    sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(num_heads * num_tiles * tile_wg, tile_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = item.get_group(0);
+          const int head = group / num_tiles;
+          const int tile_idx = group % num_tiles;
+          const int lid = item.get_local_id(0);
+          const int kv_head = head / heads_per_kv;
+          const int tile_start = tile_idx * tile_t;
+          const int tile_len = sycl::min(tile_t, effective_len - tile_start);
+          float *partial =
+              partials_ptr +
+              (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score = -1e30f;
+          if (lid < tile_len) {
+            const int t = tile_start + lid;
+            const int cache_t =
+                (t < sink_len) ? t : (tail_start + (t - sink_len));
+            const bf16 *k_row =
+                k_ptr + kv_head * max_seq_len * head_dim + cache_t * head_dim;
+            score = 0.0f;
+            for (int d = 0; d < head_dim; d += 8) {
+              score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
+              score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
+              score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
+              score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
+              score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
+              score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
+              score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
+              score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+            }
+            score *= scale;
+          }
+          logits[lid] = score;
+          const float tile_max = sycl::reduce_over_group(
+              item.get_group(), score, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_score = 0.0f;
+          if (lid < tile_len) {
+            exp_score = sycl::native::exp(logits[lid] - stats[0]);
+            logits[lid] = exp_score;
+          } else {
+            logits[lid] = 0.0f;
+          }
+          const float tile_sum = sycl::reduce_over_group(
+              item.get_group(), exp_score, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum;
+            partial[0] = stats[0];
+            partial[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            float acc = 0.0f;
+            for (int i = 0; i < tile_len; ++i) {
+              const int t = tile_start + i;
+              const int cache_t =
+                  (t < sink_len) ? t : (tail_start + (t - sink_len));
+              acc += logits[i] *
+                     static_cast<float>(
+                         v_ptr[kv_head * max_seq_len * head_dim +
+                               cache_t * head_dim + d]);
+            }
+            partial[kDecodeExact256PartialAccOffset + d] = acc;
+          }
+        });
+  });
+
+  // Phase 2: merge per-tile statistics and partial outputs exactly.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> tile_factors(sycl::range<1>(num_tiles), cgh);
+    sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(num_heads * merge_wg, merge_wg),
+        [=](sycl::nd_item<1> item) {
+          const int head = item.get_group(0);
+          const int lid = item.get_local_id(0);
+          if (lid == 0) {
+            float global_max = -1e30f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              global_max = sycl::fmax(global_max, partial[0]);
+            }
+            float sum = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              const float factor = sycl::native::exp(partial[0] - global_max);
+              tile_factors[tile_idx] = factor;
+              sum += factor * partial[1];
+            }
+            norm_sum[0] = sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float inv_sum = 1.0f / norm_sum[0];
+          for (int d = lid; d < head_dim; d += merge_wg) {
+            float acc = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              acc += tile_factors[tile_idx] *
+                     partial[kDecodeExact256PartialAccOffset + d];
+            }
+            o_ptr[head * head_dim + d] = bf16(acc * inv_sum);
           }
         });
   });
@@ -300,7 +461,8 @@ void attention_decode_joint_matrix(Context &ctx, Tensor &q, Tensor &k_cache,
 
 void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       Tensor &output, Tensor &scores_buf, int num_heads,
-                      int num_kv_heads, int head_dim, int cached_len) {
+                      int num_kv_heads, int head_dim, int cached_len,
+                      Tensor *exact_partials_buf) {
   constexpr int JM0_M = 1;
   constexpr int JM0_N = 8;
   constexpr int JM0_K = 16;
@@ -416,6 +578,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
                                   attn_start, jm_tile_id, decode_wg);
+    return;
+  }
+
+  if (head_dim == 256 && cached_len > 0 && effective_len >= kDecodeExact256MinLen &&
+      exact_partials_buf && exact_partials_buf->valid()) {
+    attention_decode_exact_head256_partial_merge(
+        ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
+        num_kv_heads, tail_start, sink_len, effective_len);
     return;
   }
 
