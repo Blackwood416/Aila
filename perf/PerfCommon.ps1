@@ -54,16 +54,19 @@ function Ensure-AilaDirectory {
 }
 
 function Initialize-AilaOneApiEnvironment {
+    [System.Environment]::SetEnvironmentVariable('MSYS2_ARG_CONV_EXCL', '*', 'Process')
+
     if ($script:AilaOneApiInitialized) {
         return
     }
 
     $setvars = 'C:\Program Files (x86)\Intel\oneAPI\setvars.bat'
+    $vsInstaller = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer'
     if (-not (Test-Path -LiteralPath $setvars)) {
         throw "oneAPI setvars.bat not found: $setvars"
     }
 
-    cmd /c "`"$setvars`" && set" |
+    cmd /c "set `"PATH=.;$vsInstaller;%PATH%`" && call `"$setvars`" && set" |
         ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$') {
                 [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')

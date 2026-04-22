@@ -10,7 +10,7 @@ namespace templating {
 
 class TemplateRegistry {
 public:
-    bool render(ModelFamily family,
+    bool render(const ModelSpec& spec,
                 const Tokenizer& tokenizer,
                 const std::vector<Message>& messages,
                 bool vision_enabled,

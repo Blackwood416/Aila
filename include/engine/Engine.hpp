@@ -143,7 +143,28 @@ public:
                       to_mb(ctx_->peak_allocated_bytes()));
 
         // 5. Warmup to amortize first-run JIT/primitive costs
-        {
+        bool is_exact_q35_0p8b_spec =
+            (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
+            is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
+        int init_warmup_mode = aila::env::read_int_raw("AILA_INIT_WARMUP", -1);
+        bool run_init_warmup = true;
+        if (init_warmup_mode == 0) {
+            run_init_warmup = false;
+        } else if (init_warmup_mode == 1) {
+            run_init_warmup = true;
+        } else if (model_spec_.family == ModelFamily::Qwen35Hybrid && !is_exact_q35_0p8b_spec) {
+            run_init_warmup = false;
+        }
+
+        if (run_init_warmup) {
+            if (init_warmup_mode == 1) {
+                AILA_LOG_INFO("[Warmup] Running init warmup (forced via AILA_INIT_WARMUP=1)");
+            } else if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+                AILA_LOG_INFO("[Warmup] Running init warmup for exact Qwen3.5-0.8B hybrid spec");
+            } else {
+                AILA_LOG_INFO("[Warmup] Running init warmup");
+            }
+
             backend_->reset();
             std::vector<Message> warmup_messages = {
                 Message{"system", {ContentPart{ContentType::Text, "You are a helpful assistant.", ""}}},
@@ -151,7 +172,7 @@ public:
             };
             std::vector<int> warmup_ids;
             std::string warmup_err;
-            if (!template_registry_.render(model_spec_.family, tokenizer_, warmup_messages,
+            if (!template_registry_.render(model_spec_, tokenizer_, warmup_messages,
                                            vision_backend_enabled_, true, warmup_ids, &warmup_err)) {
                 AILA_LOG_WARN("[Warmup] Template render failed (%s), fallback to legacy tokenizer template",
                               warmup_err.c_str());
@@ -175,10 +196,32 @@ public:
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
             AILA_LOG_INFO("[Warmup] Completed in %.2f ms", warmup_ms);
+            AILA_LOG_INFO("[Memory] After warmup: current=%.2f MB, peak=%.2f MB",
+                          to_mb(ctx_->current_allocated_bytes()),
+                          to_mb(ctx_->peak_allocated_bytes()));
+        } else {
+            backend_->reset();
+            if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+                if (init_warmup_mode == 0) {
+                    AILA_LOG_INFO("[Warmup] Skipping init warmup (AILA_INIT_WARMUP=0, hidden=%d layers=%d attn_heads=%d kv_heads=%d)",
+                                  model_spec_.qwen35_text.hidden_size,
+                                  model_spec_.qwen35_text.num_hidden_layers,
+                                  model_spec_.qwen35_text.num_attention_heads,
+                                  model_spec_.qwen35_text.num_key_value_heads);
+                } else {
+                    AILA_LOG_INFO("[Warmup] Skipping init warmup for non-0.8B Qwen3.5 hybrid spec (hidden=%d layers=%d attn_heads=%d kv_heads=%d). Set AILA_INIT_WARMUP=1 to force.",
+                                  model_spec_.qwen35_text.hidden_size,
+                                  model_spec_.qwen35_text.num_hidden_layers,
+                                  model_spec_.qwen35_text.num_attention_heads,
+                                  model_spec_.qwen35_text.num_key_value_heads);
+                }
+            } else {
+                AILA_LOG_INFO("[Warmup] Skipping init warmup (AILA_INIT_WARMUP=0)");
+            }
+            AILA_LOG_INFO("[Memory] Warmup skipped: current=%.2f MB, peak=%.2f MB",
+                          to_mb(ctx_->current_allocated_bytes()),
+                          to_mb(ctx_->peak_allocated_bytes()));
         }
-        AILA_LOG_INFO("[Memory] After warmup: current=%.2f MB, peak=%.2f MB",
-                      to_mb(ctx_->current_allocated_bytes()),
-                      to_mb(ctx_->peak_allocated_bytes()));
 
         AILA_LOG_INFO("========================================");
         AILA_LOG_INFO("  Engine ready!");
@@ -833,7 +876,7 @@ public:
         }
 
         std::vector<int> full_ids;
-        if (!template_registry_.render(model_spec_.family, tokenizer_, render_messages,
+        if (!template_registry_.render(model_spec_, tokenizer_, render_messages,
                                        vision_backend_enabled_, true, full_ids, &tmpl_err)) {
             AILA_LOG_ERROR("[GenerateMessages] Template render failed: %s", tmpl_err.c_str());
             EngineErrorCode code = (tmpl_err.find("Vision content is not enabled") != std::string::npos)

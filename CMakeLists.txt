@@ -123,26 +123,206 @@ target_compile_definitions(Aila PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC
 target_link_libraries(Aila PRIVATE AilaLib)
 
 # ============================================================
-# Post-build: Copy DLL dependencies for shared library
+# Post-build: Copy runtime DLL dependencies
 # ============================================================
 if(WIN32)
-    # Copy oneAPI runtime DLLs next to the shared library
-    add_custom_command(TARGET AilaShared POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E echo "Copying runtime DLLs..."
-        COMMENT "Copying oneAPI runtime DLLs to output directory"
-    )
-
-    # Copy dnnl DLL
     get_target_property(DNNL_DLL_LOCATION DNNL::dnnl IMPORTED_LOCATION_RELEASE)
     if(NOT DNNL_DLL_LOCATION)
         get_target_property(DNNL_DLL_LOCATION DNNL::dnnl IMPORTED_LOCATION)
     endif()
+
+    get_filename_component(AILA_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(AILA_RUNTIME_SEARCH_DIRS "${AILA_COMPILER_BIN_DIR}")
+
+    get_filename_component(AILA_ONEAPI_ROOT "${AILA_COMPILER_BIN_DIR}/../../.." ABSOLUTE)
+    file(GLOB AILA_TBB_BIN_DIRS "${AILA_ONEAPI_ROOT}/tbb/*/bin")
+    list(APPEND AILA_RUNTIME_SEARCH_DIRS ${AILA_TBB_BIN_DIRS})
+
+    set(AILA_ONEAPI_RUNTIME_ROOT_PATTERNS
+        "ur_loader.dll"
+        "ur_win_proxy_loader.dll"
+        "ur_adapter_opencl.dll"
+        "ur_adapter_level_zero.dll"
+        "ur_adapter_level_zero_v2.dll"
+        "umf.dll"
+        "xptifw.dll"
+        "sycl-jit.dll"
+        "OpenCL.dll"
+        "intelocl64.dll"
+        "common_clang64.dll"
+        "libhwloc-*.dll"
+        "tbb12.dll"
+        "tbbbind.dll"
+        "tbbbind_2_0.dll"
+        "tbbbind_2_5.dll"
+        "tbbmalloc.dll"
+        "tbbmalloc_proxy.dll"
+        "tcm.dll"
+    )
+    set(AILA_ONEAPI_RUNTIME_ROOT_DLLS)
+    foreach(pattern IN LISTS AILA_ONEAPI_RUNTIME_ROOT_PATTERNS)
+        file(GLOB AILA_ONEAPI_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_COMPILER_BIN_DIR}/${pattern}")
+        list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_ONEAPI_RUNTIME_MATCHES})
+        foreach(AILA_TBB_BIN_DIR IN LISTS AILA_TBB_BIN_DIRS)
+            file(GLOB AILA_TBB_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_TBB_BIN_DIR}/${pattern}")
+            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_TBB_RUNTIME_MATCHES})
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
+
+    get_filename_component(AILA_LINKER_BIN_DIR "${CMAKE_LINKER}" DIRECTORY)
+    if(EXISTS "${AILA_LINKER_BIN_DIR}/msvcp140.dll")
+        list(APPEND AILA_RUNTIME_SEARCH_DIRS "${AILA_LINKER_BIN_DIR}")
+
+        get_filename_component(AILA_MSVC_DIR "${AILA_LINKER_BIN_DIR}/../../../../../.." ABSOLUTE)
+        get_filename_component(AILA_MSVC_TOOLS_VERSION "${AILA_LINKER_BIN_DIR}/../../.." NAME)
+        string(REGEX MATCH "^[0-9]+\\.[0-9]+" AILA_MSVC_VERSION_PREFIX "${AILA_MSVC_TOOLS_VERSION}")
+
+        if(AILA_MSVC_VERSION_PREFIX)
+            file(GLOB AILA_MSVC_REDIST_DIRS "${AILA_MSVC_DIR}/Redist/MSVC/${AILA_MSVC_VERSION_PREFIX}*/x64/Microsoft.VC*.CRT")
+        endif()
+        if(NOT AILA_MSVC_REDIST_DIRS)
+            file(GLOB AILA_MSVC_REDIST_DIRS "${AILA_MSVC_DIR}/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+        endif()
+
+        set(AILA_MSVC_RUNTIME_ROOT_DIRS)
+        if(AILA_MSVC_REDIST_DIRS)
+            list(SORT AILA_MSVC_REDIST_DIRS)
+            list(REVERSE AILA_MSVC_REDIST_DIRS)
+            list(GET AILA_MSVC_REDIST_DIRS 0 AILA_MSVC_REDIST_DIR)
+            set(AILA_MSVC_REDIST_DIRS "${AILA_MSVC_REDIST_DIR}")
+            list(APPEND AILA_RUNTIME_SEARCH_DIRS ${AILA_MSVC_REDIST_DIRS})
+            list(APPEND AILA_MSVC_RUNTIME_ROOT_DIRS ${AILA_MSVC_REDIST_DIRS})
+        else()
+            list(APPEND AILA_MSVC_RUNTIME_ROOT_DIRS "${AILA_LINKER_BIN_DIR}")
+        endif()
+
+        set(AILA_MSVC_RUNTIME_ROOT_PATTERNS
+            "concrt140.dll"
+            "msvcp140*.dll"
+            "vccorlib140.dll"
+            "vcruntime140*.dll"
+        )
+        foreach(AILA_MSVC_RUNTIME_DIR IN LISTS AILA_MSVC_RUNTIME_ROOT_DIRS)
+            foreach(pattern IN LISTS AILA_MSVC_RUNTIME_ROOT_PATTERNS)
+                file(GLOB AILA_MSVC_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_MSVC_RUNTIME_DIR}/${pattern}")
+                list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_MSVC_RUNTIME_MATCHES})
+            endforeach()
+        endforeach()
+        list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
+    endif()
+
     if(DNNL_DLL_LOCATION)
-        add_custom_command(TARGET AilaShared POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DNNL_DLL_LOCATION}"
-                "$<TARGET_FILE_DIR:AilaShared>"
-            COMMENT "Copying dnnl DLL"
+        get_filename_component(DNNL_DLL_DIR "${DNNL_DLL_LOCATION}" DIRECTORY)
+        list(APPEND AILA_RUNTIME_SEARCH_DIRS "${DNNL_DLL_DIR}")
+    endif()
+    list(REMOVE_DUPLICATES AILA_RUNTIME_SEARCH_DIRS)
+
+    set(AILA_COPY_RUNTIME_DEPENDENCIES_TEMPLATE [=[
+set(target_path "${TARGET_PATH}")
+set(target_dir "${TARGET_DIR}")
+set(target_kind "${TARGET_KIND}")
+
+set(search_dirs [==[@AILA_RUNTIME_SEARCH_DIRS@]==])
+set(extra_root_dlls [==[@AILA_ONEAPI_RUNTIME_ROOT_DLLS@]==])
+list(APPEND search_dirs "${target_dir}")
+
+set(common_dependency_args
+    DIRECTORIES ${search_dirs}
+    PRE_EXCLUDE_REGEXES "api-ms-win-.*" "ext-ms-.*"
+    POST_EXCLUDE_REGEXES ".*[Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\][Ss][Yy][Ss][Tt][Ee][Mm]32[/\\].*"
+)
+
+set(resolved_deps)
+set(unresolved_deps)
+if(target_kind STREQUAL "EXECUTABLE")
+    file(GET_RUNTIME_DEPENDENCIES
+        EXECUTABLES "${target_path}"
+        RESOLVED_DEPENDENCIES_VAR target_resolved_deps
+        UNRESOLVED_DEPENDENCIES_VAR target_unresolved_deps
+        ${common_dependency_args}
+    )
+elseif(target_kind STREQUAL "LIBRARY")
+    file(GET_RUNTIME_DEPENDENCIES
+        LIBRARIES "${target_path}"
+        RESOLVED_DEPENDENCIES_VAR target_resolved_deps
+        UNRESOLVED_DEPENDENCIES_VAR target_unresolved_deps
+        ${common_dependency_args}
+    )
+else()
+    message(FATAL_ERROR "Unsupported target kind: ${target_kind}")
+endif()
+list(APPEND resolved_deps ${target_resolved_deps})
+list(APPEND unresolved_deps ${target_unresolved_deps})
+
+if(extra_root_dlls)
+    file(GET_RUNTIME_DEPENDENCIES
+        LIBRARIES ${extra_root_dlls}
+        RESOLVED_DEPENDENCIES_VAR extra_resolved_deps
+        UNRESOLVED_DEPENDENCIES_VAR extra_unresolved_deps
+        ${common_dependency_args}
+    )
+    list(APPEND resolved_deps ${extra_root_dlls} ${extra_resolved_deps})
+    list(APPEND unresolved_deps ${extra_unresolved_deps})
+endif()
+
+list(REMOVE_DUPLICATES resolved_deps)
+
+foreach(dep IN LISTS resolved_deps)
+    if(EXISTS "${dep}")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dep}" "${target_dir}"
+            COMMAND_ERROR_IS_FATAL ANY
         )
     endif()
+endforeach()
+
+if(unresolved_deps)
+    list(SORT unresolved_deps)
+    list(REMOVE_DUPLICATES unresolved_deps)
+    message(WARNING "Unresolved runtime dependencies for ${target_path}: ${unresolved_deps}")
+endif()
+]=])
+    string(CONFIGURE "${AILA_COPY_RUNTIME_DEPENDENCIES_TEMPLATE}" AILA_COPY_RUNTIME_DEPENDENCIES_SCRIPT @ONLY)
+    file(GENERATE
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        CONTENT "${AILA_COPY_RUNTIME_DEPENDENCIES_SCRIPT}"
+    )
+
+    function(copy_runtime_dependencies target target_kind)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DTARGET_PATH=$<TARGET_FILE:${target}>"
+                "-DTARGET_DIR=$<TARGET_FILE_DIR:${target}>"
+                "-DTARGET_KIND=${target_kind}"
+                -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+            COMMENT "Copying runtime DLLs for ${target}"
+            VERBATIM
+        )
+    endfunction()
+
+    copy_runtime_dependencies(Aila EXECUTABLE)
+    copy_runtime_dependencies(AilaShared LIBRARY)
+
+    set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
+
+    add_custom_target(release
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+            "-DTARGET_PATH=$<TARGET_FILE:Aila>"
+            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
+            "-DTARGET_KIND=EXECUTABLE"
+            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        COMMAND ${CMAKE_COMMAND}
+            "-DTARGET_PATH=$<TARGET_FILE:AilaShared>"
+            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
+            "-DTARGET_KIND=LIBRARY"
+            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
+        VERBATIM
+    )
+    add_dependencies(release Aila AilaShared)
 endif()

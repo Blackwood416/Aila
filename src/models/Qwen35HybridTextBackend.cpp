@@ -76,6 +76,43 @@ constexpr int kDecodeFfnIntermediate = 3584;
 constexpr int kDecodeFfnTile = 8;
 constexpr int kDecodeFfnK = 16;
 constexpr int kDecodeFfnSubgroup = 8;
+
+bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,
+                                        int head_k_dim, int head_v_dim,
+                                        int kernel, int conv_rows,
+                                        bool allow_grouped_fastpath = false) {
+    return q_heads > 0 &&
+           kv_heads > 0 &&
+           (kv_heads % q_heads) == 0 &&
+           (allow_grouped_fastpath || q_heads == kv_heads) &&
+           head_k_dim == head_v_dim &&
+           head_k_dim == 128 &&
+           kernel == 4 &&
+           conv_rows == 3;
+}
+
+int linear_delta_gqa_group_size(int q_heads, int kv_heads) {
+    if (q_heads <= 0 || kv_heads <= 0 || (kv_heads % q_heads) != 0) {
+        return 0;
+    }
+    return kv_heads / q_heads;
+}
+
+int linear_delta_key_head_for_value_head(int value_head, int q_heads, int kv_heads) {
+    int group_size = linear_delta_gqa_group_size(q_heads, kv_heads);
+    if (group_size <= 0) {
+        return std::clamp(value_head, 0, std::max(0, q_heads - 1));
+    }
+    return std::min(value_head / group_size, q_heads - 1);
+}
+
+bool linear_delta_is_group_leader(int value_head, int q_heads, int kv_heads) {
+    int group_size = linear_delta_gqa_group_size(q_heads, kv_heads);
+    if (group_size <= 0) {
+        return value_head < q_heads;
+    }
+    return (value_head % group_size) == 0;
+}
 }
 
 float Qwen35HybridTextBackend::softplus(float x) {
@@ -338,9 +375,30 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     linear_conv_kernel_dim_ = std::max(1, cfg_.linear_conv_kernel_dim);
     linear_conv_channels_ = linear_qkv_dim_;
     use_delta_linear_ = aila::env::read_flag("AILA_Q35_LINEAR_DELTA", true);
+    bool force_direct_tied_lm_head = aila::env::read_flag("AILA_Q35_DIRECT_TIED_LM_HEAD", false);
+    bool allow_unsupported_legacy_linear = aila::env::read_flag("AILA_Q35_ALLOW_UNSUPPORTED_LEGACY_LINEAR", false);
+    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
+    bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
     decode_ffn_custom_enabled_ = (hidden_size_ == kDecodeFfnHidden &&
                                   ff_dim_ == kDecodeFfnIntermediate &&
                                   supports_jm_bf16_f32(ctx.queue().get_device(), 1, kDecodeFfnTile, kDecodeFfnK));
+    bool is_exact_q35_0p8b_spec = is_exact_qwen35_hybrid_0p8b_spec(cfg_);
+    if (!use_delta_linear_ && linear_kv_heads_ > linear_q_heads_ && !allow_unsupported_legacy_linear) {
+        AILA_LOG_WARN("[Qwen3.5] Legacy linear-attn fallback is unsupported when value heads exceed key heads (q_heads=%d kv_heads=%d), forcing delta path. Set AILA_Q35_ALLOW_UNSUPPORTED_LEGACY_LINEAR=1 to override.",
+                      linear_q_heads_, linear_kv_heads_);
+        use_delta_linear_ = true;
+    }
+
+    int linear_conv_rows = std::max(0, linear_conv_kernel_dim_ - 1);
+    bool linear_fastpath_eligible = supports_linear_delta_gqa_fastpath(
+        linear_q_heads_,
+        linear_kv_heads_,
+        linear_head_dim_,
+        cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_,
+        linear_conv_rows,
+        experimental_gqa_fastpath);
+    int linear_gqa_group_size = linear_delta_gqa_group_size(linear_q_heads_, linear_kv_heads_);
 
     max_attn_heads_ = std::max(full_q_heads_, linear_q_heads_);
     max_qkv_dim_ = std::max(full_q_proj_dim_, linear_qkv_dim_);
@@ -686,14 +744,35 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         lm_head_.init(ctx, *lm_w, hidden_size_, cfg_.vocab_size, true);
         AILA_LOG_INFO("[Qwen3.5] lm_head loaded (standalone)");
     } else {
-        Tensor& src = *embed_weight_;
-        Tensor dst = Tensor::allocate(ctx, {src.shape(1), src.shape(0)}, src.dtype());
-        ops::transpose(ctx, src, dst);
-        ctx.synchronize();
-        weights.put("model.language_model.lm_head.weight_preprocessed", std::move(dst));
-        lm_head_.init(ctx, weights.get("model.language_model.lm_head.weight_preprocessed"),
-                      hidden_size_, cfg_.vocab_size, true);
-        AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
+        bool tied_lm_head_ready = false;
+        if (!force_direct_tied_lm_head) {
+            try {
+                Tensor& src = *embed_weight_;
+                Tensor dst = Tensor::allocate(ctx, {src.shape(1), src.shape(0)}, src.dtype());
+                ops::transpose(ctx, src, dst);
+                ctx.synchronize();
+                weights.put("model.language_model.lm_head.weight_preprocessed", std::move(dst));
+                lm_head_.init(ctx, weights.get("model.language_model.lm_head.weight_preprocessed"),
+                              hidden_size_, cfg_.vocab_size, true);
+                tied_lm_head_ready = true;
+                if (is_exact_q35_0p8b_spec) {
+                    AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
+                } else {
+                    AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy for hybrid spec)");
+                }
+            } catch (const std::exception& e) {
+                AILA_LOG_WARN("[Qwen3.5] Failed to preprocess tied lm_head, falling back to direct embed weight: %s",
+                              e.what());
+            }
+        }
+        if (!tied_lm_head_ready) {
+            lm_head_.init(ctx, *embed_weight_, hidden_size_, cfg_.vocab_size, false);
+            if (force_direct_tied_lm_head) {
+                AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight forced via AILA_Q35_DIRECT_TIED_LM_HEAD=1)");
+            } else {
+                AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight fallback)");
+            }
+        }
     }
 
     ctx.synchronize();
@@ -721,12 +800,38 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
 
     AILA_LOG_INFO("[Qwen3.5] Hybrid text backend loaded: layers=%d hidden=%d vocab=%d",
                   cfg_.num_hidden_layers, hidden_size_, cfg_.vocab_size);
+    AILA_LOG_INFO("[Qwen3.5] Full attention: q_heads=%d kv_heads=%d head_dim=%d",
+                  full_q_heads_, full_kv_heads_, full_head_dim_);
+    AILA_LOG_INFO("[Qwen3.5] Linear attention: q_heads=%d kv_heads=%d key_dim=%d value_dim=%d conv_kernel=%d exact_0p8b=%d",
+                  linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+                  linear_conv_kernel_dim_, is_exact_q35_0p8b_spec ? 1 : 0);
+    AILA_LOG_INFO("[Qwen3.5] Linear fast path: eligible=%d gqa_group=%d head_dims_match=%d key_dim=%d value_dim=%d kernel=%d conv_rows=%d experimental_gqa=%d",
+                  linear_fastpath_eligible ? 1 : 0,
+                  linear_gqa_group_size,
+                  (linear_head_dim_ == cfg_.linear_value_head_dim) ? 1 : 0,
+                  linear_head_dim_,
+                  cfg_.linear_value_head_dim,
+                  linear_conv_kernel_dim_,
+                  linear_conv_rows,
+                  experimental_gqa_fastpath ? 1 : 0);
+    if (linear_kv_heads_ > linear_q_heads_) {
+        AILA_LOG_INFO("[Qwen3.5] Grouped linear delta backend: %s (set AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU=1 to try GPU path)",
+                      experimental_grouped_linear_gpu ? "gpu" : "host-reference");
+    }
+    AILA_LOG_INFO("[Qwen3.5] Decode FFN custom path: enabled=%d (hidden=%d ff=%d)",
+                  decode_ffn_custom_enabled_ ? 1 : 0,
+                  hidden_size_,
+                  ff_dim_);
     const char* linear_mode = "legacy-attn";
     if (use_delta_linear_) {
         linear_mode = "delta-prefill-gpu-iter/decode-gpu-ring";
     }
-    AILA_LOG_INFO("[Qwen3.5] Linear mode: %s (set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback)",
-                  linear_mode);
+    AILA_LOG_INFO("[Qwen3.5] Linear mode: %s", linear_mode);
+    if (linear_kv_heads_ > linear_q_heads_) {
+        AILA_LOG_INFO("[Qwen3.5] Legacy linear-attn fallback is unsupported for grouped linear heads unless AILA_Q35_ALLOW_UNSUPPORTED_LEGACY_LINEAR=1 is set");
+    } else {
+        AILA_LOG_INFO("[Qwen3.5] Set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback");
+    }
     return true;
 }
 
@@ -836,8 +941,10 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
+    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
 
-    if (q_heads == num_heads && head_k_dim == head_v_dim && head_k_dim == 128 && kernel == 4 && conv_rows == 3) {
+    if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
+                                           experimental_gqa_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
         const int row0 = conv_head;
@@ -862,7 +969,8 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     };
 
                     int hv = static_cast<int>(item.get_group(0));
-                    int hk = hv;
+                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
+                    bool write_shared_qk = linear_delta_is_group_leader(hv, q_heads, num_heads);
                     int lid = static_cast<int>(item.get_local_id(0));
                     int q_base = hk * head_dim;
                     int k_base = q_dim + hk * head_dim;
@@ -894,8 +1002,10 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
 
                     if (lid < head_dim) {
                         size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
-                        conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
-                        conv_state_ptr[dst + k_base + lid] = static_cast<float>(qkv_ptr[k_base + lid]);
+                        if (write_shared_qk) {
+                            conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
+                            conv_state_ptr[dst + k_base + lid] = static_cast<float>(qkv_ptr[k_base + lid]);
+                        }
                         conv_state_ptr[dst + v_base + lid] = static_cast<float>(qkv_ptr[v_base + lid]);
                     }
 
@@ -1069,7 +1179,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                 for (int idx = lid; idx < kv_dim; idx += wg) {
                     int hv = idx / head_v_dim;
                     int dv = idx % head_v_dim;
-                    int hk = hv % q_heads;
+                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
                     float* S = state_ptr + static_cast<size_t>(hv) * head_k_dim * head_v_dim;
 
                     float beta = 1.0f / (1.0f + sycl::exp(-static_cast<float>(b_ptr[hv])));
@@ -1155,8 +1265,10 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
     float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
     float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
     bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
+    bool experimental_gqa_fastpath = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
 
-    if (q_heads == num_heads && head_k_dim == head_v_dim && head_k_dim == 128 && kernel == 4 && conv_rows == 3) {
+    if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
+                                           experimental_gqa_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
 
@@ -1179,7 +1291,8 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
                     };
 
                     int hv = static_cast<int>(item.get_group(0));
-                    int hk = hv;
+                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
+                    bool write_shared_qk = linear_delta_is_group_leader(hv, q_heads, num_heads);
                     int lid = static_cast<int>(item.get_local_id(0));
                     int q_base = hk * head_dim;
                     int k_base = q_dim + hk * head_dim;
@@ -1224,8 +1337,10 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
 
                         if (lid < head_dim) {
                             size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
-                            conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
-                            conv_state_ptr[dst + k_base + lid] = static_cast<float>(row[k_base + lid]);
+                            if (write_shared_qk) {
+                                conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
+                                conv_state_ptr[dst + k_base + lid] = static_cast<float>(row[k_base + lid]);
+                            }
                             conv_state_ptr[dst + v_base + lid] = static_cast<float>(row[v_base + lid]);
                         }
 
@@ -1550,7 +1665,7 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
 
     for (int t = 0; t < seq_len; ++t) {
         for (int hv = 0; hv < num_heads; ++hv) {
-            int hk = hv % std::max(1, linear_q_heads_);
+            int hk = linear_delta_key_head_for_value_head(hv, linear_q_heads_, num_heads);
             const float* q_h = scratch.q.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
             const float* k_h = scratch.k.data() + (size_t)t * linear_q_dim_ + (size_t)hk * head_k_dim;
             const float* v_h = scratch.v.data() + (size_t)t * linear_kv_dim_ + (size_t)hv * head_v_dim;
@@ -1673,6 +1788,11 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     if (full_rotary_dim <= 0) full_rotary_dim = std::min(2, full_head_dim_);
     bool debug_layer_stats = aila::env::read_flag("AILA_DEBUG_Q35_LAYER_STATS", false);
     int debug_layer_detail_idx = aila::env::read_int_raw("AILA_DEBUG_Q35_LAYER_DETAIL", -1);
+    bool debug_linear_compare = aila::env::read_flag("AILA_DEBUG_Q35_LINEAR_COMPARE", false);
+    int debug_linear_compare_layer = aila::env::read_int_raw("AILA_DEBUG_Q35_LINEAR_COMPARE_LAYER", -1);
+    bool grouped_linear_heads = linear_kv_heads_ > linear_q_heads_;
+    bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
+    bool use_host_grouped_linear = grouped_linear_heads && !experimental_grouped_linear_gpu;
     auto log_row_stats = [&](const char* tag, Tensor& t, int row, int width) {
         if (row < 0) return;
         bf16* ptr = static_cast<bf16*>(t.data()) + (size_t)row * width;
@@ -1727,13 +1847,54 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
                                                      {1, (int64_t)linear_kv_heads_});
                         Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
                                                      {1, (int64_t)linear_kv_heads_});
-                        run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
+                        if (use_host_grouped_linear) {
+                            run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, 1);
+                            return;
+                        }
+                        bool compare_this_layer = debug_linear_compare &&
+                                                  (debug_linear_compare_layer < 0 || debug_linear_compare_layer == i);
+                        if (compare_this_layer) {
+                            debug_compare_linear_delta_decode(ctx, i, layer, cache, qkv_view, z_view, a_view, b_view);
+                        } else {
+                            run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
+                        }
                     });
                 } else {
                     time_stage(ProfileStage::LinearProj, [&] {
                         layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
                     });
                     time_stage(ProfileStage::LinearDelta, [&] {
+                        if (use_host_grouped_linear) {
+                            bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
+                            bf16* qkv_ptr = static_cast<bf16*>(buf_.qkv.data());
+                            bf16* z_ptr = static_cast<bf16*>(buf_.z.data());
+                            bf16* a_ptr = static_cast<bf16*>(buf_.a.data());
+                            bf16* b_ptr = static_cast<bf16*>(buf_.b.data());
+                            const int row_width = linear_all_dim_;
+                            const int qkv_width = linear_qkv_dim_;
+                            const int z_width = linear_z_dim_;
+                            const int ab_width = linear_kv_heads_;
+                            ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(seq_len) * static_cast<size_t>(row_width)),
+                                [=](sycl::id<1> idx) {
+                                    size_t linear_idx = idx[0];
+                                    int row = static_cast<int>(linear_idx / static_cast<size_t>(row_width));
+                                    int col = static_cast<int>(linear_idx % static_cast<size_t>(row_width));
+                                    bf16 v = fused_ptr[linear_idx];
+                                    if (col < qkv_width) {
+                                        qkv_ptr[static_cast<size_t>(row) * qkv_width + col] = v;
+                                    } else if (col < qkv_width + z_width) {
+                                        z_ptr[static_cast<size_t>(row) * z_width + (col - qkv_width)] = v;
+                                    } else if (col < qkv_width + z_width + ab_width) {
+                                        a_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width)] = v;
+                                    } else {
+                                        b_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width - ab_width)] = v;
+                                    }
+                                });
+                            run_linear_delta_host(ctx, layer, cache,
+                                                  buf_.qkv, buf_.z, buf_.a, buf_.b,
+                                                  seq_len);
+                            return;
+                        }
                         run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
                                                              buf_.linear_all, buf_.attn_out, seq_len);
                     });

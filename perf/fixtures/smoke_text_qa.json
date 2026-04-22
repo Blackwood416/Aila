@@ -5,6 +5,6 @@
   },
   {
     "role": "user",
-    "content": "请简短回答：1+1等于几？"
+    "content": "请简短回答：1+1等于几？ /no_think"
   }
 ]

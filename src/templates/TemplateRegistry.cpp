@@ -1,4 +1,5 @@
 #include "TemplateRegistry.hpp"
+#include <cctype>
 
 namespace aila {
 namespace templating {
@@ -7,6 +8,35 @@ namespace {
 
 void set_error(std::string* err, const std::string& msg) {
     if (err) *err = msg;
+}
+
+void rtrim(std::string& text) {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.pop_back();
+    }
+}
+
+bool strip_no_think_suffix(std::string& text) {
+    rtrim(text);
+    constexpr const char* kNoThinkCmd = "/no_think";
+    constexpr size_t kNoThinkCmdLen = 9;
+    if (text.size() < kNoThinkCmdLen) {
+        return false;
+    }
+
+    size_t pos = text.size() - kNoThinkCmdLen;
+    if (text.compare(pos, kNoThinkCmdLen, kNoThinkCmd) != 0) {
+        return false;
+    }
+
+    bool boundary_ok = (pos == 0) || std::isspace(static_cast<unsigned char>(text[pos - 1]));
+    if (!boundary_ok) {
+        return false;
+    }
+
+    text.erase(pos);
+    rtrim(text);
+    return true;
 }
 
 void append_encoded(const Tokenizer& tokenizer, std::vector<int>& ids, const std::string& text) {
@@ -55,6 +85,7 @@ bool render_chatml(const Tokenizer& tokenizer,
                    bool allow_vision_placeholders,
                    bool add_generation_prompt,
                    bool qwen35_style_prompt,
+                   bool qwen35_closed_think_prompt,
                    std::vector<int>& out_ids,
                    std::string* error_message) {
     out_ids.clear();
@@ -70,14 +101,19 @@ bool render_chatml(const Tokenizer& tokenizer,
         return false;
     }
 
+    bool disable_thinking = false;
     std::string merged;
-    for (const auto& m : messages) {
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto& m = messages[i];
         if (m.role != "system" && m.role != "user" && m.role != "assistant" && m.role != "tool") {
             set_error(error_message, "Invalid message role: " + m.role);
             return false;
         }
         if (!collect_text_content(m.content, allow_vision_placeholders, tokenizer, merged, error_message)) {
             return false;
+        }
+        if (add_generation_prompt && i + 1 == messages.size() && m.role == "user") {
+            disable_thinking = strip_no_think_suffix(merged);
         }
 
         out_ids.push_back(im_start);
@@ -90,7 +126,11 @@ bool render_chatml(const Tokenizer& tokenizer,
         out_ids.push_back(im_start);
         append_encoded(tokenizer, out_ids, "assistant\n");
         if (qwen35_style_prompt) {
-            append_encoded(tokenizer, out_ids, "<think>\n\n</think>\n\n");
+            if (qwen35_closed_think_prompt || disable_thinking) {
+                append_encoded(tokenizer, out_ids, "<think>\n\n</think>\n\n");
+            } else {
+                append_encoded(tokenizer, out_ids, "<think>\n");
+            }
         }
     }
     return true;
@@ -98,19 +138,20 @@ bool render_chatml(const Tokenizer& tokenizer,
 
 } // namespace
 
-bool TemplateRegistry::render(ModelFamily family,
+bool TemplateRegistry::render(const ModelSpec& spec,
                               const Tokenizer& tokenizer,
                               const std::vector<Message>& messages,
                               bool vision_enabled,
                               bool add_generation_prompt,
                               std::vector<int>& out_ids,
                               std::string* error_message) const {
-    if (family == ModelFamily::Qwen35Hybrid) {
+    if (spec.family == ModelFamily::Qwen35Hybrid) {
+        bool closed_think_prompt = is_exact_qwen35_hybrid_0p8b_spec(spec.qwen35_text);
         return render_chatml(tokenizer, messages, vision_enabled, add_generation_prompt, true,
-                             out_ids, error_message);
+                             closed_think_prompt, out_ids, error_message);
     }
     return render_chatml(tokenizer, messages, false, add_generation_prompt, false,
-                         out_ids, error_message);
+                         false, out_ids, error_message);
 }
 
 } // namespace templating

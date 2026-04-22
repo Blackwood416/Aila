@@ -39,18 +39,10 @@ For Qwen3.5-0.8B, the hybrid text path is enabled, including `in_proj_a/b`, dept
 
 ### Build Commands
 
-Use `build.ps1` to build on Windows — it automatically initializes all required oneAPI environment variables.
+Use `build.ps1` to build on Windows — it initializes the required oneAPI/MSVC environment before configuring and building.
 
 ```powershell
-# Quick build (Release mode)
 ./build.ps1
-
-# Or manually:
-# 1. Initialize oneAPI environment
-cmd /c '"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" && set' | ...
-# 2. Configure and build
-cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
 ```
 
 Build outputs (in `build/`):
@@ -126,14 +118,19 @@ Aila.exe -m ./Qwen3.5-0.8B --messages-json ./messages.json --max-tokens 64 --gre
 
 ### Benchmark (Reproducible Sampling/Greedy)
 
-`bench.ps1` supports fixed-seed benchmark runs for both decode modes:
+`bench.ps1` supports fixed-seed runs for greedy and sampling decode:
 
 ```powershell
-# Greedy decode benchmark
 ./bench.ps1 -ModelDir ..\Qwen3-0.6B -PromptTokens 512 -GenTokens 512 -BenchIters 6 -WarmupIters 1
-
-# Sampling decode benchmark (fixed seed)
 ./bench.ps1 -ModelDir ..\Qwen3-0.6B -PromptTokens 512 -GenTokens 512 -BenchIters 6 -WarmupIters 1 -Sample -Seed 42 -Temperature 0.7 -TopK 15 -TopP 0.95
+```
+
+### Smoke Tests
+
+Use `smoke.ps1` to run preset-backed message checks and write `smokes.json` outputs under `tmp/perf/...`:
+
+```powershell
+./smoke.ps1 -Preset phase_gate_q35_text
 ```
 
 ### Interactive Commands
@@ -300,7 +297,11 @@ Aila/
 │   └── utils/                # Tokenizer, SafeTensors, memory-mapped I/O
 ├── third_party/simdjson/     # JSON parsing
 ├── build.ps1                 # Build script (Windows)
+├── bench.ps1                 # Benchmark script (Windows)
+├── smoke.ps1                 # Smoke test script (Windows)
 ├── run.ps1                   # Run script (Windows)
+├── perf/
+│   └── PerfCommon.ps1        # Shared PowerShell perf/build helpers
 └── CMakeLists.txt
 ```
 
