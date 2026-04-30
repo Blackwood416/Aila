@@ -898,6 +898,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     auto stage_start = t_total_start;
     const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
     const bool profile_blocks = profile && aila::env::read_flag("AILA_Q35_VISION_PROFILE_BLOCKS", false);
+    const bool profile_prep = profile && aila::env::read_flag("AILA_Q35_VISION_PROFILE_PREP", false);
     auto stage_ms = [&](clock::time_point from) -> double {
         return std::chrono::duration<double, std::milli>(clock::now() - from).count();
     };
@@ -1009,11 +1010,17 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
 
     stage_start = clock::now();
     ctx_->memcpy_h2d(image_rgb.data(), resized_rgb.data(), static_cast<size_t>(image_bytes));
+    double prep_h2d_ms = 0.0;
+    if (profile_prep) prep_h2d_ms = gpu_stage_ms(stage_start);
+
+    if (profile_prep) stage_start = clock::now();
     ops::vision_patchify_rgb_u8(*ctx_, static_cast<const uint8_t*>(image_rgb.data()), patch_rows,
                                 target_w, target_h, patch_size_,
                                 image_mean_[0], image_mean_[1], image_mean_[2],
                                 image_std_[0], image_std_[1], image_std_[2]);
-    const double prep_ms = gpu_stage_ms(stage_start);
+    double prep_patchify_ms = 0.0;
+    if (profile_prep) prep_patchify_ms = gpu_stage_ms(stage_start);
+    const double prep_ms = profile_prep ? (prep_h2d_ms + prep_patchify_ms) : gpu_stage_ms(stage_start);
 
     stage_start = clock::now();
     patch_proj_.forward(*ctx_, patch_rows, tokens_a, num_patches);
@@ -1161,6 +1168,13 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
             patch_grid_w, patch_grid_h, merged_w, merged_h,
             out.llm_grid_t, out.llm_grid_h, out.llm_grid_w, out.token_count,
             decode_ms, resize_ms, prep_ms, patch_proj_ms, pos_embed_ms, blocks_ms, merger_ms, total_ms);
+
+        if (profile_prep) {
+            AILA_LOG_INFO(
+                "[VisionPrepProfile] file=%s bytes=%d target=%dx%d patches=%d h2d=%.2fms patchify=%.2fms sum=%.2fms",
+                uri.c_str(), image_bytes, target_w, target_h, num_patches,
+                prep_h2d_ms, prep_patchify_ms, prep_ms);
+        }
 
         if (profile_blocks) {
             const double attn_stack_ms = block_ln1_ms + block_qkv_ms + block_split_ms +
