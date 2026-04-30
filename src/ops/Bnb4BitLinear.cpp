@@ -39,9 +39,12 @@ void set_error(std::string* error_message, const std::string& message) {
 }
 
 bool can_use_packed_decode_fastpath(const Bnb4BitWeightRef& weight,
-                                    bool cache_dequantized_weight,
+                                    bool /*cache_dequantized_weight*/,
                                     int seq_len) {
-    if (cache_dequantized_weight || seq_len != 1) {
+    if (seq_len != 1) {
+        return false;
+    }
+    if (!weight.packed_weight || !weight.packed_weight->valid()) {
         return false;
     }
     const int blocksize = weight.quant_state.blocksize;
@@ -69,38 +72,111 @@ void packed_nf4_gemv_bf16(Context& ctx,
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+    const bool use_sg16 = (packed_bytes_per_row >= 768);
+
+    if (!use_sg16) {
+        const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(out_features) * wg_size, wg_size),
+                             [=](sycl::nd_item<1> item) {
+                const int output_index = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+
+                if (lid < 16) {
+                    quant_map_cache[lid] = quant_map_ptr[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int row_byte_base = output_index * packed_bytes_per_row;
+                const int row_block_base = output_index * blocks_per_row;
+                float partial = 0.0f;
+                for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_ptr[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] *
+                               absmax;
+                    partial += static_cast<float>(input_ptr[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] *
+                               absmax;
+                }
+
+                const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
+                if (lid == 0) {
+                    out_ptr[output_index] = bf16(sum);
+                }
+            });
+        });
+        return;
+    }
+
+    const size_t wg_size = 256;
+    const size_t sub_group_size = 16;
+    const size_t num_sub_groups = wg_size / sub_group_size;
+    const size_t rows_per_group = num_sub_groups;
+    const size_t num_groups = (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(out_features) * wg_size, wg_size),
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) {
-            const int output_index = static_cast<int>(item.get_group(0));
             const int lid = static_cast<int>(item.get_local_id(0));
+            const int sg_id = lid / sub_group_size;
+            const int sg_lane = lid % sub_group_size;
+            const int group_row_base = static_cast<int>(item.get_group(0)) * static_cast<int>(rows_per_group);
+            const int row = group_row_base + sg_id;
 
             if (lid < 16) {
                 quant_map_cache[lid] = quant_map_ptr[lid];
             }
             item.barrier(sycl::access::fence_space::local_space);
 
-            const int row_byte_base = output_index * packed_bytes_per_row;
-            const int row_block_base = output_index * blocks_per_row;
             float partial = 0.0f;
-            for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
-                const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
-                const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
-                const int input_index = byte_offset * 2;
-                partial += static_cast<float>(input_ptr[input_index]) *
-                           quant_map_cache[(packed >> 4) & 0x0F] *
-                           absmax;
-                partial += static_cast<float>(input_ptr[input_index + 1]) *
-                           quant_map_cache[packed & 0x0F] *
-                           absmax;
+            if (row < out_features) {
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                int byte_offset = sg_lane * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size) * 4) {
+                    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_ptr + row_byte_base + byte_offset);
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_base = byte_offset * 2;
+                    const uint8_t b0 = static_cast<uint8_t>(packed4);
+                    const uint8_t b1 = static_cast<uint8_t>(packed4 >> 8);
+                    const uint8_t b2 = static_cast<uint8_t>(packed4 >> 16);
+                    const uint8_t b3 = static_cast<uint8_t>(packed4 >> 24);
+                    const float q0 = quant_map_cache[b0 >> 4] * absmax;
+                    const float q1 = quant_map_cache[b0 & 0x0F] * absmax;
+                    const float q2 = quant_map_cache[b1 >> 4] * absmax;
+                    const float q3 = quant_map_cache[b1 & 0x0F] * absmax;
+                    const float q4 = quant_map_cache[b2 >> 4] * absmax;
+                    const float q5 = quant_map_cache[b2 & 0x0F] * absmax;
+                    const float q6 = quant_map_cache[b3 >> 4] * absmax;
+                    const float q7 = quant_map_cache[b3 & 0x0F] * absmax;
+                    partial += static_cast<float>(input_ptr[input_base + 0]) * q0;
+                    partial += static_cast<float>(input_ptr[input_base + 1]) * q1;
+                    partial += static_cast<float>(input_ptr[input_base + 2]) * q2;
+                    partial += static_cast<float>(input_ptr[input_base + 3]) * q3;
+                    partial += static_cast<float>(input_ptr[input_base + 4]) * q4;
+                    partial += static_cast<float>(input_ptr[input_base + 5]) * q5;
+                    partial += static_cast<float>(input_ptr[input_base + 6]) * q6;
+                    partial += static_cast<float>(input_ptr[input_base + 7]) * q7;
+                }
+                for (; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_ptr[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
+                    partial += static_cast<float>(input_ptr[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] * absmax;
+                }
             }
 
-            const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
-            if (lid == 0) {
-                out_ptr[output_index] = bf16(sum);
+            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            if (sg_lane == 0 && row < out_features) {
+                out_ptr[row] = bf16(sum);
             }
         });
     });
@@ -123,45 +199,118 @@ void packed_nf4_gemv_bf16_2way(Context& ctx,
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const int total_out_features = out_features0 + out_features1;
-    const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+    const bool use_sg16 = (packed_bytes_per_row >= 768);
+
+    if (!use_sg16) {
+        const int total_out_features = out_features0 + out_features1;
+        const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(total_out_features) * wg_size, wg_size),
+                             [=](sycl::nd_item<1> item) {
+                const int fused_output_index = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const bool use_first = fused_output_index < out_features0;
+                const int output_index = use_first ? fused_output_index : (fused_output_index - out_features0);
+                const uint8_t* packed_ptr = use_first ? packed0 : packed1;
+                const float* absmax_ptr = use_first ? absmax0 : absmax1;
+                bf16* out_ptr = use_first ? out0 : out1;
+
+                if (lid < 16) {
+                    quant_map_cache[lid] = (use_first ? quant_map0 : quant_map1)[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int row_byte_base = output_index * packed_bytes_per_row;
+                const int row_block_base = output_index * blocks_per_row;
+                float partial = 0.0f;
+                for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_ptr[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
+                    partial += static_cast<float>(input_ptr[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] * absmax;
+                }
+
+                const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
+                if (lid == 0) {
+                    out_ptr[output_index] = bf16(sum);
+                }
+            });
+        });
+        return;
+    }
+
+    const size_t wg_size = 256;
+    const size_t sub_group_size = 16;
+    const size_t num_sub_groups = wg_size / sub_group_size;
+    const size_t rows_per_group = num_sub_groups;
+    const int64_t total_out = static_cast<int64_t>(out_features0) + static_cast<int64_t>(out_features1);
+    const size_t num_groups = (static_cast<size_t>(total_out) + rows_per_group - 1) / rows_per_group;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(total_out_features) * wg_size, wg_size),
+        sycl::local_accessor<bf16, 1> input_cache(sycl::range<1>(in_features), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) {
-            const int fused_output_index = static_cast<int>(item.get_group(0));
             const int lid = static_cast<int>(item.get_local_id(0));
-            const bool use_first = fused_output_index < out_features0;
-            const int output_index = use_first ? fused_output_index : (fused_output_index - out_features0);
+            const int sg_id = lid / sub_group_size;
+            const int sg_lane = lid % sub_group_size;
+            const int64_t global_row = static_cast<int64_t>(item.get_group(0)) * rows_per_group + sg_id;
+            const bool use_first = global_row < static_cast<int64_t>(out_features0);
+            const int row = static_cast<int>(use_first ? global_row : (global_row - static_cast<int64_t>(out_features0)));
             const uint8_t* packed_ptr = use_first ? packed0 : packed1;
-            const float* quant_map_ptr = use_first ? quant_map0 : quant_map1;
             const float* absmax_ptr = use_first ? absmax0 : absmax1;
             bf16* out_ptr = use_first ? out0 : out1;
+            const int out_features = use_first ? out_features0 : out_features1;
 
             if (lid < 16) {
-                quant_map_cache[lid] = quant_map_ptr[lid];
+                quant_map_cache[lid] = quant_map0[lid];
+            }
+            for (int i = lid; i < in_features; i += static_cast<int>(wg_size)) {
+                input_cache[i] = input_ptr[i];
             }
             item.barrier(sycl::access::fence_space::local_space);
 
-            const int row_byte_base = output_index * packed_bytes_per_row;
-            const int row_block_base = output_index * blocks_per_row;
             float partial = 0.0f;
-            for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
-                const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
-                const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
-                const int input_index = byte_offset * 2;
-                partial += static_cast<float>(input_ptr[input_index]) *
-                           quant_map_cache[(packed >> 4) & 0x0F] *
-                           absmax;
-                partial += static_cast<float>(input_ptr[input_index + 1]) *
-                           quant_map_cache[packed & 0x0F] *
-                           absmax;
+            if (row < out_features) {
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                int byte_offset = sg_lane * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size) * 4) {
+                    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_ptr + row_byte_base + byte_offset);
+                    const float absmax0 = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const float absmax1 = absmax_ptr[row_block_base + ((byte_offset + 2) / packed_bytes_per_block)];
+                    const int input_base = byte_offset * 2;
+                    const uint8_t b0 = static_cast<uint8_t>(packed4);
+                    const uint8_t b1 = static_cast<uint8_t>(packed4 >> 8);
+                    const uint8_t b2 = static_cast<uint8_t>(packed4 >> 16);
+                    const uint8_t b3 = static_cast<uint8_t>(packed4 >> 24);
+                    partial += static_cast<float>(input_cache[input_base + 0]) * quant_map_cache[b0 >> 4] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 1]) * quant_map_cache[b0 & 0x0F] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 2]) * quant_map_cache[b1 >> 4] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 3]) * quant_map_cache[b1 & 0x0F] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 4]) * quant_map_cache[b2 >> 4] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 5]) * quant_map_cache[b2 & 0x0F] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 6]) * quant_map_cache[b3 >> 4] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 7]) * quant_map_cache[b3 & 0x0F] * absmax1;
+                }
+                for (; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_cache[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
+                    partial += static_cast<float>(input_cache[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] * absmax;
+                }
             }
 
-            const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
-            if (lid == 0) {
-                out_ptr[output_index] = bf16(sum);
+            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            if (sg_lane == 0 && row < out_features) {
+                out_ptr[row] = bf16(sum);
             }
         });
     });
@@ -189,50 +338,126 @@ void packed_nf4_gemv_bf16_3way(Context& ctx,
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const int first_cut = out_features0;
-    const int second_cut = out_features0 + out_features1;
-    const int total_out_features = out_features0 + out_features1 + out_features2;
-    const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+    const bool use_sg16 = (packed_bytes_per_row >= 768);
+
+    if (!use_sg16) {
+        const int first_cut = out_features0;
+        const int second_cut = out_features0 + out_features1;
+        const int total_out_features = out_features0 + out_features1 + out_features2;
+        const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(total_out_features) * wg_size, wg_size),
+                             [=](sycl::nd_item<1> item) {
+                const int fused_output_index = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const bool use_first = fused_output_index < first_cut;
+                const bool use_second = !use_first && fused_output_index < second_cut;
+                const int output_index = use_first ? fused_output_index
+                    : (use_second ? (fused_output_index - first_cut) : (fused_output_index - second_cut));
+                const uint8_t* packed_ptr = use_first ? packed0 : (use_second ? packed1 : packed2);
+                const float* absmax_ptr = use_first ? absmax0 : (use_second ? absmax1 : absmax2);
+                bf16* out_ptr = use_first ? out0 : (use_second ? out1 : out2);
+
+                if (lid < 16) {
+                    quant_map_cache[lid] = (use_first ? quant_map0 : (use_second ? quant_map1 : quant_map2))[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int row_byte_base = output_index * packed_bytes_per_row;
+                const int row_block_base = output_index * blocks_per_row;
+                float partial = 0.0f;
+                for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_ptr[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
+                    partial += static_cast<float>(input_ptr[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] * absmax;
+                }
+
+                const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
+                if (lid == 0) {
+                    out_ptr[output_index] = bf16(sum);
+                }
+            });
+        });
+        return;
+    }
+
+    const size_t wg_size = 256;
+    const size_t sub_group_size = 16;
+    const size_t num_sub_groups = wg_size / sub_group_size;
+    const size_t rows_per_group = num_sub_groups;
+    const int64_t total_out = static_cast<int64_t>(out_features0) + static_cast<int64_t>(out_features1) + static_cast<int64_t>(out_features2);
+    const size_t num_groups = (static_cast<size_t>(total_out) + rows_per_group - 1) / rows_per_group;
+    const int64_t first_cut = static_cast<int64_t>(out_features0);
+    const int64_t second_cut = first_cut + static_cast<int64_t>(out_features1);
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(total_out_features) * wg_size, wg_size),
+        sycl::local_accessor<bf16, 1> input_cache(sycl::range<1>(in_features), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) {
-            const int fused_output_index = static_cast<int>(item.get_group(0));
             const int lid = static_cast<int>(item.get_local_id(0));
-            const bool use_first = fused_output_index < first_cut;
-            const bool use_second = !use_first && fused_output_index < second_cut;
-            const int output_index = use_first
-                ? fused_output_index
-                : (use_second ? (fused_output_index - first_cut) : (fused_output_index - second_cut));
+            const int sg_id = lid / sub_group_size;
+            const int sg_lane = lid % sub_group_size;
+            const int64_t global_row = static_cast<int64_t>(item.get_group(0)) * rows_per_group + sg_id;
+            const bool use_first = global_row < first_cut;
+            const bool use_second = !use_first && global_row < second_cut;
+            const int row = static_cast<int>(use_first ? global_row
+                : (use_second ? (global_row - first_cut) : (global_row - second_cut)));
             const uint8_t* packed_ptr = use_first ? packed0 : (use_second ? packed1 : packed2);
-            const float* quant_map_ptr = use_first ? quant_map0 : (use_second ? quant_map1 : quant_map2);
             const float* absmax_ptr = use_first ? absmax0 : (use_second ? absmax1 : absmax2);
             bf16* out_ptr = use_first ? out0 : (use_second ? out1 : out2);
+            const int out_features = use_first ? out_features0 : (use_second ? out_features1 : out_features2);
 
             if (lid < 16) {
-                quant_map_cache[lid] = quant_map_ptr[lid];
+                quant_map_cache[lid] = quant_map0[lid];
+            }
+            for (int i = lid; i < in_features; i += static_cast<int>(wg_size)) {
+                input_cache[i] = input_ptr[i];
             }
             item.barrier(sycl::access::fence_space::local_space);
 
-            const int row_byte_base = output_index * packed_bytes_per_row;
-            const int row_block_base = output_index * blocks_per_row;
             float partial = 0.0f;
-            for (int byte_offset = lid; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(wg_size)) {
-                const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
-                const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
-                const int input_index = byte_offset * 2;
-                partial += static_cast<float>(input_ptr[input_index]) *
-                           quant_map_cache[(packed >> 4) & 0x0F] *
-                           absmax;
-                partial += static_cast<float>(input_ptr[input_index + 1]) *
-                           quant_map_cache[packed & 0x0F] *
-                           absmax;
+            if (row < out_features) {
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                int byte_offset = sg_lane * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size) * 4) {
+                    const uint32_t packed4 = *reinterpret_cast<const uint32_t*>(packed_ptr + row_byte_base + byte_offset);
+                    const float absmax0 = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const float absmax1 = absmax_ptr[row_block_base + ((byte_offset + 2) / packed_bytes_per_block)];
+                    const int input_base = byte_offset * 2;
+                    const uint8_t b0 = static_cast<uint8_t>(packed4);
+                    const uint8_t b1 = static_cast<uint8_t>(packed4 >> 8);
+                    const uint8_t b2 = static_cast<uint8_t>(packed4 >> 16);
+                    const uint8_t b3 = static_cast<uint8_t>(packed4 >> 24);
+                    partial += static_cast<float>(input_cache[input_base + 0]) * quant_map_cache[b0 >> 4] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 1]) * quant_map_cache[b0 & 0x0F] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 2]) * quant_map_cache[b1 >> 4] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 3]) * quant_map_cache[b1 & 0x0F] * absmax0;
+                    partial += static_cast<float>(input_cache[input_base + 4]) * quant_map_cache[b2 >> 4] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 5]) * quant_map_cache[b2 & 0x0F] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 6]) * quant_map_cache[b3 >> 4] * absmax1;
+                    partial += static_cast<float>(input_cache[input_base + 7]) * quant_map_cache[b3 & 0x0F] * absmax1;
+                }
+                for (; byte_offset < packed_bytes_per_row; byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
+                    const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
+                    const int input_index = byte_offset * 2;
+                    partial += static_cast<float>(input_cache[input_index]) *
+                               quant_map_cache[(packed >> 4) & 0x0F] * absmax;
+                    partial += static_cast<float>(input_cache[input_index + 1]) *
+                               quant_map_cache[packed & 0x0F] * absmax;
+                }
             }
 
-            const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
-            if (lid == 0) {
-                out_ptr[output_index] = bf16(sum);
+            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            if (sg_lane == 0 && row < out_features) {
+                out_ptr[row] = bf16(sum);
             }
         });
     });
@@ -424,7 +649,7 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
     owned_packed_weight_ = Tensor::allocate(ctx, {total_packed_bytes}, dnnl::memory::data_type::u8);
     absmax_f32_ = Tensor::allocate(ctx, {total_absmax_values}, dnnl::memory::data_type::f32);
     force_dequant_cache_ = true;
-    release_quant_after_cache_ = true;
+    release_quant_after_cache_ = false;
 
     size_t packed_offset = 0;
     size_t absmax_offset = 0;

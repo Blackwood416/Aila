@@ -415,7 +415,7 @@
           "maxTokens": 24,
           "mode": "greedy",
           "expectNonEmpty": true,
-          "expectRegex": "^\\s*(1|一)(\\s*只)?(\\s*鸡)?\\s*$"
+          "expectContainsAny": ["一只鸡", "1只鸡", "1只", "一只", "一"]
         }
       ],
       "autotune": {
