@@ -897,6 +897,7 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     auto t_total_start = clock::now();
     auto stage_start = t_total_start;
     const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
+    const bool profile_blocks = profile && aila::env::read_flag("AILA_Q35_VISION_PROFILE_BLOCKS", false);
     auto stage_ms = [&](clock::time_point from) -> double {
         return std::chrono::duration<double, std::milli>(clock::now() - from).count();
     };
@@ -1030,41 +1031,89 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     ctx_->memcpy_h2d(pos_x_device_, pos_x_host_.data(), pos_bytes);
     const double pos_embed_ms = gpu_stage_ms(stage_start);
 
-    stage_start = clock::now();
+    const auto blocks_start = clock::now();
     Tensor* current = &tokens_b;
     Tensor* scratch = &tokens_a;
+    double block_ln1_ms = 0.0;
+    double block_qkv_ms = 0.0;
+    double block_split_ms = 0.0;
+    double block_rope_q_ms = 0.0;
+    double block_rope_k_ms = 0.0;
+    double block_attn_ms = 0.0;
+    double block_proj_ms = 0.0;
+    double block_resid1_ms = 0.0;
+    double block_ln2_ms = 0.0;
+    double block_fc1_ms = 0.0;
+    double block_gelu_ms = 0.0;
+    double block_fc2_ms = 0.0;
+    double block_resid2_ms = 0.0;
 
     for (auto& b : blocks_) {
+        if (profile_blocks) stage_start = clock::now();
         ops::layer_norm(*ctx_, *current, *b.ln1_weight, *b.ln1_bias, 1e-6f, normed, num_patches, hidden_size_);
+        if (profile_blocks) block_ln1_ms += gpu_stage_ms(stage_start);
 
+        if (profile_blocks) stage_start = clock::now();
         b.qkv.forward(*ctx_, normed, qkv, num_patches);
         if (b.qkv_bias) {
             ops::bias_add_inplace(*ctx_, qkv, *b.qkv_bias, num_patches, 3 * hidden_size_);
         }
-        ops::split_qkv(*ctx_, qkv, q, k, v, num_patches, hidden_size_, hidden_size_);
-        ops::vision_mrope_inplace(*ctx_, q, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
-        ops::vision_mrope_inplace(*ctx_, k, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
-        ops::attention_bidi(*ctx_, q, k, v, attn_out, scores, num_patches, num_heads_, head_dim_);
+        if (profile_blocks) block_qkv_ms += gpu_stage_ms(stage_start);
 
+        if (profile_blocks) stage_start = clock::now();
+        ops::split_qkv(*ctx_, qkv, q, k, v, num_patches, hidden_size_, hidden_size_);
+        if (profile_blocks) block_split_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
+        ops::vision_mrope_inplace(*ctx_, q, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
+        if (profile_blocks) block_rope_q_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
+        ops::vision_mrope_inplace(*ctx_, k, num_patches, num_heads_, head_dim_, pos_y_device_, pos_x_device_);
+        if (profile_blocks) block_rope_k_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
+        ops::attention_bidi(*ctx_, q, k, v, attn_out, scores, num_patches, num_heads_, head_dim_);
+        if (profile_blocks) block_attn_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         b.proj.forward(*ctx_, attn_out, *scratch, num_patches);
         if (b.proj_bias) {
             ops::bias_add_inplace(*ctx_, *scratch, *b.proj_bias, num_patches, hidden_size_);
         }
-        ops::residual_add(*ctx_, *current, *scratch, num_patches * hidden_size_);
+        if (profile_blocks) block_proj_ms += gpu_stage_ms(stage_start);
 
+        if (profile_blocks) stage_start = clock::now();
+        ops::residual_add(*ctx_, *current, *scratch, num_patches * hidden_size_);
+        if (profile_blocks) block_resid1_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         ops::layer_norm(*ctx_, *current, *b.ln2_weight, *b.ln2_bias, 1e-6f, normed, num_patches, hidden_size_);
+        if (profile_blocks) block_ln2_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         b.fc1.forward(*ctx_, normed, ffn, num_patches);
         if (b.fc1_bias) {
             ops::bias_add_inplace(*ctx_, ffn, *b.fc1_bias, num_patches, intermediate_size_);
         }
+        if (profile_blocks) block_fc1_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         ops::gelu_tanh_inplace(*ctx_, ffn, num_patches * intermediate_size_);
+        if (profile_blocks) block_gelu_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         b.fc2.forward(*ctx_, ffn, *scratch, num_patches);
         if (b.fc2_bias) {
             ops::bias_add_inplace(*ctx_, *scratch, *b.fc2_bias, num_patches, hidden_size_);
         }
+        if (profile_blocks) block_fc2_ms += gpu_stage_ms(stage_start);
+
+        if (profile_blocks) stage_start = clock::now();
         ops::residual_add(*ctx_, *current, *scratch, num_patches * hidden_size_);
+        if (profile_blocks) block_resid2_ms += gpu_stage_ms(stage_start);
     }
-    const double blocks_ms = gpu_stage_ms(stage_start);
+    const double blocks_ms = gpu_stage_ms(blocks_start);
 
     stage_start = clock::now();
     Tensor* merged_source_tokens = current;
@@ -1112,6 +1161,25 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
             patch_grid_w, patch_grid_h, merged_w, merged_h,
             out.llm_grid_t, out.llm_grid_h, out.llm_grid_w, out.token_count,
             decode_ms, resize_ms, prep_ms, patch_proj_ms, pos_embed_ms, blocks_ms, merger_ms, total_ms);
+
+        if (profile_blocks) {
+            const double attn_stack_ms = block_ln1_ms + block_qkv_ms + block_split_ms +
+                                         block_rope_q_ms + block_rope_k_ms + block_attn_ms +
+                                         block_proj_ms + block_resid1_ms;
+            const double mlp_stack_ms = block_ln2_ms + block_fc1_ms + block_gelu_ms +
+                                        block_fc2_ms + block_resid2_ms;
+            const double block_sum_ms = attn_stack_ms + mlp_stack_ms;
+            const double avg_block_ms = depth_ > 0 ? (block_sum_ms / static_cast<double>(depth_)) : 0.0;
+            AILA_LOG_INFO(
+                "[VisionBlocksProfile] file=%s layers=%d tokens=%d heads=%d head_dim=%d "
+                "ln1=%.2fms qkv=%.2fms split=%.2fms rope_q=%.2fms rope_k=%.2fms attn=%.2fms "
+                "proj=%.2fms resid1=%.2fms ln2=%.2fms fc1=%.2fms gelu=%.2fms fc2=%.2fms resid2=%.2fms "
+                "attn_stack=%.2fms mlp_stack=%.2fms sum=%.2fms avg_block=%.2fms",
+                uri.c_str(), depth_, num_patches, num_heads_, head_dim_,
+                block_ln1_ms, block_qkv_ms, block_split_ms, block_rope_q_ms, block_rope_k_ms, block_attn_ms,
+                block_proj_ms, block_resid1_ms, block_ln2_ms, block_fc1_ms, block_gelu_ms, block_fc2_ms, block_resid2_ms,
+                attn_stack_ms, mlp_stack_ms, block_sum_ms, avg_block_ms);
+        }
     }
     return true;
 }
