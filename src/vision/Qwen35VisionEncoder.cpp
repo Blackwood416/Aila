@@ -890,13 +890,17 @@ void Qwen35VisionEncoder::choose_target_size(int src_w,
     out_h = h;
 }
 
-bool Qwen35VisionEncoder::encode_image(const std::string& uri,
-                                       VisionEncodeResult& out,
-                                       std::string* error_message) {
+bool Qwen35VisionEncoder::encode_rgb_image(const std::string& uri,
+                                           int src_w,
+                                           int src_h,
+                                           const std::vector<uint8_t>& src_rgb,
+                                           double decode_ms,
+                                           bool profile,
+                                           VisionEncodeResult& out,
+                                           std::string* error_message) {
     using clock = std::chrono::high_resolution_clock;
     auto t_total_start = clock::now();
     auto stage_start = t_total_start;
-    const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
     const bool profile_blocks = profile && aila::env::read_flag("AILA_Q35_VISION_PROFILE_BLOCKS", false);
     const bool profile_prep = profile && aila::env::read_flag("AILA_Q35_VISION_PROFILE_PREP", false);
     auto stage_ms = [&](clock::time_point from) -> double {
@@ -914,13 +918,10 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
         return false;
     }
 
-    int src_w = 0;
-    int src_h = 0;
-    std::vector<uint8_t> src_rgb;
-    if (!read_image_rgb(uri, src_w, src_h, src_rgb, error_message)) {
+    if (src_w <= 0 || src_h <= 0 || src_rgb.empty()) {
+        set_error(error_message, "Vision image is empty");
         return false;
     }
-    const double decode_ms = stage_ms(stage_start);
 
     const int align = std::max(1, patch_size_ * merge_size_);
     int target_w = align;
@@ -1196,6 +1197,46 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
         }
     }
     return true;
+}
+
+bool Qwen35VisionEncoder::encode_image(const std::string& uri,
+                                       VisionEncodeResult& out,
+                                       std::string* error_message) {
+    using clock = std::chrono::high_resolution_clock;
+    auto decode_start = clock::now();
+
+    int src_w = 0;
+    int src_h = 0;
+    std::vector<uint8_t> src_rgb;
+    if (!read_image_rgb(uri, src_w, src_h, src_rgb, error_message)) {
+        return false;
+    }
+
+    const double decode_ms = std::chrono::duration<double, std::milli>(clock::now() - decode_start).count();
+    const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
+    return encode_rgb_image(uri, src_w, src_h, src_rgb, decode_ms, profile, out, error_message);
+}
+
+bool Qwen35VisionEncoder::warmup(std::string* error_message) {
+    if (!loaded_ || !ctx_) {
+        set_error(error_message, "Vision encoder is not loaded");
+        return false;
+    }
+
+    constexpr int warmup_size = 256;
+    std::vector<uint8_t> warmup_rgb(static_cast<size_t>(warmup_size) * warmup_size * 3);
+    parallel_for_1d(0, warmup_size * warmup_size, 2048, [&](int i) {
+        const int x = i % warmup_size;
+        const int y = i / warmup_size;
+        const size_t base = static_cast<size_t>(i) * 3;
+        warmup_rgb[base + 0] = static_cast<uint8_t>(x);
+        warmup_rgb[base + 1] = static_cast<uint8_t>(y);
+        warmup_rgb[base + 2] = static_cast<uint8_t>((x + y) & 255);
+    });
+
+    VisionEncodeResult warmup_out;
+    return encode_rgb_image("<vision-warmup>", warmup_size, warmup_size, warmup_rgb,
+                            0.0, false, warmup_out, error_message);
 }
 
 } // namespace vision

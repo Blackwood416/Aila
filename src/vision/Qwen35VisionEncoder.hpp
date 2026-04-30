@@ -40,6 +40,7 @@ public:
     bool encode_image(const std::string& uri,
                       VisionEncodeResult& out,
                       std::string* error_message);
+    bool warmup(std::string* error_message);
 
 private:
     struct BlockWeights {
@@ -167,6 +168,14 @@ private:
     void release_runtime_buffers();
     void fill_merge_block_positions(int grid_w, int grid_h);
 
+    bool encode_rgb_image(const std::string& uri,
+                          int src_w,
+                          int src_h,
+                          const std::vector<uint8_t>& src_rgb,
+                          double decode_ms,
+                          bool profile,
+                          VisionEncodeResult& out,
+                          std::string* error_message);
     bool read_preprocessor(const std::string& model_dir, std::string* error_message);
 };
 

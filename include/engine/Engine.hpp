@@ -274,6 +274,19 @@ public:
             AILA_LOG_INFO("[Memory] After warmup: current=%.2f MB, peak=%.2f MB",
                           to_mb(ctx_->current_allocated_bytes()),
                           to_mb(ctx_->peak_allocated_bytes()));
+
+            if (vision_backend_enabled_ && vision_encoder_) {
+                auto t_vision_warmup_start = std::chrono::high_resolution_clock::now();
+                std::string vision_warmup_error;
+                if (vision_encoder_->warmup(&vision_warmup_error)) {
+                    auto t_vision_warmup_end = std::chrono::high_resolution_clock::now();
+                    double vision_warmup_ms = std::chrono::duration<double, std::milli>(
+                        t_vision_warmup_end - t_vision_warmup_start).count();
+                    AILA_LOG_INFO("[Warmup] Vision warmup completed in %.2f ms", vision_warmup_ms);
+                } else {
+                    AILA_LOG_WARN("[Warmup] Vision warmup failed: %s", vision_warmup_error.c_str());
+                }
+            }
         } else {
             backend_->reset();
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
