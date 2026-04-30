@@ -6,30 +6,11 @@
 #include <vector>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
-using fp16 = sycl::half;
 
 namespace {
 
 int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
-}
-
-void cast_bf16_to_f16(Context& ctx, Tensor& src, Tensor& dst, int64_t count) {
-    const bf16* src_ptr = static_cast<const bf16*>(src.data());
-    fp16* dst_ptr = static_cast<fp16*>(dst.data());
-    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(count)), [=](sycl::id<1> idx) {
-        size_t i = idx[0];
-        dst_ptr[i] = static_cast<fp16>(static_cast<float>(src_ptr[i]));
-    });
-}
-
-void cast_f16_to_bf16(Context& ctx, Tensor& src, Tensor& dst, int64_t count) {
-    const fp16* src_ptr = static_cast<const fp16*>(src.data());
-    bf16* dst_ptr = static_cast<bf16*>(dst.data());
-    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(count)), [=](sycl::id<1> idx) {
-        size_t i = idx[0];
-        dst_ptr[i] = bf16(static_cast<float>(src_ptr[i]));
-    });
 }
 
 void set_error(std::string* error_message, const std::string& message) {
@@ -478,21 +459,21 @@ void Bnb4BitLinearScratch::ensure(Context& ctx, int seq_len, int in_features, in
     const int new_weight_out_cap = std::max(weight_out_capacity, out_features);
 
     if (grow_seq || grow_input) {
-        input_f16 = Tensor::allocate(ctx,
+        input_bf16 = Tensor::allocate(ctx,
                                      {(int64_t)new_seq_cap, (int64_t)new_input_dim_cap},
-                                     dnnl::memory::data_type::f16);
+                                     dnnl::memory::data_type::bf16);
     }
 
     if (grow_seq || grow_output) {
-        output_f16 = Tensor::allocate(ctx,
+        output_bf16 = Tensor::allocate(ctx,
                                       {(int64_t)new_seq_cap, (int64_t)new_output_dim_cap},
-                                      dnnl::memory::data_type::f16);
+                                      dnnl::memory::data_type::bf16);
     }
 
     if (need_weight && grow_weight) {
-        weight_f16 = Tensor::allocate(ctx,
+        weight_bf16 = Tensor::allocate(ctx,
                                       {(int64_t)new_weight_in_cap, (int64_t)new_weight_out_cap},
-                                      dnnl::memory::data_type::f16);
+                                      dnnl::memory::data_type::bf16);
     }
 
     seq_capacity = new_seq_cap;
@@ -690,16 +671,16 @@ void Bnb4BitLinear::finish_init(Context& ctx) {
     decode_weight_ptr_ = nullptr;
     decode_dst_ptr_ = nullptr;
     decode_scratchpad_ = Tensor();
-    cached_weight_f16_ = Tensor();
+    cached_weight_bf16_ = Tensor();
     cached_weight_ready_ = false;
 
     cache_dequantized_weight_ = force_dequant_cache_ ||
-                                aila::env::read_flag("AILA_BNB4_CACHE_DEQUANT", true);
+                                aila::env::read_flag("AILA_BNB4_CACHE_DEQUANT", false);
     if (cache_dequantized_weight_) {
-        cached_weight_f16_ = Tensor::allocate(ctx,
+        cached_weight_bf16_ = Tensor::allocate(ctx,
                                               {(int64_t)in_features_, (int64_t)out_features_},
-                                              dnnl::memory::data_type::f16);
-        dequantize_weight(ctx, cached_weight_f16_);
+                                              dnnl::memory::data_type::bf16);
+        dequantize_weight(ctx, cached_weight_bf16_);
         ctx.synchronize();
         cached_weight_ready_ = true;
         if (release_quant_after_cache_ && owned_packed_weight_.valid()) {
@@ -709,11 +690,11 @@ void Bnb4BitLinear::finish_init(Context& ctx) {
         }
     }
 
-    decode_src_md_ = dnnl::memory::desc({1, in_features_}, dnnl::memory::data_type::f16,
+    decode_src_md_ = dnnl::memory::desc({1, in_features_}, dnnl::memory::data_type::bf16,
                                         dnnl::memory::format_tag::ab);
-    decode_weight_md_ = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::f16,
+    decode_weight_md_ = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::bf16,
                                            dnnl::memory::format_tag::ab);
-    decode_dst_md_ = dnnl::memory::desc({1, out_features_}, dnnl::memory::data_type::f16,
+    decode_dst_md_ = dnnl::memory::desc({1, out_features_}, dnnl::memory::data_type::bf16,
                                         dnnl::memory::format_tag::ab);
 
     dnnl::primitive_attr attr;
@@ -738,11 +719,11 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
         return;
     }
 
-    auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::f16,
+    auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
                                      dnnl::memory::format_tag::ab);
-    auto weight_md = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::f16,
+    auto weight_md = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::bf16,
                                         dnnl::memory::format_tag::ab);
-    auto dst_md = dnnl::memory::desc({seq_len, out_features_}, dnnl::memory::data_type::f16,
+    auto dst_md = dnnl::memory::desc({seq_len, out_features_}, dnnl::memory::data_type::bf16,
                                      dnnl::memory::format_tag::ab);
 
     dnnl::primitive_attr attr;
@@ -764,11 +745,11 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 
-void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_f16_view) {
+void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_bf16_view) {
     const uint8_t* packed_ptr = static_cast<const uint8_t*>(weight_.packed_weight->data());
     const float* quant_map_ptr = static_cast<const float*>(weight_.quant_map->data());
     const float* absmax_ptr = static_cast<const float*>(absmax_f32_.data());
-    fp16* out_ptr = static_cast<fp16*>(weight_f16_view.data());
+    bf16* out_ptr = static_cast<bf16*>(weight_bf16_view.data());
 
     const int64_t packed_bytes = weight_.packed_num_bytes();
     const int64_t total_values = weight_.logical_numel();
@@ -787,7 +768,7 @@ void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_f16_view) {
             const int64_t row = flat0 / in_features;
             const int64_t col = flat0 % in_features;
             const int64_t out_index = col * out_features + row;
-            out_ptr[out_index] = static_cast<fp16>(quant_map_ptr[hi] * absmax_ptr[flat0 / blocksize]);
+            out_ptr[out_index] = bf16(quant_map_ptr[hi] * absmax_ptr[flat0 / blocksize]);
         }
 
         const int64_t flat1 = flat0 + 1;
@@ -795,7 +776,7 @@ void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_f16_view) {
             const int64_t row = flat1 / in_features;
             const int64_t col = flat1 % in_features;
             const int64_t out_index = col * out_features + row;
-            out_ptr[out_index] = static_cast<fp16>(quant_map_ptr[lo] * absmax_ptr[flat1 / blocksize]);
+            out_ptr[out_index] = bf16(quant_map_ptr[lo] * absmax_ptr[flat1 / blocksize]);
         }
     });
 }
@@ -926,41 +907,42 @@ void Bnb4BitLinear::forward(Context& ctx,
     const bool need_scratch_weight = !cache_dequantized_weight_;
 
     scratch.ensure(ctx, seq_len, in_features_, out_features_, need_scratch_weight);
-    Tensor input_f16 = Tensor::view(ctx, scratch.input_f16.data(),
+    Tensor input_bf16 = Tensor::view(ctx, scratch.input_bf16.data(),
                                     {seq_len, (int64_t)in_features_},
-                                    dnnl::memory::data_type::f16);
-    Tensor output_f16 = Tensor::view(ctx, scratch.output_f16.data(),
+                                    dnnl::memory::data_type::bf16);
+    Tensor output_bf16 = Tensor::view(ctx, scratch.output_bf16.data(),
                                      {seq_len, (int64_t)out_features_},
-                                     dnnl::memory::data_type::f16);
-    Tensor scratch_weight_f16;
-    Tensor* weight_f16 = nullptr;
+                                     dnnl::memory::data_type::bf16);
+    Tensor scratch_weight_bf16;
+    Tensor* weight_bf16 = nullptr;
     if (cache_dequantized_weight_) {
-        weight_f16 = &cached_weight_f16_;
+        weight_bf16 = &cached_weight_bf16_;
     } else {
-        scratch_weight_f16 = Tensor::view(ctx, scratch.weight_f16.data(),
+        scratch_weight_bf16 = Tensor::view(ctx, scratch.weight_bf16.data(),
                                           {(int64_t)in_features_, (int64_t)out_features_},
-                                          dnnl::memory::data_type::f16);
-        weight_f16 = &scratch_weight_f16;
+                                          dnnl::memory::data_type::bf16);
+        weight_bf16 = &scratch_weight_bf16;
     }
 
-    cast_bf16_to_f16(ctx, input, input_f16, static_cast<int64_t>(seq_len) * in_features_);
+    ctx.queue().memcpy(input_bf16.data(), input.data(),
+                       static_cast<size_t>(seq_len) * static_cast<size_t>(in_features_) * sizeof(bf16));
 
     if (!cache_dequantized_weight_ || !cached_weight_ready_) {
-        dequantize_weight(ctx, *weight_f16);
+        dequantize_weight(ctx, *weight_bf16);
     }
     ensure_primitive(ctx, seq_len);
 
     if (seq_len == 1 && decode_inited_) {
         if (!decode_mem_inited_) {
             decode_src_mem_ = dnnl::sycl_interop::make_memory(decode_src_md_, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, input_f16.data());
+                        dnnl::sycl_interop::memory_kind::usm, input_bf16.data());
             decode_weight_mem_ = dnnl::sycl_interop::make_memory(decode_weight_md_, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, weight_f16->data());
+                        dnnl::sycl_interop::memory_kind::usm, weight_bf16->data());
             decode_dst_mem_ = dnnl::sycl_interop::make_memory(decode_dst_md_, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, output_f16.data());
-            decode_src_ptr_ = input_f16.data();
-            decode_weight_ptr_ = weight_f16->data();
-            decode_dst_ptr_ = output_f16.data();
+                        dnnl::sycl_interop::memory_kind::usm, output_bf16.data());
+            decode_src_ptr_ = input_bf16.data();
+            decode_weight_ptr_ = weight_bf16->data();
+            decode_dst_ptr_ = output_bf16.data();
             decode_args_ = {
                 {DNNL_ARG_SRC, decode_src_mem_},
                 {DNNL_ARG_WEIGHTS, decode_weight_mem_},
@@ -971,19 +953,19 @@ void Bnb4BitLinear::forward(Context& ctx,
             }
             decode_mem_inited_ = true;
         } else {
-            if (decode_src_ptr_ != input_f16.data()) {
-                decode_src_mem_.set_data_handle(input_f16.data());
-                decode_src_ptr_ = input_f16.data();
+            if (decode_src_ptr_ != input_bf16.data()) {
+                decode_src_mem_.set_data_handle(input_bf16.data());
+                decode_src_ptr_ = input_bf16.data();
                 decode_args_[DNNL_ARG_SRC] = decode_src_mem_;
             }
-            if (decode_weight_ptr_ != weight_f16->data()) {
-                decode_weight_mem_.set_data_handle(weight_f16->data());
-                decode_weight_ptr_ = weight_f16->data();
+            if (decode_weight_ptr_ != weight_bf16->data()) {
+                decode_weight_mem_.set_data_handle(weight_bf16->data());
+                decode_weight_ptr_ = weight_bf16->data();
                 decode_args_[DNNL_ARG_WEIGHTS] = decode_weight_mem_;
             }
-            if (decode_dst_ptr_ != output_f16.data()) {
-                decode_dst_mem_.set_data_handle(output_f16.data());
-                decode_dst_ptr_ = output_f16.data();
+            if (decode_dst_ptr_ != output_bf16.data()) {
+                decode_dst_mem_.set_data_handle(output_bf16.data());
+                decode_dst_ptr_ = output_bf16.data();
                 decode_args_[DNNL_ARG_DST] = decode_dst_mem_;
             }
         }
@@ -992,14 +974,14 @@ void Bnb4BitLinear::forward(Context& ctx,
         auto& cp = prim_cache_[seq_len];
         if (!cp.mem_inited) {
             cp.src_mem = dnnl::sycl_interop::make_memory(cp.src_md, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, input_f16.data());
+                        dnnl::sycl_interop::memory_kind::usm, input_bf16.data());
             cp.weight_mem = dnnl::sycl_interop::make_memory(cp.weight_md, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, weight_f16->data());
+                        dnnl::sycl_interop::memory_kind::usm, weight_bf16->data());
             cp.dst_mem = dnnl::sycl_interop::make_memory(cp.dst_md, ctx.engine(),
-                        dnnl::sycl_interop::memory_kind::usm, output_f16.data());
-            cp.src_ptr = input_f16.data();
-            cp.weight_ptr = weight_f16->data();
-            cp.dst_ptr = output_f16.data();
+                        dnnl::sycl_interop::memory_kind::usm, output_bf16.data());
+            cp.src_ptr = input_bf16.data();
+            cp.weight_ptr = weight_bf16->data();
+            cp.dst_ptr = output_bf16.data();
             cp.args = {
                 {DNNL_ARG_SRC, cp.src_mem},
                 {DNNL_ARG_WEIGHTS, cp.weight_mem},
@@ -1010,24 +992,25 @@ void Bnb4BitLinear::forward(Context& ctx,
             }
             cp.mem_inited = true;
         } else {
-            if (cp.src_ptr != input_f16.data()) {
-                cp.src_mem.set_data_handle(input_f16.data());
-                cp.src_ptr = input_f16.data();
+            if (cp.src_ptr != input_bf16.data()) {
+                cp.src_mem.set_data_handle(input_bf16.data());
+                cp.src_ptr = input_bf16.data();
                 cp.args[DNNL_ARG_SRC] = cp.src_mem;
             }
-            if (cp.weight_ptr != weight_f16->data()) {
-                cp.weight_mem.set_data_handle(weight_f16->data());
-                cp.weight_ptr = weight_f16->data();
+            if (cp.weight_ptr != weight_bf16->data()) {
+                cp.weight_mem.set_data_handle(weight_bf16->data());
+                cp.weight_ptr = weight_bf16->data();
                 cp.args[DNNL_ARG_WEIGHTS] = cp.weight_mem;
             }
-            if (cp.dst_ptr != output_f16.data()) {
-                cp.dst_mem.set_data_handle(output_f16.data());
-                cp.dst_ptr = output_f16.data();
+            if (cp.dst_ptr != output_bf16.data()) {
+                cp.dst_mem.set_data_handle(output_bf16.data());
+                cp.dst_ptr = output_bf16.data();
                 cp.args[DNNL_ARG_DST] = cp.dst_mem;
             }
         }
         cp.prim.execute(ctx.stream(), cp.args);
     }
 
-    cast_f16_to_bf16(ctx, output_f16, output, static_cast<int64_t>(seq_len) * out_features_);
+    ctx.queue().memcpy(output.data(), output_bf16.data(),
+                       static_cast<size_t>(seq_len) * static_cast<size_t>(out_features_) * sizeof(bf16));
 }

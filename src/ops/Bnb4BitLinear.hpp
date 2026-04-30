@@ -10,9 +10,9 @@
 #include <vector>
 
 struct Bnb4BitLinearScratch {
-    Tensor input_f16;
-    Tensor output_f16;
-    Tensor weight_f16;
+    Tensor input_bf16;
+    Tensor output_bf16;
+    Tensor weight_bf16;
 
     int seq_capacity = 0;
     int input_dim_capacity = 0;
@@ -72,12 +72,12 @@ private:
                               std::string* error_message);
     void finish_init(Context& ctx);
     void ensure_primitive(Context& ctx, int seq_len);
-    void dequantize_weight(Context& ctx, Tensor& weight_f16_view);
+    void dequantize_weight(Context& ctx, Tensor& weight_bf16_view);
 
     Bnb4BitWeightRef weight_{};
     Tensor owned_packed_weight_;
     Tensor absmax_f32_;
-    Tensor cached_weight_f16_;
+    Tensor cached_weight_bf16_;
     int in_features_ = 0;
     int out_features_ = 0;
     bool force_dequant_cache_ = false;
