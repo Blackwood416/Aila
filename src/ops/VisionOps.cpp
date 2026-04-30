@@ -18,6 +18,48 @@ void vision_patchify_rgb_u8(Context& ctx, const uint8_t* rgb_device, Tensor& pat
     const int num_patches = patch_grid_w * patch_grid_h;
     const int patch_area = patch_size * patch_size;
     const int patch_dim = 3 * patch_area;
+    const float u8_scale = 1.0f / 255.0f;
+    const float inv_std0 = 1.0f / std0;
+    const float inv_std1 = 1.0f / std1;
+    const float inv_std2 = 1.0f / std2;
+
+    if (patch_size == 16) {
+        constexpr int exact_patch_size = 16;
+        constexpr int exact_patch_area = exact_patch_size * exact_patch_size;
+        constexpr int exact_patch_dim = 3 * exact_patch_area;
+        constexpr int wg_size = 128;
+        static_assert(exact_patch_area == 256);
+        static_assert(exact_patch_dim == 768);
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(num_patches * wg_size, wg_size),
+                [=](sycl::nd_item<1> item) {
+                    int patch_idx = item.get_group(0);
+                    int lid = item.get_local_id(0);
+                    int py = patch_idx / patch_grid_w;
+                    int px = patch_idx - py * patch_grid_w;
+                    int base_y = py * exact_patch_size;
+                    int base_x = px * exact_patch_size;
+                    int patch_base = patch_idx * exact_patch_dim;
+
+                    for (int flat = lid; flat < exact_patch_dim; flat += wg_size) {
+                        int channel = flat >> 8;
+                        int rem = flat & 255;
+                        int ky = rem >> 4;
+                        int kx = rem & 15;
+                        int iy = base_y + ky;
+                        int ix = base_x + kx;
+                        int rgb_offset = (iy * width + ix) * 3 + channel;
+                        float value = static_cast<float>(rgb_device[rgb_offset]) * u8_scale;
+                        if (channel == 0) value = (value - mean0) * inv_std0;
+                        else if (channel == 1) value = (value - mean1) * inv_std1;
+                        else value = (value - mean2) * inv_std2;
+                        patch_ptr[patch_base + flat] = bf16(value);
+                    }
+                });
+        });
+        return;
+    }
 
     ctx.queue().parallel_for(sycl::range<2>(num_patches, patch_dim),
         [=](sycl::id<2> idx) {
@@ -34,10 +76,10 @@ void vision_patchify_rgb_u8(Context& ctx, const uint8_t* rgb_device, Tensor& pat
             int ix = px * patch_size + kx;
 
             int rgb_offset = (iy * width + ix) * 3 + channel;
-            float value = static_cast<float>(rgb_device[rgb_offset]) / 255.0f;
-            if (channel == 0) value = (value - mean0) / std0;
-            else if (channel == 1) value = (value - mean1) / std1;
-            else value = (value - mean2) / std2;
+            float value = static_cast<float>(rgb_device[rgb_offset]) * u8_scale;
+            if (channel == 0) value = (value - mean0) * inv_std0;
+            else if (channel == 1) value = (value - mean1) * inv_std1;
+            else value = (value - mean2) * inv_std2;
             patch_ptr[patch_idx * patch_dim + flat] = bf16(value);
         });
 }
