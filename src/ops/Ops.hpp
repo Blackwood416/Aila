@@ -24,6 +24,10 @@ public:
     // forward: output = input @ weight^T
     // 如果权重已预转置，则计算 input @ weight_ptr
     void forward(Context& ctx, Tensor& input, Tensor& output, int seq_len);
+    void forward_bias(Context& ctx, Tensor& input, Tensor& bias,
+                      Tensor& output, int seq_len);
+    void forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
+                                Tensor& output, int seq_len);
 
 private:
     Tensor* weight_ = nullptr;
@@ -53,6 +57,10 @@ private:
     std::unordered_map<int, dnnl::memory> decode_args_;
 
     void ensure_primitive(Context& ctx, int seq_len);
+    void ensure_bias_primitive(Context& ctx, int seq_len,
+                               dnnl::memory::data_type bias_dtype);
+    void ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
+                                         dnnl::memory::data_type bias_dtype);
 
     // 运行时 primitive 缓存 (非 decode 模式)
     struct CachedPrimitive {
@@ -75,7 +83,54 @@ private:
         // 预缓存 args map
         std::unordered_map<int, dnnl::memory> args;
     };
+
+    struct CachedBiasPrimitive {
+        dnnl::matmul prim;
+        dnnl::memory::desc src_md;
+        dnnl::memory::desc weight_md;
+        dnnl::memory::desc bias_md;
+        dnnl::memory::desc dst_md;
+
+        dnnl::memory src_mem;
+        dnnl::memory weight_mem;
+        dnnl::memory bias_mem;
+        dnnl::memory dst_mem;
+        dnnl::memory scratchpad_mem;
+        Tensor scratchpad;
+        bool mem_inited = false;
+        void* src_ptr = nullptr;
+        void* weight_ptr = nullptr;
+        void* bias_ptr = nullptr;
+        void* dst_ptr = nullptr;
+
+        std::unordered_map<int, dnnl::memory> args;
+    };
+
+    struct CachedBiasGeluTanhPrimitive {
+        dnnl::matmul prim;
+        dnnl::memory::desc src_md;
+        dnnl::memory::desc weight_md;
+        dnnl::memory::desc bias_md;
+        dnnl::memory::desc dst_md;
+
+        dnnl::memory src_mem;
+        dnnl::memory weight_mem;
+        dnnl::memory bias_mem;
+        dnnl::memory dst_mem;
+        dnnl::memory scratchpad_mem;
+        Tensor scratchpad;
+        bool mem_inited = false;
+        void* src_ptr = nullptr;
+        void* weight_ptr = nullptr;
+        void* bias_ptr = nullptr;
+        void* dst_ptr = nullptr;
+
+        std::unordered_map<int, dnnl::memory> args;
+    };
+
     std::unordered_map<int, CachedPrimitive> prim_cache_;
+    std::unordered_map<uint64_t, CachedBiasPrimitive> bias_cache_;
+    std::unordered_map<uint64_t, CachedBiasGeluTanhPrimitive> bias_gelu_tanh_cache_;
 };
 
 // ============================================================
@@ -269,6 +324,9 @@ namespace ops {
     // qkv: [seq_len, q_dim + kv_dim + kv_dim] -> q/k/v
     void split_qkv(Context& ctx, Tensor& qkv, Tensor& q, Tensor& k, Tensor& v,
                    int seq_len, int q_dim, int kv_dim);
+    void split_qkv_bias(Context& ctx, Tensor& qkv, Tensor& bias,
+                        Tensor& q, Tensor& k, Tensor& v,
+                        int seq_len, int q_dim, int kv_dim);
 
     // Split fused FFN projection output:
     // gate_up: [seq_len, 2 * ff_dim] -> gate/up

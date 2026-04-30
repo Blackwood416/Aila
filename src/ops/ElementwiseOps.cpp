@@ -393,6 +393,43 @@ void split_qkv(Context& ctx, Tensor& qkv, Tensor& q, Tensor& k, Tensor& v,
         });
 }
 
+void split_qkv_bias(Context& ctx, Tensor& qkv, Tensor& bias,
+                    Tensor& q, Tensor& k, Tensor& v,
+                    int seq_len, int q_dim, int kv_dim) {
+    bf16* src = static_cast<bf16*>(qkv.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    bf16* bias_bf16_ptr = nullptr;
+    float* bias_f32_ptr = nullptr;
+    if (bias.dtype() == dnnl::memory::data_type::f32) {
+        bias_f32_ptr = static_cast<float*>(bias.data());
+    } else {
+        bias_bf16_ptr = static_cast<bf16*>(bias.data());
+    }
+    int total = q_dim + kv_dim + kv_dim;
+
+    ctx.queue().parallel_for(sycl::range<2>(seq_len, total),
+        [=](sycl::id<2> idx) {
+            int s = idx[0];
+            int c = idx[1];
+            int src_idx = s * total + c;
+            float value = static_cast<float>(src[src_idx]);
+            float b = bias_f32_ptr ? bias_f32_ptr[c] : static_cast<float>(bias_bf16_ptr[c]);
+            bf16 out = bf16(value + b);
+
+            if (c < q_dim) {
+                q_ptr[s * q_dim + c] = out;
+            } else if (c < q_dim + kv_dim) {
+                int kc = c - q_dim;
+                k_ptr[s * kv_dim + kc] = out;
+            } else {
+                int vc = c - q_dim - kv_dim;
+                v_ptr[s * kv_dim + vc] = out;
+            }
+        });
+}
+
 void split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate, Tensor& up,
                    int seq_len, int ff_dim) {
     bf16* src = static_cast<bf16*>(gate_up.data());

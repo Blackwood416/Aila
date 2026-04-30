@@ -41,6 +41,21 @@ int vision_cpu_threads() {
     return threads;
 }
 
+int vision_split_qkv_bias_fused() {
+    static int mode = aila::env::read_int_raw("AILA_Q35_VISION_SPLIT_QKV_BIAS_FUSED", 0);
+    return mode;
+}
+
+int vision_linear_bias_fused() {
+    static int mode = aila::env::read_int_raw("AILA_Q35_VISION_LINEAR_BIAS_FUSED", 0);
+    return mode;
+}
+
+int vision_fc1_gelu_fused() {
+    static int mode = aila::env::read_int_raw("AILA_Q35_VISION_FC1_GELU_FUSED", 0);
+    return mode;
+}
+
 template <typename Fn>
 void parallel_for_1d(int begin, int end, int min_items_per_thread, const Fn& fn) {
     const int total = end - begin;
@@ -1062,14 +1077,25 @@ bool Qwen35VisionEncoder::encode_rgb_image(const std::string& uri,
         if (profile_blocks) block_ln1_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
-        b.qkv.forward(*ctx_, normed, qkv, num_patches);
-        if (b.qkv_bias) {
-            ops::bias_add_inplace(*ctx_, qkv, *b.qkv_bias, num_patches, 3 * hidden_size_);
+        if (b.qkv_bias && vision_split_qkv_bias_fused() != 0) {
+            b.qkv.forward(*ctx_, normed, qkv, num_patches);
+        } else if (b.qkv_bias && vision_linear_bias_fused() != 0) {
+            b.qkv.forward_bias(*ctx_, normed, *b.qkv_bias, qkv, num_patches);
+        } else {
+            b.qkv.forward(*ctx_, normed, qkv, num_patches);
+            if (b.qkv_bias) {
+                ops::bias_add_inplace(*ctx_, qkv, *b.qkv_bias, num_patches, 3 * hidden_size_);
+            }
         }
         if (profile_blocks) block_qkv_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
-        ops::split_qkv(*ctx_, qkv, q, k, v, num_patches, hidden_size_, hidden_size_);
+        if (b.qkv_bias && vision_split_qkv_bias_fused() != 0) {
+            ops::split_qkv_bias(*ctx_, qkv, *b.qkv_bias, q, k, v, num_patches,
+                                hidden_size_, hidden_size_);
+        } else {
+            ops::split_qkv(*ctx_, qkv, q, k, v, num_patches, hidden_size_, hidden_size_);
+        }
         if (profile_blocks) block_split_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
@@ -1085,9 +1111,13 @@ bool Qwen35VisionEncoder::encode_rgb_image(const std::string& uri,
         if (profile_blocks) block_attn_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
-        b.proj.forward(*ctx_, attn_out, *scratch, num_patches);
-        if (b.proj_bias) {
-            ops::bias_add_inplace(*ctx_, *scratch, *b.proj_bias, num_patches, hidden_size_);
+        if (b.proj_bias && vision_linear_bias_fused() != 0) {
+            b.proj.forward_bias(*ctx_, attn_out, *b.proj_bias, *scratch, num_patches);
+        } else {
+            b.proj.forward(*ctx_, attn_out, *scratch, num_patches);
+            if (b.proj_bias) {
+                ops::bias_add_inplace(*ctx_, *scratch, *b.proj_bias, num_patches, hidden_size_);
+            }
         }
         if (profile_blocks) block_proj_ms += gpu_stage_ms(stage_start);
 
@@ -1100,20 +1130,30 @@ bool Qwen35VisionEncoder::encode_rgb_image(const std::string& uri,
         if (profile_blocks) block_ln2_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
-        b.fc1.forward(*ctx_, normed, ffn, num_patches);
-        if (b.fc1_bias) {
-            ops::bias_add_inplace(*ctx_, ffn, *b.fc1_bias, num_patches, intermediate_size_);
+        if (b.fc1_bias && vision_linear_bias_fused() != 0) {
+            if (vision_fc1_gelu_fused() != 0) {
+                b.fc1.forward_bias_gelu_tanh(*ctx_, normed, *b.fc1_bias, ffn, num_patches);
+            } else {
+                b.fc1.forward_bias(*ctx_, normed, *b.fc1_bias, ffn, num_patches);
+                ops::gelu_tanh_inplace(*ctx_, ffn, num_patches * intermediate_size_);
+            }
+        } else {
+            b.fc1.forward(*ctx_, normed, ffn, num_patches);
+            if (b.fc1_bias) {
+                ops::bias_add_inplace(*ctx_, ffn, *b.fc1_bias, num_patches, intermediate_size_);
+            }
+            ops::gelu_tanh_inplace(*ctx_, ffn, num_patches * intermediate_size_);
         }
         if (profile_blocks) block_fc1_ms += gpu_stage_ms(stage_start);
 
         if (profile_blocks) stage_start = clock::now();
-        ops::gelu_tanh_inplace(*ctx_, ffn, num_patches * intermediate_size_);
-        if (profile_blocks) block_gelu_ms += gpu_stage_ms(stage_start);
-
-        if (profile_blocks) stage_start = clock::now();
-        b.fc2.forward(*ctx_, ffn, *scratch, num_patches);
-        if (b.fc2_bias) {
-            ops::bias_add_inplace(*ctx_, *scratch, *b.fc2_bias, num_patches, hidden_size_);
+        if (b.fc2_bias && vision_linear_bias_fused() != 0) {
+            b.fc2.forward_bias(*ctx_, ffn, *b.fc2_bias, *scratch, num_patches);
+        } else {
+            b.fc2.forward(*ctx_, ffn, *scratch, num_patches);
+            if (b.fc2_bias) {
+                ops::bias_add_inplace(*ctx_, *scratch, *b.fc2_bias, num_patches, hidden_size_);
+            }
         }
         if (profile_blocks) block_fc2_ms += gpu_stage_ms(stage_start);
 
@@ -1141,15 +1181,30 @@ bool Qwen35VisionEncoder::encode_rgb_image(const std::string& uri,
         merger_src = &merger_normed;
     }
 
-    merger_fc1_.forward(*ctx_, *merger_src, merger_hidden, out_tokens);
-    if (merger_fc1_bias_) {
-        ops::bias_add_inplace(*ctx_, merger_hidden, *merger_fc1_bias_, out_tokens, merger_fc1_out_);
+    if (merger_fc1_bias_ && vision_linear_bias_fused() != 0) {
+        if (vision_fc1_gelu_fused() != 0) {
+            merger_fc1_.forward_bias_gelu_tanh(*ctx_, *merger_src, *merger_fc1_bias_,
+                                               merger_hidden, out_tokens);
+        } else {
+            merger_fc1_.forward_bias(*ctx_, *merger_src, *merger_fc1_bias_,
+                                     merger_hidden, out_tokens);
+            ops::gelu_tanh_inplace(*ctx_, merger_hidden, out_tokens * merger_fc1_out_);
+        }
+    } else {
+        merger_fc1_.forward(*ctx_, *merger_src, merger_hidden, out_tokens);
+        if (merger_fc1_bias_) {
+            ops::bias_add_inplace(*ctx_, merger_hidden, *merger_fc1_bias_, out_tokens, merger_fc1_out_);
+        }
+        ops::gelu_tanh_inplace(*ctx_, merger_hidden, out_tokens * merger_fc1_out_);
     }
-    ops::gelu_tanh_inplace(*ctx_, merger_hidden, out_tokens * merger_fc1_out_);
 
-    merger_fc2_.forward(*ctx_, merger_hidden, merger_out, out_tokens);
-    if (merger_fc2_bias_) {
-        ops::bias_add_inplace(*ctx_, merger_out, *merger_fc2_bias_, out_tokens, out_hidden_size_);
+    if (merger_fc2_bias_ && vision_linear_bias_fused() != 0) {
+        merger_fc2_.forward_bias(*ctx_, merger_hidden, *merger_fc2_bias_, merger_out, out_tokens);
+    } else {
+        merger_fc2_.forward(*ctx_, merger_hidden, merger_out, out_tokens);
+        if (merger_fc2_bias_) {
+            ops::bias_add_inplace(*ctx_, merger_out, *merger_fc2_bias_, out_tokens, out_hidden_size_);
+        }
     }
 
     out.token_count = out_tokens;

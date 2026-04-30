@@ -1642,32 +1642,37 @@ void attention_bidi_exact_head64_tile192_vec8_sg16(Context &ctx, Tensor &q,
             const float alpha = merge_state[2];
             const float beta = merge_state[3];
             float tile_acc = 0.0f;
+            const bf16 *v_tile =
+                v_ptr + tile_start * total_dim + h * exact_head_dim;
             if (unroll_v) {
+              float tile_acc0 = 0.0f;
+              float tile_acc1 = 0.0f;
+              float tile_acc2 = 0.0f;
+              float tile_acc3 = 0.0f;
               int j = 0;
               for (; j + 3 < tile_len; j += 4) {
-                const bf16 *v_row0 =
-                    v_ptr + (tile_start + j + 0) * total_dim + h * exact_head_dim;
-                const bf16 *v_row1 =
-                    v_ptr + (tile_start + j + 1) * total_dim + h * exact_head_dim;
-                const bf16 *v_row2 =
-                    v_ptr + (tile_start + j + 2) * total_dim + h * exact_head_dim;
-                const bf16 *v_row3 =
-                    v_ptr + (tile_start + j + 3) * total_dim + h * exact_head_dim;
-                tile_acc += scores[j + 0] * static_cast<float>(v_row0[lid]) +
-                            scores[j + 1] * static_cast<float>(v_row1[lid]) +
-                            scores[j + 2] * static_cast<float>(v_row2[lid]) +
-                            scores[j + 3] * static_cast<float>(v_row3[lid]);
+                const float s0 = scores[j + 0];
+                const float s1 = scores[j + 1];
+                const float s2 = scores[j + 2];
+                const float s3 = scores[j + 3];
+                tile_acc0 +=
+                    s0 * static_cast<float>(v_tile[(j + 0) * total_dim + lid]);
+                tile_acc1 +=
+                    s1 * static_cast<float>(v_tile[(j + 1) * total_dim + lid]);
+                tile_acc2 +=
+                    s2 * static_cast<float>(v_tile[(j + 2) * total_dim + lid]);
+                tile_acc3 +=
+                    s3 * static_cast<float>(v_tile[(j + 3) * total_dim + lid]);
               }
+              tile_acc = (tile_acc0 + tile_acc1) + (tile_acc2 + tile_acc3);
               for (; j < tile_len; ++j) {
-                const bf16 *v_row =
-                    v_ptr + (tile_start + j) * total_dim + h * exact_head_dim;
-                tile_acc += scores[j] * static_cast<float>(v_row[lid]);
+                tile_acc +=
+                    scores[j] * static_cast<float>(v_tile[j * total_dim + lid]);
               }
             } else {
               for (int j = 0; j < tile_len; ++j) {
-                const bf16 *v_row =
-                    v_ptr + (tile_start + j) * total_dim + h * exact_head_dim;
-                tile_acc += scores[j] * static_cast<float>(v_row[lid]);
+                tile_acc +=
+                    scores[j] * static_cast<float>(v_tile[j * total_dim + lid]);
               }
             }
             acc_local[lid] = alpha * acc_local[lid] + beta * tile_acc;

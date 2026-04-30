@@ -3,6 +3,27 @@
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+namespace {
+
+dnnl::memory::desc linear_weight_md(bool preprocessed, int in_features,
+                                    int out_features) {
+    if (preprocessed) {
+        return dnnl::memory::desc({in_features, out_features},
+                                  dnnl::memory::data_type::bf16,
+                                  dnnl::memory::format_tag::ab);
+    }
+    return dnnl::memory::desc({in_features, out_features},
+                              dnnl::memory::data_type::bf16,
+                              {1, static_cast<int64_t>(in_features)});
+}
+
+uint64_t fused_linear_key(int seq_len, dnnl::memory::data_type bias_dtype) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seq_len)) << 32) |
+           static_cast<uint32_t>(static_cast<int>(bias_dtype));
+}
+
+} // namespace
+
 // ============================================================
 // Linear 层实现 (oneDNN MatMul)
 // ============================================================
@@ -17,17 +38,7 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     decode_src_md_ = dnnl::memory::desc({1, in_features}, dnnl::memory::data_type::bf16,
                                          dnnl::memory::format_tag::ab);
     
-    if (preprocessed_) {
-        // [in, out] 物理布局
-        decode_weight_md_ = dnnl::memory::desc({in_features, out_features},
-                                                dnnl::memory::data_type::bf16,
-                                                dnnl::memory::format_tag::ab);
-    } else {
-        // [out, in] 物理布局 (逻辑上是 [in, out] 转置)
-        decode_weight_md_ = dnnl::memory::desc({in_features, out_features},
-                                                dnnl::memory::data_type::bf16,
-                                                {1, static_cast<int64_t>(in_features)});
-    }
+    decode_weight_md_ = linear_weight_md(preprocessed_, in_features, out_features);
 
     decode_dst_md_ = dnnl::memory::desc({1, out_features}, dnnl::memory::data_type::bf16,
                                          dnnl::memory::format_tag::ab);
@@ -55,16 +66,7 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
     auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
                                       dnnl::memory::format_tag::ab);
     
-    dnnl::memory::desc weight_md;
-    if (preprocessed_) {
-        weight_md = dnnl::memory::desc({in_features_, out_features_},
-                                        dnnl::memory::data_type::bf16,
-                                        dnnl::memory::format_tag::ab);
-    } else {
-        weight_md = dnnl::memory::desc({in_features_, out_features_},
-                                        dnnl::memory::data_type::bf16,
-                                        {1, static_cast<int64_t>(in_features_)});
-    }
+    dnnl::memory::desc weight_md = linear_weight_md(preprocessed_, in_features_, out_features_);
     
     auto dst_md = dnnl::memory::desc({seq_len, out_features_}, dnnl::memory::data_type::bf16,
                                       dnnl::memory::format_tag::ab);
@@ -87,6 +89,84 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
         cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
     }
     prim_cache_.emplace(seq_len, std::move(cp));
+}
+
+void Linear::ensure_bias_primitive(Context& ctx, int seq_len,
+                                   dnnl::memory::data_type bias_dtype) {
+    const uint64_t key = fused_linear_key(seq_len, bias_dtype);
+    if (bias_cache_.count(key)) return;
+
+    auto src_md = dnnl::memory::desc({seq_len, in_features_},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+    auto weight_md = linear_weight_md(preprocessed_, in_features_, out_features_);
+    auto bias_md = dnnl::memory::desc({1, out_features_}, bias_dtype,
+                                      dnnl::memory::format_tag::ab);
+    auto dst_md = dnnl::memory::desc({seq_len, out_features_},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md,
+                                           bias_md, dst_md, attr);
+
+    CachedBiasPrimitive cp;
+    cp.prim = dnnl::matmul(pd);
+    cp.src_md = src_md;
+    cp.weight_md = weight_md;
+    cp.bias_md = bias_md;
+    cp.dst_md = dst_md;
+    size_t scratchpad_size = pd.scratchpad_desc().get_size();
+    if (scratchpad_size > 0) {
+        cp.scratchpad = Tensor::allocate(ctx,
+                                         {static_cast<int64_t>(scratchpad_size)},
+                                         dnnl::memory::data_type::u8);
+        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
+    }
+    bias_cache_.emplace(key, std::move(cp));
+}
+
+void Linear::ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
+                                              dnnl::memory::data_type bias_dtype) {
+    const uint64_t key = fused_linear_key(seq_len, bias_dtype);
+    if (bias_gelu_tanh_cache_.count(key)) return;
+
+    auto src_md = dnnl::memory::desc({seq_len, in_features_},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+    auto weight_md = linear_weight_md(preprocessed_, in_features_, out_features_);
+    auto bias_md = dnnl::memory::desc({1, out_features_}, bias_dtype,
+                                      dnnl::memory::format_tag::ab);
+    auto dst_md = dnnl::memory::desc({seq_len, out_features_},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+
+    dnnl::post_ops post_ops;
+    post_ops.append_eltwise(dnnl::algorithm::eltwise_gelu_tanh, 0.0f, 0.0f);
+
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    attr.set_post_ops(post_ops);
+
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md,
+                                           bias_md, dst_md, attr);
+
+    CachedBiasGeluTanhPrimitive cp;
+    cp.prim = dnnl::matmul(pd);
+    cp.src_md = src_md;
+    cp.weight_md = weight_md;
+    cp.bias_md = bias_md;
+    cp.dst_md = dst_md;
+    size_t scratchpad_size = pd.scratchpad_desc().get_size();
+    if (scratchpad_size > 0) {
+        cp.scratchpad = Tensor::allocate(ctx,
+                                         {static_cast<int64_t>(scratchpad_size)},
+                                         dnnl::memory::data_type::u8);
+        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
+    }
+    bias_gelu_tanh_cache_.emplace(key, std::move(cp));
 }
 
 void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
@@ -173,5 +253,115 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
 
         cp.prim.execute(ctx.stream(), cp.args);
     }
+}
+
+void Linear::forward_bias(Context& ctx, Tensor& input, Tensor& bias,
+                          Tensor& output, int seq_len) {
+    const uint64_t key = fused_linear_key(seq_len, bias.dtype());
+    ensure_bias_primitive(ctx, seq_len, bias.dtype());
+
+    auto& cp = bias_cache_[key];
+    if (!cp.mem_inited) {
+        cp.src_mem = dnnl::sycl_interop::make_memory(cp.src_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, input.data());
+        cp.weight_mem = dnnl::sycl_interop::make_memory(cp.weight_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, weight_->data());
+        cp.bias_mem = dnnl::sycl_interop::make_memory(cp.bias_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, bias.data());
+        cp.dst_mem = dnnl::sycl_interop::make_memory(cp.dst_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, output.data());
+        cp.src_ptr = input.data();
+        cp.weight_ptr = weight_->data();
+        cp.bias_ptr = bias.data();
+        cp.dst_ptr = output.data();
+        cp.args = {
+            {DNNL_ARG_SRC, cp.src_mem},
+            {DNNL_ARG_WEIGHTS, cp.weight_mem},
+            {DNNL_ARG_BIAS, cp.bias_mem},
+            {DNNL_ARG_DST, cp.dst_mem}
+        };
+        if (cp.scratchpad.valid()) {
+            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
+        }
+        cp.mem_inited = true;
+    } else {
+        if (cp.src_ptr != input.data()) {
+            cp.src_mem.set_data_handle(input.data());
+            cp.src_ptr = input.data();
+            cp.args[DNNL_ARG_SRC] = cp.src_mem;
+        }
+        if (cp.weight_ptr != weight_->data()) {
+            cp.weight_mem.set_data_handle(weight_->data());
+            cp.weight_ptr = weight_->data();
+            cp.args[DNNL_ARG_WEIGHTS] = cp.weight_mem;
+        }
+        if (cp.bias_ptr != bias.data()) {
+            cp.bias_mem.set_data_handle(bias.data());
+            cp.bias_ptr = bias.data();
+            cp.args[DNNL_ARG_BIAS] = cp.bias_mem;
+        }
+        if (cp.dst_ptr != output.data()) {
+            cp.dst_mem.set_data_handle(output.data());
+            cp.dst_ptr = output.data();
+            cp.args[DNNL_ARG_DST] = cp.dst_mem;
+        }
+    }
+
+    cp.prim.execute(ctx.stream(), cp.args);
+}
+
+void Linear::forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
+                                    Tensor& output, int seq_len) {
+    const uint64_t key = fused_linear_key(seq_len, bias.dtype());
+    ensure_bias_gelu_tanh_primitive(ctx, seq_len, bias.dtype());
+
+    auto& cp = bias_gelu_tanh_cache_[key];
+    if (!cp.mem_inited) {
+        cp.src_mem = dnnl::sycl_interop::make_memory(cp.src_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, input.data());
+        cp.weight_mem = dnnl::sycl_interop::make_memory(cp.weight_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, weight_->data());
+        cp.bias_mem = dnnl::sycl_interop::make_memory(cp.bias_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, bias.data());
+        cp.dst_mem = dnnl::sycl_interop::make_memory(cp.dst_md, ctx.engine(),
+                    dnnl::sycl_interop::memory_kind::usm, output.data());
+        cp.src_ptr = input.data();
+        cp.weight_ptr = weight_->data();
+        cp.bias_ptr = bias.data();
+        cp.dst_ptr = output.data();
+        cp.args = {
+            {DNNL_ARG_SRC, cp.src_mem},
+            {DNNL_ARG_WEIGHTS, cp.weight_mem},
+            {DNNL_ARG_BIAS, cp.bias_mem},
+            {DNNL_ARG_DST, cp.dst_mem}
+        };
+        if (cp.scratchpad.valid()) {
+            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
+        }
+        cp.mem_inited = true;
+    } else {
+        if (cp.src_ptr != input.data()) {
+            cp.src_mem.set_data_handle(input.data());
+            cp.src_ptr = input.data();
+            cp.args[DNNL_ARG_SRC] = cp.src_mem;
+        }
+        if (cp.weight_ptr != weight_->data()) {
+            cp.weight_mem.set_data_handle(weight_->data());
+            cp.weight_ptr = weight_->data();
+            cp.args[DNNL_ARG_WEIGHTS] = cp.weight_mem;
+        }
+        if (cp.bias_ptr != bias.data()) {
+            cp.bias_mem.set_data_handle(bias.data());
+            cp.bias_ptr = bias.data();
+            cp.args[DNNL_ARG_BIAS] = cp.bias_mem;
+        }
+        if (cp.dst_ptr != output.data()) {
+            cp.dst_mem.set_data_handle(output.data());
+            cp.dst_ptr = output.data();
+            cp.args[DNNL_ARG_DST] = cp.dst_mem;
+        }
+    }
+
+    cp.prim.execute(ctx.stream(), cp.args);
 }
 
