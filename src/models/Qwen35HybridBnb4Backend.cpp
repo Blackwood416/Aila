@@ -1120,44 +1120,54 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     if (lid < head_dim) {
                         const int dv = lid;
                         float acc = 0.0f;
-                        for (int j = 0; j < head_dim; j += 4) {
-                            const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                            const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                            const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                            const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                            float sv0 = S[off0] * decay;
-                            float sv1 = S[off1] * decay;
-                            float sv2 = S[off2] * decay;
-                            float sv3 = S[off3] * decay;
-                            S[off0] = sv0;
-                            S[off1] = sv1;
-                            S[off2] = sv2;
-                            S[off3] = sv3;
-                            acc += sv0 * k_local[j + 0] +
-                                   sv1 * k_local[j + 1] +
-                                   sv2 * k_local[j + 2] +
-                                   sv3 * k_local[j + 3];
+                        for (int j = 0; j < head_dim; j += 8) {
+                            const size_t b = static_cast<size_t>(j) * head_dim + dv;
+                            float sv0 = S[b + 0 * head_dim] * decay;
+                            float sv1 = S[b + 1 * head_dim] * decay;
+                            float sv2 = S[b + 2 * head_dim] * decay;
+                            float sv3 = S[b + 3 * head_dim] * decay;
+                            float sv4 = S[b + 4 * head_dim] * decay;
+                            float sv5 = S[b + 5 * head_dim] * decay;
+                            float sv6 = S[b + 6 * head_dim] * decay;
+                            float sv7 = S[b + 7 * head_dim] * decay;
+                            S[b + 0 * head_dim] = sv0;
+                            S[b + 1 * head_dim] = sv1;
+                            S[b + 2 * head_dim] = sv2;
+                            S[b + 3 * head_dim] = sv3;
+                            S[b + 4 * head_dim] = sv4;
+                            S[b + 5 * head_dim] = sv5;
+                            S[b + 6 * head_dim] = sv6;
+                            S[b + 7 * head_dim] = sv7;
+                            acc += sv0 * k_local[j + 0] + sv1 * k_local[j + 1] +
+                                   sv2 * k_local[j + 2] + sv3 * k_local[j + 3] +
+                                   sv4 * k_local[j + 4] + sv5 * k_local[j + 5] +
+                                   sv6 * k_local[j + 6] + sv7 * k_local[j + 7];
                         }
 
                         float dval = (v_reg - acc) * beta;
                         float out = 0.0f;
-                        for (int j = 0; j < head_dim; j += 4) {
-                            const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                            const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                            const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                            const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                            float sv0 = S[off0] + k_local[j + 0] * dval;
-                            float sv1 = S[off1] + k_local[j + 1] * dval;
-                            float sv2 = S[off2] + k_local[j + 2] * dval;
-                            float sv3 = S[off3] + k_local[j + 3] * dval;
-                            S[off0] = sv0;
-                            S[off1] = sv1;
-                            S[off2] = sv2;
-                            S[off3] = sv3;
-                            out += sv0 * q_local[j + 0] +
-                                   sv1 * q_local[j + 1] +
-                                   sv2 * q_local[j + 2] +
-                                   sv3 * q_local[j + 3];
+                        for (int j = 0; j < head_dim; j += 8) {
+                            const size_t b = static_cast<size_t>(j) * head_dim + dv;
+                            float sv0 = S[b + 0 * head_dim] + k_local[j + 0] * dval;
+                            float sv1 = S[b + 1 * head_dim] + k_local[j + 1] * dval;
+                            float sv2 = S[b + 2 * head_dim] + k_local[j + 2] * dval;
+                            float sv3 = S[b + 3 * head_dim] + k_local[j + 3] * dval;
+                            float sv4 = S[b + 4 * head_dim] + k_local[j + 4] * dval;
+                            float sv5 = S[b + 5 * head_dim] + k_local[j + 5] * dval;
+                            float sv6 = S[b + 6 * head_dim] + k_local[j + 6] * dval;
+                            float sv7 = S[b + 7 * head_dim] + k_local[j + 7] * dval;
+                            S[b + 0 * head_dim] = sv0;
+                            S[b + 1 * head_dim] = sv1;
+                            S[b + 2 * head_dim] = sv2;
+                            S[b + 3 * head_dim] = sv3;
+                            S[b + 4 * head_dim] = sv4;
+                            S[b + 5 * head_dim] = sv5;
+                            S[b + 6 * head_dim] = sv6;
+                            S[b + 7 * head_dim] = sv7;
+                            out += sv0 * q_local[j + 0] + sv1 * q_local[j + 1] +
+                                   sv2 * q_local[j + 2] + sv3 * q_local[j + 3] +
+                                   sv4 * q_local[j + 4] + sv5 * q_local[j + 5] +
+                                   sv6 * q_local[j + 6] + sv7 * q_local[j + 7];
                         }
                         out_local[dv] = out * scale;
                     }
