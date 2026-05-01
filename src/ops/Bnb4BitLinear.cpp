@@ -752,7 +752,7 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
 
     owned_packed_weight_ = Tensor::allocate(ctx, {total_packed_bytes}, dnnl::memory::data_type::u8);
     absmax_f32_ = Tensor::allocate(ctx, {total_absmax_values}, dnnl::memory::data_type::f32);
-    force_dequant_cache_ = true;
+    force_dequant_cache_ = false;
     release_quant_after_cache_ = false;
 
     size_t packed_offset = 0;
@@ -1071,6 +1071,7 @@ void Bnb4BitLinear::forward(Context& ctx,
 
     if (!cache_dequantized_weight_ || !cached_weight_ready_) {
         dequantize_weight(ctx, *weight_bf16);
+        ctx.synchronize();
     }
     ensure_primitive(ctx, seq_len);
 
