@@ -1,6 +1,6 @@
 # Aila
 
-**Aila：基于 Arc 显卡的推理引擎。**
+**Aila：充分发挥 Arc 显卡性能的推理引擎。**
 
 [English](README.md)
 
@@ -41,16 +41,27 @@
 - **Windows 10 22H2** 或更高版本 / **Windows 11**
 
 ### 软件
-- [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html)（提供 SYCL + oneDNN 运行时）
+- [Intel Arc显卡驱动](https://www.intel.cn/content/www/cn/zh/products/docs/discrete-gpus/arc/software/drivers.html)
 - `Aila-vX.Y.Z-win64.zip` 发行包已包含所有必需的运行时 DLL
 
 ## 安装
 
-1. 安装 **Intel oneAPI Base Toolkit**。
-2. 从 [Releases](https://github.com/your-repo/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
+1. 安装 **Intel Arc显卡驱动**。
+2. 从 [Releases](https://github.com/Blackwood416/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
 3. 解压到任意目录。
-4. 打开 oneAPI 命令提示符，或运行 `Initialize-AilaOneApiEnvironment`（见 `build.ps1`）。
 5. 将模型文件放入目录中（如 `./models/qwen3.5-0.8B-bnb-nf4-offline/`）。
+
+## 性能基准
+
+基于 Intel Arc A770 16 GB，Qwen3.5-4B，pp=2048 tg=1024 测试：
+
+| 引擎 | 后端 | 模型 | Prefill | Decode |
+|------|------|------|---------|--------|
+| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | **50 tok/s** |
+| llama.cpp b8996 | SYCL | Qwen3.5-4B Q4_K_XL | 1290 tok/s | 28 tok/s |
+| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | 60 tok/s |
+
+Aila 提供最高的 prefill 吞吐量，同时在保留视觉能力的 NF4 量化下实现接近 Vulkan 的 decode 性能。
 
 ## 使用方法
 

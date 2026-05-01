@@ -1,5 +1,9 @@
 # Aila
 
+**Aila: An inference engine leveraging Arc graphics.**
+
+[中文](README_zh.md)
+
 A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYCL + oneDNN**. Features hand-optimized kernels for bitsandbytes 4-bit (NF4) quantized models, fused dequant+matmul, and GPU-accelerated DeltaNet recurrence for Qwen3.5 hybrid architectures.
 
 ## Features
@@ -37,16 +41,27 @@ Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architect
 - **Windows 10 22H2** or later / **Windows 11**
 
 ### Software
-- [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html) (SYCL + oneDNN runtime)
+- [Intel Arc Graphics Driver](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/software/drivers.html)
 - The `Aila-vX.Y.Z-win64.zip` release bundle includes all required runtime DLLs
 
 ## Installation
 
-1. Install the **Intel oneAPI Base Toolkit**.
-2. Download `Aila-vX.Y.Z-win64.zip` from the [Releases](https://github.com/your-repo/releases) page.
+1. Install the latest **Intel Arc Graphics Driver**.
+2. Download `Aila-vX.Y.Z-win64.zip` from the [Releases](https://github.com/Blackwood416/Aila/releases) page.
 3. Extract to a directory of your choice.
-4. Open a oneAPI command prompt, or run `Initialize-AilaOneApiEnvironment` from `build.ps1`.
-5. Place your model files in a directory (e.g. `./models/qwen3.5-0.8B-bnb-nf4-offline/`).
+4. Place your model files in a directory (e.g. `./models/qwen3.5-0.8B-bnb-nf4-offline/`).
+
+## Benchmark
+
+Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
+
+| Engine | Backend | Model | Prefill | Decode |
+|--------|---------|-------|---------|--------|
+| **Aila 0.1.0** | SYCL + oneDNN | Qwen3.5-4B BNB NF4 | **1600 tok/s** | **50 tok/s** |
+| llama.cpp b8996 | SYCL | Qwen3.5-4B Q4_K_XL | 1290 tok/s | 28 tok/s |
+| llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | 60 tok/s |
+
+Aila delivers the highest prefill throughput and competitive decode performance against Vulkan while using a more accurate NF4 4-bit quantization that retains vision capabilities.
 
 ## Usage
 
