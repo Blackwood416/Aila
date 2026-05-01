@@ -2,6 +2,6 @@ llama.cpp/
 oneDNN/
 build/
 bitsandbytes/
-models/
+/models/
 *.txt
 tmp/

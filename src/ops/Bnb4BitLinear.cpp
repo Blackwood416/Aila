@@ -13,6 +13,129 @@ int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
 }
 
+// Fused NF4 dequant + matmul for prefill (M > 1).
+// Computes C[M,N] = A[M,K] @ dequantize_nf4(B_packed[N,K]), B absmax per block.
+void packed_nf4_gemm_bf16(Context& ctx,
+                          const uint8_t* packed_ptr,
+                          const float* quant_map_ptr,
+                          const float* absmax_ptr,
+                          const bf16* input_ptr,
+                          bf16* output_ptr,
+                          int M, int N, int K,
+                          int blocksize) {
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+
+    constexpr int BM = 128, BN = 128, BK = 128;
+    constexpr int TM = 8, TN = 8;  // per-thread output tile
+    constexpr int TILE_M = 16, TILE_N = 16;  // thread grid in work-group
+    constexpr int WG_SIZE = TILE_M * TILE_N;
+
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        sycl::local_accessor<float, 1> B_absmax_slm(sycl::range<1>(BN), cgh);
+        sycl::local_accessor<uint8_t, 1> B_nf4_slm(sycl::range<1>(BK * BN / 2), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(grid_n) * TILE_N,
+                                             static_cast<size_t>(grid_m) * TILE_M),
+                              sycl::range<2>(TILE_N, TILE_M)),
+            [=](sycl::nd_item<2> item) {
+                const int tx = static_cast<int>(item.get_local_id(0));  // N dimension
+                const int ty = static_cast<int>(item.get_local_id(1));  // M dimension
+                const int lid = ty * TILE_N + tx;
+
+                const int block_n = static_cast<int>(item.get_group(0));
+                const int block_m = static_cast<int>(item.get_group(1));
+                const int n0 = block_n * BN;
+                const int m0 = block_m * BM;
+
+                if (lid < 16) qmap[lid] = quant_map_ptr[lid];
+
+                const int rows_per_thr = BM / TILE_M;
+                const int cols_per_thr = BN / TILE_N;
+
+                // Thread-local accumulators for output tile elements
+                float C[TM][TN] = {};
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    // Cooperative load A[BM, BK] into SLM
+                    const int a_rows = sycl::min(BM, M - m0);
+                    const int a_cols = sycl::min(BK, K - kb);
+                    const int a_elems = a_rows * a_cols;
+                    for (int i = lid; i < a_elems; i += WG_SIZE) {
+                        const int r = i / a_cols;
+                        const int c = i % a_cols;
+                        As[i] = input_ptr[(m0 + r) * K + (kb + c)];
+                    }
+
+                    // Cooperative load B NF4 bytes for [BK, BN] tile
+                    const int b_bytes = a_cols * BN / 2;
+                    for (int i = lid; i < b_bytes; i += WG_SIZE) {
+                        const int k_half = i % (a_cols / 2);
+                        const int bn_idx = i / (a_cols / 2);
+                        const int src_n = n0 + bn_idx;
+                        if (src_n < N) {
+                            B_nf4_slm[i] = packed_ptr[src_n * packed_bytes_per_row + kb / 2 + k_half];
+                        } else {
+                            B_nf4_slm[i] = 0x77;
+                        }
+                    }
+
+                    // Load absmax for each N column in this tile
+                    if (lid < BN) {
+                        const int src_n = n0 + lid;
+                        B_absmax_slm[lid] = (src_n < N)
+                            ? absmax_ptr[src_n * blocks_per_row + kb / blocksize] : 0.0f;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    // Compute partial products for this K tile
+                    const int m_local = ty * TM;
+                    const int n_local = tx * TN;
+                    const int m_local_end = sycl::min(m_local + TM, a_rows);
+                    const int n_local_end = sycl::min(n_local + TN, BN);
+
+                    for (int k = 0; k < a_cols; ++k) {
+                        const int b_byte_base = (k / 2) * BN;
+                        const bool hi = (k % 2 == 0);
+
+                        // Pre-dequantize B values for this k for our N columns
+                        float b_dequant[TN];
+                        for (int ni = n_local; ni < n_local_end; ++ni) {
+                            const uint8_t b = B_nf4_slm[b_byte_base + ni];
+                            const uint8_t nf4 = hi ? (b >> 4) : (b & 0x0F);
+                            b_dequant[ni - n_local] = qmap[nf4] * B_absmax_slm[ni];
+                        }
+
+                        for (int mi = m_local; mi < m_local_end; ++mi) {
+                            const float av = static_cast<float>(As[mi * a_cols + k]);
+                            for (int ni = n_local; ni < n_local_end; ++ni) {
+                                C[mi - m_local][ni - n_local] += av * b_dequant[ni - n_local];
+                            }
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Write output
+                for (int mi = 0; mi < TM; ++mi) {
+                    const int m = m0 + ty * TM + mi;
+                    if (m >= M) continue;
+                    for (int ni = 0; ni < TN; ++ni) {
+                        const int n = n0 + tx * TN + ni;
+                        if (n >= N) continue;
+                        output_ptr[m * N + n] = bf16(C[mi][ni]);
+                    }
+                }
+            });
+    });
+}
+
 void set_error(std::string* error_message, const std::string& message) {
     if (error_message) {
         *error_message = message;
@@ -901,6 +1024,25 @@ void Bnb4BitLinear::forward(Context& ctx,
         can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, seq_len);
     if (use_packed_decode_fastpath) {
         packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_);
+        return;
+    }
+
+    const int blocksize = weight_.quant_state.blocksize;
+    static bool use_fused_prefill =
+        aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", 1) != 0;
+    if (use_fused_prefill && seq_len > 1 &&
+        blocksize == 128 && (blocksize % 2) == 0 &&
+        in_features_ > 0 && (in_features_ % blocksize) == 0 &&
+        weight_.packed_weight && weight_.packed_weight->valid() &&
+        weight_.quant_map && weight_.quant_map->valid()) {
+        packed_nf4_gemm_bf16(ctx,
+                             static_cast<const uint8_t*>(weight_.packed_weight->data()),
+                             static_cast<const float*>(weight_.quant_map->data()),
+                             static_cast<const float*>(absmax_f32_.data()),
+                             static_cast<const bf16*>(input.data()),
+                             static_cast<bf16*>(output.data()),
+                             seq_len, out_features_, in_features_,
+                             blocksize);
         return;
     }
 
