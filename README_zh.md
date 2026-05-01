@@ -1,5 +1,9 @@
 # Aila
 
+**Aila：基于 Arc 显卡的推理引擎。**
+
+[English](README.md)
+
 基于 **SYCL + oneDNN** 构建的高性能 LLM 推理引擎，专为 **Intel Arc 显卡** 设计。针对 bitsandbytes 4-bit (NF4) 量化模型提供手写优化 kernel，包括融合反量化+矩阵乘法、GEMV 解码，以及 Qwen3.5 混合架构的 GPU DeltaNet 循环加速。
 
 ## 功能特性
