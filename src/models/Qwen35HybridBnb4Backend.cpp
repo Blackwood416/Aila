@@ -2244,18 +2244,11 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
             });
         } else if (seq_len == 1) {
-            bool used_fused_swiglu = false;
             time_stage(ProfileStage::FfnProj, [&] {
-                used_fused_swiglu = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-                    ctx, layer.gate_up_proj, buf_.normed, buf_.gate, ff_dim_);
-                if (!used_fused_swiglu) {
-                    layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
-                }
+                layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
             });
             time_stage(ProfileStage::FfnAct, [&] {
-                if (!used_fused_swiglu) {
-                    ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
-                }
+                ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
             });
             time_stage(ProfileStage::DownProj, [&] {
                 layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len);

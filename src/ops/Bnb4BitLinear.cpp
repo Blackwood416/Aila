@@ -1115,7 +1115,7 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
                                                       int ff_dim) {
     if (input.dtype() != dnnl::memory::data_type::bf16 ||
         output.dtype() != dnnl::memory::data_type::bf16) return false;
-    if (input.ndim() != 2 || input.shape(0) != 1) return false;
+    if (input.ndim() != 2) return false;
 
     const auto& w = fused_gate_up.weight_;
     if (!w.packed_weight || !w.packed_weight->valid()) return false;
@@ -1125,7 +1125,7 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
 
     const int in_features = fused_gate_up.in_features_;
     const int blocksize = w.quant_state.blocksize;
-    if (blocksize != 128 || (blocksize % 2) != 0 || (in_features % blocksize) != 0) return false;
+    if (blocksize <= 0 || (blocksize % 2) != 0 || (in_features % blocksize) != 0) return false;
 
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
