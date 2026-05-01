@@ -136,6 +136,107 @@ void packed_nf4_gemm_bf16(Context& ctx,
     });
 }
 
+// Fused gate+up gemv with SiLU activation for decode (seq_len == 1).
+// Computes out[i] = silu(dot(input, gate_weight[i,:])) * dot(input, up_weight[i,:])
+// using NF4 packed weights with per-block float absmax.
+void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
+                                    const uint8_t* gate_packed,
+                                    const float* gate_absmax,
+                                    const uint8_t* up_packed,
+                                    const float* up_absmax,
+                                    const float* quant_map_ptr,
+                                    const bf16* input_ptr,
+                                    bf16* output_ptr,
+                                    int in_features,
+                                    int intermediate_size,
+                                    int blocksize) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    const size_t wg_size = 256;
+    const size_t sub_group_size = 16;
+    const size_t num_sub_groups = wg_size / sub_group_size;
+    const size_t rows_per_group = num_sub_groups;
+    const size_t num_groups = (static_cast<size_t>(intermediate_size) + rows_per_group - 1) / rows_per_group;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        sycl::local_accessor<bf16, 1> input_slm(sycl::range<1>(in_features), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+                         [=](sycl::nd_item<1> item) {
+            const int lid = static_cast<int>(item.get_local_id(0));
+            const int sg_id = lid / sub_group_size;
+            const int sg_lane = lid % sub_group_size;
+            const int row = static_cast<int>(item.get_group(0)) * static_cast<int>(rows_per_group) + sg_id;
+
+            if (lid < 16) qmap[lid] = quant_map_ptr[lid];
+            for (int i = lid; i < in_features; i += static_cast<int>(wg_size)) {
+                input_slm[i] = input_ptr[i];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            float gate_acc = 0.0f;
+            float up_acc = 0.0f;
+            if (row < intermediate_size) {
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                for (int byte_offset = sg_lane * 4; byte_offset + 3 < packed_bytes_per_row;
+                     byte_offset += static_cast<int>(sub_group_size) * 4) {
+                    const uint32_t g4 = *reinterpret_cast<const uint32_t*>(gate_packed + row_byte_base + byte_offset);
+                    const uint32_t u4 = *reinterpret_cast<const uint32_t*>(up_packed + row_byte_base + byte_offset);
+                    const float g_absmax = gate_absmax[row_block_base + (byte_offset / (blocksize / 2))];
+                    const float u_absmax = up_absmax[row_block_base + (byte_offset / (blocksize / 2))];
+                    const int input_base = byte_offset * 2;
+                    const float i0 = static_cast<float>(input_slm[input_base + 0]);
+                    const float i1 = static_cast<float>(input_slm[input_base + 1]);
+                    const float i2 = static_cast<float>(input_slm[input_base + 2]);
+                    const float i3 = static_cast<float>(input_slm[input_base + 3]);
+                    const float i4 = static_cast<float>(input_slm[input_base + 4]);
+                    const float i5 = static_cast<float>(input_slm[input_base + 5]);
+                    const float i6 = static_cast<float>(input_slm[input_base + 6]);
+                    const float i7 = static_cast<float>(input_slm[input_base + 7]);
+                    gate_acc += i0 * qmap[static_cast<uint8_t>(g4) >> 4] * g_absmax;
+                    gate_acc += i1 * qmap[static_cast<uint8_t>(g4) & 0x0F] * g_absmax;
+                    gate_acc += i2 * qmap[static_cast<uint8_t>(g4 >> 8) >> 4] * g_absmax;
+                    gate_acc += i3 * qmap[static_cast<uint8_t>(g4 >> 8) & 0x0F] * g_absmax;
+                    gate_acc += i4 * qmap[static_cast<uint8_t>(g4 >> 16) >> 4] * g_absmax;
+                    gate_acc += i5 * qmap[static_cast<uint8_t>(g4 >> 16) & 0x0F] * g_absmax;
+                    gate_acc += i6 * qmap[static_cast<uint8_t>(g4 >> 24) >> 4] * g_absmax;
+                    gate_acc += i7 * qmap[static_cast<uint8_t>(g4 >> 24) & 0x0F] * g_absmax;
+                    up_acc += i0 * qmap[static_cast<uint8_t>(u4) >> 4] * u_absmax;
+                    up_acc += i1 * qmap[static_cast<uint8_t>(u4) & 0x0F] * u_absmax;
+                    up_acc += i2 * qmap[static_cast<uint8_t>(u4 >> 8) >> 4] * u_absmax;
+                    up_acc += i3 * qmap[static_cast<uint8_t>(u4 >> 8) & 0x0F] * u_absmax;
+                    up_acc += i4 * qmap[static_cast<uint8_t>(u4 >> 16) >> 4] * u_absmax;
+                    up_acc += i5 * qmap[static_cast<uint8_t>(u4 >> 16) & 0x0F] * u_absmax;
+                    up_acc += i6 * qmap[static_cast<uint8_t>(u4 >> 24) >> 4] * u_absmax;
+                    up_acc += i7 * qmap[static_cast<uint8_t>(u4 >> 24) & 0x0F] * u_absmax;
+                }
+                for (int byte_offset = sg_lane; byte_offset < packed_bytes_per_row;
+                     byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t gb = gate_packed[row_byte_base + byte_offset];
+                    const uint8_t ub = up_packed[row_byte_base + byte_offset];
+                    const float g_absmax = gate_absmax[row_block_base + (byte_offset / (blocksize / 2))];
+                    const float u_absmax = up_absmax[row_block_base + (byte_offset / (blocksize / 2))];
+                    const int input_index = byte_offset * 2;
+                    const float i0 = static_cast<float>(input_slm[input_index]);
+                    const float i1 = static_cast<float>(input_slm[input_index + 1]);
+                    gate_acc += i0 * qmap[gb >> 4] * g_absmax;
+                    gate_acc += i1 * qmap[gb & 0x0F] * g_absmax;
+                    up_acc += i0 * qmap[ub >> 4] * u_absmax;
+                    up_acc += i1 * qmap[ub & 0x0F] * u_absmax;
+                }
+            }
+
+            float gate_sum = sycl::reduce_over_group(item.get_sub_group(), gate_acc, sycl::plus<>());
+            float up_sum = sycl::reduce_over_group(item.get_sub_group(), up_acc, sycl::plus<>());
+            if (sg_lane == 0 && row < intermediate_size) {
+                const float silu_gate = gate_sum / (1.0f + sycl::native::exp(-gate_sum));
+                output_ptr[row] = bf16(silu_gate * up_sum);
+            }
+        });
+    });
+}
+
 void set_error(std::string* error_message, const std::string& message) {
     if (error_message) {
         *error_message = message;
@@ -1004,6 +1105,46 @@ bool Bnb4BitLinear::try_forward_decode_gate_up(Context& ctx,
                               static_cast<const bf16*>(input.data()),
                               gate_proj.in_features_,
                               blocksize);
+    return true;
+}
+
+bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
+                                                      Bnb4BitLinear& fused_gate_up,
+                                                      Tensor& input,
+                                                      Tensor& output,
+                                                      int ff_dim) {
+    if (input.dtype() != dnnl::memory::data_type::bf16 ||
+        output.dtype() != dnnl::memory::data_type::bf16) return false;
+    if (input.ndim() != 2 || input.shape(0) != 1) return false;
+
+    const auto& w = fused_gate_up.weight_;
+    if (!w.packed_weight || !w.packed_weight->valid()) return false;
+    if (!w.quant_map || !w.quant_map->valid()) return false;
+    if (!fused_gate_up.absmax_f32_.valid()) return false;
+    if (fused_gate_up.out_features_ != 2 * ff_dim) return false;
+
+    const int in_features = fused_gate_up.in_features_;
+    const int blocksize = w.quant_state.blocksize;
+    if (blocksize != 128 || (blocksize % 2) != 0 || (in_features % blocksize) != 0) return false;
+
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+
+    const uint8_t* base_packed = static_cast<const uint8_t*>(w.packed_weight->data());
+    const float* base_absmax = static_cast<const float*>(fused_gate_up.absmax_f32_.data());
+    const float* quant_map_ptr = static_cast<const float*>(w.quant_map->data());
+    const bf16* input_ptr = static_cast<const bf16*>(input.data());
+    bf16* output_ptr = static_cast<bf16*>(output.data());
+
+    const uint8_t* gate_packed = base_packed;
+    const float* gate_absmax = base_absmax;
+    const uint8_t* up_packed = base_packed + static_cast<size_t>(ff_dim) * packed_bytes_per_row;
+    const float* up_absmax = base_absmax + static_cast<size_t>(ff_dim) * blocks_per_row;
+
+    packed_nf4_gemv_gate_up_swiglu(ctx, gate_packed, gate_absmax,
+                                   up_packed, up_absmax,
+                                   quant_map_ptr, input_ptr, output_ptr,
+                                   in_features, ff_dim, blocksize);
     return true;
 }
 

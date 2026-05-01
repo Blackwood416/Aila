@@ -62,6 +62,11 @@ public:
                                            Tensor& input,
                                            Tensor& gate_output,
                                            Tensor& up_output);
+    static bool try_forward_decode_gate_up_swiglu(Context& ctx,
+                                                  Bnb4BitLinear& fused_gate_up,
+                                                  Tensor& input,
+                                                  Tensor& output,
+                                                  int ff_dim);
 
     int in_features() const { return in_features_; }
     int out_features() const { return out_features_; }
