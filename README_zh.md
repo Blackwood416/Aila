@@ -1,59 +1,63 @@
 # Aila
 
-**Aila：充分发挥 Arc 显卡性能的推理引擎。**
+<p align="center">
+  <b>充分发挥 Arc 显卡性能的推理引擎。</b><br>
+  <a href="README.md">English</a>
+</p>
 
-[English](README.md)
+---
 
-> **注意：** 该项目仍在积极开发中，并不能兼顾支持的所有模型。目前的重点在 **Qwen3.5** 模型上，Qwen3 模型的性能可能并不理想。
+> [!NOTE]
+> 该项目仍在积极开发中，并不能兼顾支持的所有模型。目前的重点在 **Qwen3.5** 模型上，Qwen3 模型的性能可能并不理想。
 
 基于 **SYCL + oneDNN** 构建的高性能 LLM 推理引擎，专为 **Intel Arc 显卡** 设计。针对 bitsandbytes 4-bit (NF4) 量化模型提供手写优化 kernel，包括融合反量化+矩阵乘法、GEMV 解码，以及 Qwen3.5 混合架构的 GPU DeltaNet 循环加速。
 
-## 功能特性
+## ✨ 功能特性
 
-- **Bitsandbytes 4-bit (NF4) 推理** — 融合反量化+矩阵乘 kernel、手写 GEMV 解码、融合 gate+up+SiLU 投影，直接在 Intel Arc 上运行量化模型
-- **Bfloat16 推理** — 通过 oneDNN 矩阵乘法原语支持密集（非量化）模型
-- **Qwen3.5 Hybrid 架构** — 完整支持双重注意力（GQA + DeltaNet 线性注意力），GPU 加速 delta 循环计算
-- **Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
-- **视觉理解 (Qwen3.5)** — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
-- **流式输出** — token 级别流式回调，支持中止生成
-- **交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
-- **性能基准测试** — 分别测量 prefill 和 decode 吞吐量
-- **C API** — 稳定的 C FFI 接口（Python、C#、Rust、Go、Java）— 见 [docs/C_API.md](docs/C_API.md)
-- **Chat 模板** — ChatML 格式，支持 `<think>` 块生成和 `/no_think` 抑制
+- **⚡ Bitsandbytes 4-bit (NF4) 推理** — 融合反量化+矩阵乘 kernel、手写 GEMV 解码、融合 gate+up+SiLU 投影，直接在 Intel Arc 上运行量化模型
+- **🔢 Bfloat16 推理** — 通过 oneDNN 矩阵乘法原语支持密集（非量化）模型
+- **🏗️ Qwen3.5 Hybrid 架构** — 完整支持双重注意力（GQA + DeltaNet 线性注意力），GPU 加速 delta 循环计算
+- **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
+- **👁️ 视觉理解 (Qwen3.5)** — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
+- **🔄 流式输出** — token 级别流式回调，支持中止生成
+- **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
+- **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
+- **🔌 C API** — 稳定的 C FFI 接口（Python、C#、Rust、Go、Java）— 见 [docs/C_API.md](docs/C_API.md)
+- **💭 Chat 模板** — ChatML 格式，支持 `<think>` 块生成和 `/no_think` 抑制
 
-## 支持的模型
+## 📦 支持的模型
 
 | 模型 | 架构 | 量化 | 视觉 |
 |------|------|------|------|
-| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
-| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
-| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | 不支持 |
-| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | 不支持 |
+| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
+| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
+| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
+| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
 
 其他符合支持架构模式的 Qwen3 / Qwen3.5 模型大小理论上也可运行。
 
-## 系统要求
+## 🔧 系统要求
 
-### 硬件
+### 🖥️ 硬件
 - **Intel Arc A770** (16 GB) — 主要开发和测试平台
 - 其他 Intel Arc 独立显卡（A750、A580、A380、B580），≥8 GB 显存
 - 集成显卡（Xe-LP、Xe-LPG）可能支持小模型，但未经测试
 
-### 操作系统
+### 💿 操作系统
 - **Windows 10 22H2** 或更高版本 / **Windows 11**
 
-### 软件
+### 💻 软件
 - [Intel Arc显卡驱动](https://www.intel.cn/content/www/cn/zh/products/docs/discrete-gpus/arc/software/drivers.html)
 - `Aila-vX.Y.Z-win64.zip` 发行包已包含所有必需的运行时 DLL
 
-## 安装
+## 📥 安装
 
 1. 安装 **Intel Arc显卡驱动**。
 2. 从 [Releases](https://github.com/Blackwood416/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
 3. 解压到任意目录。
 5. 将模型文件放入目录中（如 `./models/qwen3.5-0.8B-bnb-nf4-offline/`）。
 
-## 性能基准
+## 📊 性能基准
 
 基于 Intel Arc A770 16 GB，Qwen3.5-4B，pp=2048 tg=1024 测试：
 
@@ -65,9 +69,9 @@
 
 Aila 提供最高的 prefill 吞吐量，同时在保留视觉能力的 NF4 量化下实现接近 Vulkan 的 decode 性能。
 
-## 使用方法
+## 🚀 使用方法
 
-### CLI 快速开始
+### ⌨️ CLI 快速开始
 
 ```powershell
 # 交互式对话
@@ -86,7 +90,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --bench-pp 512 --bench
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 ```
 
-### CLI 参数
+### ⚙️ CLI 参数
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -114,7 +118,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `-h, --help` | 显示帮助 | — |
 | `-v, --version` | 显示版本 | — |
 
-### 交互命令
+### 🎮 交互命令
 
 | 命令 | 说明 |
 |------|------|
@@ -130,7 +134,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_chunk <N>` | 设置流式块大小 |
 | `/config` | 显示当前配置 |
 
-### `/no_think` 后缀
+### 🤫 `/no_think` 后缀
 
 在消息末尾添加 `/no_think` 可抑制模型的思考过程：
 
@@ -141,7 +145,7 @@ Aila: 1+1等于2。
 
 交互模式和 `--messages-json` 均支持。
 
-### Messages JSON 格式
+### 📄 Messages JSON 格式
 
 ```json
 [
@@ -152,15 +156,15 @@ Aila: 1+1等于2。
 
 支持 `text`、`image` 和 `video` 内容类型。图像部分支持 `image`、`image_url` 或 `{"image_url":{"url":"..."}}` 格式。
 
-### C API
+### 🔌 C API
 
 完整 C API 文档见 **[docs/C_API.md](docs/C_API.md)**（支持 Python ctypes、C# P/Invoke、Rust FFI 等）。
 
-### 环境变量
+### 🌐 环境变量
 
 完整环境变量列表见 **[docs/Environment_Variables.md](docs/Environment_Variables.md)**。
 
-## 从源码构建
+## 🛠️ 从源码构建
 
 ```powershell
 # 需要：Intel oneAPI Base Toolkit、CMake 3.24+、Ninja
@@ -180,7 +184,7 @@ Aila: 1+1等于2。
 | `build/AilaShared.dll` | 动态链接库（C API） |
 | `build/AilaLib.lib` | 静态库 |
 
-## 项目结构
+## 📁 项目结构
 
 ```
 Aila/
@@ -208,12 +212,14 @@ Aila/
 └── CMakeLists.txt
 ```
 
-## 致谢
+---
+
+## 🙏 致谢
 
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel 深度神经网络库，提供 bf16 推理所用的矩阵乘法原语
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 量化格式和反量化参考实现
 - **[simdjson](https://github.com/simdjson/simdjson)** — 高性能 JSON 解析器，用于模型配置和分词器元数据
 
-## 许可证
+## 📄 许可证
 
 详见 [LICENSE](LICENSE)。

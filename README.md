@@ -1,59 +1,63 @@
 # Aila
 
-**Aila: An inference engine leveraging Arc graphics.**
+<p align="center">
+  <b>An inference engine leveraging Arc graphics.</b><br>
+  <a href="README_zh.md">中文</a>
+</p>
 
-[中文](README_zh.md)
+---
 
-> **Note:** This project is under active development and does not yet fully support all listed models. The current focus is on the **Qwen3.5** family; Qwen3 model performance may not be optimal.
+> [!NOTE]
+> This project is under active development and does not yet fully support all listed models. The current focus is on the **Qwen3.5** family; Qwen3 model performance may not be optimal.
 
 A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYCL + oneDNN**. Features hand-optimized kernels for bitsandbytes 4-bit (NF4) quantized models, fused dequant+matmul, and GPU-accelerated DeltaNet recurrence for Qwen3.5 hybrid architectures.
 
-## Features
+## ✨ Features
 
-- **Bitsandbytes 4-bit (NF4) inference** — run quantized models directly on Intel Arc with fused dequant+matmul kernels, hand-written GEMV decode, and fused gate+up+SiLU projection
-- **Bfloat16 inference** — dense (unquantized) models via oneDNN matmul primitives
-- **Qwen3.5 Hybrid architecture** — full GPU acceleration for the dual attention (GQA + DeltaNet linear attention) architecture
-- **Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
-- **Vision (Qwen3.5)** — image understanding with CPU preprocessing and GPU vision transformer
-- **Streaming output** — token-level streaming callback with abort support
-- **Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
-- **Benchmark mode** — measure prefill and decode throughput separately
-- **C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
-- **Chat template** — ChatML format with `<think>` block generation and `/no_think` suppression
+- **⚡ Bitsandbytes 4-bit (NF4) inference** — run quantized models directly on Intel Arc with fused dequant+matmul kernels, hand-written GEMV decode, and fused gate+up+SiLU projection
+- **🔢 Bfloat16 inference** — dense (unquantized) models via oneDNN matmul primitives
+- **🏗️ Qwen3.5 Hybrid architecture** — full GPU acceleration for the dual attention (GQA + DeltaNet linear attention) architecture
+- **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
+- **👁️ Vision (Qwen3.5)** — image understanding with CPU preprocessing and GPU vision transformer
+- **🔄 Streaming output** — token-level streaming callback with abort support
+- **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
+- **📊 Benchmark mode** — measure prefill and decode throughput separately
+- **🔌 C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
+- **💭 Chat template** — ChatML format with `<think>` block generation and `/no_think` suppression
 
-## Supported Models
+## 📦 Supported Models
 
 | Model | Architecture | Quantization | Vision |
 |-------|-------------|-------------|--------|
-| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
-| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
-| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | No |
-| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | No |
+| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
+| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ |
+| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
+| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
 
-## Requirements
+## 🔧 Requirements
 
-### Hardware
+### 🖥️ Hardware
 - **Intel Arc A770** (16 GB) — primary development and test target
 - Other Intel Arc discrete GPUs (A750, A580, A380, B580) with ≥8 GB VRAM should work
 - Integrated GPUs (Xe-LP, Xe-LPG) may work for small models but are not tested
 
-### Operating System
+### 💿 Operating System
 - **Windows 10 22H2** or later / **Windows 11**
 
-### Software
+### 💻 Software
 - [Intel Arc Graphics Driver](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/software/drivers.html)
 - The `Aila-vX.Y.Z-win64.zip` release bundle includes all required runtime DLLs
 
-## Installation
+## 📥 Installation
 
 1. Install the latest **Intel Arc Graphics Driver**.
 2. Download `Aila-vX.Y.Z-win64.zip` from the [Releases](https://github.com/Blackwood416/Aila/releases) page.
 3. Extract to a directory of your choice.
 4. Place your model files in a directory (e.g. `./models/qwen3.5-0.8B-bnb-nf4-offline/`).
 
-## Benchmark
+## 📊 Benchmark
 
 Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
 
@@ -65,9 +69,9 @@ Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
 
 Aila delivers the highest prefill throughput and competitive decode performance against Vulkan while using a more accurate NF4 4-bit quantization that retains vision capabilities.
 
-## Usage
+## 🚀 Usage
 
-### CLI Quick Start
+### ⌨️ CLI Quick Start
 
 ```powershell
 # Interactive conversation
@@ -86,7 +90,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --bench-pp 512 --bench
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 ```
 
-### CLI Arguments
+### ⚙️ CLI Arguments
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -114,7 +118,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `-h, --help` | Show help | — |
 | `-v, --version` | Show version | — |
 
-### Interactive Commands
+### 🎮 Interactive Commands
 
 | Command | Description |
 |---------|-------------|
@@ -130,7 +134,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_chunk <N>` | Set stream chunk size |
 | `/config` | Show current configuration |
 
-### `/no_think` Suffix
+### 🤫 `/no_think` Suffix
 
 Append `/no_think` to suppress the model's `<think>` block:
 
@@ -141,7 +145,7 @@ Aila: 1+1 equals 2.
 
 Works in both interactive mode and `--messages-json`.
 
-### Messages JSON Format
+### 📄 Messages JSON Format
 
 ```json
 [
@@ -152,15 +156,15 @@ Works in both interactive mode and `--messages-json`.
 
 Supports `text`, `image`, and `video` content types. Image parts accept `image`, `image_url`, or `{"image_url":{"url":"..."}}`.
 
-### C API
+### 🔌 C API
 
 See **[docs/C_API.md](docs/C_API.md)** for the full C API reference (Python ctypes, C# P/Invoke, Rust FFI, etc.).
 
-### Environment Variables
+### 🌐 Environment Variables
 
 See **[docs/Environment_Variables.md](docs/Environment_Variables.md)** for the complete list of configuration variables.
 
-## Build from Source
+## 🛠️ Build from Source
 
 ```powershell
 # Requires: Intel oneAPI Base Toolkit, CMake 3.24+, Ninja
@@ -180,7 +184,7 @@ Outputs:
 | `build/AilaShared.dll` | Shared library (C API) |
 | `build/AilaLib.lib` | Static library |
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 Aila/
@@ -208,12 +212,14 @@ Aila/
 └── CMakeLists.txt
 ```
 
-## Credits
+---
+
+## 🙏 Credits
 
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel's deep neural network library providing the matmul primitives used for bf16 inference
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 quantization format and dequantization reference
 - **[simdjson](https://github.com/simdjson/simdjson)** — Fast JSON parser used for model config and tokenizer metadata
 
-## License
+## 📄 License
 
 See [LICENSE](LICENSE) for details.
