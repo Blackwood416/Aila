@@ -162,7 +162,7 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
         sycl::local_accessor<bf16, 1> input_slm(sycl::range<1>(in_features), cgh);
         cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
-                         [=](sycl::nd_item<1> item) {
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
@@ -326,7 +326,7 @@ void packed_nf4_gemv_bf16(Context& ctx,
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
         cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
-                         [=](sycl::nd_item<1> item) {
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
@@ -831,7 +831,7 @@ void packed_nf4_gemv_bf16_2way(Context& ctx,
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
         sycl::local_accessor<bf16, 1> input_cache(sycl::range<1>(in_features), cgh);
         cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
-                         [=](sycl::nd_item<1> item) {
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
@@ -976,7 +976,7 @@ void packed_nf4_gemv_bf16_3way(Context& ctx,
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
         sycl::local_accessor<bf16, 1> input_cache(sycl::range<1>(in_features), cgh);
         cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
-                         [=](sycl::nd_item<1> item) {
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
