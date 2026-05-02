@@ -563,8 +563,11 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     }
   }
 
-  bool allow_jm =
-      (jm_mode == 2) || (jm_mode == 1 && jm_supported == 1 && jm_tile_id >= 0);
+  // Require a supported tile regardless of mode — forcing JM without any
+  // compatible tile (e.g. on B580 where no bf16 joint_matrix tile is reported)
+  // would cause a runtime sycl::exception inside the kernel.
+  bool allow_jm = (jm_tile_id >= 0) &&
+      (jm_mode == 2 || (jm_mode == 1 && jm_supported == 1));
   bool apply_window = (decode_window > 0 && cached_len > decode_window_start);
   int effective_window = cached_len;
   if (apply_window) {
@@ -588,10 +591,17 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
   int attn_start = tail_start;
 
   if (!jm_log_once && jm_mode > 0) {
+    const char* status;
+    if (allow_jm) {
+      status = "-> enabled";
+    } else if (jm_tile_id < 0 && jm_supported == 0) {
+      status = "-> disabled (no compatible joint_matrix tile on this device)";
+    } else {
+      status = "-> fallback baseline";
+    }
     AILA_LOG_INFO("[JM] mode=%d, supported=%d, tile_id=%d, decode_wg=%d, decode_window=%d, decode_window_start=%d, decode_sink=%d %s",
                   jm_mode, jm_supported, jm_tile_id, decode_wg, decode_window,
-                  decode_window_start, decode_sink,
-                  (allow_jm ? "-> enabled" : "-> fallback baseline"));
+                  decode_window_start, decode_sink, status);
     jm_log_once = true;
   }
   if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0) {
