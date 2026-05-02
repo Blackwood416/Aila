@@ -25,10 +25,10 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 
 | Model | Architecture | Quantization | Vision |
 |-------|-------------|-------------|--------|
-| Qwen3.5-0.8B | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
-| Qwen3.5-4B | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
-| Qwen3-0.6B | Dense (GQA) | BNB NF4, dense | No |
-| Qwen3-4B | Dense (GQA) | BNB NF4, dense | No |
+| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
+| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | Yes |
+| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | No |
+| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | No |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
 

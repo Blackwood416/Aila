@@ -25,10 +25,10 @@
 
 | 模型 | 架构 | 量化 | 视觉 |
 |------|------|------|------|
-| Qwen3.5-0.8B | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
-| Qwen3.5-4B | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
-| Qwen3-0.6B | Dense (GQA) | BNB NF4, dense | 不支持 |
-| Qwen3-4B | Dense (GQA) | BNB NF4, dense | 不支持 |
+| [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
+| [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | 支持 |
+| [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | 不支持 |
+| [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | 不支持 |
 
 其他符合支持架构模式的 Qwen3 / Qwen3.5 模型大小理论上也可运行。
 
