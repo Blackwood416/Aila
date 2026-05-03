@@ -456,11 +456,12 @@ public:
                 return "";
             }
 
-            // When open-think was used and the model does NOT generate
-            // <think> as its first token (common on models trained with
-            // closed-think), prepend it so the output is well-formed.
-            bool open_think_used = force_thinking || (default_open_think && !user_wants_no_think);
-            if (open_think_used && !out.empty() && out.rfind("<think>", 0) != 0) {
+            // For default open-think (4B without /no_think), the template
+            // injected <think>\n as prefix. The decoded tokens start after
+            // that prefix, so prepend it. For /think, generate_messages()
+            // already handles the prepend — don't double-prepend here.
+            bool default_open = default_open_think && !user_wants_no_think && !force_thinking;
+            if (default_open && !out.empty() && out.compare(0, 7, "<think>") != 0) {
                 out.insert(0, "<think>\n");
             }
 
@@ -1443,7 +1444,7 @@ public:
         }
         // When open-think was used and the model does NOT generate
         // <think> as its first token, prepend it back.
-        if (force_thinking && !output_text.empty() && output_text.rfind("<think>", 0) != 0) {
+        if (force_thinking && !output_text.empty() && output_text.compare(0, 7, "<think>") != 0) {
             output_text.insert(0, "<think>\n");
         }
 
