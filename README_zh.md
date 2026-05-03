@@ -134,13 +134,19 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_chunk <N>` | 设置流式块大小 |
 | `/config` | 显示当前配置 |
 
-### 🤫 `/no_think` 后缀
+### 🤫 `/no_think` 与 `/think` 后缀
 
-在消息末尾添加 `/no_think` 可抑制模型的思考过程：
+在消息末尾添加 `/no_think` 可抑制模型的思考过程，添加 `/think` 可强制思考（对默认为非思考模式的 Qwen3.5-0.8B 有用）：
 
 ```
 User: 1+1等于几？ /no_think
 Aila: 1+1等于2。
+
+User: 解释量子计算。 /think
+Aila: <think>
+让我逐步分析...
+</think>
+量子计算是...
 ```
 
 交互模式和 `--messages-json` 均支持。
@@ -163,6 +169,31 @@ Aila: 1+1等于2。
 ### 🌐 环境变量
 
 完整环境变量列表见 **[docs/Environment_Variables.md](docs/Environment_Variables.md)**。
+
+## 📦 模型导出
+
+使用 `export_bnb_nf4.py` 将 Hugging Face 模型量化为 BNB NF4 格式：
+
+```powershell
+# 纯文本模型
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3.5-0.8B \
+    --output ./models/qwen3.5-0.8B-bnb-nf4-offline
+
+# 视觉模型
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3.5-4B \
+    --output ./models/qwen3.5-4B-bnb-nf4-vision-offline \
+    --vision
+
+# 从本地目录导出，覆盖已有导出
+python export_bnb_nf4.py \
+    --source ./Qwen3-0.6B \
+    --output ./models/qwen3-0.6B-bnb-nf4-offline \
+    --overwrite
+```
+
+需要：`torch`、`transformers`、`bitsandbytes`（Intel XPU 后端）。
 
 ## 🛠️ 从源码构建
 

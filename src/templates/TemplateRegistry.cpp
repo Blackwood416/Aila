@@ -39,6 +39,31 @@ bool strip_no_think_suffix(std::string& text) {
     return true;
 }
 
+bool strip_think_suffix(std::string& text) {
+    rtrim(text);
+    constexpr const char* kThinkCmd = "/think";
+    constexpr size_t kThinkCmdLen = 6;
+    if (text.size() < kThinkCmdLen) {
+        return false;
+    }
+
+    size_t pos = text.size() - kThinkCmdLen;
+    if (text.compare(pos, kThinkCmdLen, kThinkCmd) != 0) {
+        return false;
+    }
+
+    // Reject if preceded by "no_" — /no_think ends with "_think", not "/think",
+    // but the boundary check already handles this correctly since '_' is not space.
+    bool boundary_ok = (pos == 0) || std::isspace(static_cast<unsigned char>(text[pos - 1]));
+    if (!boundary_ok) {
+        return false;
+    }
+
+    text.erase(pos);
+    rtrim(text);
+    return true;
+}
+
 void append_encoded(const Tokenizer& tokenizer, std::vector<int>& ids, const std::string& text) {
     auto t = tokenizer.encode(text);
     ids.insert(ids.end(), t.begin(), t.end());
@@ -102,6 +127,7 @@ bool render_chatml(const Tokenizer& tokenizer,
     }
 
     bool disable_thinking = false;
+    bool force_thinking = false;
     std::string merged;
     for (size_t i = 0; i < messages.size(); ++i) {
         const auto& m = messages[i];
@@ -114,6 +140,9 @@ bool render_chatml(const Tokenizer& tokenizer,
         }
         if (add_generation_prompt && i + 1 == messages.size() && m.role == "user") {
             disable_thinking = strip_no_think_suffix(merged);
+            if (!disable_thinking) {
+                force_thinking = strip_think_suffix(merged);
+            }
         }
 
         out_ids.push_back(im_start);
@@ -126,7 +155,9 @@ bool render_chatml(const Tokenizer& tokenizer,
         out_ids.push_back(im_start);
         append_encoded(tokenizer, out_ids, "assistant\n");
         if (qwen35_style_prompt) {
-            if (qwen35_closed_think_prompt || disable_thinking) {
+            // /no_think → closed think; /think → force open think
+            bool use_closed = (qwen35_closed_think_prompt || disable_thinking) && !force_thinking;
+            if (use_closed) {
                 append_encoded(tokenizer, out_ids, "<think>\n\n</think>\n\n");
             } else {
                 append_encoded(tokenizer, out_ids, "<think>\n");

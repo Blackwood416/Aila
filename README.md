@@ -134,16 +134,22 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_chunk <N>` | Set stream chunk size |
 | `/config` | Show current configuration |
 
-### 🤫 `/no_think` Suffix
+### 🤫 `/no_think` and `/think` Suffixes
 
-Append `/no_think` to suppress the model's `<think>` block:
+Append `/no_think` to suppress the model's `<think>` block, or `/think` to force thinking (useful on Qwen3.5-0.8B which defaults to non-thinking):
 
 ```
 User: What is 1+1? /no_think
 Aila: 1+1 equals 2.
+
+User: Explain quantum computing. /think
+Aila: <think>
+Let me break this down step by step...
+</think>
+Quantum computing is...
 ```
 
-Works in both interactive mode and `--messages-json`.
+Both work in interactive mode and `--messages-json`.
 
 ### 📄 Messages JSON Format
 
@@ -163,6 +169,31 @@ See **[docs/C_API.md](docs/C_API.md)** for the full C API reference (Python ctyp
 ### 🌐 Environment Variables
 
 See **[docs/Environment_Variables.md](docs/Environment_Variables.md)** for the complete list of configuration variables.
+
+## 📦 Model Export
+
+Use `export_bnb_nf4.py` to quantize a Hugging Face model to BNB NF4 format:
+
+```powershell
+# Text-only model
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3.5-0.8B \
+    --output ./models/qwen3.5-0.8B-bnb-nf4-offline
+
+# Model with vision
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3.5-4B \
+    --output ./models/qwen3.5-4B-bnb-nf4-vision-offline \
+    --vision
+
+# From local directory, overwriting existing export
+python export_bnb_nf4.py \
+    --source ./Qwen3-0.6B \
+    --output ./models/qwen3-0.6B-bnb-nf4-offline \
+    --overwrite
+```
+
+Requirements: `torch`, `transformers`, `bitsandbytes` with Intel XPU backend.
 
 ## 🛠️ Build from Source
 
