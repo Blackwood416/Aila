@@ -8,7 +8,7 @@
 // ============================================================
 // Version
 // ============================================================
-static const char* AILA_VERSION_STRING = "0.1.0";
+static const char* AILA_VERSION_STRING = "0.1.1";
 
 // ============================================================
 // Opaque handle wraps InferenceEngine
