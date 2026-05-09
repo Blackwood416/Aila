@@ -1216,7 +1216,11 @@ public:
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
 
         int reusable_prefix = 0;
-        bool allow_incremental_prefill = (total_vision_tokens == 0);
+        // Qwen3.5 hybrid backends cannot do incremental prefill: their
+        // truncate_kv_cache always resets because DeltaNet recurrence
+        // cannot be safely rewound.  Force full prefill for correctness.
+        bool allow_incremental_prefill = (total_vision_tokens == 0) &&
+            (model_spec_.family != ModelFamily::Qwen35Hybrid);
         if (allow_incremental_prefill) {
             int max_possible_match = std::min(static_cast<int>(cached_ids_.size()),
                                               static_cast<int>(full_ids.size()));
