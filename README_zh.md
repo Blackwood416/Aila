@@ -114,7 +114,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `--bench-iters <N>` | 基准测试迭代次数 | 5 |
 | `--bench-warmup <N>` | 基准测试预热次数 | 1 |
 | `--bench-sample` / `--bench-greedy` | 基准测试解码模式 | greedy |
-| `--log-level <level>` | 最低日志级别（debug/info/warning/error） | info |
+| `--log-level <level>` | 最低日志级别（verbose/debug/info/warning/error） | info |
 | `--messages-json <path>` | JSON prompt 文件（`-` = stdin） | 无 |
 | `-h, --help` | 显示帮助 | — |
 | `-v, --version` | 显示版本 | — |
@@ -133,7 +133,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_on` / `/stream_off` | 切换流式输出 |
 | `/decode_chunk <N>` | 设置解码块大小 |
 | `/stream_chunk <N>` | 设置流式块大小 |
-| `/log_level <level>` | 设置日志级别（debug/info/warning/error） |
+| `/log_level <level>` | 设置日志级别（verbose/debug/info/warning/error） |
 | `/config` | 显示当前配置 |
 
 ### 🤫 `/no_think` 与 `/think` 后缀
