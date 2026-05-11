@@ -20,20 +20,14 @@ struct Qwen35HybridBnB4Layer {
 
     Bnb4BitLinear qkv_proj;
     Bnb4BitLinear o_proj;
-    Tensor* qkv_weight_jm = nullptr;
-    Tensor* o_weight_jm = nullptr;
 
     Bnb4BitLinear gate_up_proj;
     Bnb4BitLinear down_proj;
-    Tensor* gate_up_weight_jm = nullptr;
-    Tensor* down_weight_jm = nullptr;
 
     Bnb4BitLinear linear_all_proj;
     Bnb4BitLinear linear_o_proj;
     Bnb4BitLinear linear_qkv_proj;
     Bnb4BitLinear linear_z_proj;
-    Tensor* linear_all_weight_jm = nullptr;
-    Tensor* linear_o_weight_jm = nullptr;
     Tensor* linear_norm_weight = nullptr;
     Tensor* linear_A_log = nullptr;
     Tensor* linear_dt_bias = nullptr;
@@ -111,8 +105,6 @@ private:
     int linear_conv_kernel_dim_ = 0;
     int max_qkv_dim_ = 0, max_attn_dim_ = 0, max_attn_heads_ = 0;
     bool use_delta_linear_ = false;
-    bool decode_ffn_custom_enabled_ = false;
-
     std::vector<Qwen35HybridBnB4Layer> layers_;
     std::vector<Qwen35HybridBnB4LayerCache> layer_caches_;
     std::vector<Tensor> fused_weights_;
@@ -142,15 +134,6 @@ private:
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
-
-    bool use_decode_ffn_custom_path(int seq_len) const;
-    bool use_decode_jm_custom_path(int seq_len) const;
-    void run_decode_ffn_gate_up_swiglu_custom(Context& ctx, const Layer& layer,
-                                               Tensor& input, Tensor& output);
-    void run_decode_ffn_down_custom(Context& ctx, const Layer& layer,
-                                     Tensor& input, Tensor& output);
-    void run_decode_jm_matvec_custom(Context& ctx, Tensor& input, const Tensor& weight_jm,
-                                      int in_dim, int out_dim, Tensor& output);
 
     void run_linear_delta_decode_gpu(Context& ctx, Layer& layer,
                                       LayerCache& cache,

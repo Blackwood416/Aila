@@ -6,6 +6,8 @@
 #include <sstream>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -531,14 +533,38 @@ int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool 
         std::string model_input = normalize_input_for_model(input);
 
         std::cout << "\nAila: ";
+        auto t_start = std::chrono::high_resolution_clock::now();
+        int token_count = 0;
+        double ttft_ms = 0.0;
+
         if (stream_output) {
-            engine.generate(model_input, gen_config, [](const std::string& token_text) {
+            engine.generate(model_input, gen_config, [&](const std::string& token_text) {
+                if (token_count == 0) {
+                    auto t_first = std::chrono::high_resolution_clock::now();
+                    ttft_ms = std::chrono::duration<double, std::milli>(t_first - t_start).count();
+                }
+                ++token_count;
                 std::cout << token_text << std::flush;
             });
+            auto t_end = std::chrono::high_resolution_clock::now();
+            double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            double gen_ms = total_ms - ttft_ms;
+            double gen_tok_s = (token_count > 1 && gen_ms > 0)
+                ? (static_cast<double>(token_count - 1) / gen_ms * 1000.0) : 0.0;
+            if (token_count > 0 && total_ms > 0) {
+                std::cout << "\n[TTFT: " << std::fixed << std::setprecision(0)
+                          << ttft_ms << "ms, " << token_count << " tokens";
+                if (gen_tok_s > 0)
+                    std::cout << ", " << std::setprecision(1) << gen_tok_s << " tok/s";
+                std::cout << "]";
+            }
             std::cout << std::endl;
         } else {
             std::string response = engine.generate(model_input, gen_config, nullptr);
+            auto t_end = std::chrono::high_resolution_clock::now();
+            double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
             std::cout << response << std::endl;
+            std::cout << "[" << std::fixed << std::setprecision(0) << total_ms << "ms]" << std::endl;
         }
     }
 

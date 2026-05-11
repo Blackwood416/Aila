@@ -49,20 +49,6 @@ public:
                  Tensor& output,
                  int seq_len,
                  const sycl::ext::oneapi::bfloat16* add_residual = nullptr);
-    static bool try_forward_decode_qkv(Context& ctx,
-                                       Bnb4BitLinear& q_proj,
-                                       Bnb4BitLinear& k_proj,
-                                       Bnb4BitLinear& v_proj,
-                                       Tensor& input,
-                                       Tensor& q_output,
-                                       Tensor& k_output,
-                                       Tensor& v_output);
-    static bool try_forward_decode_gate_up(Context& ctx,
-                                           Bnb4BitLinear& gate_proj,
-                                           Bnb4BitLinear& up_proj,
-                                           Tensor& input,
-                                           Tensor& gate_output,
-                                           Tensor& up_output);
     static bool try_forward_decode_gate_up_swiglu(Context& ctx,
                                                   Bnb4BitLinear& fused_gate_up,
                                                   Tensor& input,
@@ -84,18 +70,12 @@ private:
     Tensor owned_packed_weight_;
     Tensor absmax_f32_;
     Tensor cached_weight_bf16_;
-    Tensor blocked_packed_;
-    Tensor blocked_absmax_;
     int in_features_ = 0;
     int out_features_ = 0;
     bool force_dequant_cache_ = false;
     bool release_quant_after_cache_ = false;
     bool cache_dequantized_weight_ = false;
     bool cached_weight_ready_ = false;
-    bool blocked_ready_ = false;
-
-    void ensure_blocked_weights(Context& ctx);
-
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;
     dnnl::memory::desc decode_weight_md_;

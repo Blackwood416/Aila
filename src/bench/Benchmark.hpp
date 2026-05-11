@@ -21,6 +21,7 @@ struct BenchmarkResult {
     double decode_ms_avg       = 0.0;
     double prefill_ms_stddev   = 0.0;
     double decode_ms_stddev    = 0.0;
+    double ttft_ms_avg         = 0.0;
     int    prompt_tokens       = 0;
     int    gen_tokens          = 0;
     bool   decode_do_sample    = false;

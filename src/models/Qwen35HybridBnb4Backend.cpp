@@ -71,12 +71,6 @@ bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
     return false;
 }
 
-constexpr int kDecodeFfnHidden = 1024;
-constexpr int kDecodeFfnIntermediate = 3584;
-constexpr int kDecodeFfnTile = 8;
-constexpr int kDecodeFfnK = 16;
-constexpr int kDecodeFfnSubgroup = 8;
-
 bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,
                                         int head_k_dim, int head_v_dim,
                                         int kernel, int conv_rows,
@@ -227,125 +221,6 @@ void Qwen35HybridBnb4Backend::ensure_incr_prefill_scores(Context& ctx, int seq_l
                   incr_prefill_seq_cap_, incr_prefill_total_cap_);
 }
 
-bool Qwen35HybridBnb4Backend::use_decode_ffn_custom_path(int seq_len) const {
-    (void)seq_len;
-    return false;
-}
-
-bool Qwen35HybridBnb4Backend::use_decode_jm_custom_path(int seq_len) const {
-    (void)seq_len;
-    return false;
-}
-
-void Qwen35HybridBnb4Backend::run_decode_ffn_gate_up_swiglu_custom(
-    Context& ctx, const Layer& layer, Tensor& input, Tensor& output) {
-    using vec8 = sycl::vec<bf16, 8>;
-    const bf16* input_ptr = static_cast<const bf16*>(input.data());
-    const bf16* weight_ptr = static_cast<const bf16*>(layer.gate_up_weight_jm->data());
-    bf16* output_ptr = static_cast<bf16*>(output.data());
-
-    constexpr int sg_size = kDecodeFfnSubgroup;
-    constexpr int ff_dim = kDecodeFfnIntermediate;
-    constexpr int hidden = kDecodeFfnHidden;
-    constexpr int vec_width = 8;
-    const int vec_chunks = hidden / vec_width;
-    const int tail_start = vec_chunks * vec_width;
-    const vec8* input_vec = reinterpret_cast<const vec8*>(input_ptr);
-    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
-
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(ff_dim * sg_size), sycl::range<1>(sg_size)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
-                auto sg = item.get_sub_group();
-                const int row = static_cast<int>(item.get_group(0));
-                const int lane = static_cast<int>(item.get_local_id(0));
-                const vec8* gate_row = weight_vec + row * vec_chunks;
-                const vec8* up_row = weight_vec + (ff_dim + row) * vec_chunks;
-                float gate_acc = 0.0f;
-                float up_acc = 0.0f;
-
-                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
-                    vec8 in_v = input_vec[chunk];
-                    vec8 gate_v = gate_row[chunk];
-                    vec8 up_v = up_row[chunk];
-                    for (int i = 0; i < vec_width; ++i) {
-                        gate_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(gate_v[i]), gate_acc);
-                        up_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(up_v[i]), up_acc);
-                    }
-                }
-
-                for (int k = tail_start + lane; k < hidden; k += sg_size) {
-                    const float in_v = static_cast<float>(input_ptr[k]);
-                    gate_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[row * hidden + k]), gate_acc);
-                    up_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[(ff_dim + row) * hidden + k]), up_acc);
-                }
-
-                gate_acc = sycl::reduce_over_group(sg, gate_acc, sycl::plus<float>());
-                up_acc = sycl::reduce_over_group(sg, up_acc, sycl::plus<float>());
-
-                if (lane == 0) {
-                    const float silu_gate = gate_acc / (1.0f + sycl::native::exp(-gate_acc));
-                    output_ptr[row] = bf16(silu_gate * up_acc);
-                }
-            });
-    });
-}
-
-void Qwen35HybridBnb4Backend::run_decode_ffn_down_custom(
-    Context& ctx, const Layer& layer, Tensor& input, Tensor& output) {
-    run_decode_jm_matvec_custom(ctx, input, *layer.down_weight_jm,
-                                kDecodeFfnIntermediate, kDecodeFfnHidden, output);
-}
-
-void Qwen35HybridBnb4Backend::run_decode_jm_matvec_custom(
-    Context& ctx, Tensor& input, const Tensor& weight_jm,
-    int in_dim, int out_dim, Tensor& output) {
-    using vec8 = sycl::vec<bf16, 8>;
-    const bf16* input_ptr = static_cast<const bf16*>(input.data());
-    const bf16* weight_ptr = static_cast<const bf16*>(weight_jm.data());
-    bf16* output_ptr = static_cast<bf16*>(output.data());
-
-    constexpr int sg_size = kDecodeFfnSubgroup;
-    constexpr int vec_width = 8;
-    const int vec_chunks = in_dim / vec_width;
-    const int tail_start = vec_chunks * vec_width;
-    const vec8* input_vec = reinterpret_cast<const vec8*>(input_ptr);
-    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
-
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(out_dim * sg_size), sycl::range<1>(sg_size)),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
-                auto sg = item.get_sub_group();
-                const int row = static_cast<int>(item.get_group(0));
-                const int lane = static_cast<int>(item.get_local_id(0));
-                const vec8* weight_row = weight_vec + row * vec_chunks;
-                float acc = 0.0f;
-
-                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
-                    vec8 in_v = input_vec[chunk];
-                    vec8 w_v = weight_row[chunk];
-                    for (int i = 0; i < vec_width; ++i) {
-                        acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(w_v[i]), acc);
-                    }
-                }
-
-                for (int k = tail_start + lane; k < in_dim; k += sg_size) {
-                    acc = sycl::fma(static_cast<float>(input_ptr[k]),
-                                    static_cast<float>(weight_ptr[row * in_dim + k]),
-                                    acc);
-                }
-
-                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-
-                if (lane == 0) {
-                    output_ptr[row] = bf16(acc);
-                }
-            });
-    });
-}
-
 Qwen35HybridBnb4Backend::~Qwen35HybridBnb4Backend() {
     clear_mrope_positions();
 }
@@ -404,7 +279,6 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
     bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
     bool experimental_grouped_linear_gpu = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
     bool force_host_grouped_linear = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
-    decode_ffn_custom_enabled_ = false;
     bool is_exact_q35_0p8b_spec = is_exact_qwen35_hybrid_0p8b_spec(cfg_);
 
     int linear_conv_rows = std::max(0, linear_conv_kernel_dim_ - 1);
@@ -1952,12 +1826,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
             if (use_delta_linear_) {
                 if (seq_len == 1) {
                     time_stage(ProfileStage::LinearProj, [&] {
-                        if (use_decode_jm_custom_path(seq_len) && layer.linear_all_weight_jm != nullptr) {
-                            run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.linear_all_weight_jm,
-                                                        hidden_size_, linear_all_dim_, buf_.linear_all);
-                        } else {
-                            layer.linear_all_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.linear_all, seq_len);
-                        }
+                        layer.linear_all_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.linear_all, seq_len);
                     });
                     time_stage(ProfileStage::LinearDelta, [&] {
                         bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
@@ -2076,12 +1945,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 });
             }
             time_stage(ProfileStage::LinearOProj, [&] {
-                if (use_decode_jm_custom_path(seq_len) && layer.linear_o_weight_jm != nullptr) {
-                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.linear_o_weight_jm,
-                                                linear_kv_dim_, hidden_size_, buf_.gate);
-                } else {
-                    layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
-                }
+                layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
             });
         } else {
             Tensor q_decode_view;
@@ -2094,12 +1958,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
 
             if (seq_len == 1) {
                 time_stage(ProfileStage::FullQkvProj, [&] {
-                    if (use_decode_jm_custom_path(seq_len) && layer.qkv_weight_jm != nullptr) {
-                        run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.qkv_weight_jm,
-                                                    hidden_size_, full_fused_qkv_dim_, buf_.full_qkv);
-                    } else {
-                        layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.full_qkv, seq_len);
-                    }
+                    layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.full_qkv, seq_len);
                 });
                 time_stage(ProfileStage::FullSplit, [&] {
                     bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
@@ -2235,12 +2094,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 }
             }
             time_stage(ProfileStage::FullOProj, [&] {
-                if (use_decode_jm_custom_path(seq_len) && layer.o_weight_jm != nullptr) {
-                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.o_weight_jm,
-                                                full_q_dim_, hidden_size_, buf_.gate);
-                } else {
-                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
-                }
+                layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
             });
         }
         if (debug_this_layer && seq_len > 0) {
@@ -2267,16 +2121,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
             log_row_stats(tag2, buf_.normed, dbg_row, hidden_size_);
         }
 
-        if (use_decode_ffn_custom_path(seq_len)) {
-            time_stage(ProfileStage::FfnProj, [&] {
-                run_decode_ffn_gate_up_swiglu_custom(ctx, layer, buf_.normed, buf_.gate);
-            });
-            time_stage(ProfileStage::FfnAct, [&] {
-            });
-            time_stage(ProfileStage::DownProj, [&] {
-                run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
-            });
-        } else if (seq_len == 1) {
+        if (seq_len == 1) {
             // Fused gate+up GEMV + SiLU in one kernel (no SLM, vec8+FMA).
             // Falls back to separate path if packed weights are unavailable.
             bool fused_ok = false;

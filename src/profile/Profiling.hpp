@@ -13,7 +13,7 @@
 
 namespace aila {
 
-enum class LogLevel { Debug = 0, Info = 1, Warning = 2, Error = 3 };
+enum class LogLevel { Verbose = -1, Debug = 0, Info = 1, Warning = 2, Error = 3 };
 
 // C-compatible callback signature (also used by C API)
 using LogCallback = void(*)(int level, const char* message, void* user_data);
@@ -38,6 +38,7 @@ inline LogLevel log_level_from_string(const std::string& s) {
     for (char c : s) {
         lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }
+    if (lower == "verbose" || lower == "trace" || lower == "-1") return LogLevel::Verbose;
     if (lower == "debug" || lower == "0")   return LogLevel::Debug;
     if (lower == "warning" || lower == "warn" || lower == "2") return LogLevel::Warning;
     if (lower == "error" || lower == "3")   return LogLevel::Error;
@@ -47,6 +48,7 @@ inline LogLevel log_level_from_string(const std::string& s) {
 // Get human-readable name for log level
 inline const char* log_level_name(LogLevel level) {
     switch (level) {
+        case LogLevel::Verbose: return "verbose";
         case LogLevel::Debug:   return "debug";
         case LogLevel::Info:    return "info";
         case LogLevel::Warning: return "warning";
@@ -56,6 +58,7 @@ inline const char* log_level_name(LogLevel level) {
 }
 
 // Convenience macros
+#define AILA_LOG_VERBOSE(...) ::aila::log(::aila::LogLevel::Verbose, __VA_ARGS__)
 #define AILA_LOG_DEBUG(...) ::aila::log(::aila::LogLevel::Debug, __VA_ARGS__)
 #define AILA_LOG_INFO(...)  ::aila::log(::aila::LogLevel::Info, __VA_ARGS__)
 #define AILA_LOG_WARN(...)  ::aila::log(::aila::LogLevel::Warning, __VA_ARGS__)

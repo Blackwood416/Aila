@@ -125,6 +125,8 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     result.decode_ms_stddev = compute_stddev(tg_times, result.decode_ms_avg);
     result.decode_tok_per_sec = cfg.gen_length / (result.decode_ms_avg / 1000.0);
 
+    result.ttft_ms_avg = result.prefill_ms_avg + result.decode_ms_avg / cfg.gen_length;
+
     return result;
 }
 
@@ -170,6 +172,16 @@ void print_benchmark_results(const BenchmarkResult& r) {
               << std::setw(14) << tg_ms_per_tok
               << std::setw(14) << r.decode_ms_avg
               << std::setw(14) << r.decode_ms_stddev
+              << std::endl;
+
+    // TTFT row (prefill + first decode step)
+    std::cout << std::left << std::setw(12) << "  ttft"
+              << std::right << std::fixed << std::setprecision(2)
+              << std::setw(10) << (r.prompt_tokens + 1)
+              << std::setw(14) << "-"
+              << std::setw(14) << "-"
+              << std::setw(14) << r.ttft_ms_avg
+              << std::setw(14) << "-"
               << std::endl;
 
     std::cout << "========================================" << std::endl;
