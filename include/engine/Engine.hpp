@@ -243,25 +243,20 @@ public:
             }
 
             backend_->reset();
-            std::vector<Message> warmup_messages = {
-                Message{"system", {ContentPart{ContentType::Text, "You are a helpful assistant.", ""}}},
-                Message{"user", {ContentPart{ContentType::Text, "Warmup.", ""}}}
-            };
-            std::vector<int> warmup_ids;
-            std::string warmup_err;
-            if (!template_registry_.render(model_spec_, tokenizer_, warmup_messages,
-                                           vision_backend_enabled_, true, warmup_ids, &warmup_err)) {
-                AILA_LOG_WARN("[Warmup] Template render failed (%s), fallback to legacy tokenizer template",
-                              warmup_err.c_str());
-                warmup_ids = tokenizer_.apply_chat_template("You are a helpful assistant.", "Warmup.");
-            }
-            int* warmup_token_ids = static_cast<int*>(
-                ctx_->alloc_device(warmup_ids.size() * sizeof(int)));
-            ctx_->memcpy_h2d_async(warmup_token_ids, warmup_ids.data(),
-                                   warmup_ids.size() * sizeof(int));
+
+            // Lightweight warmup: 2-token prefill (like llama.cpp's approach).
+            // A pure decode (seq_len=1) would skip prefill-score buffer allocation;
+            // the first real prefill would then allocate a large buffer directly
+            // and occasionally trigger GPU-level crashes on Arc A770.  Two tokens
+            // trigger the prefill path with a 2×2 score buffer (~tens of bytes),
+            // exercising the same allocation path as a real prefill at minimal cost.
+            int warmup_token_id = (config_.bos_token_id >= 0) ? config_.bos_token_id : 0;
+            int warmup_arr[2] = {warmup_token_id, warmup_token_id};
+            int* warmup_token_ids = static_cast<int*>(ctx_->alloc_device(2 * sizeof(int)));
+            ctx_->memcpy_h2d_async(warmup_token_ids, warmup_arr, 2 * sizeof(int));
 
             auto t_warmup_start = std::chrono::high_resolution_clock::now();
-            Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, static_cast<int>(warmup_ids.size()));
+            Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, 2);
             int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
             ctx_->synchronize();
