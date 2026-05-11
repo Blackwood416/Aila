@@ -13,7 +13,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 | `AILA_DECODE_CHUNK_SIZE` | int | `12` | Non-streaming greedy decode chunk size (tokens per host sync) |
 | `AILA_STREAM_CHUNK_SIZE` | int | `4` | Streaming greedy decode chunk size |
 | `AILA_STREAM_OUTPUT` | int | auto | Force streaming (`1`) or non-streaming (`0`). Auto-detected from terminal type when not set |
-| `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
+| `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `verbose` (-1), `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
 | `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (skip for unsupported specs) |
 
 ---
@@ -23,7 +23,8 @@ Aila supports the following environment variables for runtime configuration. Boo
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_BNB4_CACHE_DEQUANT` | bool | `false` | Cache dequantized bf16 weights in GPU memory. Saves dequant cost but increases VRAM ~2 GB for 4B models. Recommended off for large prefill |
-| `AILA_BNB4_BLOCKED_GEMV` | bool | `false` | Use experimental blocked-weight layout for decode GEMV. Currently regresses performance (~20%), kept for experimentation |
+| `AILA_BNB4_GEMV_WG` | int | `256` | Override GEMV SG16 work-group size (min 32). Controls rows-per-WG: rows = WG / 16 |
+| `AILA_FUSE_RESIDUAL_ADD` | bool | `false` | Fuse residual +=hidden into O-proj and down GEMV outputs (experimental, -1.5% decode regression on tested config) |
 | `AILA_BNB4_FUSED_PREFILL` | bool | `true` | Enable fused NF4 dequant + matmul kernel for prefill. Disable only for debugging |
 
 ---

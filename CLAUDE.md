@@ -14,7 +14,7 @@ Requires: Intel oneAPI Base Toolkit (compiler + oneDNN), CMake ≥ 3.24.
 
 ```bash
 # Smoke test
-echo -e 'What is 2+2?\n/quit\n' | ./build/Aila.exe -m '<model>' --max-tokens 32 --greedy --no-stream 2>/dev/null
+pwsh smoke.ps1 -AilaExe ./build/Aila.exe -ModelDir '<model>'
 
 # Benchmark
 pwsh bench.ps1 -ModelDir '<model>' -PromptTokens 2048 -GenTokens 512 -BenchIters 3 -WarmupIters 1

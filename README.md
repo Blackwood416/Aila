@@ -114,7 +114,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `--bench-iters <N>` | Benchmark iterations | 5 |
 | `--bench-warmup <N>` | Benchmark warmup iterations | 1 |
 | `--bench-sample` / `--bench-greedy` | Benchmark decode mode | greedy |
-| `--log-level <level>` | Minimum log level (debug/info/warning/error) | info |
+| `--log-level <level>` | Minimum log level (verbose/debug/info/warning/error) | info |
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
 | `-h, --help` | Show help | — |
 | `-v, --version` | Show version | — |
@@ -133,7 +133,7 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/stream_on` / `/stream_off` | Toggle streaming |
 | `/decode_chunk <N>` | Set decode chunk size |
 | `/stream_chunk <N>` | Set stream chunk size |
-| `/log_level <level>` | Set log level (debug/info/warning/error) |
+| `/log_level <level>` | Set log level (verbose/debug/info/warning/error) |
 | `/config` | Show current configuration |
 
 ### 🤫 `/no_think` and `/think` Suffixes
