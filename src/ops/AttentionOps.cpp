@@ -441,15 +441,29 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
           }
           item.barrier(sycl::access::fence_space::local_space);
 
-          for (int d = lid; d < head_dim; d += wg_size) {
-            float acc = 0.0f;
+          // V accumulation: work-items 0..(head_dim/8-1) each handle 8
+          // output dims with vec8 loads — coalesces V reads and shares
+          // the probability across 8 dot products, cutting SLM reads 8×.
+          using vec8 = sycl::vec<bf16, 8>;
+          const int kv_cache_offset = kv_head * max_seq_len * head_dim;
+          if (lid * 8 < head_dim) {
+            float acc[8] = {};
             for (int t = 0; t < effective_len; t++) {
               int cache_t = attn_start + t;
-              acc += shared[t] *
-                     static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim +
-                                              cache_t * head_dim + d]);
+              float p = shared[t];
+              const vec8 v_row = *reinterpret_cast<const vec8*>(
+                  v_ptr + kv_cache_offset + cache_t * head_dim + lid * 8);
+              acc[0] += p * static_cast<float>(v_row[0]);
+              acc[1] += p * static_cast<float>(v_row[1]);
+              acc[2] += p * static_cast<float>(v_row[2]);
+              acc[3] += p * static_cast<float>(v_row[3]);
+              acc[4] += p * static_cast<float>(v_row[4]);
+              acc[5] += p * static_cast<float>(v_row[5]);
+              acc[6] += p * static_cast<float>(v_row[6]);
+              acc[7] += p * static_cast<float>(v_row[7]);
             }
-            o_ptr[head * head_dim + d] = bf16(acc);
+            for (int k = 0; k < 8; k++)
+              o_ptr[head * head_dim + lid * 8 + k] = bf16(acc[k]);
           }
         });
   });
