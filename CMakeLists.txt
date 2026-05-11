@@ -32,6 +32,11 @@ endif()
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsycl")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsycl")
+# Enable >4GB device allocations on Intel GPUs (passed through to IGC via -Xs)
+# NOTE: regresses decode ~10% on Arc A770.  Keep for reference; enable only if
+# >4GB buffers are actually needed (e.g. >13B models on 16GB GPUs).
+# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Xs -ze-intel-greater-than-4GB-buffer-required")
+# set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Xs -ze-intel-greater-than-4GB-buffer-required")
 
 # ============================================================
 # Source file lists

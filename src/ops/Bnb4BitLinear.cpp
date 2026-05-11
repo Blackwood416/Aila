@@ -655,25 +655,34 @@ void Bnb4BitLinear::finish_init(Context& ctx) {
         }
     }
 
-    decode_src_md_ = dnnl::memory::desc({1, in_features_}, dnnl::memory::data_type::bf16,
-                                        dnnl::memory::format_tag::ab);
-    decode_weight_md_ = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::bf16,
-                                           dnnl::memory::format_tag::ab);
-    decode_dst_md_ = dnnl::memory::desc({1, out_features_}, dnnl::memory::data_type::bf16,
-                                        dnnl::memory::format_tag::ab);
+    // Only create the oneDNN decode primitive if the NF4 fastpath is NOT available.
+    // When fastpath is available, decode (seq_len=1) uses the custom GEMV kernel
+    // exclusively — the oneDNN primitive would be dead weight.  If the fastpath
+    // later becomes unavailable (e.g. AILA_BNB4_CACHE_DEQUANT enabled), the
+    // primitive is created lazily on first use via ensure_primitive().
+    decode_inited_ = false;
+    bool need_decode_dnnl = !can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1);
+    if (need_decode_dnnl) {
+        decode_src_md_ = dnnl::memory::desc({1, in_features_}, dnnl::memory::data_type::bf16,
+                                            dnnl::memory::format_tag::ab);
+        decode_weight_md_ = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::bf16,
+                                               dnnl::memory::format_tag::ab);
+        decode_dst_md_ = dnnl::memory::desc({1, out_features_}, dnnl::memory::data_type::bf16,
+                                            dnnl::memory::format_tag::ab);
 
-    dnnl::primitive_attr attr;
-    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), decode_src_md_, decode_weight_md_, decode_dst_md_, attr);
-    decode_prim_ = dnnl::matmul(pd);
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        decode_scratchpad_ = Tensor::allocate(ctx,
-                                              {static_cast<int64_t>(scratchpad_size)},
-                                              dnnl::memory::data_type::u8);
-        decode_scratchpad_mem_ = decode_scratchpad_.make_dnnl_memory(pd.scratchpad_desc());
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        auto pd = dnnl::matmul::primitive_desc(ctx.engine(), decode_src_md_, decode_weight_md_, decode_dst_md_, attr);
+        decode_prim_ = dnnl::matmul(pd);
+        size_t scratchpad_size = pd.scratchpad_desc().get_size();
+        if (scratchpad_size > 0) {
+            decode_scratchpad_ = Tensor::allocate(ctx,
+                                                  {static_cast<int64_t>(scratchpad_size)},
+                                                  dnnl::memory::data_type::u8);
+            decode_scratchpad_mem_ = decode_scratchpad_.make_dnnl_memory(pd.scratchpad_desc());
+        }
+        decode_inited_ = true;
     }
-    decode_inited_ = true;
 
 }
 
