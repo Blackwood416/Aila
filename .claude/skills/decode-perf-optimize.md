@@ -29,146 +29,145 @@ AILA_PROFILE_Q35_DECODE=1 AILA_PROFILE_Q35_DECODE_EVERY=4 \
   --bench-iters 1 --bench-warmup 0
 ```
 
-The profile breaks decode time into stages:
-- `linear_proj` / `linear_delta` / `linear_o` — DeltaNet attention (per DeltaNet layer)
-- `full_qkv` / `attn` / `full_o` — GQA attention (per GQA layer)
-- `ffn_proj` / `ffn_act` / `down` — FFN (all layers)
-- `post_attn` / `post_mlp` — residual + RMS norm (all layers)
-- `lm_head` — output projection
+Profile stages: `linear_proj` → `linear_delta` → `linear_o` (DeltaNet), `full_qkv` → `attn` → `full_o` (GQA), `ffn_proj` → `ffn_act` → `down` (FFN), `post_attn` → `post_mlp` (RMS norms), `lm_head`.
+
+**Important**: Profile timings include `ctx.synchronize()` which serialises the pipeline. Real decode time (without profiling) is ~2× faster. Use the profile for RELATIVE comparison, not absolute tok/s.
 
 ### 3. Identify Targets
 
-Rank stages by `ms` descending. Focus on the largest contributors. The profile shows AGGREGATE time across all layers — divide by layer count to get per-layer cost.
+Rank stages by ms, divide by layer count for per-layer cost. Focus on the largest contributors.
 
 ### 4. Apply Optimizations
 
-See "Proven Optimizations" below for patterns that worked. Always measure before and after; revert immediately if regression.
+See "Proven Optimizations" below. Always build → smoke test → profile → benchmark. Revert if regressed; analyse why before giving up (some regressions reveal hardware constraints).
 
-### 5. Verify Correctness
+### 5. Verify
 
 ```bash
-# Smoke test model output quality
-echo -e "What is 2+2?\n/quit\n" | ./build/Aila.exe -m "<model>" \
-  --max-tokens 32 --greedy --no-stream 2>/dev/null
-
-# Run comprehensive benchmark
-pwsh bench.ps1 -ModelDir "<model>" \
-  -PromptTokens 2048 -GenTokens 1024 -BenchIters 3 -WarmupIters 1
+pwsh build.ps1
+echo -e "What is 2+2?\n/quit\n" | ./build/Aila.exe -m "<model>" --max-tokens 32 --greedy --no-stream 2>/dev/null
+pwsh bench.ps1 -ModelDir "<model>" -PromptTokens 2048 -GenTokens 1024 -BenchIters 3 -WarmupIters 1
 ```
 
 ## Proven Optimizations
 
-### Pattern 1: vec8 + FMA for Memory-Bound GEMV Kernels
+### Pattern 1: vec8 + FMA for Memory-Bound GEMV Kernels (+6.8%)
 
-**File**: `src/ops/Bnb4BitLinear.cpp` — `packed_nf4_gemv_bf16` SG16 path
+**File**: `src/ops/Bnb4BitLinear.cpp` — `packed_nf4_gemv_bf16` SG16 path (`f94af7d`)
 
-**Before**: 8 individual `input_ptr[...]` reads + separate multiply-then-add
-```cpp
-partial += static_cast<float>(input_ptr[input_base + 0]) * q0;
-partial += static_cast<float>(input_ptr[input_base + 1]) * q1;
-// ... 6 more
-```
+Replace 8 individual `input_ptr[...]` reads with one `vec<bf16,8>` load + `sycl::fma` chain. Pre-compute `qmap[nybble]*am` inline in the FMA to avoid 8 named float temporaries. GEMV ops 8-11% faster.
 
-**After**: One coalesced `vec<bf16,8>` load + `sycl::fma` chain
-```cpp
-const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
-partial = sycl::fma(static_cast<float>(in_v[0]), d0, partial);
-partial = sycl::fma(static_cast<float>(in_v[1]), d1, partial);
-// ... 6 more
-```
+### Pattern 2: vec8 for Elementwise Kernels (+1.4%)
 
-**Why it works**: 
-- 8 individual 2-byte reads → 1 coalesced 16-byte vector load
-- Pre-compute dequantized weights (`d0..d7 = qmap[nybble] * am`) before FMA chain
-- `sycl::fma` maps to hardware fused multiply-add (1 instruction vs 2)
-- Separating dequant from FMA lets compiler schedule memory and compute independently
+**File**: `src/ops/NormOps.cpp` — `fused_add_rms_norm` (`ea1e1f2`)
 
-**Impact**: +6.8% decode (GEMV ops 8-11% faster)
+`vec<bf16,8>` loads for input, residual, weight tensors in RMS norm. For 1024-hidden path reduce WG from 256→128.
 
-### Pattern 2: vec8 for Elementwise Reduction Kernels
+### Pattern 3: Kernel Fusion Without SLM Barriers (+1.6%)
 
-**File**: `src/ops/NormOps.cpp` — `fused_add_rms_norm` seq_len==1 path
+**File**: `src/ops/Bnb4BitLinear.cpp` — `packed_nf4_gemv_gate_up_swiglu` (`3e2531e`)
 
-**Before**: Per-element `in_ptr[h] + res_ptr[h]` in a stride loop
-**After**: `vec<bf16,8>` loads for input, residual, and weight tensors
+Fused gate+up GEMV + SiLU. Removed SLM input caching (barrier overhead); SiLU computed AFTER subgroup reduction. Wired in `Qwen35HybridBnb4Backend.cpp` decode FFN path. Eliminates 32 kernel launches/token.
 
-**Key detail**: For the 1024-hidden specialised path, reduce work-group size from 256→128 so each item processes exactly one vec8.
+### Pattern 4: Compiler Flags (+3.7%, zero code changes)
 
-**Impact**: +1.4% decode (norm ops ~9% faster)
+**File**: `CMakeLists.txt` (`f842df6`)
 
-### Pattern 3: Kernel Fusion Without SLM Barriers
+Only ONE flag actually works on Windows icx-cl:
+- `-fsycl-default-sub-group-size 16` — match DG2 native SIMD width (+3.7% decode)
 
-**File**: `src/ops/Bnb4BitLinear.cpp` — `packed_nf4_gemv_gate_up_swiglu`
+All `-Xsycl-target-backend` flags (`-cl-fast-relaxed-math`, `-cl-mad-enable`, `-ze-opt-large-register-file`, `-force_stos_opt`) are IGNORED on icx-cl (produce "unused" warnings). AOT (`-fsycl-targets=spir64_gen`) causes runtime crash. `-ftarget-register-alloc-mode=large` also unused.
 
-**Original problem**: The fused gate+up GEMV + SiLU kernel used SLM input caching with a `barrier()`, causing significant slowdown.
+### Pattern 5: Barrier Reduction in JM Attention (minor, no regression)
 
-**Fix**: Remove SLM entirely. Use the same vec8+FMA direct global memory access pattern as the standalone GEMV. The SiLU (`gate / (1 + exp(-gate))`) is computed once per output row AFTER the subgroup reduction — outside the memory-bound inner loop.
+**File**: `src/ops/AttentionOps.cpp` (`898f5df`)
 
-**Key principle**: Never add compute (especially exp/div) to the inner loop of a memory-bound kernel. Compute heavy ops go AFTER the reduction, where they execute once per output row, not once per weight element.
+Pre-load entire Q vector (256 bf16 = 512 bytes) into SLM once per JM tile instead of per-K-block. Eliminates 15 barriers per tile. attn: 2.60→2.53ms.
 
-**Wiring**: In `src/models/Qwen35HybridBnb4Backend.cpp` decode FFN path:
-```cpp
-bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-    ctx, layer.gate_up_proj, buf_.normed, buf_.gate, ff_dim_);
-```
+### Pattern 6: vec8 V Accumulation in Attention Phase 2 (minor)
 
-**Impact**: +1.6% decode (eliminates 32 SiLU kernel launches per token)
+**File**: `src/ops/AttentionOps.cpp` (`e9918ea`)
 
-### Pattern 4: GEMV FMA Without Unrolling
+vec8 loads for V cache reads; probability shared across 8 output dims. No regression but limited impact (softmax reductions dominate Phase 2).
 
-The 2x unrolled GEMV variant (-0.7ms regression) increased register pressure, causing spills. Keep the single-iteration-per-chunk structure with vec8+FMA — it achieves the best balance of ILP and register usage.
+### Pattern 7: Inline dequant into FMA (code quality, flat benchmark)
+
+**File**: `src/ops/Bnb4BitLinear.cpp` (`2b0b79f`)
+
+Eliminate 8 intermediate float variables (d0-d7). Compiler already reuses registers; benchmark flat but cleaner code.
+
+### Pattern 8: static env var caching (CPU overhead reduction)
+
+**Files**: `src/models/Qwen35HybridBnb4Backend.cpp`, `Qwen35HybridTextBackend.cpp` (`997fbae`)
+
+10 `env::read_*` calls per token (each does malloc+atoi+free on Windows). Convert to `static const` locals. GPU-dominated benchmark flat but eliminates unnecessary syscalls.
 
 ## Regressed Optimizations (Do Not Attempt)
 
 | Optimization | Regression | Root Cause |
 |---|---|---|
-| SLM input caching in GEMV | +15ms | `item.barrier()` sync across 448 work-groups |
-| Blocked weight layout GEMV | +15ms | Transposed layout scatters cache lines; only helps GEMM (batch>1), not GEMV |
-| oneDNN cached dequant | +5ms | bf16 weights use 4× VRAM; oneDNN matmul optimised for batch>1 |
-| JM bf16 FFN (bypass NF4) | +4ms | bf16 reads 4× more weight data than NF4 packed; bandwidth loss dominates |
-| uint64 weight loads | +3ms | Intel SIMD optimised for uint32; uint64 byte extraction adds shift+mask cost |
-| SiLU inner-loop fusion | +2ms | exp/div in memory-bound inner loop adds compute latency |
-| Linear delta loop fusion | +0.5ms | Recomputing decay in second loop costs more than saved S matrix write |
-| 2× GEMV unroll | +0.7ms | Register pressure causes spills to stack |
+| SLM input caching in GEMV | +15ms | Barrier sync; 16 lanes × 4 SLM banks = 64 accesses onto 32 banks → 2× bank conflict |
+| Blocked weight layout GEMV | +15ms | Transposed layout scatters cache lines |
+| oneDNN cached dequant | +5ms | bf16 weights use 4× VRAM; oneDNN for batch>1 |
+| JM bf16 FFN (bypass NF4) | +4ms | bf16 reads 4× more weight data |
+| uint64 weight loads | +3ms | Intel SIMD prefers uint32 |
+| SiLU inner-loop fusion | +2ms | exp/div in memory-bound inner loop |
+| Cooperative GEMV (SLM input + 2 rows/sg) | +4.7ms | SLM bank conflicts; occupancy loss for small out_features |
+| 2 rows/subgroup (runtime threshold) | -1.2 tok/s | Loop overhead from runtime rows_per_sg variable |
+| Linear delta loop fusion | +0.5ms | Recomputing decay costs more than saved S writes |
+| 2× GEMV unroll | +0.7ms | Register pressure spills |
+| RoPE pre-compute + SLM freq | +3ms | USM malloc+memcpy overhead |
+| vec_u32x2 wider GEMV loads | flat | Double register pressure cancels ILP gain |
 
 ## Key Architectural Insights
 
 ### NF4 Bandwidth Advantage Is Fundamental
-NF4 packs 4 bits per weight → 4× less memory traffic than bf16. Any optimization that increases weight read size (JM bf16, oneDNN cache) eliminates this advantage. The GEMV kernels are memory-bandwidth-bound at ~3.3 GB/s effective, so bandwidth savings always beat compute savings.
+NF4: 0.5 bytes/weight. bf16: 2 bytes/weight. Any bf16 path reads 4× more data → always slower for GEMV.
 
 ### Memory-Bound vs Compute-Bound
-The GEMV inner loop reads one uint32_t (4 bytes) of packed weight per iteration. At ~3.3 GB/s effective bandwidth, each byte takes ~300ps. The compute (dequant + FMA) takes ~50ps. The inner loop is 85% memory-wait, 15% compute. Adding ANY compute to the inner loop directly increases total time.
+GEMV inner loop is ~85% memory-wait. Adding ANY compute (exp, div, extra loads) to inner loop = direct latency increase.
 
-### Kernel Launch Overhead
-Each `queue::submit()` costs ~100μs on Intel SYCL. With ~200+ submissions per token, overhead is ~20ms. Fusion eliminates submissions — the fused FFN path saves 32 submissions (3.2ms) per token.
+### SLM Bank Conflicts
+A770 has 32 SLM banks (4-byte granularity). vec8 load = 16 bytes = 4 banks per lane. 16 lanes × 4 banks = 64 accesses onto 32 banks → 2× bank conflict. SLM caching of input vector is WORSE than L1-cached global reads.
 
-### Barriers Are Expensive
-`item.barrier(access::fence_space::local_space)` synchronizes all work-items in a group. For large group counts (e.g., 448 groups in gate_up GEMV), total barrier time dominates. Only use barriers when strictly necessary (quant_map load, subgroup reduction).
+### ~290 Kernel Launches per Token
+Each `queue::submit()` ≈ 100μs CPU overhead. Fusion is the only way to reduce this, but most fusions add memory/compute overhead that outweighs launch savings.
 
-### Intel SIMD Preferences
-- uint32 loads: optimal (native SIMD width)
-- uint64 loads: slower (requires decomposition into two 32-bit ops + shift/merge)
-- vec<bf16,8>: good (16-byte aligned, single instruction)
-- SG16: best for large hidden dims (>768 packed bytes per row)
-- SG8: best for small hidden dims
+### Profiling Overhead
+Decode profile with `AILA_PROFILE_Q35_DECODE=1` adds `ctx.synchronize()` after each stage → serialises the async pipeline. Actual benchmark (without profiling) is ~2× faster. Use profile only for RELATIVE comparison.
+
+### icx-cl Flag Support
+On Windows, `-Xsycl-target-backend` flags are silently ignored. The ONLY GPU tuning flag that works is `-fsycl-default-sub-group-size 16`.
+
+### Decode Path Structure
+~290 kernel launches/token across 32 layers. Each launch is a `queue::submit()` → ~29ms CPU overhead (overlapped with GPU execution in in-order queue). Further fusion faces barrier/compute trade-offs.
+
+## Final Performance (pp2048 tg1024, Arc A770)
+
+| Metric | Baseline | Final | Improvement |
+|--------|----------|-------|-------------|
+| Prefill | 1606 tok/s | 1637 tok/s | +1.9% |
+| Decode | 50.45 tok/s | 57.9 tok/s | +14.8% |
+| vs llama.cpp Vulkan | -16.4% | -4.0% | gap narrowed 12.4pp |
 
 ## Commit History
-
-For reference, the commits on the decode optimization path:
 
 ```
 f94af7d perf: vec8 input loads + sycl::fma in packed_nf4_gemv_bf16 decode path
 ea1e1f2 perf: vec8 loads in fused_add_rms_norm decode path
 3e2531e perf: rewrite packed_nf4_gemv_gate_up_swiglu with vec8+FMA, no SLM
+997fbae perf: cache env var reads as static locals in hybrid backend forward()
+2b0b79f perf: inline NF4 dequant into FMA chain in packed_nf4_gemv_bf16
+b874c82 perf: add GPU compiler flags (subgroup size, fast math, large GRF)
+f842df6 perf: add default sub-group size 16 compiler flag (clean, no warnings)
+898f5df perf: pre-load entire Q vector into SLM in JM attention decode
+e9918ea perf: vec8 V accumulation in JM attention decode Phase 2
 ```
 
 ## Quick Verification
 
-After making changes:
 ```bash
 pwsh build.ps1
-echo -e "What is 2+2?\n/quit\n" | ./build/Aila.exe -m "<model>" \
-  --max-tokens 32 --greedy --no-stream 2>/dev/null
-pwsh bench.ps1 -ModelDir "<model>" -PromptTokens 2048 -GenTokens 1024 \
-  -BenchIters 3 -WarmupIters 1
+echo -e "What is 2+2?\n/quit\n" | ./build/Aila.exe -m "<model>" --max-tokens 32 --greedy --no-stream 2>/dev/null
+pwsh bench.ps1 -ModelDir "<model>" -PromptTokens 2048 -GenTokens 1024 -BenchIters 3 -WarmupIters 1
 ```
