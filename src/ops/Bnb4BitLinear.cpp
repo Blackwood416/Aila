@@ -274,7 +274,8 @@ void packed_nf4_gemv_bf16(Context& ctx,
                           Tensor& input,
                           Tensor& output,
                           int in_features,
-                          int out_features) {
+                          int out_features,
+                          const bf16* add_residual = nullptr) {
     const uint8_t* packed_ptr = static_cast<const uint8_t*>(weight.packed_weight->data());
     const float* quant_map_ptr = static_cast<const float*>(weight.quant_map->data());
     const float* absmax_ptr = static_cast<const float*>(absmax_f32.data());
@@ -285,7 +286,7 @@ void packed_nf4_gemv_bf16(Context& ctx,
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const bool use_sg16 = (packed_bytes_per_row >= 768);
+    const bool use_sg16 = (packed_bytes_per_row >= 256);
 
     if (!use_sg16) {
         const size_t wg_size = packed_bytes_per_row >= 1024 ? 256 : 128;
@@ -318,14 +319,17 @@ void packed_nf4_gemv_bf16(Context& ctx,
 
                 const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
                 if (lid == 0) {
-                    out_ptr[output_index] = bf16(sum);
+                    float val = sum;
+                    if (add_residual != nullptr) val += static_cast<float>(add_residual[output_index]);
+                    out_ptr[output_index] = bf16(val);
                 }
             });
         });
         return;
     }
 
-    const size_t wg_size = 256;
+    static const int gemv_wg_override = aila::env::read_int_raw("AILA_BNB4_GEMV_WG", 0);
+    const size_t wg_size = (gemv_wg_override >= 32) ? static_cast<size_t>(gemv_wg_override) : 256;
     const size_t sub_group_size = 16;
     const size_t num_sub_groups = wg_size / sub_group_size;
     const size_t rows_per_group = num_sub_groups;
@@ -790,11 +794,12 @@ void packed_nf4_gemv_bf16_2way(Context& ctx,
                                int out_features1,
                                const bf16* input_ptr,
                                int in_features,
-                               int blocksize) {
+                               int blocksize,
+                               const bf16* add_residual = nullptr) {
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const bool use_sg16 = (packed_bytes_per_row >= 768);
+    const bool use_sg16 = (packed_bytes_per_row >= 256);
 
     if (!use_sg16) {
         const int total_out_features = out_features0 + out_features1;
@@ -831,7 +836,9 @@ void packed_nf4_gemv_bf16_2way(Context& ctx,
 
                 const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
                 if (lid == 0) {
-                    out_ptr[output_index] = bf16(sum);
+                    float val = sum;
+                    if (add_residual != nullptr) val += static_cast<float>(add_residual[output_index]);
+                    out_ptr[output_index] = bf16(val);
                 }
             });
         });
@@ -929,11 +936,12 @@ void packed_nf4_gemv_bf16_3way(Context& ctx,
                                int out_features2,
                                const bf16* input_ptr,
                                int in_features,
-                               int blocksize) {
+                               int blocksize,
+                               const bf16* add_residual = nullptr) {
     const int packed_bytes_per_row = in_features / 2;
     const int packed_bytes_per_block = blocksize / 2;
     const int blocks_per_row = in_features / blocksize;
-    const bool use_sg16 = (packed_bytes_per_row >= 768);
+    const bool use_sg16 = (packed_bytes_per_row >= 256);
 
     if (!use_sg16) {
         const int first_cut = out_features0;
@@ -974,7 +982,9 @@ void packed_nf4_gemv_bf16_3way(Context& ctx,
 
                 const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
                 if (lid == 0) {
-                    out_ptr[output_index] = bf16(sum);
+                    float val = sum;
+                    if (add_residual != nullptr) val += static_cast<float>(add_residual[output_index]);
+                    out_ptr[output_index] = bf16(val);
                 }
             });
         });
@@ -1548,7 +1558,8 @@ void Bnb4BitLinear::forward(Context& ctx,
                             Bnb4BitLinearScratch& scratch,
                             Tensor& input,
                             Tensor& output,
-                            int seq_len) {
+                            int seq_len,
+                            const bf16* add_residual) {
     if (input.dtype() != dnnl::memory::data_type::bf16 ||
         output.dtype() != dnnl::memory::data_type::bf16) {
         throw std::runtime_error("Bnb4BitLinear expects bf16 input/output tensors");
@@ -1569,7 +1580,7 @@ void Bnb4BitLinear::forward(Context& ctx,
                 static_cast<bf16*>(output.data()),
                 out_features_, in_features_, weight_.quant_state.blocksize);
         } else {
-            packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_);
+            packed_nf4_gemv_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, add_residual);
         }
         return;
     }

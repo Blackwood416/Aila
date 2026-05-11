@@ -1931,6 +1931,12 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                       tag, mean, abs_mean, max_abs, v0, v1, v2, v3);
     };
 
+    static const bool s_fuse_residual = aila::env::read_flag("AILA_FUSE_RESIDUAL_ADD", false);
+    bf16* hidden_ptr_for_residual = nullptr;
+    if (seq_len == 1 && s_fuse_residual) {
+        hidden_ptr_for_residual = static_cast<bf16*>(buf_.hidden.data());
+    }
+
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         auto& layer = layers_[i];
         auto& cache = layer_caches_[i];
@@ -2074,7 +2080,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                     run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.linear_o_weight_jm,
                                                 linear_kv_dim_, hidden_size_, buf_.gate);
                 } else {
-                    layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len);
+                    layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
                 }
             });
         } else {
@@ -2233,7 +2239,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                     run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.o_weight_jm,
                                                 full_q_dim_, hidden_size_, buf_.gate);
                 } else {
-                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len);
+                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
                 }
             });
         }
@@ -2244,8 +2250,13 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
         }
 
         time_stage(ProfileStage::PostAttnNorm, [&] {
-            ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate, *layer.post_attn_ln_weight,
-                                    cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+            if (hidden_ptr_for_residual) {
+                ops::rms_norm(ctx, buf_.gate, *layer.post_attn_ln_weight,
+                              cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+            } else {
+                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate, *layer.post_attn_ln_weight,
+                                        cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+            }
         });
         if (debug_this_layer && seq_len > 0) {
             char tag1[64];
@@ -2284,7 +2295,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 });
             }
             time_stage(ProfileStage::DownProj, [&] {
-                layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len);
+                layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len, hidden_ptr_for_residual);
             });
         } else {
             time_stage(ProfileStage::FfnProj, [&] {
@@ -2295,17 +2306,27 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                 ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
             });
             time_stage(ProfileStage::DownProj, [&] {
-                layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len);
+                layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len, hidden_ptr_for_residual);
             });
         }
 
         time_stage(ProfileStage::PostMlpNorm, [&] {
-            if (i < cfg_.num_hidden_layers - 1) {
-                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *layers_[i + 1].input_ln_weight,
-                                        cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+            if (hidden_ptr_for_residual) {
+                if (i < cfg_.num_hidden_layers - 1) {
+                    ops::rms_norm(ctx, buf_.up, *layers_[i + 1].input_ln_weight,
+                                  cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+                } else {
+                    ops::rms_norm(ctx, buf_.up, *final_norm_weight_,
+                                  cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+                }
             } else {
-                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *final_norm_weight_,
-                                        cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+                if (i < cfg_.num_hidden_layers - 1) {
+                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *layers_[i + 1].input_ln_weight,
+                                            cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+                } else {
+                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *final_norm_weight_,
+                                            cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
+                }
             }
         });
         if (debug_this_layer && seq_len > 0) {

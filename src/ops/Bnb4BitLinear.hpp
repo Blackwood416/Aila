@@ -47,7 +47,8 @@ public:
                  Bnb4BitLinearScratch& scratch,
                  Tensor& input,
                  Tensor& output,
-                 int seq_len);
+                 int seq_len,
+                 const sycl::ext::oneapi::bfloat16* add_residual = nullptr);
     static bool try_forward_decode_qkv(Context& ctx,
                                        Bnb4BitLinear& q_proj,
                                        Bnb4BitLinear& k_proj,
