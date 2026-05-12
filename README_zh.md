@@ -23,7 +23,7 @@
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
 - **🔌 C API** — 稳定的 C FFI 接口（Python、C#、Rust、Go、Java）— 见 [docs/C_API.md](docs/C_API.md)
-- **💭 Chat 模板** — ChatML 格式，支持 `<think>` 块生成和 `/no_think` 抑制
+- **💭 Chat 模板** — ChatML 格式，支持 `<think>` 块生成和 `/no_think` / `/think` 思考模式指定
 
 ## 📦 支持的模型
 

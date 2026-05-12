@@ -23,7 +23,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
 - **🔌 C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
-- **💭 Chat template** — ChatML format with `<think>` block generation and `/no_think` suppression
+- **💭 Chat template** — ChatML format with `<think>` block generation and `/no_think` / `/think` thinking mode toggle
 
 ## 📦 Supported Models
 
