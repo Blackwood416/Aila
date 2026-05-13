@@ -1,5 +1,6 @@
 llama.cpp/
 oneDNN/
+vllm/
 build/
 bitsandbytes/
 /models/

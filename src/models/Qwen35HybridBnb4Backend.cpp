@@ -691,13 +691,15 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
 
     final_norm_weight_ = plus_one_norm_weight("model.language_model.norm.weight");
 
+    bool lm_head_loaded = false;
     if (weights.has("lm_head.weight") &&
         !weights.has("lm_head.weight.quant_state.bitsandbytes__nf4") &&
         weights.get("lm_head.weight").dtype() != dnnl::memory::data_type::u8) {
         Tensor* lm_w = transpose_weight("lm_head.weight");
         lm_head_.init(ctx, *lm_w, hidden_size_, cfg_.vocab_size, true);
+        lm_head_loaded = true;
         AILA_LOG_INFO("[Qwen3.5] lm_head loaded (standalone dense)");
-    } else {
+    } else if (cfg_.tie_word_embeddings) {
         bool tied_lm_head_ready = false;
         bool prefer_preprocessed_tied_lm_head = is_exact_q35_0p8b_spec && !force_direct_tied_lm_head;
         if (prefer_preprocessed_tied_lm_head) {
@@ -718,6 +720,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         }
         if (!tied_lm_head_ready) {
             lm_head_.init(ctx, *embed_weight_, hidden_size_, cfg_.vocab_size, false);
+            lm_head_loaded = true;
             if (force_direct_tied_lm_head) {
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight forced via AILA_Q35_DIRECT_TIED_LM_HEAD=1)");
             } else if (prefer_preprocessed_tied_lm_head) {
@@ -726,6 +729,46 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, direct embed weight for hybrid spec)");
             }
         }
+    }
+    if (!lm_head_loaded) {
+        // tie_word_embeddings=false with quantized lm_head — dequantize on GPU
+        Bnb4BitWeightRef lm_ref;
+        if (!LoadBnb4BitWeightRef(ctx, weights, "lm_head.weight", lm_ref, nullptr)) {
+            throw std::runtime_error("Qwen3.5 BNB: tie_word_embeddings=false but failed to load lm_head.weight ref");
+        }
+        int64_t lm_in = lm_ref.logical_in_features();
+        int64_t lm_out = lm_ref.logical_out_features();
+        int lm_blocksize = lm_ref.quant_state.blocksize;
+
+        Tensor lm_bf16 = Tensor::allocate(ctx, {lm_in, lm_out}, dnnl::memory::data_type::bf16);
+        const uint8_t* p_ptr = static_cast<const uint8_t*>(lm_ref.packed_weight->data());
+        const float* qm_ptr = static_cast<const float*>(lm_ref.quant_map->data());
+        const float* am_ptr = static_cast<const float*>(lm_ref.absmax->data());
+        bf16* out_ptr = static_cast<bf16*>(lm_bf16.data());
+        int64_t total_vals = lm_in * lm_out;
+        int64_t packed_bytes = lm_ref.packed_num_bytes();
+
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(packed_bytes)), [=](sycl::id<1> idx) {
+            int64_t bi = static_cast<int64_t>(idx[0]);
+            uint8_t p = p_ptr[bi];
+            uint8_t hi = static_cast<uint8_t>((p >> 4) & 0x0F);
+            uint8_t lo = static_cast<uint8_t>(p & 0x0F);
+            int64_t f0 = bi * 2;
+            if (f0 < total_vals) {
+                int64_t r = f0 / lm_in, c = f0 % lm_in;
+                out_ptr[c * lm_out + r] = bf16(qm_ptr[hi] * am_ptr[f0 / lm_blocksize]);
+            }
+            int64_t f1 = f0 + 1;
+            if (f1 < total_vals) {
+                int64_t r = f1 / lm_in, c = f1 % lm_in;
+                out_ptr[c * lm_out + r] = bf16(qm_ptr[lo] * am_ptr[f1 / lm_blocksize]);
+            }
+        });
+        ctx.synchronize();
+
+        lm_head_.init(ctx, lm_bf16, hidden_size_, cfg_.vocab_size, true);
+        lm_head_loaded = true;
+        AILA_LOG_INFO("[Qwen3.5] lm_head loaded (standalone, dequantized from NF4)");
     }
 
     ctx.synchronize();
