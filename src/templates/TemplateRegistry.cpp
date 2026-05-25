@@ -1,4 +1,9 @@
 #include "TemplateRegistry.hpp"
+#include "jinja/lexer.h"
+#include "jinja/parser.h"
+#include "jinja/runtime.h"
+#include "jinja/value.h"
+#include "profile/Profiling.hpp"
 #include <cctype>
 
 namespace aila {
@@ -183,6 +188,82 @@ bool render_chatml(const Tokenizer& tokenizer,
     return true;
 }
 
+bool render_jinja(const Tokenizer& tokenizer,
+                  const std::vector<Message>& messages,
+                  bool vision_enabled,
+                  bool add_generation_prompt,
+                  std::vector<int>& out_ids,
+                  std::string* error_message) {
+    try {
+        const std::string& chat_template = tokenizer.chat_template();
+        if (chat_template.empty()) {
+            set_error(error_message, "chat_template is empty");
+            return false;
+        }
+
+        jinja::lexer lex;
+        jinja::lexer_result lex_res;
+        try {
+            lex_res = lex.tokenize(chat_template);
+        } catch (const std::exception& e) {
+            set_error(error_message, std::string("Jinja tokenization failed: ") + e.what());
+            return false;
+        }
+
+        jinja::program program;
+        try {
+            program = jinja::parse_from_tokens(lex_res);
+        } catch (const std::exception& e) {
+            set_error(error_message, std::string("Jinja parsing failed: ") + e.what());
+            return false;
+        }
+
+        jinja::context ctx(chat_template);
+
+        ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(tokenizer.bos_token()));
+        ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(tokenizer.eos_token()));
+        ctx.set_val("add_generation_prompt", jinja::mk_val<jinja::value_bool>(add_generation_prompt));
+
+        auto messages_arr = jinja::mk_val<jinja::value_array>();
+        for (const auto& msg : messages) {
+            auto msg_obj = jinja::mk_val<jinja::value_object>();
+            msg_obj->insert("role", jinja::mk_val<jinja::value_string>(msg.role));
+
+            std::string text_content;
+            std::string err;
+            if (!collect_text_content(msg.content, vision_enabled, tokenizer, text_content, &err)) {
+                set_error(error_message, err);
+                return false;
+            }
+
+            auto val_content = jinja::mk_val<jinja::value_string>(text_content);
+            val_content->mark_input();
+
+            msg_obj->insert("content", val_content);
+            messages_arr->push_back(msg_obj);
+        }
+        ctx.set_val("messages", messages_arr);
+
+        jinja::runtime rt(ctx);
+        jinja::value_array res_arr;
+        try {
+            res_arr = rt.execute(program);
+        } catch (const std::exception& e) {
+            set_error(error_message, std::string("Jinja execution failed: ") + e.what());
+            return false;
+        }
+
+        jinja::value_string final_str = jinja::runtime::gather_string_parts(res_arr);
+        std::string rendered = jinja::render_string_parts(final_str);
+
+        out_ids = tokenizer.encode(rendered);
+        return true;
+    } catch (const std::exception& e) {
+        set_error(error_message, std::string("Jinja render failed with exception: ") + e.what());
+        return false;
+    }
+}
+
 } // namespace
 
 bool TemplateRegistry::render(const ModelSpec& spec,
@@ -192,6 +273,15 @@ bool TemplateRegistry::render(const ModelSpec& spec,
                               bool add_generation_prompt,
                               std::vector<int>& out_ids,
                               std::string* error_message) const {
+    if (!tokenizer.chat_template().empty()) {
+        std::string jinja_err;
+        if (render_jinja(tokenizer, messages, vision_enabled, add_generation_prompt, out_ids, &jinja_err)) {
+            return true;
+        }
+        AILA_LOG_WARN("[TemplateRegistry] Jinja render failed, falling back to legacy ChatML renderer. Error: %s",
+                      jinja_err.c_str());
+    }
+
     if (spec.family == ModelFamily::Qwen35Hybrid) {
         bool closed_think_prompt = is_exact_qwen35_hybrid_0p8b_spec(spec.qwen35_text);
         return render_chatml(tokenizer, messages, vision_enabled, add_generation_prompt, true,

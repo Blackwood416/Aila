@@ -203,6 +203,9 @@ bool Tokenizer::load(const std::string& model_dir) {
     merge_rank_.clear();
     special_tokens_.clear();
     special_token_order_.clear();
+    chat_template_.clear();
+    bos_token_.clear();
+    eos_token_.clear();
 
     auto load_special_tokens_from_tokenizer_json = [&]() {
         try {
@@ -252,21 +255,77 @@ bool Tokenizer::load(const std::string& model_dir) {
                                 std::istreambuf_iterator<char>());
             tf.close();
 
-            simdjson::padded_string tc_padded(tc_str);
-            simdjson::ondemand::parser tc_parser;
-            simdjson::ondemand::document tc_doc = tc_parser.iterate(tc_padded);
+            simdjson::dom::parser tc_parser;
+            simdjson::dom::element tc_root = tc_parser.parse(tc_str);
 
-            auto decoder_val = tc_doc["added_tokens_decoder"];
-            if (decoder_val.error() != simdjson::error_code::SUCCESS) {
+            // 1. 读取 chat_template
+            simdjson::dom::element chat_template_val;
+            if (tc_root.at_key("chat_template").get(chat_template_val) == simdjson::SUCCESS) {
+                std::string_view chat_template_sv;
+                if (chat_template_val.get_string().get(chat_template_sv) == simdjson::SUCCESS) {
+                    chat_template_ = std::string(chat_template_sv);
+                    AILA_LOG_INFO("[Tokenizer] Loaded chat_template from tokenizer_config.json (length: %zu)",
+                                  chat_template_.size());
+                }
+            }
+
+            // 2. 读取 bos_token
+            simdjson::dom::element bos_token_val;
+            if (tc_root.at_key("bos_token").get(bos_token_val) == simdjson::SUCCESS) {
+                std::string_view bos_sv;
+                if (bos_token_val.get_string().get(bos_sv) == simdjson::SUCCESS) {
+                    bos_token_ = std::string(bos_sv);
+                } else {
+                    simdjson::dom::object bos_obj;
+                    if (bos_token_val.get_object().get(bos_obj) == simdjson::SUCCESS) {
+                        std::string_view content_sv;
+                        if (bos_obj.at_key("content").get_string().get(content_sv) == simdjson::SUCCESS) {
+                            bos_token_ = std::string(content_sv);
+                        }
+                    }
+                }
+            }
+
+            // 3. 读取 eos_token
+            simdjson::dom::element eos_token_val;
+            if (tc_root.at_key("eos_token").get(eos_token_val) == simdjson::SUCCESS) {
+                std::string_view eos_sv;
+                if (eos_token_val.get_string().get(eos_sv) == simdjson::SUCCESS) {
+                    eos_token_ = std::string(eos_sv);
+                } else {
+                    simdjson::dom::object eos_obj;
+                    if (eos_token_val.get_object().get(eos_obj) == simdjson::SUCCESS) {
+                        std::string_view content_sv;
+                        if (eos_obj.at_key("content").get_string().get(content_sv) == simdjson::SUCCESS) {
+                            eos_token_ = std::string(content_sv);
+                        }
+                    }
+                }
+            }
+
+            // 4. 读取 added_tokens_decoder
+            simdjson::dom::element decoder_val;
+            if (tc_root.at_key("added_tokens_decoder").get(decoder_val) != simdjson::SUCCESS) {
                 return;
             }
-            auto decoder_obj = decoder_val.get_object();
+
+            simdjson::dom::object decoder_obj;
+            if (decoder_val.get_object().get(decoder_obj) != simdjson::SUCCESS) {
+                return;
+            }
+
             size_t loaded_count = 0;
             for (auto field : decoder_obj) {
-                std::string_view id_str = field.unescaped_key();
-                auto token_obj = field.value().get_object();
+                std::string_view id_str = field.key;
+                simdjson::dom::object token_obj;
+                if (field.value.get_object().get(token_obj) != simdjson::SUCCESS) {
+                    continue;
+                }
                 
-                std::string_view content_view = token_obj["content"].get_string();
+                std::string_view content_view;
+                if (token_obj.at_key("content").get_string().get(content_view) != simdjson::SUCCESS) {
+                    continue;
+                }
                 std::string tok_str(content_view);
                 
                 int64_t id = std::stoll(std::string(id_str));
@@ -278,9 +337,11 @@ bool Tokenizer::load(const std::string& model_dir) {
                 id_to_token_[static_cast<int>(id)] = tok_str;
 
                 bool is_special = false;
-                auto special_val = token_obj["special"];
-                if (special_val.error() == simdjson::error_code::SUCCESS) {
-                    is_special = special_val.get_bool();
+                simdjson::dom::element special_val;
+                if (token_obj.at_key("special").get(special_val) == simdjson::SUCCESS) {
+                    if (special_val.get_bool().get(is_special) != simdjson::SUCCESS) {
+                        is_special = false;
+                    }
                 }
 
                 if (is_special || tok_str == "<asr_text>" || tok_str == "<think>" || tok_str == "</think>") {
@@ -454,6 +515,10 @@ bool Tokenizer::load(const std::string& model_dir) {
     im_end_id_ = find_special("<|im_end|>");
     eot_id_ = find_special("<|endoftext|>");
     eos_id_ = im_end_id_;
+
+    if (eos_token_.empty() && eos_id_ >= 0) {
+        eos_token_ = raw_token(eos_id_);
+    }
 
     AILA_LOG_INFO("[Tokenizer] Special tokens: im_start=%d im_end=%d eot=%d total_special=%zu",
                   im_start_id_, im_end_id_, eot_id_, special_tokens_.size());

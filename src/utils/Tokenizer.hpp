@@ -50,6 +50,13 @@ public:
     int im_start_id() const { return im_start_id_; }
     int im_end_id() const { return im_end_id_; }
     int eos_id() const { return eos_id_; }
+    const std::string& chat_template() const { return chat_template_; }
+    const std::string& bos_token() const { return bos_token_; }
+    const std::string& eos_token() const { return eos_token_; }
+    std::string raw_token(int token_id) const {
+        if (token_id < 0 || token_id >= static_cast<int>(id_to_token_.size())) return "";
+        return id_to_token_[token_id];
+    }
 
 private:
     // 词表
@@ -71,6 +78,9 @@ private:
     int im_end_id_ = 151645;
     int eos_id_ = 151645;
     int eot_id_ = 151643;
+    std::string chat_template_;
+    std::string bos_token_;
+    std::string eos_token_;
 
     // 特殊 token 映射
     std::unordered_map<std::string, int> special_tokens_;

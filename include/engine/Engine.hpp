@@ -1852,12 +1852,13 @@ public:
         clear_error();
         std::vector<Message> messages;
         std::string parse_error;
-        if (!parse_messages_json(messages_json, messages, &parse_error)) {
+        GenerationConfig mutable_config = gen_config;
+        if (!parse_messages_json(messages_json, messages, mutable_config, &parse_error)) {
             AILA_LOG_ERROR("[GenerateMessages] Invalid messages JSON: %s", parse_error.c_str());
             set_error(EngineErrorCode::JsonParseError, parse_error);
             return "";
         }
-        return generate_messages(messages, gen_config, token_callback);
+        return generate_messages(messages, mutable_config, token_callback);
     }
 
     // ============================================================
@@ -2480,6 +2481,7 @@ private:
 
     bool parse_messages_json(const std::string& messages_json,
                              std::vector<Message>& out_messages,
+                             GenerationConfig& out_config,
                              std::string* error_message = nullptr) const {
         auto set_error = [&](const std::string& msg) {
             if (error_message) *error_message = msg;
@@ -2491,8 +2493,86 @@ private:
             simdjson::dom::element root = parser.parse(messages_json);
             simdjson::dom::array arr;
             if (root.get_array().get(arr) != simdjson::SUCCESS) {
-                set_error("messages root is not an array");
-                return false;
+                simdjson::dom::object obj_root;
+                if (root.get_object().get(obj_root) != simdjson::SUCCESS) {
+                    set_error("messages root is neither array nor object");
+                    return false;
+                }
+
+                simdjson::dom::element msgs_elem;
+                if (obj_root.at_key("messages").get(msgs_elem) != simdjson::SUCCESS) {
+                    set_error("messages field missing in object root");
+                    return false;
+                }
+                if (msgs_elem.get_array().get(arr) != simdjson::SUCCESS) {
+                    set_error("messages field must be an array");
+                    return false;
+                }
+
+                double temp_val = 0.0;
+                bool has_temp = false;
+                simdjson::dom::element temp_elem;
+                if (obj_root.at_key("temperature").get(temp_elem) == simdjson::SUCCESS) {
+                    if (temp_elem.get_double().get(temp_val) == simdjson::SUCCESS) {
+                        out_config.temperature = static_cast<float>(temp_val);
+                        has_temp = true;
+                    }
+                }
+
+                bool has_do_sample = false;
+                bool do_sample_val = false;
+                simdjson::dom::element ds_elem;
+                if (obj_root.at_key("do_sample").get(ds_elem) == simdjson::SUCCESS) {
+                    if (ds_elem.get_bool().get(do_sample_val) == simdjson::SUCCESS) {
+                        out_config.do_sample = do_sample_val;
+                        has_do_sample = true;
+                    } else {
+                        int64_t ds_int = 0;
+                        if (ds_elem.get_int64().get(ds_int) == simdjson::SUCCESS) {
+                            out_config.do_sample = (ds_int != 0);
+                            has_do_sample = true;
+                        }
+                    }
+                }
+
+                if (has_temp && temp_val == 0.0 && !has_do_sample) {
+                    out_config.do_sample = false;
+                }
+
+                simdjson::dom::element top_p_elem;
+                if (obj_root.at_key("top_p").get(top_p_elem) == simdjson::SUCCESS) {
+                    double top_p_val = 0.0;
+                    if (top_p_elem.get_double().get(top_p_val) == simdjson::SUCCESS) {
+                        out_config.top_p = static_cast<float>(top_p_val);
+                    }
+                }
+
+                simdjson::dom::element max_tokens_elem;
+                bool got_max_tokens = false;
+                if (obj_root.at_key("max_tokens").get(max_tokens_elem) == simdjson::SUCCESS) {
+                    int64_t mt_val = 0;
+                    if (max_tokens_elem.get_int64().get(mt_val) == simdjson::SUCCESS) {
+                        out_config.max_new_tokens = static_cast<int>(mt_val);
+                        got_max_tokens = true;
+                    }
+                }
+                if (!got_max_tokens) {
+                    if (obj_root.at_key("max_new_tokens").get(max_tokens_elem) == simdjson::SUCCESS) {
+                        int64_t mt_val = 0;
+                        if (max_tokens_elem.get_int64().get(mt_val) == simdjson::SUCCESS) {
+                            out_config.max_new_tokens = static_cast<int>(mt_val);
+                        }
+                    }
+                }
+
+                simdjson::dom::element seed_elem;
+                if (obj_root.at_key("seed").get(seed_elem) == simdjson::SUCCESS) {
+                    int64_t seed_val = 0;
+                    if (seed_elem.get_int64().get(seed_val) == simdjson::SUCCESS) {
+                        out_config.sampling_seed = static_cast<uint64_t>(seed_val);
+                        out_config.use_fixed_seed = true;
+                    }
+                }
             }
 
             for (auto item : arr) {

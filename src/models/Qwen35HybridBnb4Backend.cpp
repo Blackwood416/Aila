@@ -712,6 +712,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
                 lm_head_.init(ctx, weights.get("model.language_model.lm_head.weight_preprocessed"),
                               hidden_size_, cfg_.vocab_size, true);
                 tied_lm_head_ready = true;
+                lm_head_loaded = true;
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
             } catch (const std::exception& e) {
                 AILA_LOG_WARN("[Qwen3.5] Failed to preprocess tied lm_head, falling back to direct embed weight: %s",
@@ -779,7 +780,6 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
     incr_prefill_total_cap_ = 0;
     clear_embedding_overrides();
     ensure_runtime_buffers(ctx, 1);
-
     buf_.logits = Tensor::allocate(ctx, {1, (int64_t)cfg_.vocab_size});
     buf_.decode_scores = Tensor::allocate(
         ctx, {(int64_t)max_attn_heads_, (int64_t)max_seq_len_},
@@ -829,6 +829,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
     AILA_LOG_INFO("[Qwen3.5 BnB4] Decode FFN custom path: disabled");
     AILA_LOG_INFO("[Qwen3.5 BnB4] Linear mode: delta-prefill-gpu-iter/decode-gpu-ring");
     AILA_LOG_INFO("[Qwen3.5 BnB4] Legacy linear-attn fallback is not supported in the BnB4 backend");
+    AILA_LOG_INFO("[Qwen3.5 DEBUG] Qwen35HybridBnb4Backend::load returning true");
     return true;
 }
 

@@ -10,11 +10,12 @@ namespace ops {
 // src: [rows, cols] -> dst: [cols, rows]
 // ============================================================
 
-void transpose(Context& ctx, Tensor& src, Tensor& dst) {
+template<typename T>
+void transpose_impl(Context& ctx, Tensor& src, Tensor& dst) {
     int rows = static_cast<int>(src.shape(0));
     int cols = static_cast<int>(src.shape(1));
-    bf16* s_ptr = static_cast<bf16*>(src.data());
-    bf16* d_ptr = static_cast<bf16*>(dst.data());
+    T* s_ptr = static_cast<T*>(src.data());
+    T* d_ptr = static_cast<T*>(dst.data());
 
     // 使用 16x16 tile 优化访存合并 (Memory Coalescing)
     // A770 的 L3 cache 很大，简单的 tile 就能跑出极高性能
@@ -37,4 +38,17 @@ void transpose(Context& ctx, Tensor& src, Tensor& dst) {
     });
 }
 
+void transpose(Context& ctx, Tensor& src, Tensor& dst) {
+    if (src.dtype() == dnnl::memory::data_type::bf16) {
+        transpose_impl<bf16>(ctx, src, dst);
+    } else if (src.dtype() == dnnl::memory::data_type::f16) {
+        transpose_impl<sycl::half>(ctx, src, dst);
+    } else if (src.dtype() == dnnl::memory::data_type::f32) {
+        transpose_impl<float>(ctx, src, dst);
+    } else {
+        throw std::runtime_error("Unsupported data type for transpose");
+    }
+}
+
 } // namespace ops
+

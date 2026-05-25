@@ -299,11 +299,79 @@ def test_generate_messages(api: AilaAPI, engine):
     ])
 
     out_p = api.aila_generate_messages(engine, msgs.encode(), byref(cfg))
-    test("generate_messages returns non-NULL", out_p is not None)
+    test("generate_messages (legacy array) returns non-NULL", out_p is not None)
     if out_p:
         text = string_at(out_p).decode("utf-8", errors="replace")
-        test("generate_messages produces text", len(text) > 0, text[:80])
+        test("generate_messages (legacy array) produces text", len(text) > 0, text[:80])
         api.aila_free_string(out_p)
+
+    # Test OpenAI compatible object format
+    msgs_openai = json.dumps({
+        "messages": [
+            {"role": "system", "content": "Reply in English."},
+            {"role": "user",   "content": "say hello"},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 12,
+        "seed": 42
+    })
+    out_openai_p = api.aila_generate_messages(engine, msgs_openai.encode(), byref(cfg))
+    test("generate_messages (OpenAI compatible object) returns non-NULL", out_openai_p is not None)
+    if out_openai_p:
+        text_openai = string_at(out_openai_p).decode("utf-8", errors="replace")
+        test("generate_messages (OpenAI compatible object) produces text", len(text_openai) > 0, text_openai[:80])
+        api.aila_free_string(out_openai_p)
+
+    # Test OpenAI compatible parameters override
+    # 1. max_tokens override
+    cfg_large = api.aila_default_gen_config()
+    cfg_large.max_new_tokens = 64
+    cfg_large.do_sample = 0
+
+    msgs_max_tokens = json.dumps({
+        "messages": [
+            {"role": "user", "content": "Count from 1 to 5: 1, 2,"}
+        ],
+        "max_tokens": 3
+    })
+
+    token_count = [0]
+    @TokenCallback
+    def count_callback(text_p, _userdata):
+        token_count[0] += 1
+        return 0
+
+    api.aila_engine_reset_context(engine)
+    rc = api.aila_generate_messages_stream(engine, msgs_max_tokens.encode(), byref(cfg_large), count_callback, None)
+    test("generate_messages_stream with max_tokens override succeeds", rc == 0)
+    test("max_tokens override works (got exactly 3 tokens)", token_count[0] == 3, f"got {token_count[0]} tokens")
+
+    # 2. temperature=0.0 override to greedy
+    cfg_temp = api.aila_default_gen_config()
+    cfg_temp.do_sample = 1
+    cfg_temp.temperature = 0.95
+    cfg_temp.max_new_tokens = 8
+
+    msgs_temp = json.dumps({
+        "messages": [
+            {"role": "user", "content": "1 + 1 = ?"}
+        ],
+        "temperature": 0.0
+    })
+
+    api.aila_engine_reset_context(engine)
+    out_temp1_p = api.aila_generate_messages(engine, msgs_temp.encode(), byref(cfg_temp))
+    text1 = string_at(out_temp1_p).decode("utf-8").strip() if out_temp1_p else ""
+    if out_temp1_p:
+        api.aila_free_string(out_temp1_p)
+
+    api.aila_engine_reset_context(engine)
+    out_temp2_p = api.aila_generate_messages(engine, msgs_temp.encode(), byref(cfg_temp))
+    text2 = string_at(out_temp2_p).decode("utf-8").strip() if out_temp2_p else ""
+    if out_temp2_p:
+        api.aila_free_string(out_temp2_p)
+
+    test("temperature=0.0 override produces identical outputs (greedy)", text1 == text2 and len(text1) > 0, f"text1={text1!r}, text2={text2!r}")
 
     # NULL safety
     test("generate_messages(NULL engine)", api.aila_generate_messages(None, msgs.encode(), None) is None)

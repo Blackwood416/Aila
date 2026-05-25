@@ -65,6 +65,12 @@ set(LIB_SOURCES
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
     src/templates/TemplateRegistry.cpp
+    src/templates/jinja/lexer.cpp
+    src/templates/jinja/parser.cpp
+    src/templates/jinja/runtime.cpp
+    src/templates/jinja/jinja_string.cpp
+    src/templates/jinja/jinja_unicode.cpp
+    src/templates/jinja/value.cpp
     src/vision/Qwen35VisionEncoder.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
     src/audio/AudioPreprocessor.cpp
@@ -99,6 +105,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src/bench)
 include_directories(${PROJECT_SOURCE_DIR}/src/lora)
 include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/third_party/dr_libs)
+include_directories(${PROJECT_SOURCE_DIR}/src/templates/jinja)
 
 # ============================================================
 # Dependencies
