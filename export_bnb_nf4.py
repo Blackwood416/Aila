@@ -35,11 +35,16 @@ import bitsandbytes.cextension as bnb_cext
 import torch
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
     BitsAndBytesConfig,
 )
+try:
+    import qwen_asr
+except ImportError:
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +113,9 @@ def resolve_keep_dense_modules(
     modules = list(requested_modules or [])
     if vision:
         modules.append("model.visual")
+    model_type = getattr(config, "model_type", "unknown")
+    if model_type == "qwen3_asr":
+        modules.append("thinker.audio_tower")
     return unique_preserve_order(modules)
 
 
@@ -182,7 +190,11 @@ def main() -> int:
     )
     keep_dense_modules = resolve_keep_dense_modules(config, multimodal, args.keep_dense_modules)
     quant_config = build_quant_config(keep_dense_modules)
-    model_loader = AutoModelForImageTextToText if multimodal else AutoModelForCausalLM
+
+    if model_type == "qwen3_asr":
+        model_loader = AutoModel
+    else:
+        model_loader = AutoModelForImageTextToText if multimodal else AutoModelForCausalLM
 
     print(f"model_type={model_type}")
     print(f"multimodal={multimodal}")
@@ -206,6 +218,12 @@ def main() -> int:
     model.eval()
     load_seconds = time.perf_counter() - load_start
     print(f"Quantized in {load_seconds:.1f}s")
+
+    # Bypass strict transformers GenerationConfig validation
+    if hasattr(model, "generation_config"):
+        gen_cfg = model.generation_config
+        if getattr(gen_cfg, "temperature", None) is not None and not getattr(gen_cfg, "do_sample", False):
+            gen_cfg.temperature = None
 
     # Save
     print(f"Saving to {output}...")

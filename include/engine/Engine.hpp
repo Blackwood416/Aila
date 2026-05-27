@@ -7,6 +7,7 @@
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
+#include "../src/models/Qwen3ASRBnb4Backend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
@@ -352,7 +353,7 @@ public:
                 }
                 return false;
             }
-            if (spec.family == ModelFamily::Qwen3Dense) {
+            if (spec.family == ModelFamily::Qwen3Dense || spec.family == ModelFamily::Qwen3ASR) {
                 return true;
             }
             if (spec.family == ModelFamily::Qwen35Hybrid) {
@@ -484,7 +485,11 @@ public:
 
         // 5. Initialize backend
         if (model_spec_.family == ModelFamily::Qwen3ASR) {
-            backend_ = std::make_unique<Qwen3ASRBackend>();
+            if (model_spec_.is_bitsandbytes_4bit()) {
+                backend_ = std::make_unique<Qwen3ASRBnb4Backend>();
+            } else {
+                backend_ = std::make_unique<Qwen3ASRBackend>();
+            }
         } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
