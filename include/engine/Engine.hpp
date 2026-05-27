@@ -19,7 +19,7 @@
 #include "../src/templates/TemplateRegistry.hpp"
 #include "../src/profile/Profiling.hpp"
 #include "../src/utils/EnvUtils.hpp"
-#include "simdjson.h"
+#include "../src/utils/JsonParser.hpp"
 #include "Types.hpp"
 #include <string>
 #include <functional>
@@ -1355,6 +1355,9 @@ public:
         render_messages.reserve(messages.size());
         std::vector<sycl::ext::oneapi::bfloat16> vision_embeddings_flat;
         size_t total_vision_tokens = 0;
+        std::vector<sycl::ext::oneapi::bfloat16> audio_embeddings_flat;
+        size_t total_audio_tokens = 0;
+        using bf16 = sycl::ext::oneapi::bfloat16;
         struct VisionSegment {
             int token_count = 0;
             int llm_grid_t = 1;
@@ -1385,7 +1388,7 @@ public:
 
                     aila::vision::VisionEncodeResult encoded;
                     std::string vision_err;
-                    if (!vision_encoder_->encode_image(p.uri, encoded, &vision_err)) {
+                    if (!vision_encoder_->encode_image(p, encoded, &vision_err)) {
                         set_error(EngineErrorCode::RuntimeError,
                                   "Vision encode failed: " + vision_err);
                         return "";
@@ -1425,6 +1428,98 @@ public:
                         vision_embeddings_flat.end(),
                         encoded.embeddings.begin(),
                         encoded.embeddings.end());
+                    continue;
+                }
+                if (p.type == ContentType::Audio) {
+                    if (!audio_encoder_) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Audio encoder is not initialized");
+                        return "";
+                    }
+
+                    AudioBuffer audio;
+                    std::string audio_err;
+                    bool loaded = false;
+                    if (!p.binary_data.empty()) {
+                        loaded = load_audio_from_memory(p.binary_data.data(), p.binary_data.size(), p.media_format, audio, &audio_err);
+                    } else {
+                        loaded = load_audio(p.uri, audio, &audio_err);
+                    }
+
+                    if (!loaded) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Audio loading failed: " + audio_err);
+                        return "";
+                    }
+
+                    std::vector<float> mono;
+                    if (audio.channels > 1) {
+                        mono.resize(audio.samples.size() / audio.channels);
+                        for (size_t i = 0; i < mono.size(); ++i) {
+                            float sum = 0.0f;
+                            for (int c = 0; c < audio.channels; ++c)
+                                sum += audio.samples[i * audio.channels + c];
+                            mono[i] = sum / static_cast<float>(audio.channels);
+                        }
+                    } else {
+                        mono = std::move(audio.samples);
+                    }
+
+                    std::vector<float> mono_16k;
+                    resample_to_16k(mono, audio.sample_rate, mono_16k);
+
+                    MelSpectrogram mel;
+                    if (!compute_mel_spectrogram(mono_16k, mel, &audio_err)) {
+                        set_error(EngineErrorCode::RuntimeError, "Spectrogram calculation failed: " + audio_err);
+                        return "";
+                    }
+
+                    int mel_padded_frames = mel.n_frames;
+                    int mel_actual_frames = mel.actual_frames;
+                    int nM = mel.n_mels;
+                    std::vector<bf16> mel_bf16(static_cast<size_t>(mel_padded_frames) * nM);
+                    for (int f = 0; f < mel_padded_frames; ++f)
+                        for (int m = 0; m < nM; ++m)
+                            mel_bf16[m * mel_padded_frames + f] = bf16(mel.data[f * nM + m]);
+
+                    Tensor mel_device = Tensor::allocate(*ctx_, {1, nM, mel_padded_frames});
+                    ctx_->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(bf16));
+
+                    int audio_len = 0;
+                    int od = model_spec_.audio.output_dim;
+                    int max_audio_len = ((mel_actual_frames + 99) / 100) * 13 + 32;
+                    Tensor af_tmp = Tensor::allocate(*ctx_, {max_audio_len, od});
+                    std::string enc_error;
+                    if (!audio_encoder_->encode(*ctx_, mel_device, mel_actual_frames,
+                                                 af_tmp, audio_len, &enc_error)) {
+                        set_error(EngineErrorCode::RuntimeError, "Audio encoding failed: " + enc_error);
+                        return "";
+                    }
+
+                    Tensor audio_features = Tensor::allocate(*ctx_, {audio_len, od});
+                    bf16* af_dst = audio_features.data_as<bf16>();
+                    bf16* af_src = af_tmp.data_as<bf16>();
+                    ctx_->queue().memcpy(af_dst, af_src, static_cast<size_t>(audio_len) * od * sizeof(bf16));
+
+                    std::vector<bf16> audio_bf16(static_cast<size_t>(audio_len) * od);
+                    ctx_->memcpy_d2h(audio_bf16.data(), audio_features.data(), audio_bf16.size() * sizeof(bf16));
+                    ctx_->synchronize();
+
+                    ContentPart ph;
+                    ph.type = ContentType::Text;
+                    ph.text.reserve(static_cast<size_t>(audio_len) * 12u + 32u);
+                    ph.text += "<|audio_start|>";
+                    for (int i = 0; i < audio_len; ++i) {
+                        ph.text += "<|audio_pad|>";
+                    }
+                    ph.text += "<|audio_end|>";
+                    out_msg.content.push_back(std::move(ph));
+
+                    total_audio_tokens += static_cast<size_t>(audio_len);
+                    audio_embeddings_flat.insert(
+                        audio_embeddings_flat.end(),
+                        audio_bf16.begin(),
+                        audio_bf16.end());
                     continue;
                 }
                 set_error(EngineErrorCode::TemplateError, "Unknown content part type");
@@ -1537,6 +1632,44 @@ public:
             AILA_LOG_INFO("[Vision] Applied multimodal text RoPE positions (delta=%d)", text_pos_delta);
         }
 
+        if (total_audio_tokens > 0) {
+            int audio_pad_id = model_spec_.audio_token_id;
+            if (audio_pad_id < 0) {
+                audio_pad_id = tokenizer_.special_token_id("<|audio_pad|>");
+            }
+            if (audio_pad_id < 0) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "Tokenizer/model does not provide audio token id");
+                return "";
+            }
+
+            std::vector<int> audio_positions;
+            audio_positions.reserve(total_audio_tokens);
+            for (int i = 0; i < static_cast<int>(full_ids.size()); ++i) {
+                if (full_ids[static_cast<size_t>(i)] == audio_pad_id) {
+                    audio_positions.push_back(i);
+                }
+            }
+
+            if (audio_positions.size() != total_audio_tokens) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "Mismatch between rendered audio tokens and encoded audio tokens");
+                return "";
+            }
+
+            backend_->set_embedding_overrides(audio_positions, audio_embeddings_flat, model_spec_.audio.output_dim);
+
+            if (!aila::env::read_flag("AILA_NO_MROPE", false)) {
+                int total_len = static_cast<int>(full_ids.size());
+                std::vector<int> pos_t(total_len), pos_h(total_len), pos_w(total_len);
+                for (int i = 0; i < total_len; ++i) {
+                    pos_t[i] = i; pos_h[i] = i; pos_w[i] = i;
+                }
+                backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, 0);
+            }
+            AILA_LOG_INFO("[Audio] Injecting %zu audio embeddings into prompt", total_audio_tokens);
+        }
+
         int max_ctx = backend_->max_seq_len();
         int total_prompt_len = static_cast<int>(full_ids.size());
         bool debug_token_ids = aila::env::read_flag("AILA_DEBUG_TOKEN_IDS", false);
@@ -1559,7 +1692,7 @@ public:
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
 
         int reusable_prefix = 0;
-        bool allow_incremental_prefill = (total_vision_tokens == 0);
+        bool allow_incremental_prefill = (total_vision_tokens == 0 && total_audio_tokens == 0);
         if (allow_incremental_prefill) {
             int max_possible_match = std::min(static_cast<int>(cached_ids_.size()),
                                               static_cast<int>(full_ids.size()));
@@ -1853,7 +1986,7 @@ public:
         std::vector<Message> messages;
         std::string parse_error;
         GenerationConfig mutable_config = gen_config;
-        if (!parse_messages_json(messages_json, messages, mutable_config, &parse_error)) {
+        if (!aila::utils::parse_messages_json(messages_json, messages, mutable_config, &parse_error)) {
             AILA_LOG_ERROR("[GenerateMessages] Invalid messages JSON: %s", parse_error.c_str());
             set_error(EngineErrorCode::JsonParseError, parse_error);
             return "";
@@ -2479,254 +2612,7 @@ public:
 
 private:
 
-    bool parse_messages_json(const std::string& messages_json,
-                             std::vector<Message>& out_messages,
-                             GenerationConfig& out_config,
-                             std::string* error_message = nullptr) const {
-        auto set_error = [&](const std::string& msg) {
-            if (error_message) *error_message = msg;
-        };
 
-        out_messages.clear();
-        try {
-            simdjson::dom::parser parser;
-            simdjson::dom::element root = parser.parse(messages_json);
-            simdjson::dom::array arr;
-            if (root.get_array().get(arr) != simdjson::SUCCESS) {
-                simdjson::dom::object obj_root;
-                if (root.get_object().get(obj_root) != simdjson::SUCCESS) {
-                    set_error("messages root is neither array nor object");
-                    return false;
-                }
-
-                simdjson::dom::element msgs_elem;
-                if (obj_root.at_key("messages").get(msgs_elem) != simdjson::SUCCESS) {
-                    set_error("messages field missing in object root");
-                    return false;
-                }
-                if (msgs_elem.get_array().get(arr) != simdjson::SUCCESS) {
-                    set_error("messages field must be an array");
-                    return false;
-                }
-
-                double temp_val = 0.0;
-                bool has_temp = false;
-                simdjson::dom::element temp_elem;
-                if (obj_root.at_key("temperature").get(temp_elem) == simdjson::SUCCESS) {
-                    if (temp_elem.get_double().get(temp_val) == simdjson::SUCCESS) {
-                        out_config.temperature = static_cast<float>(temp_val);
-                        has_temp = true;
-                    }
-                }
-
-                bool has_do_sample = false;
-                bool do_sample_val = false;
-                simdjson::dom::element ds_elem;
-                if (obj_root.at_key("do_sample").get(ds_elem) == simdjson::SUCCESS) {
-                    if (ds_elem.get_bool().get(do_sample_val) == simdjson::SUCCESS) {
-                        out_config.do_sample = do_sample_val;
-                        has_do_sample = true;
-                    } else {
-                        int64_t ds_int = 0;
-                        if (ds_elem.get_int64().get(ds_int) == simdjson::SUCCESS) {
-                            out_config.do_sample = (ds_int != 0);
-                            has_do_sample = true;
-                        }
-                    }
-                }
-
-                if (has_temp && temp_val == 0.0 && !has_do_sample) {
-                    out_config.do_sample = false;
-                }
-
-                simdjson::dom::element top_p_elem;
-                if (obj_root.at_key("top_p").get(top_p_elem) == simdjson::SUCCESS) {
-                    double top_p_val = 0.0;
-                    if (top_p_elem.get_double().get(top_p_val) == simdjson::SUCCESS) {
-                        out_config.top_p = static_cast<float>(top_p_val);
-                    }
-                }
-
-                simdjson::dom::element max_tokens_elem;
-                bool got_max_tokens = false;
-                if (obj_root.at_key("max_tokens").get(max_tokens_elem) == simdjson::SUCCESS) {
-                    int64_t mt_val = 0;
-                    if (max_tokens_elem.get_int64().get(mt_val) == simdjson::SUCCESS) {
-                        out_config.max_new_tokens = static_cast<int>(mt_val);
-                        got_max_tokens = true;
-                    }
-                }
-                if (!got_max_tokens) {
-                    if (obj_root.at_key("max_new_tokens").get(max_tokens_elem) == simdjson::SUCCESS) {
-                        int64_t mt_val = 0;
-                        if (max_tokens_elem.get_int64().get(mt_val) == simdjson::SUCCESS) {
-                            out_config.max_new_tokens = static_cast<int>(mt_val);
-                        }
-                    }
-                }
-
-                simdjson::dom::element seed_elem;
-                if (obj_root.at_key("seed").get(seed_elem) == simdjson::SUCCESS) {
-                    int64_t seed_val = 0;
-                    if (seed_elem.get_int64().get(seed_val) == simdjson::SUCCESS) {
-                        out_config.sampling_seed = static_cast<uint64_t>(seed_val);
-                        out_config.use_fixed_seed = true;
-                    }
-                }
-            }
-
-            for (auto item : arr) {
-                simdjson::dom::object obj;
-                if (item.get_object().get(obj) != simdjson::SUCCESS) {
-                    set_error("message item is not an object");
-                    return false;
-                }
-
-                Message msg;
-                {
-                    simdjson::dom::element role_elem;
-                    if (obj.at_key("role").get(role_elem) != simdjson::SUCCESS) {
-                        set_error("message.role missing");
-                        return false;
-                    }
-                    std::string_view role_sv;
-                    if (role_elem.get_string().get(role_sv) != simdjson::SUCCESS) {
-                        set_error("message.role must be string");
-                        return false;
-                    }
-                    msg.role = std::string(role_sv);
-                }
-
-                simdjson::dom::element content_elem;
-                if (obj.at_key("content").get(content_elem) != simdjson::SUCCESS) {
-                    set_error("message.content missing");
-                    return false;
-                }
-
-                std::string_view content_str;
-                if (content_elem.get_string().get(content_str) == simdjson::SUCCESS) {
-                    msg.content.push_back(ContentPart{ContentType::Text, std::string(content_str), ""});
-                } else {
-                    simdjson::dom::array content_arr;
-                    if (content_elem.get_array().get(content_arr) != simdjson::SUCCESS) {
-                        set_error("message.content must be string or array");
-                        return false;
-                    }
-
-                    for (auto part_elem : content_arr) {
-                        simdjson::dom::object part_obj;
-                        if (part_elem.get_object().get(part_obj) != simdjson::SUCCESS) {
-                            set_error("content part must be object");
-                            return false;
-                        }
-
-                        simdjson::dom::element type_elem;
-                        if (part_obj.at_key("type").get(type_elem) != simdjson::SUCCESS) {
-                            set_error("content part.type missing");
-                            return false;
-                        }
-                        std::string_view type_sv;
-                        if (type_elem.get_string().get(type_sv) != simdjson::SUCCESS) {
-                            set_error("content part.type must be string");
-                            return false;
-                        }
-
-                        std::string type(type_sv);
-                        if (type == "text" || type == "input_text") {
-                            simdjson::dom::element text_elem;
-                            if (part_obj.at_key("text").get(text_elem) != simdjson::SUCCESS) {
-                                set_error("text content missing text field");
-                                return false;
-                            }
-                            std::string_view text_sv;
-                            if (text_elem.get_string().get(text_sv) != simdjson::SUCCESS) {
-                                set_error("text content.text must be string");
-                                return false;
-                            }
-                            msg.content.push_back(ContentPart{ContentType::Text, std::string(text_sv), ""});
-                        } else if (type == "image" || type == "image_url" || type == "input_image") {
-                            std::string uri;
-                            simdjson::dom::element image_url_elem;
-                            if (part_obj.at_key("image_url").get(image_url_elem) == simdjson::SUCCESS) {
-                                std::string_view image_url_sv;
-                                if (image_url_elem.get_string().get(image_url_sv) == simdjson::SUCCESS) {
-                                    uri = std::string(image_url_sv);
-                                } else {
-                                    simdjson::dom::object image_obj;
-                                    if (image_url_elem.get_object().get(image_obj) == simdjson::SUCCESS) {
-                                        simdjson::dom::element url_elem;
-                                        if (image_obj.at_key("url").get(url_elem) == simdjson::SUCCESS) {
-                                            std::string_view url_sv;
-                                            if (url_elem.get_string().get(url_sv) == simdjson::SUCCESS) {
-                                                uri = std::string(url_sv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if (uri.empty()) {
-                                simdjson::dom::element image_elem;
-                                if (part_obj.at_key("image").get(image_elem) == simdjson::SUCCESS) {
-                                    std::string_view image_sv;
-                                    if (image_elem.get_string().get(image_sv) == simdjson::SUCCESS) {
-                                        uri = std::string(image_sv);
-                                    }
-                                }
-                            }
-                            if (uri.empty()) {
-                                set_error("image content missing image/image_url/url field");
-                                return false;
-                            }
-                            msg.content.push_back(ContentPart{ContentType::Image, "", uri});
-                        } else if (type == "video" || type == "video_url" || type == "input_video") {
-                            std::string uri;
-                            simdjson::dom::element video_url_elem;
-                            if (part_obj.at_key("video_url").get(video_url_elem) == simdjson::SUCCESS) {
-                                std::string_view video_url_sv;
-                                if (video_url_elem.get_string().get(video_url_sv) == simdjson::SUCCESS) {
-                                    uri = std::string(video_url_sv);
-                                } else {
-                                    simdjson::dom::object video_obj;
-                                    if (video_url_elem.get_object().get(video_obj) == simdjson::SUCCESS) {
-                                        simdjson::dom::element url_elem;
-                                        if (video_obj.at_key("url").get(url_elem) == simdjson::SUCCESS) {
-                                            std::string_view url_sv;
-                                            if (url_elem.get_string().get(url_sv) == simdjson::SUCCESS) {
-                                                uri = std::string(url_sv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if (uri.empty()) {
-                                simdjson::dom::element video_elem;
-                                if (part_obj.at_key("video").get(video_elem) == simdjson::SUCCESS) {
-                                    std::string_view video_sv;
-                                    if (video_elem.get_string().get(video_sv) == simdjson::SUCCESS) {
-                                        uri = std::string(video_sv);
-                                    }
-                                }
-                            }
-                            if (uri.empty()) {
-                                set_error("video content missing video/video_url/url field");
-                                return false;
-                            }
-                            msg.content.push_back(ContentPart{ContentType::Video, "", uri});
-                        } else {
-                            set_error("unknown content part type: " + type);
-                            return false;
-                        }
-                    }
-                }
-
-                out_messages.push_back(std::move(msg));
-            }
-            return true;
-        } catch (const std::exception& e) {
-            set_error(std::string("JSON parse failed: ") + e.what());
-            return false;
-        }
-    }
 
     std::string model_dir_;
     std::string lora_dir_;

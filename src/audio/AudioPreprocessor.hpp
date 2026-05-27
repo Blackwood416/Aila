@@ -24,6 +24,9 @@ struct MelSpectrogram {
 // Load audio file with WAV/MP3 native support and FFmpeg fallback.
 bool load_audio(const std::string& path, AudioBuffer& audio, std::string* error = nullptr);
 
+// Load audio from memory data
+bool load_audio_from_memory(const uint8_t* data, size_t size, const std::string& format, AudioBuffer& audio, std::string* error = nullptr);
+
 // Keep for legacy compatibility, calls load_audio internally.
 bool load_wav(const std::string& path, WavFile& wav, std::string* error = nullptr);
 

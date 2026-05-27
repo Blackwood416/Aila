@@ -64,6 +64,8 @@ set(LIB_SOURCES
     src/utils/ModelSpec.cpp
     src/utils/MemoryMappedFile.cpp
     src/utils/SafeTensors.cpp
+    src/utils/Base64.cpp
+    src/utils/JsonParser.cpp
     src/templates/TemplateRegistry.cpp
     src/templates/jinja/lexer.cpp
     src/templates/jinja/parser.cpp

@@ -40,6 +40,9 @@ public:
     bool encode_image(const std::string& uri,
                       VisionEncodeResult& out,
                       std::string* error_message);
+    bool encode_image(const ContentPart& part,
+                      VisionEncodeResult& out,
+                      std::string* error_message);
     bool warmup(std::string* error_message);
 
 private:
@@ -125,6 +128,13 @@ private:
     int* pos_y_device_ = nullptr;
     int* pos_x_device_ = nullptr;
     int pos_capacity_ = 0;
+
+    static bool read_image_rgb_from_memory(const uint8_t* data,
+                                           size_t size,
+                                           int& width,
+                                           int& height,
+                                           std::vector<uint8_t>& rgb,
+                                           std::string* error_message);
 
     static bool read_image_rgb(const std::string& uri,
                                int& width,

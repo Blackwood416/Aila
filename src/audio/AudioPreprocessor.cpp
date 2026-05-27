@@ -163,6 +163,60 @@ bool load_via_ffmpeg(const std::string& path, AudioBuffer& audio, std::string* e
     return true;
 }
 
+bool load_wav_from_memory_dr(const uint8_t* data, size_t size, AudioBuffer& audio, std::string* error) {
+    drwav wav;
+    if (!drwav_init_memory(&wav, data, size, nullptr)) {
+        if (error) *error = "Failed to init WAV memory data";
+        return false;
+    }
+    audio.sample_rate = wav.sampleRate;
+    audio.channels = wav.channels;
+    audio.samples.resize(wav.totalPCMFrameCount * wav.channels);
+    drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, audio.samples.data());
+    drwav_uninit(&wav);
+    return true;
+}
+
+bool load_mp3_from_memory_dr(const uint8_t* data, size_t size, AudioBuffer& audio, std::string* error) {
+    drmp3 mp3;
+    if (!drmp3_init_memory(&mp3, data, size, nullptr)) {
+        if (error) *error = "Failed to init MP3 memory data";
+        return false;
+    }
+    audio.sample_rate = mp3.sampleRate;
+    audio.channels = mp3.channels;
+    drmp3_uint64 total_pcm_frames = drmp3_get_pcm_frame_count(&mp3);
+    if (total_pcm_frames == 0) {
+        std::vector<float> temp_buffer;
+        std::vector<float> chunk(4096 * mp3.channels);
+        while (true) {
+            drmp3_uint64 read_frames = drmp3_read_pcm_frames_f32(&mp3, 4096, chunk.data());
+            if (read_frames == 0) break;
+            temp_buffer.insert(temp_buffer.end(), chunk.begin(), chunk.begin() + read_frames * mp3.channels);
+        }
+        audio.samples = std::move(temp_buffer);
+    } else {
+        audio.samples.resize(total_pcm_frames * mp3.channels);
+        drmp3_read_pcm_frames_f32(&mp3, total_pcm_frames, audio.samples.data());
+    }
+    drmp3_uninit(&mp3);
+    return true;
+}
+
+bool load_flac_from_memory_dr(const uint8_t* data, size_t size, AudioBuffer& audio, std::string* error) {
+    drflac* flac = drflac_open_memory(data, size, nullptr);
+    if (!flac) {
+        if (error) *error = "Failed to open FLAC memory data";
+        return false;
+    }
+    audio.sample_rate = flac->sampleRate;
+    audio.channels = flac->channels;
+    audio.samples.resize(flac->totalPCMFrameCount * flac->channels);
+    drflac_read_pcm_frames_f32(flac, flac->totalPCMFrameCount, audio.samples.data());
+    drflac_close(flac);
+    return true;
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -201,6 +255,39 @@ bool load_audio(const std::string& path, AudioBuffer& audio, std::string* error)
 
     if (error) {
         *error = "Local decode failed (" + local_error + ") and FFmpeg fallback failed (" + ffmpeg_error + ")";
+    }
+    return false;
+}
+
+// ============================================================
+// load_audio_from_memory
+// ============================================================
+
+bool load_audio_from_memory(const uint8_t* data, size_t size, const std::string& format, AudioBuffer& audio, std::string* error) {
+    if (!data || size == 0) {
+        if (error) *error = "Memory data is empty";
+        return false;
+    }
+
+    std::string fmt = format;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::tolower);
+
+    std::string local_error = "";
+    if (fmt == "mp3") {
+        if (load_mp3_from_memory_dr(data, size, audio, &local_error)) return true;
+    } else if (fmt == "wav") {
+        if (load_wav_from_memory_dr(data, size, audio, &local_error)) return true;
+    } else if (fmt == "flac") {
+        if (load_flac_from_memory_dr(data, size, audio, &local_error)) return true;
+    }
+
+    // fallback try all if specific failed or fmt is unknown
+    if (load_wav_from_memory_dr(data, size, audio, nullptr)) return true;
+    if (load_mp3_from_memory_dr(data, size, audio, nullptr)) return true;
+    if (load_flac_from_memory_dr(data, size, audio, nullptr)) return true;
+
+    if (error) {
+        *error = "Failed to decode audio memory data (" + local_error + ")";
     }
     return false;
 }
@@ -267,6 +354,10 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
     const int n_mels = 128;
     const int n_freq = n_fft / 2 + 1;  // 201
     const size_t n_samples = samples_16k.size();
+    if (n_samples == 0) {
+        if (error) *error = "Input samples vector is empty";
+        return false;
+    }
 
     // 动态计算帧数。在 PyTorch（center=True）中，帧数为 n_samples / hop_length + 1
     int n_frames = static_cast<int>(n_samples / hop_length + 1);

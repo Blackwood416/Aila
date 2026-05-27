@@ -89,9 +89,22 @@ Generates a response for a single user message. Returns a newly allocated UTF-8 
 char* aila_generate_messages(AilaEngine* engine, const char* messages_json, const AilaGenConfig* config);
 ```
 
-Generates a response from an OpenAI-style messages JSON array. Same return/free semantics as `aila_generate`.
+Generates a response from an OpenAI-style messages JSON. Same return/free semantics as `aila_generate`.
 
-`messages_json` must be a valid JSON array of message objects:
+`messages_json` can be either a standard OpenAI-compatible JSON object with `"messages"` as the top-level key (which also allows passing generation/sampling parameters directly like `temperature`, `max_tokens` etc.), or a raw JSON array:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user",   "content": "Hello!"}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 128
+}
+```
+
+Or backward-compatibly:
 
 ```json
 [
@@ -100,7 +113,7 @@ Generates a response from an OpenAI-style messages JSON array. Same return/free 
 ]
 ```
 
-Each message has a `role` (`"system"`, `"user"`, or `"assistant"`) and `content` (string or array of content parts). Content parts may include `text`, `image`, and `video` types (see README for details).
+Each message has a `role` (`"system"`, `"user"`, or `"assistant"`) and `content` (string or array of content parts). Content parts may include `text`, `image`, `audio`, and `video` types (including base64 encoded image Data URIs and input_audio payload, see README for details).
 
 ### Generation (Streaming)
 

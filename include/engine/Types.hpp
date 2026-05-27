@@ -48,13 +48,16 @@ struct Qwen3Config {
 enum class ContentType {
     Text,
     Image,
-    Video
+    Video,
+    Audio
 };
 
 struct ContentPart {
     ContentType type = ContentType::Text;
     std::string text;
     std::string uri;
+    std::vector<uint8_t> binary_data;
+    std::string media_format;
 };
 
 struct Message {

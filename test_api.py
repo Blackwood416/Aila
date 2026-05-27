@@ -373,6 +373,69 @@ def test_generate_messages(api: AilaAPI, engine):
 
     test("temperature=0.0 override produces identical outputs (greedy)", text1 == text2 and len(text1) > 0, f"text1={text1!r}, text2={text2!r}")
 
+    # Multimodal base64 tests (Image)
+    image_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    msgs_image = json.dumps({
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_uri}},
+                    {"type": "text", "text": "Describe this image"}
+                ]
+            }
+        ],
+        "max_tokens": 5
+    })
+    api.aila_engine_reset_context(engine)
+    out_img_p = api.aila_generate_messages(engine, msgs_image.encode(), byref(cfg))
+    if out_img_p:
+        text_img = string_at(out_img_p).decode("utf-8", errors="replace")
+        test("generate_messages with base64 image success", len(text_img) > 0, text_img[:80])
+        api.aila_free_string(out_img_p)
+    else:
+        err_code = api.aila_last_error_code(engine)
+        if err_code == 4: # VISION_NOT_ENABLED
+            skip("generate_messages with base64 image", "Vision not enabled for this model")
+        else:
+            err_msg = api.aila_last_error_message(engine).decode("utf-8", errors="replace")
+            test("generate_messages with base64 image failed", False, f"code={err_code} msg={err_msg}")
+
+    # Multimodal base64 tests (Audio)
+    import struct
+    import base64
+    wav_header = bytearray(b"RIFF\x00\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+    data_bytes = bytes(320)
+    struct.pack_into("<I", wav_header, 4, 36 + len(data_bytes))
+    struct.pack_into("<I", wav_header, 40, len(data_bytes))
+    audio_base64 = base64.b64encode(bytes(wav_header + data_bytes)).decode("utf-8")
+    
+    msgs_audio = json.dumps({
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": audio_base64, "format": "wav"}},
+                    {"type": "text", "text": "transcribe"}
+                ]
+            }
+        ],
+        "max_tokens": 5
+    })
+    api.aila_engine_reset_context(engine)
+    out_aud_p = api.aila_generate_messages(engine, msgs_audio.encode(), byref(cfg))
+    if out_aud_p:
+        text_aud = string_at(out_aud_p).decode("utf-8", errors="replace")
+        test("generate_messages with base64 audio success", len(text_aud) > 0, text_aud[:80])
+        api.aila_free_string(out_aud_p)
+    else:
+        err_code = api.aila_last_error_code(engine)
+        err_msg = api.aila_last_error_message(engine).decode("utf-8", errors="replace")
+        if "Audio encoder is not initialized" in err_msg or "Audio encoder init failed" in err_msg:
+            skip("generate_messages with base64 audio", "Audio encoder not loaded/initialized for this model")
+        else:
+            test("generate_messages with base64 audio failed", False, f"code={err_code} msg={err_msg}")
+
     # NULL safety
     test("generate_messages(NULL engine)", api.aila_generate_messages(None, msgs.encode(), None) is None)
     test("generate_messages(NULL json)",  api.aila_generate_messages(engine, None, None) is None)
@@ -910,6 +973,7 @@ def main():
         is_asr_model = "asr" in args.model.lower()
         if is_asr_model:
             test_error_api(api, engine)
+            test_generate_messages(api, engine)
             test_transcribe(api, engine, args.model)
         else:
             test_generate_simple(api, engine)

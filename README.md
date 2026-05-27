@@ -166,14 +166,22 @@ Both work in interactive mode and `--messages-json`.
 
 ### 📄 Messages JSON Format
 
+Supports standard OpenAI compatible JSON objects with `"messages"` as the top-level key, which also allows passing sampling/generation parameters directly (e.g. `temperature`, `max_tokens`/`max_new_tokens`, `seed`/`do_sample`):
+
 ```json
-[
-  {"role": "system", "content": "You are a concise assistant."},
-  {"role": "user",   "content": [{"type": "text", "text": "介绍你自己"}]}
-]
+{
+  "messages": [
+    {"role": "system", "content": "You are a concise assistant."},
+    {"role": "user",   "content": [{"type": "text", "text": "Introduce yourself"}]}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 128
+}
 ```
 
-Supports `text`, `image`, and `video` content types. Image parts accept `image`, `image_url`, or `{"image_url":{"url":"..."}}`.
+It also backward-compatibly supports a raw JSON array as the top-level key: `[{"role": "user", "content": "..."}]`.
+
+Supports `text`, `image`, `audio`, and `video` content types. Image parts accept `image`, `image_url` (with base64 Data URI or file path), or `{"image_url":{"url":"..."}}`. Audio parts accept `audio`, `audio_url` (with base64 Data URI or file path), or `{"input_audio": {"data": "base64", "format": "wav"}}`.
 
 ### 🔌 C API
 

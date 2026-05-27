@@ -166,14 +166,22 @@ Aila: <think>
 
 ### 📄 Messages JSON 格式
 
+支持标准 OpenAI 兼容的 JSON 对象，以 `"messages"` 作为顶层键，同时也允许直接传递采样/生成参数（例如 `temperature`, `max_tokens`/`max_new_tokens`, `seed`/`do_sample` 等）：
+
 ```json
-[
-  {"role": "system", "content": "你是一个简洁的助手。"},
-  {"role": "user",   "content": [{"type": "text", "text": "介绍你自己"}]}
-]
+{
+  "messages": [
+    {"role": "system", "content": "你是一个简洁的助手。"},
+    {"role": "user",   "content": [{"type": "text", "text": "介绍你自己"}]}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 128
+}
 ```
 
-支持 `text`、`image` 和 `video` 内容类型。图像部分支持 `image`、`image_url` 或 `{"image_url":{"url":"..."}}` 格式。
+同时也向下兼容直接以 JSON 数组作为顶层对象的格式：`[{"role": "user", "content": "..."}]`。
+
+支持 `text`、`image`、`audio` 和 `video` 内容类型。图像部分支持 `image`、`image_url`（支持 base64 Data URI 或本地文件路径）或 `{"image_url":{"url":"..."}}` 格式。音频部分支持 `audio`、`audio_url`（支持 base64 Data URI 或本地文件路径）或 `{"input_audio": {"data": "base64", "format": "wav"}}` 格式。
 
 ### 🔌 C API
 

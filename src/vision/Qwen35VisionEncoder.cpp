@@ -1272,6 +1272,174 @@ bool Qwen35VisionEncoder::encode_image(const std::string& uri,
     return encode_rgb_image(uri, src_w, src_h, src_rgb, decode_ms, profile, out, error_message);
 }
 
+bool Qwen35VisionEncoder::encode_image(const ContentPart& part,
+                                       VisionEncodeResult& out,
+                                       std::string* error_message) {
+    using clock = std::chrono::high_resolution_clock;
+    auto decode_start = clock::now();
+
+    int src_w = 0;
+    int src_h = 0;
+    std::vector<uint8_t> src_rgb;
+    bool success = false;
+    if (!part.binary_data.empty()) {
+        success = read_image_rgb_from_memory(part.binary_data.data(), part.binary_data.size(),
+                                             src_w, src_h, src_rgb, error_message);
+    } else {
+        success = read_image_rgb(part.uri, src_w, src_h, src_rgb, error_message);
+    }
+
+    if (!success) {
+        return false;
+    }
+
+    const double decode_ms = std::chrono::duration<double, std::milli>(clock::now() - decode_start).count();
+    const bool profile = aila::env::read_flag("AILA_Q35_VISION_PROFILE", false);
+    return encode_rgb_image(part.uri.empty() ? "<base64_image>" : part.uri,
+                            src_w, src_h, src_rgb, decode_ms, profile, out, error_message);
+}
+
+bool Qwen35VisionEncoder::read_image_rgb_from_memory(const uint8_t* data,
+                                                     size_t size,
+                                                     int& width,
+                                                     int& height,
+                                                     std::vector<uint8_t>& rgb,
+                                                     std::string* error_message) {
+#ifdef _WIN32
+    if (!data || size == 0) {
+        set_error(error_message, "Image memory data is empty");
+        return false;
+    }
+
+    HRESULT hr_ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool need_uninit = SUCCEEDED(hr_ci);
+    if (hr_ci == RPC_E_CHANGED_MODE) {
+        need_uninit = false;
+    } else if (FAILED(hr_ci)) {
+        set_error(error_message, "COM init failed for memory image decode");
+        return false;
+    }
+
+    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!hGlobal) {
+        if (need_uninit) CoUninitialize();
+        set_error(error_message, "GlobalAlloc failed for memory image decode");
+        return false;
+    }
+    void* pGlobal = GlobalLock(hGlobal);
+    if (pGlobal) {
+        memcpy(pGlobal, data, size);
+        GlobalUnlock(hGlobal);
+    }
+
+    IStream* stream = nullptr;
+    HRESULT hr = CreateStreamOnHGlobal(hGlobal, TRUE, &stream);
+    if (FAILED(hr) || !stream) {
+        GlobalFree(hGlobal);
+        if (need_uninit) CoUninitialize();
+        set_error(error_message, "CreateStreamOnHGlobal failed");
+        return false;
+    }
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    bool ok = false;
+    std::string err = "Failed to decode image from memory";
+
+    do {
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory));
+        if (FAILED(hr) || !factory) {
+            err = "WIC factory create failed";
+            break;
+        }
+
+        hr = factory->CreateDecoderFromStream(
+            stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+        if (FAILED(hr) || !decoder) {
+            err = "WIC stream decoder create failed";
+            break;
+        }
+
+        hr = decoder->GetFrame(0, &frame);
+        if (FAILED(hr) || !frame) {
+            err = "WIC frame decode failed";
+            break;
+        }
+
+        hr = factory->CreateFormatConverter(&converter);
+        if (FAILED(hr) || !converter) {
+            err = "WIC format converter create failed";
+            break;
+        }
+
+        hr = converter->Initialize(
+            frame, GUID_WICPixelFormat24bppBGR,
+            WICBitmapDitherTypeNone, nullptr, 0.0,
+            WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) {
+            err = "WIC format convert init failed";
+            break;
+        }
+
+        UINT w = 0;
+        UINT h = 0;
+        hr = converter->GetSize(&w, &h);
+        if (FAILED(hr) || w == 0 || h == 0) {
+            err = "WIC invalid image size";
+            break;
+        }
+
+        width = static_cast<int>(w);
+        height = static_cast<int>(h);
+        UINT stride = w * 3;
+        UINT bytes = stride * h;
+        std::vector<uint8_t> bgr(bytes);
+        hr = converter->CopyPixels(nullptr, stride, bytes, bgr.data());
+        if (FAILED(hr)) {
+            err = "WIC CopyPixels failed";
+            break;
+        }
+
+        rgb.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3u);
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* src_row = bgr.data() + static_cast<size_t>(y) * static_cast<size_t>(stride);
+            uint8_t* dst_row = rgb.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3u;
+            for (int x = 0; x < width; ++x) {
+                dst_row[3 * x + 0] = src_row[3 * x + 2];
+                dst_row[3 * x + 1] = src_row[3 * x + 1];
+                dst_row[3 * x + 2] = src_row[3 * x + 0];
+            }
+        }
+
+        ok = true;
+    } while (false);
+
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    stream->Release();
+    if (need_uninit) CoUninitialize();
+
+    if (!ok) {
+        set_error(error_message, err);
+        return false;
+    }
+    return true;
+#else
+    (void)data;
+    (void)size;
+    (void)width;
+    (void)height;
+    (void)rgb;
+    set_error(error_message, "Image decode is currently implemented for Windows only");
+    return false;
+#endif
+}
+
 bool Qwen35VisionEncoder::warmup(std::string* error_message) {
     if (!loaded_ || !ctx_) {
         set_error(error_message, "Vision encoder is not loaded");
