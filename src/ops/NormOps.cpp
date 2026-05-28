@@ -186,6 +186,43 @@ void fused_add_rms_norm(Context& ctx, Tensor& input, Tensor& residual,
             return;
         }
 
+        if (hidden_size == 2048) {
+            constexpr int hidden = 2048;
+            constexpr int wg_2048 = 256;
+            ctx.queue().submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(wg_2048, wg_2048),
+                    [=](sycl::nd_item<1> item) {
+                        using vec8 = sycl::vec<bf16, 8>;
+                        int lid = static_cast<int>(item.get_local_id(0));
+                        int base = lid * 8;
+                        const vec8* in_v8 = reinterpret_cast<const vec8*>(in_ptr + base);
+                        const vec8* res_v8 = reinterpret_cast<const vec8*>(res_ptr + base);
+                        const vec8* w_v8 = reinterpret_cast<const vec8*>(w_ptr + base);
+                        vec8* out_v8 = reinterpret_cast<vec8*>(out_ptr + base);
+
+                        vec8 in_vec = *in_v8;
+                        vec8 res_vec = *res_v8;
+                        float v[8];
+                        for (int k = 0; k < 8; ++k)
+                            v[k] = static_cast<float>(in_vec[k]) + static_cast<float>(res_vec[k]);
+
+                        float local_sum_sq = v[0]*v[0] + v[1]*v[1] + v[2]*v[2] + v[3]*v[3] +
+                                             v[4]*v[4] + v[5]*v[5] + v[6]*v[6] + v[7]*v[7];
+                        float group_sum = sycl::reduce_over_group(
+                            item.get_group(), local_sum_sq, sycl::plus<float>());
+                        float inv_rms = sycl::rsqrt(group_sum / static_cast<float>(hidden) + eps);
+
+                        vec8 w_vec = *w_v8;
+                        for (int k = 0; k < 8; ++k) in_ptr[base + k] = bf16(v[k]);
+                        vec8 out_vec;
+                        for (int k = 0; k < 8; ++k)
+                            out_vec[k] = bf16(v[k] * inv_rms * static_cast<float>(w_vec[k]));
+                        *out_v8 = out_vec;
+                    });
+            });
+            return;
+        }
+
         ctx.queue().submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
                 [=](sycl::nd_item<1> item) {

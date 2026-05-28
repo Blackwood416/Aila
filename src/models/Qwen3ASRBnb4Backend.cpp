@@ -1,8 +1,11 @@
 #include "Qwen3ASRBnb4Backend.hpp"
 #include "profile/Profiling.hpp"
+#include "utils/EnvUtils.hpp"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <chrono>
+#include <array>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -10,6 +13,35 @@ namespace {
 int round_up_seq(int v, int granularity) {
     return ((v + granularity - 1) / granularity) * granularity;
 }
+
+enum class ProfileStage : int {
+    EmbedNorm = 0,
+    FullQkvProj,
+    FullSplit,
+    QkNormRope,
+    KvCache,
+    Attention,
+    OProj,
+    PostAttnNorm,
+    FfnProj,
+    FfnAct,
+    DownProj,
+    PostMlpNorm,
+    LmHead,
+    Count
+};
+
+struct StageProfileTotals {
+    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
+    int calls = 0;
+    int tokens = 0;
+
+    void reset() {
+        stage_ms.fill(0.0);
+        calls = 0;
+        tokens = 0;
+    }
+};
 }
 
 Qwen3ASRBnb4Backend::~Qwen3ASRBnb4Backend() = default;
@@ -364,6 +396,16 @@ bool Qwen3ASRBnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelS
         ctx.memcpy_h2d(buf_.rope_freq.data(), rope_freq_host.data(),
                        rope_freq_host.size() * sizeof(float));
     }
+
+    if (cfg_.head_dim == 256 || cfg_.head_dim == 128) {
+        constexpr int kDecodeExactTile = 128;
+        const int partial_stride = (cfg_.head_dim == 256) ? 272 : 144;
+        const int max_tiles = (max_seq_len + kDecodeExactTile - 1) / kDecodeExactTile;
+        buf_.decode_attn_partials = Tensor::allocate(
+            ctx,
+            {(int64_t)cfg_.num_attention_heads, (int64_t)max_tiles, (int64_t)partial_stride},
+            dnnl::memory::data_type::f32);
+    }
     override_buf_ = Tensor();
 
     AILA_LOG_INFO("[Qwen3ASRBnb4] Model fully loaded and initialized");
@@ -374,6 +416,30 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
     if (seq_len <= 0) {
         throw std::runtime_error("Qwen3ASRBnb4Backend::forward: seq_len must be positive");
     }
+
+    static const bool s_profile_decode = aila::env::read_flag("AILA_PROFILE_Q3_DECODE", false);
+    static const bool s_profile_prefill = aila::env::read_flag("AILA_PROFILE_Q3_PREFILL", false);
+    static const int s_decode_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q3_DECODE_EVERY", 32));
+    static const int s_prefill_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q3_PREFILL_EVERY", 1));
+    static const bool s_profile_host_only = aila::env::read_flag("AILA_PROFILE_Q3_HOST_ONLY", false);
+    bool profile_decode = (seq_len == 1) && s_profile_decode;
+    bool profile_prefill = (seq_len > 1) && s_profile_prefill;
+    int profile_every = profile_decode ? s_decode_every : s_prefill_every;
+    bool profile_enabled = profile_decode || profile_prefill;
+    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
+    bool profile_host_only = profile_enabled && s_profile_host_only;
+    auto time_stage = [&](ProfileStage stage, auto&& fn) {
+        if (!profile_enabled) {
+            fn();
+            return;
+        }
+        auto t0 = std::chrono::high_resolution_clock::now();
+        fn();
+        if (!profile_host_only) ctx.synchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        stage_ms[static_cast<size_t>(stage)] +=
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
 
     int H = hidden_size_;
     int QD = q_dim_;
@@ -394,42 +460,50 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
         }
     }
 
-    // 1. Embedding lookup
-    ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, H);
-
-    // 2. Apply audio embedding overrides
-    if (has_embedding_overrides_ && !override_positions_.empty()) {
-        size_t n_override = override_positions_.size();
-        if (!override_buf_.valid() || override_buf_.numel() < static_cast<int64_t>(n_override * H)) {
-            override_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override), H});
-        }
-        ctx.memcpy_h2d(override_buf_.data(), override_embeddings_.data(),
-                       n_override * H * sizeof(bf16));
-
-        if (!override_pos_buf_.valid() || override_pos_buf_.numel() < static_cast<int64_t>(n_override)) {
-            override_pos_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override)},
-                                                  dnnl::memory::data_type::s32);
-        }
-        ctx.memcpy_h2d(override_pos_buf_.data(), override_positions_.data(),
-                       n_override * sizeof(int));
-
-        bf16* hidden_ptr = buf_.hidden.data_as<bf16>();
-        bf16* over_ptr = override_buf_.data_as<bf16>();
-        int* pos_ptr = override_pos_buf_.data_as<int>();
-
-        ctx.queue().parallel_for(sycl::range<1>(n_override), [=](sycl::id<1> idx) {
-            int64_t i = idx[0];
-            int pos = pos_ptr[i];
-            for (int j = 0; j < H; ++j) {
-                hidden_ptr[pos * H + j] = over_ptr[i * H + j];
-            }
-        });
-        has_embedding_overrides_ = false;
+    static const bool s_fuse_residual = aila::env::read_flag("AILA_FUSE_RESIDUAL_ADD", false);
+    bf16* hidden_ptr_for_residual = nullptr;
+    if (seq_len == 1 && s_fuse_residual) {
+        hidden_ptr_for_residual = static_cast<bf16*>(buf_.hidden.data());
     }
 
-    // 3. Initial norm
-    ops::rms_norm(ctx, buf_.hidden, *layers_[0].input_ln_weight,
-                  cfg_.rms_norm_eps, buf_.normed, seq_len, H);
+    time_stage(ProfileStage::EmbedNorm, [&] {
+        // 1. Embedding lookup
+        ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, H);
+
+        // 2. Apply audio embedding overrides
+        if (has_embedding_overrides_ && !override_positions_.empty()) {
+            size_t n_override = override_positions_.size();
+            if (!override_buf_.valid() || override_buf_.numel() < static_cast<int64_t>(n_override * H)) {
+                override_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override), H});
+            }
+            ctx.memcpy_h2d(override_buf_.data(), override_embeddings_.data(),
+                           n_override * H * sizeof(bf16));
+
+            if (!override_pos_buf_.valid() || override_pos_buf_.numel() < static_cast<int64_t>(n_override)) {
+                override_pos_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override)},
+                                                      dnnl::memory::data_type::s32);
+            }
+            ctx.memcpy_h2d(override_pos_buf_.data(), override_positions_.data(),
+                           n_override * sizeof(int));
+
+            bf16* hidden_ptr = buf_.hidden.data_as<bf16>();
+            bf16* over_ptr = override_buf_.data_as<bf16>();
+            int* pos_ptr = override_pos_buf_.data_as<int>();
+
+            ctx.queue().parallel_for(sycl::range<1>(n_override), [=](sycl::id<1> idx) {
+                int64_t i = idx[0];
+                int pos = pos_ptr[i];
+                for (int j = 0; j < H; ++j) {
+                    hidden_ptr[pos * H + j] = over_ptr[i * H + j];
+                }
+            });
+            has_embedding_overrides_ = false;
+        }
+
+        // 3. Initial norm
+        ops::rms_norm(ctx, buf_.hidden, *layers_[0].input_ln_weight,
+                      cfg_.rms_norm_eps, buf_.normed, seq_len, H);
+    });
 
     // MRoPE dimension
     int rotary_dim = cfg_.head_dim;
@@ -449,116 +523,214 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
         Tensor* q_for_attn = &buf_.q;
 
         if (seq_len == 1) {
-            layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, 1);
+            time_stage(ProfileStage::FullQkvProj, [&] {
+                layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, 1);
+            });
             bf16* qkv_ptr = static_cast<bf16*>(buf_.qkv.data());
             q_decode_view = Tensor::view(ctx, qkv_ptr, {1, (int64_t)QD});
             Tensor k_view = Tensor::view(ctx, qkv_ptr + QD, {1, (int64_t)KVD});
             Tensor v_view = Tensor::view(ctx, qkv_ptr + QD + KVD, {1, (int64_t)KVD});
             q_for_attn = &q_decode_view;
 
-            ops::decode_prepare_qkv_partial(ctx,
-                q_decode_view, k_view, v_view,
-                *layer.q_norm_weight, *layer.k_norm_weight,
-                kv_cache_.k_cache(i), kv_cache_.v_cache(i),
-                start_pos,
-                cfg_.num_attention_heads, cfg_.num_key_value_heads, cfg_.head_dim,
-                cfg_.rms_norm_eps, rotary_dim, cfg_.rope_theta,
-                rope_.mrope_interleaved,
-                pos_t, pos_h, pos_w,
-                static_cast<int>(mrope_pos_t_.size()),
-                mrope_text_pos_delta_,
-                rope_.mrope_section[0], rope_.mrope_section[1], rope_.mrope_section[2]);
+            time_stage(ProfileStage::QkNormRope, [&] {
+                ops::decode_prepare_qkv_partial(ctx,
+                    q_decode_view, k_view, v_view,
+                    *layer.q_norm_weight, *layer.k_norm_weight,
+                    kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                    start_pos,
+                    cfg_.num_attention_heads, cfg_.num_key_value_heads, cfg_.head_dim,
+                    cfg_.rms_norm_eps, rotary_dim, cfg_.rope_theta,
+                    rope_.mrope_interleaved,
+                    pos_t, pos_h, pos_w,
+                    static_cast<int>(mrope_pos_t_.size()),
+                    mrope_text_pos_delta_,
+                    rope_.mrope_section[0], rope_.mrope_section[1], rope_.mrope_section[2]);
+            });
         } else {
-            layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, seq_len);
-            ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v, seq_len, QD, KVD);
+            time_stage(ProfileStage::FullQkvProj, [&] {
+                layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, seq_len);
+            });
+            time_stage(ProfileStage::FullSplit, [&] {
+                ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v, seq_len, QD, KVD);
+            });
 
-            ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
-                               cfg_.rms_norm_eps, seq_len,
-                               cfg_.num_attention_heads, cfg_.head_dim);
-            ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight,
-                               cfg_.rms_norm_eps, seq_len,
-                               cfg_.num_key_value_heads, cfg_.head_dim);
+            time_stage(ProfileStage::QkNormRope, [&] {
+                ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
+                                   cfg_.rms_norm_eps, seq_len,
+                                   cfg_.num_attention_heads, cfg_.head_dim);
+                ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight,
+                                   cfg_.rms_norm_eps, seq_len,
+                                   cfg_.num_key_value_heads, cfg_.head_dim);
 
-            ops::apply_rope_partial(ctx, buf_.q, buf_.k, seq_len, start_pos,
-                                    cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                    cfg_.head_dim, rotary_dim, cfg_.rope_theta,
-                                    rope_.mrope_interleaved,
-                                    pos_t, pos_h, pos_w,
-                                    static_cast<int>(mrope_pos_t_.size()),
-                                    mrope_text_pos_delta_,
-                                    rope_.mrope_section[0], rope_.mrope_section[1],
-                                    rope_.mrope_section[2]);
+                ops::apply_rope_partial(ctx, buf_.q, buf_.k, seq_len, start_pos,
+                                        cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                        cfg_.head_dim, rotary_dim, cfg_.rope_theta,
+                                        rope_.mrope_interleaved,
+                                        pos_t, pos_h, pos_w,
+                                        static_cast<int>(mrope_pos_t_.size()),
+                                        mrope_text_pos_delta_,
+                                        rope_.mrope_section[0], rope_.mrope_section[1],
+                                        rope_.mrope_section[2]);
+            });
 
-            ops::copy_to_cache(ctx, buf_.k, kv_cache_.k_cache(i), seq_len, start_pos,
-                               cfg_.num_key_value_heads, cfg_.head_dim, kv_cache_.max_length());
-            ops::copy_to_cache(ctx, buf_.v, kv_cache_.v_cache(i), seq_len, start_pos,
-                               cfg_.num_key_value_heads, cfg_.head_dim, kv_cache_.max_length());
+            time_stage(ProfileStage::KvCache, [&] {
+                ops::copy_to_cache(ctx, buf_.k, kv_cache_.k_cache(i), seq_len, start_pos,
+                                   cfg_.num_key_value_heads, cfg_.head_dim, kv_cache_.max_length());
+                ops::copy_to_cache(ctx, buf_.v, kv_cache_.v_cache(i), seq_len, start_pos,
+                                   cfg_.num_key_value_heads, cfg_.head_dim, kv_cache_.max_length());
+            });
         }
 
         // Attention
-        if (seq_len == 1) {
-            ops::attention_decode(ctx, *q_for_attn, kv_cache_.k_cache(i), kv_cache_.v_cache(i),
-                                  buf_.attn_out, buf_.decode_scores,
-                                  cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                  cfg_.head_dim, cached_len);
-        } else if (start_pos == 0) {
-            ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v,
-                                   buf_.attn_out, buf_.scores, seq_len,
-                                   cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                   cfg_.head_dim);
-        } else {
-            ops::attention_prefill_cached(ctx, buf_.q,
-                                          kv_cache_.k_cache(i), kv_cache_.v_cache(i),
-                                          buf_.attn_out, buf_.incr_scores,
-                                          seq_len, start_pos,
-                                          cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                          cfg_.head_dim, kv_cache_.max_length());
-        }
+        time_stage(ProfileStage::Attention, [&] {
+            if (seq_len == 1) {
+                ops::attention_decode(ctx, *q_for_attn, kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                                      buf_.attn_out, buf_.decode_scores,
+                                      cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                      cfg_.head_dim, cached_len,
+                                      &buf_.decode_attn_partials);
+            } else if (start_pos == 0) {
+                ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v,
+                                       buf_.attn_out, buf_.scores, seq_len,
+                                       cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                       cfg_.head_dim);
+            } else {
+                ops::attention_prefill_cached(ctx, buf_.q,
+                                              kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                                              buf_.attn_out, buf_.incr_scores,
+                                              seq_len, start_pos,
+                                              cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                              cfg_.head_dim, kv_cache_.max_length());
+            }
+        });
 
         // O projection
-        layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len);
+        time_stage(ProfileStage::OProj, [&] {
+            layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
+        });
 
         // Residual + post-attn norm
-        ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate,
-                                *layer.post_attn_ln_weight, cfg_.rms_norm_eps,
-                                buf_.normed, seq_len, H);
+        time_stage(ProfileStage::PostAttnNorm, [&] {
+            if (hidden_ptr_for_residual) {
+                ops::rms_norm(ctx, buf_.gate, *layer.post_attn_ln_weight,
+                              cfg_.rms_norm_eps, buf_.normed, seq_len, H);
+            } else {
+                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate,
+                                        *layer.post_attn_ln_weight, cfg_.rms_norm_eps,
+                                        buf_.normed, seq_len, H);
+            }
+        });
 
         // FFN
         if (seq_len == 1) {
-            layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, 1);
-            ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, FF);
+            bool fused_ok = false;
+            time_stage(ProfileStage::FfnProj, [&] {
+                fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                    ctx, layer.gate_up_proj, buf_.normed, buf_.gate, FF);
+            });
+            if (!fused_ok) {
+                time_stage(ProfileStage::FfnProj, [&] {
+                    layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, 1);
+                });
+                time_stage(ProfileStage::FfnAct, [&] {
+                    ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, FF);
+                });
+            }
         } else {
-            layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
-            ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
-            ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
+            time_stage(ProfileStage::FfnProj, [&] {
+                layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
+            });
+            time_stage(ProfileStage::FfnAct, [&] {
+                ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
+                ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
+            });
         }
 
         // Down projection
-        layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len);
+        time_stage(ProfileStage::DownProj, [&] {
+            layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len, hidden_ptr_for_residual);
+        });
 
         // Residual + next-norm
-        if (i < cfg_.num_hidden_layers - 1) {
-            ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
-                                    *layers_[i + 1].input_ln_weight, cfg_.rms_norm_eps,
-                                    buf_.normed, seq_len, H);
-        } else {
-            ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
-                                    *final_norm_weight_, cfg_.rms_norm_eps,
-                                    buf_.normed, seq_len, H);
-        }
+        time_stage(ProfileStage::PostMlpNorm, [&] {
+            if (hidden_ptr_for_residual) {
+                if (i < cfg_.num_hidden_layers - 1) {
+                    ops::rms_norm(ctx, buf_.up, *layers_[i + 1].input_ln_weight,
+                                  cfg_.rms_norm_eps, buf_.normed, seq_len, H);
+                } else {
+                    ops::rms_norm(ctx, buf_.up, *final_norm_weight_,
+                                  cfg_.rms_norm_eps, buf_.normed, seq_len, H);
+                }
+            } else {
+                if (i < cfg_.num_hidden_layers - 1) {
+                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
+                                            *layers_[i + 1].input_ln_weight, cfg_.rms_norm_eps,
+                                            buf_.normed, seq_len, H);
+                } else {
+                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
+                                            *final_norm_weight_, cfg_.rms_norm_eps,
+                                            buf_.normed, seq_len, H);
+                }
+            }
+        });
     }
 
     // LM Head
-    if (seq_len > 1) {
-        bf16* last_ptr = static_cast<bf16*>(buf_.normed.data()) + (seq_len - 1) * H;
-        Tensor last = Tensor::view(ctx, last_ptr, {1, (int64_t)H});
-        lm_head_.forward(ctx, last, buf_.logits, 1);
-    } else {
-        lm_head_.forward(ctx, buf_.normed, buf_.logits, 1);
-    }
+    time_stage(ProfileStage::LmHead, [&] {
+        if (seq_len > 1) {
+            bf16* last_ptr = static_cast<bf16*>(buf_.normed.data()) + (seq_len - 1) * H;
+            Tensor last = Tensor::view(ctx, last_ptr, {1, (int64_t)H});
+            lm_head_.forward(ctx, last, buf_.logits, 1);
+        } else {
+            lm_head_.forward(ctx, buf_.normed, buf_.logits, 1);
+        }
+    });
 
     kv_cache_.advance(seq_len);
     current_len_ += seq_len;
+
+    if (profile_enabled) {
+        static StageProfileTotals decode_totals;
+        static StageProfileTotals prefill_totals;
+        StageProfileTotals& totals = profile_decode ? decode_totals : prefill_totals;
+        for (size_t i = 0; i < stage_ms.size(); ++i) {
+            totals.stage_ms[i] += stage_ms[i];
+        }
+        totals.calls += 1;
+        totals.tokens += profile_decode ? 1 : seq_len;
+
+        if (totals.calls >= profile_every) {
+            auto avg = [&](ProfileStage stage) {
+                return totals.stage_ms[static_cast<size_t>(stage)] /
+                       static_cast<double>(std::max(1, totals.calls));
+            };
+            double total_ms = 0.0;
+            for (double v : totals.stage_ms) total_ms += v;
+            const char* tag = profile_decode ? "[Q3ASRDecodeProfile]" : "[Q3ASRPrefillProfile]";
+            AILA_LOG_INFO(
+                "%s tokens=%d total=%.3f embed=%.3f full_qkv=%.3f full_split=%.3f qk_rope=%.3f "
+                "kv_copy=%.3f attn=%.3f o_proj=%.3f post_attn=%.3f ffn_proj=%.3f ffn_act=%.3f "
+                "down=%.3f post_mlp=%.3f lm_head=%.3f",
+                tag,
+                totals.tokens,
+                total_ms / static_cast<double>(std::max(1, totals.tokens)),
+                avg(ProfileStage::EmbedNorm),
+                avg(ProfileStage::FullQkvProj),
+                avg(ProfileStage::FullSplit),
+                avg(ProfileStage::QkNormRope),
+                avg(ProfileStage::KvCache),
+                avg(ProfileStage::Attention),
+                avg(ProfileStage::OProj),
+                avg(ProfileStage::PostAttnNorm),
+                avg(ProfileStage::FfnProj),
+                avg(ProfileStage::FfnAct),
+                avg(ProfileStage::DownProj),
+                avg(ProfileStage::PostMlpNorm),
+                avg(ProfileStage::LmHead));
+            totals.reset();
+        }
+    }
+
     return buf_.logits;
 }
 

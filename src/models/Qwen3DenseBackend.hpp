@@ -65,6 +65,7 @@ private:
         Tensor scores;       // [num_heads, max_seq, max_seq] for prefill
         Tensor incr_scores;  // [num_heads, seq_len, total_len] for incremental prefill
         Tensor rope_freq;    // [head_dim/2] precomputed RoPE frequency table (f32)
+        Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
 
     int runtime_seq_capacity_ = 0;

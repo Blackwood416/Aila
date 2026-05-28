@@ -124,6 +124,108 @@ void decode_prepare_qkv(Context& ctx,
 
     (void)theta;
 
+    if (head_dim == 128) {
+        constexpr int head_dim_const = 128;
+        constexpr int half_dim_const = 64;
+        constexpr int wg_size_const = 16;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(num_heads_q * wg_size_const, wg_size_const),
+                [=](sycl::nd_item<1> item) {
+                    using vec4 = sycl::vec<bf16, 4>;
+                    int head = item.get_group(0);
+                    int lid = item.get_local_id(0);
+                    int q_base = head * head_dim_const;
+
+                    vec4 q0_vec = reinterpret_cast<const vec4*>(q_ptr + q_base)[lid];
+                    vec4 q1_vec = reinterpret_cast<const vec4*>(q_ptr + q_base + half_dim_const)[lid];
+
+                    float sum_sq = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        float x0 = static_cast<float>(q0_vec[k]);
+                        float x1 = static_cast<float>(q1_vec[k]);
+                        sum_sq += x0 * x0 + x1 * x1;
+                    }
+
+                    float group_sum = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<float>());
+                    float q_inv_rms = sycl::rsqrt(group_sum / static_cast<float>(head_dim_const) + eps);
+
+                    vec4 qn0_vec = reinterpret_cast<const vec4*>(qn_ptr)[lid];
+                    vec4 qn1_vec = reinterpret_cast<const vec4*>(qn_ptr + half_dim_const)[lid];
+
+                    for (int k = 0; k < 4; ++k) {
+                        q0_vec[k] = bf16(static_cast<float>(q0_vec[k]) * q_inv_rms * static_cast<float>(qn0_vec[k]));
+                        q1_vec[k] = bf16(static_cast<float>(q1_vec[k]) * q_inv_rms * static_cast<float>(qn1_vec[k]));
+                    }
+
+                    for (int k = 0; k < 4; ++k) {
+                        int d = lid * 4 + k;
+                        float angle = static_cast<float>(start_pos) * rope_freq_ptr[d];
+                        float c = sycl::native::cos(angle);
+                        float s = sycl::native::sin(angle);
+
+                        float v0 = static_cast<float>(q0_vec[k]);
+                        float v1 = static_cast<float>(q1_vec[k]);
+                        q0_vec[k] = bf16(v0 * c - v1 * s);
+                        q1_vec[k] = bf16(v1 * c + v0 * s);
+                    }
+
+                    reinterpret_cast<vec4*>(q_ptr + q_base)[lid] = q0_vec;
+                    reinterpret_cast<vec4*>(q_ptr + q_base + half_dim_const)[lid] = q1_vec;
+
+                    if (head >= num_kv_heads) {
+                        return;
+                    }
+
+                    int kv_base = head * head_dim_const;
+                    vec4 k0_vec = reinterpret_cast<const vec4*>(k_ptr + kv_base)[lid];
+                    vec4 k1_vec = reinterpret_cast<const vec4*>(k_ptr + kv_base + half_dim_const)[lid];
+
+                    sum_sq = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        float x0 = static_cast<float>(k0_vec[k]);
+                        float x1 = static_cast<float>(k1_vec[k]);
+                        sum_sq += x0 * x0 + x1 * x1;
+                    }
+                    group_sum = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<float>());
+                    float k_inv_rms = sycl::rsqrt(group_sum / static_cast<float>(head_dim_const) + eps);
+
+                    vec4 kn0_vec = reinterpret_cast<const vec4*>(kn_ptr)[lid];
+                    vec4 kn1_vec = reinterpret_cast<const vec4*>(kn_ptr + half_dim_const)[lid];
+
+                    for (int k = 0; k < 4; ++k) {
+                        k0_vec[k] = bf16(static_cast<float>(k0_vec[k]) * k_inv_rms * static_cast<float>(kn0_vec[k]));
+                        k1_vec[k] = bf16(static_cast<float>(k1_vec[k]) * k_inv_rms * static_cast<float>(kn1_vec[k]));
+                    }
+
+                    for (int k = 0; k < 4; ++k) {
+                        int d = lid * 4 + k;
+                        float angle = static_cast<float>(start_pos) * rope_freq_ptr[d];
+                        float c = sycl::native::cos(angle);
+                        float s = sycl::native::sin(angle);
+
+                        float v0 = static_cast<float>(k0_vec[k]);
+                        float v1 = static_cast<float>(k1_vec[k]);
+                        k0_vec[k] = bf16(v0 * c - v1 * s);
+                        k1_vec[k] = bf16(v1 * c + v0 * s);
+                    }
+
+                    reinterpret_cast<vec4*>(k_ptr + kv_base)[lid] = k0_vec;
+                    reinterpret_cast<vec4*>(k_ptr + kv_base + half_dim_const)[lid] = k1_vec;
+
+                    vec4 v0_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base)[lid];
+                    vec4 v1_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base + half_dim_const)[lid];
+
+                    int cache_base = head * max_seq_len * head_dim_const + start_pos * head_dim_const;
+                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base)[lid] = k0_vec;
+                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base + half_dim_const)[lid] = k1_vec;
+                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base)[lid] = v0_vec;
+                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base + half_dim_const)[lid] = v1_vec;
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);
 
@@ -249,48 +351,31 @@ void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_
     bf16* src_ptr = static_cast<bf16*>(gate_up.data());
     vec8* o_ptr = reinterpret_cast<vec8*>(output.data());
 
-    if (ff_dim == 3584) {
-        constexpr int wg_size = 256;
-        constexpr int chunk_count = 3584 / 8;
-        vec8* gate_ptr = reinterpret_cast<vec8*>(src_ptr);
-        vec8* up_ptr = reinterpret_cast<vec8*>(src_ptr + 3584);
-
-        ctx.queue().submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
-                [=](sycl::nd_item<1> item) {
-                    int lid = static_cast<int>(item.get_local_id(0));
-                    for (int chunk = lid; chunk < chunk_count; chunk += wg_size) {
-                        vec8 g_vec = gate_ptr[chunk];
-                        vec8 u_vec = up_ptr[chunk];
-                        vec8 o_vec;
-                        for (int k = 0; k < 8; ++k) {
-                            float g = static_cast<float>(g_vec[k]);
-                            float u = static_cast<float>(u_vec[k]);
-                            float silu_g = g / (1.0f + sycl::native::exp(-g));
-                            o_vec[k] = bf16(silu_g * u);
-                        }
-                        o_ptr[chunk] = o_vec;
-                    }
-                });
-        });
-        return;
-    }
-
     int n8 = ff_dim / 8;
+    constexpr int wg_size = 256;
+    int num_groups = (n8 + wg_size - 1) / wg_size;
 
-    ctx.queue().parallel_for(sycl::range<1>(n8),
-        [=](sycl::id<1> i) {
-            int base = static_cast<int>(i) * 8;
-            // Gate is in first half, Up is in second half
-            vec8 o_vec;
-            for (int k = 0; k < 8; ++k) {
-                float g = static_cast<float>(src_ptr[base + k]);
-                float u = static_cast<float>(src_ptr[ff_dim + base + k]);
-                float silu_g = g / (1.0f + sycl::native::exp(-g));
-                o_vec[k] = bf16(silu_g * u);
-            }
-            o_ptr[i] = o_vec;
-        });
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                int i = static_cast<int>(item.get_global_id(0));
+                if (i >= n8) return;
+
+                const vec8* gate_ptr = reinterpret_cast<const vec8*>(src_ptr);
+                const vec8* up_ptr = reinterpret_cast<const vec8*>(src_ptr + ff_dim);
+
+                vec8 g_vec = gate_ptr[i];
+                vec8 u_vec = up_ptr[i];
+                vec8 o_vec;
+                for (int k = 0; k < 8; ++k) {
+                    float g = static_cast<float>(g_vec[k]);
+                    float u = static_cast<float>(u_vec[k]);
+                    float silu_g = g / (1.0f + sycl::native::exp(-g));
+                    o_vec[k] = bf16(silu_g * u);
+                }
+                o_ptr[i] = o_vec;
+            });
+    });
 }
 
 void gelu_tanh_inplace(Context& ctx, Tensor& input, int n) {
@@ -582,6 +667,111 @@ void decode_prepare_qkv_partial(Context& ctx,
     if (rot & 1) --rot;
     int half_dim = rot / 2;
     int wg_size = (head_dim > 128 ? 256 : 128);
+
+    if (head_dim == 128 && rotary_dim == 128 && !interleaved) {
+        constexpr int head_dim_const = 128;
+        constexpr int half_dim_const = 64;
+        constexpr int wg_size_const = 16;
+        float pos_val = static_cast<float>(start_pos >= prompt_pos_len ? start_pos + text_pos_delta : start_pos);
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(num_heads_q * wg_size_const, wg_size_const),
+                [=](sycl::nd_item<1> item) {
+                    using vec4 = sycl::vec<bf16, 4>;
+                    int head = item.get_group(0);
+                    int lid = item.get_local_id(0);
+                    int q_base = head * head_dim_const;
+
+                    vec4 q0_vec = reinterpret_cast<const vec4*>(q_ptr + q_base)[lid];
+                    vec4 q1_vec = reinterpret_cast<const vec4*>(q_ptr + q_base + half_dim_const)[lid];
+
+                    float sum_sq = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        float x0 = static_cast<float>(q0_vec[k]);
+                        float x1 = static_cast<float>(q1_vec[k]);
+                        sum_sq += x0 * x0 + x1 * x1;
+                    }
+
+                    float group_sum = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<float>());
+                    float q_inv_rms = sycl::rsqrt(group_sum / static_cast<float>(head_dim_const) + eps);
+
+                    vec4 qn0_vec = reinterpret_cast<const vec4*>(qn_ptr)[lid];
+                    vec4 qn1_vec = reinterpret_cast<const vec4*>(qn_ptr + half_dim_const)[lid];
+
+                    for (int k = 0; k < 4; ++k) {
+                        q0_vec[k] = bf16(static_cast<float>(q0_vec[k]) * q_inv_rms * static_cast<float>(qn0_vec[k]));
+                        q1_vec[k] = bf16(static_cast<float>(q1_vec[k]) * q_inv_rms * static_cast<float>(qn1_vec[k]));
+                    }
+
+                    for (int k = 0; k < 4; ++k) {
+                        int d = lid * 4 + k;
+                        float freq = 1.0f / sycl::pow(theta, (2.0f * d) / 128.0f);
+                        float angle = pos_val * freq;
+                        float c = sycl::native::cos(angle);
+                        float s = sycl::native::sin(angle);
+
+                        float v0 = static_cast<float>(q0_vec[k]);
+                        float v1 = static_cast<float>(q1_vec[k]);
+                        q0_vec[k] = bf16(v0 * c - v1 * s);
+                        q1_vec[k] = bf16(v1 * c + v0 * s);
+                    }
+
+                    reinterpret_cast<vec4*>(q_ptr + q_base)[lid] = q0_vec;
+                    reinterpret_cast<vec4*>(q_ptr + q_base + half_dim_const)[lid] = q1_vec;
+
+                    if (head >= num_kv_heads) {
+                        return;
+                    }
+
+                    int kv_base = head * head_dim_const;
+                    vec4 k0_vec = reinterpret_cast<const vec4*>(k_ptr + kv_base)[lid];
+                    vec4 k1_vec = reinterpret_cast<const vec4*>(k_ptr + kv_base + half_dim_const)[lid];
+
+                    sum_sq = 0.0f;
+                    for (int k = 0; k < 4; ++k) {
+                        float x0 = static_cast<float>(k0_vec[k]);
+                        float x1 = static_cast<float>(k1_vec[k]);
+                        sum_sq += x0 * x0 + x1 * x1;
+                    }
+                    group_sum = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<float>());
+                    float k_inv_rms = sycl::rsqrt(group_sum / static_cast<float>(head_dim_const) + eps);
+
+                    vec4 kn0_vec = reinterpret_cast<const vec4*>(kn_ptr)[lid];
+                    vec4 kn1_vec = reinterpret_cast<const vec4*>(kn_ptr + half_dim_const)[lid];
+
+                    for (int k = 0; k < 4; ++k) {
+                        k0_vec[k] = bf16(static_cast<float>(k0_vec[k]) * k_inv_rms * static_cast<float>(kn0_vec[k]));
+                        k1_vec[k] = bf16(static_cast<float>(k1_vec[k]) * k_inv_rms * static_cast<float>(kn1_vec[k]));
+                    }
+
+                    for (int k = 0; k < 4; ++k) {
+                        int d = lid * 4 + k;
+                        float freq = 1.0f / sycl::pow(theta, (2.0f * d) / 128.0f);
+                        float angle = pos_val * freq;
+                        float c = sycl::native::cos(angle);
+                        float s = sycl::native::sin(angle);
+
+                        float v0 = static_cast<float>(k0_vec[k]);
+                        float v1 = static_cast<float>(k1_vec[k]);
+                        k0_vec[k] = bf16(v0 * c - v1 * s);
+                        k1_vec[k] = bf16(v1 * c + v0 * s);
+                    }
+
+                    reinterpret_cast<vec4*>(k_ptr + kv_base)[lid] = k0_vec;
+                    reinterpret_cast<vec4*>(k_ptr + kv_base + half_dim_const)[lid] = k1_vec;
+
+                    vec4 v0_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base)[lid];
+                    vec4 v1_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base + half_dim_const)[lid];
+
+                    int cache_base = head * max_seq_len * head_dim_const + start_pos * head_dim_const;
+                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base)[lid] = k0_vec;
+                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base + half_dim_const)[lid] = k1_vec;
+                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base)[lid] = v0_vec;
+                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base + half_dim_const)[lid] = v1_vec;
+                });
+        });
+        return;
+    }
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);

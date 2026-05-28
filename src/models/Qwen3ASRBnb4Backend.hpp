@@ -84,6 +84,7 @@ private:
         Tensor gate_up, gate, up, logits;
         Tensor decode_scores, scores, incr_scores;
         Tensor rope_freq;
+        Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
 
     int runtime_seq_capacity_ = 0;

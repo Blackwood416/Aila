@@ -82,6 +82,7 @@ private:
         Tensor decode_scores;
         Tensor scores;
         Tensor incr_scores;
+        Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
 
     int runtime_seq_capacity_ = 0;
