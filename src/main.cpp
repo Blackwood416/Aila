@@ -193,13 +193,22 @@ int main(int argc, char** argv) {
             return 2;
         }
 
+        std::string input_text = trim(normalize_input_for_model(opts.tts_text));
+        if (input_text.empty()) {
+            AILA_LOG_ERROR("TTS synthesis failed: input text is empty after normalization");
+            return 2;
+        }
+
         std::string output_path = opts.tts_output_path.empty() ? "output.wav" : opts.tts_output_path;
-        AILA_LOG_INFO("Synthesizing text: \"%s\"", opts.tts_text.c_str());
+        AILA_LOG_INFO("Synthesizing text: \"%s\"", input_text.c_str());
 
         std::vector<float> samples;
         std::vector<float> speaker_embedding;
+        if (!opts.tts_speaker_path.empty()) {
+            speaker_embedding = load_or_extract_speaker_embedding(engine.model_dir(), opts.tts_speaker_path);
+        }
 
-        bool ok = engine.synthesize_text_to_wav(opts.tts_text, speaker_embedding, gen_config, samples);
+        bool ok = engine.synthesize_text_to_wav(input_text, speaker_embedding, gen_config, samples);
         if (!ok) {
             AILA_LOG_ERROR("TTS synthesis failed: %s", engine.last_error_message().c_str());
             return 2;

@@ -77,6 +77,7 @@ void print_version();
 // String processing utilities
 std::string normalize_input_for_model(const std::string& text);
 std::string trim(const std::string& str);
+std::vector<float> load_or_extract_speaker_embedding(const std::string& model_dir, const std::string& path);
 
 // ============================================================
 // Interactive command registry

@@ -72,6 +72,7 @@ std::string codepage_to_utf8(const std::string& text, UINT codepage) {
     }
     return out;
 }
+#endif
 
 #ifdef _WIN32
 void setup_console_utf8(bool interactive_terminal) {
