@@ -39,6 +39,11 @@ struct Qwen3Config {
 
     RopeSpec rope{};
 
+    // TTS extensions
+    int num_code_groups = 16;
+    int codec_eos_token_id = 2150;
+    int text_hidden_size = 2048;
+
     int num_heads_per_kv_group() const { return num_attention_heads / num_key_value_heads; }
 };
 
@@ -69,6 +74,7 @@ enum class ModelFamily {
     Qwen3Dense,
     Qwen35Hybrid,
     Qwen3ASR,
+    Qwen3TTS,
     Unknown
 };
 
@@ -204,6 +210,7 @@ struct ModelSpec {
 
     // Legacy/dense path
     Qwen3Config qwen3{};
+    Qwen3Config code_predictor{};
 
     // Qwen3.5 path
     Qwen35TextConfig qwen35_text{};

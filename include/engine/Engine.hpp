@@ -8,6 +8,7 @@
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
+#include "../src/models/Qwen3TTSBackend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
@@ -484,7 +485,9 @@ public:
         }
 
         // 5. Initialize backend
-        if (model_spec_.family == ModelFamily::Qwen3ASR) {
+        if (model_spec_.family == ModelFamily::Qwen3TTS) {
+            backend_ = std::make_unique<Qwen3TTSBackend>();
+        } else if (model_spec_.family == ModelFamily::Qwen3ASR) {
             if (model_spec_.is_bitsandbytes_4bit()) {
                 backend_ = std::make_unique<Qwen3ASRBnb4Backend>();
             } else {
@@ -506,6 +509,17 @@ public:
         if (!backend_->load(*ctx_, *weights_, model_spec_, max_seq_len, &backend_error)) {
             AILA_LOG_ERROR("Failed to initialize model backend: %s", backend_error.c_str());
             return false;
+        }
+
+        if (model_spec_.family == ModelFamily::Qwen3TTS) {
+            auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+            if (tts_backend) {
+                std::string mimi_error;
+                if (!tts_backend->load_mimi_vocoder(*ctx_, model_dir_, &mimi_error)) {
+                    AILA_LOG_ERROR("Failed to load Mimi Vocoder for Qwen3TTS: %s", mimi_error.c_str());
+                    return false;
+                }
+            }
         }
 
         // Apply LoRA to NF4 backend (weights are packed uint8, must be done at runtime)
@@ -566,6 +580,8 @@ public:
         } else if (init_warmup_mode == 1) {
             run_init_warmup = true;
         } else if (model_spec_.family == ModelFamily::Qwen35Hybrid && !is_supported_qwen35_hybrid_text_spec(model_spec_.qwen35_text)) {
+            run_init_warmup = false;
+        } else if (model_spec_.family == ModelFamily::Qwen3TTS) {
             run_init_warmup = false;
         }
 
@@ -2227,6 +2243,98 @@ public:
         }
 
         return seg_text;
+    }
+
+    // TTS audio code synthesis from text
+    bool synthesize_codes(const std::vector<int>& text_tokens,
+                          const std::vector<float>& speaker_embedding,
+                          const GenerationConfig& gen_config,
+                          std::vector<int32_t>& out_codes,
+                          int& out_n_frames) {
+        clear_error();
+        if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
+            set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
+            return false;
+        }
+
+        auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+        if (!tts_backend) {
+            set_error(EngineErrorCode::RuntimeError, "Invalid TTS backend class");
+            return false;
+        }
+
+        return tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, gen_config, out_codes, out_n_frames);
+    }
+
+    // TTS audio samples synthesis from text using Mimi Decoder
+    bool synthesize_wav(const std::vector<int>& text_tokens,
+                        const std::vector<float>& speaker_embedding,
+                        const GenerationConfig& gen_config,
+                        std::vector<float>& out_samples) {
+        clear_error();
+        if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
+            set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
+            return false;
+        }
+
+        auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+        if (!tts_backend) {
+            set_error(EngineErrorCode::RuntimeError, "Invalid TTS backend class");
+            return false;
+        }
+
+        std::vector<int32_t> codes;
+        int n_frames = 0;
+        bool ok = tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, gen_config, codes, n_frames);
+        if (!ok) {
+            set_error(EngineErrorCode::RuntimeError, "TTS synthesize_codes failed");
+            return false;
+        }
+
+        return tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
+    }
+
+    // TTS audio samples synthesis directly from raw text using Mimi Decoder
+    bool synthesize_text_to_wav(const std::string& text,
+                               const std::vector<float>& speaker_embedding,
+                               const GenerationConfig& gen_config,
+                               std::vector<float>& out_samples) {
+        clear_error();
+        if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
+            set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
+            return false;
+        }
+
+        std::string formatted_text = "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+        std::vector<int> tokens = tokenizer_.encode(formatted_text);
+
+        std::string ids_str = "";
+        for (int id : tokens) {
+            ids_str += std::to_string(id) + " ";
+        }
+        AILA_LOG_INFO("[TTS] Input: \"%s\", Tokenized into %zu tokens: [ %s]",
+                      text.c_str(), tokens.size(), ids_str.c_str());
+
+        return synthesize_wav(tokens, speaker_embedding, gen_config, out_samples);
+    }
+
+    // TTS audio discrete codes decoding using Mimi Decoder
+    bool decode_mimi_vocoder(const std::vector<int32_t>& codes,
+                             int n_frames,
+                             std::vector<float>& out_samples) {
+        clear_error();
+        if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
+            set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
+            return false;
+        }
+
+        auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+        if (!tts_backend) {
+            set_error(EngineErrorCode::RuntimeError, "Invalid TTS backend class");
+            return false;
+        }
+
+        return tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
     }
 
     // ASR transcription from WAV file

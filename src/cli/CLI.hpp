@@ -57,6 +57,10 @@ struct CLIOptions {
     std::string system_prompt;      // --asr-system
     float segment_sec = 0.0f;       // --asr-segment
     bool past_text_conditioning = false; // --asr-past / --no-asr-past
+
+    // TTS synthesis mode
+    std::string tts_text;           // --synthesize
+    std::string tts_output_path;    // --output-wav
 };
 
 // Parse command-line arguments

@@ -439,3 +439,22 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
 
     return true;
 }
+
+bool save_wav(const std::string& path, const std::vector<float>& samples, unsigned int sample_rate) {
+    if (samples.empty()) return false;
+    drwav wav;
+    drwav_data_format format;
+    format.container = drwav_container_riff;
+    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    format.channels = 1;
+    format.sampleRate = sample_rate;
+    format.bitsPerSample = 32;
+
+    if (!drwav_init_file_write(&wav, path.c_str(), &format, nullptr)) {
+        return false;
+    }
+
+    drwav_uint64 frames_written = drwav_write_pcm_frames(&wav, samples.size(), samples.data());
+    drwav_uninit(&wav);
+    return frames_written == samples.size();
+}

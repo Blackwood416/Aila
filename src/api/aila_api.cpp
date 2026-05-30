@@ -437,3 +437,143 @@ AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream) {
         delete stream;
     }
 }
+
+
+AILA_API int aila_synthesize_wav(
+    AilaEngine* engine,
+    const int* text_tokens,
+    int text_tokens_len,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+) {
+    if (!engine || !text_tokens || text_tokens_len <= 0 || !out_samples || !out_sample_count) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        GenerationConfig cpp_cfg = to_cpp_config(config);
+        
+        std::vector<int> tokens(text_tokens, text_tokens + text_tokens_len);
+        std::vector<float> spk_emb;
+        if (speaker_embedding && speaker_embedding_len > 0) {
+            spk_emb.assign(speaker_embedding, speaker_embedding + speaker_embedding_len);
+        }
+
+        std::vector<float> samples;
+        bool ok = engine->engine.synthesize_wav(tokens, spk_emb, cpp_cfg, samples);
+        if (!ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        float* c_arr = (float*)malloc(samples.size() * sizeof(float));
+        if (!c_arr) {
+            return AILA_ERR_RUNTIME;
+        }
+        std::copy(samples.begin(), samples.end(), c_arr);
+
+        *out_samples = c_arr;
+        *out_sample_count = static_cast<int>(samples.size());
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Synthesis WAV failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Synthesis WAV failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_synthesize_text_to_wav(
+    AilaEngine* engine,
+    const char* text,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+) {
+    if (!engine || !text || !out_samples || !out_sample_count) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        GenerationConfig cpp_cfg = to_cpp_config(config);
+        
+        std::vector<float> spk_emb;
+        if (speaker_embedding && speaker_embedding_len > 0) {
+            spk_emb.assign(speaker_embedding, speaker_embedding + speaker_embedding_len);
+        }
+
+        std::vector<float> samples;
+        bool ok = engine->engine.synthesize_text_to_wav(text, spk_emb, cpp_cfg, samples);
+        if (!ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        float* c_arr = (float*)malloc(samples.size() * sizeof(float));
+        if (!c_arr) {
+            return AILA_ERR_RUNTIME;
+        }
+        std::copy(samples.begin(), samples.end(), c_arr);
+
+        *out_samples = c_arr;
+        *out_sample_count = static_cast<int>(samples.size());
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Synthesis text to WAV failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Synthesis text to WAV failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API void aila_free_samples(float* samples) {
+    if (samples) {
+        free(samples);
+    }
+}
+
+AILA_API int aila_decode_mimi_vocoder(
+    AilaEngine* engine,
+    const int32_t* codes,
+    int n_frames,
+    float** out_samples,
+    int* out_sample_count
+) {
+    if (!engine || !codes || n_frames <= 0 || !out_samples || !out_sample_count) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<int32_t> codes_vec(codes, codes + n_frames * 16);
+        std::vector<float> samples;
+        
+        bool ok = engine->engine.decode_mimi_vocoder(codes_vec, n_frames, samples);
+        if (!ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        float* c_arr = (float*)malloc(samples.size() * sizeof(float));
+        if (!c_arr) {
+            return AILA_ERR_RUNTIME;
+        }
+        std::copy(samples.begin(), samples.end(), c_arr);
+
+        *out_samples = c_arr;
+        *out_sample_count = static_cast<int>(samples.size());
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Decode Mimi Vocoder failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Decode Mimi Vocoder failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}

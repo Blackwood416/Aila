@@ -1,6 +1,7 @@
 #include "CLI.hpp"
 #include "engine/Engine.hpp"
 #include "profile/Profiling.hpp"
+#include "AudioPreprocessor.hpp"
 #include "utils/EnvUtils.hpp"
 #include <iostream>
 #include <sstream>
@@ -140,6 +141,9 @@ Options:
   --asr-segment <sec>      ASR segment split duration in seconds (default: 0.0, disabled)
   --asr-past               Enable past-text conditioning history for ASR segments
   --no-asr-past            Disable past-text conditioning for ASR segments (default)
+  --transcribe <path>      Offline audio transcription (ASR) file path
+  --synthesize <prompt>    TTS voice synthesis from text prompt (Qwen3-TTS only)
+  --output-wav <path>      Output path for synthesized WAV file (default: output.wav)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -333,6 +337,14 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.segment_sec = static_cast<float>(std::atof(argv[++i]));
             continue;
         }
+        if (arg == "--synthesize" && i + 1 < argc) {
+            opts.tts_text = argv[++i];
+            continue;
+        }
+        if (arg == "--output-wav" && i + 1 < argc) {
+            opts.tts_output_path = argv[++i];
+            continue;
+        }
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;
@@ -477,6 +489,45 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         }
         return true;
     });
+
+    auto tts_handler = [&, engine](const std::string& args) {
+        if (args.empty()) {
+            std::cout << "[TTS] Usage: /tts <text_prompt>" << std::endl;
+            return true;
+        }
+        if (!engine) {
+            std::cout << "[TTS] Engine is not initialized" << std::endl;
+            return true;
+        }
+        if (engine->model_spec().family != ModelFamily::Qwen3TTS) {
+            std::cout << "[TTS] Current loaded model does not support TTS! Please specify a Qwen3-TTS model." << std::endl;
+            return true;
+        }
+        std::string norm_args = normalize_input_for_model(args);
+        std::cout << "[TTS] Synthesizing: \"" << norm_args << "\"" << std::endl;
+
+        std::vector<float> samples;
+        std::vector<float> speaker_embedding;
+        
+        bool ok = engine->synthesize_text_to_wav(norm_args, speaker_embedding, gen_config, samples);
+        if (!ok) {
+            std::cout << "[TTS] Synthesis failed: " << engine->last_error_message() << std::endl;
+            return true;
+        }
+
+        std::string output_path = "tts_output.wav";
+        if (save_wav(output_path, samples, 24000)) {
+            std::cout << "[TTS] Synthesis completed successfully! Audio saved to: " << output_path 
+                      << " (Samples: " << samples.size() << ", Duration: " 
+                      << std::fixed << std::setprecision(2) << (static_cast<double>(samples.size()) / 24000.0) << "s)" << std::endl;
+        } else {
+            std::cout << "[TTS] Synthesis succeeded, but failed to write WAV file to " << output_path << std::endl;
+        }
+        return true;
+    };
+
+    registry.register_command("/synthesize", "Synthesize text to speech (TTS)", tts_handler);
+    registry.register_command("/tts", "Synthesize text to speech (TTS)", tts_handler);
 
     registry.register_command("/greedy", "Switch to greedy decoding", [&](const std::string&) {
         gen_config.do_sample = false;

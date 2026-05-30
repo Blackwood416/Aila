@@ -29,6 +29,8 @@ public:
     void forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
                                 Tensor& output, int seq_len);
 
+    Tensor* weight() const { return weight_; }
+
 private:
     Tensor* weight_ = nullptr;
     int in_features_ = 0;
@@ -307,6 +309,20 @@ namespace ops {
     // Reads first half as gate, second half as up, computes silu(gate)*up
     void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up,
                                Tensor& output, int ff_dim);
+
+    // SnakeBeta activation: output[i] = input[i] + (1.0 / (exp(beta[c]) + 1e-9)) * sin^2(input[i] * exp(alpha[c]))
+    // where c is the channel index of element i: c = (i / seq_len) % channels
+    // input/output: [N, channels, seq_len]
+    void snake_beta(Context& ctx, Tensor& input, Tensor& alpha, Tensor& beta,
+                    Tensor& output, int n, int channels, int seq_len);
+
+    // VQ Lookup and optional accumulate:
+    // codes: [n_frames, 16] (int32)
+    // table: [2048, codebook_dim] (bf16)
+    // cb_idx: index in codes cols [0..15]
+    // output: [n_frames, codebook_dim] (bf16)
+    void vq_lookup_add(Context& ctx, Tensor& codes, Tensor& table,
+                       int cb_idx, Tensor& output, int n_frames, int codebook_dim, bool accum);
 
     // GELU-Tanh activation: x = gelu(x) (in-place)
     void gelu_tanh_inplace(Context& ctx, Tensor& input, int n);

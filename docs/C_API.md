@@ -255,6 +255,94 @@ void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
 
 Destroys the streaming ASR context and frees all associated memory. Passing `NULL` is safe.
 
+### Text-to-Speech (TTS)
+
+Aila supports Text-to-Speech (TTS) synthesis when loaded with a Qwen3-TTS model. The API allows synthesizing raw 24kHz float PCM audio samples from input text token IDs.
+
+#### `aila_synthesize_wav`
+
+```c
+int aila_synthesize_wav(
+    AilaEngine* engine,
+    const int* text_tokens,
+    int text_tokens_len,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+);
+```
+
+Synthesizes raw audio samples from a list of text token IDs (blocking).
+
+- `engine` — Initialized engine handle.
+- `text_tokens` — Array of text token IDs.
+- `text_tokens_len` — Number of token IDs in the array.
+- `speaker_embedding` — Optional float array of speaker clone embeddings. Can be `NULL`.
+- `speaker_embedding_len` — Length of speaker embedding array. Set to `0` if `speaker_embedding` is `NULL`.
+- `config` — Generation configuration (can be `NULL` for defaults).
+- `out_samples` — [out] Receives a newly allocated array of float audio samples (24kHz PCM). The caller **must** free this array with `aila_free_samples()`.
+- `out_sample_count` — [out] Receives the number of generated audio samples in `out_samples`.
+
+Returns `0` (`AILA_OK`) on success, non-zero on error.
+
+#### `aila_synthesize_text_to_wav`
+
+```c
+int aila_synthesize_text_to_wav(
+    AilaEngine* engine,
+    const char* text,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+);
+```
+
+Synthesizes raw audio samples directly from a UTF-8 text string (blocking). The API automatically handles ChatML layout and tokenization.
+
+- `engine` — Initialized engine handle.
+- `text` — Null-terminated UTF-8 text prompt to synthesize.
+- `speaker_embedding` — Optional float array of speaker clone embeddings (currently ignored, pass `NULL`).
+- `speaker_embedding_len` — Length of speaker embedding array (pass `0`).
+- `config` — Generation configuration (can be `NULL` for defaults).
+- `out_samples` — [out] Receives a newly allocated array of float audio samples (24000Hz PCM). The caller **must** free this array with `aila_free_samples()`.
+- `out_sample_count` — [out] Receives the number of generated audio samples in `out_samples`.
+
+Returns `0` (`AILA_OK`) on success, non-zero on error.
+
+#### `aila_free_samples`
+
+```c
+void aila_free_samples(float* samples);
+```
+
+Frees the float audio sample array returned by `aila_synthesize_wav` or `aila_decode_mimi_vocoder`. Passing `NULL` is safe.
+
+#### `aila_decode_mimi_vocoder`
+
+```c
+int aila_decode_mimi_vocoder(
+    AilaEngine* engine,
+    const int32_t* codes,
+    int n_frames,
+    float** out_samples,
+    int* out_sample_count
+);
+```
+
+Decodes discrete acoustic codes (shape `[n_frames, 16]`) back to raw audio samples using the Mimi Vocoder.
+
+- `engine` — Initialized engine handle.
+- `codes` — Flat array of discrete codes of shape `[n_frames, 16]`.
+- `n_frames` — Number of audio frames.
+- `out_samples` — [out] Receives a newly allocated array of decoded float audio samples. The caller **must** free this array with `aila_free_samples()`.
+- `out_sample_count` — [out] Receives the number of decoded audio samples.
+
+Returns `0` (`AILA_OK`) on success, non-zero on error.
+
 ### Memory Management
 
 #### `aila_free_string`
@@ -436,6 +524,29 @@ lib.aila_transcribe_stream_destroy.restype = None
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
 
+# TTS APIs
+lib.aila_synthesize_wav.argtypes = [
+    ctypes.c_void_p,          # engine
+    ctypes.POINTER(ctypes.c_int),    # text_tokens
+    ctypes.c_int,             # text_tokens_len
+    ctypes.POINTER(ctypes.c_float),  # speaker_embedding
+    ctypes.c_int,             # speaker_embedding_len
+    ctypes.c_void_p,          # config
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)), # out_samples
+    ctypes.POINTER(ctypes.c_int)     # out_sample_count
+]
+lib.aila_synthesize_wav.restype = ctypes.c_int
+lib.aila_free_samples.argtypes = [ctypes.POINTER(ctypes.c_float)]
+lib.aila_free_samples.restype = None
+lib.aila_decode_mimi_vocoder.argtypes = [
+    ctypes.c_void_p,          # engine
+    ctypes.POINTER(ctypes.c_int32), # codes
+    ctypes.c_int,             # n_frames
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)), # out_samples
+    ctypes.POINTER(ctypes.c_int)     # out_sample_count
+]
+lib.aila_decode_mimi_vocoder.restype = ctypes.c_int
+
 # Use
 engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/qwen3.5-0.8B-bnb-nf4-offline", 4096)
@@ -497,6 +608,11 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern void aila_transcribe_stream_destroy(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_free_string(IntPtr s);
     [DllImport("AilaShared.dll")] static extern void aila_engine_destroy(IntPtr e);
+
+    // TTS APIs
+    [DllImport("AilaShared.dll")] static extern int aila_synthesize_wav(IntPtr e, int[] textTokens, int textTokensLen, float[] speakerEmbedding, int speakerEmbeddingLen, ref AilaGenConfig cfg, out IntPtr outSamples, out int outSampleCount);
+    [DllImport("AilaShared.dll")] static extern void aila_free_samples(IntPtr samples);
+    [DllImport("AilaShared.dll")] static extern int aila_decode_mimi_vocoder(IntPtr e, int[] codes, int nFrames, out IntPtr outSamples, out int outSampleCount);
     // ... etc
 }
 ```
@@ -536,6 +652,26 @@ extern "C" {
     fn aila_transcribe_stream_destroy(stream: *mut c_void);
     fn aila_free_string(s: *mut c_char);
     fn aila_engine_destroy(engine: *mut c_void);
+
+    // TTS APIs
+    fn aila_synthesize_wav(
+        engine: *mut c_void,
+        text_tokens: *const c_int,
+        text_tokens_len: c_int,
+        speaker_embedding: *const f32,
+        speaker_embedding_len: c_int,
+        config: *const AilaGenConfig,
+        out_samples: *mut *mut f32,
+        out_sample_count: *mut c_int,
+    ) -> c_int;
+    fn aila_free_samples(samples: *mut f32);
+    fn aila_decode_mimi_vocoder(
+        engine: *mut c_void,
+        codes: *const i32,
+        n_frames: c_int,
+        out_samples: *mut *mut f32,
+        out_sample_count: *mut c_int,
+    ) -> c_int;
 }
 ```
 

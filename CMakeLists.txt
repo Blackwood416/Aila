@@ -60,6 +60,7 @@ set(LIB_SOURCES
     src/models/Qwen35HybridBnb4Backend.cpp
     src/models/Qwen3ASRBackend.cpp
     src/models/Qwen3ASRBnb4Backend.cpp
+    src/models/Qwen3TTSBackend.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp

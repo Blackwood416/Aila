@@ -20,6 +20,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
+- 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder. Supports direct raw audio WAV generation (`aila_synthesize_wav`) and offline Mimi decoding (`aila_decode_mimi_vocoder`)
 - 🔄 Streaming output — token-level streaming callback with abort support
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
@@ -28,13 +29,15 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 
 ## 📦 Supported Models
 
-| Model | Architecture | Quantization | Vision | Audio (ASR) |
-|-------|-------------|-------------|--------|-------------|
+| Model | Architecture | Quantization | Vision | Audio (ASR / TTS) |
+|-------|-------------|-------------|--------|-------------------|
 | [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
-| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ |
+| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
+| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
+| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
 

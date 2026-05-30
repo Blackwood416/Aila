@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 #include "cli/CLI.hpp"
 #include "bench/Benchmark.hpp"
+#include "AudioPreprocessor.hpp"
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include <iostream>
@@ -182,6 +183,35 @@ int main(int argc, char** argv) {
                   << "Speed: " << std::fixed << std::setprecision(1) << speed << "x, "
                   << tok_s << " tok/s]" << std::endl;
 
+        return 0;
+    }
+
+    // TTS synthesis mode
+    if (!opts.tts_text.empty()) {
+        if (engine.model_spec().family != ModelFamily::Qwen3TTS) {
+            AILA_LOG_ERROR("The loaded model does not support TTS! Please load a Qwen3-TTS model.");
+            return 2;
+        }
+
+        std::string output_path = opts.tts_output_path.empty() ? "output.wav" : opts.tts_output_path;
+        AILA_LOG_INFO("Synthesizing text: \"%s\"", opts.tts_text.c_str());
+
+        std::vector<float> samples;
+        std::vector<float> speaker_embedding;
+
+        bool ok = engine.synthesize_text_to_wav(opts.tts_text, speaker_embedding, gen_config, samples);
+        if (!ok) {
+            AILA_LOG_ERROR("TTS synthesis failed: %s", engine.last_error_message().c_str());
+            return 2;
+        }
+
+        if (!save_wav(output_path, samples, 24000)) {
+            AILA_LOG_ERROR("Failed to write WAV file to: %s", output_path.c_str());
+            return 2;
+        }
+
+        AILA_LOG_INFO("TTS synthesis succeeded! Output saved to: %s (Samples: %zu, Duration: %.2fs)",
+                      output_path.c_str(), samples.size(), static_cast<double>(samples.size()) / 24000.0);
         return 0;
     }
 

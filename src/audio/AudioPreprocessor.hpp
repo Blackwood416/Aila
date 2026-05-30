@@ -39,6 +39,9 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
                              MelSpectrogram& mel,
                              std::string* error = nullptr);
 
+// Save float PCM samples to a WAV file.
+bool save_wav(const std::string& path, const std::vector<float>& samples, unsigned int sample_rate);
+
 // Convenience: full pipeline from WAV/audio path to mel spectrogram.
 inline bool wav_to_mel(const std::string& wav_path, MelSpectrogram& mel,
                        std::string* error = nullptr) {

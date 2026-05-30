@@ -144,6 +144,35 @@ class AilaAPI:
         self._set("aila_last_error_code", c_int, [c_void_p])
         self._set("aila_last_error_message", c_char_p, [c_void_p])
 
+        # TTS APIs
+        self._set("aila_synthesize_wav", c_int, [
+            c_void_p,          # engine
+            POINTER(c_int),    # text_tokens
+            c_int,             # text_tokens_len
+            POINTER(c_float),  # speaker_embedding
+            c_int,             # speaker_embedding_len
+            c_void_p,          # config
+            POINTER(POINTER(c_float)), # out_samples
+            POINTER(c_int)     # out_sample_count
+        ])
+        self._set("aila_free_samples", None, [POINTER(c_float)])
+        self._set("aila_decode_mimi_vocoder", c_int, [
+            c_void_p,          # engine
+            POINTER(ctypes.c_int32), # codes
+            c_int,             # n_frames
+            POINTER(POINTER(c_float)), # out_samples
+            POINTER(c_int)     # out_sample_count
+        ])
+        self._set("aila_synthesize_text_to_wav", c_int, [
+            c_void_p,          # engine
+            c_char_p,          # text
+            POINTER(c_float),  # speaker_embedding
+            c_int,             # speaker_embedding_len
+            c_void_p,          # config
+            POINTER(POINTER(c_float)), # out_samples
+            POINTER(c_int)     # out_sample_count
+        ])
+
     def _set(self, name, restype, argtypes):
         fn = getattr(self._dll, name)
         fn.restype = restype
@@ -895,6 +924,91 @@ def test_transcribe(api: AilaAPI, engine, model_path: str):
         test("stream destroyed successfully", True)
 
 
+def test_tts(api: AilaAPI, engine):
+    print("\n[TTS Synthesis]")
+    
+    # "你好，我是人工智能语音合成助手。端到端的音频生成测试现在开始。" (39 tokens including control tags)
+    tokens = [
+        151644, 77091, 198, 108386, 116248, 38374, 100344, 99933, 102409, 100067, 
+        34262, 120192, 114674, 99120, 104279, 109263, 101150, 110032, 116248, 100788, 
+        110901, 105658, 99407, 101859, 103983, 106093, 113197, 113337, 34262, 101150, 
+        110032, 116248, 113197, 100445, 151645, 198, 151644, 77091, 198
+    ]
+    tokens_arr = (c_int * len(tokens))(*tokens)
+    
+    cfg = api.aila_default_gen_config()
+    cfg.max_new_tokens = 256
+    cfg.temperature = 0.9
+    cfg.top_k = 50
+    cfg.top_p = 1.0
+    cfg.do_sample = 1
+    
+    # Test 1: aila_synthesize_wav
+    out_samples = POINTER(c_float)()
+    out_sample_count = c_int(0)
+    
+    t0 = time.time()
+    rc = api.aila_synthesize_wav(
+        engine,
+        tokens_arr,
+        len(tokens),
+        None,  # speaker embedding
+        0,     # speaker embedding len
+        byref(cfg),
+        byref(out_samples),
+        byref(out_sample_count)
+    )
+    elapsed = time.time() - t0
+    
+    test("aila_synthesize_wav returns OK", rc == 0, f"rc={rc}")
+    test("aila_synthesize_wav sample count > 0", out_sample_count.value > 0, f"count={out_sample_count.value} ({elapsed:.1f}s)")
+    
+    # Test 2: aila_decode_mimi_vocoder using mock zeros codes
+    # 5 frames of mock codes
+    mock_codes = [0] * (5 * 16)
+    codes_arr = (ctypes.c_int32 * len(mock_codes))(*mock_codes)
+    out_samples_mimi = POINTER(c_float)()
+    out_sample_count_mimi = c_int(0)
+    
+    rc_mimi = api.aila_decode_mimi_vocoder(
+        engine,
+        codes_arr,
+        5,  # 5 frames
+        byref(out_samples_mimi),
+        byref(out_sample_count_mimi)
+    )
+    test("aila_decode_mimi_vocoder returns OK", rc_mimi == 0, f"rc={rc_mimi}")
+    test("aila_decode_mimi_vocoder sample count is correct (5 * 1920)", out_sample_count_mimi.value == 5 * 1920, f"count={out_sample_count_mimi.value}")
+    
+    # Test 3: aila_synthesize_text_to_wav
+    text_prompt = "你好，我是人工智能语音合成助手。端到端的音频生成测试现在开始。"
+    out_samples_text = POINTER(c_float)()
+    out_sample_count_text = c_int(0)
+    
+    t0_text = time.time()
+    rc_text = api.aila_synthesize_text_to_wav(
+        engine,
+        text_prompt.encode("utf-8"),
+        None,  # speaker embedding
+        0,     # speaker embedding len
+        byref(cfg),
+        byref(out_samples_text),
+        byref(out_sample_count_text)
+    )
+    elapsed_text = time.time() - t0_text
+    
+    test("aila_synthesize_text_to_wav returns OK", rc_text == 0, f"rc={rc_text}")
+    test("aila_synthesize_text_to_wav sample count > 0", out_sample_count_text.value > 0, f"count={out_sample_count_text.value} ({elapsed_text:.1f}s)")
+    
+    # Free resources
+    if out_samples:
+        api.aila_free_samples(out_samples)
+    if out_samples_mimi:
+        api.aila_free_samples(out_samples_mimi)
+    if out_samples_text:
+        api.aila_free_samples(out_samples_text)
+
+
 def test_stress_long_prompt(api: AilaAPI, engine):
     print("\n[Stress — long prompt]")
     cfg = api.aila_default_gen_config()
@@ -971,10 +1085,14 @@ def main():
         skip("model-dependent tests", "init failed")
     else:
         is_asr_model = "asr" in args.model.lower()
+        is_tts_model = "tts" in args.model.lower()
         if is_asr_model:
             test_error_api(api, engine)
             test_generate_messages(api, engine)
             test_transcribe(api, engine, args.model)
+        elif is_tts_model:
+            test_error_api(api, engine)
+            test_tts(api, engine)
         else:
             test_generate_simple(api, engine)
             test_generate_sampling(api, engine)

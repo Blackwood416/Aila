@@ -270,4 +270,78 @@ AILA_API int aila_transcribe_stream_get_text(
  */
 AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
 
+
+
+/**
+ * Synthesize raw float audio samples from text prompt (blocking).
+ * @param engine             Initialized engine handle (configured with Qwen3-TTS model)
+ * @param text_tokens        Array of text token IDs
+ * @param text_tokens_len    Number of tokens in text_tokens array
+ * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL)
+ * @param speaker_embedding_len Length of speaker clone embedding (0 if NULL)
+ * @param config             Generation config (NULL for defaults)
+ * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
+ *                           Must be freed with aila_free_samples() by the caller.
+ * @param out_sample_count   [out] Receives the number of generated audio samples.
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_synthesize_wav(
+    AilaEngine* engine,
+    const int* text_tokens,
+    int text_tokens_len,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+);
+
+/**
+ * Synthesize raw float audio samples directly from a UTF-8 text string (blocking).
+ * Automatically handles text packaging/tokenization for Qwen3-TTS.
+ * Note: Zero-shot voice cloning is currently not active in the backend; speaker_embedding is ignored.
+ *
+ * @param engine             Initialized engine handle (configured with Qwen3-TTS model)
+ * @param text               UTF-8 text prompt to synthesize
+ * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL)
+ * @param speaker_embedding_len Length of speaker clone embedding (0 if NULL)
+ * @param config             Generation config (NULL for defaults)
+ * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
+ *                           Must be freed with aila_free_samples() by the caller.
+ * @param out_sample_count   [out] Receives the number of generated audio samples.
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_synthesize_text_to_wav(
+    AilaEngine* engine,
+    const char* text,
+    const float* speaker_embedding,
+    int speaker_embedding_len,
+    const AilaGenConfig* config,
+    float** out_samples,
+    int* out_sample_count
+);
+
+/**
+ * Free audio samples array returned by aila_synthesize_wav.
+ */
+AILA_API void aila_free_samples(float* samples);
+
+/**
+ * Decode discrete codes to float audio samples using Mimi Vocoder.
+ *
+ * @param engine             Engine handle
+ * @param codes              Array of discrete codes of shape [n_frames, 16]
+ * @param n_frames           Number of frames
+ * @param out_samples        [out] Receives newly allocated audio samples array
+ * @param out_sample_count   [out] Receives size of audio samples array
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_decode_mimi_vocoder(
+    AilaEngine* engine,
+    const int32_t* codes,
+    int n_frames,
+    float** out_samples,
+    int* out_sample_count
+);
+
 #endif /* AILA_API_H */

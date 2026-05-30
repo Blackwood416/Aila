@@ -119,6 +119,7 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | `AILA_DEBUG_Q35_LAYER_DETAIL` | int | `-1` | Log detailed info for a specific layer index |
 | `AILA_DEBUG_Q35_LINEAR_COMPARE` | bool | `false` | Compare linear layer outputs (GPU vs host reference) |
 | `AILA_DEBUG_Q35_LINEAR_COMPARE_LAYER` | int | `-1` | Target layer index for linear comparison |
+| `AILA_MIMI_DEBUG` | bool | `false` | Enable detailed step-by-step debug logging for Mimi Vocoder |
 
 ---
 

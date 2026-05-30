@@ -378,6 +378,71 @@ void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_
     });
 }
 
+void snake_beta(Context& ctx, Tensor& input, Tensor& alpha, Tensor& beta,
+                Tensor& output, int n, int channels, int seq_len) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    const void* alpha_ptr = alpha.data();
+    const void* beta_ptr = beta.data();
+    bool alpha_is_f32 = (alpha.dtype() == dnnl::memory::data_type::f32);
+    bool beta_is_f32 = (beta.dtype() == dnnl::memory::data_type::f32);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(n), [=](sycl::id<1> idx) {
+            int i = static_cast<int>(idx[0]);
+            if (i >= n) return;
+
+            // Channel index c: for row-major layout [seq_len, channels], c = i % channels
+            int c = i % channels;
+
+            float a = alpha_is_f32 ? static_cast<const float*>(alpha_ptr)[c] : static_cast<float>(
+                static_cast<const bf16*>(alpha_ptr)[c]);
+            float b = beta_is_f32 ? static_cast<const float*>(beta_ptr)[c] : static_cast<float>(
+                static_cast<const bf16*>(beta_ptr)[c]);
+
+            float exp_a = sycl::exp(a);
+            float exp_b = sycl::exp(b);
+
+            float x = static_cast<float>(in_ptr[i]);
+            float sin_val = sycl::sin(x * exp_a);
+            float res = x + (1.0f / (exp_b + 1e-9f)) * (sin_val * sin_val);
+
+            out_ptr[i] = bf16(res);
+        });
+    });
+}
+
+void vq_lookup_add(Context& ctx, Tensor& codes, Tensor& table,
+                   int cb_idx, Tensor& output, int n_frames, int codebook_dim, bool accum) {
+    const int32_t* codes_ptr = static_cast<const int32_t*>(codes.data());
+    const void* table_raw = table.data();
+    bool table_is_f32 = (table.dtype() == dnnl::memory::data_type::f32);
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<2>(n_frames, codebook_dim), [=](sycl::id<2> idx) {
+            int f = static_cast<int>(idx[0]);
+            int d = static_cast<int>(idx[1]);
+
+            int token_id = codes_ptr[f * 16 + cb_idx];
+            if (token_id < 0) token_id = 0; // fallback clamp to prevent OOB
+            
+            int out_idx = f * codebook_dim + d;
+            int tbl_idx = token_id * codebook_dim + d;
+
+            float val = table_is_f32 ? 
+                static_cast<const float*>(table_raw)[tbl_idx] : 
+                static_cast<float>(static_cast<const bf16*>(table_raw)[tbl_idx]);
+
+            if (accum) {
+                out_ptr[out_idx] = bf16(static_cast<float>(out_ptr[out_idx]) + val);
+            } else {
+                out_ptr[out_idx] = bf16(val);
+            }
+        });
+    });
+}
+
 void gelu_tanh_inplace(Context& ctx, Tensor& input, int n) {
     bf16* ptr = static_cast<bf16*>(input.data());
     constexpr float kAlpha = 0.7978845608028654f;

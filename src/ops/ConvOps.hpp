@@ -20,4 +20,34 @@ void conv2d_gelu(Context& ctx,
                  int batch, int in_ch, int out_ch,
                  int in_h, int in_w, int out_h, int out_w);
 
+// 1D Causal Convolution with dilation
+// input:   [batch, in_ch, seq_len]
+// weight:  [out_ch, in_ch, kernel_size]
+// bias:    [out_ch]
+// output:  [batch, out_ch, seq_len]
+void causal_conv1d(Context& ctx,
+                   Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                   int batch, int in_ch, int out_ch, int seq_len,
+                   int kernel_size, int dilation);
+
+// 1D Depthwise Causal Convolution with dilation
+// input:   [batch, channels, seq_len]
+// weight:  [channels, 1, kernel_size]
+// bias:    [channels]
+// output:  [batch, channels, seq_len]
+void causal_conv1d_dw(Context& ctx,
+                      Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                      int batch, int channels, int seq_len,
+                      int kernel_size, int dilation);
+
+// 1D Causal Transposed Convolution (Upsampling + Causal slicing)
+// input:   [batch, in_ch, in_len]
+// weight:  [in_ch, out_ch, kernel_size] (groups = 1)
+// bias:    [out_ch]
+// output:  [batch, out_ch, in_len * stride] (right_pad elements are skipped in computation)
+void causal_conv_transpose1d(Context& ctx,
+                             Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                             int batch, int in_ch, int out_ch, int in_len,
+                             int kernel_size, int stride);
+
 } // namespace ops

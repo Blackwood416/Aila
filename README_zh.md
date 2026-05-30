@@ -20,6 +20,7 @@
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
+- 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS）。支持直接生成原始音频 WAV（`aila_synthesize_wav`）和离线 Mimi 译码（`aila_decode_mimi_vocoder`）
 - 🔄 流式输出 — token 级别流式回调，支持中止生成
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
@@ -28,13 +29,15 @@
 
 ## 📦 支持的模型
 
-| 模型 | 架构 | 量化 | 视觉 | 语音 (ASR) |
-|------|------|------|------|------------|
+| 模型 | 架构 | 量化 | 视觉 | 语音 (ASR / TTS) |
+|------|------|------|------|------------------|
 | [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
-| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ |
+| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
+| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
+| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
 
 其他符合支持架构模式的 Qwen3 / Qwen3.5 模型大小理论上也可运行。
 
