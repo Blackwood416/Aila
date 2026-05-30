@@ -443,8 +443,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int text_body_end = L - 5;
     int text_body_len = std::max(0, text_body_end - text_body_start);
 
-    // 构建 non-streaming Prefill 每一帧输入特征 (3 + 4 + text_body_len + 1 + 1 = 9 + text_body_len)
-    int prefill_len = 9 + text_body_len;
+    // 构建 non-streaming Prefill 每一帧输入特征
+    bool has_spk = (speaker_embedding.size() == static_cast<size_t>(H_talker));
+    int prefill_len = (has_spk ? 10 : 9) + text_body_len;
     Tensor prefill_embeds = Tensor::allocate(ctx, {prefill_len, H_talker});
     {
         bf16* dst = prefill_embeds.data_as<bf16>();
@@ -468,30 +469,50 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                 dst[(3 + i) * H_talker + h] = c_embs[i * H_talker + h] + p_pad[h];
             });
         }
+        ctx.queue().wait();
+
+        int current_idx = 7;
+        if (has_spk) {
+            // 复制并计算第 7 帧 (speaker_embedding 加上 tts_pad_embed)
+            Tensor spk_emb_dev = Tensor::allocate(ctx, {1, H_talker});
+            std::vector<bf16> spk_bf16(H_talker);
+            for (int h = 0; h < H_talker; ++h) {
+                spk_bf16[h] = bf16(speaker_embedding[h]);
+            }
+            ctx.memcpy_h2d(spk_emb_dev.data(), spk_bf16.data(), H_talker * sizeof(bf16));
+            
+            bf16* s_emb = spk_emb_dev.data_as<bf16>();
+            ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                dst[7 * H_talker + h] = s_emb[h] + p_pad[h];
+            });
+            ctx.queue().wait();
+            current_idx = 8;
+        }
 
         // 3. 复制并计算正文文本的 text_body_len 帧 (文本投影 加上 embed_codec_pad)
         bf16* src_text = projected_text.data_as<bf16>() + text_body_start * H_talker;
         bf16* c_pad = embed_codec_pad.data_as<bf16>();
         for (int i = 0; i < text_body_len; ++i) {
             ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
-                dst[(7 + i) * H_talker + h] = src_text[i * H_talker + h] + c_pad[h];
+                dst[(current_idx + i) * H_talker + h] = src_text[i * H_talker + h] + c_pad[h];
             });
         }
+        ctx.queue().wait();
 
         // 4. 复制并计算 tts_eos 帧 (tts_eos_embed 加上 embed_codec_pad)
-        int eos_idx = 7 + text_body_len;
+        int eos_idx = current_idx + text_body_len;
         bf16* p_eos = tts_eos_embed.data_as<bf16>();
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
             dst[eos_idx * H_talker + h] = p_eos[h] + c_pad[h];
         });
+        ctx.queue().wait();
 
         // 5. 复制并计算最后一帧 (tts_pad_embed 加上 embed_codec_bos)
-        int bos_idx = 8 + text_body_len;
+        int bos_idx = eos_idx + 1;
         bf16* c_bos = embed_codec_bos.data_as<bf16>();
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
             dst[bos_idx * H_talker + h] = p_pad[h] + c_bos[h];
         });
-
         ctx.queue().wait();
     }
     print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);

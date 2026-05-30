@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
+#include <fstream>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -71,18 +73,7 @@ std::string codepage_to_utf8(const std::string& text, UINT codepage) {
     return out;
 }
 
-std::string normalize_input_for_model(const std::string& text) {
-    if (text.empty() || is_valid_utf8(text)) return text;
-
-    UINT cp = GetConsoleCP();
-    if (cp == 0) cp = GetACP();
-    std::string converted = codepage_to_utf8(text, cp);
-    if (is_valid_utf8(converted)) return converted;
-
-    converted = codepage_to_utf8(text, GetACP());
-    return converted;
-}
-
+#ifdef _WIN32
 void setup_console_utf8(bool interactive_terminal) {
     if (!interactive_terminal) return;
     SetConsoleCP(CP_UTF8);
@@ -90,14 +81,101 @@ void setup_console_utf8(bool interactive_terminal) {
     std::setlocale(LC_ALL, ".UTF-8");
 }
 #else
-std::string normalize_input_for_model(const std::string& text) {
-    return text;
-}
-
 void setup_console_utf8(bool /*interactive_terminal*/) {}
 #endif
 
 } // namespace
+
+#ifdef _WIN32
+std::string normalize_input_for_model(const std::string& text) {
+    if (text.empty() || is_valid_utf8(text)) return text;
+
+    UINT cp = GetConsoleCP();
+    if (cp == 0 || cp == CP_UTF8) cp = GetACP();
+    std::string converted = codepage_to_utf8(text, cp);
+    if (is_valid_utf8(converted) && !converted.empty() && converted != text) return converted;
+
+    converted = codepage_to_utf8(text, GetACP());
+    return converted;
+}
+#else
+std::string normalize_input_for_model(const std::string& text) {
+    return text;
+}
+#endif
+
+std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+std::vector<float> load_or_extract_speaker_embedding(const std::string& model_dir, const std::string& path) {
+    std::vector<float> embedding;
+    if (path.empty()) return embedding;
+
+    std::string bin_path = path;
+    bool is_audio = false;
+    if (path.size() >= 4) {
+        std::string ext = path.substr(path.size() - 4);
+        for (char& c : ext) c = std::tolower(c);
+        if (ext == ".wav" || ext == ".mp3") {
+            is_audio = true;
+        }
+    }
+
+    if (is_audio) {
+        std::cout << "[TTS] Reference audio specified. Extracting speaker embedding via Python..." << std::endl;
+        bin_path = "tmp_speaker_emb.bin";
+        
+        // Try virtual environment python first
+        std::string cmd = ".\\.venv-tts\\Scripts\\python.exe src/cli/extract_speaker_embedding.py \"" + model_dir + "\" \"" + path + "\" \"" + bin_path + "\"";
+        int ret = std::system(cmd.c_str());
+        if (ret != 0) {
+            // Fallback to system python
+            cmd = "python src/cli/extract_speaker_embedding.py \"" + model_dir + "\" \"" + path + "\" \"" + bin_path + "\"";
+            ret = std::system(cmd.c_str());
+        }
+        
+        if (ret != 0) {
+            std::cerr << "[TTS] Error: Speaker embedding extraction failed. Using default speaker." << std::endl;
+            return embedding;
+        }
+    }
+
+    std::ifstream in(bin_path, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "[TTS] Error: Failed to open speaker embedding file: " << bin_path << std::endl;
+        return embedding;
+    }
+
+    in.seekg(0, std::ios::end);
+    std::streamsize size = in.tellg();
+    in.seekg(0, std::ios::beg);
+
+    if (size <= 0 || size % sizeof(float) != 0) {
+        std::cerr << "[TTS] Error: Invalid speaker embedding file size: " << size << " bytes" << std::endl;
+        return embedding;
+    }
+
+    size_t count = size / sizeof(float);
+    embedding.resize(count);
+    if (!in.read(reinterpret_cast<char*>(embedding.data()), size)) {
+        std::cerr << "[TTS] Error: Failed to read speaker embedding data" << std::endl;
+        embedding.clear();
+    } else {
+        std::cout << "[TTS] Successfully loaded speaker embedding from: " << bin_path 
+                  << " (Dimension: " << count << ")" << std::endl;
+    }
+
+    in.close();
+    if (is_audio) {
+        std::remove(bin_path.c_str());
+    }
+
+    return embedding;
+}
 
 // ============================================================
 // CLI Argument Parsing
@@ -345,6 +423,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_output_path = argv[++i];
             continue;
         }
+        if ((arg == "--spk" || arg == "--speaker") && i + 1 < argc) {
+            opts.tts_speaker_path = argv[++i];
+            continue;
+        }
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;
@@ -491,8 +573,9 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
     });
 
     auto tts_handler = [&, engine](const std::string& args) {
-        if (args.empty()) {
-            std::cout << "[TTS] Usage: /tts <text_prompt>" << std::endl;
+        std::string trimmed_args = trim(args);
+        if (trimmed_args.empty()) {
+            std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <reference_audio_or_bin>]" << std::endl;
             return true;
         }
         if (!engine) {
@@ -503,11 +586,35 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             std::cout << "[TTS] Current loaded model does not support TTS! Please specify a Qwen3-TTS model." << std::endl;
             return true;
         }
-        std::string norm_args = normalize_input_for_model(args);
-        std::cout << "[TTS] Synthesizing: \"" << norm_args << "\"" << std::endl;
+
+        // Parse --spk argument if any
+        std::string text_prompt = trimmed_args;
+        std::string spk_path = "";
+        size_t spk_pos = trimmed_args.find("--spk ");
+        if (spk_pos != std::string::npos) {
+            text_prompt = trim(trimmed_args.substr(0, spk_pos));
+            spk_path = trim(trimmed_args.substr(spk_pos + 6));
+        } else {
+            // Also support --spk=path format
+            spk_pos = trimmed_args.find("--spk=");
+            if (spk_pos != std::string::npos) {
+                text_prompt = trim(trimmed_args.substr(0, spk_pos));
+                spk_path = trim(trimmed_args.substr(spk_pos + 6));
+            }
+        }
+
+        std::string norm_args = normalize_input_for_model(text_prompt);
+        std::cout << "[TTS] Synthesizing: \"" << norm_args << "\"";
+        if (!spk_path.empty()) {
+            std::cout << " (Speaker profile: " << spk_path << ")";
+        }
+        std::cout << std::endl;
 
         std::vector<float> samples;
         std::vector<float> speaker_embedding;
+        if (!spk_path.empty()) {
+            speaker_embedding = load_or_extract_speaker_embedding(engine->model_dir(), spk_path);
+        }
         
         bool ok = engine->synthesize_text_to_wav(norm_args, speaker_embedding, gen_config, samples);
         if (!ok) {
@@ -660,6 +767,7 @@ int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool 
     while (!should_quit) {
         std::cout << "\nUser: ";
         if (!std::getline(std::cin, input)) break;
+        input = trim(input);
 
         if (input.empty()) continue;
 

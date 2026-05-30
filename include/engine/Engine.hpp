@@ -2722,6 +2722,7 @@ public:
     double last_transcribe_duration_s() const { return last_transcribe_duration_s_; }
     double last_transcribe_latency_ms() const { return last_transcribe_latency_ms_; }
     int last_transcribe_tokens() const { return last_transcribe_tokens_; }
+    const std::string& model_dir() const { return model_dir_; }
 
 private:
 

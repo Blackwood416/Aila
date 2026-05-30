@@ -61,6 +61,7 @@ struct CLIOptions {
     // TTS synthesis mode
     std::string tts_text;           // --synthesize
     std::string tts_output_path;    // --output-wav
+    std::string tts_speaker_path;   // --spk, --speaker
 };
 
 // Parse command-line arguments
@@ -72,6 +73,10 @@ void print_help();
 
 // Print version
 void print_version();
+
+// String processing utilities
+std::string normalize_input_for_model(const std::string& text);
+std::string trim(const std::string& str);
 
 // ============================================================
 // Interactive command registry
