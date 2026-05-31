@@ -8,7 +8,7 @@
 ---
 
 > [!NOTE]
-> 该项目仍在积极开发中，并不能兼顾支持的所有模型。目前的重点在 **Qwen3.5** 模型上，Qwen3 模型的性能可能并不理想。
+> 该项目仍在积极开发中，并不能兼顾支持的所有模型。部分模型的性能可能并不理想。
 
 基于 **SYCL + oneDNN** 构建的高性能 LLM 推理引擎，专为 **Intel Arc 显卡** 设计。针对 bitsandbytes 4-bit (NF4) 量化模型提供手写优化 kernel，包括融合反量化+矩阵乘法、GEMV 解码，以及 Qwen3.5 混合架构的 GPU DeltaNet 循环加速。
 
@@ -81,7 +81,7 @@ Aila 提供最高的 prefill 吞吐量，同时在保留视觉能力的 NF4 量�
 
 ```powershell
 # 交互式对话
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 
 # 离线语音转录 (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
@@ -93,16 +93,16 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "你好世界" --outp
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
 
 # 从 JSON 文件读取单条 prompt
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json prompt.json
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --messages-json prompt.json
 
 # 从 stdin 读取 prompt
 echo '{"messages":[{"role":"user","content":"你好"}]}' | Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json -
 
 # 性能基准测试（贪心解码）
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --bench-pp 512 --bench-tg 128
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --bench-pp 2048 --bench-tg 1024 --bench-iters 3
 
 # 性能基准测试（采样解码）
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 ```
 
 ### ⚙️ CLI 参数

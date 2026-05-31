@@ -8,7 +8,7 @@
 ---
 
 > [!NOTE]
-> This project is under active development and does not yet fully support all listed models. The current focus is on the **Qwen3.5** family; Qwen3 model performance may not be optimal.
+> This project is under active development and does not yet fully support all listed models. Some models performance may not be optimal.
 
 A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYCL + oneDNN**. Features hand-optimized kernels for bitsandbytes 4-bit (NF4) quantized models, fused dequant+matmul, and GPU-accelerated DeltaNet recurrence for Qwen3.5 hybrid architectures.
 
@@ -81,7 +81,7 @@ Aila delivers the highest prefill throughput and competitive decode performance 
 
 ```powershell
 # Interactive conversation
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 
 # Offline audio transcription (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
@@ -93,16 +93,16 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "Hello world!" --outp
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
 
 # Single prompt from JSON file
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json prompt.json
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --messages-json prompt.json
 
 # Single prompt from stdin
 echo '{"messages":[{"role":"user","content":"hello"}]}' | Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json -
 
 # Benchmark (greedy)
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --bench-pp 512 --bench-tg 128
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --bench-pp 512 --bench-tg 128
 
 # Benchmark (sampling)
-Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
+Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 ```
 
 ### ⚙️ CLI Arguments
