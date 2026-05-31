@@ -282,7 +282,7 @@ AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
  * @param text_tokens        Array of text token IDs
  * @param text_tokens_len    Number of tokens in text_tokens array
  * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL for default voice)
- * @param speaker_embedding_len Length of speaker clone embedding (must be 1024 for Qwen3-TTS; 0 if NULL)
+ * @param speaker_embedding_len Length of speaker clone embedding (1024 for 0.6B, 2048 for 1.7B; 0 if NULL)
  * @param config             Generation config (NULL for defaults)
  * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
  *                           Must be freed with aila_free_samples() by the caller.
@@ -310,7 +310,7 @@ AILA_API int aila_synthesize_wav(
  * @param engine             Initialized engine handle (configured with Qwen3-TTS model)
  * @param text               UTF-8 text prompt to synthesize
  * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL for default voice)
- * @param speaker_embedding_len Length of speaker clone embedding (must be 1024 for Qwen3-TTS; 0 if NULL)
+ * @param speaker_embedding_len Length of speaker clone embedding (1024 for 0.6B, 2048 for 1.7B; 0 if NULL)
  * @param config             Generation config (NULL for defaults). TTS auto-sets repetition_penalty to 1.1
  *                           if not explicitly configured.
  * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
@@ -388,7 +388,7 @@ AILA_API int aila_decode_mimi_vocoder(
  * @param audio_path         Path to the reference audio file.
  * @param out_embedding      [out] Receives a newly allocated float array containing the speaker embedding.
  *                           The caller must free this array with aila_free_samples().
- * @param out_embedding_dim  [out] Receives the dimension of the speaker embedding (typically 1024).
+ * @param out_embedding_dim  [out] Receives the dimension of the speaker embedding (1024 for 0.6B, 2048 for 1.7B).
  * @return 0 on success, non-zero on error.
  */
 AILA_API int aila_extract_speaker_embedding(

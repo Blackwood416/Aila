@@ -327,14 +327,14 @@ int aila_extract_speaker_embedding(
 );
 ```
 
-Extracts a 1024-dimensional speaker embedding from a reference audio file for TTS voice cloning. Uses the native C++ ECAPA-TDNN speaker encoder running on CPU — no Python or external dependencies required.
+Extracts a speaker embedding from a reference audio file for TTS voice cloning. Uses the native C++ ECAPA-TDNN speaker encoder running on CPU — no Python or external dependencies required.
 
-The engine must be initialized with a Qwen3-TTS model (the speaker encoder weights are loaded from the TTS model's `model.safetensors` file).
+The engine must be initialized with a Qwen3-TTS model (the speaker encoder weights are loaded from the TTS model's `model.safetensors` file). The embedding dimension depends on the model: 1024 for 0.6B, 2048 for 1.7B.
 
 - `engine` — Initialized engine handle (Qwen3-TTS model).
 - `audio_path` — Path to the reference audio file (WAV, MP3, or FLAC).
-- `out_embedding` — [out] Receives a newly allocated float array containing the speaker embedding (1024 floats). The caller **must** free this array with `aila_free_samples()`.
-- `out_embedding_dim` — [out] Receives the dimension of the speaker embedding (typically 1024).
+- `out_embedding` — [out] Receives a newly allocated float array containing the speaker embedding. The caller **must** free this array with `aila_free_samples()`.
+- `out_embedding_dim` — [out] Receives the dimension of the speaker embedding (1024 for 0.6B, 2048 for 1.7B).
 
 Returns `0` (`AILA_OK`) on success, non-zero on error.
 
@@ -361,7 +361,7 @@ Most users should prefer `aila_synthesize_text_to_wav()` for automatic tokenizat
 - `text_tokens` — Array of text token IDs.
 - `text_tokens_len` — Number of token IDs in the array.
 - `speaker_embedding` — Optional float array of speaker clone embeddings. Pass the array returned by `aila_extract_speaker_embedding()`, or `NULL` for default voice.
-- `speaker_embedding_len` — Length of speaker embedding array (must be 1024, or `0` if `speaker_embedding` is `NULL`).
+- `speaker_embedding_len` — Length of speaker embedding array (1024 for 0.6B, 2048 for 1.7B, or `0` if `speaker_embedding` is `NULL`).
 - `config` — Generation configuration (can be `NULL` for defaults). TTS auto-sets `repetition_penalty` to 1.1 if not explicitly configured to prevent autoregressive collapse.
 - `out_samples` — [out] Receives a newly allocated array of float audio samples (24kHz PCM). The caller **must** free this array with `aila_free_samples()`.
 - `out_sample_count` — [out] Receives the number of generated audio samples in `out_samples`.
@@ -387,7 +387,7 @@ Synthesizes raw audio samples directly from a UTF-8 text string (blocking). The 
 - `engine` — Initialized engine handle.
 - `text` — Null-terminated UTF-8 text prompt to synthesize.
 - `speaker_embedding` — Optional float array of speaker clone embeddings (pass `NULL` for default voice). To clone a voice, pass the embedding from `aila_extract_speaker_embedding()`.
-- `speaker_embedding_len` — Length of speaker embedding array (must be 1024, or `0` if `speaker_embedding` is `NULL`).
+- `speaker_embedding_len` — Length of speaker embedding array (1024 for 0.6B, 2048 for 1.7B, or `0` if `speaker_embedding` is `NULL`).
 - `config` — Generation configuration (can be `NULL` for defaults).
 - `out_samples` — [out] Receives a newly allocated array of float audio samples (24000Hz PCM). The caller **must** free this array with `aila_free_samples()`.
 - `out_sample_count` — [out] Receives the number of generated audio samples in `out_samples`.
