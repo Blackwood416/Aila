@@ -35,6 +35,7 @@
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
+| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
 | [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
@@ -241,18 +242,23 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
 # 纯文本模型
 python export_bnb_nf4.py \
     --source Qwen/Qwen3.5-0.8B \
-    --output ./models/qwen3.5-0.8B-bnb-nf4-offline
+    --output ./models/Qwen3.5-0.8B-BNB-NF4
 
 # 视觉模型
 python export_bnb_nf4.py \
     --source Qwen/Qwen3.5-4B \
-    --output ./models/qwen3.5-4B-bnb-nf4-vision-offline \
+    --output ./models/Qwen3.5-4B-BNB-NF4-with-vision \
     --vision
+
+# ASR模型
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3-ASR-1.7B \
+    --output ./models/Qwen3-ASR-1.7B-BNB-NF4
 
 # 从本地目录导出，覆盖已有导出
 python export_bnb_nf4.py \
     --source ./Qwen3-0.6B \
-    --output ./models/qwen3-0.6B-bnb-nf4-offline \
+    --output ./models/Qwen3-0.6B-BNB-NF4 \
     --overwrite
 ```
 
@@ -315,6 +321,7 @@ Aila/
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 量化格式和反量化参考实现
 - **[simdjson](https://github.com/simdjson/simdjson)** — 高性能 JSON 解析器，用于模型配置和分词器元数据
 - **[dr_libs](https://github.com/mackron/dr_libs)** — 单文件头音频解码库（`dr_wav`、`dr_mp3`、`dr_flac`），用于 ASR 音频预处理
+- **[llama.cpp jinja module](https://github.com/ggml-org/llama.cpp/tree/master/common/jinja)** — jinja对话模板解析模块，用于对话模板解析和构建
 
 ## 📄 许可证
 

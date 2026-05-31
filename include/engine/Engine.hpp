@@ -2424,19 +2424,15 @@ public:
             return false;
         }
 
-        // Step 3b: run ECAPA-TDNN forward pass on GPU
-        aila::audio::GpuSpeakerEncoder gpu_enc;
-        if (!gpu_enc.loadWeights(*ctx_, safetensors_path, &error)) {
-            set_error(EngineErrorCode::RuntimeError, "Failed to load GPU speaker encoder: " + error);
-            return false;
-        }
-        if (!gpu_enc.extractEmbedding(*ctx_, mel.data(), nFrames, embedding, &error)) {
-            set_error(EngineErrorCode::RuntimeError, "GPU speaker encoder forward pass failed: " + error);
+        // Step 3b: run ECAPA-TDNN forward pass on CPU (f32 precision, proven quality)
+        if (!cpu_enc.extractEmbedding(mel.data(), nFrames, embedding, &error)) {
+            set_error(EngineErrorCode::RuntimeError, "Speaker encoder forward pass failed: " + error);
             return false;
         }
 
         // 4. Save to caches
         cacheSpeakerEmbedding(audio_path, embedding);
+        AILA_LOG_INFO("[TTS] Speaker embedding extracted and cached (dim=%d)", spk_dim);
         return true;
     }
 

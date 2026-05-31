@@ -35,6 +35,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
+| [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Dense + Audio Encoder | BF16, dense | ❌ | ✅ (ASR) |
 | [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
@@ -241,18 +242,23 @@ Use `export_bnb_nf4.py` to quantize a Hugging Face model to BNB NF4 format:
 # Text-only model
 python export_bnb_nf4.py \
     --source Qwen/Qwen3.5-0.8B \
-    --output ./models/qwen3.5-0.8B-bnb-nf4-offline
+    --output ./models/Qwen3.5-0.8B-BNB-NF4
 
 # Model with vision
 python export_bnb_nf4.py \
     --source Qwen/Qwen3.5-4B \
-    --output ./models/qwen3.5-4B-bnb-nf4-vision-offline \
+    --output ./models/Qwen3.5-4B-BNB-NF4-with-vision \
     --vision
+
+# ASR model
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3-ASR-1.7B \
+    --output ./models/Qwen3-ASR-1.7B-BNB-NF4
 
 # From local directory, overwriting existing export
 python export_bnb_nf4.py \
     --source ./Qwen3-0.6B \
-    --output ./models/qwen3-0.6B-bnb-nf4-offline \
+    --output ./models/Qwen3-0.6B-BNB-NF4 \
     --overwrite
 ```
 
@@ -315,6 +321,7 @@ Aila/
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 quantization format and dequantization reference
 - **[simdjson](https://github.com/simdjson/simdjson)** — Fast JSON parser used for model config and tokenizer metadata
 - **[dr_libs](https://github.com/mackron/dr_libs)** — Single-header audio decoding libraries (`dr_wav`, `dr_mp3`, `dr_flac`) used for ASR audio preprocessing
+- **[llama.cpp jinja module](https://github.com/ggml-org/llama.cpp/tree/master/common/jinja)** — jinja chat template parser module, used for parsing and building chat template
 
 ## 📄 License
 
