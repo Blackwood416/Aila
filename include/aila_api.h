@@ -273,12 +273,16 @@ AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
 
 
 /**
- * Synthesize raw float audio samples from text prompt (blocking).
+ * Synthesize raw float audio samples from pre-tokenized text tokens (blocking).
+ * Supports zero-shot voice cloning when speaker_embedding is provided.
+ *
+ * Most users should prefer aila_synthesize_text_to_wav() for automatic tokenization.
+ *
  * @param engine             Initialized engine handle (configured with Qwen3-TTS model)
  * @param text_tokens        Array of text token IDs
  * @param text_tokens_len    Number of tokens in text_tokens array
- * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL)
- * @param speaker_embedding_len Length of speaker clone embedding (0 if NULL)
+ * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL for default voice)
+ * @param speaker_embedding_len Length of speaker clone embedding (must be 1024 for Qwen3-TTS; 0 if NULL)
  * @param config             Generation config (NULL for defaults)
  * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
  *                           Must be freed with aila_free_samples() by the caller.
@@ -298,14 +302,17 @@ AILA_API int aila_synthesize_wav(
 
 /**
  * Synthesize raw float audio samples directly from a UTF-8 text string (blocking).
- * Automatically handles text packaging/tokenization for Qwen3-TTS.
- * Note: Zero-shot voice cloning is currently not active in the backend; speaker_embedding is ignored.
+ * Automatically handles ChatML layout and tokenization for Qwen3-TTS.
+ * Supports zero-shot voice cloning when speaker_embedding is provided.
+ *
+ * To obtain a speaker embedding, call aila_extract_speaker_embedding() with a reference audio file.
  *
  * @param engine             Initialized engine handle (configured with Qwen3-TTS model)
  * @param text               UTF-8 text prompt to synthesize
- * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL)
- * @param speaker_embedding_len Length of speaker clone embedding (0 if NULL)
- * @param config             Generation config (NULL for defaults)
+ * @param speaker_embedding  Optional array of speaker clone embeddings (can be NULL for default voice)
+ * @param speaker_embedding_len Length of speaker clone embedding (must be 1024 for Qwen3-TTS; 0 if NULL)
+ * @param config             Generation config (NULL for defaults). TTS auto-sets repetition_penalty to 1.1
+ *                           if not explicitly configured.
  * @param out_samples        [out] Receives a newly allocated array of float audio samples (24000Hz PCM)
  *                           Must be freed with aila_free_samples() by the caller.
  * @param out_sample_count   [out] Receives the number of generated audio samples.
@@ -342,6 +349,29 @@ AILA_API int aila_decode_mimi_vocoder(
     int n_frames,
     float** out_samples,
     int* out_sample_count
+);
+
+/**
+ * Extract speaker embedding from a reference audio file for TTS voice cloning.
+ * Uses the native C++ ECAPA-TDNN speaker encoder (CPU-side, no Python dependency).
+ *
+ * Supported audio formats: WAV, MP3, FLAC.
+ * Audio requirements: mono (multi-channel is averaged), any sample rate (auto-resampled to 24kHz).
+ * Recommended: ≥3 seconds of clear speech, 24kHz, mono, float32 or int16, normalized to [-1, 1].
+ *
+ * @param engine             Initialized engine handle (must be configured with a Qwen3-TTS model,
+ *                           as the speaker encoder weights reside in the TTS model's safetensors file).
+ * @param audio_path         Path to the reference audio file.
+ * @param out_embedding      [out] Receives a newly allocated float array containing the speaker embedding.
+ *                           The caller must free this array with aila_free_samples().
+ * @param out_embedding_dim  [out] Receives the dimension of the speaker embedding (typically 1024).
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_extract_speaker_embedding(
+    AilaEngine* engine,
+    const char* audio_path,
+    float** out_embedding,
+    int* out_embedding_dim
 );
 
 #endif /* AILA_API_H */

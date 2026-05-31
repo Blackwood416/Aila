@@ -577,3 +577,39 @@ AILA_API int aila_decode_mimi_vocoder(
         return AILA_ERR_RUNTIME;
     }
 }
+
+AILA_API int aila_extract_speaker_embedding(
+    AilaEngine* engine,
+    const char* audio_path,
+    float** out_embedding,
+    int* out_embedding_dim
+) {
+    if (!engine || !audio_path || !out_embedding || !out_embedding_dim) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<float> embedding;
+        bool ok = engine->engine.extractSpeakerEmbedding(audio_path, embedding);
+        if (!ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        float* c_arr = (float*)malloc(embedding.size() * sizeof(float));
+        if (!c_arr) {
+            return AILA_ERR_RUNTIME;
+        }
+        std::copy(embedding.begin(), embedding.end(), c_arr);
+
+        *out_embedding = c_arr;
+        *out_embedding_dim = static_cast<int>(embedding.size());
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Extract speaker embedding failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Extract speaker embedding failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}

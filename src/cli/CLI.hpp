@@ -62,6 +62,7 @@ struct CLIOptions {
     std::string tts_text;           // --synthesize
     std::string tts_output_path;    // --output-wav
     std::string tts_speaker_path;   // --spk, --speaker
+    std::string tts_spk_cache_dir;  // --spk-cache-dir
 };
 
 // Parse command-line arguments
@@ -77,7 +78,7 @@ void print_version();
 // String processing utilities
 std::string normalize_input_for_model(const std::string& text);
 std::string trim(const std::string& str);
-std::vector<float> load_or_extract_speaker_embedding(const std::string& model_dir, const std::string& path);
+std::vector<float> load_or_extract_speaker_embedding(InferenceEngine* engine, const std::string& path);
 
 // ============================================================
 // Interactive command registry
@@ -107,7 +108,9 @@ private:
 
 // Build the default interactive command set
 CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
-                                       bool& should_quit, InferenceEngine* engine = nullptr);
+                                       bool& should_quit, InferenceEngine* engine = nullptr,
+                                       const std::string& default_speaker_path = "");
 
 // Run the interactive loop
-int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output);
+int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output,
+                    const std::string& default_speaker_path = "");

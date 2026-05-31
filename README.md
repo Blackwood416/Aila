@@ -20,7 +20,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
-- 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder. Supports direct raw audio WAV generation (`aila_synthesize_wav`) and offline Mimi decoding (`aila_decode_mimi_vocoder`)
+- 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder and native zero-shot voice cloning. Supports direct raw audio WAV generation, voice cloning via reference audio, and offline Mimi decoding
 - 🔄 Streaming output — token-level streaming callback with abort support
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
@@ -85,6 +85,12 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline
 # Offline audio transcription (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# Text-to-speech synthesis (TTS)
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "Hello world!" --output-wav output.wav
+
+# TTS with voice cloning (zero-shot)
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
+
 # Single prompt from JSON file
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json prompt.json
 
@@ -125,6 +131,10 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `--log-level <level>` | Minimum log level (verbose/debug/info/warning/error) | info |
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
+| `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
+| `--output-wav <path>` | TTS output WAV file path | `output.wav` |
+| `--spk, --speaker <path>` | Reference audio for TTS voice cloning | (none) |
+| `--spk-cache-dir <dir>` | Speaker embedding cache directory | `AILA_SPK_CACHE_DIR` env |
 | `--forced-lang <lang>` | Force ASR language (e.g. Chinese, English) | (none) |
 | `--asr-system <prompt>` | ASR system prompt text bias | (none) |
 | `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
@@ -139,6 +149,8 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/help` | Show available commands |
 | `/quit`, `/exit` | Exit |
 | `/transcribe <path>` | Transcribe audio file (ASR) |
+| `/tts <text> [--spk <path>]` | Synthesize speech (TTS) with optional voice cloning |
+| `/synthesize <text> [--spk <path>]` | Alias for `/tts` |
 | `/clear` | Clear conversation history |
 | `/context` | Show context usage |
 | `/greedy` | Switch to greedy decoding |
@@ -166,6 +178,33 @@ Quantum computing is...
 ```
 
 Both work in interactive mode and `--messages-json`.
+
+### 🎤 TTS Voice Cloning
+
+Aila supports **zero-shot voice cloning** for Qwen3-TTS models. The speaker embedding is extracted via a native C++ ECAPA-TDNN encoder (no Python dependency).
+
+**Reference audio requirements:**
+
+| Requirement | Value |
+|-------------|-------|
+| **Format** | WAV, MP3, or FLAC |
+| **Sample rate** | Any (auto-resampled to 24kHz) |
+| **Channels** | Mono recommended (multi-channel is averaged to mono) |
+| **Duration** | ≥ 3 seconds of clear speech recommended |
+| **Content** | Clean speech from the target speaker with minimal background noise |
+| **Encoding** | 16-bit PCM or 32-bit float |
+
+```powershell
+# Clone a voice from reference audio
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "你好世界" `
+    --spk ./reference_speaker.wav `
+    --output-wav cloned_output.wav
+```
+
+The `--rep-penalty` flag controls repetition penalty (auto-set to 1.1 for TTS). Increase it (e.g. `--rep-penalty 1.3`) if the output has repetitive artifacts, or decrease it (e.g. `--rep-penalty 1.0`) for more variation.
+
+Speaker embeddings are **automatically cached**: in-memory for the session lifetime, and persisted to disk (as `<audio_path>.spk.bin`) to avoid re-extraction on subsequent runs. Use `--spk-cache-dir <dir>` or `AILA_SPK_CACHE_DIR` to store cache files in a centralized directory.
 
 ### 📄 Messages JSON Format
 
@@ -255,6 +294,7 @@ Aila/
 │   ├── models/                  # Model backends (Qwen3, Qwen3.5, BNB4)
 │   ├── ops/                     # SYCL kernels (attention, RMSNorm, Bnb4BitLinear, etc.)
 │   ├── profile/                 # Logging, profiling & device info
+│   ├── audio/                   # Audio preprocessing (ASR) + speaker encoder (TTS voice cloning)
 │   ├── utils/                   # Tokenizer, SafeTensors, memory-mapped I/O
 │   └── vision/                  # Vision encoder (Qwen3.5)
 ├── docs/

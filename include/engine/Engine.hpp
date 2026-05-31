@@ -12,6 +12,8 @@
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
+#include "../src/audio/SpeakerEncoder.hpp"
+#include "../src/audio/GpuSpeakerEncoder.hpp"
 #include "../src/lora/LoraLoader.hpp"
 #include "../src/lora/LoraConfig.hpp"
 #include "../src/utils/Tokenizer.hpp"
@@ -30,6 +32,7 @@
 #include <vector>
 #include <cctype>
 #include <fstream>
+#include <filesystem>
 #include <cstdint>
 
 namespace aila_asr {
@@ -2337,6 +2340,106 @@ public:
         return tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
     }
 
+    // Extract speaker embedding from a reference audio file for TTS voice cloning.
+    // Uses GPU-accelerated ECAPA-TDNN (SYCL kernels) for the forward pass;
+    // mel spectrogram is computed on CPU.
+    //
+    // Caching: results are cached in memory (keyed by audio file path) and
+    // optionally persisted to disk.  Disk cache location:
+    //   - If spk_cache_dir_ is set: <cache_dir>/<basename>.spk.bin
+    //   - Otherwise: <audio_path>.spk.bin alongside the reference audio
+    //
+    // The audio file must be mono, and will be automatically resampled to 24kHz if needed.
+    // Supported formats: WAV, MP3, FLAC.
+    // Returns true on success, false on error (call last_error_message() for details).
+    bool extractSpeakerEmbedding(const std::string& audio_path,
+                                 std::vector<float>& embedding) {
+        clear_error();
+
+        // 1. Load CPU encoder first to determine the correct embedding dimension
+        //    (1024 for 0.6B, 2048 for 1.7B) — this is fast (~100ms, weights are mmap'd).
+        std::string safetensors_path = model_dir_ + "/model.safetensors";
+        std::string error;
+        aila::audio::SpeakerEncoder cpu_enc;
+        if (!cpu_enc.loadWeights(safetensors_path, &error)) {
+            set_error(EngineErrorCode::RuntimeError, "Failed to load speaker encoder weights: " + error);
+            return false;
+        }
+        int spk_dim = cpu_enc.embeddingDim();
+
+        // 2. Check cache with correct dimension
+        if (lookupSpeakerCache(audio_path, spk_dim, embedding)) {
+            AILA_LOG_INFO("[TTS] Speaker embedding loaded from cache (dim=%d)", spk_dim);
+            return true;
+        }
+
+        // 3. Cache miss — extract (GPU-accelerated)
+
+        AudioBuffer audio;
+        if (!load_audio(audio_path, audio, &error)) {
+            set_error(EngineErrorCode::RuntimeError, "Failed to load audio: " + error);
+            return false;
+        }
+        std::vector<float> mono;
+        if (audio.channels > 1) {
+            mono.resize(audio.samples.size() / audio.channels);
+            for (size_t i = 0; i < mono.size(); ++i) {
+                float sum = 0.0f;
+                for (int c = 0; c < audio.channels; ++c)
+                    sum += audio.samples[i * audio.channels + c];
+                mono[i] = sum / audio.channels;
+            }
+        } else {
+            mono = std::move(audio.samples);
+        }
+        std::vector<float> resampled;
+        if (audio.sample_rate != 24000) {
+            double ratio = (double)audio.sample_rate / 24000.0;
+            size_t outSize = (size_t)std::round(mono.size() / ratio);
+            resampled.resize(outSize);
+            auto get_sample = [&](int idx) -> float {
+                if (idx < 0) return mono[0];
+                if (idx >= (int)mono.size()) return mono[mono.size() - 1];
+                return mono[idx];
+            };
+            for (size_t i = 0; i < outSize; ++i) {
+                double t = i * ratio;
+                int idx = (int)std::floor(t);
+                double f = t - idx;
+                float y0 = get_sample(idx - 1), y1 = get_sample(idx);
+                float y2 = get_sample(idx + 1), y3 = get_sample(idx + 2);
+                float a0 = -0.5f*y0+1.5f*y1-1.5f*y2+0.5f*y3;
+                float a1 = y0-2.5f*y1+2.0f*y2-0.5f*y3;
+                float a2 = -0.5f*y0+0.5f*y2;
+                resampled[i] = (float)(((a0*f+a1)*f+a2)*f+y1);
+            }
+        } else {
+            resampled = std::move(mono);
+        }
+
+        std::vector<float> mel;
+        int nFrames = 0;
+        if (!cpu_enc.computeMelSpectrogram(resampled.data(), (int)resampled.size(), mel, nFrames)) {
+            set_error(EngineErrorCode::RuntimeError, "Mel spectrogram computation failed");
+            return false;
+        }
+
+        // Step 3b: run ECAPA-TDNN forward pass on GPU
+        aila::audio::GpuSpeakerEncoder gpu_enc;
+        if (!gpu_enc.loadWeights(*ctx_, safetensors_path, &error)) {
+            set_error(EngineErrorCode::RuntimeError, "Failed to load GPU speaker encoder: " + error);
+            return false;
+        }
+        if (!gpu_enc.extractEmbedding(*ctx_, mel.data(), nFrames, embedding, &error)) {
+            set_error(EngineErrorCode::RuntimeError, "GPU speaker encoder forward pass failed: " + error);
+            return false;
+        }
+
+        // 4. Save to caches
+        cacheSpeakerEmbedding(audio_path, embedding);
+        return true;
+    }
+
     // ASR transcription from WAV file
     std::string transcribe(const std::string& wav_path,
                            const GenerationConfig& gen_config = GenerationConfig(),
@@ -2724,9 +2827,101 @@ public:
     int last_transcribe_tokens() const { return last_transcribe_tokens_; }
     const std::string& model_dir() const { return model_dir_; }
 
+    // Speaker embedding cache: avoid re-extracting the same reference audio.
+    // Set via AILA_SPK_CACHE_DIR env var or --spk-cache-dir CLI argument.
+    void setSpeakerCacheDir(const std::string& dir) { spk_cache_dir_ = dir; }
+    const std::string& speakerCacheDir() const { return spk_cache_dir_; }
+
+    // Clear the in-memory speaker embedding cache.
+    void clearSpeakerCache() { spk_cache_.clear(); }
+
+    // Build a cache key that includes the embedding dim so different models
+    // (e.g. 0.6B=1024-dim vs 1.7B=2048-dim) don't share incompatible cache files.
+    static std::string spkCacheKey(const std::string& audio_path, int dim) {
+        return audio_path + ":dim" + std::to_string(dim);
+    }
+
+    // Build disk cache path from audio path and embedding dimension.
+    std::string spkDiskCachePath(const std::string& audio_path, int dim) const {
+        std::string suffix = ".dim" + std::to_string(dim) + ".spk.bin";
+        if (!spk_cache_dir_.empty()) {
+            size_t sep = audio_path.find_last_of("/\\");
+            std::string base = (sep != std::string::npos) ? audio_path.substr(sep + 1) : audio_path;
+            return spk_cache_dir_ + "/" + base + suffix;
+        }
+        return audio_path + suffix;
+    }
+
+    // Convenience: try common embedding dimensions (1024 for 0.6B, 2048 for 1.7B).
+    bool lookupSpeakerCache(const std::string& audio_path,
+                            std::vector<float>& embedding) {
+        return lookupSpeakerCache(audio_path, 1024, embedding)
+            || lookupSpeakerCache(audio_path, 2048, embedding);
+    }
+
+    // Check if a speaker embedding is cached for a specific embedding dimension.
+    // The 'dim_hint' is used to construct the cache key; pass the expected
+    // embedding dimension (1024 for 0.6B, 2048 for 1.7B).
+    bool lookupSpeakerCache(const std::string& audio_path, int dim_hint,
+                            std::vector<float>& embedding) {
+        if (dim_hint <= 0) return false;
+        std::string key = spkCacheKey(audio_path, dim_hint);
+        auto mem_it = spk_cache_.find(key);
+        if (mem_it != spk_cache_.end()) {
+            embedding = mem_it->second;
+            return true;
+        }
+        std::string disk_path = spkDiskCachePath(audio_path, dim_hint);
+        std::ifstream in(disk_path, std::ios::binary);
+        if (in.is_open()) {
+            in.seekg(0, std::ios::end);
+            size_t sz = in.tellg();
+            in.seekg(0, std::ios::beg);
+            if (sz >= 4 && (sz - 4) % sizeof(float) == 0) {
+                int32_t hdr = 0;
+                in.read(reinterpret_cast<char*>(&hdr), 4);
+                int dim = static_cast<int>(hdr);
+                if (dim == dim_hint && static_cast<size_t>(dim) * sizeof(float) == sz - 4) {
+                    embedding.resize(dim);
+                    in.read(reinterpret_cast<char*>(embedding.data()), dim * sizeof(float));
+                    float norm_sq = 0.0f;
+                    for (float v : embedding) norm_sq += v * v;
+                    if (norm_sq > 1.0f) {
+                        spk_cache_[key] = embedding;
+                        return true;
+                    }
+                    embedding.clear();
+                }
+            }
+        }
+        return false;
+    }
+
+    // Cache an externally-extracted speaker embedding (in-memory + disk).
+    void cacheSpeakerEmbedding(const std::string& audio_path,
+                               const std::vector<float>& embedding) {
+        if (embedding.empty()) return;
+        int dim = static_cast<int>(embedding.size());
+        std::string key = spkCacheKey(audio_path, dim);
+        spk_cache_[key] = embedding;
+        std::string disk_path = spkDiskCachePath(audio_path, dim);
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(disk_path).parent_path(), ec);
+        std::ofstream out(disk_path, std::ios::binary);
+        if (out.is_open()) {
+            int32_t hdr = dim;
+            out.write(reinterpret_cast<const char*>(&hdr), 4);
+            out.write(reinterpret_cast<const char*>(embedding.data()),
+                     embedding.size() * sizeof(float));
+        }
+    }
+
 private:
-
-
+    // In-memory speaker embedding cache (keyed by audio file path).
+    std::unordered_map<std::string, std::vector<float>> spk_cache_;
+    // Optional persistent cache directory for speaker embeddings.
+    std::string spk_cache_dir_;
 
     std::string model_dir_;
     std::string lora_dir_;

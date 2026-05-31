@@ -48,6 +48,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Configure speaker embedding cache
+    {
+        std::string cache_dir = opts.tts_spk_cache_dir;
+        if (cache_dir.empty()) {
+            cache_dir = aila::env::read_string("AILA_SPK_CACHE_DIR", "");
+        }
+        if (!cache_dir.empty()) {
+            engine.setSpeakerCacheDir(cache_dir);
+        }
+    }
+
     // Benchmark mode
     if (opts.bench_mode) {
         BenchmarkConfig bench_cfg;
@@ -205,7 +216,7 @@ int main(int argc, char** argv) {
         std::vector<float> samples;
         std::vector<float> speaker_embedding;
         if (!opts.tts_speaker_path.empty()) {
-            speaker_embedding = load_or_extract_speaker_embedding(engine.model_dir(), opts.tts_speaker_path);
+            speaker_embedding = load_or_extract_speaker_embedding(&engine, opts.tts_speaker_path);
         }
 
         bool ok = engine.synthesize_text_to_wav(input_text, speaker_embedding, gen_config, samples);
@@ -225,5 +236,5 @@ int main(int argc, char** argv) {
     }
 
     // Run interactive loop
-    return run_interactive(engine, gen_config, opts.stream_output);
+    return run_interactive(engine, gen_config, opts.stream_output, opts.tts_speaker_path);
 }

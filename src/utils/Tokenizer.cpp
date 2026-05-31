@@ -654,7 +654,12 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
             !is_digit_cp(cur.cp) &&
             !is_whitespace_cp(cur.cp)) {
             size_t j = i + cur.bytes;
+            std::string dummy;
             while (j < text.size()) {
+                // Stop merging if a special token (like <|im_end|>) starts here
+                if (try_match_special(j, dummy)) {
+                    break;
+                }
                 Utf8Char cp = decode_utf8_char(text, j);
                 if (is_whitespace_cp(cp.cp) || is_letter_or_mark_cp(cp.cp) || is_digit_cp(cp.cp)) {
                     break;

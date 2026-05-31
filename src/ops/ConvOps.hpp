@@ -50,4 +50,44 @@ void causal_conv_transpose1d(Context& ctx,
                              int batch, int in_ch, int out_ch, int in_len,
                              int kernel_size, int stride);
 
+// 1D Convolution with reflect padding (symmetric on both sides, no causality)
+// Used by ECAPA-TDNN speaker encoder.
+// input:   [batch, seq_len, in_ch]  (row-major)
+// weight:  [out_ch, in_ch, kernel_size]  (row-major)
+// bias:    [out_ch]
+// output:  [batch, seq_len, out_ch]  (row-major)
+// pad: number of reflect-padded elements on each side
+// dilation: dilation factor
+// relu: if true, applies ReLU activation after conv
+void reflect_conv1d(Context& ctx,
+                    Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                    int batch, int in_ch, int out_ch, int seq_len,
+                    int kernel_size, int dilation, int pad,
+                    bool relu);
+
+// In-place element-wise ReLU activation
+// n: total number of elements
+void relu_inplace(Context& ctx, Tensor& x, int n);
+
+// In-place element-wise Sigmoid activation
+void sigmoid_inplace(Context& ctx, Tensor& x, int n);
+
+// In-place element-wise Tanh activation
+void tanh_inplace(Context& ctx, Tensor& x, int n);
+
+// Global average pooling over time dimension
+// input:  [batch, seq_len, channels]
+// output: [batch, 1, channels]
+void global_avg_pool_1d(Context& ctx, Tensor& input, Tensor& output,
+                        int batch, int seq_len, int channels);
+
+// Softmax over time dimension
+// data: [batch, channels, seq_len] — softmax applied over last dim (seq_len)
+void softmax_1d_time(Context& ctx, Tensor& data, int batch, int channels, int seq_len);
+
+// Channel-wise scale + add (used for SE block gating)
+// dst[c, t] += alpha * src[t] (src is channel-wise scalar broadcast)
+void channel_mul_add_inplace(Context& ctx, Tensor& src, Tensor& dst,
+                             int channels, int seq_len);
+
 } // namespace ops

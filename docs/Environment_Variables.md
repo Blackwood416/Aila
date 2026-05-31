@@ -94,6 +94,18 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 
 ---
 
+## TTS Speaker Embedding (AILA_SPK_*)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_SPK_CACHE_DIR` | string | `""` | Directory for persistent speaker embedding cache. When set, cache files are stored as `<dir>/<basename>.spk.bin`. When empty (default), cache files are stored alongside the reference audio (`<audio_path>.spk.bin`). |
+
+The speaker embedding cache avoids re-extracting the same reference audio on every TTS run.
+Embeddings are cached in memory (session-lifetime) and persisted to disk.
+Set `AILA_SPK_CACHE_DIR` to a shared directory to reuse embeddings across different reference audio locations.
+
+---
+
 ## Profiling and Debugging
 
 ### Performance Profiling (AILA_PROFILE_*)

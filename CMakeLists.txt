@@ -78,6 +78,8 @@ set(LIB_SOURCES
     src/vision/Qwen35VisionEncoder.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
     src/audio/AudioPreprocessor.cpp
+    src/audio/SpeakerEncoder.cpp
+    src/audio/GpuSpeakerEncoder.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp

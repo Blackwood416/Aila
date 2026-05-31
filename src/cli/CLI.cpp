@@ -2,6 +2,7 @@
 #include "engine/Engine.hpp"
 #include "profile/Profiling.hpp"
 #include "AudioPreprocessor.hpp"
+#include "SpeakerEncoder.hpp"
 #include "utils/EnvUtils.hpp"
 #include <iostream>
 #include <sstream>
@@ -112,42 +113,54 @@ std::string trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-std::vector<float> load_or_extract_speaker_embedding(const std::string& model_dir, const std::string& path) {
+std::vector<float> load_or_extract_speaker_embedding(InferenceEngine* engine, const std::string& path) {
     std::vector<float> embedding;
-    if (path.empty()) return embedding;
+    if (!engine || path.empty()) return embedding;
 
-    std::string bin_path = path;
+    // Check if the path is an audio file (extension-based heuristic)
     bool is_audio = false;
     if (path.size() >= 4) {
         std::string ext = path.substr(path.size() - 4);
-        for (char& c : ext) c = std::tolower(c);
-        if (ext == ".wav" || ext == ".mp3") {
+        for (char& c : ext) c = static_cast<char>(std::tolower(c));
+        if (ext == ".wav" || ext == ".mp3" || ext == "flac") {
             is_audio = true;
         }
     }
 
     if (is_audio) {
-        std::cout << "[TTS] Reference audio specified. Extracting speaker embedding via Python..." << std::endl;
-        bin_path = "tmp_speaker_emb.bin";
-        
-        // Try virtual environment python first
-        std::string cmd = ".\\.venv-tts\\Scripts\\python.exe src/cli/extract_speaker_embedding.py \"" + model_dir + "\" \"" + path + "\" \"" + bin_path + "\"";
-        int ret = std::system(cmd.c_str());
-        if (ret != 0) {
-            // Fallback to system python
-            cmd = "python src/cli/extract_speaker_embedding.py \"" + model_dir + "\" \"" + path + "\" \"" + bin_path + "\"";
-            ret = std::system(cmd.c_str());
-        }
-        
-        if (ret != 0) {
-            std::cerr << "[TTS] Error: Speaker embedding extraction failed. Using default speaker." << std::endl;
+        // Determine the model's embedding dimension first (fast mmap load)
+        std::string safetensors_path = engine->model_dir() + "/model.safetensors";
+        aila::audio::SpeakerEncoder encoder;
+        std::string error;
+        if (!encoder.loadWeights(safetensors_path, &error)) {
+            std::cerr << "[TTS] Error: Failed to load speaker encoder weights: " << error << std::endl;
             return embedding;
         }
+        int spk_dim = encoder.embeddingDim();
+
+        // Check cache with correct dimension
+        if (engine->lookupSpeakerCache(path, spk_dim, embedding)) {
+            std::cout << "[TTS] Speaker embedding loaded from cache (Dimension: "
+                      << embedding.size() << ")" << std::endl;
+            return embedding;
+        }
+
+        // Cache miss — extract with CPU ECAPA-TDNN (f32 precision)
+        std::cout << "[TTS] Extracting speaker embedding (CPU, dim=" << spk_dim << ")..." << std::endl;
+        if (encoder.extractEmbeddingFromFile(path, embedding, &error)) {
+            engine->cacheSpeakerEmbedding(path, embedding);
+            std::cout << "[TTS] Speaker embedding extracted and cached (Dimension: "
+                      << embedding.size() << ")" << std::endl;
+            return embedding;
+        }
+        std::cerr << "[TTS] Error: Speaker embedding extraction failed: " << error << std::endl;
+        return embedding;
     }
 
-    std::ifstream in(bin_path, std::ios::binary);
+    // Otherwise, treat path as a .bin file containing pre-extracted embedding
+    std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
-        std::cerr << "[TTS] Error: Failed to open speaker embedding file: " << bin_path << std::endl;
+        std::cerr << "[TTS] Error: Failed to open speaker embedding file: " << path << std::endl;
         return embedding;
     }
 
@@ -160,19 +173,14 @@ std::vector<float> load_or_extract_speaker_embedding(const std::string& model_di
         return embedding;
     }
 
-    size_t count = size / sizeof(float);
+    size_t count = static_cast<size_t>(size) / sizeof(float);
     embedding.resize(count);
     if (!in.read(reinterpret_cast<char*>(embedding.data()), size)) {
         std::cerr << "[TTS] Error: Failed to read speaker embedding data" << std::endl;
         embedding.clear();
     } else {
-        std::cout << "[TTS] Successfully loaded speaker embedding from: " << bin_path 
+        std::cout << "[TTS] Loaded speaker embedding from: " << path
                   << " (Dimension: " << count << ")" << std::endl;
-    }
-
-    in.close();
-    if (is_audio) {
-        std::remove(bin_path.c_str());
     }
 
     return embedding;
@@ -223,6 +231,8 @@ Options:
   --transcribe <path>      Offline audio transcription (ASR) file path
   --synthesize <prompt>    TTS voice synthesis from text prompt (Qwen3-TTS only)
   --output-wav <path>      Output path for synthesized WAV file (default: output.wav)
+  --spk, --speaker <path>  Reference audio for TTS voice cloning
+  --spk-cache-dir <dir>    Speaker embedding cache directory (default: alongside audio)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -428,6 +438,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_speaker_path = argv[++i];
             continue;
         }
+        if (arg == "--spk-cache-dir" && i + 1 < argc) {
+            opts.tts_spk_cache_dir = argv[++i];
+            continue;
+        }
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;
@@ -493,7 +507,8 @@ void CommandRegistry::print_help() const {
 }
 
 CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
-                                       bool& should_quit, InferenceEngine* engine) {
+                                       bool& should_quit, InferenceEngine* engine,
+                                       const std::string& default_speaker_path) {
     CommandRegistry registry;
 
     registry.register_command("/quit", "Exit the program", [&](const std::string&) {
@@ -573,10 +588,15 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
-    auto tts_handler = [&, engine](const std::string& args) {
+    auto tts_handler = [&, engine, default_speaker_path](const std::string& args) {
         std::string trimmed_args = trim(args);
         if (trimmed_args.empty()) {
-            std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <reference_audio_or_bin>]" << std::endl;
+            if (default_speaker_path.empty()) {
+                std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <reference_audio_or_bin>]" << std::endl;
+            } else {
+                std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <path>]  (session speaker: "
+                          << default_speaker_path << ")" << std::endl;
+            }
             return true;
         }
         if (!engine) {
@@ -588,7 +608,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             return true;
         }
 
-        // Parse --spk argument if any
+        // Parse --spk argument if any (overrides session default)
         std::string text_prompt = trimmed_args;
         std::string spk_path = "";
         size_t spk_pos = trimmed_args.find("--spk ");
@@ -596,7 +616,6 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             text_prompt = trim(trimmed_args.substr(0, spk_pos));
             spk_path = trim(trimmed_args.substr(spk_pos + 6));
         } else {
-            // Also support --spk=path format
             spk_pos = trimmed_args.find("--spk=");
             if (spk_pos != std::string::npos) {
                 text_prompt = trim(trimmed_args.substr(0, spk_pos));
@@ -604,19 +623,24 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             }
         }
 
+        // Fall back to session default speaker if no --spk in command
+        if (spk_path.empty() && !default_speaker_path.empty()) {
+            spk_path = default_speaker_path;
+        }
+
         std::string norm_args = normalize_input_for_model(text_prompt);
         std::cout << "[TTS] Synthesizing: \"" << norm_args << "\"";
         if (!spk_path.empty()) {
-            std::cout << " (Speaker profile: " << spk_path << ")";
+            std::cout << " (Speaker: " << spk_path << ")";
         }
         std::cout << std::endl;
 
         std::vector<float> samples;
         std::vector<float> speaker_embedding;
         if (!spk_path.empty()) {
-            speaker_embedding = load_or_extract_speaker_embedding(engine->model_dir(), spk_path);
+            speaker_embedding = load_or_extract_speaker_embedding(engine, spk_path);
         }
-        
+
         bool ok = engine->synthesize_text_to_wav(norm_args, speaker_embedding, gen_config, samples);
         if (!ok) {
             std::cout << "[TTS] Synthesis failed: " << engine->last_error_message() << std::endl;
@@ -750,7 +774,8 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
 // Interactive Loop
 // ============================================================
 
-int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output) {
+int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output,
+                    const std::string& default_speaker_path /* = "" in header */) {
     bool interactive_terminal = detect_interactive_terminal();
     setup_console_utf8(interactive_terminal);
 
@@ -762,7 +787,7 @@ int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool 
     stream_output = aila::env::read_flag("AILA_STREAM_OUTPUT", stream_output);
 
     bool should_quit = false;
-    auto registry = build_default_commands(gen_config, stream_output, should_quit, &engine);
+    auto registry = build_default_commands(gen_config, stream_output, should_quit, &engine, default_speaker_path);
 
     std::string input;
     while (!should_quit) {

@@ -20,7 +20,7 @@
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
-- 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS）。支持直接生成原始音频 WAV（`aila_synthesize_wav`）和离线 Mimi 译码（`aila_decode_mimi_vocoder`）
+- 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS），支持原生零样本语音克隆。支持直接生成原始音频 WAV、通过参考音频进行音色克隆，以及离线 Mimi 译码
 - 🔄 流式输出 — token 级别流式回调，支持中止生成
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
@@ -85,6 +85,12 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline
 # 离线语音转录 (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# 文本转语音合成 (TTS)
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "你好世界" --output-wav output.wav
+
+# TTS 语音克隆（零样本）
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
+
 # 从 JSON 文件读取单条 prompt
 Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --messages-json prompt.json
 
@@ -125,6 +131,10 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `--log-level <level>` | 最低日志级别（verbose/debug/info/warning/error） | info |
 | `--messages-json <path>` | JSON prompt 文件（`-` = stdin） | 无 |
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
+| `--synthesize <text>` | TTS 文本转语音合成 | 无 |
+| `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
+| `--spk, --speaker <path>` | TTS 语音克隆参考音频路径 | 无 |
+| `--spk-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_SPK_CACHE_DIR` 环境变量 |
 | `--forced-lang <lang>` | 强制指定 ASR 转录语种（如 Chinese, English） | 无 |
 | `--asr-system <prompt>` | ASR 偏置的系统提示词（system prompt） | 无 |
 | `--asr-segment <sec>` | ASR 音频分段切片秒数大小 | 0.0 (禁用) |
@@ -139,6 +149,8 @@ Aila.exe -m ./models/qwen3.5-0.8B-bnb-nf4-offline --bench --sample
 | `/help` | 显示可用命令 |
 | `/quit`、`/exit` | 退出程序 |
 | `/transcribe <path>` | 转录音频文件（ASR） |
+| `/tts <text> [--spk <path>]` | 语音合成（TTS），支持可选语音克隆 |
+| `/synthesize <text> [--spk <path>]` | `/tts` 的别名 |
 | `/clear` | 清除对话历史 |
 | `/context` | 显示上下文用量 |
 | `/greedy` | 切换到贪心解码 |
@@ -166,6 +178,33 @@ Aila: <think>
 ```
 
 交互模式和 `--messages-json` 均支持。
+
+### 🎤 TTS 语音克隆
+
+Aila 为 Qwen3-TTS 模型提供**零样本语音克隆**支持。说话人嵌入通过原生 C++ ECAPA-TDNN 编码器提取（不依赖 Python）。
+
+**参考音频要求：**
+
+| 要求 | 说明 |
+|------|------|
+| **格式** | WAV、MP3 或 FLAC |
+| **采样率** | 任意（自动重采样到 24kHz） |
+| **声道** | 推荐单声道（多声道自动平均为单声道） |
+| **时长** | 建议 ≥ 3 秒清晰语音 |
+| **内容** | 目标说话人的清晰语音，背景噪音尽量小 |
+| **编码** | 16-bit PCM 或 32-bit float |
+
+```powershell
+# 从参考音频克隆音色
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "你好世界" `
+    --spk ./reference_speaker.wav `
+    --output-wav cloned_output.wav
+```
+
+`--rep-penalty` 参数控制重复惩罚（TTS 模式下自动设为 1.1）。如果输出出现重复伪影可调高（如 `--rep-penalty 1.3`），需要更多变化时可调低（如 `--rep-penalty 1.0`）。
+
+说话人嵌入会**自动缓存**：会话期间缓存于内存中，并持久化到磁盘（`<audio_path>.spk.bin`），避免重复提取。使用 `--spk-cache-dir <dir>` 或 `AILA_SPK_CACHE_DIR` 环境变量可将缓存文件集中存储到指定目录。
 
 ### 📄 Messages JSON 格式
 
@@ -255,6 +294,7 @@ Aila/
 │   ├── models/                  # 模型后端（Qwen3、Qwen3.5、BNB4）
 │   ├── ops/                     # SYCL kernel（注意力、RMSNorm、Bnb4BitLinear 等）
 │   ├── profile/                 # 日志、性能分析和设备信息
+│   ├── audio/                   # 音频预处理（ASR）+ 说话人编码器（TTS 语音克隆）
 │   ├── utils/                   # 分词器、SafeTensors、内存映射 I/O
 │   └── vision/                  # 视觉编码器（Qwen3.5）
 ├── docs/
