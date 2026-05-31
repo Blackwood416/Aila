@@ -949,7 +949,7 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
 
     std::string safetensors_path = model_dir + "/speech_tokenizer/model.safetensors";
     try {
-        std::cout << "[MimiLoader] Loading safetensors from: " << safetensors_path << std::endl;
+        AILA_LOG_INFO("[MimiLoader] Loading safetensors from: %s", safetensors_path.c_str());
         mimi_weights_ = LoadSafetensors(safetensors_path, ctx);
     } catch (const std::exception& e) {
         if (error_message) *error_message = std::string("Failed to load mimi safetensors: ") + e.what();
@@ -1022,7 +1022,7 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     // 3. 将除了 cluster_usage 之外的所有其它 f32 权重转换成 bf16
-    std::cout << "[MimiLoader] Converting non-codebook f32 weights to bf16 on GPU..." << std::endl;
+    AILA_LOG_INFO("[MimiLoader] Converting non-codebook f32 weights to bf16 on GPU...");
     std::vector<std::string> mimi_tensor_names = mimi_weights_.names();
     for (const auto& name : mimi_tensor_names) {
         // cluster_usage 字段不参与网络前向，跳过不转换
@@ -1053,7 +1053,7 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     ctx.synchronize();
-    std::cout << "[MimiLoader] Loaded and converted all codebooks/weights successfully to bf16!" << std::endl;
+    AILA_LOG_INFO("[MimiLoader] Loaded and converted all codebooks/weights successfully to bf16!");
     mimi_loaded_ = true;
     return true;
 }
@@ -1063,12 +1063,12 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
                                          int n_frames,
                                          std::vector<float>& out_samples) {
     if (!mimi_loaded_) {
-        std::cerr << "[MimiDecoder] Error: Mimi Vocoder weights not loaded." << std::endl;
+        AILA_LOG_ERROR("[MimiDecoder] Error: Mimi Vocoder weights not loaded.");
         return false;
     }
 
     if (codes.size() < static_cast<size_t>(n_frames * 16)) {
-        std::cerr << "[MimiDecoder] Error: input codes size does not match n_frames * 16." << std::endl;
+        AILA_LOG_ERROR("[MimiDecoder] Error: input codes size does not match n_frames * 16.");
         return false;
     }
 
@@ -1196,7 +1196,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         });
     };
 
-    std::cout << "[MimiDebug] Step 6: Pre-transformer 8 layers loop" << std::endl;
+    AILA_LOG_INFO("[MimiDebug] Step 6: Pre-transformer 8 layers loop");
     Tensor x = Tensor::allocate(ctx, {n_frames, 512});
     ops::copy_tensor(ctx, pre_tfm_in, x, n_frames * 512);
 
@@ -1542,11 +1542,11 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
             }
             wav_file.write(reinterpret_cast<const char*>(pcm_data.data()), header.data_size);
         } else {
-            std::cerr << "[MimiDebug] Warning: failed to write mimi_output.wav" << std::endl;
+            AILA_LOG_WARN("[MimiDebug] Warning: failed to write mimi_output.wav");
         }
     }
 
-    std::cout << "[MimiDebug] Successful! Decoded into " << L << " samples." << std::endl;
+    AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
     return true;
 }
 
