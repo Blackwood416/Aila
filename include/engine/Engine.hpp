@@ -2318,7 +2318,18 @@ public:
         AILA_LOG_INFO("[TTS] Input: \"%s\", Tokenized into %zu tokens: [ %s]",
                       text.c_str(), tokens.size(), ids_str.c_str());
 
-        return synthesize_wav(tokens, speaker_embedding, gen_config, out_samples);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = synthesize_wav(tokens, speaker_embedding, gen_config, out_samples);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (ok && !out_samples.empty()) {
+            double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double audio_s = static_cast<double>(out_samples.size()) / 24000.0;
+            double rtf = elapsed_ms / 1000.0 / audio_s;
+            AILA_LOG_INFO("[TTS] Synthesis complete: %.0f ms, %.2f s audio, RTF=%.3f (%srealtime)",
+                          elapsed_ms, audio_s, rtf, (rtf < 1.0 ? "" : "slower than "));
+        }
+        return ok;
     }
 
     // TTS audio discrete codes decoding using Mimi Decoder
