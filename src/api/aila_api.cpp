@@ -1,6 +1,7 @@
 #include "aila_api.h"
 #include "engine/Engine.hpp"
 #include "profile/Profiling.hpp"
+#include "AudioPreprocessor.hpp"
 #include <cstring>
 #include <functional>
 #include <string>
@@ -574,6 +575,45 @@ AILA_API int aila_decode_mimi_vocoder(
         return AILA_ERR_RUNTIME;
     } catch (...) {
         AILA_LOG_ERROR("[C-API] Decode Mimi Vocoder failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_synthesize(
+    AilaEngine* engine,
+    const char* text,
+    const char* speaker_audio_path,
+    const AilaGenConfig* config,
+    const char* output_wav_path
+) {
+    if (!engine || !text || !output_wav_path) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        GenerationConfig cpp_cfg = to_cpp_config(config);
+
+        std::vector<float> spk_emb;
+        if (speaker_audio_path && speaker_audio_path[0]) {
+            if (!engine->engine.extractSpeakerEmbedding(speaker_audio_path, spk_emb)) {
+                return AILA_ERR_RUNTIME;
+            }
+        }
+
+        std::vector<float> samples;
+        if (!engine->engine.synthesize_text_to_wav(std::string(text), spk_emb, cpp_cfg, samples)) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        if (!save_wav(std::string(output_wav_path), samples, 24000)) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        return AILA_OK;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] aila_synthesize failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] aila_synthesize failed: unknown exception");
         return AILA_ERR_RUNTIME;
     }
 }

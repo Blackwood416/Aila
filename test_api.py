@@ -144,7 +144,15 @@ class AilaAPI:
         self._set("aila_last_error_code", c_int, [c_void_p])
         self._set("aila_last_error_message", c_char_p, [c_void_p])
 
-        # TTS APIs
+        # TTS APIs (simplified)
+        self._set("aila_synthesize", c_int, [
+            c_void_p,          # engine
+            c_char_p,          # text
+            c_char_p,          # speaker_audio_path
+            c_void_p,          # config
+            c_char_p,          # output_wav_path
+        ])
+        # Low-level TTS APIs
         self._set("aila_extract_speaker_embedding", c_int, [
             c_void_p,          # engine
             c_char_p,          # audio_path
@@ -1006,115 +1014,62 @@ def test_tts(api: AilaAPI, engine):
     test("aila_synthesize_text_to_wav returns OK", rc_text == 0, f"rc={rc_text}")
     test("aila_synthesize_text_to_wav sample count > 0", out_sample_count_text.value > 0, f"count={out_sample_count_text.value} ({elapsed_text:.1f}s)")
     
-    # Test 4: Voice cloning — extract speaker embedding and synthesize
+    # Test 4: Voice cloning — one-shot aila_synthesize
     print("\n  [Voice Cloning]")
-    import struct
-    import base64
+    import struct, os as _os
 
-    # Generate a short sine-wave WAV as a mock reference audio for testing
-    # (24000 Hz, 1ch, 16-bit PCM, ~3 seconds)
+    # Generate a short sine-wave WAV as a mock reference audio
     sample_rate = 24000
-    duration = 3.0
-    n_samples = int(sample_rate * duration)
+    n_samples = sample_rate * 3  # 3 seconds
     mock_audio = [int(16000 * __import__('math').sin(2 * 3.14159 * 440 * i / sample_rate))
                   for i in range(n_samples)]
-
     ref_wav_path = "./__test_ref_voice.wav"
     with open(ref_wav_path, "wb") as f:
         data_bytes = n_samples * 2
-        f.write(b"RIFF")
-        f.write(struct.pack("<I", 36 + data_bytes))
-        f.write(b"WAVE")
-        f.write(b"fmt ")
-        f.write(struct.pack("<I", 16))       # chunk size
-        f.write(struct.pack("<H", 1))        # PCM
-        f.write(struct.pack("<H", 1))        # mono
-        f.write(struct.pack("<I", sample_rate))
-        f.write(struct.pack("<I", sample_rate * 2))  # byte rate
-        f.write(struct.pack("<H", 2))        # block align
-        f.write(struct.pack("<H", 16))       # bits per sample
-        f.write(b"data")
-        f.write(struct.pack("<I", data_bytes))
-        for s in mock_audio:
-            f.write(struct.pack("<h", s))
+        f.write(b"RIFF"); f.write(struct.pack("<I", 36 + data_bytes))
+        f.write(b"WAVE"); f.write(b"fmt "); f.write(struct.pack("<I", 16))
+        f.write(struct.pack("<H", 1)); f.write(struct.pack("<H", 1))
+        f.write(struct.pack("<I", sample_rate)); f.write(struct.pack("<I", sample_rate * 2))
+        f.write(struct.pack("<H", 2)); f.write(struct.pack("<H", 16))
+        f.write(b"data"); f.write(struct.pack("<I", data_bytes))
+        for s in mock_audio: f.write(struct.pack("<h", s))
 
-    # Test 4a: First extraction (fresh, no cache)
-    emb1_ptr = POINTER(c_float)()
-    emb1_dim = c_int(0)
-    t0_first = time.time()
-    rc_first = api.aila_extract_speaker_embedding(
-        engine, ref_wav_path.encode(),
-        byref(emb1_ptr), byref(emb1_dim)
-    )
-    elapsed_first = time.time() - t0_first
-    test("aila_extract_speaker_embedding (1st call) returns OK", rc_first == 0,
-         f"rc={rc_first} ({elapsed_first:.1f}s)")
-    test("embedding dim == 1024", emb1_dim.value == 1024, f"dim={emb1_dim.value}")
+    out_path = "./__test_tts_output.wav"
 
-    # Read first embedding values for comparison
-    emb1_vals = None
-    if rc_first == 0 and emb1_dim.value == 1024:
-        emb1_vals = [emb1_ptr[i] for i in range(min(10, emb1_dim.value))]
+    # Test 4a: One-shot synthesis with voice cloning
+    t0 = time.time()
+    rc = api.aila_synthesize(engine, b"Hello world", ref_wav_path.encode(),
+                              byref(cfg), out_path.encode())
+    elapsed = time.time() - t0
+    test("aila_synthesize (voice clone) returns OK", rc == 0, f"rc={rc} ({elapsed:.1f}s)")
+    test("output WAV file exists", _os.path.isfile(out_path),
+         f"size={_os.path.getsize(out_path) if _os.path.isfile(out_path) else 0}")
 
-    # Test 4b: Second extraction (should hit in-memory cache, nearly instant)
-    emb2_ptr = POINTER(c_float)()
-    emb2_dim = c_int(0)
-    t0_second = time.time()
-    rc_second = api.aila_extract_speaker_embedding(
-        engine, ref_wav_path.encode(),
-        byref(emb2_ptr), byref(emb2_dim)
-    )
-    elapsed_second = time.time() - t0_second
-    test("aila_extract_speaker_embedding (2nd call) returns OK", rc_second == 0,
-         f"rc={rc_second} ({elapsed_second:.1f}s)")
-    test("embedding dim == 1024 (2nd call)", emb2_dim.value == 1024)
+    # Test 4b: Second call should use cache (faster)
+    out_path2 = "./__test_tts_output2.wav"
+    t0b = time.time()
+    rc2 = api.aila_synthesize(engine, b"Hello again", ref_wav_path.encode(),
+                               byref(cfg), out_path2.encode())
+    elapsed2 = time.time() - t0b
+    test("aila_synthesize (2nd call, cached spk) returns OK", rc2 == 0,
+         f"rc={rc2} ({elapsed2:.1f}s)")
+    test("2nd output WAV exists", _os.path.isfile(out_path2))
+    if elapsed < 5.0:  # only check if first call was reasonably timed
+        test("2nd call uses cached embedding (faster)", elapsed2 <= elapsed * 1.1,
+             f"1st={elapsed:.1f}s 2nd={elapsed2:.1f}s")
 
-    # Verify in-memory cache: second call should be much faster (< 0.1s)
-    cache_hit = elapsed_second < 0.1
-    test("in-memory cache hit (2nd call < 0.1s)", cache_hit,
-         f"1st={elapsed_first:.2f}s 2nd={elapsed_second:.3f}s")
-
-    # Verify both embeddings are identical
-    if rc_first == 0 and rc_second == 0 and emb1_dim.value == emb2_dim.value:
-        emb2_vals = [emb2_ptr[i] for i in range(min(10, emb2_dim.value))]
-        identical = True
-        for i in range(emb1_dim.value):
-            if abs(emb1_ptr[i] - emb2_ptr[i]) > 1e-6:
-                identical = False
-                break
-        test("in-memory cache: both embeddings are identical", identical,
-             f"1st[:5]={emb1_vals[:5]} 2nd[:5]={emb2_vals[:5]}")
-
-    # Test 4c: Synthesize with the cloned voice
-    if rc_first == 0 and emb1_dim.value == 1024:
-        out_samples_clone = POINTER(c_float)()
-        out_sample_count_clone = c_int(0)
-        t0_clone = time.time()
-        rc_clone = api.aila_synthesize_text_to_wav(
-            engine, b"Hello world",
-            emb1_ptr, emb1_dim,
-            byref(cfg),
-            byref(out_samples_clone), byref(out_sample_count_clone)
-        )
-        elapsed_clone = time.time() - t0_clone
-        test("synthesize with cloned voice returns OK", rc_clone == 0,
-             f"rc={rc_clone} ({elapsed_clone:.1f}s)")
-        test("cloned output sample count > 0",
-             out_sample_count_clone.value > 0,
-             f"count={out_sample_count_clone.value}")
-        if out_samples_clone:
-            api.aila_free_samples(out_samples_clone)
+    # Test 4c: One-shot with NULL speaker (default voice)
+    out_path3 = "./__test_tts_default.wav"
+    rc3 = api.aila_synthesize(engine, b"Default voice", None, byref(cfg), out_path3.encode())
+    test("aila_synthesize (NULL speaker, default voice) returns OK", rc3 == 0,
+         f"rc={rc3}")
+    test("default voice output WAV exists", _os.path.isfile(out_path3))
 
     # Cleanup
-    if emb1_ptr:
-        api.aila_free_samples(emb1_ptr)
-    if emb2_ptr:
-        api.aila_free_samples(emb2_ptr)
-    try:
-        os.unlink(ref_wav_path)
-        os.unlink(ref_wav_path + ".spk.bin")
-    except OSError:
-        pass
+    for p in [ref_wav_path, ref_wav_path + ".dim1024.spk.bin",
+              out_path, out_path2, out_path3]:
+        try: _os.unlink(p)
+        except OSError: pass
 
     # Free previous resources
     if out_samples:

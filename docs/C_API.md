@@ -257,25 +257,52 @@ Destroys the streaming ASR context and frees all associated memory. Passing `NUL
 
 ### Text-to-Speech (TTS)
 
-Aila supports Text-to-Speech (TTS) synthesis when loaded with a Qwen3-TTS model. The API allows synthesizing raw 24kHz float PCM audio samples from text, with optional **zero-shot voice cloning** via a speaker embedding extracted from a reference audio file.
+Aila supports Text-to-Speech (TTS) synthesis when loaded with a Qwen3-TTS model, with optional **zero-shot voice cloning**.
 
-#### End-to-End Voice Cloning Flow
+#### Quick Start: `aila_synthesize` (Recommended)
 
+The simplest API — one call handles everything: tokenization, optional voice cloning, synthesis, and WAV file output. No manual memory management.
+
+```c
+// Default voice
+aila_synthesize(engine, "Hello world!", NULL, NULL, "output.wav");
+
+// Voice cloning from reference audio
+aila_synthesize(engine, "你好世界", "./reference_speaker.wav", NULL, "cloned.wav");
 ```
-Reference audio (WAV/MP3/FLAC)
-    │
-    ▼
-aila_extract_speaker_embedding()  ← CPU ECAPA-TDNN (native C++, no Python)
-    │
-    ▼
-float embedding[1024]
-    │
-    ▼
-aila_synthesize_text_to_wav(engine, text, embedding, 1024, cfg, &samples, &count)
-    │
-    ▼
-Float PCM samples (24kHz, mono) → save as WAV or stream to audio device
+
+#### `aila_synthesize`
+
+```c
+int aila_synthesize(
+    AilaEngine* engine,
+    const char* text,
+    const char* speaker_audio_path,   // NULL for default voice
+    const AilaGenConfig* config,      // NULL for defaults
+    const char* output_wav_path       // output WAV file (24kHz, mono, f32 PCM)
+);
 ```
+
+One-shot TTS synthesis: text + optional voice cloning → WAV file. Internally handles speaker embedding extraction (with automatic caching), tokenization, synthesis, and WAV writing in a single call. No `malloc`/`free` needed.
+
+- `text` — UTF-8 text to synthesize.
+- `speaker_audio_path` — Optional reference audio (WAV/MP3/FLAC) for voice cloning. Pass `NULL` for default voice. Speaker embeddings are automatically cached in memory and on disk.
+- `config` — Generation config (`NULL` for defaults).
+- `output_wav_path` — Destination path for the output WAV file.
+
+Returns `0` on success, non-zero on error.
+
+#### Low-Level APIs
+
+For advanced use cases (custom audio post-processing, pre-tokenized input, separate embedding management):
+
+| Function | Description |
+|----------|-------------|
+| `aila_extract_speaker_embedding` | Extract speaker embedding from reference audio |
+| `aila_synthesize_text_to_wav` | Synthesize text → float PCM samples (caller frees with `aila_free_samples`) |
+| `aila_synthesize_wav` | Synthesize pre-tokenized tokens → float PCM samples |
+| `aila_decode_mimi_vocoder` | Decode discrete Mimi codes → float PCM samples |
+| `aila_free_samples` | Free sample/embedding arrays |
 
 #### Reference Audio Requirements
 
@@ -578,7 +605,17 @@ lib.aila_transcribe_stream_destroy.restype = None
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
 
-# TTS APIs
+# TTS (simplified)
+lib.aila_synthesize.argtypes = [
+    ctypes.c_void_p,          # engine
+    ctypes.c_char_p,          # text
+    ctypes.c_char_p,          # speaker_audio_path
+    ctypes.c_void_p,          # config
+    ctypes.c_char_p,          # output_wav_path
+]
+lib.aila_synthesize.restype = ctypes.c_int
+
+# TTS (low-level)
 lib.aila_extract_speaker_embedding.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # audio_path
@@ -628,37 +665,22 @@ lib.aila_engine_destroy(engine)
 ##### TTS Voice Cloning (Python)
 
 ```python
-# 1. Init engine with Qwen3-TTS model
+# 1. Init engine
 engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-Base", 4096)
 
-# 2. Extract speaker embedding from reference audio
-emb_ptr = ctypes.POINTER(ctypes.c_float)()
-emb_dim = ctypes.c_int()
-lib.aila_extract_speaker_embedding(engine, b"./reference_speaker.wav",
-                                    ctypes.byref(emb_ptr), ctypes.byref(emb_dim))
-emb = ctypes.cast(emb_ptr, ctypes.POINTER(ctypes.c_float * emb_dim.value)).contents
-
-# 3. Synthesize with cloned voice
+# 2. One-shot synthesis with voice cloning
 cfg = AilaGenConfig()
 lib.aila_default_gen_config(ctypes.byref(cfg))
-samples_ptr = ctypes.POINTER(ctypes.c_float)()
-sample_count = ctypes.c_int()
-lib.aila_synthesize_text_to_wav(engine, b"Hello world!",
-    emb_ptr, emb_dim, ctypes.byref(cfg),
-    ctypes.byref(samples_ptr), ctypes.byref(sample_count))
+rc = lib.aila_synthesize(engine,
+    b"Hello world!",                     # text
+    b"./reference_speaker.wav",          # speaker reference (NULL for default)
+    ctypes.byref(cfg),
+    b"output.wav")                       # output path
+if rc != 0:
+    raise RuntimeError(f"TTS failed: {rc}")
 
-# 4. Save to WAV
-import wave, struct
-samples = ctypes.cast(samples_ptr, ctypes.POINTER(ctypes.c_float * sample_count.value)).contents
-with wave.open("output.wav", "w") as wf:
-    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(24000)
-    for s in samples:
-        wf.writeframes(struct.pack('<h', max(-32768, min(32767, int(s * 32767)))))
-
-# 5. Cleanup
-lib.aila_free_samples(samples_ptr)
-lib.aila_free_samples(emb_ptr)
+# 3. Done — output.wav is ready
 lib.aila_engine_destroy(engine)
 ```
 
