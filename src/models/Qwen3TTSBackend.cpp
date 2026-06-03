@@ -1655,27 +1655,27 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
             ops::copy_tensor(ctx, xx, res_in, res_elems);
 
-            // act1
+            // act1: snake(xx) -> xx_act1
             Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
             Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
             ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
 
-            // conv1 [7, out_d, out_d] dilation
+            // conv1: conv(xx_act1) -> conv1_out
             Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
             Tensor& conv1_b = mimi_weights_.get(res_prefix + "conv1.conv.bias");
             ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, Ls, 7, dilations[r]);
 
-            // act2
+            // act2: snake(conv1_out) in-place
             Tensor& act2_a = mimi_weights_.get(res_prefix + "act2.alpha");
             Tensor& act2_b = mimi_weights_.get(res_prefix + "act2.beta");
             ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, res_elems, out_d, Ls);
 
-            // conv2 [1, out_d, out_d]
+            // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
             Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
             ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
 
-            // Add to residual
+            // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
             ops::residual_add(ctx, res_in, conv2_out, res_elems);
             ops::copy_tensor(ctx, res_in, xx, res_elems);
             ctx.synchronize();  // barrier between residual blocks

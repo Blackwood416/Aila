@@ -124,6 +124,74 @@ void causal_conv1d(Context& ctx,
     });
 }
 
+// Fused SnakeBeta + Causal Conv1D
+// Applies SnakeBeta activation to input during conv1d load, eliminating
+// the intermediate tensor write and one kernel launch.
+// Snake: sin(x * exp(alpha))^2 / (exp(beta) + eps) + x
+void snake_causal_conv1d(Context& ctx,
+                         Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                         Tensor& alpha, Tensor& beta,
+                         int batch, int in_ch, int out_ch, int seq_len,
+                         int kernel_size, int dilation) {
+    auto* in_ptr = input.data_as<bf16>();
+    auto* w_ptr = weight.data_as<bf16>();
+    auto* out_ptr = output.data_as<bf16>();
+    const void* b_ptr = bias.data();
+    bool bias_is_f32 = (bias.dtype() == dnnl::memory::data_type::f32);
+    const void* a_ptr = alpha.data();
+    const void* bet_ptr = beta.data();
+    bool a_is_f32 = (alpha.dtype() == dnnl::memory::data_type::f32);
+    bool bet_is_f32 = (beta.dtype() == dnnl::memory::data_type::f32);
+
+    int total_out = batch * seq_len * out_ch;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(total_out), [=](sycl::id<1> idx) {
+            int i = static_cast<int>(idx[0]);
+            if (i >= total_out) return;
+
+            int oc = i % out_ch;
+            int tmp = i / out_ch;
+            int t = tmp % seq_len;
+            int n = tmp / seq_len;
+
+            float sum = 0.0f;
+
+            for (int ic = 0; ic < in_ch; ++ic) {
+                // Pre-compute snake parameters for this input channel
+                float sa = a_is_f32 ? static_cast<const float*>(a_ptr)[ic]
+                                    : static_cast<float>(static_cast<const bf16*>(a_ptr)[ic]);
+                float sb = bet_is_f32 ? static_cast<const float*>(bet_ptr)[ic]
+                                      : static_cast<float>(static_cast<const bf16*>(bet_ptr)[ic]);
+                float exp_a = sycl::exp(sa);
+                float exp_b = sycl::exp(sb);
+                float one_over_eb = 1.0f / (exp_b + 1e-9f);
+
+                for (int k = 0; k < kernel_size; ++k) {
+                    int ih = t - (kernel_size - 1 - k) * dilation;
+                    if (ih < 0 || ih >= seq_len) continue;
+
+                    int in_idx = (n * seq_len + ih) * in_ch + ic;
+                    float x = static_cast<float>(in_ptr[in_idx]);
+
+                    // SnakeBeta activation inline: x + sin(x*e^a)^2 / e^b
+                    float sin_val = sycl::sin(x * exp_a);
+                    float snake_x = x + one_over_eb * (sin_val * sin_val);
+
+                    int w_idx = (oc * in_ch + ic) * kernel_size + k;
+                    sum += snake_x * static_cast<float>(w_ptr[w_idx]);
+                }
+            }
+
+            float bias_val = bias_is_f32 ? static_cast<const float*>(b_ptr)[oc]
+                                         : static_cast<float>(static_cast<const bf16*>(b_ptr)[oc]);
+            sum += bias_val;
+
+            out_ptr[i] = bf16(sum);
+        });
+    });
+}
+
 // 1D Depthwise Causal Convolution with dilation (row-major: [batch, seq_len, channels])
 void causal_conv1d_dw(Context& ctx,
                       Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,

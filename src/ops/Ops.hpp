@@ -321,6 +321,15 @@ namespace ops {
     void snake_beta(Context& ctx, Tensor& input, Tensor& alpha, Tensor& beta,
                     Tensor& output, int n, int channels, int seq_len);
 
+    // Fused SnakeBeta + Causal Conv1D: applies snake activation to input
+    // elements inline during the convolution inner loop, avoiding the
+    // intermediate tensor write and a separate kernel launch.
+    void snake_causal_conv1d(Context& ctx,
+                             Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                             Tensor& alpha, Tensor& beta,
+                             int batch, int in_ch, int out_ch, int seq_len,
+                             int kernel_size, int dilation);
+
     // VQ Lookup and optional accumulate:
     // codes: [n_frames, 16] (int32)
     // table: [2048, codebook_dim] (bf16)
