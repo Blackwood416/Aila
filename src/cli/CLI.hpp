@@ -61,7 +61,10 @@ struct CLIOptions {
     // TTS synthesis mode
     std::string tts_text;           // --synthesize
     std::string tts_output_path;    // --output-wav
-    std::string tts_speaker_path;   // --spk, --speaker
+    std::string tts_speaker_path;   // --spk, --speaker (reference audio path)
+    std::string tts_speaker_name;   // --speaker (CustomVoice: "vivian", etc.)
+    std::string tts_instruct_text;  // --instruct (voice style description)
+    std::string tts_language;       // --language ("chinese", "english", etc.)
     std::string tts_spk_cache_dir;  // --spk-cache-dir
 };
 

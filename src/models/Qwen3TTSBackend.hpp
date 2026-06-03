@@ -31,7 +31,10 @@ public:
     // TTS 专有 C++ API：接收文本 tokens 和 预设/克隆的 speaker_embedding (可选)，直接自回归生成 discrete codes
     bool synthesize_codes(Context& ctx,
                           const std::vector<int>& text_tokens,
-                          const std::vector<float>& speaker_embedding,
+                          const std::vector<float>& speaker_embedding,  // Base: ECAPA-TDNN embedding (empty if not used)
+                          int speaker_id,                                // CustomVoice: spk_id codec token (0 if not used)
+                          const std::vector<int>& instruct_tokens,       // VoiceDesign/CustomVoice: instruct text tokens (empty if not used)
+                          int language_id,                               // codec language token (0 = auto/nothink)
                           const GenerationConfig& gen_config,
                           std::vector<int32_t>& out_codes,
                           int& out_n_frames);
@@ -162,4 +165,7 @@ private:
     // Mimi Decoder (Speech Tokenizer) Vocoder
     bool mimi_loaded_ = false;
     ModelWeights mimi_weights_;
+
+    // TTS model type (Base / CustomVoice / VoiceDesign)
+    Qwen3TTSModelType tts_model_type_ = Qwen3TTSModelType::Base;
 };

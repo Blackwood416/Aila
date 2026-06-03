@@ -117,6 +117,10 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
     talker_cfg_ = spec.qwen3;
     predictor_cfg_ = spec.code_predictor;
     max_seq_len_ = max_seq_len;
+    tts_model_type_ = talker_cfg_.tts_model_type;
+    AILA_LOG_INFO("[TTS] Model type: %s",
+        tts_model_type_ == Qwen3TTSModelType::Base ? "Base" :
+        tts_model_type_ == Qwen3TTSModelType::CustomVoice ? "CustomVoice" : "VoiceDesign");
 
     int H_talker = talker_cfg_.hidden_size;
     int QD_talker = talker_cfg_.num_attention_heads * talker_cfg_.head_dim;
@@ -355,6 +359,9 @@ Tensor& Qwen3TTSBackend::forward(Context& ctx, const int* token_ids_device, int 
 bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        const std::vector<int>& text_tokens,
                                        const std::vector<float>& speaker_embedding,
+                                       int speaker_id,
+                                       const std::vector<int>& instruct_tokens,
+                                       int language_id,
                                        const GenerationConfig& gen_config,
                                        std::vector<int32_t>& out_codes,
                                        int& out_n_frames) {
@@ -459,57 +466,138 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
     }
 
-    // 构建 non-streaming Prefill (对齐 ggml 结构)
-    bool has_spk = (speaker_embedding.size() == static_cast<size_t>(H_talker));
-    // ggml prefill 结构:
-    // [role0] [role1] [role2] [c0+pad] [c1+pad] [c2+pad] [c3+pad] [spk+pad] [codec_pad+bos] [first_text+codec_bos]
-    int prefill_len = has_spk ? 10 : 9;
-    int first_text_idx = prefill_len - 1; // 最后一个位置 = first_text + codec_bos
-    int spk_idx = 7; // speaker embedding position (if present)
-    Tensor prefill_embeds = Tensor::allocate(ctx, {prefill_len, H_talker});
+    // ==========================================
+    // Instruct text prefix (for VoiceDesign and CustomVoice with style override)
+    // ==========================================
+    bool has_instruct = !instruct_tokens.empty();
+    int instruct_offset = 0;
+    Tensor instruct_embeds;
+    if (has_instruct) {
+        int IL = static_cast<int>(instruct_tokens.size());
+        // Tokenize instruct text
+        Tensor instruct_ids_dev = Tensor::allocate(ctx, {IL}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(instruct_ids_dev.data(), instruct_tokens.data(), IL * sizeof(int));
+
+        // text_embedding lookup
+        Tensor instruct_text_emb = Tensor::allocate(ctx, {IL, 2048});
+        ops::embedding_lookup(ctx, *talker_text_embed_weight_, instruct_ids_dev.data_as<int>(), IL, instruct_text_emb, 2048);
+
+        // Pass through text_projection (ResizeMLP)
+        Tensor inst_fc1 = Tensor::allocate(ctx, {IL, 2048});
+        talker_text_proj_fc1_.forward_bias(ctx, instruct_text_emb, *talker_text_proj_fc1_bias_, inst_fc1, IL);
+        Tensor inst_silu = Tensor::allocate(ctx, {IL, 2048});
+        ops::sigmoid_mul(ctx, inst_fc1, inst_fc1, inst_silu, IL * 2048);
+
+        instruct_embeds = Tensor::allocate(ctx, {IL, H_talker});
+        talker_text_proj_fc2_.forward_bias(ctx, inst_silu, *talker_text_proj_fc2_bias_, instruct_embeds, IL);
+
+        instruct_offset = IL;
+    }
+
+    // ==========================================
+    // Build codec prefill token list based on language
+    // language_id == 0 means "auto" → use nothink mode
+    // otherwise: think → think_bos → language → think_eos
+    // ==========================================
+    std::vector<int> codec_prefill_ids;
+    if (language_id == 0) {
+        codec_prefill_ids = {
+            talker_cfg_.codec_nothink_id,
+            talker_cfg_.codec_think_bos_id,
+            talker_cfg_.codec_think_eos_id
+        };
+    } else {
+        codec_prefill_ids = {
+            talker_cfg_.codec_think_id,
+            talker_cfg_.codec_think_bos_id,
+            language_id,
+            talker_cfg_.codec_think_eos_id
+        };
+    }
+    int codec_prefill_count = static_cast<int>(codec_prefill_ids.size());
+
+    // ==========================================
+    // Determine prefill layout based on model type
+    // Base layout:   [role(3)] [codec_prefill] [spk_embed(1)] [pad+bos(1)] [text+bos(1)]
+    // CustomVoice:   [role(3)] [codec_prefill] [spk_codec(1)] [pad+bos(1)] [text+bos(1)]
+    // VoiceDesign:   [role(3)] [codec_prefill] [pad+bos(1)] [text+bos(1)]  (no spk slot)
+    // ==========================================
+    int prefill_base_len = 3 + codec_prefill_count + 2; // role + codec_prefill + pad_bos + text_bos
+    int has_spk = 0;
+    int spk_idx = 0;
+
+    if (tts_model_type_ == Qwen3TTSModelType::Base) {
+        has_spk = (speaker_embedding.size() == static_cast<size_t>(H_talker)) ? 1 : 0;
+    } else if (tts_model_type_ == Qwen3TTSModelType::CustomVoice && speaker_id > 0) {
+        has_spk = 1;
+    }
+    // VoiceDesign: always has_spk = 0
+
+    if (has_spk) spk_idx = 3 + codec_prefill_count;
+    int prefill_len = prefill_base_len + has_spk;
+    int first_text_idx = prefill_len - 1;
+    int pad_bos_idx = 3 + codec_prefill_count + has_spk;
+
+    int total_prefill_len = instruct_offset + prefill_len;
+    Tensor prefill_embeds = Tensor::allocate(ctx, {total_prefill_len, H_talker});
     {
         bf16* dst = prefill_embeds.data_as<bf16>();
+
+        // Copy instruct embeddings if present (they go BEFORE the main prefill)
+        if (has_instruct) {
+            bf16* src_inst = instruct_embeds.data_as<bf16>();
+            ctx.queue().memcpy(dst, src_inst, instruct_offset * H_talker * sizeof(bf16)).wait();
+            dst += instruct_offset * H_talker; // advance dst to write main prefill after instruct
+        }
+
         bf16* src_role = projected_text.data_as<bf16>();
 
         // 1. 前 3 帧：role 前缀投影
         ctx.queue().memcpy(dst, src_role, 3 * H_talker * sizeof(bf16)).wait();
 
-        // 2. 第 3-6 帧：codec_prefill (4 tokens) + tts_pad_embed
-        std::vector<int> codec_prefill_ids = {2154, 2156, 2055, 2157}; // think, think_bos, language(zh), think_eos
-        Tensor codec_ids_dev = Tensor::allocate(ctx, {4}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(codec_ids_dev.data(), codec_prefill_ids.data(), 4 * sizeof(int));
-        Tensor codec_embs = Tensor::allocate(ctx, {4, H_talker});
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, codec_ids_dev.data_as<int>(), 4, codec_embs, H_talker);
+        // 2. codec_prefill tokens + tts_pad_embed
+        Tensor codec_ids_dev = Tensor::allocate(ctx, {codec_prefill_count}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(codec_ids_dev.data(), codec_prefill_ids.data(), codec_prefill_count * sizeof(int));
+        Tensor codec_embs = Tensor::allocate(ctx, {codec_prefill_count, H_talker});
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, codec_ids_dev.data_as<int>(), codec_prefill_count, codec_embs, H_talker);
 
         bf16* c_embs = codec_embs.data_as<bf16>();
         bf16* p_pad = tts_pad_embed.data_as<bf16>();
         bf16* p_bos = tts_bos_embed.data_as<bf16>();
 
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < codec_prefill_count; ++i) {
             ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
                 dst[(3 + i) * H_talker + h] = c_embs[i * H_talker + h] + p_pad[h];
             });
         }
         ctx.queue().wait();
 
-        // 3. 第 7 帧（可选）：speaker_embedding + tts_pad_embed
+        // 3. Speaker slot (if present) — differs by model type
         if (has_spk) {
-            Tensor spk_emb_dev = Tensor::allocate(ctx, {1, H_talker});
-            std::vector<bf16> spk_bf16(H_talker);
-            for (int h = 0; h < H_talker; ++h) {
-                spk_bf16[h] = bf16(speaker_embedding[h]);
+            if (tts_model_type_ == Qwen3TTSModelType::Base) {
+                // Base: ECAPA-TDNN speaker embedding
+                Tensor spk_emb_dev = Tensor::allocate(ctx, {1, H_talker});
+                std::vector<bf16> spk_bf16(H_talker);
+                for (int h = 0; h < H_talker; ++h) {
+                    spk_bf16[h] = bf16(speaker_embedding[h]);
+                }
+                ctx.memcpy_h2d(spk_emb_dev.data(), spk_bf16.data(), H_talker * sizeof(bf16));
+                bf16* s_emb = spk_emb_dev.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                    dst[spk_idx * H_talker + h] = s_emb[h] + p_pad[h];
+                });
+            } else {
+                // CustomVoice: direct codec_embed(spk_id) token lookup
+                Tensor spk_codec = get_talker_codec_embed(speaker_id);
+                bf16* s_emb = spk_codec.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                    dst[spk_idx * H_talker + h] = s_emb[h] + p_pad[h];
+                });
             }
-            ctx.memcpy_h2d(spk_emb_dev.data(), spk_bf16.data(), H_talker * sizeof(bf16));
-
-            bf16* s_emb = spk_emb_dev.data_as<bf16>();
-            ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
-                dst[spk_idx * H_talker + h] = s_emb[h] + p_pad[h];
-            });
             ctx.queue().wait();
         }
 
-        // 4. 第 8（无 spk 则为 7）帧：codec_pad + tts_bos_embed
-        int pad_bos_idx = has_spk ? 8 : 7;
+        // 4. codec_pad + tts_bos_embed
         bf16* c_pad = embed_codec_pad.data_as<bf16>();
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
             dst[pad_bos_idx * H_talker + h] = c_pad[h] + p_bos[h];
@@ -563,54 +651,54 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
     // 运行 Talker Prefill
-    ensure_talker_runtime_buffers(ctx, prefill_len);
-    ensure_talker_prefill_scores(ctx, prefill_len);
+    ensure_talker_runtime_buffers(ctx, total_prefill_len);
+    ensure_talker_prefill_scores(ctx, total_prefill_len);
 
     // 拷贝 prefill_embeds 到 t_buf_.hidden
-    ctx.queue().memcpy(t_buf_.hidden.data(), prefill_embeds.data(), prefill_len * H_talker * sizeof(bf16)).wait();
+    ctx.queue().memcpy(t_buf_.hidden.data(), prefill_embeds.data(), total_prefill_len * H_talker * sizeof(bf16)).wait();
 
     // 初始归一化
     ops::rms_norm(ctx, t_buf_.hidden, *talker_layers_[0].input_ln_weight,
-                  talker_cfg_.rms_norm_eps, t_buf_.normed, prefill_len, H_talker);
+                  talker_cfg_.rms_norm_eps, t_buf_.normed, total_prefill_len, H_talker);
 
     int rotary_dim_talker = talker_cfg_.head_dim;
     if (rotary_dim_talker & 1) --rotary_dim_talker;
 
     for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
         auto& L = talker_layers_[i];
-        
-        L.qkv_proj.forward(ctx, t_buf_.normed, t_buf_.qkv, prefill_len);
-        ops::split_qkv(ctx, t_buf_.qkv, t_buf_.q, t_buf_.k, t_buf_.v, prefill_len, QD_talker, KVD_talker);
 
-        ops::head_rms_norm(ctx, t_buf_.q, *L.q_norm_weight, talker_cfg_.rms_norm_eps, prefill_len, talker_cfg_.num_attention_heads, talker_cfg_.head_dim);
-        ops::head_rms_norm(ctx, t_buf_.k, *L.k_norm_weight, talker_cfg_.rms_norm_eps, prefill_len, talker_cfg_.num_key_value_heads, talker_cfg_.head_dim);
+        L.qkv_proj.forward(ctx, t_buf_.normed, t_buf_.qkv, total_prefill_len);
+        ops::split_qkv(ctx, t_buf_.qkv, t_buf_.q, t_buf_.k, t_buf_.v, total_prefill_len, QD_talker, KVD_talker);
 
-        ops::apply_rope_partial(ctx, t_buf_.q, t_buf_.k, prefill_len, 0,
+        ops::head_rms_norm(ctx, t_buf_.q, *L.q_norm_weight, talker_cfg_.rms_norm_eps, total_prefill_len, talker_cfg_.num_attention_heads, talker_cfg_.head_dim);
+        ops::head_rms_norm(ctx, t_buf_.k, *L.k_norm_weight, talker_cfg_.rms_norm_eps, total_prefill_len, talker_cfg_.num_key_value_heads, talker_cfg_.head_dim);
+
+        ops::apply_rope_partial(ctx, t_buf_.q, t_buf_.k, total_prefill_len, 0,
                                 talker_cfg_.num_attention_heads, talker_cfg_.num_key_value_heads,
                                 talker_cfg_.head_dim, rotary_dim_talker, talker_cfg_.rope_theta);
 
-        ops::copy_to_cache(ctx, t_buf_.k, talker_kv_cache_.k_cache(i), prefill_len, 0,
+        ops::copy_to_cache(ctx, t_buf_.k, talker_kv_cache_.k_cache(i), total_prefill_len, 0,
                            talker_cfg_.num_key_value_heads, talker_cfg_.head_dim, talker_kv_cache_.max_length());
-        ops::copy_to_cache(ctx, t_buf_.v, talker_kv_cache_.v_cache(i), prefill_len, 0,
+        ops::copy_to_cache(ctx, t_buf_.v, talker_kv_cache_.v_cache(i), total_prefill_len, 0,
                            talker_cfg_.num_key_value_heads, talker_cfg_.head_dim, talker_kv_cache_.max_length());
 
         ops::attention_prefill(ctx, t_buf_.q, t_buf_.k, t_buf_.v,
-                               t_buf_.attn_out, t_buf_.scores, prefill_len,
+                               t_buf_.attn_out, t_buf_.scores, total_prefill_len,
                                talker_cfg_.num_attention_heads, talker_cfg_.num_key_value_heads, talker_cfg_.head_dim);
 
-        L.o_proj.forward(ctx, t_buf_.attn_out, t_buf_.gate, prefill_len);
-        
-        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.gate, *L.post_attn_ln_weight, talker_cfg_.rms_norm_eps, t_buf_.normed, prefill_len, H_talker);
+        L.o_proj.forward(ctx, t_buf_.attn_out, t_buf_.gate, total_prefill_len);
 
-        L.gate_up_proj.forward(ctx, t_buf_.normed, t_buf_.gate_up, prefill_len);
-        ops::split_gate_up(ctx, t_buf_.gate_up, t_buf_.gate, t_buf_.up, prefill_len, FF_talker);
-        ops::swiglu(ctx, t_buf_.gate, t_buf_.up, t_buf_.gate, prefill_len * FF_talker);
+        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.gate, *L.post_attn_ln_weight, talker_cfg_.rms_norm_eps, t_buf_.normed, total_prefill_len, H_talker);
 
-        L.down_proj.forward(ctx, t_buf_.gate, t_buf_.attn_out, prefill_len);
-        
+        L.gate_up_proj.forward(ctx, t_buf_.normed, t_buf_.gate_up, total_prefill_len);
+        ops::split_gate_up(ctx, t_buf_.gate_up, t_buf_.gate, t_buf_.up, total_prefill_len, FF_talker);
+        ops::swiglu(ctx, t_buf_.gate, t_buf_.up, t_buf_.gate, total_prefill_len * FF_talker);
+
+        L.down_proj.forward(ctx, t_buf_.gate, t_buf_.attn_out, total_prefill_len);
+
         Tensor* next_input_ln = (i < talker_cfg_.num_hidden_layers - 1) ? talker_layers_[i + 1].input_ln_weight : talker_final_norm_weight_;
-        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.attn_out, *next_input_ln, talker_cfg_.rms_norm_eps, t_buf_.normed, prefill_len, H_talker);
-        
+        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.attn_out, *next_input_ln, talker_cfg_.rms_norm_eps, t_buf_.normed, total_prefill_len, H_talker);
+
     }
 
     // Final prefill step to get logits from the last position
@@ -618,9 +706,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     {
         bf16* src = t_buf_.hidden.data_as<bf16>();
         bf16* dst = final_hidden.data_as<bf16>();
-        ctx.queue().memcpy(dst, src + (prefill_len - 1) * H_talker, H_talker * sizeof(bf16)).wait();
+        ctx.queue().memcpy(dst, src + (total_prefill_len - 1) * H_talker, H_talker * sizeof(bf16)).wait();
     }
-    
+
     // Final Norm
     Tensor final_normed = Tensor::allocate(ctx, {1, H_talker});
     ops::rms_norm(ctx, final_hidden, *talker_final_norm_weight_, talker_cfg_.rms_norm_eps, final_normed, 1, H_talker);
@@ -630,8 +718,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     // 采样得到首码 (codebook 0)
     int first_token = ops::sample_with_config(ctx, t_buf_.logits, talker_cfg_.vocab_size, gen_config, {});
-    talker_kv_cache_.advance(prefill_len);
-    current_talker_len_ = prefill_len;
+    talker_kv_cache_.advance(total_prefill_len);
+    current_talker_len_ = total_prefill_len;
 
     // TTS autoregressive generation is prone to degenerate loops without repetition penalty.
     // Use a higher default if the user hasn't explicitly set one.

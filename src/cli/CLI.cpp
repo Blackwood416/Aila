@@ -231,7 +231,10 @@ Options:
   --transcribe <path>      Offline audio transcription (ASR) file path
   --synthesize <prompt>    TTS voice synthesis from text prompt (Qwen3-TTS only)
   --output-wav <path>      Output path for synthesized WAV file (default: output.wav)
-  --spk, --speaker <path>  Reference audio for TTS voice cloning
+  --spk <path>             Reference audio for TTS voice cloning (Base model)
+  --instruct <text>        Voice design / style description text (VoiceDesign model)
+  --speaker <name>         CustomVoice speaker name (vivian, ryan, serena, ...)
+  --language <lang>        Language code: chinese, english, japanese, korean (default: auto)
   --spk-cache-dir <dir>    Speaker embedding cache directory (default: alongside audio)
   -h, --help               Show this help message
   -v, --version            Show version
@@ -434,8 +437,20 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_output_path = argv[++i];
             continue;
         }
-        if ((arg == "--spk" || arg == "--speaker") && i + 1 < argc) {
+        if (arg == "--spk" && i + 1 < argc) {
             opts.tts_speaker_path = argv[++i];
+            continue;
+        }
+        if (arg == "--speaker" && i + 1 < argc) {
+            opts.tts_speaker_name = argv[++i];
+            continue;
+        }
+        if (arg == "--instruct" && i + 1 < argc) {
+            opts.tts_instruct_text = argv[++i];
+            continue;
+        }
+        if (arg == "--language" && i + 1 < argc) {
+            opts.tts_language = argv[++i];
             continue;
         }
         if (arg == "--spk-cache-dir" && i + 1 < argc) {

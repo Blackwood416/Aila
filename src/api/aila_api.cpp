@@ -583,6 +583,9 @@ AILA_API int aila_synthesize(
     AilaEngine* engine,
     const char* text,
     const char* speaker_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
     const AilaGenConfig* config,
     const char* output_wav_path
 ) {
@@ -592,15 +595,18 @@ AILA_API int aila_synthesize(
     try {
         GenerationConfig cpp_cfg = to_cpp_config(config);
 
-        std::vector<float> spk_emb;
-        if (speaker_audio_path && speaker_audio_path[0]) {
-            if (!engine->engine.extractSpeakerEmbedding(speaker_audio_path, spk_emb)) {
-                return AILA_ERR_RUNTIME;
-            }
-        }
-
         std::vector<float> samples;
-        if (!engine->engine.synthesize_text_to_wav(std::string(text), spk_emb, cpp_cfg, samples)) {
+        bool ok = engine->engine.synthesizeSpeech(
+            std::string(text),
+            speaker_audio_path ? std::string(speaker_audio_path) : std::string(),
+            speaker_name ? std::string(speaker_name) : std::string(),
+            instruct_text ? std::string(instruct_text) : std::string(),
+            language ? std::string(language) : std::string(),
+            cpp_cfg,
+            samples
+        );
+
+        if (!ok) {
             return AILA_ERR_RUNTIME;
         }
 

@@ -10,4 +10,30 @@ bitsandbytes/
 /models/
 *.txt
 tmp/
+.claude/HANDOVER.md
+
+# Generated audio
+*.wav
+*.bin
+*.mp3
+
+# Third-party repos
+Qwen3-TTS/
+faster-qwen3-tts/
+qwen3-tts.cpp/
+
+# Docs (internal only, not for repo)
+HANDOVER.md
+docs/superpowers/
+
+# Test scripts (keep only test_api.py and export_bnb_nf4.py)
+test_cli_think.py
+test_lora.py
+test_qwen3asr.py
+test_qwen3tts_align.py
+test_think.py
+test_think2.py
+test_think3.py
+
+# Claude internal
 .claude/

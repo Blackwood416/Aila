@@ -2266,7 +2266,7 @@ public:
             return false;
         }
 
-        return tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, gen_config, out_codes, out_n_frames);
+        return tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, 0, {}, 0, gen_config, out_codes, out_n_frames);
     }
 
     // TTS audio samples synthesis from text using Mimi Decoder
@@ -2288,7 +2288,7 @@ public:
 
         std::vector<int32_t> codes;
         int n_frames = 0;
-        bool ok = tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, gen_config, codes, n_frames);
+        bool ok = tts_backend->synthesize_codes(*ctx_, text_tokens, speaker_embedding, 0, {}, 0, gen_config, codes, n_frames);
         if (!ok) {
             set_error(EngineErrorCode::RuntimeError, "TTS synthesize_codes failed");
             return false;
@@ -2328,6 +2328,102 @@ public:
             double rtf = elapsed_ms / 1000.0 / audio_s;
             AILA_LOG_INFO("[TTS] Synthesis complete: %.0f ms, %.2f s audio, RTF=%.3f (%srealtime)",
                           elapsed_ms, audio_s, rtf, (rtf < 1.0 ? "" : "slower than "));
+        }
+        return ok;
+    }
+
+    // Unified TTS speech synthesis supporting Base (voice cloning), CustomVoice
+    // (speaker name), and VoiceDesign (instruct text) models.
+    // Exactly one of reference_audio_path / speaker_name / instruct_text should be
+    // non-empty to select the mode; all empty = default voice.
+    bool synthesizeSpeech(const std::string& text,
+                          const std::string& reference_audio_path,
+                          const std::string& speaker_name,
+                          const std::string& instruct_text,
+                          const std::string& language,
+                          const GenerationConfig& gen_config,
+                          std::vector<float>& out_samples) {
+        clear_error();
+        if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
+            set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
+            return false;
+        }
+
+        auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+        if (!tts_backend) {
+            set_error(EngineErrorCode::RuntimeError, "Invalid TTS backend class");
+            return false;
+        }
+
+        // 1. Determine mode: Base (voice cloning), CustomVoice (speaker name), or
+        //    VoiceDesign / default (instruct-only or no identity)
+        std::vector<float> spk_emb;
+        int spk_id = 0;
+
+        if (!reference_audio_path.empty()) {
+            // Base mode: ECAPA-TDNN voice cloning from reference audio
+            if (!extractSpeakerEmbedding(reference_audio_path, spk_emb)) {
+                set_error(EngineErrorCode::RuntimeError,
+                    "Failed to extract speaker embedding from: " + reference_audio_path);
+                return false;
+            }
+        } else if (!speaker_name.empty()) {
+            // CustomVoice mode: use spk_id token from model's pre-trained voice map
+            spk_id = getSpeakerId(speaker_name);
+            if (spk_id == 0) {
+                set_error(EngineErrorCode::RuntimeError,
+                    "Unknown speaker: " + speaker_name);
+                return false;
+            }
+            AILA_LOG_INFO("[TTS] CustomVoice speaker: %s (spk_id=%d)",
+                speaker_name.c_str(), spk_id);
+        }
+        // else: no speaker identity -> default voice or VoiceDesign (instruct-only)
+
+        // 2. Tokenize instruct text (optional, for VoiceDesign or style override)
+        std::vector<int> instruct_tokens;
+        if (!instruct_text.empty()) {
+            std::string fmt_instruct = "<|im_start|>assistant\n"
+                + instruct_text + "<|im_end|>\n";
+            instruct_tokens = tokenizer_.encode(fmt_instruct);
+            AILA_LOG_INFO("[TTS] Instruct: \"%s\", %zu tokens",
+                instruct_text.c_str(), instruct_tokens.size());
+        }
+
+        // 3. Get language codec ID
+        int lang_id = getLanguageId(language);
+        if (!language.empty()) {
+            AILA_LOG_INFO("[TTS] Language: %s (id=%d)", language.c_str(), lang_id);
+        }
+
+        // 4. Format and tokenize the main text
+        std::string formatted_text = "<|im_start|>assistant\n" + text
+            + "<|im_end|>\n<|im_start|>assistant\n";
+        std::vector<int> tokens = tokenizer_.encode(formatted_text);
+        AILA_LOG_INFO("[TTS] Input: \"%s\", %zu tokens", text.c_str(), tokens.size());
+
+        // 5. Synthesize codes
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<int32_t> codes;
+        int n_frames = 0;
+        bool ok = tts_backend->synthesize_codes(*ctx_, tokens, spk_emb, spk_id,
+                                                 instruct_tokens, lang_id,
+                                                 gen_config, codes, n_frames);
+        if (!ok) {
+            set_error(EngineErrorCode::RuntimeError, "TTS synthesize_codes failed");
+            return false;
+        }
+
+        // 6. Decode codes to audio via Mimi vocoder
+        ok = tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (ok && !out_samples.empty()) {
+            double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double audio_s = static_cast<double>(out_samples.size()) / 24000.0;
+            double rtf = elapsed_ms / 1000.0 / audio_s;
+            AILA_LOG_INFO("[TTS] Synthesis complete: %.0f ms, %.2f s audio, RTF=%.3f",
+                          elapsed_ms, audio_s, rtf);
         }
         return ok;
     }
@@ -2838,6 +2934,34 @@ public:
     // Set via AILA_SPK_CACHE_DIR env var or --spk-cache-dir CLI argument.
     void setSpeakerCacheDir(const std::string& dir) { spk_cache_dir_ = dir; }
     const std::string& speakerCacheDir() const { return spk_cache_dir_; }
+
+    // Look up speaker token ID from spk_id map (CustomVoice).
+    // Returns 0 if name is empty or not found.
+    int getSpeakerId(const std::string& name) const {
+        if (name.empty()) return 0;
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        auto it = model_spec_.qwen3.spk_id.find(lower);
+        if (it != model_spec_.qwen3.spk_id.end()) {
+            return it->second;
+        }
+        return 0;
+    }
+
+    // Look up language codec token ID from codec_language_id map.
+    // Returns 0 if lang is empty or not found (0 = auto/nothink).
+    int getLanguageId(const std::string& lang) const {
+        if (lang.empty()) return 0;
+        std::string lower = lang;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        auto it = model_spec_.qwen3.codec_language_id.find(lower);
+        if (it != model_spec_.qwen3.codec_language_id.end()) {
+            return it->second;
+        }
+        return 0;
+    }
 
     // Clear the in-memory speaker embedding cache.
     void clearSpeakerCache() { spk_cache_.clear(); }

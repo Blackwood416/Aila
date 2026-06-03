@@ -329,8 +329,14 @@ AILA_API int aila_synthesize_text_to_wav(
 );
 
 /**
- * One-shot TTS synthesis: text + optional voice cloning → WAV file.
+ * One-shot TTS synthesis: text + voice identity → WAV file.
  * This is the recommended high-level API for most use cases.
+ *
+ * Supports three voice identity modes:
+ *   - Base (voice cloning): provide speaker_audio_path for ECAPA-TDNN extraction
+ *   - CustomVoice: provide speaker_name (e.g. "vivian", "ryan") for pre-trained voices
+ *   - VoiceDesign: provide instruct_text for style description
+ *   - Default voice: all identity params NULL (or empty strings)
  *
  * Internally handles speaker embedding extraction (with automatic caching),
  * tokenization, synthesis, and WAV file writing in a single call.
@@ -338,16 +344,21 @@ AILA_API int aila_synthesize_text_to_wav(
  *
  * @param engine              Initialized engine handle (Qwen3-TTS model)
  * @param text                UTF-8 text to synthesize
- * @param speaker_audio_path  Optional reference audio path for voice cloning (NULL for default voice).
- *                            Supported formats: WAV, MP3, FLAC. Auto-resampled to 24kHz mono.
+ * @param speaker_audio_path  Base: reference audio path for voice cloning (NULL for none)
+ * @param speaker_name        CustomVoice: speaker name e.g. "vivian" (NULL for none)
+ * @param instruct_text       VoiceDesign: style description text (NULL for none)
+ * @param language            Language code: "chinese", "english", "japanese", "korean" (NULL for auto)
  * @param config              Generation config (NULL for defaults)
- * @param output_wav_path     Output WAV file path (24kHz, mono, 32-bit float PCM)
+ * @param output_wav_path     Output WAV file path (24kHz, mono, 16-bit PCM)
  * @return 0 on success, non-zero on error (check aila_last_error_code/aila_last_error_message)
  */
 AILA_API int aila_synthesize(
     AilaEngine* engine,
     const char* text,
     const char* speaker_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
     const AilaGenConfig* config,
     const char* output_wav_path
 );

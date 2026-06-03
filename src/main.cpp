@@ -213,13 +213,22 @@ int main(int argc, char** argv) {
         std::string output_path = opts.tts_output_path.empty() ? "output.wav" : opts.tts_output_path;
         AILA_LOG_INFO("Synthesizing text: \"%s\"", input_text.c_str());
 
-        std::vector<float> samples;
-        std::vector<float> speaker_embedding;
-        if (!opts.tts_speaker_path.empty()) {
-            speaker_embedding = load_or_extract_speaker_embedding(&engine, opts.tts_speaker_path);
-        }
+        GenerationConfig tts_gen = gen_config;
+        // TTS needs higher repetition_penalty to avoid loops
+        if (tts_gen.repetition_penalty <= 1.0f) tts_gen.repetition_penalty = 1.1f;
+        tts_gen.max_new_tokens = opts.max_new_tokens > 0 ? opts.max_new_tokens : tts_gen.max_new_tokens;
 
-        bool ok = engine.synthesize_text_to_wav(input_text, speaker_embedding, gen_config, samples);
+        std::vector<float> samples;
+        bool ok = engine.synthesizeSpeech(
+            input_text,
+            opts.tts_speaker_path,    // Base: reference audio
+            opts.tts_speaker_name,    // CustomVoice: speaker name
+            opts.tts_instruct_text,   // VoiceDesign: instruct
+            opts.tts_language,        // language
+            tts_gen,
+            samples
+        );
+
         if (!ok) {
             AILA_LOG_ERROR("TTS synthesis failed: %s", engine.last_error_message().c_str());
             return 2;
