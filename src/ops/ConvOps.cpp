@@ -75,6 +75,7 @@ void conv2d_gelu(Context& ctx,
 }
 
 // 1D Causal Convolution with dilation (row-major: [batch, seq_len, channels])
+// Optimized with vec8 weight loads and fused bias for Intel GPU.
 void causal_conv1d(Context& ctx,
                    Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
                    int batch, int in_ch, int out_ch, int seq_len,
@@ -86,13 +87,14 @@ void causal_conv1d(Context& ctx,
     bool bias_is_f32 = (bias.dtype() == dnnl::memory::data_type::f32);
 
     int total_out = batch * seq_len * out_ch;
+    int in_ch8 = in_ch / 8;  // vec8 chunks
+    int in_ch_rem = in_ch % 8;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(total_out), [=](sycl::id<1> idx) {
             int i = static_cast<int>(idx[0]);
             if (i >= total_out) return;
 
-            // Decompose index in row-major layout [batch, seq_len, out_ch]
             int oc = i % out_ch;
             int tmp = i / out_ch;
             int t = tmp % seq_len;
@@ -100,23 +102,42 @@ void causal_conv1d(Context& ctx,
 
             float sum = 0.0f;
 
-            for (int ic = 0; ic < in_ch; ++ic) {
+            // Vec8 main loop: process 8 input channels at a time
+            using vec8 = sycl::vec<bf16, 8>;
+            for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                int ic = ic8 * 8;
+
                 for (int k = 0; k < kernel_size; ++k) {
-                    // Causal index formula:
                     int ih = t - (kernel_size - 1 - k) * dilation;
                     if (ih < 0 || ih >= seq_len) continue;
 
-                    // input row-major layout: [batch, seq_len, in_ch]
                     int in_idx = (n * seq_len + ih) * in_ch + ic;
-                    // weight row-major layout: [out_ch, in_ch, kernel_size]
+                    const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_idx);
                     int w_idx = (oc * in_ch + ic) * kernel_size + k;
+                    const vec8 w_vec = *reinterpret_cast<const vec8*>(w_ptr + w_idx);
 
+                    #pragma unroll
+                    for (int v = 0; v < 8; v++) {
+                        sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_vec[v]);
+                    }
+                }
+            }
+
+            // Scalar remainder (in_ch % 8 != 0)
+            int ic_start = in_ch8 * 8;
+            for (int ic = ic_start; ic < in_ch; ++ic) {
+                for (int k = 0; k < kernel_size; ++k) {
+                    int ih = t - (kernel_size - 1 - k) * dilation;
+                    if (ih < 0 || ih >= seq_len) continue;
+
+                    int in_idx = (n * seq_len + ih) * in_ch + ic;
+                    int w_idx = (oc * in_ch + ic) * kernel_size + k;
                     sum += static_cast<float>(in_ptr[in_idx]) * static_cast<float>(w_ptr[w_idx]);
                 }
             }
 
-            float bias_val = bias_is_f32 ? static_cast<const float*>(b_ptr)[oc] : static_cast<float>(
-                static_cast<const bf16*>(b_ptr)[oc]);
+            float bias_val = bias_is_f32 ? static_cast<const float*>(b_ptr)[oc]
+                                         : static_cast<float>(static_cast<const bf16*>(b_ptr)[oc]);
             sum += bias_val;
 
             out_ptr[i] = bf16(sum);
