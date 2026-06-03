@@ -456,6 +456,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     out_codes.clear();
     out_n_frames = 0;
 
+    static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+
     int L = static_cast<int>(text_tokens.size());
     if (L <= 0) return false;
 
@@ -724,7 +726,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
     auto t_talker_setup_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prefill_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Text+embed construction: %.1f ms", t_talker_setup_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Text+embed construction: %.1f ms", t_talker_setup_ms);
 
     // 运行 Talker Prefill
     auto t_talker_fwd_start = std::chrono::high_resolution_clock::now();
@@ -783,14 +785,14 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         if ((i > 0 && (i + 1) % layer_group_interval == 0) || i == talker_cfg_.num_hidden_layers - 1) {
             double group_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_layer_group_start).count();
             int group_start = std::max(0, ((i + 1) / layer_group_interval - 1) * layer_group_interval);
-            AILA_LOG_INFO("[TTS-Profile]     Layers [%d-%d]: %.1f ms (avg %.1f ms/layer)",
+            if (tts_profile) AILA_LOG_INFO("[TTS-Profile]     Layers [%d-%d]: %.1f ms (avg %.1f ms/layer)",
                           group_start, i, group_ms, group_ms / (i - group_start + 1));
             t_layer_group_start = std::chrono::high_resolution_clock::now();
         }
     }
 
     auto t_talker_fwd_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_talker_fwd_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Talker forward (%d layers): %.1f ms (avg %.1f ms/layer)",
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Talker forward (%d layers): %.1f ms (avg %.1f ms/layer)",
                   talker_cfg_.num_hidden_layers, t_talker_fwd_ms, t_talker_fwd_ms / talker_cfg_.num_hidden_layers);
 
     // Final prefill step to get logits from the last position
@@ -829,7 +831,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     // ------------------------------------------------------------------------
     auto t_decode_start = std::chrono::high_resolution_clock::now();
     double t_prefill_ms = std::chrono::duration<double, std::milli>(t_decode_start - t_prefill_start).count();
-    AILA_LOG_INFO("[TTS-Profile] Prefill: %.1f ms", t_prefill_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Prefill: %.1f ms", t_prefill_ms);
 
     int token = first_token;
     int eos_id = talker_cfg_.codec_eos_token_id; // 2150
@@ -1128,9 +1130,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     auto t_decode_end = std::chrono::high_resolution_clock::now();
     double t_decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
     double t_total_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_total_start).count();
-    AILA_LOG_INFO("[TTS-Profile] Decode: %.1f ms (%d steps, avg %.1f ms/step)",
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Decode: %.1f ms (%d steps, avg %.1f ms/step)",
                   t_decode_ms, out_n_frames, t_decode_ms / std::max(1, out_n_frames));
-    AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
 
     return true;
 }
@@ -1268,6 +1270,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         return false;
     }
 
+    static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+
     if (codes.size() < static_cast<size_t>(n_frames * 16)) {
         AILA_LOG_ERROR("[MimiDecoder] Error: input codes size does not match n_frames * 16.");
         return false;
@@ -1366,7 +1370,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     ops::residual_add(ctx, latent, proj_rest, n_frames * 512);
 
     auto t_vq_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_vq_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   VQ lookup+proj: %.1f ms", t_vq_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   VQ lookup+proj: %.1f ms", t_vq_ms);
 
     // ==========================================
     // 2. Pre-conv 卷积 [3, 512, 1024]
@@ -1379,7 +1383,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
 
     auto t_preconv_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_preconv_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Pre-conv: %.1f ms", t_preconv_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Pre-conv: %.1f ms", t_preconv_ms);
 
     // ==========================================
     // 3. Pre-transformer (8 Layers Causal Attention)
@@ -1521,7 +1525,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     ctx.synchronize();
 
     auto t_pretfm_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Pre-transformer (8 layers): %.1f ms", t_pretfm_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Pre-transformer (8 layers): %.1f ms", t_pretfm_ms);
 
     // ==========================================
     // 4. 两层 ConvNeXt 上采样 (总共上采样 4 倍)
@@ -1591,7 +1595,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     }
 
     auto t_upsample_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_upsample_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   ConvNeXt upsample (2 layers): %.1f ms", t_upsample_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   ConvNeXt upsample (2 layers): %.1f ms", t_upsample_ms);
 
     // ==========================================
     // 5. Decoder Blocks (4 Blocks, 总共上采样 480 倍)
@@ -1684,7 +1688,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     }
 
     auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
 
     // ==========================================
     // 6. 最终 SnakeBeta 和映射 (channels=3 -> 1)
@@ -1770,8 +1774,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
     auto t_final_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_final_start).count();
     auto t_mimi_total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_mimi_start).count();
-    AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
-    AILA_LOG_INFO("[TTS-Profile] Mimi decoder total: %.1f ms (%d frames, %d samples)", t_mimi_total_ms, n_frames, L);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Mimi decoder total: %.1f ms (%d frames, %d samples)", t_mimi_total_ms, n_frames, L);
 
     AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
     return true;
