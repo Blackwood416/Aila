@@ -276,6 +276,21 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
 
 void Linear::forward_bias(Context& ctx, Tensor& input, Tensor& bias,
                           Tensor& output, int seq_len) {
+    // Fast path: native bf16 GEMV + bias for single-token decode
+    if (seq_len == 1 && aila::env::read_flag("AILA_BF16_GEMV", true) && gemv_weight_.valid()) {
+        ops::bf16_gemv_bf16(ctx, gemv_weight_,
+            input.data_as<bf16>(), output.data_as<bf16>(),
+            out_features_, in_features_);
+        // Add bias in-place
+        const bf16* bias_ptr = bias.data_as<bf16>();
+        bf16* out = output.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(out_features_)),
+            [=](sycl::id<1> i) {
+                out[i] = bf16(static_cast<float>(out[i]) + static_cast<float>(bias_ptr[i]));
+            });
+        return;
+    }
+
     const uint64_t key = fused_linear_key(seq_len, bias.dtype());
     ensure_bias_primitive(ctx, seq_len, bias.dtype());
 

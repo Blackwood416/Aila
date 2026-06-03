@@ -365,6 +365,41 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         AILA_LOG_INFO("[TTS] Talker warmup complete");
     }
 
+    // Pre-compute fixed embeddings (bos/eos/pad + codec_pad/codec_bos)
+    // These are constants used in every synthesize_codes call — computing them
+    // once eliminates ~250ms of redundant ResizeMLP forward passes per synthesis.
+    {
+        auto compute_tts_embed = [&](int token_id) -> Tensor {
+            Tensor t_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+            ctx.memcpy_h2d(t_id.data(), &token_id, sizeof(int));
+            Tensor emb = Tensor::allocate(ctx, {1, 2048});
+            ops::embedding_lookup(ctx, *talker_text_embed_weight_, t_id.data_as<int>(), 1, emb, 2048);
+            Tensor f1 = Tensor::allocate(ctx, {1, 2048});
+            talker_text_proj_fc1_.forward_bias(ctx, emb, *talker_text_proj_fc1_bias_, f1, 1);
+            Tensor s1 = Tensor::allocate(ctx, {1, 2048});
+            ops::sigmoid_mul(ctx, f1, f1, s1, 2048);
+            Tensor out = Tensor::allocate(ctx, {1, H_talker});
+            talker_text_proj_fc2_.forward_bias(ctx, s1, *talker_text_proj_fc2_bias_, out, 1);
+            return out;
+        };
+        precomputed_tts_bos_ = compute_tts_embed(talker_cfg_.tts_bos_token_id);
+        precomputed_tts_eos_ = compute_tts_embed(talker_cfg_.tts_eos_token_id);
+        precomputed_tts_pad_ = compute_tts_embed(talker_cfg_.tts_pad_token_id);
+
+        auto compute_codec_embed = [&](int codec_id) -> Tensor {
+            Tensor c_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+            ctx.memcpy_h2d(c_id.data(), &codec_id, sizeof(int));
+            Tensor out = Tensor::allocate(ctx, {1, H_talker});
+            ops::embedding_lookup(ctx, *talker_codec_embed_weight_, c_id.data_as<int>(), 1, out, H_talker);
+            return out;
+        };
+        precomputed_codec_pad_ = compute_codec_embed(talker_cfg_.codec_pad_id);
+        precomputed_codec_bos_ = compute_codec_embed(talker_cfg_.codec_bos_id);
+
+        ctx.synchronize();
+        AILA_LOG_INFO("[TTS] Pre-computed fixed embeddings");
+    }
+
     return true;
 }
 
@@ -446,30 +481,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     talker_text_proj_fc2_.forward_bias(ctx, silu_out, *talker_text_proj_fc2_bias_, projected_text, L);
     print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
 
-    // 按照 python 的规则从输入投影中提取 bos, eos, pad 的 embedding 并切片
-    // 映射 tts_bos_token_id (151672), tts_eos_token_id (151673), tts_pad_token_id (151671)
-    // 简单起见，我们在 C++ 直接用 embedding 逻辑实时计算它们的值即可：
-    auto get_resize_mlp_embed = [&](int token_id) {
-        Tensor t_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(t_id.data(), &token_id, sizeof(int));
-        Tensor emb_pt = Tensor::allocate(ctx, {1, 2048});
-        ops::embedding_lookup(ctx, *talker_text_embed_weight_, t_id.data_as<int>(), 1, emb_pt, 2048);
-
-        Tensor f1 = Tensor::allocate(ctx, {1, 2048});
-        talker_text_proj_fc1_.forward_bias(ctx, emb_pt, *talker_text_proj_fc1_bias_, f1, 1);
-        Tensor s1 = Tensor::allocate(ctx, {1, 2048});
-        ops::sigmoid_mul(ctx, f1, f1, s1, 2048);
-
-        Tensor out = Tensor::allocate(ctx, {1, H_talker});
-        talker_text_proj_fc2_.forward_bias(ctx, s1, *talker_text_proj_fc2_bias_, out, 1);
-        return out;
-    };
-
-    Tensor tts_bos_embed = get_resize_mlp_embed(151672);
-    Tensor tts_eos_embed = get_resize_mlp_embed(151673);
-    Tensor tts_pad_embed = get_resize_mlp_embed(151671);
+    // Use pre-computed embeddings (computed once during load)
+    Tensor& tts_bos_embed = precomputed_tts_bos_;
+    Tensor& tts_eos_embed = precomputed_tts_eos_;
+    Tensor& tts_pad_embed = precomputed_tts_pad_;
     print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
 
+    // Codec embedding lookup helper (still needed for dynamic spk_id in CustomVoice)
     auto get_talker_codec_embed = [&](int codec_id) {
         Tensor c_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
         ctx.memcpy_h2d(c_id.data(), &codec_id, sizeof(int));
@@ -478,8 +496,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         return out;
     };
 
-    Tensor embed_codec_pad = get_talker_codec_embed(2148);
-    Tensor embed_codec_bos = get_talker_codec_embed(2149);
+    Tensor& embed_codec_pad = precomputed_codec_pad_;
+    Tensor& embed_codec_bos = precomputed_codec_bos_;
 
     // 正文提取：找到 <|im_end|> (151645) 的位置作为正文结束边界
     // BPE tokenizer 可能将 <|im_end|> 与相邻字符合并，不能用固定 L-5 计算
@@ -1286,7 +1304,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     // 0. 将 codes 复制 to GPU 设备端
     Tensor codes_dev = Tensor::allocate(ctx, {n_frames, 16}, dnnl::memory::data_type::s32);
     ctx.memcpy_h2d(codes_dev.data(), codes.data(), n_frames * 16 * sizeof(int32_t));
-    ctx.synchronize();
+
 
     // ==========================================
     // 1. VQ 解量化查表与投影
@@ -1308,7 +1326,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ops::vq_lookup_add(ctx, codes_dev, mimi_weights_.get(emb_name),
                            c + 1, temp_rest, n_frames, 256, true);
     }
-    ctx.synchronize();
+
 
     // 线性投影 MatMul (把 [512, 256, 1] 形状的权重 reshape 成 2D 的 [512, 256])
     Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
@@ -1323,13 +1341,12 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
     first_proj.forward(ctx, temp_first, proj_first, n_frames);
     rest_proj.forward(ctx, temp_rest, proj_rest, n_frames);
-    ctx.synchronize();
+
 
     // 向量相加得到 latent
     Tensor latent = Tensor::allocate(ctx, {n_frames, 512});
     ops::copy_tensor(ctx, proj_first, latent, n_frames * 512);
     ops::residual_add(ctx, latent, proj_rest, n_frames * 512);
-    ctx.synchronize();
 
     auto t_vq_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_vq_start).count();
     AILA_LOG_INFO("[TTS-Profile]   VQ lookup+proj: %.1f ms", t_vq_ms);
@@ -1342,7 +1359,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     Tensor& pre_conv_w = mimi_weights_.get("decoder.pre_conv.conv.weight");
     Tensor& pre_conv_b = mimi_weights_.get("decoder.pre_conv.conv.bias");
     ops::causal_conv1d(ctx, latent, pre_conv_w, pre_conv_b, pre_conv_out, 1, 512, 1024, n_frames, 3, 1);
-    ctx.synchronize();
+
 
     auto t_preconv_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_preconv_start).count();
     AILA_LOG_INFO("[TTS-Profile]   Pre-conv: %.1f ms", t_preconv_ms);
@@ -1356,7 +1373,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
     Tensor& pre_tfm_in_proj_b = mimi_weights_.get("decoder.pre_transformer.input_proj.bias");
     pre_tfm_in_proj.forward_bias(ctx, pre_conv_out, pre_tfm_in_proj_b, pre_tfm_in, n_frames);
-    ctx.synchronize();
+
 
     // 辅助 layer scale 核函数
     auto apply_layer_scale_gpu = [&](Tensor& x, Tensor& scale, int length, int channels) {
@@ -1382,13 +1399,13 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
         Tensor residual = Tensor::allocate(ctx, {n_frames, 512});
         ops::copy_tensor(ctx, x, residual, n_frames * 512);
-        ctx.synchronize();
+
 
         // input rms norm
         Tensor normed = Tensor::allocate(ctx, {n_frames, 512});
         Tensor& input_ln_w = mimi_weights_.get(layer_prefix + "input_layernorm.weight");
         ops::rms_norm(ctx, x, input_ln_w, 1e-5f, normed, n_frames, 512);
-        ctx.synchronize();
+
 
         // Q/K/V Linear (无 bias)
         Linear q_proj, k_proj, v_proj;
@@ -1403,44 +1420,44 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         q_proj.forward(ctx, normed, q, n_frames);
         k_proj.forward(ctx, normed, k, n_frames);
         v_proj.forward(ctx, normed, v, n_frames);
-        ctx.synchronize();
+
 
         // Apply RoPE positions (num_heads=16, head_dim=64)
         ops::apply_rope(ctx, q, k, n_frames, 0, 16, 16, 64, 10000.0f);
-        ctx.synchronize();
+
 
         // Attention Prefill (num_heads=16, head_dim=64 -> output_dim=1024)
         Tensor attn_out = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor scores_buf = Tensor::allocate(ctx, {16, n_frames, n_frames}, dnnl::memory::data_type::f32);
         ops::attention_prefill(ctx, q, k, v, attn_out, scores_buf, n_frames, 16, 16, 64);
-        ctx.synchronize();
+
 
         // Out proj
         Linear o_proj;
         o_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.o_proj.weight"), 1024, 512, false);
         Tensor proj_out = Tensor::allocate(ctx, {n_frames, 512});
         o_proj.forward(ctx, attn_out, proj_out, n_frames);
-        ctx.synchronize();
+
 
         // Attention layer scale
         Tensor& attn_scale = mimi_weights_.get(layer_prefix + "self_attn_layer_scale.scale");
         apply_layer_scale_gpu(proj_out, attn_scale, n_frames, 512);
-        ctx.synchronize();
+
 
         // Add to residual
         ops::residual_add(ctx, residual, proj_out, n_frames * 512);
         ops::copy_tensor(ctx, residual, x, n_frames * 512);
-        ctx.synchronize();
+
 
         // MLP
         Tensor mlp_residual = Tensor::allocate(ctx, {n_frames, 512});
         ops::copy_tensor(ctx, x, mlp_residual, n_frames * 512);
-        ctx.synchronize();
+
 
         Tensor normed_post = Tensor::allocate(ctx, {n_frames, 512});
         Tensor& post_attn_ln_w = mimi_weights_.get(layer_prefix + "post_attention_layernorm.weight");
         ops::rms_norm(ctx, x, post_attn_ln_w, 1e-5f, normed_post, n_frames, 512);
-        ctx.synchronize();
+
 
         Linear gate_proj, up_proj, down_proj;
         gate_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.gate_proj.weight"), 512, 1024, false);
@@ -1451,7 +1468,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
         gate_proj.forward(ctx, normed_post, gate_out, n_frames);
         up_proj.forward(ctx, normed_post, up_out, n_frames);
-        ctx.synchronize();
+
 
         // SwiGLU activation: gate = silu(gate) * up
         ops::swiglu(ctx, gate_out, up_out, gate_out, n_frames * 1024);
