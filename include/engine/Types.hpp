@@ -5,6 +5,7 @@
 #include <vector>
 #include <functional>
 #include <array>
+#include <unordered_map>
 
 // ============================================================
 // RoPE / MRoPE configuration
@@ -19,6 +20,12 @@ struct RopeSpec {
 // ============================================================
 // Qwen3-0.6B Model Configuration
 // ============================================================
+enum class Qwen3TTSModelType {
+    Base,
+    CustomVoice,
+    VoiceDesign
+};
+
 struct Qwen3Config {
     int hidden_size           = 1024;
     int num_attention_heads   = 16;     // Q heads
@@ -41,8 +48,33 @@ struct Qwen3Config {
 
     // TTS extensions
     int num_code_groups = 16;
-    int codec_eos_token_id = 2150;
     int text_hidden_size = 2048;
+
+    // TTS model type (from top-level config.json)
+    // Defaults to Base for backward compatibility with existing models
+    Qwen3TTSModelType tts_model_type = Qwen3TTSModelType::Base;
+
+    // CustomVoice / VoiceDesign speaker identity map
+    // Keys: speaker name (e.g. "vivian"), Values: codec token id (e.g. 3065)
+    std::unordered_map<std::string, int> spk_id;
+    // Keys: speaker name, Values: dialect name (e.g. "sichuan_dialect")
+    std::unordered_map<std::string, std::string> spk_is_dialect;
+    // Keys: language name (e.g. "chinese"), Values: codec language token id
+    std::unordered_map<std::string, int> codec_language_id;
+
+    // Codec special token IDs (from talker_config, used in prefill)
+    int codec_eos_token_id = 2150;
+    int codec_think_id = 4202;
+    int codec_nothink_id = 4203;
+    int codec_think_bos_id = 4204;
+    int codec_think_eos_id = 4205;
+    int codec_pad_id = 4196;
+    int codec_bos_id = 4197;
+
+    // Text special token IDs (from top-level config, used for ChatML formatting)
+    int tts_pad_token_id = 151671;
+    int tts_bos_token_id = 151672;
+    int tts_eos_token_id = 151673;
 
     int num_heads_per_kv_group() const { return num_attention_heads / num_key_value_heads; }
 };
