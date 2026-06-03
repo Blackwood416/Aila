@@ -102,24 +102,36 @@ void causal_conv1d(Context& ctx,
 
             float sum = 0.0f;
 
-            // Vec8 main loop: process 8 input channels at a time
+            // Vec8 input load: input is [batch, seq_len, in_ch] row-major,
+            // so consecutive input channels are contiguous in memory.
+            // Weight is [out_ch, in_ch, kernel_size] — stride between
+            // consecutive in_ch is kernel_size, so weight stays scalar.
             using vec8 = sycl::vec<bf16, 8>;
+
             for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
                 int ic = ic8 * 8;
+                float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
                 for (int k = 0; k < kernel_size; ++k) {
                     int ih = t - (kernel_size - 1 - k) * dilation;
                     if (ih < 0 || ih >= seq_len) continue;
 
+                    // Vec8 input load: 8 consecutive channels from same time step
                     int in_idx = (n * seq_len + ih) * in_ch + ic;
                     const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_idx);
-                    int w_idx = (oc * in_ch + ic) * kernel_size + k;
-                    const vec8 w_vec = *reinterpret_cast<const vec8*>(w_ptr + w_idx);
 
+                    // Scalar weight: stride = kernel_size between channels
+                    int w_base = (oc * in_ch + ic) * kernel_size + k;
                     #pragma unroll
                     for (int v = 0; v < 8; v++) {
-                        sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_vec[v]);
+                        acc[v] += static_cast<float>(in_vec[v]) *
+                                  static_cast<float>(w_ptr[w_base + v * kernel_size]);
                     }
+                }
+
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    sum += acc[v];
                 }
             }
 
