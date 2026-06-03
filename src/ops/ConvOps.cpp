@@ -86,9 +86,17 @@ void causal_conv1d(Context& ctx,
     const void* b_ptr = bias.data();
     bool bias_is_f32 = (bias.dtype() == dnnl::memory::data_type::f32);
 
+    // Auto-detect weight layout:
+    //   [out_ch, in_ch, kernel_size] → ic stride=KS (legacy, scalar weight)
+    //   [out_ch, kernel_size, in_ch] → ic stride=1  (vec8-friendly, Mimi)
+    bool w_vec8 = (weight.ndim() == 3 &&
+                   static_cast<int>(weight.shape(1)) == kernel_size &&
+                   kernel_size > 1);
+    int w_ic_stride = w_vec8 ? 1 : kernel_size;
+    int w_row_stride = w_vec8 ? (kernel_size * in_ch) : (in_ch * kernel_size);
+
     int total_out = batch * seq_len * out_ch;
-    int in_ch8 = in_ch / 8;  // vec8 chunks
-    int in_ch_rem = in_ch % 8;
+    int in_ch8 = in_ch / 8;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(total_out), [=](sycl::id<1> idx) {
@@ -102,49 +110,55 @@ void causal_conv1d(Context& ctx,
 
             float sum = 0.0f;
 
-            // Vec8 input load: input is [batch, seq_len, in_ch] row-major,
-            // so consecutive input channels are contiguous in memory.
-            // Weight is [out_ch, in_ch, kernel_size] — stride between
-            // consecutive in_ch is kernel_size, so weight stays scalar.
+            // Weight layout: [out_ch, kernel_size, in_ch] row-major.
+            // w[oc, k, ic] at ptr[(oc*KS + k)*IC + ic] — ic is inner dimension.
+            // Both input and weight are contiguous in ic — dual vec8.
             using vec8 = sycl::vec<bf16, 8>;
+            int IC = in_ch;
+            int KS = kernel_size;
 
-            for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
-                int ic = ic8 * 8;
-                float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int k = 0; k < KS; ++k) {
+                int ih = t - (KS - 1 - k) * dilation;
+                if (ih < 0 || ih >= seq_len) continue;
 
-                for (int k = 0; k < kernel_size; ++k) {
-                    int ih = t - (kernel_size - 1 - k) * dilation;
-                    if (ih < 0 || ih >= seq_len) continue;
+                int in_base = (n * seq_len + ih) * IC;
+                // w_base: start of weight for (oc, k, ic=0)
+                //   new layout: (oc*KS + k)*IC
+                //   old layout: (oc*IC)*KS + k = oc*IC*KS + k
+                int w_base = w_vec8 ? ((oc * KS + k) * IC)
+                                    : (oc * IC * KS + k);
 
-                    // Vec8 input load: 8 consecutive channels from same time step
-                    int in_idx = (n * seq_len + ih) * in_ch + ic;
-                    const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_idx);
+                if (w_vec8) {
+                    // Vec8 for both input and weight (ic contiguous in both)
+                    for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                        int ic = ic8 * 8;
+                        const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
+                        const vec8 w_vec = *reinterpret_cast<const vec8*>(w_ptr + w_base + ic);
 
-                    // Scalar weight: stride = kernel_size between channels
-                    int w_base = (oc * in_ch + ic) * kernel_size + k;
-                    #pragma unroll
-                    for (int v = 0; v < 8; v++) {
-                        acc[v] += static_cast<float>(in_vec[v]) *
-                                  static_cast<float>(w_ptr[w_base + v * kernel_size]);
+                        #pragma unroll
+                        for (int v = 0; v < 8; v++) {
+                            sum += static_cast<float>(in_vec[v]) *
+                                   static_cast<float>(w_vec[v]);
+                        }
+                    }
+                } else {
+                    // Vec8 input only, scalar weight (stride=KS between ic)
+                    for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                        int ic = ic8 * 8;
+                        const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
+                        #pragma unroll
+                        for (int v = 0; v < 8; v++) {
+                            sum += static_cast<float>(in_vec[v]) *
+                                   static_cast<float>(w_ptr[w_base + (ic + v) * w_ic_stride]);
+                        }
                     }
                 }
 
-                #pragma unroll
-                for (int v = 0; v < 8; v++) {
-                    sum += acc[v];
-                }
-            }
-
-            // Scalar remainder (in_ch % 8 != 0)
-            int ic_start = in_ch8 * 8;
-            for (int ic = ic_start; ic < in_ch; ++ic) {
-                for (int k = 0; k < kernel_size; ++k) {
-                    int ih = t - (kernel_size - 1 - k) * dilation;
-                    if (ih < 0 || ih >= seq_len) continue;
-
-                    int in_idx = (n * seq_len + ih) * in_ch + ic;
-                    int w_idx = (oc * in_ch + ic) * kernel_size + k;
-                    sum += static_cast<float>(in_ptr[in_idx]) * static_cast<float>(w_ptr[w_idx]);
+                // Scalar remainder
+                for (int ic = in_ch8 * 8; ic < IC; ++ic) {
+                    int w_idx = w_base + ic * w_ic_stride;
+                    sum += static_cast<float>(in_ptr[in_base + ic]) *
+                           static_cast<float>(w_ptr[w_idx]);
                 }
             }
 

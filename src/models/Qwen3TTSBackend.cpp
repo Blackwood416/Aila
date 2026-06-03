@@ -1247,6 +1247,59 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
 
     ctx.synchronize();
     AILA_LOG_INFO("[MimiLoader] Loaded and converted all codebooks/weights successfully to bf16!");
+
+    // Transpose conv1d weights from [out_ch, in_ch, kernel_size] to
+    // [out_ch, kernel_size, in_ch] for vec8-compatible contiguous ic access.
+    // Scan all loaded weights for 3D conv tensors and reorder in-place.
+    {
+        AILA_LOG_INFO("[MimiLoader] Transposing conv1d weights for vec8 access...");
+        auto transpose_conv_weight = [&](const std::string& name) {
+            if (!mimi_weights_.has(name)) return;
+            Tensor& w = mimi_weights_.get(name);
+            if (w.ndim() != 3) return;
+            int OC = static_cast<int>(w.shape(0));
+            int IC = static_cast<int>(w.shape(1));
+            int KS = static_cast<int>(w.shape(2));
+            if (KS <= 1) return; // k=1 doesn't benefit from transpose
+
+            Tensor w_new = Tensor::allocate(ctx, {OC, KS, IC});
+            auto* old_ptr = w.data_as<bf16>();
+            auto* new_ptr = w_new.data_as<bf16>();
+
+            // w_old[oc, ic, k] → w_new[oc, k, ic]
+            int total = OC * IC * KS;
+            ctx.queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                int ic = i % IC;
+                int tmp = i / IC;
+                int k = tmp % KS;
+                int oc = tmp / KS;
+                int old_idx = (oc * IC + ic) * KS + k;
+                int new_idx = (oc * KS + k) * IC + ic;
+                new_ptr[new_idx] = old_ptr[old_idx];
+            });
+            ctx.queue().wait();
+            mimi_weights_.replace(name, std::move(w_new));
+        };
+
+        // Pre-conv
+        transpose_conv_weight("decoder.pre_conv.conv.weight");
+        // Decoder blocks convs (kernel=7)
+        for (int i = 1; i <= 4; ++i) {
+            for (int r = 2; r <= 4; ++r) {
+                transpose_conv_weight(
+                    "decoder.decoder." + std::to_string(i) + ".block." +
+                    std::to_string(r) + ".conv1.conv.weight");
+            }
+        }
+        // dec0 and dec6 convs
+        transpose_conv_weight("decoder.decoder.0.conv.weight");
+        transpose_conv_weight("decoder.decoder.6.conv.weight");
+
+        ctx.synchronize();
+        AILA_LOG_INFO("[MimiLoader] Conv1d weight transpose complete");
+    }
+
     mimi_loaded_ = true;
 
     // Warmup: run minimal mimi decode to trigger conv/attention JIT compilation
