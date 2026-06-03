@@ -295,6 +295,19 @@ void parse_qwen35(simdjson::dom::element root, ModelSpec& spec) {
 void parse_qwen3_tts(simdjson::dom::element root, ModelSpec& spec) {
     spec.family = ModelFamily::Qwen3TTS;
 
+    // Parse TTS model type from top-level config
+    {
+        std::string_view ttm_type;
+        if (root.at_key("tts_model_type").get(ttm_type) == simdjson::SUCCESS) {
+            if (ttm_type == "custom_voice") {
+                spec.qwen3.tts_model_type = Qwen3TTSModelType::CustomVoice;
+            } else if (ttm_type == "voice_design") {
+                spec.qwen3.tts_model_type = Qwen3TTSModelType::VoiceDesign;
+            }
+            // "base" is already the default
+        }
+    }
+
     simdjson::dom::element talker;
     if (root.at_key("talker_config").get(talker) != simdjson::SUCCESS) {
         talker = root;
@@ -314,7 +327,56 @@ void parse_qwen3_tts(simdjson::dom::element root, ModelSpec& spec) {
     read_bool(talker, "tie_word_embeddings", tc.tie_word_embeddings);
     read_int64(talker, "num_code_groups", tc.num_code_groups);
     read_int64(talker, "codec_eos_token_id", tc.codec_eos_token_id);
+    read_int64(talker, "codec_think_id", tc.codec_think_id);
+    read_int64(talker, "codec_nothink_id", tc.codec_nothink_id);
+    read_int64(talker, "codec_think_bos_id", tc.codec_think_bos_id);
+    read_int64(talker, "codec_think_eos_id", tc.codec_think_eos_id);
+    read_int64(talker, "codec_pad_id", tc.codec_pad_id);
+    read_int64(talker, "codec_bos_id", tc.codec_bos_id);
     read_int64(talker, "text_hidden_size", tc.text_hidden_size);
+
+    // Parse spk_id dictionary from talker_config
+    {
+        simdjson::dom::element spk_id_obj;
+        if (talker.at_key("spk_id").get(spk_id_obj) == simdjson::SUCCESS) {
+            auto obj = spk_id_obj.get_object();
+            for (auto field : obj) {
+                int64_t val = 0;
+                if (field.value.get_int64().get(val) == simdjson::SUCCESS) {
+                    spec.qwen3.spk_id[std::string(field.key.data(), field.key.size())] = static_cast<int>(val);
+                }
+            }
+        }
+    }
+
+    // Parse spk_is_dialect dictionary from talker_config
+    {
+        simdjson::dom::element dialect_obj;
+        if (talker.at_key("spk_is_dialect").get(dialect_obj) == simdjson::SUCCESS) {
+            auto obj = dialect_obj.get_object();
+            for (auto field : obj) {
+                std::string_view val_sv;
+                if (field.value.get_string().get(val_sv) == simdjson::SUCCESS) {
+                    spec.qwen3.spk_is_dialect[std::string(field.key.data(), field.key.size())]
+                        = std::string(val_sv.data(), val_sv.size());
+                }
+            }
+        }
+    }
+
+    // Parse codec_language_id dictionary from talker_config
+    {
+        simdjson::dom::element lang_obj;
+        if (talker.at_key("codec_language_id").get(lang_obj) == simdjson::SUCCESS) {
+            auto obj = lang_obj.get_object();
+            for (auto field : obj) {
+                int64_t val = 0;
+                if (field.value.get_int64().get(val) == simdjson::SUCCESS) {
+                    spec.qwen3.codec_language_id[std::string(field.key.data(), field.key.size())] = static_cast<int>(val);
+                }
+            }
+        }
+    }
 
     if (tc.num_key_value_heads <= 0) {
         tc.num_key_value_heads = tc.num_attention_heads;
@@ -361,6 +423,11 @@ void parse_qwen3_tts(simdjson::dom::element root, ModelSpec& spec) {
             }
         }
     }
+
+    // Parse TTS special token IDs from top-level config
+    read_int64(root, "tts_pad_token_id", spec.qwen3.tts_pad_token_id);
+    read_int64(root, "tts_bos_token_id", spec.qwen3.tts_bos_token_id);
+    read_int64(root, "tts_eos_token_id", spec.qwen3.tts_eos_token_id);
 }
 
 } // namespace
