@@ -363,6 +363,23 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         ctx.synchronize();
         reset();
         AILA_LOG_INFO("[TTS] Talker warmup complete");
+
+        // Extend warmup: text_projection fc1/fc2 use different dimensions
+        // (2048→2048, 2048→1024) than the talker layers. Pre-compile them at
+        // prefill batch size to avoid JIT during the first real prefill.
+        {
+            int wb = 4;
+            Tensor wt = Tensor::allocate(ctx, {wb, 2048});
+            ctx.queue().memset(wt.data(), 0, wb * 2048 * sizeof(bf16));
+            Tensor wf1 = Tensor::allocate(ctx, {wb, 2048});
+            talker_text_proj_fc1_.forward_bias(ctx, wt, *talker_text_proj_fc1_bias_, wf1, wb);
+            Tensor ws = Tensor::allocate(ctx, {wb, 2048});
+            ops::sigmoid_mul(ctx, wf1, wf1, ws, wb * 2048);
+            Tensor wf2 = Tensor::allocate(ctx, {wb, H_talker});
+            talker_text_proj_fc2_.forward_bias(ctx, ws, *talker_text_proj_fc2_bias_, wf2, wb);
+            ctx.synchronize();
+            AILA_LOG_INFO("[TTS] Text projection warmup complete (batch=%d)", wb);
+        }
     }
 
     // Pre-compute fixed embeddings (bos/eos/pad + codec_pad/codec_bos)
