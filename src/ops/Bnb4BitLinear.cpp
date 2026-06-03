@@ -1050,3 +1050,73 @@ void Bnb4BitLinear::forward(Context& ctx,
                        static_cast<size_t>(seq_len) * static_cast<size_t>(out_features_) * sizeof(bf16));
 }
 
+// ============================================================
+// Native bf16 GEMV kernel (no quantization)
+// Cooperative SG=16, vec8 load, sub-group FMA reduce.
+// ============================================================
+namespace ops {
+
+void bf16_gemv_bf16(Context& ctx,
+                    Tensor& weight,
+                    const bf16* input,
+                    bf16* output,
+                    int M, int K) {
+    const bf16* weight_ptr = weight.data_as<bf16>();
+    using vec8 = sycl::vec<bf16, 8>;
+
+    constexpr int SG = 16;
+    constexpr int WG = 256;
+
+    int K8 = (K + 7) / 8; // number of vec8 chunks
+    int num_sub_groups = WG / SG;
+    int rows_per_group = num_sub_groups;
+    int num_groups = (M + rows_per_group - 1) / rows_per_group;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(num_groups) * WG, WG),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                int sg_id = sg.get_group_linear_id();
+                int lane = sg.get_local_linear_id();
+                int row = static_cast<int>(item.get_group(0)) * rows_per_group + sg_id;
+
+                float acc = 0.0f;
+
+                if (row < M) {
+                    const bf16* w_row = weight_ptr + row * K;
+
+                    // Vectorized loop: 8 bf16 per iteration
+                    for (int k8 = lane; k8 < K8; k8 += SG) {
+                        int k = k8 * 8;
+                        int rem = K - k;
+                        const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
+                        vec8 x_vec;
+
+                        if (rem >= 8) {
+                            x_vec = *reinterpret_cast<const vec8*>(input + k);
+                        } else {
+                            // Partial tail: zero-pad
+                            bf16 tmp[8] = {};
+                            for (int v = 0; v < rem; v++) tmp[v] = input[k + v];
+                            x_vec = *reinterpret_cast<const vec8*>(tmp);
+                        }
+
+                        #pragma unroll
+                        for (int v = 0; v < 8; v++) {
+                            acc += static_cast<float>(w_vec[v]) *
+                                   static_cast<float>(x_vec[v]);
+                        }
+                    }
+                }
+
+                float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                if (lane == 0 && row < M) {
+                    output[row] = bf16(total);
+                }
+            });
+    });
+}
+
+} // namespace ops
+

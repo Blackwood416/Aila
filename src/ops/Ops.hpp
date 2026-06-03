@@ -3,6 +3,8 @@
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
+
+using bf16 = sycl::ext::oneapi::bfloat16;
 #include "oneapi/dnnl/dnnl.hpp"
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -438,5 +440,13 @@ namespace ops {
     void sinusoidal_position_embedding(Context& ctx, Tensor& input,
                                        int seq_len, int d_model,
                                        float max_timescale = 10000.0f);
+
+    // Native bf16 GEMV: output[M] = weight[M,K] × input[K]
+    // Cooperative SG=16 kernel, ~2-3× faster than oneDNN for single-token decode.
+    void bf16_gemv_bf16(Context& ctx,
+                        Tensor& weight,   // [M, K] bf16 (row-major)
+                        const bf16* input, // [K] bf16
+                        bf16* output,      // [M] bf16
+                        int M, int K);
 
 } // namespace ops

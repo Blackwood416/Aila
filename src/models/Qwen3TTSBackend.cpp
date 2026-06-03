@@ -329,6 +329,42 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
             dnnl::memory::data_type::f32);
     }
 
+    // Warmup: run one dummy talker layer to trigger oneDNN JIT compilation.
+    // Without this, the first real prefill pays ~5s of JIT overhead.
+    {
+        int H = talker_cfg_.hidden_size;
+        int QD = talker_cfg_.num_attention_heads * talker_cfg_.head_dim;
+        int KVD = talker_cfg_.num_key_value_heads * talker_cfg_.head_dim;
+        int FF = talker_cfg_.intermediate_size;
+
+        AILA_LOG_INFO("[TTS] Running talker warmup (JIT compilation)...");
+        ensure_talker_runtime_buffers(ctx, 1);
+
+        // Dummy input
+        Tensor warmup_in = Tensor::allocate(ctx, {1, H});
+        ctx.queue().memset(warmup_in.data(), 0, H * sizeof(bf16)).wait();
+        ctx.queue().memcpy(t_buf_.hidden.data(), warmup_in.data(), H * sizeof(bf16)).wait();
+
+        // RMS norm + QKV projection (triggers GEMM for [1,H]×[H,QD+2KVD])
+        ops::rms_norm(ctx, t_buf_.hidden, *talker_layers_[0].input_ln_weight,
+                      talker_cfg_.rms_norm_eps, t_buf_.normed, 1, H);
+        talker_layers_[0].qkv_proj.forward(ctx, t_buf_.normed, t_buf_.qkv, 1);
+        talker_layers_[0].o_proj.forward(ctx, t_buf_.qkv, t_buf_.attn_out, 1);
+
+        // FFN (triggers GEMM for [1,H]×[H,2FF] and [1,FF]×[FF,H])
+        ops::rms_norm(ctx, t_buf_.hidden, *talker_layers_[0].post_attn_ln_weight,
+                      talker_cfg_.rms_norm_eps, t_buf_.normed, 1, H);
+        talker_layers_[0].gate_up_proj.forward(ctx, t_buf_.normed, t_buf_.gate_up, 1);
+        talker_layers_[0].down_proj.forward(ctx, t_buf_.gate_up, t_buf_.attn_out, 1);
+
+        // Codec head (triggers GEMM for [1,H]×[H,vocab])
+        talker_codec_head_.forward(ctx, t_buf_.normed, t_buf_.logits, 1);
+
+        ctx.synchronize();
+        reset();
+        AILA_LOG_INFO("[TTS] Talker warmup complete");
+    }
+
     return true;
 }
 
@@ -384,6 +420,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     // ------------------------------------------------------------------------
     // 1. Prefill 阶段: 文本投影与前置计算
     // ------------------------------------------------------------------------
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+    auto t_prefill_start = t_total_start;
     reset();
 
     // 临时分配用于文本投影的 GPU 张量
@@ -650,7 +688,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
+    auto t_talker_setup_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prefill_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Text+embed construction: %.1f ms", t_talker_setup_ms);
+
     // 运行 Talker Prefill
+    auto t_talker_fwd_start = std::chrono::high_resolution_clock::now();
     ensure_talker_runtime_buffers(ctx, total_prefill_len);
     ensure_talker_prefill_scores(ctx, total_prefill_len);
 
@@ -664,7 +706,10 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int rotary_dim_talker = talker_cfg_.head_dim;
     if (rotary_dim_talker & 1) --rotary_dim_talker;
 
+    auto t_layer_group_start = std::chrono::high_resolution_clock::now();
+    int layer_group_interval = talker_cfg_.num_hidden_layers / 4; // report every 1/4 of layers
     for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
+        auto t_layer_start = std::chrono::high_resolution_clock::now();
         auto& L = talker_layers_[i];
 
         L.qkv_proj.forward(ctx, t_buf_.normed, t_buf_.qkv, total_prefill_len);
@@ -699,7 +744,19 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         Tensor* next_input_ln = (i < talker_cfg_.num_hidden_layers - 1) ? talker_layers_[i + 1].input_ln_weight : talker_final_norm_weight_;
         ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.attn_out, *next_input_ln, talker_cfg_.rms_norm_eps, t_buf_.normed, total_prefill_len, H_talker);
 
+        // Report per-layer-group timing
+        if ((i > 0 && (i + 1) % layer_group_interval == 0) || i == talker_cfg_.num_hidden_layers - 1) {
+            double group_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_layer_group_start).count();
+            int group_start = std::max(0, ((i + 1) / layer_group_interval - 1) * layer_group_interval);
+            AILA_LOG_INFO("[TTS-Profile]     Layers [%d-%d]: %.1f ms (avg %.1f ms/layer)",
+                          group_start, i, group_ms, group_ms / (i - group_start + 1));
+            t_layer_group_start = std::chrono::high_resolution_clock::now();
+        }
     }
+
+    auto t_talker_fwd_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_talker_fwd_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Talker forward (%d layers): %.1f ms (avg %.1f ms/layer)",
+                  talker_cfg_.num_hidden_layers, t_talker_fwd_ms, t_talker_fwd_ms / talker_cfg_.num_hidden_layers);
 
     // Final prefill step to get logits from the last position
     Tensor final_hidden = Tensor::allocate(ctx, {1, H_talker});
@@ -735,6 +792,10 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     // ------------------------------------------------------------------------
     // 2. 自回归 Decode 循环
     // ------------------------------------------------------------------------
+    auto t_decode_start = std::chrono::high_resolution_clock::now();
+    double t_prefill_ms = std::chrono::duration<double, std::milli>(t_decode_start - t_prefill_start).count();
+    AILA_LOG_INFO("[TTS-Profile] Prefill: %.1f ms", t_prefill_ms);
+
     int token = first_token;
     int eos_id = talker_cfg_.codec_eos_token_id; // 2150
     if (first_token != eos_id) {
@@ -1029,6 +1090,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         gen_step++;
     }
 
+    auto t_decode_end = std::chrono::high_resolution_clock::now();
+    double t_decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+    double t_total_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_total_start).count();
+    AILA_LOG_INFO("[TTS-Profile] Decode: %.1f ms (%d steps, avg %.1f ms/step)",
+                  t_decode_ms, out_n_frames, t_decode_ms / std::max(1, out_n_frames));
+    AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
+
     return true;
 }
 
@@ -1143,6 +1211,16 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     ctx.synchronize();
     AILA_LOG_INFO("[MimiLoader] Loaded and converted all codebooks/weights successfully to bf16!");
     mimi_loaded_ = true;
+
+    // Warmup: run minimal mimi decode to trigger conv/attention JIT compilation
+    {
+        AILA_LOG_INFO("[TTS] Running Mimi vocoder warmup...");
+        std::vector<int32_t> dummy_codes(4 * 16, 0); // 4 frames, 16 codebooks, all token 0
+        std::vector<float> dummy_samples;
+        decode_mimi_vocoder(ctx, dummy_codes, 4, dummy_samples);
+        AILA_LOG_INFO("[TTS] Mimi warmup complete");
+    }
+
     return true;
 }
 
@@ -1203,6 +1281,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         }
     };
 
+    auto t_mimi_start = std::chrono::high_resolution_clock::now();
+
     // 0. 将 codes 复制 to GPU 设备端
     Tensor codes_dev = Tensor::allocate(ctx, {n_frames, 16}, dnnl::memory::data_type::s32);
     ctx.memcpy_h2d(codes_dev.data(), codes.data(), n_frames * 16 * sizeof(int32_t));
@@ -1211,6 +1291,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     // ==========================================
     // 1. VQ 解量化查表与投影
     // ==========================================
+    auto t_vq_start = std::chrono::high_resolution_clock::now();
     Tensor temp_first = Tensor::allocate(ctx, {n_frames, 256});
     Tensor temp_rest = Tensor::allocate(ctx, {n_frames, 256});
 
@@ -1250,18 +1331,26 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     ops::residual_add(ctx, latent, proj_rest, n_frames * 512);
     ctx.synchronize();
 
+    auto t_vq_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_vq_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   VQ lookup+proj: %.1f ms", t_vq_ms);
+
     // ==========================================
     // 2. Pre-conv 卷积 [3, 512, 1024]
     // ==========================================
+    auto t_preconv_start = std::chrono::high_resolution_clock::now();
     Tensor pre_conv_out = Tensor::allocate(ctx, {n_frames, 1024});
     Tensor& pre_conv_w = mimi_weights_.get("decoder.pre_conv.conv.weight");
     Tensor& pre_conv_b = mimi_weights_.get("decoder.pre_conv.conv.bias");
     ops::causal_conv1d(ctx, latent, pre_conv_w, pre_conv_b, pre_conv_out, 1, 512, 1024, n_frames, 3, 1);
     ctx.synchronize();
 
+    auto t_preconv_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_preconv_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Pre-conv: %.1f ms", t_preconv_ms);
+
     // ==========================================
     // 3. Pre-transformer (8 Layers Causal Attention)
     // ==========================================
+    auto t_pretfm_start = std::chrono::high_resolution_clock::now();
     Tensor pre_tfm_in = Tensor::allocate(ctx, {n_frames, 512});
     Linear pre_tfm_in_proj;
     pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
@@ -1397,9 +1486,13 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     pre_tfm_out_proj.forward_bias(ctx, final_normed, pre_tfm_out_proj_b, pre_tfm_out, n_frames);
     ctx.synchronize();
 
+    auto t_pretfm_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Pre-transformer (8 layers): %.1f ms", t_pretfm_ms);
+
     // ==========================================
     // 4. 两层 ConvNeXt 上采样 (总共上采样 4 倍)
     // ==========================================
+    auto t_upsample_start = std::chrono::high_resolution_clock::now();
     Tensor upsample_in = Tensor::allocate(ctx, {n_frames, 1024});
     ops::copy_tensor(ctx, pre_tfm_out, upsample_in, n_frames * 1024);
     ctx.synchronize();
@@ -1463,9 +1556,13 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ctx.synchronize();
     }
 
+    auto t_upsample_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_upsample_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   ConvNeXt upsample (2 layers): %.1f ms", t_upsample_ms);
+
     // ==========================================
     // 5. Decoder Blocks (4 Blocks, 总共上采样 480 倍)
     // ==========================================
+    auto t_decoder_start = std::chrono::high_resolution_clock::now();
     // 先通过 dec0 一维卷积 [7, 1024, 1536]
     Tensor dec0_out = Tensor::allocate(ctx, {L, 1536});
     Tensor& dec0_w = mimi_weights_.get("decoder.decoder.0.conv.weight");
@@ -1553,9 +1650,13 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ctx.synchronize();
     }
 
+    auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
+
     // ==========================================
     // 6. 最终 SnakeBeta 和映射 (channels=3 -> 1)
     // ==========================================
+    auto t_final_start = std::chrono::high_resolution_clock::now();
     // 最终 SnakeBeta (输入维度是最后的 out_dims[3] 即 96)
     Tensor& dec5_a = mimi_weights_.get("decoder.decoder.5.alpha");
     Tensor& dec5_b = mimi_weights_.get("decoder.decoder.5.beta");
@@ -1633,6 +1734,11 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
             AILA_LOG_WARN("[MimiDebug] Warning: failed to write mimi_output.wav");
         }
     }
+
+    auto t_final_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_final_start).count();
+    auto t_mimi_total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_mimi_start).count();
+    AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
+    AILA_LOG_INFO("[TTS-Profile] Mimi decoder total: %.1f ms (%d frames, %d samples)", t_mimi_total_ms, n_frames, L);
 
     AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
     return true;
