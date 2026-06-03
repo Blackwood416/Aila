@@ -39,6 +39,9 @@ private:
     int out_features_ = 0;
     bool preprocessed_ = false; // 默认 false (原始 [out, in] 布局)
 
+    // Pre-transposed [M, K] weight copy for native GEMV kernel (contiguous access)
+    Tensor gemv_weight_;
+
     // 缓存 decode (seq_len=1) 模式的 primitive
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;

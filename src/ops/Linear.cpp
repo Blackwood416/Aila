@@ -1,4 +1,5 @@
 #include "Ops.hpp"
+#include "../utils/EnvUtils.hpp"
 #include <sycl/sycl.hpp>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -33,6 +34,15 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     in_features_ = in_features;
     out_features_ = out_features;
     preprocessed_ = preprocessed;
+
+    // Pre-transpose weight to [M, K] for native GEMV kernel (contiguous access).
+    // The standard "preprocessed" weight is [K, M] row-major for oneDNN.
+    // We store a [M, K] copy so the GEMV kernel can read weight rows contiguously.
+    if (preprocessed && in_features > 0 && out_features > 0) {
+        gemv_weight_ = Tensor::allocate(ctx, {out_features, in_features});
+        ops::transpose(ctx, weight, gemv_weight_);
+        ctx.synchronize();
+    }
 
     // 预创建 decode (seq_len=1) primitive
     decode_src_md_ = dnnl::memory::desc({1, in_features}, dnnl::memory::data_type::bf16,
@@ -170,6 +180,15 @@ void Linear::ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
 }
 
 void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
+    // Fast path: native bf16 GEMV kernel for single-token decode.
+    // Uses gemv_weight_ (pre-transposed [M,K]) for contiguous memory access.
+    if (seq_len == 1 && aila::env::read_flag("AILA_BF16_GEMV", true) && gemv_weight_.valid()) {
+        ops::bf16_gemv_bf16(ctx, gemv_weight_,
+            input.data_as<bf16>(), output.data_as<bf16>(),
+            out_features_, in_features_);
+        return;
+    }
+
     ensure_primitive(ctx, seq_len);
 
     if (seq_len == 1 && decode_inited_) {

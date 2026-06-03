@@ -1052,7 +1052,9 @@ void Bnb4BitLinear::forward(Context& ctx,
 
 // ============================================================
 // Native bf16 GEMV kernel (no quantization)
-// Cooperative SG=16, vec8 load, sub-group FMA reduce.
+// Cooperative SG=16, sub-group FMA reduce.
+// Weight is [M, K] row-major (M=out_features, K=in_features).
+// Uses contiguous vec8 load from both weight and input.
 // ============================================================
 namespace ops {
 
@@ -1067,9 +1069,8 @@ void bf16_gemv_bf16(Context& ctx,
     constexpr int SG = 16;
     constexpr int WG = 256;
 
-    int K8 = (K + 7) / 8; // number of vec8 chunks
-    int num_sub_groups = WG / SG;
-    int rows_per_group = num_sub_groups;
+    int K8 = K / 8;
+    int rows_per_group = WG / SG;
     int num_groups = (M + rows_per_group - 1) / rows_per_group;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
@@ -1086,27 +1087,24 @@ void bf16_gemv_bf16(Context& ctx,
                 if (row < M) {
                     const bf16* w_row = weight_ptr + row * K;
 
-                    // Vectorized loop: 8 bf16 per iteration
+                    // Vec8 main loop
                     for (int k8 = lane; k8 < K8; k8 += SG) {
                         int k = k8 * 8;
-                        int rem = K - k;
                         const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
-                        vec8 x_vec;
-
-                        if (rem >= 8) {
-                            x_vec = *reinterpret_cast<const vec8*>(input + k);
-                        } else {
-                            // Partial tail: zero-pad
-                            bf16 tmp[8] = {};
-                            for (int v = 0; v < rem; v++) tmp[v] = input[k + v];
-                            x_vec = *reinterpret_cast<const vec8*>(tmp);
-                        }
+                        const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
 
                         #pragma unroll
                         for (int v = 0; v < 8; v++) {
                             acc += static_cast<float>(w_vec[v]) *
                                    static_cast<float>(x_vec[v]);
                         }
+                    }
+
+                    // Scalar tail
+                    int tail_start = K8 * 8;
+                    for (int k = tail_start + lane; k < K; k += SG) {
+                        acc += static_cast<float>(w_row[k]) *
+                               static_cast<float>(input[k]);
                     }
                 }
 
