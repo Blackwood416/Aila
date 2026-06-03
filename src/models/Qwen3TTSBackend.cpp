@@ -1634,48 +1634,47 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
         // 3. 3 Residual blocks with dilations 1, 3, 9
         int dilations[3] = {1, 3, 9};
-        Tensor xx = Tensor::allocate(ctx, {L * stride, out_d});
-        ops::copy_tensor(ctx, conv_t_out, xx, L * stride * out_d);
+        int Ls = L * stride;
+        int res_elems = Ls * out_d;
+        Tensor xx = Tensor::allocate(ctx, {Ls, out_d});
+        ops::copy_tensor(ctx, conv_t_out, xx, res_elems);
         ctx.synchronize();
+
+        // Pre-allocate residual block buffers (reused across 3 iterations)
+        Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
 
         for (int r = 0; r < 3; ++r) {
             std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
 
-            Tensor res_in = Tensor::allocate(ctx, {L * stride, out_d});
-            ops::copy_tensor(ctx, xx, res_in, L * stride * out_d);
-            ctx.synchronize();
+            ops::copy_tensor(ctx, xx, res_in, res_elems);
 
             // act1
-            Tensor xx_act1 = Tensor::allocate(ctx, {L * stride, out_d});
             Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
             Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
-            ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, L * stride * out_d, out_d, L * stride);
-            ctx.synchronize();
+            ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
 
             // conv1 [7, out_d, out_d] dilation
-            Tensor conv1_out = Tensor::allocate(ctx, {L * stride, out_d});
             Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
             Tensor& conv1_b = mimi_weights_.get(res_prefix + "conv1.conv.bias");
-            ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, L * stride, 7, dilations[r]);
-            ctx.synchronize();
+            ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, Ls, 7, dilations[r]);
 
             // act2
             Tensor& act2_a = mimi_weights_.get(res_prefix + "act2.alpha");
             Tensor& act2_b = mimi_weights_.get(res_prefix + "act2.beta");
-            ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, L * stride * out_d, out_d, L * stride);
-            ctx.synchronize();
+            ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, res_elems, out_d, Ls);
 
             // conv2 [1, out_d, out_d]
-            Tensor conv2_out = Tensor::allocate(ctx, {L * stride, out_d});
             Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
-            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, L * stride, 1, 1);
-            ctx.synchronize();
+            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
 
             // Add to residual
-            ops::residual_add(ctx, res_in, conv2_out, L * stride * out_d);
-            ops::copy_tensor(ctx, res_in, xx, L * stride * out_d);
-            ctx.synchronize();
+            ops::residual_add(ctx, res_in, conv2_out, res_elems);
+            ops::copy_tensor(ctx, res_in, xx, res_elems);
+            ctx.synchronize();  // barrier between residual blocks
         }
 
         L = L * stride;
