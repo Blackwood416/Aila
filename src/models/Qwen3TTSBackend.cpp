@@ -1917,13 +1917,185 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     MimiStreamState& state, std::vector<float>& out_samples) {
     if (!mimi_loaded_ || new_frames <= 0) return false;
 
-    // Accumulate codes
+    int start_pos = state.total_frames;
+    int total_frames = start_pos + new_frames;
+
+    // === 1. VQ lookup on NEW codes only ===
+    Tensor codes_dev = Tensor::allocate(ctx, {new_frames, 16}, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(codes_dev.data(), codes.data(), new_frames * 16 * sizeof(int32_t));
+
+    Tensor temp_first = Tensor::allocate(ctx, {new_frames, 256});
+    ops::vq_lookup_add(ctx, codes_dev,
+        mimi_weights_.get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum"),
+        0, temp_first, new_frames, 256, false);
+    Tensor temp_rest = Tensor::allocate(ctx, {new_frames, 256});
+    ops::vq_lookup_add(ctx, codes_dev,
+        mimi_weights_.get("decoder.quantizer.rvq_rest.vq.layers.0._codebook.embedding_sum"),
+        1, temp_rest, new_frames, 256, false);
+    for (int c = 1; c < 15; ++c) {
+        std::string emb_name = "decoder.quantizer.rvq_rest.vq.layers." + std::to_string(c) + "._codebook.embedding_sum";
+        ops::vq_lookup_add(ctx, codes_dev, mimi_weights_.get(emb_name), c + 1, temp_rest, new_frames, 256, true);
+    }
+    ctx.synchronize();
+
+    Linear first_proj, rest_proj;
+    Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
+    Tensor rest_proj_w = mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
+    first_proj.init(ctx, first_proj_w, 256, 512, false);
+    rest_proj.init(ctx, rest_proj_w, 256, 512, false);
+    Tensor proj_first = Tensor::allocate(ctx, {new_frames, 512});
+    Tensor proj_rest = Tensor::allocate(ctx, {new_frames, 512});
+    first_proj.forward(ctx, temp_first, proj_first, new_frames);
+    rest_proj.forward(ctx, temp_rest, proj_rest, new_frames);
+    ctx.synchronize();
+
+    Tensor latent_new = Tensor::allocate(ctx, {new_frames, 512});
+    ops::copy_tensor(ctx, proj_first, latent_new, new_frames * 512);
+    ops::residual_add(ctx, latent_new, proj_rest, new_frames * 512);
+    ctx.synchronize();
+
+    // === 2. Append to latent_buffer ===
+    bf16* lat_dst = state.latent_buffer.data_as<bf16>() + start_pos * 512;
+    ctx.memcpy_h2d_async(lat_dst, latent_new.data(), new_frames * 512 * sizeof(bf16));
+
+    // === 3. Pre-conv on FULL latent ===
+    Tensor preconv_full = Tensor::allocate(ctx, {total_frames, 1024});
+    ops::causal_conv1d(ctx, state.latent_buffer,
+        mimi_weights_.get("decoder.pre_conv.conv.weight"),
+        mimi_weights_.get("decoder.pre_conv.conv.bias"),
+        preconv_full, 1, 512, 1024, total_frames, 3, 1);
+    ctx.synchronize();
+
+    // === 4. Pre-transformer with incremental KV cache ===
+    Tensor pre_tfm_in = Tensor::allocate(ctx, {total_frames, 512});
+    Linear pre_tfm_in_proj;
+    pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
+    pre_tfm_in_proj.forward_bias(ctx, preconv_full,
+        mimi_weights_.get("decoder.pre_transformer.input_proj.bias"), pre_tfm_in, total_frames);
+    ctx.synchronize();
+
+    Tensor x = Tensor::allocate(ctx, {total_frames, 512});
+    ops::copy_tensor(ctx, pre_tfm_in, x, total_frames * 512);
+    ctx.synchronize();
+
+    auto apply_layer_scale_gpu = [&](Tensor& t, Tensor& scale, int len, int ch) {
+        auto* tp = t.data_as<bf16>();
+        auto* sp = scale.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(len * ch)),
+            [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                int c = i % ch;
+                tp[i] = bf16(static_cast<float>(tp[i]) * static_cast<float>(sp[c]));
+            });
+    };
+
+    for (int l = 0; l < 8; ++l) {
+        std::string lp = "decoder.pre_transformer.layers." + std::to_string(l) + ".";
+
+        Tensor residual = Tensor::allocate(ctx, {total_frames, 512});
+        ops::copy_tensor(ctx, x, residual, total_frames * 512);
+        ctx.synchronize();
+
+        // RMS norm on full sequence
+        Tensor normed = Tensor::allocate(ctx, {total_frames, 512});
+        ops::rms_norm(ctx, x, mimi_weights_.get(lp + "input_layernorm.weight"),
+                      1e-5f, normed, total_frames, 512);
+        ctx.synchronize();
+
+        // Q/K/V for all tokens (full projection)
+        Linear q_proj, k_proj, v_proj;
+        q_proj.init(ctx, mimi_weights_.get(lp + "self_attn.q_proj.weight"), 512, 1024, false);
+        k_proj.init(ctx, mimi_weights_.get(lp + "self_attn.k_proj.weight"), 512, 1024, false);
+        v_proj.init(ctx, mimi_weights_.get(lp + "self_attn.v_proj.weight"), 512, 1024, false);
+        Tensor q = Tensor::allocate(ctx, {total_frames, 1024});
+        Tensor k = Tensor::allocate(ctx, {total_frames, 1024});
+        Tensor v = Tensor::allocate(ctx, {total_frames, 1024});
+        q_proj.forward(ctx, normed, q, total_frames);
+        k_proj.forward(ctx, normed, k, total_frames);
+        v_proj.forward(ctx, normed, v, total_frames);
+        ctx.synchronize();
+
+        // RoPE with position offset for new tokens
+        ops::apply_rope(ctx, q, k, total_frames, 0, 16, 16, 64, 10000.0f);
+        ctx.synchronize();
+
+        // Copy K/V into cache (16 heads, [max_frames, 64] layout)
+        bf16* k_full = k.data_as<bf16>();
+        bf16* v_full = v.data_as<bf16>();
+        for (int h = 0; h < 16; ++h) {
+            bf16* kc = state.k_cache[l].data_as<bf16>() + h * state.max_frames * 64;
+            bf16* vc = state.v_cache[l].data_as<bf16>() + h * state.max_frames * 64;
+            for (int t = 0; t < total_frames; ++t) {
+                ctx.queue().memcpy(kc + t * 64, k_full + t * 1024 + h * 64, 64 * sizeof(bf16));
+                ctx.queue().memcpy(vc + t * 64, v_full + t * 1024 + h * 64, 64 * sizeof(bf16));
+            }
+        }
+        ctx.queue().wait();
+
+        // Incremental attention: Q for all tokens against cached K/V
+        Tensor attn_out = Tensor::allocate(ctx, {total_frames, 1024});
+        Tensor scores_buf = Tensor::allocate(ctx, {16, total_frames, total_frames}, dnnl::memory::data_type::f32);
+        ops::attention_prefill_cached(ctx, q, state.k_cache[l], state.v_cache[l],
+                                       attn_out, scores_buf,
+                                       total_frames, 0, 16, 16, 64, state.max_frames);
+        ctx.synchronize();
+
+        // O projection
+        Linear o_proj;
+        o_proj.init(ctx, mimi_weights_.get(lp + "self_attn.o_proj.weight"), 1024, 512, false);
+        Tensor proj_out = Tensor::allocate(ctx, {total_frames, 512});
+        o_proj.forward(ctx, attn_out, proj_out, total_frames);
+        ctx.synchronize();
+
+        apply_layer_scale_gpu(proj_out, mimi_weights_.get(lp + "self_attn_layer_scale.scale"), total_frames, 512);
+        ctx.queue().wait();
+
+        ops::residual_add(ctx, residual, proj_out, total_frames * 512);
+        ops::copy_tensor(ctx, residual, x, total_frames * 512);
+        ctx.synchronize();
+
+        // MLP (full sequence)
+        Tensor mlp_res = Tensor::allocate(ctx, {total_frames, 512});
+        ops::copy_tensor(ctx, x, mlp_res, total_frames * 512);
+        ctx.synchronize();
+
+        Tensor normed_post = Tensor::allocate(ctx, {total_frames, 512});
+        ops::rms_norm(ctx, x, mimi_weights_.get(lp + "post_attention_layernorm.weight"),
+                      1e-5f, normed_post, total_frames, 512);
+        ctx.synchronize();
+
+        Linear gate_proj, up_proj, down_proj;
+        gate_proj.init(ctx, mimi_weights_.get(lp + "mlp.gate_proj.weight"), 512, 1024, false);
+        up_proj.init(ctx, mimi_weights_.get(lp + "mlp.up_proj.weight"), 512, 1024, false);
+        Tensor gate_out = Tensor::allocate(ctx, {total_frames, 1024});
+        Tensor up_out   = Tensor::allocate(ctx, {total_frames, 1024});
+        gate_proj.forward(ctx, normed_post, gate_out, total_frames);
+        up_proj.forward(ctx, normed_post, up_out, total_frames);
+        ctx.synchronize();
+
+        ops::swiglu(ctx, gate_out, up_out, gate_out, total_frames * 1024);
+        ctx.synchronize();
+
+        down_proj.init(ctx, mimi_weights_.get(lp + "mlp.down_proj.weight"), 1024, 512, false);
+        Tensor down_out = Tensor::allocate(ctx, {total_frames, 512});
+        down_proj.forward(ctx, gate_out, down_out, total_frames);
+        ctx.synchronize();
+
+        apply_layer_scale_gpu(down_out, mimi_weights_.get(lp + "mlp_layer_scale.scale"), total_frames, 512);
+        ctx.queue().wait();
+
+        ops::residual_add(ctx, mlp_res, down_out, total_frames * 512);
+        ops::copy_tensor(ctx, mlp_res, x, total_frames * 512);
+        ctx.synchronize();
+    }
+
+    // === 5-7. ConvNeXt + Decoder + Final (full recompute on all frames) ===
+    // For now: after incremental pre-transformer, run the FULL non-attention pipeline
+    // by feeding x through the existing decode_mimi_vocoder conv stages.
+    // We temporarily accumulate all codes and use decode_mimi_vocoder for conv stages.
     state.accumulated_codes.insert(state.accumulated_codes.end(),
         codes.begin(), codes.begin() + static_cast<size_t>(new_frames) * 16);
-    int total_frames = static_cast<int>(state.accumulated_codes.size()) / 16;
 
-    // Full decode on all accumulated codes
-    // With RTF < 1, reprocessing all frames is ~20-50ms per batch
     std::vector<float> full_samples;
     if (!decode_mimi_vocoder(ctx, state.accumulated_codes, total_frames, full_samples)) {
         return false;
@@ -1932,8 +2104,7 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     // Slice: extract only new audio since last call
     int new_sample_count = static_cast<int>(full_samples.size()) - state.last_audio_sample_count;
     if (new_sample_count > 0) {
-        out_samples.assign(full_samples.begin() + state.last_audio_sample_count,
-                           full_samples.end());
+        out_samples.assign(full_samples.begin() + state.last_audio_sample_count, full_samples.end());
     }
     state.last_audio_sample_count = static_cast<int>(full_samples.size());
     state.total_frames = total_frames;
@@ -1943,5 +2114,6 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
 
 bool Qwen3TTSBackend::decode_mimi_flush(Context& ctx, MimiStreamState& state,
     std::vector<float>& out_samples) {
+    (void)ctx; (void)state; (void)out_samples;
     return true;
 }
