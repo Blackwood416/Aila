@@ -3,6 +3,7 @@
 #include "profile/Profiling.hpp"
 #include "AudioPreprocessor.hpp"
 #include <cstring>
+#include <vector>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -713,5 +714,75 @@ AILA_API int aila_extract_speaker_embedding(
     } catch (...) {
         AILA_LOG_ERROR("[C-API] Extract speaker embedding failed: unknown exception");
         return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_align(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* text, const char* language,
+    AilaAlignedWord** out_words, int* out_count
+) {
+    if (out_words) *out_words = nullptr;
+    if (out_count) *out_count = 0;
+
+    if (!engine || !audio_samples || num_samples <= 0 || !text || !language) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (!out_words || !out_count) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<float> samples(audio_samples, audio_samples + num_samples);
+        auto result = engine->engine.align(samples, sample_rate,
+                                           std::string(text),
+                                           std::string(language));
+
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        int count = static_cast<int>(result.size());
+        if (count == 0) {
+            *out_count = 0;
+            *out_words = nullptr;
+            return 0;
+        }
+
+        auto* words = static_cast<AilaAlignedWord*>(malloc(count * sizeof(AilaAlignedWord)));
+        if (!words) {
+            return AILA_ERR_RUNTIME;
+        }
+        memset(words, 0, count * sizeof(AilaAlignedWord));
+
+        for (int i = 0; i < count; ++i) {
+            char* txt = static_cast<char*>(malloc(result[i].text.size() + 1));
+            if (txt) {
+                memcpy(txt, result[i].text.c_str(), result[i].text.size() + 1);
+            }
+            words[i].text = txt;
+            words[i].start_ms = result[i].start_ms;
+            words[i].end_ms = result[i].end_ms;
+        }
+
+        *out_words = words;
+        *out_count = count;
+        return 0;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Align failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Align failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count) {
+    if (words) {
+        for (int i = 0; i < count; ++i) {
+            free(const_cast<char*>(words[i].text));
+        }
+        free(words);
     }
 }

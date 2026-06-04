@@ -434,4 +434,39 @@ AILA_API int aila_extract_speaker_embedding(
     int* out_embedding_dim
 );
 
+// ============================================================
+// Forced Alignment API
+// ============================================================
+
+/** Represents one aligned word with time boundaries. */
+typedef struct {
+    const char* text;
+    int start_ms;
+    int end_ms;
+} AilaAlignedWord;
+
+/**
+ * Run forced alignment: audio samples + text → word-level timestamps.
+ *
+ * @param engine         Initialized ForceAligner engine.
+ * @param audio_samples  Mono float32 audio samples.
+ * @param num_samples    Number of audio samples.
+ * @param sample_rate    Audio sample rate in Hz (will be resampled to 16kHz).
+ * @param text           Transcript text to align.
+ * @param language       Language name (e.g. "Chinese", "English").
+ * @param out_words      Output: pointer to array of AilaAlignedWord (caller frees with aila_free_aligned_words).
+ * @param out_count      Output: number of aligned words.
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_align(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* text, const char* language,
+    AilaAlignedWord** out_words, int* out_count);
+
+/**
+ * Free memory allocated by aila_align().
+ */
+AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count);
+
 #endif /* AILA_API_H */
