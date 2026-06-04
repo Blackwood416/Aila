@@ -2439,7 +2439,7 @@ public:
         const std::string& language,
         const GenerationConfig& gen_config,
         std::function<void(const float*, int)> callback,
-        int stream_batch_frames = 4
+        int stream_batch_frames = 6
     ) {
         return std::thread([this, text, reference_audio_path, speaker_name,
                             instruct_text, language, gen_config, callback,

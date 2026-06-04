@@ -1163,7 +1163,8 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     }
 
     // 3. Feed codes in batches to incremental decoder
-    int batch_size = stream_batch_frames;
+    // Use at least 6 frames per batch for smooth audio playback (~480ms chunks)
+    int batch_size = std::max(6, stream_batch_frames);
     for (int offset = 0; offset < total_frames; offset += batch_size) {
         int batch_frames = std::min(batch_size, total_frames - offset);
 
