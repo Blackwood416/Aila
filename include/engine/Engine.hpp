@@ -2591,15 +2591,9 @@ public:
             resampled = std::move(mono);
         }
 
-        std::vector<float> mel;
-        int nFrames = 0;
-        if (!cpu_enc.computeMelSpectrogram(resampled.data(), (int)resampled.size(), mel, nFrames)) {
-            set_error(EngineErrorCode::RuntimeError, "Mel spectrogram computation failed");
-            return false;
-        }
-
-        // Step 3b: run ECAPA-TDNN forward pass on CPU (f32 precision, proven quality)
-        if (!cpu_enc.extractEmbedding(mel.data(), nFrames, embedding, &error)) {
+        // Step 3: run ECAPA-TDNN forward pass on CPU (f32 precision, proven quality).
+        // extractEmbedding internally computes mel spectrogram from raw audio samples.
+        if (!cpu_enc.extractEmbedding(resampled.data(), (int)resampled.size(), embedding, &error)) {
             set_error(EngineErrorCode::RuntimeError, "Speaker encoder forward pass failed: " + error);
             return false;
         }
