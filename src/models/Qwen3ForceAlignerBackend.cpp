@@ -37,3 +37,31 @@ bool Qwen3ForceAlignerBackend::load(Context& ctx, ModelWeights& weights,
 
     return true;
 }
+
+Tensor& Qwen3ForceAlignerBackend::forward_all(Context& ctx,
+                                               const int* token_ids_device,
+                                               int seq_len) {
+    if (seq_len <= 0)
+        throw std::runtime_error("Qwen3ForceAlignerBackend::forward_all: seq_len must be positive");
+
+    // Run the full transformer backbone via parent::forward().
+    // This executes the prefill path (embedding lookup, 28 transformer layers,
+    // audio override injection, MRoPE, attention, FFN, final norm).
+    // After it returns, buf_.normed contains final-normed hidden states
+    // for ALL positions [seq_len, hidden_size].
+    // Note: parent also runs lm_head on the last position and returns buf_.logits,
+    // but we ignore that — we need classify_head on all positions.
+    Qwen3ASRBackend::forward(ctx, token_ids_device, seq_len);
+
+    // Resize all_logits_ buffer if needed
+    if (!all_logits_.valid() || all_logits_.shape(0) < static_cast<int64_t>(seq_len)) {
+        all_logits_ = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), classify_num_},
+                                       dnnl::memory::data_type::f32);
+    }
+
+    // Run classify_head on ALL positions of the final-normed hidden states.
+    // buf_.normed is [seq_len, hidden_size] (inherited protected member).
+    classify_head_.forward(ctx, buf_.normed, all_logits_, seq_len);
+
+    return all_logits_;
+}
