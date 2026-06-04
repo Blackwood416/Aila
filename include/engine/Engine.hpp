@@ -2709,7 +2709,7 @@ public:
 
         std::vector<int> prompt_ids;
         prompt_ids.push_back(audio_start_id);
-        prompt_ids.push_back(audio_pad_id);
+        for (int i = 0; i < audio_len; ++i) prompt_ids.push_back(audio_pad_id);
         prompt_ids.push_back(audio_end_id);
 
         auto text_ids = tokenizer_.encode(prompt_text);
