@@ -66,6 +66,7 @@ struct CLIOptions {
     std::string tts_instruct_text;  // --instruct (voice style description)
     std::string tts_language;       // --language ("chinese", "english", etc.)
     std::string tts_spk_cache_dir;  // --spk-cache-dir
+    bool tts_stream = false;         // --stream-tts (output raw PCM to stdout)
 };
 
 // Parse command-line arguments

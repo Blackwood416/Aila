@@ -7,6 +7,12 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <atomic>
+#include <cstdio>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 int main(int argc, char** argv) {
     // Parse command line arguments
@@ -210,24 +216,46 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        std::string output_path = opts.tts_output_path.empty() ? "output.wav" : opts.tts_output_path;
-        AILA_LOG_INFO("Synthesizing text: \"%s\"", input_text.c_str());
-
         GenerationConfig tts_gen = gen_config;
-        // TTS needs higher repetition_penalty to avoid loops
         if (tts_gen.repetition_penalty <= 1.0f) tts_gen.repetition_penalty = 1.1f;
         tts_gen.max_new_tokens = opts.max_new_tokens > 0 ? opts.max_new_tokens : tts_gen.max_new_tokens;
 
+        if (opts.tts_stream) {
+            // Streaming mode: output raw PCM float chunks to stdout
+            // Redirect logs to stderr so PCM stays clean on stdout
+            aila::set_log_callback([](int /*level*/, const char* msg, void*) {
+                fputs(msg, stderr);
+                fputc('\n', stderr);
+                fflush(stderr);
+            }, nullptr);
+            AILA_LOG_INFO("Streaming TTS: \"%s\" (raw PCM to stdout)", input_text.c_str());
+#ifdef _WIN32
+            _setmode(_fileno(stdout), _O_BINARY);
+#endif
+            std::atomic<bool> done{false};
+            auto worker = engine.synthesizeSpeechStream(
+                input_text, opts.tts_speaker_path, opts.tts_speaker_name,
+                opts.tts_instruct_text, opts.tts_language, tts_gen,
+                [&done](const float* samples, int count) {
+                    if (count > 0) {
+                        fwrite(samples, sizeof(float), static_cast<size_t>(count), stdout);
+                        fflush(stdout);
+                    }
+                }, 4);
+            worker.join();
+            done = true;
+            AILA_LOG_INFO("TTS streaming complete");
+            return 0;
+        }
+
+        // Blocking mode: write to WAV file
+        std::string output_path = opts.tts_output_path.empty() ? "output.wav" : opts.tts_output_path;
+        AILA_LOG_INFO("Synthesizing text: \"%s\"", input_text.c_str());
+
         std::vector<float> samples;
         bool ok = engine.synthesizeSpeech(
-            input_text,
-            opts.tts_speaker_path,    // Base: reference audio
-            opts.tts_speaker_name,    // CustomVoice: speaker name
-            opts.tts_instruct_text,   // VoiceDesign: instruct
-            opts.tts_language,        // language
-            tts_gen,
-            samples
-        );
+            input_text, opts.tts_speaker_path, opts.tts_speaker_name,
+            opts.tts_instruct_text, opts.tts_language, tts_gen, samples);
 
         if (!ok) {
             AILA_LOG_ERROR("TTS synthesis failed: %s", engine.last_error_message().c_str());

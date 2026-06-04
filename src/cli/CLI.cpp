@@ -457,6 +457,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_spk_cache_dir = argv[++i];
             continue;
         }
+        if (arg == "--stream-tts") {
+            opts.tts_stream = true;
+            continue;
+        }
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;
