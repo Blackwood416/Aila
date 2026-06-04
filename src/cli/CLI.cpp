@@ -611,6 +611,85 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
+    registry.register_command("/align", "Forced alignment: audio + text -> word timestamps", [&, engine](const std::string& args) {
+        // Parse: text="..." audio=file.wav [language="Chinese"]
+        std::string text, audio_path, language = "Chinese";
+
+        auto parse_kv = [](const std::string& s, const std::string& key, std::string& out) -> bool {
+            size_t pos = s.find(key + "=\"");
+            if (pos == std::string::npos) {
+                pos = s.find(key + "=");
+                if (pos == std::string::npos) return false;
+                // Unquoted value
+                size_t val_start = pos + key.size() + 1;
+                size_t val_end = s.find(' ', val_start);
+                if (val_end == std::string::npos) val_end = s.size();
+                out = s.substr(val_start, val_end - val_start);
+                return true;
+            }
+            // Quoted value
+            size_t val_start = pos + key.size() + 2;
+            size_t val_end = s.find('"', val_start);
+            if (val_end == std::string::npos) return false;
+            out = s.substr(val_start, val_end - val_start);
+            return true;
+        };
+
+        if (!parse_kv(args, "text", text) || !parse_kv(args, "audio", audio_path)) {
+            std::cout << "[Align] Usage: /align text=\"...\" audio=file.wav [language=\"Chinese\"]" << std::endl;
+            return true;
+        }
+        parse_kv(args, "language", language);
+
+        if (!engine) {
+            std::cout << "[Align] Engine is not initialized" << std::endl;
+            return true;
+        }
+        if (engine->model_spec().family != ModelFamily::Qwen3ForceAligner) {
+            std::cout << "[Align] Current model is not a ForceAligner model!" << std::endl;
+            return true;
+        }
+
+        std::cout << "[Align] Text: \"" << text << "\"" << std::endl;
+        std::cout << "[Align] Audio: " << audio_path << std::endl;
+        std::cout << "[Align] Language: " << language << std::endl;
+
+        AudioBuffer audio;
+        std::string load_error;
+        if (!load_audio(audio_path, audio, &load_error)) {
+            std::cout << "[Align] Failed to open audio file: " << audio_path
+                      << " (" << load_error << ")" << std::endl;
+            return true;
+        }
+
+        std::vector<float> mono;
+        if (audio.channels > 1) {
+            mono.resize(audio.samples.size() / audio.channels);
+            for (size_t i = 0; i < mono.size(); ++i) {
+                float sum = 0;
+                for (int c = 0; c < audio.channels; ++c)
+                    sum += audio.samples[i * audio.channels + c];
+                mono[i] = sum / audio.channels;
+            }
+        } else {
+            mono = std::move(audio.samples);
+        }
+
+        auto result = engine->align(mono, audio.sample_rate, text, language);
+
+        if (engine->last_error_code() != EngineErrorCode::Ok) {
+            std::cout << "[Align] Error: " << engine->last_error_message() << std::endl;
+            return true;
+        }
+
+        std::cout << "\n[Align] Results (" << result.size() << " words):" << std::endl;
+        for (const auto& w : result) {
+            std::cout << "  \"" << w.text << "\"  " << w.start_ms << "ms - " << w.end_ms << "ms" << std::endl;
+        }
+
+        return true;
+    });
+
     auto tts_handler = [&, engine, default_speaker_path](const std::string& args) {
         std::string trimmed_args = trim(args);
         if (trimmed_args.empty()) {
