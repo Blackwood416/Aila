@@ -104,11 +104,11 @@ ForceAlignerPostProcess::encode_input(const std::string& text,
         word_list = tokenize_space(text);
     }
 
-    // Build prompt: words joined by <timestamp><timestamp> (audio wrapper added separately in Engine)
+    // Return word_list + plain text (no timestamp markers — those are added as
+    // explicit token IDs in Engine to ensure correct tokenization).
     std::string prompt;
     for (size_t i = 0; i < word_list.size(); ++i) {
         prompt += word_list[i];
-        prompt += "<timestamp><timestamp>";
     }
 
     return {word_list, prompt};

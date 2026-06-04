@@ -2706,14 +2706,21 @@ public:
         int audio_start_id = model_spec_.audio_start_token_id;
         int audio_end_id   = model_spec_.audio_end_token_id;
         int audio_pad_id   = model_spec_.audio_token_id;
+        int ts_token_id    = model_spec_.timestamp_token_id;
 
         std::vector<int> prompt_ids;
         prompt_ids.push_back(audio_start_id);
         for (int i = 0; i < audio_len; ++i) prompt_ids.push_back(audio_pad_id);
         prompt_ids.push_back(audio_end_id);
 
-        auto text_ids = tokenizer_.encode(prompt_text);
-        prompt_ids.insert(prompt_ids.end(), text_ids.begin(), text_ids.end());
+        // Tokenize each word and insert explicit timestamp tokens between them.
+        // This ensures timestamp_token_id (151705) is used, not text "<timestamp>".
+        for (size_t wi = 0; wi < word_list.size(); ++wi) {
+            auto word_ids = tokenizer_.encode(word_list[wi]);
+            prompt_ids.insert(prompt_ids.end(), word_ids.begin(), word_ids.end());
+            prompt_ids.push_back(ts_token_id);  // <timestamp>
+            prompt_ids.push_back(ts_token_id);  // <timestamp>
+        }
 
         std::vector<int> pad_positions;
         for (size_t i = 0; i < prompt_ids.size(); ++i)
@@ -2746,19 +2753,25 @@ public:
         if (backend_->supports_vision_embedding_override())
             backend_->clear_mrope_positions();
 
-        // 7. Download logits
+        // 7. Download logits (GPU bf16 → host bf16 → float conversion)
         int classify_num = fa_backend->classify_num();
-        std::vector<float> host_logits(static_cast<size_t>(prompt_len) * classify_num);
-        ctx_->memcpy_d2h(host_logits.data(), logits_all.data(),
-                         host_logits.size() * sizeof(float));
+        size_t total_elts = static_cast<size_t>(prompt_len) * classify_num;
+        std::vector<bf16> host_bf16(total_elts);
+        ctx_->memcpy_d2h(host_bf16.data(), logits_all.data(), total_elts * sizeof(bf16));
         ctx_->synchronize();
+        std::vector<float> host_logits(total_elts);
+        for (size_t i = 0; i < total_elts; ++i) {
+            host_logits[i] = static_cast<float>(host_bf16[i]);
+        }
 
         // 8. Extract timestamps + fix + build output
-        int ts_token_id = model_spec_.timestamp_token_id;
         auto raw_ts = aila::ForceAlignerPostProcess::extract_timestamps(
             host_logits.data(), prompt_len, classify_num,
             prompt_ids.data(), prompt_len,
             ts_token_id, model_spec_.timestamp_segment_time);
+
+        AILA_LOG_INFO("[Align] Raw timestamps: %zu values for %zu words",
+                      raw_ts.size(), word_list.size());
 
         auto fixed_ts = aila::ForceAlignerPostProcess::fix_timestamp(raw_ts);
         auto result = aila::ForceAlignerPostProcess::build_output(word_list, fixed_ts);

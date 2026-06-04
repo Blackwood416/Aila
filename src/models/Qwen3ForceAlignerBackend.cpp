@@ -19,14 +19,12 @@ bool Qwen3ForceAlignerBackend::load(Context& ctx, ModelWeights& weights,
     }
 
     // Replace lm_head with classify_head.
-    // The weight key "thinker.lm_head.weight" has shape [classify_num, hidden_size]
-    // instead of [vocab_size, hidden_size].
+    // The parent's transpose_weight() already transposed "thinker.lm_head.weight"
+    // from [classify_num, hidden_size] to [hidden_size, classify_num].
+    // We just need to re-initialize the Linear with the correct output dimension.
     {
-        Tensor& src = weights.get("thinker.lm_head.weight");
-        Tensor transposed = Tensor::allocate(ctx, {src.shape(1), src.shape(0)}, src.dtype());
-        ops::transpose(ctx, src, transposed);
-        ctx.synchronize();
-        classify_head_.init(ctx, transposed, cfg_.hidden_size, classify_num_, true);
+        Tensor& src = weights.get("thinker.lm_head.weight");  // already [H, classify_num]
+        classify_head_.init(ctx, src, cfg_.hidden_size, classify_num_, true);
     }
 
     // Re-allocate logits buffer: parent allocated [1, vocab_size], we need [1, classify_num].
@@ -45,23 +43,23 @@ Tensor& Qwen3ForceAlignerBackend::forward_all(Context& ctx,
         throw std::runtime_error("Qwen3ForceAlignerBackend::forward_all: seq_len must be positive");
 
     // Run the full transformer backbone via parent::forward().
-    // This executes the prefill path (embedding lookup, 28 transformer layers,
-    // audio override injection, MRoPE, attention, FFN, final norm).
-    // After it returns, buf_.normed contains final-normed hidden states
-    // for ALL positions [seq_len, hidden_size].
-    // Note: parent also runs lm_head on the last position and returns buf_.logits,
-    // but we ignore that — we need classify_head on all positions.
     Qwen3ASRBackend::forward(ctx, token_ids_device, seq_len);
 
     // Resize all_logits_ buffer if needed
     if (!all_logits_.valid() || all_logits_.shape(0) < static_cast<int64_t>(seq_len)) {
-        all_logits_ = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), classify_num_},
-                                       dnnl::memory::data_type::f32);
+        all_logits_ = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), classify_num_});
     }
 
-    // Run classify_head on ALL positions of the final-normed hidden states.
-    // buf_.normed is [seq_len, hidden_size] (inherited protected member).
-    classify_head_.forward(ctx, buf_.normed, all_logits_, seq_len);
+    // Use exact-sized input buffer: buf_.normed may have larger runtime capacity
+    // which oneDNN can't slice implicitly.
+    int H = cfg_.hidden_size;
+    Tensor normed_exact = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), H});
+    {
+        bf16* src = buf_.normed.data_as<bf16>();
+        bf16* dst = normed_exact.data_as<bf16>();
+        ctx.queue().memcpy(dst, src, static_cast<size_t>(seq_len) * H * sizeof(bf16));
+    }
 
+    classify_head_.forward(ctx, normed_exact, all_logits_, seq_len);
     return all_logits_;
 }
