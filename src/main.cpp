@@ -7,7 +7,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <atomic>
+#include <mutex>
 #include <cstdio>
 #ifdef _WIN32
 #include <io.h>
@@ -232,24 +232,39 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
             _setmode(_fileno(stdout), _O_BINARY);
 #endif
-            std::atomic<bool> done{false};
             // Batch size: CLI > env AILA_TTS_STREAM_BATCH > default 4
             int batch = opts.tts_stream_batch;
             if (batch <= 1) {
                 batch = aila::env::read_int_raw("AILA_TTS_STREAM_BATCH", 4);
                 if (batch <= 1) batch = 4;
             }
+            // Accumulate samples for optional WAV output
+            std::mutex sample_mutex;
+            std::vector<float> all_samples;
             auto worker = engine.synthesizeSpeechStream(
                 input_text, opts.tts_speaker_path, opts.tts_speaker_name,
                 opts.tts_instruct_text, opts.tts_language, tts_gen,
-                [&done](const float* samples, int count) {
+                [&](const float* samples, int count) {
                     if (count > 0) {
                         fwrite(samples, sizeof(float), static_cast<size_t>(count), stdout);
                         fflush(stdout);
+                        std::lock_guard<std::mutex> lock(sample_mutex);
+                        all_samples.insert(all_samples.end(), samples, samples + count);
                     }
                 }, batch);
             worker.join();
-            done = true;
+
+            // Save WAV if requested
+            std::string output_path = opts.tts_output_path;
+            if (!output_path.empty() && !all_samples.empty()) {
+                if (!save_wav(output_path, all_samples, 24000)) {
+                    AILA_LOG_ERROR("Failed to write WAV file to: %s", output_path.c_str());
+                    return 2;
+                }
+                AILA_LOG_INFO("Streaming audio saved to: %s (%.2fs)",
+                              output_path.c_str(),
+                              static_cast<double>(all_samples.size()) / 24000.0);
+            }
             AILA_LOG_INFO("TTS streaming complete");
             return 0;
         }
