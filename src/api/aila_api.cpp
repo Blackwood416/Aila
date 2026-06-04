@@ -585,7 +585,7 @@ AILA_API int aila_decode_mimi_vocoder(
 AILA_API int aila_synthesize(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,
+    const char* reference_audio_path,
     const char* speaker_name,
     const char* instruct_text,
     const char* language,
@@ -601,7 +601,7 @@ AILA_API int aila_synthesize(
         std::vector<float> samples;
         bool ok = engine->engine.synthesizeSpeech(
             std::string(text),
-            speaker_audio_path ? std::string(speaker_audio_path) : std::string(),
+            reference_audio_path ? std::string(reference_audio_path) : std::string(),
             speaker_name ? std::string(speaker_name) : std::string(),
             instruct_text ? std::string(instruct_text) : std::string(),
             language ? std::string(language) : std::string(),
@@ -640,7 +640,7 @@ struct AilaTTSStream {
 AILA_API AilaTTSStream* aila_synthesize_stream(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,
+    const char* reference_audio_path,
     const char* speaker_name,
     const char* instruct_text,
     const char* language,
@@ -654,7 +654,7 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
     GenerationConfig cpp_cfg = to_cpp_config(config);
     stream->worker = engine->engine.synthesizeSpeechStream(
         std::string(text),
-        speaker_audio_path ? std::string(speaker_audio_path) : std::string(),
+        reference_audio_path ? std::string(reference_audio_path) : std::string(),
         speaker_name ? std::string(speaker_name) : std::string(),
         instruct_text ? std::string(instruct_text) : std::string(),
         language ? std::string(language) : std::string(),

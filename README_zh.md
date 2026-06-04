@@ -110,7 +110,7 @@ Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "你好世界" --output-wav output.wav
 
 # TTS 语音克隆（零样本）
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --ref ./reference_speaker.wav --output-wav cloned.wav
 
 # 从 JSON 文件读取单条 prompt
 Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --messages-json prompt.json
@@ -154,10 +154,10 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
-| `--spk, --speaker <name_or_path>` | TTS 音色：参考音频路径或命名音色（如 vivian、ryan） | 无 |
+| `--ref, --speaker <name_or_path>` | TTS 音色：参考音频路径或命名音色（如 vivian、ryan） | 无 |
 | `--instruct <text>` | VoiceDesign 音色风格描述（如 "深沉温暖的声音"） | 无 |
 | `--language <lang>` | TTS 语言：chinese、english、japanese、korean、auto | auto |
-| `--spk-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_SPK_CACHE_DIR` 环境变量 |
+| `--ref-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_REF_CACHE_DIR` 环境变量 |
 | `--stream-tts` | 流式输出原始 24kHz 单声道 f32 PCM 到 stdout | 关闭 |
 | `--stream-batch <N>` | 流式 TTS 每批帧数 | 4 |
 | `--align-text <text>` | 强制对齐：要对齐的文本 | 无 |
@@ -178,8 +178,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/quit`、`/exit` | 退出程序 |
 | `/transcribe <path>` | 转录音频文件（ASR） |
 | `/align text="..." audio=<path> [language="..."]` | 强制对齐（词级时间戳） |
-| `/tts <text> [--spk <path>]` | 语音合成（TTS），支持可选语音克隆 |
-| `/synthesize <text> [--spk <path>]` | `/tts` 的别名 |
+| `/tts <text> [--ref <path>]` | 语音合成（TTS），支持可选语音克隆 |
+| `/synthesize <text> [--ref <path>]` | `/tts` 的别名 |
 | `/voice <name>` | 设置 TTS 音色（vivian、ryan 等） |
 | `/clear` | 清除对话历史 |
 | `/context` | 显示上下文用量 |
@@ -228,7 +228,7 @@ Aila 为 Qwen3-TTS 模型提供**零样本语音克隆**支持。说话人嵌入
 # 从参考音频克隆音色
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --synthesize "你好世界" `
-    --spk ./reference_speaker.wav `
+    --ref ./reference_speaker.wav `
     --output-wav cloned_output.wav
 
 # CustomVoice — 使用命名说话人预设
@@ -262,7 +262,7 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
 
 `--rep-penalty` 参数控制重复惩罚（TTS 模式下自动设为 1.1）。如果输出出现重复伪影可调高（如 `--rep-penalty 1.3`），需要更多变化时可调低（如 `--rep-penalty 1.0`）。
 
-说话人嵌入会**自动缓存**：会话期间缓存于内存中，并持久化到磁盘（`<audio_path>.spk.bin`），避免重复提取。使用 `--spk-cache-dir <dir>` 或 `AILA_SPK_CACHE_DIR` 环境变量可将缓存文件集中存储到指定目录。
+说话人嵌入会**自动缓存**：会话期间缓存于内存中，并持久化到磁盘（`<audio_path>.ref.bin`），避免重复提取。使用 `--ref-cache-dir <dir>` 或 `AILA_REF_CACHE_DIR` 环境变量可将缓存文件集中存储到指定目录。
 
 ### 📄 Messages JSON 格式
 

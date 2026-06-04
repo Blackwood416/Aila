@@ -112,12 +112,12 @@ int main(int argc, char** argv) {
 
     // Configure speaker embedding cache
     {
-        std::string cache_dir = opts.tts_spk_cache_dir;
+        std::string cache_dir = opts.tts_ref_cache_dir;
         if (cache_dir.empty()) {
-            cache_dir = aila::env::read_string("AILA_SPK_CACHE_DIR", "");
+            cache_dir = aila::env::read_string("AILA_REF_CACHE_DIR", "");
         }
         if (!cache_dir.empty()) {
-            engine.setSpeakerCacheDir(cache_dir);
+            engine.setRefCacheDir(cache_dir);
         }
     }
 
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
             std::mutex sample_mutex;
             std::vector<float> all_samples;
             auto worker = engine.synthesizeSpeechStream(
-                input_text, opts.tts_speaker_path, opts.tts_speaker_name,
+                input_text, opts.tts_reference_path, opts.tts_speaker_name,
                 opts.tts_instruct_text, opts.tts_language, tts_gen,
                 [&](const float* samples, int count) {
                     if (count > 0) {
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
 
         std::vector<float> samples;
         bool ok = engine.synthesizeSpeech(
-            input_text, opts.tts_speaker_path, opts.tts_speaker_name,
+            input_text, opts.tts_reference_path, opts.tts_speaker_name,
             opts.tts_instruct_text, opts.tts_language, tts_gen, samples);
 
         if (!ok) {
@@ -404,5 +404,5 @@ int main(int argc, char** argv) {
     }
 
     // Run interactive loop
-    return run_interactive(engine, gen_config, opts.stream_output, opts.tts_speaker_path);
+    return run_interactive(engine, gen_config, opts.stream_output, opts.tts_reference_path);
 }

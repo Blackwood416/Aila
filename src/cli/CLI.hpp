@@ -61,11 +61,11 @@ struct CLIOptions {
     // TTS synthesis mode
     std::string tts_text;           // --synthesize
     std::string tts_output_path;    // --output-wav
-    std::string tts_speaker_path;   // --spk, --speaker (reference audio path)
+    std::string tts_reference_path;  // --ref, --speaker (reference audio path)
     std::string tts_speaker_name;   // --speaker (CustomVoice: "vivian", etc.)
     std::string tts_instruct_text;  // --instruct (voice style description)
     std::string tts_language;       // --language ("chinese", "english", etc.)
-    std::string tts_spk_cache_dir;  // --spk-cache-dir
+    std::string tts_ref_cache_dir;  // --ref-cache-dir
     bool tts_stream = false;         // --stream-tts (output raw PCM to stdout)
     int tts_stream_batch = 4;        // --stream-batch <N> (frames per chunk, default 4)
 
@@ -119,8 +119,8 @@ private:
 // Build the default interactive command set
 CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
                                        bool& should_quit, InferenceEngine* engine = nullptr,
-                                       const std::string& default_speaker_path = "");
+                                       const std::string& default_reference_path = "");
 
 // Run the interactive loop
 int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output,
-                    const std::string& default_speaker_path = "");
+                    const std::string& default_reference_path = "");

@@ -139,7 +139,7 @@ std::vector<float> load_or_extract_speaker_embedding(InferenceEngine* engine, co
         int spk_dim = encoder.embeddingDim();
 
         // Check cache with correct dimension
-        if (engine->lookupSpeakerCache(path, spk_dim, embedding)) {
+        if (engine->lookupRefCache(path, spk_dim, embedding)) {
             std::cout << "[TTS] Speaker embedding loaded from cache (Dimension: "
                       << embedding.size() << ")" << std::endl;
             return embedding;
@@ -148,7 +148,7 @@ std::vector<float> load_or_extract_speaker_embedding(InferenceEngine* engine, co
         // Cache miss — extract with CPU ECAPA-TDNN (f32 precision)
         std::cout << "[TTS] Extracting speaker embedding (CPU, dim=" << spk_dim << ")..." << std::endl;
         if (encoder.extractEmbeddingFromFile(path, embedding, &error)) {
-            engine->cacheSpeakerEmbedding(path, embedding);
+            engine->cacheRefEmbedding(path, embedding);
             std::cout << "[TTS] Speaker embedding extracted and cached (Dimension: "
                       << embedding.size() << ")" << std::endl;
             return embedding;
@@ -231,11 +231,11 @@ Options:
   --transcribe <path>      Offline audio transcription (ASR) file path
   --synthesize <prompt>    TTS voice synthesis from text prompt (Qwen3-TTS only)
   --output-wav <path>      Output path for synthesized WAV file (default: output.wav)
-  --spk <path>             Reference audio for TTS voice cloning (Base model)
+  --ref <path>             Reference audio for TTS voice cloning (Base model)
   --instruct <text>        Voice design / style description text (VoiceDesign model)
   --speaker <name>         CustomVoice speaker name (vivian, ryan, serena, ...)
   --language <lang>        Language code: chinese, english, japanese, korean (default: auto)
-  --spk-cache-dir <dir>    Speaker embedding cache directory (default: alongside audio)
+  --ref-cache-dir <dir>    Reference embedding cache directory (default: alongside audio)
   --align-text <text>      ForceAligner: transcript text to align
   --align-audio <path>     ForceAligner: audio file path for alignment
   --align-lang <lang>      ForceAligner: language (default: Chinese)
@@ -440,8 +440,8 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_output_path = argv[++i];
             continue;
         }
-        if (arg == "--spk" && i + 1 < argc) {
-            opts.tts_speaker_path = argv[++i];
+        if (arg == "--ref" && i + 1 < argc) {
+            opts.tts_reference_path = argv[++i];
             continue;
         }
         if (arg == "--speaker" && i + 1 < argc) {
@@ -456,8 +456,8 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_language = argv[++i];
             continue;
         }
-        if (arg == "--spk-cache-dir" && i + 1 < argc) {
-            opts.tts_spk_cache_dir = argv[++i];
+        if (arg == "--ref-cache-dir" && i + 1 < argc) {
+            opts.tts_ref_cache_dir = argv[++i];
             continue;
         }
         if (arg == "--stream-tts") {
@@ -549,7 +549,7 @@ void CommandRegistry::print_help() const {
 
 CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& stream_output,
                                        bool& should_quit, InferenceEngine* engine,
-                                       const std::string& default_speaker_path) {
+                                       const std::string& default_reference_path) {
     CommandRegistry registry;
 
     registry.register_command("/quit", "Exit the program", [&](const std::string&) {
@@ -708,14 +708,14 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
-    auto tts_handler = [&, engine, default_speaker_path](const std::string& args) {
+    auto tts_handler = [&, engine, default_reference_path](const std::string& args) {
         std::string trimmed_args = trim(args);
         if (trimmed_args.empty()) {
-            if (default_speaker_path.empty()) {
-                std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <reference_audio_or_bin>]" << std::endl;
+            if (default_reference_path.empty()) {
+                std::cout << "[TTS] Usage: /tts <text_prompt> [--ref <reference_audio_or_bin>]" << std::endl;
             } else {
-                std::cout << "[TTS] Usage: /tts <text_prompt> [--spk <path>]  (session speaker: "
-                          << default_speaker_path << ")" << std::endl;
+                std::cout << "[TTS] Usage: /tts <text_prompt> [--ref <path>]  (session reference: "
+                          << default_reference_path << ")" << std::endl;
             }
             return true;
         }
@@ -728,37 +728,37 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             return true;
         }
 
-        // Parse --spk argument if any (overrides session default)
+        // Parse --ref argument if any (overrides session default)
         std::string text_prompt = trimmed_args;
-        std::string spk_path = "";
-        size_t spk_pos = trimmed_args.find("--spk ");
-        if (spk_pos != std::string::npos) {
-            text_prompt = trim(trimmed_args.substr(0, spk_pos));
-            spk_path = trim(trimmed_args.substr(spk_pos + 6));
+        std::string ref_path = "";
+        size_t ref_pos = trimmed_args.find("--ref ");
+        if (ref_pos != std::string::npos) {
+            text_prompt = trim(trimmed_args.substr(0, ref_pos));
+            ref_path = trim(trimmed_args.substr(ref_pos + 6));
         } else {
-            spk_pos = trimmed_args.find("--spk=");
-            if (spk_pos != std::string::npos) {
-                text_prompt = trim(trimmed_args.substr(0, spk_pos));
-                spk_path = trim(trimmed_args.substr(spk_pos + 6));
+            ref_pos = trimmed_args.find("--ref=");
+            if (ref_pos != std::string::npos) {
+                text_prompt = trim(trimmed_args.substr(0, ref_pos));
+                ref_path = trim(trimmed_args.substr(ref_pos + 6));
             }
         }
 
-        // Fall back to session default speaker if no --spk in command
-        if (spk_path.empty() && !default_speaker_path.empty()) {
-            spk_path = default_speaker_path;
+        // Fall back to session default reference if no --ref in command
+        if (ref_path.empty() && !default_reference_path.empty()) {
+            ref_path = default_reference_path;
         }
 
         std::string norm_args = normalize_input_for_model(text_prompt);
         std::cout << "[TTS] Synthesizing: \"" << norm_args << "\"";
-        if (!spk_path.empty()) {
-            std::cout << " (Speaker: " << spk_path << ")";
+        if (!ref_path.empty()) {
+            std::cout << " (Reference: " << ref_path << ")";
         }
         std::cout << std::endl;
 
         std::vector<float> samples;
         std::vector<float> speaker_embedding;
-        if (!spk_path.empty()) {
-            speaker_embedding = load_or_extract_speaker_embedding(engine, spk_path);
+        if (!ref_path.empty()) {
+            speaker_embedding = load_or_extract_speaker_embedding(engine, ref_path);
         }
 
         bool ok = engine->synthesize_text_to_wav(norm_args, speaker_embedding, gen_config, samples);
@@ -895,7 +895,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
 // ============================================================
 
 int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool stream_output,
-                    const std::string& default_speaker_path /* = "" in header */) {
+                    const std::string& default_reference_path /* = "" in header */) {
     bool interactive_terminal = detect_interactive_terminal();
     setup_console_utf8(interactive_terminal);
 
@@ -907,7 +907,7 @@ int run_interactive(InferenceEngine& engine, GenerationConfig& gen_config, bool 
     stream_output = aila::env::read_flag("AILA_STREAM_OUTPUT", stream_output);
 
     bool should_quit = false;
-    auto registry = build_default_commands(gen_config, stream_output, should_quit, &engine, default_speaker_path);
+    auto registry = build_default_commands(gen_config, stream_output, should_quit, &engine, default_reference_path);
 
     std::string input;
     while (!should_quit) {

@@ -333,7 +333,7 @@ AILA_API int aila_synthesize_text_to_wav(
  * This is the recommended high-level API for most use cases.
  *
  * Supports three voice identity modes:
- *   - Base (voice cloning): provide speaker_audio_path for ECAPA-TDNN extraction
+ *   - Base (voice cloning): provide reference_audio_path for ECAPA-TDNN extraction
  *   - CustomVoice: provide speaker_name (e.g. "vivian", "ryan") for pre-trained voices
  *   - VoiceDesign: provide instruct_text for style description
  *   - Default voice: all identity params NULL (or empty strings)
@@ -344,7 +344,7 @@ AILA_API int aila_synthesize_text_to_wav(
  *
  * @param engine              Initialized engine handle (Qwen3-TTS model)
  * @param text                UTF-8 text to synthesize
- * @param speaker_audio_path  Base: reference audio path for voice cloning (NULL for none)
+ * @param reference_audio_path  Base: reference audio path for voice cloning (NULL for none)
  * @param speaker_name        CustomVoice: speaker name e.g. "vivian" (NULL for none)
  * @param instruct_text       VoiceDesign: style description text (NULL for none)
  * @param language            Language code: "chinese", "english", "japanese", "korean" (NULL for auto)
@@ -355,7 +355,7 @@ AILA_API int aila_synthesize_text_to_wav(
 AILA_API int aila_synthesize(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,
+    const char* reference_audio_path,
     const char* speaker_name,
     const char* instruct_text,
     const char* language,
@@ -376,7 +376,7 @@ typedef struct AilaTTSStream AilaTTSStream;
 AILA_API AilaTTSStream* aila_synthesize_stream(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,
+    const char* reference_audio_path,
     const char* speaker_name,
     const char* instruct_text,
     const char* language,

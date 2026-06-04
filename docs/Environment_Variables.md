@@ -101,15 +101,15 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | `AILA_BF16_GEMV` | int | `1` | Enable native bf16 GEMV kernel for TTS decode (SG=16, vec8+FMA). Set to `0` to fall back to oneDNN matmul. Provides ~9x TTS throughput improvement |
 | `AILA_TTS_STREAM_BATCH` | int | `4` | Number of audio frames per streaming TTS callback chunk. Higher values reduce callback overhead at the cost of increased latency |
 
-## TTS Speaker Embedding (AILA_SPK_*)
+## TTS Reference Embedding Cache (AILA_REF_*)
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `AILA_SPK_CACHE_DIR` | string | `""` | Directory for persistent speaker embedding cache. When set, cache files are stored as `<dir>/<basename>.spk.bin`. When empty (default), cache files are stored alongside the reference audio (`<audio_path>.spk.bin`). |
+| `AILA_REF_CACHE_DIR` | string | `""` | Directory for persistent speaker embedding cache. When set, cache files are stored as `<dir>/<basename>.ref.bin`. When empty (default), cache files are stored alongside the reference audio (`<audio_path>.ref.bin`). |
 
 The speaker embedding cache avoids re-extracting the same reference audio on every TTS run.
 Embeddings are cached in memory (session-lifetime) and persisted to disk.
-Set `AILA_SPK_CACHE_DIR` to a shared directory to reuse embeddings across different reference audio locations.
+Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across different reference audio locations.
 
 ---
 

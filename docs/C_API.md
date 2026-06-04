@@ -283,7 +283,7 @@ aila_synthesize(engine, "Hello!", NULL, NULL, "A deep, warm voice", NULL, NULL, 
 int aila_synthesize(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,   // NULL for default voice
+    const char* reference_audio_path,   // NULL for default voice
     const char* speaker_name,         // NULL or named voice (e.g., "vivian", "ryan")
     const char* instruct_text,        // NULL or VoiceDesign style description
     const char* language,             // NULL/"auto" or language (chinese, english, japanese, korean)
@@ -295,7 +295,7 @@ int aila_synthesize(
 One-shot TTS synthesis: text + optional voice cloning/style → WAV file. Internally handles speaker embedding extraction (with automatic caching), tokenization, synthesis, and WAV writing in a single call. No `malloc`/`free` needed.
 
 - `text` — UTF-8 text to synthesize.
-- `speaker_audio_path` — Optional reference audio (WAV/MP3/FLAC) for voice cloning. Pass `NULL` for default voice. Speaker embeddings are automatically cached in memory and on disk.
+- `reference_audio_path` — Optional reference audio (WAV/MP3/FLAC) for voice cloning. Pass `NULL` for default voice. Speaker embeddings are automatically cached in memory and on disk.
 - `speaker_name` — Optional named speaker preset for CustomVoice (e.g., `"vivian"`, `"ryan"`). Pass `NULL` to use default or reference audio.
 - `instruct_text` — Optional VoiceDesign style description (e.g., `"A deep, warm voice with a slow pace"`). Pass `NULL` if not using VoiceDesign.
 - `language` — Optional language override (`"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"`). Pass `NULL` for auto-detection.
@@ -338,7 +338,7 @@ Callback invoked whenever a chunk of audio samples is ready. The `samples` point
 int aila_synthesize_stream(
     AilaEngine* engine,
     const char* text,
-    const char* speaker_audio_path,
+    const char* reference_audio_path,
     const char* speaker_name,
     const char* instruct_text,
     const char* language,
@@ -391,7 +391,7 @@ int main() {
 
     int rc = aila_synthesize_stream(engine,
         "Hello world!",        // text
-        NULL,                  // speaker_audio_path (default voice)
+        NULL,                  // reference_audio_path (default voice)
         "vivian",              // speaker_name (CustomVoice)
         NULL,                  // instruct_text
         NULL,                  // language (auto)
@@ -805,7 +805,7 @@ lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
 lib.aila_synthesize.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # text
-    ctypes.c_char_p,          # speaker_audio_path
+    ctypes.c_char_p,          # reference_audio_path
     ctypes.c_char_p,          # speaker_name
     ctypes.c_char_p,          # instruct_text
     ctypes.c_char_p,          # language
@@ -819,7 +819,7 @@ AilaAudioCallback = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_float), ctype
 lib.aila_synthesize_stream.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # text
-    ctypes.c_char_p,          # speaker_audio_path
+    ctypes.c_char_p,          # reference_audio_path
     ctypes.c_char_p,          # speaker_name
     ctypes.c_char_p,          # instruct_text
     ctypes.c_char_p,          # language
@@ -911,7 +911,7 @@ cfg = AilaGenConfig()
 lib.aila_default_gen_config(ctypes.byref(cfg))
 rc = lib.aila_synthesize(engine,
     b"Hello world!",                     # text
-    b"./reference_speaker.wav",          # speaker_audio_path (NULL for default)
+    b"./reference_speaker.wav",          # reference_audio_path (NULL for default)
     None,                                # speaker_name (NULL for none)
     None,                                # instruct_text (NULL for none)
     None,                                # language (NULL for auto)
@@ -941,7 +941,7 @@ lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-CustomVoice", 4096)
 
 rc = lib.aila_synthesize_stream(engine,
     b"Hello world!",       # text
-    None,                  # speaker_audio_path
+    None,                  # reference_audio_path
     b"vivian",             # speaker_name (CustomVoice)
     None,                  # instruct_text
     None,                  # language
@@ -1062,7 +1062,7 @@ extern "C" {
     fn aila_synthesize(
         engine: *mut c_void,
         text: *const c_char,
-        speaker_audio_path: *const c_char,
+        reference_audio_path: *const c_char,
         speaker_name: *const c_char,
         instruct_text: *const c_char,
         language: *const c_char,
@@ -1123,7 +1123,7 @@ extern "C" {
     fn aila_synthesize_stream(
         engine: *mut c_void,
         text: *const c_char,
-        speaker_audio_path: *const c_char,
+        reference_audio_path: *const c_char,
         speaker_name: *const c_char,
         instruct_text: *const c_char,
         language: *const c_char,

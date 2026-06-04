@@ -157,7 +157,7 @@ class AilaAPI:
         self._set("aila_synthesize", c_int, [
             c_void_p,          # engine
             c_char_p,          # text
-            c_char_p,          # speaker_audio_path
+            c_char_p,          # reference_audio_path
             c_char_p,          # speaker_name
             c_char_p,          # instruct_text
             c_char_p,          # language
@@ -168,7 +168,7 @@ class AilaAPI:
         self._set("aila_synthesize_stream", c_void_p, [
             c_void_p,          # engine
             c_char_p,          # text
-            c_char_p,          # speaker_audio_path
+            c_char_p,          # reference_audio_path
             c_char_p,          # speaker_name
             c_char_p,          # instruct_text
             c_char_p,          # language
@@ -1074,13 +1074,13 @@ def test_tts(api: AilaAPI, engine):
 
     out_path = "./__test_tts_output.wav"
 
-    # Test 4a: Base mode — voice cloning via speaker_audio_path
+    # Test 4a: Base mode — voice cloning via reference_audio_path
     # Needs a 24kHz mono WAV with clear speech (~3 seconds)
     real_ref = "./This is an English test.wav"
-    spk_path = real_ref if _os.path.isfile(real_ref) else None
-    if spk_path:
+    ref_path = real_ref if _os.path.isfile(real_ref) else None
+    if ref_path:
         t0 = time.time()
-        rc = api.aila_synthesize(engine, b"Hello world", spk_path.encode(),
+        rc = api.aila_synthesize(engine, b"Hello world", ref_path.encode(),
                                   None, None, None, byref(cfg), out_path.encode())
         elapsed = time.time() - t0
         if rc == 0:

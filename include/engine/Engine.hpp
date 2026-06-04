@@ -2520,8 +2520,8 @@ public:
     //
     // Caching: results are cached in memory (keyed by audio file path) and
     // optionally persisted to disk.  Disk cache location:
-    //   - If spk_cache_dir_ is set: <cache_dir>/<basename>.spk.bin
-    //   - Otherwise: <audio_path>.spk.bin alongside the reference audio
+    //   - If ref_cache_dir_ is set: <cache_dir>/<basename>.ref.bin
+    //   - Otherwise: <audio_path>.ref.bin alongside the reference audio
     //
     // The audio file must be mono, and will be automatically resampled to 24kHz if needed.
     // Supported formats: WAV, MP3, FLAC.
@@ -2542,7 +2542,7 @@ public:
         int spk_dim = cpu_enc.embeddingDim();
 
         // 2. Check cache with correct dimension
-        if (lookupSpeakerCache(audio_path, spk_dim, embedding)) {
+        if (lookupRefCache(audio_path, spk_dim, embedding)) {
             AILA_LOG_INFO("[TTS] Speaker embedding loaded from cache (dim=%d)", spk_dim);
             return true;
         }
@@ -2599,7 +2599,7 @@ public:
         }
 
         // 4. Save to caches
-        cacheSpeakerEmbedding(audio_path, embedding);
+        cacheRefEmbedding(audio_path, embedding);
         AILA_LOG_INFO("[TTS] Speaker embedding extracted and cached (dim=%d)", spk_dim);
         return true;
     }
@@ -3325,9 +3325,9 @@ public:
     const std::string& model_dir() const { return model_dir_; }
 
     // Speaker embedding cache: avoid re-extracting the same reference audio.
-    // Set via AILA_SPK_CACHE_DIR env var or --spk-cache-dir CLI argument.
-    void setSpeakerCacheDir(const std::string& dir) { spk_cache_dir_ = dir; }
-    const std::string& speakerCacheDir() const { return spk_cache_dir_; }
+    // Set via AILA_REF_CACHE_DIR env var or --ref-cache-dir CLI argument.
+    void setRefCacheDir(const std::string& dir) { ref_cache_dir_ = dir; }
+    const std::string& refCacheDir() const { return ref_cache_dir_; }
 
     // Look up speaker token ID from spk_id map (CustomVoice).
     // Returns 0 if name is empty or not found.
@@ -3358,45 +3358,45 @@ public:
     }
 
     // Clear the in-memory speaker embedding cache.
-    void clearSpeakerCache() { spk_cache_.clear(); }
+    void clearRefCache() { ref_cache_.clear(); }
 
     // Build a cache key that includes the embedding dim so different models
     // (e.g. 0.6B=1024-dim vs 1.7B=2048-dim) don't share incompatible cache files.
-    static std::string spkCacheKey(const std::string& audio_path, int dim) {
+    static std::string refCacheKey(const std::string& audio_path, int dim) {
         return audio_path + ":dim" + std::to_string(dim);
     }
 
     // Build disk cache path from audio path and embedding dimension.
-    std::string spkDiskCachePath(const std::string& audio_path, int dim) const {
-        std::string suffix = ".dim" + std::to_string(dim) + ".spk.bin";
-        if (!spk_cache_dir_.empty()) {
+    std::string refDiskCachePath(const std::string& audio_path, int dim) const {
+        std::string suffix = ".dim" + std::to_string(dim) + ".ref.bin";
+        if (!ref_cache_dir_.empty()) {
             size_t sep = audio_path.find_last_of("/\\");
             std::string base = (sep != std::string::npos) ? audio_path.substr(sep + 1) : audio_path;
-            return spk_cache_dir_ + "/" + base + suffix;
+            return ref_cache_dir_ + "/" + base + suffix;
         }
         return audio_path + suffix;
     }
 
     // Convenience: try common embedding dimensions (1024 for 0.6B, 2048 for 1.7B).
-    bool lookupSpeakerCache(const std::string& audio_path,
+    bool lookupRefCache(const std::string& audio_path,
                             std::vector<float>& embedding) {
-        return lookupSpeakerCache(audio_path, 1024, embedding)
-            || lookupSpeakerCache(audio_path, 2048, embedding);
+        return lookupRefCache(audio_path, 1024, embedding)
+            || lookupRefCache(audio_path, 2048, embedding);
     }
 
     // Check if a speaker embedding is cached for a specific embedding dimension.
     // The 'dim_hint' is used to construct the cache key; pass the expected
     // embedding dimension (1024 for 0.6B, 2048 for 1.7B).
-    bool lookupSpeakerCache(const std::string& audio_path, int dim_hint,
+    bool lookupRefCache(const std::string& audio_path, int dim_hint,
                             std::vector<float>& embedding) {
         if (dim_hint <= 0) return false;
-        std::string key = spkCacheKey(audio_path, dim_hint);
-        auto mem_it = spk_cache_.find(key);
-        if (mem_it != spk_cache_.end()) {
+        std::string key = refCacheKey(audio_path, dim_hint);
+        auto mem_it = ref_cache_.find(key);
+        if (mem_it != ref_cache_.end()) {
             embedding = mem_it->second;
             return true;
         }
-        std::string disk_path = spkDiskCachePath(audio_path, dim_hint);
+        std::string disk_path = refDiskCachePath(audio_path, dim_hint);
         std::ifstream in(disk_path, std::ios::binary);
         if (in.is_open()) {
             in.seekg(0, std::ios::end);
@@ -3412,7 +3412,7 @@ public:
                     float norm_sq = 0.0f;
                     for (float v : embedding) norm_sq += v * v;
                     if (norm_sq > 1.0f) {
-                        spk_cache_[key] = embedding;
+                        ref_cache_[key] = embedding;
                         return true;
                     }
                     embedding.clear();
@@ -3423,13 +3423,13 @@ public:
     }
 
     // Cache an externally-extracted speaker embedding (in-memory + disk).
-    void cacheSpeakerEmbedding(const std::string& audio_path,
+    void cacheRefEmbedding(const std::string& audio_path,
                                const std::vector<float>& embedding) {
         if (embedding.empty()) return;
         int dim = static_cast<int>(embedding.size());
-        std::string key = spkCacheKey(audio_path, dim);
-        spk_cache_[key] = embedding;
-        std::string disk_path = spkDiskCachePath(audio_path, dim);
+        std::string key = refCacheKey(audio_path, dim);
+        ref_cache_[key] = embedding;
+        std::string disk_path = refDiskCachePath(audio_path, dim);
         std::error_code ec;
         std::filesystem::create_directories(
             std::filesystem::path(disk_path).parent_path(), ec);
@@ -3444,9 +3444,9 @@ public:
 
 private:
     // In-memory speaker embedding cache (keyed by audio file path).
-    std::unordered_map<std::string, std::vector<float>> spk_cache_;
+    std::unordered_map<std::string, std::vector<float>> ref_cache_;
     // Optional persistent cache directory for speaker embeddings.
-    std::string spk_cache_dir_;
+    std::string ref_cache_dir_;
 
     std::string model_dir_;
     std::string lora_dir_;

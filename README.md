@@ -110,7 +110,7 @@ Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "Hello world!" --output-wav output.wav
 
 # TTS with voice cloning (zero-shot)
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --spk ./reference_speaker.wav --output-wav cloned.wav
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "今天天气真好。" --ref ./reference_speaker.wav --output-wav cloned.wav
 
 # Single prompt from JSON file
 Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --messages-json prompt.json
@@ -154,10 +154,10 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
-| `--spk, --speaker <name_or_path>` | TTS voice: reference audio path or named voice (e.g., vivian, ryan) | (none) |
+| `--ref, --speaker <name_or_path>` | TTS voice: reference audio path or named voice (e.g., vivian, ryan) | (none) |
 | `--instruct <text>` | VoiceDesign style description for TTS (e.g., "deep warm voice") | (none) |
 | `--language <lang>` | TTS language: chinese, english, japanese, korean, auto | auto |
-| `--spk-cache-dir <dir>` | Speaker embedding cache directory | `AILA_SPK_CACHE_DIR` env |
+| `--ref-cache-dir <dir>` | Speaker embedding cache directory | `AILA_REF_CACHE_DIR` env |
 | `--stream-tts` | Stream raw 24kHz mono f32 PCM to stdout | off |
 | `--stream-batch <N>` | Frames per streaming TTS chunk | 4 |
 | `--align-text <text>` | Forced alignment: transcript text to align | (none) |
@@ -178,8 +178,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/quit`, `/exit` | Exit |
 | `/transcribe <path>` | Transcribe audio file (ASR) |
 | `/align text="..." audio=<path> [language="..."]` | Forced alignment (word-level timestamps) |
-| `/tts <text> [--spk <path>]` | Synthesize speech (TTS) with optional voice cloning |
-| `/synthesize <text> [--spk <path>]` | Alias for `/tts` |
+| `/tts <text> [--ref <path>]` | Synthesize speech (TTS) with optional voice cloning |
+| `/synthesize <text> [--ref <path>]` | Alias for `/tts` |
 | `/voice <name>` | Set TTS voice (vivian, ryan, etc.) |
 | `/clear` | Clear conversation history |
 | `/context` | Show context usage |
@@ -228,7 +228,7 @@ Aila supports **zero-shot voice cloning** for Qwen3-TTS models. The speaker embe
 # Clone a voice from reference audio
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --synthesize "你好世界" `
-    --spk ./reference_speaker.wav `
+    --ref ./reference_speaker.wav `
     --output-wav cloned_output.wav
 
 # CustomVoice — use a named speaker preset
@@ -262,7 +262,7 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
 
 The `--rep-penalty` flag controls repetition penalty (auto-set to 1.1 for TTS). Increase it (e.g. `--rep-penalty 1.3`) if the output has repetitive artifacts, or decrease it (e.g. `--rep-penalty 1.0`) for more variation.
 
-Speaker embeddings are **automatically cached**: in-memory for the session lifetime, and persisted to disk (as `<audio_path>.spk.bin`) to avoid re-extraction on subsequent runs. Use `--spk-cache-dir <dir>` or `AILA_SPK_CACHE_DIR` to store cache files in a centralized directory.
+Speaker embeddings are **automatically cached**: in-memory for the session lifetime, and persisted to disk (as `<audio_path>.ref.bin`) to avoid re-extraction on subsequent runs. Use `--ref-cache-dir <dir>` or `AILA_REF_CACHE_DIR` to store cache files in a centralized directory.
 
 ### 📄 Messages JSON Format
 
