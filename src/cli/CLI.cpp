@@ -236,6 +236,9 @@ Options:
   --speaker <name>         CustomVoice speaker name (vivian, ryan, serena, ...)
   --language <lang>        Language code: chinese, english, japanese, korean (default: auto)
   --spk-cache-dir <dir>    Speaker embedding cache directory (default: alongside audio)
+  --align-text <text>      ForceAligner: transcript text to align
+  --align-audio <path>     ForceAligner: audio file path for alignment
+  --align-lang <lang>      ForceAligner: language (default: Chinese)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -465,6 +468,21 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_stream_batch = std::max(1, std::atoi(argv[++i]));
             continue;
         }
+
+        // ForceAligner CLI args
+        if (arg == "--align-text" && i + 1 < argc) {
+            opts.align_text = argv[++i];
+            continue;
+        }
+        if (arg == "--align-audio" && i + 1 < argc) {
+            opts.align_audio = argv[++i];
+            continue;
+        }
+        if (arg == "--align-lang" && i + 1 < argc) {
+            opts.align_language = argv[++i];
+            continue;
+        }
+
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;

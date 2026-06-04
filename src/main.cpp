@@ -293,6 +293,52 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ForceAligner mode
+    if (!opts.align_audio.empty()) {
+        if (engine.model_spec().family != ModelFamily::Qwen3ForceAligner) {
+            AILA_LOG_ERROR("The loaded model does not support forced alignment! Please load a Qwen3-ForceAligner model.");
+            return 2;
+        }
+        if (opts.align_text.empty()) {
+            AILA_LOG_ERROR("--align-text is required for forced alignment mode");
+            return 2;
+        }
+
+        // Load audio file
+        AudioBuffer audio;
+        std::string load_err;
+        if (!load_audio(opts.align_audio, audio, &load_err)) {
+            AILA_LOG_ERROR("Failed to load alignment audio: %s", load_err.c_str());
+            return 2;
+        }
+
+        // Convert to mono
+        std::vector<float> mono(audio.samples.size() / audio.channels);
+        if (audio.channels > 1) {
+            for (size_t i = 0; i < mono.size(); ++i) {
+                float sum = 0;
+                for (int c = 0; c < audio.channels; ++c)
+                    sum += audio.samples[i * audio.channels + c];
+                mono[i] = sum / audio.channels;
+            }
+        } else {
+            mono = std::move(audio.samples);
+        }
+
+        auto result = engine.align(mono, audio.sample_rate,
+                                   opts.align_text, opts.align_language);
+
+        if (engine.last_error_code() != EngineErrorCode::Ok) {
+            AILA_LOG_ERROR("Alignment failed: %s", engine.last_error_message().c_str());
+            return 2;
+        }
+
+        for (const auto& w : result) {
+            std::cout << "  \"" << w.text << "\"  " << w.start_ms << "ms - " << w.end_ms << "ms" << std::endl;
+        }
+        return 0;
+    }
+
     // Run interactive loop
     return run_interactive(engine, gen_config, opts.stream_output, opts.tts_speaker_path);
 }

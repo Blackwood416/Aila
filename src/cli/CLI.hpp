@@ -68,6 +68,11 @@ struct CLIOptions {
     std::string tts_spk_cache_dir;  // --spk-cache-dir
     bool tts_stream = false;         // --stream-tts (output raw PCM to stdout)
     int tts_stream_batch = 4;        // --stream-batch <N> (frames per chunk, default 4)
+
+    // ForceAligner mode
+    std::string align_text;          // --align-text
+    std::string align_audio;         // --align-audio
+    std::string align_language = "Chinese"; // --align-lang
 };
 
 // Parse command-line arguments

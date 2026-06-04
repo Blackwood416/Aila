@@ -2653,12 +2653,8 @@ public:
             }
         }
         int audio_n_samples = static_cast<int>(mono_16k.size());
-        AILA_LOG_INFO("[Align] Audio: %d samples (%.2f s)", audio_n_samples,
-                      static_cast<float>(audio_n_samples) / 16000.0f);
-
         // 2. Encode input text
         auto [word_list, prompt_text] = aila::ForceAlignerPostProcess::encode_input(text, language);
-        AILA_LOG_INFO("[Align] Text: %zu words", word_list.size());
 
         // 3. Compute Mel spectrogram
         MelSpectrogram mel;
@@ -2726,9 +2722,6 @@ public:
         for (size_t i = 0; i < prompt_ids.size(); ++i)
             if (prompt_ids[i] == audio_pad_id) pad_positions.push_back(static_cast<int>(i));
 
-        AILA_LOG_INFO("[Align] Prompt: %zu tokens, %zu audio_pad positions",
-                      prompt_ids.size(), pad_positions.size());
-
         // 6. Run ForceAligner forward
         backend_->reset();
         cached_ids_.clear();
@@ -2775,14 +2768,6 @@ public:
 
         auto fixed_ts = aila::ForceAlignerPostProcess::fix_timestamp(raw_ts);
         auto result = aila::ForceAlignerPostProcess::build_output(word_list, fixed_ts);
-
-        for (size_t i = 0; i < result.size() && i < 5; ++i) {
-            AILA_LOG_INFO("[Align]   [%zu] \"%s\" %d-%d ms",
-                          i, result[i].text.c_str(), result[i].start_ms, result[i].end_ms);
-        }
-        if (result.size() > 5) {
-            AILA_LOG_INFO("[Align]   ... and %zu more", result.size() - 5);
-        }
 
         return result;
     }
