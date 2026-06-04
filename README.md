@@ -223,23 +223,24 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --output-wav cloned_output.wav
 
 # CustomVoice — use a named speaker preset
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker vivian `
     --synthesize "Hello world!" `
     --output-wav vivian_output.wav
 
 # VoiceDesign — describe the voice style in natural language
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+Aila.exe -m ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign `
     --instruct "A deep, warm voice with a slow pace" `
     --synthesize "Hello world!" `
     --output-wav styled_output.wav
 
-# VoiceDesign with language override
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+# CustomVoice + language + instruct override
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker ryan `
-    --language japanese `
-    --synthesize "こんにちは世界" `
-    --output-wav japanese_output.wav
+    --language english `
+    --instruct "whispering softly" `
+    --synthesize "Hello" `
+    --output-wav ryan_english.wav
 
 # Streaming TTS — real-time PCM audio output
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `

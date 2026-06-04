@@ -385,7 +385,7 @@ void audio_chunk(const float* samples, int count, void* user_data) {
 
 int main() {
     AilaEngine* engine = aila_engine_create();
-    aila_engine_init(engine, "./models/Qwen3-TTS-12Hz-0.6B-Base", 4096);
+    aila_engine_init(engine, "./models/Qwen3-TTS-12Hz-0.6B-CustomVoice", 4096);
 
     FILE* pcm_out = fopen("output.pcm", "wb");
 
@@ -828,7 +828,7 @@ def on_audio(samples_ptr, sample_count, user_data):
 
 # Start streaming synthesis
 engine = lib.aila_engine_create()
-lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-Base", 4096)
+lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-CustomVoice", 4096)
 
 rc = lib.aila_synthesize_stream(engine,
     b"Hello world!",       # text

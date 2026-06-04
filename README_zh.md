@@ -223,7 +223,7 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --output-wav cloned_output.wav
 
 # CustomVoice — 使用命名说话人预设
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker vivian `
     --synthesize "你好世界" `
     --output-wav vivian_output.wav
@@ -235,11 +235,12 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --output-wav styled_output.wav
 
 # VoiceDesign 配合语言指定
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker ryan `
-    --language japanese `
-    --synthesize "こんにちは世界" `
-    --output-wav japanese_output.wav
+    --language english `
+    --instruct "whispering softly" `
+    --synthesize "Hello" `
+    --output-wav ryan_english.wav
 
 # 流式 TTS — 实时 PCM 音频输出
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
