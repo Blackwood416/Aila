@@ -1,37 +1,29 @@
-// Streaming PCM float player for Windows (waveOut double-buffering).
-// Reads 24kHz mono f32 PCM from stdin, plays in real-time as data arrives.
+// Streaming PCM player for Windows (waveOut double-buffering).
+// Reads 24kHz mono f32 PCM from stdin pipe, plays as data arrives.
 // Compile: cl /O2 /Fe:pcm_play.exe tools/pcm_play.cpp /link winmm.lib
-// Usage: aila --stream-tts ... 2>/dev/null | pcm_play [-b prebuffer_ms]
+// Usage: aila --stream-tts ... 2>/dev/null | pcm_play
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
 #include <cstdio>
-#include <cstdlib>
 #include <cstdint>
 #include <vector>
-#include <deque>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 #include <io.h>
 #include <fcntl.h>
 
 #pragma comment(lib, "winmm.lib")
 
-static const int SAMPLE_RATE = 24000;
+static const int SAMPLE_RATE  = 24000;
+static const size_t CHUNK_F32 = SAMPLE_RATE / 5;  // 200ms of f32 samples
+static const size_t MIN_BUFFER_F32 = SAMPLE_RATE / 2; // start playing after 500ms
 
-int main(int argc, char** argv) {
+int main() {
     _setmode(_fileno(stdin), _O_BINARY);
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
-    int prebuffer_ms = 400;
-    if (argc > 1 && strcmp(argv[1], "-b") == 0 && argc > 2) {
-        prebuffer_ms = atoi(argv[2]);
-    }
-
-    // Audio format: 24kHz mono 16-bit PCM
+    // Audio format
     WAVEFORMATEX wf = {};
     wf.wFormatTag = WAVE_FORMAT_PCM;
     wf.nChannels = 1;
@@ -46,157 +38,137 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Buffer queue: reader thread fills, playback loop drains
-    static const int CHUNK_MS = 120;
-    static const size_t CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS / 1000; // 2880
-    static const int MAX_QUEUED = 6; // ~720ms of audio queued max
+    // Accumulation buffer: f32 PCM from stdin, consumed by waveOut as s16
+    std::vector<float> f32_buf;
+    f32_buf.reserve(SAMPLE_RATE * 10);
+    // Separate s16 buffers per waveOut header (prevents pointer invalidation)
+    std::vector<int16_t> s16_a, s16_b;
 
-    struct Chunk {
-        std::vector<int16_t> data;
-        bool ready = false;
-    };
-    std::deque<Chunk> chunks;
-
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::atomic<bool> input_done{false};
     size_t total_read = 0;
     size_t total_played = 0;
+    bool pipe_closed = false;
+    bool started = false;
 
-    // Pre-allocate chunks
-    for (int i = 0; i < MAX_QUEUED * 2; ++i) {
-        Chunk c;
-        c.data.resize(CHUNK_SAMPLES);
-        chunks.push_back(std::move(c));
-    }
+    WAVEHDR hdr_a = {}, hdr_b = {};
+    bool b_active = false;
 
-    // Reader thread: reads f32 from stdin, converts to s16, fills chunks
-    std::thread reader([&]() {
-        std::vector<float> fbuf(CHUNK_SAMPLES);
-        size_t chunk_idx = 0;
+    float tmp[512]; // small read buffer
+    DWORD avail = 0;
 
-        while (true) {
-            size_t n = fread(fbuf.data(), sizeof(float), CHUNK_SAMPLES, stdin);
-            if (n == 0) break;
-
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                // Find next free chunk (cycling through pool)
-                int tries = 0;
-                while (chunks[chunk_idx % chunks.size()].ready && tries < 100) {
-                    cv.wait_for(lock, std::chrono::milliseconds(20));
-                    tries++;
-                }
-                auto& c = chunks[chunk_idx % chunks.size()];
-                c.data.resize(n);
-                for (size_t i = 0; i < n; ++i) {
-                    float s = fbuf[i];
-                    if (s < -1.0f) s = -1.0f; else if (s > 1.0f) s = 1.0f;
-                    c.data[i] = static_cast<int16_t>(s * 32767.0f);
-                }
-                c.ready = true;
-                total_read += n;
-                chunk_idx++;
-            }
-            cv.notify_one();
-        }
-
-        input_done = true;
-        cv.notify_one();
-    });
-
-    // Wait for pre-buffer to fill
-    fprintf(stderr, "pcm_play: buffering %dms...\r", prebuffer_ms);
+    fprintf(stderr, "pcm_play: buffering...\r");
     fflush(stderr);
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait_for(lock, std::chrono::milliseconds(prebuffer_ms),
-            [&]() { return total_read >= SAMPLE_RATE * prebuffer_ms / 1000 || input_done; });
-    }
 
-    if (total_read == 0) {
-        fprintf(stderr, "pcm_play: no input\n");
-        input_done = true;
-        cv.notify_all();
-        reader.join();
-        waveOutClose(hwo);
-        return 1;
-    }
-
-    fprintf(stderr, "pcm_play: playing (%.1fs buffered)   \n",
-            (double)total_read / SAMPLE_RATE);
-
-    // Playback loop: dequeue ready chunks, send to waveOut, recycle completed
-    size_t play_idx = 0;
-    std::vector<WAVEHDR> active_hdrs;
-    std::vector<size_t> active_indices;
-    bool playback_done = false;
-
-    while (!playback_done) {
-        // Queue new chunks for playback
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-            while (play_idx < chunks.size() && chunks[play_idx].ready
-                   && active_hdrs.size() < 3) {
-                auto& c = chunks[play_idx];
-
-                WAVEHDR hdr = {};
-                hdr.lpData = reinterpret_cast<LPSTR>(c.data.data());
-                hdr.dwBufferLength = static_cast<DWORD>(c.data.size() * 2);
-                waveOutPrepareHeader(hwo, &hdr, sizeof(WAVEHDR));
-                waveOutWrite(hwo, &hdr, sizeof(WAVEHDR));
-
-                active_hdrs.push_back(hdr);
-                active_indices.push_back(play_idx);
-                play_idx++;
-            }
-        }
-
-        // Reclaim completed headers
-        for (size_t i = 0; i < active_hdrs.size(); ) {
-            if (active_hdrs[i].dwFlags & WHDR_DONE) {
-                waveOutUnprepareHeader(hwo, &active_hdrs[i], sizeof(WAVEHDR));
-                total_played += active_hdrs[i].dwBufferLength / 2;
-
-                // Mark chunk as free
-                size_t idx = active_indices[i];
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    chunks[idx].ready = false;
+    while (!pipe_closed || total_played < total_read) {
+        // --- Read more data from pipe ---
+        if (!pipe_closed) {
+            if (PeekNamedPipe(hStdin, NULL, 0, NULL, &avail, NULL) && avail >= sizeof(float)) {
+                DWORD to_read = std::min<DWORD>(avail, sizeof(tmp));
+                DWORD bytes_read = 0;
+                if (ReadFile(hStdin, tmp, to_read, &bytes_read, NULL) && bytes_read > 0) {
+                    size_t n = bytes_read / sizeof(float);
+                    f32_buf.insert(f32_buf.end(), tmp, tmp + n);
+                    total_read += n;
                 }
-                cv.notify_one();
-
-                active_hdrs.erase(active_hdrs.begin() + i);
-                active_indices.erase(active_indices.begin() + i);
+            } else if (avail == 0) {
+                Sleep(10); // pipe empty, wait for more data
             } else {
-                ++i;
+                pipe_closed = true;
             }
         }
 
-        // Check if done
-        if (input_done && active_hdrs.empty()) {
-            bool all_consumed = true;
-            std::lock_guard<std::mutex> lock(mtx);
-            for (size_t i = 0; i < chunks.size(); ++i) {
-                if (chunks[i].ready) all_consumed = false;
+        // --- Start playback once enough buffered ---
+        if (!started && total_read >= MIN_BUFFER_F32) {
+            started = true;
+            fprintf(stderr, "pcm_play: playing (%.1fs buffered)\n",
+                    (double)total_read / SAMPLE_RATE);
+            size_t sz = std::min(CHUNK_F32, total_read - total_played);
+            s16_a.resize(sz);
+            for (size_t i = 0; i < sz; ++i) {
+                float s = f32_buf[i];
+                if (s < -1.0f) s = -1.0f; else if (s > 1.0f) s = 1.0f;
+                s16_a[i] = static_cast<int16_t>(s * 32767.0f);
             }
-            if (all_consumed) playback_done = true;
+            hdr_a.lpData = reinterpret_cast<LPSTR>(s16_a.data());
+            hdr_a.dwBufferLength = static_cast<DWORD>(sz * 2);
+            waveOutPrepareHeader(hwo, &hdr_a, sizeof(WAVEHDR));
+            waveOutWrite(hwo, &hdr_a, sizeof(WAVEHDR));
+            total_played += sz;
         }
 
-        // Progress indicator
-        if (total_read > 0 && (total_played % (SAMPLE_RATE * 2) < CHUNK_SAMPLES)) {
+        if (started) {
+            // Reclaim completed buffer A, refill
+            if ((hdr_a.dwFlags & WHDR_DONE) && total_played < total_read) {
+                waveOutUnprepareHeader(hwo, &hdr_a, sizeof(WAVEHDR));
+                size_t sz = std::min(CHUNK_F32, total_read - total_played);
+                s16_a.resize(sz);
+                for (size_t i = 0; i < sz; ++i) {
+                    float s = f32_buf[total_played + i];
+                    if (s < -1.0f) s = -1.0f; else if (s > 1.0f) s = 1.0f;
+                    s16_a[i] = static_cast<int16_t>(s * 32767.0f);
+                }
+                hdr_a = {};
+                hdr_a.lpData = reinterpret_cast<LPSTR>(s16_a.data());
+                hdr_a.dwBufferLength = static_cast<DWORD>(sz * 2);
+                waveOutPrepareHeader(hwo, &hdr_a, sizeof(WAVEHDR));
+                waveOutWrite(hwo, &hdr_a, sizeof(WAVEHDR));
+                total_played += sz;
+            }
+
+            // Reclaim completed buffer B, refill
+            if (b_active && (hdr_b.dwFlags & WHDR_DONE) && total_played < total_read) {
+                waveOutUnprepareHeader(hwo, &hdr_b, sizeof(WAVEHDR));
+                size_t sz = std::min(CHUNK_F32, total_read - total_played);
+                s16_b.resize(sz);
+                for (size_t i = 0; i < sz; ++i) {
+                    float s = f32_buf[total_played + i];
+                    if (s < -1.0f) s = -1.0f; else if (s > 1.0f) s = 1.0f;
+                    s16_b[i] = static_cast<int16_t>(s * 32767.0f);
+                }
+                hdr_b = {};
+                hdr_b.lpData = reinterpret_cast<LPSTR>(s16_b.data());
+                hdr_b.dwBufferLength = static_cast<DWORD>(sz * 2);
+                waveOutPrepareHeader(hwo, &hdr_b, sizeof(WAVEHDR));
+                waveOutWrite(hwo, &hdr_b, sizeof(WAVEHDR));
+                total_played += sz;
+            }
+
+            // Start second buffer for overlap
+            if (!b_active && total_played > CHUNK_F32 && total_read - total_played >= CHUNK_F32 / 2) {
+                size_t sz = std::min(CHUNK_F32, total_read - total_played);
+                s16_b.resize(sz);
+                for (size_t i = 0; i < sz; ++i) {
+                    float s = f32_buf[total_played + i];
+                    if (s < -1.0f) s = -1.0f; else if (s > 1.0f) s = 1.0f;
+                    s16_b[i] = static_cast<int16_t>(s * 32767.0f);
+                }
+                hdr_b = {};
+                hdr_b.lpData = reinterpret_cast<LPSTR>(s16_b.data());
+                hdr_b.dwBufferLength = static_cast<DWORD>(sz * 2);
+                waveOutPrepareHeader(hwo, &hdr_b, sizeof(WAVEHDR));
+                waveOutWrite(hwo, &hdr_b, sizeof(WAVEHDR));
+                b_active = true;
+                total_played += sz;
+            }
+
+            // Progress
             fprintf(stderr, "pcm_play: %.1f / %.1fs\r",
                     (double)total_played / SAMPLE_RATE,
-                    (double)total_read / SAMPLE_RATE);
+                    total_read > 0 ? (double)total_read / SAMPLE_RATE : 0.0);
             fflush(stderr);
         }
 
-        if (!playback_done) Sleep(10);
+        Sleep(10);
+    }
+
+    // Wait for final buffers
+    while (!(hdr_a.dwFlags & WHDR_DONE)) Sleep(5);
+    waveOutUnprepareHeader(hwo, &hdr_a, sizeof(WAVEHDR));
+    if (b_active) {
+        while (!(hdr_b.dwFlags & WHDR_DONE)) Sleep(5);
+        waveOutUnprepareHeader(hwo, &hdr_b, sizeof(WAVEHDR));
     }
 
     waveOutClose(hwo);
-    reader.join();
-
-    fprintf(stderr, "\npcm_play: done (%.1fs)\n", (double)total_played / SAMPLE_RATE);
+    fprintf(stderr, "\npcm_play: done (%.1fs)\n", (double)total_read / SAMPLE_RATE);
     return 0;
 }
