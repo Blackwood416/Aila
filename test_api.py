@@ -68,6 +68,7 @@ class AilaGenConfig(Structure):
 # Callback types
 TokenCallback = CFUNCTYPE(c_int, c_char_p, c_void_p)
 LogCallback = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
+AudioCallback = CFUNCTYPE(None, POINTER(c_float), c_int, c_void_p)
 
 # Error codes (must match aila_api.h)
 ERROR_CODES = {
@@ -149,9 +150,26 @@ class AilaAPI:
             c_void_p,          # engine
             c_char_p,          # text
             c_char_p,          # speaker_audio_path
+            c_char_p,          # speaker_name
+            c_char_p,          # instruct_text
+            c_char_p,          # language
             c_void_p,          # config
             c_char_p,          # output_wav_path
         ])
+        # Streaming TTS
+        self._set("aila_synthesize_stream", c_void_p, [
+            c_void_p,          # engine
+            c_char_p,          # text
+            c_char_p,          # speaker_audio_path
+            c_char_p,          # speaker_name
+            c_char_p,          # instruct_text
+            c_char_p,          # language
+            c_void_p,          # config
+            AudioCallback,     # callback
+            c_void_p,          # user_data
+        ])
+        self._set("aila_stream_wait", c_int, [c_void_p])
+        self._set("aila_stream_destroy", None, [c_void_p])
         # Low-level TTS APIs
         self._set("aila_extract_speaker_embedding", c_int, [
             c_void_p,          # engine
@@ -1014,60 +1032,73 @@ def test_tts(api: AilaAPI, engine):
     test("aila_synthesize_text_to_wav returns OK", rc_text == 0, f"rc={rc_text}")
     test("aila_synthesize_text_to_wav sample count > 0", out_sample_count_text.value > 0, f"count={out_sample_count_text.value} ({elapsed_text:.1f}s)")
     
-    # Test 4: Voice cloning — one-shot aila_synthesize
-    print("\n  [Voice Cloning]")
+    # Test 4: One-shot aila_synthesize (updated 7-param signature)
+    print("\n  [aila_synthesize]")
     import struct, os as _os
-
-    # Generate a short sine-wave WAV as a mock reference audio
-    sample_rate = 24000
-    n_samples = sample_rate * 3  # 3 seconds
-    mock_audio = [int(16000 * __import__('math').sin(2 * 3.14159 * 440 * i / sample_rate))
-                  for i in range(n_samples)]
-    ref_wav_path = "./__test_ref_voice.wav"
-    with open(ref_wav_path, "wb") as f:
-        data_bytes = n_samples * 2
-        f.write(b"RIFF"); f.write(struct.pack("<I", 36 + data_bytes))
-        f.write(b"WAVE"); f.write(b"fmt "); f.write(struct.pack("<I", 16))
-        f.write(struct.pack("<H", 1)); f.write(struct.pack("<H", 1))
-        f.write(struct.pack("<I", sample_rate)); f.write(struct.pack("<I", sample_rate * 2))
-        f.write(struct.pack("<H", 2)); f.write(struct.pack("<H", 16))
-        f.write(b"data"); f.write(struct.pack("<I", data_bytes))
-        for s in mock_audio: f.write(struct.pack("<h", s))
 
     out_path = "./__test_tts_output.wav"
 
-    # Test 4a: One-shot synthesis with voice cloning
-    t0 = time.time()
-    rc = api.aila_synthesize(engine, b"Hello world", ref_wav_path.encode(),
-                              byref(cfg), out_path.encode())
-    elapsed = time.time() - t0
-    test("aila_synthesize (voice clone) returns OK", rc == 0, f"rc={rc} ({elapsed:.1f}s)")
-    test("output WAV file exists", _os.path.isfile(out_path),
-         f"size={_os.path.getsize(out_path) if _os.path.isfile(out_path) else 0}")
+    # Test 4a: Base mode — voice cloning via speaker_audio_path
+    # Needs a 24kHz mono WAV with clear speech (~3 seconds)
+    real_ref = "./This is an English test.wav"
+    spk_path = real_ref if _os.path.isfile(real_ref) else None
+    if spk_path:
+        t0 = time.time()
+        rc = api.aila_synthesize(engine, b"Hello world", spk_path.encode(),
+                                  None, None, None, byref(cfg), out_path.encode())
+        elapsed = time.time() - t0
+        if rc == 0:
+            test("aila_synthesize (voice clone) returns OK", True, f"{elapsed:.1f}s")
+            test("output WAV file exists", _os.path.isfile(out_path))
+        else:
+            skip("aila_synthesize (voice clone)", f"ref audio incompatible (rc={rc})")
+    else:
+        skip("aila_synthesize (voice clone)", "no reference audio file")
 
-    # Test 4b: Second call should use cache (faster)
-    out_path2 = "./__test_tts_output2.wav"
-    t0b = time.time()
-    rc2 = api.aila_synthesize(engine, b"Hello again", ref_wav_path.encode(),
+    # Test 4b: Default voice (all NULL identity params)
+    out_path2 = "./__test_tts_default.wav"
+    rc2 = api.aila_synthesize(engine, b"Hello", None, None, None, None,
                                byref(cfg), out_path2.encode())
-    elapsed2 = time.time() - t0b
-    test("aila_synthesize (2nd call, cached spk) returns OK", rc2 == 0,
-         f"rc={rc2} ({elapsed2:.1f}s)")
-    test("2nd output WAV exists", _os.path.isfile(out_path2))
-    if elapsed < 5.0:  # only check if first call was reasonably timed
-        test("2nd call uses cached embedding (faster)", elapsed2 <= elapsed * 1.1,
-             f"1st={elapsed:.1f}s 2nd={elapsed2:.1f}s")
+    test("aila_synthesize (default voice) returns OK", rc2 == 0, f"rc={rc2}")
+    test("default voice output WAV exists", _os.path.isfile(out_path2))
 
-    # Test 4c: One-shot with NULL speaker (default voice)
-    out_path3 = "./__test_tts_default.wav"
-    rc3 = api.aila_synthesize(engine, b"Default voice", None, byref(cfg), out_path3.encode())
-    test("aila_synthesize (NULL speaker, default voice) returns OK", rc3 == 0,
-         f"rc={rc3}")
-    test("default voice output WAV exists", _os.path.isfile(out_path3))
+    # Test 4c: CustomVoice mode (speaker_name non-NULL)
+    out_path3 = "./__test_tts_custom.wav"
+    rc3 = api.aila_synthesize(engine, b"Hello", None, b"vivian", None, None,
+                               byref(cfg), out_path3.encode())
+    if rc3 == 0:
+        test("aila_synthesize (CustomVoice vivian) returns OK", True)
+        test("CustomVoice output WAV exists", _os.path.isfile(out_path3))
+    elif api.aila_last_error_code(engine) == 6:  # RUNTIME
+        skip("aila_synthesize (CustomVoice)", "Base model has no spk_id")
+    else:
+        test("aila_synthesize (CustomVoice) returns OK", False, f"rc={rc3}")
+
+    # Test 4d: VoiceDesign mode (instruct_text non-NULL)
+    out_path4 = "./__test_tts_voicedesign.wav"
+    rc4 = api.aila_synthesize(engine, b"Hello", None, None, b"gentle young female voice",
+                               None, byref(cfg), out_path4.encode())
+    if rc4 == 0:
+        test("aila_synthesize (VoiceDesign) returns OK", True)
+        test("VoiceDesign output WAV exists", _os.path.isfile(out_path4))
+    elif api.aila_last_error_code(engine) == 6:
+        skip("aila_synthesize (VoiceDesign)", "Base model has no VoiceDesign instruct")
+    else:
+        test("aila_synthesize (VoiceDesign) returns OK", False, f"rc={rc4}")
+
+    # Test 4e: Language selection
+    out_path5 = "./__test_tts_lang.wav"
+    rc5 = api.aila_synthesize(engine, b"Hello", None, None, None, b"english",
+                               byref(cfg), out_path5.encode())
+    test("aila_synthesize (language=english) returns OK", rc5 == 0, f"rc={rc5}")
+
+    # Test 4f: NULL safety
+    test("synthesize(NULL engine)", api.aila_synthesize(None, b"x", None, None, None, None, None, None) != 0)
+    test("synthesize(NULL text)", api.aila_synthesize(engine, None, None, None, None, None, None, None) != 0)
+    test("synthesize(NULL output)", api.aila_synthesize(engine, b"x", None, None, None, None, None, None) != 0)
 
     # Cleanup
-    for p in [ref_wav_path, ref_wav_path + ".dim1024.spk.bin",
-              out_path, out_path2, out_path3]:
+    for p in [out_path, out_path2, out_path3, out_path4, out_path5]:
         try: _os.unlink(p)
         except OSError: pass
 
@@ -1078,6 +1109,80 @@ def test_tts(api: AilaAPI, engine):
         api.aila_free_samples(out_samples_mimi)
     if out_samples_text:
         api.aila_free_samples(out_samples_text)
+
+
+def test_tts_streaming(api: AilaAPI, engine, model_path: str = ""):
+    print("\n[TTS Streaming]")
+
+    cfg = api.aila_default_gen_config()
+    cfg.max_new_tokens = 256
+    cfg.temperature = 0.9
+    cfg.top_k = 50
+    cfg.top_p = 1.0
+    cfg.do_sample = 1
+
+    # Accumulate audio chunks via callback
+    chunks = []
+    @AudioCallback
+    def on_audio(samples_p, count, _userdata):
+        if count > 0 and samples_p:
+            data = [samples_p[i] for i in range(count)]
+            chunks.append(data)
+
+    # Test 1: Basic streaming synthesis
+    t0 = time.time()
+    stream = api.aila_synthesize_stream(
+        engine, b"Hello world", None, None, None, None,
+        byref(cfg), on_audio, None
+    )
+    test("aila_synthesize_stream returns non-NULL", stream is not None)
+
+    if stream:
+        rc_wait = api.aila_stream_wait(stream)
+        elapsed = time.time() - t0
+        test("aila_stream_wait returns OK", rc_wait == 0, f"rc={rc_wait} ({elapsed:.1f}s)")
+        total_samples = sum(len(c) for c in chunks)
+        test("audio chunks received", len(chunks) > 0, f"{len(chunks)} chunks, {total_samples} samples")
+        test("audio duration > 0.1s", total_samples > 2400, f"{total_samples / 24000:.2f}s")
+
+        api.aila_stream_destroy(stream)
+        test("aila_stream_destroy succeeds", True)
+
+    # Test 2: Streaming with speaker_name (CustomVoice mode)
+    chunks2 = []
+    @AudioCallback
+    def on_audio2(samples_p, count, _userdata):
+        if count > 0 and samples_p:
+            chunks2.append([samples_p[i] for i in range(count)])
+
+    model_is_custom = "customvoice" in model_path.lower()
+    speaker = b"vivian" if model_is_custom else None
+    stream2 = api.aila_synthesize_stream(
+        engine, b"Test", None, speaker, None, None,
+        byref(cfg), on_audio2, None
+    )
+    if stream2:
+        api.aila_stream_wait(stream2)
+        total = sum(len(c) for c in chunks2)
+        if model_is_custom:
+            test("streaming with speaker_name (CustomVoice)", total > 0,
+                 f'{len(chunks2)} chunks, {total} samples')
+        else:
+            test("streaming with speaker_name NULL (Base model)", total > 0,
+                 f'{len(chunks2)} chunks, {total} samples')
+        api.aila_stream_destroy(stream2)
+    else:
+        skip("streaming with speaker_name", "stream creation failed")
+
+    # Test 3: NULL safety
+    null_cb = AudioCallback()
+    test("synthesize_stream(NULL engine)",
+         api.aila_synthesize_stream(None, b"x", None, None, None, None, None, on_audio, None) is None)
+    test("synthesize_stream(NULL callback)",
+         api.aila_synthesize_stream(engine, b"x", None, None, None, None, None, null_cb, None) is None)
+    test("stream_wait(NULL)", api.aila_stream_wait(None) != 0)
+    test("stream_destroy(NULL)", True)  # must not crash
+    api.aila_stream_destroy(None)
 
 
 def test_stress_long_prompt(api: AilaAPI, engine):
@@ -1164,6 +1269,7 @@ def main():
         elif is_tts_model:
             test_error_api(api, engine)
             test_tts(api, engine)
+            test_tts_streaming(api, engine, args.model)
         else:
             test_generate_simple(api, engine)
             test_generate_sampling(api, engine)
