@@ -1857,12 +1857,33 @@ bool Qwen3TTSBackend::init_mimi_stream(Context& ctx, MimiStreamState& state, int
 bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     const std::vector<int32_t>& codes, int new_frames,
     MimiStreamState& state, std::vector<float>& out_samples) {
-    // Will be implemented in Task 3
-    return false;
+    if (!mimi_loaded_ || new_frames <= 0) return false;
+
+    // Accumulate codes
+    state.accumulated_codes.insert(state.accumulated_codes.end(),
+        codes.begin(), codes.begin() + static_cast<size_t>(new_frames) * 16);
+    int total_frames = static_cast<int>(state.accumulated_codes.size()) / 16;
+
+    // Full decode on all accumulated codes
+    // With RTF < 1, reprocessing all frames is ~20-50ms per batch
+    std::vector<float> full_samples;
+    if (!decode_mimi_vocoder(ctx, state.accumulated_codes, total_frames, full_samples)) {
+        return false;
+    }
+
+    // Slice: extract only new audio since last call
+    int new_sample_count = static_cast<int>(full_samples.size()) - state.last_audio_sample_count;
+    if (new_sample_count > 0) {
+        out_samples.assign(full_samples.begin() + state.last_audio_sample_count,
+                           full_samples.end());
+    }
+    state.last_audio_sample_count = static_cast<int>(full_samples.size());
+    state.total_frames = total_frames;
+
+    return true;
 }
 
 bool Qwen3TTSBackend::decode_mimi_flush(Context& ctx, MimiStreamState& state,
     std::vector<float>& out_samples) {
-    // Will be implemented in Task 4
     return true;
 }

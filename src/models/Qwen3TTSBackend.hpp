@@ -58,12 +58,19 @@ public:
         Tensor latent_buffer;   // [total_frames, 512]
         Tensor preconv_buffer;  // [total_frames, 1024]
 
+        // Accumulated codec tokens (flattened: total_frames * 16)
+        std::vector<int32_t> accumulated_codes;
+        // Track previous audio output position for incremental slicing
+        int last_audio_sample_count = 0;
+
         void reset() {
             total_frames = 0;
             k_cache.clear();
             v_cache.clear();
             latent_buffer = Tensor();
             preconv_buffer = Tensor();
+            accumulated_codes.clear();
+            last_audio_sample_count = 0;
         }
     };
 
