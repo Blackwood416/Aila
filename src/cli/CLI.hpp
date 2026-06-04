@@ -67,6 +67,7 @@ struct CLIOptions {
     std::string tts_language;       // --language ("chinese", "english", etc.)
     std::string tts_spk_cache_dir;  // --spk-cache-dir
     bool tts_stream = false;         // --stream-tts (output raw PCM to stdout)
+    int tts_stream_batch = 4;        // --stream-batch <N> (frames per chunk, default 4)
 };
 
 // Parse command-line arguments

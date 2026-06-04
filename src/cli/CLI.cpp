@@ -461,6 +461,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_stream = true;
             continue;
         }
+        if (arg == "--stream-batch" && i + 1 < argc) {
+            opts.tts_stream_batch = std::max(1, std::atoi(argv[++i]));
+            continue;
+        }
         if (arg == "--asr-past") {
             opts.past_text_conditioning = true;
             continue;

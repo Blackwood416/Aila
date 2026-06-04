@@ -233,6 +233,12 @@ int main(int argc, char** argv) {
             _setmode(_fileno(stdout), _O_BINARY);
 #endif
             std::atomic<bool> done{false};
+            // Batch size: CLI > env AILA_TTS_STREAM_BATCH > default 4
+            int batch = opts.tts_stream_batch;
+            if (batch <= 1) {
+                batch = aila::env::read_int_raw("AILA_TTS_STREAM_BATCH", 4);
+                if (batch <= 1) batch = 4;
+            }
             auto worker = engine.synthesizeSpeechStream(
                 input_text, opts.tts_speaker_path, opts.tts_speaker_name,
                 opts.tts_instruct_text, opts.tts_language, tts_gen,
@@ -241,7 +247,7 @@ int main(int argc, char** argv) {
                         fwrite(samples, sizeof(float), static_cast<size_t>(count), stdout);
                         fflush(stdout);
                     }
-                }, 4);
+                }, batch);
             worker.join();
             done = true;
             AILA_LOG_INFO("TTS streaming complete");
