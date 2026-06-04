@@ -65,6 +65,14 @@ class AilaGenConfig(Structure):
     ]
 
 
+class AilaAlignedWord(Structure):
+    _fields_ = [
+        ("text",      c_char_p),
+        ("start_ms",  c_int),
+        ("end_ms",    c_int),
+    ]
+
+
 # Callback types
 TokenCallback = CFUNCTYPE(c_int, c_char_p, c_void_p)
 LogCallback = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
@@ -203,6 +211,22 @@ class AilaAPI:
             c_void_p,          # config
             POINTER(POINTER(c_float)), # out_samples
             POINTER(c_int)     # out_sample_count
+        ])
+
+        # ForceAligner API
+        self._set("aila_align", c_int, [
+            c_void_p,             # engine
+            POINTER(c_float),     # audio_samples
+            c_int,                # num_samples
+            c_int,                # sample_rate
+            c_char_p,             # text
+            c_char_p,             # language
+            POINTER(POINTER(AilaAlignedWord)),  # out_words
+            POINTER(c_int)        # out_count
+        ])
+        self._set("aila_free_aligned_words", None, [
+            POINTER(AilaAlignedWord),  # words
+            c_int                      # count
         ])
 
     def _set(self, name, restype, argtypes):
@@ -1185,6 +1209,98 @@ def test_tts_streaming(api: AilaAPI, engine, model_path: str = ""):
     api.aila_stream_destroy(None)
 
 
+def test_align(api: AilaAPI, engine):
+    print("\n[ForceAligner]")
+
+    # --- NULL safety ---
+    null_words = POINTER(AilaAlignedWord)()
+    null_count = c_int(0)
+
+    test("align(NULL engine)",
+         api.aila_align(None, None, 0, 16000, b"hello", b"English",
+                        byref(null_words), byref(null_count)) != 0)
+    test("align(NULL audio_samples)",
+         api.aila_align(engine, None, 100, 16000, b"hello", b"English",
+                        byref(null_words), byref(null_count)) != 0)
+    test("align(num_samples <= 0)",
+         api.aila_align(engine, (c_float * 1)(0.0), 0, 16000, b"hello", b"English",
+                        byref(null_words), byref(null_count)) != 0)
+    test("align(NULL text)",
+         api.aila_align(engine, (c_float * 10)(*[0.0] * 10), 10, 16000,
+                        None, b"English",
+                        byref(null_words), byref(null_count)) != 0)
+    test("align(NULL language)",
+         api.aila_align(engine, (c_float * 10)(*[0.0] * 10), 10, 16000,
+                        b"hello", None,
+                        byref(null_words), byref(null_count)) != 0)
+    test("align(NULL out_words)",
+         api.aila_align(engine, (c_float * 10)(*[0.0] * 10), 10, 16000,
+                        b"hello", b"English", None, byref(null_count)) != 0)
+
+    # --- Non-ForceAligner model defense ---
+    # The engine backend check will reject non-FA models; this tests the error path
+    import math
+
+    # Generate a short 16kHz mono sine wave (0.5s)
+    sample_rate = 16000
+    duration = 0.5
+    n_samples = int(sample_rate * duration)
+    freq = 440.0
+    samples = [math.sin(2.0 * math.pi * freq * i / sample_rate) * 0.5 for i in range(n_samples)]
+    samples_arr = (c_float * n_samples)(*samples)
+
+    out_words = POINTER(AilaAlignedWord)()
+    out_count = c_int(0)
+
+    rc = api.aila_align(engine, samples_arr, n_samples, sample_rate,
+                         b"hello world", b"English",
+                         byref(out_words), byref(out_count))
+    if rc != 0:
+        err_code = api.aila_last_error_code(engine)
+        err_msg_p = api.aila_last_error_message(engine)
+        err_msg = err_msg_p.decode("utf-8", errors="replace") if err_msg_p else "(null)"
+        test("align (non-FA model) returns error", True,
+             f"rc={rc} err=({err_code}) {err_msg}")
+        return
+
+    # --- Success path (ForceAligner model) ---
+    test("aila_align returns OK (rc=0)", rc == 0)
+    test("out_count > 0", out_count.value > 0, f"count={out_count.value}")
+
+    if out_count.value > 0 and out_words:
+        # Read the array of AilaAlignedWord structs
+        array_type = AilaAlignedWord * out_count.value
+        word_array = ctypes.cast(out_words, POINTER(array_type)).contents
+        n_words = out_count.value
+
+        all_texts = []
+        monotonic = True
+        prev_end = -1
+        for i in range(n_words):
+            w = word_array[i]
+            text = w.text.decode("utf-8", errors="replace") if w.text else ""
+            all_texts.append(text)
+            if w.start_ms < 0 or w.end_ms < w.start_ms:
+                monotonic = False
+            if prev_end >= 0 and w.start_ms < prev_end:
+                monotonic = False
+            prev_end = w.end_ms
+
+        test("all word texts non-empty", all(t != "" for t in all_texts),
+             f"{all_texts[:5]}{'...' if n_words > 5 else ''}")
+        test("timestamps monotonic (start <= end, non-decreasing)", monotonic,
+             f"n={n_words} range=[{word_array[0].start_ms}-{word_array[n_words-1].end_ms}]ms")
+
+    # Free
+    if out_words and out_count.value > 0:
+        api.aila_free_aligned_words(out_words, out_count.value)
+        test("aila_free_aligned_words succeeds (no crash)", True)
+
+    # NULL free safety
+    api.aila_free_aligned_words(None, 0)
+    test("aila_free_aligned_words(NULL, 0) safe", True)
+
+
 def test_stress_long_prompt(api: AilaAPI, engine):
     print("\n[Stress — long prompt]")
     cfg = api.aila_default_gen_config()
@@ -1262,7 +1378,10 @@ def main():
     else:
         is_asr_model = "asr" in args.model.lower()
         is_tts_model = "tts" in args.model.lower()
-        if is_asr_model:
+        is_align_model = "align" in args.model.lower()
+        if is_align_model:
+            test_align(api, engine)
+        elif is_asr_model:
             test_error_api(api, engine)
             test_generate_messages(api, engine)
             test_transcribe(api, engine, args.model)
