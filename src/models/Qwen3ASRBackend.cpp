@@ -135,7 +135,7 @@ void Qwen3ASRBackend::clear_mrope_positions() {
 
 bool Qwen3ASRBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
                              int max_seq_len, std::string* error_message) {
-    if (spec.family != ModelFamily::Qwen3ASR) {
+    if (spec.family != ModelFamily::Qwen3ASR && spec.family != ModelFamily::Qwen3ForceAligner) {
         if (error_message) *error_message = "Qwen3ASRBackend: invalid model family";
         return false;
     }

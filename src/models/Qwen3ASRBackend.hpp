@@ -44,6 +44,7 @@ private:
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
 
+protected:
     Qwen3Config cfg_{};
     RopeSpec rope_{};
     int max_seq_len_ = 0;
@@ -85,6 +86,7 @@ private:
         Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
 
+private:
     int runtime_seq_capacity_ = 0;
     int prefill_scores_capacity_ = 0;
     int incr_prefill_seq_cap_ = 0;
