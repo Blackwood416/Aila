@@ -447,6 +447,15 @@ namespace ops {
     // src: [R, C], dst: [C, R]
     void transpose(Context& ctx, Tensor& src, Tensor& dst);
 
+    // Incremental attention prefill with pre-existing KV cache.
+    // Processes q[new_tokens, heads*dim] against cached K/V from prior steps.
+    void attention_prefill_cached(Context& ctx,
+                                   Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                   Tensor& output, Tensor& scores_buf,
+                                   int seq_len, int start_pos,
+                                   int num_heads, int num_kv_heads,
+                                   int head_dim, int max_seq_len);
+
     // Sinusoidal position embedding (in-place add, used by audio encoder).
     // input: [seq_len, d_model] bf16, modified in-place.
     void sinusoidal_position_embedding(Context& ctx, Tensor& input,
