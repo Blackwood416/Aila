@@ -196,11 +196,16 @@ void parse_qwen3_asr(simdjson::dom::element root, ModelSpec& spec) {
     read_int64(thinker, "audio_end_token_id", spec.audio_end_token_id);
 
     // --- Detect forced_aligner subtype ---
+    // Check thinker_config.model_type first, fall back to classify_num > 0
+    // (NF4 export rewrites model_type to "qwen3_asr_thinker" but keeps classify_num).
     {
         std::string thinker_type = read_string(thinker, "model_type");
         if (thinker_type == "qwen3_forced_aligner") {
             spec.family = ModelFamily::Qwen3ForceAligner;
-            read_int64(thinker, "classify_num", spec.classify_num);
+        }
+        read_int64(thinker, "classify_num", spec.classify_num);
+        if (spec.classify_num > 0) {
+            spec.family = ModelFamily::Qwen3ForceAligner;
         }
     }
 

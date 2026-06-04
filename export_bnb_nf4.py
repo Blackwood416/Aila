@@ -116,6 +116,11 @@ def resolve_keep_dense_modules(
     model_type = getattr(config, "model_type", "unknown")
     if model_type == "qwen3_asr":
         modules.append("thinker.audio_tower")
+        # ForceAligner: classify_head is tiny (5000×1024 ≈ 10 MB) — keep it dense
+        # so the backend can use it directly instead of falling back to tied embeddings.
+        thinker_cfg = getattr(config, "thinker_config", None)
+        if thinker_cfg and getattr(thinker_cfg, "classify_num", 0) > 0:
+            modules.append("thinker.lm_head")
     return unique_preserve_order(modules)
 
 
