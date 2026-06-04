@@ -21,6 +21,9 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
 - 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder and native zero-shot voice cloning. Supports direct raw audio WAV generation, voice cloning via reference audio, and offline Mimi decoding
+- 🎤 **CustomVoice / VoiceDesign** — named speaker presets (vivian, ryan, etc.) for instant voice selection and text-described voice styles via VoiceDesign for creative TTS control
+- 🔉 **Streaming TTS** — real-time raw 24kHz mono f32 PCM audio output to stdout for low-latency streaming speech synthesis
+- ⚡ **Native bf16 GEMV kernel** — hand-optimized SG=16 vec8+FMA bf16 GEMV for TTS decode, delivering 9x faster TTS (RTF 8.08 to 0.89 on 0.6B)
 - 🔄 Streaming output — token-level streaming callback with abort support
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
@@ -37,8 +40,8 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-1.7B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
-| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
-| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
+| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS, CustomVoice, VoiceDesign) |
+| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS, CustomVoice, VoiceDesign) |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
 
@@ -74,6 +77,15 @@ Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
 | llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | **60 tok/s** |
 
 Aila delivers the highest prefill throughput and competitive decode performance against Vulkan while using a more accurate NF4 4-bit quantization that retains vision capabilities.
+
+TTS benchmark on Intel Arc A770 16 GB, Qwen3-TTS-12Hz-0.6B-Base:
+
+| Engine | Model | RTF | Notes |
+|--------|-------|-----|-------|
+| **Aila** | Qwen3-TTS-12Hz-0.6B-Base | **0.89** | Native bf16 GEMV kernel |
+| Aila (pre-optimization) | Qwen3-TTS-12Hz-0.6B-Base | 8.08 | oneDNN matmul only |
+
+Real-time factor (RTF) < 1 means the engine synthesizes speech faster than real-time. The native bf16 GEMV kernel delivers a 9x TTS speedup.
 
 ## 🚀 Usage
 
@@ -134,8 +146,12 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
-| `--spk, --speaker <path>` | Reference audio for TTS voice cloning | (none) |
+| `--spk, --speaker <name_or_path>` | TTS voice: reference audio path or named voice (e.g., vivian, ryan) | (none) |
+| `--instruct <text>` | VoiceDesign style description for TTS (e.g., "deep warm voice") | (none) |
+| `--language <lang>` | TTS language: chinese, english, japanese, korean, auto | auto |
 | `--spk-cache-dir <dir>` | Speaker embedding cache directory | `AILA_SPK_CACHE_DIR` env |
+| `--stream-tts` | Stream raw 24kHz mono f32 PCM to stdout | off |
+| `--stream-batch <N>` | Frames per streaming TTS chunk | 4 |
 | `--forced-lang <lang>` | Force ASR language (e.g. Chinese, English) | (none) |
 | `--asr-system <prompt>` | ASR system prompt text bias | (none) |
 | `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
@@ -152,6 +168,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/transcribe <path>` | Transcribe audio file (ASR) |
 | `/tts <text> [--spk <path>]` | Synthesize speech (TTS) with optional voice cloning |
 | `/synthesize <text> [--spk <path>]` | Alias for `/tts` |
+| `/voice <name>` | Set TTS voice (vivian, ryan, etc.) |
 | `/clear` | Clear conversation history |
 | `/context` | Show context usage |
 | `/greedy` | Switch to greedy decoding |
@@ -201,6 +218,33 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --synthesize "你好世界" `
     --spk ./reference_speaker.wav `
     --output-wav cloned_output.wav
+
+# CustomVoice — use a named speaker preset
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --speaker vivian `
+    --synthesize "Hello world!" `
+    --output-wav vivian_output.wav
+
+# VoiceDesign — describe the voice style in natural language
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --instruct "A deep, warm voice with a slow pace" `
+    --synthesize "Hello world!" `
+    --output-wav styled_output.wav
+
+# VoiceDesign with language override
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --speaker ryan `
+    --language japanese `
+    --synthesize "こんにちは世界" `
+    --output-wav japanese_output.wav
+
+# Streaming TTS — real-time PCM audio output
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --stream-tts --synthesize "Hello!" 2>/dev/null | pcm_play
+
+# Streaming TTS with custom batch size
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --stream-tts --stream-batch 8 --synthesize "Hello!" 2>/dev/null | pcm_play
 ```
 
 The `--rep-penalty` flag controls repetition penalty (auto-set to 1.1 for TTS). Increase it (e.g. `--rep-penalty 1.3`) if the output has repetitive artifacts, or decrease it (e.g. `--rep-penalty 1.0`) for more variation.

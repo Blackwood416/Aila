@@ -94,6 +94,13 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 
 ---
 
+## TTS (AILA_TTS_*)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_BF16_GEMV` | int | `1` | Enable native bf16 GEMV kernel for TTS decode (SG=16, vec8+FMA). Set to `0` to fall back to oneDNN matmul. Provides ~9x TTS throughput improvement |
+| `AILA_TTS_STREAM_BATCH` | int | `4` | Number of audio frames per streaming TTS callback chunk. Higher values reduce callback overhead at the cost of increased latency |
+
 ## TTS Speaker Embedding (AILA_SPK_*)
 
 | Variable | Type | Default | Description |
@@ -120,6 +127,7 @@ Set `AILA_SPK_CACHE_DIR` to a shared directory to reuse embeddings across differ
 | `AILA_Q35_VISION_PROFILE` | bool | `false` | Profile vision encoder |
 | `AILA_Q35_VISION_PROFILE_BLOCKS` | bool | `false` | Profile individual vision transformer blocks |
 | `AILA_Q35_VISION_PROFILE_PREP` | bool | `false` | Profile vision image preprocessing |
+| `AILA_TTS_PROFILE` | int | `0` | Enable detailed TTS profiling (talker, mimi, text projection stage timing). Set to `1` to enable |
 
 ### Debug Output (AILA_DEBUG_*)
 

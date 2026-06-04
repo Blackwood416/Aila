@@ -21,6 +21,9 @@
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
 - 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS），支持原生零样本语音克隆。支持直接生成原始音频 WAV、通过参考音频进行音色克隆，以及离线 Mimi 译码
+- 🎤 **CustomVoice / VoiceDesign** — 命名说话人预设（vivian、ryan 等）快速选择音色，以及通过 VoiceDesign 文本描述音色风格进行创意 TTS 控制
+- 🔉 **流式 TTS** — 实时原始 24kHz 单声道 f32 PCM 音频输出到 stdout，实现低延迟流式语音合成
+- ⚡ **原生 bf16 GEMV kernel** — 手写优化的 SG=16 vec8+FMA bf16 GEMV 用于 TTS 解码，TTS 速度提升 9 倍（0.6B 模型 RTF 从 8.08 降至 0.89）
 - 🔄 流式输出 — token 级别流式回调，支持中止生成
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
@@ -37,8 +40,8 @@
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-1.7B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
-| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
-| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS) |
+| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS, CustomVoice, VoiceDesign) |
+| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Dense + Mimi Vocoder | BF16, dense | ❌ | ✅ (TTS, CustomVoice, VoiceDesign) |
 
 其他符合支持架构模式的 Qwen3 / Qwen3.5 模型大小理论上也可运行。
 
@@ -74,6 +77,15 @@
 | llama.cpp b8996 | Vulkan | Qwen3.5-4B Q4_K_XL | 700 tok/s | **60 tok/s** |
 
 Aila 提供最高的 prefill 吞吐量，同时在保留视觉能力的 NF4 量化下实现接近 Vulkan 的 decode 性能。
+
+基于 Intel Arc A770 16 GB，Qwen3-TTS-12Hz-0.6B-Base 的 TTS 性能测试：
+
+| 引擎 | 模型 | RTF | 说明 |
+|------|------|-----|------|
+| **Aila** | Qwen3-TTS-12Hz-0.6B-Base | **0.89** | 原生 bf16 GEMV kernel |
+| Aila（优化前） | Qwen3-TTS-12Hz-0.6B-Base | 8.08 | 仅 oneDNN matmul |
+
+实时率（RTF）< 1 表示引擎合成语音的速度快于实时播放。原生 bf16 GEMV kernel 带来 9 倍的 TTS 速度提升。
 
 ## 🚀 使用方法
 
@@ -134,8 +146,12 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
-| `--spk, --speaker <path>` | TTS 语音克隆参考音频路径 | 无 |
+| `--spk, --speaker <name_or_path>` | TTS 音色：参考音频路径或命名音色（如 vivian、ryan） | 无 |
+| `--instruct <text>` | VoiceDesign 音色风格描述（如 "深沉温暖的声音"） | 无 |
+| `--language <lang>` | TTS 语言：chinese、english、japanese、korean、auto | auto |
 | `--spk-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_SPK_CACHE_DIR` 环境变量 |
+| `--stream-tts` | 流式输出原始 24kHz 单声道 f32 PCM 到 stdout | 关闭 |
+| `--stream-batch <N>` | 流式 TTS 每批帧数 | 4 |
 | `--forced-lang <lang>` | 强制指定 ASR 转录语种（如 Chinese, English） | 无 |
 | `--asr-system <prompt>` | ASR 偏置的系统提示词（system prompt） | 无 |
 | `--asr-segment <sec>` | ASR 音频分段切片秒数大小 | 0.0 (禁用) |
@@ -152,6 +168,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/transcribe <path>` | 转录音频文件（ASR） |
 | `/tts <text> [--spk <path>]` | 语音合成（TTS），支持可选语音克隆 |
 | `/synthesize <text> [--spk <path>]` | `/tts` 的别名 |
+| `/voice <name>` | 设置 TTS 音色（vivian、ryan 等） |
 | `/clear` | 清除对话历史 |
 | `/context` | 显示上下文用量 |
 | `/greedy` | 切换到贪心解码 |
@@ -201,6 +218,33 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --synthesize "你好世界" `
     --spk ./reference_speaker.wav `
     --output-wav cloned_output.wav
+
+# CustomVoice — 使用命名说话人预设
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --speaker vivian `
+    --synthesize "你好世界" `
+    --output-wav vivian_output.wav
+
+# VoiceDesign — 用自然语言描述音色风格
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --instruct "深沉温暖的声音，语速较慢" `
+    --synthesize "你好世界" `
+    --output-wav styled_output.wav
+
+# VoiceDesign 配合语言指定
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --speaker ryan `
+    --language japanese `
+    --synthesize "こんにちは世界" `
+    --output-wav japanese_output.wav
+
+# 流式 TTS — 实时 PCM 音频输出
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --stream-tts --synthesize "你好！" 2>/dev/null | pcm_play
+
+# 流式 TTS 自定义批大小
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --stream-tts --stream-batch 8 --synthesize "你好！" 2>/dev/null | pcm_play
 ```
 
 `--rep-penalty` 参数控制重复惩罚（TTS 模式下自动设为 1.1）。如果输出出现重复伪影可调高（如 `--rep-penalty 1.3`），需要更多变化时可调低（如 `--rep-penalty 1.0`）。

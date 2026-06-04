@@ -265,10 +265,16 @@ The simplest API — one call handles everything: tokenization, optional voice c
 
 ```c
 // Default voice
-aila_synthesize(engine, "Hello world!", NULL, NULL, "output.wav");
+aila_synthesize(engine, "Hello world!", NULL, NULL, NULL, NULL, NULL, "output.wav");
 
 // Voice cloning from reference audio
-aila_synthesize(engine, "你好世界", "./reference_speaker.wav", NULL, "cloned.wav");
+aila_synthesize(engine, "你好世界", "./reference_speaker.wav", NULL, NULL, NULL, NULL, "cloned.wav");
+
+// CustomVoice (named speaker)
+aila_synthesize(engine, "Hello!", NULL, "vivian", NULL, NULL, NULL, "output.wav");
+
+// VoiceDesign (style description)
+aila_synthesize(engine, "Hello!", NULL, NULL, "A deep, warm voice", NULL, NULL, "output.wav");
 ```
 
 #### `aila_synthesize`
@@ -278,15 +284,21 @@ int aila_synthesize(
     AilaEngine* engine,
     const char* text,
     const char* speaker_audio_path,   // NULL for default voice
+    const char* speaker_name,         // NULL or named voice (e.g., "vivian", "ryan")
+    const char* instruct_text,        // NULL or VoiceDesign style description
+    const char* language,             // NULL/"auto" or language (chinese, english, japanese, korean)
     const AilaGenConfig* config,      // NULL for defaults
     const char* output_wav_path       // output WAV file (24kHz, mono, f32 PCM)
 );
 ```
 
-One-shot TTS synthesis: text + optional voice cloning → WAV file. Internally handles speaker embedding extraction (with automatic caching), tokenization, synthesis, and WAV writing in a single call. No `malloc`/`free` needed.
+One-shot TTS synthesis: text + optional voice cloning/style → WAV file. Internally handles speaker embedding extraction (with automatic caching), tokenization, synthesis, and WAV writing in a single call. No `malloc`/`free` needed.
 
 - `text` — UTF-8 text to synthesize.
 - `speaker_audio_path` — Optional reference audio (WAV/MP3/FLAC) for voice cloning. Pass `NULL` for default voice. Speaker embeddings are automatically cached in memory and on disk.
+- `speaker_name` — Optional named speaker preset for CustomVoice (e.g., `"vivian"`, `"ryan"`). Pass `NULL` to use default or reference audio.
+- `instruct_text` — Optional VoiceDesign style description (e.g., `"A deep, warm voice with a slow pace"`). Pass `NULL` if not using VoiceDesign.
+- `language` — Optional language override (`"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"`). Pass `NULL` for auto-detection.
 - `config` — Generation config (`NULL` for defaults).
 - `output_wav_path` — Destination path for the output WAV file.
 
@@ -303,6 +315,100 @@ For advanced use cases (custom audio post-processing, pre-tokenized input, separ
 | `aila_synthesize_wav` | Synthesize pre-tokenized tokens → float PCM samples |
 | `aila_decode_mimi_vocoder` | Decode discrete Mimi codes → float PCM samples |
 | `aila_free_samples` | Free sample/embedding arrays |
+
+#### Streaming TTS API
+
+For real-time streaming speech synthesis with low-latency audio output.
+
+##### `AilaAudioCallback`
+
+```c
+typedef void (*AilaAudioCallback)(const float* samples, int sample_count, void* user_data);
+```
+
+Callback invoked whenever a chunk of audio samples is ready. The `samples` pointer is valid only during the callback — copy the data if you need to keep it.
+
+- `samples` — Float PCM audio samples (24kHz, mono).
+- `sample_count` — Number of samples in this chunk.
+- `user_data` — Opaque pointer passed through from the API call.
+
+##### `aila_synthesize_stream`
+
+```c
+int aila_synthesize_stream(
+    AilaEngine* engine,
+    const char* text,
+    const char* speaker_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    AilaAudioCallback callback,
+    void* user_data
+);
+```
+
+Starts asynchronous streaming TTS synthesis. Audio chunks are delivered via `callback` as they become available. The function returns immediately — use `aila_stream_wait` to block until synthesis completes.
+
+Parameters match `aila_synthesize` with two additions:
+- `callback` — Called for each audio chunk as it is generated. Must not be `NULL`.
+- `user_data` — Opaque pointer passed to each callback invocation.
+
+Returns `0` on success (synthesis started), non-zero on error.
+
+##### `aila_stream_wait`
+
+```c
+int aila_stream_wait(AilaEngine* engine);
+```
+
+Blocks until the current streaming TTS synthesis completes. Returns `0` on success, non-zero on error. Must be called after `aila_synthesize_stream` before starting another stream or destroying the engine.
+
+##### `aila_stream_destroy`
+
+```c
+void aila_stream_destroy(AilaEngine* engine);
+```
+
+Cancels any in-progress streaming synthesis and frees associated resources. Safe to call at any time. Does not destroy the engine itself.
+
+#### Streaming Example
+
+```c
+#include "aila_api.h"
+
+void audio_chunk(const float* samples, int count, void* user_data) {
+    // Write PCM samples to audio device or file
+    FILE* out = (FILE*)user_data;
+    fwrite(samples, sizeof(float), count, out);
+}
+
+int main() {
+    AilaEngine* engine = aila_engine_create();
+    aila_engine_init(engine, "./models/Qwen3-TTS-12Hz-0.6B-Base", 4096);
+
+    FILE* pcm_out = fopen("output.pcm", "wb");
+
+    int rc = aila_synthesize_stream(engine,
+        "Hello world!",        // text
+        NULL,                  // speaker_audio_path (default voice)
+        "vivian",              // speaker_name (CustomVoice)
+        NULL,                  // instruct_text
+        NULL,                  // language (auto)
+        NULL,                  // config (defaults)
+        audio_chunk,           // callback
+        pcm_out);              // user_data
+
+    if (rc == 0) {
+        aila_stream_wait(engine); // block until done
+    }
+
+    fclose(pcm_out);
+    aila_stream_destroy(engine);
+    aila_engine_destroy(engine);
+    return 0;
+}
+```
 
 #### Reference Audio Requirements
 
@@ -610,10 +716,32 @@ lib.aila_synthesize.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # text
     ctypes.c_char_p,          # speaker_audio_path
+    ctypes.c_char_p,          # speaker_name
+    ctypes.c_char_p,          # instruct_text
+    ctypes.c_char_p,          # language
     ctypes.c_void_p,          # config
     ctypes.c_char_p,          # output_wav_path
 ]
 lib.aila_synthesize.restype = ctypes.c_int
+
+# TTS streaming
+AilaAudioCallback = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p)
+lib.aila_synthesize_stream.argtypes = [
+    ctypes.c_void_p,          # engine
+    ctypes.c_char_p,          # text
+    ctypes.c_char_p,          # speaker_audio_path
+    ctypes.c_char_p,          # speaker_name
+    ctypes.c_char_p,          # instruct_text
+    ctypes.c_char_p,          # language
+    ctypes.c_void_p,          # config
+    AilaAudioCallback,        # callback
+    ctypes.c_void_p,          # user_data
+]
+lib.aila_synthesize_stream.restype = ctypes.c_int
+lib.aila_stream_wait.argtypes = [ctypes.c_void_p]
+lib.aila_stream_wait.restype = ctypes.c_int
+lib.aila_stream_destroy.argtypes = [ctypes.c_void_p]
+lib.aila_stream_destroy.restype = None
 
 # TTS (low-level)
 lib.aila_extract_speaker_embedding.argtypes = [
@@ -674,13 +802,47 @@ cfg = AilaGenConfig()
 lib.aila_default_gen_config(ctypes.byref(cfg))
 rc = lib.aila_synthesize(engine,
     b"Hello world!",                     # text
-    b"./reference_speaker.wav",          # speaker reference (NULL for default)
-    ctypes.byref(cfg),
-    b"output.wav")                       # output path
+    b"./reference_speaker.wav",          # speaker_audio_path (NULL for default)
+    None,                                # speaker_name (NULL for none)
+    None,                                # instruct_text (NULL for none)
+    None,                                # language (NULL for auto)
+    ctypes.byref(cfg),                   # config
+    b"output.wav")                       # output_wav_path
 if rc != 0:
     raise RuntimeError(f"TTS failed: {rc}")
 
 # 3. Done — output.wav is ready
+lib.aila_engine_destroy(engine)
+```
+
+##### Streaming TTS (Python)
+
+```python
+pcm_data = bytearray()
+
+@AilaAudioCallback
+def on_audio(samples_ptr, sample_count, user_data):
+    # Accumulate PCM samples
+    buf = ctypes.cast(samples_ptr, ctypes.POINTER(ctypes.c_float * sample_count))
+    pcm_data.extend(bytearray(buf.contents))
+
+# Start streaming synthesis
+engine = lib.aila_engine_create()
+lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-Base", 4096)
+
+rc = lib.aila_synthesize_stream(engine,
+    b"Hello world!",       # text
+    None,                  # speaker_audio_path
+    b"vivian",             # speaker_name (CustomVoice)
+    None,                  # instruct_text
+    None,                  # language
+    None,                  # config
+    on_audio,              # callback
+    None)                  # user_data
+if rc == 0:
+    lib.aila_stream_wait(engine)   # block until complete
+
+lib.aila_stream_destroy(engine)
 lib.aila_engine_destroy(engine)
 ```
 
@@ -730,10 +892,17 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern void aila_engine_destroy(IntPtr e);
 
     // TTS APIs
+    [DllImport("AilaShared.dll")] static extern int aila_synthesize(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, string outputWavPath);
     [DllImport("AilaShared.dll")] static extern int aila_extract_speaker_embedding(IntPtr e, string audioPath, out IntPtr outEmbedding, out int outEmbeddingDim);
     [DllImport("AilaShared.dll")] static extern int aila_synthesize_wav(IntPtr e, int[] textTokens, int textTokensLen, float[] speakerEmbedding, int speakerEmbeddingLen, ref AilaGenConfig cfg, out IntPtr outSamples, out int outSampleCount);
     [DllImport("AilaShared.dll")] static extern void aila_free_samples(IntPtr samples);
     [DllImport("AilaShared.dll")] static extern int aila_decode_mimi_vocoder(IntPtr e, int[] codes, int nFrames, out IntPtr outSamples, out int outSampleCount);
+
+    // TTS Streaming
+    delegate void AilaAudioCallback(IntPtr samples, int sampleCount, IntPtr userData);
+    [DllImport("AilaShared.dll")] static extern int aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
+    [DllImport("AilaShared.dll")] static extern int aila_stream_wait(IntPtr e);
+    [DllImport("AilaShared.dll")] static extern void aila_stream_destroy(IntPtr e);
     // ... etc
 }
 ```
@@ -775,6 +944,16 @@ extern "C" {
     fn aila_engine_destroy(engine: *mut c_void);
 
     // TTS APIs
+    fn aila_synthesize(
+        engine: *mut c_void,
+        text: *const c_char,
+        speaker_audio_path: *const c_char,
+        speaker_name: *const c_char,
+        instruct_text: *const c_char,
+        language: *const c_char,
+        config: *const AilaGenConfig,
+        output_wav_path: *const c_char,
+    ) -> c_int;
     fn aila_extract_speaker_embedding(
         engine: *mut c_void,
         audio_path: *const c_char,
@@ -799,6 +978,22 @@ extern "C" {
         out_samples: *mut *mut f32,
         out_sample_count: *mut c_int,
     ) -> c_int;
+
+    // TTS Streaming
+    type AilaAudioCallback = extern "C" fn(samples: *const f32, sample_count: c_int, user_data: *mut c_void);
+    fn aila_synthesize_stream(
+        engine: *mut c_void,
+        text: *const c_char,
+        speaker_audio_path: *const c_char,
+        speaker_name: *const c_char,
+        instruct_text: *const c_char,
+        language: *const c_char,
+        config: *const AilaGenConfig,
+        callback: AilaAudioCallback,
+        user_data: *mut c_void,
+    ) -> c_int;
+    fn aila_stream_wait(engine: *mut c_void) -> c_int;
+    fn aila_stream_destroy(engine: *mut c_void);
 }
 ```
 
