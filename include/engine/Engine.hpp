@@ -2381,9 +2381,8 @@ public:
 
         if (!reference_audio_path.empty()) {
             // Base mode: ECAPA-TDNN voice cloning from reference audio
+            // extractSpeakerEmbedding sets its own detailed error on failure
             if (!extractSpeakerEmbedding(reference_audio_path, spk_emb)) {
-                set_error(EngineErrorCode::RuntimeError,
-                    "Failed to extract speaker embedding from: " + reference_audio_path);
                 return false;
             }
         } else if (!speaker_name.empty()) {
