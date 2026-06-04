@@ -364,6 +364,31 @@ AILA_API int aila_synthesize(
 );
 
 /**
+ * Audio streaming callback for TTS.
+ * @param samples   PCM float audio samples (24kHz mono)
+ * @param count     Number of samples in this chunk
+ * @param user_data Opaque pointer passed to aila_synthesize_stream
+ */
+typedef void (*AilaAudioCallback)(const float* samples, int count, void* user_data);
+
+typedef struct AilaTTSStream AilaTTSStream;
+
+AILA_API AilaTTSStream* aila_synthesize_stream(
+    AilaEngine* engine,
+    const char* text,
+    const char* speaker_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    AilaAudioCallback callback,
+    void* user_data
+);
+
+AILA_API int aila_stream_wait(AilaTTSStream* stream);
+AILA_API void aila_stream_destroy(AilaTTSStream* stream);
+
+/**
  * Free audio samples array returned by aila_synthesize_wav or aila_extract_speaker_embedding.
  */
 AILA_API void aila_free_samples(float* samples);

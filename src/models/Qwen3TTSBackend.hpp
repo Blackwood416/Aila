@@ -9,6 +9,7 @@
 #include "engine/Types.hpp"
 #include <vector>
 #include <string>
+#include <functional>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -38,6 +39,19 @@ public:
                           const GenerationConfig& gen_config,
                           std::vector<int32_t>& out_codes,
                           int& out_n_frames);
+
+    // Streaming synthesis: calls audio_callback for each batch of generated audio
+    using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;
+
+    bool synthesize_codes_stream(Context& ctx,
+                                  const std::vector<int>& text_tokens,
+                                  const std::vector<float>& speaker_embedding,
+                                  int speaker_id,
+                                  const std::vector<int>& instruct_tokens,
+                                  int language_id,
+                                  const GenerationConfig& gen_config,
+                                  int stream_batch_frames,
+                                  AudioChunkCallback audio_callback);
 
     bool load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message);
     bool decode_mimi_vocoder(Context& ctx,

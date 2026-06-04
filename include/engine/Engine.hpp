@@ -27,6 +27,7 @@
 #include "Types.hpp"
 #include <string>
 #include <functional>
+#include <thread>
 #include <chrono>
 #include <algorithm>
 #include <vector>
@@ -2426,6 +2427,56 @@ public:
                           elapsed_ms, audio_s, rtf);
         }
         return ok;
+    }
+
+    // Streaming TTS: calls callback from background thread with PCM audio chunks.
+    // Returns immediately; callback fires from a worker thread as audio is generated.
+    std::thread synthesizeSpeechStream(
+        const std::string& text,
+        const std::string& reference_audio_path,
+        const std::string& speaker_name,
+        const std::string& instruct_text,
+        const std::string& language,
+        const GenerationConfig& gen_config,
+        std::function<void(const float*, int)> callback,
+        int stream_batch_frames = 4
+    ) {
+        return std::thread([this, text, reference_audio_path, speaker_name,
+                            instruct_text, language, gen_config, callback,
+                            stream_batch_frames]() {
+            // Determine mode
+            std::vector<float> spk_emb;
+            int spk_id = 0;
+            if (!reference_audio_path.empty()) {
+                extractSpeakerEmbedding(reference_audio_path, spk_emb);
+            } else if (!speaker_name.empty()) {
+                spk_id = getSpeakerId(speaker_name);
+            }
+
+            // Tokenize
+            std::vector<int> instruct_tokens;
+            if (!instruct_text.empty()) {
+                instruct_tokens = tokenizer_.encode(
+                    "<|im_start|>assistant\n" + instruct_text + "<|im_end|>\n");
+            }
+            int lang_id = getLanguageId(language);
+            std::string formatted_text = "<|im_start|>assistant\n" + text
+                + "<|im_end|>\n<|im_start|>assistant\n";
+            std::vector<int> tokens = tokenizer_.encode(formatted_text);
+
+            // Run streaming synthesis
+            auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
+            if (!tts_backend) return;
+
+            tts_backend->synthesize_codes_stream(
+                *ctx_, tokens, spk_emb, spk_id, instruct_tokens, lang_id,
+                gen_config, stream_batch_frames,
+                [&](const std::vector<float>& chunk) {
+                    if (!chunk.empty()) {
+                        callback(chunk.data(), static_cast<int>(chunk.size()));
+                    }
+                });
+        });
     }
 
     // TTS audio discrete codes decoding using Mimi Decoder

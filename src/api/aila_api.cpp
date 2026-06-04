@@ -4,7 +4,9 @@
 #include "AudioPreprocessor.hpp"
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 
 // ============================================================
 // Version
@@ -622,6 +624,60 @@ AILA_API int aila_synthesize(
         AILA_LOG_ERROR("[C-API] aila_synthesize failed: unknown exception");
         return AILA_ERR_RUNTIME;
     }
+}
+
+// ============================================================
+// Streaming TTS API
+// ============================================================
+
+struct AilaTTSStream {
+    std::thread worker;
+    std::mutex mutex;
+    bool done = false;
+};
+
+AILA_API AilaTTSStream* aila_synthesize_stream(
+    AilaEngine* engine,
+    const char* text,
+    const char* speaker_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    AilaAudioCallback callback,
+    void* user_data
+) {
+    if (!engine || !text || !callback) return nullptr;
+    auto* stream = new AilaTTSStream();
+
+    GenerationConfig cpp_cfg = to_cpp_config(config);
+    stream->worker = engine->engine.synthesizeSpeechStream(
+        std::string(text),
+        speaker_audio_path ? std::string(speaker_audio_path) : std::string(),
+        speaker_name ? std::string(speaker_name) : std::string(),
+        instruct_text ? std::string(instruct_text) : std::string(),
+        language ? std::string(language) : std::string(),
+        cpp_cfg,
+        [callback, user_data](const float* samples, int count) {
+            callback(samples, count, user_data);
+        }, 4);
+
+    return stream;
+}
+
+AILA_API int aila_stream_wait(AilaTTSStream* stream) {
+    if (!stream) return AILA_ERR_INVALID_ARGUMENT;
+    if (stream->worker.joinable()) {
+        stream->worker.join();
+        stream->done = true;
+    }
+    return AILA_OK;
+}
+
+AILA_API void aila_stream_destroy(AilaTTSStream* stream) {
+    if (!stream) return;
+    if (stream->worker.joinable()) stream->worker.join();
+    delete stream;
 }
 
 AILA_API int aila_extract_speaker_embedding(

@@ -1137,6 +1137,64 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     return true;
 }
 
+bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
+    const std::vector<int>& text_tokens,
+    const std::vector<float>& speaker_embedding,
+    int speaker_id,
+    const std::vector<int>& instruct_tokens,
+    int language_id,
+    const GenerationConfig& gen_config,
+    int stream_batch_frames,
+    AudioChunkCallback audio_callback) {
+
+    // 1. Generate all codec tokens (existing blocking call)
+    std::vector<int32_t> all_codes;
+    int total_frames = 0;
+    if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
+                           instruct_tokens, language_id, gen_config,
+                           all_codes, total_frames)) {
+        return false;
+    }
+
+    // 2. Initialize Mimi stream
+    MimiStreamState mimi_state;
+    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
+        return false;
+    }
+
+    // 3. Feed codes in batches to incremental decoder
+    int batch_size = stream_batch_frames;
+    for (int offset = 0; offset < total_frames; offset += batch_size) {
+        int batch_frames = std::min(batch_size, total_frames - offset);
+
+        // Extract batch codes: [batch_frames, 16]
+        std::vector<int32_t> batch_codes;
+        batch_codes.reserve(static_cast<size_t>(batch_frames) * 16);
+        for (int f = 0; f < batch_frames; ++f) {
+            for (int c = 0; c < 16; ++c) {
+                batch_codes.push_back(all_codes[static_cast<size_t>(offset + f) * 16 + c]);
+            }
+        }
+
+        std::vector<float> audio_chunk;
+        if (!decode_mimi_incremental(ctx, batch_codes, batch_frames, mimi_state, audio_chunk)) {
+            return false;
+        }
+        if (!audio_chunk.empty()) {
+            audio_callback(audio_chunk);
+        }
+    }
+
+    // 4. Flush
+    std::vector<float> flush_samples;
+    decode_mimi_flush(ctx, mimi_state, flush_samples);
+    if (!flush_samples.empty()) {
+        audio_callback(flush_samples);
+    }
+
+    return true;
+}
+
 bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message) {
     if (mimi_loaded_) return true;
 
