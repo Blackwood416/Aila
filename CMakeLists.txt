@@ -66,6 +66,7 @@ set(LIB_SOURCES
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp
     src/utils/MemoryMappedFile.cpp
+    src/utils/ForceAlignerPostProcess.cpp
     src/utils/SafeTensors.cpp
     src/utils/Base64.cpp
     src/utils/JsonParser.cpp
