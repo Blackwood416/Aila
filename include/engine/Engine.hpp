@@ -9,10 +9,12 @@
 #include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
 #include "../src/models/Qwen3TTSBackend.hpp"
+#include "../src/models/Qwen3ForceAlignerBackend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
 #include "../src/audio/SpeakerEncoder.hpp"
+#include "../src/utils/ForceAlignerPostProcess.hpp"
 #include "../src/audio/GpuSpeakerEncoder.hpp"
 #include "../src/lora/LoraLoader.hpp"
 #include "../src/lora/LoraConfig.hpp"
@@ -426,6 +428,13 @@ public:
                 AILA_LOG_INFO("[ModelSpec] model_type=qwen3_asr text_hidden=%d layers=%d vocab=%d audio_enc_layers=%d audio_d_model=%d",
                               config_.hidden_size, config_.num_hidden_layers, config_.vocab_size,
                               model_spec_.audio.encoder_layers, model_spec_.audio.d_model);
+            } else if (model_spec_.family == ModelFamily::Qwen3ForceAligner) {
+                config_ = model_spec_.qwen3;
+                AILA_LOG_INFO("[ModelSpec] model_type=qwen3_asr subtype=forced_aligner classify_num=%d "
+                              "text_hidden=%d layers=%d audio_enc_layers=%d audio_d_model=%d",
+                              model_spec_.classify_num,
+                              config_.hidden_size, config_.num_hidden_layers,
+                              model_spec_.audio.encoder_layers, model_spec_.audio.d_model);
             } else {
                 config_ = model_spec_.qwen3;
                 AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_dense hidden=%d layers=%d vocab=%d",
@@ -497,6 +506,8 @@ public:
             } else {
                 backend_ = std::make_unique<Qwen3ASRBackend>();
             }
+        } else if (model_spec_.family == ModelFamily::Qwen3ForceAligner) {
+            backend_ = std::make_unique<Qwen3ForceAlignerBackend>();
         } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
@@ -537,7 +548,8 @@ public:
         }
 
         audio_encoder_.reset();
-        if (model_spec_.family == ModelFamily::Qwen3ASR) {
+        if (model_spec_.family == ModelFamily::Qwen3ASR ||
+            model_spec_.family == ModelFamily::Qwen3ForceAligner) {
             audio_encoder_ = std::make_unique<aila::audio::Qwen3ASRAudioEncoder>();
             std::string audio_error;
             if (audio_encoder_->load(*ctx_, *weights_, model_spec_.audio, &audio_error)) {
@@ -2591,6 +2603,175 @@ public:
         cacheSpeakerEmbedding(audio_path, embedding);
         AILA_LOG_INFO("[TTS] Speaker embedding extracted and cached (dim=%d)", spk_dim);
         return true;
+    }
+
+    // Forced alignment: given audio samples + text → word-level timestamps.
+    std::vector<aila::AlignedWord> align(
+        const std::vector<float>& audio_samples, int sample_rate,
+        const std::string& text, const std::string& language) {
+
+        using bf16 = sycl::ext::oneapi::bfloat16;
+        clear_error();
+
+        if (model_spec_.family != ModelFamily::Qwen3ForceAligner || !audio_encoder_) {
+            set_error(EngineErrorCode::RuntimeError, "ForceAligner backend not initialized");
+            return {};
+        }
+
+        auto fa_backend = dynamic_cast<Qwen3ForceAlignerBackend*>(backend_.get());
+        if (!fa_backend) {
+            set_error(EngineErrorCode::RuntimeError, "Invalid ForceAligner backend class");
+            return {};
+        }
+
+        // 1. Resample to 16kHz
+        std::vector<float> mono_16k;
+        {
+            std::vector<float> mono = audio_samples;
+            if (sample_rate != 16000) {
+                double ratio = static_cast<double>(sample_rate) / 16000.0;
+                size_t out_size = static_cast<size_t>(std::round(mono.size() / ratio));
+                mono_16k.resize(out_size);
+                for (size_t i = 0; i < out_size; ++i) {
+                    double t = i * ratio;
+                    int idx = static_cast<int>(std::floor(t));
+                    double f = t - idx;
+                    auto get_s = [&](int ii) -> float {
+                        if (ii < 0) return mono[0];
+                        if (ii >= static_cast<int>(mono.size())) return mono[mono.size() - 1];
+                        return mono[ii];
+                    };
+                    float y0 = get_s(idx - 1), y1 = get_s(idx);
+                    float y2 = get_s(idx + 1), y3 = get_s(idx + 2);
+                    float a0 = -0.5f*y0 + 1.5f*y1 - 1.5f*y2 + 0.5f*y3;
+                    float a1 = y0 - 2.5f*y1 + 2.0f*y2 - 0.5f*y3;
+                    float a2 = -0.5f*y0 + 0.5f*y2;
+                    mono_16k[i] = static_cast<float>(((a0 * f + a1) * f + a2) * f + y1);
+                }
+            } else {
+                mono_16k = std::move(mono);
+            }
+        }
+        int audio_n_samples = static_cast<int>(mono_16k.size());
+        AILA_LOG_INFO("[Align] Audio: %d samples (%.2f s)", audio_n_samples,
+                      static_cast<float>(audio_n_samples) / 16000.0f);
+
+        // 2. Encode input text
+        auto [word_list, prompt_text] = aila::ForceAlignerPostProcess::encode_input(text, language);
+        AILA_LOG_INFO("[Align] Text: %zu words", word_list.size());
+
+        // 3. Compute Mel spectrogram
+        MelSpectrogram mel;
+        std::string prep_err;
+        if (!compute_mel_spectrogram(mono_16k, mel, &prep_err)) {
+            set_error(EngineErrorCode::RuntimeError, "Mel spectrogram failed: " + prep_err);
+            return {};
+        }
+
+        // 4. Audio encoder forward
+        int mel_padded_frames = mel.n_frames;
+        int mel_actual_frames = mel.actual_frames;
+        int nM = mel.n_mels;
+        int od = model_spec_.audio.output_dim;
+
+        std::vector<bf16> mel_bf16(static_cast<size_t>(mel_padded_frames) * nM);
+        for (int f = 0; f < mel_padded_frames; ++f)
+            for (int m = 0; m < nM; ++m)
+                mel_bf16[m * mel_padded_frames + f] = bf16(mel.data[f * nM + m]);
+
+        Tensor mel_device = Tensor::allocate(*ctx_, {1, nM, mel_padded_frames});
+        ctx_->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(bf16));
+
+        int audio_len = 0;
+        int max_audio_len = ((mel_actual_frames + 99) / 100) * 13 + 32;
+        Tensor af_tmp = Tensor::allocate(*ctx_, {max_audio_len, od});
+        std::string enc_error;
+        if (!audio_encoder_->encode(*ctx_, mel_device, mel_actual_frames,
+                                     af_tmp, audio_len, &enc_error)) {
+            set_error(EngineErrorCode::RuntimeError, "Audio encoding failed: " + enc_error);
+            return {};
+        }
+        Tensor audio_features = Tensor::allocate(*ctx_, {audio_len, od});
+        {
+            bf16* af_dst = audio_features.data_as<bf16>();
+            bf16* af_src = af_tmp.data_as<bf16>();
+            ctx_->queue().memcpy(af_dst, af_src, static_cast<size_t>(audio_len) * od * sizeof(bf16));
+        }
+
+        std::vector<bf16> audio_bf16(static_cast<size_t>(audio_len) * od);
+        ctx_->memcpy_d2h(audio_bf16.data(), audio_features.data(), audio_bf16.size() * sizeof(bf16));
+        ctx_->synchronize();
+
+        // 5. Build prompt token IDs
+        int audio_start_id = model_spec_.audio_start_token_id;
+        int audio_end_id   = model_spec_.audio_end_token_id;
+        int audio_pad_id   = model_spec_.audio_token_id;
+
+        std::vector<int> prompt_ids;
+        prompt_ids.push_back(audio_start_id);
+        prompt_ids.push_back(audio_pad_id);
+        prompt_ids.push_back(audio_end_id);
+
+        auto text_ids = tokenizer_.encode(prompt_text);
+        prompt_ids.insert(prompt_ids.end(), text_ids.begin(), text_ids.end());
+
+        std::vector<int> pad_positions;
+        for (size_t i = 0; i < prompt_ids.size(); ++i)
+            if (prompt_ids[i] == audio_pad_id) pad_positions.push_back(static_cast<int>(i));
+
+        AILA_LOG_INFO("[Align] Prompt: %zu tokens, %zu audio_pad positions",
+                      prompt_ids.size(), pad_positions.size());
+
+        // 6. Run ForceAligner forward
+        backend_->reset();
+        cached_ids_.clear();
+        backend_->set_embedding_overrides(pad_positions, audio_bf16, od);
+
+        if (!aila::env::read_flag("AILA_NO_MROPE", false)) {
+            int total_len = static_cast<int>(prompt_ids.size());
+            std::vector<int> pos_t(total_len), pos_h(total_len), pos_w(total_len);
+            for (int i = 0; i < total_len; ++i) {
+                pos_t[i] = i; pos_h[i] = i; pos_w[i] = i;
+            }
+            backend_->set_mrope_positions(*ctx_, pos_t, pos_h, pos_w, 0);
+        }
+
+        int* device_ids = static_cast<int*>(ctx_->alloc_device(prompt_ids.size() * sizeof(int)));
+        ctx_->memcpy_h2d_async(device_ids, prompt_ids.data(), prompt_ids.size() * sizeof(int));
+        int prompt_len = static_cast<int>(prompt_ids.size());
+
+        Tensor& logits_all = fa_backend->forward_all(*ctx_, device_ids, prompt_len);
+        ctx_->free_device(device_ids);
+
+        if (backend_->supports_vision_embedding_override())
+            backend_->clear_mrope_positions();
+
+        // 7. Download logits
+        int classify_num = fa_backend->classify_num();
+        std::vector<float> host_logits(static_cast<size_t>(prompt_len) * classify_num);
+        ctx_->memcpy_d2h(host_logits.data(), logits_all.data(),
+                         host_logits.size() * sizeof(float));
+        ctx_->synchronize();
+
+        // 8. Extract timestamps + fix + build output
+        int ts_token_id = model_spec_.timestamp_token_id;
+        auto raw_ts = aila::ForceAlignerPostProcess::extract_timestamps(
+            host_logits.data(), prompt_len, classify_num,
+            prompt_ids.data(), prompt_len,
+            ts_token_id, model_spec_.timestamp_segment_time);
+
+        auto fixed_ts = aila::ForceAlignerPostProcess::fix_timestamp(raw_ts);
+        auto result = aila::ForceAlignerPostProcess::build_output(word_list, fixed_ts);
+
+        for (size_t i = 0; i < result.size() && i < 5; ++i) {
+            AILA_LOG_INFO("[Align]   [%zu] \"%s\" %d-%d ms",
+                          i, result[i].text.c_str(), result[i].start_ms, result[i].end_ms);
+        }
+        if (result.size() > 5) {
+            AILA_LOG_INFO("[Align]   ... and %zu more", result.size() - 5);
+        }
+
+        return result;
     }
 
     // ASR transcription from WAV file
