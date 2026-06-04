@@ -45,6 +45,42 @@ public:
                              int n_frames,
                              std::vector<float>& out_samples);
 
+    // --- Mimi streaming state (for incremental decode) ---
+    struct MimiStreamState {
+        int total_frames = 0;
+        int max_frames = 512;
+
+        // Pre-transformer KV cache: 8 layers, per-layer [16 heads, max_frames, 64]
+        std::vector<Tensor> k_cache;
+        std::vector<Tensor> v_cache;
+
+        // Accumulated buffers (full history for conv stages)
+        Tensor latent_buffer;   // [total_frames, 512]
+        Tensor preconv_buffer;  // [total_frames, 1024]
+
+        void reset() {
+            total_frames = 0;
+            k_cache.clear();
+            v_cache.clear();
+            latent_buffer = Tensor();
+            preconv_buffer = Tensor();
+        }
+    };
+
+    // Initialize stream state: allocates KV cache for max_frames
+    bool init_mimi_stream(Context& ctx, MimiStreamState& state, int max_frames);
+
+    // Incremental Mimi decode: process new codec frames, append audio to out_samples
+    bool decode_mimi_incremental(Context& ctx,
+                                  const std::vector<int32_t>& codes,
+                                  int new_frames,
+                                  MimiStreamState& state,
+                                  std::vector<float>& out_samples);
+
+    // Flush remaining conv context into final audio samples
+    bool decode_mimi_flush(Context& ctx, MimiStreamState& state,
+                           std::vector<float>& out_samples);
+
 private:
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);

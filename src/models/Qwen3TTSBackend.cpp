@@ -1834,4 +1834,35 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     return true;
 }
 
+bool Qwen3TTSBackend::init_mimi_stream(Context& ctx, MimiStreamState& state, int max_frames) {
+    if (!mimi_loaded_) return false;
+    state.reset();
+    state.max_frames = max_frames;
 
+    // Allocate KV cache: 8 layers x [16 heads, max_frames, 64]
+    state.k_cache.resize(8);
+    state.v_cache.resize(8);
+    for (int l = 0; l < 8; ++l) {
+        state.k_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
+        state.v_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
+    }
+
+    // Accumulation buffers
+    state.latent_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 512});
+    state.preconv_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 1024});
+
+    return true;
+}
+
+bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
+    const std::vector<int32_t>& codes, int new_frames,
+    MimiStreamState& state, std::vector<float>& out_samples) {
+    // Will be implemented in Task 3
+    return false;
+}
+
+bool Qwen3TTSBackend::decode_mimi_flush(Context& ctx, MimiStreamState& state,
+    std::vector<float>& out_samples) {
+    // Will be implemented in Task 4
+    return true;
+}
