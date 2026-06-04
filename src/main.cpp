@@ -12,9 +12,65 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <clocale>
+#include <windows.h>
+#include <shellapi.h>
+#include <vector>
+#include <string>
+#pragma comment(lib, "shell32.lib")
+
+static std::vector<std::string> g_utf8_args;
+static std::vector<char*> g_utf8_argv;
+
+void convert_args_to_utf8(int& argc, char**& argv) {
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr) {
+        return;
+    }
+
+    g_utf8_args.clear();
+    g_utf8_args.resize(wargc);
+    g_utf8_argv.clear();
+    g_utf8_argv.resize(wargc + 1);
+
+    for (int i = 0; i < wargc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (len > 0) {
+            g_utf8_args[i].resize(len - 1);
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &g_utf8_args[i][0], len, nullptr, nullptr);
+        }
+        g_utf8_argv[i] = &g_utf8_args[i][0];
+    }
+    g_utf8_argv[wargc] = nullptr;
+    LocalFree(wargv);
+
+    argc = wargc;
+    argv = g_utf8_argv.data();
+}
 #endif
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // 如果 stdin/stdout/stderr 被重定向（非交互模式），设置为二进制模式，
+    // 从而防止 Windows CRT 做本地化字符集转换和换行符翻译（如 \n -> \r\n），确保管道中传输的是原始 UTF-8 字节。
+    if (_isatty(_fileno(stdin)) == 0) {
+        _setmode(_fileno(stdin), _O_BINARY);
+    }
+    if (_isatty(_fileno(stdout)) == 0) {
+        _setmode(_fileno(stdout), _O_BINARY);
+    }
+    if (_isatty(_fileno(stderr)) == 0) {
+        _setmode(_fileno(stderr), _O_BINARY);
+    }
+    // 配合强制当前 CRT 使用 UTF-8 区域设置
+    std::setlocale(LC_ALL, ".UTF-8");
+
+    // 将 Windows 宽字符命令行参数转为 UTF-8 覆盖当前的 argv，
+    // 从而使 CLI 所有命令行参数在读取中文或其它非 ASCII 字符时天然是合法的 UTF-8，彻底解决命令行中文参数乱码问题。
+    convert_args_to_utf8(argc, argv);
+#endif
+
     // Parse command line arguments
     CLIOptions opts;
     if (!parse_cli_args(argc, argv, opts)) {
@@ -124,6 +180,14 @@ int main(int argc, char** argv) {
         if (messages_json.empty()) {
             AILA_LOG_ERROR("Messages JSON input is empty");
             return 1;
+        }
+
+        // 剔除可能存在的 UTF-8 BOM (\xEF\xBB\xBF)
+        if (messages_json.size() >= 3 &&
+            static_cast<unsigned char>(messages_json[0]) == 0xEF &&
+            static_cast<unsigned char>(messages_json[1]) == 0xBB &&
+            static_cast<unsigned char>(messages_json[2]) == 0xBF) {
+            messages_json = messages_json.substr(3);
         }
 
         if (opts.stream_output) {
