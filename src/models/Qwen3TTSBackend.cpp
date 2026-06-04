@@ -1372,6 +1372,280 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     return true;
 }
 
+bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
+    std::vector<float>& out_samples) {
+    static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    auto t_conv_start = std::chrono::high_resolution_clock::now();
+
+    // 辅助 layer scale 核函数
+    auto apply_layer_scale_gpu = [&](Tensor& x, Tensor& scale, int length, int channels) {
+        auto* x_ptr = x.data_as<bf16>();
+        auto* scale_ptr = scale.data_as<bf16>();
+        int total = length * channels;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                if (i >= total) return;
+                int c = i % channels;
+                x_ptr[i] = bf16(static_cast<float>(x_ptr[i]) * static_cast<float>(scale_ptr[c]));
+            });
+        });
+    };
+
+    // ==========================================
+    // 4. 两层 ConvNeXt 上采样 (总共上采样 4 倍)
+    // ==========================================
+    auto t_upsample_start = std::chrono::high_resolution_clock::now();
+    Tensor upsample_in = Tensor::allocate(ctx, {n_frames, 1024});
+    ops::copy_tensor(ctx, pre_tfm_out, upsample_in, n_frames * 1024);
+    ctx.synchronize();
+    int L = n_frames;
+
+    for (int i = 0; i < 2; ++i) {
+        std::string up_prefix = "decoder.upsample." + std::to_string(i) + ".";
+
+        // 转置卷积上采样 2 倍: kernel_size=2, stride=2, output_channels=1024
+        Tensor conv_t_out = Tensor::allocate(ctx, {2 * L, 1024});
+        Tensor& conv_w = mimi_weights_.get(up_prefix + "0.conv.weight");
+        Tensor& conv_b = mimi_weights_.get(up_prefix + "0.conv.bias");
+        ops::causal_conv_transpose1d(ctx, upsample_in, conv_w, conv_b, conv_t_out, 1, 1024, 1024, L, 2, 2);
+        ctx.synchronize();
+
+        // ConvNeXt block
+        Tensor dw_out = Tensor::allocate(ctx, {2 * L, 1024});
+        Tensor& dw_w = mimi_weights_.get(up_prefix + "1.dwconv.conv.weight");
+        Tensor& dw_b = mimi_weights_.get(up_prefix + "1.dwconv.conv.bias");
+        ops::causal_conv1d_dw(ctx, conv_t_out, dw_w, dw_b, dw_out, 1, 1024, 2 * L, 7, 1);
+        ctx.synchronize();
+
+        // LayerNorm
+        Tensor normed_dw = Tensor::allocate(ctx, {2 * L, 1024});
+        Tensor& norm_w = mimi_weights_.get(up_prefix + "1.norm.weight");
+        Tensor& norm_b = mimi_weights_.get(up_prefix + "1.norm.bias");
+        ops::layer_norm(ctx, dw_out, norm_w, norm_b, 1e-6f, normed_dw, 2 * L, 1024);
+        ctx.synchronize();
+
+        // Linear pwconv1
+        Linear pw1;
+        pw1.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv1.weight"), 1024, 4096, false);
+        Tensor pw1_out = Tensor::allocate(ctx, {2 * L, 4096});
+        Tensor& pw1_b = mimi_weights_.get(up_prefix + "1.pwconv1.bias");
+        pw1.forward_bias(ctx, normed_dw, pw1_b, pw1_out, 2 * L);
+        ctx.synchronize();
+
+        // GELU
+        ops::gelu_tanh_inplace(ctx, pw1_out, 2 * L * 4096);
+        ctx.synchronize();
+
+        // Linear pwconv2
+        Linear pw2;
+        pw2.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv2.weight"), 4096, 1024, false);
+        Tensor pw2_out = Tensor::allocate(ctx, {2 * L, 1024});
+        Tensor& pw2_b = mimi_weights_.get(up_prefix + "1.pwconv2.bias");
+        pw2.forward_bias(ctx, pw1_out, pw2_b, pw2_out, 2 * L);
+        ctx.synchronize();
+
+        // Scale by gamma and add to residual
+        Tensor& gamma = mimi_weights_.get(up_prefix + "1.gamma");
+        apply_layer_scale_gpu(pw2_out, gamma, 2 * L, 1024);
+        ctx.synchronize();
+
+        ops::residual_add(ctx, conv_t_out, pw2_out, 2 * L * 1024);
+        ctx.synchronize();
+
+        L = 2 * L;
+        upsample_in = Tensor::allocate(ctx, {L, 1024});
+        ops::copy_tensor(ctx, conv_t_out, upsample_in, L * 1024);
+        ctx.synchronize();
+    }
+
+    auto t_upsample_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_upsample_start).count();
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   ConvNeXt upsample (2 layers): %.1f ms", t_upsample_ms);
+
+    // ==========================================
+    // 5. Decoder Blocks (4 Blocks, 总共上采样 480 倍)
+    // ==========================================
+    auto t_decoder_start = std::chrono::high_resolution_clock::now();
+    // 先通过 dec0 一维卷积 [7, 1024, 1536]
+    Tensor dec0_out = Tensor::allocate(ctx, {L, 1536});
+    Tensor& dec0_w = mimi_weights_.get("decoder.decoder.0.conv.weight");
+    Tensor& dec0_b = mimi_weights_.get("decoder.decoder.0.conv.bias");
+    ops::causal_conv1d(ctx, upsample_in, dec0_w, dec0_b, dec0_out, 1, 1024, 1536, L, 7, 1);
+    ctx.synchronize();
+
+    Tensor dec_in = Tensor::allocate(ctx, {L, 1536});
+    ops::copy_tensor(ctx, dec0_out, dec_in, L * 1536);
+    ctx.synchronize();
+
+    int upsample_rates[4] = {8, 5, 4, 3};
+    int in_dims[4] = {1536, 768, 384, 192};
+    int out_dims[4] = {768, 384, 192, 96};
+
+    for (int i = 0; i < 4; ++i) {
+        int in_d = in_dims[i];
+        int out_d = out_dims[i];
+        int stride = upsample_rates[i];
+        int kernel = 2 * stride;
+        std::string dec_prefix = "decoder.decoder." + std::to_string(i + 1) + ".block.";
+
+        // 1. SnakeBeta
+        Tensor& snake_a = mimi_weights_.get(dec_prefix + "0.alpha");
+        Tensor& snake_b = mimi_weights_.get(dec_prefix + "0.beta");
+        ops::snake_beta(ctx, dec_in, snake_a, snake_b, dec_in, L * in_d, in_d, L);
+        ctx.synchronize();
+
+        // 2. Transposed Convolution
+        Tensor conv_t_out = Tensor::allocate(ctx, {L * stride, out_d});
+        Tensor& conv_t_w = mimi_weights_.get(dec_prefix + "1.conv.weight");
+        Tensor& conv_t_b = mimi_weights_.get(dec_prefix + "1.conv.bias");
+        ops::causal_conv_transpose1d(ctx, dec_in, conv_t_w, conv_t_b, conv_t_out, 1, in_d, out_d, L, kernel, stride);
+        ctx.synchronize();
+
+        // 3. 3 Residual blocks with dilations 1, 3, 9
+        int dilations[3] = {1, 3, 9};
+        int Ls = L * stride;
+        int res_elems = Ls * out_d;
+        Tensor xx = Tensor::allocate(ctx, {Ls, out_d});
+        ops::copy_tensor(ctx, conv_t_out, xx, res_elems);
+        ctx.synchronize();
+
+        // Pre-allocate residual block buffers (reused across 3 iterations)
+        Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+
+        for (int r = 0; r < 3; ++r) {
+            std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
+
+            ops::copy_tensor(ctx, xx, res_in, res_elems);
+
+            // act1: snake(xx) -> xx_act1
+            Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
+            Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
+            ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
+
+            // conv1: conv(xx_act1) -> conv1_out
+            Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
+            Tensor& conv1_b = mimi_weights_.get(res_prefix + "conv1.conv.bias");
+            ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, Ls, 7, dilations[r]);
+
+            // act2: snake(conv1_out) in-place
+            Tensor& act2_a = mimi_weights_.get(res_prefix + "act2.alpha");
+            Tensor& act2_b = mimi_weights_.get(res_prefix + "act2.beta");
+            ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, res_elems, out_d, Ls);
+
+            // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
+            Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
+            Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
+            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
+
+            // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
+            ops::residual_add(ctx, res_in, conv2_out, res_elems);
+            ops::copy_tensor(ctx, res_in, xx, res_elems);
+            ctx.synchronize();  // barrier between residual blocks
+        }
+
+        L = L * stride;
+        dec_in = Tensor::allocate(ctx, {L, out_d});
+        ops::copy_tensor(ctx, xx, dec_in, L * out_d);
+        ctx.synchronize();
+    }
+
+    auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
+
+    // ==========================================
+    // 6. 最终 SnakeBeta 和映射 (channels=3 -> 1)
+    // ==========================================
+    auto t_final_start = std::chrono::high_resolution_clock::now();
+    // 最终 SnakeBeta (输入维度是最后的 out_dims[3] 即 96)
+    Tensor& dec5_a = mimi_weights_.get("decoder.decoder.5.alpha");
+    Tensor& dec5_b = mimi_weights_.get("decoder.decoder.5.beta");
+    ops::snake_beta(ctx, dec_in, dec5_a, dec5_b, dec_in, L * 96, 96, L);
+    ctx.synchronize();
+
+    // dec6一维卷积 [7, 96, 1]
+    Tensor dec6_out = Tensor::allocate(ctx, {L, 1});
+    Tensor& dec6_w = mimi_weights_.get("decoder.decoder.6.conv.weight");
+    Tensor& dec6_b = mimi_weights_.get("decoder.decoder.6.conv.bias");
+    ops::causal_conv1d(ctx, dec_in, dec6_w, dec6_b, dec6_out, 1, 96, 1, L, 7, 1);
+    ctx.synchronize();
+
+    // tanh 修正为 clamp 激活并拷贝到 Host
+    out_samples.resize(L);
+    float* host_ptr = out_samples.data();
+    auto* dev_ptr = dec6_out.data_as<bf16>();
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(L), [=](sycl::id<1> idx) {
+            int i = static_cast<int>(idx[0]);
+            float val = static_cast<float>(dev_ptr[i]);
+            // PyTorch clamp(min=-1, max=1)
+            if (val < -1.0f) val = -1.0f;
+            else if (val > 1.0f) val = 1.0f;
+            dev_ptr[i] = bf16(val);
+        });
+    }).wait();
+
+    // Now copy back as bf16 and convert to float on Host
+    std::vector<bf16> cpu_bf16(L);
+    ctx.queue().memcpy(cpu_bf16.data(), dev_ptr, L * sizeof(bf16)).wait();
+
+    for (int i = 0; i < L; ++i) {
+        out_samples[i] = static_cast<float>(cpu_bf16[i]);
+    }
+
+#pragma pack(push, 1)
+    struct WavHeader {
+        char riff[4] = {'R', 'I', 'F', 'F'};
+        uint32_t overall_size;
+        char wave[4] = {'W', 'A', 'V', 'E'};
+        char fmt_chunk_marker[4] = {'f', 'm', 't', ' '};
+        uint32_t length_of_fmt = 16;
+        uint16_t format_type = 1; // PCM
+        uint16_t channels = 1;
+        uint32_t sample_rate = 24000;
+        uint32_t byterate = 24000 * 1 * 2;
+        uint16_t block_align = 1 * 2;
+        uint16_t bits_per_sample = 16;
+        char data_chunk_header[4] = {'d', 'a', 't', 'a'};
+        uint32_t data_size;
+    };
+#pragma pack(pop)
+
+    {
+        std::ofstream wav_file("mimi_output.wav", std::ios::binary);
+        if (wav_file.is_open()) {
+            WavHeader header;
+            uint32_t num_samples = static_cast<uint32_t>(L);
+            header.data_size = num_samples * 2;
+            header.overall_size = header.data_size + 36;
+
+            wav_file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+            std::vector<int16_t> pcm_data(num_samples);
+            for (size_t i = 0; i < num_samples; ++i) {
+                float sample = out_samples[i];
+                if (sample < -1.0f) sample = -1.0f;
+                else if (sample > 1.0f) sample = 1.0f;
+                pcm_data[i] = static_cast<int16_t>(sample * 32767.0f);
+            }
+            wav_file.write(reinterpret_cast<const char*>(pcm_data.data()), header.data_size);
+        } else {
+            AILA_LOG_WARN("[MimiDebug] Warning: failed to write mimi_output.wav");
+        }
+    }
+
+    auto t_final_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_final_start).count();
+    auto t_conv_total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_conv_start).count();
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Conv stages total: %.1f ms (%d frames, %d samples)", t_conv_total_ms, n_frames, L);
+
+    AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
+    return true;
+}
+
 bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
                                          const std::vector<int32_t>& codes,
                                          int n_frames,
@@ -1638,258 +1912,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     auto t_pretfm_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Pre-transformer (8 layers): %.1f ms", t_pretfm_ms);
 
-    // ==========================================
-    // 4. 两层 ConvNeXt 上采样 (总共上采样 4 倍)
-    // ==========================================
-    auto t_upsample_start = std::chrono::high_resolution_clock::now();
-    Tensor upsample_in = Tensor::allocate(ctx, {n_frames, 1024});
-    ops::copy_tensor(ctx, pre_tfm_out, upsample_in, n_frames * 1024);
-    ctx.synchronize();
-    int L = n_frames;
-
-    for (int i = 0; i < 2; ++i) {
-        std::string up_prefix = "decoder.upsample." + std::to_string(i) + ".";
-
-        // 转置卷积上采样 2 倍: kernel_size=2, stride=2, output_channels=1024
-        Tensor conv_t_out = Tensor::allocate(ctx, {2 * L, 1024});
-        Tensor& conv_w = mimi_weights_.get(up_prefix + "0.conv.weight");
-        Tensor& conv_b = mimi_weights_.get(up_prefix + "0.conv.bias");
-        ops::causal_conv_transpose1d(ctx, upsample_in, conv_w, conv_b, conv_t_out, 1, 1024, 1024, L, 2, 2);
-        ctx.synchronize();
-
-        // ConvNeXt block
-        Tensor dw_out = Tensor::allocate(ctx, {2 * L, 1024});
-        Tensor& dw_w = mimi_weights_.get(up_prefix + "1.dwconv.conv.weight");
-        Tensor& dw_b = mimi_weights_.get(up_prefix + "1.dwconv.conv.bias");
-        ops::causal_conv1d_dw(ctx, conv_t_out, dw_w, dw_b, dw_out, 1, 1024, 2 * L, 7, 1);
-        ctx.synchronize();
-
-        // LayerNorm
-        Tensor normed_dw = Tensor::allocate(ctx, {2 * L, 1024});
-        Tensor& norm_w = mimi_weights_.get(up_prefix + "1.norm.weight");
-        Tensor& norm_b = mimi_weights_.get(up_prefix + "1.norm.bias");
-        ops::layer_norm(ctx, dw_out, norm_w, norm_b, 1e-6f, normed_dw, 2 * L, 1024);
-        ctx.synchronize();
-
-        // Linear pwconv1
-        Linear pw1;
-        pw1.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv1.weight"), 1024, 4096, false);
-        Tensor pw1_out = Tensor::allocate(ctx, {2 * L, 4096});
-        Tensor& pw1_b = mimi_weights_.get(up_prefix + "1.pwconv1.bias");
-        pw1.forward_bias(ctx, normed_dw, pw1_b, pw1_out, 2 * L);
-        ctx.synchronize();
-
-        // GELU
-        ops::gelu_tanh_inplace(ctx, pw1_out, 2 * L * 4096);
-        ctx.synchronize();
-
-        // Linear pwconv2
-        Linear pw2;
-        pw2.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv2.weight"), 4096, 1024, false);
-        Tensor pw2_out = Tensor::allocate(ctx, {2 * L, 1024});
-        Tensor& pw2_b = mimi_weights_.get(up_prefix + "1.pwconv2.bias");
-        pw2.forward_bias(ctx, pw1_out, pw2_b, pw2_out, 2 * L);
-        ctx.synchronize();
-
-        // Scale by gamma and add to residual
-        Tensor& gamma = mimi_weights_.get(up_prefix + "1.gamma");
-        apply_layer_scale_gpu(pw2_out, gamma, 2 * L, 1024);
-        ctx.synchronize();
-
-        ops::residual_add(ctx, conv_t_out, pw2_out, 2 * L * 1024);
-        ctx.synchronize();
-
-        L = 2 * L;
-        upsample_in = Tensor::allocate(ctx, {L, 1024});
-        ops::copy_tensor(ctx, conv_t_out, upsample_in, L * 1024);
-        ctx.synchronize();
-    }
-
-    auto t_upsample_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_upsample_start).count();
-    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   ConvNeXt upsample (2 layers): %.1f ms", t_upsample_ms);
-
-    // ==========================================
-    // 5. Decoder Blocks (4 Blocks, 总共上采样 480 倍)
-    // ==========================================
-    auto t_decoder_start = std::chrono::high_resolution_clock::now();
-    // 先通过 dec0 一维卷积 [7, 1024, 1536]
-    Tensor dec0_out = Tensor::allocate(ctx, {L, 1536});
-    Tensor& dec0_w = mimi_weights_.get("decoder.decoder.0.conv.weight");
-    Tensor& dec0_b = mimi_weights_.get("decoder.decoder.0.conv.bias");
-    ops::causal_conv1d(ctx, upsample_in, dec0_w, dec0_b, dec0_out, 1, 1024, 1536, L, 7, 1);
-    ctx.synchronize();
-
-    Tensor dec_in = Tensor::allocate(ctx, {L, 1536});
-    ops::copy_tensor(ctx, dec0_out, dec_in, L * 1536);
-    ctx.synchronize();
-
-    int upsample_rates[4] = {8, 5, 4, 3};
-    int in_dims[4] = {1536, 768, 384, 192};
-    int out_dims[4] = {768, 384, 192, 96};
-
-    for (int i = 0; i < 4; ++i) {
-        int in_d = in_dims[i];
-        int out_d = out_dims[i];
-        int stride = upsample_rates[i];
-        int kernel = 2 * stride;
-        std::string dec_prefix = "decoder.decoder." + std::to_string(i + 1) + ".block.";
-
-        // 1. SnakeBeta
-        Tensor& snake_a = mimi_weights_.get(dec_prefix + "0.alpha");
-        Tensor& snake_b = mimi_weights_.get(dec_prefix + "0.beta");
-        ops::snake_beta(ctx, dec_in, snake_a, snake_b, dec_in, L * in_d, in_d, L);
-        ctx.synchronize();
-
-        // 2. Transposed Convolution
-        Tensor conv_t_out = Tensor::allocate(ctx, {L * stride, out_d});
-        Tensor& conv_t_w = mimi_weights_.get(dec_prefix + "1.conv.weight");
-        Tensor& conv_t_b = mimi_weights_.get(dec_prefix + "1.conv.bias");
-        ops::causal_conv_transpose1d(ctx, dec_in, conv_t_w, conv_t_b, conv_t_out, 1, in_d, out_d, L, kernel, stride);
-        ctx.synchronize();
-
-        // 3. 3 Residual blocks with dilations 1, 3, 9
-        int dilations[3] = {1, 3, 9};
-        int Ls = L * stride;
-        int res_elems = Ls * out_d;
-        Tensor xx = Tensor::allocate(ctx, {Ls, out_d});
-        ops::copy_tensor(ctx, conv_t_out, xx, res_elems);
-        ctx.synchronize();
-
-        // Pre-allocate residual block buffers (reused across 3 iterations)
-        Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
-        Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
-        Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
-        Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
-
-        for (int r = 0; r < 3; ++r) {
-            std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
-
-            ops::copy_tensor(ctx, xx, res_in, res_elems);
-
-            // act1: snake(xx) -> xx_act1
-            Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
-            Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
-            ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
-
-            // conv1: conv(xx_act1) -> conv1_out
-            Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
-            Tensor& conv1_b = mimi_weights_.get(res_prefix + "conv1.conv.bias");
-            ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, Ls, 7, dilations[r]);
-
-            // act2: snake(conv1_out) in-place
-            Tensor& act2_a = mimi_weights_.get(res_prefix + "act2.alpha");
-            Tensor& act2_b = mimi_weights_.get(res_prefix + "act2.beta");
-            ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, res_elems, out_d, Ls);
-
-            // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
-            Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
-            Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
-            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
-
-            // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
-            ops::residual_add(ctx, res_in, conv2_out, res_elems);
-            ops::copy_tensor(ctx, res_in, xx, res_elems);
-            ctx.synchronize();  // barrier between residual blocks
-        }
-
-        L = L * stride;
-        dec_in = Tensor::allocate(ctx, {L, out_d});
-        ops::copy_tensor(ctx, xx, dec_in, L * out_d);
-        ctx.synchronize();
-    }
-
-    auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
-    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
-
-    // ==========================================
-    // 6. 最终 SnakeBeta 和映射 (channels=3 -> 1)
-    // ==========================================
-    auto t_final_start = std::chrono::high_resolution_clock::now();
-    // 最终 SnakeBeta (输入维度是最后的 out_dims[3] 即 96)
-    Tensor& dec5_a = mimi_weights_.get("decoder.decoder.5.alpha");
-    Tensor& dec5_b = mimi_weights_.get("decoder.decoder.5.beta");
-    ops::snake_beta(ctx, dec_in, dec5_a, dec5_b, dec_in, L * 96, 96, L);
-    ctx.synchronize();
-
-    // dec6一维卷积 [7, 96, 1]
-    Tensor dec6_out = Tensor::allocate(ctx, {L, 1});
-    Tensor& dec6_w = mimi_weights_.get("decoder.decoder.6.conv.weight");
-    Tensor& dec6_b = mimi_weights_.get("decoder.decoder.6.conv.bias");
-    ops::causal_conv1d(ctx, dec_in, dec6_w, dec6_b, dec6_out, 1, 96, 1, L, 7, 1);
-    ctx.synchronize();
-
-    // tanh 修正为 clamp 激活并拷贝到 Host
-    out_samples.resize(L);
-    float* host_ptr = out_samples.data();
-    auto* dev_ptr = dec6_out.data_as<bf16>();
-
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(L), [=](sycl::id<1> idx) {
-            int i = static_cast<int>(idx[0]);
-            float val = static_cast<float>(dev_ptr[i]);
-            // PyTorch clamp(min=-1, max=1)
-            if (val < -1.0f) val = -1.0f;
-            else if (val > 1.0f) val = 1.0f;
-            dev_ptr[i] = bf16(val);
-        });
-    }).wait();
-
-    // Now copy back as bf16 and convert to float on Host
-    std::vector<bf16> cpu_bf16(L);
-    ctx.queue().memcpy(cpu_bf16.data(), dev_ptr, L * sizeof(bf16)).wait();
-
-    for (int i = 0; i < L; ++i) {
-        out_samples[i] = static_cast<float>(cpu_bf16[i]);
-    }
-
-#pragma pack(push, 1)
-    struct WavHeader {
-        char riff[4] = {'R', 'I', 'F', 'F'};
-        uint32_t overall_size;
-        char wave[4] = {'W', 'A', 'V', 'E'};
-        char fmt_chunk_marker[4] = {'f', 'm', 't', ' '};
-        uint32_t length_of_fmt = 16;
-        uint16_t format_type = 1; // PCM
-        uint16_t channels = 1;
-        uint32_t sample_rate = 24000;
-        uint32_t byterate = 24000 * 1 * 2;
-        uint16_t block_align = 1 * 2;
-        uint16_t bits_per_sample = 16;
-        char data_chunk_header[4] = {'d', 'a', 't', 'a'};
-        uint32_t data_size;
-    };
-#pragma pack(pop)
-
-    {
-        std::ofstream wav_file("mimi_output.wav", std::ios::binary);
-        if (wav_file.is_open()) {
-            WavHeader header;
-            uint32_t num_samples = static_cast<uint32_t>(L);
-            header.data_size = num_samples * 2;
-            header.overall_size = header.data_size + 36;
-            
-            wav_file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-            
-            std::vector<int16_t> pcm_data(num_samples);
-            for (size_t i = 0; i < num_samples; ++i) {
-                float sample = out_samples[i];
-                if (sample < -1.0f) sample = -1.0f;
-                else if (sample > 1.0f) sample = 1.0f;
-                pcm_data[i] = static_cast<int16_t>(sample * 32767.0f);
-            }
-            wav_file.write(reinterpret_cast<const char*>(pcm_data.data()), header.data_size);
-        } else {
-            AILA_LOG_WARN("[MimiDebug] Warning: failed to write mimi_output.wav");
-        }
-    }
-
-    auto t_final_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_final_start).count();
-    auto t_mimi_total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_mimi_start).count();
-    if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
-    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Mimi decoder total: %.1f ms (%d frames, %d samples)", t_mimi_total_ms, n_frames, L);
-
-    AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
-    return true;
+    return mimi_conv_stages(ctx, pre_tfm_out, n_frames, out_samples);
 }
 
 bool Qwen3TTSBackend::init_mimi_stream(Context& ctx, MimiStreamState& state, int max_frames) {
@@ -2089,15 +2112,22 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
         ctx.synchronize();
     }
 
-    // === 5-7. ConvNeXt + Decoder + Final (full recompute on all frames) ===
-    // For now: after incremental pre-transformer, run the FULL non-attention pipeline
-    // by feeding x through the existing decode_mimi_vocoder conv stages.
-    // We temporarily accumulate all codes and use decode_mimi_vocoder for conv stages.
-    state.accumulated_codes.insert(state.accumulated_codes.end(),
-        codes.begin(), codes.begin() + static_cast<size_t>(new_frames) * 16);
+    // Final norm + output projection (after 8-layer loop)
+    Tensor final_normed = Tensor::allocate(ctx, {total_frames, 512});
+    ops::rms_norm(ctx, x, mimi_weights_.get("decoder.pre_transformer.norm.weight"),
+                  1e-5f, final_normed, total_frames, 512);
+    ctx.synchronize();
 
+    Tensor pre_tfm_out_i = Tensor::allocate(ctx, {total_frames, 1024});
+    Linear pre_tfm_out_proj_i;
+    pre_tfm_out_proj_i.init(ctx, mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
+    pre_tfm_out_proj_i.forward_bias(ctx, final_normed,
+        mimi_weights_.get("decoder.pre_transformer.output_proj.bias"), pre_tfm_out_i, total_frames);
+    ctx.synchronize();
+
+    // === Conv stages (shared with full decode_mimi_vocoder) ===
     std::vector<float> full_samples;
-    if (!decode_mimi_vocoder(ctx, state.accumulated_codes, total_frames, full_samples)) {
+    if (!mimi_conv_stages(ctx, pre_tfm_out_i, total_frames, full_samples)) {
         return false;
     }
 

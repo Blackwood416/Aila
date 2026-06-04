@@ -72,8 +72,6 @@ public:
         Tensor latent_buffer;   // [total_frames, 512]
         Tensor preconv_buffer;  // [total_frames, 1024]
 
-        // Accumulated codec tokens (flattened: total_frames * 16)
-        std::vector<int32_t> accumulated_codes;
         // Track previous audio output position for incremental slicing
         int last_audio_sample_count = 0;
 
@@ -83,7 +81,6 @@ public:
             v_cache.clear();
             latent_buffer = Tensor();
             preconv_buffer = Tensor();
-            accumulated_codes.clear();
             last_audio_sample_count = 0;
         }
     };
@@ -103,6 +100,10 @@ public:
                            std::vector<float>& out_samples);
 
 private:
+    // Conv stages of Mimi decoder (shared by full and incremental paths).
+    // Takes pre-transformer output [n_frames, 1024], produces float PCM audio.
+    bool mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
+                          std::vector<float>& out_samples);
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);
     void ensure_talker_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
