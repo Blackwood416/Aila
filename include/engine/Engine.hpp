@@ -10,6 +10,7 @@
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
 #include "../src/models/Qwen3TTSBackend.hpp"
 #include "../src/models/Qwen3ForceAlignerBackend.hpp"
+#include "../src/models/Qwen3ForceAlignerBnb4Backend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
@@ -360,7 +361,8 @@ public:
                 }
                 return false;
             }
-            if (spec.family == ModelFamily::Qwen3Dense || spec.family == ModelFamily::Qwen3ASR) {
+            if (spec.family == ModelFamily::Qwen3Dense || spec.family == ModelFamily::Qwen3ASR ||
+                spec.family == ModelFamily::Qwen3ForceAligner) {
                 return true;
             }
             if (spec.family == ModelFamily::Qwen35Hybrid) {
@@ -507,7 +509,11 @@ public:
                 backend_ = std::make_unique<Qwen3ASRBackend>();
             }
         } else if (model_spec_.family == ModelFamily::Qwen3ForceAligner) {
-            backend_ = std::make_unique<Qwen3ForceAlignerBackend>();
+            if (model_spec_.is_bitsandbytes_4bit()) {
+                backend_ = std::make_unique<Qwen3ForceAlignerBnb4Backend>();
+            } else {
+                backend_ = std::make_unique<Qwen3ForceAlignerBackend>();
+            }
         } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
@@ -2618,8 +2624,9 @@ public:
             return {};
         }
 
-        auto fa_backend = dynamic_cast<Qwen3ForceAlignerBackend*>(backend_.get());
-        if (!fa_backend) {
+        auto fa_bf16 = dynamic_cast<Qwen3ForceAlignerBackend*>(backend_.get());
+        auto fa_nf4 = dynamic_cast<Qwen3ForceAlignerBnb4Backend*>(backend_.get());
+        if (!fa_bf16 && !fa_nf4) {
             set_error(EngineErrorCode::RuntimeError, "Invalid ForceAligner backend class");
             return {};
         }
@@ -2740,17 +2747,24 @@ public:
         ctx_->memcpy_h2d_async(device_ids, prompt_ids.data(), prompt_ids.size() * sizeof(int));
         int prompt_len = static_cast<int>(prompt_ids.size());
 
-        Tensor& logits_all = fa_backend->forward_all(*ctx_, device_ids, prompt_len);
+        int classify_num;
+        Tensor* logits_all;
+        if (fa_bf16) {
+            logits_all = &fa_bf16->forward_all(*ctx_, device_ids, prompt_len);
+            classify_num = fa_bf16->classify_num();
+        } else {
+            logits_all = &fa_nf4->forward_all(*ctx_, device_ids, prompt_len);
+            classify_num = fa_nf4->classify_num();
+        }
         ctx_->free_device(device_ids);
 
         if (backend_->supports_vision_embedding_override())
             backend_->clear_mrope_positions();
 
         // 7. Download logits (GPU bf16 → host bf16 → float conversion)
-        int classify_num = fa_backend->classify_num();
         size_t total_elts = static_cast<size_t>(prompt_len) * classify_num;
         std::vector<bf16> host_bf16(total_elts);
-        ctx_->memcpy_d2h(host_bf16.data(), logits_all.data(), total_elts * sizeof(bf16));
+        ctx_->memcpy_d2h(host_bf16.data(), logits_all->data(), total_elts * sizeof(bf16));
         ctx_->synchronize();
         std::vector<float> host_logits(total_elts);
         for (size_t i = 0; i < total_elts; ++i) {

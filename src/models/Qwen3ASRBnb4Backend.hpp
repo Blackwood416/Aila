@@ -53,7 +53,7 @@ public:
                              int text_pos_delta) override;
     void clear_mrope_positions() override;
 
-private:
+protected:
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
@@ -87,11 +87,6 @@ private:
         Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
 
-    int runtime_seq_capacity_ = 0;
-    int prefill_scores_capacity_ = 0;
-    int incr_prefill_seq_cap_ = 0;
-    int incr_prefill_total_cap_ = 0;
-
     // Embedding override state (for audio token injection)
     bool has_embedding_overrides_ = false;
     std::vector<int> override_positions_;
@@ -112,4 +107,10 @@ private:
     int mrope_pos_capacity_ = 0;
 
     void upload_mrope_positions(Context& ctx);
+
+private:
+    int runtime_seq_capacity_ = 0;
+    int prefill_scores_capacity_ = 0;
+    int incr_prefill_seq_cap_ = 0;
+    int incr_prefill_total_cap_ = 0;
 };
