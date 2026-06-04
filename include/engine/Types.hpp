@@ -107,6 +107,7 @@ enum class ModelFamily {
     Qwen35Hybrid,
     Qwen3ASR,
     Qwen3TTS,
+    Qwen3ForceAligner,  // NEW
     Unknown
 };
 
@@ -253,6 +254,11 @@ struct ModelSpec {
     int audio_token_id = -1;
     int audio_start_token_id = -1;
     int audio_end_token_id = -1;
+
+    // Qwen3-ForceAligner path
+    int classify_num = 0;           // classification head dimension (5000)
+    int timestamp_token_id = -1;    // token ID for timestamp markers (151705)
+    int timestamp_segment_time = 0; // ms per timestamp unit (80)
 
     // Model-level quantization metadata
     QuantizationConfig quantization{};
