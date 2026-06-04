@@ -268,7 +268,7 @@ Interactive Commands:
 }
 
 void print_version() {
-    std::cout << "Aila v0.1.4" << std::endl;
+    std::cout << "Aila v0.1.5" << std::endl;
 }
 
 bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
