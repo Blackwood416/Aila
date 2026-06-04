@@ -195,6 +195,19 @@ void parse_qwen3_asr(simdjson::dom::element root, ModelSpec& spec) {
     read_int64(thinker, "audio_start_token_id", spec.audio_start_token_id);
     read_int64(thinker, "audio_end_token_id", spec.audio_end_token_id);
 
+    // --- Detect forced_aligner subtype ---
+    {
+        std::string thinker_type = read_string(thinker, "model_type");
+        if (thinker_type == "qwen3_forced_aligner") {
+            spec.family = ModelFamily::Qwen3ForceAligner;
+            read_int64(thinker, "classify_num", spec.classify_num);
+        }
+    }
+
+    // --- Timestamp config (top-level, for forced_aligner) ---
+    read_int64(root, "timestamp_token_id", spec.timestamp_token_id);
+    read_int64(root, "timestamp_segment_time", spec.timestamp_segment_time);
+
     // --- Text config ---
     simdjson::dom::element text_cfg_elem;
     bool has_text_config = (thinker.at_key("text_config").get(text_cfg_elem) == simdjson::SUCCESS);
