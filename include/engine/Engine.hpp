@@ -2382,11 +2382,11 @@ public:
         // else: no speaker identity -> default voice or VoiceDesign (instruct-only)
 
         // 2. Tokenize instruct text (optional, for VoiceDesign or style override)
+        // IMPORTANT: instruct text is raw text, NOT ChatML-formatted.
+        // The Python reference tokenizes instruct directly without <|im_start|>/<|im_end|>.
         std::vector<int> instruct_tokens;
         if (!instruct_text.empty()) {
-            std::string fmt_instruct = "<|im_start|>assistant\n"
-                + instruct_text + "<|im_end|>\n";
-            instruct_tokens = tokenizer_.encode(fmt_instruct);
+            instruct_tokens = tokenizer_.encode(instruct_text);
             AILA_LOG_INFO("[TTS] Instruct: \"%s\", %zu tokens",
                 instruct_text.c_str(), instruct_tokens.size());
         }
@@ -2456,8 +2456,7 @@ public:
             // Tokenize
             std::vector<int> instruct_tokens;
             if (!instruct_text.empty()) {
-                instruct_tokens = tokenizer_.encode(
-                    "<|im_start|>assistant\n" + instruct_text + "<|im_end|>\n");
+                instruct_tokens = tokenizer_.encode(instruct_text);
             }
             int lang_id = getLanguageId(language);
             std::string formatted_text = "<|im_start|>assistant\n" + text
