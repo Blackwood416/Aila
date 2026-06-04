@@ -786,3 +786,64 @@ AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count) {
         free(words);
     }
 }
+
+AILA_API int aila_align_words(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* const* words, int num_words,
+    AilaAlignedWord** out_words, int* out_count
+) {
+    if (out_words) *out_words = nullptr;
+    if (out_count) *out_count = 0;
+
+    if (!engine || !audio_samples || num_samples <= 0 || !words || num_words <= 0) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (!out_words || !out_count) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::vector<float> samples(audio_samples, audio_samples + num_samples);
+        std::vector<std::string> word_list;
+        word_list.reserve(num_words);
+        for (int i = 0; i < num_words; ++i) {
+            word_list.emplace_back(words[i] ? words[i] : "");
+        }
+
+        auto result = engine->engine.align_words(samples, sample_rate, word_list);
+
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return AILA_ERR_RUNTIME;
+        }
+
+        int count = static_cast<int>(result.size());
+        if (count == 0) {
+            *out_count = 0;
+            *out_words = nullptr;
+            return 0;
+        }
+
+        auto* out = static_cast<AilaAlignedWord*>(malloc(count * sizeof(AilaAlignedWord)));
+        if (!out) return AILA_ERR_RUNTIME;
+        memset(out, 0, count * sizeof(AilaAlignedWord));
+
+        for (int i = 0; i < count; ++i) {
+            char* txt = static_cast<char*>(malloc(result[i].text.size() + 1));
+            if (txt) memcpy(txt, result[i].text.c_str(), result[i].text.size() + 1);
+            out[i].text = txt;
+            out[i].start_ms = result[i].start_ms;
+            out[i].end_ms = result[i].end_ms;
+        }
+
+        *out_words = out;
+        *out_count = count;
+        return 0;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] align_words failed: %s", e.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] align_words failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}

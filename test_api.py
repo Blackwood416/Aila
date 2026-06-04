@@ -229,6 +229,18 @@ class AilaAPI:
             c_int                      # count
         ])
 
+        # ForceAligner word-list API (pre-tokenized)
+        self._set("aila_align_words", c_int, [
+            c_void_p,             # engine
+            POINTER(c_float),     # audio_samples
+            c_int,                # num_samples
+            c_int,                # sample_rate
+            POINTER(c_char_p),    # words (array of const char*)
+            c_int,                # num_words
+            POINTER(POINTER(AilaAlignedWord)),  # out_words
+            POINTER(c_int)        # out_count
+        ])
+
     def _set(self, name, restype, argtypes):
         fn = getattr(self._dll, name)
         fn.restype = restype
@@ -1290,6 +1302,38 @@ def test_align(api: AilaAPI, engine):
              f"{all_texts[:5]}{'...' if n_words > 5 else ''}")
         test("timestamps monotonic (start <= end, non-decreasing)", monotonic,
              f"n={n_words} range=[{word_array[0].start_ms}-{word_array[n_words-1].end_ms}]ms")
+
+    # --- aila_align_words (pre-tokenized word list API) ---
+    word_list = [b"hello", b"world"]
+    word_array_type = c_char_p * 2
+    word_array = word_array_type(*word_list)
+
+    out_words2 = POINTER(AilaAlignedWord)()
+    out_count2 = c_int(0)
+    rc2 = api.aila_align_words(engine, samples_arr, n_samples, sample_rate,
+                                word_array, 2,
+                                byref(out_words2), byref(out_count2))
+    if rc2 == 0:
+        test("aila_align_words returns OK (rc=0)", True)
+        test("aila_align_words out_count == 2", out_count2.value == 2,
+             f"count={out_count2.value}")
+        if out_count2.value > 0 and out_words2:
+            array_type2 = AilaAlignedWord * out_count2.value
+            wa2 = ctypes.cast(out_words2, POINTER(array_type2)).contents
+            texts2 = [wa2[i].text.decode("utf-8", errors="replace") if wa2[i].text else ""
+                      for i in range(out_count2.value)]
+            test("aila_align_words texts match input", texts2 == ["hello", "world"],
+                 f"got {texts2}")
+        if out_words2 and out_count2.value > 0:
+            api.aila_free_aligned_words(out_words2, out_count2.value)
+    else:
+        err_code = api.aila_last_error_code(engine)
+        err_msg = api.aila_last_error_message(engine).decode("utf-8", errors="replace") if api.aila_last_error_message(engine) else "(null)"
+        test("aila_align_words returns OK", False, f"rc={rc2} err=({err_code}) {err_msg}")
+
+    # NULL safety for align_words
+    test("align_words(NULL engine)", api.aila_align_words(None, None, 0, 16000, None, 0, None, None) != 0)
+    test("align_words(num_words <= 0)", api.aila_align_words(engine, samples_arr, n_samples, sample_rate, word_array, 0, byref(out_words2), byref(out_count2)) != 0)
 
     # Free
     if out_words and out_count.value > 0:

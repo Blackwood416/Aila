@@ -465,8 +465,29 @@ AILA_API int aila_align(
     AilaAlignedWord** out_words, int* out_count);
 
 /**
- * Free memory allocated by aila_align().
+ * Free memory allocated by aila_align() or aila_align_words().
  */
 AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count);
+
+/**
+ * Run forced alignment with pre-tokenized word list.
+ * Bypasses the built-in tokenizer — caller provides already-tokenized words
+ * (e.g. from Python-side nagisa for Japanese or soynlp for Korean).
+ *
+ * @param engine         Initialized ForceAligner engine.
+ * @param audio_samples  Mono float32 audio samples.
+ * @param num_samples    Number of audio samples.
+ * @param sample_rate    Audio sample rate in Hz (resampled to 16kHz).
+ * @param words          Pre-tokenized word strings (UTF-8).
+ * @param num_words      Number of words.
+ * @param out_words      Output: pointer to array of AilaAlignedWord.
+ * @param out_count      Output: number of aligned words.
+ * @return 0 on success, non-zero on error.
+ */
+AILA_API int aila_align_words(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* const* words, int num_words,
+    AilaAlignedWord** out_words, int* out_count);
 
 #endif /* AILA_API_H */

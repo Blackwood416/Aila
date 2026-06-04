@@ -12,9 +12,41 @@ static bool is_cjk_char(uint32_t cp) {
         || (cp >= 0xF900 && cp <= 0xFAFF);    // Compatibility Ideographs
 }
 
-static bool is_kept_char(char ch) {
-    if (ch == '\'') return true;
-    return std::isalnum(static_cast<unsigned char>(ch));
+static bool is_kept_char(uint32_t cp) {
+    if (cp == '\'') return true;
+    // ASCII letters and digits
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9'))
+        return true;
+    // Latin-1 Supplement letters (e.g., é, ü, ñ)
+    if ((cp >= 0xC0 && cp <= 0xD6) || (cp >= 0xD8 && cp <= 0xF6) || (cp >= 0xF8 && cp <= 0xFF))
+        return true;
+    // Latin Extended, IPA, spacing modifiers (U+0100–U+02FF)
+    if (cp >= 0x0100 && cp <= 0x02FF) return true;
+    // Greek & Coptic (U+0370–U+03FF)
+    if (cp >= 0x0370 && cp <= 0x03FF) return true;
+    // Cyrillic (U+0400–U+04FF)
+    if (cp >= 0x0400 && cp <= 0x04FF) return true;
+    // Arabic, Hebrew, Thai, etc. — broad Letter/Number blocks
+    if (cp >= 0x0600 && cp <= 0x06FF) return true;  // Arabic
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return true;  // Thai
+    // Hiragana (U+3040–U+309F)
+    if (cp >= 0x3040 && cp <= 0x309F) return true;
+    // Katakana (U+30A0–U+30FF)
+    if (cp >= 0x30A0 && cp <= 0x30FF) return true;
+    // Hangul Jamo (U+1100–U+11FF)
+    if (cp >= 0x1100 && cp <= 0x11FF) return true;
+    // Hangul Compatibility Jamo (U+3130–U+318F)
+    if (cp >= 0x3130 && cp <= 0x318F) return true;
+    // Hangul Syllables (U+AC00–U+D7AF)
+    if (cp >= 0xAC00 && cp <= 0xD7AF) return true;
+    // Fullwidth Latin letters/digits (U+FF01–U+FF5E)
+    if (cp >= 0xFF21 && cp <= 0xFF3A) return true;  // A-Z fullwidth
+    if (cp >= 0xFF41 && cp <= 0xFF5A) return true;  // a-z fullwidth
+    if (cp >= 0xFF10 && cp <= 0xFF19) return true;  // 0-9 fullwidth
+    // CJK Radicals Supplement, Kangxi (catch-all for other CJK-adjacent)
+    if (cp >= 0x2E80 && cp <= 0x2FDF) return true;
+    if (cp >= 0x31C0 && cp <= 0x31EF) return true;  // CJK Strokes
+    return false;
 }
 
 static std::vector<uint32_t> utf8_to_codepoints(const std::string& text) {
@@ -61,9 +93,8 @@ static std::vector<std::string> tokenize_cjk(const std::string& text) {
             flush_latin();
             tokens.push_back(codepoint_to_utf8(cp));
         } else {
-            std::string ch = codepoint_to_utf8(cp);
-            if (!ch.empty() && is_kept_char(ch[0])) {
-                latin_buf += ch;
+            if (is_kept_char(cp)) {
+                latin_buf += codepoint_to_utf8(cp);
             } else {
                 flush_latin();
             }
