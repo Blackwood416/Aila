@@ -20,6 +20,7 @@
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
+- 🎯 **强制对齐** — 音频 + 文本 → 词级时间戳对齐，支持 CJK 逐字分词和 LIS 时间戳修正
 - 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS），支持原生零样本语音克隆。支持直接生成原始音频 WAV、通过参考音频进行音色克隆，以及离线 Mimi 译码
 - 🎤 **CustomVoice / VoiceDesign** — 命名说话人预设（vivian、ryan 等）快速选择音色，以及通过 VoiceDesign 文本描述音色风格进行创意 TTS 控制
 - 🔉 **流式 TTS** — 实时原始 24kHz 单声道 f32 PCM 音频输出到 stdout，实现低延迟流式语音合成
@@ -40,6 +41,7 @@
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-1.7B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
+| [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Blackwood416/Qwen3-ForceAligner-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅（对齐） |
 | [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（语音克隆） |
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（语音克隆） |
 | [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（预置音色） |
@@ -101,6 +103,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 # 离线语音转录 (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# 强制对齐（词级时间戳）
+Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界" --align-audio input.wav --align-lang Chinese
+
 # 文本转语音合成 (TTS)
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "你好世界" --output-wav output.wav
 
@@ -155,6 +160,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--spk-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_SPK_CACHE_DIR` 环境变量 |
 | `--stream-tts` | 流式输出原始 24kHz 单声道 f32 PCM 到 stdout | 关闭 |
 | `--stream-batch <N>` | 流式 TTS 每批帧数 | 4 |
+| `--align-text <text>` | 强制对齐：要对齐的文本 | 无 |
+| `--align-audio <path>` | 强制对齐：音频文件路径 | 无 |
+| `--align-lang <lang>` | 强制对齐：语言（默认 Chinese） | Chinese |
 | `--forced-lang <lang>` | 强制指定 ASR 转录语种（如 Chinese, English） | 无 |
 | `--asr-system <prompt>` | ASR 偏置的系统提示词（system prompt） | 无 |
 | `--asr-segment <sec>` | ASR 音频分段切片秒数大小 | 0.0 (禁用) |
@@ -169,6 +177,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/help` | 显示可用命令 |
 | `/quit`、`/exit` | 退出程序 |
 | `/transcribe <path>` | 转录音频文件（ASR） |
+| `/align text="..." audio=<path> [language="..."]` | 强制对齐（词级时间戳） |
 | `/tts <text> [--spk <path>]` | 语音合成（TTS），支持可选语音克隆 |
 | `/synthesize <text> [--spk <path>]` | `/tts` 的别名 |
 | `/voice <name>` | 设置 TTS 音色（vivian、ryan 等） |
@@ -302,6 +311,11 @@ python export_bnb_nf4.py \
 python export_bnb_nf4.py \
     --source Qwen/Qwen3-ASR-1.7B \
     --output ./models/Qwen3-ASR-1.7B-BNB-NF4
+
+# ForceAligner 模型（自动检测，classify_head 保持密集）
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3-ForcedAligner-0.6B \
+    --output ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4
 
 # 从本地目录导出，覆盖已有导出
 python export_bnb_nf4.py \

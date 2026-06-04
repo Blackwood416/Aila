@@ -530,6 +530,96 @@ Decodes discrete acoustic codes (shape `[n_frames, 16]`) back to raw audio sampl
 
 Returns `0` (`AILA_OK`) on success, non-zero on error.
 
+### Forced Alignment
+
+Aila supports forced alignment (word-level timestamp alignment from audio + text) when loaded with a Qwen3-ForceAligner model.
+
+#### `AilaAlignedWord`
+
+```c
+typedef struct {
+    const char* text;    // UTF-8 word text
+    int start_ms;        // start time in milliseconds
+    int end_ms;          // end time in milliseconds
+} AilaAlignedWord;
+```
+
+#### `aila_align`
+
+```c
+int aila_align(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* text, const char* language,
+    AilaAlignedWord** out_words, int* out_count
+);
+```
+
+Runs forced alignment with built-in tokenization. Returns word-level timestamps.
+
+- `audio_samples` — Mono float32 audio samples.
+- `num_samples` — Number of audio samples.
+- `sample_rate` — Audio sample rate in Hz (auto-resampled to 16kHz).
+- `text` — UTF-8 transcript text to align.
+- `language` — Language name (e.g., `"Chinese"`, `"English"`, `"Japanese"`, `"Korean"`). Controls CJK char-by-char vs space-delimited tokenization.
+- `out_words` — [out] Receives array of `AilaAlignedWord` structs. Free with `aila_free_aligned_words`.
+- `out_count` — [out] Number of aligned words.
+
+Returns `0` on success, non-zero on error.
+
+#### `aila_align_words`
+
+```c
+int aila_align_words(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* const* words, int num_words,
+    AilaAlignedWord** out_words, int* out_count
+);
+```
+
+Runs forced alignment with **pre-tokenized** word list. Bypasses the built-in tokenizer — callers (e.g., Python) can use their own tokenizer (nagisa for Japanese, soynlp for Korean, etc.).
+
+- `words` — Array of null-terminated UTF-8 word strings.
+- `num_words` — Number of words in the array.
+- Other parameters same as `aila_align`.
+
+#### `aila_free_aligned_words`
+
+```c
+void aila_free_aligned_words(AilaAlignedWord* words, int count);
+```
+
+Frees the aligned word array returned by `aila_align` or `aila_align_words`. Passing `NULL` or `count=0` is safe.
+
+#### ForceAligner Example (Python)
+
+```python
+class AilaAlignedWord(ctypes.Structure):
+    _fields_ = [("text", ctypes.c_char_p), ("start_ms", ctypes.c_int), ("end_ms", ctypes.c_int)]
+
+lib.aila_align.argtypes = [c_void_p, POINTER(c_float), c_int, c_int, c_char_p, c_char_p,
+                            POINTER(POINTER(AilaAlignedWord)), POINTER(c_int)]
+lib.aila_align.restype = c_int
+lib.aila_free_aligned_words.argtypes = [POINTER(AilaAlignedWord), c_int]
+
+# Single-shot alignment
+engine = lib.aila_engine_create()
+lib.aila_engine_init(engine, b"./models/Qwen3-ForcedAligner-0.6B-BNB-NF4", 512)
+
+samples = (c_float * n)(*audio_data)
+out_words = POINTER(AilaAlignedWord)()
+out_count = c_int(0)
+rc = lib.aila_align(engine, samples, n, 16000, b"hello world", b"English",
+                     byref(out_words), byref(out_count))
+if rc == 0:
+    arr = ctypes.cast(out_words, POINTER(AilaAlignedWord * out_count.value)).contents
+    for i in range(out_count.value):
+        w = arr[i]
+        print(f"{w.text.decode()} {w.start_ms}-{w.end_ms}ms")
+    lib.aila_free_aligned_words(out_words, out_count.value)
+```
+
 ### Memory Management
 
 #### `aila_free_string`
@@ -773,6 +863,25 @@ lib.aila_decode_mimi_vocoder.argtypes = [
 ]
 lib.aila_decode_mimi_vocoder.restype = ctypes.c_int
 
+# ForceAligner
+class AilaAlignedWord(ctypes.Structure):
+    _fields_ = [("text", ctypes.c_char_p), ("start_ms", ctypes.c_int), ("end_ms", ctypes.c_int)]
+
+lib.aila_align.argtypes = [
+    ctypes.c_void_p, POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+    ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.POINTER(AilaAlignedWord)), ctypes.POINTER(ctypes.c_int)
+]
+lib.aila_align.restype = ctypes.c_int
+lib.aila_align_words.argtypes = [
+    ctypes.c_void_p, POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
+    ctypes.POINTER(ctypes.POINTER(AilaAlignedWord)), ctypes.POINTER(ctypes.c_int)
+]
+lib.aila_align_words.restype = ctypes.c_int
+lib.aila_free_aligned_words.argtypes = [ctypes.POINTER(AilaAlignedWord), ctypes.c_int]
+lib.aila_free_aligned_words.restype = None
+
 # Use
 engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/qwen3.5-0.8B-bnb-nf4-offline", 4096)
@@ -898,6 +1007,12 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern void aila_free_samples(IntPtr samples);
     [DllImport("AilaShared.dll")] static extern int aila_decode_mimi_vocoder(IntPtr e, int[] codes, int nFrames, out IntPtr outSamples, out int outSampleCount);
 
+    // ForceAligner
+    [StructLayout(LayoutKind.Sequential)] struct AilaAlignedWord { public IntPtr text; public int start_ms; public int end_ms; }
+    [DllImport("AilaShared.dll")] static extern int aila_align(IntPtr e, float[] samples, int n, int sr, string text, string lang, out IntPtr outWords, out int outCount);
+    [DllImport("AilaShared.dll")] static extern int aila_align_words(IntPtr e, float[] samples, int n, int sr, string[] words, int nWords, out IntPtr outWords, out int outCount);
+    [DllImport("AilaShared.dll")] static extern void aila_free_aligned_words(IntPtr words, int count);
+
     // TTS Streaming
     delegate void AilaAudioCallback(IntPtr samples, int sampleCount, IntPtr userData);
     [DllImport("AilaShared.dll")] static extern int aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
@@ -978,6 +1093,30 @@ extern "C" {
         out_samples: *mut *mut f32,
         out_sample_count: *mut c_int,
     ) -> c_int;
+
+    // ForceAligner
+    type AilaAlignedWord = extern "C" { fn free(words: *mut AilaAlignedWord, count: c_int); }
+    fn aila_align(
+        engine: *mut c_void,
+        audio_samples: *const f32,
+        num_samples: c_int,
+        sample_rate: c_int,
+        text: *const c_char,
+        language: *const c_char,
+        out_words: *mut *mut AilaAlignedWord,
+        out_count: *mut c_int,
+    ) -> c_int;
+    fn aila_align_words(
+        engine: *mut c_void,
+        audio_samples: *const f32,
+        num_samples: c_int,
+        sample_rate: c_int,
+        words: *const *const c_char,
+        num_words: c_int,
+        out_words: *mut *mut AilaAlignedWord,
+        out_count: *mut c_int,
+    ) -> c_int;
+    fn aila_free_aligned_words(words: *mut AilaAlignedWord, count: c_int);
 
     // TTS Streaming
     type AilaAudioCallback = extern "C" fn(samples: *const f32, sample_count: c_int, user_data: *mut c_void);

@@ -20,6 +20,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
+- 🎯 **Forced Alignment** — word-level timestamp alignment from audio + text, with CJK character-level tokenization and LIS-based timestamp correction
 - 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder and native zero-shot voice cloning. Supports direct raw audio WAV generation, voice cloning via reference audio, and offline Mimi decoding
 - 🎤 **CustomVoice / VoiceDesign** — named speaker presets (vivian, ryan, etc.) for instant voice selection and text-described voice styles via VoiceDesign for creative TTS control
 - 🔉 **Streaming TTS** — real-time raw 24kHz mono f32 PCM audio output to stdout for low-latency streaming speech synthesis
@@ -40,6 +41,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-1.7B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
+| [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Blackwood416/Qwen3-ForceAligner-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (Alignment) |
 | [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Voice Cloning) |
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Voice Cloning) |
 | [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Pre-trained Voices) |
@@ -101,6 +103,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 # Offline audio transcription (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# Forced alignment (word-level timestamps)
+Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界" --align-audio input.wav --align-lang Chinese
+
 # Text-to-speech synthesis (TTS)
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base --synthesize "Hello world!" --output-wav output.wav
 
@@ -155,6 +160,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--spk-cache-dir <dir>` | Speaker embedding cache directory | `AILA_SPK_CACHE_DIR` env |
 | `--stream-tts` | Stream raw 24kHz mono f32 PCM to stdout | off |
 | `--stream-batch <N>` | Frames per streaming TTS chunk | 4 |
+| `--align-text <text>` | Forced alignment: transcript text to align | (none) |
+| `--align-audio <path>` | Forced alignment: audio file path | (none) |
+| `--align-lang <lang>` | Forced alignment: language (default: Chinese) | Chinese |
 | `--forced-lang <lang>` | Force ASR language (e.g. Chinese, English) | (none) |
 | `--asr-system <prompt>` | ASR system prompt text bias | (none) |
 | `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
@@ -169,6 +177,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/help` | Show available commands |
 | `/quit`, `/exit` | Exit |
 | `/transcribe <path>` | Transcribe audio file (ASR) |
+| `/align text="..." audio=<path> [language="..."]` | Forced alignment (word-level timestamps) |
 | `/tts <text> [--spk <path>]` | Synthesize speech (TTS) with optional voice cloning |
 | `/synthesize <text> [--spk <path>]` | Alias for `/tts` |
 | `/voice <name>` | Set TTS voice (vivian, ryan, etc.) |
@@ -302,6 +311,11 @@ python export_bnb_nf4.py \
 python export_bnb_nf4.py \
     --source Qwen/Qwen3-ASR-1.7B \
     --output ./models/Qwen3-ASR-1.7B-BNB-NF4
+
+# ForceAligner model (auto-detected, classify_head kept dense)
+python export_bnb_nf4.py \
+    --source Qwen/Qwen3-ForcedAligner-0.6B \
+    --output ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4
 
 # From local directory, overwriting existing export
 python export_bnb_nf4.py \
