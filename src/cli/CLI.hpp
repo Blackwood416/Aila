@@ -79,9 +79,6 @@ struct CLIOptions {
 
     // KV Cache quantization (FP8)
     bool kv_quant = false;           // --kv-quant
-
-    // Qwen3.5 MTP speculative decoding
-    bool mtp = false;                // --mtp
 };
 
 // Parse command-line arguments

@@ -23,8 +23,6 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
-    Tensor* forward_mtp(Context& ctx, int next_token_id, bool use_mtp_hidden = false) override;
-    bool has_mtp() const override { return has_mtp_; }
     bool supports_vision_embedding_override() const override { return true; }
 
     void set_embedding_overrides(const std::vector<int>& positions,
@@ -233,23 +231,4 @@ private:
     };
     std::unordered_map<int, StateSnapshot> snapshots_;
     void clear_snapshots();
-
-    // MTP Components
-    bool has_mtp_ = false;
-    Tensor* mtp_pre_fc_norm_hidden_weight_ = nullptr;
-    Tensor* mtp_pre_fc_norm_embedding_weight_ = nullptr;
-    Linear mtp_fc_;
-    Tensor* mtp_norm_weight_ = nullptr;
-
-    std::vector<Layer> mtp_layers_;
-    std::vector<LayerCache> mtp_layer_caches_;
-
-    // MTP Buffers
-    Tensor buf_mtp_emb_;
-    Tensor buf_mtp_emb_norm_;
-    Tensor buf_mtp_hid_norm_;
-    Tensor buf_mtp_fused_;
-    Tensor buf_mtp_hidden_;
-    Tensor buf_mtp_logits_;
-    Tensor buf_mtp_out_;  // saved post-norm output for autoregressive chain
 };

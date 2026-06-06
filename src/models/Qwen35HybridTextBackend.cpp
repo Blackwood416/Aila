@@ -194,16 +194,6 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
 
     runtime_seq_capacity_ = new_cap;
     AILA_LOG_INFO("[Qwen3.5] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);
-
-    if (has_mtp_) {
-        buf_mtp_emb_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
-        buf_mtp_emb_norm_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
-        buf_mtp_hid_norm_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
-        buf_mtp_fused_ = Tensor::allocate(ctx, {1, (int64_t)(hidden_size_ * 2)});
-        buf_mtp_hidden_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
-        buf_mtp_logits_ = Tensor::allocate(ctx, {1, (int64_t)cfg_.vocab_size});
-        buf_mtp_out_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
-    }
 }
 
 void Qwen35HybridTextBackend::ensure_prefill_scores(Context& ctx, int seq_len) {
@@ -476,11 +466,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     fused_weights_.clear();
     layers_.resize(cfg_.num_hidden_layers);
     layer_caches_.resize(cfg_.num_hidden_layers);
-    // MTP layers also push fused weights into this vector (2 per MTP layer
-    // currently, but reserve 6 per MTP layer for headroom).  If the vector
-    // reallocates later, all raw Tensor* pointers stored in layers_[] become
-    // dangling and cause a crash on the first forward pass.
-    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers + cfg_.mtp_num_hidden_layers) * 6 + 1);
+    fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 6 + 1);
 
     auto fuse_three_cols = [&](Tensor& a, Tensor& b, Tensor& c) {
         int64_t rows = a.shape(0);
@@ -845,10 +831,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
 
     ctx.synchronize();
 
-    // Determine MTP availability early — must happen BEFORE ensure_runtime_buffers
-    // so that MTP scratch buffers are allocated during initialisation.
-    has_mtp_ = (cfg_.mtp_num_hidden_layers > 0);
-
     runtime_seq_capacity_ = 0;
     prefill_scores_capacity_ = 0;
     incr_prefill_seq_cap_ = 0;
@@ -917,87 +899,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         AILA_LOG_INFO("[Qwen3.5] Set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback");
     }
     AILA_LOG_INFO("[Qwen3.5] KV Cache config: quantized=%s", aila::env::read_flag("AILA_KV_QUANT", false) ? "true" : "false");
-
-    if (has_mtp_) {
-        AILA_LOG_INFO("[Qwen3.5 MTP] Loading MTP weights (layers=%d)...", cfg_.mtp_num_hidden_layers);
-        if (weights.has("mtp.pre_fc_norm_hidden.weight")) {
-            mtp_pre_fc_norm_hidden_weight_ = plus_one_norm_weight("mtp.pre_fc_norm_hidden.weight");
-            mtp_pre_fc_norm_embedding_weight_ = plus_one_norm_weight("mtp.pre_fc_norm_embedding.weight");
-            
-            Tensor* fc_w = transpose_weight("mtp.fc.weight");
-            mtp_fc_.init(ctx, *fc_w, hidden_size_ * 2, hidden_size_, true);
-            mtp_norm_weight_ = plus_one_norm_weight("mtp.norm.weight");
-            
-            mtp_layers_.resize(cfg_.mtp_num_hidden_layers);
-            mtp_layer_caches_.resize(cfg_.mtp_num_hidden_layers);
-            
-            for (int i = 0; i < cfg_.mtp_num_hidden_layers; ++i) {
-                auto& layer = mtp_layers_[i];
-                auto& cache = mtp_layer_caches_[i];
-                std::string prefix = "mtp.layers." + std::to_string(i) + ".";
-                std::vector<std::string> weights_to_erase;
-                
-                layer.input_ln_weight = plus_one_norm_weight(prefix + "input_layernorm.weight");
-                layer.post_attn_ln_weight = plus_one_norm_weight(prefix + "post_attention_layernorm.weight");
-                layer.is_linear = false;
-                
-                Tensor* q_w = transpose_weight(prefix + "self_attn.q_proj.weight");
-                Tensor* k_w = transpose_weight(prefix + "self_attn.k_proj.weight");
-                Tensor* v_w = transpose_weight(prefix + "self_attn.v_proj.weight");
-                Tensor* o_w = transpose_weight(prefix + "self_attn.o_proj.weight");
-
-                fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
-                layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
-                layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
-                
-                weights_to_erase.push_back(prefix + "self_attn.q_proj.weight");
-                weights_to_erase.push_back(prefix + "self_attn.k_proj.weight");
-                weights_to_erase.push_back(prefix + "self_attn.v_proj.weight");
-                
-                layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
-                layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
-                
-                auto kv_dtype = aila::env::read_flag("AILA_KV_QUANT", false) ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
-                cache.k = Tensor::allocate(ctx,
-                                           {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                           kv_dtype);
-                cache.v = Tensor::allocate(ctx,
-                                           {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                           kv_dtype);
-                // Zero-fill MTP KV cache to avoid attention reading garbage
-                ctx.queue().memset(cache.k.data(), 0, cache.k.size_bytes());
-                ctx.queue().memset(cache.v.data(), 0, cache.v.size_bytes());
-                cache.linear_state = Tensor();
-                cache.linear_conv_state = Tensor();
-                cache.host_linear_state.clear();
-                cache.host_linear_conv_state.clear();
-                cache.linear_conv_head = 0;
-
-                Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
-                Tensor* up_w = transpose_weight(prefix + "mlp.up_proj.weight");
-                Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
-                fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
-                layer.gate_up_weight = &fused_weights_.back();
-                layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
-                layer.down_weight = down_w;
-                layer.down_proj.init(ctx, *down_w, ff_dim_, hidden_size_, true);
-                weights_to_erase.push_back(prefix + "mlp.gate_proj.weight");
-                weights_to_erase.push_back(prefix + "mlp.up_proj.weight");
-                
-                if (!weights_to_erase.empty()) {
-                    ctx.synchronize();
-                    for (const auto& name : weights_to_erase) {
-                        if (weights.has(name)) weights.erase(name);
-                    }
-                }
-            }
-            AILA_LOG_INFO("[Qwen3.5 MTP] MTP weights loaded successfully.");
-        } else {
-            AILA_LOG_WARN("[Qwen3.5 MTP] mtp_num_hidden_layers > 0, but no MTP weights found in safetensors. Disabling MTP.");
-            has_mtp_ = false;
-        }
-    }
-
     return true;
 }
 
@@ -2640,164 +2541,3 @@ bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
         return true;
     }
 };
-
-Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id, bool use_mtp_hidden) {
-    if (!has_mtp_) {
-        return nullptr;
-    }
-
-    // 1. 获取隐状态：首次调用从主模型取，链式调用复用 MTP 自身输出
-    Tensor base_hidden_view;
-    if (use_mtp_hidden && buf_mtp_out_.valid()) {
-        base_hidden_view = Tensor::view(ctx, buf_mtp_out_.data(), {1, (int64_t)hidden_size_});
-    } else {
-        bf16* base_hidden_ptr = static_cast<bf16*>(buf_.hidden.data()) + (size_t)(current_len_ - 1) * hidden_size_;
-        base_hidden_view = Tensor::view(ctx, base_hidden_ptr, {1, (int64_t)hidden_size_});
-    }
-
-    // 2. embedding lookup (用设备端临时变量)
-    int* dev_token_id = static_cast<int*>(ctx.alloc_device(sizeof(int)));
-    ctx.memcpy_h2d(dev_token_id, &next_token_id, sizeof(int));
-    ops::embedding_lookup(ctx, *embed_weight_, dev_token_id, 1, buf_mtp_emb_, hidden_size_);
-    ctx.free_device(dev_token_id);
-
-    // 3. RMSNorm for embedding and hidden
-    ops::rms_norm(ctx, buf_mtp_emb_, *mtp_pre_fc_norm_embedding_weight_, cfg_.rms_norm_eps,
-                  buf_mtp_emb_norm_, 1, hidden_size_);
-                  
-    ops::rms_norm(ctx, base_hidden_view, *mtp_pre_fc_norm_hidden_weight_, cfg_.rms_norm_eps,
-                  buf_mtp_hid_norm_, 1, hidden_size_);
-
-    // 4. Concatenate embedding & hidden into mtp_fused (1, hidden_size * 2)
-    {
-        bf16* fused_ptr = static_cast<bf16*>(buf_mtp_fused_.data());
-        const bf16* emb_ptr = static_cast<const bf16*>(buf_mtp_emb_norm_.data());
-        const bf16* hid_ptr = static_cast<const bf16*>(buf_mtp_hid_norm_.data());
-        int h_size = hidden_size_;
-
-        ctx.queue().parallel_for(sycl::range<1>((size_t)h_size * 2), [=](sycl::id<1> idx) {
-            size_t i = idx[0];
-            if (i < (size_t)h_size) {
-                fused_ptr[i] = emb_ptr[i];
-            } else {
-                fused_ptr[i] = hid_ptr[i - h_size];
-            }
-        });
-    }
-
-    // 5. Projection back to hidden_size (结果保存在 buf_mtp_hidden_)
-    mtp_fc_.forward(ctx, buf_mtp_fused_, buf_mtp_hidden_, 1);
-
-    // 6. Run MTP Decoder Layer (Full Attention + FFN)
-    auto& layer = mtp_layers_[0];
-    auto& cache = mtp_layer_caches_[0];
-    
-    // Fused input RMSNorm (写入 buf_.normed)
-    ops::rms_norm(ctx, buf_mtp_hidden_, *layer.input_ln_weight, cfg_.rms_norm_eps,
-                  buf_.normed, 1, hidden_size_);
-                  
-    // QKV Projection (写入 buf_.full_qkv)
-    layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, 1);
-
-    // Ensure QKV projection is complete before split/attention
-    ctx.queue().wait();
-
-    // Split Q, K, V views
-    bf16* fused_qkv_ptr = static_cast<bf16*>(buf_.full_qkv.data());
-    Tensor q_gate_decode_view;
-    Tensor q_decode_view;
-    Tensor k_decode_view;
-    Tensor v_decode_view;
-    Tensor* q_for_attn = &buf_.q;
-    Tensor* k_for_attn = &buf_.k;
-    Tensor* v_for_attn = &buf_.v;
-    
-    if (cfg_.attn_output_gate) {
-        q_gate_decode_view = Tensor::view(ctx, fused_qkv_ptr, {1, (int64_t)full_q_proj_dim_});
-        q_for_attn = &buf_.q;
-    } else {
-        q_decode_view = Tensor::view(ctx, fused_qkv_ptr, {1, (int64_t)full_q_dim_});
-        q_for_attn = &q_decode_view;
-    }
-    k_decode_view = Tensor::view(ctx, fused_qkv_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
-    v_decode_view = Tensor::view(ctx, fused_qkv_ptr + full_q_proj_dim_ + full_kv_dim_, {1, (int64_t)full_kv_dim_});
-    k_for_attn = &k_decode_view;
-    v_for_attn = &v_decode_view;
-
-    // MTP uses its own dedicated KV cache.  Each forward_mtp call processes
-    // exactly one token and self-attention over a single token is effectively
-    // the identity (plus RoPE).  We therefore pin the MTP cache to position 0
-    // with a length of 1, avoiding reads of uninitialised cache lines.
-    const int mtp_start_pos = 0;
-    const int mtp_cached_len = 1;
-    int full_rotary_dim = std::max(2, (int)std::floor(full_head_dim_ * cfg_.rope.partial_rotary_factor));
-    full_rotary_dim = std::min(full_head_dim_, full_rotary_dim);
-    if (full_rotary_dim & 1) --full_rotary_dim;
-    if (full_rotary_dim <= 0) full_rotary_dim = std::min(2, full_head_dim_);
-
-    // QK Norm & RoPE & Write to MTP KV Cache
-    if (cfg_.attn_output_gate) {
-        ops::decode_prepare_qgkv_packed_partial(ctx, q_gate_decode_view, *k_for_attn, *v_for_attn,
-                                                buf_.q, buf_.z,
-                                                *layer.q_norm_weight, *layer.k_norm_weight,
-                                                cache.k, cache.v, mtp_start_pos,
-                                                full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                cfg_.rms_norm_eps, full_rotary_dim,
-                                                cfg_.rope.rope_theta,
-                                                cfg_.rope.mrope_interleaved,
-                                                mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                                mrope_prompt_len_, mrope_text_pos_delta_,
-                                                cfg_.rope.mrope_section[0],
-                                                cfg_.rope.mrope_section[1],
-                                                cfg_.rope.mrope_section[2]);
-    } else {
-        ops::decode_prepare_qkv_partial(ctx, *q_for_attn, *k_for_attn, *v_for_attn,
-                                        *layer.q_norm_weight, *layer.k_norm_weight,
-                                        cache.k, cache.v, mtp_start_pos,
-                                        full_q_heads_, full_kv_heads_, full_head_dim_,
-                                        cfg_.rms_norm_eps, full_rotary_dim,
-                                        cfg_.rope.rope_theta,
-                                        cfg_.rope.mrope_interleaved,
-                                        mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                        mrope_prompt_len_, mrope_text_pos_delta_,
-                                        cfg_.rope.mrope_section[0],
-                                        cfg_.rope.mrope_section[1],
-                                        cfg_.rope.mrope_section[2]);
-    }
-
-    // Attention Decode
-    ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
-                          full_q_heads_, full_kv_heads_, full_head_dim_, mtp_cached_len,
-                          &buf_.decode_attn_partials);
-
-    // Sigmoid gate mul (if enabled)
-    if (cfg_.attn_output_gate) {
-        ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, full_q_dim_);
-    }
-
-    // O projection
-    layer.o_proj.forward(ctx, buf_.attn_out, buf_.gate, 1);
-
-    // Post Attn residual add & RMSNorm (写入 buf_.normed)
-    ops::fused_add_rms_norm(ctx, buf_mtp_hidden_, buf_.gate, *layer.post_attn_ln_weight,
-                            cfg_.rms_norm_eps, buf_.normed, 1, hidden_size_);
-
-    // FFN
-    layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, 1);
-    ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
-    layer.down_proj.forward(ctx, buf_.gate, buf_.up, 1);
-
-    // FFN residual add & Final RMSNorm (写入 buf_.normed 作为 lm_head 的输入)
-    ops::fused_add_rms_norm(ctx, buf_mtp_hidden_, buf_.up, *mtp_norm_weight_,
-                            cfg_.rms_norm_eps, buf_.normed, 1, hidden_size_);
-                            
-    // 7. LM Head logits 计算
-    lm_head_.forward(ctx, buf_.normed, buf_mtp_logits_, 1);
-
-    // Save post-norm hidden state for autoregressive chain calls
-    ctx.queue().memcpy(buf_mtp_out_.data(), buf_.normed.data(),
-                       (size_t)hidden_size_ * sizeof(bf16));
-
-    return &buf_mtp_logits_;
-}
-

@@ -405,52 +405,6 @@ int argmax(Context& ctx, Tensor& logits, int vocab_size) {
 }
 
 // ============================================================
-// GPU-side top-k membership check (no host readback)
-// ============================================================
-
-void is_in_topk(Context& ctx, Tensor& logits, int vocab_size,
-                int target_token, int k, int* d_result) {
-    bf16* l_ptr = static_cast<bf16*>(logits.data());
-
-    constexpr int wg_size = 256;
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int, 1> local_count(sycl::range<1>(wg_size), cgh);
-
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(wg_size), sycl::range<1>(wg_size)),
-            [=](sycl::nd_item<1> item) {
-                auto sg = item.get_sub_group();
-                int lid = static_cast<int>(item.get_local_id(0));
-
-                // Read the target token's logit value
-                float target_val = static_cast<float>(l_ptr[target_token]);
-
-                // Count logits strictly greater than target_val
-                int count = 0;
-                for (int i = lid; i < vocab_size; i += wg_size) {
-                    float v = static_cast<float>(l_ptr[i]);
-                    if (v > target_val) count++;
-                }
-                local_count[lid] = count;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                // Tree reduction within work-group
-                for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
-                    if (lid < stride) {
-                        local_count[lid] += local_count[lid + stride];
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                // If fewer than k logits are strictly greater, target is in top-k
-                if (lid == 0) {
-                    *d_result = (local_count[0] < k) ? 1 : 0;
-                }
-            });
-    });
-}
-
-// ============================================================
 // Top-k Sampling (CPU 端)
 // ============================================================
 

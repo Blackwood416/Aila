@@ -157,9 +157,6 @@ void parse_qwen35_text_config(simdjson::dom::element text_cfg_elem, Qwen35TextCo
             }
         }
     }
-
-    read_int64(text_cfg_elem, "mtp_num_hidden_layers", cfg.mtp_num_hidden_layers);
-    read_bool(text_cfg_elem, "mtp_use_dedicated_embeddings", cfg.mtp_use_dedicated_embeddings);
 }
 
 void parse_qwen3_asr(simdjson::dom::element root, ModelSpec& spec) {
