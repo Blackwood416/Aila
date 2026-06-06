@@ -2131,6 +2131,7 @@ public:
                 int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
                 int* draft_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
                 int* topk_result_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                int* argmax_result_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
 
                 int current_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
                                                            tuned_cfg, generated_token_ids);
@@ -2184,24 +2185,22 @@ public:
                     Tensor& logits_current = backend_->forward(*ctx_, one_token_device, 1);
 
                     int real_next_token;
+                    bool draft_accepted = false;
                     if (tuned_cfg.do_sample) {
                         real_next_token = ops::sample_with_config(*ctx_, logits_current, config_.vocab_size,
                                                                   tuned_cfg, generated_token_ids);
+                        draft_accepted = (real_next_token == draft_token);
                     } else {
-                        real_next_token = ops::argmax(*ctx_, logits_current, config_.vocab_size);
-                    }
-
-                    // GPU-side top-3 check: accept draft if it ranks in main model's top-3
-                    bool draft_accepted = (real_next_token == draft_token);
-                    if (!draft_accepted && !tuned_cfg.do_sample) {
+                        // GPU-side: submit argmax + top-k kernels in parallel, single sync
                         constexpr int kMtpTopK = 3;
+                        ops::argmax(*ctx_, logits_current, config_.vocab_size, argmax_result_device);
                         ops::is_in_topk(*ctx_, logits_current, config_.vocab_size,
                                         draft_token, kMtpTopK, topk_result_device);
                         int topk_result = 0;
+                        ctx_->memcpy_d2h(&real_next_token, argmax_result_device, sizeof(int));
                         ctx_->memcpy_d2h(&topk_result, topk_result_device, sizeof(int));
-                        ctx_->synchronize();
-                        if (topk_result) {
-                            draft_accepted = true;
+                        draft_accepted = (real_next_token == draft_token) || (topk_result != 0);
+                        if (draft_accepted && real_next_token != draft_token) {
                             AILA_LOG_INFO("[MTP] Top-%d MATCH! draft=%d", kMtpTopK, draft_token);
                         }
                     }
@@ -2262,6 +2261,7 @@ public:
                 ctx_->free_device(one_token_device);
                 ctx_->free_device(draft_token_device);
                 ctx_->free_device(topk_result_device);
+                ctx_->free_device(argmax_result_device);
                 ctx_->synchronize();
                 AILA_LOG_INFO("[MTP-Stats] Speculative validation finished. Total verification steps: %d, Accepted: %d, Match rate: %.2f%%",
                               mtp_total, mtp_accepted, mtp_total > 0 ? (100.0f * mtp_accepted / mtp_total) : 0.0f);
