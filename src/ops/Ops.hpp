@@ -460,6 +460,11 @@ namespace ops {
     // Argmax: 将结果写入预先分配好的 d_result 显存指针，避免内部的 allocation 和 sync
     void argmax(Context& ctx, Tensor& logits, int vocab_size, int* d_result);
 
+    // Check if target_token is among the top-k logit values (GPU-side, no host readback).
+    // d_result is set to 1 if target ranks in top-k, 0 otherwise.
+    void is_in_topk(Context& ctx, Tensor& logits, int vocab_size,
+                    int target_token, int k, int* d_result);
+
     // Top-k sampling with temperature
     int topk_sample(Context& ctx, Tensor& logits, int vocab_size,
                     float temperature, int top_k);
