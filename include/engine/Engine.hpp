@@ -1942,7 +1942,8 @@ public:
             ctx_->free_device(generated_tokens_device);
         } else {
             bool use_pld = (!tuned_cfg.do_sample && pld_n > 0);
-            AILA_LOG_INFO("[PLD-MTP-Config] use_pld=%d, use_mtp=%d, do_sample=%d, pld_n=%d", use_pld ? 1 : 0, use_mtp ? 1 : 0, tuned_cfg.do_sample ? 1 : 0, pld_n);
+            static const bool s_mtp_cfg_debug = aila::env::read_flag("AILA_MTP_DEBUG", false);
+            if (s_mtp_cfg_debug) AILA_LOG_INFO("[PLD-MTP-Config] use_pld=%d, use_mtp=%d, do_sample=%d, pld_n=%d", use_pld ? 1 : 0, use_mtp ? 1 : 0, tuned_cfg.do_sample ? 1 : 0, pld_n);
 
             if (use_pld) {
                 auto get_argmax = [&](Tensor& logit_tensor, int row_idx = 0) -> int {
@@ -2128,6 +2129,7 @@ public:
                 // batched seq_len=2 to avoid corrupting DeltaNet recurrent state
                 // snapshots on draft rejection.
                 std::vector<int> history_tokens = full_ids;
+                static const bool s_mtp_debug = aila::env::read_flag("AILA_MTP_DEBUG", false);
                 int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
                 int* draft_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
                 int* topk_result_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
@@ -2204,14 +2206,14 @@ public:
                         ctx_->memcpy_d2h(&topk_result, topk_result_device, sizeof(int));
                         draft_accepted = (real_next_token == draft_token) || (topk_result != 0);
                         if (draft_accepted && real_next_token != draft_token) {
-                            AILA_LOG_INFO("[MTP] Top-%d MATCH! draft=%d", kMtpTopK, draft_token);
+                            if (s_mtp_debug) AILA_LOG_INFO("[MTP] Top-%d MATCH! draft=%d", kMtpTopK, draft_token);
                         }
                     }
 
                     if (draft_accepted) {
                         // Match! Accept draft token
                         mtp_accepted++;
-                        AILA_LOG_INFO("[MTP] Speculation MATCH! accepted draft: %d", draft_token);
+                        if (s_mtp_debug) AILA_LOG_INFO("[MTP] Speculation MATCH! accepted draft: %d", draft_token);
 
                         int tok = draft_token;
                         if (tok == last_token) same_token_run++;
@@ -2262,7 +2264,7 @@ public:
                         }
                         if (draft2_ok) {
                             mtp_accepted++;
-                            AILA_LOG_INFO("[MTP] Chain MATCH! accepted draft2: %d", draft_token2);
+                            if (s_mtp_debug) AILA_LOG_INFO("[MTP] Chain MATCH! accepted draft2: %d", draft_token2);
                             int tok2 = draft_token2;
                             generated_token_ids.push_back(tok2);
                             history_tokens.push_back(tok2);
@@ -2285,7 +2287,7 @@ public:
                     } else {
                         // Mismatch! No rollback needed — we only processed
                         // current_token (seq_len=1), which we always keep.
-                        AILA_LOG_INFO("[MTP] Speculation MISMATCH! pred=%d, target=%d", real_next_token, draft_token);
+                        if (s_mtp_debug) AILA_LOG_INFO("[MTP] Speculation MISMATCH! pred=%d, target=%d", real_next_token, draft_token);
                         current_token = real_next_token;
                     }
 
