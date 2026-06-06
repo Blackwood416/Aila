@@ -925,7 +925,9 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             
             Tensor* fc_w = transpose_weight("mtp.fc.weight");
             mtp_fc_.init(ctx, *fc_w, hidden_size_ * 2, hidden_size_, true);
-            
+            AILA_LOG_INFO("[MTP-Diag] mtp.fc.weight after transpose: shape=(%lld,%lld) expected_in=%d expected_out=%d",
+                          fc_w->shape(0), fc_w->shape(1), hidden_size_ * 2, hidden_size_);
+
             mtp_norm_weight_ = plus_one_norm_weight("mtp.norm.weight");
             
             mtp_layers_.resize(cfg_.mtp_num_hidden_layers);
@@ -945,7 +947,18 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 Tensor* k_w = transpose_weight(prefix + "self_attn.k_proj.weight");
                 Tensor* v_w = transpose_weight(prefix + "self_attn.v_proj.weight");
                 Tensor* o_w = transpose_weight(prefix + "self_attn.o_proj.weight");
-                
+
+                AILA_LOG_INFO("[MTP-Diag] MTP layer %d weight shapes:", i);
+                AILA_LOG_INFO("[MTP-Diag]   q_proj: (%lld,%lld)  k_proj: (%lld,%lld)  v_proj: (%lld,%lld)  o_proj: (%lld,%lld)",
+                              q_w->shape(0), q_w->shape(1),
+                              k_w->shape(0), k_w->shape(1),
+                              v_w->shape(0), v_w->shape(1),
+                              o_w->shape(0), o_w->shape(1));
+                AILA_LOG_INFO("[MTP-Diag]   Expected qkv fused dims: full_q_proj_dim=%d full_kv_dim=%d full_fused_qkv_dim=%d",
+                              full_q_proj_dim_, full_kv_dim_, full_fused_qkv_dim_);
+                AILA_LOG_INFO("[MTP-Diag]   Expected: full_q_dim=%d hidden_size=%d full_kv_heads=%d full_head_dim=%d",
+                              full_q_dim_, hidden_size_, full_kv_heads_, full_head_dim_);
+
                 fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
                 layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
                 layer.o_proj.init(ctx, *o_w, full_q_dim_, hidden_size_, true);
@@ -973,6 +986,11 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
                 Tensor* up_w = transpose_weight(prefix + "mlp.up_proj.weight");
                 Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
+                AILA_LOG_INFO("[MTP-Diag]   gate_proj: (%lld,%lld)  up_proj: (%lld,%lld)  down_proj: (%lld,%lld)",
+                              gate_w->shape(0), gate_w->shape(1),
+                              up_w->shape(0), up_w->shape(1),
+                              down_w->shape(0), down_w->shape(1));
+                AILA_LOG_INFO("[MTP-Diag]   Expected: ff_dim=%d hidden_size=%d", ff_dim_, hidden_size_);
                 fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
                 layer.gate_up_weight = &fused_weights_.back();
                 layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
