@@ -2196,10 +2196,62 @@ public:
                         real_next_token = ops::argmax(*ctx_, logits_current, config_.vocab_size);
                     }
 
-                    if (real_next_token == draft_token) {
+                    // Top-k acceptance: also accept draft if it's in the main model's top-3
+                    // (for greedy mode only; sampling already provides diversity)
+                    bool draft_accepted = (real_next_token == draft_token);
+                    if (!draft_accepted && !tuned_cfg.do_sample) {
+                        constexpr int kTopK = 3;
+                        int top_tokens[3] = {-1, -1, -1};
+
+                        if (logits_current.dtype() == dnnl::memory::data_type::bf16) {
+                            using bf16 = sycl::ext::oneapi::bfloat16;
+                            std::vector<bf16> host_logits(config_.vocab_size);
+                            ctx_->memcpy_d2h(host_logits.data(), logits_current.data(),
+                                           config_.vocab_size * sizeof(bf16));
+                            ctx_->synchronize();
+
+                            std::vector<std::pair<float, int>> scored;
+                            scored.reserve(config_.vocab_size);
+                            for (int i = 0; i < config_.vocab_size; ++i)
+                                scored.push_back({static_cast<float>(host_logits[i]), i});
+                            std::partial_sort(scored.begin(), scored.begin() + kTopK, scored.end(),
+                                            [](auto& a, auto& b) { return a.first > b.first; });
+                            for (int k = 0; k < kTopK; ++k)
+                                top_tokens[k] = scored[k].second;
+                        } else {
+                            std::vector<float> host_logits(config_.vocab_size);
+                            ctx_->memcpy_d2h(host_logits.data(), logits_current.data(),
+                                           config_.vocab_size * sizeof(float));
+                            ctx_->synchronize();
+
+                            std::vector<std::pair<float, int>> scored;
+                            scored.reserve(config_.vocab_size);
+                            for (int i = 0; i < config_.vocab_size; ++i)
+                                scored.push_back({host_logits[i], i});
+                            std::partial_sort(scored.begin(), scored.begin() + kTopK, scored.end(),
+                                            [](auto& a, auto& b) { return a.first > b.first; });
+                            for (int k = 0; k < kTopK; ++k)
+                                top_tokens[k] = scored[k].second;
+                        }
+
+                        for (int k = 0; k < kTopK; ++k) {
+                            if (top_tokens[k] == draft_token) {
+                                draft_accepted = true;
+                                AILA_LOG_INFO("[MTP] Top-k MATCH! draft=%d is rank %d in main model top-%d",
+                                              draft_token, k + 1, kTopK);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (draft_accepted) {
                         // Match! Accept draft token
                         mtp_accepted++;
-                        AILA_LOG_INFO("[MTP] Speculation MATCH! accepted draft: %d", draft_token);
+                        if (real_next_token == draft_token) {
+                            AILA_LOG_INFO("[MTP] Speculation MATCH (exact)! accepted draft: %d", draft_token);
+                        } else {
+                            AILA_LOG_INFO("[MTP] Speculation MATCH (top-k)! accepted draft: %d", draft_token);
+                        }
 
                         int tok = draft_token;
                         if (tok == last_token) same_token_run++;
