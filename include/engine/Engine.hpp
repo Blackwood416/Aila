@@ -815,29 +815,14 @@ public:
             bool prepend_think = !user_wants_no_think &&
                 (force_thinking || default_open_think);
 
-            // For streaming mode, inject <think>\n before the first real token
-            // since generate_messages() returns empty string when streaming.
-            decltype(token_callback) wrapped_cb;
-            bool think_injected = false;
-            if (prepend_think && token_callback) {
-                wrapped_cb = [&](const std::string& token) {
-                    if (!think_injected) {
-                        think_injected = true;
-                        token_callback("<think>\n");
-                    }
-                    token_callback(token);
-                };
-            }
-            auto& cb = (prepend_think && token_callback) ? wrapped_cb : token_callback;
-
-            std::string out = generate_messages(mm_history_, gen_config, cb);
+            std::string out = generate_messages(mm_history_, gen_config, token_callback);
             while (last_error_code_ == EngineErrorCode::ContextOverflow) {
                 if (!drop_oldest_mm_pair()) {
                     break;
                 }
                 AILA_LOG_WARN("[Generate] Qwen3.5 history truncated to fit context window (%zu messages remaining)",
                               mm_history_.size());
-                out = generate_messages(mm_history_, gen_config, cb);
+                out = generate_messages(mm_history_, gen_config, token_callback);
             }
 
             if (last_error_code_ != EngineErrorCode::Ok) {
@@ -951,6 +936,7 @@ public:
                 cached_ids_.clear();
                 reusable_prefix = 0;
             } else {
+                reusable_prefix = backend_->get_current_context_len();
                 cached_ids_.resize(reusable_prefix);
             }
         } else {
@@ -1754,6 +1740,7 @@ public:
                 cached_ids_.clear();
                 reusable_prefix = 0;
             } else {
+                reusable_prefix = backend_->get_current_context_len();
                 cached_ids_.resize(reusable_prefix);
             }
         } else {
@@ -1868,10 +1855,13 @@ public:
             output_text += piece;
             token_callback(piece);
         };
+        int pld_n = aila::env::read_int("AILA_PLD_N", 0);
+        int pld_k = aila::env::read_int("AILA_PLD_K", 2);
         int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
                                              : std::max(1, tuned_cfg.decode_chunk_size);
         bool use_chunked_fast_decode = (!tuned_cfg.has_penalties()) &&
-                                       (!tuned_cfg.do_sample || can_use_device_sample);
+                                       (!tuned_cfg.do_sample || can_use_device_sample) &&
+                                       (pld_n == 0);
         int same_token_run = 0;
         int last_token = -1;
         int generated_count = 0;
@@ -1949,55 +1939,237 @@ public:
             }
             ctx_->free_device(generated_tokens_device);
         } else {
-            int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
-                                                     tuned_cfg, generated_token_ids);
-            int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-            int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-            ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+            bool use_pld = (!tuned_cfg.do_sample && pld_n > 0);
+            AILA_LOG_INFO("[PLD-Config] use_pld=%d, do_sample=%d, pld_n=%d, pld_k=%d", use_pld ? 1 : 0, tuned_cfg.do_sample ? 1 : 0, pld_n, pld_k);
 
-            int current_token = next_token;
-            while (generated_count < max_new_tokens) {
-                if (tokenizer_.is_eos(current_token)) break;
+            if (use_pld) {
+                auto get_argmax = [&](Tensor& logit_tensor, int row_idx = 0) -> int {
+                    int vocab = config_.vocab_size;
+                    int offset = row_idx * vocab;
+                    if (logit_tensor.dtype() == dnnl::memory::data_type::f32) {
+                        std::vector<float> tmp((size_t)vocab);
+                        ctx_->memcpy_d2h(tmp.data(), static_cast<float*>(logit_tensor.data()) + offset, vocab * sizeof(float));
+                        ctx_->synchronize();
+                        int max_i = 0;
+                        float max_v = tmp[0];
+                        for (int i = 1; i < vocab; ++i) {
+                            if (tmp[(size_t)i] > max_v) {
+                                max_v = tmp[(size_t)i];
+                                max_i = i;
+                            }
+                        }
+                        return max_i;
+                    } else {
+                        using bf16 = sycl::ext::oneapi::bfloat16;
+                        std::vector<bf16> tmp((size_t)vocab);
+                        ctx_->memcpy_d2h(tmp.data(), static_cast<bf16*>(logit_tensor.data()) + offset, vocab * sizeof(bf16));
+                        ctx_->synchronize();
+                        int max_i = 0;
+                        float max_v = static_cast<float>(tmp[0]);
+                        for (int i = 1; i < vocab; ++i) {
+                            float val = static_cast<float>(tmp[(size_t)i]);
+                            if (val > max_v) {
+                                max_v = val;
+                                max_i = i;
+                            }
+                        }
+                        return max_i;
+                    }
+                };
 
-                if (current_token == last_token) same_token_run++;
-                else {
-                    same_token_run = 1;
-                    last_token = current_token;
-                }
+                auto lookup_draft_tokens = [&](const std::vector<int>& history, int K, int N) -> std::vector<int> {
+                    if (history.size() < static_cast<size_t>(K + 1)) {
+                        return {};
+                    }
+                    std::vector<int> ngram(history.end() - K, history.end());
+                    int match_idx = -1;
+                    for (int i = static_cast<int>(history.size()) - K - 1; i >= 0; --i) {
+                        bool match = true;
+                        for (int j = 0; j < K; ++j) {
+                            if (history[static_cast<size_t>(i + j)] != ngram[static_cast<size_t>(j)]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            match_idx = i;
+                            break;
+                        }
+                    }
+                    if (match_idx == -1) {
+                        return {};
+                    }
+                    std::vector<int> draft;
+                    int draft_start = match_idx + K;
+                    int draft_end = std::min(draft_start + N, static_cast<int>(history.size()) - K);
+                    for (int i = draft_start; i < draft_end; ++i) {
+                        draft.push_back(history[static_cast<size_t>(i)]);
+                    }
+                    return draft;
+                };
 
-                generated_token_ids.push_back(current_token);
-                int step_index = generated_count;
-                generated_count++;
-                if (same_token_run >= 48) {
-                    AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
-                                  current_token, same_token_run);
-                    break;
-                }
+                std::vector<int> history_tokens = full_ids;
+                int current_token = get_argmax(logits, 0);
 
-                if (debug_token_ids && step_index < 64) {
-                    std::string piece = tokenizer_.decode(current_token);
-                    AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
-                                  step_index, current_token, piece.c_str());
-                }
-                if (streaming) {
-                    std::string token_text = tokenizer_.decode(current_token);
-                    output_text += token_text;
-                    token_callback(token_text);
-                }
-                if (generated_count >= max_new_tokens) {
-                    break;
-                }
+                while (generated_count < max_new_tokens) {
+                    if (tokenizer_.is_eos(current_token)) {
+                        break;
+                    }
 
-                Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
-                next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
-                                                     tuned_cfg, generated_token_ids);
-                ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
-                std::swap(current_token_device, next_token_device);
-                current_token = next_token;
+                    if (current_token == last_token) same_token_run++;
+                    else {
+                        same_token_run = 1;
+                        last_token = current_token;
+                    }
+
+                    generated_token_ids.push_back(current_token);
+                    history_tokens.push_back(current_token);
+                    int step_index = generated_count;
+                    generated_count++;
+                    if (same_token_run >= 48) {
+                        AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                      current_token, same_token_run);
+                        break;
+                    }
+
+                    if (debug_token_ids && step_index < 64) {
+                        std::string piece = tokenizer_.decode(current_token);
+                        AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                      step_index, current_token, piece.c_str());
+                    }
+                    if (streaming) {
+                        std::string token_text = tokenizer_.decode(current_token);
+                        emit_stream_piece(token_text);
+                    }
+
+                    if (generated_count >= max_new_tokens) {
+                        break;
+                    }
+
+                    std::vector<int> draft = lookup_draft_tokens(history_tokens, pld_k, pld_n);
+                    if (!draft.empty()) {
+                        int L = static_cast<int>(draft.size());
+                        AILA_LOG_INFO("[PLD] Found history draft match: L=%d, draft[0]=%d, current_token=%d", L, draft[0], current_token);
+                        std::vector<int> spec_input(L + 1);
+                        spec_input[0] = current_token;
+                        for (int i = 0; i < L; ++i) {
+                            spec_input[i + 1] = draft[i];
+                        }
+
+                        int* draft_tokens_device = static_cast<int*>(ctx_->alloc_device((L + 1) * sizeof(int)));
+                        ctx_->memcpy_h2d(draft_tokens_device, spec_input.data(), (L + 1) * sizeof(int));
+                        
+                        Tensor& draft_logits = backend_->forward(*ctx_, draft_tokens_device, L + 1);
+                        ctx_->free_device(draft_tokens_device);
+                        
+                        int accepted_count = 0;
+                        int next_predicted_token = -1;
+                        for (int i = 0; i <= L; ++i) {
+                            int pred_i = get_argmax(draft_logits, i);
+                            if (i < L) {
+                                AILA_LOG_INFO("[PLD] Verify index %d: pred=%d, target=%d (%s)",
+                                              i, pred_i, draft[i], pred_i == draft[i] ? "MATCH" : "MISMATCH");
+                                if (pred_i == draft[i]) {
+                                    accepted_count++;
+                                } else {
+                                    next_predicted_token = pred_i;
+                                    break;
+                                }
+                            } else {
+                                AILA_LOG_INFO("[PLD] Final step predicted next token: pred=%d", pred_i);
+                                next_predicted_token = pred_i;
+                            }
+                        }
+
+                        // Output accepted draft tokens
+                        for (int i = 0; i < accepted_count; ++i) {
+                            int tok = draft[i];
+                            if (tok == last_token) same_token_run++;
+                            else {
+                                same_token_run = 1;
+                                last_token = tok;
+                            }
+
+                            generated_token_ids.push_back(tok);
+                            history_tokens.push_back(tok);
+                            int step_idx = generated_count;
+                            generated_count++;
+
+                            if (debug_token_ids && step_idx < 64) {
+                                std::string piece = tokenizer_.decode(tok);
+                                AILA_LOG_INFO("[DebugToken] [PLD-Accepted] step=%d id=%d text='%s'",
+                                              step_idx, tok, piece.c_str());
+                            }
+                            if (streaming) {
+                                std::string token_text = tokenizer_.decode(tok);
+                                emit_stream_piece(token_text);
+                            }
+                        }
+
+                        int current_ctx_len = backend_->get_current_context_len();
+                        int target_len = current_ctx_len - (L - accepted_count);
+                        backend_->truncate_kv_cache(target_len);
+
+                        current_token = next_predicted_token;
+                    } else {
+                        int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                        ctx_->memcpy_h2d(current_token_device, &current_token, sizeof(int));
+                        Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
+                        ctx_->free_device(current_token_device);
+                        current_token = get_argmax(logits_next, 0);
+                    }
+                }
+                ctx_->synchronize();
+            } else {
+                int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                         tuned_cfg, generated_token_ids);
+                int* current_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                int* next_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
+
+                int current_token = next_token;
+                while (generated_count < max_new_tokens) {
+                    if (tokenizer_.is_eos(current_token)) break;
+
+                    if (current_token == last_token) same_token_run++;
+                    else {
+                        same_token_run = 1;
+                        last_token = current_token;
+                    }
+
+                    generated_token_ids.push_back(current_token);
+                    int step_index = generated_count;
+                    generated_count++;
+                    if (same_token_run >= 48) {
+                        AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                      current_token, same_token_run);
+                        break;
+                    }
+
+                    if (debug_token_ids && step_index < 64) {
+                        std::string piece = tokenizer_.decode(current_token);
+                        AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                      step_index, current_token, piece.c_str());
+                    }
+                    if (streaming) {
+                        std::string token_text = tokenizer_.decode(current_token);
+                        emit_stream_piece(token_text);
+                    }
+                    if (generated_count >= max_new_tokens) {
+                        break;
+                    }
+
+                    Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
+                    next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
+                                                         tuned_cfg, generated_token_ids);
+                    ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
+                    std::swap(current_token_device, next_token_device);
+                    current_token = next_token;
+                }
+                ctx_->synchronize();
+                ctx_->free_device(current_token_device);
+                ctx_->free_device(next_token_device);
             }
-            ctx_->synchronize();
-            ctx_->free_device(current_token_device);
-            ctx_->free_device(next_token_device);
         }
         auto t_end = std::chrono::high_resolution_clock::now();
 
