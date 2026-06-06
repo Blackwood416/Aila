@@ -2803,3 +2803,83 @@ Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id) {
 
     return &buf_mtp_logits_;
 }
+
+void Qwen35HybridTextBackend::debug_compare_mtp_logits(Context& ctx, int token_id) {
+    if (!has_mtp_) return;
+
+    // Run MTP on this token
+    Tensor* mtp_logits = forward_mtp(ctx, token_id);
+    if (!mtp_logits) return;
+
+    // Run main model forward on same token to get baseline logits
+    int* dev_token = static_cast<int*>(ctx.alloc_device(sizeof(int)));
+    ctx.memcpy_h2d(dev_token, &token_id, sizeof(int));
+    Tensor& main_logits = forward(ctx, dev_token, 1);
+    ctx.free_device(dev_token);
+    ctx.synchronize();
+
+    // Read back first 20 logit values from both
+    int vocab = cfg_.vocab_size;
+    std::vector<float> mtp_host(std::min(20, vocab));
+    std::vector<float> main_host(std::min(20, vocab));
+
+    if (mtp_logits->dtype() == dnnl::memory::data_type::bf16) {
+        std::vector<bf16> tmp(20);
+        ctx.memcpy_d2h(tmp.data(), mtp_logits->data(), 20 * sizeof(bf16));
+        for (int i = 0; i < 20; ++i) mtp_host[i] = static_cast<float>(tmp[i]);
+        ctx.memcpy_d2h(tmp.data(), main_logits.data(), 20 * sizeof(bf16));
+        for (int i = 0; i < 20; ++i) main_host[i] = static_cast<float>(tmp[i]);
+    } else {
+        ctx.memcpy_d2h(mtp_host.data(), mtp_logits->data(), 20 * sizeof(float));
+        ctx.memcpy_d2h(main_host.data(), main_logits.data(), 20 * sizeof(float));
+    }
+
+    // Find argmax for both (read full vocab)
+    int mtp_argmax = 0, main_argmax = 0;
+    float mtp_max = -1e9f, main_max = -1e9f;
+    std::vector<float> mtp_full(vocab);
+    std::vector<float> main_full(vocab);
+    if (mtp_logits->dtype() == dnnl::memory::data_type::bf16) {
+        std::vector<bf16> tmp(vocab);
+        ctx.memcpy_d2h(tmp.data(), mtp_logits->data(), vocab * sizeof(bf16));
+        for (int i = 0; i < vocab; ++i) mtp_full[i] = static_cast<float>(tmp[i]);
+        ctx.memcpy_d2h(tmp.data(), main_logits.data(), vocab * sizeof(bf16));
+        for (int i = 0; i < vocab; ++i) main_full[i] = static_cast<float>(tmp[i]);
+    }
+    ctx.synchronize(); // ensure all d2h transfers complete before CPU-side computation
+
+    for (int i = 0; i < vocab; ++i) {
+        if (mtp_full[i] > mtp_max) { mtp_max = mtp_full[i]; mtp_argmax = i; }
+        if (main_full[i] > main_max) { main_max = main_full[i]; main_argmax = i; }
+    }
+
+    AILA_LOG_INFO("[MTP-Diag] Token %d: MTP argmax=%d (max=%.4f)  Main argmax=%d (max=%.4f)  match=%d",
+                  token_id, mtp_argmax, mtp_max, main_argmax, main_max,
+                  mtp_argmax == main_argmax ? 1 : 0);
+    AILA_LOG_INFO("[MTP-Diag] First 20 MTP logits:  [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
+                  mtp_host[0], mtp_host[1], mtp_host[2], mtp_host[3], mtp_host[4],
+                  mtp_host[5], mtp_host[6], mtp_host[7], mtp_host[8], mtp_host[9],
+                  mtp_host[10], mtp_host[11], mtp_host[12], mtp_host[13], mtp_host[14],
+                  mtp_host[15], mtp_host[16], mtp_host[17], mtp_host[18], mtp_host[19]);
+    AILA_LOG_INFO("[MTP-Diag] First 20 Main logits: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
+                  main_host[0], main_host[1], main_host[2], main_host[3], main_host[4],
+                  main_host[5], main_host[6], main_host[7], main_host[8], main_host[9],
+                  main_host[10], main_host[11], main_host[12], main_host[13], main_host[14],
+                  main_host[15], main_host[16], main_host[17], main_host[18], main_host[19]);
+
+    // Compute cosine similarity over full vocab
+    double dot = 0.0, norm_mtp = 0.0, norm_main = 0.0;
+    for (int i = 0; i < vocab; ++i) {
+        dot += (double)mtp_full[i] * (double)main_full[i];
+        norm_mtp += (double)mtp_full[i] * (double)mtp_full[i];
+        norm_main += (double)main_full[i] * (double)main_full[i];
+    }
+    double cosine = dot / (std::sqrt(norm_mtp) * std::sqrt(norm_main));
+    AILA_LOG_INFO("[MTP-Diag] Cosine similarity (full vocab): %.6f", cosine);
+
+    // Roll back the main model's KV cache (forward() incremented current_len_)
+    // This is safe because we're in warmup and backend_->reset() will be called next.
+    if (current_len_ > 0) {
+        truncate_kv_cache(current_len_ - 1);
+    }
+}

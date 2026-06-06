@@ -636,6 +636,12 @@ public:
             int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
             ctx_->synchronize();
+            // Diagnostic: compare MTP logits against main model logits
+            int warmup_predicted_token;
+            ctx_->memcpy_d2h(&warmup_predicted_token, warmup_argmax, sizeof(int));
+            ctx_->synchronize();
+            AILA_LOG_INFO("[MTP-Diag] Warmup predicted token: %d", warmup_predicted_token);
+            backend_->debug_compare_mtp_logits(*ctx_, warmup_predicted_token);
             auto t_warmup_end = std::chrono::high_resolution_clock::now();
 
             ctx_->free_device(warmup_argmax);
