@@ -33,7 +33,7 @@ public:
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;
-    virtual Tensor* forward_mtp(Context& ctx, int next_token_id) { return nullptr; }
+    virtual Tensor* forward_mtp(Context& ctx, int next_token_id, bool use_mtp_hidden = false) { (void)use_mtp_hidden; return nullptr; }
     virtual bool has_mtp() const { return false; }
     virtual bool supports_vision_embedding_override() const { return false; }
     virtual void set_embedding_overrides(

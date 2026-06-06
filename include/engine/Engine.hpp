@@ -2137,6 +2137,9 @@ public:
                                                            tuned_cfg, generated_token_ids);
                 Tensor* mtp_logits = backend_->forward_mtp(*ctx_, current_token);
                 int draft_token = ops::argmax(*ctx_, *mtp_logits, config_.vocab_size);
+                // Chain: predict second draft from MTP's own output
+                Tensor* chain_logits = backend_->forward_mtp(*ctx_, draft_token, true);
+                int draft_token2 = ops::argmax(*ctx_, *chain_logits, config_.vocab_size);
 
                 int mtp_accepted = 0;
                 int mtp_total = 0;
@@ -2247,6 +2250,38 @@ public:
                         } else {
                             current_token = ops::argmax(*ctx_, logits_draft, config_.vocab_size);
                         }
+
+                        // Try second draft (chain prediction) on the same logits
+                        bool draft2_ok = (current_token == draft_token2);
+                        if (!draft2_ok && !tuned_cfg.do_sample) {
+                            ops::is_in_topk(*ctx_, logits_draft, config_.vocab_size,
+                                            draft_token2, 3, topk_result_device);
+                            int topk2 = 0;
+                            ctx_->memcpy_d2h(&topk2, topk_result_device, sizeof(int));
+                            if (topk2) draft2_ok = true;
+                        }
+                        if (draft2_ok) {
+                            mtp_accepted++;
+                            AILA_LOG_INFO("[MTP] Chain MATCH! accepted draft2: %d", draft_token2);
+                            int tok2 = draft_token2;
+                            generated_token_ids.push_back(tok2);
+                            history_tokens.push_back(tok2);
+                            generated_count++;
+                            if (streaming) {
+                                std::string tt = tokenizer_.decode(tok2);
+                                emit_stream_piece(tt);
+                            }
+                            if (generated_count < max_new_tokens) {
+                                ctx_->memcpy_h2d(draft_token_device, &draft_token2, sizeof(int));
+                                Tensor& logits_draft2 = backend_->forward(*ctx_, draft_token_device, 1);
+                                if (tuned_cfg.do_sample) {
+                                    current_token = ops::sample_with_config(*ctx_, logits_draft2,
+                                        config_.vocab_size, tuned_cfg, generated_token_ids);
+                                } else {
+                                    current_token = ops::argmax(*ctx_, logits_draft2, config_.vocab_size);
+                                }
+                            }
+                        }
                     } else {
                         // Mismatch! No rollback needed — we only processed
                         // current_token (seq_len=1), which we always keep.
@@ -2254,9 +2289,11 @@ public:
                         current_token = real_next_token;
                     }
 
-                    // Predict new draft token based on current_token
+                    // Predict new drafts (2-token lookahead)
                     Tensor* next_mtp_logits = backend_->forward_mtp(*ctx_, current_token);
                     draft_token = ops::argmax(*ctx_, *next_mtp_logits, config_.vocab_size);
+                    Tensor* next_chain_logits = backend_->forward_mtp(*ctx_, draft_token, true);
+                    draft_token2 = ops::argmax(*ctx_, *next_chain_logits, config_.vocab_size);
                 }
                 ctx_->free_device(one_token_device);
                 ctx_->free_device(draft_token_device);

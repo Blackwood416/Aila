@@ -202,6 +202,7 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
         buf_mtp_fused_ = Tensor::allocate(ctx, {1, (int64_t)(hidden_size_ * 2)});
         buf_mtp_hidden_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
         buf_mtp_logits_ = Tensor::allocate(ctx, {1, (int64_t)cfg_.vocab_size});
+        buf_mtp_out_ = Tensor::allocate(ctx, {1, (int64_t)hidden_size_});
     }
 }
 
@@ -2640,14 +2641,19 @@ bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
     }
 };
 
-Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id) {
+Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id, bool use_mtp_hidden) {
     if (!has_mtp_) {
         return nullptr;
     }
 
-    // 1. 获取主模型最后一层输出隐状态 (大小为 [1, hidden_size])
-    bf16* base_hidden_ptr = static_cast<bf16*>(buf_.hidden.data()) + (size_t)(current_len_ - 1) * hidden_size_;
-    Tensor base_hidden_view = Tensor::view(ctx, base_hidden_ptr, {1, (int64_t)hidden_size_});
+    // 1. 获取隐状态：首次调用从主模型取，链式调用复用 MTP 自身输出
+    Tensor base_hidden_view;
+    if (use_mtp_hidden && buf_mtp_out_.valid()) {
+        base_hidden_view = Tensor::view(ctx, buf_mtp_out_.data(), {1, (int64_t)hidden_size_});
+    } else {
+        bf16* base_hidden_ptr = static_cast<bf16*>(buf_.hidden.data()) + (size_t)(current_len_ - 1) * hidden_size_;
+        base_hidden_view = Tensor::view(ctx, base_hidden_ptr, {1, (int64_t)hidden_size_});
+    }
 
     // 2. embedding lookup (用设备端临时变量)
     int* dev_token_id = static_cast<int*>(ctx.alloc_device(sizeof(int)));
@@ -2787,6 +2793,10 @@ Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id) {
                             
     // 7. LM Head logits 计算
     lm_head_.forward(ctx, buf_.normed, buf_mtp_logits_, 1);
+
+    // Save post-norm hidden state for autoregressive chain calls
+    ctx.queue().memcpy(buf_mtp_out_.data(), buf_.normed.data(),
+                       (size_t)hidden_size_ * sizeof(bf16));
 
     return &buf_mtp_logits_;
 }

@@ -23,7 +23,7 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
-    Tensor* forward_mtp(Context& ctx, int next_token_id) override;
+    Tensor* forward_mtp(Context& ctx, int next_token_id, bool use_mtp_hidden = false) override;
     bool has_mtp() const override { return has_mtp_; }
     bool supports_vision_embedding_override() const override { return true; }
 
@@ -251,4 +251,5 @@ private:
     Tensor buf_mtp_fused_;
     Tensor buf_mtp_hidden_;
     Tensor buf_mtp_logits_;
+    Tensor buf_mtp_out_;  // saved post-norm output for autoregressive chain
 };
