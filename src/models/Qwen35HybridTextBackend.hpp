@@ -25,7 +25,6 @@ public:
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
     Tensor* forward_mtp(Context& ctx, int next_token_id) override;
     bool has_mtp() const override { return has_mtp_; }
-    void debug_compare_mtp_logits(Context& ctx, int token_id) override;
     bool supports_vision_embedding_override() const override { return true; }
 
     void set_embedding_overrides(const std::vector<int>& positions,

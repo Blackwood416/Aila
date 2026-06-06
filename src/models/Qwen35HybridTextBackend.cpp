@@ -925,9 +925,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             
             Tensor* fc_w = transpose_weight("mtp.fc.weight");
             mtp_fc_.init(ctx, *fc_w, hidden_size_ * 2, hidden_size_, true);
-            AILA_LOG_INFO("[MTP-Diag] mtp.fc.weight after transpose: shape=(%lld,%lld) expected_in=%d expected_out=%d",
-                          fc_w->shape(0), fc_w->shape(1), hidden_size_ * 2, hidden_size_);
-
             mtp_norm_weight_ = plus_one_norm_weight("mtp.norm.weight");
             
             mtp_layers_.resize(cfg_.mtp_num_hidden_layers);
@@ -947,17 +944,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 Tensor* k_w = transpose_weight(prefix + "self_attn.k_proj.weight");
                 Tensor* v_w = transpose_weight(prefix + "self_attn.v_proj.weight");
                 Tensor* o_w = transpose_weight(prefix + "self_attn.o_proj.weight");
-
-                AILA_LOG_INFO("[MTP-Diag] MTP layer %d weight shapes:", i);
-                AILA_LOG_INFO("[MTP-Diag]   q_proj: (%lld,%lld)  k_proj: (%lld,%lld)  v_proj: (%lld,%lld)  o_proj: (%lld,%lld)",
-                              q_w->shape(0), q_w->shape(1),
-                              k_w->shape(0), k_w->shape(1),
-                              v_w->shape(0), v_w->shape(1),
-                              o_w->shape(0), o_w->shape(1));
-                AILA_LOG_INFO("[MTP-Diag]   Expected qkv fused dims: full_q_proj_dim=%d full_kv_dim=%d full_fused_qkv_dim=%d",
-                              full_q_proj_dim_, full_kv_dim_, full_fused_qkv_dim_);
-                AILA_LOG_INFO("[MTP-Diag]   Expected: full_q_dim=%d hidden_size=%d full_kv_heads=%d full_head_dim=%d",
-                              full_q_dim_, hidden_size_, full_kv_heads_, full_head_dim_);
 
                 fused_weights_.push_back(fuse_three_cols(*q_w, *k_w, *v_w));
                 layer.qkv_proj.init(ctx, fused_weights_.back(), hidden_size_, full_fused_qkv_dim_, true);
@@ -989,11 +975,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
                 Tensor* up_w = transpose_weight(prefix + "mlp.up_proj.weight");
                 Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
-                AILA_LOG_INFO("[MTP-Diag]   gate_proj: (%lld,%lld)  up_proj: (%lld,%lld)  down_proj: (%lld,%lld)",
-                              gate_w->shape(0), gate_w->shape(1),
-                              up_w->shape(0), up_w->shape(1),
-                              down_w->shape(0), down_w->shape(1));
-                AILA_LOG_INFO("[MTP-Diag]   Expected: ff_dim=%d hidden_size=%d", ff_dim_, hidden_size_);
                 fused_weights_.push_back(fuse_two_cols(*gate_w, *up_w));
                 layer.gate_up_weight = &fused_weights_.back();
                 layer.gate_up_proj.init(ctx, fused_weights_.back(), hidden_size_, 2 * ff_dim_, true);
@@ -2810,82 +2791,3 @@ Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id) {
     return &buf_mtp_logits_;
 }
 
-void Qwen35HybridTextBackend::debug_compare_mtp_logits(Context& ctx, int token_id) {
-    if (!has_mtp_) return;
-
-    // Run MTP on this token
-    Tensor* mtp_logits = forward_mtp(ctx, token_id);
-    if (!mtp_logits) return;
-
-    // Run main model forward on same token to get baseline logits
-    int* dev_token = static_cast<int*>(ctx.alloc_device(sizeof(int)));
-    ctx.memcpy_h2d(dev_token, &token_id, sizeof(int));
-    Tensor& main_logits = forward(ctx, dev_token, 1);
-    ctx.free_device(dev_token);
-    ctx.synchronize();
-
-    // Read back first 20 logit values from both
-    int vocab = cfg_.vocab_size;
-    std::vector<float> mtp_host(std::min(20, vocab));
-    std::vector<float> main_host(std::min(20, vocab));
-
-    if (mtp_logits->dtype() == dnnl::memory::data_type::bf16) {
-        std::vector<bf16> tmp(20);
-        ctx.memcpy_d2h(tmp.data(), mtp_logits->data(), 20 * sizeof(bf16));
-        for (int i = 0; i < 20; ++i) mtp_host[i] = static_cast<float>(tmp[i]);
-        ctx.memcpy_d2h(tmp.data(), main_logits.data(), 20 * sizeof(bf16));
-        for (int i = 0; i < 20; ++i) main_host[i] = static_cast<float>(tmp[i]);
-    } else {
-        ctx.memcpy_d2h(mtp_host.data(), mtp_logits->data(), 20 * sizeof(float));
-        ctx.memcpy_d2h(main_host.data(), main_logits.data(), 20 * sizeof(float));
-    }
-
-    // Find argmax for both (read full vocab)
-    int mtp_argmax = 0, main_argmax = 0;
-    float mtp_max = -1e9f, main_max = -1e9f;
-    std::vector<float> mtp_full(vocab);
-    std::vector<float> main_full(vocab);
-    if (mtp_logits->dtype() == dnnl::memory::data_type::bf16) {
-        std::vector<bf16> tmp(vocab);
-        ctx.memcpy_d2h(tmp.data(), mtp_logits->data(), vocab * sizeof(bf16));
-        for (int i = 0; i < vocab; ++i) mtp_full[i] = static_cast<float>(tmp[i]);
-        ctx.memcpy_d2h(tmp.data(), main_logits.data(), vocab * sizeof(bf16));
-        for (int i = 0; i < vocab; ++i) main_full[i] = static_cast<float>(tmp[i]);
-    }
-    ctx.synchronize(); // ensure all d2h transfers complete before CPU-side computation
-
-    for (int i = 0; i < vocab; ++i) {
-        if (mtp_full[i] > mtp_max) { mtp_max = mtp_full[i]; mtp_argmax = i; }
-        if (main_full[i] > main_max) { main_max = main_full[i]; main_argmax = i; }
-    }
-
-    AILA_LOG_INFO("[MTP-Diag] Token %d: MTP argmax=%d (max=%.4f)  Main argmax=%d (max=%.4f)  match=%d",
-                  token_id, mtp_argmax, mtp_max, main_argmax, main_max,
-                  mtp_argmax == main_argmax ? 1 : 0);
-    AILA_LOG_INFO("[MTP-Diag] First 20 MTP logits:  [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
-                  mtp_host[0], mtp_host[1], mtp_host[2], mtp_host[3], mtp_host[4],
-                  mtp_host[5], mtp_host[6], mtp_host[7], mtp_host[8], mtp_host[9],
-                  mtp_host[10], mtp_host[11], mtp_host[12], mtp_host[13], mtp_host[14],
-                  mtp_host[15], mtp_host[16], mtp_host[17], mtp_host[18], mtp_host[19]);
-    AILA_LOG_INFO("[MTP-Diag] First 20 Main logits: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
-                  main_host[0], main_host[1], main_host[2], main_host[3], main_host[4],
-                  main_host[5], main_host[6], main_host[7], main_host[8], main_host[9],
-                  main_host[10], main_host[11], main_host[12], main_host[13], main_host[14],
-                  main_host[15], main_host[16], main_host[17], main_host[18], main_host[19]);
-
-    // Compute cosine similarity over full vocab
-    double dot = 0.0, norm_mtp = 0.0, norm_main = 0.0;
-    for (int i = 0; i < vocab; ++i) {
-        dot += (double)mtp_full[i] * (double)main_full[i];
-        norm_mtp += (double)mtp_full[i] * (double)mtp_full[i];
-        norm_main += (double)main_full[i] * (double)main_full[i];
-    }
-    double cosine = dot / (std::sqrt(norm_mtp) * std::sqrt(norm_main));
-    AILA_LOG_INFO("[MTP-Diag] Cosine similarity (full vocab): %.6f", cosine);
-
-    // Roll back the main model's KV cache (forward() incremented current_len_)
-    // This is safe because we're in warmup and backend_->reset() will be called next.
-    if (current_len_ > 0) {
-        truncate_kv_cache(current_len_ - 1);
-    }
-}
