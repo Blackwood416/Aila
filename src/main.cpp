@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
     gen_config.do_sample         = opts.do_sample;
     gen_config.sampling_seed     = opts.sampling_seed;
     gen_config.use_fixed_seed    = opts.use_fixed_seed;
+    gen_config.mtp               = opts.mtp;
     gen_config.decode_chunk_size = opts.decode_chunk_size;
     gen_config.stream_chunk_size = opts.stream_chunk_size;
     gen_config.repetition_penalty = opts.repetition_penalty;

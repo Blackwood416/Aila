@@ -1857,11 +1857,13 @@ public:
         };
         int pld_n = aila::env::read_int("AILA_PLD_N", 0);
         int pld_k = aila::env::read_int("AILA_PLD_K", 2);
+        bool use_mtp = (backend_ && backend_->has_mtp() && tuned_cfg.mtp);
         int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
                                              : std::max(1, tuned_cfg.decode_chunk_size);
         bool use_chunked_fast_decode = (!tuned_cfg.has_penalties()) &&
                                        (!tuned_cfg.do_sample || can_use_device_sample) &&
-                                       (pld_n == 0);
+                                       (pld_n == 0) &&
+                                       (!use_mtp);
         int same_token_run = 0;
         int last_token = -1;
         int generated_count = 0;
@@ -1940,7 +1942,7 @@ public:
             ctx_->free_device(generated_tokens_device);
         } else {
             bool use_pld = (!tuned_cfg.do_sample && pld_n > 0);
-            AILA_LOG_INFO("[PLD-Config] use_pld=%d, do_sample=%d, pld_n=%d, pld_k=%d", use_pld ? 1 : 0, tuned_cfg.do_sample ? 1 : 0, pld_n, pld_k);
+            AILA_LOG_INFO("[PLD-MTP-Config] use_pld=%d, use_mtp=%d, do_sample=%d, pld_n=%d", use_pld ? 1 : 0, use_mtp ? 1 : 0, tuned_cfg.do_sample ? 1 : 0, pld_n);
 
             if (use_pld) {
                 auto get_argmax = [&](Tensor& logit_tensor, int row_idx = 0) -> int {
@@ -2120,6 +2122,132 @@ public:
                     }
                 }
                 ctx_->synchronize();
+            } else if (use_mtp) {
+                // MTP Speculative Decoding Loop
+                // Uses per-token forward (seq_len=1) for verification instead of
+                // batched seq_len=2 to avoid corrupting DeltaNet recurrent state
+                // snapshots on draft rejection.
+                std::vector<int> history_tokens = full_ids;
+                int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                int* draft_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+
+                int current_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
+                                                           tuned_cfg, generated_token_ids);
+                Tensor* mtp_logits = backend_->forward_mtp(*ctx_, current_token);
+                int draft_token = ops::argmax(*ctx_, *mtp_logits, config_.vocab_size);
+
+                int mtp_accepted = 0;
+                int mtp_total = 0;
+
+                while (generated_count < max_new_tokens) {
+                    if (tokenizer_.is_eos(current_token)) {
+                        break;
+                    }
+
+                    if (current_token == last_token) same_token_run++;
+                    else {
+                        same_token_run = 1;
+                        last_token = current_token;
+                    }
+
+                    generated_token_ids.push_back(current_token);
+                    history_tokens.push_back(current_token);
+                    int step_index = generated_count;
+                    generated_count++;
+                    if (same_token_run >= 48) {
+                        AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                      current_token, same_token_run);
+                        break;
+                    }
+
+                    if (debug_token_ids && step_index < 64) {
+                        std::string piece = tokenizer_.decode(current_token);
+                        AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                      step_index, current_token, piece.c_str());
+                    }
+                    if (streaming) {
+                        std::string token_text = tokenizer_.decode(current_token);
+                        emit_stream_piece(token_text);
+                    }
+
+                    if (generated_count >= max_new_tokens) {
+                        break;
+                    }
+
+                    // MTP Verify Step — use per-token forward (seq_len=1)
+                    // to avoid DeltaNet snapshot corruption on rollback.
+                    mtp_total++;
+
+                    // 1. Process current_token to get its logits
+                    ctx_->memcpy_h2d(one_token_device, &current_token, sizeof(int));
+                    Tensor& logits_current = backend_->forward(*ctx_, one_token_device, 1);
+
+                    int real_next_token;
+                    if (tuned_cfg.do_sample) {
+                        real_next_token = ops::sample_with_config(*ctx_, logits_current, config_.vocab_size,
+                                                                  tuned_cfg, generated_token_ids);
+                    } else {
+                        real_next_token = ops::argmax(*ctx_, logits_current, config_.vocab_size);
+                    }
+
+                    if (real_next_token == draft_token) {
+                        // Match! Accept draft token
+                        mtp_accepted++;
+                        AILA_LOG_INFO("[MTP] Speculation MATCH! accepted draft: %d", draft_token);
+
+                        int tok = draft_token;
+                        if (tok == last_token) same_token_run++;
+                        else {
+                            same_token_run = 1;
+                            last_token = tok;
+                        }
+
+                        generated_token_ids.push_back(tok);
+                        history_tokens.push_back(tok);
+                        int step_idx = generated_count;
+                        generated_count++;
+
+                        if (debug_token_ids && step_idx < 64) {
+                            std::string piece = tokenizer_.decode(tok);
+                            AILA_LOG_INFO("[DebugToken] [MTP-Accepted] step=%d id=%d text='%s'",
+                                          step_idx, tok, piece.c_str());
+                        }
+                        if (streaming) {
+                            std::string token_text = tokenizer_.decode(tok);
+                            emit_stream_piece(token_text);
+                        }
+
+                        if (generated_count >= max_new_tokens) {
+                            current_token = tok;
+                            break;
+                        }
+
+                        // 2. Process the accepted draft token to get next logits
+                        ctx_->memcpy_h2d(draft_token_device, &draft_token, sizeof(int));
+                        Tensor& logits_draft = backend_->forward(*ctx_, draft_token_device, 1);
+
+                        if (tuned_cfg.do_sample) {
+                            current_token = ops::sample_with_config(*ctx_, logits_draft, config_.vocab_size,
+                                                                    tuned_cfg, generated_token_ids);
+                        } else {
+                            current_token = ops::argmax(*ctx_, logits_draft, config_.vocab_size);
+                        }
+                    } else {
+                        // Mismatch! No rollback needed — we only processed
+                        // current_token (seq_len=1), which we always keep.
+                        AILA_LOG_INFO("[MTP] Speculation MISMATCH! pred=%d, target=%d", real_next_token, draft_token);
+                        current_token = real_next_token;
+                    }
+
+                    // Predict new draft token based on current_token
+                    Tensor* next_mtp_logits = backend_->forward_mtp(*ctx_, current_token);
+                    draft_token = ops::argmax(*ctx_, *next_mtp_logits, config_.vocab_size);
+                }
+                ctx_->free_device(one_token_device);
+                ctx_->free_device(draft_token_device);
+                ctx_->synchronize();
+                AILA_LOG_INFO("[MTP-Stats] Speculative validation finished. Total verification steps: %d, Accepted: %d, Match rate: %.2f%%",
+                              mtp_total, mtp_accepted, mtp_total > 0 ? (100.0f * mtp_accepted / mtp_total) : 0.0f);
             } else {
                 int next_token = ops::sample_with_config(*ctx_, logits, config_.vocab_size,
                                                          tuned_cfg, generated_token_ids);

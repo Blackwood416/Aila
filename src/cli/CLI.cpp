@@ -241,6 +241,7 @@ Options:
   --align-lang <lang>      ForceAligner: language (default: Chinese)
   --q35-prefill-step <N>   Qwen3.5 prefill checkpoint step (default: 64)
   --kv-quant               Enable KV cache quantization (FP8, E4M3)
+  --mtp                    Enable Qwen3.5 MTP speculative decoding
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -379,6 +380,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--kv-quant") {
             opts.kv_quant = true;
+            continue;
+        }
+        if (arg == "--mtp") {
+            opts.mtp = true;
             continue;
         }
         if (arg == "--rep-penalty" && i + 1 < argc) {

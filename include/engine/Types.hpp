@@ -133,6 +133,10 @@ struct Qwen35TextConfig {
     int eos_token_id = 248044;
     RopeSpec rope{};
     std::vector<std::string> layer_types;
+
+    // MTP config
+    int mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
 };
 
 inline bool is_exact_qwen35_hybrid_0p8b_spec(const Qwen35TextConfig& cfg) {
@@ -290,6 +294,7 @@ struct GenerationConfig {
     bool do_sample          = true;
     uint64_t sampling_seed  = 42;   // used when use_fixed_seed=true
     bool use_fixed_seed     = false;
+    bool mtp                = false;   // Enable Qwen3.5 MTP speculative decoding
     int decode_chunk_size   = 12;   // greedy + non-streaming: tokens per host sync chunk
     int stream_chunk_size   = 4;    // greedy + streaming: tokens per flush chunk
 
