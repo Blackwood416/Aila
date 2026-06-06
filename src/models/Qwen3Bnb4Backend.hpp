@@ -33,6 +33,7 @@ public:
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;
+    int get_current_context_len() const override { return kv_cache_.current_length(); }
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen3Dense; }

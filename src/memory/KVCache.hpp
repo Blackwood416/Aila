@@ -37,6 +37,7 @@ public:
     }
 
     int max_length() const { return max_len_; }
+    bool quantized() const { return quantized_; }
 
 private:
     struct LayerCache {
@@ -49,4 +50,5 @@ private:
     int max_len_ = 0;
     int num_kv_heads_ = 0;
     int head_dim_ = 0;
+    bool quantized_ = false;
 };

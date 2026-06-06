@@ -13,6 +13,78 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 #include <cstdint>
 
 // ============================================================
+// FP8 (E4M3FN) Conversions
+// ============================================================
+
+inline uint8_t float_to_fp8_e4m3fn(float x) {
+    union { float f; uint32_t u; } val;
+    val.f = x;
+    uint32_t sign = (val.u >> 31) & 1;
+    uint32_t abs_u = val.u & 0x7FFFFFFF;
+
+    if (abs_u > 0x7F800000) {
+        return 0x7F; // NaN
+    }
+    if (abs_u >= 0x7F800000) {
+        return (sign << 7) | 0x7E; // Inf -> 224.0
+    }
+    if (abs_u > 0x43600000) {
+        return (sign << 7) | 0x7E; // Clamp to max positive val 224.0 (0x43600000 is 224.0f)
+    }
+
+    if (abs_u < 0x3b800000) {
+        // subnormal numbers (2^-9 = 0x3b800000)
+        if (abs_u < 0x39000000) { // 2^-13
+            return sign << 7; // 0
+        }
+        float scaled = val.f * (sign ? -1024.0f : 1024.0f);
+        int m = static_cast<int>(scaled + 0.5f);
+        if (m > 7) m = 7;
+        return (sign << 7) | m;
+    }
+
+    int exp_f = (abs_u >> 23) & 0xFF;
+    int e_fp8 = exp_f - 119;
+    
+    uint32_t mant_f = abs_u & 0x7FFFFF;
+    uint32_t round_bit = 1 << 19;
+    uint32_t rounded_mant = mant_f + round_bit;
+
+    if (rounded_mant & 0x800000) {
+        e_fp8 += 1;
+        rounded_mant = 0;
+    }
+
+    if (e_fp8 >= 15) {
+        return (sign << 7) | 0x7E;
+    }
+
+    uint8_t m_fp8 = (rounded_mant >> 20) & 7;
+    return (sign << 7) | (e_fp8 << 3) | m_fp8;
+}
+
+inline float fp8_e4m3fn_to_float(uint8_t val) {
+    uint32_t sign = (val >> 7) & 1;
+    uint32_t e = (val >> 3) & 0xF;
+    uint32_t m = val & 7;
+
+    union { uint32_t u; float f; } res;
+    if (e == 0) {
+        if (m == 0) {
+            res.u = sign << 31;
+        } else {
+            float sign_val = sign ? -1.0f : 1.0f;
+            return sign_val * static_cast<float>(m) * 0.0009765625f;
+        }
+    } else if (e == 15 && m == 7) {
+        res.u = 0x7FC00000; // NaN
+    } else {
+        res.u = (sign << 31) | ((e + 119) << 23) | (m << 20);
+    }
+    return res.f;
+}
+
+// ============================================================
 // Linear 层 (oneDNN MatMul 封装)
 // ============================================================
 class Linear {

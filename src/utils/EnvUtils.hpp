@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <cstring>
 
 // ============================================================
 // Cross-platform environment variable utilities
@@ -11,7 +12,13 @@
 namespace aila {
 namespace env {
 
+extern int g_q35_prefill_step_override;
+extern bool g_kv_quant_override;
+
 inline bool read_flag(const char* name, bool default_value) {
+    if (std::strcmp(name, "AILA_KV_QUANT") == 0 && g_kv_quant_override) {
+        return true;
+    }
 #ifdef _WIN32
     char* value = nullptr;
     size_t len = 0;

@@ -29,6 +29,7 @@ public:
     // prefill can continue).  Returns false if a full reset was necessary
     // (caller must do a full prefill of all prompt tokens).
     virtual bool truncate_kv_cache(int new_len) = 0;
+    virtual int get_current_context_len() const { return 0; }
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;

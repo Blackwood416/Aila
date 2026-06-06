@@ -25,6 +25,7 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen3ASR; }
+    int get_current_context_len() const override { return current_len_; }
 
     // Multimodal injection for audio features
     bool supports_vision_embedding_override() const override { return true; }

@@ -14,6 +14,25 @@ namespace ops {
 
 namespace {
 
+template <bool Quantized>
+struct KVCacheAccessor {
+  const void *ptr;
+  int max_seq_len;
+  int head_dim;
+
+  KVCacheAccessor(const void *p, int msl, int hd)
+      : ptr(p), max_seq_len(msl), head_dim(hd) {}
+
+  inline float load(int kv_head, int t, int d) const {
+    int idx = kv_head * max_seq_len * head_dim + t * head_dim + d;
+    if constexpr (Quantized) {
+      return fp8_e4m3fn_to_float(static_cast<const uint8_t *>(ptr)[idx]);
+    } else {
+      return static_cast<float>(static_cast<const bf16 *>(ptr)[idx]);
+    }
+  }
+};
+
 inline int round_up(int x, int align) {
   return ((x + align - 1) / align) * align;
 }
@@ -75,15 +94,16 @@ constexpr int kVisionBidiExact64VUnrollEnabled = 1;
 constexpr int kVisionBidiExact64VUnrollDefault =
     kVisionBidiExact64VUnrollEnabled;
 
-void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
-                               Tensor &v_cache, Tensor &output,
-                               Tensor &scores_buf, int num_heads,
-                               int num_kv_heads, int head_dim, int cached_len,
-                               int tail_start, int sink_len, int effective_len,
-                               int wg_size) {
+template <bool Quantized>
+void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
+                                    Tensor &v_cache, Tensor &output,
+                                    Tensor &scores_buf, int num_heads,
+                                    int num_kv_heads, int head_dim, int cached_len,
+                                    int tail_start, int sink_len, int effective_len,
+                                    int wg_size) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
-  bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-  bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
   bf16 *o_ptr = static_cast<bf16 *>(output.data());
   (void)scores_buf;
 
@@ -104,6 +124,9 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
           int lid = item.get_local_id(0);
           int kv_head = head / heads_per_kv;
 
+          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+
           for (int d = lid; d < head_dim; d += wg_size) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
           }
@@ -112,22 +135,20 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
           for (int t = lid; t < effective_len; t += wg_size) {
             int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
             float sum = 0.0f;
-            const bf16 *k_row =
-                k_ptr + kv_head * max_seq_len * head_dim + cache_t * head_dim;
             if ((head_dim & 7) == 0) {
               for (int d = 0; d < head_dim; d += 8) {
-                sum += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-                sum += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-                sum += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-                sum += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-                sum += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-                sum += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-                sum += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-                sum += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+                sum += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+                sum += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+                sum += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+                sum += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+                sum += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+                sum += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+                sum += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+                sum += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
               }
             } else {
               for (int d = 0; d < head_dim; d++) {
-                sum += q_cache[d] * static_cast<float>(k_row[d]);
+                sum += q_cache[d] * k_acc.load(kv_head, cache_t, d);
               }
             }
             shared[t] = sum * scale;
@@ -160,9 +181,7 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
             float acc = 0.0f;
             for (int t = 0; t < effective_len; t++) {
               int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
-              acc += shared[t] *
-                     static_cast<float>(v_ptr[kv_head * max_seq_len * head_dim +
-                                              cache_t * head_dim + d]);
+              acc += shared[t] * v_acc.load(kv_head, cache_t, d);
             }
             o_ptr[head * head_dim + d] = bf16(acc);
           }
@@ -170,13 +189,31 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
   });
 }
 
-void attention_decode_exact_head256_partial_merge(
+void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
+                               Tensor &v_cache, Tensor &output,
+                               Tensor &scores_buf, int num_heads,
+                               int num_kv_heads, int head_dim, int cached_len,
+                               int tail_start, int sink_len, int effective_len,
+                               int wg_size) {
+  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    attention_decode_baseline_impl<true>(
+        ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size);
+  } else {
+    attention_decode_baseline_impl<false>(
+        ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size);
+  }
+}
+
+template <bool Quantized>
+void attention_decode_exact_head256_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
-  bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-  bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
   bf16 *o_ptr = static_cast<bf16 *>(output.data());
   float *partials_ptr = static_cast<float *>(partials_buf.data());
 
@@ -212,6 +249,9 @@ void attention_decode_exact_head256_partial_merge(
               partials_ptr +
               (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
 
+          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+
           for (int d = lid; d < head_dim; d += tile_wg) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
           }
@@ -222,18 +262,16 @@ void attention_decode_exact_head256_partial_merge(
             const int t = tile_start + lid;
             const int cache_t =
                 (t < sink_len) ? t : (tail_start + (t - sink_len));
-            const bf16 *k_row =
-                k_ptr + kv_head * max_seq_len * head_dim + cache_t * head_dim;
             score = 0.0f;
             for (int d = 0; d < head_dim; d += 8) {
-              score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-              score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-              score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-              score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-              score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-              score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-              score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-              score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+              score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+              score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+              score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+              score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+              score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+              score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+              score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+              score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
             }
             score *= scale;
           }
@@ -267,10 +305,7 @@ void attention_decode_exact_head256_partial_merge(
               const int t = tile_start + i;
               const int cache_t =
                   (t < sink_len) ? t : (tail_start + (t - sink_len));
-              acc += logits[i] *
-                     static_cast<float>(
-                         v_ptr[kv_head * max_seq_len * head_dim +
-                               cache_t * head_dim + d]);
+              acc += logits[i] * v_acc.load(kv_head, cache_t, d);
             }
             partial[kDecodeExact256PartialAccOffset + d] = acc;
           }
@@ -324,13 +359,29 @@ void attention_decode_exact_head256_partial_merge(
   });
 }
 
-void attention_decode_exact_head128_partial_merge(
+void attention_decode_exact_head256_partial_merge(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
+    int sink_len, int effective_len) {
+  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    attention_decode_exact_head256_partial_merge_impl<true>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len);
+  } else {
+    attention_decode_exact_head256_partial_merge_impl<false>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len);
+  }
+}
+
+template <bool Quantized>
+void attention_decode_exact_head128_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
-  bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-  bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
   bf16 *o_ptr = static_cast<bf16 *>(output.data());
   float *partials_ptr = static_cast<float *>(partials_buf.data());
 
@@ -365,6 +416,9 @@ void attention_decode_exact_head128_partial_merge(
               partials_ptr +
               (head * max_tiles + tile_idx) * kDecodeExact128PartialStride;
 
+          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+
           q_cache[lid] = static_cast<float>(q_ptr[head * head_dim + lid]);
           item.barrier(sycl::access::fence_space::local_space);
 
@@ -373,18 +427,16 @@ void attention_decode_exact_head128_partial_merge(
             const int t = tile_start + lid;
             const int cache_t =
                 (t < sink_len) ? t : (tail_start + (t - sink_len));
-            const bf16 *k_row =
-                k_ptr + kv_head * max_seq_len * head_dim + cache_t * head_dim;
             score = 0.0f;
             for (int d = 0; d < head_dim; d += 8) {
-              score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-              score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-              score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-              score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-              score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-              score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-              score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-              score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+              score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+              score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+              score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+              score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+              score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+              score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+              score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+              score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
             }
             score *= scale;
           }
@@ -417,10 +469,7 @@ void attention_decode_exact_head128_partial_merge(
             const int t = tile_start + i;
             const int cache_t =
                 (t < sink_len) ? t : (tail_start + (t - sink_len));
-            acc += logits[i] *
-                   static_cast<float>(
-                       v_ptr[kv_head * max_seq_len * head_dim +
-                             cache_t * head_dim + lid]);
+            acc += logits[i] * v_acc.load(kv_head, cache_t, lid);
           }
           partial[kDecodeExact128PartialAccOffset + lid] = acc;
         });
@@ -469,6 +518,21 @@ void attention_decode_exact_head128_partial_merge(
           o_ptr[head * head_dim + lid] = bf16(acc * inv_sum);
         });
   });
+}
+
+void attention_decode_exact_head128_partial_merge(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
+    int sink_len, int effective_len) {
+  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    attention_decode_exact_head128_partial_merge_impl<true>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len);
+  } else {
+    attention_decode_exact_head128_partial_merge_impl<false>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len);
+  }
 }
 
 template <int TM, int TN, int TK, int SG>
@@ -2576,17 +2640,18 @@ void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
 // SYCL Kernel: Incremental Prefill Attention
 // ============================================================
 
-void attention_prefill_cached(Context& ctx,
-                              Tensor& q, Tensor& k_cache, Tensor& v_cache,
-                              Tensor& output, Tensor& scores_buf,
-                              int seq_len, int start_pos,
-                              int num_heads, int num_kv_heads,
-                              int head_dim, int max_seq_len) {
+template <bool Quantized>
+void attention_prefill_cached_impl(Context& ctx,
+                                   Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                   Tensor& output, Tensor& scores_buf,
+                                   int seq_len, int start_pos,
+                                   int num_heads, int num_kv_heads,
+                                   int head_dim, int max_seq_len) {
   const int total_len = start_pos + seq_len;
   if (head_dim == 128 && total_len >= kPrefillCachedExact128MinTotal) {
     bf16 *q_ptr = static_cast<bf16 *>(q.data());
-    bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-    bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+    const void *k_ptr = k_cache.data();
+    const void *v_ptr = v_cache.data();
     bf16 *o_ptr = static_cast<bf16 *>(output.data());
 
     constexpr int tile_t = 128;
@@ -2621,6 +2686,10 @@ void attention_prefill_cached(Context& ctx,
               merge_state[2] = 0.0f;
               merge_state[3] = 0.0f;
             }
+
+            KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, exact_head_dim);
+
             item.barrier(sycl::access::fence_space::local_space);
 
             for (int tile_start = 0; tile_start <= q_end; tile_start += tile_t) {
@@ -2629,19 +2698,16 @@ void attention_prefill_cached(Context& ctx,
               float score = -1e30f;
               if (lid < tile_len) {
                 const int key_idx = tile_start + lid;
-                const bf16 *k_row =
-                    k_ptr + kv_h * max_seq_len * exact_head_dim +
-                    key_idx * exact_head_dim;
                 score = 0.0f;
                 for (int d = 0; d < exact_head_dim; d += 8) {
-                  score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-                  score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-                  score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-                  score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-                  score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-                  score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-                  score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-                  score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+                  score += q_cache[d + 0] * k_acc.load(kv_h, key_idx, d + 0);
+                  score += q_cache[d + 1] * k_acc.load(kv_h, key_idx, d + 1);
+                  score += q_cache[d + 2] * k_acc.load(kv_h, key_idx, d + 2);
+                  score += q_cache[d + 3] * k_acc.load(kv_h, key_idx, d + 3);
+                  score += q_cache[d + 4] * k_acc.load(kv_h, key_idx, d + 4);
+                  score += q_cache[d + 5] * k_acc.load(kv_h, key_idx, d + 5);
+                  score += q_cache[d + 6] * k_acc.load(kv_h, key_idx, d + 6);
+                  score += q_cache[d + 7] * k_acc.load(kv_h, key_idx, d + 7);
                 }
                 score *= scale;
                 scores[lid] = score;
@@ -2681,10 +2747,7 @@ void attention_prefill_cached(Context& ctx,
               float tile_acc = 0.0f;
               for (int j = 0; j < tile_len; ++j) {
                 const int key_idx = tile_start + j;
-                const bf16 *v_row =
-                    v_ptr + kv_h * max_seq_len * exact_head_dim +
-                    key_idx * exact_head_dim;
-                tile_acc += scores[j] * static_cast<float>(v_row[lid]);
+                tile_acc += scores[j] * v_acc.load(kv_h, key_idx, lid);
               }
               acc_local[lid] = alpha * acc_local[lid] + beta * tile_acc;
               item.barrier(sycl::access::fence_space::local_space);
@@ -2700,8 +2763,8 @@ void attention_prefill_cached(Context& ctx,
 
   if (head_dim == 256 && total_len >= kPrefillCachedExact256MinTotal) {
     bf16 *q_ptr = static_cast<bf16 *>(q.data());
-    bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-    bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+    const void *k_ptr = k_cache.data();
+    const void *v_ptr = v_cache.data();
     bf16 *o_ptr = static_cast<bf16 *>(output.data());
 
     constexpr int tile_t = kPrefillExact256Tile;
@@ -2738,6 +2801,10 @@ void attention_prefill_cached(Context& ctx,
               merge_state[2] = 0.0f;
               merge_state[3] = 0.0f;
             }
+
+            KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, exact_head_dim);
+
             item.barrier(sycl::access::fence_space::local_space);
 
             for (int tile_start = 0; tile_start <= q_end; tile_start += tile_t) {
@@ -2746,19 +2813,16 @@ void attention_prefill_cached(Context& ctx,
               float score = -1e30f;
               if (lid < tile_len) {
                 const int key_idx = tile_start + lid;
-                const bf16 *k_row =
-                    k_ptr + kv_h * max_seq_len * exact_head_dim +
-                    key_idx * exact_head_dim;
                 score = 0.0f;
                 for (int d = 0; d < exact_head_dim; d += 8) {
-                  score += q_cache[d + 0] * static_cast<float>(k_row[d + 0]);
-                  score += q_cache[d + 1] * static_cast<float>(k_row[d + 1]);
-                  score += q_cache[d + 2] * static_cast<float>(k_row[d + 2]);
-                  score += q_cache[d + 3] * static_cast<float>(k_row[d + 3]);
-                  score += q_cache[d + 4] * static_cast<float>(k_row[d + 4]);
-                  score += q_cache[d + 5] * static_cast<float>(k_row[d + 5]);
-                  score += q_cache[d + 6] * static_cast<float>(k_row[d + 6]);
-                  score += q_cache[d + 7] * static_cast<float>(k_row[d + 7]);
+                  score += q_cache[d + 0] * k_acc.load(kv_h, key_idx, d + 0);
+                  score += q_cache[d + 1] * k_acc.load(kv_h, key_idx, d + 1);
+                  score += q_cache[d + 2] * k_acc.load(kv_h, key_idx, d + 2);
+                  score += q_cache[d + 3] * k_acc.load(kv_h, key_idx, d + 3);
+                  score += q_cache[d + 4] * k_acc.load(kv_h, key_idx, d + 4);
+                  score += q_cache[d + 5] * k_acc.load(kv_h, key_idx, d + 5);
+                  score += q_cache[d + 6] * k_acc.load(kv_h, key_idx, d + 6);
+                  score += q_cache[d + 7] * k_acc.load(kv_h, key_idx, d + 7);
                 }
                 score *= scale;
                 scores[lid] = score;
@@ -2799,10 +2863,7 @@ void attention_prefill_cached(Context& ctx,
                 float tile_acc = 0.0f;
                 for (int j = 0; j < tile_len; ++j) {
                   const int key_idx = tile_start + j;
-                  const bf16 *v_row =
-                      v_ptr + kv_h * max_seq_len * exact_head_dim +
-                      key_idx * exact_head_dim;
-                  tile_acc += scores[j] * static_cast<float>(v_row[d]);
+                  tile_acc += scores[j] * v_acc.load(kv_h, key_idx, d);
                 }
                 acc_local[d] = alpha * acc_local[d] + beta * tile_acc;
               }
@@ -2820,8 +2881,8 @@ void attention_prefill_cached(Context& ctx,
   }
 
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
-  bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
-  bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
   bf16 *o_ptr = static_cast<bf16 *>(output.data());
 
   int heads_per_kv = num_heads / num_kv_heads;
@@ -2841,11 +2902,12 @@ void attention_prefill_cached(Context& ctx,
           return;
         }
 
+        KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
+
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
           float qv = static_cast<float>(q_ptr[qi * q_total + h * head_dim + d]);
-          float kv = static_cast<float>(
-              k_ptr[kv_h * max_seq_len * head_dim + ki * head_dim + d]);
+          float kv = k_acc.load(kv_h, ki, d);
           dot += qv * kv;
         }
         scores_device[h * seq_len * total_len + qi * total_len + ki] = dot * scale;
@@ -2881,26 +2943,45 @@ void attention_prefill_cached(Context& ctx,
         int d = idx[2];
         int kv_h = h / heads_per_kv;
 
+        KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+
         float acc = 0.0f;
         float *row = scores_device + h * seq_len * total_len + qi * total_len;
         for (int t = 0; t <= start_pos + qi; t++) {
-          float vv = static_cast<float>(
-              v_ptr[kv_h * max_seq_len * head_dim + t * head_dim + d]);
+          float vv = v_acc.load(kv_h, t, d);
           acc += row[t] * vv;
         }
         o_ptr[qi * q_total + h * head_dim + d] = bf16(acc);
       });
 }
 
+void attention_prefill_cached(Context& ctx,
+                              Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                              Tensor& output, Tensor& scores_buf,
+                              int seq_len, int start_pos,
+                              int num_heads, int num_kv_heads,
+                              int head_dim, int max_seq_len) {
+  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    attention_prefill_cached_impl<true>(
+        ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
+        num_heads, num_kv_heads, head_dim, max_seq_len);
+  } else {
+    attention_prefill_cached_impl<false>(
+        ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
+        num_heads, num_kv_heads, head_dim, max_seq_len);
+  }
+}
+
 // ============================================================
 // SYCL Kernel: Copy K/V to Cache
 // ============================================================
 
-void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
-                   int start_pos, int num_heads, int head_dim,
-                   int max_seq_len) {
+template <bool Quantized>
+void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
+                        int start_pos, int num_heads, int head_dim,
+                        int max_seq_len) {
   bf16 *src = static_cast<bf16 *>(new_kv.data());
-  bf16 *dst = static_cast<bf16 *>(cache.data());
+  void *dst_void = cache.data();
   int total_dim = num_heads * head_dim;
 
   ctx.queue().parallel_for(sycl::range<2>(seq_len, total_dim),
@@ -2913,8 +2994,24 @@ void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
                              int src_idx = s * total_dim + flat;
                              int dst_idx = h * max_seq_len * head_dim +
                                            (start_pos + s) * head_dim + d;
-                             dst[dst_idx] = src[src_idx];
+                             if constexpr (Quantized) {
+                               uint8_t *dst = static_cast<uint8_t *>(dst_void);
+                               dst[dst_idx] = float_to_fp8_e4m3fn(static_cast<float>(src[src_idx]));
+                             } else {
+                               bf16 *dst = static_cast<bf16 *>(dst_void);
+                               dst[dst_idx] = src[src_idx];
+                             }
                            });
+}
+
+void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
+                   int start_pos, int num_heads, int head_dim,
+                   int max_seq_len) {
+  if (cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    copy_to_cache_impl<true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
+  } else {
+    copy_to_cache_impl<false>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
+  }
 }
 
 } // namespace ops

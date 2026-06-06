@@ -86,3 +86,9 @@ Do not attempt these optimizations (documented in `.claude/skills/decode-perf-op
 | `docs/Environment_Variables.md` | All AILA_* env vars |
 | `docs/perf-tuning.md` | Performance tuning guide |
 | `.claude/skills/decode-perf-optimize.md` | Optimization history and methodology |
+
+## TODOs / 后续改进计划
+
+- **Chat Template 改进**：
+  - 自动剥离用户历史输入消息（`mm_history_` 外部导入数据）中的思维链 `<think>` 块，避免多轮历史污染。
+  - 在 `GenerationConfig` 中支持 `max_thinking_tokens` (或 `thinking_budget`) 限制，在自回归生成循环中当生成 token 超过预算时强制注入 `</think>\n` 并退出思考阶段。

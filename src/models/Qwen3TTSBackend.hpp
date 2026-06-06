@@ -28,6 +28,7 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return talker_cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen3TTS; }
+    int get_current_context_len() const override { return current_talker_len_; }
 
     // TTS 专有 C++ API：接收文本 tokens 和 预设/克隆的 speaker_embedding (可选)，直接自回归生成 discrete codes
     bool synthesize_codes(Context& ctx,

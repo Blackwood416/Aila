@@ -102,22 +102,23 @@ void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
         });
 }
 
-void decode_prepare_qkv(Context& ctx,
-                        Tensor& q, Tensor& k, Tensor& v,
-                        Tensor& rope_freq,
-                        Tensor& q_norm_weight, Tensor& k_norm_weight,
-                        Tensor& k_cache, Tensor& v_cache,
-                        int start_pos,
-                        int num_heads_q, int num_kv_heads, int head_dim,
-                        float eps, float theta) {
+template <bool Quantized>
+void decode_prepare_qkv_impl(Context& ctx,
+                             Tensor& q, Tensor& k, Tensor& v,
+                             Tensor& rope_freq,
+                             Tensor& q_norm_weight, Tensor& k_norm_weight,
+                             Tensor& k_cache, Tensor& v_cache,
+                             int start_pos,
+                             int num_heads_q, int num_kv_heads, int head_dim,
+                             float eps, float theta) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k.data());
     bf16* v_ptr = static_cast<bf16*>(v.data());
     float* rope_freq_ptr = static_cast<float*>(rope_freq.data());
     bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
     bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
-    bf16* k_cache_ptr = static_cast<bf16*>(k_cache.data());
-    bf16* v_cache_ptr = static_cast<bf16*>(v_cache.data());
+    void* k_cache_ptr = k_cache.data();
+    void* v_cache_ptr = v_cache.data();
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int half_dim = head_dim / 2;
     int wg_size = 128;
@@ -217,10 +218,21 @@ void decode_prepare_qkv(Context& ctx,
                     vec4 v1_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base + half_dim_const)[lid];
 
                     int cache_base = head * max_seq_len * head_dim_const + start_pos * head_dim_const;
-                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base)[lid] = k0_vec;
-                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base + half_dim_const)[lid] = k1_vec;
-                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base)[lid] = v0_vec;
-                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base + half_dim_const)[lid] = v1_vec;
+                    if constexpr (Quantized) {
+                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                        for (int k = 0; k < 4; ++k) {
+                            k_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(k0_vec[k]));
+                            v_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(v0_vec[k]));
+                        }
+                    } else {
+                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                        reinterpret_cast<vec4*>(k_cache_bf16 + cache_base)[lid] = k0_vec;
+                        reinterpret_cast<vec4*>(k_cache_bf16 + cache_base + half_dim_const)[lid] = k1_vec;
+                        reinterpret_cast<vec4*>(v_cache_bf16 + cache_base)[lid] = v0_vec;
+                        reinterpret_cast<vec4*>(v_cache_bf16 + cache_base + half_dim_const)[lid] = v1_vec;
+                    }
                 });
         });
         return;
@@ -310,11 +322,35 @@ void decode_prepare_qkv(Context& ctx,
 
                 int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
                 for (int d = lid; d < head_dim; d += wg_size) {
-                    k_cache_ptr[cache_base + d] = k_ptr[kv_base + d];
-                    v_cache_ptr[cache_base + d] = v_ptr[kv_base + d];
+                    if constexpr (Quantized) {
+                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                        k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[kv_base + d]));
+                        v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[kv_base + d]));
+                    } else {
+                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                        k_cache_bf16[cache_base + d] = k_ptr[kv_base + d];
+                        v_cache_bf16[cache_base + d] = v_ptr[kv_base + d];
+                    }
                 }
             });
     });
+}
+
+void decode_prepare_qkv(Context& ctx,
+                        Tensor& q, Tensor& k, Tensor& v,
+                        Tensor& rope_freq,
+                        Tensor& q_norm_weight, Tensor& k_norm_weight,
+                        Tensor& k_cache, Tensor& v_cache,
+                        int start_pos,
+                        int num_heads_q, int num_kv_heads, int head_dim,
+                        float eps, float theta) {
+    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+        decode_prepare_qkv_impl<true>(ctx, q, k, v, rope_freq, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, theta);
+    } else {
+        decode_prepare_qkv_impl<false>(ctx, q, k, v, rope_freq, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, theta);
+    }
 }
 
 // ============================================================
@@ -702,29 +738,30 @@ void sigmoid_mul(Context& ctx, Tensor& input, Tensor& gate, Tensor& output, int 
     });
 }
 
-void decode_prepare_qkv_partial(Context& ctx,
-                                Tensor& q, Tensor& k, Tensor& v,
-                                Tensor& q_norm_weight, Tensor& k_norm_weight,
-                                Tensor& k_cache, Tensor& v_cache,
-                                int start_pos,
-                                int num_heads_q, int num_kv_heads, int head_dim,
-                                float eps, int rotary_dim, float theta,
-                                bool interleaved,
-                                const int* pos_t,
-                                const int* pos_h,
-                                const int* pos_w,
-                                int prompt_pos_len,
-                                int text_pos_delta,
-                                int mrope_section_t,
-                                int mrope_section_h,
-                                int mrope_section_w) {
+template <bool Quantized>
+void decode_prepare_qkv_partial_impl(Context& ctx,
+                                     Tensor& q, Tensor& k, Tensor& v,
+                                     Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                     Tensor& k_cache, Tensor& v_cache,
+                                     int start_pos,
+                                     int num_heads_q, int num_kv_heads, int head_dim,
+                                     float eps, int rotary_dim, float theta,
+                                     bool interleaved,
+                                     const int* pos_t,
+                                     const int* pos_h,
+                                     const int* pos_w,
+                                     int prompt_pos_len,
+                                     int text_pos_delta,
+                                     int mrope_section_t,
+                                     int mrope_section_h,
+                                     int mrope_section_w) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k.data());
     bf16* v_ptr = static_cast<bf16*>(v.data());
     bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
     bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
-    bf16* k_cache_ptr = static_cast<bf16*>(k_cache.data());
-    bf16* v_cache_ptr = static_cast<bf16*>(v_cache.data());
+    void* k_cache_ptr = k_cache.data();
+    void* v_cache_ptr = v_cache.data();
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int q_dim = num_heads_q * head_dim;
     int k_dim = num_kv_heads * head_dim;
@@ -829,10 +866,21 @@ void decode_prepare_qkv_partial(Context& ctx,
                     vec4 v1_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base + half_dim_const)[lid];
 
                     int cache_base = head * max_seq_len * head_dim_const + start_pos * head_dim_const;
-                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base)[lid] = k0_vec;
-                    reinterpret_cast<vec4*>(k_cache_ptr + cache_base + half_dim_const)[lid] = k1_vec;
-                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base)[lid] = v0_vec;
-                    reinterpret_cast<vec4*>(v_cache_ptr + cache_base + half_dim_const)[lid] = v1_vec;
+                    if constexpr (Quantized) {
+                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                        for (int k = 0; k < 4; ++k) {
+                            k_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(k0_vec[k]));
+                            v_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(v0_vec[k]));
+                        }
+                    } else {
+                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                        reinterpret_cast<vec4*>(k_cache_bf16 + cache_base)[lid] = k0_vec;
+                        reinterpret_cast<vec4*>(k_cache_bf16 + cache_base + half_dim_const)[lid] = k1_vec;
+                        reinterpret_cast<vec4*>(v_cache_bf16 + cache_base)[lid] = v0_vec;
+                        reinterpret_cast<vec4*>(v_cache_bf16 + cache_base + half_dim_const)[lid] = v1_vec;
+                    }
                 });
         });
         return;
@@ -952,30 +1000,63 @@ void decode_prepare_qkv_partial(Context& ctx,
 
                 int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
                 for (int d = lid; d < head_dim; d += wg_size) {
-                    k_cache_ptr[cache_base + d] = k_ptr[k_base + d];
-                    v_cache_ptr[cache_base + d] = v_ptr[k_base + d];
+                    if constexpr (Quantized) {
+                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                        k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
+                        v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
+                    } else {
+                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                        k_cache_bf16[cache_base + d] = k_ptr[k_base + d];
+                        v_cache_bf16[cache_base + d] = v_ptr[k_base + d];
+                    }
                 }
             });
     });
 }
 
-void decode_prepare_qgkv_packed_partial(Context& ctx,
-                                        Tensor& q_gate_packed, Tensor& k, Tensor& v,
-                                        Tensor& q_out, Tensor& gate_out,
-                                        Tensor& q_norm_weight, Tensor& k_norm_weight,
-                                        Tensor& k_cache, Tensor& v_cache,
-                                        int start_pos,
-                                        int num_heads_q, int num_kv_heads, int head_dim,
-                                        float eps, int rotary_dim, float theta,
-                                        bool interleaved,
-                                        const int* pos_t,
-                                        const int* pos_h,
-                                        const int* pos_w,
-                                        int prompt_pos_len,
-                                        int text_pos_delta,
-                                        int mrope_section_t,
-                                        int mrope_section_h,
-                                        int mrope_section_w) {
+void decode_prepare_qkv_partial(Context& ctx,
+                                Tensor& q, Tensor& k, Tensor& v,
+                                Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                Tensor& k_cache, Tensor& v_cache,
+                                int start_pos,
+                                int num_heads_q, int num_kv_heads, int head_dim,
+                                float eps, int rotary_dim, float theta,
+                                bool interleaved,
+                                const int* pos_t,
+                                const int* pos_h,
+                                const int* pos_w,
+                                int prompt_pos_len,
+                                int text_pos_delta,
+                                int mrope_section_t,
+                                int mrope_section_h,
+                                int mrope_section_w) {
+    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+        decode_prepare_qkv_partial_impl<true>(ctx, q, k, v, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+    } else {
+        decode_prepare_qkv_partial_impl<false>(ctx, q, k, v, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+    }
+}
+
+template <bool Quantized>
+void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
+                                             Tensor& q_gate_packed, Tensor& k, Tensor& v,
+                                             Tensor& q_out, Tensor& gate_out,
+                                             Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                             Tensor& k_cache, Tensor& v_cache,
+                                             int start_pos,
+                                             int num_heads_q, int num_kv_heads, int head_dim,
+                                             float eps, int rotary_dim, float theta,
+                                             bool interleaved,
+                                             const int* pos_t,
+                                             const int* pos_h,
+                                             const int* pos_w,
+                                             int prompt_pos_len,
+                                             int text_pos_delta,
+                                             int mrope_section_t,
+                                             int mrope_section_h,
+                                             int mrope_section_w) {
     bf16* packed_ptr = static_cast<bf16*>(q_gate_packed.data());
     bf16* q_ptr = static_cast<bf16*>(q_out.data());
     bf16* gate_ptr = static_cast<bf16*>(gate_out.data());
@@ -983,8 +1064,8 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
     bf16* v_ptr = static_cast<bf16*>(v.data());
     bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
     bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
-    bf16* k_cache_ptr = static_cast<bf16*>(k_cache.data());
-    bf16* v_cache_ptr = static_cast<bf16*>(v_cache.data());
+    void* k_cache_ptr = k_cache.data();
+    void* v_cache_ptr = v_cache.data();
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int packed_per_head = head_dim * 2;
     int k_dim = num_kv_heads * head_dim;
@@ -1110,11 +1191,44 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
 
                 int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
                 for (int d = lid; d < head_dim; d += wg_size) {
-                    k_cache_ptr[cache_base + d] = k_ptr[k_base + d];
-                    v_cache_ptr[cache_base + d] = v_ptr[k_base + d];
+                    if constexpr (Quantized) {
+                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                        k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
+                        v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
+                    } else {
+                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                        k_cache_bf16[cache_base + d] = k_ptr[k_base + d];
+                        v_cache_bf16[cache_base + d] = v_ptr[k_base + d];
+                    }
                 }
             });
     });
+}
+
+void decode_prepare_qgkv_packed_partial(Context& ctx,
+                                        Tensor& q_gate_packed, Tensor& k, Tensor& v,
+                                        Tensor& q_out, Tensor& gate_out,
+                                        Tensor& q_norm_weight, Tensor& k_norm_weight,
+                                        Tensor& k_cache, Tensor& v_cache,
+                                        int start_pos,
+                                        int num_heads_q, int num_kv_heads, int head_dim,
+                                        float eps, int rotary_dim, float theta,
+                                        bool interleaved,
+                                        const int* pos_t,
+                                        const int* pos_h,
+                                        const int* pos_w,
+                                        int prompt_pos_len,
+                                        int text_pos_delta,
+                                        int mrope_section_t,
+                                        int mrope_section_h,
+                                        int mrope_section_w) {
+    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+        decode_prepare_qgkv_packed_partial_impl<true>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+    } else {
+        decode_prepare_qgkv_packed_partial_impl<false>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+    }
 }
 
 // ============================================================

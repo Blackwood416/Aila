@@ -3,6 +3,7 @@
 #include "IModelBackend.hpp"
 #include "../ops/Ops.hpp"
 #include <vector>
+#include <unordered_map>
 #include <sycl/sycl.hpp>
 
 class Qwen35HybridTextBackend : public IModelBackend {
@@ -18,6 +19,7 @@ public:
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;
+    int get_current_context_len() const override { return current_len_; }
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
@@ -218,4 +220,15 @@ private:
     int* mrope_pos_w_ = nullptr;
     int mrope_prompt_len_ = 0;
     int mrope_text_pos_delta_ = 0;
+
+    struct LayerStateSnapshot {
+        std::vector<float> linear_state_host;
+        std::vector<float> linear_conv_state_host;
+        int linear_conv_head = 0;
+    };
+    struct StateSnapshot {
+        std::vector<LayerStateSnapshot> layers;
+    };
+    std::unordered_map<int, StateSnapshot> snapshots_;
+    void clear_snapshots();
 };

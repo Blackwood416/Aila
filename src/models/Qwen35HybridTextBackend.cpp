@@ -345,6 +345,7 @@ void Qwen35HybridTextBackend::run_decode_jm_matvec_custom(
 }
 
 Qwen35HybridTextBackend::~Qwen35HybridTextBackend() {
+    clear_snapshots();
     clear_mrope_positions();
 }
 
@@ -700,12 +701,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                     0.0f);
                 cache.linear_conv_head = 0;
             } else {
+                auto kv_dtype = aila::env::read_flag("AILA_KV_QUANT", false) ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
                 cache.k = Tensor::allocate(ctx,
                                            {(int64_t)linear_q_heads_, (int64_t)max_seq_len_, (int64_t)linear_head_dim_},
-                                           dnnl::memory::data_type::bf16);
+                                           kv_dtype);
                 cache.v = Tensor::allocate(ctx,
                                            {(int64_t)linear_kv_heads_, (int64_t)max_seq_len_, (int64_t)cfg_.linear_value_head_dim},
-                                           dnnl::memory::data_type::bf16);
+                                           kv_dtype);
                 cache.linear_state = Tensor();
                 cache.linear_conv_state = Tensor();
                 cache.host_linear_state.clear();
@@ -741,12 +743,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
             layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
 
+            auto kv_dtype = aila::env::read_flag("AILA_KV_QUANT", false) ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
             cache.k = Tensor::allocate(ctx,
                                        {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                       dnnl::memory::data_type::bf16);
+                                       kv_dtype);
             cache.v = Tensor::allocate(ctx,
                                        {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                       dnnl::memory::data_type::bf16);
+                                       kv_dtype);
             cache.linear_state = Tensor();
             cache.linear_conv_state = Tensor();
             cache.host_linear_state.clear();
@@ -895,6 +898,7 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     } else {
         AILA_LOG_INFO("[Qwen3.5] Set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback");
     }
+    AILA_LOG_INFO("[Qwen3.5] KV Cache config: quantized=%s", aila::env::read_flag("AILA_KV_QUANT", false) ? "true" : "false");
     return true;
 }
 
@@ -2307,10 +2311,20 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
     time_stage(ProfileStage::LmHead, [&] {
         if (seq_len > 1) {
-            bf16* last_token_ptr = static_cast<bf16*>(buf_.normed.data()) + (seq_len - 1) * hidden_size_;
-            Tensor last_hidden = Tensor::view(ctx, last_token_ptr, {1, (int64_t)hidden_size_});
-            lm_head_.forward(ctx, last_hidden, buf_.logits, 1);
+            if (current_len_ > 0 && seq_len <= 16) {
+                if (!buf_.logits.valid() || buf_.logits.shape(0) < seq_len) {
+                    buf_.logits = Tensor::allocate(ctx, {seq_len, (int64_t)cfg_.vocab_size});
+                }
+                lm_head_.forward(ctx, buf_.normed, buf_.logits, seq_len);
+            } else {
+                bf16* last_token_ptr = static_cast<bf16*>(buf_.normed.data()) + (seq_len - 1) * hidden_size_;
+                Tensor last_hidden = Tensor::view(ctx, last_token_ptr, {1, (int64_t)hidden_size_});
+                lm_head_.forward(ctx, last_hidden, buf_.logits, 1);
+            }
         } else {
+            if (!buf_.logits.valid() || buf_.logits.shape(0) < 1) {
+                buf_.logits = Tensor::allocate(ctx, {1, (int64_t)cfg_.vocab_size});
+            }
             lm_head_.forward(ctx, buf_.normed, buf_.logits, 1);
         }
     });
@@ -2392,49 +2406,54 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
+    // Take sparse snapshots of DeltaNet recurrent states
+    if (use_delta_linear_) {
+        int step = aila::env::g_q35_prefill_step_override;
+        if (step <= 0) {
+            step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
+        }
+        if (step <= 0) step = 64;
+
+        int next_len = current_len_ + seq_len;
+        bool is_prefill = (seq_len > 1);
+        bool is_step_boundary = (next_len % step == 0);
+        if (is_prefill || is_step_boundary) {
+            ctx.synchronize();
+            StateSnapshot snapshot;
+            snapshot.layers.resize(layer_caches_.size());
+            for (size_t i = 0; i < layer_caches_.size(); ++i) {
+                auto& cache = layer_caches_[i];
+                auto& layer = layers_[i];
+                if (!layer.is_linear) continue;
+
+                if (cache.device_state_dirty) {
+                    if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
+                        ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
+                                       cache.host_linear_state.size() * sizeof(float));
+                    }
+                    if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
+                        ctx.memcpy_d2h(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
+                                       cache.host_linear_conv_state.size() * sizeof(float));
+                    }
+                    cache.device_state_dirty = false;
+                }
+                snapshot.layers[i].linear_state_host = cache.host_linear_state;
+                snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
+                snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
+            }
+            snapshots_[next_len] = std::move(snapshot);
+        }
+    }
+
     current_len_ += seq_len;
     return buf_.logits;
 }
 
 void Qwen35HybridTextBackend::reset() {
     current_len_ = 0;
-    if (!use_delta_linear_) return;
-    for (size_t i = 0; i < layer_caches_.size(); ++i) {
-        auto& layer = layers_[i];
-        auto& cache = layer_caches_[i];
-        if (!layer.is_linear) continue;
-        if (cache.linear_state.valid()) {
-            cache.linear_state.context()->queue().memset(
-                cache.linear_state.data(), 0, cache.linear_state.size_bytes());
-        }
-        if (cache.linear_conv_state.valid()) {
-            cache.linear_conv_state.context()->queue().memset(
-                cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
-        }
-        std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
-        std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
-        cache.device_state_dirty = false;
-        cache.linear_conv_head = 0;
-    }
-}
-
-bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
-    if (new_len >= current_len_) return true;
-    if (new_len == 0) {
-        reset();
-        return false;
-    }
-    // Truncate attention KV caches to new_len (just move the position
-    // cursor — GQA layers use current_len_ as the write head).
-    current_len_ = new_len;
-    // DeltaNet recurrent state cannot be positionally truncated — it is a
-    // single accumulated matrix.  Zero it out and let the caller replay
-    // all prompt tokens through a full prefill to rebuild it.
+    clear_snapshots();
     if (use_delta_linear_) {
-        for (size_t i = 0; i < layer_caches_.size(); ++i) {
-            auto& layer = layers_[i];
-            auto& cache = layer_caches_[i];
-            if (!layer.is_linear) continue;
+        for (auto& cache : layer_caches_) {
             if (cache.linear_state.valid()) {
                 cache.linear_state.context()->queue().memset(
                     cache.linear_state.data(), 0, cache.linear_state.size_bytes());
@@ -2449,5 +2468,76 @@ bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
             cache.linear_conv_head = 0;
         }
     }
-    return false;
 }
+
+void Qwen35HybridTextBackend::clear_snapshots() {
+    snapshots_.clear();
+}
+
+bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
+    if (new_len >= current_len_) return true;
+    if (new_len == 0) {
+        reset();
+        return false;
+    }
+
+    if (use_delta_linear_) {
+        int best_checkpoint = -1;
+        for (const auto& pair : snapshots_) {
+            int cp = pair.first;
+            if (cp <= new_len && cp > best_checkpoint) {
+                best_checkpoint = cp;
+            }
+        }
+
+        if (best_checkpoint >= 0) {
+            const auto& snapshot = snapshots_[best_checkpoint];
+            for (size_t i = 0; i < layer_caches_.size(); ++i) {
+                auto& layer = layers_[i];
+                auto& cache = layer_caches_[i];
+                if (!layer.is_linear) continue;
+
+                cache.host_linear_state = snapshot.layers[i].linear_state_host;
+                cache.host_linear_conv_state = snapshot.layers[i].linear_conv_state_host;
+                cache.linear_conv_head = snapshot.layers[i].linear_conv_head;
+
+                if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
+                    cache.linear_state.context()->queue().memcpy(
+                        cache.linear_state.data(), cache.host_linear_state.data(),
+                        cache.host_linear_state.size() * sizeof(float));
+                }
+                if (cache.linear_conv_state.valid() && !cache.host_linear_conv_state.empty()) {
+                    cache.linear_conv_state.context()->queue().memcpy(
+                        cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
+                        cache.host_linear_conv_state.size() * sizeof(float));
+                }
+                cache.device_state_dirty = false;
+            }
+
+            if (!layer_caches_.empty() && layer_caches_[0].linear_state.valid()) {
+                layer_caches_[0].linear_state.context()->synchronize();
+            }
+
+            current_len_ = best_checkpoint;
+
+            for (auto it = snapshots_.begin(); it != snapshots_.end(); ) {
+                if (it->first > best_checkpoint) {
+                    it = snapshots_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            AILA_LOG_INFO("[Qwen35HybridTextBackend] Restored Mamba recurrent state from checkpoint %d (requested truncate to %d)",
+                          best_checkpoint, new_len);
+            return true;
+        } else {
+            AILA_LOG_WARN("[Qwen35HybridTextBackend] No suitable checkpoint found for truncate to %d, falling back to full reset", new_len);
+            reset();
+            return false;
+        }
+    } else {
+        current_len_ = new_len;
+        return true;
+    }
+};

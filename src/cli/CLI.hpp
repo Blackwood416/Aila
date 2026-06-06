@@ -73,6 +73,12 @@ struct CLIOptions {
     std::string align_text;          // --align-text
     std::string align_audio;         // --align-audio
     std::string align_language = "Chinese"; // --align-lang
+
+    // Qwen3.5 prefill checkpoint step
+    int q35_prefill_step = 64;       // --q35-prefill-step
+
+    // KV Cache quantization (FP8)
+    bool kv_quant = false;           // --kv-quant
 };
 
 // Parse command-line arguments

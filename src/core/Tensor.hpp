@@ -120,7 +120,9 @@ public:
             case dnnl::memory::data_type::bf16:
             case dnnl::memory::data_type::f16: return 2;
             case dnnl::memory::data_type::s8:
-            case dnnl::memory::data_type::u8: return 1;
+            case dnnl::memory::data_type::u8:
+            case dnnl::memory::data_type::f8_e4m3:
+            case dnnl::memory::data_type::f8_e5m2: return 1;
             case dnnl::memory::data_type::s32: return 4;
             case dnnl::memory::data_type::f64: return 8;
             default: return 0;

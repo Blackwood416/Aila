@@ -484,3 +484,10 @@ bool load_from_dir(const std::string& model_dir,
 
 } // namespace modelspec
 } // namespace aila
+
+namespace aila {
+namespace env {
+int g_q35_prefill_step_override = -1;
+bool g_kv_quant_override = false;
+}
+}

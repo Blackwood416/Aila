@@ -239,6 +239,8 @@ Options:
   --align-text <text>      ForceAligner: transcript text to align
   --align-audio <path>     ForceAligner: audio file path for alignment
   --align-lang <lang>      ForceAligner: language (default: Chinese)
+  --q35-prefill-step <N>   Qwen3.5 prefill checkpoint step (default: 64)
+  --kv-quant               Enable KV cache quantization (FP8, E4M3)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -249,6 +251,8 @@ Environment Variables:
   AILA_STREAM_OUTPUT       Force stream mode (0/1)
   AILA_DECODE_CHUNK_SIZE   Default decode chunk size
   AILA_STREAM_CHUNK_SIZE   Default stream chunk size
+  AILA_Q35_PREFILL_STEP    Default Qwen3.5 prefill checkpoint step (default: 64)
+  AILA_KV_QUANT            Enable KV cache quantization (0/1, default: 0)
 
 Interactive Commands:
   /help                    Show available commands
@@ -278,6 +282,7 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
     opts.max_seq_len = aila::env::read_int("AILA_MAX_SEQ_LEN", 4096);
     opts.decode_chunk_size = aila::env::read_int("AILA_DECODE_CHUNK_SIZE", 12);
     opts.stream_chunk_size = aila::env::read_int("AILA_STREAM_CHUNK_SIZE", 4);
+    opts.q35_prefill_step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
     {
         std::string log_level_env = aila::env::read_string("AILA_LOG_LEVEL", "");
         if (!log_level_env.empty()) {
@@ -362,6 +367,18 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--stream-chunk" && i + 1 < argc) {
             opts.stream_chunk_size = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--q35-prefill-step" && i + 1 < argc) {
+            opts.q35_prefill_step = std::atoi(argv[++i]);
+            if (opts.q35_prefill_step <= 0) {
+                std::cerr << "Error: --q35-prefill-step must be a positive integer" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--kv-quant") {
+            opts.kv_quant = true;
             continue;
         }
         if (arg == "--rep-penalty" && i + 1 < argc) {
@@ -502,6 +519,8 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         return false;
     }
 
+    aila::env::g_q35_prefill_step_override = opts.q35_prefill_step;
+    aila::env::g_kv_quant_override = opts.kv_quant;
     return true;
 }
 
