@@ -977,12 +977,15 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 cache.v = Tensor::allocate(ctx,
                                            {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
                                            kv_dtype);
+                // Zero-fill MTP KV cache to avoid attention reading garbage
+                ctx.queue().memset(cache.k.data(), 0, cache.k.size_bytes());
+                ctx.queue().memset(cache.v.data(), 0, cache.v.size_bytes());
                 cache.linear_state = Tensor();
                 cache.linear_conv_state = Tensor();
                 cache.host_linear_state.clear();
                 cache.host_linear_conv_state.clear();
                 cache.linear_conv_head = 0;
-                
+
                 Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
                 Tensor* up_w = transpose_weight(prefix + "mlp.up_proj.weight");
                 Tensor* down_w = transpose_weight(prefix + "mlp.down_proj.weight");
@@ -2708,7 +2711,10 @@ Tensor* Qwen35HybridTextBackend::forward_mtp(Context& ctx, int next_token_id) {
                   
     // QKV Projection (写入 buf_.full_qkv)
     layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, 1);
-    
+
+    // Ensure QKV projection is complete before split/attention
+    ctx.queue().wait();
+
     // Split Q, K, V views
     bf16* fused_qkv_ptr = static_cast<bf16*>(buf_.full_qkv.data());
     Tensor q_gate_decode_view;
