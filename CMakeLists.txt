@@ -49,6 +49,8 @@ set(CHAT_SOURCES
     src/chat/ChatJson.cpp
     src/chat/ChatSessionState.cpp
     src/chat/ChatTemplateEngine.cpp
+    src/chat/StructuredStreamParser.cpp
+    src/chat/ToolPolicy.cpp
 )
 
 set(JINJA_SOURCES
@@ -118,6 +120,8 @@ set(CHAT_TEST_SOURCES
     tests/chat/ChatTemplateEngineTests.cpp
     tests/chat/ChatFormatterTests.cpp
     tests/chat/ThinkingBudgetControllerTests.cpp
+    tests/chat/StructuredStreamParserTests.cpp
+    tests/chat/ToolPolicyTests.cpp
 )
 
 # Third-party

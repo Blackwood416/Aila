@@ -208,7 +208,10 @@ to print structured assistant JSON with `content`, `reasoning_content`,
 
 Aila formats and parses tool calls but does not execute tools. Callers should
 execute returned `tool_calls` externally and send tool results back as `tool`
-messages.
+messages. `tool_choice` policy violations are reported as warnings, and
+reasoning can be bounded with `reasoning_budget` / `--thinking-budget`. C API
+callers can use `aila_generate_chat_json_ex` with `AilaGenConfigV2` for
+ABI-safe chat options.
 
 ### 🎤 TTS Voice Cloning
 

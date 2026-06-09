@@ -207,6 +207,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 
 Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推理引擎内部执行工具。
 调用方应在外部执行返回的 `tool_calls`，再把工具结果作为 `tool` 消息传回 Aila。
+`tool_choice` 策略违背会以 warning 返回，reasoning 可通过 `reasoning_budget` /
+`--thinking-budget` 限制。C API 调用方可使用 `aila_generate_chat_json_ex` 和
+`AilaGenConfigV2` 获取 ABI-safe 的 chat 选项。
 
 ### 🎤 TTS 语音克隆
 

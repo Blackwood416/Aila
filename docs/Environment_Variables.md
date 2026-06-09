@@ -147,6 +147,7 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_DEBUG_PROMPT_TEXT` | bool | `false` | Log the fully rendered prompt text before prefill, including chat-template special markers such as `<|im_start|>` and `<|im_end|>` |
+| `AILA_DEBUG_CHAT_TEMPLATE` | bool | `false` | Log the selected chat template source/version without dumping the full prompt |
 | `AILA_DEBUG_PROMPT_TEXT_MAX_CHARS` | int | `20000` | Maximum rendered prompt characters to log when `AILA_DEBUG_PROMPT_TEXT=1`. Set to `0` for unlimited output |
 | `AILA_DEBUG_TOKEN_IDS` | bool | `false` | Log token IDs during generation |
 | `AILA_DEBUG_Q35_LOGITS` | bool | `false` | Log top-N logits after prefill |

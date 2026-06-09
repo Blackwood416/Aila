@@ -39,9 +39,12 @@ from ctypes import (
     c_char_p,
     c_float,
     c_int,
+    c_uint32,
+    c_uint64,
     c_void_p,
     cdll,
     create_string_buffer,
+    sizeof,
     string_at,
 )
 
@@ -62,6 +65,26 @@ class AilaGenConfig(Structure):
         ("do_sample",          c_int),
         ("decode_chunk_size",  c_int),
         ("stream_chunk_size",  c_int),
+    ]
+
+
+class AilaGenConfigV2(Structure):
+    _fields_ = [
+        ("struct_size",            c_uint32),
+        ("max_new_tokens",         c_int),
+        ("temperature",            c_float),
+        ("top_k",                  c_int),
+        ("top_p",                  c_float),
+        ("repetition_penalty",     c_float),
+        ("presence_penalty",       c_float),
+        ("frequency_penalty",      c_float),
+        ("do_sample",              c_int),
+        ("decode_chunk_size",      c_int),
+        ("stream_chunk_size",      c_int),
+        ("thinking_budget_tokens", c_int),
+        ("sampling_seed",          c_uint64),
+        ("use_fixed_seed",         c_int),
+        ("reserved",               c_int * 8),
     ]
 
 
@@ -104,10 +127,12 @@ class AilaAPI:
         self._set("aila_engine_init", c_int, [c_void_p, c_char_p, c_int])
 
         self._set("aila_default_gen_config", AilaGenConfig, [])
+        self._set("aila_default_gen_config_v2", AilaGenConfigV2, [])
 
         self._set("aila_generate", c_void_p, [c_void_p, c_char_p, c_void_p])
         self._set("aila_generate_messages", c_void_p, [c_void_p, c_char_p, c_void_p])
         self._set("aila_generate_chat_json", c_void_p, [c_void_p, c_char_p, c_void_p])
+        self._set("aila_generate_chat_json_ex", c_void_p, [c_void_p, c_char_p, c_void_p])
         self._set("aila_generate_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
         self._set("aila_generate_messages_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
 
@@ -594,6 +619,29 @@ def test_generate_chat_json(api: AilaAPI, engine):
 
     test("generate_chat_json(NULL engine)", api.aila_generate_chat_json(None, req.encode(), None) is None)
     test("generate_chat_json(NULL json)", api.aila_generate_chat_json(engine, None, None) is None)
+
+    api.aila_engine_reset_context(engine)
+    cfg2 = api.aila_default_gen_config_v2()
+    cfg2.max_new_tokens = 12
+    cfg2.do_sample = 0
+    cfg2.thinking_budget_tokens = 0
+    out_v2_p = api.aila_generate_chat_json_ex(engine, req.encode(), byref(cfg2))
+    test("generate_chat_json_ex returns non-NULL", out_v2_p is not None)
+    if out_v2_p:
+        raw_v2 = string_at(out_v2_p).decode("utf-8", errors="replace")
+        api.aila_free_string(out_v2_p)
+        try:
+            obj_v2 = json.loads(raw_v2)
+            ok = (
+                obj_v2.get("role") == "assistant"
+                and "content" in obj_v2
+                and "finish_reason" in obj_v2
+            )
+            test("generate_chat_json_ex returns assistant result shape", ok, raw_v2[:160])
+        except Exception as exc:
+            test("generate_chat_json_ex returns valid JSON", False, f"{exc}: {raw_v2[:160]}")
+    test("generate_chat_json_ex(NULL engine)", api.aila_generate_chat_json_ex(None, req.encode(), None) is None)
+    test("generate_chat_json_ex(NULL json)", api.aila_generate_chat_json_ex(engine, None, None) is None)
 
 
 def test_streaming(api: AilaAPI, engine):
@@ -1384,6 +1432,21 @@ def test_default_config(api: AilaAPI):
          f"tokens={cfg.max_new_tokens} temp={cfg.temperature:.3f} "
          f"top_k={cfg.top_k} top_p={cfg.top_p:.3f} "
          f"do_sample={cfg.do_sample} dc={cfg.decode_chunk_size} sc={cfg.stream_chunk_size}")
+    cfg2 = api.aila_default_gen_config_v2()
+    ok2 = (
+        cfg2.struct_size >= sizeof(AilaGenConfigV2)
+        and cfg2.max_new_tokens == cfg.max_new_tokens
+        and abs(cfg2.temperature - cfg.temperature) < 0.01
+        and cfg2.top_k == cfg.top_k
+        and abs(cfg2.top_p - cfg.top_p) < 0.01
+        and cfg2.do_sample == cfg.do_sample
+        and cfg2.decode_chunk_size == cfg.decode_chunk_size
+        and cfg2.stream_chunk_size == cfg.stream_chunk_size
+        and cfg2.thinking_budget_tokens == -1
+    )
+    test("v2 defaults match spec", ok2,
+         f"struct_size={cfg2.struct_size} sizeof={sizeof(AilaGenConfigV2)} "
+         f"thinking_budget={cfg2.thinking_budget_tokens}")
 
 
 # ---------------------------------------------------------------------------

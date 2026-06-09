@@ -61,6 +61,24 @@ typedef struct AilaGenConfig {
     int   stream_chunk_size;    /* default: 4      */
 } AilaGenConfig;
 
+typedef struct AilaGenConfigV2 {
+    uint32_t struct_size;       /* set to sizeof(AilaGenConfigV2) */
+    int   max_new_tokens;       /* default: 512    */
+    float temperature;          /* default: 0.6    */
+    int   top_k;                /* default: 20     */
+    float top_p;                /* default: 0.95   */
+    float repetition_penalty;   /* default: 1.0    */
+    float presence_penalty;     /* default: 0.0    */
+    float frequency_penalty;    /* default: 0.0    */
+    int   do_sample;            /* 0=greedy, 1=sampling */
+    int   decode_chunk_size;    /* default: 12     */
+    int   stream_chunk_size;    /* default: 4      */
+    int   thinking_budget_tokens; /* -1=disabled, 0=no-think, >0 budget */
+    uint64_t sampling_seed;     /* valid when use_fixed_seed != 0 */
+    int   use_fixed_seed;       /* 0=random/default, 1=use sampling_seed */
+    int   reserved[8];          /* must be zero */
+} AilaGenConfigV2;
+
 /* -------------- Callback types -------------- */
 
 /**
@@ -111,6 +129,12 @@ AILA_API void aila_engine_destroy(AilaEngine* engine);
 AILA_API AilaGenConfig aila_default_gen_config(void);
 
 /**
+ * Get ABI-safe v2 generation config defaults.
+ * Set struct_size to sizeof(AilaGenConfigV2) before passing custom configs.
+ */
+AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void);
+
+/**
  * Generate response (blocking, non-streaming).
  * @param engine   Initialized engine handle
  * @param prompt   User message (UTF-8 null-terminated)
@@ -150,6 +174,13 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
  */
 AILA_API char* aila_generate_chat_json(AilaEngine* engine, const char* chat_request_json,
                                        const AilaGenConfig* config);
+
+/**
+ * Generate a structured assistant result using ABI-safe v2 generation config.
+ * @param config  V2 config (NULL for defaults). struct_size must be non-zero.
+ */
+AILA_API char* aila_generate_chat_json_ex(AilaEngine* engine, const char* chat_request_json,
+                                          const AilaGenConfigV2* config);
 
 /**
  * Generate response from OpenAI-style messages JSON with streaming token callback.

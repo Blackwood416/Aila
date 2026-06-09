@@ -154,7 +154,18 @@ when the structured result contains parsed tool calls.
 
 Chat request JSON may include `reasoning_budget`, `thinking_budget`, or
 `thinking_budget_tokens`. These fields are preferred for C API callers because
-the legacy `AilaGenConfig` struct is not expanded in this stage.
+the legacy `AilaGenConfig` struct remains ABI-stable.
+
+#### `aila_generate_chat_json_ex`
+
+```c
+char* aila_generate_chat_json_ex(AilaEngine* engine, const char* chat_request_json, const AilaGenConfigV2* config);
+```
+
+ABI-safe variant of `aila_generate_chat_json` that accepts `AilaGenConfigV2`.
+Set `config->struct_size = sizeof(AilaGenConfigV2)` before calling. Passing
+`NULL` uses defaults. Returned strings follow the same ownership rule and must
+be freed with `aila_free_string`.
 
 ### Generation (Streaming)
 
@@ -698,6 +709,39 @@ AilaGenConfig aila_default_gen_config(void);
 
 Returns a config struct with sensible defaults. All fields can be overridden before passing to generation functions.
 
+#### `AilaGenConfigV2`
+
+```c
+typedef struct {
+    uint32_t struct_size;       // set to sizeof(AilaGenConfigV2)
+    int   max_new_tokens;
+    float temperature;
+    int   top_k;
+    float top_p;
+    float repetition_penalty;
+    float presence_penalty;
+    float frequency_penalty;
+    int   do_sample;
+    int   decode_chunk_size;
+    int   stream_chunk_size;
+    int   thinking_budget_tokens; // -1 = disabled, 0 = no-think, >0 = budget
+    uint64_t sampling_seed;
+    int   use_fixed_seed;
+    int   reserved[8];          // must be zero
+} AilaGenConfigV2;
+```
+
+`AilaGenConfigV2` is append-safe: Aila reads only fields covered by
+`struct_size`, so future fields can be added without changing old callers.
+
+#### `aila_default_gen_config_v2`
+
+```c
+AilaGenConfigV2 aila_default_gen_config_v2(void);
+```
+
+Returns v2 defaults with `struct_size` initialized.
+
 ### Context Management
 
 #### `aila_engine_reset_context`
@@ -812,12 +856,34 @@ class AilaGenConfig(ctypes.Structure):
         ("stream_chunk_size", ctypes.c_int),
     ]
 
+class AilaGenConfigV2(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("max_new_tokens", ctypes.c_int),
+        ("temperature", ctypes.c_float),
+        ("top_k", ctypes.c_int),
+        ("top_p", ctypes.c_float),
+        ("repetition_penalty", ctypes.c_float),
+        ("presence_penalty", ctypes.c_float),
+        ("frequency_penalty", ctypes.c_float),
+        ("do_sample", ctypes.c_int),
+        ("decode_chunk_size", ctypes.c_int),
+        ("stream_chunk_size", ctypes.c_int),
+        ("thinking_budget_tokens", ctypes.c_int),
+        ("sampling_seed", ctypes.c_uint64),
+        ("use_fixed_seed", ctypes.c_int),
+        ("reserved", ctypes.c_int * 8),
+    ]
+
 # Bind functions
 lib.aila_engine_create.restype = ctypes.c_void_p
 lib.aila_engine_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.aila_engine_init.restype = ctypes.c_int
 lib.aila_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 lib.aila_generate.restype = ctypes.c_void_p
+lib.aila_default_gen_config_v2.restype = AilaGenConfigV2
+lib.aila_generate_chat_json_ex.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+lib.aila_generate_chat_json_ex.restype = ctypes.c_void_p
 lib.aila_transcribe.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # wav_path

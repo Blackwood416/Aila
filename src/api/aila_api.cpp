@@ -2,6 +2,9 @@
 #include "engine/Engine.hpp"
 #include "profile/Profiling.hpp"
 #include "AudioPreprocessor.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <functional>
@@ -39,6 +42,69 @@ static GenerationConfig to_cpp_config(const AilaGenConfig* c_config) {
     cfg.decode_chunk_size  = c_config->decode_chunk_size;
     cfg.stream_chunk_size  = c_config->stream_chunk_size;
     return cfg;
+}
+
+static bool v2_has_field(const AilaGenConfigV2* c_config, size_t offset, size_t size) {
+    return c_config &&
+           c_config->struct_size >= offset + size;
+}
+
+#define AILA_V2_HAS_FIELD(config, field) \
+    v2_has_field((config), offsetof(AilaGenConfigV2, field), sizeof((config)->field))
+
+static GenerationConfig to_cpp_config_v2(const AilaGenConfigV2* c_config) {
+    GenerationConfig cfg;
+    if (!c_config) return cfg;
+
+    if (AILA_V2_HAS_FIELD(c_config, max_new_tokens)) {
+        cfg.max_new_tokens = c_config->max_new_tokens;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, temperature)) {
+        cfg.temperature = c_config->temperature;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, top_k)) {
+        cfg.top_k = c_config->top_k;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, top_p)) {
+        cfg.top_p = c_config->top_p;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, repetition_penalty)) {
+        cfg.repetition_penalty = c_config->repetition_penalty;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, presence_penalty)) {
+        cfg.presence_penalty = c_config->presence_penalty;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, frequency_penalty)) {
+        cfg.frequency_penalty = c_config->frequency_penalty;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, do_sample)) {
+        cfg.do_sample = (c_config->do_sample != 0);
+    }
+    if (AILA_V2_HAS_FIELD(c_config, decode_chunk_size)) {
+        cfg.decode_chunk_size = c_config->decode_chunk_size;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, stream_chunk_size)) {
+        cfg.stream_chunk_size = c_config->stream_chunk_size;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, thinking_budget_tokens)) {
+        cfg.thinking_budget_tokens = std::max(-1, c_config->thinking_budget_tokens);
+    }
+    if (AILA_V2_HAS_FIELD(c_config, sampling_seed)) {
+        cfg.sampling_seed = c_config->sampling_seed;
+    }
+    if (AILA_V2_HAS_FIELD(c_config, use_fixed_seed)) {
+        cfg.use_fixed_seed = (c_config->use_fixed_seed != 0);
+    }
+    return cfg;
+}
+
+#undef AILA_V2_HAS_FIELD
+
+static char* copy_string_result(const std::string& result) {
+    char* out = static_cast<char*>(malloc(result.size() + 1));
+    if (!out) return nullptr;
+    memcpy(out, result.c_str(), result.size() + 1);
+    return out;
 }
 
 static int to_c_error_code(EngineErrorCode code) {
@@ -123,6 +189,26 @@ AILA_API AilaGenConfig aila_default_gen_config(void) {
     return cfg;
 }
 
+AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void) {
+    const AilaGenConfig base = aila_default_gen_config();
+    AilaGenConfigV2 cfg{};
+    cfg.struct_size = sizeof(AilaGenConfigV2);
+    cfg.max_new_tokens = base.max_new_tokens;
+    cfg.temperature = base.temperature;
+    cfg.top_k = base.top_k;
+    cfg.top_p = base.top_p;
+    cfg.repetition_penalty = base.repetition_penalty;
+    cfg.presence_penalty = base.presence_penalty;
+    cfg.frequency_penalty = base.frequency_penalty;
+    cfg.do_sample = base.do_sample;
+    cfg.decode_chunk_size = base.decode_chunk_size;
+    cfg.stream_chunk_size = base.stream_chunk_size;
+    cfg.thinking_budget_tokens = -1;
+    cfg.sampling_seed = 42;
+    cfg.use_fixed_seed = 0;
+    return cfg;
+}
+
 AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaGenConfig* config) {
     if (!engine || !prompt) return nullptr;
 
@@ -133,11 +219,7 @@ AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaG
             return nullptr;
         }
 
-        // Allocate and copy result
-        char* out = static_cast<char*>(malloc(result.size() + 1));
-        if (!out) return nullptr;
-        memcpy(out, result.c_str(), result.size() + 1);
-        return out;
+        return copy_string_result(result);
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[C-API] Generate failed: %s", e.what());
         return nullptr;
@@ -156,10 +238,7 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
         if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
             return nullptr;
         }
-        char* out = static_cast<char*>(malloc(result.size() + 1));
-        if (!out) return nullptr;
-        memcpy(out, result.c_str(), result.size() + 1);
-        return out;
+        return copy_string_result(result);
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[C-API] Generate messages failed: %s", e.what());
         return nullptr;
@@ -178,15 +257,32 @@ AILA_API char* aila_generate_chat_json(AilaEngine* engine, const char* chat_requ
         if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
             return nullptr;
         }
-        char* out = static_cast<char*>(malloc(result.size() + 1));
-        if (!out) return nullptr;
-        memcpy(out, result.c_str(), result.size() + 1);
-        return out;
+        return copy_string_result(result);
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[C-API] Generate chat JSON failed: %s", e.what());
         return nullptr;
     } catch (...) {
         AILA_LOG_ERROR("[C-API] Generate chat JSON failed: unknown exception");
+        return nullptr;
+    }
+}
+
+AILA_API char* aila_generate_chat_json_ex(AilaEngine* engine, const char* chat_request_json,
+                                          const AilaGenConfigV2* config) {
+    if (!engine || !chat_request_json) return nullptr;
+    if (config && config->struct_size == 0) return nullptr;
+    try {
+        GenerationConfig cfg = to_cpp_config_v2(config);
+        std::string result = engine->engine.generate_chat_json(std::string(chat_request_json), cfg, nullptr);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return nullptr;
+        }
+        return copy_string_result(result);
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Generate chat JSON v2 failed: %s", e.what());
+        return nullptr;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Generate chat JSON v2 failed: unknown exception");
         return nullptr;
     }
 }
