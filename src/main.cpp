@@ -190,7 +190,18 @@ int main(int argc, char** argv) {
             messages_json = messages_json.substr(3);
         }
 
-        if (opts.stream_output) {
+        if (opts.chat_output_json) {
+            if (opts.stream_output) {
+                AILA_LOG_WARN("--chat-output-json disables token streaming so stdout remains valid JSON");
+            }
+            std::string out = engine.generate_chat_json(messages_json, gen_config, nullptr);
+            if (engine.last_error_code() != EngineErrorCode::Ok) {
+                AILA_LOG_ERROR("chat JSON generation failed: %s",
+                               engine.last_error_message().c_str());
+                return 2;
+            }
+            std::cout << out << std::endl;
+        } else if (opts.stream_output) {
             std::cout << "\nAila: ";
             engine.generate_messages_json(messages_json, gen_config,
                 [](const std::string& token_text) {

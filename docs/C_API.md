@@ -115,6 +115,43 @@ Or backward-compatibly:
 
 Each message has a `role` (`"system"`, `"user"`, or `"assistant"`) and `content` (string or array of content parts). Content parts may include `text`, `image`, `audio`, and `video` types (including base64 encoded image Data URIs and input_audio payload, see README for details).
 
+#### `aila_generate_chat_json`
+
+```c
+char* aila_generate_chat_json(AilaEngine* engine, const char* chat_request_json, const AilaGenConfig* config);
+```
+
+Generates from the same JSON shape as `aila_generate_messages`, then parses the assistant output into structured JSON. This API is intended for tool-calling and reasoning-aware callers that need more than raw assistant text.
+
+The returned JSON has this shape:
+
+```json
+{
+  "role": "assistant",
+  "content": "final answer text",
+  "reasoning_content": "optional hidden reasoning text",
+  "tool_calls": [
+    {
+      "id": "call_0",
+      "type": "function",
+      "function": {
+        "name": "search",
+        "arguments": "{\"query\":\"cats\"}"
+      }
+    }
+  ],
+  "raw_text": "<think>...</think><tool_call>...</tool_call>",
+  "finish_reason": "stop",
+  "warnings": []
+}
+```
+
+Aila only formats prompts and parses assistant tool calls. It does not execute tools. Callers should execute `tool_calls` externally, append tool results as `tool` messages, and call Aila again.
+
+`finish_reason` is `"stop"` for EOS, `"length"` when `max_new_tokens` is
+exhausted, `"loop_guard"` for repetitive decode early-stop, and `"tool_calls"`
+when the structured result contains parsed tool calls.
+
 ### Generation (Streaming)
 
 #### `aila_generate_stream`

@@ -222,6 +222,7 @@ Options:
   --bench-greedy           Benchmark decode in greedy mode (default)
   --log-level <level>      Minimum log level (debug/info/warning/error, default: info)
   --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
+  --chat-output-json       With --messages-json, print structured assistant JSON instead of raw text
   --lora <path>              LoRA adapter directory (or set AILA_LORA_DIR)
   --forced-lang <lang>     Force ASR language (e.g. Chinese, English)
   --asr-system <prompt>    ASR system prompt text bias
@@ -429,6 +430,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.messages_json_path = argv[++i];
             continue;
         }
+        if (arg == "--chat-output-json") {
+            opts.chat_output_json = true;
+            continue;
+        }
         if (arg == "--lora" && i + 1 < argc) {
             opts.lora_dir = argv[++i];
             continue;
@@ -590,9 +595,12 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
     registry.register_command("/context", "Show context usage", [&, engine](const std::string&) {
         if (engine) {
             std::cout << "\n[Context]" << std::endl;
+            std::cout << "  Context tokens:   " << engine->conversation_context_length()
+                       << " / " << engine->max_context_length() << std::endl;
             std::cout << "  KV cache tokens:  " << engine->context_length()
                        << " / " << engine->max_context_length() << std::endl;
-            std::cout << "  History turns:    " << engine->history().size() << std::endl;
+            std::cout << "  History messages: " << engine->active_history_message_count() << std::endl;
+            std::cout << "  History turns:    " << engine->active_history_turn_count() << std::endl;
             std::cout << std::endl;
         }
         return true;
@@ -893,9 +901,12 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::cout << "  pres_penalty:       " << gen_config.presence_penalty << std::endl;
         std::cout << "  freq_penalty:       " << gen_config.frequency_penalty << std::endl;
         if (engine) {
-            std::cout << "  context_tokens:     " << engine->context_length()
+            std::cout << "  context_tokens:     " << engine->conversation_context_length()
                       << " / " << engine->max_context_length() << std::endl;
-            std::cout << "  history_turns:      " << engine->history().size() << std::endl;
+            std::cout << "  kv_cache_tokens:    " << engine->context_length()
+                      << " / " << engine->max_context_length() << std::endl;
+            std::cout << "  history_messages:   " << engine->active_history_message_count() << std::endl;
+            std::cout << "  history_turns:      " << engine->active_history_turn_count() << std::endl;
         }
         std::cout << std::endl;
         return true;

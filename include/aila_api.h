@@ -132,6 +132,26 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
                                       const AilaGenConfig* config);
 
 /**
+ * Generate a structured assistant result from OpenAI-style chat request JSON.
+ *
+ * The input may be either a messages array or an object containing `messages`,
+ * `tools`, `tool_choice`, `chat_template_kwargs`, and generation parameters.
+ * The returned JSON contains `role`, `content`, `reasoning_content`,
+ * `tool_calls`, `raw_text`, `finish_reason`, and `warnings`. Aila formats and
+ * parses tool calls but does not execute tools; callers should execute returned
+ * tool calls externally and feed tool results back as `tool` messages.
+ * `finish_reason` may be "stop", "length", "loop_guard", or "tool_calls".
+ *
+ * @param engine            Initialized engine handle
+ * @param chat_request_json UTF-8 JSON chat request string
+ * @param config            Generation config defaults/overrides (NULL for defaults)
+ * @return Newly allocated UTF-8 JSON string. Caller must free with aila_free_string().
+ *         Returns NULL on error.
+ */
+AILA_API char* aila_generate_chat_json(AilaEngine* engine, const char* chat_request_json,
+                                       const AilaGenConfig* config);
+
+/**
  * Generate response from OpenAI-style messages JSON with streaming token callback.
  * @param engine         Initialized engine handle
  * @param messages_json  UTF-8 JSON array string. Each item should contain role/content.

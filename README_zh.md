@@ -29,7 +29,7 @@
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
 - **🔌 C API** — 稳定的 C FFI 接口（Python、C#、Rust、Go、Java）— 见 [docs/C_API.md](docs/C_API.md)
-- **💭 Chat 模板** — ChatML 格式，支持 `<think>` 块生成和 `/no_think` / `/think` 思考模式指定
+- **💭 Chat Formatting** — llama.cpp 风格 Jinja 渲染、修复版 Qwen3.5 模板、结构化 reasoning/tool-call 解析
 
 ## 📦 支持的模型
 
@@ -151,6 +151,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--bench-sample` / `--bench-greedy` | 基准测试解码模式 | greedy |
 | `--log-level <level>` | 最低日志级别（verbose/debug/info/warning/error） | info |
 | `--messages-json <path>` | JSON prompt 文件（`-` = stdin） | 无 |
+| `--chat-output-json` | 与 `--messages-json` 配合，输出结构化 assistant JSON 而非原始文本 | 关闭 |
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
@@ -192,22 +193,18 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/log_level <level>` | 设置日志级别（verbose/debug/info/warning/error） |
 | `/config` | 显示当前配置 |
 
-### 🤫 `/no_think` 与 `/think` 后缀
+### 💭 Chat Formatting 与工具调用
 
-在消息末尾添加 `/no_think` 可抑制模型的思考过程，添加 `/think` 可强制思考（对默认为非思考模式的 Qwen3.5-0.8B 有用）：
+`--messages-json` 接受 OpenAI 风格 chat request，支持 `messages`、`tools`、
+`tool_choice`、`chat_template_kwargs` 和生成参数。Qwen3.5 Hybrid 模型在未显式
+覆盖模板时会使用 Aila 内置的修复版 Qwen3.5 Jinja 模板。
 
-```
-User: 1+1等于几？ /no_think
-Aila: 1+1等于2。
+默认情况下，`--messages-json` 输出原始 assistant 文本。添加
+`--chat-output-json` 后会输出结构化 assistant JSON，包括 `content`、
+`reasoning_content`、`tool_calls`、`raw_text`、`finish_reason` 和 `warnings`。
 
-User: 解释量子计算。 /think
-Aila: <think>
-让我逐步分析...
-</think>
-量子计算是...
-```
-
-交互模式和 `--messages-json` 均支持。
+Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推理引擎内部执行工具。
+调用方应在外部执行返回的 `tool_calls`，再把工具结果作为 `tool` 消息传回 Aila。
 
 ### 🎤 TTS 语音克隆
 

@@ -18,6 +18,17 @@ Aila supports the following environment variables for runtime configuration. Boo
 
 ---
 
+## Chat Formatting
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_CHAT_TEMPLATE` | string | unset | Raw Jinja chat template override. Takes precedence over request/model/built-in template selection when the request does not provide an explicit template override. |
+| `AILA_CHAT_TEMPLATE_PATH` | string | unset | Path to a Jinja chat template override file. Used when `AILA_CHAT_TEMPLATE` is unset and the request does not provide an explicit template override. |
+
+Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explicit override is provided. Request-level `chat_template_kwargs` can set `enable_thinking`, `preserve_thinking`, `auto_disable_thinking_with_tools`, `max_tool_arg_chars`, and `max_tool_response_chars`.
+
+---
+
 ## Bitsandbytes 4-bit (AILA_BNB4_*)
 
 | Variable | Type | Default | Description |
@@ -90,6 +101,7 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `AILA_Q35_PREFILL_CHUNK` | int | `512` | Qwen3.5 prompt prefill chunk size. Caps temporary attention/runtime scratch memory during long prompt or incremental prefill. Set to `0` to disable chunking |
 | `AILA_Q35_PREFILL_TOKENWISE` | bool | `false` | Tokenwise prefill mode (debug only — feeds tokens one at a time) |
 
 ---
@@ -133,6 +145,8 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `AILA_DEBUG_PROMPT_TEXT` | bool | `false` | Log the fully rendered prompt text before prefill, including chat-template special markers such as `<|im_start|>` and `<|im_end|>` |
+| `AILA_DEBUG_PROMPT_TEXT_MAX_CHARS` | int | `20000` | Maximum rendered prompt characters to log when `AILA_DEBUG_PROMPT_TEXT=1`. Set to `0` for unlimited output |
 | `AILA_DEBUG_TOKEN_IDS` | bool | `false` | Log token IDs during generation |
 | `AILA_DEBUG_Q35_LOGITS` | bool | `false` | Log top-N logits after prefill |
 | `AILA_DEBUG_Q35_LAYER_STATS` | bool | `false` | Log per-layer statistics |

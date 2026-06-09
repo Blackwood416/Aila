@@ -29,7 +29,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
 - **🔌 C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
-- **💭 Chat template** — ChatML format with `<think>` block generation and `/no_think` / `/think` thinking mode toggle
+- **💭 Chat formatting** — llama.cpp-style Jinja rendering, fixed Qwen3.5 template, structured reasoning/tool-call parsing
 
 ## 📦 Supported Models
 
@@ -151,6 +151,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--bench-sample` / `--bench-greedy` | Benchmark decode mode | greedy |
 | `--log-level <level>` | Minimum log level (verbose/debug/info/warning/error) | info |
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
+| `--chat-output-json` | With `--messages-json`, print structured assistant JSON instead of raw text | off |
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
@@ -192,22 +193,20 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/log_level <level>` | Set log level (verbose/debug/info/warning/error) |
 | `/config` | Show current configuration |
 
-### 🤫 `/no_think` and `/think` Suffixes
+### 💭 Chat Formatting and Tool Calls
 
-Append `/no_think` to suppress the model's `<think>` block, or `/think` to force thinking (useful on Qwen3.5-0.8B which defaults to non-thinking):
+`--messages-json` accepts OpenAI-style chat requests with `messages`, `tools`,
+`tool_choice`, `chat_template_kwargs`, and generation parameters. Qwen3.5 Hybrid
+models use Aila's built-in fixed Qwen3.5 Jinja template unless a request or
+environment override is provided.
 
-```
-User: What is 1+1? /no_think
-Aila: 1+1 equals 2.
+By default `--messages-json` prints raw assistant text. Add `--chat-output-json`
+to print structured assistant JSON with `content`, `reasoning_content`,
+`tool_calls`, `raw_text`, `finish_reason`, and `warnings`.
 
-User: Explain quantum computing. /think
-Aila: <think>
-Let me break this down step by step...
-</think>
-Quantum computing is...
-```
-
-Both work in interactive mode and `--messages-json`.
+Aila formats and parses tool calls but does not execute tools. Callers should
+execute returned `tool_calls` externally and send tool results back as `tool`
+messages.
 
 ### 🎤 TTS Voice Cloning
 

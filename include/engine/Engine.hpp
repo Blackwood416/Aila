@@ -23,7 +23,10 @@
 #include "../src/utils/ModelConfig.hpp"
 #include "../src/utils/ModelSpec.hpp"
 #include "../src/utils/SafeTensors.hpp"
-#include "../src/templates/TemplateRegistry.hpp"
+#include "../src/chat/AssistantOutputParser.hpp"
+#include "../src/chat/ChatFormatter.hpp"
+#include "../src/chat/ChatJson.hpp"
+#include "../src/chat/ChatSessionState.hpp"
 #include "../src/profile/Profiling.hpp"
 #include "../src/utils/EnvUtils.hpp"
 #include "../src/utils/JsonParser.hpp"
@@ -38,6 +41,8 @@
 #include <fstream>
 #include <filesystem>
 #include <cstdint>
+#include <cstddef>
+#include <utility>
 
 namespace aila_asr {
 
@@ -701,6 +706,7 @@ public:
     void reset_context() {
         history_.clear();
         mm_history_.clear();
+        chat_session_.clear();
         cached_ids_.clear();
         benchmark_seed_ready_ = false;
         if (backend_) backend_->reset();
@@ -710,6 +716,247 @@ public:
     int context_length() const { return static_cast<int>(cached_ids_.size()); }
     int max_context_length() const { return backend_ ? backend_->max_seq_len() : 0; }
     const ChatHistory& history() const { return history_; }
+    size_t active_history_message_count() const {
+        if (chat_session_.message_count_without_system() > 0) {
+            return chat_session_.message_count_without_system();
+        }
+        if (!mm_history_.empty()) {
+            size_t count = 0;
+            for (const auto& msg : mm_history_) {
+                if (msg.role != "system") ++count;
+            }
+            return count;
+        }
+        return history_.size();
+    }
+    size_t active_history_turn_count() const {
+        size_t count = 0;
+        if (chat_session_.turn_count() > 0) {
+            return chat_session_.turn_count();
+        }
+        if (!mm_history_.empty()) {
+            for (const auto& msg : mm_history_) {
+                if (msg.role == "user") ++count;
+            }
+            return count;
+        }
+        for (const auto& msg : history_.messages()) {
+            if (msg.role == "user") ++count;
+        }
+        return count;
+    }
+    int conversation_context_length() const {
+        auto render_chat_request_len = [&](const aila::chat::ChatRequest& request) -> int {
+            aila::chat::ChatFormatTextResult rendered;
+            std::string error;
+            if (!chat_formatter_.render_text(make_chat_format_input(request), false, rendered, &error)) {
+                return -1;
+            }
+            return static_cast<int>(tokenizer_.encode(rendered.text).size());
+        };
+
+        if (chat_session_.message_count_without_system() > 0) {
+            aila::chat::ChatRequest request = chat_session_.to_request_without_reasoning();
+            int len = render_chat_request_len(request);
+            if (len >= 0) {
+                return len;
+            }
+            return context_length();
+        }
+        if (!mm_history_.empty()) {
+            aila::chat::ChatRequest request =
+                make_chat_request_from_legacy(mm_history_, GenerationConfig{});
+            int len = render_chat_request_len(request);
+            if (len >= 0) {
+                return len;
+            }
+            return context_length();
+        }
+        if (!history_.empty()) {
+            return static_cast<int>(
+                tokenizer_.apply_chat_template(system_prompt_, history_).size());
+        }
+        return 0;
+    }
+
+    void align_backend_context_to_sequence(const std::vector<int>& prompt_ids,
+                                           const std::vector<int>& generated_ids,
+                                           int prompt_len,
+                                           const char* log_tag) {
+        if (!backend_ || !ctx_) return;
+        int accepted_len = prompt_len + static_cast<int>(generated_ids.size());
+        int actual_len = backend_->get_current_context_len();
+        if (actual_len == accepted_len) return;
+
+        auto replay_range = [&](const std::vector<int>& ids, int start, int len) {
+            if (len <= 0) return;
+            Tensor* ignored_logits = forward_prompt_tokens(ids, start, len);
+            (void)ignored_logits;
+        };
+
+        if (actual_len > accepted_len) {
+            AILA_LOG_INFO("%s KV decode overrun: backend_len=%d accepted_len=%d; replaying accepted tail",
+                          log_tag, actual_len, accepted_len);
+            if (!backend_->truncate_kv_cache(prompt_len)) {
+                backend_->reset();
+                actual_len = 0;
+            } else {
+                actual_len = backend_->get_current_context_len();
+            }
+        }
+
+        if (actual_len < prompt_len) {
+            replay_range(prompt_ids, actual_len, prompt_len - actual_len);
+            actual_len = backend_->get_current_context_len();
+        } else if (actual_len > prompt_len) {
+            if (!backend_->truncate_kv_cache(prompt_len)) {
+                backend_->reset();
+                replay_range(prompt_ids, 0, prompt_len);
+            }
+            actual_len = backend_->get_current_context_len();
+        }
+
+        int generated_start = std::max(0, actual_len - prompt_len);
+        if (generated_start < static_cast<int>(generated_ids.size())) {
+            replay_range(generated_ids,
+                         generated_start,
+                         static_cast<int>(generated_ids.size()) - generated_start);
+        }
+        ctx_->synchronize();
+
+        int final_len = backend_->get_current_context_len();
+        if (final_len != accepted_len) {
+            AILA_LOG_WARN("%s KV context alignment ended at %d, expected %d",
+                          log_tag, final_len, accepted_len);
+        }
+    }
+
+    Tensor* forward_prompt_tokens(const std::vector<int>& token_ids,
+                                  int start,
+                                  int len,
+                                  int snapshot_after_len = 0,
+                                  bool async_h2d = false) {
+        if (!backend_ || !ctx_ || len <= 0) return nullptr;
+
+        int chunk_size = len;
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+            int configured = aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 512);
+            if (configured > 0) {
+                chunk_size = std::max(1, std::min(configured, len));
+            }
+        }
+
+        Tensor* logits_ptr = nullptr;
+        const int end = start + len;
+        int pos = start;
+        while (pos < end) {
+            int next = std::min(end, pos + chunk_size);
+            if (snapshot_after_len > pos && snapshot_after_len < next) {
+                next = snapshot_after_len;
+            }
+            const int slice_len = next - pos;
+            int* token_ids_device = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(slice_len) * sizeof(int)));
+            if (async_h2d) {
+                ctx_->memcpy_h2d_async(token_ids_device,
+                                       token_ids.data() + pos,
+                                       static_cast<size_t>(slice_len) * sizeof(int));
+            } else {
+                ctx_->memcpy_h2d(token_ids_device,
+                                 token_ids.data() + pos,
+                                 static_cast<size_t>(slice_len) * sizeof(int));
+            }
+            logits_ptr = &backend_->forward(*ctx_, token_ids_device, slice_len);
+            ctx_->synchronize();
+            ctx_->free_device(token_ids_device);
+
+            pos = next;
+        }
+        return logits_ptr;
+    }
+
+    std::string decode_with_special_tokens(const std::vector<int>& ids) const {
+        std::string out;
+        for (int id : ids) {
+            std::string raw = tokenizer_.raw_token(id);
+            if (!raw.empty() && tokenizer_.special_token_id(raw) == id) {
+                out += raw;
+            } else {
+                out += tokenizer_.decode(id);
+            }
+        }
+        return out;
+    }
+
+    void debug_dump_prompt_text(const char* label,
+                                const std::string& prompt_text,
+                                int prompt_tokens) const {
+        if (!aila::env::read_flag("AILA_DEBUG_PROMPT_TEXT", false)) return;
+        int max_chars = aila::env::read_int("AILA_DEBUG_PROMPT_TEXT_MAX_CHARS", 20000);
+        std::string shown = prompt_text;
+        bool truncated = false;
+        if (max_chars > 0 && static_cast<int>(shown.size()) > max_chars) {
+            shown.resize(static_cast<size_t>(max_chars));
+            truncated = true;
+        }
+        AILA_LOG_INFO("[DebugPromptText] %s tokens=%d chars=%zu%s\n----- BEGIN RENDERED PROMPT -----\n%s\n----- END RENDERED PROMPT -----",
+                      label,
+                      prompt_tokens,
+                      prompt_text.size(),
+                      truncated ? " (truncated)" : "",
+                      shown.c_str());
+    }
+
+    aila::chat::ChatRequest make_chat_request_from_legacy(
+        const std::vector<Message>& messages,
+        const GenerationConfig& config,
+        const aila::chat::ChatRequest* source_request = nullptr) const {
+        aila::chat::ChatRequest request;
+        request.generation_config = config;
+        request.messages.reserve(messages.size());
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& legacy_msg = messages[i];
+            aila::chat::ChatMessage msg;
+            msg.role = aila::chat::role_from_string(legacy_msg.role);
+            for (const auto& part : legacy_msg.content) {
+                aila::chat::ChatContentPart out;
+                out.type = part.type;
+                out.text = part.text;
+                out.uri = part.uri;
+                out.binary_data = part.binary_data;
+                out.media_format = part.media_format;
+                msg.content.push_back(std::move(out));
+            }
+            if (source_request && i < source_request->messages.size()) {
+                const auto& source_msg = source_request->messages[i];
+                msg.reasoning_content = source_msg.reasoning_content;
+                msg.tool_calls = source_msg.tool_calls;
+                msg.name = source_msg.name;
+                msg.tool_call_id = source_msg.tool_call_id;
+            }
+            request.messages.push_back(std::move(msg));
+        }
+        if (source_request) {
+            request.tools = source_request->tools;
+            request.tool_choice = source_request->tool_choice;
+            request.tool_choice_function_name = source_request->tool_choice_function_name;
+            request.template_options = source_request->template_options;
+        }
+        return request;
+    }
+
+    aila::chat::ChatFormatInput make_chat_format_input(const aila::chat::ChatRequest& request) const {
+        aila::chat::ChatFormatInput input;
+        input.request = &request;
+        input.family = model_spec_.family;
+        input.is_qwen35_0p8b =
+            (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
+            is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
+        input.tokenizer_chat_template = tokenizer_.chat_template();
+        input.bos_token = tokenizer_.bos_token();
+        input.eos_token = tokenizer_.eos_token();
+        return input;
+    }
 
     // ============================================================
     // Generate response (multi-turn with incremental prefill)
@@ -723,6 +970,41 @@ public:
                          const GenerationConfig& gen_config = GenerationConfig(),
                          std::function<void(const std::string&)> token_callback = nullptr) {
         clear_error();
+        if (!backend_) {
+            set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
+            return "";
+        }
+
+        chat_session_.set_system_prompt(system_prompt_);
+        chat_session_.add_user_text(user_message);
+
+        auto make_session_request = [&]() {
+            aila::chat::ChatRequest request = chat_session_.to_request_without_reasoning();
+            request.generation_config = gen_config;
+            return request;
+        };
+
+        aila::chat::ChatRequest request = make_session_request();
+        std::string out = generate_chat_request_text(request, token_callback);
+        while (last_error_code_ == EngineErrorCode::ContextOverflow) {
+            if (!chat_session_.drop_oldest_turn()) {
+                break;
+            }
+            AILA_LOG_WARN("[Generate] Chat history truncated to fit context window (%zu messages remaining)",
+                          chat_session_.message_count_without_system());
+            request = make_session_request();
+            out = generate_chat_request_text(request, token_callback);
+        }
+
+        if (last_error_code_ != EngineErrorCode::Ok) {
+            chat_session_.remove_last_user_message();
+            return "";
+        }
+
+        aila::chat::AssistantChatResult result = aila::chat::parse_assistant_output(out);
+        chat_session_.add_assistant_result(result, false);
+        return out;
+
         if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
             auto rtrim_inplace = [](std::string& s) {
                 while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
@@ -917,6 +1199,29 @@ public:
         // We always use apply_chat_template to cleanly construct the prompt,
         // which naturally handles dynamically stripped context (e.g. removed <think> blocks).
         std::vector<int> full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
+        int recurrent_prefill_anchor = 0;
+        auto refresh_recurrent_prefill_anchor = [&]() {
+            recurrent_prefill_anchor = 0;
+            if (model_spec_.family != ModelFamily::Qwen35Hybrid) return;
+
+            std::vector<int> stable_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
+            if (stable_ids.empty() || stable_ids.size() >= full_ids.size()) return;
+            if (std::equal(stable_ids.begin(), stable_ids.end(), full_ids.begin())) {
+                recurrent_prefill_anchor = static_cast<int>(stable_ids.size());
+                std::vector<int> assistant_header;
+                assistant_header.push_back(tokenizer_.im_start_id());
+                auto assistant_header_text = tokenizer_.encode("assistant\n");
+                assistant_header.insert(assistant_header.end(),
+                                        assistant_header_text.begin(),
+                                        assistant_header_text.end());
+                if (stable_ids.size() + assistant_header.size() < full_ids.size() &&
+                    std::equal(assistant_header.begin(), assistant_header.end(),
+                               full_ids.begin() + static_cast<std::ptrdiff_t>(stable_ids.size()))) {
+                    recurrent_prefill_anchor += static_cast<int>(assistant_header.size());
+                }
+            }
+        };
+        refresh_recurrent_prefill_anchor();
         int reusable_prefix = 0;
 
         // Find the longest common prefix (LCP) with the current KV cache contents
@@ -929,6 +1234,7 @@ public:
         // Truncate the physical KV cache inside the model to match the reusable prefix.
         // This is necessary because if we stripped <think> blocks, the sequence diverged,
         // and we cannot append new tokens to the end of the previous longer sequence.
+        int requested_reusable_prefix = reusable_prefix;
         if (backend_) {
             bool trunc_ok = backend_->truncate_kv_cache(reusable_prefix);
             if (!trunc_ok) {
@@ -937,6 +1243,11 @@ public:
                 reusable_prefix = 0;
             } else {
                 reusable_prefix = backend_->get_current_context_len();
+                if (requested_reusable_prefix > reusable_prefix) {
+                    AILA_LOG_INFO("[Generate] Incremental prefill rollback: requested reuse=%d actual reuse=%d reprefill=%d",
+                                  requested_reusable_prefix, reusable_prefix,
+                                  requested_reusable_prefix - reusable_prefix);
+                }
                 cached_ids_.resize(reusable_prefix);
             }
         } else {
@@ -950,6 +1261,7 @@ public:
             while (static_cast<int>(full_ids.size()) > max_ctx - 64 && history_.size() > 1) {
                 history_.truncate_oldest(static_cast<int>(history_.size()) - 2);
                 full_ids = tokenizer_.apply_chat_template(system_prompt_, history_);
+                refresh_recurrent_prefill_anchor();
                 AILA_LOG_WARN("[Context] History truncated to fit context window (%zu messages remaining)",
                               history_.size());
             }
@@ -960,6 +1272,9 @@ public:
         }
 
         int total_prompt_len = static_cast<int>(full_ids.size());
+        debug_dump_prompt_text("[Generate]",
+                               decode_with_special_tokens(full_ids),
+                               total_prompt_len);
 
         // --- Determine prefill range ---
         int prefill_start = reusable_prefix;
@@ -988,24 +1303,23 @@ public:
                           gen_config.max_new_tokens, max_new_tokens);
         }
 
-        // --- Upload new tokens to GPU and prefill ---
-        int* token_ids_device = static_cast<int*>(
-            ctx_->alloc_device(static_cast<size_t>(new_tokens_to_prefill) * sizeof(int)));
-        ctx_->memcpy_h2d_async(token_ids_device,
-                               full_ids.data() + prefill_start,
-                               static_cast<size_t>(new_tokens_to_prefill) * sizeof(int));
-
         auto t_start = std::chrono::high_resolution_clock::now();
-        Tensor& logits = backend_->forward(*ctx_, token_ids_device, new_tokens_to_prefill);
-        ctx_->synchronize();
+        int snapshot_after_len =
+            (recurrent_prefill_anchor > prefill_start &&
+             recurrent_prefill_anchor < total_prompt_len)
+                ? recurrent_prefill_anchor
+                : 0;
+        Tensor* logits_ptr = forward_prompt_tokens(full_ids, prefill_start,
+                                                   new_tokens_to_prefill,
+                                                   snapshot_after_len,
+                                                   true);
         auto t_prefill = std::chrono::high_resolution_clock::now();
+        Tensor& logits = *logits_ptr;
 
         double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
         AILA_LOG_INFO("[Generate] Prefill: %d tokens in %.2f ms (%.1f tok/s)",
                       new_tokens_to_prefill, prefill_ms,
                       new_tokens_to_prefill / (prefill_ms / 1000.0));
-
-        ctx_->free_device(token_ids_device);
 
         // --- Decode loop ---
         // Collect generated tokens for penalty tracking
@@ -1232,6 +1546,8 @@ public:
         if (no_think_requested) {
             strip_leading_think_artifacts(output_text);
         }
+        align_backend_context_to_sequence(full_ids, generated_token_ids,
+                                          total_prompt_len, "[Generate]");
 
         // --- Update context state ---
         // cached_ids_ = the entire token sequence now in the KV cache
@@ -1268,8 +1584,10 @@ public:
 
     std::string generate_messages(const std::vector<Message>& messages,
                                   const GenerationConfig& gen_config = GenerationConfig(),
-                                  std::function<void(const std::string&)> token_callback = nullptr) {
+                                  std::function<void(const std::string&)> token_callback = nullptr,
+                                  const aila::chat::ChatRequest* structured_request = nullptr) {
         clear_error();
+        last_generation_finish_reason_ = "stop";
         if (!backend_) {
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
@@ -1278,73 +1596,6 @@ public:
             backend_->clear_embedding_overrides();
             backend_->clear_mrope_positions();
         }
-
-        auto trim_copy = [](const std::string& s) -> std::string {
-            std::string out = s;
-            while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
-                out.pop_back();
-            }
-            return out;
-        };
-        auto ends_with_no_think = [&](const std::string& s) -> bool {
-            const std::string cmd = "/no_think";
-            std::string t = trim_copy(s);
-            if (t.size() < cmd.size()) return false;
-            size_t pos = t.size() - cmd.size();
-            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
-            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
-        };
-        auto ends_with_think = [&](const std::string& s) -> bool {
-            const std::string cmd = "/think";
-            std::string t = trim_copy(s);
-            if (t.size() < cmd.size()) return false;
-            size_t pos = t.size() - cmd.size();
-            if (t.compare(pos, cmd.size(), cmd) != 0) return false;
-            return (pos == 0) || std::isspace(static_cast<unsigned char>(t[pos - 1]));
-        };
-        auto strip_leading_think_artifacts = [](std::string& text) {
-            auto ltrim = [](std::string& x) {
-                size_t i = 0;
-                while (i < x.size() && std::isspace(static_cast<unsigned char>(x[i]))) ++i;
-                if (i > 0) x.erase(0, i);
-            };
-
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                ltrim(text);
-                if (text.rfind("<think>", 0) == 0) {
-                    text.erase(0, 7);
-                    changed = true;
-                    continue;
-                }
-                if (text.rfind("</think>", 0) == 0) {
-                    text.erase(0, 8);
-                    changed = true;
-                    continue;
-                }
-            }
-            ltrim(text);
-        };
-        bool no_think_requested = false;
-        bool force_thinking = false;
-        if (!messages.empty() && messages.back().role == "user") {
-            std::string merged_user_text;
-            for (const auto& part : messages.back().content) {
-                if (part.type == ContentType::Text) {
-                    merged_user_text += part.text;
-                }
-            }
-            no_think_requested = ends_with_no_think(merged_user_text);
-            if (!no_think_requested) {
-                force_thinking = ends_with_think(merged_user_text);
-            }
-        }
-        bool default_open_think =
-            (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
-            !is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
-        bool prepend_think = !no_think_requested &&
-            (force_thinking || default_open_think);
 
         GenerationConfig tuned_cfg = gen_config;
         if (model_spec_.family == ModelFamily::Qwen35Hybrid && tuned_cfg.do_sample) {
@@ -1379,7 +1630,6 @@ public:
             }
         }
 
-        std::string tmpl_err;
         std::vector<Message> render_messages;
         render_messages.reserve(messages.size());
         std::vector<sycl::ext::oneapi::bfloat16> vision_embeddings_flat;
@@ -1557,15 +1807,55 @@ public:
             render_messages.push_back(std::move(out_msg));
         }
 
-        std::vector<int> full_ids;
-        if (!template_registry_.render(model_spec_, tokenizer_, render_messages,
-                                       vision_backend_enabled_, true, full_ids, &tmpl_err)) {
-            AILA_LOG_ERROR("[GenerateMessages] Template render failed: %s", tmpl_err.c_str());
-            EngineErrorCode code = (tmpl_err.find("Vision content is not enabled") != std::string::npos)
-                                       ? EngineErrorCode::VisionNotEnabled
-                                       : EngineErrorCode::TemplateError;
-            set_error(code, tmpl_err);
+        aila::chat::ChatRequest chat_request =
+            make_chat_request_from_legacy(render_messages, tuned_cfg, structured_request);
+        aila::chat::ChatFormatTextResult rendered;
+        std::string render_error;
+        if (!chat_formatter_.render_text(make_chat_format_input(chat_request), true, rendered, &render_error)) {
+            AILA_LOG_ERROR("[GenerateMessages] Template render failed: %s", render_error.c_str());
+            set_error(EngineErrorCode::TemplateError, render_error);
             return "";
+        }
+        std::vector<int> full_ids = tokenizer_.encode(rendered.text);
+        auto rendered_ends_with = [](const std::string& text, const std::string& suffix) -> bool {
+            return text.size() >= suffix.size() &&
+                   text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        bool restore_open_think_prefix =
+            model_spec_.family == ModelFamily::Qwen35Hybrid &&
+            (rendered_ends_with(rendered.text, "<think>\n") ||
+             rendered_ends_with(rendered.text, "<think>\r\n") ||
+             rendered_ends_with(rendered.text, "<think>"));
+        int recurrent_prefill_anchor = 0;
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid &&
+            total_vision_tokens == 0 && total_audio_tokens == 0) {
+            std::string stable_err;
+            aila::chat::ChatFormatTextResult stable_rendered;
+            if (chat_formatter_.render_text(make_chat_format_input(chat_request), false, stable_rendered, &stable_err)) {
+                std::vector<int> stable_ids = tokenizer_.encode(stable_rendered.text);
+                if (!stable_ids.empty() && stable_ids.size() < full_ids.size() &&
+                    std::equal(stable_ids.begin(), stable_ids.end(), full_ids.begin())) {
+                    recurrent_prefill_anchor = static_cast<int>(stable_ids.size());
+                    std::vector<int> assistant_header;
+                    assistant_header.push_back(tokenizer_.im_start_id());
+                    auto assistant_header_text = tokenizer_.encode("assistant\n");
+                    assistant_header.insert(assistant_header.end(),
+                                            assistant_header_text.begin(),
+                                            assistant_header_text.end());
+                    if (stable_ids.size() + assistant_header.size() < full_ids.size() &&
+                        std::equal(assistant_header.begin(), assistant_header.end(),
+                                   full_ids.begin() + static_cast<std::ptrdiff_t>(stable_ids.size()))) {
+                        recurrent_prefill_anchor += static_cast<int>(assistant_header.size());
+                    }
+                }
+            } else {
+                AILA_LOG_WARN("[GenerateMessages] Stable-prefix render failed; skipping recurrent prefill anchor: %s",
+                              stable_err.c_str());
+            }
+        }
+        if (aila::env::read_flag("AILA_DEBUG_PROMPT_TEXT", false)) {
+            debug_dump_prompt_text("[GenerateMessages]", rendered.text,
+                                   static_cast<int>(full_ids.size()));
         }
 
         if (total_vision_tokens > 0) {
@@ -1730,6 +2020,7 @@ public:
                 reusable_prefix++;
             }
         }
+        int requested_reusable_prefix = reusable_prefix;
         if (backend_) {
             bool trunc_ok = backend_->truncate_kv_cache(reusable_prefix);
             if (!trunc_ok) {
@@ -1741,6 +2032,11 @@ public:
                 reusable_prefix = 0;
             } else {
                 reusable_prefix = backend_->get_current_context_len();
+                if (requested_reusable_prefix > reusable_prefix) {
+                    AILA_LOG_INFO("[GenerateMessages] Incremental prefill rollback: requested reuse=%d actual reuse=%d reprefill=%d",
+                                  requested_reusable_prefix, reusable_prefix,
+                                  requested_reusable_prefix - reusable_prefix);
+                }
                 cached_ids_.resize(reusable_prefix);
             }
         } else {
@@ -1768,12 +2064,14 @@ public:
         bool tokenwise_prefill = (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
                                  aila::env::read_flag("AILA_Q35_PREFILL_TOKENWISE", false);
         if (!tokenwise_prefill) {
-            int* token_ids_device = static_cast<int*>(
-                ctx_->alloc_device(static_cast<size_t>(new_tokens_to_prefill) * sizeof(int)));
-            ctx_->memcpy_h2d(token_ids_device, full_ids.data() + prefill_start,
-                             static_cast<size_t>(new_tokens_to_prefill) * sizeof(int));
-            logits_ptr = &backend_->forward(*ctx_, token_ids_device, new_tokens_to_prefill);
-            ctx_->free_device(token_ids_device);
+            int snapshot_after_len =
+                (recurrent_prefill_anchor > prefill_start &&
+                 recurrent_prefill_anchor < total_prompt_len)
+                    ? recurrent_prefill_anchor
+                    : 0;
+            logits_ptr = forward_prompt_tokens(full_ids, prefill_start,
+                                               new_tokens_to_prefill,
+                                               snapshot_after_len);
         } else {
             AILA_LOG_INFO("[Qwen3.5] Tokenwise prefill enabled for debug");
             int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
@@ -1826,31 +2124,14 @@ public:
 
         std::string output_text;
         bool streaming = (token_callback != nullptr);
-        bool suppress_leading_think = no_think_requested;
-        bool think_injected = false;
+        bool think_prefix_restored = false;
         auto emit_stream_piece = [&](const std::string& piece) {
-            if (prepend_think && !think_injected) {
-                think_injected = true;
+            if (restore_open_think_prefix && !think_prefix_restored) {
+                think_prefix_restored = true;
                 if (piece != "<think>") {
                     output_text += "<think>\n";
                     token_callback("<think>\n");
                 }
-            }
-            if (no_think_requested && suppress_leading_think) {
-                if (piece == "<think>" || piece == "</think>") {
-                    return;
-                }
-                bool all_ws = true;
-                for (unsigned char c : piece) {
-                    if (!std::isspace(c)) {
-                        all_ws = false;
-                        break;
-                    }
-                }
-                if (all_ws) {
-                    return;
-                }
-                suppress_leading_think = false;
             }
             output_text += piece;
             token_callback(piece);
@@ -1862,6 +2143,8 @@ public:
         int same_token_run = 0;
         int last_token = -1;
         int generated_count = 0;
+        bool hit_eos = false;
+        bool hit_loop_guard = false;
         if (use_chunked_fast_decode) {
             bool stop_decode = false;
             int available_tokens = 1;
@@ -1903,6 +2186,7 @@ public:
                 for (int i = chunk_begin; i < chunk_end; ++i) {
                     int current_token = host_tokens[i];
                     if (tokenizer_.is_eos(current_token)) {
+                        hit_eos = true;
                         stop_decode = true;
                         break;
                     }
@@ -1919,6 +2203,7 @@ public:
                     if (same_token_run >= 48) {
                         AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
                                       current_token, same_token_run);
+                        hit_loop_guard = true;
                         stop_decode = true;
                         break;
                     }
@@ -1944,7 +2229,10 @@ public:
 
                 int current_token = next_token;
                 while (generated_count < max_new_tokens) {
-                    if (tokenizer_.is_eos(current_token)) break;
+                    if (tokenizer_.is_eos(current_token)) {
+                        hit_eos = true;
+                        break;
+                    }
 
                     if (current_token == last_token) same_token_run++;
                     else {
@@ -1958,6 +2246,7 @@ public:
                     if (same_token_run >= 48) {
                         AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
                                       current_token, same_token_run);
+                        hit_loop_guard = true;
                         break;
                     }
 
@@ -1986,18 +2275,19 @@ public:
                 ctx_->free_device(next_token_device);
         }
         auto t_end = std::chrono::high_resolution_clock::now();
+        bool hit_length = !hit_eos && !hit_loop_guard && generated_count >= max_new_tokens;
+        last_generation_finish_reason_ =
+            aila::chat::decode_finish_reason(hit_loop_guard, hit_length, false);
 
         if (!streaming && !generated_token_ids.empty()) {
             output_text = tokenizer_.decode(generated_token_ids);
         }
-        if (no_think_requested) {
-            strip_leading_think_artifacts(output_text);
-        }
-        // When open-think was used (explicit /think or model default) and the
-        // model does NOT generate <think> as its first token, prepend it back.
-        if (prepend_think && !output_text.empty() && output_text.compare(0, 7, "<think>") != 0) {
+        if (restore_open_think_prefix && !output_text.empty() &&
+            output_text.compare(0, 7, "<think>") != 0) {
             output_text.insert(0, "<think>\n");
         }
+        align_backend_context_to_sequence(full_ids, generated_token_ids,
+                                          total_prompt_len, "[GenerateMessages]");
 
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         AILA_LOG_INFO("[GenerateMessages] Prompt=%d Generated=%zu in %.2f ms",
@@ -2008,19 +2298,75 @@ public:
         return output_text;
     }
 
+    std::string generate_chat_request_text(
+        const aila::chat::ChatRequest& request,
+        std::function<void(const std::string&)> token_callback = nullptr) {
+        std::vector<Message> legacy_messages;
+        legacy_messages.reserve(request.messages.size());
+        for (const auto& chat_msg : request.messages) {
+            Message legacy;
+            legacy.role = aila::chat::role_to_string(chat_msg.role);
+            for (const auto& part : chat_msg.content) {
+                ContentPart out;
+                out.type = part.type;
+                out.text = part.text;
+                out.uri = part.uri;
+                out.binary_data = part.binary_data;
+                out.media_format = part.media_format;
+                legacy.content.push_back(std::move(out));
+            }
+            legacy_messages.push_back(std::move(legacy));
+        }
+        return generate_messages(legacy_messages, request.generation_config, token_callback, &request);
+    }
+
+    aila::chat::AssistantChatResult generate_chat_request_result(
+        const aila::chat::ChatRequest& request,
+        std::function<void(const std::string&)> token_callback = nullptr) {
+        std::string raw = generate_chat_request_text(request, token_callback);
+        if (last_error_code_ != EngineErrorCode::Ok) {
+            return {};
+        }
+        aila::chat::AssistantChatResult result = aila::chat::parse_assistant_output(raw);
+        result.finish_reason =
+            aila::chat::decode_finish_reason(
+                last_generation_finish_reason_ == "loop_guard",
+                last_generation_finish_reason_ == "length",
+                !result.tool_calls.empty());
+        return result;
+    }
+
     std::string generate_messages_json(const std::string& messages_json,
                                        const GenerationConfig& gen_config = GenerationConfig(),
                                        std::function<void(const std::string&)> token_callback = nullptr) {
         clear_error();
-        std::vector<Message> messages;
+        aila::chat::ChatRequest request;
         std::string parse_error;
-        GenerationConfig mutable_config = gen_config;
-        if (!aila::utils::parse_messages_json(messages_json, messages, mutable_config, &parse_error)) {
+        if (!aila::chat::parse_chat_request_json(messages_json, gen_config, request, &parse_error)) {
             AILA_LOG_ERROR("[GenerateMessages] Invalid messages JSON: %s", parse_error.c_str());
             set_error(EngineErrorCode::JsonParseError, parse_error);
             return "";
         }
-        return generate_messages(messages, mutable_config, token_callback);
+        return generate_chat_request_text(request, token_callback);
+    }
+
+    std::string generate_chat_json(const std::string& chat_request_json,
+                                   const GenerationConfig& gen_config = GenerationConfig(),
+                                   std::function<void(const std::string&)> token_callback = nullptr) {
+        clear_error();
+        aila::chat::ChatRequest request;
+        std::string parse_error;
+        if (!aila::chat::parse_chat_request_json(chat_request_json, gen_config, request, &parse_error)) {
+            AILA_LOG_ERROR("[GenerateChatJson] Invalid chat request JSON: %s", parse_error.c_str());
+            set_error(EngineErrorCode::JsonParseError, parse_error);
+            return "";
+        }
+
+        aila::chat::AssistantChatResult result = generate_chat_request_result(request, token_callback);
+        if (last_error_code_ != EngineErrorCode::Ok) {
+            return "";
+        }
+        return aila::chat::assistant_result_to_json(result);
     }
 
     // ============================================================
@@ -3444,13 +3790,14 @@ private:
     std::unique_ptr<IModelBackend> backend_;
     std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
     std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
-    aila::templating::TemplateRegistry template_registry_;
+    aila::chat::ChatFormatter chat_formatter_;
     Tokenizer tokenizer_;
     bool vision_backend_enabled_ = false;
 
     // Multi-turn conversation state
     ChatHistory history_;
     std::vector<Message> mm_history_;
+    aila::chat::ChatSessionState chat_session_;
     // Exact token IDs currently stored in the KV cache.
     // This is the ground truth for incremental prefill.
     std::vector<int> cached_ids_;
@@ -3460,6 +3807,7 @@ private:
     bool benchmark_seed_ready_ = false;
     EngineErrorCode last_error_code_ = EngineErrorCode::Ok;
     std::string last_error_message_;
+    std::string last_generation_finish_reason_ = "stop";
     double last_transcribe_duration_s_ = 0.0;
     double last_transcribe_latency_ms_ = 0.0;
     int last_transcribe_tokens_ = 0;

@@ -21,6 +21,7 @@ tmp/
 Qwen3-TTS/
 faster-qwen3-tts/
 qwen3-tts.cpp/
+Qwen-Fixed-Chat-Templates/
 
 # Docs (internal only, not for repo)
 HANDOVER.md
@@ -37,3 +38,4 @@ test_think3.py
 
 # Claude internal
 .claude/
+.codex/

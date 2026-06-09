@@ -42,8 +42,27 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsycl")
 # Source file lists
 # ============================================================
 
+set(CHAT_SOURCES
+    src/chat/AssistantOutputParser.cpp
+    src/chat/BuiltinTemplates.cpp
+    src/chat/ChatFormatter.cpp
+    src/chat/ChatJson.cpp
+    src/chat/ChatSessionState.cpp
+    src/chat/ChatTemplateEngine.cpp
+)
+
+set(JINJA_SOURCES
+    src/templates/jinja/lexer.cpp
+    src/templates/jinja/parser.cpp
+    src/templates/jinja/runtime.cpp
+    src/templates/jinja/jinja_string.cpp
+    src/templates/jinja/jinja_unicode.cpp
+    src/templates/jinja/value.cpp
+)
+
 # Core library sources (everything except main.cpp and CLI)
 set(LIB_SOURCES
+    ${CHAT_SOURCES}
     src/ops/Linear.cpp
     src/ops/Bnb4BitLinear.cpp
     src/ops/NormOps.cpp
@@ -71,13 +90,7 @@ set(LIB_SOURCES
     src/utils/SafeTensors.cpp
     src/utils/Base64.cpp
     src/utils/JsonParser.cpp
-    src/templates/TemplateRegistry.cpp
-    src/templates/jinja/lexer.cpp
-    src/templates/jinja/parser.cpp
-    src/templates/jinja/runtime.cpp
-    src/templates/jinja/jinja_string.cpp
-    src/templates/jinja/jinja_unicode.cpp
-    src/templates/jinja/value.cpp
+    ${JINJA_SOURCES}
     src/vision/Qwen35VisionEncoder.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
     src/audio/AudioPreprocessor.cpp
@@ -93,6 +106,17 @@ set(LIB_SOURCES
 # CLI-only sources
 set(CLI_SOURCES
     src/cli/CLI.cpp
+)
+
+# Lightweight chat tests
+set(CHAT_TEST_SOURCES
+    ${CHAT_SOURCES}
+    ${JINJA_SOURCES}
+    tests/chat/ChatTestMain.cpp
+    tests/chat/AssistantOutputParserTests.cpp
+    tests/chat/ChatJsonTests.cpp
+    tests/chat/ChatTemplateEngineTests.cpp
+    tests/chat/ChatFormatterTests.cpp
 )
 
 # Third-party
@@ -158,6 +182,18 @@ set_target_properties(AilaShared PROPERTIES OUTPUT_NAME "AilaShared")
 add_executable(Aila src/main.cpp ${CLI_SOURCES})
 target_compile_definitions(Aila PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_link_libraries(Aila PRIVATE AilaLib)
+
+# ============================================================
+# Executable: AilaChatTests
+# ============================================================
+add_executable(AilaChatTests ${CHAT_TEST_SOURCES})
+target_compile_definitions(AilaChatTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaChatTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat
+)
+target_link_libraries(AilaChatTests PRIVATE simdjson)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies

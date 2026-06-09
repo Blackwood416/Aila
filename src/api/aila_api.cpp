@@ -169,6 +169,28 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
     }
 }
 
+AILA_API char* aila_generate_chat_json(AilaEngine* engine, const char* chat_request_json,
+                                       const AilaGenConfig* config) {
+    if (!engine || !chat_request_json) return nullptr;
+    try {
+        GenerationConfig cfg = to_cpp_config(config);
+        std::string result = engine->engine.generate_chat_json(std::string(chat_request_json), cfg, nullptr);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return nullptr;
+        }
+        char* out = static_cast<char*>(malloc(result.size() + 1));
+        if (!out) return nullptr;
+        memcpy(out, result.c_str(), result.size() + 1);
+        return out;
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Generate chat JSON failed: %s", e.what());
+        return nullptr;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Generate chat JSON failed: unknown exception");
+        return nullptr;
+    }
+}
+
 AILA_API int aila_generate_messages_stream(AilaEngine* engine, const char* messages_json,
                                            const AilaGenConfig* config,
                                            AilaTokenCallback callback, void* user_data) {
