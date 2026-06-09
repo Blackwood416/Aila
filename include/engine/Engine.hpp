@@ -27,6 +27,7 @@
 #include "../src/chat/ChatFormatter.hpp"
 #include "../src/chat/ChatJson.hpp"
 #include "../src/chat/ChatSessionState.hpp"
+#include "../src/chat/ThinkingBudgetController.hpp"
 #include "../src/profile/Profiling.hpp"
 #include "../src/utils/EnvUtils.hpp"
 #include "../src/utils/JsonParser.hpp"
@@ -958,6 +959,20 @@ public:
         return input;
     }
 
+    std::vector<int> thinking_close_token_ids() const {
+        std::vector<int> ids;
+        int end_think = tokenizer_.special_token_id("</think>");
+        if (end_think >= 0) {
+            ids.push_back(end_think);
+        } else {
+            auto fallback = tokenizer_.encode("</think>");
+            ids.insert(ids.end(), fallback.begin(), fallback.end());
+        }
+        auto suffix = tokenizer_.encode("\n\n");
+        ids.insert(ids.end(), suffix.begin(), suffix.end());
+        return ids;
+    }
+
     // ============================================================
     // Generate response (multi-turn with incremental prefill)
     //
@@ -1588,6 +1603,8 @@ public:
                                   const aila::chat::ChatRequest* structured_request = nullptr) {
         clear_error();
         last_generation_finish_reason_ = "stop";
+        last_generation_forced_think_close_ = false;
+        last_generation_think_close_truncated_ = false;
         if (!backend_) {
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
@@ -2136,10 +2153,18 @@ public:
             output_text += piece;
             token_callback(piece);
         };
+        aila::chat::ThinkingBudgetController think_budget;
+        think_budget.start(
+            restore_open_think_prefix,
+            tuned_cfg.thinking_budget_tokens,
+            tokenizer_.special_token_id("<think>"),
+            tokenizer_.special_token_id("</think>"));
         int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
                                              : std::max(1, tuned_cfg.decode_chunk_size);
-        bool use_chunked_fast_decode = (!tuned_cfg.has_penalties()) &&
-                                       (!tuned_cfg.do_sample || can_use_device_sample);
+        bool use_chunked_fast_decode =
+            !think_budget.should_disable_chunked_decode() &&
+            (!tuned_cfg.has_penalties()) &&
+            (!tuned_cfg.do_sample || can_use_device_sample);
         int same_token_run = 0;
         int last_token = -1;
         int generated_count = 0;
@@ -2228,6 +2253,15 @@ public:
                 ctx_->memcpy_h2d(current_token_device, &next_token, sizeof(int));
 
                 int current_token = next_token;
+                std::vector<int> forced_tokens;
+                size_t forced_token_index = 0;
+                auto has_forced_token = [&]() -> bool {
+                    return forced_token_index < forced_tokens.size();
+                };
+                auto pop_forced_token = [&]() -> int {
+                    return forced_tokens[forced_token_index++];
+                };
+
                 while (generated_count < max_new_tokens) {
                     if (tokenizer_.is_eos(current_token)) {
                         hit_eos = true;
@@ -2259,13 +2293,32 @@ public:
                         std::string token_text = tokenizer_.decode(current_token);
                         emit_stream_piece(token_text);
                     }
+
+                    think_budget.observe_generated_token(current_token);
+                    if (think_budget.needs_forced_close()) {
+                        std::vector<int> close_ids = thinking_close_token_ids();
+                        const int remaining_slots = max_new_tokens - generated_count;
+                        if (remaining_slots < static_cast<int>(close_ids.size())) {
+                            last_generation_think_close_truncated_ = true;
+                            break;
+                        }
+                        forced_tokens = std::move(close_ids);
+                        forced_token_index = 0;
+                        think_budget.mark_forced_close();
+                        last_generation_forced_think_close_ = true;
+                    }
+
                     if (generated_count >= max_new_tokens) {
                         break;
                     }
 
                     Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
-                    next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
-                                                         tuned_cfg, generated_token_ids);
+                    if (has_forced_token()) {
+                        next_token = pop_forced_token();
+                    } else {
+                        next_token = ops::sample_with_config(*ctx_, logits_next, config_.vocab_size,
+                                                             tuned_cfg, generated_token_ids);
+                    }
                     ctx_->memcpy_h2d(next_token_device, &next_token, sizeof(int));
                     std::swap(current_token_device, next_token_device);
                     current_token = next_token;
@@ -2275,7 +2328,9 @@ public:
                 ctx_->free_device(next_token_device);
         }
         auto t_end = std::chrono::high_resolution_clock::now();
-        bool hit_length = !hit_eos && !hit_loop_guard && generated_count >= max_new_tokens;
+        bool hit_length = !hit_eos && !hit_loop_guard &&
+                          (generated_count >= max_new_tokens ||
+                           last_generation_think_close_truncated_);
         last_generation_finish_reason_ =
             aila::chat::decode_finish_reason(hit_loop_guard, hit_length, false);
 
@@ -2333,6 +2388,12 @@ public:
                 last_generation_finish_reason_ == "loop_guard",
                 last_generation_finish_reason_ == "length",
                 !result.tool_calls.empty());
+        if (last_generation_forced_think_close_) {
+            result.warnings.emplace_back("reasoning budget exhausted; forced </think>");
+        }
+        if (last_generation_think_close_truncated_) {
+            result.warnings.emplace_back("reasoning budget exhausted but max_new_tokens prevented forced close");
+        }
         return result;
     }
 
@@ -3808,6 +3869,8 @@ private:
     EngineErrorCode last_error_code_ = EngineErrorCode::Ok;
     std::string last_error_message_;
     std::string last_generation_finish_reason_ = "stop";
+    bool last_generation_forced_think_close_ = false;
+    bool last_generation_think_close_truncated_ = false;
     double last_transcribe_duration_s_ = 0.0;
     double last_transcribe_latency_ms_ = 0.0;
     int last_transcribe_tokens_ = 0;

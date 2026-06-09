@@ -84,6 +84,27 @@ void run_chat_formatter_tests() {
     AILA_CHAT_EXPECT_TRUE(formatter.render_text(tool_none_input, true, tool_none_rendered, &error));
     AILA_CHAT_EXPECT_TRUE(tool_none_rendered.text.find("<tools>") == std::string::npos);
     AILA_CHAT_EXPECT_TRUE(tool_none_rendered.text.find("search") == std::string::npos);
+
+    ChatRequest budget_zero_req;
+    ChatMessage budget_user;
+    budget_user.role = ChatRole::User;
+    budget_user.content.push_back(ChatContentPart::text_part("hello"));
+    budget_zero_req.messages.push_back(budget_user);
+    budget_zero_req.generation_config.thinking_budget_tokens = 0;
+
+    ChatFormatInput budget_input;
+    budget_input.request = &budget_zero_req;
+    budget_input.family = ModelFamily::Qwen35Hybrid;
+    budget_input.is_qwen35_0p8b = false;
+    budget_input.tokenizer_chat_template = "";
+    budget_input.bos_token = "";
+    budget_input.eos_token = "<|im_end|>";
+
+    ChatFormatTextResult budget_rendered;
+    AILA_CHAT_EXPECT_TRUE(formatter.render_text(budget_input, true, budget_rendered, &error));
+    AILA_CHAT_EXPECT_TRUE(budget_rendered.text.find("<think>\n</think>") != std::string::npos);
+    AILA_CHAT_EXPECT_TRUE(budget_rendered.text.rfind("<think>\n") !=
+                          budget_rendered.text.size() - std::string("<think>\n").size());
 }
 
 } // namespace aila::chat::test

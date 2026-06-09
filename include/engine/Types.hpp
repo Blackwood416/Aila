@@ -292,6 +292,7 @@ struct GenerationConfig {
     bool use_fixed_seed     = false;
     int decode_chunk_size   = 12;   // greedy + non-streaming: tokens per host sync chunk
     int stream_chunk_size   = 4;    // greedy + streaming: tokens per flush chunk
+    int thinking_budget_tokens = -1; // -1=disabled, 0=no-think, >0=max tokens inside <think>
 
     // Penalty parameters
     float repetition_penalty = 1.0f;   // > 1.0 penalizes repeated tokens multiplicatively
@@ -300,6 +301,9 @@ struct GenerationConfig {
 
     bool has_penalties() const {
         return repetition_penalty != 1.0f || presence_penalty != 0.0f || frequency_penalty != 0.0f;
+    }
+    bool has_thinking_budget() const {
+        return thinking_budget_tokens >= 0;
     }
 };
 

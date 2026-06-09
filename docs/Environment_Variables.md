@@ -12,6 +12,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 | `AILA_MAX_SEQ_LEN` | int | `4096` | Maximum context window length |
 | `AILA_DECODE_CHUNK_SIZE` | int | `12` | Non-streaming greedy decode chunk size (tokens per host sync) |
 | `AILA_STREAM_CHUNK_SIZE` | int | `4` | Streaming greedy decode chunk size |
+| `AILA_THINKING_BUDGET` | int | `-1` | Thinking budget: `-1` = disabled, `0` = no-think prompt mode, `>0` = max generated tokens inside `<think>` |
 | `AILA_STREAM_OUTPUT` | int | auto | Force streaming (`1`) or non-streaming (`0`). Auto-detected from terminal type when not set |
 | `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `verbose` (-1), `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
 | `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (skip for unsupported specs) |
@@ -25,7 +26,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 | `AILA_CHAT_TEMPLATE` | string | unset | Raw Jinja chat template override. Takes precedence over request/model/built-in template selection when the request does not provide an explicit template override. |
 | `AILA_CHAT_TEMPLATE_PATH` | string | unset | Path to a Jinja chat template override file. Used when `AILA_CHAT_TEMPLATE` is unset and the request does not provide an explicit template override. |
 
-Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explicit override is provided. Request-level `chat_template_kwargs` can set `enable_thinking`, `preserve_thinking`, `auto_disable_thinking_with_tools`, `max_tool_arg_chars`, and `max_tool_response_chars`.
+Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explicit override is provided. Request-level `chat_template_kwargs` can set `enable_thinking`, `preserve_thinking`, `auto_disable_thinking_with_tools`, `max_tool_arg_chars`, and `max_tool_response_chars`. Request JSON may also set `reasoning_budget`, `thinking_budget`, or `thinking_budget_tokens`.
 
 ---
 

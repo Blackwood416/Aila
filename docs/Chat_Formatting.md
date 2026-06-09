@@ -69,12 +69,18 @@ and generation parameters:
     "max_tool_response_chars": 0
   },
   "temperature": 0.7,
-  "max_tokens": 128
+  "max_tokens": 128,
+  "reasoning_budget": -1
 }
 ```
 
 `tool_choice` may be `"auto"`, `"none"`, `"required"`, or an OpenAI-style
 named function object.
+
+Thinking budget aliases `reasoning_budget`, `thinking_budget`, and
+`thinking_budget_tokens` are accepted in request JSON. `-1` disables budget
+control, `0` requests no-think prompt mode, and positive values cap generated
+tokens inside `<think>`.
 
 ## Structured Output
 

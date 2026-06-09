@@ -208,6 +208,7 @@ Options:
   --stream                 Force streaming output
   --no-stream              Force non-streaming output
   --max-tokens <N>         Maximum new tokens (default: 1024)
+  --thinking-budget <N>    Thinking token budget: -1=off, 0=no-think, >0 cap
   --decode-chunk <N>       Decode chunk size (default: 12)
   --stream-chunk <N>       Stream chunk size (default: 4)
   --rep-penalty <F>        Repetition penalty (default: 1.0, >1.0 to penalize)
@@ -252,6 +253,7 @@ Environment Variables:
   AILA_STREAM_OUTPUT       Force stream mode (0/1)
   AILA_DECODE_CHUNK_SIZE   Default decode chunk size
   AILA_STREAM_CHUNK_SIZE   Default stream chunk size
+  AILA_THINKING_BUDGET     Default thinking budget (-1=off, 0=no-think)
   AILA_Q35_PREFILL_STEP    Default Qwen3.5 prefill checkpoint step (default: 64)
   AILA_KV_QUANT            Enable KV cache quantization (0/1, default: 0)
 
@@ -267,6 +269,7 @@ Interactive Commands:
   /stream_off              Disable streaming output
   /decode_chunk <N>        Set decode chunk size
   /stream_chunk <N>        Set stream chunk size
+  /thinking_budget <N|off> Set thinking budget (-1/off disables, 0=no-think)
   /log_level <level>       Set log level (debug/info/warning/error)
   /config                  Show current configuration
 )" << std::flush;
@@ -283,6 +286,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
     opts.max_seq_len = aila::env::read_int("AILA_MAX_SEQ_LEN", 4096);
     opts.decode_chunk_size = aila::env::read_int("AILA_DECODE_CHUNK_SIZE", 12);
     opts.stream_chunk_size = aila::env::read_int("AILA_STREAM_CHUNK_SIZE", 4);
+    opts.thinking_budget_tokens = aila::env::read_int("AILA_THINKING_BUDGET", -1);
+    if (opts.thinking_budget_tokens < -1) {
+        opts.thinking_budget_tokens = -1;
+    }
     opts.q35_prefill_step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
     {
         std::string log_level_env = aila::env::read_string("AILA_LOG_LEVEL", "");
@@ -360,6 +367,14 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--max-tokens" && i + 1 < argc) {
             opts.max_new_tokens = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--thinking-budget" && i + 1 < argc) {
+            opts.thinking_budget_tokens = std::atoi(argv[++i]);
+            if (opts.thinking_budget_tokens < -1) {
+                std::cerr << "Error: --thinking-budget must be -1, 0, or a positive integer" << std::endl;
+                return false;
+            }
             continue;
         }
         if (arg == "--decode-chunk" && i + 1 < argc) {
@@ -872,6 +887,22 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         return true;
     });
 
+    registry.register_command("/thinking_budget", "Set thinking budget (-1/off disables, 0=no-think)", [&](const std::string& args) {
+        std::string v = trim(args);
+        if (v == "off" || v == "disable" || v == "disabled") {
+            gen_config.thinking_budget_tokens = -1;
+        } else {
+            int n = std::atoi(v.c_str());
+            if (n < -1) {
+                std::cout << "[Config] thinking_budget must be -1, 0, or a positive integer" << std::endl;
+                return true;
+            }
+            gen_config.thinking_budget_tokens = n;
+        }
+        std::cout << "[Config] thinking_budget_tokens=" << gen_config.thinking_budget_tokens << std::endl;
+        return true;
+    });
+
     registry.register_command("/log_level", "Set log level (debug/info/warning/error)", [&](const std::string& args) {
         if (!args.empty()) {
             aila::LogLevel lv = aila::log_level_from_string(args);
@@ -895,6 +926,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::cout << "  max_new_tokens:     " << gen_config.max_new_tokens << std::endl;
         std::cout << "  decode_chunk_size:  " << gen_config.decode_chunk_size << std::endl;
         std::cout << "  stream_chunk_size:  " << gen_config.stream_chunk_size << std::endl;
+        std::cout << "  thinking_budget:    " << gen_config.thinking_budget_tokens << std::endl;
         std::cout << "  stream_output:      " << (stream_output ? "true" : "false") << std::endl;
         std::cout << "  log_level:          " << aila::log_level_name(aila::get_log_level()) << std::endl;
         std::cout << "  rep_penalty:        " << gen_config.repetition_penalty << std::endl;

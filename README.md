@@ -138,6 +138,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--greedy` / `--sample` | Decoding mode | sample |
 | `--stream` / `--no-stream` | Force streaming on/off | auto |
 | `--max-tokens <N>` | Max new tokens | 1024 |
+| `--thinking-budget <N>` | Thinking budget: -1 off, 0 no-think, >0 cap | -1 |
 | `--decode-chunk <N>` | Decode chunk size | 12 |
 | `--stream-chunk <N>` | Stream chunk size | 4 |
 | `--rep-penalty <F>` | Repetition penalty | 1.0 |
@@ -190,6 +191,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/stream_on` / `/stream_off` | Toggle streaming |
 | `/decode_chunk <N>` | Set decode chunk size |
 | `/stream_chunk <N>` | Set stream chunk size |
+| `/thinking_budget <N|off>` | Set thinking budget |
 | `/log_level <level>` | Set log level (verbose/debug/info/warning/error) |
 | `/config` | Show current configuration |
 

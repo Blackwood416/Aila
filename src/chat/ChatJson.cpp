@@ -318,6 +318,11 @@ void parse_generation_options(simdjson::dom::object root_obj, ChatRequest& out) 
     if (read_int(root_obj, "max_tokens", i) || read_int(root_obj, "max_new_tokens", i)) {
         out.generation_config.max_new_tokens = i;
     }
+    if (read_int(root_obj, "reasoning_budget", i) ||
+        read_int(root_obj, "thinking_budget", i) ||
+        read_int(root_obj, "thinking_budget_tokens", i)) {
+        out.generation_config.thinking_budget_tokens = i < -1 ? -1 : i;
+    }
     if (read_int(root_obj, "top_k", i)) {
         out.generation_config.top_k = i;
     }

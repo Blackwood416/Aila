@@ -28,6 +28,7 @@ struct CLIOptions {
     bool stream_output = true;     // --stream / --no-stream (auto-detect)
     int decode_chunk_size = 12;    // --decode-chunk
     int stream_chunk_size = 4;     // --stream-chunk
+    int thinking_budget_tokens = -1; // --thinking-budget, -1=off, 0=no-think, >0 cap
     bool show_help = false;        // -h, --help
     bool show_version = false;     // -v, --version
     bool explicit_stream = false;  // user explicitly set stream mode

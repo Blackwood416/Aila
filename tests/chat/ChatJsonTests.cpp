@@ -63,6 +63,27 @@ void run_chat_json_tests() {
     AILA_CHAT_EXPECT_EQ(req.generation_config.max_new_tokens, 12);
     AILA_CHAT_EXPECT_TRUE(!req.generation_config.do_sample);
 
+    AILA_CHAT_EXPECT_TRUE(parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"reasoning_budget":8})",
+        GenerationConfig{},
+        req,
+        &error));
+    AILA_CHAT_EXPECT_EQ(req.generation_config.thinking_budget_tokens, 8);
+
+    AILA_CHAT_EXPECT_TRUE(parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"thinking_budget":0})",
+        GenerationConfig{},
+        req,
+        &error));
+    AILA_CHAT_EXPECT_EQ(req.generation_config.thinking_budget_tokens, 0);
+
+    AILA_CHAT_EXPECT_TRUE(parse_chat_request_json(
+        R"({"messages":[{"role":"user","content":"hi"}],"thinking_budget_tokens":16})",
+        GenerationConfig{},
+        req,
+        &error));
+    AILA_CHAT_EXPECT_EQ(req.generation_config.thinking_budget_tokens, 16);
+
     ChatRequest array_req;
     GenerationConfig defaults;
     defaults.max_new_tokens = 7;

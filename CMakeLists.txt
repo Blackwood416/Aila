@@ -117,6 +117,7 @@ set(CHAT_TEST_SOURCES
     tests/chat/ChatJsonTests.cpp
     tests/chat/ChatTemplateEngineTests.cpp
     tests/chat/ChatFormatterTests.cpp
+    tests/chat/ThinkingBudgetControllerTests.cpp
 )
 
 # Third-party

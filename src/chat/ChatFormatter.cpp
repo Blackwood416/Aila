@@ -59,6 +59,10 @@ bool ChatFormatter::render_text(const ChatFormatInput& input,
             request_copy.tools.end());
     }
 
+    if (request_copy.generation_config.thinking_budget_tokens == 0) {
+        request_copy.template_options.enable_thinking = false;
+    }
+
     if (!request_copy.template_options.enable_thinking.has_value() &&
         input.family == ModelFamily::Qwen35Hybrid) {
         request_copy.template_options.enable_thinking = !input.is_qwen35_0p8b;

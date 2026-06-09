@@ -138,6 +138,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--greedy` / `--sample` | 解码模式 | sample |
 | `--stream` / `--no-stream` | 强制流式输出开/关 | 自动 |
 | `--max-tokens <N>` | 最大生成 token 数 | 1024 |
+| `--thinking-budget <N>` | 思考预算：-1 关闭，0 禁止思考，>0 限制 token | -1 |
 | `--decode-chunk <N>` | 解码块大小 | 12 |
 | `--stream-chunk <N>` | 流式块大小 | 4 |
 | `--rep-penalty <F>` | 重复惩罚 | 1.0 |
@@ -190,6 +191,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `/stream_on` / `/stream_off` | 切换流式输出 |
 | `/decode_chunk <N>` | 设置解码块大小 |
 | `/stream_chunk <N>` | 设置流式块大小 |
+| `/thinking_budget <N|off>` | 设置思考预算 |
 | `/log_level <level>` | 设置日志级别（verbose/debug/info/warning/error） |
 | `/config` | 显示当前配置 |
 

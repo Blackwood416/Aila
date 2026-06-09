@@ -152,6 +152,10 @@ Aila only formats prompts and parses assistant tool calls. It does not execute t
 exhausted, `"loop_guard"` for repetitive decode early-stop, and `"tool_calls"`
 when the structured result contains parsed tool calls.
 
+Chat request JSON may include `reasoning_budget`, `thinking_budget`, or
+`thinking_budget_tokens`. These fields are preferred for C API callers because
+the legacy `AilaGenConfig` struct is not expanded in this stage.
+
 ### Generation (Streaming)
 
 #### `aila_generate_stream`
