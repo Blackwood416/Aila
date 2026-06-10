@@ -43,8 +43,8 @@ size_t longest_suffix_matching_prefix(const std::string& value, const std::strin
     return 0;
 }
 
-size_t longest_open_marker_prefix_suffix(const std::string& value) {
-    const std::string markers[] = {kThinkOpen, kToolOpen};
+size_t longest_content_marker_prefix_suffix(const std::string& value) {
+    const std::string markers[] = {kThinkOpen, kThinkClose, kToolOpen};
     size_t best = 0;
     for (const auto& marker : markers) {
         best = std::max(best, longest_suffix_matching_prefix(value, marker));
@@ -113,18 +113,26 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
         }
 
         const size_t think_pos = buffer_.find(kThinkOpen);
+        const size_t think_close_pos = buffer_.find(kThinkClose);
         const size_t tool_pos = buffer_.find(kToolOpen);
         size_t marker_pos = std::string::npos;
         bool marker_is_think = false;
+        bool marker_is_orphan_think_close = false;
         if (think_pos != std::string::npos && (tool_pos == std::string::npos || think_pos < tool_pos)) {
             marker_pos = think_pos;
             marker_is_think = true;
         } else if (tool_pos != std::string::npos) {
             marker_pos = tool_pos;
         }
+        if (think_close_pos != std::string::npos &&
+            (marker_pos == std::string::npos || think_close_pos < marker_pos)) {
+            marker_pos = think_close_pos;
+            marker_is_think = false;
+            marker_is_orphan_think_close = true;
+        }
 
         if (marker_pos == std::string::npos) {
-            const size_t keep = final ? 0 : longest_open_marker_prefix_suffix(buffer_);
+            const size_t keep = final ? 0 : longest_content_marker_prefix_suffix(buffer_);
             if (buffer_.size() <= keep) {
                 return;
             }
@@ -133,6 +141,13 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
                  out_events);
             buffer_.erase(0, buffer_.size() - keep);
             return;
+        }
+
+        if (marker_is_orphan_think_close) {
+            emit(StructuredStreamEventType::ReasoningDelta, trim(buffer_.substr(0, marker_pos)), out_events);
+            buffer_.erase(0, marker_pos + std::string(kThinkClose).size());
+            trim_left_in_place(buffer_);
+            continue;
         }
 
         if (marker_pos > 0) {

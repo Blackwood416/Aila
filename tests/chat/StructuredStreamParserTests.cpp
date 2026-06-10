@@ -79,6 +79,18 @@ void run_structured_stream_parser_tests() {
     {
         StructuredStreamParser parser;
         std::vector<StructuredStreamEvent> events;
+        parser.push("\nThe model already thought.\n</think>\n\nHello!", events);
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ReasoningDelta),
+            std::string("The model already thought."));
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ContentDelta),
+            std::string("Hello!"));
+    }
+
+    {
+        StructuredStreamParser parser;
+        std::vector<StructuredStreamEvent> events;
         parser.push("<tool_call>\n<function=search>\n", events);
         AILA_CHAT_EXPECT_TRUE(events.empty());
 
