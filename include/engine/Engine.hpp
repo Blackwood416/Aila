@@ -960,6 +960,28 @@ public:
         return input;
     }
 
+    std::string current_model_family_name() const {
+        switch (model_spec_.family) {
+        case ModelFamily::Qwen35Hybrid: return "qwen3_5_hybrid";
+        case ModelFamily::Qwen3Dense: return "qwen3";
+        default: return "unknown";
+        }
+    }
+
+    std::string tool_choice_name(const aila::chat::ChatRequest& request) const {
+        switch (request.tool_choice) {
+        case aila::chat::ToolChoice::None: return "none";
+        case aila::chat::ToolChoice::Required: return "required";
+        case aila::chat::ToolChoice::Function: return "function:" + request.tool_choice_function_name;
+        case aila::chat::ToolChoice::Auto: return "auto";
+        }
+        return "auto";
+    }
+
+    std::string tool_policy_name(aila::chat::ToolPolicyMode policy) const {
+        return policy == aila::chat::ToolPolicyMode::Strict ? "strict" : "warn";
+    }
+
     std::vector<int> thinking_close_token_ids() const {
         std::vector<int> ids;
         int end_think = tokenizer_.special_token_id("</think>");
@@ -1031,6 +1053,7 @@ public:
         last_generation_finish_reason_ = "stop";
         last_generation_forced_think_close_ = false;
         last_generation_think_close_truncated_ = false;
+        last_generation_template_name_.clear();
         if (!backend_) {
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
@@ -1259,6 +1282,7 @@ public:
             set_error(EngineErrorCode::TemplateError, render_error);
             return "";
         }
+        last_generation_template_name_ = rendered.template_name;
         if (aila::env::read_flag("AILA_DEBUG_CHAT_TEMPLATE", false) ||
             aila::env::read_flag("AILA_DEBUG_PROMPT_TEXT", false)) {
             AILA_LOG_INFO("[ChatTemplate] source=%s", rendered.template_name.c_str());
@@ -1829,6 +1853,16 @@ public:
         result.warnings.insert(result.warnings.end(),
                                policy_validation.warnings.begin(),
                                policy_validation.warnings.end());
+        if (policy_validation.hard_error) {
+            result.finish_reason = "tool_policy";
+        }
+        result.metadata.template_name = last_generation_template_name_;
+        result.metadata.model_family = current_model_family_name();
+        result.metadata.reasoning_budget_tokens = request.generation_config.thinking_budget_tokens;
+        result.metadata.reasoning_budget_forced_close = last_generation_forced_think_close_;
+        result.metadata.reasoning_budget_truncated = last_generation_think_close_truncated_;
+        result.metadata.tool_policy = tool_policy_name(request.tool_policy);
+        result.metadata.tool_choice = tool_choice_name(request);
         return result;
     }
 
@@ -3304,6 +3338,7 @@ private:
     EngineErrorCode last_error_code_ = EngineErrorCode::Ok;
     std::string last_error_message_;
     std::string last_generation_finish_reason_ = "stop";
+    std::string last_generation_template_name_;
     bool last_generation_forced_think_close_ = false;
     bool last_generation_think_close_truncated_ = false;
     double last_transcribe_duration_s_ = 0.0;
