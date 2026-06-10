@@ -9,12 +9,18 @@ enum class StructuredStreamEventType {
     ReasoningDelta,
     ContentDelta,
     ToolCallDelta,
-    Warning
+    Warning,
+    Final
 };
 
 struct StructuredStreamEvent {
     StructuredStreamEventType type = StructuredStreamEventType::ContentDelta;
     std::string text;
+    std::string tool_call_id;
+    std::string tool_name;
+    std::string arguments_delta;
+    std::string finish_reason;
+    std::vector<std::string> warnings;
 };
 
 class StructuredStreamParser {

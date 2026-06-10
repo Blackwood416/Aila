@@ -33,16 +33,21 @@ void trim_left_in_place(std::string& value) {
     value.erase(0, begin);
 }
 
-size_t longest_marker_prefix_suffix(const std::string& value) {
+size_t longest_suffix_matching_prefix(const std::string& value, const std::string& marker) {
+    const size_t max_len = std::min(value.size(), marker.size() - 1);
+    for (size_t len = max_len; len > 0; --len) {
+        if (value.compare(value.size() - len, len, marker, 0, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+size_t longest_open_marker_prefix_suffix(const std::string& value) {
     const std::string markers[] = {kThinkOpen, kToolOpen};
     size_t best = 0;
     for (const auto& marker : markers) {
-        const size_t max_len = std::min(value.size(), marker.size() - 1);
-        for (size_t len = 1; len <= max_len; ++len) {
-            if (value.compare(value.size() - len, len, marker, 0, len) == 0) {
-                best = std::max(best, len);
-            }
-        }
+        best = std::max(best, longest_suffix_matching_prefix(value, marker));
     }
     return best;
 }
@@ -76,6 +81,14 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
         if (state_ == State::Reasoning) {
             const size_t close = buffer_.find(kThinkClose);
             if (close == std::string::npos) {
+                const size_t keep = final ? 0 : longest_suffix_matching_prefix(buffer_, kThinkClose);
+                if (buffer_.size() <= keep) {
+                    return;
+                }
+                emit(StructuredStreamEventType::ReasoningDelta,
+                     buffer_.substr(0, buffer_.size() - keep),
+                     out_events);
+                buffer_.erase(0, buffer_.size() - keep);
                 return;
             }
 
@@ -111,7 +124,7 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
         }
 
         if (marker_pos == std::string::npos) {
-            const size_t keep = final ? 0 : longest_marker_prefix_suffix(buffer_);
+            const size_t keep = final ? 0 : longest_open_marker_prefix_suffix(buffer_);
             if (buffer_.size() <= keep) {
                 return;
             }
@@ -130,6 +143,7 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
 
         if (marker_is_think) {
             buffer_.erase(0, std::string(kThinkOpen).size());
+            trim_left_in_place(buffer_);
             state_ = State::Reasoning;
         } else {
             state_ = State::ToolCall;

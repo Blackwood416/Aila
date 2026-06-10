@@ -26,12 +26,34 @@ void run_structured_stream_parser_tests() {
         StructuredStreamParser parser;
         std::vector<StructuredStreamEvent> events;
         parser.push("<think>\nplan", events);
-        AILA_CHAT_EXPECT_TRUE(events.empty());
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ReasoningDelta),
+            std::string("plan"));
 
         parser.push("\n</think>\nanswer", events);
         AILA_CHAT_EXPECT_EQ(
             collect_text(events, StructuredStreamEventType::ReasoningDelta),
             std::string("plan"));
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ContentDelta),
+            std::string("answer"));
+    }
+
+    {
+        StructuredStreamParser parser;
+        std::vector<StructuredStreamEvent> events;
+        parser.push("<think>\nfirst sentence. second", events);
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ReasoningDelta),
+            std::string("first sentence. second"));
+
+        events.clear();
+        parser.push(" sentence.</thi", events);
+        AILA_CHAT_EXPECT_EQ(
+            collect_text(events, StructuredStreamEventType::ReasoningDelta),
+            std::string(" sentence."));
+
+        parser.push("nk>\nanswer", events);
         AILA_CHAT_EXPECT_EQ(
             collect_text(events, StructuredStreamEventType::ContentDelta),
             std::string("answer"));
