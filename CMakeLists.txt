@@ -47,6 +47,7 @@ set(CHAT_SOURCES
     src/chat/BuiltinTemplates.cpp
     src/chat/ChatFormatter.cpp
     src/chat/ChatJson.cpp
+    src/chat/ChatStreamJson.cpp
     src/chat/ChatSessionState.cpp
     src/chat/ChatTemplateEngine.cpp
     src/chat/StructuredStreamParser.cpp
@@ -117,6 +118,7 @@ set(CHAT_TEST_SOURCES
     tests/chat/ChatTestMain.cpp
     tests/chat/AssistantOutputParserTests.cpp
     tests/chat/ChatJsonTests.cpp
+    tests/chat/ChatStreamJsonTests.cpp
     tests/chat/ChatTemplateEngineTests.cpp
     tests/chat/ChatFormatterTests.cpp
     tests/chat/ThinkingBudgetControllerTests.cpp
