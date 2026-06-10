@@ -27,6 +27,7 @@
 #include "../src/chat/ChatFormatter.hpp"
 #include "../src/chat/ChatJson.hpp"
 #include "../src/chat/ChatSessionState.hpp"
+#include "../src/chat/StructuredStreamParser.hpp"
 #include "../src/chat/ThinkingBudgetController.hpp"
 #include "../src/chat/ToolPolicy.hpp"
 #include "../src/profile/Profiling.hpp"
@@ -315,6 +316,8 @@ inline void parse_asr_output(const std::string& raw, const std::string& user_lan
 // ============================================================
 class InferenceEngine {
 public:
+    using ChatStreamCallback = std::function<bool(const aila::chat::StructuredStreamEvent&)>;
+
     InferenceEngine() = default;
 
     // Initialize: load model + tokenizer from model directory
@@ -1597,11 +1600,17 @@ public:
         bool streaming = (token_callback != nullptr);
         bool think_prefix_restored = false;
         auto emit_stream_piece = [&](const std::string& piece) {
+            if (generation_abort_requested_) {
+                return;
+            }
             if (restore_open_think_prefix && !think_prefix_restored) {
                 think_prefix_restored = true;
                 if (piece != "<think>") {
                     output_text += "<think>\n";
                     token_callback("<think>\n");
+                    if (generation_abort_requested_) {
+                        return;
+                    }
                 }
             }
             output_text += piece;
@@ -1695,6 +1704,10 @@ public:
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(current_token);
                         emit_stream_piece(token_text);
+                        if (generation_abort_requested_) {
+                            stop_decode = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1746,6 +1759,9 @@ public:
                     if (streaming) {
                         std::string token_text = tokenizer_.decode(current_token);
                         emit_stream_piece(token_text);
+                        if (generation_abort_requested_) {
+                            break;
+                        }
                     }
 
                     think_budget.observe_generated_token(current_token);
@@ -1864,6 +1880,69 @@ public:
         result.metadata.tool_policy = tool_policy_name(request.tool_policy);
         result.metadata.tool_choice = tool_choice_name(request);
         return result;
+    }
+
+    aila::chat::StructuredStreamEvent make_final_stream_event(
+        const aila::chat::AssistantChatResult& result) const {
+        aila::chat::StructuredStreamEvent event;
+        event.type = aila::chat::StructuredStreamEventType::Final;
+        event.finish_reason = result.finish_reason;
+        event.warnings = result.warnings;
+        return event;
+    }
+
+    int generate_chat_request_stream(
+        const aila::chat::ChatRequest& request,
+        ChatStreamCallback callback) {
+        if (!callback) {
+            set_error(EngineErrorCode::InvalidArgument, "chat stream callback is null");
+            return -1;
+        }
+
+        aila::chat::StructuredStreamParser parser;
+        bool aborted = false;
+
+        generation_abort_requested_ = false;
+        auto token_callback = [&](const std::string& piece) {
+            if (aborted) {
+                generation_abort_requested_ = true;
+                return;
+            }
+
+            std::vector<aila::chat::StructuredStreamEvent> events;
+            parser.push(piece, events);
+            for (const auto& event : events) {
+                if (!callback(event)) {
+                    aborted = true;
+                    generation_abort_requested_ = true;
+                    break;
+                }
+            }
+        };
+
+        aila::chat::AssistantChatResult result =
+            generate_chat_request_result(request, token_callback);
+        generation_abort_requested_ = false;
+
+        if (last_error_code_ != EngineErrorCode::Ok) {
+            return -1;
+        }
+        if (aborted) {
+            return 1;
+        }
+
+        std::vector<aila::chat::StructuredStreamEvent> tail_events;
+        parser.finish(tail_events);
+        for (const auto& event : tail_events) {
+            if (!callback(event)) {
+                return 1;
+            }
+        }
+
+        if (!callback(make_final_stream_event(result))) {
+            return 1;
+        }
+        return 0;
     }
 
     std::string generate_messages_json(const std::string& messages_json,
@@ -3341,6 +3420,7 @@ private:
     std::string last_generation_template_name_;
     bool last_generation_forced_think_close_ = false;
     bool last_generation_think_close_truncated_ = false;
+    bool generation_abort_requested_ = false;
     double last_transcribe_duration_s_ = 0.0;
     double last_transcribe_latency_ms_ = 0.0;
     int last_transcribe_tokens_ = 0;
