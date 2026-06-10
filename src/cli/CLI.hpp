@@ -52,6 +52,7 @@ struct CLIOptions {
     // Single-shot messages JSON mode
     std::string messages_json_path; // --messages-json
     bool chat_output_json = false;   // --chat-output-json
+    bool chat_stream_jsonl = false;  // --chat-stream-jsonl
 
     // ASR transcription mode
     std::string transcribe_path;    // --transcribe

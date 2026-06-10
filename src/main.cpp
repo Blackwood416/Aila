@@ -1,5 +1,7 @@
 #include "engine/Engine.hpp"
 #include "cli/CLI.hpp"
+#include "chat/ChatJson.hpp"
+#include "chat/ChatStreamJson.hpp"
 #include "bench/Benchmark.hpp"
 #include "AudioPreprocessor.hpp"
 #include "profile/Device.hpp"
@@ -183,6 +185,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (opts.chat_output_json && opts.chat_stream_jsonl) {
+            AILA_LOG_ERROR("--chat-output-json and --chat-stream-jsonl cannot be used together");
+            return 1;
+        }
+
         // 剔除可能存在的 UTF-8 BOM (\xEF\xBB\xBF)
         if (messages_json.size() >= 3 &&
             static_cast<unsigned char>(messages_json[0]) == 0xEF &&
@@ -191,7 +198,25 @@ int main(int argc, char** argv) {
             messages_json = messages_json.substr(3);
         }
 
-        if (opts.chat_output_json) {
+        if (opts.chat_stream_jsonl) {
+            aila::chat::ChatRequest request;
+            std::string parse_error;
+            if (!aila::chat::parse_chat_request_json(messages_json, gen_config, request, &parse_error)) {
+                AILA_LOG_ERROR("messages-json parse failed: %s", parse_error.c_str());
+                return 1;
+            }
+            int rc = engine.generate_chat_request_stream(
+                request,
+                [](const aila::chat::StructuredStreamEvent& event) {
+                    std::cout << aila::chat::stream_event_to_json(event) << std::endl;
+                    return true;
+                });
+            if (rc != 0) {
+                AILA_LOG_ERROR("messages-json structured stream failed: %s",
+                               engine.last_error_message().c_str());
+                return 1;
+            }
+        } else if (opts.chat_output_json) {
             if (opts.stream_output) {
                 AILA_LOG_WARN("--chat-output-json disables token streaming so stdout remains valid JSON");
             }

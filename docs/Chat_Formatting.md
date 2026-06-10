@@ -142,3 +142,10 @@ calls.
 ```bash
 Aila.exe --model <model-dir> --messages-json request.json --chat-output-json
 ```
+
+Use `--chat-stream-jsonl` to print structured stream events as
+newline-delimited JSON:
+
+```bash
+Aila.exe --model <model-dir> --messages-json request.json --chat-stream-jsonl
+```

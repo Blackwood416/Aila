@@ -153,6 +153,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--log-level <level>` | 最低日志级别（verbose/debug/info/warning/error） | info |
 | `--messages-json <path>` | JSON prompt 文件（`-` = stdin） | 无 |
 | `--chat-output-json` | 与 `--messages-json` 配合，输出结构化 assistant JSON 而非原始文本 | 关闭 |
+| `--chat-stream-jsonl` | 与 `--messages-json` 配合，以 JSONL 输出结构化流事件 | 关闭 |
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
@@ -204,6 +205,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 默认情况下，`--messages-json` 输出原始 assistant 文本。添加
 `--chat-output-json` 后会输出结构化 assistant JSON，包括 `content`、
 `reasoning_content`、`tool_calls`、`raw_text`、`finish_reason` 和 `warnings`。
+也可以改用 `--chat-stream-jsonl`，以 newline-delimited JSON 输出结构化流事件。
 
 Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推理引擎内部执行工具。
 调用方应在外部执行返回的 `tool_calls`，再把工具结果作为 `tool` 消息传回 Aila。

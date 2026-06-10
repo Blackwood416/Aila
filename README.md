@@ -153,6 +153,7 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--log-level <level>` | Minimum log level (verbose/debug/info/warning/error) | info |
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
 | `--chat-output-json` | With `--messages-json`, print structured assistant JSON instead of raw text | off |
+| `--chat-stream-jsonl` | With `--messages-json`, print structured stream events as JSONL | off |
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
@@ -205,6 +206,8 @@ environment override is provided.
 By default `--messages-json` prints raw assistant text. Add `--chat-output-json`
 to print structured assistant JSON with `content`, `reasoning_content`,
 `tool_calls`, `raw_text`, `finish_reason`, and `warnings`.
+Use `--chat-stream-jsonl` instead to print structured stream events as
+newline-delimited JSON.
 
 Aila formats and parses tool calls but does not execute tools. Callers should
 execute returned `tool_calls` externally and send tool results back as `tool`

@@ -224,6 +224,7 @@ Options:
   --log-level <level>      Minimum log level (debug/info/warning/error, default: info)
   --messages-json <path>   Single-shot generation from OpenAI-style messages JSON file ('-' = stdin)
   --chat-output-json       With --messages-json, print structured assistant JSON instead of raw text
+  --chat-stream-jsonl      With --messages-json, print structured stream events as JSONL
   --lora <path>              LoRA adapter directory (or set AILA_LORA_DIR)
   --forced-lang <lang>     Force ASR language (e.g. Chinese, English)
   --asr-system <prompt>    ASR system prompt text bias
@@ -447,6 +448,10 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--chat-output-json") {
             opts.chat_output_json = true;
+            continue;
+        }
+        if (arg == "--chat-stream-jsonl") {
+            opts.chat_stream_jsonl = true;
             continue;
         }
         if (arg == "--lora" && i + 1 < argc) {
