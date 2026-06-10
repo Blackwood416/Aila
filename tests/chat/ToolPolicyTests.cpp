@@ -23,6 +23,19 @@ void run_tool_policy_tests() {
     {
         ChatRequest request;
         request.tool_choice = ToolChoice::Required;
+        request.tool_policy = ToolPolicyMode::Strict;
+
+        const auto parsed = parse_assistant_output("plain answer");
+        const auto validation = validate_tool_policy(request, parsed);
+
+        AILA_CHAT_EXPECT_TRUE(validation.hard_error);
+        AILA_CHAT_EXPECT_EQ(validation.warnings.size(), static_cast<size_t>(1));
+        AILA_CHAT_EXPECT_EQ(validation.warnings[0], std::string("tool_choice required but no tool call was returned"));
+    }
+
+    {
+        ChatRequest request;
+        request.tool_choice = ToolChoice::Required;
 
         const auto parsed = parse_assistant_output("plain answer");
         const auto validation = validate_tool_policy(request, parsed);

@@ -41,6 +41,10 @@ ToolPolicyValidation validate_tool_policy(
         break;
     }
 
+    if (request.tool_policy == ToolPolicyMode::Strict && !validation.warnings.empty()) {
+        validation.hard_error = true;
+    }
+
     return validation;
 }
 

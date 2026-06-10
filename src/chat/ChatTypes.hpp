@@ -104,6 +104,11 @@ enum class ToolChoice {
     Function
 };
 
+enum class ToolPolicyMode {
+    Warn,
+    Strict
+};
+
 struct ChatTemplateOptions {
     std::optional<bool> enable_thinking;
     bool preserve_thinking = true;
@@ -120,6 +125,7 @@ struct ChatRequest {
     std::vector<ChatMessage> messages;
     std::vector<ChatTool> tools;
     ToolChoice tool_choice = ToolChoice::Auto;
+    ToolPolicyMode tool_policy = ToolPolicyMode::Warn;
     std::string tool_choice_function_name;
     ChatTemplateOptions template_options;
     GenerationConfig generation_config;
@@ -132,6 +138,16 @@ struct ChatRenderResult {
     std::string template_name;
 };
 
+struct ChatResponseMetadata {
+    std::string template_name;
+    std::string model_family;
+    int reasoning_budget_tokens = -1;
+    bool reasoning_budget_forced_close = false;
+    bool reasoning_budget_truncated = false;
+    std::string tool_policy = "warn";
+    std::string tool_choice = "auto";
+};
+
 struct AssistantChatResult {
     std::string role = "assistant";
     std::string content;
@@ -140,6 +156,7 @@ struct AssistantChatResult {
     std::string raw_text;
     std::string finish_reason = "stop";
     std::vector<std::string> warnings;
+    ChatResponseMetadata metadata;
 };
 
 inline std::string decode_finish_reason(bool hit_loop_guard, bool hit_length, bool has_tool_calls) {

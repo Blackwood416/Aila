@@ -389,6 +389,23 @@ bool parse_tool_choice(simdjson::dom::object root_obj, ChatRequest& out, std::st
     return true;
 }
 
+bool parse_tool_policy(simdjson::dom::object root_obj, ChatRequest& out, std::string* error) {
+    std::string value;
+    if (!read_string(root_obj, "tool_policy", value)) {
+        return true;
+    }
+    if (value == "warn") {
+        out.tool_policy = ToolPolicyMode::Warn;
+        return true;
+    }
+    if (value == "strict") {
+        out.tool_policy = ToolPolicyMode::Strict;
+        return true;
+    }
+    set_error(error, "unsupported tool_policy: " + value);
+    return false;
+}
+
 void parse_template_kwargs(simdjson::dom::object root_obj, ChatRequest& out) {
     simdjson::dom::element elem;
     simdjson::dom::object kwargs;
@@ -551,6 +568,9 @@ bool parse_chat_request_json(const std::string& request_json,
             if (!parse_tool_choice(root_obj, out, error_message)) {
                 return false;
             }
+            if (!parse_tool_policy(root_obj, out, error_message)) {
+                return false;
+            }
             if (!parse_tools(root_obj, out, error_message)) {
                 return false;
             }
@@ -592,7 +612,18 @@ std::string assistant_result_to_json(const AssistantChatResult& result) {
         }
         out << json_escape_string(result.warnings[i]);
     }
-    out << "]}";
+    out << "]";
+    out << ",\"metadata\":{";
+    out << "\"template_name\":" << json_escape_string(result.metadata.template_name);
+    out << ",\"model_family\":" << json_escape_string(result.metadata.model_family);
+    out << ",\"reasoning_budget_tokens\":" << result.metadata.reasoning_budget_tokens;
+    out << ",\"reasoning_budget_forced_close\":"
+        << (result.metadata.reasoning_budget_forced_close ? "true" : "false");
+    out << ",\"reasoning_budget_truncated\":"
+        << (result.metadata.reasoning_budget_truncated ? "true" : "false");
+    out << ",\"tool_policy\":" << json_escape_string(result.metadata.tool_policy);
+    out << ",\"tool_choice\":" << json_escape_string(result.metadata.tool_choice);
+    out << "}}";
     return out.str();
 }
 
