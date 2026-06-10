@@ -88,6 +88,26 @@ class AilaGenConfigV2(Structure):
     ]
 
 
+AILA_CHAT_STREAM_REASONING_DELTA = 0
+AILA_CHAT_STREAM_CONTENT_DELTA = 1
+AILA_CHAT_STREAM_TOOL_CALL_DELTA = 2
+AILA_CHAT_STREAM_WARNING = 3
+AILA_CHAT_STREAM_FINAL = 4
+
+
+class AilaChatStreamEvent(Structure):
+    _fields_ = [
+        ("struct_size", c_uint32),
+        ("type", c_int),
+        ("text", c_char_p),
+        ("tool_call_id", c_char_p),
+        ("tool_name", c_char_p),
+        ("arguments_delta", c_char_p),
+        ("finish_reason", c_char_p),
+        ("warnings_json", c_char_p),
+    ]
+
+
 class AilaAlignedWord(Structure):
     _fields_ = [
         ("text",      c_char_p),
@@ -98,6 +118,7 @@ class AilaAlignedWord(Structure):
 
 # Callback types
 TokenCallback = CFUNCTYPE(c_int, c_char_p, c_void_p)
+ChatStreamCallback = CFUNCTYPE(c_int, POINTER(AilaChatStreamEvent), c_void_p)
 LogCallback = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
 AudioCallback = CFUNCTYPE(None, POINTER(c_float), c_int, c_void_p)
 
@@ -133,6 +154,8 @@ class AilaAPI:
         self._set("aila_generate_messages", c_void_p, [c_void_p, c_char_p, c_void_p])
         self._set("aila_generate_chat_json", c_void_p, [c_void_p, c_char_p, c_void_p])
         self._set("aila_generate_chat_json_ex", c_void_p, [c_void_p, c_char_p, c_void_p])
+        self._set("aila_generate_chat_json_stream_ex", c_int,
+                  [c_void_p, c_char_p, c_void_p, ChatStreamCallback, c_void_p])
         self._set("aila_generate_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
         self._set("aila_generate_messages_stream", c_int, [c_void_p, c_char_p, c_void_p, TokenCallback, c_void_p])
 
@@ -642,6 +665,41 @@ def test_generate_chat_json(api: AilaAPI, engine):
             test("generate_chat_json_ex returns valid JSON", False, f"{exc}: {raw_v2[:160]}")
     test("generate_chat_json_ex(NULL engine)", api.aila_generate_chat_json_ex(None, req.encode(), None) is None)
     test("generate_chat_json_ex(NULL json)", api.aila_generate_chat_json_ex(engine, None, None) is None)
+
+
+def test_generate_chat_json_stream_ex(api: AilaAPI, engine):
+    print("\n[Generate — structured chat stream]")
+    cfg = api.aila_default_gen_config_v2()
+    cfg.max_new_tokens = 16
+    cfg.do_sample = 0
+    cfg.thinking_budget_tokens = 0
+    req = json.dumps({
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "temperature": 0.0,
+    })
+
+    seen = []
+
+    @ChatStreamCallback
+    def on_event(event_p, _userdata):
+        event = event_p.contents
+        seen.append(event.type)
+        return 0
+
+    api.aila_engine_reset_context(engine)
+    rc = api.aila_generate_chat_json_stream_ex(engine, req.encode(), byref(cfg), on_event, None)
+    test("generate_chat_json_stream_ex succeeds", rc == 0, f"rc={rc}")
+    test("structured stream emits final event",
+         AILA_CHAT_STREAM_FINAL in seen,
+         f"events={seen}")
+
+    @ChatStreamCallback
+    def abort_event(event_p, _userdata):
+        return 1
+
+    api.aila_engine_reset_context(engine)
+    rc_abort = api.aila_generate_chat_json_stream_ex(engine, req.encode(), byref(cfg), abort_event, None)
+    test("generate_chat_json_stream_ex abort returns 1", rc_abort == 1, f"rc={rc_abort}")
 
 
 def test_streaming(api: AilaAPI, engine):
@@ -1508,6 +1566,7 @@ def main():
             test_generate_sampling(api, engine)
             test_generate_messages(api, engine)
             test_generate_chat_json(api, engine)
+            test_generate_chat_json_stream_ex(api, engine)
             test_streaming(api, engine)
             test_streaming_messages(api, engine)
             test_streaming_abort(api, engine)

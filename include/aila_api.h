@@ -79,6 +79,25 @@ typedef struct AilaGenConfigV2 {
     int   reserved[8];          /* must be zero */
 } AilaGenConfigV2;
 
+typedef enum AilaChatStreamEventType {
+    AILA_CHAT_STREAM_REASONING_DELTA = 0,
+    AILA_CHAT_STREAM_CONTENT_DELTA = 1,
+    AILA_CHAT_STREAM_TOOL_CALL_DELTA = 2,
+    AILA_CHAT_STREAM_WARNING = 3,
+    AILA_CHAT_STREAM_FINAL = 4
+} AilaChatStreamEventType;
+
+typedef struct AilaChatStreamEvent {
+    uint32_t struct_size;
+    int type;
+    const char* text;
+    const char* tool_call_id;
+    const char* tool_name;
+    const char* arguments_delta;
+    const char* finish_reason;
+    const char* warnings_json;
+} AilaChatStreamEvent;
+
 /* -------------- Callback types -------------- */
 
 /**
@@ -88,6 +107,15 @@ typedef struct AilaGenConfigV2 {
  * @return 0 to continue, non-zero to abort generation
  */
 typedef int (*AilaTokenCallback)(const char* token_text, void* user_data);
+
+/**
+ * Structured chat streaming callback.
+ * All string pointers in event are UTF-8 encoded and valid only during this call.
+ * @param event      Structured chat stream event
+ * @param user_data  Opaque pointer passed to aila_generate_chat_json_stream_ex
+ * @return 0 to continue, non-zero to abort generation
+ */
+typedef int (*AilaChatStreamCallback)(const AilaChatStreamEvent* event, void* user_data);
 
 /**
  * Log callback.
@@ -181,6 +209,17 @@ AILA_API char* aila_generate_chat_json(AilaEngine* engine, const char* chat_requ
  */
 AILA_API char* aila_generate_chat_json_ex(AilaEngine* engine, const char* chat_request_json,
                                           const AilaGenConfigV2* config);
+
+/**
+ * Generate structured chat stream events using ABI-safe v2 generation config.
+ * Aila formats and parses tool calls but does not execute tools.
+ * @return 0 on success, 1 when aborted by callback, -1 on error
+ */
+AILA_API int aila_generate_chat_json_stream_ex(AilaEngine* engine,
+                                               const char* chat_request_json,
+                                               const AilaGenConfigV2* config,
+                                               AilaChatStreamCallback callback,
+                                               void* user_data);
 
 /**
  * Generate response from OpenAI-style messages JSON with streaming token callback.

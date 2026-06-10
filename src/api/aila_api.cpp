@@ -1,5 +1,6 @@
 #include "aila_api.h"
 #include "engine/Engine.hpp"
+#include "chat/ChatJson.hpp"
 #include "profile/Profiling.hpp"
 #include "AudioPreprocessor.hpp"
 #include <algorithm>
@@ -117,6 +118,22 @@ static int to_c_error_code(EngineErrorCode code) {
         case EngineErrorCode::ContextOverflow: return AILA_ERR_CONTEXT_OVERFLOW;
         default: return AILA_ERR_RUNTIME;
     }
+}
+
+static int to_c_chat_stream_event_type(aila::chat::StructuredStreamEventType type) {
+    switch (type) {
+        case aila::chat::StructuredStreamEventType::ReasoningDelta:
+            return AILA_CHAT_STREAM_REASONING_DELTA;
+        case aila::chat::StructuredStreamEventType::ContentDelta:
+            return AILA_CHAT_STREAM_CONTENT_DELTA;
+        case aila::chat::StructuredStreamEventType::ToolCallDelta:
+            return AILA_CHAT_STREAM_TOOL_CALL_DELTA;
+        case aila::chat::StructuredStreamEventType::Warning:
+            return AILA_CHAT_STREAM_WARNING;
+        case aila::chat::StructuredStreamEventType::Final:
+            return AILA_CHAT_STREAM_FINAL;
+    }
+    return AILA_CHAT_STREAM_CONTENT_DELTA;
 }
 
 static int run_streaming_call(AilaEngine* engine,
@@ -284,6 +301,60 @@ AILA_API char* aila_generate_chat_json_ex(AilaEngine* engine, const char* chat_r
     } catch (...) {
         AILA_LOG_ERROR("[C-API] Generate chat JSON v2 failed: unknown exception");
         return nullptr;
+    }
+}
+
+AILA_API int aila_generate_chat_json_stream_ex(AilaEngine* engine,
+                                               const char* chat_request_json,
+                                               const AilaGenConfigV2* config,
+                                               AilaChatStreamCallback callback,
+                                               void* user_data) {
+    if (!engine || !chat_request_json || !callback) return -1;
+    if (config && config->struct_size == 0) return -1;
+
+    try {
+        GenerationConfig cfg = to_cpp_config_v2(config);
+        aila::chat::ChatRequest request;
+        std::string parse_error;
+        if (!aila::chat::parse_chat_request_json(std::string(chat_request_json), cfg, request, &parse_error)) {
+            AILA_LOG_ERROR("[C-API] Structured chat stream parse failed: %s", parse_error.c_str());
+            engine->engine.set_error(EngineErrorCode::JsonParseError, parse_error);
+            return -1;
+        }
+
+        std::string warnings_json;
+        return engine->engine.generate_chat_request_stream(
+            request,
+            [&](const aila::chat::StructuredStreamEvent& cpp_event) {
+                warnings_json.clear();
+                if (!cpp_event.warnings.empty()) {
+                    warnings_json = "[";
+                    for (size_t i = 0; i < cpp_event.warnings.size(); ++i) {
+                        if (i != 0) {
+                            warnings_json += ",";
+                        }
+                        warnings_json += aila::chat::json_escape_string(cpp_event.warnings[i]);
+                    }
+                    warnings_json += "]";
+                }
+
+                AilaChatStreamEvent event{};
+                event.struct_size = sizeof(AilaChatStreamEvent);
+                event.type = to_c_chat_stream_event_type(cpp_event.type);
+                event.text = cpp_event.text.empty() ? nullptr : cpp_event.text.c_str();
+                event.tool_call_id = cpp_event.tool_call_id.empty() ? nullptr : cpp_event.tool_call_id.c_str();
+                event.tool_name = cpp_event.tool_name.empty() ? nullptr : cpp_event.tool_name.c_str();
+                event.arguments_delta = cpp_event.arguments_delta.empty() ? nullptr : cpp_event.arguments_delta.c_str();
+                event.finish_reason = cpp_event.finish_reason.empty() ? nullptr : cpp_event.finish_reason.c_str();
+                event.warnings_json = warnings_json.empty() ? nullptr : warnings_json.c_str();
+                return callback(&event, user_data) == 0;
+            });
+    } catch (const std::exception& e) {
+        AILA_LOG_ERROR("[C-API] Structured chat stream failed: %s", e.what());
+        return -1;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Structured chat stream failed: unknown exception");
+        return -1;
     }
 }
 
