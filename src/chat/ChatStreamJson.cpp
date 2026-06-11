@@ -51,9 +51,21 @@ std::string stream_event_to_json(const StructuredStreamEvent& event) {
         }
         out << "]";
     }
+    if (!event.tool_calls.empty()) {
+        out << ",\"tool_calls\":" << tool_calls_to_json(event.tool_calls);
+    }
 
     out << "}";
     return out.str();
+}
+
+StructuredStreamEvent final_stream_event_from_result(const AssistantChatResult& result) {
+    StructuredStreamEvent event;
+    event.type = StructuredStreamEventType::Final;
+    event.finish_reason = result.finish_reason;
+    event.warnings = result.warnings;
+    event.tool_calls = result.tool_calls;
+    return event;
 }
 
 } // namespace aila::chat

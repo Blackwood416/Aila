@@ -27,6 +27,7 @@
 #include "../src/chat/ChatFormatter.hpp"
 #include "../src/chat/ChatJson.hpp"
 #include "../src/chat/ChatSessionState.hpp"
+#include "../src/chat/ChatStreamJson.hpp"
 #include "../src/chat/StructuredStreamParser.hpp"
 #include "../src/chat/ThinkingBudgetController.hpp"
 #include "../src/chat/ToolPolicy.hpp"
@@ -1884,11 +1885,7 @@ public:
 
     aila::chat::StructuredStreamEvent make_final_stream_event(
         const aila::chat::AssistantChatResult& result) const {
-        aila::chat::StructuredStreamEvent event;
-        event.type = aila::chat::StructuredStreamEventType::Final;
-        event.finish_reason = result.finish_reason;
-        event.warnings = result.warnings;
-        return event;
+        return aila::chat::final_stream_event_from_result(result);
     }
 
     int generate_chat_request_stream(
