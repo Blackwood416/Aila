@@ -14,6 +14,8 @@ const std::string& qwen35_fixed_chat_template() {
 {%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 %}
 {%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 0 %}
 {%- set _has_tools = (tools is defined and tools and tools is iterable and tools is not mapping) %}
+{%- set _tool_choice = tool_choice if tool_choice is defined else "auto" %}
+{%- set _tool_choice_function_name = tool_choice_function_name if tool_choice_function_name is defined else "" %}
 {%- set ns_state = namespace(thinking=enable_thinking) %}
 {%- if auto_disable_thinking_with_tools and _has_tools %}
     {%- set ns_state.thinking = false %}
@@ -111,6 +113,15 @@ multiple lines
 </tool_call>
 
 <IMPORTANT>
+{% if _tool_choice == 'required' %}
+Tool choice requirement:
+- You MUST call at least one available tool.
+- Do NOT answer directly before making a tool call.
+{% elif _tool_choice == 'function' and _tool_choice_function_name %}
+Tool choice requirement:
+- You MUST call the {{ _tool_choice_function_name }} tool.
+- Do NOT answer directly or call another tool before making that tool call.
+{% endif %}
 Reminder:
 - You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.
 - ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.
@@ -118,7 +129,11 @@ Reminder:
 - If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after closing </think>. Do NOT output any conversational text before the tool call.
 - The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.
 - To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.
+{%- if _tool_choice == 'required' or _tool_choice == 'function' %}
+- Because tool_choice requires a tool call, do NOT decide that no tool is needed. Produce a tool call first.
+{%- else %}
 - If you have gathered all necessary data and do not need to call a tool, answer the question like normal and provide your final response to the user IMMEDIATELY after closing </think>.
+{%- endif %}
 </IMPORTANT>
     {%- endset %}
     {{- '\n\n' ~ tool_instructions | trim }}

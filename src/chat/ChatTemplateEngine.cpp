@@ -158,6 +158,20 @@ jinja::value mk_tools(const ChatRequest& request) {
     return arr;
 }
 
+std::string tool_choice_to_string(const ChatRequest& request) {
+    switch (request.tool_choice) {
+    case ToolChoice::None:
+        return "none";
+    case ToolChoice::Required:
+        return "required";
+    case ToolChoice::Function:
+        return "function";
+    case ToolChoice::Auto:
+    default:
+        return "auto";
+    }
+}
+
 } // namespace
 
 bool ChatTemplateEngine::render(const ChatTemplateRenderInput& input,
@@ -181,6 +195,8 @@ bool ChatTemplateEngine::render(const ChatTemplateRenderInput& input,
 
         ctx.set_val("messages", mk_messages(*input.request));
         ctx.set_val("tools", mk_tools(*input.request));
+        ctx.set_val("tool_choice", mk_string(tool_choice_to_string(*input.request)));
+        ctx.set_val("tool_choice_function_name", mk_string(input.request->tool_choice_function_name));
         ctx.set_val("bos_token", mk_string(input.bos_token));
         ctx.set_val("eos_token", mk_string(input.eos_token));
         ctx.set_val("add_generation_prompt", jinja::mk_val<jinja::value_bool>(input.add_generation_prompt));

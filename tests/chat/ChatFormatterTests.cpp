@@ -85,6 +85,20 @@ void run_chat_formatter_tests() {
     AILA_CHAT_EXPECT_TRUE(tool_none_rendered.text.find("<tools>") == std::string::npos);
     AILA_CHAT_EXPECT_TRUE(tool_none_rendered.text.find("search") == std::string::npos);
 
+    ChatRequest tool_required_req = tool_none_req;
+    tool_required_req.tool_choice = ToolChoice::Required;
+
+    ChatFormatInput tool_required_input = tool_none_input;
+    tool_required_input.request = &tool_required_req;
+
+    ChatFormatTextResult tool_required_rendered;
+    AILA_CHAT_EXPECT_TRUE(formatter.render_text(tool_required_input, true, tool_required_rendered, &error));
+    AILA_CHAT_EXPECT_TRUE(
+        tool_required_rendered.text.find("You MUST call at least one available tool.") != std::string::npos);
+    AILA_CHAT_EXPECT_TRUE(
+        tool_required_rendered.text.find("If you have gathered all necessary data and do not need to call a tool") ==
+        std::string::npos);
+
     ChatRequest budget_zero_req;
     ChatMessage budget_user;
     budget_user.role = ChatRole::User;
