@@ -101,20 +101,34 @@ if ($null -eq $first.tool_calls -or @($first.tool_calls).Count -lt 1) {
     throw "Expected at least one tool call for required tool_choice. Warnings: $($first.warnings -join '|') Raw: $($first.raw_text)"
 }
 
-$streamEvents = Invoke-ChatJsonStream -Request $requiredReq
-$streamFinal = @($streamEvents | Where-Object { $_.type -eq "final" }) | Select-Object -Last 1
-if ($null -eq $streamFinal) {
-    throw "Expected final stream event. Events: $($streamEvents | ConvertTo-Json -Depth 8 -Compress)"
+$streamFinal = $null
+$streamToolDelta = $null
+$streamAttemptErrors = @()
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $streamEvents = Invoke-ChatJsonStream -Request $requiredReq
+    $candidateFinal = @($streamEvents | Where-Object { $_.type -eq "final" }) | Select-Object -Last 1
+    $candidateToolDelta = @(
+        $streamEvents |
+            Where-Object {
+                $_.type -eq "tool_call_delta" -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.tool_name)
+            }
+    ) | Select-Object -First 1
+
+    if ($null -ne $candidateFinal -and
+        $candidateFinal.finish_reason -eq "tool_calls" -and
+        $null -ne $candidateFinal.tool_calls -and
+        @($candidateFinal.tool_calls).Count -ge 1 -and
+        $null -ne $candidateToolDelta) {
+        $streamFinal = $candidateFinal
+        $streamToolDelta = $candidateToolDelta
+        break
+    }
+
+    $streamAttemptErrors += "attempt ${attempt}: final=$($candidateFinal | ConvertTo-Json -Depth 8 -Compress)"
 }
-if ($streamFinal.finish_reason -ne "tool_calls") {
-    throw "Expected streaming final finish_reason tool_calls. Final: $($streamFinal | ConvertTo-Json -Depth 8 -Compress)"
-}
-if ($null -eq $streamFinal.tool_calls -or @($streamFinal.tool_calls).Count -lt 1) {
-    throw "Expected streaming final tool_calls. Final: $($streamFinal | ConvertTo-Json -Depth 8 -Compress)"
-}
-$streamToolDelta = @($streamEvents | Where-Object { $_.type -eq "tool_call_delta" }) | Select-Object -First 1
-if ($null -eq $streamToolDelta -or [string]::IsNullOrWhiteSpace([string]$streamToolDelta.tool_name)) {
-    throw "Expected parsed streaming tool_call_delta. Events: $($streamEvents | ConvertTo-Json -Depth 8 -Compress)"
+if ($null -eq $streamFinal -or $null -eq $streamToolDelta) {
+    throw "Expected streaming tool-call handoff within retries. $($streamAttemptErrors -join ' | ')"
 }
 
 $call = @($first.tool_calls)[0]
