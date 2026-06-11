@@ -71,6 +71,16 @@ void run_assistant_output_parser_tests() {
     }
 
     {
+        ChatToolCall call;
+        AILA_CHAT_EXPECT_TRUE(parse_tool_call_content(
+            "<function=search>\n<parameter=query>cats</parameter>\n</function>",
+            call));
+        AILA_CHAT_EXPECT_EQ(call.type, std::string("function"));
+        AILA_CHAT_EXPECT_EQ(call.function.name, std::string("search"));
+        AILA_CHAT_EXPECT_EQ(call.function.arguments_json, std::string(R"({"query":"cats"})"));
+    }
+
+    {
         const auto result = parse_assistant_output(
             "<tool_call>\n"
             "<function=add>\n"

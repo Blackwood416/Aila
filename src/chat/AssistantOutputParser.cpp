@@ -381,8 +381,7 @@ std::string extract_tool_calls(
             remaining += content.substr(pos, begin - pos);
             ChatToolCall tool_call;
             const std::string block = content.substr(inner_begin);
-            if (parse_tool_call_block(block, tool_call) ||
-                parse_named_xml_tool_call_block(block, tool_call)) {
+            if (parse_tool_call_content(block, tool_call)) {
                 tool_call.id = "call_" + std::to_string(tool_calls.size());
                 tool_calls.push_back(std::move(tool_call));
                 warnings.emplace_back("Recovered tool_call block: missing closing </tool_call>");
@@ -398,8 +397,7 @@ std::string extract_tool_calls(
         const std::string block = content.substr(inner_begin, end - inner_begin);
 
         ChatToolCall tool_call;
-        if (parse_tool_call_block(block, tool_call) ||
-            parse_named_xml_tool_call_block(block, tool_call)) {
+        if (parse_tool_call_content(block, tool_call)) {
             tool_call.id = "call_" + std::to_string(tool_calls.size());
             tool_calls.push_back(std::move(tool_call));
         } else {
@@ -437,6 +435,12 @@ std::string strip_leading_think_close_artifacts(std::string content) {
 }
 
 } // namespace
+
+bool parse_tool_call_content(const std::string& content, ChatToolCall& tool_call) {
+    tool_call = ChatToolCall{};
+    return parse_tool_call_block(content, tool_call) ||
+           parse_named_xml_tool_call_block(content, tool_call);
+}
 
 AssistantChatResult parse_assistant_output(const std::string& raw_text) {
     AssistantChatResult result;

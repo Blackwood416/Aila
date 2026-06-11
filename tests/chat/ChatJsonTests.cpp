@@ -1,6 +1,8 @@
 #include "ChatTest.hpp"
 #include "chat/ChatJson.hpp"
 
+#include <vector>
+
 namespace aila::chat::test {
 
 void run_chat_json_tests() {
@@ -153,6 +155,22 @@ void run_chat_json_tests() {
     AILA_CHAT_EXPECT_TRUE(out.find("\"reasoning_budget_truncated\":true") != std::string::npos);
     AILA_CHAT_EXPECT_TRUE(out.find("\"tool_policy\":\"warn\"") != std::string::npos);
     AILA_CHAT_EXPECT_TRUE(out.find("\"tool_choice\":\"auto\"") != std::string::npos);
+
+    {
+        ChatToolCall helper_call;
+        helper_call.id = "call_0";
+        helper_call.type = "function";
+        helper_call.function.name = "search";
+        helper_call.function.arguments_json = R"({"query":"cats"})";
+
+        const std::string json = tool_calls_to_json(std::vector<ChatToolCall>{helper_call});
+
+        AILA_CHAT_EXPECT_EQ(
+            json,
+            std::string(
+                "[{\"id\":\"call_0\",\"type\":\"function\","
+                "\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"query\\\":\\\"cats\\\"}\"}}]"));
+    }
 }
 
 } // namespace aila::chat::test

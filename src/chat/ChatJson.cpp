@@ -582,27 +582,38 @@ bool parse_chat_request_json(const std::string& request_json,
     }
 }
 
+std::string tool_call_to_json(const ChatToolCall& call) {
+    std::ostringstream out;
+    out << "{";
+    out << "\"id\":" << json_escape_string(call.id);
+    out << ",\"type\":" << json_escape_string(call.type.empty() ? std::string("function") : call.type);
+    out << ",\"function\":{";
+    out << "\"name\":" << json_escape_string(call.function.name);
+    out << ",\"arguments\":" << json_escape_string(call.function.arguments_json);
+    out << "}}";
+    return out.str();
+}
+
+std::string tool_calls_to_json(const std::vector<ChatToolCall>& calls) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        if (i > 0) {
+            out << ",";
+        }
+        out << tool_call_to_json(calls[i]);
+    }
+    out << "]";
+    return out.str();
+}
+
 std::string assistant_result_to_json(const AssistantChatResult& result) {
     std::ostringstream out;
     out << "{";
     out << "\"role\":" << json_escape_string(result.role);
     out << ",\"content\":" << json_escape_string(result.content);
     out << ",\"reasoning_content\":" << json_escape_string(result.reasoning_content);
-    out << ",\"tool_calls\":[";
-    for (size_t i = 0; i < result.tool_calls.size(); ++i) {
-        const auto& call = result.tool_calls[i];
-        if (i > 0) {
-            out << ",";
-        }
-        out << "{";
-        out << "\"id\":" << json_escape_string(call.id);
-        out << ",\"type\":" << json_escape_string(call.type.empty() ? std::string("function") : call.type);
-        out << ",\"function\":{";
-        out << "\"name\":" << json_escape_string(call.function.name);
-        out << ",\"arguments\":" << json_escape_string(call.function.arguments_json);
-        out << "}}";
-    }
-    out << "]";
+    out << ",\"tool_calls\":" << tool_calls_to_json(result.tool_calls);
     out << ",\"raw_text\":" << json_escape_string(result.raw_text);
     out << ",\"finish_reason\":" << json_escape_string(result.finish_reason);
     out << ",\"warnings\":[";
