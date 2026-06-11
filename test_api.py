@@ -105,6 +105,7 @@ class AilaChatStreamEvent(Structure):
         ("arguments_delta", c_char_p),
         ("finish_reason", c_char_p),
         ("warnings_json", c_char_p),
+        ("tool_calls_json", c_char_p),
     ]
 
 
@@ -679,11 +680,15 @@ def test_generate_chat_json_stream_ex(api: AilaAPI, engine):
     })
 
     seen = []
+    final_tool_calls_json = []
 
     @ChatStreamCallback
     def on_event(event_p, _userdata):
         event = event_p.contents
         seen.append(event.type)
+        if event.type == AILA_CHAT_STREAM_FINAL and event.tool_calls_json:
+            final_tool_calls_json.append(
+                string_at(event.tool_calls_json).decode("utf-8", errors="replace"))
         return 0
 
     api.aila_engine_reset_context(engine)
@@ -692,6 +697,11 @@ def test_generate_chat_json_stream_ex(api: AilaAPI, engine):
     test("structured stream emits final event",
          AILA_CHAT_STREAM_FINAL in seen,
          f"events={seen}")
+    if final_tool_calls_json:
+        parsed_tool_calls = json.loads(final_tool_calls_json[-1])
+        test("structured stream final tool_calls_json is an array",
+             isinstance(parsed_tool_calls, list),
+             final_tool_calls_json[-1])
 
     @ChatStreamCallback
     def abort_event(event_p, _userdata):

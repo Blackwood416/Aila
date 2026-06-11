@@ -323,10 +323,12 @@ AILA_API int aila_generate_chat_json_stream_ex(AilaEngine* engine,
         }
 
         std::string warnings_json;
+        std::string tool_calls_json;
         return engine->engine.generate_chat_request_stream(
             request,
             [&](const aila::chat::StructuredStreamEvent& cpp_event) {
                 warnings_json.clear();
+                tool_calls_json.clear();
                 if (!cpp_event.warnings.empty()) {
                     warnings_json = "[";
                     for (size_t i = 0; i < cpp_event.warnings.size(); ++i) {
@@ -336,6 +338,10 @@ AILA_API int aila_generate_chat_json_stream_ex(AilaEngine* engine,
                         warnings_json += aila::chat::json_escape_string(cpp_event.warnings[i]);
                     }
                     warnings_json += "]";
+                }
+                if (cpp_event.type == aila::chat::StructuredStreamEventType::Final &&
+                    !cpp_event.tool_calls.empty()) {
+                    tool_calls_json = aila::chat::tool_calls_to_json(cpp_event.tool_calls);
                 }
 
                 AilaChatStreamEvent event{};
@@ -347,6 +353,7 @@ AILA_API int aila_generate_chat_json_stream_ex(AilaEngine* engine,
                 event.arguments_delta = cpp_event.arguments_delta.empty() ? nullptr : cpp_event.arguments_delta.c_str();
                 event.finish_reason = cpp_event.finish_reason.empty() ? nullptr : cpp_event.finish_reason.c_str();
                 event.warnings_json = warnings_json.empty() ? nullptr : warnings_json.c_str();
+                event.tool_calls_json = tool_calls_json.empty() ? nullptr : tool_calls_json.c_str();
                 return callback(&event, user_data) == 0;
             });
     } catch (const std::exception& e) {

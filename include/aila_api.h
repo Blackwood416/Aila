@@ -96,6 +96,7 @@ typedef struct AilaChatStreamEvent {
     const char* arguments_delta;
     const char* finish_reason;
     const char* warnings_json;
+    const char* tool_calls_json;
 } AilaChatStreamEvent;
 
 /* -------------- Callback types -------------- */
