@@ -45,6 +45,25 @@ function Invoke-ChatJson {
     return $line | ConvertFrom-Json
 }
 
+function Invoke-ChatJsonStream {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Request
+    )
+
+    $json = $Request | ConvertTo-Json -Depth 32 -Compress
+    $out = $json | & $resolvedAilaExe -m $resolvedModelDir --greedy --messages-json - --chat-stream-jsonl --log-level error
+    if ($LASTEXITCODE -ne 0) {
+        throw "Aila stream exited with code $LASTEXITCODE. Output: $out"
+    }
+
+    $events = @($out | Where-Object { $_.Trim().StartsWith("{") } | ForEach-Object { $_ | ConvertFrom-Json })
+    if ($events.Count -lt 1) {
+        throw "No JSONL stream events returned. Output: $out"
+    }
+    return $events
+}
+
 $tools = @(
     @{
         type = "function"
@@ -82,6 +101,22 @@ if ($null -eq $first.tool_calls -or @($first.tool_calls).Count -lt 1) {
     throw "Expected at least one tool call for required tool_choice. Warnings: $($first.warnings -join '|') Raw: $($first.raw_text)"
 }
 
+$streamEvents = Invoke-ChatJsonStream -Request $requiredReq
+$streamFinal = @($streamEvents | Where-Object { $_.type -eq "final" }) | Select-Object -Last 1
+if ($null -eq $streamFinal) {
+    throw "Expected final stream event. Events: $($streamEvents | ConvertTo-Json -Depth 8 -Compress)"
+}
+if ($streamFinal.finish_reason -ne "tool_calls") {
+    throw "Expected streaming final finish_reason tool_calls. Final: $($streamFinal | ConvertTo-Json -Depth 8 -Compress)"
+}
+if ($null -eq $streamFinal.tool_calls -or @($streamFinal.tool_calls).Count -lt 1) {
+    throw "Expected streaming final tool_calls. Final: $($streamFinal | ConvertTo-Json -Depth 8 -Compress)"
+}
+$streamToolDelta = @($streamEvents | Where-Object { $_.type -eq "tool_call_delta" }) | Select-Object -First 1
+if ($null -eq $streamToolDelta -or [string]::IsNullOrWhiteSpace([string]$streamToolDelta.tool_name)) {
+    throw "Expected parsed streaming tool_call_delta. Events: $($streamEvents | ConvertTo-Json -Depth 8 -Compress)"
+}
+
 $call = @($first.tool_calls)[0]
 $followReq = @{
     messages = @(
@@ -111,4 +146,4 @@ if ([string]::IsNullOrWhiteSpace([string]$final.content)) {
     throw "Expected final content after tool result. Raw: $($final.raw_text)"
 }
 
-Write-Host "TOOL_WORKFLOW_OK first_finish=$($first.finish_reason) final_finish=$($final.finish_reason) final_content=$($final.content)"
+Write-Host "TOOL_WORKFLOW_OK first_finish=$($first.finish_reason) stream_finish=$($streamFinal.finish_reason) final_finish=$($final.finish_reason) final_content=$($final.content)"
