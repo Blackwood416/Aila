@@ -129,6 +129,10 @@ Tool calls are parsed from Qwen-style XML blocks:
 Callers execute returned tool calls externally and append their results as
 `tool` messages with `tool_call_id`.
 
+`tests/chat_tool_workflow_smoke.ps1` exercises the caller-executed tool loop:
+assistant tool call, external tool result, and final answer. It checks
+structure rather than exact wording.
+
 `finish_reason` is `"stop"` when decoding ended on EOS, `"length"` when
 `max_new_tokens` was exhausted, `"loop_guard"` when Aila stopped repetitive
 decode, and `"tool_calls"` when the assistant result contains parsed tool
