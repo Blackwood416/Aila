@@ -1,5 +1,7 @@
 #pragma once
 
+#include "chat/ChatTypes.hpp"
+
 #include <string>
 #include <vector>
 
@@ -21,6 +23,7 @@ struct StructuredStreamEvent {
     std::string arguments_delta;
     std::string finish_reason;
     std::vector<std::string> warnings;
+    std::vector<ChatToolCall> tool_calls;
 };
 
 class StructuredStreamParser {
@@ -38,10 +41,11 @@ private:
     void process(std::vector<StructuredStreamEvent>& out_events, bool final);
     void emit(StructuredStreamEventType type,
               const std::string& text,
-              std::vector<StructuredStreamEvent>& out_events) const;
+              std::vector<StructuredStreamEvent>& out_events);
 
     State state_ = State::Content;
     std::string buffer_;
+    size_t next_tool_call_index_ = 0;
 };
 
 } // namespace aila::chat

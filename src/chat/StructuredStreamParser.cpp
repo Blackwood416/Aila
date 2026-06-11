@@ -1,8 +1,11 @@
 #include "chat/StructuredStreamParser.hpp"
 
+#include "chat/AssistantOutputParser.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <utility>
 
 namespace aila::chat {
 namespace {
@@ -50,6 +53,22 @@ size_t longest_content_marker_prefix_suffix(const std::string& value) {
         best = std::max(best, longest_suffix_matching_prefix(value, marker));
     }
     return best;
+}
+
+std::string unwrap_tool_call_block(const std::string& text) {
+    const std::string trimmed = trim(text);
+    const std::string open = kToolOpen;
+    const std::string close = kToolClose;
+    if (trimmed.rfind(open, 0) != 0) {
+        return trimmed;
+    }
+
+    const size_t inner_begin = open.size();
+    const size_t close_pos = trimmed.rfind(close);
+    if (close_pos == std::string::npos || close_pos < inner_begin) {
+        return trimmed.substr(inner_begin);
+    }
+    return trimmed.substr(inner_begin, close_pos - inner_begin);
 }
 
 } // namespace
@@ -168,7 +187,7 @@ void StructuredStreamParser::process(std::vector<StructuredStreamEvent>& out_eve
 
 void StructuredStreamParser::emit(StructuredStreamEventType type,
                                   const std::string& text,
-                                  std::vector<StructuredStreamEvent>& out_events) const {
+                                  std::vector<StructuredStreamEvent>& out_events) {
     if (text.empty()) {
         return;
     }
@@ -176,6 +195,20 @@ void StructuredStreamParser::emit(StructuredStreamEventType type,
     StructuredStreamEvent event;
     event.type = type;
     event.text = text;
+
+    if (type == StructuredStreamEventType::ToolCallDelta) {
+        ChatToolCall call;
+        if (parse_tool_call_content(unwrap_tool_call_block(text), call)) {
+            call.id = "call_" + std::to_string(next_tool_call_index_++);
+            event.tool_call_id = call.id;
+            event.tool_name = call.function.name;
+            event.arguments_delta = call.function.arguments_json;
+            event.tool_calls.push_back(std::move(call));
+        } else {
+            event.warnings.emplace_back("Malformed tool_call block: leaving raw text in stream");
+        }
+    }
+
     out_events.push_back(std::move(event));
 }
 

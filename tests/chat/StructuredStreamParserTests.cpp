@@ -98,6 +98,29 @@ void run_structured_stream_parser_tests() {
         AILA_CHAT_EXPECT_EQ(
             collect_text(events, StructuredStreamEventType::ToolCallDelta),
             std::string("<tool_call>\n<function=search>\n<parameter=query>hello</parameter>\n</function>\n</tool_call>"));
+        AILA_CHAT_EXPECT_EQ(events.size(), static_cast<size_t>(1));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_call_id, std::string("call_0"));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_name, std::string("search"));
+        AILA_CHAT_EXPECT_EQ(events[0].arguments_delta, std::string(R"({"query":"hello"})"));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_calls.size(), static_cast<size_t>(1));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_calls[0].id, std::string("call_0"));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_calls[0].function.name, std::string("search"));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_calls[0].function.arguments_json, std::string(R"({"query":"hello"})"));
+    }
+
+    {
+        StructuredStreamParser parser;
+        std::vector<StructuredStreamEvent> events;
+        parser.push(
+            "<tool_call>\n<function=search>\n<parameter=query>cats</parameter>\n</function>\n</tool_call>"
+            "<tool_call>\n<function=lookup>\n<parameter=id>42</parameter>\n</function>\n</tool_call>",
+            events);
+
+        AILA_CHAT_EXPECT_EQ(events.size(), static_cast<size_t>(2));
+        AILA_CHAT_EXPECT_EQ(events[0].tool_call_id, std::string("call_0"));
+        AILA_CHAT_EXPECT_EQ(events[1].tool_call_id, std::string("call_1"));
+        AILA_CHAT_EXPECT_EQ(events[1].tool_name, std::string("lookup"));
+        AILA_CHAT_EXPECT_EQ(events[1].arguments_delta, std::string(R"({"id":"42"})"));
     }
 
     {
