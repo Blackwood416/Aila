@@ -29,7 +29,7 @@
 - **💬 交互式 CLI** — 多轮对话，支持运行时命令（`/clear`、`/greedy`、`/sample` 等）
 - **📊 性能基准测试** — 分别测量 prefill 和 decode 吞吐量
 - **🔌 C API** — 稳定的 C FFI 接口（Python、C#、Rust、Go、Java）— 见 [docs/C_API.md](docs/C_API.md)
-- **💭 Chat Formatting** — llama.cpp 风格 Jinja 渲染、修复版 Qwen3.5 模板、结构化 reasoning/tool-call 解析
+- **💭 Chat Formatting** — llama.cpp 风格 Jinja 渲染、修复版 Qwen3.5 模板、结构化 reasoning/tool-call 解析，以及 JSONL chat 流事件
 
 ## 📦 支持的模型
 
@@ -204,13 +204,16 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 
 默认情况下，`--messages-json` 输出原始 assistant 文本。添加
 `--chat-output-json` 后会输出结构化 assistant JSON，包括 `content`、
-`reasoning_content`、`tool_calls`、`raw_text`、`finish_reason` 和 `warnings`。
+`reasoning_content`、`tool_calls`、`raw_text`、`finish_reason`、`warnings` 和
+`metadata`。
 也可以改用 `--chat-stream-jsonl`，以 newline-delimited JSON 输出结构化流事件。
 
 Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推理引擎内部执行工具。
 调用方应在外部执行返回的 `tool_calls`，再把工具结果作为 `tool` 消息传回 Aila。
-`tool_choice` 策略违背会以 warning 返回，reasoning 可通过 `reasoning_budget` /
-`--thinking-budget` 限制。C API 调用方可使用 `aila_generate_chat_json_ex` 和
+`tool_policy` 支持 `"warn"` 和 `"strict"`；strict 会用
+`finish_reason: "tool_policy"` 标记策略违背。reasoning 可通过
+`reasoning_budget` / `--thinking-budget` 限制。C API 调用方可使用
+`aila_generate_chat_json_ex` 和 `aila_generate_chat_json_stream_ex` 搭配
 `AilaGenConfigV2` 获取 ABI-safe 的 chat 选项。
 
 ### 🎤 TTS 语音克隆

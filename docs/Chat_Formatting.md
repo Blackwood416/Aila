@@ -14,7 +14,7 @@ result. Tool execution is intentionally outside the inference engine.
 | `src/chat/ChatFormatter.*` | Select the template and render text for Engine prompt construction. |
 | `src/chat/AssistantOutputParser.*` | Parse `<think>` and Qwen-style `<tool_call>` output blocks. |
 | `src/chat/StructuredStreamParser.*` | Split raw streaming text into reasoning, content, and tool-call deltas. |
-| `src/chat/ToolPolicy.*` | Validate parsed tool calls against `tool_choice` and emit warning-only policy diagnostics. |
+| `src/chat/ToolPolicy.*` | Validate parsed tool calls against `tool_choice` and emit warn/strict policy diagnostics. |
 | `src/chat/BuiltinTemplates.*` | Built-in fixed templates, currently including the fixed Qwen3.5 template. |
 
 ## Template Selection
@@ -37,9 +37,10 @@ chat API.
 Set `AILA_DEBUG_CHAT_TEMPLATE=1` to log the selected template source, or
 `AILA_DEBUG_PROMPT_TEXT=1` to log both the source and rendered prompt text.
 
-The current structured stream parser emits completed reasoning and tool-call
-blocks as deltas once their closing tags arrive. Raw token streaming remains
-available for callers that need every token immediately.
+The structured stream parser emits content and reasoning deltas as soon as
+marker boundaries are safe. Tool-call blocks are emitted as deltas once their
+closing tags arrive. Raw token streaming remains available for callers that need
+every token immediately.
 
 ## Request JSON
 
@@ -70,6 +71,7 @@ and generation parameters:
     }
   ],
   "tool_choice": "auto",
+  "tool_policy": "warn",
   "chat_template_kwargs": {
     "enable_thinking": false,
     "preserve_thinking": true,
@@ -88,6 +90,11 @@ named function object. Aila treats `tool_choice` as prompt guidance plus
 warning-only validation: it still never executes tools, but structured results
 warn when the assistant returns a tool call despite `"none"`, fails to return a
 tool call for `"required"`, or calls a different function than requested.
+
+`tool_policy` may be `"warn"` or `"strict"`. `"warn"` is the default and records
+policy violations in `warnings`. `"strict"` still does not execute tools, but it
+marks policy violations with `finish_reason: "tool_policy"` so callers can treat
+them as hard failures.
 
 Thinking budget aliases `reasoning_budget`, `thinking_budget`, and
 `thinking_budget_tokens` are accepted in request JSON. `-1` disables budget
@@ -112,7 +119,16 @@ Assistant result JSON contains:
   "tool_calls": [],
   "raw_text": "raw decoded assistant text",
   "finish_reason": "stop",
-  "warnings": []
+  "warnings": [],
+  "metadata": {
+    "template_name": "builtin:qwen3.5-fixed",
+    "model_family": "qwen3.5-hybrid",
+    "reasoning_budget_tokens": -1,
+    "reasoning_budget_forced_close": false,
+    "reasoning_budget_truncated": false,
+    "tool_policy": "warn",
+    "tool_choice": "auto"
+  }
 }
 ```
 
@@ -136,7 +152,11 @@ structure rather than exact wording.
 `finish_reason` is `"stop"` when decoding ended on EOS, `"length"` when
 `max_new_tokens` was exhausted, `"loop_guard"` when Aila stopped repetitive
 decode, and `"tool_calls"` when the assistant result contains parsed tool
-calls.
+calls. `"tool_policy"` indicates a strict tool policy violation.
+
+`metadata` reports the selected template name, model family, effective
+reasoning budget, whether budget enforcement forced or attempted a `</think>`
+close, and the effective `tool_policy` / `tool_choice`.
 
 ## CLI
 
@@ -153,3 +173,13 @@ newline-delimited JSON:
 ```bash
 Aila.exe --model <model-dir> --messages-json request.json --chat-stream-jsonl
 ```
+
+Structured stream event types are:
+
+| Event type | Fields | Meaning |
+|------------|--------|---------|
+| `reasoning_delta` | `text` | Text from `<think>...</think>`. |
+| `content_delta` | `text` | Visible assistant content. |
+| `tool_call_delta` | `text` | Completed Qwen-style `<tool_call>...</tool_call>` block. |
+| `warning` | `text` or `warnings` | Policy/parser warning event when emitted. |
+| `final` | `finish_reason`, `warnings` | End-of-stream status and accumulated warnings. |

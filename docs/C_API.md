@@ -142,7 +142,16 @@ The returned JSON has this shape:
   ],
   "raw_text": "<think>...</think><tool_call>...</tool_call>",
   "finish_reason": "stop",
-  "warnings": []
+  "warnings": [],
+  "metadata": {
+    "template_name": "builtin:qwen3.5-fixed",
+    "model_family": "qwen3.5-hybrid",
+    "reasoning_budget_tokens": -1,
+    "reasoning_budget_forced_close": false,
+    "reasoning_budget_truncated": false,
+    "tool_policy": "warn",
+    "tool_choice": "auto"
+  }
 }
 ```
 
@@ -150,11 +159,20 @@ Aila only formats prompts and parses assistant tool calls. It does not execute t
 
 `finish_reason` is `"stop"` for EOS, `"length"` when `max_new_tokens` is
 exhausted, `"loop_guard"` for repetitive decode early-stop, and `"tool_calls"`
-when the structured result contains parsed tool calls.
+when the structured result contains parsed tool calls. With `tool_policy` set
+to `"strict"`, policy violations are returned as warnings and set
+`finish_reason` to `"tool_policy"`.
+
+The `metadata` object reports the selected chat template, model family,
+effective reasoning budget, whether budget enforcement forced or attempted a
+forced `</think>` close, and the effective tool policy/choice used for
+validation.
 
 Chat request JSON may include `reasoning_budget`, `thinking_budget`, or
 `thinking_budget_tokens`. These fields are preferred for C API callers because
-the legacy `AilaGenConfig` struct remains ABI-stable.
+the legacy `AilaGenConfig` struct remains ABI-stable. It may also include
+`tool_policy: "warn"` or `"strict"`; Aila still never executes tools in either
+mode.
 
 #### `aila_generate_chat_json_ex`
 
@@ -168,6 +186,89 @@ Set `config->struct_size = sizeof(AilaGenConfigV2)` before calling. Passing
 be freed with `aila_free_string`.
 
 ### Generation (Streaming)
+
+#### `AilaChatStreamEventType`
+
+```c
+typedef enum AilaChatStreamEventType {
+    AILA_CHAT_STREAM_REASONING_DELTA = 0,
+    AILA_CHAT_STREAM_CONTENT_DELTA = 1,
+    AILA_CHAT_STREAM_TOOL_CALL_DELTA = 2,
+    AILA_CHAT_STREAM_WARNING = 3,
+    AILA_CHAT_STREAM_FINAL = 4
+} AilaChatStreamEventType;
+```
+
+Structured chat streaming splits decoded assistant text into typed events:
+
+- `AILA_CHAT_STREAM_REASONING_DELTA` - text from `<think>...</think>`.
+- `AILA_CHAT_STREAM_CONTENT_DELTA` - visible assistant content.
+- `AILA_CHAT_STREAM_TOOL_CALL_DELTA` - a completed tool-call block.
+- `AILA_CHAT_STREAM_WARNING` - warning event type for policy/parser warnings.
+- `AILA_CHAT_STREAM_FINAL` - final event with `finish_reason` and warnings.
+
+The current parser streams content/reasoning deltas as soon as marker boundaries
+are safe, while tool-call deltas are emitted once the closing `</tool_call>` tag
+arrives.
+
+#### `AilaChatStreamEvent`
+
+```c
+typedef struct AilaChatStreamEvent {
+    uint32_t struct_size;
+    int type;
+    const char* text;
+    const char* tool_call_id;
+    const char* tool_name;
+    const char* arguments_delta;
+    const char* finish_reason;
+    const char* warnings_json;
+} AilaChatStreamEvent;
+```
+
+`struct_size` is set to `sizeof(AilaChatStreamEvent)` by Aila. String pointers
+are UTF-8, may be `NULL` when the field is not present, and are valid only for
+the duration of the callback. Copy any field that must outlive the callback.
+
+`text` carries reasoning/content deltas and, for current tool-call events, the
+completed Qwen-style `<tool_call>...</tool_call>` block. `finish_reason` and
+`warnings_json` are primarily set on the final event; `warnings_json` is a JSON
+array string when present.
+
+#### `AilaChatStreamCallback`
+
+```c
+typedef int (*AilaChatStreamCallback)(
+    const AilaChatStreamEvent* event,
+    void* user_data
+);
+```
+
+Return `0` to continue streaming. Return any non-zero value to abort generation;
+the API returns `1` for this caller-requested abort.
+
+#### `aila_generate_chat_json_stream_ex`
+
+```c
+int aila_generate_chat_json_stream_ex(
+    AilaEngine* engine,
+    const char* chat_request_json,
+    const AilaGenConfigV2* config,
+    AilaChatStreamCallback callback,
+    void* user_data
+);
+```
+
+Streams the same structured chat request shape accepted by
+`aila_generate_chat_json_ex`, using `AilaGenConfigV2`. Set
+`config->struct_size = sizeof(AilaGenConfigV2)` before passing a non-NULL
+config.
+
+Return codes:
+
+- `0` - completed successfully.
+- `1` - aborted because the callback returned non-zero.
+- `-1` - invalid arguments, JSON/config error, or generation failure.
 
 #### `aila_generate_stream`
 

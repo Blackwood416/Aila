@@ -29,7 +29,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **💬 Interactive CLI** — multi-turn conversation with runtime commands (`/clear`, `/greedy`, `/sample`, etc.)
 - **📊 Benchmark mode** — measure prefill and decode throughput separately
 - **🔌 C API** — stable C FFI interface (Python, C#, Rust, Go, Java) — see [docs/C_API.md](docs/C_API.md)
-- **💭 Chat formatting** — llama.cpp-style Jinja rendering, fixed Qwen3.5 template, structured reasoning/tool-call parsing
+- **💭 Chat formatting** — llama.cpp-style Jinja rendering, fixed Qwen3.5 template, structured reasoning/tool-call parsing, and JSONL chat stream events
 
 ## 📦 Supported Models
 
@@ -205,16 +205,17 @@ environment override is provided.
 
 By default `--messages-json` prints raw assistant text. Add `--chat-output-json`
 to print structured assistant JSON with `content`, `reasoning_content`,
-`tool_calls`, `raw_text`, `finish_reason`, and `warnings`.
+`tool_calls`, `raw_text`, `finish_reason`, `warnings`, and `metadata`.
 Use `--chat-stream-jsonl` instead to print structured stream events as
 newline-delimited JSON.
 
 Aila formats and parses tool calls but does not execute tools. Callers should
 execute returned `tool_calls` externally and send tool results back as `tool`
-messages. `tool_choice` policy violations are reported as warnings, and
-reasoning can be bounded with `reasoning_budget` / `--thinking-budget`. C API
-callers can use `aila_generate_chat_json_ex` with `AilaGenConfigV2` for
-ABI-safe chat options.
+messages. `tool_policy` can be `"warn"` or `"strict"`; strict policy marks
+violations with `finish_reason: "tool_policy"`. Reasoning can be bounded with
+`reasoning_budget` / `--thinking-budget`. C API callers can use
+`aila_generate_chat_json_ex` and `aila_generate_chat_json_stream_ex` with
+`AilaGenConfigV2` for ABI-safe chat options.
 
 ### 🎤 TTS Voice Cloning
 
