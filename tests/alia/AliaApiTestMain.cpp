@@ -1,0 +1,855 @@
+#include "alia_api.h"
+#include "alia/AliaContext.hpp"
+#include "alia/AliaBackgroundPipeline.hpp"
+#include "alia/AliaAsrPipeline.hpp"
+#include "alia/AliaTtsPipeline.hpp"
+#include "alia/RuntimeContext.hpp"
+
+#include <cstdlib>
+#include <cstring>
+#include <condition_variable>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <string>
+
+namespace {
+
+int failures = 0;
+
+void expect_true(bool condition, const char* expression, int line) {
+    if (!condition) {
+        ++failures;
+        std::cerr << "FAIL line " << line << ": expected " << expression << "\n";
+    }
+}
+
+#define ALIA_EXPECT_TRUE(expr) expect_true((expr), #expr, __LINE__)
+#define ALIA_EXPECT_EQ(actual, expected) \
+    expect_true(((actual) == (expected)), #actual " == " #expected, __LINE__)
+
+std::filesystem::path make_temp_model_dir(const std::string& name, const std::string& config_json) {
+    auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("aila_alia_api_tests_" + name + "_" + std::to_string(stamp));
+    std::filesystem::create_directories(dir);
+    std::ofstream out(dir / "config.json", std::ios::binary);
+    out << config_json;
+    return dir;
+}
+
+void remove_temp_dir(const std::filesystem::path& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+std::string qwen35_nf4_config() {
+    return R"({
+        "model_type":"qwen3_5",
+        "quantization_config":{
+            "quant_method":"bitsandbytes",
+            "load_in_4bit":true,
+            "bnb_4bit_quant_type":"nf4",
+            "bnb_4bit_compute_dtype":"float16",
+            "bnb_4bit_quant_storage":"uint8"
+        }
+    })";
+}
+
+struct BlockingAudioCallbackState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    int call_count = 0;
+    int sample_count = 0;
+};
+
+struct BlockingBackgroundCallbackState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    int call_count = 0;
+    std::string result_json;
+    void* user_data = reinterpret_cast<void*>(0x1);
+};
+
+BlockingBackgroundCallbackState* g_background_callback_state = nullptr;
+
+struct ToolCallbackState {
+    int call_count = 0;
+    std::string tool_json;
+    std::string result_to_write = R"({"ok":true,"text":"window title is Settings"})";
+};
+
+struct CountingAudioCallbackState {
+    int call_count = 0;
+    int total_samples = 0;
+};
+
+void blocking_audio_callback(const float* samples, int sample_count, void* user_data) {
+    auto* state = static_cast<BlockingAudioCallbackState*>(user_data);
+    if (!state) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->entered = true;
+    state->call_count++;
+    state->sample_count = sample_count;
+    ALIA_EXPECT_TRUE(samples != nullptr);
+    ALIA_EXPECT_TRUE(sample_count > 0);
+    state->cv.notify_all();
+    state->cv.wait(lock, [&]() { return state->release; });
+}
+
+void counting_audio_callback(const float* samples, int sample_count, void* user_data) {
+    auto* state = static_cast<CountingAudioCallbackState*>(user_data);
+    if (!state) {
+        return;
+    }
+
+    ALIA_EXPECT_TRUE(samples != nullptr);
+    ALIA_EXPECT_TRUE(sample_count > 0);
+    state->call_count++;
+    state->total_samples += sample_count;
+}
+
+void blocking_background_callback(const char* extracted_json, void* user_data) {
+    auto* state = g_background_callback_state;
+    if (!state) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->entered = true;
+    state->call_count++;
+    state->result_json = extracted_json ? extracted_json : "";
+    state->user_data = user_data;
+    state->cv.notify_all();
+    state->cv.wait(lock, [&]() { return state->release; });
+}
+
+int recording_tool_callback(const char* tool_json,
+                            char* out_result_buf,
+                            int max_result_len,
+                            void* user_data) {
+    auto* state = static_cast<ToolCallbackState*>(user_data);
+    if (!state) {
+        return 1;
+    }
+
+    state->call_count++;
+    state->tool_json = tool_json ? tool_json : "";
+    if (!out_result_buf || max_result_len <= 0) {
+        return 1;
+    }
+
+    const std::string& result = state->result_to_write;
+    const int copy_len = std::min(static_cast<int>(result.size()), max_result_len - 1);
+    std::memcpy(out_result_buf, result.data(), static_cast<size_t>(copy_len));
+    out_result_buf[copy_len] = '\0';
+    return 0;
+}
+
+void test_context_init_rejects_null_out_pointer() {
+    int rc = alia_context_init(nullptr, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(rc, ALIA_ERR_INVALID_ARGUMENT);
+}
+
+void test_context_init_and_destroy_allocates_handle_without_models() {
+    AliaContext* ctx = nullptr;
+    int rc = alia_context_init(&ctx, "", "", "", "", 2048);
+
+    ALIA_EXPECT_EQ(rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    alia_context_destroy(ctx);
+}
+
+void test_context_init_rejects_non_positive_sequence_length() {
+    AliaContext* ctx = reinterpret_cast<AliaContext*>(0x1);
+    int rc = alia_context_init(&ctx, "", "", "", "", 0);
+
+    ALIA_EXPECT_EQ(rc, ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_TRUE(ctx == nullptr);
+}
+
+void test_runtime_functions_reject_null_context() {
+    float sample = 0.0f;
+    char* stable = reinterpret_cast<char*>(0x1);
+    char* partial = reinterpret_cast<char*>(0x1);
+
+    ALIA_EXPECT_EQ(alia_abort_inference(nullptr, ALIA_PIPELINE_ALL), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(nullptr, 1), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_asr_feed_audio(nullptr, &sample, 1), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_asr_get_text(nullptr, &stable, &partial), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(nullptr, "turn"), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(nullptr, nullptr, nullptr, nullptr, nullptr),
+                   ALIA_ERR_INVALID_ARGUMENT);
+
+    alia_asr_reset(nullptr);
+    alia_register_background_callback(nullptr, nullptr);
+}
+
+void test_asr_feed_rejects_bad_audio_arguments() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    float sample = 0.0f;
+    ALIA_EXPECT_EQ(alia_asr_feed_audio(ctx, nullptr, 1), ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(alia_asr_feed_audio(ctx, &sample, 0), ALIA_ERR_INVALID_ARGUMENT);
+
+    alia_context_destroy(ctx);
+}
+
+void test_asr_pipeline_owns_feed_and_reset_state() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+
+    float samples[3] = {0.1f, -0.1f, 0.0f};
+    ALIA_EXPECT_EQ(alia_asr_feed_audio(ctx, samples, 3), ALIA_OK);
+    ALIA_EXPECT_EQ(ctx->asr_pipeline->buffered_sample_count(), static_cast<size_t>(3));
+
+    alia_asr_reset(ctx);
+    ALIA_EXPECT_EQ(ctx->asr_pipeline->buffered_sample_count(), static_cast<size_t>(0));
+
+    alia_context_destroy(ctx);
+}
+
+void test_asr_pipeline_reports_readiness_from_loaded_slot() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(!ctx->asr_pipeline->ready());
+
+    alia_context_destroy(ctx);
+}
+
+void test_asr_pipeline_process_pending_is_safe_without_loaded_model() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    float samples[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    ALIA_EXPECT_EQ(alia_asr_feed_audio(ctx, samples, 4), ALIA_OK);
+    ALIA_EXPECT_TRUE(!ctx->asr_pipeline->process_pending());
+    ALIA_EXPECT_EQ(ctx->asr_pipeline->buffered_sample_count(), static_cast<size_t>(4));
+
+    alia_context_destroy(ctx);
+}
+
+void test_asr_output_parser_extracts_language_and_text() {
+    std::string language;
+    std::string text;
+    aila::alia::parse_asr_output("language Chinese\n<asr_text>hello Alia", "", language, text);
+
+    ALIA_EXPECT_TRUE(language == "Chinese");
+    ALIA_EXPECT_TRUE(text == "hello Alia");
+
+    aila::alia::parse_asr_output("plain transcript", "japanese", language, text);
+    ALIA_EXPECT_TRUE(language == "Japanese");
+    ALIA_EXPECT_TRUE(text == "plain transcript");
+}
+
+void test_background_trigger_requires_registered_callback() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    alia_register_background_callback(ctx, nullptr);
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(ctx, "hello"), ALIA_ERR_INVALID_STATE);
+
+    alia_context_destroy(ctx);
+}
+
+void test_background_system_prompt_is_alia_json_extraction_prompt() {
+    const std::string prompt = aila::alia::background_system_prompt();
+
+    ALIA_EXPECT_TRUE(prompt.find("Alia") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("JSON") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("memory") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("conversation") != std::string::npos);
+}
+
+void test_background_schema_accepts_valid_memory_result() {
+    const std::string valid =
+        R"({"summary":"user likes concise replies","memory_candidates":[],"preferences":[],"tasks":[]})";
+
+    const std::string enforced = aila::alia::enforce_background_result_schema(
+        valid, "chat turn");
+
+    ALIA_EXPECT_TRUE(enforced == valid);
+}
+
+void test_background_schema_repairs_malformed_json_with_required_key_names() {
+    const std::string malformed =
+        R"({"summary":"partial","memory_candidates":[],"preferences":[],"tasks":[])";
+
+    const std::string enforced = aila::alia::enforce_background_result_schema(
+        malformed, "fallback summary");
+
+    ALIA_EXPECT_TRUE(enforced.find("\"summary\":\"fallback summary\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"memory_candidates\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"preferences\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"tasks\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"raw_model_output\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"source\":\"schema_repair\"") != std::string::npos);
+}
+
+void test_background_schema_repairs_wrong_required_field_types() {
+    const std::string wrong_types =
+        R"({"summary":42,"memory_candidates":"oops","preferences":{},"tasks":null})";
+
+    const std::string enforced = aila::alia::enforce_background_result_schema(
+        wrong_types, "typed fallback");
+
+    ALIA_EXPECT_TRUE(enforced.find("\"summary\":\"typed fallback\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"memory_candidates\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"preferences\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"tasks\":[]") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"raw_model_output\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(enforced.find("\"source\":\"schema_repair\"") != std::string::npos);
+}
+
+void test_background_pipeline_invokes_callback_and_rejects_busy_trigger() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline != nullptr);
+
+    BlockingBackgroundCallbackState callback_state;
+    g_background_callback_state = &callback_state;
+    alia_register_background_callback(ctx, blocking_background_callback);
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(ctx, "turn text"), ALIA_OK);
+
+    {
+        std::unique_lock<std::mutex> lock(callback_state.mutex);
+        ALIA_EXPECT_TRUE(callback_state.cv.wait_for(
+            lock, std::chrono::seconds(2), [&]() { return callback_state.entered; }));
+    }
+
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(ctx, "second turn"),
+                   ALIA_ERR_INVALID_STATE);
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    callback_state.cv.notify_all();
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("turn text") != std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("alia_background_stub") ==
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"summary\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"memory_candidates\"") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"preferences\"") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"tasks\"") != std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_decode_mode() ==
+                     aila::alia::BackgroundDecodeMode::NoModelFallback);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_prompt_text().find("turn text") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_prompt_text().find("JSON") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.user_data == nullptr);
+
+    g_background_callback_state = nullptr;
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_pipeline_rejects_second_turn_while_worker_is_running() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    BlockingAudioCallbackState callback_state;
+    AliaGenConfig config{0.2f, 0.9f, 8};
+    int start_rc = alia_start_conversation_turn(
+        ctx, &config, nullptr, blocking_audio_callback, &callback_state);
+    ALIA_EXPECT_EQ(start_rc, ALIA_OK);
+
+    {
+        std::unique_lock<std::mutex> lock(callback_state.mutex);
+        ALIA_EXPECT_TRUE(callback_state.cv.wait_for(
+            lock, std::chrono::seconds(2), [&]() { return callback_state.entered; }));
+    }
+
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, blocking_audio_callback, &callback_state),
+                   ALIA_ERR_INVALID_STATE);
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    callback_state.cv.notify_all();
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_TRUE(callback_state.sample_count > 0);
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_turn_rejects_invalid_generation_config() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    AliaGenConfig zero_tokens{0.2f, 0.9f, 0};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(ctx, &zero_tokens, nullptr, nullptr, nullptr),
+                   ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(ctx->foreground_pipeline->state(), aila::alia::ForegroundTurnState::Idle);
+
+    AliaGenConfig bad_top_p{0.2f, 1.5f, 8};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(ctx, &bad_top_p, nullptr, nullptr, nullptr),
+                   ALIA_ERR_INVALID_ARGUMENT);
+    ALIA_EXPECT_EQ(ctx->foreground_pipeline->state(), aila::alia::ForegroundTurnState::Idle);
+
+    alia_context_destroy(ctx);
+}
+
+void test_vlm_rollback_requires_loaded_foreground_anchor() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+
+    ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(ctx, 0), ALIA_OK);
+    ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(ctx, 1), ALIA_ERR_INVALID_STATE);
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_turn_captures_asr_text_and_generation_config() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    ctx->asr_pipeline->append_stable_text("please summarize the active window");
+
+    BlockingAudioCallbackState callback_state;
+    AliaGenConfig config{0.35f, 0.72f, 33};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, blocking_audio_callback, &callback_state),
+                   ALIA_OK);
+
+    {
+        std::unique_lock<std::mutex> lock(callback_state.mutex);
+        ALIA_EXPECT_TRUE(callback_state.cv.wait_for(
+            lock, std::chrono::seconds(2), [&]() { return callback_state.entered; }));
+    }
+
+    const GenerationConfig translated = ctx->foreground_pipeline->last_generation_config();
+    ALIA_EXPECT_EQ(translated.max_new_tokens, 33);
+    ALIA_EXPECT_TRUE(translated.temperature == 0.35f);
+    ALIA_EXPECT_TRUE(translated.top_p == 0.72f);
+    ALIA_EXPECT_TRUE(translated.do_sample);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_user_text() ==
+                     "please summarize the active window");
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_decode_mode() ==
+                     aila::alia::ForegroundDecodeMode::NoModelFallback);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text() ==
+                     "please summarize the active window");
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    callback_state.cv.notify_all();
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_system_prompt_is_alia_specific() {
+    const std::string prompt = aila::alia::foreground_system_prompt();
+
+    ALIA_EXPECT_TRUE(prompt.find("Alia") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("local companion") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("tool call") != std::string::npos);
+    ALIA_EXPECT_TRUE(prompt.find("generic") == std::string::npos);
+}
+
+void test_foreground_tool_call_invokes_callback_and_keeps_spoken_text_native() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    ctx->asr_pipeline->append_stable_text(
+        "Let me check."
+        "<tool_call>\n"
+        "<function=inspect_window>\n"
+        "<parameter=target>active</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+        "Done.");
+
+    ToolCallbackState tool_state;
+    AliaGenConfig config{0.0f, 1.0f, 16};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, recording_tool_callback, nullptr, &tool_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(tool_state.call_count, 1);
+    ALIA_EXPECT_TRUE(tool_state.tool_json.find("inspect_window") != std::string::npos);
+    ALIA_EXPECT_TRUE(tool_state.tool_json.find("target") != std::string::npos);
+    ALIA_EXPECT_TRUE(tool_state.tool_json.find("active") != std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_tool_call_json().find("inspect_window") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_tool_result_text() ==
+                     tool_state.result_to_write);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text() ==
+                     "Let me check.Done.");
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_tool_result_is_promoted_to_resume_prompt_state() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    ctx->asr_pipeline->append_stable_text(
+        "What is on my screen?"
+        "<tool_call>\n"
+        "<function=inspect_window>\n"
+        "<parameter=target>active</parameter>\n"
+        "</function>\n"
+        "</tool_call>");
+
+    ToolCallbackState tool_state;
+    tool_state.result_to_write = R"({"ok":true,"title":"Settings","control":"Privacy"})";
+    AliaGenConfig config{0.0f, 1.0f, 16};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, recording_tool_callback, nullptr, &tool_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    const std::string resume_prompt =
+        ctx->foreground_pipeline->last_tool_resume_prompt_text();
+    ALIA_EXPECT_TRUE(resume_prompt.find("What is on my screen?") != std::string::npos);
+    ALIA_EXPECT_TRUE(resume_prompt.find("inspect_window") != std::string::npos);
+    ALIA_EXPECT_TRUE(resume_prompt.find("Settings") != std::string::npos);
+    ALIA_EXPECT_TRUE(resume_prompt.find("Continue the response") != std::string::npos);
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_spoken_text_is_streamed_to_tts_as_chunks() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    ctx->asr_pipeline->append_stable_text("First sentence. Second sentence.");
+
+    CountingAudioCallbackState audio_state;
+    AliaGenConfig config{0.0f, 1.0f, 16};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, counting_audio_callback, &audio_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(audio_state.call_count, 2);
+    ALIA_EXPECT_TRUE(audio_state.total_samples > 0);
+    ALIA_EXPECT_EQ(ctx->tts_pipeline->pending_text_count(), static_cast<size_t>(0));
+
+    alia_context_destroy(ctx);
+}
+
+void test_foreground_abort_during_tts_chunk_stops_remaining_audio() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->asr_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    ctx->asr_pipeline->append_stable_text("First sentence. Second sentence.");
+
+    BlockingAudioCallbackState callback_state;
+    AliaGenConfig config{0.0f, 1.0f, 16};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, blocking_audio_callback, &callback_state),
+                   ALIA_OK);
+
+    {
+        std::unique_lock<std::mutex> lock(callback_state.mutex);
+        ALIA_EXPECT_TRUE(callback_state.cv.wait_for(
+            lock, std::chrono::seconds(2), [&]() { return callback_state.entered; }));
+    }
+
+    ALIA_EXPECT_EQ(alia_abort_inference(ctx, ALIA_PIPELINE_ALL), ALIA_OK);
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    callback_state.cv.notify_all();
+
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_EQ(ctx->foreground_pipeline->state(), aila::alia::ForegroundTurnState::Aborted);
+
+    alia_context_destroy(ctx);
+}
+
+void test_tts_pipeline_owns_text_queue_and_audio_callback() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(!ctx->tts_pipeline->ready());
+
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline->enqueue_text("hello from foreground"));
+    ALIA_EXPECT_EQ(ctx->tts_pipeline->pending_text_count(), static_cast<size_t>(1));
+
+    BlockingAudioCallbackState callback_state;
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    AliaGenConfig config{0.2f, 0.9f, 8};
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline->synthesize_pending(
+        config, blocking_audio_callback, &callback_state));
+    ALIA_EXPECT_EQ(ctx->tts_pipeline->pending_text_count(), static_cast<size_t>(0));
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_TRUE(callback_state.sample_count > 0);
+
+    alia_context_destroy(ctx);
+}
+
+void test_runtime_context_creates_two_lanes_on_one_sycl_context() {
+    aila::alia::RuntimeContext runtime;
+
+    ALIA_EXPECT_TRUE(runtime.foreground().queue().get_context() ==
+                     runtime.background().queue().get_context());
+    ALIA_EXPECT_TRUE(runtime.foreground().queue().get_device() ==
+                     runtime.background().queue().get_device());
+    ALIA_EXPECT_TRUE(&runtime.foreground() != &runtime.background());
+}
+
+void test_runtime_context_lanes_can_allocate_and_copy_device_memory() {
+    aila::alia::RuntimeContext runtime;
+
+    int host_in = 42;
+    int host_out = 0;
+
+    void* fg_ptr = runtime.foreground().alloc_device(sizeof(int));
+    runtime.foreground().memcpy_h2d(fg_ptr, &host_in, sizeof(int));
+    runtime.foreground().memcpy_d2h(&host_out, fg_ptr, sizeof(int));
+    runtime.foreground().free_device(fg_ptr);
+    ALIA_EXPECT_EQ(host_out, 42);
+
+    host_in = 77;
+    host_out = 0;
+    void* bg_ptr = runtime.background().alloc_device(sizeof(int));
+    runtime.background().memcpy_h2d(bg_ptr, &host_in, sizeof(int));
+    runtime.background().memcpy_d2h(&host_out, bg_ptr, sizeof(int));
+    runtime.background().free_device(bg_ptr);
+    ALIA_EXPECT_EQ(host_out, 77);
+}
+
+void test_context_initializes_four_model_slots_on_expected_lanes() {
+    auto asr_dir = make_temp_model_dir("asr", R"({"model_type":"qwen3_asr"})");
+    auto fg_dir = make_temp_model_dir("fg", qwen35_nf4_config());
+    auto bg_dir = make_temp_model_dir("bg", qwen35_nf4_config());
+    auto tts_dir = make_temp_model_dir("tts", R"({"model_type":"qwen3_tts"})");
+
+    AliaContext ctx(4096);
+    ctx.asr_model_dir = asr_dir.string();
+    ctx.vlm_4b_model_dir = fg_dir.string();
+    ctx.vlm_0_8b_model_dir = bg_dir.string();
+    ctx.tts_model_dir = tts_dir.string();
+    ctx.configure_model_slots();
+
+    ALIA_EXPECT_TRUE(ctx.load_model_metadata());
+    ALIA_EXPECT_EQ(ctx.asr.role(), aila::alia::ModelRole::Asr);
+    ALIA_EXPECT_EQ(ctx.foreground_vlm.role(), aila::alia::ModelRole::ForegroundVlm);
+    ALIA_EXPECT_EQ(ctx.background_vlm.role(), aila::alia::ModelRole::BackgroundVlm);
+    ALIA_EXPECT_EQ(ctx.tts.role(), aila::alia::ModelRole::Tts);
+
+    ALIA_EXPECT_TRUE(ctx.asr.context() == &ctx.runtime->foreground());
+    ALIA_EXPECT_TRUE(ctx.foreground_vlm.context() == &ctx.runtime->foreground());
+    ALIA_EXPECT_TRUE(ctx.tts.context() == &ctx.runtime->foreground());
+    ALIA_EXPECT_TRUE(ctx.background_vlm.context() == &ctx.runtime->background());
+
+    ALIA_EXPECT_TRUE(ctx.asr.model_dir() == asr_dir.string());
+    ALIA_EXPECT_TRUE(ctx.foreground_vlm.model_dir() == fg_dir.string());
+    ALIA_EXPECT_TRUE(ctx.background_vlm.model_dir() == bg_dir.string());
+    ALIA_EXPECT_TRUE(ctx.tts.model_dir() == tts_dir.string());
+    ALIA_EXPECT_EQ(ctx.asr.state(), aila::alia::ModelSlotState::MetadataLoaded);
+    ALIA_EXPECT_EQ(ctx.foreground_vlm.state(), aila::alia::ModelSlotState::MetadataLoaded);
+    ALIA_EXPECT_EQ(ctx.background_vlm.state(), aila::alia::ModelSlotState::MetadataLoaded);
+    ALIA_EXPECT_EQ(ctx.tts.state(), aila::alia::ModelSlotState::MetadataLoaded);
+
+    remove_temp_dir(asr_dir);
+    remove_temp_dir(fg_dir);
+    remove_temp_dir(bg_dir);
+    remove_temp_dir(tts_dir);
+}
+
+void test_context_init_fails_when_required_model_path_is_missing() {
+    auto missing_dir = std::filesystem::temp_directory_path() /
+        "aila_alia_api_tests_missing_model_dir";
+    remove_temp_dir(missing_dir);
+
+    AliaContext* ctx = reinterpret_cast<AliaContext*>(0x1);
+    int rc = alia_context_init(&ctx, missing_dir.string().c_str(), "", "", "", 4096);
+
+    ALIA_EXPECT_EQ(rc, ALIA_ERR_MODEL_LOAD);
+    ALIA_EXPECT_TRUE(ctx == nullptr);
+}
+
+void test_context_init_fails_when_model_assets_are_incomplete() {
+    auto asr_dir = make_temp_model_dir("asr_incomplete_assets",
+                                       R"({"model_type":"qwen3_asr"})");
+
+    AliaContext* ctx = reinterpret_cast<AliaContext*>(0x1);
+    int rc = alia_context_init(&ctx, asr_dir.string().c_str(), "", "", "", 4096);
+
+    ALIA_EXPECT_EQ(rc, ALIA_ERR_MODEL_LOAD);
+    ALIA_EXPECT_TRUE(ctx == nullptr);
+
+    remove_temp_dir(asr_dir);
+}
+
+void test_model_slot_records_metadata_load_errors() {
+    aila::alia::RuntimeContext runtime;
+    aila::alia::ModelSlot slot;
+    slot.configure(aila::alia::ModelRole::Asr, "Z:/definitely/missing/alia/model",
+                   &runtime.foreground());
+
+    ALIA_EXPECT_TRUE(!slot.load_metadata());
+    ALIA_EXPECT_EQ(slot.state(), aila::alia::ModelSlotState::Failed);
+    ALIA_EXPECT_TRUE(slot.last_error().find("config.json") != std::string::npos);
+}
+
+void test_model_slot_load_model_fails_before_loaded_when_tokenizer_is_missing() {
+    auto asr_dir = make_temp_model_dir("asr_no_tokenizer", R"({"model_type":"qwen3_asr"})");
+
+    aila::alia::RuntimeContext runtime;
+    aila::alia::ModelSlot slot;
+    slot.configure(aila::alia::ModelRole::Asr, asr_dir.string(), &runtime.foreground());
+
+    ALIA_EXPECT_TRUE(!slot.load_model(2048));
+    ALIA_EXPECT_EQ(slot.state(), aila::alia::ModelSlotState::Failed);
+    ALIA_EXPECT_TRUE(slot.last_error().find("tokenizer") != std::string::npos ||
+                     slot.last_error().find("Tokenizer") != std::string::npos);
+    ALIA_EXPECT_TRUE(slot.backend() == nullptr);
+    ALIA_EXPECT_TRUE(slot.weights() == nullptr);
+
+    remove_temp_dir(asr_dir);
+}
+
+void test_model_slots_select_alia_backend_kinds_from_metadata() {
+    auto asr_dir = make_temp_model_dir("asr_nf4", R"({
+        "model_type":"qwen3_asr",
+        "quantization_config":{
+            "quant_method":"bitsandbytes",
+            "load_in_4bit":true,
+            "bnb_4bit_quant_type":"nf4",
+            "bnb_4bit_compute_dtype":"float16",
+            "bnb_4bit_quant_storage":"uint8"
+        }
+    })");
+    auto fg_dir = make_temp_model_dir("fg_nf4", qwen35_nf4_config());
+    auto bg_dir = make_temp_model_dir("bg_nf4", qwen35_nf4_config());
+    auto tts_dir = make_temp_model_dir("tts_dense", R"({"model_type":"qwen3_tts"})");
+
+    AliaContext ctx(4096);
+    ctx.asr_model_dir = asr_dir.string();
+    ctx.vlm_4b_model_dir = fg_dir.string();
+    ctx.vlm_0_8b_model_dir = bg_dir.string();
+    ctx.tts_model_dir = tts_dir.string();
+    ctx.configure_model_slots();
+
+    ALIA_EXPECT_TRUE(ctx.load_model_metadata());
+    ALIA_EXPECT_EQ(ctx.asr.backend_kind(), aila::alia::BackendKind::Qwen3AsrBnb4);
+    ALIA_EXPECT_EQ(ctx.foreground_vlm.backend_kind(), aila::alia::BackendKind::Qwen35HybridBnb4);
+    ALIA_EXPECT_EQ(ctx.background_vlm.backend_kind(), aila::alia::BackendKind::Qwen35HybridBnb4);
+    ALIA_EXPECT_EQ(ctx.tts.backend_kind(), aila::alia::BackendKind::Qwen3Tts);
+
+    remove_temp_dir(asr_dir);
+    remove_temp_dir(fg_dir);
+    remove_temp_dir(bg_dir);
+    remove_temp_dir(tts_dir);
+}
+
+}  // namespace
+
+int main() {
+    test_context_init_rejects_null_out_pointer();
+    test_context_init_and_destroy_allocates_handle_without_models();
+    test_context_init_rejects_non_positive_sequence_length();
+    test_runtime_functions_reject_null_context();
+    test_asr_feed_rejects_bad_audio_arguments();
+    test_asr_pipeline_owns_feed_and_reset_state();
+    test_asr_pipeline_reports_readiness_from_loaded_slot();
+    test_asr_pipeline_process_pending_is_safe_without_loaded_model();
+    test_asr_output_parser_extracts_language_and_text();
+    test_background_trigger_requires_registered_callback();
+    test_background_system_prompt_is_alia_json_extraction_prompt();
+    test_background_schema_accepts_valid_memory_result();
+    test_background_schema_repairs_malformed_json_with_required_key_names();
+    test_background_schema_repairs_wrong_required_field_types();
+    test_background_pipeline_invokes_callback_and_rejects_busy_trigger();
+    test_foreground_pipeline_rejects_second_turn_while_worker_is_running();
+    test_foreground_turn_rejects_invalid_generation_config();
+    test_vlm_rollback_requires_loaded_foreground_anchor();
+    test_foreground_turn_captures_asr_text_and_generation_config();
+    test_foreground_system_prompt_is_alia_specific();
+    test_foreground_tool_call_invokes_callback_and_keeps_spoken_text_native();
+    test_foreground_tool_result_is_promoted_to_resume_prompt_state();
+    test_foreground_spoken_text_is_streamed_to_tts_as_chunks();
+    test_foreground_abort_during_tts_chunk_stops_remaining_audio();
+    test_tts_pipeline_owns_text_queue_and_audio_callback();
+    test_runtime_context_creates_two_lanes_on_one_sycl_context();
+    test_runtime_context_lanes_can_allocate_and_copy_device_memory();
+    test_context_initializes_four_model_slots_on_expected_lanes();
+    test_context_init_fails_when_required_model_path_is_missing();
+    test_context_init_fails_when_model_assets_are_incomplete();
+    test_model_slot_records_metadata_load_errors();
+    test_model_slot_load_model_fails_before_loaded_when_tokenizer_is_missing();
+    test_model_slots_select_alia_backend_kinds_from_metadata();
+
+    if (failures != 0) {
+        std::cerr << failures << " Alia API test assertion(s) failed\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "Alia API tests passed\n";
+    return EXIT_SUCCESS;
+}

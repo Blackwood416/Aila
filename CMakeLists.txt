@@ -102,6 +102,14 @@ set(LIB_SOURCES
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
+    src/alia/RuntimeContext.cpp
+    src/alia/ModelSlot.cpp
+    src/alia/AliaAsrPipeline.cpp
+    src/alia/AliaTtsPipeline.cpp
+    src/alia/AliaForegroundPipeline.cpp
+    src/alia/AliaBackgroundPipeline.cpp
+    src/alia/AliaContext.cpp
+    src/alia/AliaApi.cpp
     src/lora/LoraLoader.cpp
     src/bench/Benchmark.cpp
 )
@@ -124,6 +132,10 @@ set(CHAT_TEST_SOURCES
     tests/chat/ThinkingBudgetControllerTests.cpp
     tests/chat/StructuredStreamParserTests.cpp
     tests/chat/ToolPolicyTests.cpp
+)
+
+set(ALIA_API_TEST_SOURCES
+    tests/alia/AliaApiTestMain.cpp
 )
 
 # Third-party
@@ -201,6 +213,18 @@ target_include_directories(AilaChatTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat
 )
 target_link_libraries(AilaChatTests PRIVATE simdjson)
+
+# ============================================================
+# Executable: AilaAliaApiTests
+# ============================================================
+add_executable(AilaAliaApiTests ${ALIA_API_TEST_SOURCES})
+target_compile_definitions(AilaAliaApiTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaApiTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/alia
+)
+target_link_libraries(AilaAliaApiTests PRIVATE AilaLib)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies

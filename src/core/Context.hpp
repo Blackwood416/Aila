@@ -7,17 +7,20 @@
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 // ============================================================
 // SYCL + oneDNN 运行时上下文
 // ============================================================
 class Context {
 public:
-    Context() {
-        q_ = sycl::queue{sycl::default_selector_v, sycl::property::queue::in_order()};
+    Context()
+        : Context(sycl::queue{sycl::default_selector_v, sycl::property::queue::in_order()}) {}
+
+    explicit Context(sycl::queue queue) {
+        q_ = std::move(queue);
         eng_ = dnnl::sycl_interop::make_engine(q_.get_device(), q_.get_context());
         stream_ = dnnl::sycl_interop::make_stream(eng_, q_);
-
     }
 
     sycl::queue& queue() { return q_; }

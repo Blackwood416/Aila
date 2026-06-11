@@ -1,0 +1,54 @@
+#include "AliaContext.hpp"
+
+AliaContext::AliaContext(int max_seq_len_in)
+    : max_seq_len(max_seq_len_in),
+      runtime(std::make_unique<aila::alia::RuntimeContext>()),
+      asr_pipeline(std::make_unique<aila::alia::AliaAsrPipeline>(&asr)),
+      tts_pipeline(std::make_unique<aila::alia::AliaTtsPipeline>(&tts)),
+      foreground_pipeline(std::make_unique<aila::alia::AliaForegroundPipeline>(
+          &foreground_vlm, tts_pipeline.get(), asr_pipeline.get())),
+      background_pipeline(std::make_unique<aila::alia::AliaBackgroundPipeline>(
+          &background_vlm)) {}
+
+void AliaContext::configure_model_slots() {
+    asr.configure(aila::alia::ModelRole::Asr, asr_model_dir, &runtime->foreground());
+    foreground_vlm.configure(aila::alia::ModelRole::ForegroundVlm, vlm_4b_model_dir,
+                             &runtime->foreground());
+    background_vlm.configure(aila::alia::ModelRole::BackgroundVlm, vlm_0_8b_model_dir,
+                             &runtime->background());
+    tts.configure(aila::alia::ModelRole::Tts, tts_model_dir, &runtime->foreground());
+}
+
+bool AliaContext::load_model_metadata() {
+    last_error.clear();
+
+    auto load_slot = [&](aila::alia::ModelSlot& slot) {
+        if (slot.load_metadata()) {
+            return true;
+        }
+        last_error = slot.last_error();
+        return false;
+    };
+
+    return load_slot(asr) &&
+           load_slot(foreground_vlm) &&
+           load_slot(background_vlm) &&
+           load_slot(tts);
+}
+
+bool AliaContext::load_model_slots() {
+    last_error.clear();
+
+    auto load_slot = [&](aila::alia::ModelSlot& slot) {
+        if (slot.load_model(max_seq_len)) {
+            return true;
+        }
+        last_error = slot.last_error();
+        return false;
+    };
+
+    return load_slot(asr) &&
+           load_slot(foreground_vlm) &&
+           load_slot(background_vlm) &&
+           load_slot(tts);
+}
