@@ -298,7 +298,9 @@ Reminder:
 {%- endfor %}
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
-    {%- if not ns_state.thinking %}
+    {%- if _has_tools and (_tool_choice == 'required' or _tool_choice == 'function') %}
+        {{- '<think>\n</think>\n' }}
+    {%- elif not ns_state.thinking %}
         {{- '<think>\n</think>\n' }}
     {%- elif ns2.consecutive_failures >= 2 %}
         {{- '<think>\n</think>\n' }}

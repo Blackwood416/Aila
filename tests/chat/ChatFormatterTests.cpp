@@ -98,6 +98,31 @@ void run_chat_formatter_tests() {
     AILA_CHAT_EXPECT_TRUE(
         tool_required_rendered.text.find("If you have gathered all necessary data and do not need to call a tool") ==
         std::string::npos);
+    const std::string forced_tool_suffix = "<|im_start|>assistant\n<think>\n</think>\n";
+    AILA_CHAT_EXPECT_TRUE(
+        tool_required_rendered.text.size() >= forced_tool_suffix.size() &&
+        tool_required_rendered.text.compare(
+            tool_required_rendered.text.size() - forced_tool_suffix.size(),
+            forced_tool_suffix.size(),
+            forced_tool_suffix) == 0);
+
+    ChatRequest tool_function_req = tool_none_req;
+    tool_function_req.tool_choice = ToolChoice::Function;
+    tool_function_req.tool_choice_function_name = "search";
+
+    ChatFormatInput tool_function_input = tool_none_input;
+    tool_function_input.request = &tool_function_req;
+
+    ChatFormatTextResult tool_function_rendered;
+    AILA_CHAT_EXPECT_TRUE(formatter.render_text(tool_function_input, true, tool_function_rendered, &error));
+    AILA_CHAT_EXPECT_TRUE(
+        tool_function_rendered.text.find("You MUST call the search tool.") != std::string::npos);
+    AILA_CHAT_EXPECT_TRUE(
+        tool_function_rendered.text.size() >= forced_tool_suffix.size() &&
+        tool_function_rendered.text.compare(
+            tool_function_rendered.text.size() - forced_tool_suffix.size(),
+            forced_tool_suffix.size(),
+            forced_tool_suffix) == 0);
 
     ChatRequest budget_zero_req;
     ChatMessage budget_user;
