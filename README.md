@@ -216,6 +216,9 @@ violations with `finish_reason: "tool_policy"`. Reasoning can be bounded with
 `reasoning_budget` / `--thinking-budget`. C API callers can use
 `aila_generate_chat_json_ex` and `aila_generate_chat_json_stream_ex` with
 `AilaGenConfigV2` for ABI-safe chat options.
+Streaming callers can use the final JSONL/C API event with
+`finish_reason: "tool_calls"` as the handoff point for executing tools and
+starting the next request.
 
 ### 🎤 TTS Voice Cloning
 

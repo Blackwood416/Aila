@@ -215,6 +215,8 @@ Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推�
 `reasoning_budget` / `--thinking-budget` 限制。C API 调用方可使用
 `aila_generate_chat_json_ex` 和 `aila_generate_chat_json_stream_ex` 搭配
 `AilaGenConfigV2` 获取 ABI-safe 的 chat 选项。
+流式调用方可以把带有 `finish_reason: "tool_calls"` 的 final JSONL / C API
+事件作为工具执行交接点，然后发起下一轮请求。
 
 ### 🎤 TTS 语音克隆
 

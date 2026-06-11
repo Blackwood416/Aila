@@ -180,6 +180,12 @@ Structured stream event types are:
 |------------|--------|---------|
 | `reasoning_delta` | `text` | Text from `<think>...</think>`. |
 | `content_delta` | `text` | Visible assistant content. |
-| `tool_call_delta` | `text` | Completed Qwen-style `<tool_call>...</tool_call>` block. |
+| `tool_call_delta` | `text`, `tool_call_id`, `tool_name`, `arguments_delta` | Completed Qwen-style tool-call block plus parsed call fields. |
 | `warning` | `text` or `warnings` | Policy/parser warning event when emitted. |
-| `final` | `finish_reason`, `warnings` | End-of-stream status and accumulated warnings. |
+| `final` | `finish_reason`, `warnings`, `tool_calls` | End-of-stream status, accumulated warnings, and canonical tool calls. |
+
+For caller-executed tools, treat the `final` event as the handoff point. When
+`finish_reason` is `"tool_calls"`, execute the returned `tool_calls`, append the
+assistant call plus `tool` results to `messages`, and start a second request.
+Aila does not execute tools internally and does not keep a stream open while
+waiting for tool results.

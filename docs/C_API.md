@@ -203,9 +203,9 @@ Structured chat streaming splits decoded assistant text into typed events:
 
 - `AILA_CHAT_STREAM_REASONING_DELTA` - text from `<think>...</think>`.
 - `AILA_CHAT_STREAM_CONTENT_DELTA` - visible assistant content.
-- `AILA_CHAT_STREAM_TOOL_CALL_DELTA` - a completed tool-call block.
+- `AILA_CHAT_STREAM_TOOL_CALL_DELTA` - a completed tool-call block with parsed call fields.
 - `AILA_CHAT_STREAM_WARNING` - warning event type for policy/parser warnings.
-- `AILA_CHAT_STREAM_FINAL` - final event with `finish_reason` and warnings.
+- `AILA_CHAT_STREAM_FINAL` - final event with `finish_reason`, warnings, and canonical tool calls when present.
 
 The current parser streams content/reasoning deltas as soon as marker boundaries
 are safe, while tool-call deltas are emitted once the closing `</tool_call>` tag
@@ -223,6 +223,7 @@ typedef struct AilaChatStreamEvent {
     const char* arguments_delta;
     const char* finish_reason;
     const char* warnings_json;
+    const char* tool_calls_json;
 } AilaChatStreamEvent;
 ```
 
@@ -231,9 +232,15 @@ are UTF-8, may be `NULL` when the field is not present, and are valid only for
 the duration of the callback. Copy any field that must outlive the callback.
 
 `text` carries reasoning/content deltas and, for current tool-call events, the
-completed Qwen-style `<tool_call>...</tool_call>` block. `finish_reason` and
-`warnings_json` are primarily set on the final event; `warnings_json` is a JSON
-array string when present.
+completed Qwen-style `<tool_call>...</tool_call>` block. Tool-call events also
+populate `tool_call_id`, `tool_name`, and `arguments_delta` when parsing
+succeeds. `finish_reason`, `warnings_json`, and `tool_calls_json` are primarily
+set on the final event; `warnings_json` is a JSON array string when present.
+`tool_calls_json` is a JSON array string on final events when parsed tool calls
+are present. Treat final events with `finish_reason == "tool_calls"` as the
+handoff point: execute tools externally, append the assistant call and `tool`
+results to `messages`, then start a second request. Aila does not execute tools
+internally or keep the stream open while waiting for tool results.
 
 #### `AilaChatStreamCallback`
 
