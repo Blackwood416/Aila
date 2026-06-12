@@ -159,11 +159,13 @@ public:
     explicit SessionCountingBackend(
         Context& ctx,
         int vocab_size = 3,
-        std::vector<std::vector<int>> generation_sequences = {{0}, {1}})
+        std::vector<std::vector<int>> generation_sequences = {{0}, {1}},
+        bool reset_on_truncate_failure = false)
         : logits_(Tensor::allocate(ctx, {vocab_size}, dnnl::memory::data_type::bf16)),
           generation_sequences_(std::move(generation_sequences)),
           vocab_size_(vocab_size),
-          fallback_token_id_(std::max(0, vocab_size - 1)) {}
+          fallback_token_id_(std::max(0, vocab_size - 1)),
+          reset_on_truncate_failure_(reset_on_truncate_failure) {}
 
     bool load(Context&,
               ModelWeights&,
@@ -199,6 +201,11 @@ public:
     }
 
     bool truncate_kv_cache(int new_len) override {
+        last_truncate_request_ = new_len;
+        if (reset_on_truncate_failure_) {
+            context_len_ = 0;
+            return false;
+        }
         context_len_ = new_len;
         return true;
     }
@@ -213,6 +220,7 @@ public:
     int prefill_length(size_t index) const {
         return index < prefill_lengths_.size() ? prefill_lengths_[index] : -1;
     }
+    int last_truncate_request() const { return last_truncate_request_; }
     const std::vector<int>& sampled_token_ids() const { return sampled_token_ids_; }
 
 private:
@@ -240,6 +248,8 @@ private:
     int reset_count_ = 0;
     int prefill_count_ = 0;
     int context_len_ = 0;
+    int last_truncate_request_ = -1;
+    bool reset_on_truncate_failure_ = false;
     std::vector<int> prefill_lengths_;
     std::vector<int> sampled_token_ids_;
 };
@@ -936,6 +946,55 @@ void test_vlm_rollback_requires_loaded_foreground_anchor() {
     ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(ctx, 1), ALIA_ERR_INVALID_STATE);
 
     alia_context_destroy(ctx);
+}
+
+void test_vlm_rollback_replays_prompt_when_backend_requires_reset() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    std::vector<std::string> normal_tokens{"first", "second", "unused"};
+    const int eos_token_id = static_cast<int>(normal_tokens.size()) + 3;
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_rollback_replay", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    auto backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->foreground(),
+        tokenizer->vocab_size(),
+        std::vector<std::vector<int>>{{0, 1, eos_token_id}},
+        true);
+    SessionCountingBackend* backend_observer = backend.get();
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    AliaGenConfig config{0.0f, 1.0f, 3};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, nullptr, nullptr),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    const int anchor_len = backend_observer->prefill_length(0);
+    ALIA_EXPECT_TRUE(anchor_len > 0);
+    ALIA_EXPECT_EQ(backend_observer->get_current_context_len(), anchor_len + 2);
+
+    ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(ctx, 99), ALIA_OK);
+    ALIA_EXPECT_EQ(backend_observer->last_truncate_request(), anchor_len);
+    ALIA_EXPECT_EQ(backend_observer->get_current_context_len(), anchor_len);
+    ALIA_EXPECT_EQ(backend_observer->prefill_count(), 2);
+    ALIA_EXPECT_EQ(backend_observer->prefill_length(1), anchor_len);
+    ALIA_EXPECT_EQ(alia_vlm_rollback_kv_cache(ctx, 1), ALIA_ERR_INVALID_STATE);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
 }
 
 void test_foreground_turn_captures_asr_text_and_generation_config() {
@@ -1667,6 +1726,7 @@ int main() {
     test_foreground_pipeline_rejects_second_turn_while_worker_is_running();
     test_foreground_turn_rejects_invalid_generation_config();
     test_vlm_rollback_requires_loaded_foreground_anchor();
+    test_vlm_rollback_replays_prompt_when_backend_requires_reset();
     test_foreground_turn_captures_asr_text_and_generation_config();
     test_foreground_system_prompt_is_alia_specific();
     test_foreground_tool_call_invokes_callback_and_keeps_spoken_text_native();

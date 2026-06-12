@@ -274,9 +274,13 @@ AliaErrorCode AliaForegroundPipeline::rollback_kv_cache(int rollback_tokens) {
     IModelBackend* backend = vlm_slot_->backend();
     const int current_len = backend->get_current_context_len();
     int anchor = 0;
+    std::vector<int> anchor_prompt_ids;
+    std::vector<int> generated_token_ids;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         anchor = generation_start_context_len_;
+        anchor_prompt_ids = generation_anchor_prompt_ids_;
+        generated_token_ids = generation_token_ids_;
     }
 
     int target_len = std::max(anchor, current_len - rollback_tokens);
@@ -284,13 +288,52 @@ AliaErrorCode AliaForegroundPipeline::rollback_kv_cache(int rollback_tokens) {
         target_len = current_len;
     }
 
-    if (!backend->truncate_kv_cache(target_len)) {
-        return ALIA_ERR_RUNTIME;
+    auto replay_to_target = [&](int replay_target_len) -> bool {
+        if (!vlm_slot_ || !vlm_slot_->context() || anchor_prompt_ids.empty()) {
+            return false;
+        }
+        const int replay_generated_count = replay_target_len - anchor;
+        if (replay_target_len < anchor ||
+            replay_generated_count < 0 ||
+            replay_generated_count > static_cast<int>(generated_token_ids.size())) {
+            return false;
+        }
+
+        Context* context = vlm_slot_->context();
+        backend->reset();
+
+        DeviceAllocation prompt_device(*context, anchor_prompt_ids.size() * sizeof(int));
+        context->memcpy_h2d(prompt_device.as<int>(), anchor_prompt_ids.data(),
+                            anchor_prompt_ids.size() * sizeof(int));
+        backend->forward(*context, prompt_device.as<int>(),
+                         static_cast<int>(anchor_prompt_ids.size()));
+
+        if (replay_generated_count > 0) {
+            DeviceAllocation token_device(*context, sizeof(int));
+            for (int i = 0; i < replay_generated_count; ++i) {
+                const int token_id = generated_token_ids[static_cast<size_t>(i)];
+                context->memcpy_h2d(token_device.as<int>(), &token_id, sizeof(int));
+                backend->forward(*context, token_device.as<int>(), 1);
+            }
+        }
+
+        return backend->get_current_context_len() == replay_target_len;
+    };
+
+    const bool truncated = backend->truncate_kv_cache(target_len);
+    const int truncated_len = backend->get_current_context_len();
+    if (!truncated || truncated_len != target_len) {
+        if (!replay_to_target(target_len)) {
+            return ALIA_ERR_RUNTIME;
+        }
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         last_generated_token_count_ = std::max(0, target_len - generation_start_context_len_);
+        if (static_cast<int>(generation_token_ids_.size()) > last_generated_token_count_) {
+            generation_token_ids_.resize(static_cast<size_t>(last_generated_token_count_));
+        }
     }
     return ALIA_OK;
 }
@@ -373,6 +416,8 @@ void AliaForegroundPipeline::run_turn(
             last_tool_resume_prompt_text_.clear();
             generation_start_context_len_ = -1;
             last_generated_token_count_ = 0;
+            generation_anchor_prompt_ids_.clear();
+            generation_token_ids_.clear();
             last_decode_mode_ = ForegroundDecodeMode::None;
             if (abort_requested_) {
                 state_ = ForegroundTurnState::Aborted;
@@ -557,6 +602,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         std::lock_guard<std::mutex> lock(mutex_);
         generation_start_context_len_ = backend->get_current_context_len();
         last_generated_token_count_ = 0;
+        generation_anchor_prompt_ids_ = prompt_ids;
+        generation_token_ids_.clear();
     }
 
     DeviceAllocation one_token_device(*context, sizeof(int));
@@ -633,8 +680,12 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         std::lock_guard<std::mutex> lock(mutex_);
         if (record_generation_anchor) {
             last_generated_token_count_ = static_cast<int>(generated_ids.size());
+            generation_token_ids_ = generated_ids;
         } else {
             last_generated_token_count_ += static_cast<int>(generated_ids.size());
+            generation_token_ids_.insert(generation_token_ids_.end(),
+                                         generated_ids.begin(),
+                                         generated_ids.end());
         }
     }
     last_error_.clear();

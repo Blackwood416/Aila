@@ -124,6 +124,11 @@ multi-pipeline runtime shape:
   no-op: positive rollbacks require a loaded foreground VLM generation anchor,
   and loaded backends are asked to truncate KV state through
   `IModelBackend::truncate_kv_cache`.
+- Foreground rollback now records the initial loaded-VLM prompt tokens and
+  generated token IDs from the anchored turn. If a backend cannot truncate
+  exactly, or restores an earlier checkpoint than requested, the pipeline resets
+  and replays the prompt plus the required generated-token prefix to restore the
+  requested context length before reporting rollback success.
 - Background processing now requires a registered result callback, records an
   Alia-specific JSON extraction prompt, reports whether it used no-model
   fallback or a loaded VLM slot, and has a real loaded background VLM decode
@@ -166,8 +171,7 @@ product work is concentrated in these areas:
   loaded TTS backend streaming path, and loaded VLM backend forward path, but
   hard latency guarantees still require timing tests with real assets.
 - Selective KV rollback still needs full Qwen3.5 Hybrid recurrent-state
-  snapshot/replay validation and exact generation-start restoration tests with
-  real model assets.
+  snapshot/replay validation with real model assets.
 - Computer Use, WGC texture injection, YOLO/SAM entity extraction, and related
   low-latency vision routing remain later-stage work.
 
@@ -185,9 +189,10 @@ Result:
 - `AilaShared.dll` was rebuilt and relinked after the foreground
   token-time tool-call pause, tool-result continuation-token resume,
   token-time foreground-to-TTS forwarding, foreground abort-state, rollback
-  state, loaded TTS backend streaming hook plus cancellation propagation, loaded
-  VLM backend forward cancellation propagation, and background VLM
-  prompt/type-level schema validation plus guided retry/diagnostic changes.
+  state plus prompt replay fallback, loaded TTS backend streaming hook plus
+  cancellation propagation, loaded VLM backend forward cancellation propagation,
+  and background VLM prompt/type-level schema validation plus guided
+  retry/diagnostic changes.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaAliaApiTests.exe"
@@ -205,7 +210,9 @@ Result:
   tests also cover a loaded TTS slot using the backend streaming hook rather
   than deterministic fallback audio, plus foreground abort propagation into a
   loaded TTS backend stream before any audio callback is emitted, and foreground
-  abort propagation into a loaded VLM backend `forward` call.
+  abort propagation into a loaded VLM backend `forward` call. Rollback coverage
+  includes backend reset fallback that replays the saved prompt to the
+  generation anchor.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaChatTests.exe"
@@ -239,9 +246,9 @@ git diff --check
 Result:
 
 - No whitespace errors were reported.
-- Git warned that the modified branch-status doc, foreground pipeline,
-  `IModelBackend`, Qwen3.5 Hybrid backend, and Alia API test file will be
-  converted from LF to CRLF the next time Git touches them.
+- Git warned that the modified branch-status doc, foreground pipeline files,
+  and Alia API test file will be converted from LF to CRLF the next time Git
+  touches them.
 
 ## Recommended Next Implementation Order
 
@@ -249,8 +256,8 @@ Result:
 2. Run model-asset smoke validation for Qwen3-TTS plus Mimi streaming output and
    calibrate the callback batch size against the PRD 100ms audio-chunk target.
 3. Add hard-interruption timing tests with real VLM/TTS assets.
-4. Expand selective KV rollback from backend truncation to Qwen3.5 Hybrid
-   recurrent-state snapshot/replay validation.
+4. Validate selective KV rollback against Qwen3.5 Hybrid recurrent-state
+   snapshots with real model assets.
 
 ## Review Notes
 

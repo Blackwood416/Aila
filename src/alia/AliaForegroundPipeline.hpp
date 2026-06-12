@@ -108,6 +108,8 @@ private:
     std::string last_tool_resume_prompt_text_;
     int generation_start_context_len_ = -1;
     int last_generated_token_count_ = 0;
+    std::vector<int> generation_anchor_prompt_ids_;
+    std::vector<int> generation_token_ids_;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;
 };
 
