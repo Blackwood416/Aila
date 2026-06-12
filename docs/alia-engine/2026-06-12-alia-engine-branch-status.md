@@ -170,6 +170,10 @@ multi-pipeline runtime shape:
   `qwen3.5-0.8B-bnb-nf4-offline`, and
   `Qwen3-TTS-12Hz-0.6B-Base`. The smoke enforces those model directory names by
   default and requires `--allow-non-target-models` for exploratory probes.
+- If the request WAV is missing, `AilaAliaRealSmoke` now uses the target
+  Qwen3-TTS slot to synthesize `--request-text` into that WAV path before
+  feeding the generated audio into ASR. This keeps the full-pipeline smoke
+  self-contained after `tmp/` cleanup.
 - `tools/alia/RunAliaTargetPipeline.ps1` is the branch-local verification
   entrypoint. It configures/builds `AliaEngine` with generic CLI, generic API,
   generic chat tests, and lightweight Alia API tests disabled, then runs the
@@ -183,6 +187,10 @@ multi-pipeline runtime shape:
 - Noisy TTS/Mimi debug tensor dumps, `mimi_output.wav` debug emission, and a
   Qwen3.5 debug load log were moved behind explicit debug-level logging or
   `AILA_TTS_DEBUG` / `AILA_TTS_DEBUG_WAV`.
+- Loaded background JSON gets a narrow post-validation cleanup pass for the
+  fixed flow: array values are deduplicated, one-shot completed hello requests
+  are removed from `memory_candidates` and `tasks`, and summaries that mistake
+  `Alia,` as the speaker are normalized back to `User`.
 - The deterministic no-model foreground response is now explicitly marked as
   `NoModelFallback` state for ABI/lightweight tests, not treated as normal
   model inference.
@@ -203,10 +211,9 @@ product work is concentrated in these areas:
   cadence/TTFT is still too slow for the PRD target and needs calibration.
   Host voice control inputs and real-asset cancellation timing proof remain.
 - Background processing has real 0.8B extraction smoke coverage, including
-  Markdown-fence normalization. The latest prompt tuning removed schema/prompt
-  echo from `memory_candidates` and `preferences` on the fixed smoke prompt, but
-  the 0.8B model still sometimes records already-completed one-shot requests as
-  `tasks`, so output quality still needs real-model iteration.
+  Markdown-fence normalization and a narrow cleanup pass for duplicate/completed
+  one-shot items. Broader memory quality should still be tuned with real
+  multi-turn prompts instead of API-only tests.
 - Abort handling is wired at the API, worker lifecycle, TTS callback boundary,
   loaded TTS backend streaming path, and loaded VLM backend forward path, but
   hard latency guarantees still require timing tests with real assets.
@@ -233,7 +240,9 @@ Result:
 - The default branch build rebuilt `AilaLib`, `AilaAliaRealSmoke`, and
   `AilaShared`; it did not build the generic CLI, generic chat tests, or the
   lightweight Alia API tests.
-- A follow-up rebuild after the TTS log cleanup completed without warnings.
+- After the build directory was reconfigured, a full rebuild completed. It still
+  reports unrelated pre-existing Jinja warnings from `src/templates/jinja`, but
+  the Alia/TTS changes compile cleanly.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; dumpbin /exports build\AilaShared.dll | Select-String 'alia_|aila_'"
@@ -254,7 +263,7 @@ Result:
 - No generic `aila_*` exports were present with `AILA_BUILD_GENERIC_API=OFF`.
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath tmp\alia-real-smoke\alia_autogen_request.wav -OutputWav tmp\alia-real-smoke\alia_full_pipeline_autogen.wav -LogPath tmp\alia-real-smoke\alia_full_pipeline_autogen.log
 ```
 
 Result:
@@ -265,21 +274,24 @@ Result:
   `qwen3.5-4B-bnb-nf4-offline-visiondense`, background
   `qwen3.5-0.8B-bnb-nf4-offline`, and TTS
   `Qwen3-TTS-12Hz-0.6B-Base`.
-- Model load time: `28276ms`.
-- ASR time: `1765ms`.
+- The request WAV was intentionally absent before the run. The smoke generated
+  it through the target TTS model:
+  `request_audio_generated=true`, callback count `8`, samples `90240`.
+- Model load time: `27236ms`.
+- ASR time: `1700ms`.
 - ASR partial text: `Alia, please say hello in one short sentence.`
-- Foreground time: `4956ms`.
+- Foreground time: `5015ms`.
 - Foreground decode mode: `LoadedVlm`.
 - Foreground assistant text: `Hello!`
-- TTS emitted `2` callbacks, first audio at `4716ms`, `21120` total samples,
+- TTS emitted `2` callbacks, first audio at `4767ms`, `21120` total samples,
   `21099` nonzero samples, chunk sizes `11520,9600`.
-- Background time: `795ms`.
+- Background time: `902ms`.
 - Background decode mode: `LoadedVlm`.
 - Background schema valid: `true`, retry count `0`, repair applied `false`.
-- Background JSON now avoids schema/prompt echo in `memory_candidates` and
-  `preferences`, but still records the completed greeting request as a task:
-  `"Alia should say hello in one short sentence."`
-- Full log: `tmp\alia-real-smoke\alia_full_pipeline_target_models.log`.
+- Background diagnostic: `initial background JSON accepted; post cleanup applied`.
+- Background JSON:
+  `{"summary":"User asked to say hello in one short sentence, and the assistant replied with 'Hello!'.","memory_candidates":[],"preferences":[],"tasks":[]}`
+- Full log: `tmp\alia-real-smoke\alia_full_pipeline_autogen.log`.
 
 4B rollback probe:
 
@@ -302,12 +314,12 @@ Result:
 
 ## Recommended Next Implementation Order
 
-1. Calibrate Qwen3-TTS callback cadence/TTFT against the PRD 100ms audio-chunk
+1. Add one more real-model flow smoke for a non-trivial user turn that should
+   produce a durable preference or unresolved task, so background cleanup is
+   proven on something richer than the hello request.
+2. Calibrate Qwen3-TTS callback cadence/TTFT against the PRD 100ms audio-chunk
    target. The fixed four-model smoke emits real audio, but first audio is still
    about `4.7s` after foreground turn start.
-2. Continue real-model background extraction tuning or add a narrow
-   post-validation cleanup pass so completed one-shot requests do not survive in
-   `tasks`.
 3. Add hard-interruption timing probes with the fixed 4B foreground and TTS
    assets.
 4. Investigate and fix the foreground 4B rollback crash before treating

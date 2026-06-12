@@ -27,11 +27,13 @@ struct Options {
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
     std::string output_wav = "tmp/alia-real-smoke/alia_full_pipeline_target_models.wav";
+    std::string request_text = "Alia, please say hello in one short sentence.";
     int max_seq_len = 2048;
     int max_tokens = 48;
     int timeout_sec = 1500;
     int rollback_tokens = 0;
     bool enforce_target_models = true;
+    bool generate_audio_if_missing = true;
 };
 
 struct AudioCapture {
@@ -74,10 +76,12 @@ void print_usage() {
         << "  --tts-model <dir>\n"
         << "  --audio <path>\n"
         << "  --output-wav <path>\n"
+        << "  --request-text <text>  default \"Alia, please say hello in one short sentence.\"\n"
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
         << "  --rollback-tokens <N>  default 0, set >0 for optional rollback probe\n"
+        << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
         << "  --allow-non-target-models\n";
 }
 
@@ -132,6 +136,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_value(opts.audio_path)) return false;
         } else if (arg == "--output-wav") {
             if (!require_value(opts.output_wav)) return false;
+        } else if (arg == "--request-text") {
+            if (!require_value(opts.request_text)) return false;
         } else if (arg == "--max-seq") {
             if (!require_int(opts.max_seq_len)) return false;
         } else if (arg == "--max-tokens") {
@@ -140,6 +146,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.timeout_sec)) return false;
         } else if (arg == "--rollback-tokens") {
             if (!require_int(opts.rollback_tokens)) return false;
+        } else if (arg == "--no-generate-audio") {
+            opts.generate_audio_if_missing = false;
         } else if (arg == "--allow-non-target-models") {
             opts.enforce_target_models = false;
         } else {
@@ -150,6 +158,10 @@ bool parse_args(int argc, char** argv, Options& opts) {
 
     if (opts.max_seq_len <= 0 || opts.max_tokens <= 0 || opts.timeout_sec <= 0) {
         std::cerr << "max-seq, max-tokens, and timeout-sec must be positive.\n";
+        return false;
+    }
+    if (opts.request_text.empty()) {
+        std::cerr << "request-text must not be empty.\n";
         return false;
     }
     return true;
@@ -320,6 +332,51 @@ bool save_capture_wav(const std::string& path, const std::vector<float>& samples
     return save_wav(path, samples, 24000);
 }
 
+bool generate_request_audio_with_target_tts(AliaContext& ctx, const Options& opts) {
+    if (!ctx.tts_pipeline || !ctx.tts_pipeline->ready()) {
+        std::cerr << "request_audio_generation_error=\"target TTS pipeline is not ready\"\n";
+        return false;
+    }
+
+    AliaGenConfig gen{};
+    gen.temperature = 0.6f;
+    gen.top_p = 0.9f;
+    gen.max_tokens = std::max(opts.max_tokens, 48);
+
+    AudioCapture capture;
+    capture.turn_start = Clock::now();
+    ctx.tts_pipeline->reset();
+    if (!ctx.tts_pipeline->enqueue_text(opts.request_text)) {
+        std::cerr << "request_audio_generation_error=\"request text enqueue failed\"\n";
+        return false;
+    }
+    if (!ctx.tts_pipeline->synthesize_pending(gen, audio_callback, &capture)) {
+        std::cerr << "request_audio_generation_error=\"target TTS synthesis failed\"\n";
+        return false;
+    }
+    ctx.tts_pipeline->reset();
+
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    if (capture.callback_count <= 0 || capture.nonzero_samples <= 0) {
+        std::cerr << "request_audio_generation_error=\"target TTS produced no usable audio\""
+                  << " callbacks=" << capture.callback_count
+                  << " nonzero_samples=" << capture.nonzero_samples << "\n";
+        return false;
+    }
+    if (!save_capture_wav(opts.audio_path, capture.samples)) {
+        std::cerr << "request_audio_save_failed=" << quote(opts.audio_path) << "\n";
+        return false;
+    }
+
+    std::cout << "request_audio_generated=true"
+              << " request_text=" << quote(opts.request_text)
+              << " output_path=" << quote(opts.audio_path)
+              << " callback_count=" << capture.callback_count
+              << " samples=" << capture.samples.size()
+              << "\n";
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -340,11 +397,13 @@ int main(int argc, char** argv) {
               << "foreground_model=" << quote(opts.foreground_model) << "\n"
               << "background_model=" << quote(opts.background_model) << "\n"
               << "tts_model=" << quote(opts.tts_model) << "\n"
+              << "request_text=" << quote(opts.request_text) << "\n"
               << "max_seq_len=" << opts.max_seq_len << "\n"
               << "max_tokens=" << opts.max_tokens << "\n";
 
-    std::vector<float> mono_16k;
-    if (!load_mono_16k_audio(opts.audio_path, mono_16k)) {
+    const bool audio_exists_before_load = std::filesystem::exists(opts.audio_path);
+    if (!audio_exists_before_load && !opts.generate_audio_if_missing) {
+        std::cerr << "audio_missing=" << quote(opts.audio_path) << "\n";
         return 1;
     }
 
@@ -367,6 +426,18 @@ int main(int argc, char** argv) {
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - load_start).count();
     std::cout << "model_load_ms=" << load_ms << "\n";
+
+    if (!audio_exists_before_load) {
+        std::cout << "request_audio_missing=true path=" << quote(opts.audio_path) << "\n";
+        if (!generate_request_audio_with_target_tts(*ctx, opts)) {
+            return 1;
+        }
+    }
+
+    std::vector<float> mono_16k;
+    if (!load_mono_16k_audio(opts.audio_path, mono_16k)) {
+        return 1;
+    }
 
     const auto asr_start = Clock::now();
     int rc = alia_asr_feed_audio(ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));

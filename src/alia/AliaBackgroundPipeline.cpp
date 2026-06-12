@@ -11,6 +11,8 @@
 #include <cctype>
 #include <exception>
 #include <sstream>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace aila::alia {
@@ -114,6 +116,8 @@ std::string build_background_extraction_prompt(const std::string& chat_turn_text
     std::string prompt;
     prompt += "Conversation turn text:\n";
     prompt += chat_turn_text;
+    prompt += "\n\nThe User line is spoken by the human. If that line starts ";
+    prompt += "with \"Alia,\" then Alia is being addressed; Alia is not the speaker.";
     prompt += "\n\nReturn exactly one JSON object with keys: ";
     prompt += "summary, memory_candidates, preferences, tasks.\n";
     prompt += "summary: one concise sentence about what happened in this turn.\n";
@@ -188,6 +192,151 @@ std::string normalize_background_model_json(const std::string& raw_result_json) 
     }
 
     return raw_result_json;
+}
+
+std::string lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool contains_ci(const std::string& haystack, const std::string& needle) {
+    return lower_ascii(haystack).find(lower_ascii(needle)) != std::string::npos;
+}
+
+std::string line_after_prefix(const std::string& text, const std::string& prefix) {
+    const size_t begin = text.find(prefix);
+    if (begin == std::string::npos) {
+        return "";
+    }
+    const size_t value_begin = begin + prefix.size();
+    const size_t value_end = text.find('\n', value_begin);
+    return trim(text.substr(value_begin, value_end == std::string::npos
+        ? std::string::npos
+        : value_end - value_begin));
+}
+
+std::string read_string_field(simdjson::dom::object object, const char* key) {
+    simdjson::dom::element element;
+    std::string_view value;
+    if (object.at_key(key).get(element) == simdjson::SUCCESS &&
+        element.get_string().get(value) == simdjson::SUCCESS) {
+        return std::string(value);
+    }
+    return "";
+}
+
+void append_unique_string(std::vector<std::string>& values,
+                          std::unordered_set<std::string>& seen,
+                          std::string value) {
+    value = trim(std::move(value));
+    if (value.empty()) {
+        return;
+    }
+    const std::string key = lower_ascii(value);
+    if (seen.insert(key).second) {
+        values.push_back(std::move(value));
+    }
+}
+
+std::vector<std::string> read_string_array(simdjson::dom::object object, const char* key) {
+    std::vector<std::string> values;
+    std::unordered_set<std::string> seen;
+    simdjson::dom::element element;
+    simdjson::dom::array array;
+    if (object.at_key(key).get(element) != simdjson::SUCCESS ||
+        element.get_array().get(array) != simdjson::SUCCESS) {
+        return values;
+    }
+
+    for (simdjson::dom::element item : array) {
+        std::string_view text;
+        if (item.get_string().get(text) == simdjson::SUCCESS) {
+            append_unique_string(values, seen, std::string(text));
+        }
+    }
+    return values;
+}
+
+bool is_completed_hello_request(const std::string& value,
+                                const std::string& user_text,
+                                const std::string& assistant_text) {
+    if (assistant_text.empty() || !contains_ci(assistant_text, "hello")) {
+        return false;
+    }
+    return contains_ci(value, "say hello") ||
+           contains_ci(user_text, "say hello") ||
+           contains_ci(user_text, "hello in one short sentence");
+}
+
+std::vector<std::string> remove_completed_one_shot_items(
+    const std::vector<std::string>& values,
+    const std::string& user_text,
+    const std::string& assistant_text) {
+    std::vector<std::string> filtered;
+    std::unordered_set<std::string> seen;
+    for (const std::string& value : values) {
+        if (is_completed_hello_request(value, user_text, assistant_text)) {
+            continue;
+        }
+        append_unique_string(filtered, seen, value);
+    }
+    return filtered;
+}
+
+std::string normalize_summary(std::string summary, const std::string& user_text) {
+    if (contains_ci(user_text, "alia,") && summary.rfind("Alia asked Alia", 0) == 0) {
+        summary.replace(0, std::string("Alia asked Alia").size(), "User asked Alia");
+    } else if (contains_ci(user_text, "alia,") && summary.rfind("Alia asked", 0) == 0) {
+        summary.replace(0, std::string("Alia").size(), "User");
+    }
+    return summary;
+}
+
+void append_json_string_array(std::ostringstream& out,
+                              const char* key,
+                              const std::vector<std::string>& values) {
+    out << ",\"" << key << "\":[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            out << ",";
+        }
+        out << "\"" << AliaBackgroundPipeline::json_escape(values[i]) << "\"";
+    }
+    out << "]";
+}
+
+std::string cleanup_background_result_json(const std::string& raw_result_json,
+                                           const std::string& chat_turn_text) {
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    if (parser.parse(raw_result_json).get(root) != simdjson::SUCCESS) {
+        return raw_result_json;
+    }
+
+    simdjson::dom::object object;
+    if (root.get_object().get(object) != simdjson::SUCCESS) {
+        return raw_result_json;
+    }
+
+    const std::string user_text = line_after_prefix(chat_turn_text, "User:");
+    const std::string assistant_text = line_after_prefix(chat_turn_text, "Assistant:");
+    const std::string summary = normalize_summary(
+        read_string_field(object, "summary"), user_text);
+    std::vector<std::string> memory_candidates = remove_completed_one_shot_items(
+        read_string_array(object, "memory_candidates"), user_text, assistant_text);
+    std::vector<std::string> preferences = read_string_array(object, "preferences");
+    std::vector<std::string> tasks = remove_completed_one_shot_items(
+        read_string_array(object, "tasks"), user_text, assistant_text);
+
+    std::ostringstream out;
+    out << "{\"summary\":\"" << AliaBackgroundPipeline::json_escape(summary) << "\"";
+    append_json_string_array(out, "memory_candidates", memory_candidates);
+    append_json_string_array(out, "preferences", preferences);
+    append_json_string_array(out, "tasks", tasks);
+    out << "}";
+    return out.str();
 }
 
 AliaBackgroundPipeline::AliaBackgroundPipeline(ModelSlot* slot)
@@ -364,6 +513,19 @@ void AliaBackgroundPipeline::run_job(
         }
         schema_repair_applied = !AliaBackgroundPipeline::has_required_schema_keys(result_json);
         result_json = enforce_background_result_schema(result_json, chat_turn_text);
+        if (decode_mode == BackgroundDecodeMode::LoadedVlm && !schema_repair_applied) {
+            const std::string cleaned_json =
+                cleanup_background_result_json(result_json, chat_turn_text);
+            if (cleaned_json != result_json &&
+                AliaBackgroundPipeline::has_required_schema_keys(cleaned_json)) {
+                result_json = cleaned_json;
+                if (!schema_diagnostic.empty()) {
+                    schema_diagnostic += "; post cleanup applied";
+                } else {
+                    schema_diagnostic = "post cleanup applied";
+                }
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
