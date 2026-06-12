@@ -138,6 +138,10 @@ set(ALIA_API_TEST_SOURCES
     tests/alia/AliaApiTestMain.cpp
 )
 
+set(ALIA_REAL_SMOKE_SOURCES
+    tools/alia/AliaRealModelSmoke.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -225,6 +229,17 @@ target_include_directories(AilaAliaApiTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/alia
 )
 target_link_libraries(AilaAliaApiTests PRIVATE AilaLib)
+
+# ============================================================
+# Executable: AilaAliaRealSmoke
+# ============================================================
+add_executable(AilaAliaRealSmoke ${ALIA_REAL_SMOKE_SOURCES})
+target_compile_definitions(AilaAliaRealSmoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaRealSmoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies

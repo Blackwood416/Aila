@@ -8,6 +8,7 @@
 #include "simdjson.h"
 
 #include <algorithm>
+#include <cctype>
 #include <exception>
 #include <sstream>
 #include <utility>
@@ -52,6 +53,49 @@ bool has_array_field(simdjson::dom::object object, const char* key) {
     simdjson::dom::array value;
     return object.at_key(key).get(element) == simdjson::SUCCESS &&
            element.get_array().get(value) == simdjson::SUCCESS;
+}
+
+std::vector<int> apply_alia_chat_template(
+    Tokenizer* tokenizer,
+    const std::string& system_prompt,
+    const std::string& user_message) {
+    std::vector<int> prompt_ids =
+        tokenizer->apply_chat_template(system_prompt, user_message);
+    const std::vector<int> closed_think_ids =
+        tokenizer->encode("<think>\n\n</think>\n\n");
+    prompt_ids.insert(prompt_ids.end(),
+                      closed_think_ids.begin(),
+                      closed_think_ids.end());
+    return prompt_ids;
+}
+
+std::string trim(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(0, 1);
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string strip_markdown_json_fence(const std::string& value) {
+    std::string trimmed = trim(value);
+    if (trimmed.rfind("```", 0) != 0) {
+        return trimmed;
+    }
+
+    const size_t first_newline = trimmed.find('\n');
+    if (first_newline == std::string::npos) {
+        return trimmed;
+    }
+
+    size_t body_begin = first_newline + 1;
+    size_t body_end = trimmed.rfind("```");
+    if (body_end == std::string::npos || body_end <= body_begin) {
+        body_end = trimmed.size();
+    }
+    return trim(trimmed.substr(body_begin, body_end - body_begin));
 }
 
 }  // namespace
@@ -109,6 +153,28 @@ std::string enforce_background_result_schema(const std::string& raw_result_json,
         "\"raw_model_output\":\"" + AliaBackgroundPipeline::json_escape(raw_result_json) + "\"," +
         "\"source\":\"schema_repair\"" +
         "}";
+}
+
+std::string normalize_background_model_json(const std::string& raw_result_json) {
+    if (AliaBackgroundPipeline::has_required_schema_keys(raw_result_json)) {
+        return raw_result_json;
+    }
+
+    const std::string unfenced = strip_markdown_json_fence(raw_result_json);
+    if (AliaBackgroundPipeline::has_required_schema_keys(unfenced)) {
+        return unfenced;
+    }
+
+    const size_t begin = unfenced.find('{');
+    const size_t end = unfenced.rfind('}');
+    if (begin != std::string::npos && end != std::string::npos && begin < end) {
+        const std::string object_candidate = unfenced.substr(begin, end - begin + 1);
+        if (AliaBackgroundPipeline::has_required_schema_keys(object_candidate)) {
+            return object_candidate;
+        }
+    }
+
+    return raw_result_json;
 }
 
 AliaBackgroundPipeline::AliaBackgroundPipeline(ModelSlot* slot)
@@ -247,6 +313,7 @@ void AliaBackgroundPipeline::run_job(
                 cv_.notify_all();
                 return;
             }
+            result_json = normalize_background_model_json(result_json);
             if (!AliaBackgroundPipeline::has_required_schema_keys(result_json)) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -271,7 +338,7 @@ void AliaBackgroundPipeline::run_job(
                     cv_.notify_all();
                     return;
                 }
-                result_json = std::move(repaired_json);
+                result_json = normalize_background_model_json(repaired_json);
                 schema_diagnostic = AliaBackgroundPipeline::has_required_schema_keys(result_json)
                     ? "retry accepted schema-valid background JSON"
                     : "retry failed schema validation; applying schema repair wrapper";
@@ -344,7 +411,7 @@ bool AliaBackgroundPipeline::generate_with_loaded_vlm(
     }
 
     std::vector<int> prompt_ids =
-        tokenizer->apply_chat_template(background_system_prompt(), prompt_text);
+        apply_alia_chat_template(tokenizer, background_system_prompt(), prompt_text);
     if (prompt_ids.empty()) {
         last_error_ = "background VLM prompt encoded to zero tokens";
         return false;

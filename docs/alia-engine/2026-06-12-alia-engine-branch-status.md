@@ -50,6 +50,7 @@ Build and test integration:
 
 - `CMakeLists.txt`
 - `tests/alia/AliaApiTestMain.cpp`
+- `tools/alia/AliaRealModelSmoke.cpp`
 - `src/core/Context.hpp`
 
 ## Implemented Foundation
@@ -142,10 +143,25 @@ multi-pipeline runtime shape:
   repair wrapping. If the first 0.8B output is malformed or has wrong required
   field types, the pipeline builds a repair prompt containing the invalid output
   and asks the loaded background slot for strict schema JSON again.
+- Loaded background VLM output now normalizes common real-model Markdown JSON
+  fences before schema validation. This allows strict JSON returned inside
+  Markdown code fences to be accepted without falling into the repair wrapper
+  path.
 - Background schema decisions are now recorded as native diagnostics: retry
   count, whether the final callback result used the schema-repair wrapper, and a
   short diagnostic string for initial acceptance, retry acceptance, or retry
   failure followed by repair wrapping.
+- Foreground and background Qwen3.5 prompts now append the same closed-think
+  prefix used by the general 0.8B chat path (`<think>...</think>`) instead of
+  relying on the lightweight `/no_think` suffix. Real 0.8B/4B runs showed that
+  the suffix path can emit only reasoning, malformed tool-call scaffolds, or
+  immediate EOS, while the closed-think prompt produces spoken content and
+  strict background JSON.
+- `AilaAliaRealSmoke` is a model-asset smoke executable for the Alia runtime.
+  It loads ASR, foreground VLM, background VLM, and TTS slots in one
+  `AliaContext`, feeds real audio, waits for async foreground/background work,
+  records ASR text, foreground response, TTS chunk timing/samples, background
+  JSON diagnostics, and writes the resulting TTS WAV.
 - The deterministic no-model foreground response is now explicitly marked as
   `NoModelFallback` state for ABI/lightweight tests, not treated as normal
   model inference.
@@ -161,17 +177,21 @@ product work is concentrated in these areas:
 
 - Foreground VLM generation still needs full multi-turn prompt/session
   ownership, deeper multi-tool continuation coverage with real model assets, and
-  async overlap between VLM decode and real TTS synthesis.
-- TTS still needs real model-asset smoke validation for Qwen3-TTS plus Mimi
-  streaming output, callback cadence/TTFT calibration, host voice control
-  inputs, and real-asset cancellation timing proof.
-- Background processing still needs model-asset smoke validation for real 0.8B
-  extraction output.
+  better async overlap between VLM decode and real TTS synthesis.
+- TTS has real Qwen3-TTS plus Mimi streaming smoke coverage, but callback
+  cadence/TTFT is still too slow for the PRD target and needs calibration.
+  Host voice control inputs and real-asset cancellation timing proof remain.
+- Background processing has real 0.8B extraction smoke coverage, including
+  Markdown-fence normalization, but schema quality still needs prompt tuning so
+  extracted `preferences` and `tasks` avoid echoing schema instructions.
 - Abort handling is wired at the API, worker lifecycle, TTS callback boundary,
   loaded TTS backend streaming path, and loaded VLM backend forward path, but
   hard latency guarantees still require timing tests with real assets.
-- Selective KV rollback still needs full Qwen3.5 Hybrid recurrent-state
-  snapshot/replay validation with real model assets.
+- Selective KV rollback is only partially validated with real assets. A
+  foreground 0.8B + background 0.8B smoke survived a one-token rollback, but a
+  foreground 4B + background 0.8B run crashed during subsequent background
+  generation after rollback. The same 4B full pipeline passes when rollback is
+  skipped, so rollback must remain a separate investigation item.
 - Computer Use, WGC texture injection, YOLO/SAM entity extraction, and related
   low-latency vision routing remain later-stage work.
 
@@ -240,6 +260,85 @@ Result:
 - `alia_vlm_rollback_kv_cache`
 
 ```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\smoke.ps1 -Preset phase_gate_q35_text -CaseNames q35_08_bnb_nf4_smoke -OutputDir tmp\alia-real-smoke\baseline-q35
+```
+
+Result:
+
+- Passed with `models/qwen3.5-0.8B-bnb-nf4-offline`, returning
+  `1+1 等于 2。`.
+- The run exercised the real Qwen3.5 Hybrid BnB4 backend and recurrent-state
+  replay path (`KV decode overrun ... replaying accepted tail`).
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\Aila.exe -m .\models\Qwen3-ASR-0.6B-BNB-NF4 --transcribe '.\This is an English test.wav' --forced-lang English --log-level info"
+```
+
+Result:
+
+- Passed with `This is an English test.` and `[Language] English`.
+- Reported `Audio: 2.1s`, `Latency: 1635ms`, `Speed: 1.3x`.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\Aila.exe -m .\models\Qwen3-TTS-12Hz-0.6B-Base --synthesize 'Hello from Alia real model smoke.' --output-wav .\tmp\alia-real-smoke\tts_base_smoke.wav --language english --log-level info --max-tokens 48 --stream-tts --stream-batch 6"
+```
+
+Result:
+
+- Passed. Qwen3-TTS Base and Mimi vocoder loaded successfully.
+- Streaming output was saved to
+  `tmp\alia-real-smoke\tts_base_smoke.wav` (`161324` bytes).
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command '. .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; $env:AILA_INIT_WARMUP="0"; .\build\Aila.exe -m .\models\Qwen3-TTS-12Hz-0.6B-Base --synthesize "Alia, please say hello in one short sentence." --output-wav .\tmp\alia-real-smoke\alia_request.wav --language english --log-level error --max-tokens 48'
+```
+
+Result:
+
+- Passed. This generated the real audio request used by the Alia full-pipeline
+  smoke (`tmp\alia-real-smoke\alia_request.wav`, `307244` bytes).
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command '. .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; $env:AILA_INIT_WARMUP="0"; $env:AILA_LOG_LEVEL="info"; .\build\AilaAliaRealSmoke.exe --asr-model .\models\Qwen3-ASR-0.6B-BNB-NF4 --foreground-model .\models\qwen3.5-0.8B-bnb-nf4-offline --background-model .\models\qwen3.5-0.8B-bnb-nf4-offline --tts-model .\models\Qwen3-TTS-12Hz-0.6B-Base --audio ".\tmp\alia-real-smoke\alia_request.wav" --output-wav .\tmp\alia-real-smoke\alia_full_pipeline_0p8.wav --max-seq 2048 --max-tokens 48 --timeout-sec 900'
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- ASR partial text: `Alia, please say hello in one short sentence.`
+- Foreground decode mode: `LoadedVlm`
+- Foreground assistant text:
+  `Hello! I'm Alia, and I'm here to help you with your needs.`
+- TTS emitted `9` callbacks, first audio at about `4149ms`, `99840` total
+  samples, `99425` nonzero samples.
+- Background decode mode: `LoadedVlm`
+- Background schema valid: `true`, retry count `0`, repair applied `false`.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command '. .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; $env:AILA_INIT_WARMUP="0"; $env:AILA_LOG_LEVEL="info"; .\build\AilaAliaRealSmoke.exe --asr-model .\models\Qwen3-ASR-0.6B-BNB-NF4 --foreground-model .\models\qwen3.5-4B-bnb-nf4-offline --background-model .\models\qwen3.5-0.8B-bnb-nf4-offline --tts-model .\models\Qwen3-TTS-12Hz-0.6B-Base --audio ".\tmp\alia-real-smoke\alia_request.wav" --output-wav .\tmp\alia-real-smoke\alia_full_pipeline_4b_no_rollback.wav --max-seq 2048 --max-tokens 48 --timeout-sec 1200 --rollback-tokens 0'
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- ASR partial text: `Alia, please say hello in one short sentence.`
+- Foreground 4B decode mode: `LoadedVlm`
+- Foreground assistant text: `Hello!`
+- TTS emitted `2` callbacks, first audio at about `4339ms`, `21120` total
+  samples, `21099` nonzero samples.
+- Background 0.8B decode mode: `LoadedVlm`
+- Background schema valid: `true`, retry count `0`, repair applied `false`.
+
+4B rollback probe:
+
+- The same 4B full-pipeline command with an explicit rollback probe
+  (`--rollback-tokens 1`) completed ASR, foreground 4B, TTS, and rollback, then
+  crashed with access violation while background 0.8B generation was starting.
+- The successful `--rollback-tokens 0` run above isolates this as a
+  rollback-after-4B issue, not a general 4B full-pipeline load or generation
+  issue.
+
+```powershell
 git diff --check
 ```
 
@@ -252,12 +351,16 @@ Result:
 
 ## Recommended Next Implementation Order
 
-1. Add model-asset smoke validation for background 0.8B JSON extraction output.
-2. Run model-asset smoke validation for Qwen3-TTS plus Mimi streaming output and
-   calibrate the callback batch size against the PRD 100ms audio-chunk target.
+1. Investigate and fix the foreground 4B rollback crash before treating
+   `alia_vlm_rollback_kv_cache` as production-ready with Qwen3.5 Hybrid 4B.
+2. Calibrate Qwen3-TTS callback cadence/TTFT against the PRD 100ms audio-chunk
+   target; the current full-pipeline smoke emits real audio but first audio is
+   still roughly 4.1-4.3s after foreground turn start.
 3. Add hard-interruption timing tests with real VLM/TTS assets.
-4. Validate selective KV rollback against Qwen3.5 Hybrid recurrent-state
-   snapshots with real model assets.
+4. Improve background extraction prompt quality so `preferences` and `tasks`
+   contain user/product facts instead of schema-task echoes.
+5. Expand real full-pipeline smoke to multi-turn and tool-result continuation
+   once the voice path stays stable.
 
 ## Review Notes
 

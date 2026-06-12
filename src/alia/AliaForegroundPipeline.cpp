@@ -107,6 +107,20 @@ bool is_tts_chunk_boundary(char ch) {
     return ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n';
 }
 
+std::vector<int> apply_alia_chat_template(
+    Tokenizer* tokenizer,
+    const std::string& system_prompt,
+    const std::string& user_message) {
+    std::vector<int> prompt_ids =
+        tokenizer->apply_chat_template(system_prompt, user_message);
+    const std::vector<int> closed_think_ids =
+        tokenizer->encode("<think>\n\n</think>\n\n");
+    prompt_ids.insert(prompt_ids.end(),
+                      closed_think_ids.begin(),
+                      closed_think_ids.end());
+    return prompt_ids;
+}
+
 std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) {
     size_t cutoff = std::string::npos;
     if (force) {
@@ -134,8 +148,10 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) 
 std::string foreground_system_prompt() {
     return "You are Alia, a local companion running inside the native Aila "
            "engine. Answer with concise spoken text for real-time voice "
-           "interaction. When an external action is required, emit a compact "
-           "JSON tool call and wait for the host tool result before continuing.";
+           "interaction. Do not answer in JSON, Markdown code fences, or "
+           "schemas. No host tools are available unless the user message "
+           "explicitly provides a tool request, so ordinary turns must be "
+           "answered as natural language only.";
 }
 
 std::vector<std::string> split_spoken_text_for_tts(const std::string& text) {
@@ -560,7 +576,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         ? "Continue the current conversation."
         : user_text;
     std::vector<int> prompt_ids = use_chat_template
-        ? tokenizer->apply_chat_template(foreground_system_prompt(), prompt_text)
+        ? apply_alia_chat_template(tokenizer, foreground_system_prompt(), prompt_text)
         : tokenizer->encode(prompt_text);
     if (prompt_ids.empty()) {
         last_error_ = use_chat_template
