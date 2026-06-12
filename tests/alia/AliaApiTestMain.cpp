@@ -244,6 +244,86 @@ private:
     std::vector<int> sampled_token_ids_;
 };
 
+class CancellableForwardBackend final : public IModelBackend {
+public:
+    explicit CancellableForwardBackend(Context& ctx)
+        : logits_(Tensor::allocate(ctx, {3}, dnnl::memory::data_type::bf16)) {}
+
+    bool load(Context&,
+              ModelWeights&,
+              const ModelSpec&,
+              int,
+              std::string*) override {
+        return true;
+    }
+
+    Tensor& forward(Context& ctx, const int*, int seq_len) override {
+        context_len_ += seq_len;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            forward_call_count_++;
+            entered_ = true;
+        }
+        cv_.notify_all();
+
+        for (int i = 0; i < 200; ++i) {
+            if (cancellation_requested()) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    observed_cancel_ = true;
+                }
+                cv_.notify_all();
+                throw_if_cancelled();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        using Bf16 = sycl::ext::oneapi::bfloat16;
+        std::vector<Bf16> host_logits{Bf16(100.0f), Bf16(-100.0f), Bf16(-100.0f)};
+        ctx.memcpy_h2d(logits_.data(), host_logits.data(),
+                       host_logits.size() * sizeof(Bf16));
+        return logits_;
+    }
+
+    void reset() override {
+        context_len_ = 0;
+    }
+
+    bool truncate_kv_cache(int new_len) override {
+        context_len_ = new_len;
+        return true;
+    }
+
+    int get_current_context_len() const override { return context_len_; }
+    int max_seq_len() const override { return 4096; }
+    int vocab_size() const override { return 3; }
+    ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+
+    bool wait_until_entered_for(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&]() { return entered_; });
+    }
+
+    bool observed_cancel() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return observed_cancel_;
+    }
+
+    int forward_call_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return forward_call_count_;
+    }
+
+private:
+    Tensor logits_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool observed_cancel_ = false;
+    int forward_call_count_ = 0;
+    int context_len_ = 0;
+};
+
 class StreamingTtsBackend final : public IModelBackend {
 public:
     explicit StreamingTtsBackend(Context& ctx)
@@ -1366,6 +1446,47 @@ void test_foreground_abort_cancels_loaded_tts_backend_stream() {
     remove_temp_dir(tts_tokenizer_dir);
 }
 
+void test_foreground_abort_cancels_loaded_vlm_backend_forward() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    std::vector<std::string> tokens{"hello", "unused"};
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_abort_vlm_forward", tokens);
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+
+    auto backend = std::make_unique<CancellableForwardBackend>(ctx->runtime->foreground());
+    CancellableForwardBackend* backend_observer = backend.get();
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    AliaGenConfig config{0.0f, 1.0f, 4};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, nullptr, nullptr),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(backend_observer->wait_until_entered_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(alia_abort_inference(ctx, ALIA_PIPELINE_ALL), ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(backend_observer->forward_call_count(), 1);
+    ALIA_EXPECT_TRUE(backend_observer->observed_cancel());
+    ALIA_EXPECT_EQ(ctx->foreground_pipeline->state(),
+                   aila::alia::ForegroundTurnState::Aborted);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
 void test_runtime_context_creates_two_lanes_on_one_sycl_context() {
     aila::alia::RuntimeContext runtime;
 
@@ -1558,6 +1679,7 @@ int main() {
     test_tts_pipeline_owns_text_queue_and_audio_callback();
     test_tts_pipeline_uses_loaded_backend_streaming_path();
     test_foreground_abort_cancels_loaded_tts_backend_stream();
+    test_foreground_abort_cancels_loaded_vlm_backend_forward();
     test_runtime_context_creates_two_lanes_on_one_sycl_context();
     test_runtime_context_lanes_can_allocate_and_copy_device_memory();
     test_context_initializes_four_model_slots_on_expected_lanes();

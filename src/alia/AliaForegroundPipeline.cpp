@@ -15,6 +15,7 @@
 #include <exception>
 #include <cstring>
 #include <cctype>
+#include <functional>
 #include <vector>
 
 namespace aila::alia {
@@ -43,6 +44,28 @@ public:
 private:
     Context* ctx_ = nullptr;
     void* ptr_ = nullptr;
+};
+
+class BackendCancellationScope {
+public:
+    BackendCancellationScope(IModelBackend* backend, std::function<bool()> should_cancel)
+        : backend_(backend) {
+        if (backend_) {
+            backend_->set_cancellation_checker(std::move(should_cancel));
+        }
+    }
+
+    ~BackendCancellationScope() {
+        if (backend_) {
+            backend_->set_cancellation_checker({});
+        }
+    }
+
+    BackendCancellationScope(const BackendCancellationScope&) = delete;
+    BackendCancellationScope& operator=(const BackendCancellationScope&) = delete;
+
+private:
+    IModelBackend* backend_ = nullptr;
 };
 
 AliaGenConfig default_alia_generation_config() {
@@ -432,6 +455,14 @@ void AliaForegroundPipeline::run_turn(
             state_ = abort_requested_ ? ForegroundTurnState::Aborted
                                       : ForegroundTurnState::Completed;
         }
+    } catch (const ModelBackendCancelled&) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (abort_requested_) {
+            state_ = ForegroundTurnState::Aborted;
+        } else {
+            last_error_ = "foreground VLM backend cancelled without an abort request";
+            state_ = ForegroundTurnState::Failed;
+        }
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = e.what();
@@ -476,6 +507,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         last_error_ = "foreground VLM slot is incomplete";
         return false;
     }
+    BackendCancellationScope cancellation_scope(
+        backend,
+        [this]() { return abort_requested(); });
 
     const std::string prompt_text = user_text.empty()
         ? "Continue the current conversation."

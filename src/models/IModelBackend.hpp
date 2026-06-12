@@ -6,9 +6,17 @@
 #include "../lora/LoraLoader.hpp"
 #include "engine/Types.hpp"
 #include <functional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <sycl/sycl.hpp>
+
+class ModelBackendCancelled final : public std::runtime_error {
+public:
+    ModelBackendCancelled()
+        : std::runtime_error("model backend inference cancelled") {}
+};
 
 class IModelBackend {
 public:
@@ -34,6 +42,10 @@ public:
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;
+
+    virtual void set_cancellation_checker(std::function<bool()> should_cancel) {
+        cancellation_checker_ = std::move(should_cancel);
+    }
 
     virtual bool synthesize_tts_stream(
         Context& ctx,
@@ -77,5 +89,18 @@ public:
         (void)text_pos_delta;
     }
     virtual void clear_mrope_positions() {}
-};
 
+protected:
+    bool cancellation_requested() const {
+        return cancellation_checker_ && cancellation_checker_();
+    }
+
+    void throw_if_cancelled() const {
+        if (cancellation_requested()) {
+            throw ModelBackendCancelled();
+        }
+    }
+
+private:
+    std::function<bool()> cancellation_checker_;
+};

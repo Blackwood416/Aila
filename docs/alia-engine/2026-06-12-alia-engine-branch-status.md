@@ -114,6 +114,12 @@ multi-pipeline runtime shape:
   foreground generation passes `abort_requested()`, and `Qwen3TTSBackend`
   checks cancellation during codec generation and between Mimi streaming
   batches so long synthesis work can unwind before emitting fallback audio.
+- Foreground abort is now propagated into loaded VLM backend `forward` calls.
+  `IModelBackend` exposes a cancellation checker plus `ModelBackendCancelled`,
+  `AliaForegroundPipeline` installs `abort_requested()` while a loaded VLM turn
+  is active, and `Qwen35HybridBnb4Backend` checks cancellation at forward entry,
+  layer boundaries, before LM head projection, and before recurrent-state
+  snapshots.
 - `alia_vlm_rollback_kv_cache` now has stateful behavior instead of acting as a
   no-op: positive rollbacks require a loaded foreground VLM generation anchor,
   and loaded backends are asked to truncate KV state through
@@ -157,8 +163,8 @@ product work is concentrated in these areas:
 - Background processing still needs model-asset smoke validation for real 0.8B
   extraction output.
 - Abort handling is wired at the API, worker lifecycle, TTS callback boundary,
-  and loaded TTS backend streaming path, but hard latency guarantees still
-  require VLM model-step cancellation checks and timing tests with real assets.
+  loaded TTS backend streaming path, and loaded VLM backend forward path, but
+  hard latency guarantees still require timing tests with real assets.
 - Selective KV rollback still needs full Qwen3.5 Hybrid recurrent-state
   snapshot/replay validation and exact generation-start restoration tests with
   real model assets.
@@ -179,9 +185,9 @@ Result:
 - `AilaShared.dll` was rebuilt and relinked after the foreground
   token-time tool-call pause, tool-result continuation-token resume,
   token-time foreground-to-TTS forwarding, foreground abort-state, rollback
-  state, loaded TTS backend streaming hook plus cancellation propagation, and
-  background VLM prompt/type-level schema validation plus guided
-  retry/diagnostic changes.
+  state, loaded TTS backend streaming hook plus cancellation propagation, loaded
+  VLM backend forward cancellation propagation, and background VLM
+  prompt/type-level schema validation plus guided retry/diagnostic changes.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaAliaApiTests.exe"
@@ -198,7 +204,8 @@ Result:
   spoken sentence reaches TTS before later assistant tokens are sampled. The
   tests also cover a loaded TTS slot using the backend streaming hook rather
   than deterministic fallback audio, plus foreground abort propagation into a
-  loaded TTS backend stream before any audio callback is emitted.
+  loaded TTS backend stream before any audio callback is emitted, and foreground
+  abort propagation into a loaded VLM backend `forward` call.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaChatTests.exe"
@@ -232,16 +239,16 @@ git diff --check
 Result:
 
 - No whitespace errors were reported.
-- Git warned that the modified branch-status doc, foreground/TTS
-  pipeline/backend files, and Alia API test file will be converted from LF to
-  CRLF the next time Git touches them.
+- Git warned that the modified branch-status doc, foreground pipeline,
+  `IModelBackend`, Qwen3.5 Hybrid backend, and Alia API test file will be
+  converted from LF to CRLF the next time Git touches them.
 
 ## Recommended Next Implementation Order
 
 1. Add model-asset smoke validation for background 0.8B JSON extraction output.
 2. Run model-asset smoke validation for Qwen3-TTS plus Mimi streaming output and
    calibrate the callback batch size against the PRD 100ms audio-chunk target.
-3. Add VLM model-step cancellation checks and hard-interruption timing tests.
+3. Add hard-interruption timing tests with real VLM/TTS assets.
 4. Expand selective KV rollback from backend truncation to Qwen3.5 Hybrid
    recurrent-state snapshot/replay validation.
 

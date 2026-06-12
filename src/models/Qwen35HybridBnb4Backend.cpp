@@ -1747,6 +1747,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
     if (seq_len <= 0) {
         throw std::runtime_error("Qwen35HybridBnb4Backend::forward: seq_len must be positive");
     }
+    throw_if_cancelled();
     static const bool s_profile_decode = aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
     static const bool s_profile_prefill = aila::env::read_flag("AILA_PROFILE_Q35_PREFILL", false);
     static const int s_decode_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
@@ -1857,6 +1858,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
     }
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+        throw_if_cancelled();
         auto& layer = layers_[i];
         auto& cache = layer_caches_[i];
         int dbg_row = seq_len - 1;
@@ -2254,6 +2256,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
+    throw_if_cancelled();
     time_stage(ProfileStage::LmHead, [&] {
         if (seq_len > 1) {
             if (current_len_ > 0 && seq_len <= 16) {
@@ -2351,6 +2354,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
+    throw_if_cancelled();
     // Take sparse snapshots of DeltaNet recurrent states
     if (use_delta_linear_) {
         int step = aila::env::g_q35_prefill_step_override;
