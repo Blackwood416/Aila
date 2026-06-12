@@ -41,12 +41,14 @@ public:
         const GenerationConfig& gen_config,
         int stream_batch_frames,
         std::function<void(const std::vector<float>&)> audio_callback,
-        std::string* error_message = nullptr) {
+        std::string* error_message = nullptr,
+        std::function<bool()> should_cancel = {}) {
         (void)ctx;
         (void)text_tokens;
         (void)gen_config;
         (void)stream_batch_frames;
         (void)audio_callback;
+        (void)should_cancel;
         if (error_message) {
             *error_message = "backend does not support TTS streaming";
         }

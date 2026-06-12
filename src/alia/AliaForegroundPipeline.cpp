@@ -539,7 +539,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 return;
             }
             if (tts_pipeline_->enqueue_text(chunk)) {
-                tts_pipeline_->synthesize_pending(*tts_config, audio_cb, user_data);
+                tts_pipeline_->synthesize_pending(
+                    *tts_config,
+                    audio_cb,
+                    user_data,
+                    [this]() { return abort_requested(); });
             }
         }
     };
@@ -684,7 +688,11 @@ void AliaForegroundPipeline::synthesize_spoken_text(
             break;
         }
         if (tts_pipeline_->enqueue_text(chunk)) {
-            tts_pipeline_->synthesize_pending(config, audio_cb, user_data);
+            tts_pipeline_->synthesize_pending(
+                config,
+                audio_cb,
+                user_data,
+                [this]() { return abort_requested(); });
         }
     }
 }

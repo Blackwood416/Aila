@@ -52,11 +52,15 @@ bool AliaTtsPipeline::enqueue_text(std::string text) {
 
 bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
                                          AliaAudioCallback audio_cb,
-                                         void* user_data) {
-    (void)config;
+                                         void* user_data,
+                                         std::function<bool()> should_cancel) {
     if (!audio_cb) {
         return false;
     }
+
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
 
     std::deque<std::string> pending;
     {
@@ -69,6 +73,10 @@ bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
     }
 
     for (const auto& text : pending) {
+        if (cancelled()) {
+            break;
+        }
+
         bool used_backend_audio = false;
         if (ready()) {
             Context* context = slot_->context();
@@ -88,12 +96,20 @@ bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
                         if (samples.empty()) {
                             return;
                         }
+                        if (cancelled()) {
+                            return;
+                        }
                         emitted_backend_audio = true;
                         audio_cb(samples.data(), static_cast<int>(samples.size()), user_data);
                     },
-                    &backend_error);
+                    &backend_error,
+                    should_cancel);
                 used_backend_audio = used_backend_audio || emitted_backend_audio;
             }
+        }
+
+        if (cancelled()) {
+            break;
         }
 
         if (!used_backend_audio) {

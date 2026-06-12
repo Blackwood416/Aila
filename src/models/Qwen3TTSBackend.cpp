@@ -452,9 +452,16 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        int language_id,
                                        const GenerationConfig& gen_config,
                                        std::vector<int32_t>& out_codes,
-                                       int& out_n_frames) {
+                                       int& out_n_frames,
+                                       std::function<bool()> should_cancel) {
     out_codes.clear();
     out_n_frames = 0;
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return false;
+    }
 
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
 
@@ -849,6 +856,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     out_codes.reserve(max_tokens * 16);
 
     while (gen_step < max_tokens) {
+        if (cancelled()) {
+            return false;
+        }
         if (token == eos_id) {
             break;
         }
@@ -893,6 +903,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         if (rotary_dim_pred & 1) --rotary_dim_pred;
 
         for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
+            if (cancelled()) {
+                return false;
+            }
             auto& L = predictor_layers_[i];
             L.qkv_proj.forward(ctx, p_buf_.normed, p_buf_.qkv, 2);
             ops::split_qkv(ctx, p_buf_.qkv, p_buf_.q, p_buf_.k, p_buf_.v, 2, QD_pred, KVD_pred);
@@ -940,6 +953,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
         // --- Predictor Decode loop (step 2 to 15, i.e., cb_idx = 1 to 14) ---
         for (int cb_idx = 1; cb_idx < 15; cb_idx++) {
+            if (cancelled()) {
+                return false;
+            }
             Tensor tok_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
             ctx.memcpy_h2d(tok_dev.data(), &tok, sizeof(int));
             Tensor emb_h = Tensor::allocate(ctx, {1, H_talker});
@@ -962,6 +978,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
             // Forward layers with decode path (seq_len = 1)
             for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
+                if (cancelled()) {
+                    return false;
+                }
                 auto& L = predictor_layers_[i];
                 L.qkv_proj.forward(ctx, step_normed, p_buf_.qkv, 1);
 
@@ -1075,6 +1094,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         int current_pos = current_talker_len_;
 
         for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
+            if (cancelled()) {
+                return false;
+            }
             auto& L = talker_layers_[i];
             L.qkv_proj.forward(ctx, step_normed_talker, t_buf_.qkv, 1);
 
@@ -1145,14 +1167,24 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     int language_id,
     const GenerationConfig& gen_config,
     int stream_batch_frames,
-    AudioChunkCallback audio_callback) {
+    AudioChunkCallback audio_callback,
+    std::function<bool()> should_cancel) {
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return false;
+    }
 
     // 1. Generate all codec tokens (existing blocking call)
     std::vector<int32_t> all_codes;
     int total_frames = 0;
     if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
                            instruct_tokens, language_id, gen_config,
-                           all_codes, total_frames)) {
+                           all_codes, total_frames, should_cancel)) {
+        return false;
+    }
+    if (cancelled()) {
         return false;
     }
 
@@ -1165,6 +1197,9 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     // 3. Feed codes in batches to incremental decoder
     int batch_size = stream_batch_frames;
     for (int offset = 0; offset < total_frames; offset += batch_size) {
+        if (cancelled()) {
+            return false;
+        }
         int batch_frames = std::min(batch_size, total_frames - offset);
 
         // Extract batch codes: [batch_frames, 16]
@@ -1181,14 +1216,23 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
             return false;
         }
         if (!audio_chunk.empty()) {
+            if (cancelled()) {
+                return false;
+            }
             audio_callback(audio_chunk);
         }
     }
 
     // 4. Flush
+    if (cancelled()) {
+        return false;
+    }
     std::vector<float> flush_samples;
     decode_mimi_flush(ctx, mimi_state, flush_samples);
     if (!flush_samples.empty()) {
+        if (cancelled()) {
+            return false;
+        }
         audio_callback(flush_samples);
     }
 
@@ -1201,7 +1245,8 @@ bool Qwen3TTSBackend::synthesize_tts_stream(
     const GenerationConfig& gen_config,
     int stream_batch_frames,
     std::function<void(const std::vector<float>&)> audio_callback,
-    std::string* error_message) {
+    std::string* error_message,
+    std::function<bool()> should_cancel) {
     if (text_tokens.empty()) {
         if (error_message) {
             *error_message = "TTS text encoded to zero tokens";
@@ -1214,12 +1259,21 @@ bool Qwen3TTSBackend::synthesize_tts_stream(
         }
         return false;
     }
+    if (should_cancel && should_cancel()) {
+        if (error_message) {
+            *error_message = "Qwen3-TTS streaming synthesis cancelled";
+        }
+        return false;
+    }
 
     const int batch_frames = std::max(1, stream_batch_frames);
     if (!synthesize_codes_stream(ctx, text_tokens, {}, 0, {}, 0, gen_config,
-                                 batch_frames, std::move(audio_callback))) {
+                                 batch_frames, std::move(audio_callback),
+                                 should_cancel)) {
         if (error_message) {
-            *error_message = "Qwen3-TTS streaming synthesis failed";
+            *error_message = (should_cancel && should_cancel())
+                ? "Qwen3-TTS streaming synthesis cancelled"
+                : "Qwen3-TTS streaming synthesis failed";
         }
         return false;
     }

@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -277,7 +278,11 @@ public:
                                const GenerationConfig& gen_config,
                                int stream_batch_frames,
                                std::function<void(const std::vector<float>&)> audio_callback,
-                               std::string*) override {
+                               std::string*,
+                               std::function<bool()> should_cancel) override {
+        if (should_cancel && should_cancel()) {
+            return false;
+        }
         stream_call_count_++;
         last_text_tokens_ = text_tokens;
         last_config_ = gen_config;
@@ -300,6 +305,82 @@ private:
     std::vector<int> last_text_tokens_;
     GenerationConfig last_config_;
     int last_stream_batch_frames_ = 0;
+};
+
+class CancellableStreamingTtsBackend final : public IModelBackend {
+public:
+    explicit CancellableStreamingTtsBackend(Context& ctx)
+        : logits_(Tensor::allocate(ctx, {1}, dnnl::memory::data_type::bf16)) {}
+
+    bool load(Context&,
+              ModelWeights&,
+              const ModelSpec&,
+              int,
+              std::string*) override {
+        return true;
+    }
+
+    Tensor& forward(Context&, const int*, int) override {
+        return logits_;
+    }
+
+    void reset() override {}
+    bool truncate_kv_cache(int) override { return true; }
+    int max_seq_len() const override { return 4096; }
+    int vocab_size() const override { return 32; }
+    ModelFamily family() const override { return ModelFamily::Qwen3TTS; }
+
+    bool synthesize_tts_stream(Context&,
+                               const std::vector<int>&,
+                               const GenerationConfig&,
+                               int,
+                               std::function<void(const std::vector<float>&)>,
+                               std::string*,
+                               std::function<bool()> should_cancel) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stream_call_count_++;
+            entered_ = true;
+        }
+        cv_.notify_all();
+
+        for (int i = 0; i < 200; ++i) {
+            if (should_cancel && should_cancel()) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    observed_cancel_ = true;
+                }
+                cv_.notify_all();
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        return true;
+    }
+
+    bool wait_until_entered_for(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&]() { return entered_; });
+    }
+
+    bool observed_cancel() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return observed_cancel_;
+    }
+
+    int stream_call_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stream_call_count_;
+    }
+
+private:
+    Tensor logits_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool observed_cancel_ = false;
+    int stream_call_count_ = 0;
 };
 
 void blocking_audio_callback(const float* samples, int sample_count, void* user_data) {
@@ -1218,6 +1299,73 @@ void test_tts_pipeline_uses_loaded_backend_streaming_path() {
     remove_temp_dir(tokenizer_dir);
 }
 
+void test_foreground_abort_cancels_loaded_tts_backend_stream() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline != nullptr);
+
+    std::vector<std::string> foreground_tokens{"hello.", "unused"};
+    const int eos_token_id = static_cast<int>(foreground_tokens.size()) + 3;
+    std::filesystem::path foreground_tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_abort_tts_cancel", foreground_tokens);
+    auto foreground_tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(foreground_tokenizer->load(foreground_tokenizer_dir.string()));
+
+    const int foreground_vocab_size = foreground_tokenizer->vocab_size();
+    auto foreground_backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->foreground(),
+        foreground_vocab_size,
+        std::vector<std::vector<int>>{{0, eos_token_id}});
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(foreground_tokenizer),
+        std::move(foreground_backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    std::vector<std::string> tts_tokens{
+        "a", "s", "i", "t", "n", "h", "e", "l", "o"
+    };
+    std::filesystem::path tts_tokenizer_dir =
+        make_temp_tokenizer_dir("tts_cancel_streaming", tts_tokens);
+    auto tts_tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tts_tokenizer->load(tts_tokenizer_dir.string()));
+
+    auto tts_backend = std::make_unique<CancellableStreamingTtsBackend>(
+        ctx->runtime->foreground());
+    CancellableStreamingTtsBackend* tts_observer = tts_backend.get();
+    ctx->tts.configure_loaded_for_tests(
+        aila::alia::ModelRole::Tts,
+        &ctx->runtime->foreground(),
+        std::move(tts_tokenizer),
+        std::move(tts_backend),
+        aila::alia::BackendKind::Qwen3Tts);
+
+    RecordingAudioCallbackState audio_state;
+    AliaGenConfig config{0.0f, 1.0f, 2};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, recording_audio_callback, &audio_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(tts_observer->wait_until_entered_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(alia_abort_inference(ctx, ALIA_PIPELINE_ALL), ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(tts_observer->stream_call_count(), 1);
+    ALIA_EXPECT_TRUE(tts_observer->observed_cancel());
+    ALIA_EXPECT_EQ(audio_state.call_count, 0);
+    ALIA_EXPECT_EQ(ctx->foreground_pipeline->state(),
+                   aila::alia::ForegroundTurnState::Aborted);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(foreground_tokenizer_dir);
+    remove_temp_dir(tts_tokenizer_dir);
+}
+
 void test_runtime_context_creates_two_lanes_on_one_sycl_context() {
     aila::alia::RuntimeContext runtime;
 
@@ -1409,6 +1557,7 @@ int main() {
     test_foreground_abort_during_tts_chunk_stops_remaining_audio();
     test_tts_pipeline_owns_text_queue_and_audio_callback();
     test_tts_pipeline_uses_loaded_backend_streaming_path();
+    test_foreground_abort_cancels_loaded_tts_backend_stream();
     test_runtime_context_creates_two_lanes_on_one_sycl_context();
     test_runtime_context_lanes_can_allocate_and_copy_device_memory();
     test_context_initializes_four_model_slots_on_expected_lanes();

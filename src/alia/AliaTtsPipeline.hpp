@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -18,7 +19,8 @@ public:
     bool enqueue_text(std::string text);
     bool synthesize_pending(const AliaGenConfig& config,
                             AliaAudioCallback audio_cb,
-                            void* user_data);
+                            void* user_data,
+                            std::function<bool()> should_cancel = {});
     void reset();
 
     bool ready() const;

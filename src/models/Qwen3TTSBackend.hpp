@@ -39,7 +39,8 @@ public:
                           int language_id,                               // codec language token (0 = auto/nothink)
                           const GenerationConfig& gen_config,
                           std::vector<int32_t>& out_codes,
-                          int& out_n_frames);
+                          int& out_n_frames,
+                          std::function<bool()> should_cancel = {});
 
     // Streaming synthesis: calls audio_callback for each batch of generated audio
     using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;
@@ -52,7 +53,8 @@ public:
                                   int language_id,
                                   const GenerationConfig& gen_config,
                                   int stream_batch_frames,
-                                  AudioChunkCallback audio_callback);
+                                  AudioChunkCallback audio_callback,
+                                  std::function<bool()> should_cancel = {});
 
     bool synthesize_tts_stream(
         Context& ctx,
@@ -60,7 +62,8 @@ public:
         const GenerationConfig& gen_config,
         int stream_batch_frames,
         std::function<void(const std::vector<float>&)> audio_callback,
-        std::string* error_message = nullptr) override;
+        std::string* error_message = nullptr,
+        std::function<bool()> should_cancel = {}) override;
 
     bool load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message);
     bool decode_mimi_vocoder(Context& ctx,
