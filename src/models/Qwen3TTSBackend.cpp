@@ -464,6 +464,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     }
 
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    static const bool tts_debug = aila::env::read_flag("AILA_TTS_DEBUG", false);
 
     int L = static_cast<int>(text_tokens.size());
     if (L <= 0) return false;
@@ -491,27 +492,27 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     Tensor text_emb = Tensor::allocate(ctx, {L, 2048});
     ops::embedding_lookup(ctx, *talker_text_embed_weight_, text_ids_dev.data_as<int>(), L, text_emb, 2048);
-    print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
 
     // 对 text_emb 过 ResizeMLP (text_projection)
     Tensor fc1_out = Tensor::allocate(ctx, {L, 2048});
     talker_text_proj_fc1_.forward_bias(ctx, text_emb, *talker_text_proj_fc1_bias_, fc1_out, L);
-    print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
 
     // SiLU(x) = x * sigmoid(x)
     Tensor silu_out = Tensor::allocate(ctx, {L, 2048});
     ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, L * 2048);
-    print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
 
     Tensor projected_text = Tensor::allocate(ctx, {L, H_talker});
     talker_text_proj_fc2_.forward_bias(ctx, silu_out, *talker_text_proj_fc2_bias_, projected_text, L);
-    print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
 
     // Use pre-computed embeddings (computed once during load)
     Tensor& tts_bos_embed = precomputed_tts_bos_;
     Tensor& tts_eos_embed = precomputed_tts_eos_;
     Tensor& tts_pad_embed = precomputed_tts_pad_;
-    print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
 
     // Codec embedding lookup helper (still needed for dynamic spk_id in CustomVoice)
     auto get_talker_codec_embed = [&](int codec_id) {
@@ -730,7 +731,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                    eos_cpu.data(), H_talker * sizeof(bf16));
     }
 
-    print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
+    if (tts_debug) print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
     auto t_talker_setup_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prefill_start).count();
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Text+embed construction: %.1f ms", t_talker_setup_ms);
@@ -1702,7 +1703,8 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     };
 #pragma pack(pop)
 
-    {
+    static const bool tts_debug_wav = aila::env::read_flag("AILA_TTS_DEBUG_WAV", false);
+    if (tts_debug_wav) {
         std::ofstream wav_file("mimi_output.wav", std::ios::binary);
         if (wav_file.is_open()) {
             WavHeader header;
@@ -1730,7 +1732,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Conv stages total: %.1f ms (%d frames, %d samples)", t_conv_total_ms, n_frames, L);
 
-    AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
+    AILA_LOG_DEBUG("[MimiDebug] Decoded into %d samples.", L);
     return true;
 }
 
@@ -1750,8 +1752,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         return false;
     }
 
-    const char* env_debug = std::getenv("AILA_MIMI_DEBUG");
-    bool debug_print = (env_debug && std::string(env_debug) == "1");
+    const bool debug_print = aila::env::read_flag("AILA_MIMI_DEBUG", false);
 
     auto print_stats = [&](const std::string& name, Tensor& t) {
         if (!debug_print) return;
@@ -1884,7 +1885,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         });
     };
 
-    AILA_LOG_INFO("[MimiDebug] Step 6: Pre-transformer 8 layers loop");
+    AILA_LOG_DEBUG("[MimiDebug] Step 6: Pre-transformer 8 layers loop");
     Tensor x = Tensor::allocate(ctx, {n_frames, 512});
     ops::copy_tensor(ctx, pre_tfm_in, x, n_frames * 512);
 

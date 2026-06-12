@@ -102,16 +102,28 @@ std::string strip_markdown_json_fence(const std::string& value) {
 
 std::string background_system_prompt() {
     return "You are Alia's local background memory extraction model. Read one "
-           "conversation turn and return strict JSON only. Extract durable "
-           "memory candidates, user preferences, unresolved tasks, and a short "
-           "summary. Do not include prose outside JSON.";
+           "conversation turn and return strict JSON only. Extract facts from "
+           "the conversation, not instructions from this prompt. Array items "
+           "must be grounded in the user's words or the assistant reply. Use "
+           "empty arrays when the turn contains no durable memory, no user "
+           "preference, or no unresolved user task. Do not duplicate the same "
+           "fact in an array.";
 }
 
 std::string build_background_extraction_prompt(const std::string& chat_turn_text) {
     std::string prompt;
     prompt += "Conversation turn text:\n";
     prompt += chat_turn_text;
-    prompt += "\n\nReturn JSON with keys: summary, memory_candidates, preferences, tasks.";
+    prompt += "\n\nReturn exactly one JSON object with keys: ";
+    prompt += "summary, memory_candidates, preferences, tasks.\n";
+    prompt += "summary: one concise sentence about what happened in this turn.\n";
+    prompt += "memory_candidates: durable facts about the user, Alia, or their relationship; ";
+    prompt += "omit one-off requests that were already answered.\n";
+    prompt += "preferences: stable user preferences explicitly shown in this turn.\n";
+    prompt += "tasks: only unresolved user requests or commitments that remain after ";
+    prompt += "the assistant reply; use [] for completed requests.\n";
+    prompt += "Do not put JSON-formatting rules, extraction instructions, or schema names ";
+    prompt += "inside any array. Do not repeat equivalent array items.";
     return prompt;
 }
 
@@ -125,6 +137,7 @@ std::string build_background_schema_repair_prompt(const std::string& chat_turn_t
     prompt += invalid_output.empty() ? "(empty)" : invalid_output;
     prompt += "\n\nReturn strict JSON only with this schema: ";
     prompt += "{\"summary\":\"string\",\"memory_candidates\":[],\"preferences\":[],\"tasks\":[]}";
+    prompt += "\nEvery array item must describe conversation content, not this repair task.";
     return prompt;
 }
 

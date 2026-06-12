@@ -21,16 +21,17 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 struct Options {
-    std::string asr_model = "models/Qwen3-ASR-0.6B-BNB-NF4";
-    std::string foreground_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
+    std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
+    std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
-    std::string audio_path = "This is an English test.wav";
-    std::string output_wav = "tmp/alia-real-smoke/alia_full_pipeline_tts.wav";
+    std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
+    std::string output_wav = "tmp/alia-real-smoke/alia_full_pipeline_target_models.wav";
     int max_seq_len = 2048;
-    int max_tokens = 32;
-    int timeout_sec = 900;
+    int max_tokens = 48;
+    int timeout_sec = 1500;
     int rollback_tokens = 0;
+    bool enforce_target_models = true;
 };
 
 struct AudioCapture {
@@ -74,9 +75,10 @@ void print_usage() {
         << "  --audio <path>\n"
         << "  --output-wav <path>\n"
         << "  --max-seq <N>          default 2048\n"
-        << "  --max-tokens <N>       default 32\n"
-        << "  --timeout-sec <N>      default 900\n"
-        << "  --rollback-tokens <N>  default 0, set >0 for optional rollback probe\n";
+        << "  --max-tokens <N>       default 48\n"
+        << "  --timeout-sec <N>      default 1500\n"
+        << "  --rollback-tokens <N>  default 0, set >0 for optional rollback probe\n"
+        << "  --allow-non-target-models\n";
 }
 
 bool parse_int_arg(const char* text, int& out) {
@@ -138,6 +140,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.timeout_sec)) return false;
         } else if (arg == "--rollback-tokens") {
             if (!require_int(opts.rollback_tokens)) return false;
+        } else if (arg == "--allow-non-target-models") {
+            opts.enforce_target_models = false;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -149,6 +153,49 @@ bool parse_args(int argc, char** argv, Options& opts) {
         return false;
     }
     return true;
+}
+
+std::string leaf_name(const std::string& path) {
+    std::filesystem::path normalized = std::filesystem::path(path).lexically_normal();
+    if (normalized.filename().empty() || normalized.filename() == ".") {
+        normalized = normalized.parent_path();
+    }
+    return normalized.filename().string();
+}
+
+bool validate_target_model_dir(
+    const char* label,
+    const std::string& path,
+    const char* expected_leaf) {
+    const std::string leaf = leaf_name(path);
+    if (leaf != expected_leaf) {
+        std::cerr << "target_model_mismatch=" << quote(label)
+                  << " path=" << quote(path)
+                  << " expected_leaf=" << quote(expected_leaf)
+                  << " actual_leaf=" << quote(leaf) << "\n";
+        return false;
+    }
+    if (!std::filesystem::exists(path)) {
+        std::cerr << "target_model_missing=" << quote(label)
+                  << " path=" << quote(path) << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool validate_target_models(const Options& opts) {
+    bool ok = true;
+    ok = validate_target_model_dir(
+             "asr", opts.asr_model, "Qwen3-ASR-1.7B-BNB-NF4") && ok;
+    ok = validate_target_model_dir(
+             "foreground", opts.foreground_model,
+             "qwen3.5-4B-bnb-nf4-offline-visiondense") && ok;
+    ok = validate_target_model_dir(
+             "background", opts.background_model,
+             "qwen3.5-0.8B-bnb-nf4-offline") && ok;
+    ok = validate_target_model_dir(
+             "tts", opts.tts_model, "Qwen3-TTS-12Hz-0.6B-Base") && ok;
+    return ok;
 }
 
 std::string foreground_state_name(aila::alia::ForegroundTurnState state) {
@@ -281,8 +328,14 @@ int main(int argc, char** argv) {
         print_usage();
         return 2;
     }
+    if (opts.enforce_target_models && !validate_target_models(opts)) {
+        std::cerr << "target_model_enforcement_failed=true\n";
+        return 2;
+    }
 
     std::cout << "ALIA_REAL_MODEL_SMOKE_BEGIN\n"
+              << "target_model_enforcement="
+              << (opts.enforce_target_models ? "true" : "false") << "\n"
               << "asr_model=" << quote(opts.asr_model) << "\n"
               << "foreground_model=" << quote(opts.foreground_model) << "\n"
               << "background_model=" << quote(opts.background_model) << "\n"

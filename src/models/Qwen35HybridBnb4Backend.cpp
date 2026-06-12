@@ -830,7 +830,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         }
     }
     AILA_LOG_INFO("[Qwen3.5 BnB4] KV Cache config: quantized=%s", aila::env::read_flag("AILA_KV_QUANT", false) ? "true" : "false");
-    AILA_LOG_INFO("[Qwen3.5 DEBUG] Qwen35HybridBnb4Backend::load returning true");
+    AILA_LOG_DEBUG("[Qwen3.5] Qwen35HybridBnb4Backend::load returning true");
     return true;
 }
 
