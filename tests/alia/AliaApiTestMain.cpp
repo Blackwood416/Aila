@@ -15,6 +15,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -147,6 +148,11 @@ struct CountingAudioCallbackState {
     int total_samples = 0;
 };
 
+struct RecordingAudioCallbackState {
+    int call_count = 0;
+    std::vector<float> samples;
+};
+
 class SessionCountingBackend final : public IModelBackend {
 public:
     explicit SessionCountingBackend(
@@ -237,6 +243,65 @@ private:
     std::vector<int> sampled_token_ids_;
 };
 
+class StreamingTtsBackend final : public IModelBackend {
+public:
+    explicit StreamingTtsBackend(Context& ctx)
+        : logits_(Tensor::allocate(ctx, {1}, dnnl::memory::data_type::bf16)) {}
+
+    bool load(Context&,
+              ModelWeights&,
+              const ModelSpec&,
+              int,
+              std::string*) override {
+        return true;
+    }
+
+    Tensor& forward(Context&, const int*, int) override {
+        return logits_;
+    }
+
+    void reset() override {
+        reset_count_++;
+    }
+
+    bool truncate_kv_cache(int) override {
+        return true;
+    }
+
+    int max_seq_len() const override { return 4096; }
+    int vocab_size() const override { return 32; }
+    ModelFamily family() const override { return ModelFamily::Qwen3TTS; }
+
+    bool synthesize_tts_stream(Context&,
+                               const std::vector<int>& text_tokens,
+                               const GenerationConfig& gen_config,
+                               int stream_batch_frames,
+                               std::function<void(const std::vector<float>&)> audio_callback,
+                               std::string*) override {
+        stream_call_count_++;
+        last_text_tokens_ = text_tokens;
+        last_config_ = gen_config;
+        last_stream_batch_frames_ = stream_batch_frames;
+        audio_callback(std::vector<float>{0.25f, -0.5f});
+        audio_callback(std::vector<float>{0.75f});
+        return true;
+    }
+
+    int reset_count() const { return reset_count_; }
+    int stream_call_count() const { return stream_call_count_; }
+    const std::vector<int>& last_text_tokens() const { return last_text_tokens_; }
+    const GenerationConfig& last_config() const { return last_config_; }
+    int last_stream_batch_frames() const { return last_stream_batch_frames_; }
+
+private:
+    Tensor logits_;
+    int reset_count_ = 0;
+    int stream_call_count_ = 0;
+    std::vector<int> last_text_tokens_;
+    GenerationConfig last_config_;
+    int last_stream_batch_frames_ = 0;
+};
+
 void blocking_audio_callback(const float* samples, int sample_count, void* user_data) {
     auto* state = static_cast<BlockingAudioCallbackState*>(user_data);
     if (!state) {
@@ -263,6 +328,18 @@ void counting_audio_callback(const float* samples, int sample_count, void* user_
     ALIA_EXPECT_TRUE(sample_count > 0);
     state->call_count++;
     state->total_samples += sample_count;
+}
+
+void recording_audio_callback(const float* samples, int sample_count, void* user_data) {
+    auto* state = static_cast<RecordingAudioCallbackState*>(user_data);
+    if (!state) {
+        return;
+    }
+
+    ALIA_EXPECT_TRUE(samples != nullptr);
+    ALIA_EXPECT_TRUE(sample_count > 0);
+    state->call_count++;
+    state->samples.insert(state->samples.end(), samples, samples + sample_count);
 }
 
 void blocking_background_callback(const char* extracted_json, void* user_data) {
@@ -1092,6 +1169,55 @@ void test_tts_pipeline_owns_text_queue_and_audio_callback() {
     alia_context_destroy(ctx);
 }
 
+void test_tts_pipeline_uses_loaded_backend_streaming_path() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline != nullptr);
+
+    std::vector<std::string> normal_tokens{
+        "a", "s", "i", "t", "n", "h", "e", "l", "o", "f", "r", "m"
+    };
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("tts_backend_streaming", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+
+    auto backend = std::make_unique<StreamingTtsBackend>(ctx->runtime->foreground());
+    StreamingTtsBackend* backend_observer = backend.get();
+    ctx->tts.configure_loaded_for_tests(
+        aila::alia::ModelRole::Tts,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen3Tts);
+
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline->ready());
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline->enqueue_text("hello"));
+
+    RecordingAudioCallbackState audio_state;
+    AliaGenConfig config{0.3f, 0.8f, 12};
+    ALIA_EXPECT_TRUE(ctx->tts_pipeline->synthesize_pending(
+        config, recording_audio_callback, &audio_state));
+
+    ALIA_EXPECT_EQ(backend_observer->stream_call_count(), 1);
+    ALIA_EXPECT_EQ(backend_observer->last_config().max_new_tokens, 12);
+    ALIA_EXPECT_EQ(backend_observer->last_stream_batch_frames(), 6);
+    ALIA_EXPECT_TRUE(!backend_observer->last_text_tokens().empty());
+    ALIA_EXPECT_EQ(audio_state.call_count, 2);
+    ALIA_EXPECT_EQ(audio_state.samples.size(), static_cast<size_t>(3));
+    ALIA_EXPECT_TRUE(audio_state.samples[0] == 0.25f);
+    ALIA_EXPECT_TRUE(audio_state.samples[1] == -0.5f);
+    ALIA_EXPECT_TRUE(audio_state.samples[2] == 0.75f);
+    ALIA_EXPECT_EQ(ctx->tts_pipeline->pending_text_count(), static_cast<size_t>(0));
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
 void test_runtime_context_creates_two_lanes_on_one_sycl_context() {
     aila::alia::RuntimeContext runtime;
 
@@ -1282,6 +1408,7 @@ int main() {
     test_foreground_spoken_text_is_streamed_to_tts_as_chunks();
     test_foreground_abort_during_tts_chunk_stops_remaining_audio();
     test_tts_pipeline_owns_text_queue_and_audio_callback();
+    test_tts_pipeline_uses_loaded_backend_streaming_path();
     test_runtime_context_creates_two_lanes_on_one_sycl_context();
     test_runtime_context_lanes_can_allocate_and_copy_device_memory();
     test_context_initializes_four_model_slots_on_expected_lanes();

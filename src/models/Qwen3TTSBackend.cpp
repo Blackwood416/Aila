@@ -1195,6 +1195,40 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     return true;
 }
 
+bool Qwen3TTSBackend::synthesize_tts_stream(
+    Context& ctx,
+    const std::vector<int>& text_tokens,
+    const GenerationConfig& gen_config,
+    int stream_batch_frames,
+    std::function<void(const std::vector<float>&)> audio_callback,
+    std::string* error_message) {
+    if (text_tokens.empty()) {
+        if (error_message) {
+            *error_message = "TTS text encoded to zero tokens";
+        }
+        return false;
+    }
+    if (!audio_callback) {
+        if (error_message) {
+            *error_message = "TTS audio callback is empty";
+        }
+        return false;
+    }
+
+    const int batch_frames = std::max(1, stream_batch_frames);
+    if (!synthesize_codes_stream(ctx, text_tokens, {}, 0, {}, 0, gen_config,
+                                 batch_frames, std::move(audio_callback))) {
+        if (error_message) {
+            *error_message = "Qwen3-TTS streaming synthesis failed";
+        }
+        return false;
+    }
+    if (error_message) {
+        error_message->clear();
+    }
+    return true;
+}
+
 bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message) {
     if (mimi_loaded_) return true;
 

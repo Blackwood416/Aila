@@ -54,6 +54,14 @@ public:
                                   int stream_batch_frames,
                                   AudioChunkCallback audio_callback);
 
+    bool synthesize_tts_stream(
+        Context& ctx,
+        const std::vector<int>& text_tokens,
+        const GenerationConfig& gen_config,
+        int stream_batch_frames,
+        std::function<void(const std::vector<float>&)> audio_callback,
+        std::string* error_message = nullptr) override;
+
     bool load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message);
     bool decode_mimi_vocoder(Context& ctx,
                              const std::vector<int32_t>& codes,

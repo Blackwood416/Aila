@@ -5,6 +5,7 @@
 #include "../utils/SafeTensors.hpp"
 #include "../lora/LoraLoader.hpp"
 #include "engine/Types.hpp"
+#include <functional>
 #include <string>
 #include <vector>
 #include <sycl/sycl.hpp>
@@ -33,6 +34,24 @@ public:
     virtual int max_seq_len() const = 0;
     virtual int vocab_size() const = 0;
     virtual ModelFamily family() const = 0;
+
+    virtual bool synthesize_tts_stream(
+        Context& ctx,
+        const std::vector<int>& text_tokens,
+        const GenerationConfig& gen_config,
+        int stream_batch_frames,
+        std::function<void(const std::vector<float>&)> audio_callback,
+        std::string* error_message = nullptr) {
+        (void)ctx;
+        (void)text_tokens;
+        (void)gen_config;
+        (void)stream_batch_frames;
+        (void)audio_callback;
+        if (error_message) {
+            *error_message = "backend does not support TTS streaming";
+        }
+        return false;
+    }
 
     virtual bool supports_vision_embedding_override() const { return false; }
     virtual void set_embedding_overrides(

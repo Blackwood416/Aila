@@ -98,6 +98,14 @@ multi-pipeline runtime shape:
   decode loop. Sentence-like content chunks are enqueued and synthesized as soon
   as they are complete, before later assistant tokens are sampled; the no-model
   fallback still uses the deterministic whole-text chunking path.
+- The TTS pipeline now prefers a loaded TTS backend streaming path for queued
+  spoken text. `AliaTtsPipeline` formats assistant text for Qwen3-TTS,
+  tokenizes it through the loaded TTS slot, and forwards backend audio chunks to
+  `AliaAudioCallback`; no-model, unsupported-backend, and empty-token cases
+  keep the deterministic fallback audio behavior for lightweight tests.
+- `Qwen3TTSBackend` now exposes the Alia TTS streaming hook by delegating to its
+  existing `synthesize_codes_stream` plus Mimi incremental decoder path using
+  the default voice, no instruct prompt, and automatic language mode.
 - Foreground abort now has an explicit `Aborted` terminal state. If abort is
   requested while a TTS chunk callback is in flight, the pipeline stops before
   synthesizing remaining spoken chunks after the callback returns.
@@ -138,7 +146,9 @@ product work is concentrated in these areas:
 - Foreground VLM generation still needs full multi-turn prompt/session
   ownership, deeper multi-tool continuation coverage with real model assets, and
   async overlap between VLM decode and real TTS synthesis.
-- TTS still needs real Qwen3-TTS plus Mimi streaming synthesis from queued text.
+- TTS still needs real model-asset smoke validation for Qwen3-TTS plus Mimi
+  streaming output, callback cadence/TTFT calibration, host voice control
+  inputs, and cancellation checks inside long synthesis steps.
 - Background processing still needs model-asset smoke validation for real 0.8B
   extraction output.
 - Abort handling is wired at the API, worker lifecycle, and TTS chunk boundary,
@@ -164,8 +174,8 @@ Result:
 - `AilaShared.dll` was rebuilt and relinked after the foreground
   token-time tool-call pause, tool-result continuation-token resume,
   token-time foreground-to-TTS forwarding, foreground abort-state, rollback
-  state, and background VLM prompt/type-level schema validation plus guided
-  retry/diagnostic changes.
+  state, loaded TTS backend streaming hook, and background VLM prompt/type-level
+  schema validation plus guided retry/diagnostic changes.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaAliaApiTests.exe"
@@ -179,7 +189,9 @@ Result:
   foreground VLM tool-result resume coverage that verifies only the initial turn
   prefill resets the backend session, resume prefill avoids the chat scaffold,
   initial decode stops when a complete tool call is emitted, and a complete
-  spoken sentence reaches TTS before later assistant tokens are sampled.
+  spoken sentence reaches TTS before later assistant tokens are sampled. The
+  tests also cover a loaded TTS slot using the backend streaming hook rather
+  than deterministic fallback audio.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaChatTests.exe"
@@ -213,13 +225,15 @@ git diff --check
 Result:
 
 - No whitespace errors were reported.
-- Git warned that `CMakeLists.txt` and `src/core/Context.hpp` will be converted
-  from LF to CRLF the next time Git touches them.
+- Git warned that the modified branch-status doc, TTS pipeline/backend files,
+  and Alia API test file will be converted from LF to CRLF the next time Git
+  touches them.
 
 ## Recommended Next Implementation Order
 
 1. Add model-asset smoke validation for background 0.8B JSON extraction output.
-2. Wire real TTS synthesis behind the existing text queue and callback boundary.
+2. Run model-asset smoke validation for Qwen3-TTS plus Mimi streaming output and
+   calibrate the callback batch size against the PRD 100ms audio-chunk target.
 3. Add hard-interruption timing tests and model-step cancellation checks.
 4. Expand selective KV rollback from backend truncation to Qwen3.5 Hybrid
    recurrent-state snapshot/replay validation.
