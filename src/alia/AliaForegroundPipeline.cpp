@@ -5,6 +5,7 @@
 #include "AliaTtsPipeline.hpp"
 #include "../chat/AssistantOutputParser.hpp"
 #include "../chat/ChatJson.hpp"
+#include "../chat/StructuredStreamParser.hpp"
 #include "../models/IModelBackend.hpp"
 #include "../ops/Ops.hpp"
 #include "../utils/Tokenizer.hpp"
@@ -68,6 +69,41 @@ std::string build_tool_resume_prompt_text(const std::string& user_text,
     prompt += "\n\nContinue the response to the user in concise spoken text. "
               "Do not repeat the tool call JSON.";
     return prompt;
+}
+
+std::string build_tool_result_continuation_text(const std::string& tool_result_text) {
+    std::string text;
+    text += "\n<tool_result>\n";
+    text += tool_result_text.empty() ? "{}" : tool_result_text;
+    text += "\n</tool_result>\n";
+    text += "Continue the response in concise spoken text.\n";
+    return text;
+}
+
+bool is_tts_chunk_boundary(char ch) {
+    return ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n';
+}
+
+std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) {
+    size_t cutoff = std::string::npos;
+    if (force) {
+        cutoff = buffer.size();
+    } else {
+        for (size_t i = buffer.size(); i > 0; --i) {
+            if (is_tts_chunk_boundary(buffer[i - 1])) {
+                cutoff = i;
+                break;
+            }
+        }
+    }
+
+    if (cutoff == std::string::npos || cutoff == 0) {
+        return {};
+    }
+
+    std::string ready = buffer.substr(0, cutoff);
+    buffer.erase(0, cutoff);
+    return split_spoken_text_for_tts(ready);
 }
 
 }  // namespace
@@ -326,7 +362,9 @@ void AliaForegroundPipeline::run_turn(
         ForegroundDecodeMode decode_mode = ForegroundDecodeMode::NoModelFallback;
         if (can_generate_with_loaded_vlm()) {
             decode_mode = ForegroundDecodeMode::LoadedVlm;
-            if (!generate_with_loaded_vlm(user_text, generation_config, assistant_text)) {
+            if (!generate_with_loaded_vlm(user_text, generation_config, assistant_text,
+                                          true, true, true, true,
+                                          &config, audio_cb, user_data)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (last_error_.empty()) {
                     last_error_ = "foreground VLM generation failed";
@@ -354,7 +392,11 @@ void AliaForegroundPipeline::run_turn(
             const std::string resume_prompt = last_tool_resume_prompt_text();
             if (!resume_prompt.empty()) {
                 std::string resumed_text;
-                if (!generate_with_loaded_vlm(resume_prompt, generation_config, resumed_text)) {
+                const std::string continuation_text =
+                    build_tool_result_continuation_text(last_tool_result_text());
+                if (!generate_with_loaded_vlm(continuation_text, generation_config, resumed_text,
+                                              false, false, false, false,
+                                              &config, audio_cb, user_data)) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (last_error_.empty()) {
                         last_error_ = "foreground VLM tool-result resume failed";
@@ -380,7 +422,8 @@ void AliaForegroundPipeline::run_turn(
             }
         }
 
-        if (tts_pipeline_ && audio_cb && !spoken_text.empty()) {
+        if (decode_mode != ForegroundDecodeMode::LoadedVlm &&
+            tts_pipeline_ && audio_cb && !spoken_text.empty()) {
             synthesize_spoken_text(spoken_text, config, audio_cb, user_data);
         }
 
@@ -413,7 +456,14 @@ bool AliaForegroundPipeline::can_generate_with_loaded_vlm() const {
 bool AliaForegroundPipeline::generate_with_loaded_vlm(
     const std::string& user_text,
     const GenerationConfig& config,
-    std::string& assistant_text) {
+    std::string& assistant_text,
+    bool reset_session,
+    bool record_generation_anchor,
+    bool use_chat_template,
+    bool stop_on_tool_call,
+    const AliaGenConfig* tts_config,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
     assistant_text.clear();
     if (!can_generate_with_loaded_vlm()) {
         return false;
@@ -430,17 +480,13 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     const std::string prompt_text = user_text.empty()
         ? "Continue the current conversation."
         : user_text;
-    std::vector<int> prompt_ids =
-        tokenizer->apply_chat_template(foreground_system_prompt(), prompt_text);
+    std::vector<int> prompt_ids = use_chat_template
+        ? tokenizer->apply_chat_template(foreground_system_prompt(), prompt_text)
+        : tokenizer->encode(prompt_text);
     if (prompt_ids.empty()) {
-        last_error_ = "foreground VLM prompt encoded to zero tokens";
-        return false;
-    }
-
-    const int max_seq_len = backend->max_seq_len();
-    if (max_seq_len > 0 &&
-        static_cast<int>(prompt_ids.size()) + config.max_new_tokens > max_seq_len) {
-        last_error_ = "foreground VLM prompt would exceed max sequence length";
+        last_error_ = use_chat_template
+            ? "foreground VLM prompt encoded to zero tokens"
+            : "foreground VLM continuation encoded to zero tokens";
         return false;
     }
 
@@ -452,14 +498,28 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         return false;
     }
 
-    backend->reset();
+    if (reset_session) {
+        backend->reset();
+    }
+
+    const int max_seq_len = backend->max_seq_len();
+    const int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
+    if (max_seq_len > 0 &&
+        context_len_before_prompt + static_cast<int>(prompt_ids.size()) +
+            config.max_new_tokens > max_seq_len) {
+        last_error_ = use_chat_template
+            ? "foreground VLM prompt would exceed max sequence length"
+            : "foreground VLM continuation would exceed max sequence length";
+        return false;
+    }
+
     DeviceAllocation prompt_device(*context, prompt_ids.size() * sizeof(int));
     context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
                         prompt_ids.size() * sizeof(int));
     Tensor* logits = &backend->forward(*context, prompt_device.as<int>(),
                                        static_cast<int>(prompt_ids.size()));
 
-    {
+    if (record_generation_anchor) {
         std::lock_guard<std::mutex> lock(mutex_);
         generation_start_context_len_ = backend->get_current_context_len();
         last_generated_token_count_ = 0;
@@ -467,6 +527,23 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
 
     DeviceAllocation one_token_device(*context, sizeof(int));
     std::vector<int> generated_ids;
+    aila::chat::StructuredStreamParser stream_parser;
+    std::string pending_tts_text;
+    bool paused_on_tool_call = false;
+    auto flush_tts = [&](bool force) {
+        if (!tts_pipeline_ || !audio_cb || !tts_config) {
+            return;
+        }
+        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, force)) {
+            if (abort_requested()) {
+                return;
+            }
+            if (tts_pipeline_->enqueue_text(chunk)) {
+                tts_pipeline_->synthesize_pending(*tts_config, audio_cb, user_data);
+            }
+        }
+    };
+
     const int max_new_tokens = std::max(config.max_new_tokens, 1);
     for (int step = 0; step < max_new_tokens; ++step) {
         if (abort_requested()) {
@@ -480,14 +557,47 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         }
 
         generated_ids.push_back(next_token);
+        bool complete_tool_call = false;
+        std::vector<aila::chat::StructuredStreamEvent> events;
+        stream_parser.push(tokenizer->decode(next_token), events);
+        for (const auto& event : events) {
+            if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
+                pending_tts_text += event.text;
+            }
+            if (event.type == aila::chat::StructuredStreamEventType::ToolCallDelta &&
+                !event.tool_calls.empty()) {
+                complete_tool_call = true;
+            }
+        }
         context->memcpy_h2d(one_token_device.as<int>(), &next_token, sizeof(int));
         logits = &backend->forward(*context, one_token_device.as<int>(), 1);
+        flush_tts(false);
+        if (stop_on_tool_call && complete_tool_call) {
+            paused_on_tool_call = true;
+            flush_tts(true);
+            break;
+        }
+    }
+
+    if (!paused_on_tool_call) {
+        std::vector<aila::chat::StructuredStreamEvent> final_events;
+        stream_parser.finish(final_events);
+        for (const auto& event : final_events) {
+            if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
+                pending_tts_text += event.text;
+            }
+        }
+        flush_tts(true);
     }
 
     assistant_text = tokenizer->decode(generated_ids);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        last_generated_token_count_ = static_cast<int>(generated_ids.size());
+        if (record_generation_anchor) {
+            last_generated_token_count_ = static_cast<int>(generated_ids.size());
+        } else {
+            last_generated_token_count_ += static_cast<int>(generated_ids.size());
+        }
     }
     last_error_.clear();
     return true;

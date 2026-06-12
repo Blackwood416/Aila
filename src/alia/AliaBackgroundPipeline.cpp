@@ -71,6 +71,19 @@ std::string build_background_extraction_prompt(const std::string& chat_turn_text
     return prompt;
 }
 
+std::string build_background_schema_repair_prompt(const std::string& chat_turn_text,
+                                                  const std::string& invalid_output) {
+    std::string prompt;
+    prompt += "Repair the previous background memory extraction output for Alia.\n";
+    prompt += "Conversation turn text:\n";
+    prompt += chat_turn_text;
+    prompt += "\n\nPrevious invalid output:\n";
+    prompt += invalid_output.empty() ? "(empty)" : invalid_output;
+    prompt += "\n\nReturn strict JSON only with this schema: ";
+    prompt += "{\"summary\":\"string\",\"memory_candidates\":[],\"preferences\":[],\"tasks\":[]}";
+    return prompt;
+}
+
 std::string make_background_fallback_json(const std::string& chat_turn_text) {
     return std::string("{") +
         "\"summary\":\"" + AliaBackgroundPipeline::json_escape(chat_turn_text) + "\"," +
@@ -135,6 +148,9 @@ bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     last_error_.clear();
     last_prompt_text_.clear();
     last_result_json_.clear();
+    last_schema_retry_count_ = 0;
+    last_schema_repair_applied_ = false;
+    last_schema_diagnostic_.clear();
     last_decode_mode_ = BackgroundDecodeMode::None;
     state_ = BackgroundJobState::Running;
     worker_ = std::thread([this, text = std::move(chat_turn_text), callback]() mutable {
@@ -185,6 +201,21 @@ std::string AliaBackgroundPipeline::last_result_json() const {
     return last_result_json_;
 }
 
+int AliaBackgroundPipeline::last_schema_retry_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_schema_retry_count_;
+}
+
+bool AliaBackgroundPipeline::last_schema_repair_applied() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_schema_repair_applied_;
+}
+
+std::string AliaBackgroundPipeline::last_schema_diagnostic() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_schema_diagnostic_;
+}
+
 void AliaBackgroundPipeline::run_job(
     std::string chat_turn_text,
     AliaBackgroundResultCallback callback) {
@@ -199,7 +230,11 @@ void AliaBackgroundPipeline::run_job(
         }
 
         const std::string prompt_text = build_background_extraction_prompt(chat_turn_text);
+        std::string final_prompt_text = prompt_text;
         std::string result_json;
+        int schema_retry_count = 0;
+        bool schema_repair_applied = false;
+        std::string schema_diagnostic;
         BackgroundDecodeMode decode_mode = BackgroundDecodeMode::NoModelFallback;
         if (can_generate_with_loaded_vlm()) {
             decode_mode = BackgroundDecodeMode::LoadedVlm;
@@ -212,15 +247,51 @@ void AliaBackgroundPipeline::run_job(
                 cv_.notify_all();
                 return;
             }
+            if (!AliaBackgroundPipeline::has_required_schema_keys(result_json)) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (abort_requested_) {
+                        state_ = BackgroundJobState::Completed;
+                        cv_.notify_all();
+                        return;
+                    }
+                }
+
+                const std::string repair_prompt =
+                    build_background_schema_repair_prompt(chat_turn_text, result_json);
+                schema_retry_count = 1;
+                final_prompt_text = repair_prompt;
+                std::string repaired_json;
+                if (!generate_with_loaded_vlm(repair_prompt, repaired_json)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (last_error_.empty()) {
+                        last_error_ = "background VLM schema repair generation failed";
+                    }
+                    state_ = BackgroundJobState::Failed;
+                    cv_.notify_all();
+                    return;
+                }
+                result_json = std::move(repaired_json);
+                schema_diagnostic = AliaBackgroundPipeline::has_required_schema_keys(result_json)
+                    ? "retry accepted schema-valid background JSON"
+                    : "retry failed schema validation; applying schema repair wrapper";
+            } else {
+                schema_diagnostic = "initial background JSON accepted";
+            }
         } else {
             result_json = make_background_fallback_json(chat_turn_text);
+            schema_diagnostic = "no-model fallback produced schema-valid background JSON";
         }
+        schema_repair_applied = !AliaBackgroundPipeline::has_required_schema_keys(result_json);
         result_json = enforce_background_result_schema(result_json, chat_turn_text);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_prompt_text_ = prompt_text;
+            last_prompt_text_ = final_prompt_text;
             last_result_json_ = result_json;
+            last_schema_retry_count_ = schema_retry_count;
+            last_schema_repair_applied_ = schema_repair_applied;
+            last_schema_diagnostic_ = schema_diagnostic;
             last_decode_mode_ = decode_mode;
             if (abort_requested_) {
                 state_ = BackgroundJobState::Completed;

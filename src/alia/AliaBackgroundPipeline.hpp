@@ -49,6 +49,9 @@ public:
     BackgroundDecodeMode last_decode_mode() const;
     std::string last_prompt_text() const;
     std::string last_result_json() const;
+    int last_schema_retry_count() const;
+    bool last_schema_repair_applied() const;
+    std::string last_schema_diagnostic() const;
     static std::string json_escape(const std::string& value);
     static bool has_required_schema_keys(const std::string& value);
     const std::string& last_error() const { return last_error_; }
@@ -70,6 +73,9 @@ private:
     std::string last_error_;
     std::string last_prompt_text_;
     std::string last_result_json_;
+    int last_schema_retry_count_ = 0;
+    bool last_schema_repair_applied_ = false;
+    std::string last_schema_diagnostic_;
     BackgroundDecodeMode last_decode_mode_ = BackgroundDecodeMode::None;
 };
 

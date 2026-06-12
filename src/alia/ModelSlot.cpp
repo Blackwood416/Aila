@@ -148,6 +148,29 @@ bool ModelSlot::load_model(int max_seq_len) {
     return true;
 }
 
+void ModelSlot::configure_loaded_for_tests(
+    ModelRole role,
+    Context* context,
+    std::unique_ptr<Tokenizer> tokenizer,
+    std::unique_ptr<IModelBackend> backend,
+    BackendKind backend_kind) {
+    clear_loaded_objects();
+    role_ = role;
+    model_dir_.clear();
+    context_ = context;
+    backend_kind_ = backend_kind;
+    tokenizer_ = std::move(tokenizer);
+    backend_ = std::move(backend);
+    weights_.reset();
+    audio_encoder_.reset();
+    vision_encoder_.reset();
+    vision_enabled_ = false;
+    last_error_.clear();
+    state_ = (context_ && tokenizer_ && backend_)
+        ? ModelSlotState::Loaded
+        : ModelSlotState::Failed;
+}
+
 bool ModelSlot::family_matches_role() const {
     switch (role_) {
         case ModelRole::Asr:

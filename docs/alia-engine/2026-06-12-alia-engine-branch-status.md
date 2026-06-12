@@ -80,16 +80,24 @@ multi-pipeline runtime shape:
   calls are serialized through the existing chat JSON helpers and passed to
   `AliaToolCallCallback`; spoken text is kept separate so tool JSON is not sent
   into TTS.
+- Loaded foreground VLM generation now also feeds decoded token deltas through
+  `StructuredStreamParser` during the initial decode pass. As soon as a complete
+  tool-call block is detected, the pipeline advances backend state for that
+  emitted token and pauses before sampling further ordinary text.
 - Foreground pipeline state records the last tool-call JSON and host tool
   result text, creating the native state boundary needed for the later
   pause/resume decode loop.
 - Tool callback results are promoted into a native resume prompt containing the
-  captured user request, assistant tool-call JSON, and host tool result. When a
-  loaded foreground VLM slot is available, the pipeline uses this prompt as the
-  second-pass generation input after the tool result is returned.
-- Spoken foreground text is split into TTS-sized chunks at sentence-like
-  boundaries and each chunk is enqueued/synthesized separately, moving the
-  foreground-to-TTS boundary toward streaming consumption.
+  captured user request, assistant tool-call JSON, and host tool result for
+  diagnostics. When a loaded foreground VLM slot is available, the actual
+  resume pass now appends compact `<tool_result>` continuation tokens instead
+  of re-encoding a fresh chat scaffold. The loaded backend is reset for the
+  initial turn prefill only, and the resume pass keeps the current VLM session
+  and original generation-start rollback anchor.
+- Loaded foreground VLM content deltas are now streamed toward TTS during the
+  decode loop. Sentence-like content chunks are enqueued and synthesized as soon
+  as they are complete, before later assistant tokens are sampled; the no-model
+  fallback still uses the deterministic whole-text chunking path.
 - Foreground abort now has an explicit `Aborted` terminal state. If abort is
   requested while a TTS chunk callback is in flight, the pipeline stops before
   synthesizing remaining spoken chunks after the callback returns.
@@ -106,6 +114,14 @@ multi-pipeline runtime shape:
   uses that schema, and loaded-model output is parsed with `simdjson` before it
   is accepted: malformed JSON, missing fields, or wrong required field types are
   wrapped into a schema-repair result that preserves the raw model output.
+- Loaded background VLM extraction now gets one guided retry before schema
+  repair wrapping. If the first 0.8B output is malformed or has wrong required
+  field types, the pipeline builds a repair prompt containing the invalid output
+  and asks the loaded background slot for strict schema JSON again.
+- Background schema decisions are now recorded as native diagnostics: retry
+  count, whether the final callback result used the schema-repair wrapper, and a
+  short diagnostic string for initial acceptance, retry acceptance, or retry
+  failure followed by repair wrapping.
 - The deterministic no-model foreground response is now explicitly marked as
   `NoModelFallback` state for ABI/lightweight tests, not treated as normal
   model inference.
@@ -120,11 +136,11 @@ The current implementation is not yet the full PRD runtime. The remaining
 product work is concentrated in these areas:
 
 - Foreground VLM generation still needs full multi-turn prompt/session
-  ownership, true token-to-TTS streaming, KV-preserving post-tool resume, and
-  rollback anchors.
+  ownership, deeper multi-tool continuation coverage with real model assets, and
+  async overlap between VLM decode and real TTS synthesis.
 - TTS still needs real Qwen3-TTS plus Mimi streaming synthesis from queued text.
-- Background processing still needs model-asset smoke validation, guided retry
-  behavior for invalid 0.8B output, and richer diagnostics for repair decisions.
+- Background processing still needs model-asset smoke validation for real 0.8B
+  extraction output.
 - Abort handling is wired at the API, worker lifecycle, and TTS chunk boundary,
   but hard latency guarantees still require model-step cancellation checks and
   timing tests.
@@ -145,9 +161,11 @@ pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initi
 
 Result:
 
-- `AilaShared.dll` was rebuilt and relinked after the foreground resume prompt,
-  TTS chunking, foreground abort-state, rollback state, and background VLM
-  prompt/type-level schema validation changes.
+- `AilaShared.dll` was rebuilt and relinked after the foreground
+  token-time tool-call pause, tool-result continuation-token resume,
+  token-time foreground-to-TTS forwarding, foreground abort-state, rollback
+  state, and background VLM prompt/type-level schema validation plus guided
+  retry/diagnostic changes.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaAliaApiTests.exe"
@@ -156,7 +174,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initi
 Result:
 
 - `Alia API tests passed`, including background schema accept/repair coverage
-  for valid JSON, malformed JSON, and wrong required field types.
+  for valid JSON, malformed JSON, wrong required field types, loaded background
+  VLM guided retry before schema repair, retry/repair diagnostics, and loaded
+  foreground VLM tool-result resume coverage that verifies only the initial turn
+  prefill resets the backend session, resume prefill avoids the chat scaffold,
+  initial decode stops when a complete tool call is emitted, and a complete
+  spoken sentence reaches TTS before later assistant tokens are sampled.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; .\build\AilaChatTests.exe"
@@ -195,15 +218,10 @@ Result:
 
 ## Recommended Next Implementation Order
 
-1. Extend functional tool-result resume into KV-preserving pause/resume decode
-   instead of a second prompt pass.
-2. Upgrade sentence-level foreground-to-TTS chunking to token-time streaming
-   from the VLM decode loop.
-3. Add model-asset smoke validation and guided retry/repair for background 0.8B
-   JSON extraction output.
-4. Wire real TTS synthesis behind the existing text queue and callback boundary.
-5. Add hard-interruption timing tests and model-step cancellation checks.
-6. Expand selective KV rollback from backend truncation to Qwen3.5 Hybrid
+1. Add model-asset smoke validation for background 0.8B JSON extraction output.
+2. Wire real TTS synthesis behind the existing text queue and callback boundary.
+3. Add hard-interruption timing tests and model-step cancellation checks.
+4. Expand selective KV rollback from backend truncation to Qwen3.5 Hybrid
    recurrent-state snapshot/replay validation.
 
 ## Review Notes

@@ -54,6 +54,11 @@ public:
     void configure(ModelRole role, std::string model_dir, Context* context);
     bool load_metadata();
     bool load_model(int max_seq_len);
+    void configure_loaded_for_tests(ModelRole role,
+                                    Context* context,
+                                    std::unique_ptr<Tokenizer> tokenizer,
+                                    std::unique_ptr<IModelBackend> backend,
+                                    BackendKind backend_kind);
 
     ModelRole role() const { return role_; }
     ModelSlotState state() const { return state_; }

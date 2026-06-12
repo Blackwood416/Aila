@@ -4,16 +4,23 @@
 #include "alia/AliaAsrPipeline.hpp"
 #include "alia/AliaTtsPipeline.hpp"
 #include "alia/RuntimeContext.hpp"
+#include "core/Tensor.hpp"
+#include "models/IModelBackend.hpp"
+#include "utils/Tokenizer.hpp"
 
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <condition_variable>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -37,6 +44,48 @@ std::filesystem::path make_temp_model_dir(const std::string& name, const std::st
     std::filesystem::create_directories(dir);
     std::ofstream out(dir / "config.json", std::ios::binary);
     out << config_json;
+    return dir;
+}
+
+std::filesystem::path make_temp_tokenizer_dir(const std::string& name,
+                                              const std::vector<std::string>& normal_tokens) {
+    auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("aila_alia_api_tests_" + name + "_" + std::to_string(stamp));
+    std::filesystem::create_directories(dir);
+
+    const int tool_result_open_id = static_cast<int>(normal_tokens.size());
+    const int tool_result_close_id = tool_result_open_id + 1;
+    const int im_start_id = tool_result_open_id + 2;
+    const int im_end_id = tool_result_open_id + 3;
+    const int endoftext_id = tool_result_open_id + 4;
+
+    std::ofstream out(dir / "tokenizer.json", std::ios::binary);
+    out << "{\"added_tokens\":[";
+    out << "{\"id\":" << tool_result_open_id << ",\"content\":\"<tool_result>\"},";
+    out << "{\"id\":" << tool_result_close_id << ",\"content\":\"</tool_result>\"},";
+    out << "{\"id\":" << im_start_id << ",\"content\":\"<|im_start|>\"},";
+    out << "{\"id\":" << im_end_id << ",\"content\":\"<|im_end|>\"},";
+    out << "{\"id\":" << endoftext_id << ",\"content\":\"<|endoftext|>\"}";
+    out << "],\"model\":{\"vocab\":{";
+    bool first = true;
+    auto write_vocab_entry = [&](const std::string& token, int id) {
+        if (!first) {
+            out << ",";
+        }
+        first = false;
+        out << "\"" << aila::alia::AliaBackgroundPipeline::json_escape(token)
+            << "\":" << id;
+    };
+    for (size_t i = 0; i < normal_tokens.size(); ++i) {
+        write_vocab_entry(normal_tokens[i], static_cast<int>(i));
+    }
+    write_vocab_entry("<tool_result>", tool_result_open_id);
+    write_vocab_entry("</tool_result>", tool_result_close_id);
+    write_vocab_entry("<|im_start|>", im_start_id);
+    write_vocab_entry("<|im_end|>", im_end_id);
+    write_vocab_entry("<|endoftext|>", endoftext_id);
+    out << "},\"merges\":[]}}";
     return dir;
 }
 
@@ -79,6 +128,14 @@ struct BlockingBackgroundCallbackState {
 
 BlockingBackgroundCallbackState* g_background_callback_state = nullptr;
 
+struct RecordingBackgroundCallbackState {
+    int call_count = 0;
+    std::string result_json;
+    void* user_data = reinterpret_cast<void*>(0x1);
+};
+
+RecordingBackgroundCallbackState* g_recording_background_callback_state = nullptr;
+
 struct ToolCallbackState {
     int call_count = 0;
     std::string tool_json;
@@ -88,6 +145,96 @@ struct ToolCallbackState {
 struct CountingAudioCallbackState {
     int call_count = 0;
     int total_samples = 0;
+};
+
+class SessionCountingBackend final : public IModelBackend {
+public:
+    explicit SessionCountingBackend(
+        Context& ctx,
+        int vocab_size = 3,
+        std::vector<std::vector<int>> generation_sequences = {{0}, {1}})
+        : logits_(Tensor::allocate(ctx, {vocab_size}, dnnl::memory::data_type::bf16)),
+          generation_sequences_(std::move(generation_sequences)),
+          vocab_size_(vocab_size),
+          fallback_token_id_(std::max(0, vocab_size - 1)) {}
+
+    bool load(Context&,
+              ModelWeights&,
+              const ModelSpec&,
+              int,
+              std::string*) override {
+        return true;
+    }
+
+    Tensor& forward(Context& ctx, const int*, int seq_len) override {
+        context_len_ += seq_len;
+        if (seq_len > 1) {
+            prefill_lengths_.push_back(seq_len);
+            active_sequence_index_ = std::min(
+                static_cast<size_t>(prefill_count_),
+                generation_sequences_.empty() ? size_t{0} : generation_sequences_.size() - 1);
+            active_sequence_offset_ = 0;
+            prefill_count_++;
+        }
+        const int token_id = next_token_id();
+
+        using Bf16 = sycl::ext::oneapi::bfloat16;
+        std::vector<Bf16> host_logits(static_cast<size_t>(vocab_size_), Bf16(-100.0f));
+        host_logits[static_cast<size_t>(token_id)] = Bf16(100.0f);
+        ctx.memcpy_h2d(logits_.data(), host_logits.data(),
+                       host_logits.size() * sizeof(Bf16));
+        return logits_;
+    }
+
+    void reset() override {
+        reset_count_++;
+        context_len_ = 0;
+    }
+
+    bool truncate_kv_cache(int new_len) override {
+        context_len_ = new_len;
+        return true;
+    }
+
+    int get_current_context_len() const override { return context_len_; }
+    int max_seq_len() const override { return 4096; }
+    int vocab_size() const override { return vocab_size_; }
+    ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+
+    int reset_count() const { return reset_count_; }
+    int prefill_count() const { return prefill_count_; }
+    int prefill_length(size_t index) const {
+        return index < prefill_lengths_.size() ? prefill_lengths_[index] : -1;
+    }
+    const std::vector<int>& sampled_token_ids() const { return sampled_token_ids_; }
+
+private:
+    int next_token_id() {
+        if (generation_sequences_.empty()) {
+            sampled_token_ids_.push_back(fallback_token_id_);
+            return fallback_token_id_;
+        }
+        const auto& sequence = generation_sequences_[active_sequence_index_];
+        int token_id = fallback_token_id_;
+        if (active_sequence_offset_ < sequence.size()) {
+            token_id = sequence[active_sequence_offset_++];
+        }
+        token_id = std::clamp(token_id, 0, std::max(0, vocab_size_ - 1));
+        sampled_token_ids_.push_back(token_id);
+        return token_id;
+    }
+
+    Tensor logits_;
+    std::vector<std::vector<int>> generation_sequences_;
+    int vocab_size_ = 3;
+    int fallback_token_id_ = 2;
+    size_t active_sequence_index_ = 0;
+    size_t active_sequence_offset_ = 0;
+    int reset_count_ = 0;
+    int prefill_count_ = 0;
+    int context_len_ = 0;
+    std::vector<int> prefill_lengths_;
+    std::vector<int> sampled_token_ids_;
 };
 
 void blocking_audio_callback(const float* samples, int sample_count, void* user_data) {
@@ -131,6 +278,16 @@ void blocking_background_callback(const char* extracted_json, void* user_data) {
     state->user_data = user_data;
     state->cv.notify_all();
     state->cv.wait(lock, [&]() { return state->release; });
+}
+
+void recording_background_callback(const char* extracted_json, void* user_data) {
+    auto* state = g_recording_background_callback_state;
+    if (!state) {
+        return;
+    }
+    state->call_count++;
+    state->result_json = extracted_json ? extracted_json : "";
+    state->user_data = user_data;
 }
 
 int recording_tool_callback(const char* tool_json,
@@ -373,6 +530,110 @@ void test_background_pipeline_invokes_callback_and_rejects_busy_trigger() {
     alia_context_destroy(ctx);
 }
 
+void test_background_loaded_vlm_retries_invalid_json_before_schema_repair() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline != nullptr);
+
+    const std::string invalid_json =
+        R"({"summary":42,"memory_candidates":"bad","preferences":[],"tasks":[]})";
+    const std::string valid_json =
+        R"({"summary":"learned preference","memory_candidates":[],"preferences":[],"tasks":[]})";
+    std::vector<std::string> normal_tokens{invalid_json, valid_json, "unused"};
+    const int eos_token_id = static_cast<int>(normal_tokens.size()) + 3;
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("background_retry", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    auto backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->background(),
+        tokenizer->vocab_size(),
+        std::vector<std::vector<int>>{{0, eos_token_id}, {1, eos_token_id}});
+    SessionCountingBackend* backend_observer = backend.get();
+    ctx->background_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::BackgroundVlm,
+        &ctx->runtime->background(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    RecordingBackgroundCallbackState callback_state;
+    g_recording_background_callback_state = &callback_state;
+    alia_register_background_callback(ctx, recording_background_callback);
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(ctx, "user likes concise answers"), ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_EQ(backend_observer->prefill_count(), 2);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"summary\":\"learned preference\"") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"source\":\"schema_repair\"") ==
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_prompt_text().find("Repair") !=
+                     std::string::npos);
+    ALIA_EXPECT_EQ(ctx->background_pipeline->last_schema_retry_count(), 1);
+    ALIA_EXPECT_TRUE(!ctx->background_pipeline->last_schema_repair_applied());
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_schema_diagnostic().find("retry accepted") !=
+                     std::string::npos);
+
+    g_recording_background_callback_state = nullptr;
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
+void test_background_loaded_vlm_reports_schema_repair_after_retry_failure() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline != nullptr);
+
+    const std::string first_invalid =
+        R"({"summary":42,"memory_candidates":"bad","preferences":[],"tasks":[]})";
+    const std::string second_invalid =
+        R"({"summary":"still bad","memory_candidates":[],"preferences":{},"tasks":[]})";
+    std::vector<std::string> normal_tokens{first_invalid, second_invalid, "unused"};
+    const int eos_token_id = static_cast<int>(normal_tokens.size()) + 3;
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("background_retry_repair", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    auto backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->background(),
+        tokenizer->vocab_size(),
+        std::vector<std::vector<int>>{{0, eos_token_id}, {1, eos_token_id}});
+    ctx->background_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::BackgroundVlm,
+        &ctx->runtime->background(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    RecordingBackgroundCallbackState callback_state;
+    g_recording_background_callback_state = &callback_state;
+    alia_register_background_callback(ctx, recording_background_callback);
+    ALIA_EXPECT_EQ(alia_trigger_background_processing(ctx, "user asked for broken schema"), ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(callback_state.call_count, 1);
+    ALIA_EXPECT_TRUE(callback_state.result_json.find("\"source\":\"schema_repair\"") !=
+                     std::string::npos);
+    ALIA_EXPECT_EQ(ctx->background_pipeline->last_schema_retry_count(), 1);
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_schema_repair_applied());
+    ALIA_EXPECT_TRUE(ctx->background_pipeline->last_schema_diagnostic().find("retry failed") !=
+                     std::string::npos);
+
+    g_recording_background_callback_state = nullptr;
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
 void test_foreground_pipeline_rejects_second_turn_while_worker_is_running() {
     AliaContext* ctx = nullptr;
     int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
@@ -562,6 +823,186 @@ void test_foreground_tool_result_is_promoted_to_resume_prompt_state() {
     ALIA_EXPECT_TRUE(resume_prompt.find("Continue the response") != std::string::npos);
 
     alia_context_destroy(ctx);
+}
+
+void test_foreground_tool_resume_appends_result_without_chat_scaffold() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    const std::string first_token =
+        "Checking."
+        "<tool_call>\n"
+        "<function=inspect_window>\n"
+        "<parameter=target>active</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const std::string second_token = "The Settings window is open.";
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_loaded_resume",
+                                {first_token, second_token, "unused"});
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    auto backend = std::make_unique<SessionCountingBackend>(ctx->runtime->foreground());
+    SessionCountingBackend* backend_observer = backend.get();
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    ToolCallbackState tool_state;
+    tool_state.result_to_write = R"({"ok":true,"title":"Settings"})";
+    AliaGenConfig config{0.0f, 1.0f, 1};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, recording_tool_callback, nullptr, &tool_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(tool_state.call_count, 1);
+    ALIA_EXPECT_EQ(backend_observer->prefill_count(), 2);
+    ALIA_EXPECT_EQ(backend_observer->reset_count(), 1);
+    ALIA_EXPECT_EQ(backend_observer->prefill_length(1), 2);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_decode_mode() ==
+                     aila::alia::ForegroundDecodeMode::LoadedVlm);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find("Checking.") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find("Settings window") !=
+                     std::string::npos);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
+void test_foreground_loaded_vlm_pauses_initial_decode_on_complete_tool_call() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    const std::string spoken_before_tool = "Checking.";
+    const std::string tool_call_text =
+        "<tool_call>\n"
+        "<function=inspect_window>\n"
+        "<parameter=target>active</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const std::string leaked_after_tool = "SHOULD_NOT_BE_INITIAL";
+    const std::string resumed_text = "The Settings window is open.";
+    std::vector<std::string> normal_tokens{
+        spoken_before_tool,
+        tool_call_text,
+        leaked_after_tool,
+        resumed_text,
+        "unused"
+    };
+    const int eos_token_id = static_cast<int>(normal_tokens.size()) + 3;
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_tool_pause", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    const int vocab_size = tokenizer->vocab_size();
+    auto backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->foreground(),
+        vocab_size,
+        std::vector<std::vector<int>>{{0, 1, 2}, {3, eos_token_id}});
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    ToolCallbackState tool_state;
+    tool_state.result_to_write = R"({"ok":true,"title":"Settings"})";
+    AliaGenConfig config{0.0f, 1.0f, 3};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, recording_tool_callback, nullptr, &tool_state),
+                   ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+
+    ALIA_EXPECT_EQ(tool_state.call_count, 1);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find(spoken_before_tool) !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find(resumed_text) !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find(leaked_after_tool) ==
+                     std::string::npos);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
+}
+
+void test_foreground_loaded_vlm_streams_sentence_to_tts_before_decode_finishes() {
+    AliaContext* ctx = nullptr;
+    int init_rc = alia_context_init(&ctx, "", "", "", "", 2048);
+    ALIA_EXPECT_EQ(init_rc, ALIA_OK);
+    ALIA_EXPECT_TRUE(ctx != nullptr);
+    ALIA_EXPECT_TRUE(ctx->runtime != nullptr);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline != nullptr);
+
+    std::vector<std::string> normal_tokens{
+        "First sentence.",
+        "Second sentence.",
+        "unused"
+    };
+    const int eos_token_id = static_cast<int>(normal_tokens.size()) + 3;
+    std::filesystem::path tokenizer_dir =
+        make_temp_tokenizer_dir("foreground_token_tts", normal_tokens);
+
+    auto tokenizer = std::make_unique<Tokenizer>();
+    ALIA_EXPECT_TRUE(tokenizer->load(tokenizer_dir.string()));
+    const int vocab_size = tokenizer->vocab_size();
+    auto backend = std::make_unique<SessionCountingBackend>(
+        ctx->runtime->foreground(),
+        vocab_size,
+        std::vector<std::vector<int>>{{0, 1, eos_token_id}});
+    SessionCountingBackend* backend_observer = backend.get();
+    ctx->foreground_vlm.configure_loaded_for_tests(
+        aila::alia::ModelRole::ForegroundVlm,
+        &ctx->runtime->foreground(),
+        std::move(tokenizer),
+        std::move(backend),
+        aila::alia::BackendKind::Qwen35HybridBnb4);
+
+    BlockingAudioCallbackState callback_state;
+    AliaGenConfig config{0.0f, 1.0f, 3};
+    ALIA_EXPECT_EQ(alia_start_conversation_turn(
+                       ctx, &config, nullptr, blocking_audio_callback, &callback_state),
+                   ALIA_OK);
+
+    {
+        std::unique_lock<std::mutex> lock(callback_state.mutex);
+        ALIA_EXPECT_TRUE(callback_state.cv.wait_for(
+            lock, std::chrono::seconds(2), [&]() { return callback_state.entered; }));
+    }
+
+    ALIA_EXPECT_EQ(backend_observer->get_current_context_len(),
+                   backend_observer->prefill_length(0) + 1);
+
+    {
+        std::lock_guard<std::mutex> lock(callback_state.mutex);
+        callback_state.release = true;
+    }
+    callback_state.cv.notify_all();
+
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(2)));
+    ALIA_EXPECT_EQ(callback_state.call_count, 2);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find("First sentence.") !=
+                     std::string::npos);
+    ALIA_EXPECT_TRUE(ctx->foreground_pipeline->last_assistant_text().find("Second sentence.") !=
+                     std::string::npos);
+
+    alia_context_destroy(ctx);
+    remove_temp_dir(tokenizer_dir);
 }
 
 void test_foreground_spoken_text_is_streamed_to_tts_as_chunks() {
@@ -826,6 +1267,8 @@ int main() {
     test_background_schema_repairs_malformed_json_with_required_key_names();
     test_background_schema_repairs_wrong_required_field_types();
     test_background_pipeline_invokes_callback_and_rejects_busy_trigger();
+    test_background_loaded_vlm_retries_invalid_json_before_schema_repair();
+    test_background_loaded_vlm_reports_schema_repair_after_retry_failure();
     test_foreground_pipeline_rejects_second_turn_while_worker_is_running();
     test_foreground_turn_rejects_invalid_generation_config();
     test_vlm_rollback_requires_loaded_foreground_anchor();
@@ -833,6 +1276,9 @@ int main() {
     test_foreground_system_prompt_is_alia_specific();
     test_foreground_tool_call_invokes_callback_and_keeps_spoken_text_native();
     test_foreground_tool_result_is_promoted_to_resume_prompt_state();
+    test_foreground_tool_resume_appends_result_without_chat_scaffold();
+    test_foreground_loaded_vlm_pauses_initial_decode_on_complete_tool_call();
+    test_foreground_loaded_vlm_streams_sentence_to_tts_before_decode_finishes();
     test_foreground_spoken_text_is_streamed_to_tts_as_chunks();
     test_foreground_abort_during_tts_chunk_stops_remaining_audio();
     test_tts_pipeline_owns_text_queue_and_audio_callback();

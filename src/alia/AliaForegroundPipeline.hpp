@@ -70,7 +70,14 @@ private:
     bool can_generate_with_loaded_vlm() const;
     bool generate_with_loaded_vlm(const std::string& user_text,
                                   const GenerationConfig& config,
-                                  std::string& assistant_text);
+                                  std::string& assistant_text,
+                                  bool reset_session,
+                                  bool record_generation_anchor,
+                                  bool use_chat_template,
+                                  bool stop_on_tool_call,
+                                  const AliaGenConfig* tts_config,
+                                  AliaAudioCallback audio_cb,
+                                  void* user_data);
     bool process_tool_calls(const std::string& raw_assistant_text,
                             const std::string& user_text,
                             AliaToolCallCallback tool_cb,
