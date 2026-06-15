@@ -455,8 +455,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        int& out_n_frames,
                                        std::function<bool()> should_cancel,
                                        CodeFrameCallback frame_callback,
-                                       int frame_callback_batch_frames,
-                                       int frame_callback_first_batch_frames) {
+                                       int frame_callback_batch_frames) {
     out_codes.clear();
     out_n_frames = 0;
     auto cancelled = [&]() {
@@ -859,12 +858,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int max_tokens = tts_gen.max_new_tokens;
     out_codes.reserve(max_tokens * 16);
     const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
-    const int callback_first_batch_frames = frame_callback_first_batch_frames > 0
-        ? std::max(1, frame_callback_first_batch_frames)
-        : callback_batch_frames;
     std::vector<int32_t> pending_callback_codes;
     int pending_callback_frames = 0;
-    int callback_batches_emitted = 0;
     if (frame_callback) {
         pending_callback_codes.reserve(static_cast<size_t>(callback_batch_frames) * 16);
     }
@@ -875,9 +870,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         const bool ok = frame_callback(pending_callback_codes, pending_callback_frames);
         pending_callback_codes.clear();
         pending_callback_frames = 0;
-        if (ok) {
-            ++callback_batches_emitted;
-        }
         return ok;
     };
 
@@ -1062,10 +1054,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         out_n_frames++;
         if (frame_callback) {
             ++pending_callback_frames;
-            const int callback_target_frames = callback_batches_emitted == 0
-                ? callback_first_batch_frames
-                : callback_batch_frames;
-            if (pending_callback_frames >= callback_target_frames &&
+            if (pending_callback_frames >= callback_batch_frames &&
                 !flush_frame_callback()) {
                 return false;
             }
@@ -1269,11 +1258,10 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     std::vector<int32_t> all_codes;
     int total_frames = 0;
     const int batch_size = std::max(1, stream_batch_frames);
-    const int first_batch_size = std::max(1, std::min(3, batch_size));
     if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
                            instruct_tokens, language_id, gen_config,
                            all_codes, total_frames, should_cancel,
-                           emit_audio_batch, batch_size, first_batch_size)) {
+                           emit_audio_batch, batch_size)) {
         return false;
     }
     const auto codes_done = std::chrono::high_resolution_clock::now();

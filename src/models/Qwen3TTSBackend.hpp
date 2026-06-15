@@ -45,8 +45,7 @@ public:
                           int& out_n_frames,
                           std::function<bool()> should_cancel = {},
                           CodeFrameCallback frame_callback = {},
-                          int frame_callback_batch_frames = 0,
-                          int frame_callback_first_batch_frames = 0);
+                          int frame_callback_batch_frames = 0);
 
     // Streaming synthesis: calls audio_callback for each batch of generated audio
     using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;

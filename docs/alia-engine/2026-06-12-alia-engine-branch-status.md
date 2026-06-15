@@ -130,11 +130,12 @@ multi-pipeline runtime shape:
   path initializes Mimi before codec generation and feeds completed codec frame
   batches directly into `decode_mimi_incremental`, so first audio no longer
   waits for the full spoken chunk's codec sequence.
-- The Alia TTS stream schedule now uses a small first Mimi batch and a larger
-  steady-state batch: the first audio batch is requested after `3` codec
-  frames, while subsequent product-path batches use `12` frames. This keeps
-  perceived latency low while reducing the number of full-history Mimi
-  incremental calls on longer chunks.
+- The Alia TTS stream schedule now uses uniform `12`-frame codec/Mimi batches.
+  A previous first-small/steady-large schedule improved measured TTFA, but was
+  rejected because the short first audio buffer can finish playback before the
+  second batch is ready. The product path now favors playback continuity until
+  Mimi incremental-state work or an explicit playback buffer scheduler can
+  reduce latency without under-run risk.
 - Foreground abort now has an explicit `Aborted` terminal state. If abort is
   requested while a TTS chunk callback is in flight, the pipeline stops before
   synthesizing remaining spoken chunks after the callback returns.
@@ -244,10 +245,11 @@ product work is concentrated in these areas:
   content at roughly `3.6s` to `3.8s` after foreground turn start.
 - TTS has real Qwen3-TTS plus Mimi streaming smoke coverage, foreground decode
   overlaps TTS synthesis, codec frames stream into Mimi before the full chunk is
-  complete, and stream batches now use a first-small/steady-large schedule. The
-  current matrix shows first TTS enqueue around `3.8s` to `4.5s`, while first
-  audio arrives around `4.5s` to `5.1s`. This is still too slow for the PRD
-  target because foreground first content remains around `3.7s` to `3.9s`.
+  complete, and stream batches now use uniform `12`-frame batches for playback
+  continuity. The current matrix shows first TTS enqueue around `3.8s` to
+  `4.5s`, while first audio arrives around `4.9s` to `5.4s`. This is still too
+  slow for the PRD target because foreground first content remains around
+  `3.7s` to `3.9s`.
   The next TTS-side bottleneck is true Mimi incremental-state efficiency: the
   boundary is streaming, but the current Mimi path still recomputes
   full-history pre-transformer/conv work per batch. Host voice control inputs
@@ -366,12 +368,12 @@ Result:
 - Scenario metrics:
 
 ```text
-scenario          asr_ms  prompt_tokens  generated_tokens  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  backend_total_ms  foreground_ms  background_ms
-short_hello       1691    120            37                3697              3838                  4944            996.176         15287.7           19130          1138
-persona_chat      1823    123            13                3853              4219                  4517            194.839         8331.75           12553          851
-preference_memory 1781    123            22                3856              4463                  4766            195.586         6833.15           11299          1120
-task_memory       1725    122            39                3791              4052                  5103            946.233         19418.3           23475          1150
-long_answer       1758    125            18                3827              4164                  4601            333.946         4834.66           9002           769
+scenario          asr_ms  prompt_tokens  generated_tokens  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_audio_samples  backend_total_ms  foreground_ms  background_ms
+short_hello       1648    120            15                3584              3842                  4948            850.632         1105.47                 23040                8100.67           11946          1043
+persona_chat      1752    123            23                3656              3927                  5155            992.303         1228.05                 23040                9086.63           13017          1335
+preference_memory 1720    123            20                3712              4247                  5186            689.095         938.956                 23040                6031.53           10281          1067
+task_memory       1817    122            21                3658              3917                  5169            1002.79         1251.63                 23040                12178.2           16098          1061
+long_answer       1693    125            28                3731              4090                  5406            1065.1          1315.44                 23040                10229.3           14322          655
 ```
 
 - A prior `task_memory` run reproduced an access violation after foreground/TTS
@@ -379,22 +381,29 @@ long_answer       1758    125            18                3827              416
   ordinary voice answer. The foreground structured-artifact guard fixed that
   failure and reduced the reproduced `task_memory` generation from `64` tokens
   to `21` tokens.
-- The current batch-scheduled codec streaming run uses a `3`-frame first batch
-  and `12`-frame steady batches. Single-chunk runs show first backend audio
-  around `0.30s` to `0.44s`; multi-chunk runs depend on the first spoken chunk
-  shape and landed around `1.05s` to `1.11s` in this matrix.
+- The current batch-scheduled codec streaming run uses uniform `12`-frame
+  batches. This moves first backend audio later than the rejected `3`-frame
+  first batch, but the first callback now carries `23040` samples, reducing the
+  risk that playback drains before the second batch is available. The latest
+  matrix landed first backend audio around `1.1s` after TTS starts.
 
 ```powershell
-.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -AudioPath "tmp\alia-real-smoke\voice_matrix\short_hello_request.wav" -OutputWav "tmp\alia-real-smoke\alia_tts_batch_schedule_tool_probe.wav" -LogPath "tmp\alia-real-smoke\alia_tts_batch_schedule_tool_probe.log" -RequestText "Alia, please say hello in one short sentence." -MaxTokens 48 -TimeoutSec 1500
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -SkipToolProbe -AudioPath "tmp\alia-real-smoke\voice_matrix\short_hello_request.wav" -OutputWav "tmp\alia-real-smoke\alia_tts_uniform_batch_short.wav" -LogPath "tmp\alia-real-smoke\alia_tts_uniform_batch_short.log" -RequestText "Alia, please say hello in one short sentence." -MaxTokens 48 -TimeoutSec 1500
 ```
 
 Result:
 
 - Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
-- Tool probe remained enabled: `tool_probe=true`.
-- Tool probe executed `inspect_window` with argument `{"id":"42"}` and received
-  `{"ok":true,"result":"real smoke tool callback executed"}`.
-- Full log: `tmp\alia-real-smoke\alia_tts_batch_schedule_tool_probe.log`.
+- Tool probe was skipped for this TTS schedule verification:
+  `tool_probe=false`.
+- Uniform `12`-frame stream batching produced first backend audio samples of
+  `23040`; the observed output chunks were
+  `23040,11520,23040,7680`.
+- A natural-language tool probe miss under the identity LoRA produced persona
+  text instead of a tool call. Tool-call robustness should be tracked as its
+  own foreground-model task rather than folded into the TTS batch schedule
+  change.
+- Full log: `tmp\alia-real-smoke\alia_tts_uniform_batch_short.log`.
 
 ```powershell
 git diff --check

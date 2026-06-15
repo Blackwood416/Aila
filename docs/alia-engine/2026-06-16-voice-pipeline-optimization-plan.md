@@ -176,11 +176,11 @@ Steps:
 
 Steps:
 
-- Keep the first Mimi batch small so the first audio callback can be emitted
-  quickly.
-- Increase the steady-state frame batch size so long chunks make fewer Mimi
-  incremental calls while the current implementation still recomputes full
-  history per batch.
+- Use uniform `12`-frame Mimi batches for the product path so the first emitted
+  audio buffer is long enough to cover likely generation time for the next
+  batch.
+- Keep smaller first-batch experiments out of the product path unless paired
+  with playback-aware buffering that can prove no under-run.
 - Preserve the full-code generation API and default behavior for non-streaming
   callers.
 
@@ -319,9 +319,11 @@ Interpretation:
 
 ## 2026-06-16 TTS Batch Schedule Update
 
-After adding a two-stage stream schedule, the voice matrix passed again. The
-first batch emits after `3` codec frames, then the Alia product path uses `12`
-frames for subsequent batches:
+After adding a two-stage stream schedule, the voice matrix passed again, but
+the strategy was rejected for product playback. A `3`-frame first batch lowers
+the first callback timestamp, yet it also makes the first audio buffer short
+enough that playback can drain before the second batch is generated. The Alia
+product path therefore returned to uniform `12`-frame batches:
 
 ```text
 scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  tts_backend_total_ms  foreground_ms
@@ -332,7 +334,7 @@ task_memory       1725    3791              4052                  5103          
 long_answer       1758    3827              4164                  4601            333.946         436.832                 3701.61                 4834.66               9002
 ```
 
-Interpretation:
+Rejected two-stage run:
 
 - Single-chunk replies now show first backend audio around `300ms` to `440ms`
   after TTS starts, while multi-chunk replies still depend on the first spoken
@@ -342,3 +344,22 @@ Interpretation:
 - The remaining hard floor is still foreground first content at roughly
   `3.7s` to `3.9s`; TTS can now often be ready soon after the first chunk is
   enqueued.
+
+Current uniform-batch verification:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  tts_backend_total_ms  foreground_ms
+short_hello       1648    3584              3842                  4948            850.632         1105.47                 8100.67               11946
+persona_chat      1752    3656              3927                  5155            992.303         1228.05                 9086.63               13017
+preference_memory 1720    3712              4247                  5186            689.095         938.956                 6031.53               10281
+task_memory       1817    3658              3917                  5169            1002.79         1251.63                 12178.2               16098
+long_answer       1693    3731              4090                  5406            1065.10         1315.44                 10229.3               14322
+```
+
+Interpretation:
+
+- The first callback is later than the rejected `3`-frame first-batch run, but
+  now contains `23040` samples, which gives playback materially more buffer.
+- This is a continuity-first schedule. Further latency work should target true
+  Mimi incremental-state efficiency and playback-aware buffering instead of
+  shortening only the first chunk.
