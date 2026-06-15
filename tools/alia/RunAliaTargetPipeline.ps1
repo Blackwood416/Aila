@@ -4,12 +4,16 @@ param(
     [string]$OutputWav = "tmp\alia-real-smoke\alia_full_pipeline_target_models.wav",
     [string]$LogPath = "tmp\alia-real-smoke\alia_full_pipeline_target_models.log",
     [string]$RequestText = "Alia, please say hello in one short sentence.",
+    [string]$ForegroundLora = "F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400",
+    [string]$ToolProbeText = "Call the host tool inspect_window with parameter id equal to 42 now. Return only the tool call.",
     [int]$MaxSeq = 2048,
     [int]$MaxTokens = 48,
     [int]$TimeoutSec = 1500,
     [int]$RollbackTokens = 0,
     [switch]$SkipBuild,
-    [switch]$NoGenerateAudio
+    [switch]$NoGenerateAudio,
+    [switch]$NoForegroundLora,
+    [switch]$NoToolProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +55,9 @@ try {
     if (-not (Test-Path -LiteralPath $smokeExe)) {
         throw "Smoke executable not found: $smokeExe"
     }
+    if (-not $NoForegroundLora -and -not (Test-Path -LiteralPath $ForegroundLora)) {
+        throw "Foreground LoRA not found: $ForegroundLora. Pass -NoForegroundLora to run the base foreground model."
+    }
 
     Ensure-ParentDirectory $OutputWav
     Ensure-ParentDirectory $LogPath
@@ -73,6 +80,12 @@ try {
         "--timeout-sec", "$TimeoutSec",
         "--rollback-tokens", "$RollbackTokens"
     )
+    if (-not $NoForegroundLora) {
+        $smokeArgs += @("--foreground-lora", $ForegroundLora)
+    }
+    if (-not $NoToolProbe) {
+        $smokeArgs += @("--tool-probe", "--tool-probe-text", $ToolProbeText)
+    }
     if ($NoGenerateAudio) {
         $smokeArgs += "--no-generate-audio"
     }

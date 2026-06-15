@@ -287,6 +287,26 @@ bool parse_tool_call_block(const std::string& block, ChatToolCall& tool_call) {
             return false;
         }
 
+        const size_t early_parameter_close = body.find("</parameter>", parameter_name_begin);
+        if (early_parameter_close != std::string::npos &&
+            early_parameter_close < parameter_open_end) {
+            const std::string malformed_parameter =
+                trim(body.substr(parameter_name_begin,
+                                 early_parameter_close - parameter_name_begin));
+            const size_t equals = malformed_parameter.find('=');
+            if (equals == std::string::npos) {
+                return false;
+            }
+            const std::string recovered_name = trim(malformed_parameter.substr(0, equals));
+            const std::string recovered_value = trim(malformed_parameter.substr(equals + 1));
+            if (recovered_name.empty() || recovered_value.empty()) {
+                return false;
+            }
+            parameters.emplace_back(recovered_name, recovered_value);
+            pos = early_parameter_close + std::string("</parameter>").size();
+            continue;
+        }
+
         const std::string parameter_name =
             trim(body.substr(parameter_name_begin, parameter_open_end - parameter_name_begin));
         const size_t parameter_close = body.find("</parameter>", parameter_open_end + 1);

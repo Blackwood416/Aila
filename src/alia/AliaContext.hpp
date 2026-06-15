@@ -24,6 +24,7 @@ struct AliaContext {
     std::string last_error;
     std::string asr_model_dir;
     std::string vlm_4b_model_dir;
+    std::string vlm_4b_lora_dir;
     std::string vlm_0_8b_model_dir;
     std::string tts_model_dir;
 

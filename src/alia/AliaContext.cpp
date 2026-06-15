@@ -14,6 +14,7 @@ void AliaContext::configure_model_slots() {
     asr.configure(aila::alia::ModelRole::Asr, asr_model_dir, &runtime->foreground());
     foreground_vlm.configure(aila::alia::ModelRole::ForegroundVlm, vlm_4b_model_dir,
                              &runtime->foreground());
+    foreground_vlm.set_lora_dir(vlm_4b_lora_dir);
     background_vlm.configure(aila::alia::ModelRole::BackgroundVlm, vlm_0_8b_model_dir,
                              &runtime->background());
     tts.configure(aila::alia::ModelRole::Tts, tts_model_dir, &runtime->foreground());

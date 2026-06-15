@@ -23,17 +23,22 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
     std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
+    std::string foreground_lora;
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
     std::string output_wav = "tmp/alia-real-smoke/alia_full_pipeline_target_models.wav";
     std::string request_text = "Alia, please say hello in one short sentence.";
+    std::string tool_probe_text =
+        "Call the host tool inspect_window with parameter id equal to 42 now. "
+        "Return only the tool call.";
     int max_seq_len = 2048;
     int max_tokens = 48;
     int timeout_sec = 1500;
     int rollback_tokens = 0;
     bool enforce_target_models = true;
     bool generate_audio_if_missing = true;
+    bool run_tool_probe = false;
 };
 
 struct AudioCapture {
@@ -72,11 +77,14 @@ void print_usage() {
         << "Options:\n"
         << "  --asr-model <dir>\n"
         << "  --foreground-model <dir>\n"
+        << "  --foreground-lora <dir>\n"
         << "  --background-model <dir>\n"
         << "  --tts-model <dir>\n"
         << "  --audio <path>\n"
         << "  --output-wav <path>\n"
         << "  --request-text <text>  default \"Alia, please say hello in one short sentence.\"\n"
+        << "  --tool-probe-text <text>\n"
+        << "  --tool-probe         run a real foreground VLM tool-call probe\n"
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
@@ -128,6 +136,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_value(opts.asr_model)) return false;
         } else if (arg == "--foreground-model") {
             if (!require_value(opts.foreground_model)) return false;
+        } else if (arg == "--foreground-lora") {
+            if (!require_value(opts.foreground_lora)) return false;
         } else if (arg == "--background-model") {
             if (!require_value(opts.background_model)) return false;
         } else if (arg == "--tts-model") {
@@ -138,6 +148,10 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_value(opts.output_wav)) return false;
         } else if (arg == "--request-text") {
             if (!require_value(opts.request_text)) return false;
+        } else if (arg == "--tool-probe-text") {
+            if (!require_value(opts.tool_probe_text)) return false;
+        } else if (arg == "--tool-probe") {
+            opts.run_tool_probe = true;
         } else if (arg == "--max-seq") {
             if (!require_int(opts.max_seq_len)) return false;
         } else if (arg == "--max-tokens") {
@@ -162,6 +176,10 @@ bool parse_args(int argc, char** argv, Options& opts) {
     }
     if (opts.request_text.empty()) {
         std::cerr << "request-text must not be empty.\n";
+        return false;
+    }
+    if (opts.run_tool_probe && opts.tool_probe_text.empty()) {
+        std::cerr << "tool-probe-text must not be empty when --tool-probe is set.\n";
         return false;
     }
     return true;
@@ -207,6 +225,10 @@ bool validate_target_models(const Options& opts) {
              "qwen3.5-0.8B-bnb-nf4-offline") && ok;
     ok = validate_target_model_dir(
              "tts", opts.tts_model, "Qwen3-TTS-12Hz-0.6B-Base") && ok;
+    if (!opts.foreground_lora.empty() && !std::filesystem::exists(opts.foreground_lora)) {
+        std::cerr << "foreground_lora_missing=" << quote(opts.foreground_lora) << "\n";
+        ok = false;
+    }
     return ok;
 }
 
@@ -377,6 +399,62 @@ bool generate_request_audio_with_target_tts(AliaContext& ctx, const Options& opt
     return true;
 }
 
+bool run_foreground_tool_probe(AliaContext& ctx, const Options& opts) {
+    if (!ctx.asr_pipeline || !ctx.foreground_pipeline) {
+        std::cerr << "tool_probe_error=\"Alia foreground pipelines are not ready\"\n";
+        return false;
+    }
+
+    ctx.asr_pipeline->reset();
+    ctx.asr_pipeline->append_stable_text(opts.tool_probe_text);
+
+    AliaGenConfig gen{};
+    gen.temperature = 0.0f;
+    gen.top_p = 1.0f;
+    gen.max_tokens = std::max(opts.max_tokens, 96);
+
+    const auto probe_start = Clock::now();
+    int rc = alia_start_conversation_turn(
+        &ctx, &gen, tool_callback, nullptr, nullptr);
+    if (rc != ALIA_OK) {
+        std::cerr << "tool_probe_start_rc=" << rc << "\n";
+        return false;
+    }
+    if (!ctx.foreground_pipeline->wait_until_idle_for(std::chrono::seconds(opts.timeout_sec))) {
+        std::cerr << "tool_probe_timeout=true\n";
+        alia_abort_inference(&ctx, ALIA_PIPELINE_VLM_FOREGROUND);
+        ctx.foreground_pipeline->join();
+        return false;
+    }
+    ctx.foreground_pipeline->join();
+    const auto probe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - probe_start).count();
+
+    const auto state = ctx.foreground_pipeline->state();
+    const auto mode = ctx.foreground_pipeline->last_decode_mode();
+    const std::string assistant_text = ctx.foreground_pipeline->last_assistant_text();
+    const std::string tool_json = ctx.foreground_pipeline->last_tool_call_json();
+    const std::string tool_result = ctx.foreground_pipeline->last_tool_result_text();
+    std::cout << "tool_probe_ms=" << probe_ms << "\n"
+              << "tool_probe_state=" << foreground_state_name(state) << "\n"
+              << "tool_probe_decode_mode=" << foreground_mode_name(mode) << "\n"
+              << "tool_probe_user_text=" << quote(ctx.foreground_pipeline->last_user_text()) << "\n"
+              << "tool_probe_assistant_text=" << quote(assistant_text) << "\n"
+              << "tool_probe_tool_call_json=" << quote(tool_json) << "\n"
+              << "tool_probe_tool_result_text=" << quote(tool_result) << "\n"
+              << "tool_probe_error=" << quote(ctx.foreground_pipeline->last_error()) << "\n";
+
+    if (state != aila::alia::ForegroundTurnState::Completed ||
+        mode != aila::alia::ForegroundDecodeMode::LoadedVlm ||
+        tool_json.empty() ||
+        tool_json.find("inspect_window") == std::string::npos ||
+        tool_result.empty()) {
+        std::cerr << "tool_probe_validation_failed=true\n";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -395,9 +473,11 @@ int main(int argc, char** argv) {
               << (opts.enforce_target_models ? "true" : "false") << "\n"
               << "asr_model=" << quote(opts.asr_model) << "\n"
               << "foreground_model=" << quote(opts.foreground_model) << "\n"
+              << "foreground_lora=" << quote(opts.foreground_lora) << "\n"
               << "background_model=" << quote(opts.background_model) << "\n"
               << "tts_model=" << quote(opts.tts_model) << "\n"
               << "request_text=" << quote(opts.request_text) << "\n"
+              << "tool_probe=" << (opts.run_tool_probe ? "true" : "false") << "\n"
               << "max_seq_len=" << opts.max_seq_len << "\n"
               << "max_tokens=" << opts.max_tokens << "\n";
 
@@ -410,6 +490,7 @@ int main(int argc, char** argv) {
     auto ctx = std::make_unique<AliaContext>(opts.max_seq_len);
     ctx->asr_model_dir = opts.asr_model;
     ctx->vlm_4b_model_dir = opts.foreground_model;
+    ctx->vlm_4b_lora_dir = opts.foreground_lora;
     ctx->vlm_0_8b_model_dir = opts.background_model;
     ctx->tts_model_dir = opts.tts_model;
     ctx->configure_model_slots();
@@ -425,7 +506,11 @@ int main(int argc, char** argv) {
     }
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - load_start).count();
-    std::cout << "model_load_ms=" << load_ms << "\n";
+    std::cout << "model_load_ms=" << load_ms << "\n"
+              << "foreground_lora_applied="
+              << (ctx->foreground_vlm.lora_applied() ? "true" : "false") << "\n"
+              << "foreground_lora_pair_count="
+              << ctx->foreground_vlm.lora_pair_count() << "\n";
 
     if (!audio_exists_before_load) {
         std::cout << "request_audio_missing=true path=" << quote(opts.audio_path) << "\n";
@@ -597,6 +682,10 @@ int main(int argc, char** argv) {
         !bg_schema_valid ||
         callback_json.empty()) {
         std::cerr << "background_validation_failed=true\n";
+        return 1;
+    }
+
+    if (opts.run_tool_probe && !run_foreground_tool_probe(*ctx, opts)) {
         return 1;
     }
 

@@ -1,6 +1,7 @@
 #include "ModelSlot.hpp"
 
 #include "../audio/Qwen3ASRAudioEncoder.hpp"
+#include "../lora/LoraLoader.hpp"
 #include "../models/Qwen35HybridBnb4Backend.hpp"
 #include "../models/Qwen3ASRBackend.hpp"
 #include "../models/Qwen3ASRBnb4Backend.hpp"
@@ -24,10 +25,17 @@ void ModelSlot::configure(ModelRole role, std::string model_dir, Context* contex
     clear_loaded_objects();
     role_ = role;
     model_dir_ = std::move(model_dir);
+    lora_dir_.clear();
     context_ = context;
     backend_kind_ = BackendKind::Unknown;
     last_error_.clear();
     state_ = ModelSlotState::Configured;
+}
+
+void ModelSlot::set_lora_dir(std::string lora_dir) {
+    lora_dir_ = std::move(lora_dir);
+    lora_applied_ = false;
+    lora_pair_count_ = 0;
 }
 
 bool ModelSlot::load_metadata() {
@@ -108,6 +116,10 @@ bool ModelSlot::load_model(int max_seq_len) {
         return fail_load(std::string(role_name()) + " backend load failed: " + backend_error);
     }
 
+    if (!apply_lora_adapter()) {
+        return fail_load(last_error_);
+    }
+
     if (backend_kind_ == BackendKind::Qwen3Tts) {
         auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
         if (tts_backend) {
@@ -162,6 +174,9 @@ void ModelSlot::configure_loaded_for_tests(
     tokenizer_ = std::move(tokenizer);
     backend_ = std::move(backend);
     weights_.reset();
+    lora_dir_.clear();
+    lora_applied_ = false;
+    lora_pair_count_ = 0;
     audio_encoder_.reset();
     vision_encoder_.reset();
     vision_enabled_ = false;
@@ -259,6 +274,42 @@ bool ModelSlot::validate_quantization() {
     return true;
 }
 
+bool ModelSlot::apply_lora_adapter() {
+    lora_applied_ = false;
+    lora_pair_count_ = 0;
+    if (lora_dir_.empty()) {
+        return true;
+    }
+
+    if (role_ != ModelRole::ForegroundVlm ||
+        backend_kind_ != BackendKind::Qwen35HybridBnb4 ||
+        !backend_ || !context_) {
+        last_error_ = std::string(role_name()) +
+                      " LoRA is only supported on the foreground Qwen3.5 Hybrid NF4 slot";
+        return false;
+    }
+
+    aila::lora::LoraAdapter adapter;
+    std::string lora_error;
+    if (!aila::lora::LoraLoader::load(lora_dir_, adapter, &lora_error)) {
+        last_error_ = std::string(role_name()) + " LoRA load failed: " + lora_error;
+        return false;
+    }
+    if (adapter.pairs.empty()) {
+        last_error_ = std::string(role_name()) + " LoRA load produced zero adapter pairs";
+        return false;
+    }
+
+    if (!backend_->apply_lora(*context_, adapter, &lora_error)) {
+        last_error_ = std::string(role_name()) + " LoRA apply failed: " + lora_error;
+        return false;
+    }
+
+    lora_applied_ = true;
+    lora_pair_count_ = adapter.pairs.size();
+    return true;
+}
+
 bool ModelSlot::create_backend() {
     switch (backend_kind_) {
         case BackendKind::Qwen3AsrDense:
@@ -288,6 +339,8 @@ bool ModelSlot::create_backend() {
 
 void ModelSlot::clear_loaded_objects() {
     vision_enabled_ = false;
+    lora_applied_ = false;
+    lora_pair_count_ = 0;
     vision_encoder_.reset();
     audio_encoder_.reset();
     backend_.reset();

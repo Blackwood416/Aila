@@ -151,7 +151,10 @@ std::string foreground_system_prompt() {
            "interaction. Do not answer in JSON, Markdown code fences, or "
            "schemas. No host tools are available unless the user message "
            "explicitly provides a tool request, so ordinary turns must be "
-           "answered as natural language only.";
+           "answered as natural language only. For explicit host tool "
+           "requests, emit only "
+           "<tool_call><function=name><parameter=name>value</parameter>"
+           "</function></tool_call>.";
 }
 
 std::vector<std::string> split_spoken_text_for_tts(const std::string& text) {

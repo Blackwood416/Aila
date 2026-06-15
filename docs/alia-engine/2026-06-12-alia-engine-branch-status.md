@@ -1,6 +1,6 @@
 # Alia Engine Branch Status
 
-Date: 2026-06-12
+Date: 2026-06-15
 
 Branch: `codex/alia-custom-engine`
 
@@ -170,6 +170,18 @@ multi-pipeline runtime shape:
   `qwen3.5-0.8B-bnb-nf4-offline`, and
   `Qwen3-TTS-12Hz-0.6B-Base`. The smoke enforces those model directory names by
   default and requires `--allow-non-target-models` for exploratory probes.
+- The foreground Qwen3.5 4B slot can now load the Alia identity LoRA from
+  `F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400` when
+  configured through `AliaContext::vlm_4b_lora_dir` or
+  `AilaAliaRealSmoke --foreground-lora`. The Qwen3.5 Hybrid NF4 backend applies
+  PEFT q/k/v/o adapters to full-attention layers, including fused QKV row
+  offsets and the gated full-attention `o_proj` input shape.
+- `LoraLoader` now accepts the PEFT prefix shape emitted by the identity LoRA
+  (`base_model.model.model.language_model.layers...`) and normalizes it to the
+  local `model.layers...` weight names used by backend LoRA attachment code.
+- Foreground tool-call parsing now tolerates one real-model near miss observed
+  during LoRA smoke: `<parameter=id=42</parameter>` is recovered as
+  `{"id":"42"}` when it appears inside an otherwise valid function tool block.
 - If the request WAV is missing, `AilaAliaRealSmoke` now uses the target
   Qwen3-TTS slot to synthesize `--request-text` into that WAV path before
   feeding the generated audio into ASR. This keeps the full-pipeline smoke
@@ -177,7 +189,9 @@ multi-pipeline runtime shape:
 - `tools/alia/RunAliaTargetPipeline.ps1` is the branch-local verification
   entrypoint. It configures/builds `AliaEngine` with generic CLI, generic API,
   generic chat tests, and lightweight Alia API tests disabled, then runs the
-  fixed four-model full pipeline.
+  fixed four-model full pipeline. By default it also passes the identity LoRA
+  and runs the real foreground tool-call probe; use `-NoForegroundLora` or
+  `-NoToolProbe` only for focused diagnostics.
 - `CMakeLists.txt` now treats `AliaEngine` as the custom branch aggregate
   target. Default configure builds `AilaShared` plus `AilaAliaRealSmoke`; the
   generic CLI, generic chat tests, lightweight Alia API tests, and generic
@@ -224,6 +238,9 @@ product work is concentrated in these areas:
   skipped, so rollback must remain a separate investigation item.
 - Computer Use, WGC texture injection, YOLO/SAM entity extraction, and related
   low-latency vision routing remain later-stage work.
+- The identity LoRA can execute the current smoke tool probe after parser
+  recovery, but its raw output is less protocol-clean than the base model. Keep
+  the LoRA tool probe in smoke so regressions stay visible.
 
 ## Fresh Verification
 
@@ -263,7 +280,7 @@ Result:
 - No generic `aila_*` exports were present with `AILA_BUILD_GENERIC_API=OFF`.
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath tmp\alia-real-smoke\alia_autogen_request.wav -OutputWav tmp\alia-real-smoke\alia_full_pipeline_autogen.wav -LogPath tmp\alia-real-smoke\alia_full_pipeline_autogen.log
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoForegroundLora -NoToolProbe -AudioPath tmp\alia-real-smoke\alia_autogen_request.wav -OutputWav tmp\alia-real-smoke\alia_full_pipeline_autogen.wav -LogPath tmp\alia-real-smoke\alia_full_pipeline_autogen.log
 ```
 
 Result:
@@ -292,6 +309,47 @@ Result:
 - Background JSON:
   `{"summary":"User asked to say hello in one short sentence, and the assistant replied with 'Hello!'.","memory_candidates":[],"preferences":[],"tasks":[]}`
 - Full log: `tmp\alia-real-smoke\alia_full_pipeline_autogen.log`.
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath "tmp\alia-real-smoke\alia_lora_request.wav" -OutputWav "tmp\alia-real-smoke\alia_full_pipeline_lora.wav" -LogPath "tmp\alia-real-smoke\alia_full_pipeline_lora.log" -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- Foreground LoRA:
+  `F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400`.
+- LoRA load/apply evidence: `Parsed 32 LoRA pairs`,
+  `LoRA adapter applied: r=16 alpha=32 scaling=2.00 applied=32 skipped=0`,
+  `foreground_lora_applied=true`, `foreground_lora_pair_count=32`.
+- Main full pipeline used the fixed target ASR, 4B foreground, 0.8B background,
+  and TTS models. ASR recovered
+  `Alia, please say hello in one short sentence.`, foreground used
+  `LoadedVlm`, TTS wrote `tmp\alia-real-smoke\alia_full_pipeline_lora.wav`,
+  and background accepted schema JSON without retry or repair.
+- Tool probe user text:
+  `Call the host tool inspect_window with parameter id equal to 42 now. Return only the tool call.`
+- Tool probe callback executed:
+  `tool_probe_tool_call_json={"id":"call_0","type":"function","function":{"name":"inspect_window","arguments":"{\"id\":\"42\"}"}}`
+  and `tool_probe_tool_result_text={"ok":true,"result":"real smoke tool callback executed"}`.
+- The LoRA raw assistant text still contained spoken preface plus an orphan
+  think close artifact, so the parser recovery is part of the smoke coverage
+  rather than a reason to remove the probe.
+- Full log: `tmp\alia-real-smoke\alia_full_pipeline_lora.log`.
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoForegroundLora -AudioPath "tmp\alia-real-smoke\alia_base_request.wav" -OutputWav "tmp\alia-real-smoke\alia_full_pipeline_base_tool_probe.wav" -LogPath "tmp\alia-real-smoke\alia_full_pipeline_base_tool_probe.log" -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- Base foreground comparison had `foreground_lora_applied=false`.
+- Base tool probe produced a cleaner recoverable tool block and executed the
+  same `inspect_window` callback with argument `id=42`.
+- This confirms the probe itself is valid for the base 4B model and that the
+  identity LoRA changes raw protocol style enough to warrant permanent smoke
+  coverage.
 
 4B rollback probe:
 
