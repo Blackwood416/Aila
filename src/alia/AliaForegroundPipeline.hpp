@@ -23,7 +23,6 @@ std::vector<std::string> split_spoken_text_for_tts(const std::string& text);
 
 enum class ForegroundDecodeMode {
     None,
-    NoModelFallback,
     LoadedVlm
 };
 
@@ -83,10 +82,6 @@ private:
                             AliaToolCallCallback tool_cb,
                             void* user_data,
                             std::string& spoken_text);
-    void synthesize_spoken_text(const std::string& spoken_text,
-                                const AliaGenConfig& config,
-                                AliaAudioCallback audio_cb,
-                                void* user_data);
     bool abort_requested() const;
     bool is_busy_locked() const;
 

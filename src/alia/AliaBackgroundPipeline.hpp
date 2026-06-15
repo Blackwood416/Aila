@@ -16,13 +16,11 @@ class ModelSlot;
 
 std::string background_system_prompt();
 std::string build_background_extraction_prompt(const std::string& chat_turn_text);
-std::string make_background_fallback_json(const std::string& chat_turn_text);
 std::string enforce_background_result_schema(const std::string& raw_result_json,
                                              const std::string& chat_turn_text);
 
 enum class BackgroundDecodeMode {
     None,
-    NoModelFallback,
     LoadedVlm
 };
 

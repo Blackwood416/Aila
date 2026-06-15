@@ -19,12 +19,6 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project (Aila CXX)
 
-option(AILA_BUILD_GENERIC_API "Build the generic aila_* API surface into AilaShared" OFF)
-option(AILA_BUILD_GENERIC_CLI "Build the generic Aila command-line executable" OFF)
-option(AILA_BUILD_GENERIC_CHAT_TESTS "Build generic chat/template unit tests" OFF)
-option(AILA_BUILD_ALIA_API_TESTS "Build lightweight Alia API unit tests" OFF)
-option(AILA_BUILD_ALIA_REAL_SMOKE "Build the Alia fixed-model full-pipeline smoke executable" ON)
-
 if(MSVC)
     # --- Base flags ---
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl /Qstd=c++17 /EHsc /Qftz")
@@ -122,41 +116,9 @@ set(ALIA_ENGINE_SOURCES
     src/alia/AliaApi.cpp
 )
 
-set(GENERIC_API_SOURCES
-    src/api/aila_api.cpp
-)
-
 set(LIB_SOURCES
     ${COMMON_ENGINE_SOURCES}
     ${ALIA_ENGINE_SOURCES}
-)
-
-if(AILA_BUILD_GENERIC_API)
-    list(APPEND LIB_SOURCES ${GENERIC_API_SOURCES})
-endif()
-
-# CLI-only sources
-set(CLI_SOURCES
-    src/cli/CLI.cpp
-)
-
-# Lightweight chat tests
-set(CHAT_TEST_SOURCES
-    ${CHAT_SOURCES}
-    ${JINJA_SOURCES}
-    tests/chat/ChatTestMain.cpp
-    tests/chat/AssistantOutputParserTests.cpp
-    tests/chat/ChatJsonTests.cpp
-    tests/chat/ChatStreamJsonTests.cpp
-    tests/chat/ChatTemplateEngineTests.cpp
-    tests/chat/ChatFormatterTests.cpp
-    tests/chat/ThinkingBudgetControllerTests.cpp
-    tests/chat/StructuredStreamParserTests.cpp
-    tests/chat/ToolPolicyTests.cpp
-)
-
-set(ALIA_API_TEST_SOURCES
-    tests/alia/AliaApiTestMain.cpp
 )
 
 set(ALIA_REAL_SMOKE_SOURCES
@@ -220,60 +182,19 @@ target_include_directories(AilaShared PUBLIC
 )
 set_target_properties(AilaShared PROPERTIES OUTPUT_NAME "AilaShared")
 
-if(AILA_BUILD_GENERIC_CLI)
-    # ============================================================
-    # Executable: Aila
-    # ============================================================
-    add_executable(Aila src/main.cpp ${CLI_SOURCES})
-    target_compile_definitions(Aila PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-    target_link_libraries(Aila PRIVATE AilaLib)
-endif()
-
-if(AILA_BUILD_GENERIC_CHAT_TESTS)
-    # ============================================================
-    # Executable: AilaChatTests
-    # ============================================================
-    add_executable(AilaChatTests ${CHAT_TEST_SOURCES})
-    target_compile_definitions(AilaChatTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-    target_include_directories(AilaChatTests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat
-    )
-    target_link_libraries(AilaChatTests PRIVATE simdjson)
-endif()
-
-if(AILA_BUILD_ALIA_API_TESTS)
-    # ============================================================
-    # Executable: AilaAliaApiTests
-    # ============================================================
-    add_executable(AilaAliaApiTests ${ALIA_API_TEST_SOURCES})
-    target_compile_definitions(AilaAliaApiTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-    target_include_directories(AilaAliaApiTests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/alia
-    )
-    target_link_libraries(AilaAliaApiTests PRIVATE AilaLib)
-endif()
-
-if(AILA_BUILD_ALIA_REAL_SMOKE)
-    # ============================================================
-    # Executable: AilaAliaRealSmoke
-    # ============================================================
-    add_executable(AilaAliaRealSmoke ${ALIA_REAL_SMOKE_SOURCES})
-    target_compile_definitions(AilaAliaRealSmoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-    target_include_directories(AilaAliaRealSmoke PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
-endif()
+# ============================================================
+# Executable: AilaAliaRealSmoke
+# ============================================================
+add_executable(AilaAliaRealSmoke ${ALIA_REAL_SMOKE_SOURCES})
+target_compile_definitions(AilaAliaRealSmoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaRealSmoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
 
 add_custom_target(AliaEngine DEPENDS AilaShared)
-if(TARGET AilaAliaRealSmoke)
-    add_dependencies(AliaEngine AilaAliaRealSmoke)
-endif()
+add_dependencies(AliaEngine AilaAliaRealSmoke)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
@@ -454,22 +375,11 @@ endif()
         )
     endfunction()
 
-    if(TARGET Aila)
-        copy_runtime_dependencies(Aila EXECUTABLE)
-    endif()
-    if(TARGET AilaAliaRealSmoke)
-        copy_runtime_dependencies(AilaAliaRealSmoke EXECUTABLE)
-    endif()
+    copy_runtime_dependencies(AilaAliaRealSmoke EXECUTABLE)
     copy_runtime_dependencies(AilaShared LIBRARY)
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
-    set(AILA_RELEASE_TARGETS AilaShared)
-    if(TARGET AilaAliaRealSmoke)
-        list(APPEND AILA_RELEASE_TARGETS AilaAliaRealSmoke)
-    endif()
-    if(TARGET Aila)
-        list(APPEND AILA_RELEASE_TARGETS Aila)
-    endif()
+    set(AILA_RELEASE_TARGETS AilaShared AilaAliaRealSmoke)
 
     set(AILA_RELEASE_COPY_COMMANDS)
     foreach(AILA_RELEASE_TARGET IN LISTS AILA_RELEASE_TARGETS)

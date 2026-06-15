@@ -9,11 +9,8 @@ param(
     [int]$MaxSeq = 2048,
     [int]$MaxTokens = 48,
     [int]$TimeoutSec = 1500,
-    [int]$RollbackTokens = 0,
     [switch]$SkipBuild,
-    [switch]$NoGenerateAudio,
-    [switch]$NoForegroundLora,
-    [switch]$NoToolProbe
+    [switch]$NoGenerateAudio
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,12 +32,7 @@ try {
     Initialize-AilaOneApiEnvironment
 
     if (-not $SkipBuild) {
-        cmake -S . -B $BuildDir `
-            -DAILA_BUILD_GENERIC_API=OFF `
-            -DAILA_BUILD_GENERIC_CLI=OFF `
-            -DAILA_BUILD_GENERIC_CHAT_TESTS=OFF `
-            -DAILA_BUILD_ALIA_API_TESTS=OFF `
-            -DAILA_BUILD_ALIA_REAL_SMOKE=ON
+        cmake -S . -B $BuildDir
         if ($LASTEXITCODE -ne 0) {
             throw "CMake configure failed with exit code $LASTEXITCODE"
         }
@@ -55,8 +47,8 @@ try {
     if (-not (Test-Path -LiteralPath $smokeExe)) {
         throw "Smoke executable not found: $smokeExe"
     }
-    if (-not $NoForegroundLora -and -not (Test-Path -LiteralPath $ForegroundLora)) {
-        throw "Foreground LoRA not found: $ForegroundLora. Pass -NoForegroundLora to run the base foreground model."
+    if (-not (Test-Path -LiteralPath $ForegroundLora)) {
+        throw "Foreground LoRA not found: $ForegroundLora"
     }
 
     Ensure-ParentDirectory $OutputWav
@@ -78,14 +70,9 @@ try {
         "--max-seq", "$MaxSeq",
         "--max-tokens", "$MaxTokens",
         "--timeout-sec", "$TimeoutSec",
-        "--rollback-tokens", "$RollbackTokens"
+        "--foreground-lora", $ForegroundLora,
+        "--tool-probe-text", $ToolProbeText
     )
-    if (-not $NoForegroundLora) {
-        $smokeArgs += @("--foreground-lora", $ForegroundLora)
-    }
-    if (-not $NoToolProbe) {
-        $smokeArgs += @("--tool-probe", "--tool-probe-text", $ToolProbeText)
-    }
     if ($NoGenerateAudio) {
         $smokeArgs += "--no-generate-audio"
     }

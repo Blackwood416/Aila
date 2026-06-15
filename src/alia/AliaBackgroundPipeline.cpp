@@ -145,17 +145,6 @@ std::string build_background_schema_repair_prompt(const std::string& chat_turn_t
     return prompt;
 }
 
-std::string make_background_fallback_json(const std::string& chat_turn_text) {
-    return std::string("{") +
-        "\"summary\":\"" + AliaBackgroundPipeline::json_escape(chat_turn_text) + "\"," +
-        "\"memory_candidates\":[]," +
-        "\"preferences\":[]," +
-        "\"tasks\":[]," +
-        "\"source_turn_text\":\"" + AliaBackgroundPipeline::json_escape(chat_turn_text) + "\"," +
-        "\"source\":\"no_model_fallback\"" +
-        "}";
-}
-
 std::string enforce_background_result_schema(const std::string& raw_result_json,
                                              const std::string& chat_turn_text) {
     if (AliaBackgroundPipeline::has_required_schema_keys(raw_result_json)) {
@@ -463,57 +452,58 @@ void AliaBackgroundPipeline::run_job(
         int schema_retry_count = 0;
         bool schema_repair_applied = false;
         std::string schema_diagnostic;
-        BackgroundDecodeMode decode_mode = BackgroundDecodeMode::NoModelFallback;
-        if (can_generate_with_loaded_vlm()) {
-            decode_mode = BackgroundDecodeMode::LoadedVlm;
-            if (!generate_with_loaded_vlm(prompt_text, result_json)) {
+        BackgroundDecodeMode decode_mode = BackgroundDecodeMode::LoadedVlm;
+        if (!can_generate_with_loaded_vlm()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "background VLM slot is not loaded";
+            state_ = BackgroundJobState::Failed;
+            cv_.notify_all();
+            return;
+        }
+        if (!generate_with_loaded_vlm(prompt_text, result_json)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (last_error_.empty()) {
+                last_error_ = "background VLM generation failed";
+            }
+            state_ = BackgroundJobState::Failed;
+            cv_.notify_all();
+            return;
+        }
+        result_json = normalize_background_model_json(result_json);
+        if (!AliaBackgroundPipeline::has_required_schema_keys(result_json)) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (abort_requested_) {
+                    state_ = BackgroundJobState::Completed;
+                    cv_.notify_all();
+                    return;
+                }
+            }
+
+            const std::string repair_prompt =
+                build_background_schema_repair_prompt(chat_turn_text, result_json);
+            schema_retry_count = 1;
+            final_prompt_text = repair_prompt;
+            std::string repaired_json;
+            if (!generate_with_loaded_vlm(repair_prompt, repaired_json)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (last_error_.empty()) {
-                    last_error_ = "background VLM generation failed";
+                    last_error_ = "background VLM schema repair generation failed";
                 }
                 state_ = BackgroundJobState::Failed;
                 cv_.notify_all();
                 return;
             }
-            result_json = normalize_background_model_json(result_json);
-            if (!AliaBackgroundPipeline::has_required_schema_keys(result_json)) {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (abort_requested_) {
-                        state_ = BackgroundJobState::Completed;
-                        cv_.notify_all();
-                        return;
-                    }
-                }
-
-                const std::string repair_prompt =
-                    build_background_schema_repair_prompt(chat_turn_text, result_json);
-                schema_retry_count = 1;
-                final_prompt_text = repair_prompt;
-                std::string repaired_json;
-                if (!generate_with_loaded_vlm(repair_prompt, repaired_json)) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (last_error_.empty()) {
-                        last_error_ = "background VLM schema repair generation failed";
-                    }
-                    state_ = BackgroundJobState::Failed;
-                    cv_.notify_all();
-                    return;
-                }
-                result_json = normalize_background_model_json(repaired_json);
-                schema_diagnostic = AliaBackgroundPipeline::has_required_schema_keys(result_json)
-                    ? "retry accepted schema-valid background JSON"
-                    : "retry failed schema validation; applying schema repair wrapper";
-            } else {
-                schema_diagnostic = "initial background JSON accepted";
-            }
+            result_json = normalize_background_model_json(repaired_json);
+            schema_diagnostic = AliaBackgroundPipeline::has_required_schema_keys(result_json)
+                ? "retry accepted schema-valid background JSON"
+                : "retry failed schema validation; applying schema repair wrapper";
         } else {
-            result_json = make_background_fallback_json(chat_turn_text);
-            schema_diagnostic = "no-model fallback produced schema-valid background JSON";
+            schema_diagnostic = "initial background JSON accepted";
         }
         schema_repair_applied = !AliaBackgroundPipeline::has_required_schema_keys(result_json);
         result_json = enforce_background_result_schema(result_json, chat_turn_text);
-        if (decode_mode == BackgroundDecodeMode::LoadedVlm && !schema_repair_applied) {
+        if (!schema_repair_applied) {
             const std::string cleaned_json =
                 cleanup_background_result_json(result_json, chat_turn_text);
             if (cleaned_json != result_json &&

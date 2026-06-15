@@ -413,9 +413,6 @@ void AliaForegroundPipeline::run_turn(
     AliaToolCallCallback tool_cb,
     AliaAudioCallback audio_cb,
     void* user_data) {
-    (void)tool_cb;
-    (void)vlm_slot_;
-
     try {
         GenerationConfig generation_config = translate_generation_config(&config);
         std::string stable_text;
@@ -446,22 +443,24 @@ void AliaForegroundPipeline::run_turn(
         }
 
         std::string assistant_text;
-        ForegroundDecodeMode decode_mode = ForegroundDecodeMode::NoModelFallback;
-        if (can_generate_with_loaded_vlm()) {
-            decode_mode = ForegroundDecodeMode::LoadedVlm;
-            if (!generate_with_loaded_vlm(user_text, generation_config, assistant_text,
-                                          true, true, true, true,
-                                          &config, audio_cb, user_data)) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (last_error_.empty()) {
-                    last_error_ = "foreground VLM generation failed";
-                }
-                state_ = ForegroundTurnState::Failed;
-                cv_.notify_all();
-                return;
+        ForegroundDecodeMode decode_mode = ForegroundDecodeMode::LoadedVlm;
+        if (!can_generate_with_loaded_vlm()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "foreground VLM slot is not loaded";
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
+        }
+        if (!generate_with_loaded_vlm(user_text, generation_config, assistant_text,
+                                      true, true, true, true,
+                                      &config, audio_cb, user_data)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (last_error_.empty()) {
+                last_error_ = "foreground VLM generation failed";
             }
-        } else {
-            assistant_text = user_text.empty() ? "Alia foreground turn" : user_text;
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
         }
 
         std::string spoken_text;
@@ -507,11 +506,6 @@ void AliaForegroundPipeline::run_turn(
                 cv_.notify_all();
                 return;
             }
-        }
-
-        if (decode_mode != ForegroundDecodeMode::LoadedVlm &&
-            tts_pipeline_ && audio_cb && !spoken_text.empty()) {
-            synthesize_spoken_text(spoken_text, config, audio_cb, user_data);
         }
 
         {
@@ -776,29 +770,6 @@ bool AliaForegroundPipeline::process_tool_calls(
         last_error_.clear();
     }
     return true;
-}
-
-void AliaForegroundPipeline::synthesize_spoken_text(
-    const std::string& spoken_text,
-    const AliaGenConfig& config,
-    AliaAudioCallback audio_cb,
-    void* user_data) {
-    if (!tts_pipeline_ || !audio_cb) {
-        return;
-    }
-
-    for (const std::string& chunk : split_spoken_text_for_tts(spoken_text)) {
-        if (abort_requested()) {
-            break;
-        }
-        if (tts_pipeline_->enqueue_text(chunk)) {
-            tts_pipeline_->synthesize_pending(
-                config,
-                audio_cb,
-                user_data,
-                [this]() { return abort_requested(); });
-        }
-    }
 }
 
 bool AliaForegroundPipeline::abort_requested() const {

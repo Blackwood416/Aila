@@ -1,6 +1,6 @@
 # Alia Engine Branch Status
 
-Date: 2026-06-15
+Date: 2026-06-16
 
 Branch: `codex/alia-custom-engine`
 
@@ -49,8 +49,6 @@ Alia runtime implementation files:
 Build and test integration:
 
 - `CMakeLists.txt`
-- `tests/alia/AliaApiTestMain.cpp` (optional diagnostic target, not the default
-  branch verification path)
 - `tools/alia/AliaRealModelSmoke.cpp`
 - `tools/alia/RunAliaTargetPipeline.ps1`
 - `src/core/Context.hpp`
@@ -99,13 +97,12 @@ multi-pipeline runtime shape:
   and original generation-start rollback anchor.
 - Loaded foreground VLM content deltas are now streamed toward TTS during the
   decode loop. Sentence-like content chunks are enqueued and synthesized as soon
-  as they are complete, before later assistant tokens are sampled; the no-model
-  fallback still uses the deterministic whole-text chunking path.
+  as they are complete, before later assistant tokens are sampled.
 - The TTS pipeline now prefers a loaded TTS backend streaming path for queued
   spoken text. `AliaTtsPipeline` formats assistant text for Qwen3-TTS,
-  tokenizes it through the loaded TTS slot, and forwards backend audio chunks to
-  `AliaAudioCallback`; no-model, unsupported-backend, and empty-token cases
-  keep the deterministic fallback audio behavior for lightweight tests.
+  tokenizes it through the loaded TTS slot, and forwards backend audio chunks
+  to `AliaAudioCallback`. Missing or non-emitting TTS backends fail the product
+  path instead of emitting deterministic placeholder audio.
 - `Qwen3TTSBackend` now exposes the Alia TTS streaming hook by delegating to its
   existing `synthesize_codes_stream` plus Mimi incremental decoder path using
   the default voice, no instruct prompt, and automatic language mode.
@@ -116,7 +113,7 @@ multi-pipeline runtime shape:
   path. `AliaTtsPipeline::synthesize_pending` accepts a cancellation predicate,
   foreground generation passes `abort_requested()`, and `Qwen3TTSBackend`
   checks cancellation during codec generation and between Mimi streaming
-  batches so long synthesis work can unwind before emitting fallback audio.
+  batches so long synthesis work can unwind cleanly.
 - Foreground abort is now propagated into loaded VLM backend `forward` calls.
   `IModelBackend` exposes a cancellation checker plus `ModelBackendCancelled`,
   `AliaForegroundPipeline` installs `abort_requested()` while a loaded VLM turn
@@ -133,14 +130,13 @@ multi-pipeline runtime shape:
   and replays the prompt plus the required generated-token prefix to restore the
   requested context length before reporting rollback success.
 - Background processing now requires a registered result callback, records an
-  Alia-specific JSON extraction prompt, reports whether it used no-model
-  fallback or a loaded VLM slot, and has a real loaded background VLM decode
-  entry point for 0.8B memory extraction.
+  Alia-specific JSON extraction prompt, and uses the real loaded background VLM
+  decode entry point for 0.8B memory extraction.
 - Background results now use a stable Alia memory-extraction JSON shape with
-  `summary`, `memory_candidates`, `preferences`, and `tasks`. Fallback output
-  uses that schema, and loaded-model output is parsed with `simdjson` before it
-  is accepted: malformed JSON, missing fields, or wrong required field types are
-  wrapped into a schema-repair result that preserves the raw model output.
+  `summary`, `memory_candidates`, `preferences`, and `tasks`. Loaded-model
+  output is parsed with `simdjson` before it is accepted: malformed JSON,
+  missing fields, or wrong required field types are wrapped into a schema-repair
+  result that preserves the raw model output.
 - Loaded background VLM extraction now gets one guided retry before schema
   repair wrapping. If the first 0.8B output is malformed or has wrong required
   field types, the pipeline builds a repair prompt containing the invalid output
@@ -169,7 +165,7 @@ multi-pipeline runtime shape:
   `qwen3.5-4B-bnb-nf4-offline-visiondense`,
   `qwen3.5-0.8B-bnb-nf4-offline`, and
   `Qwen3-TTS-12Hz-0.6B-Base`. The smoke enforces those model directory names by
-  default and requires `--allow-non-target-models` for exploratory probes.
+  default.
 - The foreground Qwen3.5 4B slot can now load the Alia identity LoRA from
   `F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400` when
   configured through `AliaContext::vlm_4b_lora_dir` or
@@ -187,17 +183,13 @@ multi-pipeline runtime shape:
   feeding the generated audio into ASR. This keeps the full-pipeline smoke
   self-contained after `tmp/` cleanup.
 - `tools/alia/RunAliaTargetPipeline.ps1` is the branch-local verification
-  entrypoint. It configures/builds `AliaEngine` with generic CLI, generic API,
-  generic chat tests, and lightweight Alia API tests disabled, then runs the
-  fixed four-model full pipeline. By default it also passes the identity LoRA
-  and runs the real foreground tool-call probe; use `-NoForegroundLora` or
-  `-NoToolProbe` only for focused diagnostics.
+  entrypoint. It configures/builds `AliaEngine`, then runs the fixed four-model
+  full pipeline with the identity LoRA and real foreground tool-call probe.
 - `CMakeLists.txt` now treats `AliaEngine` as the custom branch aggregate
-  target. Default configure builds `AilaShared` plus `AilaAliaRealSmoke`; the
-  generic CLI, generic chat tests, lightweight Alia API tests, and generic
-  `aila_*` shared API surface are opt-in.
-- The default `AilaShared.dll` export surface is now Alia ABI only when
-  `AILA_BUILD_GENERIC_API=OFF`.
+  target. Default configure builds only `AilaShared` plus
+  `AilaAliaRealSmoke`; generic CLI/API/test targets and the lightweight Alia
+  API unit-test executable have been removed from this custom branch.
+- The default `AilaShared.dll` export surface is now Alia ABI only.
 - Noisy TTS/Mimi debug tensor dumps, `mimi_output.wav` debug emission, and a
   Qwen3.5 debug load log were moved behind explicit debug-level logging or
   `AILA_TTS_DEBUG` / `AILA_TTS_DEBUG_WAV`.
@@ -205,12 +197,6 @@ multi-pipeline runtime shape:
   fixed flow: array values are deduplicated, one-shot completed hello requests
   are removed from `memory_candidates` and `tasks`, and summaries that mistake
   `Alia,` as the speaker are normalized back to `User`.
-- The deterministic no-model foreground response is now explicitly marked as
-  `NoModelFallback` state for ABI/lightweight tests, not treated as normal
-  model inference.
-- The no-model path can initialize, destroy, feed/reset ASR state, run
-  deterministic foreground/TTS callback behavior, and invoke background
-  callbacks.
 - `AilaShared.dll` exports the Alia ABI symbols expected by Alia Host.
 
 ## Known Incomplete Areas
@@ -248,18 +234,16 @@ Run from `E:\RiderProjects\Aila` with the oneAPI environment initialized through
 `perf/PerfCommon.ps1`.
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; cmake -S . -B build -DAILA_BUILD_GENERIC_API=OFF -DAILA_BUILD_GENERIC_CLI=OFF -DAILA_BUILD_GENERIC_CHAT_TESTS=OFF -DAILA_BUILD_ALIA_API_TESTS=OFF -DAILA_BUILD_ALIA_REAL_SMOKE=ON; cmake --build build --target AliaEngine --config Release"
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; cmake -S . -B build; cmake --build build --target AliaEngine --config Release"
 ```
 
 Result:
 
 - Passed.
-- The default branch build rebuilt `AilaLib`, `AilaAliaRealSmoke`, and
-  `AilaShared`; it did not build the generic CLI, generic chat tests, or the
-  lightweight Alia API tests.
-- After the build directory was reconfigured, a full rebuild completed. It still
-  reports unrelated pre-existing Jinja warnings from `src/templates/jinja`, but
-  the Alia/TTS changes compile cleanly.
+- The default branch build generated `AilaLib`, `AilaAliaRealSmoke`, and
+  `AilaShared`.
+- Generic CLI/API/test targets and lightweight API unit tests are no longer part
+  of this branch build graph.
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; dumpbin /exports build\AilaShared.dll | Select-String 'alia_|aila_'"
@@ -277,10 +261,10 @@ Result:
 - `alia_start_conversation_turn`
 - `alia_trigger_background_processing`
 - `alia_vlm_rollback_kv_cache`
-- No generic `aila_*` exports were present with `AILA_BUILD_GENERIC_API=OFF`.
+- No generic `aila_*` exports were present.
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoForegroundLora -NoToolProbe -AudioPath tmp\alia-real-smoke\alia_autogen_request.wav -OutputWav tmp\alia-real-smoke\alia_full_pipeline_autogen.wav -LogPath tmp\alia-real-smoke\alia_full_pipeline_autogen.log
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath "tmp\alia-real-smoke\alia_clean_request.wav" -OutputWav "tmp\alia-real-smoke\alia_full_pipeline_clean.wav" -LogPath "tmp\alia-real-smoke\alia_full_pipeline_clean.log" -TimeoutSec 1500
 ```
 
 Result:
@@ -291,42 +275,27 @@ Result:
   `qwen3.5-4B-bnb-nf4-offline-visiondense`, background
   `qwen3.5-0.8B-bnb-nf4-offline`, and TTS
   `Qwen3-TTS-12Hz-0.6B-Base`.
-- The request WAV was intentionally absent before the run. The smoke generated
-  it through the target TTS model:
-  `request_audio_generated=true`, callback count `8`, samples `90240`.
-- Model load time: `27236ms`.
-- ASR time: `1700ms`.
-- ASR partial text: `Alia, please say hello in one short sentence.`
-- Foreground time: `5015ms`.
-- Foreground decode mode: `LoadedVlm`.
-- Foreground assistant text: `Hello!`
-- TTS emitted `2` callbacks, first audio at `4767ms`, `21120` total samples,
-  `21099` nonzero samples, chunk sizes `11520,9600`.
-- Background time: `902ms`.
-- Background decode mode: `LoadedVlm`.
-- Background schema valid: `true`, retry count `0`, repair applied `false`.
-- Background diagnostic: `initial background JSON accepted; post cleanup applied`.
-- Background JSON:
-  `{"summary":"User asked to say hello in one short sentence, and the assistant replied with 'Hello!'.","memory_candidates":[],"preferences":[],"tasks":[]}`
-- Full log: `tmp\alia-real-smoke\alia_full_pipeline_autogen.log`.
-
-```powershell
-.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath "tmp\alia-real-smoke\alia_lora_request.wav" -OutputWav "tmp\alia-real-smoke\alia_full_pipeline_lora.wav" -LogPath "tmp\alia-real-smoke\alia_full_pipeline_lora.log" -TimeoutSec 1500
-```
-
-Result:
-
-- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
 - Foreground LoRA:
   `F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400`.
 - LoRA load/apply evidence: `Parsed 32 LoRA pairs`,
   `LoRA adapter applied: r=16 alpha=32 scaling=2.00 applied=32 skipped=0`,
   `foreground_lora_applied=true`, `foreground_lora_pair_count=32`.
-- Main full pipeline used the fixed target ASR, 4B foreground, 0.8B background,
-  and TTS models. ASR recovered
-  `Alia, please say hello in one short sentence.`, foreground used
-  `LoadedVlm`, TTS wrote `tmp\alia-real-smoke\alia_full_pipeline_lora.wav`,
-  and background accepted schema JSON without retry or repair.
+- The request WAV was intentionally absent before the run. The smoke generated
+  it through the target TTS model:
+  `request_audio_generated=true`, callback count `8`, samples `90240`.
+- Model load time: `25178ms`.
+- ASR time: `1634ms`.
+- ASR partial text: `Alia, please say hello in one short sentence.`
+- Foreground time: `11220ms`.
+- Foreground decode mode: `LoadedVlm`.
+- Foreground assistant text:
+  `父亲大人教过我，要简短回应。我……我可以用“Hello”和“我是Alia”回答，虽然有点害羞，但试试看吧。`
+- TTS emitted `8` callbacks, first audio at `7559ms`, `92160` total samples,
+  `91557` nonzero samples.
+- Background time: `1515ms`.
+- Background decode mode: `LoadedVlm`.
+- Background schema valid: `true`, retry count `0`, repair applied `false`.
+- Background diagnostic: `initial background JSON accepted; post cleanup applied`.
 - Tool probe user text:
   `Call the host tool inspect_window with parameter id equal to 42 now. Return only the tool call.`
 - Tool probe callback executed:
@@ -335,30 +304,7 @@ Result:
 - The LoRA raw assistant text still contained spoken preface plus an orphan
   think close artifact, so the parser recovery is part of the smoke coverage
   rather than a reason to remove the probe.
-- Full log: `tmp\alia-real-smoke\alia_full_pipeline_lora.log`.
-
-```powershell
-.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoForegroundLora -AudioPath "tmp\alia-real-smoke\alia_base_request.wav" -OutputWav "tmp\alia-real-smoke\alia_full_pipeline_base_tool_probe.wav" -LogPath "tmp\alia-real-smoke\alia_full_pipeline_base_tool_probe.log" -TimeoutSec 1500
-```
-
-Result:
-
-- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
-- Base foreground comparison had `foreground_lora_applied=false`.
-- Base tool probe produced a cleaner recoverable tool block and executed the
-  same `inspect_window` callback with argument `id=42`.
-- This confirms the probe itself is valid for the base 4B model and that the
-  identity LoRA changes raw protocol style enough to warrant permanent smoke
-  coverage.
-
-4B rollback probe:
-
-- The same 4B full-pipeline command with an explicit rollback probe
-  (`--rollback-tokens 1`) completed ASR, foreground 4B, TTS, and rollback, then
-  crashed with access violation while background 0.8B generation was starting.
-- The successful `--rollback-tokens 0` run above isolates this as a
-  rollback-after-4B issue, not a general 4B full-pipeline load or generation
-  issue.
+- Full log: `tmp\alia-real-smoke\alia_full_pipeline_clean.log`.
 
 ```powershell
 git diff --check
@@ -387,6 +333,7 @@ Result:
 
 ## Review Notes
 
-The architecture direction is intentionally Alia-specific. The generic Aila API
-can remain temporarily while this branch migrates, but it should not constrain
-the final runtime shape.
+The architecture direction is intentionally Alia-specific. This branch now keeps
+the build and verification surface focused on the fixed Alia product pipeline
+instead of carrying generic API, generic CLI, or lightweight API-test entry
+points forward.

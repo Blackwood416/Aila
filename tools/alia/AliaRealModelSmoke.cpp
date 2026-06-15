@@ -23,7 +23,8 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
     std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
-    std::string foreground_lora;
+    std::string foreground_lora =
+        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-1400";
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
@@ -35,10 +36,7 @@ struct Options {
     int max_seq_len = 2048;
     int max_tokens = 48;
     int timeout_sec = 1500;
-    int rollback_tokens = 0;
-    bool enforce_target_models = true;
     bool generate_audio_if_missing = true;
-    bool run_tool_probe = false;
 };
 
 struct AudioCapture {
@@ -84,13 +82,10 @@ void print_usage() {
         << "  --output-wav <path>\n"
         << "  --request-text <text>  default \"Alia, please say hello in one short sentence.\"\n"
         << "  --tool-probe-text <text>\n"
-        << "  --tool-probe         run a real foreground VLM tool-call probe\n"
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
-        << "  --rollback-tokens <N>  default 0, set >0 for optional rollback probe\n"
-        << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
-        << "  --allow-non-target-models\n";
+        << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n";
 }
 
 bool parse_int_arg(const char* text, int& out) {
@@ -150,20 +145,14 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_value(opts.request_text)) return false;
         } else if (arg == "--tool-probe-text") {
             if (!require_value(opts.tool_probe_text)) return false;
-        } else if (arg == "--tool-probe") {
-            opts.run_tool_probe = true;
         } else if (arg == "--max-seq") {
             if (!require_int(opts.max_seq_len)) return false;
         } else if (arg == "--max-tokens") {
             if (!require_int(opts.max_tokens)) return false;
         } else if (arg == "--timeout-sec") {
             if (!require_int(opts.timeout_sec)) return false;
-        } else if (arg == "--rollback-tokens") {
-            if (!require_int(opts.rollback_tokens)) return false;
         } else if (arg == "--no-generate-audio") {
             opts.generate_audio_if_missing = false;
-        } else if (arg == "--allow-non-target-models") {
-            opts.enforce_target_models = false;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -178,8 +167,12 @@ bool parse_args(int argc, char** argv, Options& opts) {
         std::cerr << "request-text must not be empty.\n";
         return false;
     }
-    if (opts.run_tool_probe && opts.tool_probe_text.empty()) {
-        std::cerr << "tool-probe-text must not be empty when --tool-probe is set.\n";
+    if (opts.foreground_lora.empty()) {
+        std::cerr << "foreground-lora must not be empty.\n";
+        return false;
+    }
+    if (opts.tool_probe_text.empty()) {
+        std::cerr << "tool-probe-text must not be empty.\n";
         return false;
     }
     return true;
@@ -247,7 +240,6 @@ std::string foreground_state_name(aila::alia::ForegroundTurnState state) {
 std::string foreground_mode_name(aila::alia::ForegroundDecodeMode mode) {
     switch (mode) {
         case aila::alia::ForegroundDecodeMode::None: return "None";
-        case aila::alia::ForegroundDecodeMode::NoModelFallback: return "NoModelFallback";
         case aila::alia::ForegroundDecodeMode::LoadedVlm: return "LoadedVlm";
     }
     return "Unknown";
@@ -267,7 +259,6 @@ std::string background_state_name(aila::alia::BackgroundJobState state) {
 std::string background_mode_name(aila::alia::BackgroundDecodeMode mode) {
     switch (mode) {
         case aila::alia::BackgroundDecodeMode::None: return "None";
-        case aila::alia::BackgroundDecodeMode::NoModelFallback: return "NoModelFallback";
         case aila::alia::BackgroundDecodeMode::LoadedVlm: return "LoadedVlm";
     }
     return "Unknown";
@@ -463,21 +454,20 @@ int main(int argc, char** argv) {
         print_usage();
         return 2;
     }
-    if (opts.enforce_target_models && !validate_target_models(opts)) {
+    if (!validate_target_models(opts)) {
         std::cerr << "target_model_enforcement_failed=true\n";
         return 2;
     }
 
     std::cout << "ALIA_REAL_MODEL_SMOKE_BEGIN\n"
-              << "target_model_enforcement="
-              << (opts.enforce_target_models ? "true" : "false") << "\n"
+              << "target_model_enforcement=true\n"
               << "asr_model=" << quote(opts.asr_model) << "\n"
               << "foreground_model=" << quote(opts.foreground_model) << "\n"
               << "foreground_lora=" << quote(opts.foreground_lora) << "\n"
               << "background_model=" << quote(opts.background_model) << "\n"
               << "tts_model=" << quote(opts.tts_model) << "\n"
               << "request_text=" << quote(opts.request_text) << "\n"
-              << "tool_probe=" << (opts.run_tool_probe ? "true" : "false") << "\n"
+              << "tool_probe=true\n"
               << "max_seq_len=" << opts.max_seq_len << "\n"
               << "max_tokens=" << opts.max_tokens << "\n";
 
@@ -620,19 +610,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (opts.rollback_tokens > 0) {
-        const auto rollback_start = Clock::now();
-        rc = alia_vlm_rollback_kv_cache(ctx.get(), opts.rollback_tokens);
-        const auto rollback_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            Clock::now() - rollback_start).count();
-        std::cout << "rollback_tokens=" << opts.rollback_tokens << "\n"
-                  << "rollback_rc=" << rc << "\n"
-                  << "rollback_ms=" << rollback_ms << "\n";
-        if (rc != ALIA_OK) {
-            return 1;
-        }
-    }
-
     {
         std::lock_guard<std::mutex> lock(g_background_mutex);
         g_background_json.clear();
@@ -685,7 +662,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (opts.run_tool_probe && !run_foreground_tool_probe(*ctx, opts)) {
+    if (!run_foreground_tool_probe(*ctx, opts)) {
         return 1;
     }
 
