@@ -417,6 +417,32 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         AILA_LOG_INFO("[TTS] Pre-computed fixed embeddings");
     }
 
+    // Warm the real codec-generation path after fixed embeddings are ready.
+    // The earlier warmup covers representative GEMMs, but the first product
+    // utterance also needs predictor decode/talker decode kernels.
+    {
+        AILA_LOG_INFO("[TTS] Running codec decode warmup...");
+        GenerationConfig warmup_gen{};
+        warmup_gen.max_new_tokens = 2;
+        warmup_gen.temperature = 0.0f;
+        warmup_gen.top_k = 1;
+        warmup_gen.top_p = 1.0f;
+        warmup_gen.do_sample = false;
+        warmup_gen.repetition_penalty = 1.1f;
+
+        std::vector<int> warmup_text = {151644, 77091, 198, 0, 151645};
+        std::vector<int32_t> warmup_codes;
+        int warmup_frames = 0;
+        if (!synthesize_codes(ctx, warmup_text, {}, 0, {}, 0, warmup_gen,
+                              warmup_codes, warmup_frames,
+                              []() { return false; }, {}, 0)) {
+            AILA_LOG_WARN("[TTS] Codec decode warmup failed; first synthesis may pay JIT cost");
+        } else {
+            AILA_LOG_INFO("[TTS] Codec decode warmup complete (frames=%d)", warmup_frames);
+        }
+        reset();
+    }
+
     return true;
 }
 
@@ -713,25 +739,22 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int trailing_len = trailing_token_count + 1; // +1 for tts_eos_embed at end
     AILA_LOG_INFO("[TTS] text_body_end=%d (detected), trailing_tokens=%d, trailing_len=%d",
                   text_body_end, trailing_token_count, trailing_len);
-    std::vector<bf16> trailing_text_hidden(trailing_len * H_talker);
+    Tensor trailing_text_hidden = Tensor::allocate(ctx, {trailing_len, H_talker});
     if (trailing_token_count > 0) {
-        // 拷贝第 5 个 token (index=4) 起的正文投影
         bf16* all_proj = projected_text.data_as<bf16>();
-        std::vector<bf16> proj_cpu(L * H_talker);
-        ctx.queue().memcpy(proj_cpu.data(), all_proj, L * H_talker * sizeof(bf16)).wait();
+        bf16* trailing_ptr = trailing_text_hidden.data_as<bf16>();
         for (int t = 0; t < trailing_token_count; ++t) {
-            std::memcpy(trailing_text_hidden.data() + t * H_talker,
-                       proj_cpu.data() + (text_body_start + 1 + t) * H_talker,
-                       H_talker * sizeof(bf16));
+            ctx.queue().memcpy(trailing_ptr + t * H_talker,
+                               all_proj + (text_body_start + 1 + t) * H_talker,
+                               H_talker * sizeof(bf16));
         }
     }
     // 末尾追加 tts_eos_embed
     {
-        std::vector<bf16> eos_cpu(H_talker);
-        ctx.queue().memcpy(eos_cpu.data(), tts_eos_embed.data(), H_talker * sizeof(bf16)).wait();
-        std::memcpy(trailing_text_hidden.data() + (trailing_len - 1) * H_talker,
-                   eos_cpu.data(), H_talker * sizeof(bf16));
+        ctx.queue().memcpy(trailing_text_hidden.data_as<bf16>() + (trailing_len - 1) * H_talker,
+                           tts_eos_embed.data(), H_talker * sizeof(bf16));
     }
+    ctx.queue().wait();
 
     if (tts_debug) print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
@@ -854,6 +877,17 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     ctx.queue().memcpy(past_hidden_talker.data(), final_normed.data(), H_talker * sizeof(bf16)).wait();
     // 临时张量用于拼接 Code Predictor 的输入
     Tensor pred_input = Tensor::allocate(ctx, {2, H_talker});
+    Tensor token_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+    Tensor last_id_hidden = Tensor::allocate(ctx, {1, H_talker});
+    Tensor predictor_final_hidden = Tensor::allocate(ctx, {1, H_pred});
+    Tensor predictor_final_normed = Tensor::allocate(ctx, {1, H_pred});
+    Tensor predictor_emb_h = Tensor::allocate(ctx, {1, H_talker});
+    Tensor predictor_emb_pred = Tensor::allocate(ctx, {1, H_pred});
+    Tensor predictor_step_normed = Tensor::allocate(ctx, {1, H_pred});
+    Tensor sum_emb = Tensor::allocate(ctx, {1, H_talker});
+    Tensor single_emb = Tensor::allocate(ctx, {1, H_talker});
+    Tensor step_normed_talker = Tensor::allocate(ctx, {1, H_talker});
+    Tensor final_normed_talker = Tensor::allocate(ctx, {1, H_talker});
 
     int max_tokens = tts_gen.max_new_tokens;
     out_codes.reserve(max_tokens * 16);
@@ -886,10 +920,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         frame_codes[0] = token;
 
         // 获取首码 embedding
-        Tensor first_code_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(first_code_dev.data(), &token, sizeof(int));
-        Tensor last_id_hidden = Tensor::allocate(ctx, {1, H_talker});
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, first_code_dev.data_as<int>(), 1, last_id_hidden, H_talker);
+        ctx.memcpy_h2d(token_dev.data(), &token, sizeof(int));
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, token_dev.data_as<int>(), 1, last_id_hidden, H_talker);
 
         // 拼接 past_hidden_talker 与 last_id_hidden -> pred_input [2, H_talker]
         {
@@ -957,13 +989,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // Get logits for codebook 1 (cb_idx = 0)
-        Tensor final_hidden_pred = Tensor::allocate(ctx, {1, H_pred});
-        ctx.queue().memcpy(final_hidden_pred.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16)).wait();
+        ctx.queue().memcpy(predictor_final_hidden.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16)).wait();
         
-        Tensor final_normed_pred = Tensor::allocate(ctx, {1, H_pred});
-        ops::rms_norm(ctx, final_hidden_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, final_normed_pred, 1, H_pred);
+        ops::rms_norm(ctx, predictor_final_hidden, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
 
-        predictor_lm_heads_[0].forward(ctx, final_normed_pred, p_buf_.logits, 1);
+        predictor_lm_heads_[0].forward(ctx, predictor_final_normed, p_buf_.logits, 1);
         int tok = ops::sample_with_config(ctx, p_buf_.logits, predictor_cfg_.vocab_size, gen_config, {});
         frame_codes[1] = tok;
 
@@ -974,25 +1004,21 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             if (cancelled()) {
                 return false;
             }
-            Tensor tok_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-            ctx.memcpy_h2d(tok_dev.data(), &tok, sizeof(int));
-            Tensor emb_h = Tensor::allocate(ctx, {1, H_talker});
-            ops::embedding_lookup(ctx, *predictor_embed_weights_[cb_idx - 1], tok_dev.data_as<int>(), 1, emb_h, H_talker);
+            ctx.memcpy_h2d(token_dev.data(), &tok, sizeof(int));
+            ops::embedding_lookup(ctx, *predictor_embed_weights_[cb_idx - 1], token_dev.data_as<int>(), 1, predictor_emb_h, H_talker);
 
-            Tensor emb_pred = Tensor::allocate(ctx, {1, H_pred});
             if (has_predictor_projection_) {
-                predictor_projection_linear_.forward_bias(ctx, emb_h, *predictor_projection_bias_, emb_pred, 1);
+                predictor_projection_linear_.forward_bias(ctx, predictor_emb_h, *predictor_projection_bias_, predictor_emb_pred, 1);
             } else {
-                ctx.queue().memcpy(emb_pred.data(), emb_h.data(), H_pred * sizeof(bf16)).wait();
+                ctx.queue().memcpy(predictor_emb_pred.data(), predictor_emb_h.data(), H_pred * sizeof(bf16)).wait();
             }
 
             // Copy to single slot in p_buf_.hidden at position cb_idx + 1 (since prefill took slots 0, 1)
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, emb_pred.data(), H_pred * sizeof(bf16)).wait();
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16)).wait();
             
             // Norm
-            Tensor step_normed = Tensor::allocate(ctx, {1, H_pred});
-            ops::rms_norm(ctx, emb_pred, *predictor_layers_[0].input_ln_weight,
-                          predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
+            ops::rms_norm(ctx, predictor_emb_pred, *predictor_layers_[0].input_ln_weight,
+                          predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
 
             // Forward layers with decode path (seq_len = 1)
             for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
@@ -1000,7 +1026,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                     return false;
                 }
                 auto& L = predictor_layers_[i];
-                L.qkv_proj.forward(ctx, step_normed, p_buf_.qkv, 1);
+                L.qkv_proj.forward(ctx, predictor_step_normed, p_buf_.qkv, 1);
 
                 bf16* qkv_ptr = p_buf_.qkv.data_as<bf16>();
                 Tensor q_dec = Tensor::view(ctx, qkv_ptr, {1, QD_pred});
@@ -1023,20 +1049,20 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                       &p_buf_.decode_attn_partials);
 
                 L.o_proj.forward(ctx, p_buf_.attn_out, p_buf_.gate, 1);
-                ops::fused_add_rms_norm(ctx, emb_pred, p_buf_.gate, *L.post_attn_ln_weight, predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
+                ops::fused_add_rms_norm(ctx, predictor_emb_pred, p_buf_.gate, *L.post_attn_ln_weight, predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
 
-                L.gate_up_proj.forward(ctx, step_normed, p_buf_.gate_up, 1);
+                L.gate_up_proj.forward(ctx, predictor_step_normed, p_buf_.gate_up, 1);
                 ops::fused_gate_up_swiglu(ctx, p_buf_.gate_up, p_buf_.gate, FF_pred);
 
                 L.down_proj.forward(ctx, p_buf_.gate, p_buf_.attn_out, 1);
                 Tensor* next_input_ln = (i < predictor_cfg_.num_hidden_layers - 1) ? predictor_layers_[i + 1].input_ln_weight : predictor_final_norm_weight_;
-                ops::fused_add_rms_norm(ctx, emb_pred, p_buf_.attn_out, *next_input_ln, predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
+                ops::fused_add_rms_norm(ctx, predictor_emb_pred, p_buf_.attn_out, *next_input_ln, predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
             }
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, emb_pred.data(), H_pred * sizeof(bf16)).wait();
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16)).wait();
 
             // Compute logits and sample tok
-            ops::rms_norm(ctx, emb_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, final_normed_pred, 1, H_pred);
-            predictor_lm_heads_[cb_idx].forward(ctx, final_normed_pred, p_buf_.logits, 1);
+            ops::rms_norm(ctx, predictor_emb_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
+            predictor_lm_heads_[cb_idx].forward(ctx, predictor_final_normed, p_buf_.logits, 1);
             
             tok = ops::sample_with_config(ctx, p_buf_.logits, predictor_cfg_.vocab_size, tts_gen, {});
             frame_codes[cb_idx + 1] = tok;
@@ -1065,26 +1091,16 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         // ==========================================
         
         // 查找 16 个 codes 的 embeddings
-        Tensor frame_tokens_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(frame_tokens_dev.data(), frame_codes.data(), 16 * sizeof(int));
-
-        Tensor sum_emb = Tensor::allocate(ctx, {1, H_talker});
-        
-        // 临时分配用于计算和
-        Tensor single_emb = Tensor::allocate(ctx, {1, H_talker});
-
         // 查找 codebook 0
         int c0 = frame_codes[0];
-        Tensor c0_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(c0_dev.data(), &c0, sizeof(int));
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, c0_dev.data_as<int>(), 1, sum_emb, H_talker);
+        ctx.memcpy_h2d(token_dev.data(), &c0, sizeof(int));
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, token_dev.data_as<int>(), 1, sum_emb, H_talker);
 
         // 查找 predictor 对应的 15 个 embeddings 并累加
         for (int i = 0; i < 15; i++) {
             int ci = frame_codes[i + 1];
-            Tensor ci_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-            ctx.memcpy_h2d(ci_dev.data(), &ci, sizeof(int));
-            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], ci_dev.data_as<int>(), 1, single_emb, H_talker);
+            ctx.memcpy_h2d(token_dev.data(), &ci, sizeof(int));
+            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], token_dev.data_as<int>(), 1, single_emb, H_talker);
             
             // 累加：sum_emb += single_emb
             bf16* sum_ptr = sum_emb.data_as<bf16>();
@@ -1096,26 +1112,16 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // 加上 trailing_text_hidden[gen_step] 或 tts_pad_embed（对齐 ggml）
-        Tensor add_vec = Tensor::allocate(ctx, {1, H_talker});
-        if (gen_step < trailing_len) {
-            // 使用预计算的 trailing text hidden state（正文 token 的 ResizeMLP 投影）
-            ctx.queue().memcpy(add_vec.data(),
-                trailing_text_hidden.data() + gen_step * H_talker,
-                H_talker * sizeof(bf16)).wait();
-        } else {
-            // 超出 trailing text 长度后回落到 tts_pad_embed
-            ctx.queue().memcpy(add_vec.data(), tts_pad_embed.data(), H_talker * sizeof(bf16)).wait();
-        }
-
         bf16* sum_ptr = sum_emb.data_as<bf16>();
-        bf16* add_ptr = add_vec.data_as<bf16>();
+        bf16* add_ptr = gen_step < trailing_len
+            ? trailing_text_hidden.data_as<bf16>() + gen_step * H_talker
+            : tts_pad_embed.data_as<bf16>();
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> idx) {
             sum_ptr[idx[0]] = sum_ptr[idx[0]] + add_ptr[idx[0]];
         });
         ctx.queue().wait();
 
         // 运行 Talker Decode Step (seq_len = 1)
-        Tensor step_normed_talker = Tensor::allocate(ctx, {1, H_talker});
         ops::rms_norm(ctx, sum_emb, *talker_layers_[0].input_ln_weight,
                       talker_cfg_.rms_norm_eps, step_normed_talker, 1, H_talker);
 
@@ -1160,7 +1166,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // 预测下一个首码
-        Tensor final_normed_talker = Tensor::allocate(ctx, {1, H_talker});
         ops::rms_norm(ctx, sum_emb, *talker_final_norm_weight_, talker_cfg_.rms_norm_eps, final_normed_talker, 1, H_talker);
 
         // 保存新的 past_hidden_talker (保存归一化后的值以对齐 Python)

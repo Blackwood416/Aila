@@ -405,6 +405,56 @@ Result:
   change.
 - Full log: `tmp\alia-real-smoke\alia_tts_uniform_batch_short.log`.
 
+## 2026-06-16 TTS TTFA Inner-Loop Pass
+
+The next TTS-focused pass keeps the uniform `12`-frame playback-continuity
+schedule and reduces codec-generation overhead instead of shrinking the first
+audio buffer.
+
+Changes:
+
+- Qwen3-TTS load now runs a tiny codec decode warmup after fixed embeddings are
+  precomputed, so predictor/talker decode kernels are exercised before the
+  first product utterance.
+- `synthesize_codes` reuses fixed-shape decode tensors across codec frames
+  instead of allocating them inside every frame/codebook step.
+- Trailing text hidden states stay on GPU, and the frame loop adds them directly
+  from GPU memory instead of copying small hidden vectors through CPU memory.
+- Tool-call robustness under the identity LoRA remains a foreground-model TODO;
+  it is intentionally not part of the TTS TTFA gate.
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_VOICE_SCENARIO_MATRIX_PASS`.
+- Summary CSV:
+  `tmp\alia-real-smoke\voice_matrix\summary.csv`.
+- Every scenario kept `tts_first_backend_audio_samples=23040`, so the first
+  audio callback still carries the continuity-first buffer.
+- Scenario metrics:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_samples  first_codes_ms  first_backend_audio_ms  backend_total_ms  foreground_ms  background_ms
+short_hello       923     3646              3897                  4938            19                 44            23040          796.032         1040.16                 7811.55           11712          1033
+persona_chat      1033    3714              3987                  5189            19                 39            23040          969.469         1201.37                 9195.24           13186          1584
+preference_memory 1022    3547              3919                  5288            23                 43            23040          1132.98         1368.79                 9365.56           13287          1143
+task_memory       963     3498              3746                  5524            18                 42            23040          1543.68         1777.94                 21246             24996          1529
+long_answer       1036    3583              4004                  5288            24                 56            23040          1051.66         1283.34                 10555.4           14563          669
+```
+
+Interpretation:
+
+- The comparable `short_hello` run improved first backend audio from about
+  `1105ms` to `1040ms` while keeping the first callback at `23040` samples.
+- The larger remaining TTS variance is codec generation for the first spoken
+  chunk. When the first chunk shape grows, first-code timing still ranges near
+  `1.0s` to `1.5s`.
+- Next useful TTS work is deeper predictor/talker decode profiling or reducing
+  first spoken chunk shape without creating a too-short audio buffer.
+
 ```powershell
 git diff --check
 ```

@@ -363,3 +363,42 @@ Interpretation:
 - This is a continuity-first schedule. Further latency work should target true
   Mimi incremental-state efficiency and playback-aware buffering instead of
   shortening only the first chunk.
+
+## 2026-06-16 TTS Inner-Loop TTFA Update
+
+The next pass kept the uniform `12`-frame first audio buffer and attacked
+codec-generation overhead directly:
+
+- Added a tiny codec decode warmup during Qwen3-TTS load, after fixed embeddings
+  are precomputed, to exercise predictor/talker decode kernels before the first
+  product utterance.
+- Reused fixed-shape decode tensors in `synthesize_codes` instead of allocating
+  them for every codec frame and codebook step.
+- Kept trailing text hidden states on GPU and added them directly in the frame
+  loop, removing small CPU round trips and synchronization points.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_samples  first_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3646              3897                  4938            19                 44            23040          796.032         1040.16                 7811.55
+persona_chat      3714              3987                  5189            19                 39            23040          969.469         1201.37                 9195.24
+preference_memory 3547              3919                  5288            23                 43            23040          1132.98         1368.79                 9365.56
+task_memory       3498              3746                  5524            18                 42            23040          1543.68         1777.94                 21246
+long_answer       3583              4004                  5288            24                 56            23040          1051.66         1283.34                 10555.4
+```
+
+Interpretation:
+
+- `short_hello` is the closest apples-to-apples comparison with the previous
+  uniform-batch matrix: first backend audio moved from about `1105ms` to
+  `1040ms` while the first callback stayed at `23040` samples.
+- The main TTS-side TTFA ceiling is still first-chunk codec generation, not
+  Mimi init. Next work should profile predictor/talker decode per substage and
+  reduce first spoken chunk shape without reducing playback buffer duration.
+- Identity LoRA tool-call misses are recorded as a foreground TODO and should
+  not gate TTS TTFA optimization.
