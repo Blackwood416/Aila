@@ -10,7 +10,7 @@
 namespace aila::alia {
 namespace {
 
-constexpr int kTtsStreamBatchFrames = 6;
+constexpr int kTtsStreamBatchFrames = 12;
 
 GenerationConfig translate_tts_generation_config(const AliaGenConfig& config) {
     GenerationConfig translated;

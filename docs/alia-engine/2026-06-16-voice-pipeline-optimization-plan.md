@@ -166,6 +166,24 @@ Steps:
 - Preserve cancellation checks before codec generation, inside predictor/talker
   loops, before Mimi decode, and before host audio callbacks.
 
+## Task 4C: Tune TTS Stream Batch Schedule
+
+**Files:**
+
+- Modify: `src/alia/AliaTtsPipeline.cpp`
+- Modify: `src/models/Qwen3TTSBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+
+Steps:
+
+- Keep the first Mimi batch small so the first audio callback can be emitted
+  quickly.
+- Increase the steady-state frame batch size so long chunks make fewer Mimi
+  incremental calls while the current implementation still recomputes full
+  history per batch.
+- Preserve the full-code generation API and default behavior for non-streaming
+  callers.
+
 ## Task 5: Optimize Foreground Prompt/Decode
 
 **Files:**
@@ -298,3 +316,29 @@ Interpretation:
 - Foreground first content remains about `3.6s` to `3.9s`, so further
   end-to-end TTFA work needs both foreground first-token profiling and Mimi
   incremental-state optimization.
+
+## 2026-06-16 TTS Batch Schedule Update
+
+After adding a two-stage stream schedule, the voice matrix passed again. The
+first batch emits after `3` codec frames, then the Alia product path uses `12`
+frames for subsequent batches:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  tts_backend_total_ms  foreground_ms
+short_hello       1691    3697              3838                  4944            996.176         1105.24                 2907.38                 15287.7               19130
+persona_chat      1823    3853              4219                  4517            194.839         298.012                 8331.75                 8331.75               12553
+preference_memory 1781    3856              4463                  4766            195.586         302.900                 6833.15                 6833.15               11299
+task_memory       1725    3791              4052                  5103            946.233         1049.55                 5483.24                 19418.3               23475
+long_answer       1758    3827              4164                  4601            333.946         436.832                 3701.61                 4834.66               9002
+```
+
+Interpretation:
+
+- Single-chunk replies now show first backend audio around `300ms` to `440ms`
+  after TTS starts, while multi-chunk replies still depend on the first spoken
+  chunk shape.
+- Steady-state batching reduces Mimi call count on longer chunks, improving
+  total backend drain compared with the previous fixed `6`-frame schedule.
+- The remaining hard floor is still foreground first content at roughly
+  `3.7s` to `3.9s`; TTS can now often be ready soon after the first chunk is
+  enqueued.
