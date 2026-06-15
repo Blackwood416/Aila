@@ -31,6 +31,9 @@ public:
     int get_current_context_len() const override { return current_talker_len_; }
 
     // TTS 专有 C++ API：接收文本 tokens 和 预设/克隆的 speaker_embedding (可选)，直接自回归生成 discrete codes
+    using CodeFrameCallback = std::function<bool(const std::vector<int32_t>& codes,
+                                                 int n_frames)>;
+
     bool synthesize_codes(Context& ctx,
                           const std::vector<int>& text_tokens,
                           const std::vector<float>& speaker_embedding,  // Base: ECAPA-TDNN embedding (empty if not used)
@@ -40,7 +43,9 @@ public:
                           const GenerationConfig& gen_config,
                           std::vector<int32_t>& out_codes,
                           int& out_n_frames,
-                          std::function<bool()> should_cancel = {});
+                          std::function<bool()> should_cancel = {},
+                          CodeFrameCallback frame_callback = {},
+                          int frame_callback_batch_frames = 0);
 
     // Streaming synthesis: calls audio_callback for each batch of generated audio
     using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;

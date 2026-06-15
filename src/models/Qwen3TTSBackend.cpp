@@ -453,7 +453,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        const GenerationConfig& gen_config,
                                        std::vector<int32_t>& out_codes,
                                        int& out_n_frames,
-                                       std::function<bool()> should_cancel) {
+                                       std::function<bool()> should_cancel,
+                                       CodeFrameCallback frame_callback,
+                                       int frame_callback_batch_frames) {
     out_codes.clear();
     out_n_frames = 0;
     auto cancelled = [&]() {
@@ -855,6 +857,21 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     int max_tokens = tts_gen.max_new_tokens;
     out_codes.reserve(max_tokens * 16);
+    const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
+    std::vector<int32_t> pending_callback_codes;
+    int pending_callback_frames = 0;
+    if (frame_callback) {
+        pending_callback_codes.reserve(static_cast<size_t>(callback_batch_frames) * 16);
+    }
+    auto flush_frame_callback = [&]() -> bool {
+        if (!frame_callback || pending_callback_frames <= 0) {
+            return true;
+        }
+        const bool ok = frame_callback(pending_callback_codes, pending_callback_frames);
+        pending_callback_codes.clear();
+        pending_callback_frames = 0;
+        return ok;
+    };
 
     while (gen_step < max_tokens) {
         if (cancelled()) {
@@ -1030,8 +1047,18 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         // 保存这帧的 16 个 codes
         for (int c : frame_codes) {
             out_codes.push_back(static_cast<int32_t>(c));
+            if (frame_callback) {
+                pending_callback_codes.push_back(static_cast<int32_t>(c));
+            }
         }
         out_n_frames++;
+        if (frame_callback) {
+            ++pending_callback_frames;
+            if (pending_callback_frames >= callback_batch_frames &&
+                !flush_frame_callback()) {
+                return false;
+            }
+        }
 
         // ==========================================
         // 运行 Talker Decode (seq_len = 1) 并生成下一个首码
@@ -1157,6 +1184,10 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                   t_decode_ms, out_n_frames, t_decode_ms / std::max(1, out_n_frames));
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
 
+    if (!flush_frame_callback()) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1180,47 +1211,28 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     last_tts_timing_ = TtsBackendTiming{};
     const auto timing_start = std::chrono::high_resolution_clock::now();
 
-    // 1. Generate all codec tokens (existing blocking call)
-    std::vector<int32_t> all_codes;
-    int total_frames = 0;
-    if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
-                           instruct_tokens, language_id, gen_config,
-                           all_codes, total_frames, should_cancel)) {
-        return false;
-    }
-    const auto codes_done = std::chrono::high_resolution_clock::now();
-    last_tts_timing_.codes_ms =
-        std::chrono::duration<double, std::milli>(codes_done - timing_start).count();
-    last_tts_timing_.total_frames = total_frames;
-    if (cancelled()) {
-        return false;
-    }
-
-    // 2. Initialize Mimi stream
+    // Initialize Mimi before codec generation so the first generated frame batch
+    // can be decoded immediately instead of waiting for the whole utterance.
     MimiStreamState mimi_state;
-    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
+    const int max_stream_frames = std::max(128, gen_config.max_new_tokens + 16);
+    if (!init_mimi_stream(ctx, mimi_state, max_stream_frames)) {
         return false;
     }
-    const auto mimi_init_done = std::chrono::high_resolution_clock::now();
+    const auto codes_start = std::chrono::high_resolution_clock::now();
     last_tts_timing_.mimi_init_ms =
-        std::chrono::duration<double, std::milli>(mimi_init_done - codes_done).count();
+        std::chrono::duration<double, std::milli>(codes_start - timing_start).count();
 
-    // 3. Feed codes in batches to incremental decoder
-    int batch_size = stream_batch_frames;
-    for (int offset = 0; offset < total_frames; offset += batch_size) {
+    auto emit_audio_batch = [&](const std::vector<int32_t>& batch_codes,
+                                int batch_frames) -> bool {
         if (cancelled()) {
             return false;
         }
-        int batch_frames = std::min(batch_size, total_frames - offset);
-
-        // Extract batch codes: [batch_frames, 16]
-        std::vector<int32_t> batch_codes;
-        batch_codes.reserve(static_cast<size_t>(batch_frames) * 16);
-        for (int f = 0; f < batch_frames; ++f) {
-            for (int c = 0; c < 16; ++c) {
-                batch_codes.push_back(all_codes[static_cast<size_t>(offset + f) * 16 + c]);
-            }
+        if (last_tts_timing_.total_frames == 0) {
+            last_tts_timing_.codes_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - codes_start).count();
         }
+        last_tts_timing_.total_frames += batch_frames;
 
         std::vector<float> audio_chunk;
         if (!decode_mimi_incremental(ctx, batch_codes, batch_frames, mimi_state, audio_chunk)) {
@@ -1240,9 +1252,25 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
             ++last_tts_timing_.callback_count;
             audio_callback(audio_chunk);
         }
-    }
+        return true;
+    };
 
-    // 4. Flush
+    std::vector<int32_t> all_codes;
+    int total_frames = 0;
+    const int batch_size = std::max(1, stream_batch_frames);
+    if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
+                           instruct_tokens, language_id, gen_config,
+                           all_codes, total_frames, should_cancel,
+                           emit_audio_batch, batch_size)) {
+        return false;
+    }
+    const auto codes_done = std::chrono::high_resolution_clock::now();
+    if (last_tts_timing_.codes_ms < 0.0) {
+        last_tts_timing_.codes_ms =
+            std::chrono::duration<double, std::milli>(codes_done - codes_start).count();
+    }
+    last_tts_timing_.total_frames = total_frames;
+
     if (cancelled()) {
         return false;
     }

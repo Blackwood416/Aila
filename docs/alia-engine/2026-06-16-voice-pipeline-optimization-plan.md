@@ -149,6 +149,23 @@ Steps:
 - Guard asynchronous worker cleanup across normal returns, failures, aborts, and
   exceptions.
 
+## Task 4B: Stream Codec Frames Into Mimi
+
+**Files:**
+
+- Modify: `src/models/Qwen3TTSBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+
+Steps:
+
+- Keep the existing `synthesize_codes` API usable for full-code generation.
+- Add an optional codec-frame callback to the existing Qwen3-TTS generation
+  loop so generated frames can be consumed before the whole utterance finishes.
+- Initialize Mimi before codec generation in `synthesize_codes_stream`.
+- Feed each completed codec frame batch directly into `decode_mimi_incremental`.
+- Preserve cancellation checks before codec generation, inside predictor/talker
+  loops, before Mimi decode, and before host audio callbacks.
+
 ## Task 5: Optimize Foreground Prompt/Decode
 
 **Files:**
@@ -251,3 +268,33 @@ Interpretation:
   emit samples. The next high-value optimization is real codec-token streaming
   into Mimi, or an equivalent first-batch path that does not wait for all frames
   of the chunk.
+
+## 2026-06-16 Codec Frame Streaming Update
+
+After adding the codec-frame callback and feeding generated frame batches into
+Mimi during Qwen3-TTS generation, the voice matrix passed again:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  tts_backend_total_ms  foreground_ms
+short_hello       1699    3714              3971                  4617            502.655         645.291                 6336.79                 10539.7               14514
+persona_chat      1807    3869              4155                  5032            718.912         876.405                 5701.58                 12819.8               16978
+preference_memory 1819    3690              3776                  4849            927.459         1073.02                 2786.95                 20506.9               24287
+task_memory       1735    3632              3885                  5218            1184.03         1332.59                 6238.73                 28728.4               32618
+long_answer       1783    3738              4174                  5262            933.657         1086.64                 9428.29                 18816.4               22994
+```
+
+Summary CSV:
+`tmp\alia-real-smoke\voice_matrix\summary.csv`.
+
+Interpretation:
+
+- First audio moved from the previous `5.8s` to `7.5s` range into roughly
+  `4.6s` to `5.3s` across the matrix.
+- First codec batch readiness moved from full-chunk generation (`1.7s` to
+  `3.2s`) to frame-batch generation (`0.5s` to `1.2s`).
+- The next bottleneck is Mimi incremental decode efficiency. It is incremental
+  at the API boundary, but currently recomputes full-history pre-transformer
+  and conv stages per batch, so long answers still have high total TTS drain.
+- Foreground first content remains about `3.6s` to `3.9s`, so further
+  end-to-end TTFA work needs both foreground first-token profiling and Mimi
+  incremental-state optimization.
