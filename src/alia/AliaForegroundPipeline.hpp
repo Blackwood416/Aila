@@ -59,6 +59,10 @@ public:
     std::string last_tool_result_text() const;
     std::string last_tool_resume_prompt_text() const;
     ForegroundDecodeMode last_decode_mode() const;
+    int last_prompt_token_count() const;
+    int last_generated_token_count() const;
+    long long last_first_content_delta_ms() const;
+    long long last_first_tts_enqueue_ms() const;
     const std::string& last_error() const { return last_error_; }
 
 private:
@@ -76,7 +80,8 @@ private:
                                   bool stop_on_tool_call,
                                   const AliaGenConfig* tts_config,
                                   AliaAudioCallback audio_cb,
-                                  void* user_data);
+                                  void* user_data,
+                                  std::chrono::steady_clock::time_point turn_start);
     bool process_tool_calls(const std::string& raw_assistant_text,
                             const std::string& user_text,
                             AliaToolCallCallback tool_cb,
@@ -102,7 +107,10 @@ private:
     std::string last_tool_result_text_;
     std::string last_tool_resume_prompt_text_;
     int generation_start_context_len_ = -1;
+    int last_prompt_token_count_ = 0;
     int last_generated_token_count_ = 0;
+    long long last_first_content_delta_ms_ = -1;
+    long long last_first_tts_enqueue_ms_ = -1;
     std::vector<int> generation_anchor_prompt_ids_;
     std::vector<int> generation_token_ids_;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;

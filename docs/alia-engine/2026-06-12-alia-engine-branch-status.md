@@ -98,6 +98,15 @@ multi-pipeline runtime shape:
 - Loaded foreground VLM content deltas are now streamed toward TTS during the
   decode loop. Sentence-like content chunks are enqueued and synthesized as soon
   as they are complete, before later assistant tokens are sampled.
+- Foreground turns now record real voice-pipeline timing markers for the main
+  loaded 4B generation: prompt token count, generated token count, first
+  decoded content delta, and first TTS enqueue.
+- Ordinary voice turns now guard against malformed structured-control leakage
+  from the identity LoRA. If a non-tool user turn starts emitting
+  `<tool_call>` markup, the foreground decode stops early, the markup is
+  removed from spoken text, and the background memory turn receives only
+  natural-language assistant text. Explicit host-tool requests still use the
+  normal tool-call path.
 - The TTS pipeline now prefers a loaded TTS backend streaming path for queued
   spoken text. `AliaTtsPipeline` formats assistant text for Qwen3-TTS,
   tokenizes it through the loaded TTS slot, and forwards backend audio chunks
@@ -185,6 +194,11 @@ multi-pipeline runtime shape:
 - `tools/alia/RunAliaTargetPipeline.ps1` is the branch-local verification
   entrypoint. It configures/builds `AliaEngine`, then runs the fixed four-model
   full pipeline with the identity LoRA and real foreground tool-call probe.
+- `tools/alia/RunAliaVoiceScenarioMatrix.ps1` runs the fixed real voice
+  scenarios and writes `tmp\alia-real-smoke\voice_matrix\summary.csv`. It
+  skips the dedicated tool probe by default so voice timing regressions are not
+  hidden by tool-call stochasticity; pass `-IncludeToolProbe` when intentionally
+  stress-testing that path per scenario.
 - `CMakeLists.txt` now treats `AliaEngine` as the custom branch aggregate
   target. Default configure builds only `AilaShared` plus
   `AilaAliaRealSmoke`; generic CLI/API/test targets and the lightweight Alia
@@ -206,10 +220,13 @@ product work is concentrated in these areas:
 
 - Foreground VLM generation still needs full multi-turn prompt/session
   ownership, deeper multi-tool continuation coverage with real model assets, and
-  better async overlap between VLM decode and real TTS synthesis.
+  faster first-token/content latency. The current real voice matrix shows first
+  content at roughly `3.6s` to `3.8s` after foreground turn start.
 - TTS has real Qwen3-TTS plus Mimi streaming smoke coverage, but callback
-  cadence/TTFT is still too slow for the PRD target and needs calibration.
-  Host voice control inputs and real-asset cancellation timing proof remain.
+  cadence/TTFT is still too slow for the PRD target and needs calibration. The
+  current matrix shows first TTS enqueue around `3.8s` to `4.3s`, while first
+  audio arrives around `5.0s` to `8.0s`. Host voice control inputs and
+  real-asset cancellation timing proof remain.
 - Background processing has real 0.8B extraction smoke coverage, including
   Markdown-fence normalization and a narrow cleanup pass for duplicate/completed
   one-shot items. Broader memory quality should still be tuned with real
@@ -307,6 +324,50 @@ Result:
 - Full log: `tmp\alia-real-smoke\alia_full_pipeline_clean.log`.
 
 ```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_VOICE_SCENARIO_MATRIX_PASS`.
+- Summary CSV:
+  `tmp\alia-real-smoke\voice_matrix\summary.csv`.
+- Every scenario used the fixed ASR, foreground 4B + identity LoRA, background
+  0.8B, and TTS model set.
+- Every scenario reported `foreground_lora_applied=true` and
+  `foreground_lora_pair_count=32`.
+- Tool probe was intentionally disabled for the voice matrix:
+  `tool_probe=false`.
+- Scenario metrics:
+
+```text
+scenario          asr_ms  prompt_tokens  generated_tokens  first_content_ms  first_tts_enqueue_ms  first_audio_ms  foreground_ms  background_ms
+short_hello       1589    120            7                 3626              3794                  5692            9477           929
+persona_chat      1716    123            17                3714              3803                  4955            13959          2950
+preference_memory 1784    123            20                3704              4261                  8008            14637          1075
+task_memory       1679    122            21                3670              4257                  8034            14702          1035
+long_answer       1769    125            28                3790              4125                  5510            12024          830
+```
+
+- A prior `task_memory` run reproduced an access violation after foreground/TTS
+  because the LoRA model emitted a half-open `<tool_call>` fragment in an
+  ordinary voice answer. The foreground structured-artifact guard fixed that
+  failure and reduced the reproduced `task_memory` generation from `64` tokens
+  to `21` tokens.
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -AudioPath "tmp\alia-real-smoke\voice_matrix\short_hello_request.wav" -OutputWav "tmp\alia-real-smoke\tool_probe_check.wav" -LogPath "tmp\alia-real-smoke\tool_probe_check.log" -RequestText "Alia, please say hello in one short sentence." -MaxTokens 48 -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- Tool probe remained enabled: `tool_probe=true`.
+- Tool probe executed `inspect_window` with argument `{"id":"42"}` and received
+  `{"ok":true,"result":"real smoke tool callback executed"}`.
+- Full log: `tmp\alia-real-smoke\tool_probe_check.log`.
+
+```powershell
 git diff --check
 ```
 
@@ -318,17 +379,20 @@ Result:
 
 ## Recommended Next Implementation Order
 
-1. Add one more real-model flow smoke for a non-trivial user turn that should
-   produce a durable preference or unresolved task, so background cleanup is
-   proven on something richer than the hello request.
-2. Calibrate Qwen3-TTS callback cadence/TTFT against the PRD 100ms audio-chunk
-   target. The fixed four-model smoke emits real audio, but first audio is still
-   about `4.7s` after foreground turn start.
-3. Add hard-interruption timing probes with the fixed 4B foreground and TTS
+1. Reduce foreground first-content latency. The prompt is only about `120` to
+   `125` tokens, so the next useful measurement is prefill time versus first
+   sampled-token time inside the 4B backend.
+2. Reduce TTS first-chunk latency. The matrix now shows a separate gap between
+   first TTS enqueue and first audio, so the next optimization should inspect
+   fixed Qwen3-TTS prefill/setup and first Mimi batch emission.
+3. Improve background memory quality with real scenarios. It is functional and
+   isolated, but some outputs still include schema-instruction artifacts or
+   require repair wrapping.
+4. Add hard-interruption timing probes with the fixed 4B foreground and TTS
    assets.
-4. Investigate and fix the foreground 4B rollback crash before treating
+5. Investigate and fix the foreground 4B rollback crash before treating
    `alia_vlm_rollback_kv_cache` as production-ready with Qwen3.5 Hybrid 4B.
-5. Migrate the 4B visiondense image path into the Alia foreground pipeline once
+6. Migrate the 4B visiondense image path into the Alia foreground pipeline once
    the audio/text full pipeline latency is under control.
 
 ## Review Notes

@@ -10,7 +10,8 @@ param(
     [int]$MaxTokens = 48,
     [int]$TimeoutSec = 1500,
     [switch]$SkipBuild,
-    [switch]$NoGenerateAudio
+    [switch]$NoGenerateAudio,
+    [switch]$SkipToolProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,6 +76,9 @@ try {
     )
     if ($NoGenerateAudio) {
         $smokeArgs += "--no-generate-audio"
+    }
+    if ($SkipToolProbe) {
+        $smokeArgs += "--skip-tool-probe"
     }
 
     & $smokeExe @smokeArgs 2>&1 | Tee-Object -FilePath $LogPath

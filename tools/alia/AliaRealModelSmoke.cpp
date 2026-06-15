@@ -37,6 +37,7 @@ struct Options {
     int max_tokens = 48;
     int timeout_sec = 1500;
     bool generate_audio_if_missing = true;
+    bool run_tool_probe = true;
 };
 
 struct AudioCapture {
@@ -85,7 +86,8 @@ void print_usage() {
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
-        << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n";
+        << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
+        << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
 }
 
 bool parse_int_arg(const char* text, int& out) {
@@ -153,6 +155,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.timeout_sec)) return false;
         } else if (arg == "--no-generate-audio") {
             opts.generate_audio_if_missing = false;
+        } else if (arg == "--skip-tool-probe") {
+            opts.run_tool_probe = false;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -467,7 +471,7 @@ int main(int argc, char** argv) {
               << "background_model=" << quote(opts.background_model) << "\n"
               << "tts_model=" << quote(opts.tts_model) << "\n"
               << "request_text=" << quote(opts.request_text) << "\n"
-              << "tool_probe=true\n"
+              << "tool_probe=" << (opts.run_tool_probe ? "true" : "false") << "\n"
               << "max_seq_len=" << opts.max_seq_len << "\n"
               << "max_tokens=" << opts.max_tokens << "\n";
 
@@ -569,6 +573,12 @@ int main(int argc, char** argv) {
     std::cout << "foreground_ms=" << fg_ms << "\n"
               << "foreground_state=" << foreground_state_name(fg_state) << "\n"
               << "foreground_decode_mode=" << foreground_mode_name(fg_mode) << "\n"
+              << "foreground_prompt_tokens=" << ctx->foreground_pipeline->last_prompt_token_count() << "\n"
+              << "foreground_generated_tokens=" << ctx->foreground_pipeline->last_generated_token_count() << "\n"
+              << "foreground_first_content_delta_ms="
+              << ctx->foreground_pipeline->last_first_content_delta_ms() << "\n"
+              << "foreground_first_tts_enqueue_ms="
+              << ctx->foreground_pipeline->last_first_tts_enqueue_ms() << "\n"
               << "foreground_user_text=" << quote(ctx->foreground_pipeline->last_user_text()) << "\n"
               << "foreground_assistant_text=" << quote(assistant_text) << "\n"
               << "foreground_tool_call_json=" << quote(ctx->foreground_pipeline->last_tool_call_json()) << "\n"
@@ -662,8 +672,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (!run_foreground_tool_probe(*ctx, opts)) {
-        return 1;
+    if (opts.run_tool_probe) {
+        if (!run_foreground_tool_probe(*ctx, opts)) {
+            return 1;
+        }
+    } else {
+        std::cout << "tool_probe_skipped=true\n";
     }
 
     std::cout << "ALIA_REAL_MODEL_SMOKE_PASS\n";
