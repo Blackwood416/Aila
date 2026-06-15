@@ -103,8 +103,35 @@ std::string build_tool_result_continuation_text(const std::string& tool_result_t
     return text;
 }
 
-bool is_tts_chunk_boundary(char ch) {
-    return ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n';
+const std::vector<std::string>& tts_chunk_boundary_markers() {
+    static const std::vector<std::string> markers = {
+        ".", "!", "?", ";", "\n",
+        "。", "！", "？", "；", "…",
+    };
+    return markers;
+}
+
+bool ends_with_tts_chunk_boundary(const std::string& text) {
+    for (const std::string& marker : tts_chunk_boundary_markers()) {
+        if (text.size() >= marker.size() &&
+            text.compare(text.size() - marker.size(), marker.size(), marker) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t last_tts_chunk_boundary(const std::string& text) {
+    size_t cutoff = std::string::npos;
+    for (const std::string& marker : tts_chunk_boundary_markers()) {
+        size_t pos = text.find(marker);
+        while (pos != std::string::npos) {
+            cutoff = std::max(cutoff == std::string::npos ? 0 : cutoff,
+                              pos + marker.size());
+            pos = text.find(marker, pos + marker.size());
+        }
+    }
+    return cutoff;
 }
 
 std::string trim_ascii(std::string value) {
@@ -177,12 +204,7 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) 
     if (force) {
         cutoff = buffer.size();
     } else {
-        for (size_t i = buffer.size(); i > 0; --i) {
-            if (is_tts_chunk_boundary(buffer[i - 1])) {
-                cutoff = i;
-                break;
-            }
-        }
+        cutoff = last_tts_chunk_boundary(buffer);
     }
 
     if (cutoff == std::string::npos || cutoff == 0) {
@@ -230,7 +252,7 @@ std::vector<std::string> split_spoken_text_for_tts(const std::string& text) {
 
     for (char ch : text) {
         current.push_back(ch);
-        if (ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n') {
+        if (ends_with_tts_chunk_boundary(current)) {
             flush();
         }
     }
@@ -493,6 +515,26 @@ void AliaForegroundPipeline::run_turn(
             asr_pipeline_->get_text(stable_text, partial_text);
         }
         const std::string user_text = !stable_text.empty() ? stable_text : partial_text;
+        if (tts_pipeline_) {
+            tts_pipeline_->begin_turn_metrics();
+        }
+        bool tts_async_started = false;
+        auto finish_tts_async = [&]() -> bool {
+            if (!tts_async_started || !tts_pipeline_) {
+                return true;
+            }
+            const bool ok = tts_pipeline_->finish_async_turn();
+            tts_async_started = false;
+            return ok;
+        };
+        struct TtsAsyncTurnGuard {
+            std::function<bool()> finish;
+            ~TtsAsyncTurnGuard() {
+                if (finish) {
+                    finish();
+                }
+            }
+        } tts_async_guard{finish_tts_async};
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -517,9 +559,25 @@ void AliaForegroundPipeline::run_turn(
             }
         }
 
+        if (tts_pipeline_ && audio_cb) {
+            tts_async_started = tts_pipeline_->start_async_turn(
+                config,
+                audio_cb,
+                user_data,
+                [this]() { return abort_requested(); });
+            if (!tts_async_started) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                last_error_ = "failed to start asynchronous TTS worker";
+                state_ = ForegroundTurnState::Failed;
+                cv_.notify_all();
+                return;
+            }
+        }
+
         std::string assistant_text;
         ForegroundDecodeMode decode_mode = ForegroundDecodeMode::LoadedVlm;
         if (!can_generate_with_loaded_vlm()) {
+            finish_tts_async();
             std::lock_guard<std::mutex> lock(mutex_);
             last_error_ = "foreground VLM slot is not loaded";
             state_ = ForegroundTurnState::Failed;
@@ -529,6 +587,7 @@ void AliaForegroundPipeline::run_turn(
         if (!generate_with_loaded_vlm(user_text, generation_config, assistant_text,
                                       true, true, true, true,
                                       &config, audio_cb, user_data, turn_start)) {
+            finish_tts_async();
             std::lock_guard<std::mutex> lock(mutex_);
             if (last_error_.empty()) {
                 last_error_ = "foreground VLM generation failed";
@@ -540,6 +599,7 @@ void AliaForegroundPipeline::run_turn(
 
         std::string spoken_text;
         if (!process_tool_calls(assistant_text, user_text, tool_cb, user_data, spoken_text)) {
+            finish_tts_async();
             std::lock_guard<std::mutex> lock(mutex_);
             if (last_error_.empty()) {
                 last_error_ = "foreground tool call failed";
@@ -558,6 +618,7 @@ void AliaForegroundPipeline::run_turn(
                 if (!generate_with_loaded_vlm(continuation_text, generation_config, resumed_text,
                                               false, false, false, false,
                                               &config, audio_cb, user_data, turn_start)) {
+                    finish_tts_async();
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (last_error_.empty()) {
                         last_error_ = "foreground VLM tool-result resume failed";
@@ -570,6 +631,14 @@ void AliaForegroundPipeline::run_turn(
                     spoken_text += resumed_text;
                 }
             }
+        }
+
+        if (!finish_tts_async() && !abort_requested()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "asynchronous TTS worker failed";
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
         }
 
         {
@@ -722,11 +791,6 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                                 std::chrono::steady_clock::now() - turn_start).count();
                     }
                 }
-                tts_pipeline_->synthesize_pending(
-                    *tts_config,
-                    audio_cb,
-                    user_data,
-                    [this]() { return abort_requested(); });
             }
         }
     };

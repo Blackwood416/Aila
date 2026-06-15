@@ -1177,6 +1177,9 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
         return false;
     }
 
+    last_tts_timing_ = TtsBackendTiming{};
+    const auto timing_start = std::chrono::high_resolution_clock::now();
+
     // 1. Generate all codec tokens (existing blocking call)
     std::vector<int32_t> all_codes;
     int total_frames = 0;
@@ -1185,6 +1188,10 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
                            all_codes, total_frames, should_cancel)) {
         return false;
     }
+    const auto codes_done = std::chrono::high_resolution_clock::now();
+    last_tts_timing_.codes_ms =
+        std::chrono::duration<double, std::milli>(codes_done - timing_start).count();
+    last_tts_timing_.total_frames = total_frames;
     if (cancelled()) {
         return false;
     }
@@ -1194,6 +1201,9 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
         return false;
     }
+    const auto mimi_init_done = std::chrono::high_resolution_clock::now();
+    last_tts_timing_.mimi_init_ms =
+        std::chrono::duration<double, std::milli>(mimi_init_done - codes_done).count();
 
     // 3. Feed codes in batches to incremental decoder
     int batch_size = stream_batch_frames;
@@ -1220,6 +1230,14 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
             if (cancelled()) {
                 return false;
             }
+            if (last_tts_timing_.callback_count == 0) {
+                last_tts_timing_.first_audio_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - timing_start).count();
+                last_tts_timing_.first_audio_samples =
+                    static_cast<int>(audio_chunk.size());
+            }
+            ++last_tts_timing_.callback_count;
             audio_callback(audio_chunk);
         }
     }
@@ -1234,9 +1252,20 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
         if (cancelled()) {
             return false;
         }
+        if (last_tts_timing_.callback_count == 0) {
+            last_tts_timing_.first_audio_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - timing_start).count();
+            last_tts_timing_.first_audio_samples =
+                static_cast<int>(flush_samples.size());
+        }
+        ++last_tts_timing_.callback_count;
         audio_callback(flush_samples);
     }
 
+    last_tts_timing_.total_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - timing_start).count();
     return true;
 }
 

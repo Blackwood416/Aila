@@ -125,6 +125,30 @@ Steps:
 - If TTS enqueue is late, make the foreground chunk boundary more aggressive for
   short Chinese/persona replies without sending malformed text to TTS.
 
+## Task 4A: Overlap Foreground Decode and TTS Synthesis
+
+**Files:**
+
+- Modify: `src/alia/AliaForegroundPipeline.cpp`
+- Modify: `src/alia/AliaTtsPipeline.hpp`
+- Modify: `src/alia/AliaTtsPipeline.cpp`
+- Modify: `src/models/IModelBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+- Modify: `tools/alia/AliaRealModelSmoke.cpp`
+- Modify: `tools/alia/RunAliaVoiceScenarioMatrix.ps1`
+
+Steps:
+
+- Record first-chunk TTS backend timing separately from host callback timing:
+  codec generation, Mimi init, first audio, total backend time, frames, callback
+  count, and first audio sample count.
+- Start a per-turn TTS worker before foreground decode, enqueue spoken chunks
+  from the decode loop, and drain the worker before background extraction.
+- Keep the synchronous `synthesize_pending` path for request-audio generation.
+- Use UTF-8-safe chunk boundaries for ASCII and CJK sentence punctuation.
+- Guard asynchronous worker cleanup across normal returns, failures, aborts, and
+  exceptions.
+
 ## Task 5: Optimize Foreground Prompt/Decode
 
 **Files:**
@@ -197,3 +221,33 @@ Initial bottleneck split:
 - TTS receives the first chunk around `3.8s` to `4.3s`, but first audio arrives
   at `5.0s` to `8.0s`, so TTS first-chunk synthesis still adds roughly `1.2s`
   to `3.8s`.
+
+## 2026-06-16 Async TTS Update
+
+After adding UTF-8 chunk boundaries, first-chunk backend metrics, and a
+per-turn asynchronous TTS worker, the voice matrix passed again:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  tts_first_codes_ms  tts_first_audio_backend_ms  tts_backend_total_ms  foreground_ms
+short_hello       1710    3760              4073                  7402            3176.86             3328.15                     14712.7               18790
+persona_chat      1829    3870              3960                  5848            1739.50             1887.76                     12124.9               16088
+preference_memory 1784    3697              4248                  7522            3125.40             3273.52                     7898.39               12149
+task_memory       1698    3642              3900                  7022            2976.00             3120.76                     18040.5               21944
+long_answer       1780    3798              4137                  6854            2568.91             2716.31                     25685.1               29826
+```
+
+Summary CSV:
+`tmp\alia-real-smoke\voice_matrix\summary.csv`.
+
+Interpretation:
+
+- Foreground decode now overlaps TTS synthesis, so VLM sampling no longer
+  blocks on each completed spoken chunk.
+- `foreground_ms` still includes final TTS drain by design because the smoke
+  waits for full speech before background extraction.
+- Mimi stream initialization is not the first-audio bottleneck; it is about
+  `3ms` on the measured runs.
+- First audio is dominated by full first-chunk codec generation before Mimi can
+  emit samples. The next high-value optimization is real codec-token streaming
+  into Mimi, or an equivalent first-batch path that does not wait for all frames
+  of the chunk.

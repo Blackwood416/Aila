@@ -20,6 +20,16 @@ public:
 
 class IModelBackend {
 public:
+    struct TtsBackendTiming {
+        double codes_ms = -1.0;
+        double mimi_init_ms = -1.0;
+        double first_audio_ms = -1.0;
+        double total_ms = -1.0;
+        int total_frames = 0;
+        int callback_count = 0;
+        int first_audio_samples = 0;
+    };
+
     virtual ~IModelBackend() = default;
 
     virtual bool load(Context& ctx,
@@ -65,6 +75,10 @@ public:
             *error_message = "backend does not support TTS streaming";
         }
         return false;
+    }
+
+    virtual TtsBackendTiming last_tts_backend_timing() const {
+        return {};
     }
 
     virtual bool supports_vision_embedding_override() const { return false; }

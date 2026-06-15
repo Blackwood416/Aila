@@ -112,6 +112,17 @@ multi-pipeline runtime shape:
   tokenizes it through the loaded TTS slot, and forwards backend audio chunks
   to `AliaAudioCallback`. Missing or non-emitting TTS backends fail the product
   path instead of emitting deterministic placeholder audio.
+- Foreground and TTS now overlap on the real product path. A per-turn TTS
+  worker starts before foreground decode, consumes spoken chunks as the 4B model
+  emits sentence-like content, and is drained before background extraction.
+  Synchronous TTS remains available for request-audio generation.
+- TTS chunk boundaries now handle UTF-8 CJK sentence punctuation in addition to
+  ASCII punctuation, reducing unnecessary first-chunk size for Chinese persona
+  replies.
+- The TTS path now records real first-chunk backend timings: codec generation,
+  Mimi init, first audio, total backend time, emitted frames, callback count,
+  and first audio sample count. `AilaAliaRealSmoke` and the voice matrix CSV
+  both report these metrics.
 - `Qwen3TTSBackend` now exposes the Alia TTS streaming hook by delegating to its
   existing `synthesize_codes_stream` plus Mimi incremental decoder path using
   the default voice, no instruct prompt, and automatic language mode.
@@ -222,11 +233,13 @@ product work is concentrated in these areas:
   ownership, deeper multi-tool continuation coverage with real model assets, and
   faster first-token/content latency. The current real voice matrix shows first
   content at roughly `3.6s` to `3.8s` after foreground turn start.
-- TTS has real Qwen3-TTS plus Mimi streaming smoke coverage, but callback
-  cadence/TTFT is still too slow for the PRD target and needs calibration. The
-  current matrix shows first TTS enqueue around `3.8s` to `4.3s`, while first
-  audio arrives around `5.0s` to `8.0s`. Host voice control inputs and
-  real-asset cancellation timing proof remain.
+- TTS has real Qwen3-TTS plus Mimi streaming smoke coverage, and foreground
+  decode now overlaps TTS synthesis, but callback cadence/TTFT is still too
+  slow for the PRD target. The current matrix shows first TTS enqueue around
+  `3.9s` to `4.2s`, while first audio arrives around `5.8s` to `7.5s`. The new
+  backend metrics show Mimi init is only about `3ms`; first audio is dominated
+  by full first-chunk codec generation before Mimi receives frames. Host voice
+  control inputs and real-asset cancellation timing proof remain.
 - Background processing has real 0.8B extraction smoke coverage, including
   Markdown-fence normalization and a narrow cleanup pass for duplicate/completed
   one-shot items. Broader memory quality should still be tuned with real
@@ -341,12 +354,12 @@ Result:
 - Scenario metrics:
 
 ```text
-scenario          asr_ms  prompt_tokens  generated_tokens  first_content_ms  first_tts_enqueue_ms  first_audio_ms  foreground_ms  background_ms
-short_hello       1589    120            7                 3626              3794                  5692            9477           929
-persona_chat      1716    123            17                3714              3803                  4955            13959          2950
-preference_memory 1784    123            20                3704              4261                  8008            14637          1075
-task_memory       1679    122            21                3670              4257                  8034            14702          1035
-long_answer       1769    125            28                3790              4125                  5510            12024          830
+scenario          asr_ms  prompt_tokens  generated_tokens  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  backend_total_ms  foreground_ms  background_ms
+short_hello       1710    120            24                3760              4073                  7402            3176.86         14712.7           18790          1185
+persona_chat      1829    123            26                3870              3960                  5848            1739.50         12124.9           16088          1218
+preference_memory 1784    123            20                3697              4248                  7522            3125.40         7898.39           12149          1063
+task_memory       1698    122            30                3642              3900                  7022            2976.00         18040.5           21944          1396
+long_answer       1780    125            57                3798              4137                  6854            2568.91         25685.1           29826          818
 ```
 
 - A prior `task_memory` run reproduced an access violation after foreground/TTS
@@ -354,9 +367,12 @@ long_answer       1769    125            28                3790              412
   ordinary voice answer. The foreground structured-artifact guard fixed that
   failure and reduced the reproduced `task_memory` generation from `64` tokens
   to `21` tokens.
+- The current async-TTS run confirms the next TTS bottleneck is not Mimi stream
+  initialization. First-chunk `codes_ms` is roughly `1.7s` to `3.2s`, while
+  `mimi_init_ms` is roughly `3ms`.
 
 ```powershell
-.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -AudioPath "tmp\alia-real-smoke\voice_matrix\short_hello_request.wav" -OutputWav "tmp\alia-real-smoke\tool_probe_check.wav" -LogPath "tmp\alia-real-smoke\tool_probe_check.log" -RequestText "Alia, please say hello in one short sentence." -MaxTokens 48 -TimeoutSec 1500
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -AudioPath "tmp\alia-real-smoke\voice_matrix\short_hello_request.wav" -OutputWav "tmp\alia-real-smoke\alia_async_tool_probe_latest.wav" -LogPath "tmp\alia-real-smoke\alia_async_tool_probe_latest.log" -RequestText "Alia, please say hello in one short sentence." -MaxTokens 48 -TimeoutSec 1500
 ```
 
 Result:
@@ -365,7 +381,7 @@ Result:
 - Tool probe remained enabled: `tool_probe=true`.
 - Tool probe executed `inspect_window` with argument `{"id":"42"}` and received
   `{"ok":true,"result":"real smoke tool callback executed"}`.
-- Full log: `tmp\alia-real-smoke\tool_probe_check.log`.
+- Full log: `tmp\alia-real-smoke\alia_async_tool_probe_latest.log`.
 
 ```powershell
 git diff --check

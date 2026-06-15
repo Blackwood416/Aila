@@ -2,6 +2,7 @@
 #include "alia/AliaBackgroundPipeline.hpp"
 #include "alia/AliaContext.hpp"
 #include "alia/AliaForegroundPipeline.hpp"
+#include "alia/AliaTtsPipeline.hpp"
 #include "audio/AudioPreprocessor.hpp"
 
 #include <algorithm>
@@ -587,12 +588,30 @@ int main(int argc, char** argv) {
 
     {
         std::lock_guard<std::mutex> lock(audio_capture.mutex);
+        const aila::alia::AliaTtsMetrics tts_metrics =
+            ctx->tts_pipeline->last_metrics();
         const double first_audio_ms = audio_capture.callback_count > 0
             ? static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                   audio_capture.first_audio - audio_capture.turn_start).count())
             : -1.0;
         std::cout << "tts_callback_count=" << audio_capture.callback_count << "\n"
                   << "tts_first_audio_ms=" << first_audio_ms << "\n"
+                  << "tts_chunks_synthesized=" << tts_metrics.chunks_synthesized << "\n"
+                  << "tts_first_text_chars=" << tts_metrics.first_text_chars << "\n"
+                  << "tts_first_text_tokens=" << tts_metrics.first_text_tokens << "\n"
+                  << "tts_first_backend_frames=" << tts_metrics.first_backend_frames << "\n"
+                  << "tts_first_backend_callbacks=" << tts_metrics.first_backend_callbacks << "\n"
+                  << "tts_first_backend_audio_samples="
+                  << tts_metrics.first_backend_audio_samples << "\n"
+                  << "tts_first_backend_codes_ms="
+                  << tts_metrics.first_backend_codes_ms << "\n"
+                  << "tts_first_backend_mimi_init_ms="
+                  << tts_metrics.first_backend_mimi_init_ms << "\n"
+                  << "tts_first_backend_audio_ms="
+                  << tts_metrics.first_backend_audio_ms << "\n"
+                  << "tts_first_backend_total_ms="
+                  << tts_metrics.first_backend_total_ms << "\n"
+                  << "tts_backend_total_ms=" << tts_metrics.backend_total_ms << "\n"
                   << "tts_total_samples=" << audio_capture.samples.size() << "\n"
                   << "tts_nonzero_samples=" << audio_capture.nonzero_samples << "\n"
                   << "tts_chunk_sizes=";

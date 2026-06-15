@@ -64,6 +64,7 @@ public:
         std::function<void(const std::vector<float>&)> audio_callback,
         std::string* error_message = nullptr,
         std::function<bool()> should_cancel = {}) override;
+    TtsBackendTiming last_tts_backend_timing() const override { return last_tts_timing_; }
 
     bool load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message);
     bool decode_mimi_vocoder(Context& ctx,
@@ -245,4 +246,5 @@ private:
     Tensor precomputed_tts_pad_; // [1, H_talker]
     Tensor precomputed_codec_pad_; // [1, H_talker]
     Tensor precomputed_codec_bos_; // [1, H_talker]
+    TtsBackendTiming last_tts_timing_;
 };
