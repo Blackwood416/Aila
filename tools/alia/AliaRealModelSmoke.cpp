@@ -554,8 +554,8 @@ int main(int argc, char** argv) {
         const int get_rc = alia_asr_get_text(ctx.get(), &stable_raw, &partial_raw);
         stable_text = stable_raw ? stable_raw : "";
         partial_text = partial_raw ? partial_raw : "";
-        std::free(stable_raw);
-        std::free(partial_raw);
+        alia_free_string(stable_raw);
+        alia_free_string(partial_raw);
         if (get_rc != ALIA_OK) {
             std::cerr << "alia_asr_get_text_rc=" << get_rc << "\n";
             return false;

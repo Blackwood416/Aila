@@ -571,6 +571,11 @@ AliaErrorCode AliaForegroundPipeline::rollback_kv_cache(int rollback_tokens) {
         generated_token_ids = generation_token_ids_;
     }
 
+    const int replayable_len = anchor + static_cast<int>(generated_token_ids.size());
+    if (anchor < 0 || anchor_prompt_ids.empty() || current_len != replayable_len) {
+        return ALIA_ERR_INVALID_STATE;
+    }
+
     int target_len = std::max(anchor, current_len - rollback_tokens);
     if (target_len > current_len) {
         target_len = current_len;
@@ -1131,7 +1136,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             last_generated_token_count_ = static_cast<int>(generated_ids.size());
             generation_token_ids_ = generated_ids;
         } else {
-            last_generated_token_count_ += static_cast<int>(generated_ids.size());
+            last_generated_token_count_ += prompt_tokens_to_forward +
+                                           static_cast<int>(generated_ids.size());
+            generation_token_ids_.insert(generation_token_ids_.end(),
+                                         prompt_ids.begin() + prefilled_prompt_tokens,
+                                         prompt_ids.end());
             generation_token_ids_.insert(generation_token_ids_.end(),
                                          generated_ids.begin(),
                                          generated_ids.end());

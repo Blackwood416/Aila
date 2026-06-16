@@ -88,6 +88,7 @@ ALIA_API int alia_vlm_prefill_asr_text(
     const char* partial_text);
 ALIA_API int alia_asr_feed_audio(AliaContext* ctx, const float* samples, int sample_count);
 ALIA_API void alia_asr_reset(AliaContext* ctx);
+ALIA_API void alia_free_string(char* s);
 ALIA_API int alia_asr_get_text(AliaContext* ctx, char** out_stable, char** out_partial);
 ALIA_API void alia_register_background_callback(AliaContext* ctx, AliaBackgroundResultCallback callback);
 ALIA_API int alia_trigger_background_processing(AliaContext* ctx, const char* chat_turn_text);

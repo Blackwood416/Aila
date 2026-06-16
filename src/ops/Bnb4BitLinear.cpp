@@ -1000,7 +1000,8 @@ void Bnb4BitLinear::forward(Context& ctx,
                 decode_args_[DNNL_ARG_DST] = decode_dst_mem_;
             }
         }
-        decode_prim_.execute(ctx.stream(), decode_args_);
+        auto stream_lock = ctx.lock_dnnl_stream();
+        decode_prim_.execute(stream_lock.stream(), decode_args_);
     } else {
         auto& cp = prim_cache_[seq_len];
         if (!cp.mem_inited) {
@@ -1039,7 +1040,8 @@ void Bnb4BitLinear::forward(Context& ctx,
                 cp.args[DNNL_ARG_DST] = cp.dst_mem;
             }
         }
-        cp.prim.execute(ctx.stream(), cp.args);
+        auto stream_lock = ctx.lock_dnnl_stream();
+        cp.prim.execute(stream_lock.stream(), cp.args);
     }
 
     if (!lora_attachments_.empty()) {
@@ -1117,4 +1119,3 @@ void bf16_gemv_bf16(Context& ctx,
 }
 
 } // namespace ops
-

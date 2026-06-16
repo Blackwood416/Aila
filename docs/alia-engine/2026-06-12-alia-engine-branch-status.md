@@ -489,3 +489,63 @@ The architecture direction is intentionally Alia-specific. This branch now keeps
 the build and verification surface focused on the fixed Alia product pipeline
 instead of carrying generic API, generic CLI, or lightweight API-test entry
 points forward.
+
+## 2026-06-17 Stability/ABI Fix Notes
+
+Changes:
+
+- Finding #1: TTS now uses its own `RuntimeContext::tts()` execution lane
+  (separate in-order SYCL queue, oneDNN stream, and `Context` allocator) while
+  still sharing the single `sycl::context`/device with foreground and
+  background lanes. This avoids the normal VLM-decode/TTS-worker shared
+  `Context` race without touching NF4 decode kernels. `Context` allocator
+  bookkeeping and USM allocation/free are also mutex-protected, and oneDNN
+  stream execution is serialized per `Context`.
+- Finding #2: the Alia ABI now exports `alia_free_string(char* s)`, implemented
+  with `std::free` to match `alia_asr_get_text` string allocation. The
+  real-model smoke now frees ASR strings through this export; host callers must
+  do the same instead of using host-side deallocators.
+- Finding #3: every `alia_*` entry point in `src/alia/AliaApi.cpp` is wrapped so
+  C++ exceptions cannot cross the C ABI. `ModelBackendCancelled` maps to
+  `ALIA_ERR_ABORTED`; allocation, standard, and unknown exceptions map to
+  `ALIA_ERR_RUNTIME`.
+- Finding #4: rollback replay now refuses to report success unless the current
+  backend context length exactly matches the recorded replay sequence. Tool
+  result continuation tokens forwarded during resume are recorded alongside
+  sampled tokens so replay can reconstruct the forwarded token stream.
+
+Verification:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; cmake -S . -B build; cmake --build build --target AliaEngine --config Release"
+```
+
+Result:
+
+- Passed after the TTS-lane revision.
+- Build output completed `[72/72] Linking CXX shared library AilaShared.dll; Copying runtime DLLs for AilaShared`.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; dumpbin /exports build\AilaShared.dll | Select-String 'alia_'"
+```
+
+Result:
+
+- Passed and showed `alia_free_string` in the Alia export surface alongside the
+  existing `alia_*` exports.
+
+Runtime note:
+
+- A first `RunAliaTargetPipeline.ps1 -SkipBuild` pass under an earlier lock-only
+  version printed `ALIA_REAL_MODEL_SMOKE_PASS`, but it also showed severe timing
+  regression and is not counted as final verification for the revised code.
+- `RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500` was interrupted
+  after high VRAM copy utilization and a display/GPU crash/black-screen report.
+  The remaining `AilaAliaRealSmoke.exe` process was terminated.
+- A later `RunAliaTargetPipeline.ps1 -SkipBuild` pass after the TTS-lane
+  revision printed `ALIA_REAL_MODEL_SMOKE_PASS`, but still showed severe
+  performance regression versus the 2026-06-16 baseline:
+  `model_load_ms=135933`, `asr_ms=11069`, `foreground_first_content_delta_ms=17334`,
+  `foreground_first_tts_enqueue_ms=23126`, and `tts_first_audio_ms=40341`.
+  Because this did not satisfy the no-regression condition, no review-request
+  handoff was written from this run.

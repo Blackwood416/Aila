@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 #include <cstddef>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -14,6 +15,19 @@
 // ============================================================
 class Context {
 public:
+    class DnnlStreamLock {
+    public:
+        explicit DnnlStreamLock(Context& ctx)
+            : ctx_(ctx),
+              lock_(ctx.dnnl_stream_mutex_) {}
+
+        dnnl::stream& stream() { return ctx_.stream_; }
+
+    private:
+        Context& ctx_;
+        std::unique_lock<std::mutex> lock_;
+    };
+
     Context()
         : Context(sycl::queue{sycl::default_selector_v, sycl::property::queue::in_order()}) {}
 
@@ -26,9 +40,11 @@ public:
     sycl::queue& queue() { return q_; }
     dnnl::engine& engine() { return eng_; }
     dnnl::stream& stream() { return stream_; }
+    DnnlStreamLock lock_dnnl_stream() { return DnnlStreamLock(*this); }
 
     // USM Device memory allocation
     void* alloc_device(size_t bytes) {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
         void* ptr = sycl::malloc_device(bytes, q_);
         if (!ptr) {
             throw std::runtime_error("GPU memory allocation failed: " + std::to_string(bytes) + " bytes");
@@ -43,6 +59,7 @@ public:
 
     void free_device(void* ptr) {
         if (!ptr) return;
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
         auto it = alloc_bytes_.find(ptr);
         if (it != alloc_bytes_.end()) {
             size_t bytes = it->second;
@@ -80,13 +97,22 @@ public:
         q_.wait_and_throw();
     }
 
-    size_t current_allocated_bytes() const { return current_allocated_bytes_; }
-    size_t peak_allocated_bytes() const { return peak_allocated_bytes_; }
+    size_t current_allocated_bytes() const {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        return current_allocated_bytes_;
+    }
+
+    size_t peak_allocated_bytes() const {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        return peak_allocated_bytes_;
+    }
 
 private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
+    mutable std::mutex alloc_mutex_;
+    std::mutex dnnl_stream_mutex_;
     std::unordered_map<void*, size_t> alloc_bytes_;
     size_t current_allocated_bytes_ = 0;
     size_t peak_allocated_bytes_ = 0;
