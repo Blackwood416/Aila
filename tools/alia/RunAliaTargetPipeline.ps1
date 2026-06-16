@@ -9,6 +9,7 @@ param(
     [int]$MaxSeq = 2048,
     [int]$MaxTokens = 48,
     [int]$TimeoutSec = 1500,
+    [int]$StreamChunkMs = 1000,
     [switch]$SkipBuild,
     [switch]$NoGenerateAudio,
     [switch]$StreamAsrPrefill,
@@ -72,6 +73,7 @@ try {
         "--max-seq", "$MaxSeq",
         "--max-tokens", "$MaxTokens",
         "--timeout-sec", "$TimeoutSec",
+        "--stream-chunk-ms", "$StreamChunkMs",
         "--foreground-lora", $ForegroundLora,
         "--tool-probe-text", $ToolProbeText
     )

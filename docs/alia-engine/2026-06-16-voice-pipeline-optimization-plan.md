@@ -587,3 +587,53 @@ Interpretation:
 - Next step is a more realistic streaming harness that records wall-clock from
   simulated VAD fall while feeding chunks over time, and then a matrix run with
   `-StreamAsrPrefill` once the harness reflects product overlap.
+
+## 2026-06-16 ASR/VLM Live-Stream Harness Update
+
+The ASR prefill prototype now has a more useful real-model measurement mode:
+
+- `AliaRealModelSmoke` accepts `--stream-chunk-ms` for the ASR partial cadence
+  used by `--stream-asr-prefill`; the PowerShell wrapper exposes this as
+  `-StreamChunkMs`.
+- The runner still executes deterministically in one process, but it now
+  computes a simulated live timeline: each ASR/prefill operation can start only
+  once its audio chunk would have arrived, and any compute before VAD fall is
+  treated as hidden behind microphone capture.
+- New log fields:
+  - `asr_audio_duration_ms`
+  - `asr_stream_simulated_tail_ms`
+  - `simulated_vad_asr_tail_ms`
+  - `simulated_vad_to_first_content_ms`
+  - `simulated_vad_to_first_tts_enqueue_ms`
+  - `simulated_vad_to_first_audio_ms`
+- The default non-streaming path reports `simulated_vad_asr_tail_ms=asr_ms`,
+  making it a conservative VAD-fall baseline where ASR work starts after the
+  utterance is complete.
+
+This is still a harness-level estimate, not a replacement for a real capture
+thread. It is good enough to answer the next product question: whether ASR
+partial text plus VLM prefix prefill materially reduces VAD-fall-to-first-audio
+once capture overlap is accounted for.
+
+Short real-smoke checks with the existing `short_hello_request.wav`:
+
+```text
+mode                  asr_ms  prefill_calls  vad_tail_ms  vad_to_first_content_ms  vad_to_first_audio_ms
+default               943     0              943          4476                     5685
+stream 1000ms chunks  6478    4              3717         4631                     6077
+stream 2000ms chunks  4901    2              3140         4051                     5753
+```
+
+Interpretation:
+
+- Prefix prefill is doing the useful foreground work: streaming runs reduce
+  `foreground_first_content_delta_ms` from roughly `3.5s` to roughly `0.9s`.
+- Running ASR partial after every `1000ms` of audio is too expensive for this
+  implementation and leaves a large simulated VAD tail. `2000ms` cadence is
+  better for first content, but the sampled TTS first chunk still made first
+  audio roughly equal to the default run.
+- A `4000ms` exploratory run is not a good product shape: it effectively waits
+  until the utterance is over before prefill, and in one run produced a long
+  max-token foreground output followed by a background-stage access violation.
+  Keep the next pass focused on partial cadence and ASR compute reuse, not on
+  end-of-utterance-only prefill.

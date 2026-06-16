@@ -38,6 +38,7 @@ struct Options {
     int max_seq_len = 2048;
     int max_tokens = 48;
     int timeout_sec = 1500;
+    int stream_chunk_ms = 1000;
     bool generate_audio_if_missing = true;
     bool run_tool_probe = true;
     bool stream_asr_prefill = false;
@@ -89,6 +90,7 @@ void print_usage() {
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
+        << "  --stream-chunk-ms <N>  ASR stream chunk duration for --stream-asr-prefill, default 1000\n"
         << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
         << "  --stream-asr-prefill   feed ASR in chunks and prefill foreground VLM from stable/partial text\n"
         << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
@@ -157,6 +159,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.max_tokens)) return false;
         } else if (arg == "--timeout-sec") {
             if (!require_int(opts.timeout_sec)) return false;
+        } else if (arg == "--stream-chunk-ms") {
+            if (!require_int(opts.stream_chunk_ms)) return false;
         } else if (arg == "--no-generate-audio") {
             opts.generate_audio_if_missing = false;
         } else if (arg == "--stream-asr-prefill") {
@@ -169,8 +173,9 @@ bool parse_args(int argc, char** argv, Options& opts) {
         }
     }
 
-    if (opts.max_seq_len <= 0 || opts.max_tokens <= 0 || opts.timeout_sec <= 0) {
-        std::cerr << "max-seq, max-tokens, and timeout-sec must be positive.\n";
+    if (opts.max_seq_len <= 0 || opts.max_tokens <= 0 || opts.timeout_sec <= 0 ||
+        opts.stream_chunk_ms <= 0) {
+        std::cerr << "max-seq, max-tokens, timeout-sec, and stream-chunk-ms must be positive.\n";
         return false;
     }
     if (opts.request_text.empty()) {
@@ -527,6 +532,11 @@ int main(int argc, char** argv) {
     const auto asr_start = Clock::now();
     int rc = ALIA_OK;
     int asr_prefill_calls = 0;
+    constexpr double kAsrSampleRate = 16000.0;
+    const double asr_audio_duration_ms =
+        static_cast<double>(mono_16k.size()) * 1000.0 / kAsrSampleRate;
+    double asr_stream_simulated_clock_ms = 0.0;
+    double asr_stream_simulated_tail_ms = -1.0;
     auto get_asr_text = [&](std::string& stable_text, std::string& partial_text) -> bool {
         char* stable_raw = nullptr;
         char* partial_raw = nullptr;
@@ -545,9 +555,17 @@ int main(int argc, char** argv) {
     std::string stable_text;
     std::string partial_text;
     if (opts.stream_asr_prefill) {
-        constexpr int kStreamChunkSamples = 16000;
-        for (size_t offset = 0; offset < mono_16k.size(); offset += kStreamChunkSamples) {
-            const size_t count = std::min<size_t>(kStreamChunkSamples, mono_16k.size() - offset);
+        const int stream_chunk_samples =
+            std::max(1, static_cast<int>(std::llround(
+                static_cast<double>(opts.stream_chunk_ms) * kAsrSampleRate / 1000.0)));
+        for (size_t offset = 0; offset < mono_16k.size();
+             offset += static_cast<size_t>(stream_chunk_samples)) {
+            const size_t count = std::min<size_t>(
+                static_cast<size_t>(stream_chunk_samples),
+                mono_16k.size() - offset);
+            const double chunk_end_ms =
+                static_cast<double>(offset + count) * 1000.0 / kAsrSampleRate;
+            const auto chunk_op_start = Clock::now();
             rc = alia_asr_feed_audio(
                 ctx.get(),
                 mono_16k.data() + offset,
@@ -567,10 +585,14 @@ int main(int argc, char** argv) {
                 }
                 ++asr_prefill_calls;
             }
+            const double chunk_op_ms = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - chunk_op_start).count());
+            asr_stream_simulated_clock_ms =
+                std::max(asr_stream_simulated_clock_ms, chunk_end_ms) + chunk_op_ms;
         }
-        if (!get_asr_text(stable_text, partial_text)) {
-            return 1;
-        }
+        asr_stream_simulated_tail_ms =
+            std::max(0.0, asr_stream_simulated_clock_ms - asr_audio_duration_ms);
     } else {
         rc = alia_asr_feed_audio(ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));
         if (rc != ALIA_OK) {
@@ -596,7 +618,10 @@ int main(int argc, char** argv) {
     }
     std::cout << "asr_ms=" << asr_ms << "\n"
               << "asr_stream_prefill_enabled=" << (opts.stream_asr_prefill ? "true" : "false") << "\n"
+              << "asr_stream_chunk_ms=" << (opts.stream_asr_prefill ? opts.stream_chunk_ms : 0) << "\n"
               << "asr_stream_prefill_calls=" << asr_prefill_calls << "\n"
+              << "asr_audio_duration_ms=" << asr_audio_duration_ms << "\n"
+              << "asr_stream_simulated_tail_ms=" << asr_stream_simulated_tail_ms << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"
               << "asr_partial_text=" << quote(partial_text) << "\n";
     if (user_text.empty()) {
@@ -632,6 +657,21 @@ int main(int argc, char** argv) {
     const auto fg_state = ctx->foreground_pipeline->state();
     const auto fg_mode = ctx->foreground_pipeline->last_decode_mode();
     const std::string assistant_text = ctx->foreground_pipeline->last_assistant_text();
+    const double simulated_vad_asr_tail_ms = opts.stream_asr_prefill
+        ? asr_stream_simulated_tail_ms
+        : static_cast<double>(asr_ms);
+    const long long foreground_first_content_delta_ms =
+        ctx->foreground_pipeline->last_first_content_delta_ms();
+    const long long foreground_first_tts_enqueue_ms =
+        ctx->foreground_pipeline->last_first_tts_enqueue_ms();
+    const double simulated_vad_to_first_content_ms =
+        foreground_first_content_delta_ms >= 0
+            ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_content_delta_ms)
+            : -1.0;
+    const double simulated_vad_to_first_tts_enqueue_ms =
+        foreground_first_tts_enqueue_ms >= 0
+            ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_tts_enqueue_ms)
+            : -1.0;
     std::cout << "foreground_ms=" << fg_ms << "\n"
               << "foreground_state=" << foreground_state_name(fg_state) << "\n"
               << "foreground_decode_mode=" << foreground_mode_name(fg_mode) << "\n"
@@ -642,9 +682,14 @@ int main(int argc, char** argv) {
               << "foreground_asr_prefill_ms="
               << ctx->foreground_pipeline->last_asr_prefill_ms() << "\n"
               << "foreground_first_content_delta_ms="
-              << ctx->foreground_pipeline->last_first_content_delta_ms() << "\n"
+              << foreground_first_content_delta_ms << "\n"
               << "foreground_first_tts_enqueue_ms="
-              << ctx->foreground_pipeline->last_first_tts_enqueue_ms() << "\n"
+              << foreground_first_tts_enqueue_ms << "\n"
+              << "simulated_vad_asr_tail_ms=" << simulated_vad_asr_tail_ms << "\n"
+              << "simulated_vad_to_first_content_ms="
+              << simulated_vad_to_first_content_ms << "\n"
+              << "simulated_vad_to_first_tts_enqueue_ms="
+              << simulated_vad_to_first_tts_enqueue_ms << "\n"
               << "foreground_user_text=" << quote(ctx->foreground_pipeline->last_user_text()) << "\n"
               << "foreground_assistant_text=" << quote(assistant_text) << "\n"
               << "foreground_tool_call_json=" << quote(ctx->foreground_pipeline->last_tool_call_json()) << "\n"
@@ -659,8 +704,13 @@ int main(int argc, char** argv) {
             ? static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                   audio_capture.first_audio - audio_capture.turn_start).count())
             : -1.0;
+        const double simulated_vad_to_first_audio_ms = first_audio_ms >= 0.0
+            ? simulated_vad_asr_tail_ms + first_audio_ms
+            : -1.0;
         std::cout << "tts_callback_count=" << audio_capture.callback_count << "\n"
                   << "tts_first_audio_ms=" << first_audio_ms << "\n"
+                  << "simulated_vad_to_first_audio_ms="
+                  << simulated_vad_to_first_audio_ms << "\n"
                   << "tts_chunks_synthesized=" << tts_metrics.chunks_synthesized << "\n"
                   << "tts_first_text_chars=" << tts_metrics.first_text_chars << "\n"
                   << "tts_first_text_tokens=" << tts_metrics.first_text_tokens << "\n"
