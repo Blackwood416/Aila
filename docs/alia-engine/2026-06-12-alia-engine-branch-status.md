@@ -494,13 +494,14 @@ points forward.
 
 Changes:
 
-- Finding #1: TTS now uses its own `RuntimeContext::tts()` execution lane
-  (separate in-order SYCL queue, oneDNN stream, and `Context` allocator) while
-  still sharing the single `sycl::context`/device with foreground and
-  background lanes. This avoids the normal VLM-decode/TTS-worker shared
-  `Context` race without touching NF4 decode kernels. `Context` allocator
-  bookkeeping and USM allocation/free are also mutex-protected, and oneDNN
-  stream execution is serialized per `Context`.
+- Finding #1: shared foreground `Context` access is now serialized at pipeline
+  boundaries instead of inside the NF4/Linear hot path. `Context` exposes a
+  lane-level execution lock and mutex-protects allocation bookkeeping; ASR GPU
+  transcription, foreground VLM prefill/decode/rollback, and TTS chunk
+  synthesis take that lane lock around model-level GPU submission windows. TTS
+  remains on the foreground lane, and the expensive per-oneDNN-primitive stream
+  locks plus the separate TTS queue attempt were removed after they caused a
+  broad GPU slowdown/high copy-utilization regression.
 - Finding #2: the Alia ABI now exports `alia_free_string(char* s)`, implemented
   with `std::free` to match `alia_asr_get_text` string allocation. The
   real-model smoke now frees ASR strings through this export; host callers must
@@ -534,18 +535,30 @@ Result:
 - Passed and showed `alia_free_string` in the Alia export surface alongside the
   existing `alia_*` exports.
 
-Runtime note:
+Regression follow-up:
 
-- A first `RunAliaTargetPipeline.ps1 -SkipBuild` pass under an earlier lock-only
-  version printed `ALIA_REAL_MODEL_SMOKE_PASS`, but it also showed severe timing
-  regression and is not counted as final verification for the revised code.
-- `RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500` was interrupted
-  after high VRAM copy utilization and a display/GPU crash/black-screen report.
-  The remaining `AilaAliaRealSmoke.exe` process was terminated.
-- A later `RunAliaTargetPipeline.ps1 -SkipBuild` pass after the TTS-lane
-  revision printed `ALIA_REAL_MODEL_SMOKE_PASS`, but still showed severe
-  performance regression versus the 2026-06-16 baseline:
-  `model_load_ms=135933`, `asr_ms=11069`, `foreground_first_content_delta_ms=17334`,
-  `foreground_first_tts_enqueue_ms=23126`, and `tts_first_audio_ms=40341`.
-  Because this did not satisfy the no-regression condition, no review-request
-  handoff was written from this run.
+- The first Finding #1 implementation used per-primitive oneDNN stream locks
+  and a separate TTS `Context`. It passed functionally but regressed badly:
+  `model_load_ms=135933`, `asr_ms=11069`,
+  `foreground_first_content_delta_ms=17334`, and `tts_first_audio_ms=40341`.
+- A parent-control worktree built from `HEAD~1` on the same machine/GPU was
+  fast (`model_load_ms=25496`, `asr_ms=895`, `foreground_ms=4077`,
+  `tts_first_audio_ms=3593`), proving the slowdown came from the attempted
+  synchronization changes rather than the model assets or driver state.
+- A forced clean rebuild of this branch with pipeline-level lane locking passed:
+  `cmake -S . -B build -G Ninja` followed by
+  `cmake --build build --target AliaEngine --config Release` completed through
+  `[124/124] Linking CXX shared library AilaShared.dll; Copying runtime DLLs for AilaShared`.
+- Short smoke after the revised fix passed with normal timings:
+  `ALIA_REAL_MODEL_SMOKE_PASS`, `model_load_ms=26811`, `asr_ms=945`,
+  `foreground_ms=3809`, `foreground_first_content_delta_ms=3067`,
+  `foreground_first_tts_enqueue_ms=3312`, and `tts_first_audio_ms=3807`.
+- Full target smoke with tool probe passed:
+  `ALIA_REAL_MODEL_SMOKE_PASS`, `model_load_ms=25762`, `asr_ms=897`,
+  `foreground_first_content_delta_ms=2927`, `foreground_first_tts_enqueue_ms=3185`,
+  `tts_first_audio_ms=4063`, `tool_probe_ms=2081`.
+- Voice scenario matrix passed without the previous black-screen/display crash:
+  `ALIA_VOICE_SCENARIO_MATRIX_PASS summary=E:\RiderProjects\Aila\tmp\alia-real-smoke\voice_matrix\summary.csv`.
+  Scenario `model_load_ms` stayed around `25.6s` to `26.2s`, `asr_ms` around
+  `0.93s` to `1.13s`, first content around `3.09s` to `3.16s`, and first audio
+  around `4.23s` to `4.74s`.

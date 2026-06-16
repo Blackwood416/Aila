@@ -17,7 +17,7 @@ void AliaContext::configure_model_slots() {
     foreground_vlm.set_lora_dir(vlm_4b_lora_dir);
     background_vlm.configure(aila::alia::ModelRole::BackgroundVlm, vlm_0_8b_model_dir,
                              &runtime->background());
-    tts.configure(aila::alia::ModelRole::Tts, tts_model_dir, &runtime->tts());
+    tts.configure(aila::alia::ModelRole::Tts, tts_model_dir, &runtime->foreground());
 }
 
 bool AliaContext::load_model_metadata() {

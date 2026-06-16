@@ -230,8 +230,7 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
             }
         }
 
-        auto stream_lock = ctx.lock_dnnl_stream();
-        decode_prim_.execute(stream_lock.stream(), decode_args_);
+        decode_prim_.execute(ctx.stream(), decode_args_);
     } else {
         auto& cp = prim_cache_[seq_len];
         if (!cp.mem_inited) {
@@ -271,8 +270,7 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
             }
         }
 
-        auto stream_lock = ctx.lock_dnnl_stream();
-        cp.prim.execute(stream_lock.stream(), cp.args);
+        cp.prim.execute(ctx.stream(), cp.args);
     }
 }
 
@@ -343,8 +341,7 @@ void Linear::forward_bias(Context& ctx, Tensor& input, Tensor& bias,
         }
     }
 
-    auto stream_lock = ctx.lock_dnnl_stream();
-    cp.prim.execute(stream_lock.stream(), cp.args);
+    cp.prim.execute(ctx.stream(), cp.args);
 }
 
 void Linear::forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
@@ -399,7 +396,6 @@ void Linear::forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
         }
     }
 
-    auto stream_lock = ctx.lock_dnnl_stream();
-    cp.prim.execute(stream_lock.stream(), cp.args);
+    cp.prim.execute(ctx.stream(), cp.args);
 }
 

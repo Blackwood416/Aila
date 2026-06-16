@@ -195,27 +195,31 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
         return false;
     }
 
-    std::string backend_error;
     bool emitted_backend_audio = false;
-    const bool backend_ok = backend->synthesize_tts_stream(
-        *context,
-        text_tokens,
-        translate_tts_generation_config(config),
-        kTtsStreamBatchFrames,
-        [&](const std::vector<float>& samples) {
-            if (samples.empty()) {
-                return;
-            }
-            if (cancelled()) {
-                return;
-            }
-            emitted_backend_audio = true;
-            audio_cb(samples.data(), static_cast<int>(samples.size()), user_data);
-        },
-        &backend_error,
-        should_cancel);
-    const IModelBackend::TtsBackendTiming backend_timing =
-        backend->last_tts_backend_timing();
+    bool backend_ok = false;
+    IModelBackend::TtsBackendTiming backend_timing;
+    {
+        auto lane_lock = context->lock_execution();
+        std::string backend_error;
+        backend_ok = backend->synthesize_tts_stream(
+            *context,
+            text_tokens,
+            translate_tts_generation_config(config),
+            kTtsStreamBatchFrames,
+            [&](const std::vector<float>& samples) {
+                if (samples.empty()) {
+                    return;
+                }
+                if (cancelled()) {
+                    return;
+                }
+                emitted_backend_audio = true;
+                audio_cb(samples.data(), static_cast<int>(samples.size()), user_data);
+            },
+            &backend_error,
+            should_cancel);
+        backend_timing = backend->last_tts_backend_timing();
+    }
     if (!backend_ok || !emitted_backend_audio) {
         return cancelled();
     }

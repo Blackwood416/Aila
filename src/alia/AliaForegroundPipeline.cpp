@@ -453,6 +453,7 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         return ALIA_ERR_CONTEXT_OVERFLOW;
     }
 
+    auto lane_lock = context->lock_execution();
     std::vector<int> current_prefill;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -559,7 +560,12 @@ AliaErrorCode AliaForegroundPipeline::rollback_kv_cache(int rollback_tokens) {
         return ALIA_ERR_INVALID_STATE;
     }
 
+    Context* context = vlm_slot_->context();
     IModelBackend* backend = vlm_slot_->backend();
+    if (!context || !backend) {
+        return ALIA_ERR_INVALID_STATE;
+    }
+    auto lane_lock = context->lock_execution();
     const int current_len = backend->get_current_context_len();
     int anchor = 0;
     std::vector<int> anchor_prompt_ids;
@@ -592,7 +598,6 @@ AliaErrorCode AliaForegroundPipeline::rollback_kv_cache(int rollback_tokens) {
             return false;
         }
 
-        Context* context = vlm_slot_->context();
         backend->reset();
 
         DeviceAllocation prompt_device(*context, anchor_prompt_ids.size() * sizeof(int));
@@ -982,42 +987,47 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         return false;
     }
 
-    if (reset_session) {
-        backend->reset();
-        prefilled_prompt_tokens = 0;
-    }
-    if (prefilled_prompt_tokens < 0 ||
-        prefilled_prompt_tokens > static_cast<int>(prompt_ids.size()) ||
-        (!reset_session && prefilled_prompt_tokens > 0 &&
-         backend->get_current_context_len() != prefilled_prompt_tokens)) {
-        backend->reset();
-        prefilled_prompt_tokens = 0;
-    }
+    int prompt_tokens_to_forward = 0;
+    Tensor* logits = nullptr;
+    {
+        auto lane_lock = context->lock_execution();
+        if (reset_session) {
+            backend->reset();
+            prefilled_prompt_tokens = 0;
+        }
+        if (prefilled_prompt_tokens < 0 ||
+            prefilled_prompt_tokens > static_cast<int>(prompt_ids.size()) ||
+            (!reset_session && prefilled_prompt_tokens > 0 &&
+             backend->get_current_context_len() != prefilled_prompt_tokens)) {
+            backend->reset();
+            prefilled_prompt_tokens = 0;
+        }
 
-    const int max_seq_len = backend->max_seq_len();
-    const int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
-    const int prompt_tokens_to_forward =
-        static_cast<int>(prompt_ids.size()) - prefilled_prompt_tokens;
-    if (max_seq_len > 0 &&
-        context_len_before_prompt + prompt_tokens_to_forward +
-            config.max_new_tokens > max_seq_len) {
-        last_error_ = use_chat_template
-            ? "foreground VLM prompt would exceed max sequence length"
-            : "foreground VLM continuation would exceed max sequence length";
-        return false;
-    }
+        const int max_seq_len = backend->max_seq_len();
+        const int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
+        prompt_tokens_to_forward =
+            static_cast<int>(prompt_ids.size()) - prefilled_prompt_tokens;
+        if (max_seq_len > 0 &&
+            context_len_before_prompt + prompt_tokens_to_forward +
+                config.max_new_tokens > max_seq_len) {
+            last_error_ = use_chat_template
+                ? "foreground VLM prompt would exceed max sequence length"
+                : "foreground VLM continuation would exceed max sequence length";
+            return false;
+        }
 
-    if (prompt_tokens_to_forward <= 0) {
-        last_error_ = "foreground VLM prompt was fully prefetched without cached logits";
-        return false;
-    }
+        if (prompt_tokens_to_forward <= 0) {
+            last_error_ = "foreground VLM prompt was fully prefetched without cached logits";
+            return false;
+        }
 
-    DeviceAllocation prompt_device(*context, prompt_tokens_to_forward * sizeof(int));
-    context->memcpy_h2d(prompt_device.as<int>(),
-                        prompt_ids.data() + prefilled_prompt_tokens,
-                        prompt_tokens_to_forward * sizeof(int));
-    Tensor* logits = &backend->forward(*context, prompt_device.as<int>(),
-                                       prompt_tokens_to_forward);
+        DeviceAllocation prompt_device(*context, prompt_tokens_to_forward * sizeof(int));
+        context->memcpy_h2d(prompt_device.as<int>(),
+                            prompt_ids.data() + prefilled_prompt_tokens,
+                            prompt_tokens_to_forward * sizeof(int));
+        logits = &backend->forward(*context, prompt_device.as<int>(),
+                                   prompt_tokens_to_forward);
+    }
 
     if (record_generation_anchor) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1064,8 +1074,12 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             break;
         }
 
-        int next_token = ops::sample_with_config(
-            *context, *logits, vocab_size, config, generated_ids);
+        int next_token = 0;
+        {
+            auto lane_lock = context->lock_execution();
+            next_token = ops::sample_with_config(
+                *context, *logits, vocab_size, config, generated_ids);
+        }
         if (tokenizer->is_eos(next_token)) {
             break;
         }
@@ -1096,8 +1110,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 complete_tool_call = true;
             }
         }
-        context->memcpy_h2d(one_token_device.as<int>(), &next_token, sizeof(int));
-        logits = &backend->forward(*context, one_token_device.as<int>(), 1);
+        {
+            auto lane_lock = context->lock_execution();
+            context->memcpy_h2d(one_token_device.as<int>(), &next_token, sizeof(int));
+            logits = &backend->forward(*context, one_token_device.as<int>(), 1);
+        }
         flush_tts(false);
         if (ordinary_turn_started_tool_markup) {
             flush_tts(true);

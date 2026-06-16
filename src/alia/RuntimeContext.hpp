@@ -11,7 +11,6 @@ public:
     RuntimeContext();
 
     Context& foreground() { return foreground_; }
-    Context& tts() { return tts_; }
     Context& background() { return background_; }
     const sycl::device& device() const { return device_; }
     const sycl::context& sycl_context() const { return sycl_context_; }
@@ -23,7 +22,6 @@ private:
     sycl::device device_;
     sycl::context sycl_context_;
     Context foreground_;
-    Context tts_;
     Context background_;
 };
 

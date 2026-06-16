@@ -15,16 +15,12 @@
 // ============================================================
 class Context {
 public:
-    class DnnlStreamLock {
+    class ExecutionLock {
     public:
-        explicit DnnlStreamLock(Context& ctx)
-            : ctx_(ctx),
-              lock_(ctx.dnnl_stream_mutex_) {}
-
-        dnnl::stream& stream() { return ctx_.stream_; }
+        explicit ExecutionLock(Context& ctx)
+            : lock_(ctx.execution_mutex_) {}
 
     private:
-        Context& ctx_;
         std::unique_lock<std::mutex> lock_;
     };
 
@@ -40,7 +36,7 @@ public:
     sycl::queue& queue() { return q_; }
     dnnl::engine& engine() { return eng_; }
     dnnl::stream& stream() { return stream_; }
-    DnnlStreamLock lock_dnnl_stream() { return DnnlStreamLock(*this); }
+    ExecutionLock lock_execution() { return ExecutionLock(*this); }
 
     // USM Device memory allocation
     void* alloc_device(size_t bytes) {
@@ -111,8 +107,8 @@ private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
+    std::mutex execution_mutex_;
     mutable std::mutex alloc_mutex_;
-    std::mutex dnnl_stream_mutex_;
     std::unordered_map<void*, size_t> alloc_bytes_;
     size_t current_allocated_bytes_ = 0;
     size_t peak_allocated_bytes_ = 0;

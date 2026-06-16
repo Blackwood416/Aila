@@ -424,6 +424,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         }
     }
 
+    auto lane_lock = context->lock_execution();
     Tensor mel_device = Tensor::allocate(*context, {1, mel.n_mels, mel.n_frames});
     context->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(AsrBf16));
     finish_stage(call_metrics.upload_ms, context);
