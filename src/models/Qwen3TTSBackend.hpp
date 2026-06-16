@@ -7,6 +7,7 @@
 #include "../memory/KVCache.hpp"
 #include "../utils/SafeTensors.hpp"
 #include "engine/Types.hpp"
+#include <array>
 #include <vector>
 #include <string>
 #include <functional>
@@ -82,23 +83,15 @@ public:
         int total_frames = 0;
         int max_frames = 512;
 
-        // Pre-transformer KV cache: 8 layers, per-layer [16 heads, max_frames, 64]
-        std::vector<Tensor> k_cache;
-        std::vector<Tensor> v_cache;
-
-        // Accumulated buffers (full history for conv stages)
+        // Accumulated latent history for full-history conv/pre-transformer stages.
         Tensor latent_buffer;   // [total_frames, 512]
-        Tensor preconv_buffer;  // [total_frames, 1024]
 
         // Track previous audio output position for incremental slicing
         int last_audio_sample_count = 0;
 
         void reset() {
             total_frames = 0;
-            k_cache.clear();
-            v_cache.clear();
             latent_buffer = Tensor();
-            preconv_buffer = Tensor();
             last_audio_sample_count = 0;
         }
     };
@@ -122,6 +115,7 @@ private:
     // Takes pre-transformer output [n_frames, 1024], produces float PCM audio.
     bool mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
                           std::vector<float>& out_samples);
+    void init_mimi_runtime_linears(Context& ctx);
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);
     void ensure_talker_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
@@ -241,6 +235,23 @@ private:
     // Mimi Decoder (Speech Tokenizer) Vocoder
     bool mimi_loaded_ = false;
     ModelWeights mimi_weights_;
+    bool mimi_runtime_linears_initialized_ = false;
+    Tensor mimi_first_proj_weight_view_;
+    Tensor mimi_rest_proj_weight_view_;
+    Linear mimi_first_proj_;
+    Linear mimi_rest_proj_;
+    Linear mimi_pre_tfm_in_proj_;
+    Linear mimi_pre_tfm_out_proj_;
+    struct MimiPreTransformerLayerLinears {
+        Linear q_proj;
+        Linear k_proj;
+        Linear v_proj;
+        Linear o_proj;
+        Linear gate_proj;
+        Linear up_proj;
+        Linear down_proj;
+    };
+    std::array<MimiPreTransformerLayerLinears, 8> mimi_pre_tfm_linears_;
 
     // TTS model type (Base / CustomVoice / VoiceDesign)
     Qwen3TTSModelType tts_model_type_ = Qwen3TTSModelType::Base;

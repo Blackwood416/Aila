@@ -1519,6 +1519,7 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     mimi_loaded_ = true;
+    init_mimi_runtime_linears(ctx);
 
     // Warmup: run minimal mimi decode to trigger conv/attention JIT compilation
     {
@@ -1530,6 +1531,36 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     return true;
+}
+
+void Qwen3TTSBackend::init_mimi_runtime_linears(Context& ctx) {
+    if (mimi_runtime_linears_initialized_) return;
+
+    mimi_first_proj_weight_view_ =
+        mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
+    mimi_rest_proj_weight_view_ =
+        mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
+    mimi_first_proj_.init(ctx, mimi_first_proj_weight_view_, 256, 512, false);
+    mimi_rest_proj_.init(ctx, mimi_rest_proj_weight_view_, 256, 512, false);
+
+    mimi_pre_tfm_in_proj_.init(ctx,
+        mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
+    mimi_pre_tfm_out_proj_.init(ctx,
+        mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
+
+    for (int l = 0; l < 8; ++l) {
+        const std::string layer_prefix = "decoder.pre_transformer.layers." + std::to_string(l) + ".";
+        auto& layer = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
+        layer.q_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.q_proj.weight"), 512, 1024, false);
+        layer.k_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.k_proj.weight"), 512, 1024, false);
+        layer.v_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.v_proj.weight"), 512, 1024, false);
+        layer.o_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.o_proj.weight"), 1024, 512, false);
+        layer.gate_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.gate_proj.weight"), 512, 1024, false);
+        layer.up_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.up_proj.weight"), 512, 1024, false);
+        layer.down_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.down_proj.weight"), 1024, 512, false);
+    }
+
+    mimi_runtime_linears_initialized_ = true;
 }
 
 bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
@@ -1894,19 +1925,11 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     }
 
 
-    // 线性投影 MatMul (把 [512, 256, 1] 形状的权重 reshape 成 2D 的 [512, 256])
-    Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
-    Tensor rest_proj_w = mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
-
-    Linear first_proj, rest_proj;
-    first_proj.init(ctx, first_proj_w, 256, 512, false);
-    rest_proj.init(ctx, rest_proj_w, 256, 512, false);
-
     Tensor proj_first = Tensor::allocate(ctx, {n_frames, 512});
     Tensor proj_rest = Tensor::allocate(ctx, {n_frames, 512});
 
-    first_proj.forward(ctx, temp_first, proj_first, n_frames);
-    rest_proj.forward(ctx, temp_rest, proj_rest, n_frames);
+    mimi_first_proj_.forward(ctx, temp_first, proj_first, n_frames);
+    mimi_rest_proj_.forward(ctx, temp_rest, proj_rest, n_frames);
 
 
     // 向量相加得到 latent
@@ -1935,10 +1958,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     // ==========================================
     auto t_pretfm_start = std::chrono::high_resolution_clock::now();
     Tensor pre_tfm_in = Tensor::allocate(ctx, {n_frames, 512});
-    Linear pre_tfm_in_proj;
-    pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
     Tensor& pre_tfm_in_proj_b = mimi_weights_.get("decoder.pre_transformer.input_proj.bias");
-    pre_tfm_in_proj.forward_bias(ctx, pre_conv_out, pre_tfm_in_proj_b, pre_tfm_in, n_frames);
+    mimi_pre_tfm_in_proj_.forward_bias(ctx, pre_conv_out, pre_tfm_in_proj_b, pre_tfm_in, n_frames);
 
 
     // 辅助 layer scale 核函数
@@ -1973,19 +1994,14 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ops::rms_norm(ctx, x, input_ln_w, 1e-5f, normed, n_frames, 512);
 
 
-        // Q/K/V Linear (无 bias)
-        Linear q_proj, k_proj, v_proj;
-        q_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.q_proj.weight"), 512, 1024, false);
-        k_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.k_proj.weight"), 512, 1024, false);
-        v_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.v_proj.weight"), 512, 1024, false);
-
         Tensor q = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor k = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor v = Tensor::allocate(ctx, {n_frames, 1024});
 
-        q_proj.forward(ctx, normed, q, n_frames);
-        k_proj.forward(ctx, normed, k, n_frames);
-        v_proj.forward(ctx, normed, v, n_frames);
+        auto& layer_linears = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
+        layer_linears.q_proj.forward(ctx, normed, q, n_frames);
+        layer_linears.k_proj.forward(ctx, normed, k, n_frames);
+        layer_linears.v_proj.forward(ctx, normed, v, n_frames);
 
 
         // Apply RoPE positions (num_heads=16, head_dim=64)
@@ -1999,10 +2015,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
 
         // Out proj
-        Linear o_proj;
-        o_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.o_proj.weight"), 1024, 512, false);
         Tensor proj_out = Tensor::allocate(ctx, {n_frames, 512});
-        o_proj.forward(ctx, attn_out, proj_out, n_frames);
+        layer_linears.o_proj.forward(ctx, attn_out, proj_out, n_frames);
 
 
         // Attention layer scale
@@ -2025,24 +2039,19 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ops::rms_norm(ctx, x, post_attn_ln_w, 1e-5f, normed_post, n_frames, 512);
 
 
-        Linear gate_proj, up_proj, down_proj;
-        gate_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.gate_proj.weight"), 512, 1024, false);
-        up_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.up_proj.weight"), 512, 1024, false);
-
         Tensor gate_out = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor up_out = Tensor::allocate(ctx, {n_frames, 1024});
 
-        gate_proj.forward(ctx, normed_post, gate_out, n_frames);
-        up_proj.forward(ctx, normed_post, up_out, n_frames);
+        layer_linears.gate_proj.forward(ctx, normed_post, gate_out, n_frames);
+        layer_linears.up_proj.forward(ctx, normed_post, up_out, n_frames);
 
 
         // SwiGLU activation: gate = silu(gate) * up
         ops::swiglu(ctx, gate_out, up_out, gate_out, n_frames * 1024);
         ctx.synchronize();
 
-        down_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.down_proj.weight"), 1024, 512, false);
         Tensor down_out = Tensor::allocate(ctx, {n_frames, 512});
-        down_proj.forward(ctx, gate_out, down_out, n_frames);
+        layer_linears.down_proj.forward(ctx, gate_out, down_out, n_frames);
         ctx.synchronize();
 
         // MLP layer scale
@@ -2063,10 +2072,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     ctx.synchronize();
 
     Tensor pre_tfm_out = Tensor::allocate(ctx, {n_frames, 1024});
-    Linear pre_tfm_out_proj;
-    pre_tfm_out_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
     Tensor& pre_tfm_out_proj_b = mimi_weights_.get("decoder.pre_transformer.output_proj.bias");
-    pre_tfm_out_proj.forward_bias(ctx, final_normed, pre_tfm_out_proj_b, pre_tfm_out, n_frames);
+    mimi_pre_tfm_out_proj_.forward_bias(ctx, final_normed, pre_tfm_out_proj_b, pre_tfm_out, n_frames);
     ctx.synchronize();
 
     auto t_pretfm_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
@@ -2080,17 +2087,8 @@ bool Qwen3TTSBackend::init_mimi_stream(Context& ctx, MimiStreamState& state, int
     state.reset();
     state.max_frames = max_frames;
 
-    // Allocate KV cache: 8 layers x [16 heads, max_frames, 64]
-    state.k_cache.resize(8);
-    state.v_cache.resize(8);
-    for (int l = 0; l < 8; ++l) {
-        state.k_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
-        state.v_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
-    }
-
-    // Accumulation buffers
+    // Accumulation buffer for full-history Mimi decode stages.
     state.latent_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 512});
-    state.preconv_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 1024});
 
     return true;
 }
@@ -2099,11 +2097,14 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     const std::vector<int32_t>& codes, int new_frames,
     MimiStreamState& state, std::vector<float>& out_samples) {
     if (!mimi_loaded_ || new_frames <= 0) return false;
+    static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    const auto t_decode_start = std::chrono::high_resolution_clock::now();
 
     int start_pos = state.total_frames;
     int total_frames = start_pos + new_frames;
 
     // === 1. VQ lookup on NEW codes only ===
+    const auto t_vq_start = std::chrono::high_resolution_clock::now();
     Tensor codes_dev = Tensor::allocate(ctx, {new_frames, 16}, dnnl::memory::data_type::s32);
     ctx.memcpy_h2d(codes_dev.data(), codes.data(), new_frames * 16 * sizeof(int32_t));
 
@@ -2121,39 +2122,45 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     }
     ctx.synchronize();
 
-    Linear first_proj, rest_proj;
-    Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
-    Tensor rest_proj_w = mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
-    first_proj.init(ctx, first_proj_w, 256, 512, false);
-    rest_proj.init(ctx, rest_proj_w, 256, 512, false);
     Tensor proj_first = Tensor::allocate(ctx, {new_frames, 512});
     Tensor proj_rest = Tensor::allocate(ctx, {new_frames, 512});
-    first_proj.forward(ctx, temp_first, proj_first, new_frames);
-    rest_proj.forward(ctx, temp_rest, proj_rest, new_frames);
+    mimi_first_proj_.forward(ctx, temp_first, proj_first, new_frames);
+    mimi_rest_proj_.forward(ctx, temp_rest, proj_rest, new_frames);
     ctx.synchronize();
 
     Tensor latent_new = Tensor::allocate(ctx, {new_frames, 512});
     ops::copy_tensor(ctx, proj_first, latent_new, new_frames * 512);
     ops::residual_add(ctx, latent_new, proj_rest, new_frames * 512);
     ctx.synchronize();
+    if (tts_profile) {
+        const auto t_vq_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_vq_start).count();
+        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental VQ+proj: %.1f ms (%d new/%d total frames)",
+                      t_vq_ms, new_frames, total_frames);
+    }
 
     // === 2. Append to latent_buffer ===
     bf16* lat_dst = state.latent_buffer.data_as<bf16>() + start_pos * 512;
     ctx.memcpy_h2d_async(lat_dst, latent_new.data(), new_frames * 512 * sizeof(bf16));
 
     // === 3. Pre-conv on FULL latent ===
+    const auto t_preconv_start = std::chrono::high_resolution_clock::now();
     Tensor preconv_full = Tensor::allocate(ctx, {total_frames, 1024});
     ops::causal_conv1d(ctx, state.latent_buffer,
         mimi_weights_.get("decoder.pre_conv.conv.weight"),
         mimi_weights_.get("decoder.pre_conv.conv.bias"),
         preconv_full, 1, 512, 1024, total_frames, 3, 1);
     ctx.synchronize();
+    if (tts_profile) {
+        const auto t_preconv_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_preconv_start).count();
+        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental pre-conv: %.1f ms", t_preconv_ms);
+    }
 
     // === 4. Pre-transformer with incremental KV cache ===
+    const auto t_pretfm_start = std::chrono::high_resolution_clock::now();
     Tensor pre_tfm_in = Tensor::allocate(ctx, {total_frames, 512});
-    Linear pre_tfm_in_proj;
-    pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
-    pre_tfm_in_proj.forward_bias(ctx, preconv_full,
+    mimi_pre_tfm_in_proj_.forward_bias(ctx, preconv_full,
         mimi_weights_.get("decoder.pre_transformer.input_proj.bias"), pre_tfm_in, total_frames);
     ctx.synchronize();
 
@@ -2185,49 +2192,29 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
                       1e-5f, normed, total_frames, 512);
         ctx.synchronize();
 
-        // Q/K/V for all tokens (full projection)
-        Linear q_proj, k_proj, v_proj;
-        q_proj.init(ctx, mimi_weights_.get(lp + "self_attn.q_proj.weight"), 512, 1024, false);
-        k_proj.init(ctx, mimi_weights_.get(lp + "self_attn.k_proj.weight"), 512, 1024, false);
-        v_proj.init(ctx, mimi_weights_.get(lp + "self_attn.v_proj.weight"), 512, 1024, false);
         Tensor q = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor k = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor v = Tensor::allocate(ctx, {total_frames, 1024});
-        q_proj.forward(ctx, normed, q, total_frames);
-        k_proj.forward(ctx, normed, k, total_frames);
-        v_proj.forward(ctx, normed, v, total_frames);
+        auto& layer_linears = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
+        layer_linears.q_proj.forward(ctx, normed, q, total_frames);
+        layer_linears.k_proj.forward(ctx, normed, k, total_frames);
+        layer_linears.v_proj.forward(ctx, normed, v, total_frames);
         ctx.synchronize();
 
         // RoPE with position offset for new tokens
         ops::apply_rope(ctx, q, k, total_frames, 0, 16, 16, 64, 10000.0f);
         ctx.synchronize();
 
-        // Copy K/V into cache (16 heads, [max_frames, 64] layout)
-        bf16* k_full = k.data_as<bf16>();
-        bf16* v_full = v.data_as<bf16>();
-        for (int h = 0; h < 16; ++h) {
-            bf16* kc = state.k_cache[l].data_as<bf16>() + h * state.max_frames * 64;
-            bf16* vc = state.v_cache[l].data_as<bf16>() + h * state.max_frames * 64;
-            for (int t = 0; t < total_frames; ++t) {
-                ctx.queue().memcpy(kc + t * 64, k_full + t * 1024 + h * 64, 64 * sizeof(bf16));
-                ctx.queue().memcpy(vc + t * 64, v_full + t * 1024 + h * 64, 64 * sizeof(bf16));
-            }
-        }
-        ctx.queue().wait();
-
-        // Incremental attention: Q for all tokens against cached K/V
+        // This path still recomputes full-history Q/K/V, so using direct prefill
+        // attention avoids thousands of tiny K/V cache copies per Mimi chunk.
         Tensor attn_out = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor scores_buf = Tensor::allocate(ctx, {16, total_frames, total_frames}, dnnl::memory::data_type::f32);
-        ops::attention_prefill_cached(ctx, q, state.k_cache[l], state.v_cache[l],
-                                       attn_out, scores_buf,
-                                       total_frames, 0, 16, 16, 64, state.max_frames);
+        ops::attention_prefill(ctx, q, k, v, attn_out, scores_buf, total_frames, 16, 16, 64);
         ctx.synchronize();
 
         // O projection
-        Linear o_proj;
-        o_proj.init(ctx, mimi_weights_.get(lp + "self_attn.o_proj.weight"), 1024, 512, false);
         Tensor proj_out = Tensor::allocate(ctx, {total_frames, 512});
-        o_proj.forward(ctx, attn_out, proj_out, total_frames);
+        layer_linears.o_proj.forward(ctx, attn_out, proj_out, total_frames);
         ctx.synchronize();
 
         apply_layer_scale_gpu(proj_out, mimi_weights_.get(lp + "self_attn_layer_scale.scale"), total_frames, 512);
@@ -2247,21 +2234,17 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
                       1e-5f, normed_post, total_frames, 512);
         ctx.synchronize();
 
-        Linear gate_proj, up_proj, down_proj;
-        gate_proj.init(ctx, mimi_weights_.get(lp + "mlp.gate_proj.weight"), 512, 1024, false);
-        up_proj.init(ctx, mimi_weights_.get(lp + "mlp.up_proj.weight"), 512, 1024, false);
         Tensor gate_out = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor up_out   = Tensor::allocate(ctx, {total_frames, 1024});
-        gate_proj.forward(ctx, normed_post, gate_out, total_frames);
-        up_proj.forward(ctx, normed_post, up_out, total_frames);
+        layer_linears.gate_proj.forward(ctx, normed_post, gate_out, total_frames);
+        layer_linears.up_proj.forward(ctx, normed_post, up_out, total_frames);
         ctx.synchronize();
 
         ops::swiglu(ctx, gate_out, up_out, gate_out, total_frames * 1024);
         ctx.synchronize();
 
-        down_proj.init(ctx, mimi_weights_.get(lp + "mlp.down_proj.weight"), 1024, 512, false);
         Tensor down_out = Tensor::allocate(ctx, {total_frames, 512});
-        down_proj.forward(ctx, gate_out, down_out, total_frames);
+        layer_linears.down_proj.forward(ctx, gate_out, down_out, total_frames);
         ctx.synchronize();
 
         apply_layer_scale_gpu(down_out, mimi_weights_.get(lp + "mlp_layer_scale.scale"), total_frames, 512);
@@ -2279,16 +2262,28 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     ctx.synchronize();
 
     Tensor pre_tfm_out_i = Tensor::allocate(ctx, {total_frames, 1024});
-    Linear pre_tfm_out_proj_i;
-    pre_tfm_out_proj_i.init(ctx, mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
-    pre_tfm_out_proj_i.forward_bias(ctx, final_normed,
+    mimi_pre_tfm_out_proj_.forward_bias(ctx, final_normed,
         mimi_weights_.get("decoder.pre_transformer.output_proj.bias"), pre_tfm_out_i, total_frames);
     ctx.synchronize();
+    if (tts_profile) {
+        const auto t_pretfm_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
+        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental pre-transformer: %.1f ms", t_pretfm_ms);
+    }
 
     // === Conv stages (shared with full decode_mimi_vocoder) ===
+    const auto t_conv_start = std::chrono::high_resolution_clock::now();
     std::vector<float> full_samples;
     if (!mimi_conv_stages(ctx, pre_tfm_out_i, total_frames, full_samples)) {
         return false;
+    }
+    if (tts_profile) {
+        const auto t_conv_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_conv_start).count();
+        const auto t_decode_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_decode_start).count();
+        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental total: %.1f ms (conv+readback %.1f ms)",
+                      t_decode_ms, t_conv_ms);
     }
 
     // Slice: extract only new audio since last call

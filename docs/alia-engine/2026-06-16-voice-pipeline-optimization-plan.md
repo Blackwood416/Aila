@@ -441,3 +441,87 @@ Interpretation:
   TTS-specific sampling contract.
 - Next high-value TTS work is still true Mimi incremental-state efficiency and
   predictor/talker substage profiling, not shrinking the first audio chunk.
+
+## 2026-06-16 Mimi Streaming Decode Update
+
+This pass kept the uniform `12`-frame first audio callback and reduced overhead
+inside Mimi streaming decode:
+
+- Cached fixed Mimi `Linear` wrappers at vocoder load time instead of rebuilding
+  them inside every full/incremental decode call. Persistent reshape views are
+  kept for the VQ output projection weights so cached wrappers do not point at
+  temporary tensors.
+- Replaced the incremental pre-transformer's full-history K/V cache copy with
+  direct prefill attention. The path already recomputes full-history Q/K/V, so
+  copying all K/V into a stream cache before attention only added many small
+  queued copies.
+- Removed now-unused Mimi stream K/V/pre-conv cache allocations after direct
+  prefill made those buffers dead state.
+- Added `AILA_TTS_PROFILE=1` breakdowns for incremental VQ/projection,
+  pre-conv, pre-transformer, conv/readback, and total Mimi chunk time.
+
+Profile check on `short_hello`:
+
+```text
+first 12-frame Mimi chunk before direct prefill:
+  VQ+proj 1.8 ms, pre-conv 0.4 ms, pre-transformer 76.8 ms,
+  conv/readback 164.9 ms, total 244.1 ms
+
+first 12-frame Mimi chunk after direct prefill:
+  VQ+proj 2.1 ms, pre-conv 0.2 ms, pre-transformer 27.8 ms,
+  conv/readback 166.1 ms, total 196.3 ms
+```
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_samples  first_codes_ms  mimi_init_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3656              3911                  5100            19                 46            23040          999.592         0.0092        1188.63                 9129.08
+persona_chat      3771              4052                  5115            19                 39            23040          868.054         0.0098        1062.41                 7358.56
+preference_memory 3745              4028                  5464            19                 30            23040          1238.77         0.0106        1435.22                 11370.6
+task_memory       3735              3991                  5391            18                 42            23040          1207.64         0.0098        1398.91                 12129.2
+long_answer       3831              4269                  5792            24                 27            23040          1333.83         0.0083        1522.89                 9919.51
+```
+
+Interpretation:
+
+- The fixed first audio buffer stayed at `23040` samples in every scenario.
+- Removing unused stream K/V/pre-conv allocations reduced measured Mimi stream
+  init from roughly `5ms` to near-zero.
+- The profile run shows a real Mimi pre-transformer reduction, but the final
+  full matrix is not an end-to-end TTFA win because this sampled run produced
+  heavier first chunks and larger codec generation times. The pipeline remains
+  functionally healthy, and the fixed first audio callback contract is intact.
+- The remaining Mimi-side first-chunk cost is now mostly conv/readback
+  (`~160ms` for the 12-frame first batch). Deeper conv-stage synchronization
+  cleanup is possible, but should be done with care because the current code
+  relies on local tensor lifetimes around queued device work.
+
+## Next TODO: ASR Partial-to-VLM Prefill
+
+Pause deeper TTS surgery unless profiling shows a clear low-risk win. Qwen3-TTS
+has nested transformer generation, so codec sampling speed will naturally vary
+with first spoken chunk shape. The current TTS path is good enough to shift the
+main TTFA effort to ASR/VLM overlap.
+
+High-value next step:
+
+- Use ASR streaming `stable_text` / `partial_text` to start foreground VLM
+  prefill before the ASR utterance is fully finalized.
+- Maintain a foreground prefill state keyed by the stable ASR prefix. Stable
+  text can be committed into the VLM prompt/KV state; partial text can be
+  speculatively prefed only if the implementation can discard or rewind it when
+  ASR revises the suffix.
+- Keep the handoff stateful rather than repeatedly rebuilding the full
+  foreground prompt. The expected TTFA gain comes from overlapping ASR decode
+  tail time with VLM prompt prefill.
+- First implementation should only bridge ASR -> foreground text prefill.
+  Computer Use, visual input, and tool-call execution remain TODOs outside this
+  phase.
+- Verify with the real voice matrix, comparing `asr_ms`,
+  `foreground_first_content_delta_ms`, `foreground_first_tts_enqueue_ms`, and
+  `tts_first_audio_ms`. Do not replace this with API-only unit tests.
