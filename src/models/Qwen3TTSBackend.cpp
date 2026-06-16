@@ -878,6 +878,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     // 临时张量用于拼接 Code Predictor 的输入
     Tensor pred_input = Tensor::allocate(ctx, {2, H_talker});
     Tensor token_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+    Tensor frame_codes_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::s32);
     Tensor last_id_hidden = Tensor::allocate(ctx, {1, H_talker});
     Tensor predictor_final_hidden = Tensor::allocate(ctx, {1, H_pred});
     Tensor predictor_final_normed = Tensor::allocate(ctx, {1, H_pred});
@@ -890,6 +891,18 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     Tensor final_normed_talker = Tensor::allocate(ctx, {1, H_talker});
 
     int max_tokens = tts_gen.max_new_tokens;
+    std::vector<int> token_upload_storage(static_cast<size_t>(std::max(1, max_tokens) * 16 + 16));
+    size_t token_upload_index = 0;
+    auto upload_token_async = [&](int value) {
+        if (token_upload_index < token_upload_storage.size()) {
+            token_upload_storage[token_upload_index] = value;
+            ctx.queue().memcpy(token_dev.data(), &token_upload_storage[token_upload_index], sizeof(int));
+            ++token_upload_index;
+        } else {
+            ctx.memcpy_h2d(token_dev.data(), &value, sizeof(int));
+        }
+    };
+
     out_codes.reserve(max_tokens * 16);
     const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
     std::vector<int32_t> pending_callback_codes;
@@ -916,11 +929,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // 收集这帧 codebook 0
-        std::vector<int> frame_codes(16, 0);
+        std::array<int, 16> frame_codes{};
         frame_codes[0] = token;
 
         // 获取首码 embedding
-        ctx.memcpy_h2d(token_dev.data(), &token, sizeof(int));
+        upload_token_async(token);
         ops::embedding_lookup(ctx, *talker_codec_embed_weight_, token_dev.data_as<int>(), 1, last_id_hidden, H_talker);
 
         // 拼接 past_hidden_talker 与 last_id_hidden -> pred_input [2, H_talker]
@@ -928,15 +941,15 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             bf16* dst = pred_input.data_as<bf16>();
             bf16* src_past = past_hidden_talker.data_as<bf16>();
             bf16* src_last = last_id_hidden.data_as<bf16>();
-            ctx.queue().memcpy(dst, src_past, H_talker * sizeof(bf16)).wait();
-            ctx.queue().memcpy(dst + H_talker, src_last, H_talker * sizeof(bf16)).wait();
+            ctx.queue().memcpy(dst, src_past, H_talker * sizeof(bf16));
+            ctx.queue().memcpy(dst + H_talker, src_last, H_talker * sizeof(bf16));
         }
 
         // 输入到 Code Predictor
         if (has_predictor_projection_) {
             predictor_projection_linear_.forward_bias(ctx, pred_input, *predictor_projection_bias_, p_buf_.pred_input_proj, 2);
         } else {
-            ctx.queue().memcpy(p_buf_.pred_input_proj.data(), pred_input.data(), 2 * H_pred * sizeof(bf16)).wait();
+            ctx.queue().memcpy(p_buf_.pred_input_proj.data(), pred_input.data(), 2 * H_pred * sizeof(bf16));
         }
 
         // ==========================================
@@ -945,7 +958,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         predictor_kv_cache_.reset();
 
         // --- Predictor Prefill (seq_len = 2) ---
-        ctx.queue().memcpy(p_buf_.hidden.data(), p_buf_.pred_input_proj.data(), 2 * H_pred * sizeof(bf16)).wait();
+        ctx.queue().memcpy(p_buf_.hidden.data(), p_buf_.pred_input_proj.data(), 2 * H_pred * sizeof(bf16));
         ops::rms_norm(ctx, p_buf_.hidden, *predictor_layers_[0].input_ln_weight,
                       predictor_cfg_.rms_norm_eps, p_buf_.normed, 2, H_pred);
 
@@ -989,7 +1002,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // Get logits for codebook 1 (cb_idx = 0)
-        ctx.queue().memcpy(predictor_final_hidden.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16)).wait();
+        ctx.queue().memcpy(predictor_final_hidden.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16));
         
         ops::rms_norm(ctx, predictor_final_hidden, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
 
@@ -1004,17 +1017,17 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             if (cancelled()) {
                 return false;
             }
-            ctx.memcpy_h2d(token_dev.data(), &tok, sizeof(int));
+            upload_token_async(tok);
             ops::embedding_lookup(ctx, *predictor_embed_weights_[cb_idx - 1], token_dev.data_as<int>(), 1, predictor_emb_h, H_talker);
 
             if (has_predictor_projection_) {
                 predictor_projection_linear_.forward_bias(ctx, predictor_emb_h, *predictor_projection_bias_, predictor_emb_pred, 1);
             } else {
-                ctx.queue().memcpy(predictor_emb_pred.data(), predictor_emb_h.data(), H_pred * sizeof(bf16)).wait();
+                ctx.queue().memcpy(predictor_emb_pred.data(), predictor_emb_h.data(), H_pred * sizeof(bf16));
             }
 
             // Copy to single slot in p_buf_.hidden at position cb_idx + 1 (since prefill took slots 0, 1)
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16)).wait();
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16));
             
             // Norm
             ops::rms_norm(ctx, predictor_emb_pred, *predictor_layers_[0].input_ln_weight,
@@ -1058,7 +1071,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                 Tensor* next_input_ln = (i < predictor_cfg_.num_hidden_layers - 1) ? predictor_layers_[i + 1].input_ln_weight : predictor_final_norm_weight_;
                 ops::fused_add_rms_norm(ctx, predictor_emb_pred, p_buf_.attn_out, *next_input_ln, predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
             }
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16)).wait();
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16));
 
             // Compute logits and sample tok
             ops::rms_norm(ctx, predictor_emb_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
@@ -1092,15 +1105,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         
         // 查找 16 个 codes 的 embeddings
         // 查找 codebook 0
-        int c0 = frame_codes[0];
-        ctx.memcpy_h2d(token_dev.data(), &c0, sizeof(int));
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, token_dev.data_as<int>(), 1, sum_emb, H_talker);
+        ctx.queue().memcpy(frame_codes_dev.data(), frame_codes.data(), frame_codes.size() * sizeof(int));
+        int* frame_codes_ptr = frame_codes_dev.data_as<int>();
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, frame_codes_ptr, 1, sum_emb, H_talker);
 
         // 查找 predictor 对应的 15 个 embeddings 并累加
         for (int i = 0; i < 15; i++) {
-            int ci = frame_codes[i + 1];
-            ctx.memcpy_h2d(token_dev.data(), &ci, sizeof(int));
-            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], token_dev.data_as<int>(), 1, single_emb, H_talker);
+            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], frame_codes_ptr + i + 1, 1, single_emb, H_talker);
             
             // 累加：sum_emb += single_emb
             bf16* sum_ptr = sum_emb.data_as<bf16>();
@@ -1108,7 +1119,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> idx) {
                 sum_ptr[idx[0]] = sum_ptr[idx[0]] + sgl_ptr[idx[0]];
             });
-            ctx.queue().wait();
         }
 
         // 加上 trailing_text_hidden[gen_step] 或 tts_pad_embed（对齐 ggml）
@@ -1119,7 +1129,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> idx) {
             sum_ptr[idx[0]] = sum_ptr[idx[0]] + add_ptr[idx[0]];
         });
-        ctx.queue().wait();
 
         // 运行 Talker Decode Step (seq_len = 1)
         ops::rms_norm(ctx, sum_emb, *talker_layers_[0].input_ln_weight,
@@ -1169,7 +1178,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         ops::rms_norm(ctx, sum_emb, *talker_final_norm_weight_, talker_cfg_.rms_norm_eps, final_normed_talker, 1, H_talker);
 
         // 保存新的 past_hidden_talker (保存归一化后的值以对齐 Python)
-        ctx.queue().memcpy(past_hidden_talker.data(), final_normed_talker.data(), H_talker * sizeof(bf16)).wait();
+        ctx.queue().memcpy(past_hidden_talker.data(), final_normed_talker.data(), H_talker * sizeof(bf16));
 
         talker_codec_head_.forward(ctx, final_normed_talker, t_buf_.logits, 1);
         token = ops::sample_with_config(ctx, t_buf_.logits, talker_cfg_.vocab_size, tts_gen, generated_cb0_tokens);

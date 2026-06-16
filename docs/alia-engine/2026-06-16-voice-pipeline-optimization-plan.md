@@ -402,3 +402,42 @@ Interpretation:
   reduce first spoken chunk shape without reducing playback buffer duration.
 - Identity LoRA tool-call misses are recorded as a foreground TODO and should
   not gate TTS TTFA optimization.
+
+## 2026-06-16 TTS Wait Cleanup Update
+
+This pass kept the uniform `12`-frame callback contract and removed host-side
+blocking from low-risk in-order queue paths inside `synthesize_codes`:
+
+- Device-to-device copies for predictor inputs, hidden slots, and
+  `past_hidden_talker` are now queued without immediate host waits.
+- Talker-frame embedding accumulation no longer waits after every vector add.
+- The 16 generated code ids for talker decode are uploaded as one frame array,
+  and sampled predictor tokens use a stable host upload buffer so the queue can
+  consume them asynchronously.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3830              4099                  5065            19                 44            703.279         965.217                 7296.87
+persona_chat      3930              4299                  5125            21                 64            562.527         825.118                 7156.94
+preference_memory 3951              4123                  5049            14                 23            664.119         925.609                 5111.15
+task_memory       3929              4192                  5307            18                 42            854.988         1115.02                 11370.3
+long_answer       4142              4326                  5559            15                 22            966.582         1231.96                 7603.42
+```
+
+Interpretation:
+
+- The change is intentionally conservative: it reduces unnecessary host
+  synchronization while keeping sampling semantics, first audio size, and the
+  streaming callback contract unchanged.
+- A device-sampling experiment was tried and rejected for this pass. It passed
+  smoke, but changed sampled text/chunk shapes enough that matrix TTFA was not
+  reliably better. Revisit only with a tighter deterministic comparison or a
+  TTS-specific sampling contract.
+- Next high-value TTS work is still true Mimi incremental-state efficiency and
+  predictor/talker substage profiling, not shrinking the first audio chunk.
