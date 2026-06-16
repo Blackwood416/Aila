@@ -64,6 +64,8 @@ public:
     int last_prompt_token_count() const;
     int last_generated_token_count() const;
     int last_asr_prefill_token_count() const;
+    int last_asr_prefill_reused_token_count() const;
+    int last_asr_prefill_suffix_token_count() const;
     long long last_asr_prefill_ms() const;
     long long last_first_content_delta_ms() const;
     long long last_first_tts_enqueue_ms() const;
@@ -122,6 +124,8 @@ private:
     std::vector<int> asr_prefill_prompt_ids_;
     std::string asr_prefill_text_;
     int last_asr_prefill_token_count_ = 0;
+    int last_asr_prefill_reused_token_count_ = 0;
+    int last_asr_prefill_suffix_token_count_ = 0;
     long long last_asr_prefill_ms_ = -1;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;
 };

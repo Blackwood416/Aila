@@ -779,3 +779,29 @@ Interpretation:
 - A promising next design is a streaming-specific ASR prompt contract with a
   stable append-only prefix, or an audio-token reservation/window scheme that
   preserves prefix reuse without changing recognized text.
+
+## 2026-06-17 VLM Partial Suffix Recompute Reduction
+
+The safe suffix-reuse target is the foreground VLM ASR-text prefill, not the
+ASR audio-token prompt:
+
+- The ASR audio encoder uses block-wise bidirectional attention
+  (`n_window=50`, `n_window_infer=800`, giving 104 encoder tokens per block).
+  Short utterances are usually inside one bidirectional block, so adding suffix
+  audio can change earlier audio features. Reusing old audio-token KV would not
+  be equivalent to a full ASR recompute.
+- The foreground VLM prefill is text-only and causal, so unchanged token
+  prefixes are safe to reuse.
+
+Implementation:
+
+- `AliaForegroundPipeline::prefill_asr_text` now handles ASR partial text
+  revisions by finding the longest common token prefix between the previous
+  prefill prompt and the new guarded target prompt.
+- If the previous backend context still matches the previous prefill length, it
+  truncates KV to that common prefix and only forwards the changed suffix.
+- Pure append partials keep the existing fast path. Full reset is only used
+  when the backend state cannot be trusted or truncation fails.
+- Smoke/matrix logs now include
+  `foreground_asr_prefill_reused_tokens` and
+  `foreground_asr_prefill_suffix_tokens`.

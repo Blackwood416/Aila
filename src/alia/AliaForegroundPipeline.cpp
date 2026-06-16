@@ -253,6 +253,15 @@ bool is_token_prefix(const std::vector<int>& prefix, const std::vector<int>& val
            std::equal(prefix.begin(), prefix.end(), value.begin());
 }
 
+size_t common_token_prefix_size(const std::vector<int>& a, const std::vector<int>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+
 std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) {
     size_t cutoff = std::string::npos;
     if (force) {
@@ -452,22 +461,47 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
 
     bool reset_required = false;
     size_t already_prefilled = 0;
+    int reused_tokens = 0;
     const int current_len = backend->get_current_context_len();
     if (!current_prefill.empty() &&
-        current_len == static_cast<int>(current_prefill.size()) &&
-        is_token_prefix(current_prefill, target_ids)) {
-        already_prefilled = current_prefill.size();
+        current_len == static_cast<int>(current_prefill.size())) {
+        if (is_token_prefix(current_prefill, target_ids)) {
+            already_prefilled = current_prefill.size();
+        } else {
+            const size_t common_prefix = common_token_prefix_size(current_prefill, target_ids);
+            if (common_prefix > 0 &&
+                backend->truncate_kv_cache(static_cast<int>(common_prefix)) &&
+                backend->get_current_context_len() == static_cast<int>(common_prefix)) {
+                already_prefilled = common_prefix;
+            } else {
+                reset_required = true;
+            }
+        }
     } else {
         reset_required = true;
     }
 
+    reused_tokens = static_cast<int>(already_prefilled);
     if (already_prefilled >= target_ids.size()) {
+        const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            asr_prefill_prompt_ids_ = std::move(target_ids);
+            asr_prefill_text_ = user_prefix;
+            last_asr_prefill_token_count_ =
+                static_cast<int>(asr_prefill_prompt_ids_.size());
+            last_asr_prefill_reused_token_count_ = reused_tokens;
+            last_asr_prefill_suffix_token_count_ = 0;
+            last_asr_prefill_ms_ = elapsed_ms;
+        }
         return ALIA_OK;
     }
 
     if (reset_required) {
         backend->reset();
         already_prefilled = 0;
+        reused_tokens = 0;
     }
 
     const size_t suffix_count = target_ids.size() - already_prefilled;
@@ -485,6 +519,8 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         asr_prefill_prompt_ids_ = std::move(target_ids);
         asr_prefill_text_ = user_prefix;
         last_asr_prefill_token_count_ = static_cast<int>(asr_prefill_prompt_ids_.size());
+        last_asr_prefill_reused_token_count_ = reused_tokens;
+        last_asr_prefill_suffix_token_count_ = static_cast<int>(suffix_count);
         last_asr_prefill_ms_ = elapsed_ms;
     }
     return ALIA_OK;
@@ -654,6 +690,16 @@ int AliaForegroundPipeline::last_generated_token_count() const {
 int AliaForegroundPipeline::last_asr_prefill_token_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_asr_prefill_token_count_;
+}
+
+int AliaForegroundPipeline::last_asr_prefill_reused_token_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_reused_token_count_;
+}
+
+int AliaForegroundPipeline::last_asr_prefill_suffix_token_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_suffix_token_count_;
 }
 
 long long AliaForegroundPipeline::last_asr_prefill_ms() const {
