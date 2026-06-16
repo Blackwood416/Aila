@@ -699,3 +699,33 @@ Interpretation:
   either reuse audio encoder/model work for the growing suffix, or run partial
   only near likely VAD fall while keeping the last good partial available to
   the foreground prompt cache.
+
+## 2026-06-17 ASR Tail-Only Partial Experiment
+
+Tested an experimental `AILA_ASR_TAIL_PARTIAL=1` path that tries to avoid
+full suffix recompute by decoding only newly arrived audio after the previous
+partial, using the previous partial text as ASR past text. The implementation
+keeps a guard: if the tail decode does not produce a changed partial, it falls
+back to the full non-stable suffix decode.
+
+Short `short_hello_request.wav` checks:
+
+```text
+mode                         full_decodes  tail_decodes  vad_tail_ms  asr_partial_text
+tail-only without full guard  1             3             2319         "Alia. Please say hello."
+tail-only with full guard     2             2             3643         "Alia, please say hello in one short sentence."
+```
+
+Conclusion:
+
+- Fine audio chunks are still the right product direction, but text-level
+  tail stitching is not reliable enough to enable by default. Without the full
+  guard it can drop the end of the utterance; with the guard it preserves ASR
+  correctness but recovers little latency because it falls back to full suffix
+  decode.
+- `AILA_ASR_TAIL_PARTIAL` is therefore default-off and should stay an
+  experiment only.
+- The next useful ASR optimization is below the text stitching layer: profile
+  and reuse mel/audio encoder work for growing partial suffixes, or add a real
+  ASR decoder prefill/KV reuse path. The existing VLM prefill path is ready to
+  consume finer ASR partials once they are cheap enough.

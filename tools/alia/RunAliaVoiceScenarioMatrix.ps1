@@ -150,6 +150,8 @@ try {
             asr_stream_text_calls = Get-ValueOrEmpty $values "asr_stream_text_calls"
             asr_stream_prefill_calls = Get-ValueOrEmpty $values "asr_stream_prefill_calls"
             asr_stream_prefill_skipped_unchanged = Get-ValueOrEmpty $values "asr_stream_prefill_skipped_unchanged"
+            asr_partial_full_decode_count = Get-ValueOrEmpty $values "asr_partial_full_decode_count"
+            asr_partial_tail_decode_count = Get-ValueOrEmpty $values "asr_partial_tail_decode_count"
             foreground_ms = Get-ValueOrEmpty $values "foreground_ms"
             foreground_prompt_tokens = Get-ValueOrEmpty $values "foreground_prompt_tokens"
             foreground_generated_tokens = Get-ValueOrEmpty $values "foreground_generated_tokens"
@@ -191,7 +193,7 @@ try {
 
     $summaryPath = Join-Path $outputRoot "summary.csv"
     $rows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
-    $rows | Format-Table scenario, pass, asr_ms, asr_stream_text_calls, simulated_vad_asr_tail_ms, simulated_vad_to_first_content_ms, simulated_vad_to_first_audio_ms, foreground_first_content_delta_ms, tts_first_audio_ms, foreground_ms, background_ms -AutoSize
+    $rows | Format-Table scenario, pass, asr_ms, asr_stream_text_calls, asr_partial_tail_decode_count, simulated_vad_asr_tail_ms, simulated_vad_to_first_content_ms, simulated_vad_to_first_audio_ms, foreground_first_content_delta_ms, tts_first_audio_ms, foreground_ms, background_ms -AutoSize
 
     $failed = @($rows | Where-Object { -not $_.pass })
     if ($failed.Count -gt 0) {

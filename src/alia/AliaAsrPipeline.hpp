@@ -21,6 +21,8 @@ public:
 
     bool ready() const;
     size_t buffered_sample_count() const;
+    int partial_full_decode_count() const;
+    int partial_tail_decode_count() const;
     ModelSlot* slot() const { return slot_; }
     const std::string& last_error() const { return last_error_; }
 
@@ -45,6 +47,8 @@ private:
     std::string partial_text_;
     std::string past_text_;
     std::string last_error_;
+    int partial_full_decode_count_ = 0;
+    int partial_tail_decode_count_ = 0;
 };
 
 void parse_asr_output(const std::string& raw,

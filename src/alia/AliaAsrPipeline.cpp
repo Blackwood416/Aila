@@ -6,6 +6,7 @@
 #include "../core/Tensor.hpp"
 #include "../models/IModelBackend.hpp"
 #include "../ops/Ops.hpp"
+#include "../utils/EnvUtils.hpp"
 #include "../utils/Tokenizer.hpp"
 
 #include <algorithm>
@@ -72,6 +73,70 @@ std::string normalize_language_name(std::string language) {
         language[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(language[i])));
     }
     return language;
+}
+
+bool should_insert_boundary_space_for_text(char prev_ch, char next_ch) {
+    if (std::isspace(static_cast<unsigned char>(prev_ch))) {
+        return false;
+    }
+    if (std::isspace(static_cast<unsigned char>(next_ch))) {
+        return false;
+    }
+    if (std::ispunct(static_cast<unsigned char>(next_ch))) {
+        return false;
+    }
+    return true;
+}
+
+std::string join_asr_text(const std::string& prefix, const std::string& suffix) {
+    std::string trimmed_suffix = trim(suffix);
+    if (prefix.empty()) {
+        return trimmed_suffix;
+    }
+    if (trimmed_suffix.empty()) {
+        return prefix;
+    }
+
+    std::string out = prefix;
+    if (should_insert_boundary_space_for_text(out.back(), trimmed_suffix.front())) {
+        out += " ";
+    }
+    out += trimmed_suffix;
+    return out;
+}
+
+std::string merge_partial_tail(const std::string& prefix, const std::string& tail) {
+    std::string trimmed_tail = trim(tail);
+    if (prefix.empty() || trimmed_tail.empty()) {
+        return join_asr_text(prefix, trimmed_tail);
+    }
+
+    const size_t max_overlap = std::min(prefix.size(), trimmed_tail.size());
+    size_t best_overlap = 0;
+    for (size_t overlap = max_overlap; overlap >= 3; --overlap) {
+        bool matches = true;
+        const size_t prefix_start = prefix.size() - overlap;
+        for (size_t i = 0; i < overlap; ++i) {
+            const unsigned char a = static_cast<unsigned char>(prefix[prefix_start + i]);
+            const unsigned char b = static_cast<unsigned char>(trimmed_tail[i]);
+            if (std::tolower(a) != std::tolower(b)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            best_overlap = overlap;
+            break;
+        }
+        if (overlap == 3) {
+            break;
+        }
+    }
+
+    if (best_overlap > 0) {
+        return prefix + trimmed_tail.substr(best_overlap);
+    }
+    return join_asr_text(prefix, trimmed_tail);
 }
 
 }  // namespace
@@ -170,21 +235,69 @@ bool AliaAsrPipeline::process_pending() {
         if (remaining >= kMinPartialSamples) {
             if (partial_processed_audio_size_ != audio_buffer_.size() ||
                 partial_processed_stable_offset_ != stable_samples_offset_) {
-                std::vector<float> segment(audio_buffer_.begin() +
-                                               static_cast<std::ptrdiff_t>(stable_samples_offset_),
-                                           audio_buffer_.end());
-                if (segment.size() < 8000) {
-                    segment.resize(8000, 0.0f);
+                std::string partial_language;
+                std::string decoded_text;
+                bool tail_decode = false;
+                auto run_full_partial_decode = [&]() -> bool {
+                    std::vector<float> segment(audio_buffer_.begin() +
+                                                   static_cast<std::ptrdiff_t>(stable_samples_offset_),
+                                               audio_buffer_.end());
+                    if (segment.size() < 8000) {
+                        segment.resize(8000, 0.0f);
+                    }
+                    return transcribe_segment_raw(segment, past_text_, partial_language, decoded_text);
+                };
+                static const bool s_tail_partial_enabled =
+                    aila::env::read_flag("AILA_ASR_TAIL_PARTIAL", false);
+                constexpr size_t kMinTailSamples = static_cast<size_t>(0.5f * 16000);
+                constexpr size_t kTailOverlapSamples = static_cast<size_t>(0.5f * 16000);
+                if (s_tail_partial_enabled &&
+                    !partial_text_.empty() &&
+                    partial_processed_stable_offset_ == stable_samples_offset_ &&
+                    partial_processed_audio_size_ > stable_samples_offset_ &&
+                    audio_buffer_.size() > partial_processed_audio_size_ &&
+                    audio_buffer_.size() - partial_processed_audio_size_ >= kMinTailSamples) {
+                    const std::string previous_partial = partial_text_;
+                    const size_t tail_start = partial_processed_audio_size_ >
+                            stable_samples_offset_ + kTailOverlapSamples
+                        ? partial_processed_audio_size_ - kTailOverlapSamples
+                        : stable_samples_offset_;
+                    std::vector<float> segment(audio_buffer_.begin() +
+                                                   static_cast<std::ptrdiff_t>(tail_start),
+                                               audio_buffer_.end());
+                    if (segment.size() < 8000) {
+                        segment.resize(8000, 0.0f);
+                    }
+                    const std::string context_text = join_asr_text(stable_text_, partial_text_);
+                    if (transcribe_segment_raw(segment, context_text, partial_language, decoded_text)) {
+                        const std::string merged = merge_partial_tail(partial_text_, decoded_text);
+                        if (!decoded_text.empty() && merged != previous_partial) {
+                            partial_text_ = merged;
+                            tail_decode = true;
+                        } else if (run_full_partial_decode()) {
+                            partial_text_ = decoded_text;
+                        } else {
+                            return processed;
+                        }
+                    } else {
+                        return processed;
+                    }
+                } else {
+                    if (run_full_partial_decode()) {
+                        partial_text_ = decoded_text;
+                    } else {
+                        return processed;
+                    }
                 }
 
-                std::string partial_language;
-                std::string partial_text;
-                if (transcribe_segment_raw(segment, past_text_, partial_language, partial_text)) {
-                    partial_text_ = partial_text;
-                    partial_processed_audio_size_ = audio_buffer_.size();
-                    partial_processed_stable_offset_ = stable_samples_offset_;
-                    processed = true;
+                if (tail_decode) {
+                    ++partial_tail_decode_count_;
+                } else {
+                    ++partial_full_decode_count_;
                 }
+                partial_processed_audio_size_ = audio_buffer_.size();
+                partial_processed_stable_offset_ = stable_samples_offset_;
+                processed = true;
             }
         } else {
             partial_text_.clear();
@@ -215,6 +328,8 @@ void AliaAsrPipeline::reset() {
     partial_text_.clear();
     past_text_.clear();
     last_error_.clear();
+    partial_full_decode_count_ = 0;
+    partial_tail_decode_count_ = 0;
 }
 
 void AliaAsrPipeline::get_text(std::string& out_stable, std::string& out_partial) {
@@ -237,6 +352,16 @@ bool AliaAsrPipeline::ready() const {
 size_t AliaAsrPipeline::buffered_sample_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return audio_buffer_.size();
+}
+
+int AliaAsrPipeline::partial_full_decode_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return partial_full_decode_count_;
+}
+
+int AliaAsrPipeline::partial_tail_decode_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return partial_tail_decode_count_;
 }
 
 bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
@@ -413,16 +538,7 @@ int AliaAsrPipeline::find_split_point(const float* samples,
 }
 
 bool AliaAsrPipeline::should_insert_boundary_space(char prev_ch, char next_ch) {
-    if (std::isspace(static_cast<unsigned char>(prev_ch))) {
-        return false;
-    }
-    if (std::isspace(static_cast<unsigned char>(next_ch))) {
-        return false;
-    }
-    if (std::ispunct(static_cast<unsigned char>(next_ch))) {
-        return false;
-    }
-    return true;
+    return should_insert_boundary_space_for_text(prev_ch, next_ch);
 }
 
 void parse_asr_output(const std::string& raw,
