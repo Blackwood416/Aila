@@ -82,6 +82,10 @@ ALIA_API int alia_context_init(
 ALIA_API void alia_context_destroy(AliaContext* ctx);
 ALIA_API int alia_abort_inference(AliaContext* ctx, int pipeline_mask);
 ALIA_API int alia_vlm_rollback_kv_cache(AliaContext* ctx, int rollback_tokens);
+ALIA_API int alia_vlm_prefill_asr_text(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text);
 ALIA_API int alia_asr_feed_audio(AliaContext* ctx, const float* samples, int sample_count);
 ALIA_API void alia_asr_reset(AliaContext* ctx);
 ALIA_API int alia_asr_get_text(AliaContext* ctx, char** out_stable, char** out_partial);

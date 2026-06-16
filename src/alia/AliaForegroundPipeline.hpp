@@ -46,6 +46,8 @@ public:
                     AliaToolCallCallback tool_cb,
                     AliaAudioCallback audio_cb,
                     void* user_data);
+    AliaErrorCode prefill_asr_text(const std::string& stable_text,
+                                   const std::string& partial_text);
     void request_abort();
     AliaErrorCode rollback_kv_cache(int rollback_tokens);
     void join();
@@ -61,6 +63,8 @@ public:
     ForegroundDecodeMode last_decode_mode() const;
     int last_prompt_token_count() const;
     int last_generated_token_count() const;
+    int last_asr_prefill_token_count() const;
+    long long last_asr_prefill_ms() const;
     long long last_first_content_delta_ms() const;
     long long last_first_tts_enqueue_ms() const;
     const std::string& last_error() const { return last_error_; }
@@ -78,6 +82,8 @@ private:
                                   bool record_generation_anchor,
                                   bool use_chat_template,
                                   bool stop_on_tool_call,
+                                  const std::vector<int>* prompt_override_ids,
+                                  int prefilled_prompt_tokens,
                                   const AliaGenConfig* tts_config,
                                   AliaAudioCallback audio_cb,
                                   void* user_data,
@@ -113,6 +119,10 @@ private:
     long long last_first_tts_enqueue_ms_ = -1;
     std::vector<int> generation_anchor_prompt_ids_;
     std::vector<int> generation_token_ids_;
+    std::vector<int> asr_prefill_prompt_ids_;
+    std::string asr_prefill_text_;
+    int last_asr_prefill_token_count_ = 0;
+    long long last_asr_prefill_ms_ = -1;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;
 };
 

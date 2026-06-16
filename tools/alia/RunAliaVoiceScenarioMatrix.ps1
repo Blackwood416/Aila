@@ -140,6 +140,8 @@ try {
             foreground_ms = Get-ValueOrEmpty $values "foreground_ms"
             foreground_prompt_tokens = Get-ValueOrEmpty $values "foreground_prompt_tokens"
             foreground_generated_tokens = Get-ValueOrEmpty $values "foreground_generated_tokens"
+            foreground_asr_prefill_tokens = Get-ValueOrEmpty $values "foreground_asr_prefill_tokens"
+            foreground_asr_prefill_ms = Get-ValueOrEmpty $values "foreground_asr_prefill_ms"
             foreground_first_content_delta_ms = Get-ValueOrEmpty $values "foreground_first_content_delta_ms"
             foreground_first_tts_enqueue_ms = Get-ValueOrEmpty $values "foreground_first_tts_enqueue_ms"
             tts_first_audio_ms = Get-ValueOrEmpty $values "tts_first_audio_ms"

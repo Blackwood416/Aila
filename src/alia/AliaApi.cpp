@@ -92,6 +92,21 @@ ALIA_API int alia_vlm_rollback_kv_cache(AliaContext* ctx, int rollback_tokens) {
     return ctx->foreground_pipeline->rollback_kv_cache(rollback_tokens);
 }
 
+ALIA_API int alia_vlm_prefill_asr_text(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text) {
+    if (!ctx) {
+        return ALIA_ERR_INVALID_ARGUMENT;
+    }
+    if (!ctx->foreground_pipeline) {
+        return ALIA_ERR_INVALID_STATE;
+    }
+    return ctx->foreground_pipeline->prefill_asr_text(
+        safe_string(stable_text),
+        safe_string(partial_text));
+}
+
 ALIA_API int alia_asr_feed_audio(AliaContext* ctx, const float* samples, int sample_count) {
     if (!ctx || !ctx->asr_pipeline || !samples || sample_count <= 0) {
         return ALIA_ERR_INVALID_ARGUMENT;

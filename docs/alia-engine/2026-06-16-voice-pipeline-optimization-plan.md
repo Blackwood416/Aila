@@ -525,3 +525,65 @@ High-value next step:
 - Verify with the real voice matrix, comparing `asr_ms`,
   `foreground_first_content_delta_ms`, `foreground_first_tts_enqueue_ms`, and
   `tts_first_audio_ms`. Do not replace this with API-only unit tests.
+
+## 2026-06-16 ASR Partial-to-VLM Prefill Prototype
+
+First prototype implemented an opt-in ASR/VLM overlap path:
+
+- Added `alia_vlm_prefill_asr_text(stable, partial)` for the Alia product API.
+- Foreground VLM now supports speculative prompt-prefix prefill from
+  `stable_text + partial_text`. The prefetched prefix is validated against the
+  final full prompt before generation; if ASR revised the prefix, generation
+  falls back to a full prompt prefill.
+- The prefill path only commits a token prefix of the final ChatML prompt and
+  leaves a suffix guard so turn start can still forward at least one prompt
+  token and obtain logits.
+- `RunAliaTargetPipeline.ps1 -StreamAsrPrefill` feeds ASR in chunks and calls
+  the VLM prefill hook after each ASR update. The default matrix path remains
+  unchanged unless this flag is set.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio `
+  -SkipToolProbe -StreamAsrPrefill `
+  -AudioPath 'tmp\alia-real-smoke\voice_matrix\short_hello_request.wav' `
+  -OutputWav 'tmp\alia-real-smoke\alia_asr_prefill_short.wav' `
+  -LogPath 'tmp\alia-real-smoke\alia_asr_prefill_short.log' `
+  -RequestText 'Alia, please say hello in one short sentence.' `
+  -MaxTokens 48 -TimeoutSec 1500
+```
+
+```text
+asr_ms=6875
+asr_stream_prefill_enabled=true
+asr_stream_prefill_calls=4
+foreground_prompt_tokens=120
+foreground_asr_prefill_tokens=79
+foreground_asr_prefill_ms=330
+foreground_first_content_delta_ms=920
+foreground_first_tts_enqueue_ms=1306
+tts_first_audio_ms=2240
+```
+
+Default path sanity check:
+
+```text
+asr_stream_prefill_enabled=false
+foreground_asr_prefill_tokens=0
+foreground_first_content_delta_ms=3459
+foreground_first_tts_enqueue_ms=3818
+tts_first_audio_ms=4691
+```
+
+Interpretation:
+
+- The prototype proves the desired state handoff: most foreground prompt
+  prefill can be completed before `alia_start_conversation_turn`.
+- The smoke runner is still sequential, so `asr_ms` grows because it repeatedly
+  invokes ASR partial transcription after each chunk. In the product, these
+  prefill calls should run during live capture / ASR tail time, not after the
+  whole utterance is already available.
+- Next step is a more realistic streaming harness that records wall-clock from
+  simulated VAD fall while feeding chunks over time, and then a matrix run with
+  `-StreamAsrPrefill` once the harness reflects product overlap.

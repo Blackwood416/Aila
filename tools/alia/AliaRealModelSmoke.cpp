@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -39,6 +40,7 @@ struct Options {
     int timeout_sec = 1500;
     bool generate_audio_if_missing = true;
     bool run_tool_probe = true;
+    bool stream_asr_prefill = false;
 };
 
 struct AudioCapture {
@@ -88,6 +90,7 @@ void print_usage() {
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
         << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
+        << "  --stream-asr-prefill   feed ASR in chunks and prefill foreground VLM from stable/partial text\n"
         << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
 }
 
@@ -156,6 +159,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.timeout_sec)) return false;
         } else if (arg == "--no-generate-audio") {
             opts.generate_audio_if_missing = false;
+        } else if (arg == "--stream-asr-prefill") {
+            opts.stream_asr_prefill = true;
         } else if (arg == "--skip-tool-probe") {
             opts.run_tool_probe = false;
         } else {
@@ -520,22 +525,78 @@ int main(int argc, char** argv) {
     }
 
     const auto asr_start = Clock::now();
-    int rc = alia_asr_feed_audio(ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));
-    if (rc != ALIA_OK) {
-        std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
-        return 1;
+    int rc = ALIA_OK;
+    int asr_prefill_calls = 0;
+    auto get_asr_text = [&](std::string& stable_text, std::string& partial_text) -> bool {
+        char* stable_raw = nullptr;
+        char* partial_raw = nullptr;
+        const int get_rc = alia_asr_get_text(ctx.get(), &stable_raw, &partial_raw);
+        stable_text = stable_raw ? stable_raw : "";
+        partial_text = partial_raw ? partial_raw : "";
+        std::free(stable_raw);
+        std::free(partial_raw);
+        if (get_rc != ALIA_OK) {
+            std::cerr << "alia_asr_get_text_rc=" << get_rc << "\n";
+            return false;
+        }
+        return true;
+    };
+
+    std::string stable_text;
+    std::string partial_text;
+    if (opts.stream_asr_prefill) {
+        constexpr int kStreamChunkSamples = 16000;
+        for (size_t offset = 0; offset < mono_16k.size(); offset += kStreamChunkSamples) {
+            const size_t count = std::min<size_t>(kStreamChunkSamples, mono_16k.size() - offset);
+            rc = alia_asr_feed_audio(
+                ctx.get(),
+                mono_16k.data() + offset,
+                static_cast<int>(count));
+            if (rc != ALIA_OK) {
+                std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
+                return 1;
+            }
+            if (!get_asr_text(stable_text, partial_text)) {
+                return 1;
+            }
+            if (!stable_text.empty() || !partial_text.empty()) {
+                rc = alia_vlm_prefill_asr_text(ctx.get(), stable_text.c_str(), partial_text.c_str());
+                if (rc != ALIA_OK) {
+                    std::cerr << "alia_vlm_prefill_asr_text_rc=" << rc << "\n";
+                    return 1;
+                }
+                ++asr_prefill_calls;
+            }
+        }
+        if (!get_asr_text(stable_text, partial_text)) {
+            return 1;
+        }
+    } else {
+        rc = alia_asr_feed_audio(ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));
+        if (rc != ALIA_OK) {
+            std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
+            return 1;
+        }
+        if (!get_asr_text(stable_text, partial_text)) {
+            return 1;
+        }
     }
-    char* stable_raw = nullptr;
-    char* partial_raw = nullptr;
-    rc = alia_asr_get_text(ctx.get(), &stable_raw, &partial_raw);
-    std::string stable_text = stable_raw ? stable_raw : "";
-    std::string partial_text = partial_raw ? partial_raw : "";
-    std::free(stable_raw);
-    std::free(partial_raw);
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
-    const std::string user_text = !stable_text.empty() ? stable_text : partial_text;
+    std::string user_text = stable_text;
+    if (user_text.empty()) {
+        user_text = partial_text;
+    } else if (!partial_text.empty()) {
+        if (!std::isspace(static_cast<unsigned char>(user_text.back())) &&
+            !std::isspace(static_cast<unsigned char>(partial_text.front())) &&
+            !std::ispunct(static_cast<unsigned char>(partial_text.front()))) {
+            user_text += " ";
+        }
+        user_text += partial_text;
+    }
     std::cout << "asr_ms=" << asr_ms << "\n"
+              << "asr_stream_prefill_enabled=" << (opts.stream_asr_prefill ? "true" : "false") << "\n"
+              << "asr_stream_prefill_calls=" << asr_prefill_calls << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"
               << "asr_partial_text=" << quote(partial_text) << "\n";
     if (user_text.empty()) {
@@ -576,6 +637,10 @@ int main(int argc, char** argv) {
               << "foreground_decode_mode=" << foreground_mode_name(fg_mode) << "\n"
               << "foreground_prompt_tokens=" << ctx->foreground_pipeline->last_prompt_token_count() << "\n"
               << "foreground_generated_tokens=" << ctx->foreground_pipeline->last_generated_token_count() << "\n"
+              << "foreground_asr_prefill_tokens="
+              << ctx->foreground_pipeline->last_asr_prefill_token_count() << "\n"
+              << "foreground_asr_prefill_ms="
+              << ctx->foreground_pipeline->last_asr_prefill_ms() << "\n"
               << "foreground_first_content_delta_ms="
               << ctx->foreground_pipeline->last_first_content_delta_ms() << "\n"
               << "foreground_first_tts_enqueue_ms="

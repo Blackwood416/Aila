@@ -11,6 +11,7 @@ param(
     [int]$TimeoutSec = 1500,
     [switch]$SkipBuild,
     [switch]$NoGenerateAudio,
+    [switch]$StreamAsrPrefill,
     [switch]$SkipToolProbe
 )
 
@@ -76,6 +77,9 @@ try {
     )
     if ($NoGenerateAudio) {
         $smokeArgs += "--no-generate-audio"
+    }
+    if ($StreamAsrPrefill) {
+        $smokeArgs += "--stream-asr-prefill"
     }
     if ($SkipToolProbe) {
         $smokeArgs += "--skip-tool-probe"
