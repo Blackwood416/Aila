@@ -641,6 +641,7 @@ int main(int argc, char** argv) {
     }
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
+    const aila::alia::AliaAsrMetrics asr_metrics = ctx->asr_pipeline->last_metrics();
     std::string user_text = stable_text;
     if (user_text.empty()) {
         user_text = partial_text;
@@ -665,6 +666,17 @@ int main(int argc, char** argv) {
               << ctx->asr_pipeline->partial_full_decode_count() << "\n"
               << "asr_partial_tail_decode_count="
               << ctx->asr_pipeline->partial_tail_decode_count() << "\n"
+              << "asr_profile_transcribe_calls=" << asr_metrics.transcribe_calls << "\n"
+              << "asr_profile_generated_tokens=" << asr_metrics.generated_tokens << "\n"
+              << "asr_profile_input_audio_ms=" << asr_metrics.input_audio_ms << "\n"
+              << "asr_profile_mel_ms=" << asr_metrics.mel_ms << "\n"
+              << "asr_profile_upload_ms=" << asr_metrics.upload_ms << "\n"
+              << "asr_profile_encoder_ms=" << asr_metrics.encoder_ms << "\n"
+              << "asr_profile_readback_ms=" << asr_metrics.readback_ms << "\n"
+              << "asr_profile_prompt_ms=" << asr_metrics.prompt_ms << "\n"
+              << "asr_profile_prefill_ms=" << asr_metrics.prefill_ms << "\n"
+              << "asr_profile_decode_ms=" << asr_metrics.decode_ms << "\n"
+              << "asr_profile_total_ms=" << asr_metrics.total_ms << "\n"
               << "asr_audio_duration_ms=" << asr_audio_duration_ms << "\n"
               << "asr_stream_simulated_tail_ms=" << asr_stream_simulated_tail_ms << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"

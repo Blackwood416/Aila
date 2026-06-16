@@ -729,3 +729,53 @@ Conclusion:
   and reuse mel/audio encoder work for growing partial suffixes, or add a real
   ASR decoder prefill/KV reuse path. The existing VLM prefill path is ready to
   consume finer ASR partials once they are cheap enough.
+
+## 2026-06-17 ASR Partial Profile Probe
+
+Added `AILA_ASR_PROFILE=1` stage metrics for each raw ASR segment
+transcription. The smoke logs now include:
+
+- `asr_profile_transcribe_calls`
+- `asr_profile_generated_tokens`
+- `asr_profile_input_audio_ms`
+- `asr_profile_mel_ms`
+- `asr_profile_upload_ms`
+- `asr_profile_encoder_ms`
+- `asr_profile_readback_ms`
+- `asr_profile_prompt_ms`
+- `asr_profile_prefill_ms`
+- `asr_profile_decode_ms`
+- `asr_profile_total_ms`
+
+Short `short_hello_request.wav`, `-StreamAsrPrefill -StreamChunkMs 1000
+-StreamPrefillIntervalMs 1000`, with `AILA_ASR_PROFILE=1`:
+
+```text
+asr_stream_text_calls=4
+asr_partial_full_decode_count=4
+asr_partial_tail_decode_count=0
+asr_profile_transcribe_calls=4
+asr_profile_generated_tokens=44
+asr_profile_input_audio_ms=9760
+asr_profile_mel_ms=429.948
+asr_profile_upload_ms=2.9577
+asr_profile_encoder_ms=260.048
+asr_profile_readback_ms=3.1643
+asr_profile_prompt_ms=4.7312
+asr_profile_prefill_ms=1157.05
+asr_profile_decode_ms=571.751
+asr_profile_total_ms=2429.88
+```
+
+Interpretation:
+
+- The largest measured ASR-internal stage is the text model prompt prefill over
+  the growing audio-token prompt, not the audio encoder.
+- Audio encoder reuse can still help, especially for longer utterances, but it
+  is not the whole TTFA problem for short partials.
+- KV reuse for the ASR text model is awkward with the current prompt shape
+  because new audio tokens are inserted before `<audio_end>`, so the next
+  partial is not a simple token-prefix extension of the previous partial.
+- A promising next design is a streaming-specific ASR prompt contract with a
+  stable append-only prefix, or an audio-token reservation/window scheme that
+  preserves prefix reuse without changing recognized text.

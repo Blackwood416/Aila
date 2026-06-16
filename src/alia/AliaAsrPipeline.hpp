@@ -9,6 +9,20 @@ namespace aila::alia {
 
 class ModelSlot;
 
+struct AliaAsrMetrics {
+    int transcribe_calls = 0;
+    int generated_tokens = 0;
+    double input_audio_ms = 0.0;
+    double mel_ms = 0.0;
+    double upload_ms = 0.0;
+    double encoder_ms = 0.0;
+    double readback_ms = 0.0;
+    double prompt_ms = 0.0;
+    double prefill_ms = 0.0;
+    double decode_ms = 0.0;
+    double total_ms = 0.0;
+};
+
 class AliaAsrPipeline {
 public:
     explicit AliaAsrPipeline(ModelSlot* slot);
@@ -23,6 +37,7 @@ public:
     size_t buffered_sample_count() const;
     int partial_full_decode_count() const;
     int partial_tail_decode_count() const;
+    AliaAsrMetrics last_metrics() const;
     ModelSlot* slot() const { return slot_; }
     const std::string& last_error() const { return last_error_; }
 
@@ -49,6 +64,7 @@ private:
     std::string last_error_;
     int partial_full_decode_count_ = 0;
     int partial_tail_decode_count_ = 0;
+    AliaAsrMetrics metrics_;
 };
 
 void parse_asr_output(const std::string& raw,

@@ -10,6 +10,7 @@
 #include "../utils/Tokenizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <exception>
 #include <sycl/sycl.hpp>
@@ -330,6 +331,7 @@ void AliaAsrPipeline::reset() {
     last_error_.clear();
     partial_full_decode_count_ = 0;
     partial_tail_decode_count_ = 0;
+    metrics_ = AliaAsrMetrics{};
 }
 
 void AliaAsrPipeline::get_text(std::string& out_stable, std::string& out_partial) {
@@ -364,6 +366,11 @@ int AliaAsrPipeline::partial_tail_decode_count() const {
     return partial_tail_decode_count_;
 }
 
+AliaAsrMetrics AliaAsrPipeline::last_metrics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metrics_;
+}
+
 bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
                                              const std::string& past_text,
                                              std::string& language_out,
@@ -374,6 +381,25 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     if (!ready()) {
         return false;
     }
+
+    static const bool s_profile_asr = aila::env::read_flag("AILA_ASR_PROFILE", false);
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto stage_start = total_start;
+    AliaAsrMetrics call_metrics;
+    call_metrics.transcribe_calls = 1;
+    call_metrics.input_audio_ms =
+        static_cast<double>(segment.size()) * 1000.0 / 16000.0;
+    auto finish_stage = [&](double& target, Context* maybe_context = nullptr) {
+        if (!s_profile_asr) {
+            return;
+        }
+        if (maybe_context) {
+            maybe_context->synchronize();
+        }
+        const auto now = std::chrono::high_resolution_clock::now();
+        target += std::chrono::duration<double, std::milli>(now - stage_start).count();
+        stage_start = now;
+    };
 
     Context* context = slot_->context();
     IModelBackend* backend = slot_->backend();
@@ -388,6 +414,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         last_error_ = "ASR mel spectrogram failed: " + prep_error;
         return false;
     }
+    finish_stage(call_metrics.mel_ms);
 
     std::vector<AsrBf16> mel_bf16(static_cast<size_t>(mel.n_frames) * mel.n_mels);
     for (int frame = 0; frame < mel.n_frames; ++frame) {
@@ -399,6 +426,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
 
     Tensor mel_device = Tensor::allocate(*context, {1, mel.n_mels, mel.n_frames});
     context->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(AsrBf16));
+    finish_stage(call_metrics.upload_ms, context);
 
     int audio_len = 0;
     const int output_dim = spec.audio.output_dim;
@@ -411,6 +439,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         last_error_ = "ASR audio encoder failed: " + audio_error;
         return false;
     }
+    finish_stage(call_metrics.encoder_ms, context);
 
     Tensor audio_features = Tensor::allocate(*context, {audio_len, output_dim});
     context->queue().memcpy(audio_features.data_as<AsrBf16>(),
@@ -421,6 +450,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     context->memcpy_d2h(audio_host.data(), audio_features.data(),
                         audio_host.size() * sizeof(AsrBf16));
     context->synchronize();
+    finish_stage(call_metrics.readback_ms);
 
     std::vector<int> prompt_ids;
     auto add_text = [&](const std::string& text) {
@@ -473,6 +503,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         pos_w[i] = static_cast<int>(i);
     }
     backend->set_mrope_positions(*context, pos_t, pos_h, pos_w, 0);
+    finish_stage(call_metrics.prompt_ms, context);
 
     DeviceAllocation prompt_device(*context, prompt_ids.size() * sizeof(int));
     context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
@@ -481,6 +512,7 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     Tensor* logits = &backend->forward(*context, prompt_device.as<int>(),
                                        static_cast<int>(prompt_ids.size()));
     backend->clear_mrope_positions();
+    finish_stage(call_metrics.prefill_ms, context);
 
     DeviceAllocation one_token_device(*context, sizeof(int));
     std::vector<int> generated_ids;
@@ -502,11 +534,26 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         context->memcpy_h2d(one_token_device.as<int>(), &next_token, sizeof(int));
         logits = &backend->forward(*context, one_token_device.as<int>(), 1);
     }
+    finish_stage(call_metrics.decode_ms, context);
 
     backend->clear_embedding_overrides();
 
     std::string raw = tokenizer->decode(generated_ids);
     parse_asr_output(raw, "", language_out, text_out);
+    call_metrics.generated_tokens = static_cast<int>(generated_ids.size());
+    call_metrics.total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - total_start).count();
+    metrics_.transcribe_calls += call_metrics.transcribe_calls;
+    metrics_.generated_tokens += call_metrics.generated_tokens;
+    metrics_.input_audio_ms += call_metrics.input_audio_ms;
+    metrics_.mel_ms += call_metrics.mel_ms;
+    metrics_.upload_ms += call_metrics.upload_ms;
+    metrics_.encoder_ms += call_metrics.encoder_ms;
+    metrics_.readback_ms += call_metrics.readback_ms;
+    metrics_.prompt_ms += call_metrics.prompt_ms;
+    metrics_.prefill_ms += call_metrics.prefill_ms;
+    metrics_.decode_ms += call_metrics.decode_ms;
+    metrics_.total_ms += call_metrics.total_ms;
     return true;
 }
 
