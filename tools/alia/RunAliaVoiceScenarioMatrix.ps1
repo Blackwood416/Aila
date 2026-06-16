@@ -3,6 +3,7 @@ param(
     [string]$OutputDir = "tmp\alia-real-smoke\voice_matrix",
     [int]$TimeoutSec = 1500,
     [int]$StreamChunkMs = 1000,
+    [int]$StreamPrefillIntervalMs = 0,
     [switch]$SkipBuild,
     [switch]$StreamAsrPrefill,
     [switch]$IncludeToolProbe
@@ -115,6 +116,7 @@ try {
                 MaxTokens = $scenario.MaxTokens
                 TimeoutSec = $TimeoutSec
                 StreamChunkMs = $StreamChunkMs
+                StreamPrefillIntervalMs = $StreamPrefillIntervalMs
             }
             if ($StreamAsrPrefill) {
                 $targetArgs.StreamAsrPrefill = $true
@@ -143,6 +145,11 @@ try {
             request_text = $scenario.RequestText
             model_load_ms = Get-ValueOrEmpty $values "model_load_ms"
             asr_ms = Get-ValueOrEmpty $values "asr_ms"
+            asr_stream_chunk_ms = Get-ValueOrEmpty $values "asr_stream_chunk_ms"
+            asr_stream_prefill_interval_ms = Get-ValueOrEmpty $values "asr_stream_prefill_interval_ms"
+            asr_stream_text_calls = Get-ValueOrEmpty $values "asr_stream_text_calls"
+            asr_stream_prefill_calls = Get-ValueOrEmpty $values "asr_stream_prefill_calls"
+            asr_stream_prefill_skipped_unchanged = Get-ValueOrEmpty $values "asr_stream_prefill_skipped_unchanged"
             foreground_ms = Get-ValueOrEmpty $values "foreground_ms"
             foreground_prompt_tokens = Get-ValueOrEmpty $values "foreground_prompt_tokens"
             foreground_generated_tokens = Get-ValueOrEmpty $values "foreground_generated_tokens"
@@ -184,7 +191,7 @@ try {
 
     $summaryPath = Join-Path $outputRoot "summary.csv"
     $rows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
-    $rows | Format-Table scenario, pass, asr_ms, simulated_vad_asr_tail_ms, simulated_vad_to_first_content_ms, simulated_vad_to_first_audio_ms, foreground_first_content_delta_ms, tts_first_audio_ms, foreground_ms, background_ms -AutoSize
+    $rows | Format-Table scenario, pass, asr_ms, asr_stream_text_calls, simulated_vad_asr_tail_ms, simulated_vad_to_first_content_ms, simulated_vad_to_first_audio_ms, foreground_first_content_delta_ms, tts_first_audio_ms, foreground_ms, background_ms -AutoSize
 
     $failed = @($rows | Where-Object { -not $_.pass })
     if ($failed.Count -gt 0) {

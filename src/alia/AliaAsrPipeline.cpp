@@ -103,6 +103,8 @@ void AliaAsrPipeline::append_stable_text(std::string text) {
     stable_text_ += text;
     past_text_ = std::move(text);
     partial_text_.clear();
+    partial_processed_audio_size_ = 0;
+    partial_processed_stable_offset_ = stable_samples_offset_;
 }
 
 bool AliaAsrPipeline::process_pending() {
@@ -159,26 +161,35 @@ bool AliaAsrPipeline::process_pending() {
             }
 
             stable_samples_offset_ = split_absolute;
+            partial_processed_audio_size_ = 0;
+            partial_processed_stable_offset_ = stable_samples_offset_;
             processed = true;
         }
 
         const size_t remaining = audio_buffer_.size() - stable_samples_offset_;
         if (remaining >= kMinPartialSamples) {
-            std::vector<float> segment(audio_buffer_.begin() +
-                                           static_cast<std::ptrdiff_t>(stable_samples_offset_),
-                                       audio_buffer_.end());
-            if (segment.size() < 8000) {
-                segment.resize(8000, 0.0f);
-            }
+            if (partial_processed_audio_size_ != audio_buffer_.size() ||
+                partial_processed_stable_offset_ != stable_samples_offset_) {
+                std::vector<float> segment(audio_buffer_.begin() +
+                                               static_cast<std::ptrdiff_t>(stable_samples_offset_),
+                                           audio_buffer_.end());
+                if (segment.size() < 8000) {
+                    segment.resize(8000, 0.0f);
+                }
 
-            std::string partial_language;
-            std::string partial_text;
-            if (transcribe_segment_raw(segment, past_text_, partial_language, partial_text)) {
-                partial_text_ = partial_text;
-                processed = true;
+                std::string partial_language;
+                std::string partial_text;
+                if (transcribe_segment_raw(segment, past_text_, partial_language, partial_text)) {
+                    partial_text_ = partial_text;
+                    partial_processed_audio_size_ = audio_buffer_.size();
+                    partial_processed_stable_offset_ = stable_samples_offset_;
+                    processed = true;
+                }
             }
         } else {
             partial_text_.clear();
+            partial_processed_audio_size_ = 0;
+            partial_processed_stable_offset_ = stable_samples_offset_;
         }
 
         last_error_.clear();
@@ -198,6 +209,8 @@ void AliaAsrPipeline::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     audio_buffer_.clear();
     stable_samples_offset_ = 0;
+    partial_processed_audio_size_ = 0;
+    partial_processed_stable_offset_ = 0;
     stable_text_.clear();
     partial_text_.clear();
     past_text_.clear();

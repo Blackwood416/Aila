@@ -637,3 +637,65 @@ Interpretation:
   max-token foreground output followed by a background-stage access violation.
   Keep the next pass focused on partial cadence and ASR compute reuse, not on
   end-of-utterance-only prefill.
+
+## 2026-06-16 ASR Partial Cache and Cadence Split
+
+Follow-up changes:
+
+- Split streaming audio feed cadence from ASR partial/VLM prefill cadence.
+  `--stream-chunk-ms` controls audio feed size, while
+  `--stream-prefill-interval-ms` controls when the runner calls
+  `alia_asr_get_text` and `alia_vlm_prefill_asr_text`.
+- Added runner counters for `asr_stream_text_calls`,
+  `asr_stream_prefill_calls`, and
+  `asr_stream_prefill_skipped_unchanged`.
+- Cached the last ASR partial result inside `AliaAsrPipeline` when the audio
+  buffer size and stable offset are unchanged. This avoids a duplicate full
+  partial transcription when a streaming prefill pass has already finalized
+  ASR text before `alia_start_conversation_turn`.
+
+Short smoke result on `short_hello_request.wav` with `-StreamAsrPrefill
+-StreamChunkMs 1000 -StreamPrefillIntervalMs 3000`:
+
+```text
+before ASR partial cache:
+foreground_first_content_delta_ms=929
+foreground_first_tts_enqueue_ms=1173
+simulated_vad_to_first_audio_ms=5407
+
+after ASR partial cache:
+foreground_first_content_delta_ms=354
+foreground_first_tts_enqueue_ms=600
+simulated_vad_to_first_audio_ms=4847
+```
+
+Streaming-prefill matrix:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild `
+  -StreamAsrPrefill -StreamChunkMs 1000 -StreamPrefillIntervalMs 3000 `
+  -OutputDir 'tmp\alia-real-smoke\voice_matrix_stream_prefill_3s' `
+  -TimeoutSec 1500
+```
+
+```text
+scenario          asr_ms  text_calls  prefill_calls  vad_tail_ms  fg_first_ms  vad_to_first_content_ms  tts_first_audio_ms  vad_to_first_audio_ms
+short_hello       4526    2           1              3766         349          4115                     1870                5636
+persona_chat      5165    2           2              3283         351          3634                     1719                5002
+preference_memory 5109    2           2              3388         353          3741                     1882                5270
+task_memory       4959    2           2              3798         350          4148                     1692                5490
+long_answer       5159    2           2              2799         347          3146                     2522                5321
+```
+
+Interpretation:
+
+- The foreground part of TTFA is now mostly solved for this prefill path:
+  first content after turn start is around `350ms` across the matrix.
+- The remaining live-simulated gap is dominated by ASR partial recompute tail
+  plus TTS first-chunk variance. The ASR pipeline still transcribes the full
+  non-stable suffix for each partial; the cache only removes repeated work when
+  no new audio has arrived.
+- Next ASR work should target incremental or cadence-aware partial decode:
+  either reuse audio encoder/model work for the growing suffix, or run partial
+  only near likely VAD fall while keeping the last good partial available to
+  the foreground prompt cache.

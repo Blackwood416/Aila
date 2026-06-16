@@ -39,6 +39,7 @@ struct Options {
     int max_tokens = 48;
     int timeout_sec = 1500;
     int stream_chunk_ms = 1000;
+    int stream_prefill_interval_ms = 0;
     bool generate_audio_if_missing = true;
     bool run_tool_probe = true;
     bool stream_asr_prefill = false;
@@ -91,6 +92,8 @@ void print_usage() {
         << "  --max-tokens <N>       default 48\n"
         << "  --timeout-sec <N>      default 1500\n"
         << "  --stream-chunk-ms <N>  ASR stream chunk duration for --stream-asr-prefill, default 1000\n"
+        << "  --stream-prefill-interval-ms <N>\n"
+        << "                         ASR partial/prefill cadence, default matches --stream-chunk-ms\n"
         << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
         << "  --stream-asr-prefill   feed ASR in chunks and prefill foreground VLM from stable/partial text\n"
         << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
@@ -161,6 +164,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             if (!require_int(opts.timeout_sec)) return false;
         } else if (arg == "--stream-chunk-ms") {
             if (!require_int(opts.stream_chunk_ms)) return false;
+        } else if (arg == "--stream-prefill-interval-ms") {
+            if (!require_int(opts.stream_prefill_interval_ms)) return false;
         } else if (arg == "--no-generate-audio") {
             opts.generate_audio_if_missing = false;
         } else if (arg == "--stream-asr-prefill") {
@@ -174,9 +179,13 @@ bool parse_args(int argc, char** argv, Options& opts) {
     }
 
     if (opts.max_seq_len <= 0 || opts.max_tokens <= 0 || opts.timeout_sec <= 0 ||
-        opts.stream_chunk_ms <= 0) {
-        std::cerr << "max-seq, max-tokens, timeout-sec, and stream-chunk-ms must be positive.\n";
+        opts.stream_chunk_ms <= 0 || opts.stream_prefill_interval_ms < 0) {
+        std::cerr << "max-seq, max-tokens, timeout-sec, and stream-chunk-ms must be positive; "
+                  << "stream-prefill-interval-ms must be non-negative.\n";
         return false;
+    }
+    if (opts.stream_prefill_interval_ms == 0) {
+        opts.stream_prefill_interval_ms = opts.stream_chunk_ms;
     }
     if (opts.request_text.empty()) {
         std::cerr << "request-text must not be empty.\n";
@@ -532,6 +541,8 @@ int main(int argc, char** argv) {
     const auto asr_start = Clock::now();
     int rc = ALIA_OK;
     int asr_prefill_calls = 0;
+    int asr_text_calls = 0;
+    int asr_prefill_skipped_unchanged = 0;
     constexpr double kAsrSampleRate = 16000.0;
     const double asr_audio_duration_ms =
         static_cast<double>(mono_16k.size()) * 1000.0 / kAsrSampleRate;
@@ -558,6 +569,9 @@ int main(int argc, char** argv) {
         const int stream_chunk_samples =
             std::max(1, static_cast<int>(std::llround(
                 static_cast<double>(opts.stream_chunk_ms) * kAsrSampleRate / 1000.0)));
+        double next_prefill_ms = static_cast<double>(opts.stream_prefill_interval_ms);
+        std::string last_prefill_stable_text;
+        std::string last_prefill_partial_text;
         for (size_t offset = 0; offset < mono_16k.size();
              offset += static_cast<size_t>(stream_chunk_samples)) {
             const size_t count = std::min<size_t>(
@@ -565,7 +579,7 @@ int main(int argc, char** argv) {
                 mono_16k.size() - offset);
             const double chunk_end_ms =
                 static_cast<double>(offset + count) * 1000.0 / kAsrSampleRate;
-            const auto chunk_op_start = Clock::now();
+            const bool final_chunk = offset + count >= mono_16k.size();
             rc = alia_asr_feed_audio(
                 ctx.get(),
                 mono_16k.data() + offset,
@@ -574,22 +588,43 @@ int main(int argc, char** argv) {
                 std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
                 return 1;
             }
+            const bool should_prefill =
+                final_chunk || chunk_end_ms + 0.001 >= next_prefill_ms;
+            if (!should_prefill) {
+                continue;
+            }
+
+            const auto chunk_op_start = Clock::now();
             if (!get_asr_text(stable_text, partial_text)) {
                 return 1;
             }
+            ++asr_text_calls;
             if (!stable_text.empty() || !partial_text.empty()) {
-                rc = alia_vlm_prefill_asr_text(ctx.get(), stable_text.c_str(), partial_text.c_str());
-                if (rc != ALIA_OK) {
-                    std::cerr << "alia_vlm_prefill_asr_text_rc=" << rc << "\n";
-                    return 1;
+                if (stable_text == last_prefill_stable_text &&
+                    partial_text == last_prefill_partial_text) {
+                    ++asr_prefill_skipped_unchanged;
+                } else {
+                    rc = alia_vlm_prefill_asr_text(
+                        ctx.get(),
+                        stable_text.c_str(),
+                        partial_text.c_str());
+                    if (rc != ALIA_OK) {
+                        std::cerr << "alia_vlm_prefill_asr_text_rc=" << rc << "\n";
+                        return 1;
+                    }
+                    last_prefill_stable_text = stable_text;
+                    last_prefill_partial_text = partial_text;
+                    ++asr_prefill_calls;
                 }
-                ++asr_prefill_calls;
             }
             const double chunk_op_ms = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - chunk_op_start).count());
             asr_stream_simulated_clock_ms =
                 std::max(asr_stream_simulated_clock_ms, chunk_end_ms) + chunk_op_ms;
+            while (next_prefill_ms <= chunk_end_ms + 0.001) {
+                next_prefill_ms += static_cast<double>(opts.stream_prefill_interval_ms);
+            }
         }
         asr_stream_simulated_tail_ms =
             std::max(0.0, asr_stream_simulated_clock_ms - asr_audio_duration_ms);
@@ -602,6 +637,7 @@ int main(int argc, char** argv) {
         if (!get_asr_text(stable_text, partial_text)) {
             return 1;
         }
+        ++asr_text_calls;
     }
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
@@ -619,7 +655,12 @@ int main(int argc, char** argv) {
     std::cout << "asr_ms=" << asr_ms << "\n"
               << "asr_stream_prefill_enabled=" << (opts.stream_asr_prefill ? "true" : "false") << "\n"
               << "asr_stream_chunk_ms=" << (opts.stream_asr_prefill ? opts.stream_chunk_ms : 0) << "\n"
+              << "asr_stream_prefill_interval_ms="
+              << (opts.stream_asr_prefill ? opts.stream_prefill_interval_ms : 0) << "\n"
+              << "asr_stream_text_calls=" << asr_text_calls << "\n"
               << "asr_stream_prefill_calls=" << asr_prefill_calls << "\n"
+              << "asr_stream_prefill_skipped_unchanged="
+              << asr_prefill_skipped_unchanged << "\n"
               << "asr_audio_duration_ms=" << asr_audio_duration_ms << "\n"
               << "asr_stream_simulated_tail_ms=" << asr_stream_simulated_tail_ms << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"

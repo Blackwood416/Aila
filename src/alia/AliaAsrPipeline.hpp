@@ -39,6 +39,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<float> audio_buffer_;
     size_t stable_samples_offset_ = 0;
+    size_t partial_processed_audio_size_ = 0;
+    size_t partial_processed_stable_offset_ = 0;
     std::string stable_text_;
     std::string partial_text_;
     std::string past_text_;
