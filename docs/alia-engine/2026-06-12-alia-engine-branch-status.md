@@ -617,3 +617,43 @@ preference_memory  26917          1060    2910              2974                
 task_memory        29359          1071    3300              3561                  4598
 long_answer        27779          1105    3113              3449                  4548
 ```
+
+## 2026-06-21 Review Status Audit
+
+The follow-up review report is now tracked at:
+
+- `docs/alia-engine/review/2026-06-21-alia-stability-followup-review.md`
+
+Result:
+
+- The follow-up review found no blocking issues and assessed the lane-lock
+  callback fix as ready to merge.
+- Remaining open question: the host must not destroy `AliaContext` from inside
+  an audio callback. That lifecycle reentrancy is still unsafe, but it is
+  outside the foreground lane-lock fix reviewed here.
+
+Initial 2026-06-17 review finding status:
+
+- Finding #1, foreground `Context` race: resolved for the reviewed Alia runtime
+  paths. ASR, foreground VLM, and TTS share the foreground lane, but GPU
+  submission windows are serialized with `Context::ExecutionLock`, allocator
+  bookkeeping is mutex-protected, and host audio callbacks run outside the lane
+  lock.
+- Finding #2, missing string deallocator: resolved. `alia_free_string` is
+  exported, implemented with `std::free`, used by the smoke, documented in
+  `include/alia_api.h`, and listed in this status document's export surface.
+- Finding #3, exceptions escaping the C ABI: resolved for the current `alia_*`
+  exports. `src/alia/AliaApi.cpp` routes entry points through guarded wrappers.
+- Finding #4, rollback replay desync after tool resume: resolved to the minimum
+  safety bar. Tool-result continuation tokens are recorded in the replayable
+  sequence, and rollback refuses success when recorded and current context
+  lengths cannot be reconciled.
+- Finding #5, ASR mutex held across GPU transcription: still open. This was
+  optional in the original task and remains a streaming-ingestion follow-up.
+- Finding #6, parser recovery unit-test coverage: still open. The chat parser
+  tests exist in the tree, but `AilaChatTests` is not part of the current custom
+  branch build graph and the malformed `<parameter=id=42</parameter>` case still
+  needs focused lightweight coverage.
+- Finding #7, minor cleanup: partially open. `load_model_metadata()` and the
+  fixed `decode_mode` local remain; the LoRA key-normalization fragility noted
+  in the original review no longer matches the current implementation.
