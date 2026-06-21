@@ -17,8 +17,30 @@ class Context {
 public:
     class ExecutionLock {
     public:
+        class ScopedUnlock {
+        public:
+            explicit ScopedUnlock(ExecutionLock& lock)
+                : lock_(lock) {
+                lock_.unlock();
+            }
+
+            ScopedUnlock(const ScopedUnlock&) = delete;
+            ScopedUnlock& operator=(const ScopedUnlock&) = delete;
+
+            ~ScopedUnlock() {
+                lock_.lock();
+            }
+
+        private:
+            ExecutionLock& lock_;
+        };
+
         explicit ExecutionLock(Context& ctx)
             : lock_(ctx.execution_mutex_) {}
+
+        void unlock() { lock_.unlock(); }
+        void lock() { lock_.lock(); }
+        ScopedUnlock scoped_unlock() { return ScopedUnlock(*this); }
 
     private:
         std::unique_lock<std::mutex> lock_;

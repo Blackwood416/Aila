@@ -301,6 +301,7 @@ Result:
 - `alia_asr_reset`
 - `alia_context_destroy`
 - `alia_context_init`
+- `alia_free_string`
 - `alia_register_background_callback`
 - `alia_start_conversation_turn`
 - `alia_trigger_background_processing`
@@ -562,3 +563,57 @@ Regression follow-up:
   Scenario `model_load_ms` stayed around `25.6s` to `26.2s`, `asr_ms` around
   `0.93s` to `1.13s`, first content around `3.09s` to `3.16s`, and first audio
   around `4.23s` to `4.74s`.
+
+## 2026-06-21 Stability Follow-up Notes
+
+Changes:
+
+- The TTS streaming path no longer invokes the host `AliaAudioCallback` while
+  holding the foreground `Context` execution lock. `Context::ExecutionLock` now
+  supports a scoped unlock, and `AliaTtsPipeline::synthesize_text` releases the
+  lane only for the host callback call before reacquiring it for subsequent TTS
+  backend work.
+- `include/alia_api.h` now documents that strings returned from
+  `alia_asr_get_text` must be freed with `alia_free_string`, not host-side
+  allocators.
+- The earlier export list in this document now includes `alia_free_string`.
+
+Verification:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ". .\perf\PerfCommon.ps1; Initialize-AilaOneApiEnvironment; cmake --build build --target AliaEngine --config Release"
+```
+
+Result:
+
+- Passed and linked `AilaShared.dll` through `[72/72]`.
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -AudioPath "tmp\alia-real-smoke\alia_request.wav" -OutputWav "tmp\alia-real-smoke\callback_unlock_full.wav" -LogPath "tmp\alia-real-smoke\callback_unlock_full.log" -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- `model_load_ms=26228`, `asr_ms=905`,
+  `foreground_first_content_delta_ms=2865`,
+  `foreground_first_tts_enqueue_ms=2930`, `tts_first_audio_ms=3756`,
+  `tool_probe_ms=2018`.
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+Result:
+
+- Passed with `ALIA_VOICE_SCENARIO_MATRIX_PASS`.
+- Latest matrix summary:
+
+```text
+scenario           model_load_ms  asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms
+short_hello        26141          955     3054              3314                  4218
+persona_chat       26625          1087    3022              3112                  4389
+preference_memory  26917          1060    2910              2974                  4689
+task_memory        29359          1071    3300              3561                  4598
+long_answer        27779          1105    3113              3449                  4548
+```

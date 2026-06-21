@@ -214,6 +214,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
                     return;
                 }
                 emitted_backend_audio = true;
+                auto callback_unlock = lane_lock.scoped_unlock();
                 audio_cb(samples.data(), static_cast<int>(samples.size()), user_data);
             },
             &backend_error,
