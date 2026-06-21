@@ -727,6 +727,11 @@ long long AliaForegroundPipeline::last_first_tts_enqueue_ms() const {
     return last_first_tts_enqueue_ms_;
 }
 
+AliaForegroundMetrics AliaForegroundPipeline::last_metrics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metrics_;
+}
+
 void AliaForegroundPipeline::run_turn(
     AliaGenConfig config,
     AliaToolCallCallback tool_cb,
@@ -778,6 +783,7 @@ void AliaForegroundPipeline::run_turn(
             last_generated_token_count_ = 0;
             last_first_content_delta_ms_ = -1;
             last_first_tts_enqueue_ms_ = -1;
+            metrics_ = AliaForegroundMetrics{};
             generation_anchor_prompt_ids_.clear();
             generation_token_ids_.clear();
             last_decode_mode_ = ForegroundDecodeMode::None;
@@ -953,6 +959,12 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         return false;
     }
 
+    const auto model_started = std::chrono::steady_clock::now();
+    auto elapsed_ms = [](std::chrono::steady_clock::time_point start) -> long long {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+    };
+
     Context* context = vlm_slot_->context();
     Tokenizer* tokenizer = vlm_slot_->tokenizer();
     IModelBackend* backend = vlm_slot_->backend();
@@ -972,6 +984,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         : (use_chat_template
             ? build_alia_chat_prompt(tokenizer, foreground_system_prompt(), prompt_text)
             : tokenizer->encode(prompt_text));
+    const long long prompt_build_ms = elapsed_ms(model_started);
     if (prompt_ids.empty()) {
         last_error_ = use_chat_template
             ? "foreground VLM prompt encoded to zero tokens"
@@ -988,6 +1001,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     }
 
     int prompt_tokens_to_forward = 0;
+    int effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
+    long long prompt_prefill_ms = -1;
     Tensor* logits = nullptr;
     {
         auto lane_lock = context->lock_execution();
@@ -1007,6 +1022,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         const int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
         prompt_tokens_to_forward =
             static_cast<int>(prompt_ids.size()) - prefilled_prompt_tokens;
+        effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
         if (max_seq_len > 0 &&
             context_len_before_prompt + prompt_tokens_to_forward +
                 config.max_new_tokens > max_seq_len) {
@@ -1025,8 +1041,10 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         context->memcpy_h2d(prompt_device.as<int>(),
                             prompt_ids.data() + prefilled_prompt_tokens,
                             prompt_tokens_to_forward * sizeof(int));
+        const auto prompt_prefill_started = std::chrono::steady_clock::now();
         logits = &backend->forward(*context, prompt_device.as<int>(),
                                    prompt_tokens_to_forward);
+        prompt_prefill_ms = elapsed_ms(prompt_prefill_started);
     }
 
     if (record_generation_anchor) {
@@ -1047,6 +1065,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     std::string raw_stream_text;
     std::string pending_tts_text;
     bool paused_on_tool_call = false;
+    long long first_token_delta_ms = -1;
+    const auto decode_started = std::chrono::steady_clock::now();
     auto flush_tts = [&](bool force) {
         if (!tts_pipeline_ || !audio_cb || !tts_config) {
             return;
@@ -1084,6 +1104,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             break;
         }
 
+        if (first_token_delta_ms < 0) {
+            first_token_delta_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - turn_start).count();
+        }
         generated_ids.push_back(next_token);
         const std::string token_text = tokenizer->decode(next_token);
         raw_stream_text += token_text;
@@ -1146,12 +1171,24 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         flush_tts(true);
     }
 
+    const long long decode_ms = elapsed_ms(decode_started);
     assistant_text = tokenizer->decode(generated_ids);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (record_generation_anchor) {
             last_generated_token_count_ = static_cast<int>(generated_ids.size());
             generation_token_ids_ = generated_ids;
+            metrics_.prompt_tokens = static_cast<int>(prompt_ids.size());
+            metrics_.prefilled_prompt_tokens = effective_prefilled_prompt_tokens;
+            metrics_.prompt_suffix_tokens = prompt_tokens_to_forward;
+            metrics_.generated_tokens = static_cast<int>(generated_ids.size());
+            metrics_.prompt_build_ms = prompt_build_ms;
+            metrics_.prompt_prefill_ms = prompt_prefill_ms;
+            metrics_.first_token_delta_ms = first_token_delta_ms;
+            metrics_.first_content_delta_ms = last_first_content_delta_ms_;
+            metrics_.first_tts_enqueue_ms = last_first_tts_enqueue_ms_;
+            metrics_.decode_ms = decode_ms;
+            metrics_.model_ms = elapsed_ms(model_started);
         } else {
             last_generated_token_count_ += prompt_tokens_to_forward +
                                            static_cast<int>(generated_ids.size());

@@ -721,6 +721,8 @@ int main(int argc, char** argv) {
         ctx->foreground_pipeline->last_first_content_delta_ms();
     const long long foreground_first_tts_enqueue_ms =
         ctx->foreground_pipeline->last_first_tts_enqueue_ms();
+    const aila::alia::AliaForegroundMetrics foreground_metrics =
+        ctx->foreground_pipeline->last_metrics();
     const double simulated_vad_to_first_content_ms =
         foreground_first_content_delta_ms >= 0
             ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_content_delta_ms)
@@ -746,6 +748,28 @@ int main(int argc, char** argv) {
               << foreground_first_content_delta_ms << "\n"
               << "foreground_first_tts_enqueue_ms="
               << foreground_first_tts_enqueue_ms << "\n"
+              << "foreground_profile_prompt_tokens="
+              << foreground_metrics.prompt_tokens << "\n"
+              << "foreground_profile_prefilled_prompt_tokens="
+              << foreground_metrics.prefilled_prompt_tokens << "\n"
+              << "foreground_profile_prompt_suffix_tokens="
+              << foreground_metrics.prompt_suffix_tokens << "\n"
+              << "foreground_profile_generated_tokens="
+              << foreground_metrics.generated_tokens << "\n"
+              << "foreground_profile_prompt_build_ms="
+              << foreground_metrics.prompt_build_ms << "\n"
+              << "foreground_profile_prompt_prefill_ms="
+              << foreground_metrics.prompt_prefill_ms << "\n"
+              << "foreground_profile_first_token_delta_ms="
+              << foreground_metrics.first_token_delta_ms << "\n"
+              << "foreground_profile_first_content_delta_ms="
+              << foreground_metrics.first_content_delta_ms << "\n"
+              << "foreground_profile_first_tts_enqueue_ms="
+              << foreground_metrics.first_tts_enqueue_ms << "\n"
+              << "foreground_profile_decode_ms="
+              << foreground_metrics.decode_ms << "\n"
+              << "foreground_profile_model_ms="
+              << foreground_metrics.model_ms << "\n"
               << "simulated_vad_asr_tail_ms=" << simulated_vad_asr_tail_ms << "\n"
               << "simulated_vad_to_first_content_ms="
               << simulated_vad_to_first_content_ms << "\n"

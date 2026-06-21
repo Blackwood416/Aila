@@ -35,6 +35,20 @@ enum class ForegroundTurnState {
     Failed
 };
 
+struct AliaForegroundMetrics {
+    int prompt_tokens = 0;
+    int prefilled_prompt_tokens = 0;
+    int prompt_suffix_tokens = 0;
+    int generated_tokens = 0;
+    long long prompt_build_ms = -1;
+    long long prompt_prefill_ms = -1;
+    long long first_token_delta_ms = -1;
+    long long first_content_delta_ms = -1;
+    long long first_tts_enqueue_ms = -1;
+    long long decode_ms = -1;
+    long long model_ms = -1;
+};
+
 class AliaForegroundPipeline {
 public:
     AliaForegroundPipeline(ModelSlot* vlm_slot,
@@ -69,6 +83,7 @@ public:
     long long last_asr_prefill_ms() const;
     long long last_first_content_delta_ms() const;
     long long last_first_tts_enqueue_ms() const;
+    AliaForegroundMetrics last_metrics() const;
     const std::string& last_error() const { return last_error_; }
 
 private:
@@ -119,6 +134,7 @@ private:
     int last_generated_token_count_ = 0;
     long long last_first_content_delta_ms_ = -1;
     long long last_first_tts_enqueue_ms_ = -1;
+    AliaForegroundMetrics metrics_;
     std::vector<int> generation_anchor_prompt_ids_;
     std::vector<int> generation_token_ids_;
     std::vector<int> asr_prefill_prompt_ids_;

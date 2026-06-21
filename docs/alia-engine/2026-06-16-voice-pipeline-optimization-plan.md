@@ -805,3 +805,72 @@ Implementation:
 - Smoke/matrix logs now include
   `foreground_asr_prefill_reused_tokens` and
   `foreground_asr_prefill_suffix_tokens`.
+
+## 2026-06-21 Foreground First-Content Profile Probe
+
+Added foreground-stage metrics to the real smoke and matrix logs so future
+TTFA work can separate VLM prompt construction, cached-prefix reuse, suffix
+prefill, first token, first content, and decode drain time:
+
+- `foreground_profile_prompt_tokens`
+- `foreground_profile_prefilled_prompt_tokens`
+- `foreground_profile_prompt_suffix_tokens`
+- `foreground_profile_generated_tokens`
+- `foreground_profile_prompt_build_ms`
+- `foreground_profile_prompt_prefill_ms`
+- `foreground_profile_first_token_delta_ms`
+- `foreground_profile_first_content_delta_ms`
+- `foreground_profile_first_tts_enqueue_ms`
+- `foreground_profile_decode_ms`
+- `foreground_profile_model_ms`
+
+The metrics are wall-clock timings on the real product path and do not insert
+extra GPU synchronizations. They are meant to explain TTFA behavior without
+turning the profile itself into a new latency regression.
+
+Short no-stream smoke (`short_hello_request.wav`) showed the baseline
+foreground cost clearly:
+
+```text
+foreground_profile_prompt_tokens=120
+foreground_profile_prefilled_prompt_tokens=0
+foreground_profile_prompt_suffix_tokens=120
+foreground_profile_prompt_prefill_ms=3279
+foreground_profile_first_token_delta_ms=3294
+foreground_profile_first_content_delta_ms=3294
+foreground_profile_decode_ms=573
+foreground_profile_model_ms=3860
+```
+
+With 3s ASR streaming prefill, the same short scenario reused 79 prompt tokens
+and only forwarded the final 41-token chat suffix during `start_turn`:
+
+```text
+foreground_profile_prefilled_prompt_tokens=79
+foreground_profile_prompt_suffix_tokens=41
+foreground_profile_prompt_prefill_ms=347
+foreground_profile_first_token_delta_ms=355
+foreground_profile_first_content_delta_ms=355
+foreground_profile_model_ms=1289
+```
+
+3s streaming-prefill matrix:
+
+```text
+scenario          prefilled  suffix  suffix_prefill_ms  first_token_ms  first_tts_enqueue_ms  vad_tail_ms  vad_to_first_content_ms  vad_to_first_audio_ms
+short_hello       79         41      348                356             603                   3823         4179                     5153
+persona_chat      82         41      349                356             823                   3515         3871                     5532
+preference_memory 82         41      350                357             853                   3709         4067                     5875
+task_memory       81         41      347                355             745                   4007         4362                     5671
+long_answer       84         41      347                355             641                   2916         3271                     4865
+```
+
+Interpretation:
+
+- The VLM-side streaming prefill path is doing its job: foreground turn-time
+  prompt work is consistently reduced from the full 120-token prompt to a
+  41-token suffix, and first content lands around 355ms.
+- The remaining simulated TTFA is dominated by ASR partial cadence/recompute
+  tail and TTS first-audio variance, not foreground first token generation.
+- The next optimization should therefore return to ASR streaming partial cost
+  and cadence, while preserving the VLM suffix-prefill contract measured here.
