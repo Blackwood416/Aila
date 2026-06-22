@@ -1,0 +1,876 @@
+# Voice Pipeline Optimization Plan
+
+> For agentic workers: execute this plan task-by-task against the Alia custom
+> branch. Keep verification on real models; do not reintroduce API-only unit
+> tests or generic engine paths.
+
+**Goal:** Improve the fixed Alia voice pipeline from real user speech input to
+first TTS audio callback, while preserving identity LoRA behavior and background
+memory extraction.
+
+**Architecture:** Keep the product path fixed to Qwen3-ASR 1.7B NF4,
+Qwen3.5 4B NF4 visiondense + identity LoRA, Qwen3.5 0.8B NF4 background, and
+Qwen3-TTS 0.6B BF16. Use real scenario smoke runs to measure stage latency and
+quality, then optimize the slow foreground/TTS overlap and TTS first-audio path.
+
+**Tech Stack:** C++17, SYCL/oneAPI, oneDNN, PowerShell smoke runners, real model
+assets under `models/`, identity LoRA under
+`F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400`.
+
+---
+
+## Current Baseline
+
+Latest product smoke (`tmp\alia-real-smoke\alia_full_pipeline_clean.log`) passed
+with:
+
+- ASR: `1634ms`
+- foreground 4B + LoRA + streamed TTS turn: `11220ms`
+- first audio callback from turn start: `7559ms`
+- TTS callbacks: `8`
+- background 0.8B extraction: `1515ms`
+- tool probe: `1874ms`
+
+The branch is functionally alive, but the PRD target is much more aggressive:
+VAD fall to first audio should approach `400ms` in the final product. The first
+optimization phase is therefore about measurement and pipeline overlap, not
+Computer Use or visual input.
+
+## Scenario Matrix
+
+Use these fixed text prompts to synthesize request audio through the target TTS,
+feed that audio through ASR, then run foreground/TTS/background:
+
+- `short_hello`: `Alia, please say hello in one short sentence.`
+- `persona_chat`: `Alia, I feel tired today. Say something gentle and brief.`
+- `preference_memory`: `Alia, please remember that I prefer short Chinese replies at night.`
+- `task_memory`: `Alia, remind me later to stretch my shoulders after work.`
+- `long_answer`: `Alia, explain in three short sentences how you will help me focus tonight.`
+
+Each run must write:
+
+- a request wav
+- an output wav
+- a full log
+- one CSV row containing stage metrics and validation flags
+
+The voice matrix is for ASR -> foreground -> TTS -> background timing and
+quality. It skips the dedicated LoRA tool probe by default so tool-call
+stochasticity does not hide voice pipeline regressions. The full target smoke
+still runs the tool probe unless `-SkipToolProbe` is explicitly passed.
+
+## Task 1: Build Real Scenario Matrix Runner
+
+**Files:**
+
+- Create: `tools/alia/RunAliaVoiceScenarioMatrix.ps1`
+- Modify: `tools/alia/RunAliaTargetPipeline.ps1`
+- Verify with: `tools/alia/RunAliaVoiceScenarioMatrix.ps1 -SkipBuild`
+
+Steps:
+
+- Add a PowerShell matrix runner that builds once, invokes
+  `RunAliaTargetPipeline.ps1` once per scenario, and writes
+  `tmp\alia-real-smoke\voice_matrix\summary.csv`.
+- Parse key-value log lines for `model_load_ms`, `asr_ms`, `foreground_ms`,
+  `foreground_prompt_tokens`, `foreground_generated_tokens`,
+  `foreground_first_content_delta_ms`, `foreground_first_tts_enqueue_ms`,
+  `tts_first_audio_ms`, `tts_callback_count`, `tts_total_samples`,
+  `background_ms`, `background_schema_valid`, `tool_probe_enabled`,
+  `tool_probe_ms`, and pass/fail.
+- Keep every scenario on the fixed model set and identity LoRA.
+
+## Task 2: Add Foreground/TTS Timing Markers
+
+**Files:**
+
+- Modify: `src/alia/AliaForegroundPipeline.hpp`
+- Modify: `src/alia/AliaForegroundPipeline.cpp`
+- Modify: `tools/alia/AliaRealModelSmoke.cpp`
+
+Steps:
+
+- Record elapsed milliseconds from foreground turn start to first decoded
+  content delta.
+- Record elapsed milliseconds from foreground turn start to first TTS enqueue.
+- Record prompt token count and generated token count for the main foreground
+  turn.
+- Print these metrics in `AilaAliaRealSmoke`.
+
+## Task 3: Measure Before Optimizing
+
+**Files:**
+
+- Modify: `docs/alia-engine/2026-06-12-alia-engine-branch-status.md`
+
+Steps:
+
+- Run the full matrix once.
+- Save the command and summary CSV path in the status document.
+- Identify the top two bottlenecks from real data.
+
+## Task 4: Optimize TTS First Audio
+
+**Files:**
+
+- Modify: `src/alia/AliaForegroundPipeline.cpp`
+- Modify: `src/alia/AliaTtsPipeline.cpp`
+- Inspect: `src/models/Qwen3TTSBackend.cpp`
+
+Steps:
+
+- Use Task 2 markers to distinguish VLM text delay from TTS synthesis delay.
+- If TTS enqueue is early but first audio is late, reduce repeated TTS setup or
+  prefill work on the fixed Qwen3-TTS path.
+- If TTS enqueue is late, make the foreground chunk boundary more aggressive for
+  short Chinese/persona replies without sending malformed text to TTS.
+
+## Task 4A: Overlap Foreground Decode and TTS Synthesis
+
+**Files:**
+
+- Modify: `src/alia/AliaForegroundPipeline.cpp`
+- Modify: `src/alia/AliaTtsPipeline.hpp`
+- Modify: `src/alia/AliaTtsPipeline.cpp`
+- Modify: `src/models/IModelBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+- Modify: `tools/alia/AliaRealModelSmoke.cpp`
+- Modify: `tools/alia/RunAliaVoiceScenarioMatrix.ps1`
+
+Steps:
+
+- Record first-chunk TTS backend timing separately from host callback timing:
+  codec generation, Mimi init, first audio, total backend time, frames, callback
+  count, and first audio sample count.
+- Start a per-turn TTS worker before foreground decode, enqueue spoken chunks
+  from the decode loop, and drain the worker before background extraction.
+- Keep the synchronous `synthesize_pending` path for request-audio generation.
+- Use UTF-8-safe chunk boundaries for ASCII and CJK sentence punctuation.
+- Guard asynchronous worker cleanup across normal returns, failures, aborts, and
+  exceptions.
+
+## Task 4B: Stream Codec Frames Into Mimi
+
+**Files:**
+
+- Modify: `src/models/Qwen3TTSBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+
+Steps:
+
+- Keep the existing `synthesize_codes` API usable for full-code generation.
+- Add an optional codec-frame callback to the existing Qwen3-TTS generation
+  loop so generated frames can be consumed before the whole utterance finishes.
+- Initialize Mimi before codec generation in `synthesize_codes_stream`.
+- Feed each completed codec frame batch directly into `decode_mimi_incremental`.
+- Preserve cancellation checks before codec generation, inside predictor/talker
+  loops, before Mimi decode, and before host audio callbacks.
+
+## Task 4C: Tune TTS Stream Batch Schedule
+
+**Files:**
+
+- Modify: `src/alia/AliaTtsPipeline.cpp`
+- Modify: `src/models/Qwen3TTSBackend.hpp`
+- Modify: `src/models/Qwen3TTSBackend.cpp`
+
+Steps:
+
+- Use uniform `12`-frame Mimi batches for the product path so the first emitted
+  audio buffer is long enough to cover likely generation time for the next
+  batch.
+- Keep smaller first-batch experiments out of the product path unless paired
+  with playback-aware buffering that can prove no under-run.
+- Preserve the full-code generation API and default behavior for non-streaming
+  callers.
+
+## Task 5: Optimize Foreground Prompt/Decode
+
+**Files:**
+
+- Modify: `src/alia/AliaForegroundPipeline.cpp`
+- Inspect: `src/models/Qwen35HybridBnb4Backend.cpp`
+
+Steps:
+
+- Keep the identity LoRA enabled.
+- Reduce unnecessary prompt tokens in the foreground system prompt while keeping
+  tool-call behavior covered by smoke.
+- Use existing Qwen3.5 profile flags only after the scenario matrix shows VLM
+  decode or prefill is the dominant bottleneck.
+
+## Task 6: Background Isolation Check
+
+**Files:**
+
+- Modify: `tools/alia/AliaRealModelSmoke.cpp`
+- Modify: `tools/alia/RunAliaVoiceScenarioMatrix.ps1`
+
+Steps:
+
+- Add a scenario mode that starts background extraction while a subsequent
+  foreground turn begins.
+- Verify foreground first-audio metrics do not regress under background load.
+
+## Verification Commands
+
+```powershell
+. .\perf\PerfCommon.ps1
+Initialize-AilaOneApiEnvironment
+cmake -S . -B build
+cmake --build build --target AliaEngine --config Release
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild
+git diff --check
+```
+
+Success requires:
+
+- Every matrix scenario exits with `ALIA_REAL_MODEL_SMOKE_PASS`.
+- Every run uses the target four-model set and applies 32 foreground LoRA pairs.
+- The matrix keeps `tool_probe=false` by default; run
+  `.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild` for the real
+  `inspect_window` tool probe.
+- Summary CSV is written with numeric timing data.
+
+## 2026-06-16 Measurement Update
+
+After adding the timing markers and ordinary-turn structured-artifact guard,
+the voice matrix passed:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  foreground_ms
+short_hello       1589    3626              3794                  5692            9477
+persona_chat      1716    3714              3803                  4955            13959
+preference_memory 1784    3704              4261                  8008            14637
+task_memory       1679    3670              4257                  8034            14702
+long_answer       1769    3790              4125                  5510            12024
+```
+
+Summary CSV:
+`tmp\alia-real-smoke\voice_matrix\summary.csv`.
+
+Initial bottleneck split:
+
+- The foreground 4B path needs about `3.6s` to `3.8s` before the first
+  content delta on these real scenarios.
+- TTS receives the first chunk around `3.8s` to `4.3s`, but first audio arrives
+  at `5.0s` to `8.0s`, so TTS first-chunk synthesis still adds roughly `1.2s`
+  to `3.8s`.
+
+## 2026-06-16 Async TTS Update
+
+After adding UTF-8 chunk boundaries, first-chunk backend metrics, and a
+per-turn asynchronous TTS worker, the voice matrix passed again:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  tts_first_codes_ms  tts_first_audio_backend_ms  tts_backend_total_ms  foreground_ms
+short_hello       1710    3760              4073                  7402            3176.86             3328.15                     14712.7               18790
+persona_chat      1829    3870              3960                  5848            1739.50             1887.76                     12124.9               16088
+preference_memory 1784    3697              4248                  7522            3125.40             3273.52                     7898.39               12149
+task_memory       1698    3642              3900                  7022            2976.00             3120.76                     18040.5               21944
+long_answer       1780    3798              4137                  6854            2568.91             2716.31                     25685.1               29826
+```
+
+Summary CSV:
+`tmp\alia-real-smoke\voice_matrix\summary.csv`.
+
+Interpretation:
+
+- Foreground decode now overlaps TTS synthesis, so VLM sampling no longer
+  blocks on each completed spoken chunk.
+- `foreground_ms` still includes final TTS drain by design because the smoke
+  waits for full speech before background extraction.
+- Mimi stream initialization is not the first-audio bottleneck; it is about
+  `3ms` on the measured runs.
+- First audio is dominated by full first-chunk codec generation before Mimi can
+  emit samples. The next high-value optimization is real codec-token streaming
+  into Mimi, or an equivalent first-batch path that does not wait for all frames
+  of the chunk.
+
+## 2026-06-16 Codec Frame Streaming Update
+
+After adding the codec-frame callback and feeding generated frame batches into
+Mimi during Qwen3-TTS generation, the voice matrix passed again:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  tts_backend_total_ms  foreground_ms
+short_hello       1699    3714              3971                  4617            502.655         645.291                 6336.79                 10539.7               14514
+persona_chat      1807    3869              4155                  5032            718.912         876.405                 5701.58                 12819.8               16978
+preference_memory 1819    3690              3776                  4849            927.459         1073.02                 2786.95                 20506.9               24287
+task_memory       1735    3632              3885                  5218            1184.03         1332.59                 6238.73                 28728.4               32618
+long_answer       1783    3738              4174                  5262            933.657         1086.64                 9428.29                 18816.4               22994
+```
+
+Summary CSV:
+`tmp\alia-real-smoke\voice_matrix\summary.csv`.
+
+Interpretation:
+
+- First audio moved from the previous `5.8s` to `7.5s` range into roughly
+  `4.6s` to `5.3s` across the matrix.
+- First codec batch readiness moved from full-chunk generation (`1.7s` to
+  `3.2s`) to frame-batch generation (`0.5s` to `1.2s`).
+- The next bottleneck is Mimi incremental decode efficiency. It is incremental
+  at the API boundary, but currently recomputes full-history pre-transformer
+  and conv stages per batch, so long answers still have high total TTS drain.
+- Foreground first content remains about `3.6s` to `3.9s`, so further
+  end-to-end TTFA work needs both foreground first-token profiling and Mimi
+  incremental-state optimization.
+
+## 2026-06-16 TTS Batch Schedule Update
+
+After adding a two-stage stream schedule, the voice matrix passed again, but
+the strategy was rejected for product playback. A `3`-frame first batch lowers
+the first callback timestamp, yet it also makes the first audio buffer short
+enough that playback can drain before the second batch is generated. The Alia
+product path therefore returned to uniform `12`-frame batches:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  tts_backend_total_ms  foreground_ms
+short_hello       1691    3697              3838                  4944            996.176         1105.24                 2907.38                 15287.7               19130
+persona_chat      1823    3853              4219                  4517            194.839         298.012                 8331.75                 8331.75               12553
+preference_memory 1781    3856              4463                  4766            195.586         302.900                 6833.15                 6833.15               11299
+task_memory       1725    3791              4052                  5103            946.233         1049.55                 5483.24                 19418.3               23475
+long_answer       1758    3827              4164                  4601            333.946         436.832                 3701.61                 4834.66               9002
+```
+
+Rejected two-stage run:
+
+- Single-chunk replies now show first backend audio around `300ms` to `440ms`
+  after TTS starts, while multi-chunk replies still depend on the first spoken
+  chunk shape.
+- Steady-state batching reduces Mimi call count on longer chunks, improving
+  total backend drain compared with the previous fixed `6`-frame schedule.
+- The remaining hard floor is still foreground first content at roughly
+  `3.7s` to `3.9s`; TTS can now often be ready soon after the first chunk is
+  enqueued.
+
+Current uniform-batch verification:
+
+```text
+scenario          asr_ms  first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_codes_ms  first_backend_audio_ms  tts_backend_total_ms  foreground_ms
+short_hello       1648    3584              3842                  4948            850.632         1105.47                 8100.67               11946
+persona_chat      1752    3656              3927                  5155            992.303         1228.05                 9086.63               13017
+preference_memory 1720    3712              4247                  5186            689.095         938.956                 6031.53               10281
+task_memory       1817    3658              3917                  5169            1002.79         1251.63                 12178.2               16098
+long_answer       1693    3731              4090                  5406            1065.10         1315.44                 10229.3               14322
+```
+
+Interpretation:
+
+- The first callback is later than the rejected `3`-frame first-batch run, but
+  now contains `23040` samples, which gives playback materially more buffer.
+- This is a continuity-first schedule. Further latency work should target true
+  Mimi incremental-state efficiency and playback-aware buffering instead of
+  shortening only the first chunk.
+
+## 2026-06-16 TTS Inner-Loop TTFA Update
+
+The next pass kept the uniform `12`-frame first audio buffer and attacked
+codec-generation overhead directly:
+
+- Added a tiny codec decode warmup during Qwen3-TTS load, after fixed embeddings
+  are precomputed, to exercise predictor/talker decode kernels before the first
+  product utterance.
+- Reused fixed-shape decode tensors in `synthesize_codes` instead of allocating
+  them for every codec frame and codebook step.
+- Kept trailing text hidden states on GPU and added them directly in the frame
+  loop, removing small CPU round trips and synchronization points.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_samples  first_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3646              3897                  4938            19                 44            23040          796.032         1040.16                 7811.55
+persona_chat      3714              3987                  5189            19                 39            23040          969.469         1201.37                 9195.24
+preference_memory 3547              3919                  5288            23                 43            23040          1132.98         1368.79                 9365.56
+task_memory       3498              3746                  5524            18                 42            23040          1543.68         1777.94                 21246
+long_answer       3583              4004                  5288            24                 56            23040          1051.66         1283.34                 10555.4
+```
+
+Interpretation:
+
+- `short_hello` is the closest apples-to-apples comparison with the previous
+  uniform-batch matrix: first backend audio moved from about `1105ms` to
+  `1040ms` while the first callback stayed at `23040` samples.
+- The main TTS-side TTFA ceiling is still first-chunk codec generation, not
+  Mimi init. Next work should profile predictor/talker decode per substage and
+  reduce first spoken chunk shape without reducing playback buffer duration.
+- Identity LoRA tool-call misses are recorded as a foreground TODO and should
+  not gate TTS TTFA optimization.
+
+## 2026-06-16 TTS Wait Cleanup Update
+
+This pass kept the uniform `12`-frame callback contract and removed host-side
+blocking from low-risk in-order queue paths inside `synthesize_codes`:
+
+- Device-to-device copies for predictor inputs, hidden slots, and
+  `past_hidden_talker` are now queued without immediate host waits.
+- Talker-frame embedding accumulation no longer waits after every vector add.
+- The 16 generated code ids for talker decode are uploaded as one frame array,
+  and sampled predictor tokens use a stable host upload buffer so the queue can
+  consume them asynchronously.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3830              4099                  5065            19                 44            703.279         965.217                 7296.87
+persona_chat      3930              4299                  5125            21                 64            562.527         825.118                 7156.94
+preference_memory 3951              4123                  5049            14                 23            664.119         925.609                 5111.15
+task_memory       3929              4192                  5307            18                 42            854.988         1115.02                 11370.3
+long_answer       4142              4326                  5559            15                 22            966.582         1231.96                 7603.42
+```
+
+Interpretation:
+
+- The change is intentionally conservative: it reduces unnecessary host
+  synchronization while keeping sampling semantics, first audio size, and the
+  streaming callback contract unchanged.
+- A device-sampling experiment was tried and rejected for this pass. It passed
+  smoke, but changed sampled text/chunk shapes enough that matrix TTFA was not
+  reliably better. Revisit only with a tighter deterministic comparison or a
+  TTS-specific sampling contract.
+- Next high-value TTS work is still true Mimi incremental-state efficiency and
+  predictor/talker substage profiling, not shrinking the first audio chunk.
+
+## 2026-06-16 Mimi Streaming Decode Update
+
+This pass kept the uniform `12`-frame first audio callback and reduced overhead
+inside Mimi streaming decode:
+
+- Cached fixed Mimi `Linear` wrappers at vocoder load time instead of rebuilding
+  them inside every full/incremental decode call. Persistent reshape views are
+  kept for the VQ output projection weights so cached wrappers do not point at
+  temporary tensors.
+- Replaced the incremental pre-transformer's full-history K/V cache copy with
+  direct prefill attention. The path already recomputes full-history Q/K/V, so
+  copying all K/V into a stream cache before attention only added many small
+  queued copies.
+- Removed now-unused Mimi stream K/V/pre-conv cache allocations after direct
+  prefill made those buffers dead state.
+- Added `AILA_TTS_PROFILE=1` breakdowns for incremental VQ/projection,
+  pre-conv, pre-transformer, conv/readback, and total Mimi chunk time.
+
+Profile check on `short_hello`:
+
+```text
+first 12-frame Mimi chunk before direct prefill:
+  VQ+proj 1.8 ms, pre-conv 0.4 ms, pre-transformer 76.8 ms,
+  conv/readback 164.9 ms, total 244.1 ms
+
+first 12-frame Mimi chunk after direct prefill:
+  VQ+proj 2.1 ms, pre-conv 0.2 ms, pre-transformer 27.8 ms,
+  conv/readback 166.1 ms, total 196.3 ms
+```
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500
+```
+
+```text
+scenario          first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_text_tokens  first_frames  first_samples  first_codes_ms  mimi_init_ms  first_backend_audio_ms  backend_total_ms
+short_hello       3656              3911                  5100            19                 46            23040          999.592         0.0092        1188.63                 9129.08
+persona_chat      3771              4052                  5115            19                 39            23040          868.054         0.0098        1062.41                 7358.56
+preference_memory 3745              4028                  5464            19                 30            23040          1238.77         0.0106        1435.22                 11370.6
+task_memory       3735              3991                  5391            18                 42            23040          1207.64         0.0098        1398.91                 12129.2
+long_answer       3831              4269                  5792            24                 27            23040          1333.83         0.0083        1522.89                 9919.51
+```
+
+Interpretation:
+
+- The fixed first audio buffer stayed at `23040` samples in every scenario.
+- Removing unused stream K/V/pre-conv allocations reduced measured Mimi stream
+  init from roughly `5ms` to near-zero.
+- The profile run shows a real Mimi pre-transformer reduction, but the final
+  full matrix is not an end-to-end TTFA win because this sampled run produced
+  heavier first chunks and larger codec generation times. The pipeline remains
+  functionally healthy, and the fixed first audio callback contract is intact.
+- The remaining Mimi-side first-chunk cost is now mostly conv/readback
+  (`~160ms` for the 12-frame first batch). Deeper conv-stage synchronization
+  cleanup is possible, but should be done with care because the current code
+  relies on local tensor lifetimes around queued device work.
+
+## Next TODO: ASR Partial-to-VLM Prefill
+
+Pause deeper TTS surgery unless profiling shows a clear low-risk win. Qwen3-TTS
+has nested transformer generation, so codec sampling speed will naturally vary
+with first spoken chunk shape. The current TTS path is good enough to shift the
+main TTFA effort to ASR/VLM overlap.
+
+High-value next step:
+
+- Use ASR streaming `stable_text` / `partial_text` to start foreground VLM
+  prefill before the ASR utterance is fully finalized.
+- Maintain a foreground prefill state keyed by the stable ASR prefix. Stable
+  text can be committed into the VLM prompt/KV state; partial text can be
+  speculatively prefed only if the implementation can discard or rewind it when
+  ASR revises the suffix.
+- Keep the handoff stateful rather than repeatedly rebuilding the full
+  foreground prompt. The expected TTFA gain comes from overlapping ASR decode
+  tail time with VLM prompt prefill.
+- First implementation should only bridge ASR -> foreground text prefill.
+  Computer Use, visual input, and tool-call execution remain TODOs outside this
+  phase.
+- Verify with the real voice matrix, comparing `asr_ms`,
+  `foreground_first_content_delta_ms`, `foreground_first_tts_enqueue_ms`, and
+  `tts_first_audio_ms`. Do not replace this with API-only unit tests.
+
+## 2026-06-16 ASR Partial-to-VLM Prefill Prototype
+
+First prototype implemented an opt-in ASR/VLM overlap path:
+
+- Added `alia_vlm_prefill_asr_text(stable, partial)` for the Alia product API.
+- Foreground VLM now supports speculative prompt-prefix prefill from
+  `stable_text + partial_text`. The prefetched prefix is validated against the
+  final full prompt before generation; if ASR revised the prefix, generation
+  falls back to a full prompt prefill.
+- The prefill path only commits a token prefix of the final ChatML prompt and
+  leaves a suffix guard so turn start can still forward at least one prompt
+  token and obtain logits.
+- `RunAliaTargetPipeline.ps1 -StreamAsrPrefill` feeds ASR in chunks and calls
+  the VLM prefill hook after each ASR update. The default matrix path remains
+  unchanged unless this flag is set.
+
+Verification:
+
+```powershell
+.\tools\alia\RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio `
+  -SkipToolProbe -StreamAsrPrefill `
+  -AudioPath 'tmp\alia-real-smoke\voice_matrix\short_hello_request.wav' `
+  -OutputWav 'tmp\alia-real-smoke\alia_asr_prefill_short.wav' `
+  -LogPath 'tmp\alia-real-smoke\alia_asr_prefill_short.log' `
+  -RequestText 'Alia, please say hello in one short sentence.' `
+  -MaxTokens 48 -TimeoutSec 1500
+```
+
+```text
+asr_ms=6875
+asr_stream_prefill_enabled=true
+asr_stream_prefill_calls=4
+foreground_prompt_tokens=120
+foreground_asr_prefill_tokens=79
+foreground_asr_prefill_ms=330
+foreground_first_content_delta_ms=920
+foreground_first_tts_enqueue_ms=1306
+tts_first_audio_ms=2240
+```
+
+Default path sanity check:
+
+```text
+asr_stream_prefill_enabled=false
+foreground_asr_prefill_tokens=0
+foreground_first_content_delta_ms=3459
+foreground_first_tts_enqueue_ms=3818
+tts_first_audio_ms=4691
+```
+
+Interpretation:
+
+- The prototype proves the desired state handoff: most foreground prompt
+  prefill can be completed before `alia_start_conversation_turn`.
+- The smoke runner is still sequential, so `asr_ms` grows because it repeatedly
+  invokes ASR partial transcription after each chunk. In the product, these
+  prefill calls should run during live capture / ASR tail time, not after the
+  whole utterance is already available.
+- Next step is a more realistic streaming harness that records wall-clock from
+  simulated VAD fall while feeding chunks over time, and then a matrix run with
+  `-StreamAsrPrefill` once the harness reflects product overlap.
+
+## 2026-06-16 ASR/VLM Live-Stream Harness Update
+
+The ASR prefill prototype now has a more useful real-model measurement mode:
+
+- `AliaRealModelSmoke` accepts `--stream-chunk-ms` for the ASR partial cadence
+  used by `--stream-asr-prefill`; the PowerShell wrapper exposes this as
+  `-StreamChunkMs`.
+- The runner still executes deterministically in one process, but it now
+  computes a simulated live timeline: each ASR/prefill operation can start only
+  once its audio chunk would have arrived, and any compute before VAD fall is
+  treated as hidden behind microphone capture.
+- New log fields:
+  - `asr_audio_duration_ms`
+  - `asr_stream_simulated_tail_ms`
+  - `simulated_vad_asr_tail_ms`
+  - `simulated_vad_to_first_content_ms`
+  - `simulated_vad_to_first_tts_enqueue_ms`
+  - `simulated_vad_to_first_audio_ms`
+- The default non-streaming path reports `simulated_vad_asr_tail_ms=asr_ms`,
+  making it a conservative VAD-fall baseline where ASR work starts after the
+  utterance is complete.
+
+This is still a harness-level estimate, not a replacement for a real capture
+thread. It is good enough to answer the next product question: whether ASR
+partial text plus VLM prefix prefill materially reduces VAD-fall-to-first-audio
+once capture overlap is accounted for.
+
+Short real-smoke checks with the existing `short_hello_request.wav`:
+
+```text
+mode                  asr_ms  prefill_calls  vad_tail_ms  vad_to_first_content_ms  vad_to_first_audio_ms
+default               943     0              943          4476                     5685
+stream 1000ms chunks  6478    4              3717         4631                     6077
+stream 2000ms chunks  4901    2              3140         4051                     5753
+```
+
+Interpretation:
+
+- Prefix prefill is doing the useful foreground work: streaming runs reduce
+  `foreground_first_content_delta_ms` from roughly `3.5s` to roughly `0.9s`.
+- Running ASR partial after every `1000ms` of audio is too expensive for this
+  implementation and leaves a large simulated VAD tail. `2000ms` cadence is
+  better for first content, but the sampled TTS first chunk still made first
+  audio roughly equal to the default run.
+- A `4000ms` exploratory run is not a good product shape: it effectively waits
+  until the utterance is over before prefill, and in one run produced a long
+  max-token foreground output followed by a background-stage access violation.
+  Keep the next pass focused on partial cadence and ASR compute reuse, not on
+  end-of-utterance-only prefill.
+
+## 2026-06-16 ASR Partial Cache and Cadence Split
+
+Follow-up changes:
+
+- Split streaming audio feed cadence from ASR partial/VLM prefill cadence.
+  `--stream-chunk-ms` controls audio feed size, while
+  `--stream-prefill-interval-ms` controls when the runner calls
+  `alia_asr_get_text` and `alia_vlm_prefill_asr_text`.
+- Added runner counters for `asr_stream_text_calls`,
+  `asr_stream_prefill_calls`, and
+  `asr_stream_prefill_skipped_unchanged`.
+- Cached the last ASR partial result inside `AliaAsrPipeline` when the audio
+  buffer size and stable offset are unchanged. This avoids a duplicate full
+  partial transcription when a streaming prefill pass has already finalized
+  ASR text before `alia_start_conversation_turn`.
+
+Short smoke result on `short_hello_request.wav` with `-StreamAsrPrefill
+-StreamChunkMs 1000 -StreamPrefillIntervalMs 3000`:
+
+```text
+before ASR partial cache:
+foreground_first_content_delta_ms=929
+foreground_first_tts_enqueue_ms=1173
+simulated_vad_to_first_audio_ms=5407
+
+after ASR partial cache:
+foreground_first_content_delta_ms=354
+foreground_first_tts_enqueue_ms=600
+simulated_vad_to_first_audio_ms=4847
+```
+
+Streaming-prefill matrix:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild `
+  -StreamAsrPrefill -StreamChunkMs 1000 -StreamPrefillIntervalMs 3000 `
+  -OutputDir 'tmp\alia-real-smoke\voice_matrix_stream_prefill_3s' `
+  -TimeoutSec 1500
+```
+
+```text
+scenario          asr_ms  text_calls  prefill_calls  vad_tail_ms  fg_first_ms  vad_to_first_content_ms  tts_first_audio_ms  vad_to_first_audio_ms
+short_hello       4526    2           1              3766         349          4115                     1870                5636
+persona_chat      5165    2           2              3283         351          3634                     1719                5002
+preference_memory 5109    2           2              3388         353          3741                     1882                5270
+task_memory       4959    2           2              3798         350          4148                     1692                5490
+long_answer       5159    2           2              2799         347          3146                     2522                5321
+```
+
+Interpretation:
+
+- The foreground part of TTFA is now mostly solved for this prefill path:
+  first content after turn start is around `350ms` across the matrix.
+- The remaining live-simulated gap is dominated by ASR partial recompute tail
+  plus TTS first-chunk variance. The ASR pipeline still transcribes the full
+  non-stable suffix for each partial; the cache only removes repeated work when
+  no new audio has arrived.
+- Next ASR work should target incremental or cadence-aware partial decode:
+  either reuse audio encoder/model work for the growing suffix, or run partial
+  only near likely VAD fall while keeping the last good partial available to
+  the foreground prompt cache.
+
+## 2026-06-17 ASR Tail-Only Partial Experiment
+
+Tested an experimental `AILA_ASR_TAIL_PARTIAL=1` path that tries to avoid
+full suffix recompute by decoding only newly arrived audio after the previous
+partial, using the previous partial text as ASR past text. The implementation
+keeps a guard: if the tail decode does not produce a changed partial, it falls
+back to the full non-stable suffix decode.
+
+Short `short_hello_request.wav` checks:
+
+```text
+mode                         full_decodes  tail_decodes  vad_tail_ms  asr_partial_text
+tail-only without full guard  1             3             2319         "Alia. Please say hello."
+tail-only with full guard     2             2             3643         "Alia, please say hello in one short sentence."
+```
+
+Conclusion:
+
+- Fine audio chunks are still the right product direction, but text-level
+  tail stitching is not reliable enough to enable by default. Without the full
+  guard it can drop the end of the utterance; with the guard it preserves ASR
+  correctness but recovers little latency because it falls back to full suffix
+  decode.
+- `AILA_ASR_TAIL_PARTIAL` is therefore default-off and should stay an
+  experiment only.
+- The next useful ASR optimization is below the text stitching layer: profile
+  and reuse mel/audio encoder work for growing partial suffixes, or add a real
+  ASR decoder prefill/KV reuse path. The existing VLM prefill path is ready to
+  consume finer ASR partials once they are cheap enough.
+
+## 2026-06-17 ASR Partial Profile Probe
+
+Added `AILA_ASR_PROFILE=1` stage metrics for each raw ASR segment
+transcription. The smoke logs now include:
+
+- `asr_profile_transcribe_calls`
+- `asr_profile_generated_tokens`
+- `asr_profile_input_audio_ms`
+- `asr_profile_mel_ms`
+- `asr_profile_upload_ms`
+- `asr_profile_encoder_ms`
+- `asr_profile_readback_ms`
+- `asr_profile_prompt_ms`
+- `asr_profile_prefill_ms`
+- `asr_profile_decode_ms`
+- `asr_profile_total_ms`
+
+Short `short_hello_request.wav`, `-StreamAsrPrefill -StreamChunkMs 1000
+-StreamPrefillIntervalMs 1000`, with `AILA_ASR_PROFILE=1`:
+
+```text
+asr_stream_text_calls=4
+asr_partial_full_decode_count=4
+asr_partial_tail_decode_count=0
+asr_profile_transcribe_calls=4
+asr_profile_generated_tokens=44
+asr_profile_input_audio_ms=9760
+asr_profile_mel_ms=429.948
+asr_profile_upload_ms=2.9577
+asr_profile_encoder_ms=260.048
+asr_profile_readback_ms=3.1643
+asr_profile_prompt_ms=4.7312
+asr_profile_prefill_ms=1157.05
+asr_profile_decode_ms=571.751
+asr_profile_total_ms=2429.88
+```
+
+Interpretation:
+
+- The largest measured ASR-internal stage is the text model prompt prefill over
+  the growing audio-token prompt, not the audio encoder.
+- Audio encoder reuse can still help, especially for longer utterances, but it
+  is not the whole TTFA problem for short partials.
+- KV reuse for the ASR text model is awkward with the current prompt shape
+  because new audio tokens are inserted before `<audio_end>`, so the next
+  partial is not a simple token-prefix extension of the previous partial.
+- A promising next design is a streaming-specific ASR prompt contract with a
+  stable append-only prefix, or an audio-token reservation/window scheme that
+  preserves prefix reuse without changing recognized text.
+
+## 2026-06-17 VLM Partial Suffix Recompute Reduction
+
+The safe suffix-reuse target is the foreground VLM ASR-text prefill, not the
+ASR audio-token prompt:
+
+- The ASR audio encoder uses block-wise bidirectional attention
+  (`n_window=50`, `n_window_infer=800`, giving 104 encoder tokens per block).
+  Short utterances are usually inside one bidirectional block, so adding suffix
+  audio can change earlier audio features. Reusing old audio-token KV would not
+  be equivalent to a full ASR recompute.
+- The foreground VLM prefill is text-only and causal, so unchanged token
+  prefixes are safe to reuse.
+
+Implementation:
+
+- `AliaForegroundPipeline::prefill_asr_text` now handles ASR partial text
+  revisions by finding the longest common token prefix between the previous
+  prefill prompt and the new guarded target prompt.
+- If the previous backend context still matches the previous prefill length, it
+  truncates KV to that common prefix and only forwards the changed suffix.
+- Pure append partials keep the existing fast path. Full reset is only used
+  when the backend state cannot be trusted or truncation fails.
+- Smoke/matrix logs now include
+  `foreground_asr_prefill_reused_tokens` and
+  `foreground_asr_prefill_suffix_tokens`.
+
+## 2026-06-21 Foreground First-Content Profile Probe
+
+Added foreground-stage metrics to the real smoke and matrix logs so future
+TTFA work can separate VLM prompt construction, cached-prefix reuse, suffix
+prefill, first token, first content, and decode drain time:
+
+- `foreground_profile_prompt_tokens`
+- `foreground_profile_prefilled_prompt_tokens`
+- `foreground_profile_prompt_suffix_tokens`
+- `foreground_profile_generated_tokens`
+- `foreground_profile_prompt_build_ms`
+- `foreground_profile_prompt_prefill_ms`
+- `foreground_profile_first_token_delta_ms`
+- `foreground_profile_first_content_delta_ms`
+- `foreground_profile_first_tts_enqueue_ms`
+- `foreground_profile_decode_ms`
+- `foreground_profile_model_ms`
+
+The metrics are wall-clock timings on the real product path and do not insert
+extra GPU synchronizations. They are meant to explain TTFA behavior without
+turning the profile itself into a new latency regression.
+
+Short no-stream smoke (`short_hello_request.wav`) showed the baseline
+foreground cost clearly:
+
+```text
+foreground_profile_prompt_tokens=120
+foreground_profile_prefilled_prompt_tokens=0
+foreground_profile_prompt_suffix_tokens=120
+foreground_profile_prompt_prefill_ms=3279
+foreground_profile_first_token_delta_ms=3294
+foreground_profile_first_content_delta_ms=3294
+foreground_profile_decode_ms=573
+foreground_profile_model_ms=3860
+```
+
+With 3s ASR streaming prefill, the same short scenario reused 79 prompt tokens
+and only forwarded the final 41-token chat suffix during `start_turn`:
+
+```text
+foreground_profile_prefilled_prompt_tokens=79
+foreground_profile_prompt_suffix_tokens=41
+foreground_profile_prompt_prefill_ms=347
+foreground_profile_first_token_delta_ms=355
+foreground_profile_first_content_delta_ms=355
+foreground_profile_model_ms=1289
+```
+
+3s streaming-prefill matrix:
+
+```text
+scenario          prefilled  suffix  suffix_prefill_ms  first_token_ms  first_tts_enqueue_ms  vad_tail_ms  vad_to_first_content_ms  vad_to_first_audio_ms
+short_hello       79         41      348                356             603                   3823         4179                     5153
+persona_chat      82         41      349                356             823                   3515         3871                     5532
+preference_memory 82         41      350                357             853                   3709         4067                     5875
+task_memory       81         41      347                355             745                   4007         4362                     5671
+long_answer       84         41      347                355             641                   2916         3271                     4865
+```
+
+Interpretation:
+
+- The VLM-side streaming prefill path is doing its job: foreground turn-time
+  prompt work is consistently reduced from the full 120-token prompt to a
+  41-token suffix, and first content lands around 355ms.
+- The remaining simulated TTFA is dominated by ASR partial cadence/recompute
+  tail and TTS first-audio variance, not foreground first token generation.
+- The next optimization should therefore return to ASR streaming partial cost
+  and cadence, while preserving the VLM suffix-prefill contract measured here.

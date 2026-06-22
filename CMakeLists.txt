@@ -63,8 +63,8 @@ set(JINJA_SOURCES
     src/templates/jinja/value.cpp
 )
 
-# Core library sources (everything except main.cpp and CLI)
-set(LIB_SOURCES
+# Core engine sources shared by the Alia custom runtime and optional tools.
+set(COMMON_ENGINE_SOURCES
     ${CHAT_SOURCES}
     src/ops/Linear.cpp
     src/ops/Bnb4BitLinear.cpp
@@ -101,29 +101,28 @@ set(LIB_SOURCES
     src/audio/GpuSpeakerEncoder.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
-    src/api/aila_api.cpp
     src/lora/LoraLoader.cpp
     src/bench/Benchmark.cpp
 )
 
-# CLI-only sources
-set(CLI_SOURCES
-    src/cli/CLI.cpp
+set(ALIA_ENGINE_SOURCES
+    src/alia/RuntimeContext.cpp
+    src/alia/ModelSlot.cpp
+    src/alia/AliaAsrPipeline.cpp
+    src/alia/AliaTtsPipeline.cpp
+    src/alia/AliaForegroundPipeline.cpp
+    src/alia/AliaBackgroundPipeline.cpp
+    src/alia/AliaContext.cpp
+    src/alia/AliaApi.cpp
 )
 
-# Lightweight chat tests
-set(CHAT_TEST_SOURCES
-    ${CHAT_SOURCES}
-    ${JINJA_SOURCES}
-    tests/chat/ChatTestMain.cpp
-    tests/chat/AssistantOutputParserTests.cpp
-    tests/chat/ChatJsonTests.cpp
-    tests/chat/ChatStreamJsonTests.cpp
-    tests/chat/ChatTemplateEngineTests.cpp
-    tests/chat/ChatFormatterTests.cpp
-    tests/chat/ThinkingBudgetControllerTests.cpp
-    tests/chat/StructuredStreamParserTests.cpp
-    tests/chat/ToolPolicyTests.cpp
+set(LIB_SOURCES
+    ${COMMON_ENGINE_SOURCES}
+    ${ALIA_ENGINE_SOURCES}
+)
+
+set(ALIA_REAL_SMOKE_SOURCES
+    tools/alia/AliaRealModelSmoke.cpp
 )
 
 # Third-party
@@ -184,23 +183,18 @@ target_include_directories(AilaShared PUBLIC
 set_target_properties(AilaShared PROPERTIES OUTPUT_NAME "AilaShared")
 
 # ============================================================
-# Executable: Aila
+# Executable: AilaAliaRealSmoke
 # ============================================================
-add_executable(Aila src/main.cpp ${CLI_SOURCES})
-target_compile_definitions(Aila PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_link_libraries(Aila PRIVATE AilaLib)
-
-# ============================================================
-# Executable: AilaChatTests
-# ============================================================
-add_executable(AilaChatTests ${CHAT_TEST_SOURCES})
-target_compile_definitions(AilaChatTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_include_directories(AilaChatTests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+add_executable(AilaAliaRealSmoke ${ALIA_REAL_SMOKE_SOURCES})
+target_compile_definitions(AilaAliaRealSmoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaRealSmoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(AilaChatTests PRIVATE simdjson)
+target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
+
+add_custom_target(AliaEngine DEPENDS AilaShared)
+add_dependencies(AliaEngine AilaAliaRealSmoke)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
@@ -381,28 +375,36 @@ endif()
         )
     endfunction()
 
-    copy_runtime_dependencies(Aila EXECUTABLE)
+    copy_runtime_dependencies(AilaAliaRealSmoke EXECUTABLE)
     copy_runtime_dependencies(AilaShared LIBRARY)
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
+    set(AILA_RELEASE_TARGETS AilaShared AilaAliaRealSmoke)
+
+    set(AILA_RELEASE_COPY_COMMANDS)
+    foreach(AILA_RELEASE_TARGET IN LISTS AILA_RELEASE_TARGETS)
+        get_target_property(AILA_RELEASE_TARGET_TYPE ${AILA_RELEASE_TARGET} TYPE)
+        if(AILA_RELEASE_TARGET_TYPE STREQUAL "SHARED_LIBRARY")
+            set(AILA_RELEASE_TARGET_KIND LIBRARY)
+        else()
+            set(AILA_RELEASE_TARGET_KIND EXECUTABLE)
+        endif()
+        list(APPEND AILA_RELEASE_COPY_COMMANDS
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${AILA_RELEASE_TARGET}>" "${AILA_RELEASE_BIN_DIR}"
+            COMMAND ${CMAKE_COMMAND}
+                "-DTARGET_PATH=$<TARGET_FILE:${AILA_RELEASE_TARGET}>"
+                "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
+                "-DTARGET_KIND=${AILA_RELEASE_TARGET_KIND}"
+                -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        )
+    endforeach()
 
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_BIN_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_BIN_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
-        COMMAND ${CMAKE_COMMAND}
-            "-DTARGET_PATH=$<TARGET_FILE:Aila>"
-            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
-            "-DTARGET_KIND=EXECUTABLE"
-            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
-        COMMAND ${CMAKE_COMMAND}
-            "-DTARGET_PATH=$<TARGET_FILE:AilaShared>"
-            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
-            "-DTARGET_KIND=LIBRARY"
-            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        ${AILA_RELEASE_COPY_COMMANDS}
         COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )
-    add_dependencies(release Aila AilaShared)
+    add_dependencies(release ${AILA_RELEASE_TARGETS})
 endif()
