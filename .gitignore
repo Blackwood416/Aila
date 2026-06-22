@@ -39,3 +39,6 @@ test_think3.py
 # Claude internal
 .claude/
 .codex/
+
+# local worktrees
+.worktrees/
