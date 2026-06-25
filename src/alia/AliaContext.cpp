@@ -48,8 +48,21 @@ bool AliaContext::load_model_slots() {
         return false;
     };
 
-    return load_slot(asr) &&
-           load_slot(foreground_vlm) &&
-           load_slot(background_vlm) &&
-           load_slot(tts);
+    if (!load_slot(asr) ||
+        !load_slot(foreground_vlm) ||
+        !load_slot(background_vlm) ||
+        !load_slot(tts)) {
+        return false;
+    }
+
+    std::string reference_voice_error;
+    if (tts_pipeline &&
+        !tts_pipeline->preload_reference_voice(&reference_voice_error)) {
+        last_error = reference_voice_error.empty()
+            ? "failed to preload Alia TTS reference voice"
+            : reference_voice_error;
+        return false;
+    }
+
+    return true;
 }

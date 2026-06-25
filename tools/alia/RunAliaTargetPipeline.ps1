@@ -3,6 +3,7 @@ param(
     [string]$AudioPath = "tmp\alia-real-smoke\alia_request.wav",
     [string]$OutputWav = "tmp\alia-real-smoke\alia_full_pipeline_target_models.wav",
     [string]$LogPath = "tmp\alia-real-smoke\alia_full_pipeline_target_models.log",
+    [string]$ModelRoot = "",
     [string]$RequestText = "Alia, please say hello in one short sentence.",
     [string]$ForegroundLora = "F:\unsloth\qwen35_4b_alia_identity_r16_lr1e5\checkpoint-1400",
     [string]$ToolProbeText = "Call the host tool inspect_window with parameter id equal to 42 now. Return only the tool call.",
@@ -28,7 +29,31 @@ function Ensure-ParentDirectory {
     }
 }
 
+function Resolve-ModelRoot {
+    param(
+        [string]$RepoRoot,
+        [string]$RequestedModelRoot
+    )
+
+    if ($RequestedModelRoot) {
+        return (Resolve-Path -LiteralPath $RequestedModelRoot).Path
+    }
+
+    $localModels = Join-Path $RepoRoot "models"
+    if (Test-Path -LiteralPath $localModels) {
+        return (Resolve-Path -LiteralPath $localModels).Path
+    }
+
+    $mainWorktreeModels = Join-Path $RepoRoot "..\..\models"
+    if (Test-Path -LiteralPath $mainWorktreeModels) {
+        return (Resolve-Path -LiteralPath $mainWorktreeModels).Path
+    }
+
+    return $localModels
+}
+
 $repoRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")
+$modelRootPath = Resolve-ModelRoot -RepoRoot $repoRoot -RequestedModelRoot $ModelRoot
 
 Push-Location $repoRoot
 try {
@@ -62,12 +87,18 @@ try {
     if (-not $env:AILA_LOG_LEVEL) {
         $env:AILA_LOG_LEVEL = "info"
     }
+    if (-not $env:AILA_TTS_REF_AUDIO) {
+        $refAudio = Join-Path $repoRoot "alia_ref.wav"
+        if (Test-Path -LiteralPath $refAudio) {
+            $env:AILA_TTS_REF_AUDIO = (Resolve-Path -LiteralPath $refAudio).Path
+        }
+    }
 
     $smokeArgs = @(
-        "--asr-model", ".\models\Qwen3-ASR-1.7B-BNB-NF4",
-        "--foreground-model", ".\models\qwen3.5-4B-bnb-nf4-offline-visiondense",
-        "--background-model", ".\models\qwen3.5-0.8B-bnb-nf4-offline",
-        "--tts-model", ".\models\Qwen3-TTS-12Hz-0.6B-Base",
+        "--asr-model", (Join-Path $modelRootPath "Qwen3-ASR-1.7B-BNB-NF4"),
+        "--foreground-model", (Join-Path $modelRootPath "qwen3.5-4B-bnb-nf4-offline-visiondense"),
+        "--background-model", (Join-Path $modelRootPath "qwen3.5-0.8B-bnb-nf4-offline"),
+        "--tts-model", (Join-Path $modelRootPath "Qwen3-TTS-12Hz-0.6B-Base"),
         "--audio", $AudioPath,
         "--output-wav", $OutputWav,
         "--request-text", $RequestText,

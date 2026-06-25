@@ -1,6 +1,7 @@
 param(
     [string]$BuildDir = "build",
     [string]$OutputDir = "tmp\alia-real-smoke\voice_matrix",
+    [string]$ModelRoot = "",
     [int]$TimeoutSec = 1500,
     [int]$StreamChunkMs = 1000,
     [int]$StreamPrefillIntervalMs = 0,
@@ -112,6 +113,7 @@ try {
                 AudioPath = $audioPath
                 OutputWav = $wavPath
                 LogPath = $logPath
+                ModelRoot = $ModelRoot
                 RequestText = $scenario.RequestText
                 MaxTokens = $scenario.MaxTokens
                 TimeoutSec = $TimeoutSec
@@ -190,6 +192,11 @@ try {
             simulated_vad_to_first_audio_ms = Get-ValueOrEmpty $values "simulated_vad_to_first_audio_ms"
             tts_callback_count = Get-ValueOrEmpty $values "tts_callback_count"
             tts_chunks_synthesized = Get-ValueOrEmpty $values "tts_chunks_synthesized"
+            tts_reference_audio_enabled = Get-ValueOrEmpty $values "tts_reference_audio_enabled"
+            tts_reference_embedding_dim = Get-ValueOrEmpty $values "tts_reference_embedding_dim"
+            tts_reference_embedding_ms = Get-ValueOrEmpty $values "tts_reference_embedding_ms"
+            tts_reference_audio_path = Get-ValueOrEmpty $values "tts_reference_audio_path"
+            tts_reference_audio_error = Get-ValueOrEmpty $values "tts_reference_audio_error"
             tts_first_text_chars = Get-ValueOrEmpty $values "tts_first_text_chars"
             tts_first_text_tokens = Get-ValueOrEmpty $values "tts_first_text_tokens"
             tts_first_backend_frames = Get-ValueOrEmpty $values "tts_first_backend_frames"

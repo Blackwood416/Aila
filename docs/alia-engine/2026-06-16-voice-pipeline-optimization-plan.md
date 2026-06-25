@@ -874,3 +874,58 @@ Interpretation:
   tail and TTS first-audio variance, not foreground first token generation.
 - The next optimization should therefore return to ASR streaming partial cost
   and cadence, while preserving the VLM suffix-prefill contract measured here.
+
+## 2026-06-25 Alia Reference Voice
+
+Alia TTS now uses the worktree-local `alia_ref.wav` as the default Qwen3-TTS
+Base speaker reference. `AILA_TTS_REF_AUDIO` can override the path; relative
+paths are resolved from the current working directory, and the Alia smoke
+runners set the default to the worktree root copy when present.
+
+Implementation notes:
+
+- `AliaTtsPipeline` extracts an ECAPA speaker embedding through the existing
+  CPU `SpeakerEncoder`, caches it in memory, and passes it into
+  `Qwen3TTSBackend::synthesize_codes_stream`.
+- Reference voice loading happens immediately after the TTS model slot is
+  loaded, so the roughly 8.5s extraction cost is accounted as model load time
+  instead of first-turn TTFA.
+- Missing or invalid reference audio is a setup failure for this custom Alia
+  branch rather than silently falling back to the default TTS voice.
+- Real smoke/matrix logs now report `tts_reference_audio_enabled`,
+  `tts_reference_embedding_dim`, `tts_reference_embedding_ms`,
+  `tts_reference_audio_path`, and `tts_reference_audio_error`.
+- `RunAliaTargetPipeline.ps1` and `RunAliaVoiceScenarioMatrix.ps1` can run from
+  the migrated worktree: they prefer `./models` and fall back to
+  `../../models`, with `-ModelRoot` available for explicit overrides.
+
+Validation:
+
+```text
+cmake --build build --target AliaEngine --config Release
+
+RunAliaTargetPipeline.ps1 -SkipBuild -NoGenerateAudio -SkipToolProbe ...
+ALIA_REAL_MODEL_SMOKE_PASS
+tts_reference_audio_enabled=1
+tts_reference_embedding_dim=1024
+tts_reference_embedding_ms=8537.83
+tts_first_backend_audio_samples=23040
+tts_first_backend_audio_ms=724.553
+
+RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -OutputDir tmp\alia-real-smoke\voice_matrix_ref_tts
+ALIA_VOICE_SCENARIO_MATRIX_PASS
+```
+
+Reference-voice matrix summary:
+
+```text
+scenario          ref  dim   first_content_ms  first_tts_enqueue_ms  first_audio_ms  first_samples  first_codes_ms  first_backend_audio_ms  first_backend_total_ms  backend_total_ms
+short_hello       1    1024  4560              4622                  5841            23040          447.418         695.506                 1049.68                 7147.66
+persona_chat      1    1024  4590              4860                  5901            23040          452.315         698.937                 3237.91                 12817.1
+preference_memory 1    1024  4585              5105                  5829            23040          464.3           708.98                  4594.63                 4594.63
+task_memory       1    1024  4620              4870                  6756            23040          456.502         704.117                 2959.63                 17301.8
+long_answer       1    1024  4556              4876                  5974            23040          447.046         630.776                 2803.69                 6884.43
+```
+
+The first audio callback remains the fixed 12-frame / 23040-sample packet.
+Reference extraction is now visible but no longer part of turn-time TTFA.
