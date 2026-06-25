@@ -1056,3 +1056,59 @@ Interpretation:
 - Foreground prompt prefill remains about 2.0-2.4s even with a 31-38-token final
   suffix, so the next VLM-side target is the incremental prefill backend path
   itself rather than only reducing suffix length.
+
+## 2026-06-25 Decode-Path Foreground Suffix Prefill
+
+Profiling `AILA_PROFILE_Q35_PREFILL=1` on the 31-token final foreground suffix
+showed that incremental batch prefill was dominated by the BnB matmul/FFN
+stages, not attention:
+
+```text
+[Q35PrefillProfile] calls=1 tokens=31 total=2366.777 total_tok=76.347655
+linear_proj=14.191884 linear_o=10.661868 ffn_proj=28.987668 down=15.159871
+attn=0.093300 lm_head=0.104871
+```
+
+The existing Qwen3.5 decode path has faster single-token kernels. For cached
+foreground prefixes, a small suffix is causally equivalent whether it is
+forwarded as one batch or token-by-token through decode. The product path now
+uses decode-path forwarding for cached prompt suffixes up to 64 tokens, while
+initial full prompt prefill still uses the normal batch path.
+
+Implementation:
+
+- Added a small `forward_token_span` helper in `AliaForegroundPipeline`.
+- `prefill_asr_text` uses decode-path forwarding for non-initial ASR prefill
+  suffixes up to 64 tokens.
+- `generate_with_loaded_vlm` uses decode-path forwarding for final cached prompt
+  suffixes up to 64 tokens.
+
+1s streaming-prefill matrix with reference voice:
+
+```text
+scenario          pass  suffix  prompt_prefill_ms  fg_first_ms  vad_tail_ms  vad_to_first_content_ms  tts_first_audio_ms  vad_to_first_audio_ms  first_samples
+short_hello       true  31      739                755          4027         4782                     1548                5575                   23040
+persona_chat      true  36      882                897          3674         4571                     1936                5610                   23040
+preference_memory true  36      883                898          3621         4519                     1989                5610                   23040
+task_memory       true  35      861                876          3829         4705                     1966                5795                   23040
+long_answer       true  38      928                944          3775         4719                     2428                6203                   23040
+```
+
+Compared with the guard-tightening matrix:
+
+```text
+scenario          prompt_prefill_delta_ms  vad_to_first_content_delta_ms  vad_to_first_audio_delta_ms
+short_hello       -1663                    -1762                          -2052
+persona_chat      -1149                    -943                           -694
+preference_memory -1283                    -1236                          -1719
+task_memory       -1300                    -1572                          -1544
+long_answer       -1214                    -1532                          -1666
+```
+
+Interpretation:
+
+- The foreground/VLM side of the streaming path is now consistently under 1s
+  from `start_turn` to first content for these scenarios.
+- The remaining VAD-to-first-audio budget is mostly ASR partial tail plus TTS
+  first audio. Further VLM suffix length trimming is less valuable than ASR
+  partial recompute work or TTS first-chunk variance reduction.

@@ -46,6 +46,32 @@ private:
     void* ptr_ = nullptr;
 };
 
+Tensor* forward_token_span(Context& context,
+                           IModelBackend& backend,
+                           const int* token_ids,
+                           int token_count,
+                           bool use_decode_path) {
+    if (token_count <= 0) {
+        return nullptr;
+    }
+
+    Tensor* logits = nullptr;
+    if (use_decode_path) {
+        DeviceAllocation token_device(context, sizeof(int));
+        for (int i = 0; i < token_count; ++i) {
+            context.memcpy_h2d(token_device.as<int>(), token_ids + i, sizeof(int));
+            logits = &backend.forward(context, token_device.as<int>(), 1);
+        }
+        return logits;
+    }
+
+    DeviceAllocation prompt_device(context, static_cast<size_t>(token_count) * sizeof(int));
+    context.memcpy_h2d(prompt_device.as<int>(),
+                       token_ids,
+                       static_cast<size_t>(token_count) * sizeof(int));
+    return &backend.forward(context, prompt_device.as<int>(), token_count);
+}
+
 class BackendCancellationScope {
 public:
     BackendCancellationScope(IModelBackend* backend, std::function<bool()> should_cancel)
@@ -422,6 +448,7 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     constexpr int kRetokenizeGuardTokens = 16;
     constexpr int kFinalPromptSuffixGuardTokens = 16;
     constexpr int kMinIncrementalPrefillSuffixTokens = 16;
+    constexpr int kMaxDecodePathPrefillSuffixTokens = 64;
     const auto started = std::chrono::steady_clock::now();
     std::vector<int> target_ids =
         build_alia_user_prefix_prompt(tokenizer, foreground_system_prompt(), user_prefix);
@@ -526,12 +553,16 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         return ALIA_OK;
     }
 
-    DeviceAllocation prompt_device(*context, suffix_count * sizeof(int));
-    context->memcpy_h2d(
-        prompt_device.as<int>(),
-        target_ids.data() + already_prefilled,
-        suffix_count * sizeof(int));
-    backend->forward(*context, prompt_device.as<int>(), static_cast<int>(suffix_count));
+    const int suffix_tokens = static_cast<int>(suffix_count);
+    // For small cached suffixes, the single-token decode kernels are faster
+    // than the Qwen3.5 batch prefill path while preserving causal equivalence.
+    const bool decode_path_suffix =
+        already_prefilled > 0 && suffix_tokens <= kMaxDecodePathPrefillSuffixTokens;
+    forward_token_span(*context,
+                       *backend,
+                       target_ids.data() + already_prefilled,
+                       suffix_tokens,
+                       decode_path_suffix);
 
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
@@ -1065,13 +1096,19 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             return false;
         }
 
-        DeviceAllocation prompt_device(*context, prompt_tokens_to_forward * sizeof(int));
-        context->memcpy_h2d(prompt_device.as<int>(),
-                            prompt_ids.data() + prefilled_prompt_tokens,
-                            prompt_tokens_to_forward * sizeof(int));
+        constexpr int kMaxDecodePathPromptSuffixTokens = 64;
+        // Keep full initial prompts on the batch path; use decode kernels only
+        // for small suffixes after a validated cached prefix.
+        const bool decode_path_prompt_suffix =
+            !reset_session &&
+            prefilled_prompt_tokens > 0 &&
+            prompt_tokens_to_forward <= kMaxDecodePathPromptSuffixTokens;
         const auto prompt_prefill_started = std::chrono::steady_clock::now();
-        logits = &backend->forward(*context, prompt_device.as<int>(),
-                                   prompt_tokens_to_forward);
+        logits = forward_token_span(*context,
+                                    *backend,
+                                    prompt_ids.data() + prefilled_prompt_tokens,
+                                    prompt_tokens_to_forward,
+                                    decode_path_prompt_suffix);
         prompt_prefill_ms = elapsed_ms(prompt_prefill_started);
     }
 
