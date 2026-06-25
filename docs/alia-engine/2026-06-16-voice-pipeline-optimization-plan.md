@@ -929,3 +929,78 @@ long_answer       1    1024  4556              4876                  5974       
 
 The first audio callback remains the fixed 12-frame / 23040-sample packet.
 Reference extraction is now visible but no longer part of turn-time TTFA.
+
+## 2026-06-25 VLM Tiny Partial Suffix Skip
+
+With 1s ASR streaming cadence, the last few partial updates can append only a
+handful of foreground prompt tokens. Forwarding those tiny suffixes through the
+4B foreground VLM still costs roughly the same scheduling/launch overhead as a
+larger useful suffix, and the final turn has to validate the full prompt prefix
+again anyway.
+
+Implementation:
+
+- `AliaForegroundPipeline::prefill_asr_text` now skips pure append suffixes
+  smaller than 16 tokens when the backend already matches the previous cached
+  ASR prompt prefix.
+- The skip deliberately keeps the old cached prompt prefix instead of updating
+  `asr_prefill_prompt_ids_`; the skipped tokens are then included in the next
+  non-tiny suffix or in the final `start_turn` prompt suffix.
+- This only affects foreground text prefill. It does not change ASR decoding,
+  TTS sampling, or the fixed 12-frame / 23040-sample first audio packet.
+- Smoke/matrix logs now include
+  `foreground_asr_prefill_skipped_small_suffix`.
+
+Short 1s streaming smoke before the skip:
+
+```text
+asr_stream_simulated_tail_ms=8485
+foreground_asr_prefill_tokens=79
+foreground_asr_prefill_reused_tokens=75
+foreground_asr_prefill_suffix_tokens=4
+foreground_asr_prefill_ms=2176
+foreground_profile_prefilled_prompt_tokens=79
+foreground_profile_prompt_suffix_tokens=41
+foreground_profile_prompt_prefill_ms=2212
+tts_first_audio_ms=3698
+simulated_vad_to_first_audio_ms=12183
+```
+
+Short 1s streaming smoke after the skip:
+
+```text
+asr_stream_simulated_tail_ms=4040
+foreground_asr_prefill_tokens=71
+foreground_asr_prefill_reused_tokens=71
+foreground_asr_prefill_suffix_tokens=8
+foreground_asr_prefill_skipped_small_suffix=2
+foreground_asr_prefill_ms=0
+foreground_profile_prefilled_prompt_tokens=71
+foreground_profile_prompt_suffix_tokens=49
+foreground_profile_prompt_prefill_ms=2259
+tts_first_audio_ms=3583
+simulated_vad_to_first_audio_ms=7623
+```
+
+1s streaming-prefill matrix with reference voice:
+
+```text
+scenario          pass  skipped  vad_tail_ms  prefilled  final_suffix  final_prefill_ms  tts_first_audio_ms  vad_to_first_audio_ms  first_samples
+short_hello       true  2        4102         71         47            2267              3755                7857                   23040
+persona_chat      true  4        3824         71         52            2265              3458                7282                   23040
+preference_memory true  3        3653         71         52            2249              4180                7833                   23040
+task_memory       true  3        3928         71         51            2236              3188                7116                   23040
+long_answer       true  4        3829         71         54            2159              3567                7396                   23040
+```
+
+Interpretation:
+
+- The optimization removes wasted VLM prefill work for tiny late partials and
+  keeps correctness anchored on the final full prompt-prefix check.
+- The final foreground suffix is larger because skipped partial tokens are
+  carried into `start_turn`, but this moves the work out of the live ASR tail
+  path where it was repeatedly delaying the simulated VAD-to-first-audio clock.
+- The remaining gap is still dominated by ASR partial recompute/cadence plus
+  the unavoidable foreground/TTS first-chunk work. The next high-value work is
+  ASR partial cost reduction or a cadence policy that avoids expensive partial
+  calls when the recognized text is unlikely to change enough.

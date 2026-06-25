@@ -80,6 +80,7 @@ public:
     int last_asr_prefill_token_count() const;
     int last_asr_prefill_reused_token_count() const;
     int last_asr_prefill_suffix_token_count() const;
+    int last_asr_prefill_skipped_small_suffix_count() const;
     long long last_asr_prefill_ms() const;
     long long last_first_content_delta_ms() const;
     long long last_first_tts_enqueue_ms() const;
@@ -142,6 +143,7 @@ private:
     int last_asr_prefill_token_count_ = 0;
     int last_asr_prefill_reused_token_count_ = 0;
     int last_asr_prefill_suffix_token_count_ = 0;
+    int last_asr_prefill_skipped_small_suffix_count_ = 0;
     long long last_asr_prefill_ms_ = -1;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;
 };

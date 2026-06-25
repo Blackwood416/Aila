@@ -742,6 +742,8 @@ int main(int argc, char** argv) {
               << ctx->foreground_pipeline->last_asr_prefill_reused_token_count() << "\n"
               << "foreground_asr_prefill_suffix_tokens="
               << ctx->foreground_pipeline->last_asr_prefill_suffix_token_count() << "\n"
+              << "foreground_asr_prefill_skipped_small_suffix="
+              << ctx->foreground_pipeline->last_asr_prefill_skipped_small_suffix_count() << "\n"
               << "foreground_asr_prefill_ms="
               << ctx->foreground_pipeline->last_asr_prefill_ms() << "\n"
               << "foreground_first_content_delta_ms="

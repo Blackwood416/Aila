@@ -171,6 +171,7 @@ try {
             foreground_asr_prefill_tokens = Get-ValueOrEmpty $values "foreground_asr_prefill_tokens"
             foreground_asr_prefill_reused_tokens = Get-ValueOrEmpty $values "foreground_asr_prefill_reused_tokens"
             foreground_asr_prefill_suffix_tokens = Get-ValueOrEmpty $values "foreground_asr_prefill_suffix_tokens"
+            foreground_asr_prefill_skipped_small_suffix = Get-ValueOrEmpty $values "foreground_asr_prefill_skipped_small_suffix"
             foreground_asr_prefill_ms = Get-ValueOrEmpty $values "foreground_asr_prefill_ms"
             foreground_first_content_delta_ms = Get-ValueOrEmpty $values "foreground_first_content_delta_ms"
             foreground_first_tts_enqueue_ms = Get-ValueOrEmpty $values "foreground_first_tts_enqueue_ms"

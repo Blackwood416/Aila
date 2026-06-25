@@ -421,6 +421,7 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
 
     constexpr int kRetokenizeGuardTokens = 32;
     constexpr int kFinalPromptSuffixGuardTokens = 16;
+    constexpr int kMinIncrementalPrefillSuffixTokens = 16;
     const auto started = std::chrono::steady_clock::now();
     std::vector<int> target_ids =
         build_alia_user_prefix_prompt(tokenizer, foreground_system_prompt(), user_prefix);
@@ -506,6 +507,25 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     }
 
     const size_t suffix_count = target_ids.size() - already_prefilled;
+    const bool small_append =
+        !reset_required &&
+        !current_prefill.empty() &&
+        already_prefilled == current_prefill.size() &&
+        suffix_count > 0 &&
+        suffix_count < static_cast<size_t>(kMinIncrementalPrefillSuffixTokens) &&
+        is_token_prefix(current_prefill, target_ids);
+    if (small_append) {
+        const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++last_asr_prefill_skipped_small_suffix_count_;
+        last_asr_prefill_token_count_ = static_cast<int>(current_prefill.size());
+        last_asr_prefill_reused_token_count_ = reused_tokens;
+        last_asr_prefill_suffix_token_count_ = static_cast<int>(suffix_count);
+        last_asr_prefill_ms_ = elapsed_ms;
+        return ALIA_OK;
+    }
+
     DeviceAllocation prompt_device(*context, suffix_count * sizeof(int));
     context->memcpy_h2d(
         prompt_device.as<int>(),
@@ -517,6 +537,9 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         std::chrono::steady_clock::now() - started).count();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (already_prefilled == 0) {
+            last_asr_prefill_skipped_small_suffix_count_ = 0;
+        }
         asr_prefill_prompt_ids_ = std::move(target_ids);
         asr_prefill_text_ = user_prefix;
         last_asr_prefill_token_count_ = static_cast<int>(asr_prefill_prompt_ids_.size());
@@ -710,6 +733,11 @@ int AliaForegroundPipeline::last_asr_prefill_reused_token_count() const {
 int AliaForegroundPipeline::last_asr_prefill_suffix_token_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_asr_prefill_suffix_token_count_;
+}
+
+int AliaForegroundPipeline::last_asr_prefill_skipped_small_suffix_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_skipped_small_suffix_count_;
 }
 
 long long AliaForegroundPipeline::last_asr_prefill_ms() const {
