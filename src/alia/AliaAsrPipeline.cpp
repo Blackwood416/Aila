@@ -442,15 +442,9 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     }
     finish_stage(call_metrics.encoder_ms, context);
 
-    Tensor audio_features = Tensor::allocate(*context, {audio_len, output_dim});
-    context->queue().memcpy(audio_features.data_as<AsrBf16>(),
-                            audio_tmp.data_as<AsrBf16>(),
-                            static_cast<size_t>(audio_len) * output_dim * sizeof(AsrBf16));
-
     std::vector<AsrBf16> audio_host(static_cast<size_t>(audio_len) * output_dim);
-    context->memcpy_d2h(audio_host.data(), audio_features.data(),
+    context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
                         audio_host.size() * sizeof(AsrBf16));
-    context->synchronize();
     finish_stage(call_metrics.readback_ms);
 
     std::vector<int> prompt_ids;
@@ -516,14 +510,15 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     finish_stage(call_metrics.prefill_ms, context);
 
     DeviceAllocation one_token_device(*context, sizeof(int));
+    DeviceAllocation argmax_device(*context, sizeof(int));
     std::vector<int> generated_ids;
     GenerationConfig gen_config;
     gen_config.max_new_tokens = 256;
     gen_config.do_sample = false;
+    generated_ids.reserve(static_cast<size_t>(gen_config.max_new_tokens));
 
     for (int step = 0; step < gen_config.max_new_tokens; ++step) {
         int next_token = 0;
-        DeviceAllocation argmax_device(*context, sizeof(int));
         ops::argmax(*context, *logits, cfg.vocab_size, argmax_device.as<int>());
         context->memcpy_d2h(&next_token, argmax_device.as<int>(), sizeof(int));
 

@@ -419,7 +419,7 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         return ALIA_ERR_INVALID_STATE;
     }
 
-    constexpr int kRetokenizeGuardTokens = 32;
+    constexpr int kRetokenizeGuardTokens = 16;
     constexpr int kFinalPromptSuffixGuardTokens = 16;
     constexpr int kMinIncrementalPrefillSuffixTokens = 16;
     const auto started = std::chrono::steady_clock::now();

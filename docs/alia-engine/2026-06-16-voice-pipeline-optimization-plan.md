@@ -1004,3 +1004,55 @@ Interpretation:
   the unavoidable foreground/TTS first-chunk work. The next high-value work is
   ASR partial cost reduction or a cadence policy that avoids expensive partial
   calls when the recognized text is unlikely to change enough.
+
+## 2026-06-25 ASR/VLM Prefill Guard Tightening
+
+The ASR partial-to-VLM prefill path was still leaving a large final foreground
+suffix because it kept a 32-token retokenization guard on the speculative user
+prefix, plus the separate 16-token final-prompt guard. The final turn already
+checks that the cached prompt ids are a prefix of the real final ChatML prompt,
+so the retokenization guard can be tighter without risking an incorrect
+generation state: if the prefix ever stops matching, the final turn falls back
+to normal prompt prefill.
+
+Implementation:
+
+- Reduced `kRetokenizeGuardTokens` in
+  `AliaForegroundPipeline::prefill_asr_text` from 32 to 16.
+- Kept the final 16-token prompt suffix guard unchanged.
+- Cleaned up ASR runtime overhead by reading the valid audio encoder prefix
+  directly from `audio_tmp` and reusing the ASR decode-loop argmax device
+  buffer.
+
+1s streaming-prefill matrix with reference voice:
+
+```text
+scenario          pass  prefilled  suffix  fg_prefill_ms  vad_tail_ms  vad_to_first_audio_ms  first_samples
+short_hello       true  87         31      2402           4136         7627                   23040
+persona_chat      true  87         36      2031           3478         6304                   23040
+preference_memory true  87         36      2166           3584         7329                   23040
+task_memory       true  87         35      2161           4110         7339                   23040
+long_answer       true  87         38      2142           4103         7869                   23040
+```
+
+Compared with the previous 1s tiny-suffix matrix:
+
+```text
+scenario          prefilled_delta  suffix_delta  vad_to_first_audio_delta_ms
+short_hello       +16              -16           -230
+persona_chat      +16              -16           -978
+preference_memory +16              -16           -504
+task_memory       +16              -16           +223
+long_answer       +16              -16           +473
+```
+
+Interpretation:
+
+- The guard change consistently moves 16 more foreground prompt tokens into the
+  speculative prefill cache and leaves a smaller final suffix.
+- End-to-end TTFA is still noisy because foreground sampling and TTS first chunk
+  shape vary, but the matrix average improved by roughly 200ms while preserving
+  the fixed 23040-sample first audio packet.
+- Foreground prompt prefill remains about 2.0-2.4s even with a 31-38-token final
+  suffix, so the next VLM-side target is the incremental prefill backend path
+  itself rather than only reducing suffix length.
