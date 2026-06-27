@@ -1604,3 +1604,70 @@ Interpretation:
 - Keep the default at 12 frames for now. The next high-value work is reducing
   Mimi incremental decode cost or pipelining/overlapping TTS segment generation
   so a smaller uniform batch can keep up with playback.
+
+## 2026-06-27 Mimi Streaming RTF Probe
+
+The next profile confirmed that Qwen3-TTS latency is now mostly backend RTF,
+not packet sizing. Mimi incremental decode was only incremental through VQ; the
+pre-transformer and conv vocoder stages still recomputed full history. The
+largest recurring cost was the causal conv decoder blocks after upsampling.
+
+Implemented:
+
+- Reused Mimi ConvNeXt upsample pointwise `Linear` wrappers instead of creating
+  them inside every `mimi_conv_stages` call.
+- Added tail-only host readback to `mimi_conv_stages`, so incremental streaming
+  copies only the newly generated audio samples from GPU.
+- Added `AILA_TTS_MIMI_CONV_WINDOW_FRAMES`, default `24`, for incremental Mimi
+  conv-stage decoding. Once the stream has more than the configured history, the
+  conv vocoder runs on a suffix view of pre-transformer output and reads back
+  only the new tail. Set it to `0` to force full-history conv stages.
+
+The 24-frame history is intentionally conservative. The current causal
+upsample/decoder chain has an estimated input-frame receptive field of roughly
+13 frames, so 24 frames leaves room for boundary effects without keeping long
+segments on the full-history path.
+
+Short streaming smoke with `AILA_TTS_PROFILE=1`:
+
+```text
+simulated_vad_to_first_audio_ms  1668
+tts_first_backend_audio_samples  23040
+tts_first_backend_codes_ms       459.135
+tts_first_backend_audio_ms       650.747
+tts_first_backend_total_ms       1235.83
+tts_backend_total_ms             4769.91
+
+first 12-frame Mimi chunk:
+Conv stages total                165.0 ms (12 frames, 23040/23040 samples)
+Mimi incremental total           191.5 ms
+
+later 48-frame stream state:
+Conv stages total                429.3 ms (36 frames, 23040/69120 samples)
+Mimi conv window                 24+12/48 frames, tail=23040 samples
+```
+
+Default voice matrix after the change:
+
+```text
+scenario           asr_ms  vad_to_content_ms  vad_to_audio_ms  first_backend_audio_ms  backend_total_ms  first_samples
+short_hello        473     816                1759             655.197                 6060.43           23040
+persona_chat       537     881                1747             626.887                 9939.91           23040
+preference_memory  539     882                3446             921.984                 4892.79           23040
+task_memory        541     885                2119             654.669                 10822.1           23040
+long_answer        555     900                2083             615.574                 9706.78           23040
+```
+
+Interpretation:
+
+- The first audio packet is still the default 12-frame / 23040-sample packet.
+- The change mainly reduces later incremental decode work: full-history audio
+  readback is gone, and conv stages stop growing with total frames after the
+  history window is exceeded.
+- TTFA remains dominated by foreground enqueue timing plus first code generation
+  and first Mimi decode. Lowering overall TTS RTF now makes it safer to revisit
+  smaller uniform batch sizes or more aggressive text chunking without creating
+  playback gaps.
+- The next higher-risk backend step is true Mimi pre-transformer state reuse or
+  more exact conv state carry. Both should be profile-driven and validated with
+  real-model smoke/matrix because they can affect audio boundaries.

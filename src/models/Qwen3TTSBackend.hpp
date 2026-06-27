@@ -114,7 +114,8 @@ private:
     // Conv stages of Mimi decoder (shared by full and incremental paths).
     // Takes pre-transformer output [n_frames, 1024], produces float PCM audio.
     bool mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
-                          std::vector<float>& out_samples);
+                          std::vector<float>& out_samples,
+                          int tail_samples = -1);
     void init_mimi_runtime_linears(Context& ctx);
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);
@@ -252,6 +253,11 @@ private:
         Linear down_proj;
     };
     std::array<MimiPreTransformerLayerLinears, 8> mimi_pre_tfm_linears_;
+    struct MimiUpsampleLinears {
+        Linear pwconv1;
+        Linear pwconv2;
+    };
+    std::array<MimiUpsampleLinears, 2> mimi_upsample_linears_;
 
     // TTS model type (Base / CustomVoice / VoiceDesign)
     Qwen3TTSModelType tts_model_type_ = Qwen3TTSModelType::Base;

@@ -16,6 +16,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 
 namespace {
 int round_up_seq(int v, int g) { return ((v + g - 1) / g) * g; }
+constexpr int kMimiSamplesPerFrame = 1920;
 
 void print_gpu_tensor(Context& ctx, const std::string& name, Tensor& tensor, int offset = 0) {
     std::cout << name << " = [";
@@ -1560,11 +1561,18 @@ void Qwen3TTSBackend::init_mimi_runtime_linears(Context& ctx) {
         layer.down_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.down_proj.weight"), 1024, 512, false);
     }
 
+    for (int i = 0; i < 2; ++i) {
+        const std::string up_prefix = "decoder.upsample." + std::to_string(i) + ".1.";
+        auto& layer = mimi_upsample_linears_[static_cast<size_t>(i)];
+        layer.pwconv1.init(ctx, mimi_weights_.get(up_prefix + "pwconv1.weight"), 1024, 4096, false);
+        layer.pwconv2.init(ctx, mimi_weights_.get(up_prefix + "pwconv2.weight"), 4096, 1024, false);
+    }
+
     mimi_runtime_linears_initialized_ = true;
 }
 
 bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
-    std::vector<float>& out_samples) {
+    std::vector<float>& out_samples, int tail_samples) {
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
     auto t_conv_start = std::chrono::high_resolution_clock::now();
 
@@ -1617,11 +1625,10 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         ctx.synchronize();
 
         // Linear pwconv1
-        Linear pw1;
-        pw1.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv1.weight"), 1024, 4096, false);
         Tensor pw1_out = Tensor::allocate(ctx, {2 * L, 4096});
         Tensor& pw1_b = mimi_weights_.get(up_prefix + "1.pwconv1.bias");
-        pw1.forward_bias(ctx, normed_dw, pw1_b, pw1_out, 2 * L);
+        auto& up_linears = mimi_upsample_linears_[static_cast<size_t>(i)];
+        up_linears.pwconv1.forward_bias(ctx, normed_dw, pw1_b, pw1_out, 2 * L);
         ctx.synchronize();
 
         // GELU
@@ -1629,11 +1636,9 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         ctx.synchronize();
 
         // Linear pwconv2
-        Linear pw2;
-        pw2.init(ctx, mimi_weights_.get(up_prefix + "1.pwconv2.weight"), 4096, 1024, false);
         Tensor pw2_out = Tensor::allocate(ctx, {2 * L, 1024});
         Tensor& pw2_b = mimi_weights_.get(up_prefix + "1.pwconv2.bias");
-        pw2.forward_bias(ctx, pw1_out, pw2_b, pw2_out, 2 * L);
+        up_linears.pwconv2.forward_bias(ctx, pw1_out, pw2_b, pw2_out, 2 * L);
         ctx.synchronize();
 
         // Scale by gamma and add to residual
@@ -1763,13 +1768,19 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     ops::causal_conv1d(ctx, dec_in, dec6_w, dec6_b, dec6_out, 1, 96, 1, L, 7, 1);
     ctx.synchronize();
 
-    // tanh 修正为 clamp 激活并拷贝到 Host
-    out_samples.resize(L);
+    // Clamp and copy back only the requested tail when incremental streaming
+    // used a history window. Full vocoder decode still reads the whole tensor.
+    int read_samples = L;
+    if (tail_samples > 0) {
+        read_samples = std::min(tail_samples, L);
+    }
+    const int read_start = L - read_samples;
+    out_samples.resize(read_samples);
     float* host_ptr = out_samples.data();
-    auto* dev_ptr = dec6_out.data_as<bf16>();
+    auto* dev_ptr = dec6_out.data_as<bf16>() + read_start;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(L), [=](sycl::id<1> idx) {
+        cgh.parallel_for(sycl::range<1>(read_samples), [=](sycl::id<1> idx) {
             int i = static_cast<int>(idx[0]);
             float val = static_cast<float>(dev_ptr[i]);
             // PyTorch clamp(min=-1, max=1)
@@ -1780,10 +1791,10 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     }).wait();
 
     // Now copy back as bf16 and convert to float on Host
-    std::vector<bf16> cpu_bf16(L);
-    ctx.queue().memcpy(cpu_bf16.data(), dev_ptr, L * sizeof(bf16)).wait();
+    std::vector<bf16> cpu_bf16(read_samples);
+    ctx.queue().memcpy(cpu_bf16.data(), dev_ptr, read_samples * sizeof(bf16)).wait();
 
-    for (int i = 0; i < L; ++i) {
+    for (int i = 0; i < read_samples; ++i) {
         out_samples[i] = static_cast<float>(cpu_bf16[i]);
     }
 
@@ -1832,7 +1843,8 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     auto t_final_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_final_start).count();
     auto t_conv_total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_conv_start).count();
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
-    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Conv stages total: %.1f ms (%d frames, %d samples)", t_conv_total_ms, n_frames, L);
+    if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Conv stages total: %.1f ms (%d frames, %d/%d samples)",
+        t_conv_total_ms, n_frames, read_samples, L);
 
     AILA_LOG_DEBUG("[MimiDebug] Decoded into %d samples.", L);
     return true;
@@ -2273,8 +2285,25 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
 
     // === Conv stages (shared with full decode_mimi_vocoder) ===
     const auto t_conv_start = std::chrono::high_resolution_clock::now();
-    std::vector<float> full_samples;
-    if (!mimi_conv_stages(ctx, pre_tfm_out_i, total_frames, full_samples)) {
+    static const int s_conv_window_history_frames = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_MIMI_CONV_WINDOW_FRAMES", 24));
+    const int target_new_samples = new_frames * kMimiSamplesPerFrame;
+    int conv_window_start = 0;
+    int conv_window_frames = total_frames;
+    if (s_conv_window_history_frames > 0 && start_pos > s_conv_window_history_frames) {
+        conv_window_start = start_pos - s_conv_window_history_frames;
+        conv_window_frames = total_frames - conv_window_start;
+    }
+
+    Tensor conv_input_view;
+    Tensor* conv_input = &pre_tfm_out_i;
+    if (conv_window_start > 0) {
+        bf16* window_ptr = pre_tfm_out_i.data_as<bf16>() + conv_window_start * 1024;
+        conv_input_view = Tensor::view(ctx, window_ptr, {conv_window_frames, 1024}, pre_tfm_out_i.dtype());
+        conv_input = &conv_input_view;
+    }
+
+    if (!mimi_conv_stages(ctx, *conv_input, conv_window_frames, out_samples, target_new_samples)) {
         return false;
     }
     if (tts_profile) {
@@ -2284,14 +2313,14 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
             std::chrono::high_resolution_clock::now() - t_decode_start).count();
         AILA_LOG_INFO("[TTS-Profile]   Mimi incremental total: %.1f ms (conv+readback %.1f ms)",
                       t_decode_ms, t_conv_ms);
+        if (conv_window_start > 0) {
+            AILA_LOG_INFO("[TTS-Profile]   Mimi conv window: %d+%d/%d frames, tail=%d samples",
+                          s_conv_window_history_frames, new_frames, total_frames,
+                          static_cast<int>(out_samples.size()));
+        }
     }
 
-    // Slice: extract only new audio since last call
-    int new_sample_count = static_cast<int>(full_samples.size()) - state.last_audio_sample_count;
-    if (new_sample_count > 0) {
-        out_samples.assign(full_samples.begin() + state.last_audio_sample_count, full_samples.end());
-    }
-    state.last_audio_sample_count = static_cast<int>(full_samples.size());
+    state.last_audio_sample_count = total_frames * kMimiSamplesPerFrame;
     state.total_frames = total_frames;
 
     return true;
