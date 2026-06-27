@@ -97,6 +97,7 @@ set(COMMON_ENGINE_SOURCES
     src/vision/Qwen35VisionEncoder.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
     src/audio/AudioPreprocessor.cpp
+    src/audio/GpuMelSpectrogram.cpp
     src/audio/SpeakerEncoder.cpp
     src/audio/GpuSpeakerEncoder.cpp
     src/profile/Device.cpp

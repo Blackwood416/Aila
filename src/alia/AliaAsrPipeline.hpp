@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../audio/AudioPreprocessor.hpp"
+#include "../audio/GpuMelSpectrogram.hpp"
 
 #include <cstddef>
 #include <mutex>
@@ -45,6 +46,7 @@ public:
     bool feed_audio(const float* samples, int sample_count);
     void append_stable_text(std::string text);
     bool process_pending(bool force_partial_decode = true);
+    bool warmup_gpu_mel(std::string* error_message = nullptr);
     void reset();
     void get_text(std::string& out_stable, std::string& out_partial);
     void get_partial_text(std::string& out_stable, std::string& out_partial);
@@ -84,6 +86,7 @@ private:
     int partial_throttled_count_ = 0;
     AliaAsrMetrics metrics_;
     MelSpectrogramCache partial_mel_cache_;
+    aila::audio::AsrGpuMelCache partial_gpu_mel_cache_;
     size_t partial_mel_cache_stable_offset_ = 0;
 
     struct PrefixCache {

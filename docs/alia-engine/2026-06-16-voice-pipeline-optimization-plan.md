@@ -1454,3 +1454,62 @@ Interpretation:
   mel/STFT to remove the CPU computation and upload sync, or a cheaper
   partial/final policy that avoids full ASR prefill when the transcript is
   unlikely to change.
+
+## 2026-06-27 ASR GPU Mel/STFT Prototype
+
+Implemented an ASR-specific GPU mel path for the Qwen3-ASR frontend:
+
+- `GpuMelSpectrogram` preloads the ASR Hann window, direct DFT cos/sin table,
+  and embedded 201x128 mel filterbank to the ASR context.
+- The GPU path computes raw log-mel frames, reuses the stable prefix exactly
+  like the CPU mel cache, normalizes on device, and writes the bf16 transposed
+  `[1,128,n_frames]` tensor directly for the audio encoder.
+- `AILA_ASR_GPU_MEL` is enabled by default on this branch; set
+  `AILA_ASR_GPU_MEL=0` to return to the CPU mel path.
+- `AILA_ASR_GPU_MEL_VALIDATE=1` compares GPU normalized f32 mel against the CPU
+  full mel path and reports the max absolute diff through
+  `asr_profile_mel_cache_max_abs_diff`.
+- `AILA_ASR_GPU_MEL_WARMUP=1` is enabled by default when GPU mel is enabled.
+  This compiles the GPU mel kernels during model load so the first live ASR
+  partial does not pay the SYCL JIT cost.
+
+Correctness smoke with validation:
+
+```text
+asr_profile_mel_cache_max_abs_diff  3.92199e-05
+asr_partial_text                    "Alia, please say hello in one."
+result                              ALIA_REAL_MODEL_SMOKE_PASS
+```
+
+Short prompt profile, 500ms stream chunk, 1500ms partial advance gate:
+
+```text
+mode                    mel_stft_ms  mel_ms   asr_total_ms  asr_tail_ms  vad_to_audio_ms
+CPU cached mel           141.321      n/a      1490.17       381          2022
+GPU mel + warmup           1.638       17.052  1339.96       356          1966
+```
+
+Default voice matrix after enabling GPU mel:
+
+```text
+scenario           asr_ms  mel_stft_ms  mel_norm_ms  vad_to_audio_ms  first_audio_samples
+short_hello        583     0.652        6.084        1738             23040
+persona_chat       656     0.766        7.349        1750             23040
+preference_memory  660     1.279        7.500        1818             23040
+task_memory        639     0.635        7.016        2209             23040
+long_answer        667     0.782        8.380        2221             23040
+```
+
+Interpretation:
+
+- The direct GPU DFT is sufficient for the ASR `n_fft=400` case: after warmup,
+  the full short-prompt streaming run spends about 1.6ms in GPU STFT instead of
+  about 141ms in CPU STFT.
+- Warmup matters. Without it, the first GPU mel call paid roughly 400ms of
+  kernel compilation and erased the TTFA win.
+- End-to-end TTFA improves modestly because the remaining short-prompt path is
+  dominated by ASR text prefill/decode, foreground first token, and TTS first
+  audio. The mel bottleneck is now mostly removed for ASR.
+- TTS reference speaker mel uses a different 24kHz / `n_fft=1024` / magnitude
+  mel contract. The shared GPU mel scaffolding can be extended to it later, but
+  it should be validated as a separate TTS-speaker-encoder pass.

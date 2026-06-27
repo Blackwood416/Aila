@@ -57,6 +57,18 @@ bool AliaContext::load_model_slots() {
         return false;
     }
 
+    if (asr_pipeline &&
+        aila::env::read_flag("AILA_ASR_GPU_MEL", true) &&
+        aila::env::read_flag("AILA_ASR_GPU_MEL_WARMUP", true)) {
+        std::string asr_warmup_error;
+        if (!asr_pipeline->warmup_gpu_mel(&asr_warmup_error)) {
+            last_error = asr_warmup_error.empty()
+                ? "failed to warm up Alia ASR GPU mel"
+                : "failed to warm up Alia ASR GPU mel: " + asr_warmup_error;
+            return false;
+        }
+    }
+
     if (foreground_pipeline &&
         aila::env::read_flag("AILA_FOREGROUND_VLM_WARMUP", true)) {
         std::string foreground_warmup_error;

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cctype>
 #include <exception>
+#include <memory>
 #include <sycl/sycl.hpp>
 #include <utility>
 
@@ -174,6 +175,7 @@ void AliaAsrPipeline::append_stable_text(std::string text) {
     partial_processed_stable_offset_ = stable_samples_offset_;
     prefix_cache_.reset();
     partial_mel_cache_.reset();
+    partial_gpu_mel_cache_.reset();
     partial_mel_cache_stable_offset_ = stable_samples_offset_;
 }
 
@@ -239,6 +241,7 @@ bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
             partial_processed_stable_offset_ = stable_samples_offset_;
             prefix_cache_.reset();
             partial_mel_cache_.reset();
+            partial_gpu_mel_cache_.reset();
             partial_mel_cache_stable_offset_ = stable_samples_offset_;
             processed = true;
         }
@@ -349,6 +352,57 @@ bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
     }
 }
 
+bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
+    if (!ready()) {
+        if (error_message) {
+            *error_message = "ASR slot is not loaded";
+        }
+        return false;
+    }
+
+    Context* context = slot_->context();
+    if (!context) {
+        if (error_message) {
+            *error_message = "ASR context is not available";
+        }
+        return false;
+    }
+
+    try {
+        std::lock_guard<std::mutex> pipeline_lock(mutex_);
+        auto lane_lock = context->lock_execution();
+        std::vector<float> silence(16000, 0.0f);
+        int n_frames = 0;
+        int actual_frames = 0;
+        Tensor* mel_device = nullptr;
+        std::string mel_error;
+        aila::audio::GpuMelSpectrogramTiming timing;
+        if (!aila::audio::compute_asr_mel_spectrogram_gpu(
+                *context, silence, partial_gpu_mel_cache_, n_frames, actual_frames,
+                mel_device, &mel_error, &timing, false)) {
+            if (error_message) {
+                *error_message = mel_error.empty()
+                    ? "ASR GPU mel warmup failed"
+                    : "ASR GPU mel warmup failed: " + mel_error;
+            }
+            return false;
+        }
+        context->synchronize();
+        partial_gpu_mel_cache_.reset();
+        return true;
+    } catch (const std::exception& e) {
+        if (error_message) {
+            *error_message = e.what();
+        }
+        return false;
+    } catch (...) {
+        if (error_message) {
+            *error_message = "unknown ASR GPU mel warmup failure";
+        }
+        return false;
+    }
+}
+
 void AliaAsrPipeline::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     audio_buffer_.clear();
@@ -365,6 +419,7 @@ void AliaAsrPipeline::reset() {
     metrics_ = AliaAsrMetrics{};
     prefix_cache_.reset();
     partial_mel_cache_.reset();
+    partial_gpu_mel_cache_.reset();
     partial_mel_cache_stable_offset_ = 0;
 }
 
@@ -455,61 +510,107 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     const ModelSpec& spec = slot_->model_spec();
     const Qwen3Config& cfg = spec.qwen3;
 
-    MelSpectrogram mel;
-    MelSpectrogramTiming mel_timing;
     std::string prep_error;
+    static const bool s_gpu_mel = aila::env::read_flag("AILA_ASR_GPU_MEL", true);
+    static const bool s_gpu_mel_validate =
+        aila::env::read_flag("AILA_ASR_GPU_MEL_VALIDATE", false);
     static const bool s_mel_cache = aila::env::read_flag("AILA_ASR_MEL_CACHE", true);
     static const bool s_mel_cache_validate =
         aila::env::read_flag("AILA_ASR_MEL_CACHE_VALIDATE", false);
     bool used_mel_cache = false;
-    if (s_mel_cache) {
+
+    Tensor* mel_device_ptr = nullptr;
+    Tensor cpu_mel_device;
+    int mel_frames = 0;
+    int mel_actual_frames = 0;
+    std::unique_ptr<Context::ExecutionLock> lane_lock;
+
+    if (s_gpu_mel) {
         if (partial_mel_cache_stable_offset_ != stable_samples_offset_) {
             partial_mel_cache_.reset();
+            partial_gpu_mel_cache_.reset();
             partial_mel_cache_stable_offset_ = stable_samples_offset_;
         }
-        used_mel_cache = partial_mel_cache_.sample_count > 0 &&
-                         partial_mel_cache_.sample_count <= segment.size();
-    }
-    const bool mel_ok = s_mel_cache
-        ? compute_mel_spectrogram_cached(segment, mel, partial_mel_cache_,
-                                         &prep_error, &mel_timing,
-                                         s_mel_cache_validate)
-        : compute_mel_spectrogram(segment, mel, &prep_error, &mel_timing);
-    if (!mel_ok) {
-        last_error_ = "ASR mel spectrogram failed: " + prep_error;
-        return false;
-    }
-    if (used_mel_cache) {
-        ++call_metrics.mel_cache_hits;
-    }
-    call_metrics.mel_cache_reused_frames += mel_timing.reused_frames;
-    call_metrics.mel_cache_computed_frames += mel_timing.computed_frames;
-    call_metrics.mel_cache_max_abs_diff =
-        std::max(call_metrics.mel_cache_max_abs_diff, mel_timing.max_abs_diff);
-    call_metrics.mel_stft_ms += mel_timing.stft_ms;
-    call_metrics.mel_norm_ms += mel_timing.norm_ms;
-    finish_stage(call_metrics.mel_ms);
+        used_mel_cache = partial_gpu_mel_cache_.sample_count > 0 &&
+                         partial_gpu_mel_cache_.sample_count <= segment.size();
 
-    std::vector<AsrBf16> mel_bf16(static_cast<size_t>(mel.n_frames) * mel.n_mels);
-    for (int frame = 0; frame < mel.n_frames; ++frame) {
-        for (int mel_bin = 0; mel_bin < mel.n_mels; ++mel_bin) {
-            mel_bf16[static_cast<size_t>(mel_bin) * mel.n_frames + frame] =
-                AsrBf16(mel.data[static_cast<size_t>(frame) * mel.n_mels + mel_bin]);
+        lane_lock = std::make_unique<Context::ExecutionLock>(context->lock_execution());
+        aila::audio::GpuMelSpectrogramTiming gpu_mel_timing;
+        const bool gpu_mel_ok = aila::audio::compute_asr_mel_spectrogram_gpu(
+            *context, segment, partial_gpu_mel_cache_, mel_frames, mel_actual_frames,
+            mel_device_ptr, &prep_error, &gpu_mel_timing, s_gpu_mel_validate);
+        if (!gpu_mel_ok) {
+            last_error_ = "ASR GPU mel spectrogram failed: " + prep_error;
+            return false;
         }
-    }
+        if (used_mel_cache) {
+            ++call_metrics.mel_cache_hits;
+        }
+        call_metrics.mel_cache_reused_frames += gpu_mel_timing.reused_frames;
+        call_metrics.mel_cache_computed_frames += gpu_mel_timing.computed_frames;
+        call_metrics.mel_cache_max_abs_diff =
+            std::max(call_metrics.mel_cache_max_abs_diff, gpu_mel_timing.max_abs_diff);
+        call_metrics.mel_stft_ms += gpu_mel_timing.stft_ms;
+        call_metrics.mel_norm_ms += gpu_mel_timing.norm_ms;
+        call_metrics.upload_ms += gpu_mel_timing.upload_ms;
+        finish_stage(call_metrics.mel_ms);
+    } else {
+        MelSpectrogram mel;
+        MelSpectrogramTiming mel_timing;
+        if (partial_mel_cache_stable_offset_ != stable_samples_offset_) {
+            partial_mel_cache_.reset();
+            partial_gpu_mel_cache_.reset();
+            partial_mel_cache_stable_offset_ = stable_samples_offset_;
+        }
+        if (s_mel_cache) {
+            used_mel_cache = partial_mel_cache_.sample_count > 0 &&
+                             partial_mel_cache_.sample_count <= segment.size();
+        }
+        const bool mel_ok = s_mel_cache
+            ? compute_mel_spectrogram_cached(segment, mel, partial_mel_cache_,
+                                             &prep_error, &mel_timing,
+                                             s_mel_cache_validate)
+            : compute_mel_spectrogram(segment, mel, &prep_error, &mel_timing);
+        if (!mel_ok) {
+            last_error_ = "ASR mel spectrogram failed: " + prep_error;
+            return false;
+        }
+        if (used_mel_cache) {
+            ++call_metrics.mel_cache_hits;
+        }
+        call_metrics.mel_cache_reused_frames += mel_timing.reused_frames;
+        call_metrics.mel_cache_computed_frames += mel_timing.computed_frames;
+        call_metrics.mel_cache_max_abs_diff =
+            std::max(call_metrics.mel_cache_max_abs_diff, mel_timing.max_abs_diff);
+        call_metrics.mel_stft_ms += mel_timing.stft_ms;
+        call_metrics.mel_norm_ms += mel_timing.norm_ms;
+        finish_stage(call_metrics.mel_ms);
 
-    auto lane_lock = context->lock_execution();
-    Tensor mel_device = Tensor::allocate(*context, {1, mel.n_mels, mel.n_frames});
-    context->memcpy_h2d(mel_device.data(), mel_bf16.data(), mel_bf16.size() * sizeof(AsrBf16));
-    finish_stage(call_metrics.upload_ms, context);
+        std::vector<AsrBf16> mel_bf16(static_cast<size_t>(mel.n_frames) * mel.n_mels);
+        for (int frame = 0; frame < mel.n_frames; ++frame) {
+            for (int mel_bin = 0; mel_bin < mel.n_mels; ++mel_bin) {
+                mel_bf16[static_cast<size_t>(mel_bin) * mel.n_frames + frame] =
+                    AsrBf16(mel.data[static_cast<size_t>(frame) * mel.n_mels + mel_bin]);
+            }
+        }
+
+        lane_lock = std::make_unique<Context::ExecutionLock>(context->lock_execution());
+        cpu_mel_device = Tensor::allocate(*context, {1, mel.n_mels, mel.n_frames});
+        context->memcpy_h2d(cpu_mel_device.data(), mel_bf16.data(),
+                            mel_bf16.size() * sizeof(AsrBf16));
+        finish_stage(call_metrics.upload_ms, context);
+        mel_device_ptr = &cpu_mel_device;
+        mel_frames = mel.n_frames;
+        mel_actual_frames = mel.actual_frames;
+    }
 
     int audio_len = 0;
     const int output_dim = spec.audio.output_dim;
-    const int max_audio_len = ((mel.actual_frames + 99) / 100) * 13 + 32;
+    const int max_audio_len = ((mel_actual_frames + 99) / 100) * 13 + 32;
     Tensor audio_tmp = Tensor::allocate(*context, {max_audio_len, output_dim});
 
     std::string audio_error;
-    if (!audio_encoder->encode(*context, mel_device, mel.actual_frames,
+    if (!audio_encoder->encode(*context, *mel_device_ptr, mel_actual_frames,
                                audio_tmp, audio_len, &audio_error)) {
         last_error_ = "ASR audio encoder failed: " + audio_error;
         return false;
