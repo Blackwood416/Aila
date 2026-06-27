@@ -2161,3 +2161,56 @@ Remaining hotspot:
   profile (`asr_profile_decode_ms` around 815ms with profile enabled). The next
   ASR-focused pass should look for decode-specific reductions or fewer repeated
   partial decodes.
+
+### 2026-06-27 short-prompt TTFA probe notes
+
+The current short streaming smoke is still dominated by three request-path
+components:
+
+```text
+default short smoke, no sync profile:
+asr_stream_simulated_tail_ms       369
+foreground_first_tts_enqueue_ms    661
+foreground_profile_prompt_prefill_ms 466
+tts_first_audio_ms                1147
+simulated_vad_to_first_audio_ms   1516
+```
+
+Rejected probes from this pass:
+
+```text
+probe                                      result
+AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS=32     Enqueue could move earlier on one sample, but default A/B was within variance and extra TTS chunks raised backend total.
+AILA_FOREGROUND_RETOKENIZE_GUARD=0
+  FINAL_SUFFIX_GUARD=1                     Final suffix fell 31 -> 9 tokens, but Q35 truncate fell back to full reset and ASR tail rose to 700ms.
+StreamChunkMs=250 StreamPrefillInterval=250  More ticks only hit ASR throttle; partial full decodes stayed at 3 and tail stayed around 355ms.
+AILA_ASR_PARTIAL_MIN_ADVANCE_MS=500        Partial full decodes rose 3 -> 8 and ASR get_text total rose 0.94s -> 2.26s; tail did not improve.
+AILA_TTS_STREAM_BATCH_FRAMES=6             First backend audio fell about 471ms -> 365ms, but sampled foreground text became longer and TTFA regressed.
+AILA_ASR_PREFIX_REUSE=1                    Reuse hit 2/2 attempts, but ASR get_text total rose about 0.93s -> 1.09s from truncate/reuse overhead.
+Aggressive foreground guard + Q35 step=4   Still missed truncate checkpoints at 100/104, caused full resets, and sampled identity text drifted.
+```
+
+Interpretation:
+
+- TTS first-audio generation for an 8-frame uniform chunk is near 440-470ms on
+  the short smoke. Smaller uniform chunks can reduce that number, but the
+  end-to-end result is currently more sensitive to foreground sampling length
+  and TTS chunk count.
+- Lower ASR partial cadence alone is not enough. The current throttle prevents
+  extra decodes at 250ms ticks; removing it just repeats expensive full partial
+  decodes without reducing the simulated final tail.
+- Foreground partial prefill has the largest visible ceiling: aggressive guards
+  can cut final prompt prefill roughly in half, but only if Qwen3.5 can restore
+  recurrent state at the partial common-prefix length instead of resetting.
+
+Next high-value implementation options:
+
+- Add precise Qwen3.5 recurrent-state checkpoints for foreground ASR partial
+  prefill boundaries, or keep speculative partial prefill within checkpointed
+  lengths so truncate never falls back to full reset.
+- Revisit foreground final prompt handoff so a verified full-prefix match can
+  reuse logits or only forward the final token, while keeping conservative
+  retokenization guards for unstable partial text.
+- Treat TTS batch size as a matrix-level tuning knob only after foreground
+  enqueue latency is stable; do not change the default based on a single short
+  prompt sample.
