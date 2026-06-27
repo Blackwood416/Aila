@@ -154,6 +154,7 @@ try {
             asr_stream_prefill_skipped_unchanged = Get-ValueOrEmpty $values "asr_stream_prefill_skipped_unchanged"
             asr_partial_full_decode_count = Get-ValueOrEmpty $values "asr_partial_full_decode_count"
             asr_partial_tail_decode_count = Get-ValueOrEmpty $values "asr_partial_tail_decode_count"
+            asr_partial_throttled_count = Get-ValueOrEmpty $values "asr_partial_throttled_count"
             asr_profile_transcribe_calls = Get-ValueOrEmpty $values "asr_profile_transcribe_calls"
             asr_profile_generated_tokens = Get-ValueOrEmpty $values "asr_profile_generated_tokens"
             asr_profile_input_audio_ms = Get-ValueOrEmpty $values "asr_profile_input_audio_ms"

@@ -65,6 +65,8 @@ private:
                          void* user_data,
                          std::function<bool()> should_cancel);
     bool ensure_reference_voice_loaded();
+    std::vector<std::vector<float>> prepare_audio_callbacks(const std::vector<float>& samples);
+    std::vector<float> flush_first_audio_buffer();
     void async_worker_loop();
 
     ModelSlot* slot_ = nullptr;
@@ -73,12 +75,14 @@ private:
     std::condition_variable cv_;
     std::deque<std::string> text_queue_;
     AliaTtsMetrics metrics_;
+    std::vector<float> first_audio_buffer_;
     std::vector<float> reference_speaker_embedding_;
     std::string reference_audio_path_;
     std::string reference_audio_error_;
     double reference_embedding_ms_ = -1.0;
     bool reference_voice_loaded_ = false;
     bool reference_voice_failed_ = false;
+    bool first_audio_callback_emitted_ = false;
     std::thread worker_;
     bool async_active_ = false;
     bool async_finishing_ = false;

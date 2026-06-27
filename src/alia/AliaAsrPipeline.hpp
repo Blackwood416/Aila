@@ -29,14 +29,16 @@ public:
 
     bool feed_audio(const float* samples, int sample_count);
     void append_stable_text(std::string text);
-    bool process_pending();
+    bool process_pending(bool force_partial_decode = true);
     void reset();
     void get_text(std::string& out_stable, std::string& out_partial);
+    void get_partial_text(std::string& out_stable, std::string& out_partial);
 
     bool ready() const;
     size_t buffered_sample_count() const;
     int partial_full_decode_count() const;
     int partial_tail_decode_count() const;
+    int partial_throttled_count() const;
     AliaAsrMetrics last_metrics() const;
     ModelSlot* slot() const { return slot_; }
     const std::string& last_error() const { return last_error_; }
@@ -64,6 +66,7 @@ private:
     std::string last_error_;
     int partial_full_decode_count_ = 0;
     int partial_tail_decode_count_ = 0;
+    int partial_throttled_count_ = 0;
     AliaAsrMetrics metrics_;
 };
 

@@ -1112,3 +1112,68 @@ Interpretation:
 - The remaining VAD-to-first-audio budget is mostly ASR partial tail plus TTS
   first audio. Further VLM suffix length trimming is less valuable than ASR
   partial recompute work or TTS first-chunk variance reduction.
+
+## 2026-06-27 ASR Partial Decode Throttle
+
+After the foreground suffix path moved under 1s, the main avoidable cost in the
+streaming path became repeated ASR partial recompute. A 500ms stream chunk can
+still drive frequent VLM prefill checks, but the ASR model should not rerun a
+partial decode for every small appended slice when the cached partial text is
+already good enough for speculative prefill.
+
+Short-scenario cadence probe:
+
+```text
+partial cadence  text calls  ASR transcribes  ASR total ms  ASR tail ms  VAD->audio ms
+500ms            8           8                3415.9        3006         4651
+1500ms           3           3                1691.3        2127         3653
+2000ms           2           2                1299.4        2224         3848
+```
+
+Implementation:
+
+- Added `alia_asr_get_partial_text()` for non-final streaming reads. It reuses
+  cached stable/partial text unless enough new audio has arrived.
+- Kept `alia_asr_get_text()` as the final/forced decode path so final turn text
+  still flushes pending audio.
+- Added `AILA_ASR_PARTIAL_MIN_ADVANCE_MS` with a default of 1500ms and a 500ms
+  floor.
+- Added `asr_partial_throttled_count` to the smoke/matrix output.
+- Added TTS pipeline first-callback aggregation so backend short chunks cannot
+  expose an underfilled first host callback. The first host audio callback
+  remains fixed at 12 frames / 23040 samples; only later callbacks may be
+  smaller.
+
+500ms stream chunk + 500ms VLM prefill tick matrix, with 1500ms ASR partial
+advance gate and reference voice:
+
+```text
+scenario          pass  text_calls  throttled  transcribes  asr_total_ms  vad_tail_ms  fg_prefill_ms  vad_to_first_audio_ms  first_samples
+short_hello       true  8           5          3            1755.96       2238         757            4117                   23040
+persona_chat      true  10          6          4            2517.71       2141         752            5128                   23040
+preference_memory true  10          6          4            2476.72       2148         825            4134                   23040
+task_memory       true  9           6          3            1848.03       1839         858            3848                   23040
+long_answer       true  11          7          4            2623.49       1684         890            4363                   23040
+```
+
+Compared with the previous 1s streaming-prefill decode-suffix matrix:
+
+```text
+scenario          old_vad_to_audio_ms  new_vad_to_audio_ms  delta_ms
+short_hello       5575                 4117                 -1458
+persona_chat      5610                 5128                 -482
+preference_memory 5610                 4134                 -1476
+task_memory       5795                 3848                 -1947
+long_answer       6203                 4363                 -1840
+```
+
+Interpretation:
+
+- The stream can poll text/prefill at 500ms granularity without paying a full
+  ASR partial decode on every poll.
+- The final forced decode keeps correctness anchored on the actual final audio.
+- End-to-end TTFA is still shaped by TTS first audio and generation variance,
+  but the ASR-side tail is now roughly 1.7-2.2s in this matrix instead of the
+  previous 3.6-4.0s range.
+- Next ASR work should look at reusing encoder/prompt state inside real partial
+  transcribes, not increasing the partial call cadence again.

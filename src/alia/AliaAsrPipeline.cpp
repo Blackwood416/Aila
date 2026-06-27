@@ -173,7 +173,7 @@ void AliaAsrPipeline::append_stable_text(std::string text) {
     partial_processed_stable_offset_ = stable_samples_offset_;
 }
 
-bool AliaAsrPipeline::process_pending() {
+bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
     if (!ready()) {
         return false;
     }
@@ -183,6 +183,10 @@ bool AliaAsrPipeline::process_pending() {
         constexpr size_t kMinStableSamples = static_cast<size_t>(6 * 16000);
         constexpr size_t kTargetChunkSamples = static_cast<size_t>(5 * 16000);
         constexpr size_t kMinPartialSamples = static_cast<size_t>(0.5f * 16000);
+        const int min_partial_advance_ms =
+            std::max(500, aila::env::read_int_raw("AILA_ASR_PARTIAL_MIN_ADVANCE_MS", 1500));
+        const size_t min_partial_advance_samples =
+            static_cast<size_t>(min_partial_advance_ms * 16);
 
         std::lock_guard<std::mutex> lock(mutex_);
         while (true) {
@@ -236,6 +240,25 @@ bool AliaAsrPipeline::process_pending() {
         if (remaining >= kMinPartialSamples) {
             if (partial_processed_audio_size_ != audio_buffer_.size() ||
                 partial_processed_stable_offset_ != stable_samples_offset_) {
+                const bool has_cached_partial =
+                    partial_processed_audio_size_ > stable_samples_offset_ &&
+                    partial_processed_stable_offset_ == stable_samples_offset_;
+                const size_t new_samples_since_partial =
+                    has_cached_partial && audio_buffer_.size() > partial_processed_audio_size_
+                        ? audio_buffer_.size() - partial_processed_audio_size_
+                        : 0;
+                const bool throttle_initial_partial =
+                    !force_partial_decode && !has_cached_partial &&
+                    remaining < min_partial_advance_samples;
+                const bool throttle_incremental_partial =
+                    !force_partial_decode && has_cached_partial &&
+                    new_samples_since_partial < min_partial_advance_samples;
+                if (throttle_initial_partial || throttle_incremental_partial) {
+                    ++partial_throttled_count_;
+                    last_error_.clear();
+                    return processed;
+                }
+
                 std::string partial_language;
                 std::string decoded_text;
                 bool tail_decode = false;
@@ -331,11 +354,20 @@ void AliaAsrPipeline::reset() {
     last_error_.clear();
     partial_full_decode_count_ = 0;
     partial_tail_decode_count_ = 0;
+    partial_throttled_count_ = 0;
     metrics_ = AliaAsrMetrics{};
 }
 
 void AliaAsrPipeline::get_text(std::string& out_stable, std::string& out_partial) {
-    process_pending();
+    process_pending(true);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    out_stable = stable_text_;
+    out_partial = partial_text_;
+}
+
+void AliaAsrPipeline::get_partial_text(std::string& out_stable, std::string& out_partial) {
+    process_pending(false);
 
     std::lock_guard<std::mutex> lock(mutex_);
     out_stable = stable_text_;
@@ -364,6 +396,11 @@ int AliaAsrPipeline::partial_full_decode_count() const {
 int AliaAsrPipeline::partial_tail_decode_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return partial_tail_decode_count_;
+}
+
+int AliaAsrPipeline::partial_throttled_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return partial_throttled_count_;
 }
 
 AliaAsrMetrics AliaAsrPipeline::last_metrics() const {

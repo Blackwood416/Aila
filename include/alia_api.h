@@ -94,6 +94,11 @@ ALIA_API void alia_free_string(char* s);
 
 /* Returns malloc-owned UTF-8 strings; release each non-null output with alia_free_string(). */
 ALIA_API int alia_asr_get_text(AliaContext* ctx, char** out_stable, char** out_partial);
+/*
+ * Returns cached text unless enough new audio has arrived to justify another partial decode.
+ * Use alia_asr_get_text() for final/forced turn text.
+ */
+ALIA_API int alia_asr_get_partial_text(AliaContext* ctx, char** out_stable, char** out_partial);
 ALIA_API void alia_register_background_callback(AliaContext* ctx, AliaBackgroundResultCallback callback);
 ALIA_API int alia_trigger_background_processing(AliaContext* ctx, const char* chat_turn_text);
 ALIA_API int alia_start_conversation_turn(

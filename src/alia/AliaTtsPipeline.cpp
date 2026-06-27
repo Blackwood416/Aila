@@ -19,6 +19,8 @@ namespace aila::alia {
 namespace {
 
 constexpr int kTtsStreamBatchFrames = 12;
+constexpr int kTtsSamplesPerFrame = 1920;
+constexpr int kTtsFirstAudioSamples = kTtsStreamBatchFrames * kTtsSamplesPerFrame;
 constexpr const char* kTtsReferenceAudioEnv = "AILA_TTS_REF_AUDIO";
 constexpr const char* kDefaultTtsReferenceAudio = "alia_ref.wav";
 
@@ -122,6 +124,8 @@ bool AliaTtsPipeline::enqueue_text(std::string text) {
 void AliaTtsPipeline::begin_turn_metrics() {
     std::lock_guard<std::mutex> lock(mutex_);
     metrics_ = AliaTtsMetrics{};
+    first_audio_buffer_.clear();
+    first_audio_callback_emitted_ = false;
 }
 
 bool AliaTtsPipeline::preload_reference_voice(std::string* error_message) {
@@ -152,6 +156,8 @@ bool AliaTtsPipeline::start_async_turn(const AliaGenConfig& config,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         text_queue_.clear();
+        first_audio_buffer_.clear();
+        first_audio_callback_emitted_ = false;
         async_config_ = config;
         async_audio_cb_ = audio_cb;
         async_user_data_ = user_data;
@@ -225,12 +231,19 @@ bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
         }
     }
 
+    std::vector<float> final_first_audio = flush_first_audio_buffer();
+    if (!final_first_audio.empty() && !cancelled()) {
+        audio_cb(final_first_audio.data(), static_cast<int>(final_first_audio.size()), user_data);
+    }
+
     return true;
 }
 
 void AliaTtsPipeline::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     text_queue_.clear();
+    first_audio_buffer_.clear();
+    first_audio_callback_emitted_ = false;
 }
 
 bool AliaTtsPipeline::ready() const {
@@ -249,6 +262,50 @@ size_t AliaTtsPipeline::pending_text_count() const {
 AliaTtsMetrics AliaTtsPipeline::last_metrics() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return metrics_;
+}
+
+std::vector<std::vector<float>> AliaTtsPipeline::prepare_audio_callbacks(
+    const std::vector<float>& samples) {
+    std::vector<std::vector<float>> callbacks;
+    if (samples.empty()) {
+        return callbacks;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (first_audio_callback_emitted_) {
+        callbacks.push_back(samples);
+        return callbacks;
+    }
+
+    first_audio_buffer_.insert(first_audio_buffer_.end(), samples.begin(), samples.end());
+    if (static_cast<int>(first_audio_buffer_.size()) < kTtsFirstAudioSamples) {
+        return callbacks;
+    }
+
+    callbacks.emplace_back(first_audio_buffer_.begin(),
+                           first_audio_buffer_.begin() + kTtsFirstAudioSamples);
+    metrics_.first_backend_audio_samples = kTtsFirstAudioSamples;
+    first_audio_callback_emitted_ = true;
+    if (first_audio_buffer_.size() > static_cast<size_t>(kTtsFirstAudioSamples)) {
+        callbacks.emplace_back(first_audio_buffer_.begin() + kTtsFirstAudioSamples,
+                               first_audio_buffer_.end());
+    }
+    first_audio_buffer_.clear();
+    return callbacks;
+}
+
+std::vector<float> AliaTtsPipeline::flush_first_audio_buffer() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (first_audio_callback_emitted_ || first_audio_buffer_.empty()) {
+        return {};
+    }
+
+    std::vector<float> padded = std::move(first_audio_buffer_);
+    padded.resize(kTtsFirstAudioSamples, 0.0f);
+    first_audio_buffer_.clear();
+    first_audio_callback_emitted_ = true;
+    metrics_.first_backend_audio_samples = kTtsFirstAudioSamples;
+    return padded;
 }
 
 bool AliaTtsPipeline::ensure_reference_voice_loaded() {
@@ -399,8 +456,20 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
                     return;
                 }
                 emitted_backend_audio = true;
+                std::vector<std::vector<float>> callbacks =
+                    prepare_audio_callbacks(samples);
+                if (callbacks.empty()) {
+                    return;
+                }
                 auto callback_unlock = lane_lock.scoped_unlock();
-                audio_cb(samples.data(), static_cast<int>(samples.size()), user_data);
+                for (const auto& callback_samples : callbacks) {
+                    if (callback_samples.empty() || cancelled()) {
+                        break;
+                    }
+                    audio_cb(callback_samples.data(),
+                             static_cast<int>(callback_samples.size()),
+                             user_data);
+                }
             },
             should_cancel);
         backend_timing = tts_backend->last_tts_backend_timing();
@@ -416,7 +485,10 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
             metrics_.first_text_tokens = static_cast<int>(text_tokens.size());
             metrics_.first_backend_frames = backend_timing.total_frames;
             metrics_.first_backend_callbacks = backend_timing.callback_count;
-            metrics_.first_backend_audio_samples = backend_timing.first_audio_samples;
+            if (metrics_.first_backend_audio_samples == 0 &&
+                backend_timing.first_audio_samples >= kTtsFirstAudioSamples) {
+                metrics_.first_backend_audio_samples = backend_timing.first_audio_samples;
+            }
             metrics_.first_backend_codes_ms = backend_timing.codes_ms;
             metrics_.first_backend_mimi_init_ms = backend_timing.mimi_init_ms;
             metrics_.first_backend_audio_ms = backend_timing.first_audio_ms;
@@ -444,6 +516,20 @@ void AliaTtsPipeline::async_worker_loop() {
             });
             if (text_queue_.empty()) {
                 if (async_finishing_) {
+                    AliaAudioCallback finish_audio_cb = async_audio_cb_;
+                    void* finish_user_data = async_user_data_;
+                    auto finish_should_cancel = async_should_cancel_;
+                    lock.unlock();
+                    std::vector<float> final_first_audio;
+                    if (!(finish_should_cancel && finish_should_cancel())) {
+                        final_first_audio = flush_first_audio_buffer();
+                    }
+                    if (!final_first_audio.empty() && finish_audio_cb) {
+                        finish_audio_cb(final_first_audio.data(),
+                                        static_cast<int>(final_first_audio.size()),
+                                        finish_user_data);
+                    }
+                    lock.lock();
                     async_active_ = false;
                     return;
                 }

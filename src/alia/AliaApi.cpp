@@ -206,6 +206,45 @@ ALIA_API int alia_asr_get_text(AliaContext* ctx, char** out_stable, char** out_p
     });
 }
 
+ALIA_API int alia_asr_get_partial_text(AliaContext* ctx, char** out_stable, char** out_partial) {
+    return guarded_alia_call([&]() -> int {
+        if (out_stable) {
+            *out_stable = nullptr;
+        }
+        if (out_partial) {
+            *out_partial = nullptr;
+        }
+        if (!ctx) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx->asr_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+
+        std::string stable;
+        std::string partial;
+        ctx->asr_pipeline->get_partial_text(stable, partial);
+        if (out_stable) {
+            *out_stable = duplicate_c_string(stable);
+            if (!*out_stable) {
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        if (out_partial) {
+            *out_partial = duplicate_c_string(partial);
+            if (!*out_partial) {
+                if (out_stable && *out_stable) {
+                    alia_free_string(*out_stable);
+                    *out_stable = nullptr;
+                }
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        return ALIA_OK;
+    });
+}
+
 ALIA_API void alia_register_background_callback(
     AliaContext* ctx,
     AliaBackgroundResultCallback callback) {

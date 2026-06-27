@@ -548,10 +548,12 @@ int main(int argc, char** argv) {
         static_cast<double>(mono_16k.size()) * 1000.0 / kAsrSampleRate;
     double asr_stream_simulated_clock_ms = 0.0;
     double asr_stream_simulated_tail_ms = -1.0;
-    auto get_asr_text = [&](std::string& stable_text, std::string& partial_text) -> bool {
+    auto get_asr_text = [&](std::string& stable_text, std::string& partial_text, bool force_decode) -> bool {
         char* stable_raw = nullptr;
         char* partial_raw = nullptr;
-        const int get_rc = alia_asr_get_text(ctx.get(), &stable_raw, &partial_raw);
+        const int get_rc = force_decode
+            ? alia_asr_get_text(ctx.get(), &stable_raw, &partial_raw)
+            : alia_asr_get_partial_text(ctx.get(), &stable_raw, &partial_raw);
         stable_text = stable_raw ? stable_raw : "";
         partial_text = partial_raw ? partial_raw : "";
         alia_free_string(stable_raw);
@@ -595,7 +597,7 @@ int main(int argc, char** argv) {
             }
 
             const auto chunk_op_start = Clock::now();
-            if (!get_asr_text(stable_text, partial_text)) {
+            if (!get_asr_text(stable_text, partial_text, final_chunk)) {
                 return 1;
             }
             ++asr_text_calls;
@@ -634,7 +636,7 @@ int main(int argc, char** argv) {
             std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
             return 1;
         }
-        if (!get_asr_text(stable_text, partial_text)) {
+        if (!get_asr_text(stable_text, partial_text, true)) {
             return 1;
         }
         ++asr_text_calls;
@@ -666,6 +668,8 @@ int main(int argc, char** argv) {
               << ctx->asr_pipeline->partial_full_decode_count() << "\n"
               << "asr_partial_tail_decode_count="
               << ctx->asr_pipeline->partial_tail_decode_count() << "\n"
+              << "asr_partial_throttled_count="
+              << ctx->asr_pipeline->partial_throttled_count() << "\n"
               << "asr_profile_transcribe_calls=" << asr_metrics.transcribe_calls << "\n"
               << "asr_profile_generated_tokens=" << asr_metrics.generated_tokens << "\n"
               << "asr_profile_input_audio_ms=" << asr_metrics.input_audio_ms << "\n"
