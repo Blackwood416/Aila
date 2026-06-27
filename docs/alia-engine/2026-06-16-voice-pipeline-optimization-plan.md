@@ -1838,3 +1838,73 @@ Interpretation:
   TTS win likely needs more exact Mimi conv state carry, more aggressive buffer
   reuse/preallocation inside decoder blocks, or reducing the first code
   generation latency.
+
+## 2026-06-27 Mimi Decoder Copy Elision
+
+A follow-up Mimi decoder pass removed several full-device copies in
+`mimi_conv_stages` while preserving the same queued ops and tensor values:
+
+- Moved ConvNeXt upsample output storage directly into the next `upsample_in`
+  instead of allocating a new tensor and copying the whole block.
+- Moved `dec0_out` directly into `dec_in`.
+- Moved each decoder block transposed-conv output directly into the residual
+  working tensor.
+- Replaced the residual-block `res_in -> xx` copy with two stable buffers and a
+  `Tensor*` role swap after `residual_add`.
+- Moved the final residual working tensor directly into the next `dec_in`.
+
+The lifetime rule is unchanged: waits remain before move-assigning over tensors
+whose old storage may still be referenced by queued kernels.
+
+Short streaming profile:
+
+```text
+representative first 12-frame chunks:
+ConvNeXt upsample                         2.2-3.5 ms
+Decoder blocks                          141.8-148.3 ms
+Conv stages total                       145.1-151.4 ms
+Mimi incremental total                  170.5-177.8 ms
+
+representative 24-frame chunks after warmup:
+ConvNeXt upsample                         2.9-3.3 ms
+Decoder blocks                          272.6-277.1 ms
+Conv stages total                       276.8-281.1 ms
+```
+
+Validation:
+
+```text
+git diff --check: pass
+build: cmake --build build --target AliaEngine --config Release
+short streaming smoke: ALIA_REAL_MODEL_SMOKE_PASS
+short smoke output ASR: "Kurasu, Kurasu. Ah. I'm Alia, a virtual AI from Illa. I can be helpful if you ask."
+matrix: RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr
+matrix result: 5/5 PASS
+```
+
+Default voice matrix after the change:
+
+```text
+scenario           vad_to_audio_ms  first_backend_frames  first_backend_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello        1747             26                    508.298                 692.217                 1857.49
+persona_chat       2143             17                    480.581                 656.808                 11023.0
+preference_memory  2157             64                    475.253                 653.178                 4598.77
+task_memory        1898             38                    461.193                 637.997                 16907.9
+long_answer        2672             36                    469.524                 643.590                 6958.02
+```
+
+Interpretation:
+
+- The change validates that these full-device copies are not semantically
+  required. Output ASR stayed aligned with the foreground text across the
+  matrix.
+- Profiled conv stages improved modestly, especially for warmed 24-frame
+  chunks, but first backend audio remains around 638-656ms in comparable
+  multi-chunk cases and can be worse when the first backend batch has more
+  frames or colder scheduling.
+- Short-scene TTFA is highly sensitive to foreground output length and first
+  TTS batch shape. Use matrix plus profile breakdown, not a single short result,
+  when judging backend changes.
+- The next deeper TTS work is exact Mimi conv state carry or targeted kernel
+  optimization in decoder blocks; allocation/copy cleanup is now mostly
+  harvested.

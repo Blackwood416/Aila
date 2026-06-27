@@ -11,6 +11,7 @@
 #include <array>
 #include <iostream>
 #include <fstream>
+#include <utility>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -1645,11 +1646,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         ctx.synchronize();
 
         L = 2 * L;
-        upsample_in = Tensor::allocate(ctx, {L, 1024});
-        ops::copy_tensor(ctx, conv_t_out, upsample_in, L * 1024);
-        // The queue is in-order. One stage-end wait is enough to keep local
-        // tensors alive until all queued work that references them is done.
-        ctx.synchronize();
+        upsample_in = std::move(conv_t_out);
     }
 
     auto t_upsample_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_upsample_start).count();
@@ -1665,8 +1662,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     Tensor& dec0_b = mimi_weights_.get("decoder.decoder.0.conv.bias");
     ops::causal_conv1d(ctx, upsample_in, dec0_w, dec0_b, dec0_out, 1, 1024, 1536, L, 7, 1);
 
-    Tensor dec_in = Tensor::allocate(ctx, {L, 1536});
-    ops::copy_tensor(ctx, dec0_out, dec_in, L * 1536);
+    Tensor dec_in = std::move(dec0_out);
 
     int upsample_rates[4] = {8, 5, 4, 3};
     int in_dims[4] = {1536, 768, 384, 192};
@@ -1694,24 +1690,25 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         int dilations[3] = {1, 3, 9};
         int Ls = L * stride;
         int res_elems = Ls * out_d;
-        Tensor xx = Tensor::allocate(ctx, {Ls, out_d});
-        ops::copy_tensor(ctx, conv_t_out, xx, res_elems);
+        Tensor xx = std::move(conv_t_out);
 
         // Pre-allocate residual block buffers (reused across 3 iterations)
         Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
         Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
         Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
         Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor* xx_cur = &xx;
+        Tensor* residual_buf = &res_in;
 
         for (int r = 0; r < 3; ++r) {
             std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
 
-            ops::copy_tensor(ctx, xx, res_in, res_elems);
+            ops::copy_tensor(ctx, *xx_cur, *residual_buf, res_elems);
 
-            // act1: snake(xx) -> xx_act1
+            // act1: snake(xx_cur) -> xx_act1
             Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
             Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
-            ops::snake_beta(ctx, xx, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
+            ops::snake_beta(ctx, *xx_cur, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
 
             // conv1: conv(xx_act1) -> conv1_out
             Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
@@ -1728,9 +1725,10 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
             ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
 
-            // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
-            ops::residual_add(ctx, res_in, conv2_out, res_elems);
-            ops::copy_tensor(ctx, res_in, xx, res_elems);
+            // residual_buf now holds the next xx. Swap buffer roles instead of
+            // copying the whole residual output back into xx.
+            ops::residual_add(ctx, *residual_buf, conv2_out, res_elems);
+            std::swap(xx_cur, residual_buf);
         }
 
         // dec_in is about to be replaced, so the queued conv-transpose work
@@ -1738,11 +1736,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         ctx.synchronize();
 
         L = L * stride;
-        dec_in = Tensor::allocate(ctx, {L, out_d});
-        ops::copy_tensor(ctx, xx, dec_in, L * out_d);
-        // Stage-end wait protects local buffers before they leave scope and
-        // before the next dec_in move assignment can free the previous tensor.
-        ctx.synchronize();
+        dec_in = std::move(*xx_cur);
     }
 
     auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
