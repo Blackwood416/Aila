@@ -1562,3 +1562,45 @@ Interpretation:
 - A 500ms streaming matrix showed final suffixes up to 36 tokens and live
   incremental score growth to `seq_cap=48`, so the cached warmup shape was
   widened to 64 suffix tokens while keeping the same 128-token warmup prompt.
+
+## 2026-06-27 TTS Stream Batch Probe
+
+The next TTS profile split latency into two parts:
+
+- `foreground_first_tts_enqueue_ms`: when foreground text is first ready for
+  TTS.
+- `tts_first_backend_audio_ms`: time from TTS backend start to the first audio
+  callback for that text chunk.
+
+The text side is highly output-dependent. Some turns emit an early punctuation
+boundary such as `Kurash...`, producing a very small first text chunk. Other
+turns wait for a much longer sentence boundary, producing 70-116 character
+first chunks. A soft text splitter was added behind
+`AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS`, but it remains disabled by default
+because smaller text chunks can make later chunks larger and increase playback
+gap risk.
+
+Added `AILA_TTS_STREAM_BATCH_FRAMES` to test uniform audio frame batches. The
+first host audio target follows the same batch size, so experiments do not use a
+special smaller first packet. Default remains 12 frames.
+
+Short streaming smoke:
+
+```text
+batch_frames  first_audio_samples  first_backend_codes_ms  first_backend_audio_ms  vad_to_audio_ms  chunk_sizes
+12            23040                ~451-453                ~639-677                ~1880            23040,...
+8             15360                345.619                 481.612                 1501             15360,...,tail smaller
+10            19200                431.504                 724.044                 2168             19200,...,tail smaller
+```
+
+Interpretation:
+
+- Uniform 8-frame batches can reduce TTFA on short output, and the callback
+  sizes stay uniform with smaller tail chunks.
+- The 8-frame path increases callback/Mimi decode frequency. A longer persona
+  probe showed a first TTS segment with 64 frames taking 7.1s total backend
+  time for about 5.1s of audio, which is a gap-risk signal.
+- 10-frame batches were worse in the short smoke and are not promising.
+- Keep the default at 12 frames for now. The next high-value work is reducing
+  Mimi incremental decode cost or pipelining/overlapping TTS segment generation
+  so a smaller uniform batch can keep up with playback.

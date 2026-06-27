@@ -138,6 +138,15 @@ const std::vector<std::string>& tts_chunk_boundary_markers() {
     return markers;
 }
 
+const std::vector<std::string>& tts_soft_chunk_boundary_markers() {
+    static const std::vector<std::string> markers = {
+        ",", ":", ")", "]",
+        "，", "、", "：", "）", "】",
+        " ",
+    };
+    return markers;
+}
+
 bool ends_with_tts_chunk_boundary(const std::string& text) {
     for (const std::string& marker : tts_chunk_boundary_markers()) {
         if (text.size() >= marker.size() &&
@@ -155,6 +164,31 @@ size_t last_tts_chunk_boundary(const std::string& text) {
         while (pos != std::string::npos) {
             cutoff = std::max(cutoff == std::string::npos ? 0 : cutoff,
                               pos + marker.size());
+            pos = text.find(marker, pos + marker.size());
+        }
+    }
+    return cutoff;
+}
+
+size_t last_tts_soft_chunk_boundary(const std::string& text,
+                                    size_t min_cutoff,
+                                    size_t max_cutoff) {
+    if (max_cutoff == 0 || text.size() < max_cutoff) {
+        return std::string::npos;
+    }
+    max_cutoff = std::min(max_cutoff, text.size());
+    size_t cutoff = std::string::npos;
+    for (const std::string& marker : tts_soft_chunk_boundary_markers()) {
+        size_t pos = text.find(marker);
+        while (pos != std::string::npos) {
+            const size_t candidate = pos + marker.size();
+            if (candidate > max_cutoff) {
+                break;
+            }
+            if (candidate >= min_cutoff) {
+                cutoff = std::max(cutoff == std::string::npos ? 0 : cutoff,
+                                  candidate);
+            }
             pos = text.find(marker, pos + marker.size());
         }
     }
@@ -290,11 +324,23 @@ size_t common_token_prefix_size(const std::vector<int>& a, const std::vector<int
 }
 
 std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) {
+    static const int kSoftMinChars = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MIN_CHARS", 24));
+    static const int kSoftMaxChars = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS", 0));
     size_t cutoff = std::string::npos;
     if (force) {
         cutoff = buffer.size();
     } else {
         cutoff = last_tts_chunk_boundary(buffer);
+        if (cutoff == std::string::npos &&
+            kSoftMaxChars > 0 &&
+            static_cast<int>(buffer.size()) >= kSoftMaxChars) {
+            cutoff = last_tts_soft_chunk_boundary(
+                buffer,
+                static_cast<size_t>(std::min(kSoftMinChars, kSoftMaxChars)),
+                static_cast<size_t>(kSoftMaxChars));
+        }
     }
 
     if (cutoff == std::string::npos || cutoff == 0) {

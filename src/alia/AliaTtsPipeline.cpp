@@ -18,11 +18,21 @@
 namespace aila::alia {
 namespace {
 
-constexpr int kTtsStreamBatchFrames = 12;
 constexpr int kTtsSamplesPerFrame = 1920;
-constexpr int kTtsFirstAudioSamples = kTtsStreamBatchFrames * kTtsSamplesPerFrame;
 constexpr const char* kTtsReferenceAudioEnv = "AILA_TTS_REF_AUDIO";
 constexpr const char* kDefaultTtsReferenceAudio = "alia_ref.wav";
+
+int tts_stream_batch_frames() {
+    static const int frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_STREAM_BATCH_FRAMES", 12),
+        1,
+        24);
+    return frames;
+}
+
+int tts_first_audio_samples() {
+    return tts_stream_batch_frames() * kTtsSamplesPerFrame;
+}
 
 GenerationConfig translate_tts_generation_config(const AliaGenConfig& config) {
     GenerationConfig translated;
@@ -278,16 +288,17 @@ std::vector<std::vector<float>> AliaTtsPipeline::prepare_audio_callbacks(
     }
 
     first_audio_buffer_.insert(first_audio_buffer_.end(), samples.begin(), samples.end());
-    if (static_cast<int>(first_audio_buffer_.size()) < kTtsFirstAudioSamples) {
+    const int first_audio_samples = tts_first_audio_samples();
+    if (static_cast<int>(first_audio_buffer_.size()) < first_audio_samples) {
         return callbacks;
     }
 
     callbacks.emplace_back(first_audio_buffer_.begin(),
-                           first_audio_buffer_.begin() + kTtsFirstAudioSamples);
-    metrics_.first_backend_audio_samples = kTtsFirstAudioSamples;
+                           first_audio_buffer_.begin() + first_audio_samples);
+    metrics_.first_backend_audio_samples = first_audio_samples;
     first_audio_callback_emitted_ = true;
-    if (first_audio_buffer_.size() > static_cast<size_t>(kTtsFirstAudioSamples)) {
-        callbacks.emplace_back(first_audio_buffer_.begin() + kTtsFirstAudioSamples,
+    if (first_audio_buffer_.size() > static_cast<size_t>(first_audio_samples)) {
+        callbacks.emplace_back(first_audio_buffer_.begin() + first_audio_samples,
                                first_audio_buffer_.end());
     }
     first_audio_buffer_.clear();
@@ -301,10 +312,11 @@ std::vector<float> AliaTtsPipeline::flush_first_audio_buffer() {
     }
 
     std::vector<float> padded = std::move(first_audio_buffer_);
-    padded.resize(kTtsFirstAudioSamples, 0.0f);
+    const int first_audio_samples = tts_first_audio_samples();
+    padded.resize(first_audio_samples, 0.0f);
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = true;
-    metrics_.first_backend_audio_samples = kTtsFirstAudioSamples;
+    metrics_.first_backend_audio_samples = first_audio_samples;
     return padded;
 }
 
@@ -447,7 +459,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
             {},
             0,
             translate_tts_generation_config(config),
-            kTtsStreamBatchFrames,
+            tts_stream_batch_frames(),
             [&](const std::vector<float>& samples) {
                 if (samples.empty()) {
                     return;
@@ -486,7 +498,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
             metrics_.first_backend_frames = backend_timing.total_frames;
             metrics_.first_backend_callbacks = backend_timing.callback_count;
             if (metrics_.first_backend_audio_samples == 0 &&
-                backend_timing.first_audio_samples >= kTtsFirstAudioSamples) {
+                backend_timing.first_audio_samples >= tts_first_audio_samples()) {
                 metrics_.first_backend_audio_samples = backend_timing.first_audio_samples;
             }
             metrics_.first_backend_codes_ms = backend_timing.codes_ms;
