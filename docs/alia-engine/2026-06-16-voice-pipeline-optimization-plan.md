@@ -1223,3 +1223,58 @@ Interpretation:
 - Tail-partial ASR and final cached/contextual decode experiments were rejected:
   they reduced some ASR work but changed user text shape enough to make VLM/TTS
   behavior worse.
+
+## 2026-06-27 Foreground VLM Warmup
+
+The next profiling pass split the ASR streaming tick into ASR text decode and
+foreground ASR-prefill work. The short prompt showed that the largest remaining
+tail was not ASR decode itself, but the first foreground Qwen3.5 forward:
+
+```text
+metric                              before warmup
+asr_stream_get_text_total_ms        1691
+asr_stream_vlm_prefill_total_ms     4503
+asr_stream_vlm_prefill_max_ms       4503
+foreground_profile_prompt_prefill_ms 751
+simulated_vad_to_first_audio_ms     5564
+```
+
+Two scheduling experiments were rejected:
+
+- Async foreground prefill moved the cost out of `alia_vlm_prefill_asr_text`,
+  but GPU contention made ASR `get_text` block instead; short prompt TTFA
+  regressed to roughly 6.2s.
+- Small per-tick VLM prefill slices still paid the same first-forward/resize
+  cost on the first slice and regressed TTFA.
+
+Implementation:
+
+- Added `AliaForegroundPipeline::warmup_loaded_vlm()` with a 128-token dummy
+  foreground prompt forward followed by `reset()`.
+- `AliaContext::load_model_slots()` runs this warmup after foreground model and
+  LoRA load, before real audio pipeline work. It can be disabled with
+  `AILA_FOREGROUND_VLM_WARMUP=0`.
+- Added smoke/matrix telemetry for ASR stream text, VLM prefill, and total tick
+  time so future regressions show up in the real-model matrix.
+
+500ms stream chunk + 500ms VLM prefill tick matrix after foreground warmup:
+
+```text
+scenario          pass  asr_tail_ms  vlm_prefill_max_ms  fg_prefill_ms  vad_to_content_ms  vad_to_audio_ms  first_samples
+short_hello       true  484          333                 751            1251               2081             23040
+persona_chat      true  1091         331                 744            1851               3746             23040
+preference_memory true  1001         330                 821            1838               2936             23040
+task_memory       true  557          329                 847            1420               2582             23040
+long_answer       true  738          332                 869            1623               2791             23040
+```
+
+Interpretation:
+
+- The foreground first-forward spike moved to model-load time, outside the
+  voice TTFA path.
+- Streaming VLM prefill max is now about 330ms instead of about 4.5s on the
+  short prompt.
+- The remaining short-prompt TTFA is roughly `0.48s ASR tail + 0.76s foreground
+  first content + 1.6s TTS first audio`. The next high-value work is therefore
+  TTS first-audio latency and ASR final/partial tail, not VLM prefill
+  scheduling.

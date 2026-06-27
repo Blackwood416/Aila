@@ -543,6 +543,12 @@ int main(int argc, char** argv) {
     int asr_prefill_calls = 0;
     int asr_text_calls = 0;
     int asr_prefill_skipped_unchanged = 0;
+    double asr_stream_get_text_total_ms = 0.0;
+    double asr_stream_get_text_max_ms = 0.0;
+    double asr_stream_vlm_prefill_total_ms = 0.0;
+    double asr_stream_vlm_prefill_max_ms = 0.0;
+    double asr_stream_tick_total_ms = 0.0;
+    double asr_stream_tick_max_ms = 0.0;
     constexpr double kAsrSampleRate = 16000.0;
     const double asr_audio_duration_ms =
         static_cast<double>(mono_16k.size()) * 1000.0 / kAsrSampleRate;
@@ -597,15 +603,23 @@ int main(int argc, char** argv) {
             }
 
             const auto chunk_op_start = Clock::now();
+            const auto get_text_start = Clock::now();
             if (!get_asr_text(stable_text, partial_text, final_chunk)) {
                 return 1;
             }
+            const double get_text_ms = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - get_text_start).count());
+            asr_stream_get_text_total_ms += get_text_ms;
+            asr_stream_get_text_max_ms =
+                std::max(asr_stream_get_text_max_ms, get_text_ms);
             ++asr_text_calls;
             if (!stable_text.empty() || !partial_text.empty()) {
                 if (stable_text == last_prefill_stable_text &&
                     partial_text == last_prefill_partial_text) {
                     ++asr_prefill_skipped_unchanged;
                 } else {
+                    const auto vlm_prefill_start = Clock::now();
                     rc = alia_vlm_prefill_asr_text(
                         ctx.get(),
                         stable_text.c_str(),
@@ -617,11 +631,20 @@ int main(int argc, char** argv) {
                     last_prefill_stable_text = stable_text;
                     last_prefill_partial_text = partial_text;
                     ++asr_prefill_calls;
+                    const double vlm_prefill_ms = static_cast<double>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - vlm_prefill_start).count());
+                    asr_stream_vlm_prefill_total_ms += vlm_prefill_ms;
+                    asr_stream_vlm_prefill_max_ms =
+                        std::max(asr_stream_vlm_prefill_max_ms, vlm_prefill_ms);
                 }
             }
             const double chunk_op_ms = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - chunk_op_start).count());
+            asr_stream_tick_total_ms += chunk_op_ms;
+            asr_stream_tick_max_ms =
+                std::max(asr_stream_tick_max_ms, chunk_op_ms);
             asr_stream_simulated_clock_ms =
                 std::max(asr_stream_simulated_clock_ms, chunk_end_ms) + chunk_op_ms;
             while (next_prefill_ms <= chunk_end_ms + 0.001) {
@@ -664,6 +687,12 @@ int main(int argc, char** argv) {
               << "asr_stream_prefill_calls=" << asr_prefill_calls << "\n"
               << "asr_stream_prefill_skipped_unchanged="
               << asr_prefill_skipped_unchanged << "\n"
+              << "asr_stream_get_text_total_ms=" << asr_stream_get_text_total_ms << "\n"
+              << "asr_stream_get_text_max_ms=" << asr_stream_get_text_max_ms << "\n"
+              << "asr_stream_vlm_prefill_total_ms=" << asr_stream_vlm_prefill_total_ms << "\n"
+              << "asr_stream_vlm_prefill_max_ms=" << asr_stream_vlm_prefill_max_ms << "\n"
+              << "asr_stream_tick_total_ms=" << asr_stream_tick_total_ms << "\n"
+              << "asr_stream_tick_max_ms=" << asr_stream_tick_max_ms << "\n"
               << "asr_partial_full_decode_count="
               << ctx->asr_pipeline->partial_full_decode_count() << "\n"
               << "asr_partial_tail_decode_count="

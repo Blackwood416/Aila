@@ -62,6 +62,7 @@ public:
                     void* user_data);
     AliaErrorCode prefill_asr_text(const std::string& stable_text,
                                    const std::string& partial_text);
+    bool warmup_loaded_vlm(std::string* error_message = nullptr);
     void request_abort();
     AliaErrorCode rollback_kv_cache(int rollback_tokens);
     void join();

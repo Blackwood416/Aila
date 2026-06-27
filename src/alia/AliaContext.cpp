@@ -1,5 +1,7 @@
 #include "AliaContext.hpp"
 
+#include "../utils/EnvUtils.hpp"
+
 AliaContext::AliaContext(int max_seq_len_in)
     : max_seq_len(max_seq_len_in),
       runtime(std::make_unique<aila::alia::RuntimeContext>()),
@@ -53,6 +55,17 @@ bool AliaContext::load_model_slots() {
         !load_slot(background_vlm) ||
         !load_slot(tts)) {
         return false;
+    }
+
+    if (foreground_pipeline &&
+        aila::env::read_flag("AILA_FOREGROUND_VLM_WARMUP", true)) {
+        std::string foreground_warmup_error;
+        if (!foreground_pipeline->warmup_loaded_vlm(&foreground_warmup_error)) {
+            last_error = foreground_warmup_error.empty()
+                ? "failed to warm up Alia foreground VLM"
+                : "failed to warm up Alia foreground VLM: " + foreground_warmup_error;
+            return false;
+        }
     }
 
     std::string reference_voice_error;

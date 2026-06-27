@@ -581,6 +581,75 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     return ALIA_OK;
 }
 
+bool AliaForegroundPipeline::warmup_loaded_vlm(std::string* error_message) {
+    if (!can_generate_with_loaded_vlm()) {
+        if (error_message) {
+            *error_message = "foreground VLM slot is not loaded";
+        }
+        return false;
+    }
+
+    Context* context = vlm_slot_->context();
+    Tokenizer* tokenizer = vlm_slot_->tokenizer();
+    IModelBackend* backend = vlm_slot_->backend();
+    if (!context || !tokenizer || !backend) {
+        if (error_message) {
+            *error_message = "foreground VLM slot is incomplete";
+        }
+        return false;
+    }
+
+    constexpr int kWarmupPromptTokens = 128;
+    std::vector<int> warmup_ids = build_alia_chat_prompt(
+        tokenizer,
+        foreground_system_prompt(),
+        "Warm up the real-time voice response path.");
+    const std::vector<int> filler_ids = tokenizer->encode(" warmup");
+    while (static_cast<int>(warmup_ids.size()) < kWarmupPromptTokens &&
+           !filler_ids.empty()) {
+        warmup_ids.insert(warmup_ids.end(), filler_ids.begin(), filler_ids.end());
+    }
+    if (static_cast<int>(warmup_ids.size()) > kWarmupPromptTokens) {
+        warmup_ids.resize(kWarmupPromptTokens);
+    }
+    const int max_seq_len = backend->max_seq_len();
+    if (max_seq_len > 0 && static_cast<int>(warmup_ids.size()) > max_seq_len) {
+        warmup_ids.resize(static_cast<size_t>(max_seq_len));
+    }
+    if (warmup_ids.empty()) {
+        if (error_message) {
+            *error_message = "foreground VLM warmup prompt encoded to zero tokens";
+        }
+        return false;
+    }
+
+    try {
+        auto lane_lock = context->lock_execution();
+        backend->reset();
+        forward_token_span(*context,
+                           *backend,
+                           warmup_ids.data(),
+                           static_cast<int>(warmup_ids.size()),
+                           false);
+        backend->reset();
+    } catch (const std::exception& e) {
+        if (error_message) {
+            *error_message = e.what();
+        }
+        return false;
+    } catch (...) {
+        if (error_message) {
+            *error_message = "unknown foreground VLM warmup failure";
+        }
+        return false;
+    }
+
+    if (error_message) {
+        error_message->clear();
+    }
+    return true;
+}
+
 void AliaForegroundPipeline::request_abort() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
