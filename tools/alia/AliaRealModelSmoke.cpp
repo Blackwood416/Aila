@@ -103,6 +103,10 @@ aila::alia::AliaAsrMetrics subtract_asr_metrics(
     aila::alia::AliaAsrMetrics delta;
     delta.transcribe_calls = after.transcribe_calls - before.transcribe_calls;
     delta.generated_tokens = after.generated_tokens - before.generated_tokens;
+    delta.prefix_reuse_attempts = after.prefix_reuse_attempts - before.prefix_reuse_attempts;
+    delta.prefix_reuse_hits = after.prefix_reuse_hits - before.prefix_reuse_hits;
+    delta.prefix_reused_tokens = after.prefix_reused_tokens - before.prefix_reused_tokens;
+    delta.prefix_appended_tokens = after.prefix_appended_tokens - before.prefix_appended_tokens;
     delta.input_audio_ms = after.input_audio_ms - before.input_audio_ms;
     delta.mel_ms = after.mel_ms - before.mel_ms;
     delta.upload_ms = after.upload_ms - before.upload_ms;
@@ -130,6 +134,10 @@ void print_asr_profile_call(const char* prefix,
               << ",call_ms:" << call_ms
               << ",transcribes:" << delta.transcribe_calls
               << ",generated_tokens:" << delta.generated_tokens
+              << ",prefix_reuse_attempts:" << delta.prefix_reuse_attempts
+              << ",prefix_reuse_hits:" << delta.prefix_reuse_hits
+              << ",prefix_reused_tokens:" << delta.prefix_reused_tokens
+              << ",prefix_appended_tokens:" << delta.prefix_appended_tokens
               << ",input_audio_ms:" << delta.input_audio_ms
               << ",mel_ms:" << delta.mel_ms
               << ",upload_ms:" << delta.upload_ms
@@ -804,6 +812,14 @@ int main(int argc, char** argv) {
               << ctx->asr_pipeline->partial_throttled_count() << "\n"
               << "asr_profile_transcribe_calls=" << asr_metrics.transcribe_calls << "\n"
               << "asr_profile_generated_tokens=" << asr_metrics.generated_tokens << "\n"
+              << "asr_profile_prefix_reuse_attempts="
+              << asr_metrics.prefix_reuse_attempts << "\n"
+              << "asr_profile_prefix_reuse_hits="
+              << asr_metrics.prefix_reuse_hits << "\n"
+              << "asr_profile_prefix_reused_tokens="
+              << asr_metrics.prefix_reused_tokens << "\n"
+              << "asr_profile_prefix_appended_tokens="
+              << asr_metrics.prefix_appended_tokens << "\n"
               << "asr_profile_input_audio_ms=" << asr_metrics.input_audio_ms << "\n"
               << "asr_profile_mel_ms=" << asr_metrics.mel_ms << "\n"
               << "asr_profile_upload_ms=" << asr_metrics.upload_ms << "\n"

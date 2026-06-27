@@ -1323,3 +1323,38 @@ Interpretation:
   verification, not a coarser partial cadence. Candidate work: cache/reuse ASR
   prompt/audio prefix state across partials, or add a deterministic low-cost
   stability check before rerunning full ASR prefill.
+
+## 2026-06-27 ASR Prompt Prefix Reuse Experiment
+
+Qwen3-ASR prompt-prefix KV reuse was prototyped behind
+`AILA_ASR_PREFIX_REUSE=1` and left disabled by default. The implementation keeps
+the cached backend KV up to `<audio_start> + audio_tokens` after each ASR
+partial/final call. A later growing partial can truncate back to that prefix,
+upload only new audio-token embeddings, and run incremental prefill for the new
+audio tokens plus the text suffix. Smoke telemetry now reports
+`asr_profile_prefix_reuse_attempts`, `asr_profile_prefix_reuse_hits`,
+`asr_profile_prefix_reused_tokens`, and `asr_profile_prefix_appended_tokens`.
+
+Short prompt profile, 500ms stream chunk, 1500ms partial advance gate:
+
+```text
+mode          calls  hits  reused_tokens  appended_tokens  prefill_ms  total_ms  final_text
+reuse off     3      0     0              0                808.139     1615.63   "Alia, please say hello in one."
+reuse on      3      2     102            44               820.209     1636.67   "Alia, please say hello in one."
+```
+
+Interpretation:
+
+- Prefix reuse is mechanically viable: the second partial and final call both
+  hit the cached KV path.
+- It is not a good default optimization for the current cadence. The reusable
+  ASR prompt prefix is small, and cached incremental prefill attention still
+  attends over the full prefix, so the extra bookkeeping slightly regressed the
+  profiled short prompt.
+- Reusing audio-token KV is also conceptually risky because the ASR audio
+  encoder runs self-attention over encoder blocks; older audio embeddings are
+  not guaranteed to be invariant when more audio arrives.
+- The next ASR optimization should target the larger repeated costs directly:
+  mel/audio encoder reuse for stable audio blocks, or a cheaper partial
+  verification path that avoids full ASR prefill when the transcript is unlikely
+  to change.

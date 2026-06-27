@@ -12,6 +12,10 @@ class ModelSlot;
 struct AliaAsrMetrics {
     int transcribe_calls = 0;
     int generated_tokens = 0;
+    int prefix_reuse_attempts = 0;
+    int prefix_reuse_hits = 0;
+    int prefix_reused_tokens = 0;
+    int prefix_appended_tokens = 0;
     double input_audio_ms = 0.0;
     double mel_ms = 0.0;
     double upload_ms = 0.0;
@@ -68,6 +72,22 @@ private:
     int partial_tail_decode_count_ = 0;
     int partial_throttled_count_ = 0;
     AliaAsrMetrics metrics_;
+
+    struct PrefixCache {
+        bool valid = false;
+        size_t stable_samples_offset = 0;
+        int audio_len = 0;
+        int prefix_len = 0;
+        std::vector<int> prefix_token_ids;
+
+        void reset() {
+            valid = false;
+            stable_samples_offset = 0;
+            audio_len = 0;
+            prefix_len = 0;
+            prefix_token_ids.clear();
+        }
+    } prefix_cache_;
 };
 
 void parse_asr_output(const std::string& raw,

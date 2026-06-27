@@ -172,6 +172,7 @@ void AliaAsrPipeline::append_stable_text(std::string text) {
     partial_text_.clear();
     partial_processed_audio_size_ = 0;
     partial_processed_stable_offset_ = stable_samples_offset_;
+    prefix_cache_.reset();
 }
 
 bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
@@ -234,6 +235,7 @@ bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
             stable_samples_offset_ = split_absolute;
             partial_processed_audio_size_ = 0;
             partial_processed_stable_offset_ = stable_samples_offset_;
+            prefix_cache_.reset();
             processed = true;
         }
 
@@ -357,6 +359,7 @@ void AliaAsrPipeline::reset() {
     partial_tail_decode_count_ = 0;
     partial_throttled_count_ = 0;
     metrics_ = AliaAsrMetrics{};
+    prefix_cache_.reset();
 }
 
 void AliaAsrPipeline::get_text(std::string& out_stable, std::string& out_partial) {
@@ -518,21 +521,88 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
             audio_positions.push_back(static_cast<int>(i));
         }
     }
+    const int audio_prefix_len = audio_positions.empty()
+        ? 0
+        : audio_positions.back() + 1;
 
-    backend->reset();
+    static const bool s_prefix_reuse =
+        aila::env::read_flag("AILA_ASR_PREFIX_REUSE", false);
+    int reuse_len = 0;
+    int reuse_audio_len = 0;
+    if (s_prefix_reuse && prefix_cache_.valid) {
+        ++call_metrics.prefix_reuse_attempts;
+        const bool prefix_shape_matches =
+            prefix_cache_.stable_samples_offset == stable_samples_offset_ &&
+            prefix_cache_.audio_len > 0 &&
+            audio_len >= prefix_cache_.audio_len &&
+            prefix_cache_.prefix_len > 0 &&
+            prefix_cache_.prefix_len <= audio_prefix_len &&
+            prefix_cache_.prefix_len <= static_cast<int>(prompt_ids.size()) &&
+            prefix_cache_.prefix_token_ids.size() ==
+                static_cast<size_t>(prefix_cache_.prefix_len);
+        const bool prefix_tokens_match = prefix_shape_matches &&
+            std::equal(prefix_cache_.prefix_token_ids.begin(),
+                       prefix_cache_.prefix_token_ids.end(),
+                       prompt_ids.begin());
+        if (prefix_tokens_match) {
+            reuse_len = prefix_cache_.prefix_len;
+            reuse_audio_len = prefix_cache_.audio_len;
+        }
+    }
+
     static const bool s_device_embedding_overrides =
         aila::env::read_flag("AILA_ASR_DEVICE_EMBEDDING_OVERRIDES", true);
     auto* asr_bnb4 = s_device_embedding_overrides
         ? dynamic_cast<Qwen3ASRBnb4Backend*>(backend)
         : nullptr;
+
+    bool use_prefix_reuse = false;
+    if (reuse_len > 0) {
+        use_prefix_reuse = backend->truncate_kv_cache(reuse_len);
+        if (!use_prefix_reuse) {
+            reuse_len = 0;
+            reuse_audio_len = 0;
+        }
+    }
+    if (!use_prefix_reuse) {
+        backend->reset();
+    }
+
+    std::vector<int> active_audio_positions;
+    active_audio_positions.reserve(audio_positions.size());
+    for (int pos : audio_positions) {
+        if (pos >= reuse_len) {
+            active_audio_positions.push_back(pos - reuse_len);
+        }
+    }
+    const int active_audio_len = std::max(0, audio_len - reuse_audio_len);
+    Tensor active_audio_view;
     if (asr_bnb4) {
-        asr_bnb4->set_embedding_overrides_device(audio_positions, audio_tmp, audio_len, output_dim);
+        if (active_audio_len > 0) {
+            active_audio_view = Tensor::view(
+                *context,
+                audio_tmp.data_as<AsrBf16>() +
+                    static_cast<size_t>(reuse_audio_len) * output_dim,
+                {active_audio_len, output_dim},
+                audio_tmp.dtype());
+            asr_bnb4->set_embedding_overrides_device(
+                active_audio_positions, active_audio_view, active_audio_len, output_dim);
+        } else {
+            backend->clear_embedding_overrides();
+        }
     } else {
-        std::vector<AsrBf16> audio_host(static_cast<size_t>(audio_len) * output_dim);
-        context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
-                            audio_host.size() * sizeof(AsrBf16));
-        finish_stage(call_metrics.readback_ms);
-        backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+        if (active_audio_len > 0) {
+            std::vector<AsrBf16> audio_host(static_cast<size_t>(active_audio_len) * output_dim);
+            context->memcpy_d2h(
+                audio_host.data(),
+                audio_tmp.data_as<AsrBf16>() +
+                    static_cast<size_t>(reuse_audio_len) * output_dim,
+                audio_host.size() * sizeof(AsrBf16));
+            finish_stage(call_metrics.readback_ms);
+            backend->set_embedding_overrides(active_audio_positions, audio_host, output_dim);
+        } else {
+            backend->clear_embedding_overrides();
+        }
     }
 
     std::vector<int> pos_t(prompt_ids.size());
@@ -546,13 +616,20 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     backend->set_mrope_positions(*context, pos_t, pos_h, pos_w, 0);
     finish_stage(call_metrics.prompt_ms, context);
 
-    DeviceAllocation prompt_device(*context, prompt_ids.size() * sizeof(int));
-    context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
-                        prompt_ids.size() * sizeof(int));
+    const int prompt_forward_len = static_cast<int>(prompt_ids.size()) - reuse_len;
+    DeviceAllocation prompt_device(*context,
+                                   static_cast<size_t>(prompt_forward_len) * sizeof(int));
+    context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data() + reuse_len,
+                        static_cast<size_t>(prompt_forward_len) * sizeof(int));
 
     Tensor* logits = &backend->forward(*context, prompt_device.as<int>(),
-                                       static_cast<int>(prompt_ids.size()));
+                                       prompt_forward_len);
     backend->clear_mrope_positions();
+    if (use_prefix_reuse) {
+        ++call_metrics.prefix_reuse_hits;
+        call_metrics.prefix_reused_tokens += reuse_len;
+        call_metrics.prefix_appended_tokens += prompt_forward_len;
+    }
     finish_stage(call_metrics.prefill_ms, context);
 
     DeviceAllocation one_token_device(*context, sizeof(int));
@@ -579,6 +656,20 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     finish_stage(call_metrics.decode_ms, context);
 
     backend->clear_embedding_overrides();
+    if (s_prefix_reuse && audio_prefix_len > 0) {
+        if (backend->truncate_kv_cache(audio_prefix_len)) {
+            prefix_cache_.valid = true;
+            prefix_cache_.stable_samples_offset = stable_samples_offset_;
+            prefix_cache_.audio_len = audio_len;
+            prefix_cache_.prefix_len = audio_prefix_len;
+            prefix_cache_.prefix_token_ids.assign(prompt_ids.begin(),
+                                                  prompt_ids.begin() + audio_prefix_len);
+        } else {
+            prefix_cache_.reset();
+        }
+    } else {
+        prefix_cache_.reset();
+    }
 
     std::string raw = tokenizer->decode(generated_ids);
     parse_asr_output(raw, "", language_out, text_out);
@@ -587,6 +678,10 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         std::chrono::high_resolution_clock::now() - total_start).count();
     metrics_.transcribe_calls += call_metrics.transcribe_calls;
     metrics_.generated_tokens += call_metrics.generated_tokens;
+    metrics_.prefix_reuse_attempts += call_metrics.prefix_reuse_attempts;
+    metrics_.prefix_reuse_hits += call_metrics.prefix_reuse_hits;
+    metrics_.prefix_reused_tokens += call_metrics.prefix_reused_tokens;
+    metrics_.prefix_appended_tokens += call_metrics.prefix_appended_tokens;
     metrics_.input_audio_ms += call_metrics.input_audio_ms;
     metrics_.mel_ms += call_metrics.mel_ms;
     metrics_.upload_ms += call_metrics.upload_ms;
