@@ -1513,3 +1513,52 @@ Interpretation:
 - TTS reference speaker mel uses a different 24kHz / `n_fft=1024` / magnitude
   mel contract. The shared GPU mel scaffolding can be extended to it later, but
   it should be validated as a separate TTS-speaker-encoder pass.
+
+## 2026-06-27 Foreground Cached Suffix Prefill
+
+The next short-prompt profile showed the foreground final suffix as a larger
+turn-time hotspot than ASR mel:
+
+```text
+before:
+foreground_profile_prefilled_prompt_tokens  87
+foreground_profile_prompt_suffix_tokens     31
+foreground_profile_prompt_prefill_ms        751
+simulated_vad_to_first_content_ms           1124
+simulated_vad_to_first_audio_ms             1982
+```
+
+The 31-token suffix was still routed through the single-token decode path
+because the old decode-path cutoff was 64 tokens. That assumption was wrong for
+this shape: cached batch prefill is faster even though it attends over the
+prefilled prefix.
+
+Implemented:
+
+- `AILA_FOREGROUND_DECODE_SUFFIX_TOKENS` controls the maximum cached suffix
+  length routed through single-token decode kernels.
+- The default is now 16 tokens, so the common 31-token final suffix uses cached
+  batch prefill.
+- `warmup_loaded_vlm` now warms a 64-token prefix followed by a 64-token cached
+  suffix, moving the first incremental prefill buffer/JIT cost into model load.
+
+Short prompt, 500ms ASR chunk/prefill cadence:
+
+```text
+mode                              prompt_prefill_ms  first_content_ms  first_tts_enqueue_ms  vad_to_audio_ms
+decode suffix <=64                751                1124              1210                  1982
+batch suffix <=16                 467                827               890                   1879
+batch suffix <=16 + cached warmup 307                676               764                   1529
+```
+
+Interpretation:
+
+- The fixed 12-frame / 23040-sample first TTS buffer is unchanged.
+- The win comes from reducing foreground final prompt suffix latency before the
+  first generated token can reach TTS.
+- The current short-prompt TTFA hotspot is now the TTS first-audio path after
+  enqueue: first code generation plus Mimi incremental decode. ASR tail is about
+  360ms, and foreground first content is now below 700ms on the short smoke.
+- A 500ms streaming matrix showed final suffixes up to 36 tokens and live
+  incremental score growth to `seq_cap=48`, so the cached warmup shape was
+  widened to 64 suffix tokens while keeping the same 128-token warmup prompt.

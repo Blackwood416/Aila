@@ -9,6 +9,7 @@
 #include "../models/IModelBackend.hpp"
 #include "../ops/Ops.hpp"
 #include "../utils/Tokenizer.hpp"
+#include "../utils/EnvUtils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -448,7 +449,8 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     constexpr int kRetokenizeGuardTokens = 16;
     constexpr int kFinalPromptSuffixGuardTokens = 16;
     constexpr int kMinIncrementalPrefillSuffixTokens = 16;
-    constexpr int kMaxDecodePathPrefillSuffixTokens = 64;
+    static const int kMaxDecodePathPrefillSuffixTokens = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
     const auto started = std::chrono::steady_clock::now();
     std::vector<int> target_ids =
         build_alia_user_prefix_prompt(tokenizer, foreground_system_prompt(), user_prefix);
@@ -600,6 +602,8 @@ bool AliaForegroundPipeline::warmup_loaded_vlm(std::string* error_message) {
     }
 
     constexpr int kWarmupPromptTokens = 128;
+    constexpr int kWarmupCachedPrefixTokens = 64;
+    constexpr int kWarmupCachedSuffixTokens = 64;
     std::vector<int> warmup_ids = build_alia_chat_prompt(
         tokenizer,
         foreground_system_prompt(),
@@ -631,6 +635,20 @@ bool AliaForegroundPipeline::warmup_loaded_vlm(std::string* error_message) {
                            warmup_ids.data(),
                            static_cast<int>(warmup_ids.size()),
                            false);
+        if (static_cast<int>(warmup_ids.size()) >=
+            kWarmupCachedPrefixTokens + kWarmupCachedSuffixTokens) {
+            backend->reset();
+            forward_token_span(*context,
+                               *backend,
+                               warmup_ids.data(),
+                               kWarmupCachedPrefixTokens,
+                               false);
+            forward_token_span(*context,
+                               *backend,
+                               warmup_ids.data() + kWarmupCachedPrefixTokens,
+                               kWarmupCachedSuffixTokens,
+                               false);
+        }
         backend->reset();
     } catch (const std::exception& e) {
         if (error_message) {
@@ -1165,7 +1183,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             return false;
         }
 
-        constexpr int kMaxDecodePathPromptSuffixTokens = 64;
+        static const int kMaxDecodePathPromptSuffixTokens = std::max(
+            0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
         // Keep full initial prompts on the batch path; use decode kernels only
         // for small suffixes after a validated cached prefix.
         const bool decode_path_prompt_suffix =
