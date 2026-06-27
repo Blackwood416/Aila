@@ -1711,3 +1711,68 @@ These transcripts match the foreground text closely enough to validate that the
 vocoder output stayed intelligible. Cases where the foreground response itself
 is off-policy or repetitive should be treated as foreground/model behavior, not
 as TTS corruption, unless the output ASR diverges from `foreground_assistant_text`.
+
+## 2026-06-27 Mimi Pre-Transformer State Reuse
+
+The next stateful Mimi step moved the pre-transformer incremental path from
+"full-history recompute" to "new frames plus cached state":
+
+- `MimiStreamState` now owns persistent 8-layer pre-transformer K/V caches
+  shaped `[16, max_frames, 64]`.
+- The pre-conv stage runs on the new frames plus the 2-frame causal overlap
+  needed by the kernel-3 pre-conv.
+- Each pre-transformer layer computes Q/K/V only for the new frames, applies
+  RoPE with `start_pos`, writes the new K/V into cache, and uses
+  `attention_prefill_cached` for nonzero `start_pos`.
+- The final pre-transformer output projection is stored in
+  `pre_tfm_out_buffer`, which the existing Mimi conv-window path consumes as a
+  suffix view.
+
+Short streaming profile after the change:
+
+```text
+first 12-frame chunk:
+Mimi incremental pre-conv                 0.2 ms (12/12 frames)
+Mimi incremental pre-transformer cached  27.2 ms (12 new/12 total frames)
+Conv stages total                       164.7 ms (12 frames, 23040/23040 samples)
+Mimi incremental total                  194.1 ms
+
+later chunks:
+15 total frames: pre-transformer cached  22.4 ms (3 new/15 total frames)
+24 total frames: pre-transformer cached  24.8 ms (12 new/24 total frames)
+36 total frames: pre-transformer cached  24.5 ms (12 new/36 total frames)
+48 total frames: pre-transformer cached  25.0 ms (12 new/48 total frames)
+```
+
+Validation:
+
+```text
+build: cmake --build build --target AliaEngine --config Release
+short streaming smoke: ALIA_REAL_MODEL_SMOKE_PASS
+short smoke output ASR: "Crash, I am a little shy, but I can say hello."
+matrix: RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr
+matrix result: 5/5 PASS
+```
+
+Default voice matrix after the change:
+
+```text
+scenario           vad_to_audio_ms  first_backend_audio_ms  backend_total_ms  output ASR
+short_hello        2370             651.468                 12315.1           matched foreground, truncated by ASR near the tail
+persona_chat       2024             645.511                 9881.68           matched foreground
+preference_memory  2116             646.276                 4621.19           matched foreground
+task_memory        2529             651.105                 10799.8           matched foreground
+long_answer        3238             635.7                   13318.6           matched foreground
+```
+
+Interpretation:
+
+- This is a correctness and scaling foundation more than a short-prompt TTFA
+  win. The short-prompt pre-transformer slice is already small; cached mode is
+  roughly flat at 22-27ms but does not move the first-audio bottleneck.
+- First-audio latency is still dominated by first code generation and Mimi conv
+  vocoder decode. Decoder blocks remain the main TTS backend RTF hotspot.
+- The cached pre-transformer path adds about 3ms to `mimi_init_ms` for cache
+  allocation, which is acceptable but visible in timing.
+- The next high-value TTS backend step is still more exact conv state carry or
+  reducing sync/allocation overhead inside the Mimi conv decoder.

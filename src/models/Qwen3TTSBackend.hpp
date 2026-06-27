@@ -85,6 +85,9 @@ public:
 
         // Accumulated latent history for full-history conv/pre-transformer stages.
         Tensor latent_buffer;   // [total_frames, 512]
+        Tensor pre_tfm_out_buffer; // [total_frames, 1024]
+        std::array<Tensor, 8> pre_tfm_k_cache; // [16, max_frames, 64]
+        std::array<Tensor, 8> pre_tfm_v_cache; // [16, max_frames, 64]
 
         // Track previous audio output position for incremental slicing
         int last_audio_sample_count = 0;
@@ -92,6 +95,9 @@ public:
         void reset() {
             total_frames = 0;
             latent_buffer = Tensor();
+            pre_tfm_out_buffer = Tensor();
+            for (auto& cache : pre_tfm_k_cache) cache = Tensor();
+            for (auto& cache : pre_tfm_v_cache) cache = Tensor();
             last_audio_sample_count = 0;
         }
     };
