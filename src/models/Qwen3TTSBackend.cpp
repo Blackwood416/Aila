@@ -1597,7 +1597,6 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     auto t_upsample_start = std::chrono::high_resolution_clock::now();
     Tensor upsample_in = Tensor::allocate(ctx, {n_frames, 1024});
     ops::copy_tensor(ctx, pre_tfm_out, upsample_in, n_frames * 1024);
-    ctx.synchronize();
     int L = n_frames;
 
     for (int i = 0; i < 2; ++i) {
@@ -1608,50 +1607,48 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         Tensor& conv_w = mimi_weights_.get(up_prefix + "0.conv.weight");
         Tensor& conv_b = mimi_weights_.get(up_prefix + "0.conv.bias");
         ops::causal_conv_transpose1d(ctx, upsample_in, conv_w, conv_b, conv_t_out, 1, 1024, 1024, L, 2, 2);
-        ctx.synchronize();
 
         // ConvNeXt block
         Tensor dw_out = Tensor::allocate(ctx, {2 * L, 1024});
         Tensor& dw_w = mimi_weights_.get(up_prefix + "1.dwconv.conv.weight");
         Tensor& dw_b = mimi_weights_.get(up_prefix + "1.dwconv.conv.bias");
         ops::causal_conv1d_dw(ctx, conv_t_out, dw_w, dw_b, dw_out, 1, 1024, 2 * L, 7, 1);
-        ctx.synchronize();
 
         // LayerNorm
         Tensor normed_dw = Tensor::allocate(ctx, {2 * L, 1024});
         Tensor& norm_w = mimi_weights_.get(up_prefix + "1.norm.weight");
         Tensor& norm_b = mimi_weights_.get(up_prefix + "1.norm.bias");
         ops::layer_norm(ctx, dw_out, norm_w, norm_b, 1e-6f, normed_dw, 2 * L, 1024);
-        ctx.synchronize();
 
         // Linear pwconv1
         Tensor pw1_out = Tensor::allocate(ctx, {2 * L, 4096});
         Tensor& pw1_b = mimi_weights_.get(up_prefix + "1.pwconv1.bias");
         auto& up_linears = mimi_upsample_linears_[static_cast<size_t>(i)];
         up_linears.pwconv1.forward_bias(ctx, normed_dw, pw1_b, pw1_out, 2 * L);
-        ctx.synchronize();
 
         // GELU
         ops::gelu_tanh_inplace(ctx, pw1_out, 2 * L * 4096);
-        ctx.synchronize();
 
         // Linear pwconv2
         Tensor pw2_out = Tensor::allocate(ctx, {2 * L, 1024});
         Tensor& pw2_b = mimi_weights_.get(up_prefix + "1.pwconv2.bias");
         up_linears.pwconv2.forward_bias(ctx, pw1_out, pw2_b, pw2_out, 2 * L);
-        ctx.synchronize();
 
         // Scale by gamma and add to residual
         Tensor& gamma = mimi_weights_.get(up_prefix + "1.gamma");
         apply_layer_scale_gpu(pw2_out, gamma, 2 * L, 1024);
-        ctx.synchronize();
 
         ops::residual_add(ctx, conv_t_out, pw2_out, 2 * L * 1024);
+
+        // upsample_in is about to be replaced, which frees the previous input.
+        // Wait here so queued kernels no longer reference that storage.
         ctx.synchronize();
 
         L = 2 * L;
         upsample_in = Tensor::allocate(ctx, {L, 1024});
         ops::copy_tensor(ctx, conv_t_out, upsample_in, L * 1024);
+        // The queue is in-order. One stage-end wait is enough to keep local
+        // tensors alive until all queued work that references them is done.
         ctx.synchronize();
     }
 
@@ -1667,11 +1664,9 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     Tensor& dec0_w = mimi_weights_.get("decoder.decoder.0.conv.weight");
     Tensor& dec0_b = mimi_weights_.get("decoder.decoder.0.conv.bias");
     ops::causal_conv1d(ctx, upsample_in, dec0_w, dec0_b, dec0_out, 1, 1024, 1536, L, 7, 1);
-    ctx.synchronize();
 
     Tensor dec_in = Tensor::allocate(ctx, {L, 1536});
     ops::copy_tensor(ctx, dec0_out, dec_in, L * 1536);
-    ctx.synchronize();
 
     int upsample_rates[4] = {8, 5, 4, 3};
     int in_dims[4] = {1536, 768, 384, 192};
@@ -1688,14 +1683,12 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         Tensor& snake_a = mimi_weights_.get(dec_prefix + "0.alpha");
         Tensor& snake_b = mimi_weights_.get(dec_prefix + "0.beta");
         ops::snake_beta(ctx, dec_in, snake_a, snake_b, dec_in, L * in_d, in_d, L);
-        ctx.synchronize();
 
         // 2. Transposed Convolution
         Tensor conv_t_out = Tensor::allocate(ctx, {L * stride, out_d});
         Tensor& conv_t_w = mimi_weights_.get(dec_prefix + "1.conv.weight");
         Tensor& conv_t_b = mimi_weights_.get(dec_prefix + "1.conv.bias");
         ops::causal_conv_transpose1d(ctx, dec_in, conv_t_w, conv_t_b, conv_t_out, 1, in_d, out_d, L, kernel, stride);
-        ctx.synchronize();
 
         // 3. 3 Residual blocks with dilations 1, 3, 9
         int dilations[3] = {1, 3, 9};
@@ -1703,7 +1696,6 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         int res_elems = Ls * out_d;
         Tensor xx = Tensor::allocate(ctx, {Ls, out_d});
         ops::copy_tensor(ctx, conv_t_out, xx, res_elems);
-        ctx.synchronize();
 
         // Pre-allocate residual block buffers (reused across 3 iterations)
         Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
@@ -1739,12 +1731,17 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
             // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
             ops::residual_add(ctx, res_in, conv2_out, res_elems);
             ops::copy_tensor(ctx, res_in, xx, res_elems);
-            ctx.synchronize();  // barrier between residual blocks
         }
+
+        // dec_in is about to be replaced, so the queued conv-transpose work
+        // that consumed the previous dec_in must be complete first.
+        ctx.synchronize();
 
         L = L * stride;
         dec_in = Tensor::allocate(ctx, {L, out_d});
         ops::copy_tensor(ctx, xx, dec_in, L * out_d);
+        // Stage-end wait protects local buffers before they leave scope and
+        // before the next dec_in move assignment can free the previous tensor.
         ctx.synchronize();
     }
 
@@ -1759,14 +1756,12 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     Tensor& dec5_a = mimi_weights_.get("decoder.decoder.5.alpha");
     Tensor& dec5_b = mimi_weights_.get("decoder.decoder.5.beta");
     ops::snake_beta(ctx, dec_in, dec5_a, dec5_b, dec_in, L * 96, 96, L);
-    ctx.synchronize();
 
     // dec6一维卷积 [7, 96, 1]
     Tensor dec6_out = Tensor::allocate(ctx, {L, 1});
     Tensor& dec6_w = mimi_weights_.get("decoder.decoder.6.conv.weight");
     Tensor& dec6_b = mimi_weights_.get("decoder.decoder.6.conv.bias");
     ops::causal_conv1d(ctx, dec_in, dec6_w, dec6_b, dec6_out, 1, 96, 1, L, 7, 1);
-    ctx.synchronize();
 
     // Clamp and copy back only the requested tail when incremental streaming
     // used a history window. Full vocoder decode still reads the whole tensor.

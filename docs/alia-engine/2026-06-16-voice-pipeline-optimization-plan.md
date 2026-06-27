@@ -1776,3 +1776,65 @@ Interpretation:
   allocation, which is acceptable but visible in timing.
 - The next high-value TTS backend step is still more exact conv state carry or
   reducing sync/allocation overhead inside the Mimi conv decoder.
+
+## 2026-06-27 Mimi Conv Sync Cleanup
+
+The next low-risk Mimi backend pass reduced host-side synchronization inside
+`mimi_conv_stages` without changing the vocoder math:
+
+- Removed per-op waits between in-order queued kernels in the ConvNeXt upsample
+  path, decoder residual blocks, final activation, and clamp/readback setup.
+- Kept waits before move-assigning tensors whose previous device storage would
+  be freed immediately, and at stage boundaries where local tensors are about to
+  leave scope.
+- Kept the final host readback as the hard synchronization point.
+
+Short streaming smoke with `AILA_TTS_PROFILE=1`:
+
+```text
+first 12-frame chunk:
+Mimi incremental pre-transformer cached  25.7 ms (12 new/12 total frames)
+ConvNeXt upsample                         4.0 ms
+Decoder blocks                          147.8 ms
+Conv stages total                       152.8 ms (12 frames, 23040/23040 samples)
+Mimi incremental total                  180.8 ms
+
+later chunks:
+24 total frames: conv stages total      414.9 ms
+36 total frames: conv stages total      575.8 ms
+48 total frames, 24+12 window           422.3 ms
+```
+
+Validation:
+
+```text
+git diff --check: pass
+build: cmake --build build --target AliaEngine --config Release
+short streaming smoke: ALIA_REAL_MODEL_SMOKE_PASS
+short smoke output ASR: "Kurasu, Isla is a bit shy about speaking, but I can."
+matrix: RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr
+matrix result: 5/5 PASS
+```
+
+Default voice matrix after the change:
+
+```text
+scenario           vad_to_audio_ms  first_backend_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello        2061             473.594                 652.104                 9047.56
+persona_chat       2106             467.007                 648.070                 14694.6
+preference_memory  2057             457.023                 633.482                 6845.47
+task_memory        2471             447.619                 628.793                 11033.0
+long_answer        2604             445.901                 623.308                 8712.1
+```
+
+Interpretation:
+
+- The cleanup is safe under the current `Tensor` lifetime model because waits
+  remain at storage-freeing boundaries, but it is a modest latency win rather
+  than a structural improvement.
+- First backend audio is now roughly 623-652ms across the matrix, with code
+  generation around 446-474ms and Mimi first audio decode around 623-652ms.
+- Decoder blocks remain the largest TTS backend hotspot. The next substantial
+  TTS win likely needs more exact Mimi conv state carry, more aggressive buffer
+  reuse/preallocation inside decoder blocks, or reducing the first code
+  generation latency.
