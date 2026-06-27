@@ -107,10 +107,23 @@ aila::alia::AliaAsrMetrics subtract_asr_metrics(
     delta.prefix_reuse_hits = after.prefix_reuse_hits - before.prefix_reuse_hits;
     delta.prefix_reused_tokens = after.prefix_reused_tokens - before.prefix_reused_tokens;
     delta.prefix_appended_tokens = after.prefix_appended_tokens - before.prefix_appended_tokens;
+    delta.mel_cache_hits = after.mel_cache_hits - before.mel_cache_hits;
+    delta.mel_cache_reused_frames =
+        after.mel_cache_reused_frames - before.mel_cache_reused_frames;
+    delta.mel_cache_computed_frames =
+        after.mel_cache_computed_frames - before.mel_cache_computed_frames;
+    delta.mel_cache_max_abs_diff =
+        std::max(after.mel_cache_max_abs_diff, before.mel_cache_max_abs_diff);
     delta.input_audio_ms = after.input_audio_ms - before.input_audio_ms;
     delta.mel_ms = after.mel_ms - before.mel_ms;
+    delta.mel_stft_ms = after.mel_stft_ms - before.mel_stft_ms;
+    delta.mel_norm_ms = after.mel_norm_ms - before.mel_norm_ms;
     delta.upload_ms = after.upload_ms - before.upload_ms;
     delta.encoder_ms = after.encoder_ms - before.encoder_ms;
+    delta.encoder_conv_ms = after.encoder_conv_ms - before.encoder_conv_ms;
+    delta.encoder_transformer_ms =
+        after.encoder_transformer_ms - before.encoder_transformer_ms;
+    delta.encoder_proj_ms = after.encoder_proj_ms - before.encoder_proj_ms;
     delta.readback_ms = after.readback_ms - before.readback_ms;
     delta.prompt_ms = after.prompt_ms - before.prompt_ms;
     delta.prefill_ms = after.prefill_ms - before.prefill_ms;
@@ -138,10 +151,19 @@ void print_asr_profile_call(const char* prefix,
               << ",prefix_reuse_hits:" << delta.prefix_reuse_hits
               << ",prefix_reused_tokens:" << delta.prefix_reused_tokens
               << ",prefix_appended_tokens:" << delta.prefix_appended_tokens
+              << ",mel_cache_hits:" << delta.mel_cache_hits
+              << ",mel_cache_reused_frames:" << delta.mel_cache_reused_frames
+              << ",mel_cache_computed_frames:" << delta.mel_cache_computed_frames
+              << ",mel_cache_max_abs_diff:" << delta.mel_cache_max_abs_diff
               << ",input_audio_ms:" << delta.input_audio_ms
               << ",mel_ms:" << delta.mel_ms
+              << ",mel_stft_ms:" << delta.mel_stft_ms
+              << ",mel_norm_ms:" << delta.mel_norm_ms
               << ",upload_ms:" << delta.upload_ms
               << ",encoder_ms:" << delta.encoder_ms
+              << ",encoder_conv_ms:" << delta.encoder_conv_ms
+              << ",encoder_transformer_ms:" << delta.encoder_transformer_ms
+              << ",encoder_proj_ms:" << delta.encoder_proj_ms
               << ",readback_ms:" << delta.readback_ms
               << ",prompt_ms:" << delta.prompt_ms
               << ",prefill_ms:" << delta.prefill_ms
@@ -820,10 +842,26 @@ int main(int argc, char** argv) {
               << asr_metrics.prefix_reused_tokens << "\n"
               << "asr_profile_prefix_appended_tokens="
               << asr_metrics.prefix_appended_tokens << "\n"
+              << "asr_profile_mel_cache_hits="
+              << asr_metrics.mel_cache_hits << "\n"
+              << "asr_profile_mel_cache_reused_frames="
+              << asr_metrics.mel_cache_reused_frames << "\n"
+              << "asr_profile_mel_cache_computed_frames="
+              << asr_metrics.mel_cache_computed_frames << "\n"
+              << "asr_profile_mel_cache_max_abs_diff="
+              << asr_metrics.mel_cache_max_abs_diff << "\n"
               << "asr_profile_input_audio_ms=" << asr_metrics.input_audio_ms << "\n"
               << "asr_profile_mel_ms=" << asr_metrics.mel_ms << "\n"
+              << "asr_profile_mel_stft_ms=" << asr_metrics.mel_stft_ms << "\n"
+              << "asr_profile_mel_norm_ms=" << asr_metrics.mel_norm_ms << "\n"
               << "asr_profile_upload_ms=" << asr_metrics.upload_ms << "\n"
               << "asr_profile_encoder_ms=" << asr_metrics.encoder_ms << "\n"
+              << "asr_profile_encoder_conv_ms="
+              << asr_metrics.encoder_conv_ms << "\n"
+              << "asr_profile_encoder_transformer_ms="
+              << asr_metrics.encoder_transformer_ms << "\n"
+              << "asr_profile_encoder_proj_ms="
+              << asr_metrics.encoder_proj_ms << "\n"
               << "asr_profile_readback_ms=" << asr_metrics.readback_ms << "\n"
               << "asr_profile_prompt_ms=" << asr_metrics.prompt_ms << "\n"
               << "asr_profile_prefill_ms=" << asr_metrics.prefill_ms << "\n"

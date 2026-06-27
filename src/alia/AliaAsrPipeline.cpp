@@ -173,6 +173,8 @@ void AliaAsrPipeline::append_stable_text(std::string text) {
     partial_processed_audio_size_ = 0;
     partial_processed_stable_offset_ = stable_samples_offset_;
     prefix_cache_.reset();
+    partial_mel_cache_.reset();
+    partial_mel_cache_stable_offset_ = stable_samples_offset_;
 }
 
 bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
@@ -236,6 +238,8 @@ bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
             partial_processed_audio_size_ = 0;
             partial_processed_stable_offset_ = stable_samples_offset_;
             prefix_cache_.reset();
+            partial_mel_cache_.reset();
+            partial_mel_cache_stable_offset_ = stable_samples_offset_;
             processed = true;
         }
 
@@ -360,6 +364,8 @@ void AliaAsrPipeline::reset() {
     partial_throttled_count_ = 0;
     metrics_ = AliaAsrMetrics{};
     prefix_cache_.reset();
+    partial_mel_cache_.reset();
+    partial_mel_cache_stable_offset_ = 0;
 }
 
 void AliaAsrPipeline::get_text(std::string& out_stable, std::string& out_partial) {
@@ -450,11 +456,38 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     const Qwen3Config& cfg = spec.qwen3;
 
     MelSpectrogram mel;
+    MelSpectrogramTiming mel_timing;
     std::string prep_error;
-    if (!compute_mel_spectrogram(segment, mel, &prep_error)) {
+    static const bool s_mel_cache = aila::env::read_flag("AILA_ASR_MEL_CACHE", true);
+    static const bool s_mel_cache_validate =
+        aila::env::read_flag("AILA_ASR_MEL_CACHE_VALIDATE", false);
+    bool used_mel_cache = false;
+    if (s_mel_cache) {
+        if (partial_mel_cache_stable_offset_ != stable_samples_offset_) {
+            partial_mel_cache_.reset();
+            partial_mel_cache_stable_offset_ = stable_samples_offset_;
+        }
+        used_mel_cache = partial_mel_cache_.sample_count > 0 &&
+                         partial_mel_cache_.sample_count <= segment.size();
+    }
+    const bool mel_ok = s_mel_cache
+        ? compute_mel_spectrogram_cached(segment, mel, partial_mel_cache_,
+                                         &prep_error, &mel_timing,
+                                         s_mel_cache_validate)
+        : compute_mel_spectrogram(segment, mel, &prep_error, &mel_timing);
+    if (!mel_ok) {
         last_error_ = "ASR mel spectrogram failed: " + prep_error;
         return false;
     }
+    if (used_mel_cache) {
+        ++call_metrics.mel_cache_hits;
+    }
+    call_metrics.mel_cache_reused_frames += mel_timing.reused_frames;
+    call_metrics.mel_cache_computed_frames += mel_timing.computed_frames;
+    call_metrics.mel_cache_max_abs_diff =
+        std::max(call_metrics.mel_cache_max_abs_diff, mel_timing.max_abs_diff);
+    call_metrics.mel_stft_ms += mel_timing.stft_ms;
+    call_metrics.mel_norm_ms += mel_timing.norm_ms;
     finish_stage(call_metrics.mel_ms);
 
     std::vector<AsrBf16> mel_bf16(static_cast<size_t>(mel.n_frames) * mel.n_mels);
@@ -481,6 +514,10 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
         last_error_ = "ASR audio encoder failed: " + audio_error;
         return false;
     }
+    const auto encoder_timing = audio_encoder->last_timing();
+    call_metrics.encoder_conv_ms += encoder_timing.conv_ms;
+    call_metrics.encoder_transformer_ms += encoder_timing.transformer_ms;
+    call_metrics.encoder_proj_ms += encoder_timing.proj_ms;
     finish_stage(call_metrics.encoder_ms, context);
 
     std::vector<int> prompt_ids;
@@ -682,10 +719,21 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     metrics_.prefix_reuse_hits += call_metrics.prefix_reuse_hits;
     metrics_.prefix_reused_tokens += call_metrics.prefix_reused_tokens;
     metrics_.prefix_appended_tokens += call_metrics.prefix_appended_tokens;
+    metrics_.mel_cache_hits += call_metrics.mel_cache_hits;
+    metrics_.mel_cache_reused_frames += call_metrics.mel_cache_reused_frames;
+    metrics_.mel_cache_computed_frames += call_metrics.mel_cache_computed_frames;
     metrics_.input_audio_ms += call_metrics.input_audio_ms;
     metrics_.mel_ms += call_metrics.mel_ms;
+    metrics_.mel_stft_ms += call_metrics.mel_stft_ms;
+    metrics_.mel_norm_ms += call_metrics.mel_norm_ms;
+    metrics_.mel_cache_max_abs_diff =
+        std::max(metrics_.mel_cache_max_abs_diff,
+                 call_metrics.mel_cache_max_abs_diff);
     metrics_.upload_ms += call_metrics.upload_ms;
     metrics_.encoder_ms += call_metrics.encoder_ms;
+    metrics_.encoder_conv_ms += call_metrics.encoder_conv_ms;
+    metrics_.encoder_transformer_ms += call_metrics.encoder_transformer_ms;
+    metrics_.encoder_proj_ms += call_metrics.encoder_proj_ms;
     metrics_.readback_ms += call_metrics.readback_ms;
     metrics_.prompt_ms += call_metrics.prompt_ms;
     metrics_.prefill_ms += call_metrics.prefill_ms;

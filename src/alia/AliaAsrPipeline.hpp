@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../audio/AudioPreprocessor.hpp"
+
 #include <cstddef>
 #include <mutex>
 #include <string>
@@ -16,10 +18,19 @@ struct AliaAsrMetrics {
     int prefix_reuse_hits = 0;
     int prefix_reused_tokens = 0;
     int prefix_appended_tokens = 0;
+    int mel_cache_hits = 0;
+    int mel_cache_reused_frames = 0;
+    int mel_cache_computed_frames = 0;
     double input_audio_ms = 0.0;
     double mel_ms = 0.0;
+    double mel_stft_ms = 0.0;
+    double mel_norm_ms = 0.0;
+    double mel_cache_max_abs_diff = 0.0;
     double upload_ms = 0.0;
     double encoder_ms = 0.0;
+    double encoder_conv_ms = 0.0;
+    double encoder_transformer_ms = 0.0;
+    double encoder_proj_ms = 0.0;
     double readback_ms = 0.0;
     double prompt_ms = 0.0;
     double prefill_ms = 0.0;
@@ -72,6 +83,8 @@ private:
     int partial_tail_decode_count_ = 0;
     int partial_throttled_count_ = 0;
     AliaAsrMetrics metrics_;
+    MelSpectrogramCache partial_mel_cache_;
+    size_t partial_mel_cache_stable_offset_ = 0;
 
     struct PrefixCache {
         bool valid = false;

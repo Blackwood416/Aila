@@ -21,6 +21,28 @@ struct MelSpectrogram {
     std::vector<float> data;  // [n_mels * n_frames] row-major
 };
 
+struct MelSpectrogramTiming {
+    double stft_ms = 0.0;
+    double norm_ms = 0.0;
+    int reused_frames = 0;
+    int computed_frames = 0;
+    double max_abs_diff = 0.0;
+};
+
+struct MelSpectrogramCache {
+    size_t sample_count = 0;
+    int n_frames = 0;
+    int n_mels = 128;
+    std::vector<float> raw_log_mel;
+
+    void reset() {
+        sample_count = 0;
+        n_frames = 0;
+        n_mels = 128;
+        raw_log_mel.clear();
+    }
+};
+
 // Load audio file with WAV/MP3 native support and FFmpeg fallback.
 bool load_audio(const std::string& path, AudioBuffer& audio, std::string* error = nullptr);
 
@@ -37,7 +59,15 @@ void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<
 // Input: mono 16kHz float samples.
 bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
                              MelSpectrogram& mel,
-                             std::string* error = nullptr);
+                             std::string* error = nullptr,
+                             MelSpectrogramTiming* timing = nullptr);
+
+bool compute_mel_spectrogram_cached(const std::vector<float>& samples_16k,
+                                    MelSpectrogram& mel,
+                                    MelSpectrogramCache& cache,
+                                    std::string* error = nullptr,
+                                    MelSpectrogramTiming* timing = nullptr,
+                                    bool validate = false);
 
 // Save float PCM samples to a WAV file.
 bool save_wav(const std::string& path, const std::vector<float>& samples, unsigned int sample_rate);

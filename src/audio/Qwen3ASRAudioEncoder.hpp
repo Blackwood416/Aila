@@ -16,6 +16,12 @@ namespace audio {
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+struct Qwen3ASRAudioEncoderTiming {
+    double conv_ms = 0.0;
+    double transformer_ms = 0.0;
+    double proj_ms = 0.0;
+};
+
 // Qwen3-ASR Audio Encoder (thinker.audio_tower).
 // Conv2D frontend + sinusoidal PE + N transformer encoder layers + output projection.
 class Qwen3ASRAudioEncoder {
@@ -38,6 +44,8 @@ public:
                 Tensor& mel_input, int mel_time_len,
                 Tensor& output_features, int& output_len,
                 std::string* error_message);
+
+    Qwen3ASRAudioEncoderTiming last_timing() const { return last_timing_; }
 
 private:
     AudioEncoderConfig cfg_;
@@ -94,6 +102,7 @@ private:
     int buf_capacity_ = 0;
 
     std::deque<Tensor> owned_weights_;
+    Qwen3ASRAudioEncoderTiming last_timing_;
 
     void ensure_buffers(int seq_len);
     Tensor* get_tensor(ModelWeights& weights, const std::string& name,

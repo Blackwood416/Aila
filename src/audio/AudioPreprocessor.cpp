@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 
 #ifndef M_PI
@@ -342,26 +343,37 @@ void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<
     }
 }
 
-// ============================================================
-// compute_mel_spectrogram
-// ============================================================
+namespace {
+constexpr int kMelFft = 400;
+constexpr int kMelHop = 160;
+constexpr int kMelBins = 128;
+constexpr int kMelFreqs = kMelFft / 2 + 1;
 
-bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
-                             MelSpectrogram& mel,
-                             std::string* error) {
+void normalize_log_mel(const std::vector<float>& raw_log_mel,
+                       int n_frames,
+                       std::vector<float>& normalized) {
+    normalized.resize(raw_log_mel.size());
+    float mel_max = -1e30f;
+    for (float v : raw_log_mel) {
+        mel_max = std::max(mel_max, v);
+    }
+    const float mel_min = mel_max - 8.0f;
+    for (size_t i = 0; i < raw_log_mel.size(); ++i) {
+        float v = std::max(raw_log_mel[i], mel_min);
+        normalized[i] = (v + 4.0f) / 4.0f;
+    }
+    (void)n_frames;
+}
+
+void compute_raw_log_mel_frames(const std::vector<float>& samples_16k,
+                                int frame_start,
+                                int frame_end,
+                                std::vector<float>& raw_log_mel) {
     const int n_fft = 400;
     const int hop_length = 160;
     const int n_mels = 128;
     const int n_freq = n_fft / 2 + 1;  // 201
     const size_t n_samples = samples_16k.size();
-    if (n_samples == 0) {
-        if (error) *error = "Input samples vector is empty";
-        return false;
-    }
-
-    // 动态计算帧数。在 PyTorch（center=True）中，帧数为 n_samples / hop_length + 1
-    int n_frames = static_cast<int>(n_samples / hop_length + 1);
-    int actual_frames = n_frames;
 
     // Hann window (PyTorch default: periodic, cos(2*pi*n/N))
     std::vector<float> hann(n_fft);
@@ -372,7 +384,6 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
 
     // Compute mel spectrogram
     std::vector<float> power_spec(n_freq);
-    std::vector<float> mel_full(static_cast<size_t>(n_mels) * n_frames);
     // Reflect padding: mirrors PyTorch F.pad mode='reflect'
     // Left:  idx < 0        → signal[-idx]     (idx=-200→200, idx=-1→1)
     // Valid: 0 <= idx < N   → signal[idx]
@@ -386,7 +397,7 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
         return idx;
     };
 
-    for (int frm = 0; frm < n_frames; ++frm) {
+    for (int frm = frame_start; frm < frame_end; ++frm) {
         power_spec.assign(n_freq, 0.0f);
         // With center=True, frame center is at frm * hop
         int center = frm * hop_length;
@@ -416,27 +427,147 @@ bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
             for (int f = 0; f < n_freq; ++f)
                 mel_energy += power_spec[f] * kMelFbData[f * kMelFbMels + m];
             mel_energy = std::max(mel_energy, 1e-10f);
-            mel_full[static_cast<size_t>(frm) * n_mels + m] = std::log10(mel_energy);
+            raw_log_mel[static_cast<size_t>(frm) * n_mels + m] = std::log10(mel_energy);
         }
+    }
+}
+}  // namespace
+
+// ============================================================
+// compute_mel_spectrogram
+// ============================================================
+
+bool compute_mel_spectrogram(const std::vector<float>& samples_16k,
+                             MelSpectrogram& mel,
+                             std::string* error,
+                             MelSpectrogramTiming* timing) {
+    if (timing) {
+        *timing = MelSpectrogramTiming{};
+    }
+    auto stage_start = std::chrono::high_resolution_clock::now();
+    auto finish_stage = [&](double& target) {
+        const auto now = std::chrono::high_resolution_clock::now();
+        target += std::chrono::duration<double, std::milli>(now - stage_start).count();
+        stage_start = now;
+    };
+
+    const size_t n_samples = samples_16k.size();
+    if (n_samples == 0) {
+        if (error) *error = "Input samples vector is empty";
+        return false;
+    }
+
+    // 动态计算帧数。在 PyTorch（center=True）中，帧数为 n_samples / hop_length + 1
+    int n_frames = static_cast<int>(n_samples / kMelHop + 1);
+    int actual_frames = n_frames;
+    std::vector<float> raw_log_mel(static_cast<size_t>(kMelBins) * n_frames);
+    compute_raw_log_mel_frames(samples_16k, 0, n_frames, raw_log_mel);
+    if (timing) {
+        finish_stage(timing->stft_ms);
+        timing->computed_frames = n_frames;
     }
 
     // Whisper normalization: clamp to [max-8, max], then scale
-    {
-        float mel_max = -1e30f;
-        for (size_t i = 0; i < mel_full.size(); ++i)
-            mel_max = std::max(mel_max, mel_full[i]);
-        float mel_min = mel_max - 8.0f;
-        for (size_t i = 0; i < mel_full.size(); ++i) {
-            mel_full[i] = std::max(mel_full[i], mel_min);
-            mel_full[i] = (mel_full[i] + 4.0f) / 4.0f;
-        }
+    std::vector<float> mel_full;
+    normalize_log_mel(raw_log_mel, n_frames, mel_full);
+    if (timing) {
+        finish_stage(timing->norm_ms);
     }
 
     mel.n_frames = n_frames;
-    mel.n_mels = n_mels;
+    mel.n_mels = kMelBins;
     mel.actual_frames = actual_frames;
     mel.data = std::move(mel_full);
 
+    return true;
+}
+
+bool compute_mel_spectrogram_cached(const std::vector<float>& samples_16k,
+                                    MelSpectrogram& mel,
+                                    MelSpectrogramCache& cache,
+                                    std::string* error,
+                                    MelSpectrogramTiming* timing,
+                                    bool validate) {
+    if (timing) {
+        *timing = MelSpectrogramTiming{};
+    }
+    auto stage_start = std::chrono::high_resolution_clock::now();
+    auto finish_stage = [&](double& target) {
+        const auto now = std::chrono::high_resolution_clock::now();
+        target += std::chrono::duration<double, std::milli>(now - stage_start).count();
+        stage_start = now;
+    };
+
+    const size_t n_samples = samples_16k.size();
+    if (n_samples == 0) {
+        if (error) *error = "Input samples vector is empty";
+        return false;
+    }
+
+    const int n_frames = static_cast<int>(n_samples / kMelHop + 1);
+    bool can_reuse = cache.sample_count > 0 &&
+                     cache.sample_count <= n_samples &&
+                     cache.n_frames > 0 &&
+                     cache.n_frames <= n_frames &&
+                     cache.n_mels == kMelBins &&
+                     cache.raw_log_mel.size() ==
+                         static_cast<size_t>(cache.n_frames) * kMelBins;
+    int recompute_start = 0;
+    if (can_reuse) {
+        recompute_start = std::max(0, cache.n_frames - 3);
+    } else {
+        cache.raw_log_mel.clear();
+        recompute_start = 0;
+    }
+
+    std::vector<float> raw_log_mel(static_cast<size_t>(n_frames) * kMelBins);
+    if (can_reuse && recompute_start > 0) {
+        const size_t reused_values = static_cast<size_t>(recompute_start) * kMelBins;
+        std::copy_n(cache.raw_log_mel.begin(), reused_values, raw_log_mel.begin());
+    }
+
+    compute_raw_log_mel_frames(samples_16k, recompute_start, n_frames, raw_log_mel);
+    if (timing) {
+        finish_stage(timing->stft_ms);
+        timing->reused_frames = recompute_start;
+        timing->computed_frames = n_frames - recompute_start;
+    }
+
+    std::vector<float> mel_full;
+    normalize_log_mel(raw_log_mel, n_frames, mel_full);
+    if (timing) {
+        finish_stage(timing->norm_ms);
+    }
+
+    if (validate) {
+        MelSpectrogram full_mel;
+        MelSpectrogramTiming full_timing;
+        if (!compute_mel_spectrogram(samples_16k, full_mel, error, &full_timing)) {
+            return false;
+        }
+        double max_abs_diff = 0.0;
+        if (full_mel.data.size() == mel_full.size()) {
+            for (size_t i = 0; i < mel_full.size(); ++i) {
+                max_abs_diff = std::max(max_abs_diff,
+                                        static_cast<double>(std::abs(mel_full[i] - full_mel.data[i])));
+            }
+        } else {
+            max_abs_diff = 1e30;
+        }
+        if (timing) {
+            timing->max_abs_diff = max_abs_diff;
+        }
+    }
+
+    cache.sample_count = n_samples;
+    cache.n_frames = n_frames;
+    cache.n_mels = kMelBins;
+    cache.raw_log_mel = std::move(raw_log_mel);
+
+    mel.n_frames = n_frames;
+    mel.n_mels = kMelBins;
+    mel.actual_frames = n_frames;
+    mel.data = std::move(mel_full);
     return true;
 }
 

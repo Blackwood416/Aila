@@ -1358,3 +1358,62 @@ Interpretation:
   mel/audio encoder reuse for stable audio blocks, or a cheaper partial
   verification path that avoids full ASR prefill when the transcript is unlikely
   to change.
+
+## 2026-06-27 ASR Mel/Audio Encoder Reuse Probe
+
+Added finer ASR profile telemetry for mel and audio encoder work:
+
+- `asr_profile_mel_stft_ms`
+- `asr_profile_mel_norm_ms`
+- `asr_profile_encoder_conv_ms`
+- `asr_profile_encoder_transformer_ms`
+- `asr_profile_encoder_proj_ms`
+
+The profile confirmed that short-prompt mel time is almost entirely CPU STFT,
+not Whisper normalization:
+
+```text
+short profile before mel cache:
+asr_profile_mel_ms                   296.562
+asr_profile_mel_stft_ms              296.478
+asr_profile_mel_norm_ms              0.0747
+asr_profile_encoder_ms               232.856
+asr_profile_encoder_conv_ms          157.946
+asr_profile_encoder_transformer_ms   54.0329
+asr_profile_encoder_proj_ms          20.4088
+```
+
+Implemented exact raw-log-mel prefix reuse for growing ASR partials:
+
+- `compute_mel_spectrogram_cached` stores unnormalized log-mel frames.
+- On a growing partial, it reuses the stable prefix, recomputes the last 3 old
+  frames plus new frames to cover reflect-padding right-edge effects, then
+  normalizes over the full raw-log-mel buffer. This keeps output equivalent to
+  full recompute while avoiding repeated STFT work.
+- `AILA_ASR_MEL_CACHE=0` disables the cache.
+- `AILA_ASR_MEL_CACHE_VALIDATE=1` computes both cached and full mel and reports
+  `asr_profile_mel_cache_max_abs_diff`.
+- Smoke/matrix telemetry now includes `asr_profile_mel_cache_hits`,
+  `asr_profile_mel_cache_reused_frames`,
+  `asr_profile_mel_cache_computed_frames`, and
+  `asr_profile_mel_cache_max_abs_diff`.
+
+Short prompt, 500ms stream chunk, 1500ms partial advance gate:
+
+```text
+mode                 hits  reused_frames  computed_frames  max_diff  mel_ms   mel_stft_ms  asr_total_ms  asr_tail_ms
+validate cache       2     446            391              0         462.145  140.933      1828.52       538
+cache on             2     446            391              0         141.811  141.518      1515.08       388
+previous no-cache    0     0              0                n/a       296.562  296.478      1663.66       505
+```
+
+Interpretation:
+
+- The cached mel path matched full recompute exactly on the real short smoke
+  (`max_abs_diff=0`).
+- It removes about 155ms of repeated short-prompt mel STFT work in the profiled
+  streaming path and reduces the final ASR tail by about 117ms in this run.
+- Audio encoder block reuse is still a longer-utterance optimization. With
+  `n_window=50` and `n_window_infer=800`, the encoder block is 104 audio tokens.
+  The 3.84s short prompt reaches only about 50 audio tokens, so no complete
+  bidirectional block can be sealed safely yet.

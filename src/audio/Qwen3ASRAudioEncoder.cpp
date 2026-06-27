@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cstdint>
+#include <chrono>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -196,6 +197,18 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
     }
 
     bool dump_logits = aila::env::read_flag("AILA_DUMP_LOGITS", false);
+    static const bool s_profile_asr = aila::env::read_flag("AILA_ASR_PROFILE", false);
+    last_timing_ = Qwen3ASRAudioEncoderTiming{};
+    auto stage_start = std::chrono::high_resolution_clock::now();
+    auto finish_stage = [&](double& target) {
+        if (!s_profile_asr) {
+            return;
+        }
+        ctx.synchronize();
+        const auto now = std::chrono::high_resolution_clock::now();
+        target += std::chrono::duration<double, std::milli>(now - stage_start).count();
+        stage_start = now;
+    };
 
     int d = cfg_.d_model;
     int ffn = cfg_.encoder_ffn_dim;
@@ -298,6 +311,7 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
 
         out_offset += cw;
     }
+    finish_stage(last_timing_.conv_ms);
 
     // Now run encoder layers on full sequence
     int audio_seq_len = total_out;
@@ -403,6 +417,7 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
             dump_tensor_f32(ctx, enc_hidden_, fname);
         }
     }
+    finish_stage(last_timing_.transformer_ms);
 
     // Output projection
     ops::layer_norm(ctx, enc_hidden_, *ln_post_weight, *ln_post_bias,
@@ -416,6 +431,7 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
     if (proj2_bias_) {
         ops::bias_add_inplace(ctx, output_features, *proj2_bias_, audio_seq_len, cfg_.output_dim);
     }
+    finish_stage(last_timing_.proj_ms);
 
     if (dump_logits) {
         dump_tensor_f32(ctx, output_features, "debug_cpp_af.bin");
