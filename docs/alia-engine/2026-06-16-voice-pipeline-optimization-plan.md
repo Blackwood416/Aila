@@ -2188,6 +2188,7 @@ AILA_ASR_PARTIAL_MIN_ADVANCE_MS=500        Partial full decodes rose 3 -> 8 and 
 AILA_TTS_STREAM_BATCH_FRAMES=6             First backend audio fell about 471ms -> 365ms, but sampled foreground text became longer and TTFA regressed.
 AILA_ASR_PREFIX_REUSE=1                    Reuse hit 2/2 attempts, but ASR get_text total rose about 0.93s -> 1.09s from truncate/reuse overhead.
 Aggressive foreground guard + Q35 step=4   Still missed truncate checkpoints at 100/104, caused full resets, and sampled identity text drifted.
+AILA_FOREGROUND_DECODE_SUFFIX_TOKENS=32    Forced the 31-token final suffix onto the decode path; prompt prefill regressed from about 466ms to 753ms.
 ```
 
 Interpretation:
@@ -2202,6 +2203,9 @@ Interpretation:
 - Foreground partial prefill has the largest visible ceiling: aggressive guards
   can cut final prompt prefill roughly in half, but only if Qwen3.5 can restore
   recurrent state at the partial common-prefix length instead of resetting.
+- The existing decode-path suffix threshold should stay small. For the observed
+  31-token final suffix, token-by-token decode is slower than the batch prefill
+  path.
 
 Next high-value implementation options:
 
