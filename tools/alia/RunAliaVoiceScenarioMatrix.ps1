@@ -7,7 +7,9 @@ param(
     [int]$StreamPrefillIntervalMs = 0,
     [switch]$SkipBuild,
     [switch]$StreamAsrPrefill,
-    [switch]$IncludeToolProbe
+    [switch]$IncludeToolProbe,
+    [switch]$VerifyOutputAsr,
+    [string]$OutputAsrScriptPath = "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +46,33 @@ function Get-ValueOrEmpty {
         return $Values[$Key]
     }
     return ""
+}
+
+function Invoke-OutputAsr {
+    param(
+        [string]$ScriptPath,
+        [string]$AudioPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ScriptPath)) {
+        throw "Output ASR script not found: $ScriptPath"
+    }
+    if (-not (Test-Path -LiteralPath $AudioPath)) {
+        throw "Output audio not found: $AudioPath"
+    }
+
+    if (-not $env:MIMO_API_KEY) {
+        $machineApiKey = [Environment]::GetEnvironmentVariable("MIMO_API_KEY", "Machine")
+        if ($machineApiKey) {
+            $env:MIMO_API_KEY = $machineApiKey
+        }
+    }
+
+    $output = & powershell -ExecutionPolicy Bypass -File $ScriptPath -AudioFile $AudioPath 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw (($output | Out-String).Trim())
+    }
+    return (($output | Out-String).Trim())
 }
 
 $repoRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")
@@ -133,12 +162,29 @@ try {
         }
 
         $absoluteLogPath = Join-Path $repoRoot $logPath
+        $absoluteWavPath = Join-Path $repoRoot $wavPath
         $values = Convert-KeyValueLog -LogPath $absoluteLogPath
         $logText = ""
         if (Test-Path -LiteralPath $absoluteLogPath) {
             $logText = Get-Content -Raw -LiteralPath $absoluteLogPath
         }
         $passed = $passed -and $logText.Contains("ALIA_REAL_MODEL_SMOKE_PASS")
+
+        $outputAsrText = ""
+        $outputAsrError = ""
+        if ($VerifyOutputAsr) {
+            try {
+                $outputAsrText = Invoke-OutputAsr -ScriptPath $OutputAsrScriptPath -AudioPath $absoluteWavPath
+                Write-Host ("output_asr_text[{0}]={1}" -f $scenario.Name, $outputAsrText)
+            } catch {
+                $outputAsrError = $_.Exception.Message
+                $passed = $false
+            }
+            if (-not $outputAsrText) {
+                $outputAsrError = "Output ASR returned empty transcript."
+                $passed = $false
+            }
+        }
 
         $rows += [pscustomobject]@{
             scenario = $scenario.Name
@@ -233,6 +279,8 @@ try {
             foreground_lora_pair_count = Get-ValueOrEmpty $values "foreground_lora_pair_count"
             asr_partial_text = Get-ValueOrEmpty $values "asr_partial_text"
             foreground_assistant_text = Get-ValueOrEmpty $values "foreground_assistant_text"
+            output_asr_text = $outputAsrText
+            output_asr_error = $outputAsrError
             background_result_json = Get-ValueOrEmpty $values "background_result_json"
             log_path = $logPath
             output_wav = $wavPath

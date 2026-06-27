@@ -1671,3 +1671,43 @@ Interpretation:
 - The next higher-risk backend step is true Mimi pre-transformer state reuse or
   more exact conv state carry. Both should be profile-driven and validated with
   real-model smoke/matrix because they can affect audio boundaries.
+
+## 2026-06-27 Output ASR Validation Hook
+
+The Mimi conv-window change showed a validation gap: matrix PASS, nonzero audio,
+and callback shape do not prove that the vocoder output is still intelligible or
+aligned with the foreground text. For TTS/vocoder work, the generated wav should
+be accumulated and transcribed by an independent ASR model.
+
+Added an optional matrix flag:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr
+```
+
+When enabled, the matrix calls:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1" -AudioFile "<scenario_output.wav>"
+```
+
+The script uses `MIMO_API_KEY`; if the current process does not have it, the
+matrix helper imports the machine-scope environment variable without printing
+the secret. `summary.csv` now includes `output_asr_text` and
+`output_asr_error`.
+
+Observed validation result for the current build:
+
+```text
+scenario           output_asr_text
+short_hello        父亲大人教过我要简短回答，但如果是你主动请求，我可以稍微多说一点。
+persona_chat       父亲大人教过我，要温柔地回应，但我不确定自己是否真的能做好，声音越来越小。
+preference_memory  Kurasho no, I'm just a virtual AI, but I'll do my best to be helpful and friendly.
+task_memory        父亲大人教过我要诚实回答，但父亲大人也说过，可以推荐一些轻松的话题，比如艾莉亚的虚拟形象或艾莉亚的爱好都是好。
+long_answer        Kurasho, no, I'm not a voice assistant. I'm just a local companion. But I can try to explain. I can talk and listen and help you focus. I can't do anything else.
+```
+
+These transcripts match the foreground text closely enough to validate that the
+vocoder output stayed intelligible. Cases where the foreground response itself
+is off-policy or repetitive should be treated as foreground/model behavior, not
+as TTS corruption, unless the output ASR diverges from `foreground_assistant_text`.
