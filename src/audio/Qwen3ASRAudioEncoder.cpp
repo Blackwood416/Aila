@@ -47,6 +47,35 @@ static void nchw_to_ntch(Context& ctx, Tensor& src, Tensor& dst,
 
 Qwen3ASRAudioEncoder::~Qwen3ASRAudioEncoder() = default;
 
+void Qwen3ASRAudioEncoder::ensure_conv_buffers(Context& ctx, int total_out) {
+    const int mel_bins = cfg_.num_mel_bins;
+    const int ds = cfg_.downsample_hidden_size;
+    const int d = cfg_.d_model;
+    const int chunk_size = cfg_.n_window * 2;
+
+    int c1_h = (mel_bins + 2 - 3) / 2 + 1;
+    int c1_w = (chunk_size + 2 - 3) / 2 + 1;
+    int c2_h = (c1_h + 2 - 3) / 2 + 1;
+    int c2_w = (c1_w + 2 - 3) / 2 + 1;
+    int c3_h = (c2_h + 2 - 3) / 2 + 1;
+    int c3_w = (c2_w + 2 - 3) / 2 + 1;
+    int conv_flat_dim = ds * c3_h;
+
+    if (!conv_chunk_buffers_ready_) {
+        conv_chunk_mel_ = Tensor::allocate(ctx, {1, 1, mel_bins, chunk_size});
+        conv_c1_out_ = Tensor::allocate(ctx, {1, ds, c1_h, c1_w});
+        conv_c2_out_ = Tensor::allocate(ctx, {1, ds, c2_h, c2_w});
+        conv_c3_out_ = Tensor::allocate(ctx, {1, ds, c3_h, c3_w});
+        conv_flat_ = Tensor::allocate(ctx, {c3_w, conv_flat_dim});
+        conv_chunk_buffers_ready_ = true;
+    }
+
+    if (total_out > conv_total_capacity_) {
+        conv_total_capacity_ = total_out + 32;
+        conv_all_out_ = Tensor::allocate(ctx, {conv_total_capacity_, d});
+    }
+}
+
 Tensor* Qwen3ASRAudioEncoder::get_tensor(ModelWeights& weights,
                                           const std::string& name,
                                           std::string* error_message,
@@ -181,6 +210,7 @@ bool Qwen3ASRAudioEncoder::load(Context& ctx,
         return false;
     }
 
+    ensure_conv_buffers(ctx, std::max(1, cfg.max_source_positions));
     loaded_ = true;
     return true;
 }
@@ -225,7 +255,6 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
     int conv_flat_dim = ds * feat_height;  // 7680
 
     // Compute per-chunk conv output length (13 frames per 100-frame chunk)
-    int chunk_out_w = 0;
     int total_out = 0;
     std::vector<int> chunk_out_lengths;
     for (int ci = 0; ci < n_chunks; ++ci) {
@@ -235,12 +264,17 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         for (int s = 0; s < 3; ++s) cw = (cw + 2 - 3) / 2 + 1;
         chunk_out_lengths.push_back(cw);
         total_out += cw;
-        if (ci == 0) chunk_out_w = cw;  // first chunk determines padded width
     }
-
-    // Allocate buffer for all chunks' conv output
-    Tensor all_conv_out = Tensor::allocate(ctx, {total_out, d});
+    ensure_conv_buffers(ctx, total_out);
     int out_offset = 0;
+    int mel_row_len = mel_input.shape(2);
+    int chunk_mel_w = chunk_size;
+    int c1_h = (mel_bins + 2 - 3) / 2 + 1;
+    int c1_w = (chunk_mel_w + 2 - 3) / 2 + 1;
+    int c2_h = (c1_h + 2 - 3) / 2 + 1;
+    int c2_w = (c1_w + 2 - 3) / 2 + 1;
+    int c3_h = (c2_h + 2 - 3) / 2 + 1;
+    int c3_w = (c2_w + 2 - 3) / 2 + 1;
 
     // Process each chunk through conv2d independently
     for (int ci = 0; ci < n_chunks; ++ci) {
@@ -249,12 +283,9 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
         int cw = chunk_out_lengths[ci];
 
         // Copy chunk: mel_input({1,mel_bins,padded}) -> chunk_mel({1,1,mel_bins,chunk_size}) (always pad to chunk_size=100)
-        int mel_row_len = mel_input.shape(2);
-        int chunk_mel_w = chunk_size;
-        Tensor chunk_mel = Tensor::allocate(ctx, {1, 1, mel_bins, chunk_mel_w});
         {
             bf16* src_base = mel_input.data_as<bf16>();
-            bf16* dst = chunk_mel.data_as<bf16>();
+            bf16* dst = conv_chunk_mel_.data_as<bf16>();
             int ck = chunk_start;
             int cl_eff = this_chunk_len;
             int cl_pad = chunk_mel_w;
@@ -272,39 +303,30 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
             });
         }
 
-        int c1_h = (mel_bins + 2 - 3) / 2 + 1;
-        int c1_w = (chunk_mel_w + 2 - 3) / 2 + 1;
-        Tensor c1_out = Tensor::allocate(ctx, {1, ds, c1_h, c1_w});
-        ops::conv2d_gelu(ctx, chunk_mel, *conv2d1_weight_, *conv2d1_bias_,
-                         c1_out, 1, 1, ds, mel_bins, chunk_mel_w, c1_h, c1_w);
+        ops::conv2d_gelu(ctx, conv_chunk_mel_, *conv2d1_weight_, *conv2d1_bias_,
+                         conv_c1_out_, 1, 1, ds, mel_bins, chunk_mel_w, c1_h, c1_w);
 
         if (ci == 0 && dump_logits) {
-            dump_tensor_f32(ctx, c1_out, "debug_cpp_c1.bin");
+            dump_tensor_f32(ctx, conv_c1_out_, "debug_cpp_c1.bin");
         }
 
-        int c2_h = (c1_h + 2 - 3) / 2 + 1;
-        int c2_w = (c1_w + 2 - 3) / 2 + 1;
-        Tensor c2_out = Tensor::allocate(ctx, {1, ds, c2_h, c2_w});
-        ops::conv2d_gelu(ctx, c1_out, *conv2d2_weight_, *conv2d2_bias_,
-                         c2_out, 1, ds, ds, c1_h, c1_w, c2_h, c2_w);
+        ops::conv2d_gelu(ctx, conv_c1_out_, *conv2d2_weight_, *conv2d2_bias_,
+                         conv_c2_out_, 1, ds, ds, c1_h, c1_w, c2_h, c2_w);
 
-        int c3_h = (c2_h + 2 - 3) / 2 + 1;
-        int c3_w = (c2_w + 2 - 3) / 2 + 1;
-        Tensor c3_out = Tensor::allocate(ctx, {1, ds, c3_h, c3_w});
-        ops::conv2d_gelu(ctx, c2_out, *conv2d3_weight_, *conv2d3_bias_,
-                         c3_out, 1, ds, ds, c2_h, c2_w, c3_h, c3_w);
+        ops::conv2d_gelu(ctx, conv_c2_out_, *conv2d3_weight_, *conv2d3_bias_,
+                         conv_c3_out_, 1, ds, ds, c2_h, c2_w, c3_h, c3_w);
         if (ci == 0 && dump_logits) {
-            dump_tensor_f32(ctx, c3_out, "debug_cpp_c3.bin");
+            dump_tensor_f32(ctx, conv_c3_out_, "debug_cpp_c3.bin");
         }
 
         // Reshape + conv_out
-        Tensor conv_flat = Tensor::allocate(ctx, {cw, conv_flat_dim});
-        nchw_to_ntch(ctx, c3_out, conv_flat, ds, c3_h, c3_w, cw);
+        Tensor conv_flat_view = Tensor::view(ctx, conv_flat_.data(), {cw, conv_flat_dim});
+        nchw_to_ntch(ctx, conv_c3_out_, conv_flat_view, ds, c3_h, c3_w, cw);
 
         // View of output buffer for this chunk
-        bf16* out_ptr = all_conv_out.data_as<bf16>() + out_offset * d;
+        bf16* out_ptr = conv_all_out_.data_as<bf16>() + out_offset * d;
         Tensor chunk_dst = Tensor::view(ctx, out_ptr, {cw, d});
-        conv_out_.forward(ctx, conv_flat, chunk_dst, cw);
+        conv_out_.forward(ctx, conv_flat_view, chunk_dst, cw);
 
         // Add sinusoidal PE (per-chunk positions 0..cw-1)
         ops::sinusoidal_position_embedding(ctx, chunk_dst, cw, d);
@@ -318,7 +340,7 @@ bool Qwen3ASRAudioEncoder::encode(Context& ctx,
     ensure_buffers(audio_seq_len);
 
     // Copy all_conv_out to enc_hidden_
-    ops::copy_tensor(ctx, all_conv_out, enc_hidden_, audio_seq_len * d);
+    ops::copy_tensor(ctx, conv_all_out_, enc_hidden_, audio_seq_len * d);
 
     if (dump_logits) {
         dump_tensor_f32(ctx, enc_hidden_, "debug_cpp_hidden_states_pre_encoder.bin");

@@ -1417,3 +1417,40 @@ Interpretation:
   `n_window=50` and `n_window_infer=800`, the encoder block is 104 audio tokens.
   The 3.84s short prompt reaches only about 50 audio tokens, so no complete
   bidirectional block can be sealed safely yet.
+
+## 2026-06-27 ASR Conv Frontend Preallocation
+
+The ASR audio encoder conv frontend still allocated several fixed-shape tensors
+on every partial/final encode. This pass reuses persistent buffers for the
+100-frame mel chunk, the three conv2d intermediates, the flattened conv output,
+and the concatenated pre-transformer output. `conv_all_out` is also preallocated
+at load time to the configured source-position capacity, with dynamic growth for
+larger inputs.
+
+Short prompt profile, 500ms stream chunk, 1500ms partial advance gate:
+
+```text
+mode                  encoder_conv_ms  asr_total_ms  asr_tail_ms
+before prealloc       155.077          n/a           n/a
+after prealloc        146.790          1440.08       380
+```
+
+Default short smoke after the change, without ASR profiling sync:
+
+```text
+asr_ms                            1796
+asr_stream_simulated_tail_ms       381
+simulated_vad_to_first_content_ms 1144
+simulated_vad_to_first_audio_ms   1977
+first_audio_samples              23040
+```
+
+Interpretation:
+
+- This removes avoidable frontend allocation churn and is worth keeping, but the
+  measured short-prompt gain is small: roughly 8ms in profiled conv time.
+- The fixed 12-frame / 23040-sample first TTS buffer remains intact.
+- The next high-value ASR optimization should move below this layer: either GPU
+  mel/STFT to remove the CPU computation and upload sync, or a cheaper
+  partial/final policy that avoids full ASR prefill when the transcript is
+  unlikely to change.

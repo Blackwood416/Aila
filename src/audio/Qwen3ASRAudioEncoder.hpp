@@ -88,8 +88,12 @@ private:
     Tensor* proj2_bias_ = nullptr;
 
     // Runtime buffers (reallocated as needed)
-    Tensor conv_buf_a_;   // intermediate conv output
-    Tensor conv_buf_b_;   // intermediate conv output
+    Tensor conv_chunk_mel_;   // [1,1,num_mel_bins,n_window*2]
+    Tensor conv_c1_out_;      // fixed conv frontend intermediate
+    Tensor conv_c2_out_;      // fixed conv frontend intermediate
+    Tensor conv_c3_out_;      // fixed conv frontend intermediate
+    Tensor conv_flat_;        // [max_chunk_out_w, conv_flat_dim]
+    Tensor conv_all_out_;     // [audio_seq_len, d_model] before encoder
     Tensor enc_hidden_;   // [seq_len, d_model] main hidden state
     Tensor enc_normed_;   // [seq_len, d_model] after layer norm
     Tensor enc_q_;        // [seq_len, d_model] Q
@@ -100,10 +104,13 @@ private:
     Tensor enc_proj1_;    // [seq_len, d_model] proj1 output
     Tensor enc_scores_;   // [num_heads, seq_len, seq_len] attention scores
     int buf_capacity_ = 0;
+    int conv_total_capacity_ = 0;
+    bool conv_chunk_buffers_ready_ = false;
 
     std::deque<Tensor> owned_weights_;
     Qwen3ASRAudioEncoderTiming last_timing_;
 
+    void ensure_conv_buffers(Context& ctx, int total_out);
     void ensure_buffers(int seq_len);
     Tensor* get_tensor(ModelWeights& weights, const std::string& name,
                        std::string* error_message, bool required = true);
