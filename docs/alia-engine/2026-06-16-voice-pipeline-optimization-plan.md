@@ -2117,3 +2117,47 @@ Interpretation:
 - Further ASR gains need either a better incremental ASR prefill path or audio
   encoder reuse that avoids recomputing the conv frontend for growing partial
   windows.
+
+### ASR backend multi-shape warmup follow-up
+
+Q3-ASR backend stage profiling after the initial ASR backend warmup showed that
+the first real streaming partial still paid a short-prompt shape cost:
+
+```text
+before multi-shape warmup, first real 48-token prefill:
+Q3ASRPrefillProfile tokens=48 total=8.259ms/token
+o_proj=197.301ms ffn_proj=89.799ms full_qkv=36.185ms
+
+later real prefill calls:
+tokens=68 total=2.988ms/token o_proj=17.223ms
+tokens=78 total=2.608ms/token o_proj=17.249ms
+```
+
+The ASR backend warmup now runs representative streaming prompt lengths
+`48/64/80/128` over the same silent audio features, with audio embedding
+overrides and a one-token decode after each prefill. This keeps request
+semantics unchanged while moving more one-time backend work to model load.
+
+Validation:
+
+```text
+after multi-shape warmup, first real 48-token prefill:
+Q3ASRPrefillProfile tokens=48 total=4.152ms/token
+o_proj=16.318ms ffn_proj=84.978ms full_qkv=33.144ms
+
+short streaming smoke without profile:
+asr_ms                         1254
+asr_stream_get_text_total_ms   921
+asr_stream_get_text_max_ms     350
+simulated_vad_to_first_content_ms      809
+simulated_vad_to_first_tts_enqueue_ms  870
+simulated_vad_to_first_audio_ms        1664
+output ASR                     "Crash, I am a little shy, but I can say hello."
+```
+
+Remaining hotspot:
+
+- Q3-ASR decode is now comparable to or larger than prefill in the synchronized
+  profile (`asr_profile_decode_ms` around 815ms with profile enabled). The next
+  ASR-focused pass should look for decode-specific reductions or fewer repeated
+  partial decodes.

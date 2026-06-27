@@ -455,50 +455,73 @@ bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
                 prompt_ids.resize(static_cast<size_t>(max_seq_len));
             }
 
-            std::vector<int> audio_positions;
-            for (size_t i = 0; i < prompt_ids.size(); ++i) {
-                if (prompt_ids[i] == spec.audio_token_id) {
-                    audio_positions.push_back(static_cast<int>(i));
+            auto run_asr_backend_warmup = [&](int requested_len) {
+                if (requested_len <= 0 || prompt_ids.empty()) {
+                    return;
                 }
-            }
-            if (!audio_positions.empty()) {
-                if (auto* asr_bnb4 = dynamic_cast<Qwen3ASRBnb4Backend*>(backend)) {
-                    asr_bnb4->set_embedding_overrides_device(
-                        audio_positions, audio_tmp, audio_len, output_dim);
-                } else {
-                    std::vector<AsrBf16> audio_host(
-                        static_cast<size_t>(audio_len) * static_cast<size_t>(output_dim));
-                    context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
-                                        audio_host.size() * sizeof(AsrBf16));
-                    backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+                const int prompt_len = std::min(
+                    requested_len, static_cast<int>(prompt_ids.size()));
+
+                std::vector<int> audio_positions;
+                audio_positions.reserve(static_cast<size_t>(std::min(audio_len, prompt_len)));
+                for (int i = 0; i < prompt_len; ++i) {
+                    if (prompt_ids[static_cast<size_t>(i)] == spec.audio_token_id) {
+                        audio_positions.push_back(i);
+                    }
                 }
-            }
+                const int override_count =
+                    std::min(static_cast<int>(audio_positions.size()), audio_len);
+                if (override_count > 0) {
+                    if (auto* asr_bnb4 = dynamic_cast<Qwen3ASRBnb4Backend*>(backend)) {
+                        asr_bnb4->set_embedding_overrides_device(
+                            audio_positions, audio_tmp, override_count, output_dim);
+                    } else {
+                        std::vector<AsrBf16> audio_host(
+                            static_cast<size_t>(override_count) *
+                            static_cast<size_t>(output_dim));
+                        context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
+                                            audio_host.size() * sizeof(AsrBf16));
+                        backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+                    }
+                }
 
-            std::vector<int> pos_t(prompt_ids.size());
-            std::vector<int> pos_h(prompt_ids.size());
-            std::vector<int> pos_w(prompt_ids.size());
-            for (size_t i = 0; i < prompt_ids.size(); ++i) {
-                pos_t[i] = static_cast<int>(i);
-                pos_h[i] = static_cast<int>(i);
-                pos_w[i] = static_cast<int>(i);
-            }
-            backend->reset();
-            backend->set_mrope_positions(*context, pos_t, pos_h, pos_w, 0);
-            DeviceAllocation prompt_device(
-                *context, static_cast<size_t>(prompt_ids.size()) * sizeof(int));
-            context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
-                                prompt_ids.size() * sizeof(int));
-            backend->forward(*context, prompt_device.as<int>(),
-                             static_cast<int>(prompt_ids.size()));
-            backend->clear_mrope_positions();
+                std::vector<int> pos_t(static_cast<size_t>(prompt_len));
+                std::vector<int> pos_h(static_cast<size_t>(prompt_len));
+                std::vector<int> pos_w(static_cast<size_t>(prompt_len));
+                for (int i = 0; i < prompt_len; ++i) {
+                    pos_t[static_cast<size_t>(i)] = i;
+                    pos_h[static_cast<size_t>(i)] = i;
+                    pos_w[static_cast<size_t>(i)] = i;
+                }
+                backend->reset();
+                backend->set_mrope_positions(*context, pos_t, pos_h, pos_w, 0);
+                DeviceAllocation prompt_device(
+                    *context, static_cast<size_t>(prompt_len) * sizeof(int));
+                context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
+                                    static_cast<size_t>(prompt_len) * sizeof(int));
+                backend->forward(*context, prompt_device.as<int>(), prompt_len);
+                backend->clear_mrope_positions();
 
-            int warmup_token = 0;
-            DeviceAllocation one_token_device(*context, sizeof(int));
-            context->memcpy_h2d(one_token_device.as<int>(), &warmup_token, sizeof(int));
-            backend->forward(*context, one_token_device.as<int>(), 1);
-            context->synchronize();
-            backend->clear_embedding_overrides();
-            backend->reset();
+                int warmup_token = 0;
+                DeviceAllocation one_token_device(*context, sizeof(int));
+                context->memcpy_h2d(one_token_device.as<int>(), &warmup_token, sizeof(int));
+                backend->forward(*context, one_token_device.as<int>(), 1);
+                context->synchronize();
+                backend->clear_embedding_overrides();
+                backend->reset();
+            };
+
+            const int warmup_lengths[] = {48, 64, 80, s_warmup_prompt_tokens};
+            int last_warmup_len = -1;
+            for (int requested_len : warmup_lengths) {
+                const int prompt_len = std::min(
+                    requested_len, static_cast<int>(prompt_ids.size()));
+                if (prompt_len <= 0 || prompt_len == last_warmup_len) {
+                    continue;
+                }
+                run_asr_backend_warmup(prompt_len);
+                last_warmup_len = prompt_len;
+            }
         }
 
         partial_gpu_mel_cache_.reset();
