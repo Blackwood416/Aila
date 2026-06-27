@@ -371,7 +371,9 @@ bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
     try {
         std::lock_guard<std::mutex> pipeline_lock(mutex_);
         auto lane_lock = context->lock_execution();
-        std::vector<float> silence(16000, 0.0f);
+        const int warmup_samples = std::max(
+            16000, aila::env::read_int_raw("AILA_ASR_WARMUP_SAMPLES", 64000));
+        std::vector<float> silence(static_cast<size_t>(warmup_samples), 0.0f);
         int n_frames = 0;
         int actual_frames = 0;
         Tensor* mel_device = nullptr;
@@ -388,6 +390,117 @@ bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
             return false;
         }
         context->synchronize();
+
+        static const bool s_backend_warmup =
+            aila::env::read_flag("AILA_ASR_BACKEND_WARMUP", true);
+        if (s_backend_warmup) {
+            IModelBackend* backend = slot_->backend();
+            Tokenizer* tokenizer = slot_->tokenizer();
+            aila::audio::Qwen3ASRAudioEncoder* audio_encoder = slot_->audio_encoder();
+            const ModelSpec& spec = slot_->model_spec();
+            const Qwen3Config& cfg = spec.qwen3;
+            if (!backend || !tokenizer || !audio_encoder) {
+                if (error_message) {
+                    *error_message = "ASR backend warmup prerequisites are not available";
+                }
+                return false;
+            }
+
+            int audio_len = 0;
+            const int output_dim = spec.audio.output_dim;
+            const int max_audio_len = ((actual_frames + 99) / 100) * 13 + 32;
+            Tensor audio_tmp = Tensor::allocate(*context, {max_audio_len, output_dim});
+            std::string audio_error;
+            if (!audio_encoder->encode(*context, *mel_device, actual_frames,
+                                       audio_tmp, audio_len, &audio_error)) {
+                if (error_message) {
+                    *error_message = audio_error.empty()
+                        ? "ASR audio encoder warmup failed"
+                        : "ASR audio encoder warmup failed: " + audio_error;
+                }
+                return false;
+            }
+
+            std::vector<int> prompt_ids;
+            auto add_text = [&](const std::string& text) {
+                std::vector<int> ids = tokenizer->encode(text);
+                prompt_ids.insert(prompt_ids.end(), ids.begin(), ids.end());
+            };
+            prompt_ids.push_back(cfg.im_start_id);
+            add_text("system\nYou are an accurate streaming ASR engine for Alia.");
+            prompt_ids.push_back(cfg.im_end_id);
+            add_text("\n");
+            prompt_ids.push_back(cfg.im_start_id);
+            add_text("user\n");
+            prompt_ids.push_back(spec.audio_start_token_id);
+            for (int i = 0; i < audio_len; ++i) {
+                prompt_ids.push_back(spec.audio_token_id);
+            }
+            prompt_ids.push_back(spec.audio_end_token_id);
+            add_text("\n");
+            prompt_ids.push_back(cfg.im_end_id);
+            add_text("\n");
+            prompt_ids.push_back(cfg.im_start_id);
+            add_text("assistant\n");
+
+            static const int s_warmup_prompt_tokens = std::max(
+                1, aila::env::read_int_raw("AILA_ASR_BACKEND_WARMUP_PROMPT_TOKENS", 128));
+            const std::vector<int> filler_ids = tokenizer->encode(" warmup");
+            while (static_cast<int>(prompt_ids.size()) < s_warmup_prompt_tokens &&
+                   !filler_ids.empty()) {
+                prompt_ids.insert(prompt_ids.end(), filler_ids.begin(), filler_ids.end());
+            }
+            const int max_seq_len = backend->max_seq_len();
+            if (max_seq_len > 0 && static_cast<int>(prompt_ids.size()) > max_seq_len) {
+                prompt_ids.resize(static_cast<size_t>(max_seq_len));
+            }
+
+            std::vector<int> audio_positions;
+            for (size_t i = 0; i < prompt_ids.size(); ++i) {
+                if (prompt_ids[i] == spec.audio_token_id) {
+                    audio_positions.push_back(static_cast<int>(i));
+                }
+            }
+            if (!audio_positions.empty()) {
+                if (auto* asr_bnb4 = dynamic_cast<Qwen3ASRBnb4Backend*>(backend)) {
+                    asr_bnb4->set_embedding_overrides_device(
+                        audio_positions, audio_tmp, audio_len, output_dim);
+                } else {
+                    std::vector<AsrBf16> audio_host(
+                        static_cast<size_t>(audio_len) * static_cast<size_t>(output_dim));
+                    context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
+                                        audio_host.size() * sizeof(AsrBf16));
+                    backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+                }
+            }
+
+            std::vector<int> pos_t(prompt_ids.size());
+            std::vector<int> pos_h(prompt_ids.size());
+            std::vector<int> pos_w(prompt_ids.size());
+            for (size_t i = 0; i < prompt_ids.size(); ++i) {
+                pos_t[i] = static_cast<int>(i);
+                pos_h[i] = static_cast<int>(i);
+                pos_w[i] = static_cast<int>(i);
+            }
+            backend->reset();
+            backend->set_mrope_positions(*context, pos_t, pos_h, pos_w, 0);
+            DeviceAllocation prompt_device(
+                *context, static_cast<size_t>(prompt_ids.size()) * sizeof(int));
+            context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
+                                prompt_ids.size() * sizeof(int));
+            backend->forward(*context, prompt_device.as<int>(),
+                             static_cast<int>(prompt_ids.size()));
+            backend->clear_mrope_positions();
+
+            int warmup_token = 0;
+            DeviceAllocation one_token_device(*context, sizeof(int));
+            context->memcpy_h2d(one_token_device.as<int>(), &warmup_token, sizeof(int));
+            backend->forward(*context, one_token_device.as<int>(), 1);
+            context->synchronize();
+            backend->clear_embedding_overrides();
+            backend->reset();
+        }
+
         partial_gpu_mel_cache_.reset();
         return true;
     } catch (const std::exception& e) {

@@ -492,9 +492,12 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         return ALIA_ERR_INVALID_STATE;
     }
 
-    constexpr int kRetokenizeGuardTokens = 16;
-    constexpr int kFinalPromptSuffixGuardTokens = 16;
-    constexpr int kMinIncrementalPrefillSuffixTokens = 16;
+    const int kRetokenizeGuardTokens = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_RETOKENIZE_GUARD_TOKENS", 16));
+    const int kFinalPromptSuffixGuardTokens = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_FINAL_SUFFIX_GUARD_TOKENS", 16));
+    const int kMinIncrementalPrefillSuffixTokens = std::max(
+        1, aila::env::read_int_raw("AILA_FOREGROUND_MIN_INCREMENTAL_PREFILL_SUFFIX_TOKENS", 16));
     static const int kMaxDecodePathPrefillSuffixTokens = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
     const auto started = std::chrono::steady_clock::now();

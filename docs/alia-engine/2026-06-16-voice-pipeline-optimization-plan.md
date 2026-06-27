@@ -2039,3 +2039,81 @@ Next useful work:
   per-call hotspot once prefix reuse is enabled.
 - Alternatively, optimize the 31-token foreground final suffix batch prefill,
   because it now directly contributes roughly 460-470ms to VAD-to-enqueue.
+
+## 2026-06-27 ASR Warmup And Partial-Prefill Probes
+
+Q35 final suffix profile on the short streaming smoke confirmed that the
+31-token final foreground suffix spends most of its time in small-batch BnB4
+linear work, not attention:
+
+```text
+foreground_profile_prompt_suffix_tokens  31
+foreground_profile_prompt_prefill_ms     492
+Q35PrefillProfile total                  451.9 ms
+largest per-token stages                 linear_o, ffn_proj/down, linear_proj
+```
+
+Rejected foreground partial-prefill probes:
+
+```text
+probe                                      result
+BNB4 small-M prefill tiles                 Only moved 31-token suffix by about 5ms in A/B; not retained.
+MIN_INCREMENTAL_PREFILL_SUFFIX=1           Prefilled the 4-6 token ASR tail, but final suffix still batch-prefilled 25 tokens and TTFA regressed.
+RETOKENIZE_GUARD=4 FINAL_SUFFIX_GUARD=8    Final suffix dropped to 13 and prompt prefill to ~320ms, but sampled text became unstable; not default.
+AILA_ASR_PREFIX_REUSE=1 with ASR profile   Hit 2/2 reuse attempts, but ASR prefill rose from ~682ms to ~797ms due small incremental prefill.
+```
+
+ASR profile with the conservative default path showed the true short-prompt ASR
+hotspot:
+
+```text
+asr_profile_total_ms       1214.47
+asr_profile_mel_ms         17.08
+asr_profile_encoder_ms     223.17
+  conv_ms                  151.13
+  transformer_ms            51.68
+  proj_ms                   19.95
+asr_profile_prompt_ms        3.84
+asr_profile_prefill_ms     682.48
+asr_profile_decode_ms      287.78
+```
+
+The request path also still paid first-use ASR backend allocation:
+
+```text
+[Qwen3ASRBnb4] Runtime buffers resized: seq_cap=128
+[Qwen3ASRBnb4] Prefill score buffer resized: seq_cap=128
+```
+
+Implemented warmup extension:
+
+- `AliaAsrPipeline::warmup_gpu_mel` now uses a 4s silent warmup buffer by
+  default (`AILA_ASR_WARMUP_SAMPLES=64000`).
+- The same warmup also runs the ASR audio encoder and a representative
+  Qwen3-ASR prompt prefill/decode (`AILA_ASR_BACKEND_WARMUP=1`), then resets the
+  backend before the first real request.
+- The ASR prompt warmup target defaults to 128 tokens via
+  `AILA_ASR_BACKEND_WARMUP_PROMPT_TOKENS`.
+
+Short streaming validation after ASR backend warmup:
+
+```text
+request-time ASR resize logs              eliminated
+asr_ms                                    1446-1457
+asr_stream_get_text_total_ms              1105-1113
+asr_stream_get_text_max_ms                447-452
+simulated_vad_to_first_content_ms         840-841
+simulated_vad_to_first_tts_enqueue_ms     900
+simulated_vad_to_first_audio_ms           1698 (sample/chunk variance)
+short smoke output ASR                    "Crash, I am a bit shy, but I can say hello."
+```
+
+Interpretation:
+
+- The warmup moves roughly 100ms of ASR first-use overhead out of the request
+  path without changing the conservative partial-prefill policy.
+- ASR prefix reuse is still not ready as a default; current incremental prefill
+  costs more than it saves on the short prompt.
+- Further ASR gains need either a better incremental ASR prefill path or audio
+  encoder reuse that avoids recomputing the conv frontend for growing partial
+  windows.
