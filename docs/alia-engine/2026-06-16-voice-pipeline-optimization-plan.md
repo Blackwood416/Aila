@@ -1177,3 +1177,49 @@ Interpretation:
   previous 3.6-4.0s range.
 - Next ASR work should look at reusing encoder/prompt state inside real partial
   transcribes, not increasing the partial call cadence again.
+
+## 2026-06-27 ASR Device Embedding Override
+
+The ASR partial path used the audio encoder output by copying the encoded audio
+features from GPU to host and then uploading them again as transformer embedding
+overrides. That host bounce also creates an implicit synchronization point in
+the streaming path. The Qwen3-ASR BnB4 backend now accepts device-resident
+embedding overrides, so Alia ASR can scatter `audio_tmp` directly into the token
+hidden states.
+
+Implementation:
+
+- Added `Qwen3ASRBnb4Backend::set_embedding_overrides_device(...)`.
+- Kept the existing host `set_embedding_overrides(...)` path as fallback.
+- Added `AILA_ASR_DEVICE_EMBEDDING_OVERRIDES`; default is enabled.
+- Alia ASR uses the device path only for the Qwen3-ASR BnB4 backend.
+
+Short prompt A/B, same build and audio, no ASR profiling sync:
+
+```text
+mode                 pass  transcribes  asr_tail_ms  vad_to_first_audio_ms  first_samples  asr_text
+device override on   true  3            2004         3576                   23040          "Alia, please say hello in one."
+device override off  true  3            3838         5476                   23040          "Alia, please say hello in one."
+```
+
+500ms stream chunk matrix with device override enabled, no ASR profiling sync:
+
+```text
+scenario          pass  asr_tail_ms  vad_to_first_audio_ms  first_samples
+short_hello       true  2004         3576                   23040
+persona_chat      true  3918         6663                   23040
+preference_memory true  3775         5658                   23040
+task_memory       true  3475         5455                   23040
+long_answer       true  3247         5545                   23040
+```
+
+Interpretation:
+
+- The device override removes a real GPU-host-GPU sync/copy in the ASR path and
+  preserves ASR text on the short A/B.
+- The full matrix still shows substantial runtime and generation variance, so
+  this should be treated as a low-risk plumbing improvement rather than the main
+  path to sub-1s TTFA.
+- Tail-partial ASR and final cached/contextual decode experiments were rejected:
+  they reduced some ASR work but changed user text shape enough to make VLM/TTS
+  behavior worse.

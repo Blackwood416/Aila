@@ -5,6 +5,7 @@
 #include "../audio/Qwen3ASRAudioEncoder.hpp"
 #include "../core/Tensor.hpp"
 #include "../models/IModelBackend.hpp"
+#include "../models/Qwen3ASRBnb4Backend.hpp"
 #include "../ops/Ops.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../utils/Tokenizer.hpp"
@@ -479,11 +480,6 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     }
     finish_stage(call_metrics.encoder_ms, context);
 
-    std::vector<AsrBf16> audio_host(static_cast<size_t>(audio_len) * output_dim);
-    context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
-                        audio_host.size() * sizeof(AsrBf16));
-    finish_stage(call_metrics.readback_ms);
-
     std::vector<int> prompt_ids;
     auto add_text = [&](const std::string& text) {
         std::vector<int> ids = tokenizer->encode(text);
@@ -524,7 +520,20 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
     }
 
     backend->reset();
-    backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+    static const bool s_device_embedding_overrides =
+        aila::env::read_flag("AILA_ASR_DEVICE_EMBEDDING_OVERRIDES", true);
+    auto* asr_bnb4 = s_device_embedding_overrides
+        ? dynamic_cast<Qwen3ASRBnb4Backend*>(backend)
+        : nullptr;
+    if (asr_bnb4) {
+        asr_bnb4->set_embedding_overrides_device(audio_positions, audio_tmp, audio_len, output_dim);
+    } else {
+        std::vector<AsrBf16> audio_host(static_cast<size_t>(audio_len) * output_dim);
+        context->memcpy_d2h(audio_host.data(), audio_tmp.data(),
+                            audio_host.size() * sizeof(AsrBf16));
+        finish_stage(call_metrics.readback_ms);
+        backend->set_embedding_overrides(audio_positions, audio_host, output_dim);
+    }
 
     std::vector<int> pos_t(prompt_ids.size());
     std::vector<int> pos_h(prompt_ids.size());

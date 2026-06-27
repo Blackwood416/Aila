@@ -46,6 +46,10 @@ public:
     void set_embedding_overrides(const std::vector<int>& positions,
                                  const std::vector<bf16>& embeddings,
                                  int hidden_size) override;
+    void set_embedding_overrides_device(const std::vector<int>& positions,
+                                        Tensor& embeddings,
+                                        int embedding_count,
+                                        int hidden_size);
     void clear_embedding_overrides() override;
     void set_mrope_positions(Context& ctx,
                              const std::vector<int>& pos_t,
@@ -90,8 +94,11 @@ protected:
 
     // Embedding override state (for audio token injection)
     bool has_embedding_overrides_ = false;
+    bool override_embeddings_device_ = false;
     std::vector<int> override_positions_;
     std::vector<bf16> override_embeddings_;
+    Tensor* override_embeddings_device_tensor_ = nullptr;
+    int override_embedding_count_ = 0;
     int override_hidden_size_ = 0;
     Tensor override_buf_;      // GPU buffer for override values
     Tensor override_pos_buf_;  // GPU buffer for override positions (persistent)

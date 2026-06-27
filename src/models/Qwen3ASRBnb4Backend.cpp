@@ -207,18 +207,37 @@ void Qwen3ASRBnb4Backend::upload_mrope_positions(Context& ctx) {
 }
 
 void Qwen3ASRBnb4Backend::set_embedding_overrides(const std::vector<int>& positions,
-                                                 const std::vector<bf16>& embeddings,
-                                                 int hidden_size) {
+                                                  const std::vector<bf16>& embeddings,
+                                                  int hidden_size) {
     has_embedding_overrides_ = true;
+    override_embeddings_device_ = false;
     override_positions_ = positions;
     override_embeddings_ = embeddings;
+    override_embeddings_device_tensor_ = nullptr;
+    override_embedding_count_ = static_cast<int>(positions.size());
+    override_hidden_size_ = hidden_size;
+}
+
+void Qwen3ASRBnb4Backend::set_embedding_overrides_device(const std::vector<int>& positions,
+                                                         Tensor& embeddings,
+                                                         int embedding_count,
+                                                         int hidden_size) {
+    has_embedding_overrides_ = true;
+    override_embeddings_device_ = true;
+    override_positions_ = positions;
+    override_embeddings_.clear();
+    override_embeddings_device_tensor_ = &embeddings;
+    override_embedding_count_ = embedding_count;
     override_hidden_size_ = hidden_size;
 }
 
 void Qwen3ASRBnb4Backend::clear_embedding_overrides() {
     has_embedding_overrides_ = false;
+    override_embeddings_device_ = false;
     override_positions_.clear();
     override_embeddings_.clear();
+    override_embeddings_device_tensor_ = nullptr;
+    override_embedding_count_ = 0;
 }
 
 void Qwen3ASRBnb4Backend::set_mrope_positions(Context& ctx,
@@ -473,11 +492,18 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
         // 2. Apply audio embedding overrides
         if (has_embedding_overrides_ && !override_positions_.empty()) {
             size_t n_override = override_positions_.size();
-            if (!override_buf_.valid() || override_buf_.numel() < static_cast<int64_t>(n_override * H)) {
-                override_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override), H});
+            const bool use_device_overrides =
+                override_embeddings_device_ &&
+                override_embeddings_device_tensor_ &&
+                override_embedding_count_ >= static_cast<int>(n_override) &&
+                override_hidden_size_ == H;
+            if (!use_device_overrides) {
+                if (!override_buf_.valid() || override_buf_.numel() < static_cast<int64_t>(n_override * H)) {
+                    override_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override), H});
+                }
+                ctx.memcpy_h2d(override_buf_.data(), override_embeddings_.data(),
+                               n_override * H * sizeof(bf16));
             }
-            ctx.memcpy_h2d(override_buf_.data(), override_embeddings_.data(),
-                           n_override * H * sizeof(bf16));
 
             if (!override_pos_buf_.valid() || override_pos_buf_.numel() < static_cast<int64_t>(n_override)) {
                 override_pos_buf_ = Tensor::allocate(ctx, {static_cast<int64_t>(n_override)},
@@ -487,7 +513,9 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
                            n_override * sizeof(int));
 
             bf16* hidden_ptr = buf_.hidden.data_as<bf16>();
-            bf16* over_ptr = override_buf_.data_as<bf16>();
+            bf16* over_ptr = use_device_overrides
+                ? override_embeddings_device_tensor_->data_as<bf16>()
+                : override_buf_.data_as<bf16>();
             int* pos_ptr = override_pos_buf_.data_as<int>();
 
             ctx.queue().parallel_for(sycl::range<1>(n_override), [=](sycl::id<1> idx) {
@@ -498,6 +526,8 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
                 }
             });
             has_embedding_overrides_ = false;
+            override_embeddings_device_ = false;
+            override_embeddings_device_tensor_ = nullptr;
         }
 
         // 3. Initial norm
@@ -738,6 +768,8 @@ void Qwen3ASRBnb4Backend::reset() {
     kv_cache_.reset();
     current_len_ = 0;
     has_embedding_overrides_ = false;
+    override_embeddings_device_ = false;
+    override_embeddings_device_tensor_ = nullptr;
 }
 
 bool Qwen3ASRBnb4Backend::truncate_kv_cache(int new_len) {
