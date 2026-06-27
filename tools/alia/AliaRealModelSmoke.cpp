@@ -75,6 +75,75 @@ std::string quote(const std::string& value) {
     return out.str();
 }
 
+bool env_flag_enabled(const char* name, bool default_value = false) {
+#ifdef _WIN32
+    char* raw = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&raw, &len, name) != 0 || !raw) {
+        if (raw) {
+            std::free(raw);
+        }
+        return default_value;
+    }
+    const bool enabled = *raw ? std::atoi(raw) != 0 : default_value;
+    std::free(raw);
+    return enabled;
+#else
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return default_value;
+    }
+    return std::atoi(raw) != 0;
+#endif
+}
+
+aila::alia::AliaAsrMetrics subtract_asr_metrics(
+    const aila::alia::AliaAsrMetrics& after,
+    const aila::alia::AliaAsrMetrics& before) {
+    aila::alia::AliaAsrMetrics delta;
+    delta.transcribe_calls = after.transcribe_calls - before.transcribe_calls;
+    delta.generated_tokens = after.generated_tokens - before.generated_tokens;
+    delta.input_audio_ms = after.input_audio_ms - before.input_audio_ms;
+    delta.mel_ms = after.mel_ms - before.mel_ms;
+    delta.upload_ms = after.upload_ms - before.upload_ms;
+    delta.encoder_ms = after.encoder_ms - before.encoder_ms;
+    delta.readback_ms = after.readback_ms - before.readback_ms;
+    delta.prompt_ms = after.prompt_ms - before.prompt_ms;
+    delta.prefill_ms = after.prefill_ms - before.prefill_ms;
+    delta.decode_ms = after.decode_ms - before.decode_ms;
+    delta.total_ms = after.total_ms - before.total_ms;
+    return delta;
+}
+
+void print_asr_profile_call(const char* prefix,
+                            int index,
+                            bool force_decode,
+                            double chunk_end_ms,
+                            double call_ms,
+                            const aila::alia::AliaAsrMetrics& delta,
+                            const std::string& stable_text,
+                            const std::string& partial_text) {
+    std::cout << prefix
+              << "=index:" << index
+              << ",force:" << (force_decode ? "true" : "false")
+              << ",chunk_end_ms:" << chunk_end_ms
+              << ",call_ms:" << call_ms
+              << ",transcribes:" << delta.transcribe_calls
+              << ",generated_tokens:" << delta.generated_tokens
+              << ",input_audio_ms:" << delta.input_audio_ms
+              << ",mel_ms:" << delta.mel_ms
+              << ",upload_ms:" << delta.upload_ms
+              << ",encoder_ms:" << delta.encoder_ms
+              << ",readback_ms:" << delta.readback_ms
+              << ",prompt_ms:" << delta.prompt_ms
+              << ",prefill_ms:" << delta.prefill_ms
+              << ",decode_ms:" << delta.decode_ms
+              << ",total_ms:" << delta.total_ms
+              << ",stable_chars:" << stable_text.size()
+              << ",partial_chars:" << partial_text.size()
+              << "\n";
+}
+
 void print_usage() {
     std::cout
         << "AilaAliaRealSmoke - real-model Alia full pipeline smoke\n\n"
@@ -549,6 +618,8 @@ int main(int argc, char** argv) {
     double asr_stream_vlm_prefill_max_ms = 0.0;
     double asr_stream_tick_total_ms = 0.0;
     double asr_stream_tick_max_ms = 0.0;
+    const bool asr_profile_calls = env_flag_enabled("AILA_ASR_PROFILE_CALLS", false);
+    int asr_profile_call_index = 0;
     constexpr double kAsrSampleRate = 16000.0;
     const double asr_audio_duration_ms =
         static_cast<double>(mono_16k.size()) * 1000.0 / kAsrSampleRate;
@@ -603,6 +674,8 @@ int main(int argc, char** argv) {
             }
 
             const auto chunk_op_start = Clock::now();
+            const aila::alia::AliaAsrMetrics metrics_before =
+                ctx->asr_pipeline->last_metrics();
             const auto get_text_start = Clock::now();
             if (!get_asr_text(stable_text, partial_text, final_chunk)) {
                 return 1;
@@ -610,6 +683,18 @@ int main(int argc, char** argv) {
             const double get_text_ms = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - get_text_start).count());
+            if (asr_profile_calls) {
+                const aila::alia::AliaAsrMetrics metrics_after =
+                    ctx->asr_pipeline->last_metrics();
+                print_asr_profile_call("asr_profile_call",
+                                       asr_profile_call_index++,
+                                       final_chunk,
+                                       chunk_end_ms,
+                                       get_text_ms,
+                                       subtract_asr_metrics(metrics_after, metrics_before),
+                                       stable_text,
+                                       partial_text);
+            }
             asr_stream_get_text_total_ms += get_text_ms;
             asr_stream_get_text_max_ms =
                 std::max(asr_stream_get_text_max_ms, get_text_ms);
@@ -659,8 +744,26 @@ int main(int argc, char** argv) {
             std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
             return 1;
         }
+        const aila::alia::AliaAsrMetrics metrics_before =
+            ctx->asr_pipeline->last_metrics();
+        const auto get_text_start = Clock::now();
         if (!get_asr_text(stable_text, partial_text, true)) {
             return 1;
+        }
+        const double get_text_ms = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - get_text_start).count());
+        if (asr_profile_calls) {
+            const aila::alia::AliaAsrMetrics metrics_after =
+                ctx->asr_pipeline->last_metrics();
+            print_asr_profile_call("asr_profile_call",
+                                   asr_profile_call_index++,
+                                   true,
+                                   asr_audio_duration_ms,
+                                   get_text_ms,
+                                   subtract_asr_metrics(metrics_after, metrics_before),
+                                   stable_text,
+                                   partial_text);
         }
         ++asr_text_calls;
     }

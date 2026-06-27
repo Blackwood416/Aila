@@ -1278,3 +1278,48 @@ Interpretation:
   first content + 1.6s TTS first audio`. The next high-value work is therefore
   TTS first-audio latency and ASR final/partial tail, not VLM prefill
   scheduling.
+
+## 2026-06-27 ASR Partial/Final Breakdown
+
+`AILA_ASR_PROFILE=1` now has an optional smoke-level per-call trace via
+`AILA_ASR_PROFILE_CALLS=1`. The profile mode synchronizes after ASR stages, so
+the resulting TTFA is not a product number; the stage split is useful for root
+cause analysis.
+
+Short prompt, 500ms stream chunk, 1500ms partial advance gate:
+
+```text
+call  kind     audio_ms  call_ms  mel_ms  encoder_ms  prefill_ms  decode_ms  tokens
+0     partial  1500      605      54      124         355         70         6
+1     partial  3000      569      109     58          307         94         8
+2     final    3840      504      137     36          186         143        12
+total          8340      1679     300     218         847         306        26
+```
+
+Final-only, same audio:
+
+```text
+call  kind   audio_ms  call_ms  mel_ms  encoder_ms  prefill_ms  decode_ms  tokens
+0     final  3840      753      138     151         318         144        12
+```
+
+Existing throttle A/B without ASR profiling sync:
+
+```text
+partial_min_advance_ms  transcribes  asr_total_ms  asr_tail_ms  vad_to_audio_ms
+1500                    3            1625          484          2081
+2500                    2            1277          625          2738
+3000                    2            1190          705          2437
+```
+
+Interpretation:
+
+- The stream is paying for repeated full ASR transformer prefill over growing
+  audio prefixes. The current short prompt spends about half of ASR model time
+  in prefill across partial/final calls.
+- Simply raising the partial interval removes one ASR transcribe, but it delays
+  useful VLM prefill and does not improve TTFA in real smoke.
+- The promising ASR direction is state reuse or cheaper incremental partial
+  verification, not a coarser partial cadence. Candidate work: cache/reuse ASR
+  prompt/audio prefix state across partials, or add a deterministic low-cost
+  stability check before rerunning full ASR prefill.
