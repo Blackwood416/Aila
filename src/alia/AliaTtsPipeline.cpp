@@ -24,7 +24,7 @@ constexpr const char* kDefaultTtsReferenceAudio = "alia_ref.wav";
 
 int tts_stream_batch_frames() {
     static const int frames = std::clamp(
-        aila::env::read_int_raw("AILA_TTS_STREAM_BATCH_FRAMES", 12),
+        aila::env::read_int_raw("AILA_TTS_STREAM_BATCH_FRAMES", 8),
         1,
         24);
     return frames;

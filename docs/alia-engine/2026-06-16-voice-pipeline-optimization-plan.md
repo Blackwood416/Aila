@@ -1582,7 +1582,9 @@ gap risk.
 
 Added `AILA_TTS_STREAM_BATCH_FRAMES` to test uniform audio frame batches. The
 first host audio target follows the same batch size, so experiments do not use a
-special smaller first packet. Default remains 12 frames.
+special smaller first packet. The original conservative default was 12 frames;
+after later Mimi RTF work and the 2026-06-27 batch-8 reprobe below, the default
+was lowered to 8 frames.
 
 Short streaming smoke:
 
@@ -1601,9 +1603,10 @@ Interpretation:
   probe showed a first TTS segment with 64 frames taking 7.1s total backend
   time for about 5.1s of audio, which is a gap-risk signal.
 - 10-frame batches were worse in the short smoke and are not promising.
-- Keep the default at 12 frames for now. The next high-value work is reducing
-  Mimi incremental decode cost or pipelining/overlapping TTS segment generation
-  so a smaller uniform batch can keep up with playback.
+- Keep 12 frames as the runtime fallback via `AILA_TTS_STREAM_BATCH_FRAMES=12`
+  if a machine or content shape shows playback gaps. The next high-value work
+  is reducing code generation latency and foreground enqueue time so the lower
+  backend first-audio latency translates into sub-second end-to-end TTFA.
 
 ## 2026-06-27 Mimi Streaming RTF Probe
 
@@ -1908,3 +1911,74 @@ Interpretation:
 - The next deeper TTS work is exact Mimi conv state carry or targeted kernel
   optimization in decoder blocks; allocation/copy cleanup is now mostly
   harvested.
+
+## 2026-06-27 TTS Batch-8 Default Reprobe
+
+After Mimi pre-transformer reuse, conv-window decoding, sync cleanup, and
+decoder copy elision, the earlier 8-frame gap-risk probe was rerun. The new
+backend profile is materially better, so `AILA_TTS_STREAM_BATCH_FRAMES` now
+defaults to 8 instead of 12. This keeps chunks uniform at 15360 samples, with
+only segment tails smaller.
+
+Short streaming smoke with `AILA_TTS_STREAM_BATCH_FRAMES=8` and
+`AILA_TTS_PROFILE=1`:
+
+```text
+first backend audio samples        15360
+first backend codes ms             334.109
+first backend audio ms             464.185
+simulated vad to first audio ms    1492
+short smoke output ASR             "Crash, I am a bit shy, but I can say hello."
+```
+
+Representative profile:
+
+```text
+first 8-frame chunk:
+Mimi incremental pre-transformer cached   23.4 ms
+Conv stages total                        101.8 ms
+Mimi incremental total                   126.9 ms
+
+later 24-frame state:
+Conv stages total                        413.2 ms
+Mimi incremental total                   436.2 ms
+
+later conv-window state, 24+8 frames:
+Conv stages total                        368-372 ms
+Mimi incremental total                   391-395 ms
+```
+
+Batch-8 matrix with output ASR:
+
+```text
+scenario           vad_to_audio_ms  first_tts_enqueue_ms  first_backend_frames  first_codes_ms  first_backend_audio_ms  backend_total_ms
+short_hello        1561             564                   41                    314.326         438.694                 7157.99
+persona_chat       1430             439                   17                    315.986         440.531                 17721.9
+preference_memory  2205             1015                  64                    489.330         619.740                 5158.6
+task_memory        1985             748                   44                    313.201         436.294                 6121.91
+long_answer        1833             468                   18                    315.180         439.108                 20415.1
+```
+
+Validation:
+
+```text
+short streaming smoke: ALIA_REAL_MODEL_SMOKE_PASS
+short smoke output ASR: matched foreground text
+matrix: RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr
+matrix result: 5/5 PASS
+```
+
+Interpretation:
+
+- Batch 8 reduces typical first backend audio from roughly 638-656ms to roughly
+  436-441ms when the first TTS segment can emit an early 8-frame callback.
+- Long first TTS segments can still push first backend audio to about 620ms, as
+  seen in `preference_memory`; this is caused by first segment/frame shape and
+  code generation variance, not by the first audio buffer being special.
+- Backend RTF is close but acceptable in this matrix: the longest outputs stay
+  around real-time, with `persona_chat` as the tightest case. Keep the env
+  fallback to 12 frames for conservative playback validation.
+- The new TTFA bottleneck is mostly before or beside Mimi: ASR/foreground
+  enqueue time and first TTS code generation. To reach sub-second short-prompt
+  TTFA, continue with ASR partial/VLM prefill latency and first-code generation
+  profiling.
