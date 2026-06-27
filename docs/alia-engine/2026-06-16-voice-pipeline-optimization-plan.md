@@ -1982,3 +1982,60 @@ Interpretation:
   enqueue time and first TTS code generation. To reach sub-second short-prompt
   TTFA, continue with ASR partial/VLM prefill latency and first-code generation
   profiling.
+
+## 2026-06-27 ASR/VLM Enqueue Reprobes After Batch 8
+
+After lowering default TTS batches to 8 frames, the short streaming smoke still
+spends roughly 880-900ms before TTS enqueue and about 440ms inside the TTS
+backend. The next probes targeted the VAD-to-enqueue side.
+
+Baseline short streaming smoke after the batch-8 default:
+
+```text
+asr_stream_chunk_ms                 500
+asr_stream_prefill_interval_ms      500
+asr_profile_transcribe_calls        3
+asr_partial_throttled_count         5
+foreground_profile_prefilled_prompt_tokens  87
+foreground_profile_prompt_suffix_tokens     31
+foreground_profile_prompt_prefill_ms        469
+simulated_vad_to_first_tts_enqueue_ms       894
+tts_first_backend_audio_ms                  437.549
+simulated_vad_to_first_audio_ms             1497
+```
+
+Rejected probes:
+
+```text
+probe                                      result
+AILA_FOREGROUND_DECODE_SUFFIX_TOKENS=32   31-token final suffix used decode path, but prompt_prefill_ms regressed to 760ms.
+StreamChunkMs=250 / StreamPrefill=250     More outer ticks, but ASR still transcribed only 3 times; final suffix stayed 31 tokens.
+AILA_ASR_PARTIAL_MIN_ADVANCE_MS=500       ASR transcribes rose to 8, asr_ms rose to 2872ms, final suffix stayed 31 tokens.
+AILA_ASR_PREFIX_REUSE=1                   Prefix reuse hit 2/2 attempts, but short TTFA did not improve.
+PREFIX_REUSE=1 + MIN_ADVANCE=500          Prefix reuse hit 7/7 attempts, but asr_ms rose to 3057ms and final suffix stayed 31 tokens.
+```
+
+Interpretation:
+
+- The 250ms cadence does not help because `AliaAsrPipeline` internally gates
+  partial decoding with `AILA_ASR_PARTIAL_MIN_ADVANCE_MS` and unchanged-text
+  skips.
+- Lowering the partial advance threshold makes more ASR calls, but those calls
+  do not make the final foreground prompt prefix materially closer to the final
+  prompt. They mostly add work.
+- Current ASR prefix reuse can reuse prompt/audio-token prefix positions, but
+  it does not reduce enough of the expensive partial path to justify enabling
+  it by default.
+- Raising the foreground decode-path suffix threshold is counterproductive for
+  the 31-token final suffix; the batch prefill path remains faster at that
+  size.
+
+Next useful work:
+
+- Implement deeper ASR partial reuse around the audio encoder/audio-token path,
+  not just prompt-token prefix reuse.
+- Add finer ASR timing for encoder/prompt/decode even when aggregate metrics
+  are printed after multiple calls; the current cumulative summary hides the
+  per-call hotspot once prefix reuse is enabled.
+- Alternatively, optimize the 31-token foreground final suffix batch prefill,
+  because it now directly contributes roughly 460-470ms to VAD-to-enqueue.
