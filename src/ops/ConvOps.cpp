@@ -363,20 +363,33 @@ void causal_conv_transpose1d(Context& ctx,
 
             float sum = 0.0f;
 
-            for (int ic = 0; ic < in_ch; ++ic) {
-                for (int k = 0; k < kernel_size; ++k) {
-                    int rem = ot - k;
-                    if (rem >= 0 && (rem % stride == 0)) {
-                        int it = rem / stride;
-                        if (it < in_len) {
-                            // input row-major layout: [batch, in_len, in_ch]
-                            int in_idx = (n * in_len + it) * in_ch + ic;
-                            // weight row-major layout: [in_ch, out_ch, kernel_size]
-                            int w_idx = (ic * out_ch + oc) * kernel_size + k;
+            using vec8 = sycl::vec<bf16, 8>;
+            int in_ch8 = in_ch / 8;
+            int first_k = ot % stride;
+            for (int k = first_k; k < kernel_size; k += stride) {
+                int it = (ot - k) / stride;
+                if (it < 0) break;
+                if (it >= in_len) continue;
 
-                            sum += static_cast<float>(in_ptr[in_idx]) * static_cast<float>(w_ptr[w_idx]);
-                        }
+                int in_base = (n * in_len + it) * in_ch;
+
+                // input row-major layout: [batch, in_len, in_ch]
+                // weight row-major layout: [in_ch, out_ch, kernel_size]
+                for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                    int ic = ic8 * 8;
+                    const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
+                    #pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        int icv = ic + v;
+                        int w_idx = (icv * out_ch + oc) * kernel_size + k;
+                        sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_ptr[w_idx]);
                     }
+                }
+
+                for (int ic = in_ch8 * 8; ic < in_ch; ++ic) {
+                    int in_idx = in_base + ic;
+                    int w_idx = (ic * out_ch + oc) * kernel_size + k;
+                    sum += static_cast<float>(in_ptr[in_idx]) * static_cast<float>(w_ptr[w_idx]);
                 }
             }
 

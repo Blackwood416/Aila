@@ -1625,6 +1625,8 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     static const bool tts_alloc_profile = aila::env::read_flag("AILA_TTS_MIMI_ALLOC_PROFILE", false);
     static const bool tts_decoder_fused_conv2_residual =
         aila::env::read_flag("AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL", false);
+    static const bool tts_decoder_block_profile =
+        aila::env::read_flag("AILA_TTS_MIMI_DECODER_BLOCK_PROFILE", false);
     ScopedAllocationProfile alloc_profile(ctx, tts_alloc_profile, "Mimi conv stages");
     auto t_conv_start = std::chrono::high_resolution_clock::now();
 
@@ -1707,11 +1709,31 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     // 5. Decoder Blocks (4 Blocks, 总共上采样 480 倍)
     // ==========================================
     auto t_decoder_start = std::chrono::high_resolution_clock::now();
+    double decoder_dec0_ms = 0.0;
+    double decoder_stage_act_ms = 0.0;
+    double decoder_stage_transpose_ms = 0.0;
+    double decoder_res_copy_ms = 0.0;
+    double decoder_res_act1_ms = 0.0;
+    double decoder_res_conv1_ms = 0.0;
+    double decoder_res_act2_ms = 0.0;
+    double decoder_res_conv2_ms = 0.0;
+    double decoder_res_add_ms = 0.0;
+    auto profile_step_start = std::chrono::high_resolution_clock::now();
+    auto profile_step_done = [&](double& bucket) {
+        if (!tts_decoder_block_profile) return;
+        ctx.synchronize();
+        const auto now = std::chrono::high_resolution_clock::now();
+        bucket += std::chrono::duration<double, std::milli>(now - profile_step_start).count();
+        profile_step_start = now;
+    };
+
     // 先通过 dec0 一维卷积 [7, 1024, 1536]
     Tensor dec0_out = Tensor::allocate(ctx, {L, 1536});
     Tensor& dec0_w = mimi_weights_.get("decoder.decoder.0.conv.weight");
     Tensor& dec0_b = mimi_weights_.get("decoder.decoder.0.conv.bias");
+    profile_step_start = std::chrono::high_resolution_clock::now();
     ops::causal_conv1d(ctx, upsample_in, dec0_w, dec0_b, dec0_out, 1, 1024, 1536, L, 7, 1);
+    profile_step_done(decoder_dec0_ms);
 
     Tensor dec_in = std::move(dec0_out);
 
@@ -1729,13 +1751,17 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         // 1. SnakeBeta
         Tensor& snake_a = mimi_weights_.get(dec_prefix + "0.alpha");
         Tensor& snake_b = mimi_weights_.get(dec_prefix + "0.beta");
+        profile_step_start = std::chrono::high_resolution_clock::now();
         ops::snake_beta(ctx, dec_in, snake_a, snake_b, dec_in, L * in_d, in_d, L);
+        profile_step_done(decoder_stage_act_ms);
 
         // 2. Transposed Convolution
         Tensor conv_t_out = Tensor::allocate(ctx, {L * stride, out_d});
         Tensor& conv_t_w = mimi_weights_.get(dec_prefix + "1.conv.weight");
         Tensor& conv_t_b = mimi_weights_.get(dec_prefix + "1.conv.bias");
+        profile_step_start = std::chrono::high_resolution_clock::now();
         ops::causal_conv_transpose1d(ctx, dec_in, conv_t_w, conv_t_b, conv_t_out, 1, in_d, out_d, L, kernel, stride);
+        profile_step_done(decoder_stage_transpose_ms);
 
         // 3. 3 Residual blocks with dilations 1, 3, 9
         int dilations[3] = {1, 3, 9};
@@ -1757,36 +1783,49 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         for (int r = 0; r < 3; ++r) {
             std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
 
+            profile_step_start = std::chrono::high_resolution_clock::now();
             ops::copy_tensor(ctx, *xx_cur, *residual_buf, res_elems);
+            profile_step_done(decoder_res_copy_ms);
 
             // act1: snake(xx_cur) -> xx_act1
             Tensor& act1_a = mimi_weights_.get(res_prefix + "act1.alpha");
             Tensor& act1_b = mimi_weights_.get(res_prefix + "act1.beta");
+            profile_step_start = std::chrono::high_resolution_clock::now();
             ops::snake_beta(ctx, *xx_cur, act1_a, act1_b, xx_act1, res_elems, out_d, Ls);
+            profile_step_done(decoder_res_act1_ms);
 
             // conv1: conv(xx_act1) -> conv1_out
             Tensor& conv1_w = mimi_weights_.get(res_prefix + "conv1.conv.weight");
             Tensor& conv1_b = mimi_weights_.get(res_prefix + "conv1.conv.bias");
+            profile_step_start = std::chrono::high_resolution_clock::now();
             ops::causal_conv1d(ctx, xx_act1, conv1_w, conv1_b, conv1_out, 1, out_d, out_d, Ls, 7, dilations[r]);
+            profile_step_done(decoder_res_conv1_ms);
 
             // act2: snake(conv1_out) in-place
             Tensor& act2_a = mimi_weights_.get(res_prefix + "act2.alpha");
             Tensor& act2_b = mimi_weights_.get(res_prefix + "act2.beta");
+            profile_step_start = std::chrono::high_resolution_clock::now();
             ops::snake_beta(ctx, conv1_out, act2_a, act2_b, conv1_out, res_elems, out_d, Ls);
+            profile_step_done(decoder_res_act2_ms);
 
             // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
             Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
+            profile_step_start = std::chrono::high_resolution_clock::now();
             if (tts_decoder_fused_conv2_residual) {
                 ops::causal_conv1d_k1_residual_add(ctx, conv1_out, conv2_w, conv2_b,
                                                    *residual_buf, 1, out_d, out_d, Ls);
+                profile_step_done(decoder_res_conv2_ms);
             } else {
                 ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out,
                                    1, out_d, out_d, Ls, 1, 1);
+                profile_step_done(decoder_res_conv2_ms);
 
                 // residual_buf now holds the next xx. Swap buffer roles instead of
                 // copying the whole residual output back into xx.
+                profile_step_start = std::chrono::high_resolution_clock::now();
                 ops::residual_add(ctx, *residual_buf, conv2_out, res_elems);
+                profile_step_done(decoder_res_add_ms);
             }
             std::swap(xx_cur, residual_buf);
         }
@@ -1801,6 +1840,18 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
 
     auto t_decoder_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_decoder_start).count();
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Decoder blocks (4 layers): %.1f ms", t_decoder_ms);
+    if (tts_decoder_block_profile) {
+        AILA_LOG_INFO("[TTS-Profile]   Decoder detail: dec0=%.1f ms stage_act=%.1f ms transpose=%.1f ms res_copy=%.1f ms res_act1=%.1f ms res_conv1=%.1f ms res_act2=%.1f ms res_conv2=%.1f ms res_add=%.1f ms",
+                      decoder_dec0_ms,
+                      decoder_stage_act_ms,
+                      decoder_stage_transpose_ms,
+                      decoder_res_copy_ms,
+                      decoder_res_act1_ms,
+                      decoder_res_conv1_ms,
+                      decoder_res_act2_ms,
+                      decoder_res_conv2_ms,
+                      decoder_res_add_ms);
+    }
 
     // ==========================================
     // 6. 最终 SnakeBeta 和映射 (channels=3 -> 1)

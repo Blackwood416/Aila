@@ -427,6 +427,68 @@ one pointwise conv output tensor plus one residual-add launch per decoder
 residual block. The gain is modest and noisy, so keep this default-off until a
 matrix run shows stable backend gains and no transcript regressions.
 
+Added a default-off decoder block breakdown probe:
+
+```powershell
+$env:AILA_TTS_MIMI_DECODER_BLOCK_PROFILE = "1"
+```
+
+This inserts synchronization only while the probe is enabled and reports the
+decoder substage split: initial `dec0`, per-stage SnakeBeta, transposed
+convolution, residual copy, residual `act1`, `conv1`, `act2`, `conv2`, and
+residual add. Use it to choose the next decoder optimization target; do not use
+its end-to-end latency as an A/B result because the probe intentionally adds
+extra waits.
+
+Short default-path profile with the probe enabled:
+
+```text
+frames  decoder  transpose  conv1  conv2
+8       105.3 ms 63.3 ms    17.7   12.1
+15      185.5 ms 118.5 ms   33.6   19.7
+16      194.0 ms 125.0 ms   35.3   21.2
+24      286.6 ms 186.9 ms   53.2   30.8
+32      376.6 ms 247.8 ms   70.6   40.4
+29      343.4 ms 226.0 ms   63.8   36.2
+```
+
+Interpretation: transposed convolution is the dominant decoder block cost,
+around 60-65% of decoder time. `conv1` is the next meaningful target, while
+SnakeBeta, copies, and residual adds are small. The first transpose-conv cleanup
+keeps the same `[in_ch, out_ch, kernel_size]` weight layout but iterates only
+valid stride-compatible taps (`k = ot % stride; k += stride`) instead of scanning
+the whole kernel and checking `rem % stride`. For Qwen3-TTS decoder stages this
+reduces the per-output tap loop from `2 * stride` checks to at most two useful
+taps.
+
+Optimized default-path smoke result:
+
+```text
+ALIA_REAL_MODEL_SMOKE_PASS
+first backend frames: 15
+first backend codes: 323.036 ms
+first backend audio: 410.409 ms
+first audio: 900 ms
+backend total: 5380.69 ms
+
+frames  decoder  conv+readback  mimi incremental
+8       57.5 ms  60.7 ms        84.2 ms
+15      105.2 ms 108.5 ms       132.4 ms
+16      109.5 ms 112.2 ms       134.2 ms
+24      160.6 ms 162.8 ms       184.4 ms
+32      213-215 ms 216-217 ms   238-239 ms
+29      195.3 ms 198.1 ms       221.0 ms
+25      168.4 ms 171.6 ms       191.9 ms
+```
+
+With block-profile enabled after the optimization, the transpose substage drops
+from about `63/118/125/247 ms` for `8/15/16/32` frame windows to about
+`27/47/51/96-99 ms`. External Mimo-ASR on both optimized smoke outputs reads:
+
+```text
+Krash, I am Alia, a local companion. I can help with simple tasks.
+```
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests
@@ -441,6 +503,7 @@ $env:AILA_TTS_PROFILE = "1"
 $env:AILA_TTS_MIMI_ALLOC_PROFILE = "1"
 $env:AILA_TTS_MIMI_PTFM_FUSED_RESIDUAL = "1"
 $env:AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL = "1"
+$env:AILA_TTS_MIMI_DECODER_BLOCK_PROFILE = "1"
 .\tools\alia\RunAliaTargetPipeline.ps1 `
   -SkipBuild -SkipToolProbe `
   -AudioPath 'tmp\alia-real-smoke\voice_matrix_stream_500ms_fg_suffix\short_hello_request.wav' `
