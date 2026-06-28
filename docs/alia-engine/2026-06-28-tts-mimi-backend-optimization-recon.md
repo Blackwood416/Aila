@@ -548,6 +548,61 @@ However, repeated VLM output can still create too many TTS invocations when the
 steady threshold is too low; the default steady threshold was raised to
 `96/120` to prefer stable post-first chunks.
 
+## Uniform 4-frame TTS streaming
+
+After the user clarified that the first audio buffer is not fixed as long as
+later chunks do not fall behind, the first-chunk probes were re-run with callback
+timeline metrics. A `4` frame initial chunk plus default `8` frame steady chunks
+reduced backend first audio but exposed a playback-risk shape:
+
+```text
+mode                         first_audio_ms  vad_to_first_audio_ms  callback_intervals_ms  chunk_audio_ms
+initial4/first4/steady8      674             1049                   674,411,465,...       320,640,400,...
+```
+
+The first callback only carried `320 ms` of audio, while the second callback
+arrived `411 ms` later. That can create an early gap even though backend first
+audio looks faster.
+
+Using uniform `4` frame batches kept the TTFA gain while making the playback
+shape consistent:
+
+```text
+mode                         first_audio_ms  vad_to_first_audio_ms  callback_intervals_ms        chunk_audio_ms
+steady4/initial4/first4      684             1064                   684,232,258,310,446,...     320,320,320,320,80,...
+```
+
+Because the early callbacks mostly arrive before the previous `320 ms` chunk has
+played out, the buffer can carry over the occasional slower callback. The custom
+engine now defaults to:
+
+```powershell
+$env:AILA_TTS_STREAM_BATCH_FRAMES = "4"
+$env:AILA_TTS_INITIAL_STREAM_BATCH_FRAMES = "4"
+$env:AILA_TTS_FIRST_AUDIO_FRAMES = "4"
+$env:AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY = "1"
+```
+
+The first-audio priority timeout remains `250 ms`. This is an intentional
+custom-engine latency tradeoff: VLM decode briefly yields after the first TTS
+chunk is enqueued so TTS can produce the first audio callback without waiting
+behind continued foreground decoding.
+
+Full matrix with output-ASR verification:
+
+```text
+scenario           vad_to_first_audio_ms  first_audio_ms  first_enqueue_ms  first_backend_audio_ms
+short_hello        989                    634             414               219.519
+persona_chat       993                    572             345               227.314
+preference_memory  1245                   827             597               229.048
+task_memory        970                    564             341               222.403
+long_answer        1495                   948             724               223.114
+```
+
+The remaining slow scenarios are dominated by delayed foreground text enqueue,
+not by TTS first-backend audio, which is now consistently around `220-230 ms`
+for the first 4-frame callback.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests

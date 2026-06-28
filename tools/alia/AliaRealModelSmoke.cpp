@@ -52,6 +52,7 @@ struct AudioCapture {
     Clock::time_point first_audio{};
     std::vector<float> samples;
     std::vector<int> chunk_sizes;
+    std::vector<long long> callback_times_ms;
     int callback_count = 0;
     int nonzero_samples = 0;
 };
@@ -480,12 +481,16 @@ void audio_callback(const float* samples, int sample_count, void* user_data) {
     }
 
     auto* capture = static_cast<AudioCapture*>(user_data);
+    const auto now = Clock::now();
     std::lock_guard<std::mutex> lock(capture->mutex);
     if (capture->callback_count == 0) {
-        capture->first_audio = Clock::now();
+        capture->first_audio = now;
     }
     ++capture->callback_count;
     capture->chunk_sizes.push_back(sample_count);
+    capture->callback_times_ms.push_back(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - capture->turn_start).count());
     for (int i = 0; i < sample_count; ++i) {
         if (std::fabs(samples[i]) > 1.0e-6f) {
             ++capture->nonzero_samples;
@@ -1182,6 +1187,32 @@ int main(int argc, char** argv) {
                   << "tts_backend_total_ms=" << tts_metrics.backend_total_ms << "\n"
                   << "tts_total_samples=" << audio_capture.samples.size() << "\n"
                   << "tts_nonzero_samples=" << audio_capture.nonzero_samples << "\n"
+                  << "tts_callback_times_ms=";
+        for (size_t i = 0; i < audio_capture.callback_times_ms.size(); ++i) {
+            if (i != 0) {
+                std::cout << ",";
+            }
+            std::cout << audio_capture.callback_times_ms[i];
+        }
+        std::cout << "\n"
+                  << "tts_callback_intervals_ms=";
+        for (size_t i = 0; i < audio_capture.callback_times_ms.size(); ++i) {
+            if (i != 0) {
+                std::cout << ",";
+            }
+            const long long previous = i == 0 ? 0 : audio_capture.callback_times_ms[i - 1];
+            std::cout << (audio_capture.callback_times_ms[i] - previous);
+        }
+        std::cout << "\n"
+                  << "tts_chunk_audio_ms=";
+        for (size_t i = 0; i < audio_capture.chunk_sizes.size(); ++i) {
+            if (i != 0) {
+                std::cout << ",";
+            }
+            std::cout << static_cast<long long>(
+                std::llround(static_cast<double>(audio_capture.chunk_sizes[i]) * 1000.0 / 24000.0));
+        }
+        std::cout << "\n"
                   << "tts_chunk_sizes=";
         for (size_t i = 0; i < audio_capture.chunk_sizes.size(); ++i) {
             if (i != 0) {

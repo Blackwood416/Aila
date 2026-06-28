@@ -1718,7 +1718,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     bool first_tts_priority_wait_done = false;
     long long first_tts_priority_wait_ms = 0;
     static const bool s_tts_first_audio_priority =
-        aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", false);
+        aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
     static const int s_tts_first_audio_priority_timeout_ms = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     long long first_token_delta_ms = -1;
