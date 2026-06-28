@@ -24,6 +24,17 @@ public:
         double hold_ms_max = 0.0;
     };
 
+    struct AllocationStats {
+        long long alloc_count = 0;
+        long long free_count = 0;
+        size_t allocated_bytes = 0;
+        size_t freed_bytes = 0;
+        double alloc_ms_total = 0.0;
+        double alloc_ms_max = 0.0;
+        double free_ms_total = 0.0;
+        double free_ms_max = 0.0;
+    };
+
     class ExecutionLock {
     public:
         class ScopedUnlock {
@@ -124,10 +135,39 @@ public:
         execution_stats_ = ExecutionStats{};
     }
 
+    AllocationStats allocation_stats() const {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        return allocation_stats_;
+    }
+
+    void reset_allocation_stats() {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        allocation_stats_ = AllocationStats{};
+    }
+
+    void set_allocation_stats_enabled(bool enabled) {
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        allocation_stats_enabled_ = enabled;
+    }
+
     // USM Device memory allocation
     void* alloc_device(size_t bytes) {
         std::lock_guard<std::mutex> lock(alloc_mutex_);
+        const bool profile = allocation_stats_enabled_;
+        const auto alloc_start = profile ? std::chrono::high_resolution_clock::now()
+                                         : std::chrono::high_resolution_clock::time_point{};
         void* ptr = sycl::malloc_device(bytes, q_);
+        if (profile) {
+            const auto alloc_end = std::chrono::high_resolution_clock::now();
+            const double alloc_ms =
+                std::chrono::duration<double, std::milli>(alloc_end - alloc_start).count();
+            ++allocation_stats_.alloc_count;
+            allocation_stats_.allocated_bytes += bytes;
+            allocation_stats_.alloc_ms_total += alloc_ms;
+            if (alloc_ms > allocation_stats_.alloc_ms_max) {
+                allocation_stats_.alloc_ms_max = alloc_ms;
+            }
+        }
         if (!ptr) {
             throw std::runtime_error("GPU memory allocation failed: " + std::to_string(bytes) + " bytes");
         }
@@ -142,9 +182,11 @@ public:
     void free_device(void* ptr) {
         if (!ptr) return;
         std::lock_guard<std::mutex> lock(alloc_mutex_);
+        const bool profile = allocation_stats_enabled_;
+        size_t bytes = 0;
         auto it = alloc_bytes_.find(ptr);
         if (it != alloc_bytes_.end()) {
-            size_t bytes = it->second;
+            bytes = it->second;
             if (current_allocated_bytes_ >= bytes) {
                 current_allocated_bytes_ -= bytes;
             } else {
@@ -152,7 +194,20 @@ public:
             }
             alloc_bytes_.erase(it);
         }
+        const auto free_start = profile ? std::chrono::high_resolution_clock::now()
+                                        : std::chrono::high_resolution_clock::time_point{};
         sycl::free(ptr, q_);
+        if (profile) {
+            const auto free_end = std::chrono::high_resolution_clock::now();
+            const double free_ms =
+                std::chrono::duration<double, std::milli>(free_end - free_start).count();
+            ++allocation_stats_.free_count;
+            allocation_stats_.freed_bytes += bytes;
+            allocation_stats_.free_ms_total += free_ms;
+            if (free_ms > allocation_stats_.free_ms_max) {
+                allocation_stats_.free_ms_max = free_ms;
+            }
+        }
     }
 
     // Host -> Device copy (blocking, for synchronous operations)
@@ -217,4 +272,6 @@ private:
     std::unordered_map<void*, size_t> alloc_bytes_;
     size_t current_allocated_bytes_ = 0;
     size_t peak_allocated_bytes_ = 0;
+    bool allocation_stats_enabled_ = false;
+    AllocationStats allocation_stats_;
 };

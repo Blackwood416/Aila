@@ -19,6 +19,45 @@ namespace {
 int round_up_seq(int v, int g) { return ((v + g - 1) / g) * g; }
 constexpr int kMimiSamplesPerFrame = 1920;
 
+class ScopedAllocationProfile {
+public:
+    ScopedAllocationProfile(Context& ctx, bool enabled, const char* label)
+        : ctx_(ctx), enabled_(enabled), label_(label) {
+        if (enabled_) {
+            ctx_.reset_allocation_stats();
+            ctx_.set_allocation_stats_enabled(true);
+        }
+    }
+
+    ScopedAllocationProfile(const ScopedAllocationProfile&) = delete;
+    ScopedAllocationProfile& operator=(const ScopedAllocationProfile&) = delete;
+
+    ~ScopedAllocationProfile() {
+        if (!enabled_) {
+            return;
+        }
+        const auto stats = ctx_.allocation_stats();
+        ctx_.set_allocation_stats_enabled(false);
+        const double alloc_mb = static_cast<double>(stats.allocated_bytes) / (1024.0 * 1024.0);
+        const double freed_mb = static_cast<double>(stats.freed_bytes) / (1024.0 * 1024.0);
+        AILA_LOG_INFO("[TTS-Profile]   %s allocs: %lld alloc / %lld free, %.2f / %.2f MB, alloc %.3f ms (max %.3f), free %.3f ms (max %.3f)",
+                      label_,
+                      static_cast<long long>(stats.alloc_count),
+                      static_cast<long long>(stats.free_count),
+                      alloc_mb,
+                      freed_mb,
+                      stats.alloc_ms_total,
+                      stats.alloc_ms_max,
+                      stats.free_ms_total,
+                      stats.free_ms_max);
+    }
+
+private:
+    Context& ctx_;
+    bool enabled_ = false;
+    const char* label_ = "";
+};
+
 void print_gpu_tensor(Context& ctx, const std::string& name, Tensor& tensor, int offset = 0) {
     std::cout << name << " = [";
     if (tensor.dtype() == dnnl::memory::data_type::bf16) {
@@ -1583,6 +1622,8 @@ void Qwen3TTSBackend::init_mimi_runtime_linears(Context& ctx) {
 bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
     std::vector<float>& out_samples, int tail_samples) {
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    static const bool tts_alloc_profile = aila::env::read_flag("AILA_TTS_MIMI_ALLOC_PROFILE", false);
+    ScopedAllocationProfile alloc_profile(ctx, tts_alloc_profile, "Mimi conv stages");
     auto t_conv_start = std::chrono::high_resolution_clock::now();
 
     // 辅助 layer scale 核函数

@@ -291,6 +291,44 @@ The next practical probe should be small and default-off:
 No temporary code probe was run in this pass. This was a source/log
 reconnaissance pass only.
 
+## Follow-up probe
+
+Added a default-off allocation timing probe for the Mimi conv stage:
+
+```powershell
+$env:AILA_TTS_MIMI_ALLOC_PROFILE = "1"
+```
+
+When enabled, `mimi_conv_stages` logs allocation/free counts, bytes, and
+`sycl::malloc_device` / `sycl::free` wall time for the full conv-stage call.
+The probe does not change tensor math or buffer lifetimes; it only enables
+`Context` allocation accounting while the conv stage is active. Use it with
+`AILA_TTS_PROFILE=1` so allocation cost can be compared against ConvNeXt,
+decoder block, and total conv-stage timing.
+
+Short real smoke result:
+
+```text
+ALIA_REAL_MODEL_SMOKE_PASS
+first backend frames: 15
+first backend codes: 316.599 ms
+first backend audio: 442.729 ms
+first audio: 933 ms
+
+conv frames  alloc/free  bytes alloc/free  alloc ms  free ms  conv total
+8            33 / 33     30.89 / 30.89 MB  5.228     0.249    99.3
+15           33 / 33     57.92 / 57.92 MB  5.309     0.280    184.2
+8            33 / 33     30.89 / 30.89 MB  2.212     0.322    96.9
+16           33 / 33     61.78 / 61.78 MB  2.862     0.418    185.5
+24           33 / 33     92.67 / 92.67 MB  5.580     0.419    400.2
+32           33 / 33     123.55 / 123.55 MB 5.648    0.386    366.4
+```
+
+Interpretation: scratch reuse is still a valid cleanup, but allocation/free is
+only a few milliseconds per Mimi conv call on this profile. It is not the
+largest TTS RTF lever. Prioritize decoder kernel work, pre-transformer small
+kernel fusion, or pipeline scheduling before a large scratch-buffer rewrite.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests
@@ -302,6 +340,7 @@ Initialize-AilaOneApiEnvironment
 cmake --build build --target AliaEngine --config Release
 
 $env:AILA_TTS_PROFILE = "1"
+$env:AILA_TTS_MIMI_ALLOC_PROFILE = "1"
 .\tools\alia\RunAliaTargetPipeline.ps1 `
   -SkipBuild -SkipToolProbe `
   -AudioPath 'tmp\alia-real-smoke\voice_matrix_stream_500ms_fg_suffix\short_hello_request.wav' `
