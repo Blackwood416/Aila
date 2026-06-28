@@ -402,6 +402,15 @@ namespace ops {
                              int batch, int in_ch, int out_ch, int seq_len,
                              int kernel_size, int dilation);
 
+    // Fused kernel=1 causal conv plus residual accumulation:
+    // residual_output += conv1d(input, weight, bias), where weight is laid out
+    // as [out_ch, in_ch, 1]. The conv result is rounded to bf16 before the
+    // residual add to match the unfused conv2_out intermediate.
+    void causal_conv1d_k1_residual_add(Context& ctx,
+                                       Tensor& input, Tensor& weight, Tensor& bias,
+                                       Tensor& residual_output,
+                                       int batch, int in_ch, int out_ch, int seq_len);
+
     // VQ Lookup and optional accumulate:
     // codes: [n_frames, 16] (int32)
     // table: [2048, codebook_dim] (bf16)

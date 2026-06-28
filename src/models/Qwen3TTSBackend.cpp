@@ -1623,6 +1623,8 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     std::vector<float>& out_samples, int tail_samples) {
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
     static const bool tts_alloc_profile = aila::env::read_flag("AILA_TTS_MIMI_ALLOC_PROFILE", false);
+    static const bool tts_decoder_fused_conv2_residual =
+        aila::env::read_flag("AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL", false);
     ScopedAllocationProfile alloc_profile(ctx, tts_alloc_profile, "Mimi conv stages");
     auto t_conv_start = std::chrono::high_resolution_clock::now();
 
@@ -1745,7 +1747,10 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
         Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
         Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
-        Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv2_out;
+        if (!tts_decoder_fused_conv2_residual) {
+            conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+        }
         Tensor* xx_cur = &xx;
         Tensor* residual_buf = &res_in;
 
@@ -1772,11 +1777,17 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
             // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
             Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
-            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
+            if (tts_decoder_fused_conv2_residual) {
+                ops::causal_conv1d_k1_residual_add(ctx, conv1_out, conv2_w, conv2_b,
+                                                   *residual_buf, 1, out_d, out_d, Ls);
+            } else {
+                ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out,
+                                   1, out_d, out_d, Ls, 1, 1);
 
-            // residual_buf now holds the next xx. Swap buffer roles instead of
-            // copying the whole residual output back into xx.
-            ops::residual_add(ctx, *residual_buf, conv2_out, res_elems);
+                // residual_buf now holds the next xx. Swap buffer roles instead of
+                // copying the whole residual output back into xx.
+                ops::residual_add(ctx, *residual_buf, conv2_out, res_elems);
+            }
             std::swap(xx_cur, residual_buf);
         }
 

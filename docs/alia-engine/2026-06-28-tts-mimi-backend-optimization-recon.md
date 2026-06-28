@@ -377,6 +377,56 @@ The transcripts match their foreground text closely enough for this default-off
 probe. The gain is real but small relative to the conv decoder; keep it as an
 opt-in probe until matrix coverage confirms no audio regressions.
 
+Added a default-off decoder residual block conv2 fusion probe:
+
+```powershell
+$env:AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL = "1"
+```
+
+This targets only Mimi decoder residual-block `conv2`, where the convolution is
+kernel size 1 and the weight layout remains `[out_ch, in_ch, 1]`. The fused
+kernel writes `residual += bf16(conv2(input))` directly, preserving the bf16
+rounding point of the previous `conv2_out` intermediate while removing one
+temporary tensor and one residual-add kernel per residual block. It deliberately
+does not fuse `act1 + conv1`, because that would recompute SnakeBeta for every
+output channel and is likely to regress.
+
+Short opt-in smoke result:
+
+```text
+ALIA_REAL_MODEL_SMOKE_PASS
+first backend frames: 15
+first backend codes: 316.717 ms
+first backend audio: 437.031 ms
+first audio: 933 ms
+
+conv frames  decoder blocks  conv total
+8            89.7 ms         93.3 ms
+15           166.2 ms        169.9 ms
+8            90.3 ms         93.6 ms
+16           172.0 ms        175.2 ms
+24           260.2 ms        390.7 ms
+32           345.4 ms        349.4 ms
+32           349.5 ms        353.8 ms
+29           314.3 ms        319.0 ms
+8            87.4 ms         91.3 ms
+16           174.9 ms        177.9 ms
+24           264.2 ms        268.1 ms
+25           276.2 ms        280.6 ms
+```
+
+External ASR check:
+
+```text
+Krash, I am Alia, a local companion. I can help with simple tasks.
+```
+
+Interpretation: the opt-in path keeps the generated content aligned with the
+foreground text and trims a small amount from decoder-block time by removing
+one pointwise conv output tensor plus one residual-add launch per decoder
+residual block. The gain is modest and noisy, so keep this default-off until a
+matrix run shows stable backend gains and no transcript regressions.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests
@@ -390,6 +440,7 @@ cmake --build build --target AliaEngine --config Release
 $env:AILA_TTS_PROFILE = "1"
 $env:AILA_TTS_MIMI_ALLOC_PROFILE = "1"
 $env:AILA_TTS_MIMI_PTFM_FUSED_RESIDUAL = "1"
+$env:AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL = "1"
 .\tools\alia\RunAliaTargetPipeline.ps1 `
   -SkipBuild -SkipToolProbe `
   -AudioPath 'tmp\alia-real-smoke\voice_matrix_stream_500ms_fg_suffix\short_hello_request.wav' `
