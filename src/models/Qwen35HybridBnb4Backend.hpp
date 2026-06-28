@@ -6,6 +6,7 @@
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -177,6 +178,18 @@ private:
     struct StateSnapshot {
         std::vector<LayerStateSnapshot> layers;
     };
+    struct DeviceLayerStateSnapshot {
+        Tensor linear_state;
+        Tensor linear_conv_state;
+        int linear_conv_head = 0;
+    };
+    struct DeviceStateSnapshot {
+        std::vector<DeviceLayerStateSnapshot> layers;
+    };
     std::unordered_map<int, StateSnapshot> snapshots_;
+    std::unordered_map<int, std::unique_ptr<DeviceStateSnapshot>> device_snapshots_;
     void clear_snapshots();
+    void save_recurrent_state_snapshot(Context& ctx, int checkpoint_len);
+    bool restore_device_state_snapshot(Context& ctx, int checkpoint_len);
+    void prune_device_state_snapshots();
 };

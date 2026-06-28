@@ -2492,7 +2492,7 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
     }
 
     throw_if_cancelled();
-    // Take sparse snapshots of DeltaNet recurrent states
+    const int next_len = current_len_ + seq_len;
     if (use_delta_linear_) {
         int step = aila::env::g_q35_prefill_step_override;
         if (step <= 0) {
@@ -2500,38 +2500,14 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
         }
         if (step <= 0) step = 64;
 
-        int next_len = current_len_ + seq_len;
-        bool is_prefill = (seq_len > 1);
-        bool is_step_boundary = (next_len % step == 0);
+        const bool is_prefill = (seq_len > 1);
+        const bool is_step_boundary = (next_len % step == 0);
         if (is_prefill || is_step_boundary) {
-            ctx.synchronize();
-            StateSnapshot snapshot;
-            snapshot.layers.resize(layer_caches_.size());
-            for (size_t i = 0; i < layer_caches_.size(); ++i) {
-                auto& cache = layer_caches_[i];
-                auto& layer = layers_[i];
-                if (!layer.is_linear) continue;
-
-                if (cache.device_state_dirty) {
-                    if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
-                        ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
-                                       cache.host_linear_state.size() * sizeof(float));
-                    }
-                    if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
-                        ctx.memcpy_d2h(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
-                                       cache.host_linear_conv_state.size() * sizeof(float));
-                    }
-                    cache.device_state_dirty = false;
-                }
-                snapshot.layers[i].linear_state_host = cache.host_linear_state;
-                snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
-                snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
-            }
-            snapshots_[next_len] = std::move(snapshot);
+            save_recurrent_state_snapshot(ctx, next_len);
         }
     }
 
-    current_len_ += seq_len;
+    current_len_ = next_len;
     return buf_.logits;
 }
 
@@ -2558,6 +2534,127 @@ void Qwen35HybridBnb4Backend::reset() {
 
 void Qwen35HybridBnb4Backend::clear_snapshots() {
     snapshots_.clear();
+    device_snapshots_.clear();
+}
+
+void Qwen35HybridBnb4Backend::prune_device_state_snapshots() {
+    const int limit = std::max(
+        0, aila::env::read_int_raw("AILA_Q35_DEVICE_STATE_SNAPSHOT_LIMIT", 8));
+    if (limit <= 0) {
+        device_snapshots_.clear();
+        return;
+    }
+    while (static_cast<int>(device_snapshots_.size()) > limit) {
+        auto oldest = device_snapshots_.begin();
+        for (auto it = device_snapshots_.begin(); it != device_snapshots_.end(); ++it) {
+            if (it->first < oldest->first) {
+                oldest = it;
+            }
+        }
+        device_snapshots_.erase(oldest);
+    }
+}
+
+void Qwen35HybridBnb4Backend::save_recurrent_state_snapshot(Context& ctx,
+                                                            int checkpoint_len) {
+    if (!use_delta_linear_ || checkpoint_len <= 0) {
+        return;
+    }
+
+    static const bool s_device_snapshots =
+        aila::env::read_flag("AILA_Q35_DEVICE_STATE_SNAPSHOTS", true);
+    if (s_device_snapshots) {
+        auto snapshot = std::make_unique<DeviceStateSnapshot>();
+        snapshot->layers.resize(layer_caches_.size());
+        for (size_t i = 0; i < layer_caches_.size(); ++i) {
+            auto& layer = layers_[i];
+            auto& cache = layer_caches_[i];
+            if (!layer.is_linear) {
+                continue;
+            }
+
+            auto& layer_snapshot = snapshot->layers[i];
+            if (cache.linear_state.valid()) {
+                layer_snapshot.linear_state =
+                    Tensor::allocate(ctx, cache.linear_state.shape(),
+                                     cache.linear_state.dtype());
+                ctx.queue().memcpy(layer_snapshot.linear_state.data(),
+                                   cache.linear_state.data(),
+                                   cache.linear_state.size_bytes());
+            }
+            if (cache.linear_conv_state.valid()) {
+                layer_snapshot.linear_conv_state =
+                    Tensor::allocate(ctx, cache.linear_conv_state.shape(),
+                                     cache.linear_conv_state.dtype());
+                ctx.queue().memcpy(layer_snapshot.linear_conv_state.data(),
+                                   cache.linear_conv_state.data(),
+                                   cache.linear_conv_state.size_bytes());
+            }
+            layer_snapshot.linear_conv_head = cache.linear_conv_head;
+        }
+        device_snapshots_[checkpoint_len] = std::move(snapshot);
+        prune_device_state_snapshots();
+        return;
+    }
+
+    ctx.synchronize();
+    StateSnapshot snapshot;
+    snapshot.layers.resize(layer_caches_.size());
+    for (size_t i = 0; i < layer_caches_.size(); ++i) {
+        auto& cache = layer_caches_[i];
+        auto& layer = layers_[i];
+        if (!layer.is_linear) continue;
+
+        if (cache.device_state_dirty) {
+            if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
+                ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
+                               cache.host_linear_state.size() * sizeof(float));
+            }
+            if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
+                ctx.memcpy_d2h(cache.host_linear_conv_state.data(),
+                               cache.linear_conv_state.data(),
+                               cache.host_linear_conv_state.size() * sizeof(float));
+            }
+            cache.device_state_dirty = false;
+        }
+        snapshot.layers[i].linear_state_host = cache.host_linear_state;
+        snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
+        snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
+    }
+    snapshots_[checkpoint_len] = std::move(snapshot);
+}
+
+bool Qwen35HybridBnb4Backend::restore_device_state_snapshot(Context& ctx,
+                                                            int checkpoint_len) {
+    auto it = device_snapshots_.find(checkpoint_len);
+    if (it == device_snapshots_.end() || !it->second) {
+        return false;
+    }
+
+    const auto& snapshot = *it->second;
+    for (size_t i = 0; i < layer_caches_.size(); ++i) {
+        auto& layer = layers_[i];
+        auto& cache = layer_caches_[i];
+        if (!layer.is_linear || i >= snapshot.layers.size()) {
+            continue;
+        }
+
+        const auto& layer_snapshot = snapshot.layers[i];
+        if (cache.linear_state.valid() && layer_snapshot.linear_state.valid()) {
+            ctx.queue().memcpy(cache.linear_state.data(),
+                               layer_snapshot.linear_state.data(),
+                               cache.linear_state.size_bytes());
+        }
+        if (cache.linear_conv_state.valid() &&
+            layer_snapshot.linear_conv_state.valid()) {
+            ctx.queue().memcpy(cache.linear_conv_state.data(),
+                               layer_snapshot.linear_conv_state.data(),
+                               cache.linear_conv_state.size_bytes());
+        }
+        cache.linear_conv_head = layer_snapshot.linear_conv_head;
+        cache.device_state_dirty = true;
+    }
+    return true;
 }
 
 bool Qwen35HybridBnb4Backend::truncate_kv_cache(int new_len) {
@@ -2568,6 +2665,50 @@ bool Qwen35HybridBnb4Backend::truncate_kv_cache(int new_len) {
     }
 
     if (use_delta_linear_) {
+        int best_device_checkpoint = -1;
+        for (const auto& pair : device_snapshots_) {
+            int cp = pair.first;
+            if (cp <= new_len && cp > best_device_checkpoint) {
+                best_device_checkpoint = cp;
+            }
+        }
+        if (best_device_checkpoint >= 0) {
+            Context* restore_context = nullptr;
+            for (auto& cache : layer_caches_) {
+                if (cache.linear_state.valid()) {
+                    restore_context = cache.linear_state.context();
+                    break;
+                }
+                if (cache.linear_conv_state.valid()) {
+                    restore_context = cache.linear_conv_state.context();
+                    break;
+                }
+            }
+            if (restore_context &&
+                restore_device_state_snapshot(*restore_context, best_device_checkpoint)) {
+                current_len_ = best_device_checkpoint;
+
+                for (auto it = device_snapshots_.begin(); it != device_snapshots_.end(); ) {
+                    if (it->first > best_device_checkpoint) {
+                        it = device_snapshots_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                for (auto it = snapshots_.begin(); it != snapshots_.end(); ) {
+                    if (it->first > best_device_checkpoint) {
+                        it = snapshots_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                AILA_LOG_INFO("[Qwen35HybridBnb4Backend] Restored device recurrent state from checkpoint %d (requested truncate to %d)",
+                              best_device_checkpoint, new_len);
+                return true;
+            }
+        }
+
         int best_checkpoint = -1;
         for (const auto& pair : snapshots_) {
             int cp = pair.first;
@@ -2609,6 +2750,13 @@ bool Qwen35HybridBnb4Backend::truncate_kv_cache(int new_len) {
             for (auto it = snapshots_.begin(); it != snapshots_.end(); ) {
                 if (it->first > best_checkpoint) {
                     it = snapshots_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = device_snapshots_.begin(); it != device_snapshots_.end(); ) {
+                if (it->first > best_checkpoint) {
+                    it = device_snapshots_.erase(it);
                 } else {
                     ++it;
                 }

@@ -2218,3 +2218,75 @@ Next high-value implementation options:
 - Treat TTS batch size as a matrix-level tuning knob only after foreground
   enqueue latency is stable; do not change the default based on a single short
   prompt sample.
+
+### 2026-06-28 Qwen3.5 recurrent-state checkpoint storage
+
+vLLM's hybrid/Mamba cache path stores recurrent state in GPU-addressable cache
+blocks and copies state block-to-block on device. The useful idea for Aila is
+not the full request scheduler, but the separation between:
+
+- token/block ownership metadata, and
+- the physical recurrent state storage that can be restored with device copies.
+
+Implemented the first local step for `Qwen35HybridBnb4Backend`:
+
+- Recurrent-state snapshots for linear/GDN layers can now be stored as device
+  tensors (`AILA_Q35_DEVICE_STATE_SNAPSHOTS=1`, default on).
+- `truncate_kv_cache` prefers device snapshots and restores linear recurrent
+  state with queued D2D copies instead of host d2h/h2d round-trips.
+- `AILA_Q35_DEVICE_STATE_SNAPSHOT_LIMIT` defaults to 8 to cap retained GPU
+  snapshots.
+- Host snapshots remain as a fallback when device snapshots are disabled.
+
+Validation:
+
+```text
+Release build                         pass
+default short streaming smoke          pass
+foreground_profile_prompt_prefill_ms   440
+asr_stream_vlm_prefill_total_ms        306
+simulated_vad_to_first_audio_ms       1638
+output ASR                             "Crash, I am a bit shy, but I can say hello."
+```
+
+Full voice matrix with output ASR also passed:
+
+```text
+scenario             pass  asr_ms  tts_first_audio_ms  simulated_vad_to_first_audio_ms
+short_hello          true  359     1610                1969
+persona_chat         true  422     1087                1509
+preference_memory    true  425     1573                1998
+task_memory          true  411     1988                2399
+long_answer          true  553     1197                1750
+```
+
+The matrix is the non-streaming ASR-prefill path, so it validates stability and
+audio recognizability more than the current short-prompt streaming TTFA target.
+Several outputs still show the existing identity/persona sampling bias; that is
+a model/prompt issue rather than evidence of broken vocoder output.
+
+The aggressive foreground guard probe still logged:
+
+```text
+No suitable checkpoint found for truncate to 100
+No suitable checkpoint found for truncate to 104
+```
+
+Interpretation:
+
+- Device-side restore removes the host snapshot transport from checkpointed
+  restores, but it does not create checkpoints inside a large batch prefill.
+- The remaining precision gap is checkpoint generation, not checkpoint restore:
+  when the first speculative partial prefill runs as one large batch ending at
+  109 tokens, there is still no stored state for intermediate 100/104-token
+  prefixes.
+
+Next step:
+
+- Add a foreground-ASR-only chunked prefill mode that forwards the initial
+  speculative prefix in small block-aligned chunks, saving device snapshots at
+  the same boundaries. Measure whether avoiding later full resets is worth the
+  extra small-batch prefill cost.
+- If chunking is too slow, the higher-effort path is exporting intermediate
+  GDN states from the batched linear-attention kernel, closer to vLLM's
+  block-state model.
