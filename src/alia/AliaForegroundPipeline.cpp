@@ -483,6 +483,115 @@ bool AliaForegroundPipeline::start_turn(
     return true;
 }
 
+bool AliaForegroundPipeline::start_speculative_turn(
+    const std::string& stable_text,
+    const std::string& partial_text,
+    const AliaGenConfig* config) {
+    if (config && !is_valid_generation_config(*config)) {
+        return false;
+    }
+
+    const std::string user_text = combine_asr_text(stable_text, partial_text);
+    if (user_text.empty()) {
+        return false;
+    }
+
+    AliaGenConfig captured_config{};
+    if (config) {
+        captured_config = *config;
+    } else {
+        captured_config = default_alia_generation_config();
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (is_busy_locked()) {
+        return false;
+    }
+
+    if (worker_.joinable()) {
+        lock.unlock();
+        worker_.join();
+        lock.lock();
+    }
+
+    abort_requested_ = false;
+    last_error_.clear();
+    speculative_ready_ = false;
+    speculative_user_text_.clear();
+    speculative_assistant_text_.clear();
+    speculative_prompt_ids_.clear();
+    speculative_generated_token_ids_.clear();
+    last_speculative_commit_hit_ = false;
+    last_speculative_commit_reason_ = "speculative turn started";
+    state_ = ForegroundTurnState::Running;
+
+    worker_ = std::thread([this,
+                           stable = stable_text,
+                           partial = partial_text,
+                           captured_config]() mutable {
+        run_speculative_turn(std::move(stable), std::move(partial), captured_config);
+    });
+    return true;
+}
+
+bool AliaForegroundPipeline::commit_speculative_turn(
+    const std::string& stable_text,
+    const std::string& partial_text,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
+    if (config && !is_valid_generation_config(*config)) {
+        return false;
+    }
+
+    AliaGenConfig captured_config{};
+    if (config) {
+        captured_config = *config;
+    } else {
+        captured_config = default_alia_generation_config();
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (state_ == ForegroundTurnState::Running && worker_.joinable()) {
+        abort_requested_ = true;
+        state_ = ForegroundTurnState::Aborting;
+        cv_.notify_all();
+        lock.unlock();
+        worker_.join();
+        lock.lock();
+    }
+    if (is_busy_locked()) {
+        return false;
+    }
+
+    if (worker_.joinable()) {
+        lock.unlock();
+        worker_.join();
+        lock.lock();
+    }
+
+    abort_requested_ = false;
+    last_error_.clear();
+    state_ = ForegroundTurnState::Running;
+
+    worker_ = std::thread([this,
+                           stable = stable_text,
+                           partial = partial_text,
+                           captured_config,
+                           tool_cb,
+                           audio_cb,
+                           user_data]() mutable {
+        run_commit_speculative_turn(std::move(stable),
+                                    std::move(partial),
+                                    captured_config,
+                                    tool_cb,
+                                    audio_cb,
+                                    user_data);
+    });
+    return true;
+}
+
 AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     const std::string& stable_text,
     const std::string& partial_text) {
@@ -947,6 +1056,284 @@ AliaForegroundMetrics AliaForegroundPipeline::last_metrics() const {
     return metrics_;
 }
 
+bool AliaForegroundPipeline::last_speculative_commit_hit() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_speculative_commit_hit_;
+}
+
+std::string AliaForegroundPipeline::last_speculative_commit_reason() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_speculative_commit_reason_;
+}
+
+void AliaForegroundPipeline::run_speculative_turn(
+    std::string stable_text,
+    std::string partial_text,
+    AliaGenConfig config) {
+    try {
+        const auto turn_start = std::chrono::steady_clock::now();
+        GenerationConfig generation_config = translate_generation_config(&config);
+        const std::string user_text = combine_asr_text(stable_text, partial_text);
+        if (user_text.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "speculative foreground user text is empty";
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
+        }
+
+        std::vector<int> prefetched_prompt_ids;
+        std::vector<int> prompt_override_ids;
+        int prefilled_prompt_tokens = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_generation_config_ = generation_config;
+            last_user_text_ = user_text;
+            last_assistant_text_.clear();
+            last_tool_call_json_.clear();
+            last_tool_result_text_.clear();
+            last_tool_resume_prompt_text_.clear();
+            generation_start_context_len_ = -1;
+            last_prompt_token_count_ = 0;
+            last_generated_token_count_ = 0;
+            last_first_content_delta_ms_ = -1;
+            last_first_tts_enqueue_ms_ = -1;
+            metrics_ = AliaForegroundMetrics{};
+            generation_anchor_prompt_ids_.clear();
+            generation_token_ids_.clear();
+            speculative_ready_ = false;
+            speculative_user_text_.clear();
+            speculative_assistant_text_.clear();
+            speculative_prompt_ids_.clear();
+            speculative_generated_token_ids_.clear();
+            last_decode_mode_ = ForegroundDecodeMode::None;
+            prefetched_prompt_ids = asr_prefill_prompt_ids_;
+            if (abort_requested_) {
+                state_ = ForegroundTurnState::Aborted;
+                cv_.notify_all();
+                return;
+            }
+        }
+
+        if (!can_generate_with_loaded_vlm()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "foreground VLM slot is not loaded";
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
+        }
+
+        if (!prefetched_prompt_ids.empty()) {
+            Tokenizer* tokenizer = vlm_slot_->tokenizer();
+            IModelBackend* backend = vlm_slot_->backend();
+            std::vector<int> full_prompt =
+                build_alia_chat_prompt(tokenizer, foreground_system_prompt(), user_text);
+            if (backend &&
+                backend->get_current_context_len() == static_cast<int>(prefetched_prompt_ids.size()) &&
+                is_token_prefix(prefetched_prompt_ids, full_prompt)) {
+                prefilled_prompt_tokens = static_cast<int>(prefetched_prompt_ids.size());
+                prompt_override_ids = std::move(full_prompt);
+            } else {
+                prefilled_prompt_tokens = 0;
+            }
+        }
+
+        std::string assistant_text;
+        if (!generate_with_loaded_vlm(user_text,
+                                      generation_config,
+                                      assistant_text,
+                                      prefilled_prompt_tokens <= 0,
+                                      true,
+                                      true,
+                                      true,
+                                      prompt_override_ids.empty() ? nullptr : &prompt_override_ids,
+                                      prefilled_prompt_tokens,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      turn_start)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (last_error_.empty()) {
+                last_error_ = "speculative foreground VLM generation failed";
+            }
+            state_ = ForegroundTurnState::Failed;
+            cv_.notify_all();
+            return;
+        }
+
+        const std::string spoken_text =
+            strip_structured_artifacts_from_spoken_text(assistant_text);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (abort_requested_) {
+                speculative_ready_ = false;
+                speculative_user_text_.clear();
+                speculative_assistant_text_.clear();
+                speculative_prompt_ids_.clear();
+                speculative_generated_token_ids_.clear();
+                last_speculative_commit_reason_ = "speculative turn aborted";
+                state_ = ForegroundTurnState::Aborted;
+            } else {
+                speculative_ready_ = !spoken_text.empty();
+                speculative_user_text_ = user_text;
+                speculative_assistant_text_ = spoken_text;
+                speculative_prompt_ids_ = generation_anchor_prompt_ids_;
+                speculative_generated_token_ids_ = generation_token_ids_;
+                last_speculative_commit_reason_ =
+                    speculative_ready_ ? "speculative text ready" : "speculative text empty";
+                last_assistant_text_ = spoken_text;
+                last_decode_mode_ = ForegroundDecodeMode::LoadedVlm;
+                state_ = ForegroundTurnState::Completed;
+            }
+        }
+    } catch (const ModelBackendCancelled&) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = abort_requested_ ? ForegroundTurnState::Aborted
+                                  : ForegroundTurnState::Failed;
+        if (!abort_requested_) {
+            last_error_ = "speculative foreground VLM backend cancelled";
+        }
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_error_ = e.what();
+        state_ = ForegroundTurnState::Failed;
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_error_ = "unknown speculative foreground failure";
+        state_ = ForegroundTurnState::Failed;
+    }
+
+    cv_.notify_all();
+}
+
+bool AliaForegroundPipeline::synthesize_committed_text(
+    const std::string& user_text,
+    const std::string& spoken_text,
+    const AliaGenConfig& config,
+    AliaAudioCallback audio_cb,
+    void* user_data,
+    std::chrono::steady_clock::time_point turn_start) {
+    if (spoken_text.empty()) {
+        return false;
+    }
+
+    if (tts_pipeline_) {
+        tts_pipeline_->begin_turn_metrics();
+    }
+
+    long long first_enqueue_ms = -1;
+    if (tts_pipeline_ && audio_cb) {
+        const bool started = tts_pipeline_->start_async_turn(
+            config,
+            audio_cb,
+            user_data,
+            [this]() { return abort_requested(); });
+        if (!started) {
+            last_error_ = "failed to start asynchronous TTS worker";
+            return false;
+        }
+
+        std::string pending_tts_text = spoken_text;
+        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, true)) {
+            if (abort_requested()) {
+                break;
+            }
+            if (tts_pipeline_->enqueue_text(chunk) && first_enqueue_ms < 0) {
+                first_enqueue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - turn_start).count();
+            }
+        }
+
+        if (!tts_pipeline_->finish_async_turn() && !abort_requested()) {
+            last_error_ = "asynchronous TTS worker failed";
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_user_text_ = user_text;
+        last_assistant_text_ = spoken_text;
+        last_tool_call_json_.clear();
+        last_tool_result_text_.clear();
+        last_tool_resume_prompt_text_.clear();
+        last_first_content_delta_ms_ = 0;
+        last_first_tts_enqueue_ms_ = first_enqueue_ms;
+        metrics_.first_content_delta_ms = 0;
+        metrics_.first_tts_enqueue_ms = first_enqueue_ms;
+    }
+    return true;
+}
+
+void AliaForegroundPipeline::run_commit_speculative_turn(
+    std::string stable_text,
+    std::string partial_text,
+    AliaGenConfig config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
+    const auto turn_start = std::chrono::steady_clock::now();
+    const std::string final_user_text = combine_asr_text(stable_text, partial_text);
+    static const bool s_allow_prefix_commit =
+        aila::env::read_flag("AILA_FOREGROUND_SPECULATIVE_PREFIX_COMMIT", false);
+
+    bool can_commit = false;
+    std::string speculative_user_text;
+    std::string speculative_assistant_text;
+    std::string commit_reason;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        speculative_user_text = speculative_user_text_;
+        speculative_assistant_text = speculative_assistant_text_;
+        if (!speculative_ready_) {
+            commit_reason = "no speculative text ready";
+        } else if (final_user_text.empty()) {
+            commit_reason = "final ASR text empty";
+        } else if (speculative_user_text.empty()) {
+            commit_reason = "speculative user text empty";
+        } else if (final_user_text == speculative_user_text) {
+            can_commit = true;
+            commit_reason = "exact ASR text match";
+        } else if (s_allow_prefix_commit &&
+                   final_user_text.size() > speculative_user_text.size() &&
+                   final_user_text.compare(0,
+                                           speculative_user_text.size(),
+                                           speculative_user_text) == 0) {
+            can_commit = true;
+            commit_reason = "prefix ASR text match";
+        } else {
+            commit_reason = "ASR text mismatch; speculative='" +
+                speculative_user_text + "' final='" + final_user_text + "'";
+        }
+        speculative_ready_ = false;
+    }
+
+    if (can_commit &&
+        synthesize_committed_text(final_user_text,
+                                  speculative_assistant_text,
+                                  config,
+                                  audio_cb,
+                                  user_data,
+                                  turn_start)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_speculative_commit_hit_ = true;
+        last_speculative_commit_reason_ = commit_reason;
+        last_decode_mode_ = ForegroundDecodeMode::LoadedVlm;
+        state_ = abort_requested_ ? ForegroundTurnState::Aborted
+                                  : ForegroundTurnState::Completed;
+        cv_.notify_all();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_speculative_commit_hit_ = false;
+        last_speculative_commit_reason_ =
+            can_commit ? "speculative TTS commit failed" : commit_reason;
+    }
+    run_turn(config, tool_cb, audio_cb, user_data);
+}
+
 void AliaForegroundPipeline::run_turn(
     AliaGenConfig config,
     AliaToolCallCallback tool_cb,
@@ -1001,6 +1388,11 @@ void AliaForegroundPipeline::run_turn(
             metrics_ = AliaForegroundMetrics{};
             generation_anchor_prompt_ids_.clear();
             generation_token_ids_.clear();
+            speculative_ready_ = false;
+            speculative_user_text_.clear();
+            speculative_assistant_text_.clear();
+            speculative_prompt_ids_.clear();
+            speculative_generated_token_ids_.clear();
             last_decode_mode_ = ForegroundDecodeMode::None;
             prefetched_prompt_ids = asr_prefill_prompt_ids_;
             if (abort_requested_) {

@@ -43,6 +43,7 @@ struct Options {
     bool generate_audio_if_missing = true;
     bool run_tool_probe = true;
     bool stream_asr_prefill = false;
+    bool speculative_foreground = false;
 };
 
 struct AudioCapture {
@@ -95,6 +96,56 @@ bool env_flag_enabled(const char* name, bool default_value = false) {
     }
     return std::atoi(raw) != 0;
 #endif
+}
+
+int env_int_value(const char* name, int default_value, int min_value, int max_value) {
+#ifdef _WIN32
+    char* raw = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&raw, &len, name) != 0 || !raw) {
+        if (raw) {
+            std::free(raw);
+        }
+        return default_value;
+    }
+    const int parsed = *raw ? std::atoi(raw) : default_value;
+    std::free(raw);
+#else
+    const char* raw = std::getenv(name);
+    const int parsed = raw && *raw ? std::atoi(raw) : default_value;
+#endif
+    return std::max(min_value, std::min(max_value, parsed));
+}
+
+std::string combine_asr_text_for_prompt(const std::string& stable_text,
+                                        const std::string& partial_text) {
+    if (stable_text.empty()) {
+        return partial_text;
+    }
+    if (partial_text.empty()) {
+        return stable_text;
+    }
+    std::string combined = stable_text;
+    if (!std::isspace(static_cast<unsigned char>(combined.back())) &&
+        !std::isspace(static_cast<unsigned char>(partial_text.front())) &&
+        !std::ispunct(static_cast<unsigned char>(partial_text.front()))) {
+        combined += " ";
+    }
+    combined += partial_text;
+    return combined;
+}
+
+int ascii_word_count(const std::string& text) {
+    int words = 0;
+    bool in_word = false;
+    for (unsigned char ch : text) {
+        const bool is_word = std::isalpha(ch) || std::isdigit(ch);
+        if (is_word && !in_word) {
+            ++words;
+        }
+        in_word = is_word;
+    }
+    return words;
 }
 
 aila::alia::AliaAsrMetrics subtract_asr_metrics(
@@ -195,6 +246,8 @@ void print_usage() {
         << "                         ASR partial/prefill cadence, default matches --stream-chunk-ms\n"
         << "  --no-generate-audio    fail if --audio is missing instead of using target TTS\n"
         << "  --stream-asr-prefill   feed ASR in chunks and prefill foreground VLM from stable/partial text\n"
+        << "  --speculative-foreground\n"
+        << "                         start a text-only foreground response from ASR partial text and commit/fallback at final ASR\n"
         << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
 }
 
@@ -269,6 +322,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
             opts.generate_audio_if_missing = false;
         } else if (arg == "--stream-asr-prefill") {
             opts.stream_asr_prefill = true;
+        } else if (arg == "--speculative-foreground") {
+            opts.speculative_foreground = true;
         } else if (arg == "--skip-tool-probe") {
             opts.run_tool_probe = false;
         } else {
@@ -637,11 +692,28 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    AliaGenConfig gen{};
+    gen.temperature = 0.6f;
+    gen.top_p = 0.9f;
+    gen.max_tokens = opts.max_tokens;
+
     const auto asr_start = Clock::now();
     int rc = ALIA_OK;
     int asr_prefill_calls = 0;
     int asr_text_calls = 0;
     int asr_prefill_skipped_unchanged = 0;
+    bool speculative_foreground_started = false;
+    double speculative_foreground_start_audio_ms = -1.0;
+    const int speculative_min_chars =
+        env_int_value("AILA_FOREGROUND_SPECULATIVE_MIN_CHARS", 24, 1, 4096);
+    const int speculative_required_stable_ticks =
+        env_int_value("AILA_FOREGROUND_SPECULATIVE_STABLE_TICKS", 1, 1, 16);
+    const int speculative_min_ascii_words =
+        env_int_value("AILA_FOREGROUND_SPECULATIVE_MIN_ASCII_WORDS", 3, 0, 128);
+    int speculative_candidate_stable_ticks = 0;
+    std::string speculative_last_candidate_text;
+    std::string speculative_start_text;
+    std::string speculative_skip_reason = "not evaluated";
     double asr_stream_get_text_total_ms = 0.0;
     double asr_stream_get_text_max_ms = 0.0;
     double asr_stream_vlm_prefill_total_ms = 0.0;
@@ -730,10 +802,38 @@ int main(int argc, char** argv) {
                 std::max(asr_stream_get_text_max_ms, get_text_ms);
             ++asr_text_calls;
             if (!stable_text.empty() || !partial_text.empty()) {
+                bool speculative_candidate_ready = false;
+                std::string speculative_text;
+                if (opts.speculative_foreground &&
+                    !speculative_foreground_started &&
+                    !final_chunk) {
+                    speculative_text = combine_asr_text_for_prompt(stable_text, partial_text);
+                    if (speculative_text == speculative_last_candidate_text) {
+                        ++speculative_candidate_stable_ticks;
+                    } else {
+                        speculative_last_candidate_text = speculative_text;
+                        speculative_candidate_stable_ticks = 1;
+                    }
+
+                    const int candidate_ascii_words =
+                        ascii_word_count(speculative_text);
+                    if (static_cast<int>(speculative_text.size()) < speculative_min_chars) {
+                        speculative_skip_reason = "candidate shorter than min chars";
+                    } else if (speculative_candidate_stable_ticks <
+                               speculative_required_stable_ticks) {
+                        speculative_skip_reason = "candidate waiting for stable repeat";
+                    } else if (candidate_ascii_words > 0 &&
+                               candidate_ascii_words < speculative_min_ascii_words) {
+                        speculative_skip_reason = "candidate has too few ASCII words";
+                    } else {
+                        speculative_candidate_ready = true;
+                    }
+                }
+
                 if (stable_text == last_prefill_stable_text &&
                     partial_text == last_prefill_partial_text) {
                     ++asr_prefill_skipped_unchanged;
-                } else {
+                } else if (!speculative_foreground_started) {
                     const auto vlm_prefill_start = Clock::now();
                     rc = alia_vlm_prefill_asr_text(
                         ctx.get(),
@@ -752,6 +852,23 @@ int main(int argc, char** argv) {
                     asr_stream_vlm_prefill_total_ms += vlm_prefill_ms;
                     asr_stream_vlm_prefill_max_ms =
                         std::max(asr_stream_vlm_prefill_max_ms, vlm_prefill_ms);
+
+                }
+                if (speculative_candidate_ready) {
+                    rc = alia_start_speculative_conversation_turn(
+                        ctx.get(),
+                        stable_text.c_str(),
+                        partial_text.c_str(),
+                        &gen);
+                    if (rc != ALIA_OK) {
+                        std::cerr << "alia_start_speculative_conversation_turn_rc="
+                                  << rc << "\n";
+                        return 1;
+                    }
+                    speculative_foreground_started = true;
+                    speculative_foreground_start_audio_ms = chunk_end_ms;
+                    speculative_start_text = speculative_text;
+                    speculative_skip_reason = "started";
                 }
             }
             const double chunk_op_ms = static_cast<double>(
@@ -800,17 +917,7 @@ int main(int argc, char** argv) {
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
     const aila::alia::AliaAsrMetrics asr_metrics = ctx->asr_pipeline->last_metrics();
-    std::string user_text = stable_text;
-    if (user_text.empty()) {
-        user_text = partial_text;
-    } else if (!partial_text.empty()) {
-        if (!std::isspace(static_cast<unsigned char>(user_text.back())) &&
-            !std::isspace(static_cast<unsigned char>(partial_text.front())) &&
-            !std::ispunct(static_cast<unsigned char>(partial_text.front()))) {
-            user_text += " ";
-        }
-        user_text += partial_text;
-    }
+    std::string user_text = combine_asr_text_for_prompt(stable_text, partial_text);
     std::cout << "asr_ms=" << asr_ms << "\n"
               << "asr_stream_prefill_enabled=" << (opts.stream_asr_prefill ? "true" : "false") << "\n"
               << "asr_stream_chunk_ms=" << (opts.stream_asr_prefill ? opts.stream_chunk_ms : 0) << "\n"
@@ -869,6 +976,26 @@ int main(int argc, char** argv) {
               << "asr_profile_total_ms=" << asr_metrics.total_ms << "\n"
               << "asr_audio_duration_ms=" << asr_audio_duration_ms << "\n"
               << "asr_stream_simulated_tail_ms=" << asr_stream_simulated_tail_ms << "\n"
+              << "foreground_speculative_enabled="
+              << (opts.speculative_foreground ? "true" : "false") << "\n"
+              << "foreground_speculative_started="
+              << (speculative_foreground_started ? "true" : "false") << "\n"
+              << "foreground_speculative_min_chars="
+              << speculative_min_chars << "\n"
+              << "foreground_speculative_required_stable_ticks="
+              << speculative_required_stable_ticks << "\n"
+              << "foreground_speculative_min_ascii_words="
+              << speculative_min_ascii_words << "\n"
+              << "foreground_speculative_candidate_stable_ticks="
+              << speculative_candidate_stable_ticks << "\n"
+              << "foreground_speculative_start_audio_ms="
+              << speculative_foreground_start_audio_ms << "\n"
+              << "foreground_speculative_start_text="
+              << quote(speculative_start_text) << "\n"
+              << "foreground_speculative_last_candidate_text="
+              << quote(speculative_last_candidate_text) << "\n"
+              << "foreground_speculative_skip_reason="
+              << quote(speculative_skip_reason) << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"
               << "asr_partial_text=" << quote(partial_text) << "\n";
     if (user_text.empty()) {
@@ -876,18 +1003,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    AliaGenConfig gen{};
-    gen.temperature = 0.6f;
-    gen.top_p = 0.9f;
-    gen.max_tokens = opts.max_tokens;
-
     AudioCapture audio_capture;
     audio_capture.turn_start = Clock::now();
     const auto fg_start = Clock::now();
-    rc = alia_start_conversation_turn(
-        ctx.get(), &gen, tool_callback, audio_callback, &audio_capture);
+    rc = speculative_foreground_started
+        ? alia_commit_speculative_conversation_turn(
+            ctx.get(),
+            stable_text.c_str(),
+            partial_text.c_str(),
+            &gen,
+            tool_callback,
+            audio_callback,
+            &audio_capture)
+        : alia_start_conversation_turn(
+            ctx.get(), &gen, tool_callback, audio_callback, &audio_capture);
     if (rc != ALIA_OK) {
-        std::cerr << "alia_start_conversation_turn_rc=" << rc << "\n";
+        std::cerr << (speculative_foreground_started
+            ? "alia_commit_speculative_conversation_turn_rc="
+            : "alia_start_conversation_turn_rc=")
+                  << rc << "\n";
         return 1;
     }
 
@@ -936,6 +1070,10 @@ int main(int argc, char** argv) {
               << ctx->foreground_pipeline->last_asr_prefill_skipped_small_suffix_count() << "\n"
               << "foreground_asr_prefill_ms="
               << ctx->foreground_pipeline->last_asr_prefill_ms() << "\n"
+              << "foreground_speculative_commit_hit="
+              << (ctx->foreground_pipeline->last_speculative_commit_hit() ? "true" : "false") << "\n"
+              << "foreground_speculative_commit_reason="
+              << quote(ctx->foreground_pipeline->last_speculative_commit_reason()) << "\n"
               << "foreground_first_content_delta_ms="
               << foreground_first_content_delta_ms << "\n"
               << "foreground_first_tts_enqueue_ms="

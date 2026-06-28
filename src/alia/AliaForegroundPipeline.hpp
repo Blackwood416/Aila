@@ -60,6 +60,15 @@ public:
                     AliaToolCallCallback tool_cb,
                     AliaAudioCallback audio_cb,
                     void* user_data);
+    bool start_speculative_turn(const std::string& stable_text,
+                                const std::string& partial_text,
+                                const AliaGenConfig* config);
+    bool commit_speculative_turn(const std::string& stable_text,
+                                 const std::string& partial_text,
+                                 const AliaGenConfig* config,
+                                 AliaToolCallCallback tool_cb,
+                                 AliaAudioCallback audio_cb,
+                                 void* user_data);
     AliaErrorCode prefill_asr_text(const std::string& stable_text,
                                    const std::string& partial_text);
     bool warmup_loaded_vlm(std::string* error_message = nullptr);
@@ -86,6 +95,8 @@ public:
     long long last_first_content_delta_ms() const;
     long long last_first_tts_enqueue_ms() const;
     AliaForegroundMetrics last_metrics() const;
+    bool last_speculative_commit_hit() const;
+    std::string last_speculative_commit_reason() const;
     const std::string& last_error() const { return last_error_; }
 
 private:
@@ -93,6 +104,21 @@ private:
                   AliaToolCallCallback tool_cb,
                   AliaAudioCallback audio_cb,
                   void* user_data);
+    void run_speculative_turn(std::string stable_text,
+                              std::string partial_text,
+                              AliaGenConfig config);
+    void run_commit_speculative_turn(std::string stable_text,
+                                     std::string partial_text,
+                                     AliaGenConfig config,
+                                     AliaToolCallCallback tool_cb,
+                                     AliaAudioCallback audio_cb,
+                                     void* user_data);
+    bool synthesize_committed_text(const std::string& user_text,
+                                   const std::string& spoken_text,
+                                   const AliaGenConfig& config,
+                                   AliaAudioCallback audio_cb,
+                                   void* user_data,
+                                   std::chrono::steady_clock::time_point turn_start);
     bool can_generate_with_loaded_vlm() const;
     bool generate_with_loaded_vlm(const std::string& user_text,
                                   const GenerationConfig& config,
@@ -139,6 +165,13 @@ private:
     AliaForegroundMetrics metrics_;
     std::vector<int> generation_anchor_prompt_ids_;
     std::vector<int> generation_token_ids_;
+    bool speculative_ready_ = false;
+    std::string speculative_user_text_;
+    std::string speculative_assistant_text_;
+    std::vector<int> speculative_prompt_ids_;
+    std::vector<int> speculative_generated_token_ids_;
+    bool last_speculative_commit_hit_ = false;
+    std::string last_speculative_commit_reason_;
     std::vector<int> asr_prefill_prompt_ids_;
     std::string asr_prefill_text_;
     int last_asr_prefill_token_count_ = 0;

@@ -137,6 +137,48 @@ ALIA_API int alia_vlm_prefill_asr_text(
     });
 }
 
+ALIA_API int alia_start_speculative_conversation_turn(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text,
+    const AliaGenConfig* config) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        return ctx->foreground_pipeline->start_speculative_turn(
+            safe_string(stable_text),
+            safe_string(partial_text),
+            config)
+            ? ALIA_OK
+            : ALIA_ERR_INVALID_STATE;
+    });
+}
+
+ALIA_API int alia_commit_speculative_conversation_turn(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        return ctx->foreground_pipeline->commit_speculative_turn(
+            safe_string(stable_text),
+            safe_string(partial_text),
+            config,
+            tool_cb,
+            audio_cb,
+            user_data)
+            ? ALIA_OK
+            : ALIA_ERR_INVALID_STATE;
+    });
+}
+
 ALIA_API int alia_asr_feed_audio(AliaContext* ctx, const float* samples, int sample_count) {
     return guarded_alia_call([&]() -> int {
         if (!ctx || !ctx->asr_pipeline || !samples || sample_count <= 0) {

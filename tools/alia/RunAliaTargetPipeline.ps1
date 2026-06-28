@@ -15,6 +15,7 @@ param(
     [switch]$SkipBuild,
     [switch]$NoGenerateAudio,
     [switch]$StreamAsrPrefill,
+    [switch]$SpeculativeForeground,
     [switch]$SkipToolProbe
 )
 
@@ -115,6 +116,9 @@ try {
     }
     if ($StreamAsrPrefill) {
         $smokeArgs += "--stream-asr-prefill"
+    }
+    if ($SpeculativeForeground) {
+        $smokeArgs += "--speculative-foreground"
     }
     if ($SkipToolProbe) {
         $smokeArgs += "--skip-tool-probe"

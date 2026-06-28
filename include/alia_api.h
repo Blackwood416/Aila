@@ -86,6 +86,19 @@ ALIA_API int alia_vlm_prefill_asr_text(
     AliaContext* ctx,
     const char* stable_text,
     const char* partial_text);
+ALIA_API int alia_start_speculative_conversation_turn(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text,
+    const AliaGenConfig* config);
+ALIA_API int alia_commit_speculative_conversation_turn(
+    AliaContext* ctx,
+    const char* stable_text,
+    const char* partial_text,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data);
 ALIA_API int alia_asr_feed_audio(AliaContext* ctx, const float* samples, int sample_count);
 ALIA_API void alia_asr_reset(AliaContext* ctx);
 

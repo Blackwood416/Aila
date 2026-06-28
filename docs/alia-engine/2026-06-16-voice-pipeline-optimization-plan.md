@@ -2350,3 +2350,55 @@ Interpretation:
 - Next high-value work should profile whether tighter ASR partial cadence,
   earlier stable/partial VLM handoff, or TTS backend RTF gives the biggest
   remaining gain.
+
+### 2026-06-28 speculative foreground decode plan
+
+Goal: move foreground response generation into the ASR streaming window instead
+of waiting for final ASR text. The first implementation should be deliberately
+small:
+
+- Add a foreground speculative text-only turn that starts from current
+  stable/partial ASR text and produces assistant text without TTS callbacks.
+- Add a final commit step. If final ASR text matches the speculative text
+  contract, commit the cached assistant text directly to TTS. If it does not
+  match, discard the speculative result and run the existing final foreground
+  path.
+- Keep exact text match as the safe default. Add an experimental prefix commit
+  mode for matrix probes where final ASR text starts with the speculative
+  partial text; this measures the ceiling before a real VAD silence contract is
+  available.
+- Do not enable tool calls in the speculative path. Tool call support remains a
+  TODO for a later host-tool phase.
+
+Host/VAD TODO:
+
+- After real VAD is connected, add a speculative silence window. When partial
+  text flushes, start a timer shorter than the host VAD silence window. If the
+  timer expires before more audio arrives, commit the ASR text early and begin
+  VLM prefill/decode. If more audio arrives, roll the foreground KV cache back
+  to the last exact recurrent checkpoint and recompute the changed suffix.
+
+Initial implementation notes:
+
+- Speculative foreground is exposed as an opt-in probe path. It runs foreground
+  text generation from ASR stable/partial text without TTS, then commits cached
+  assistant text to TTS only when final ASR text satisfies the commit contract.
+- Exact ASR text match remains the safe default; prefix commit is guarded by
+  `AILA_FOREGROUND_SPECULATIVE_PREFIX_COMMIT=1` for ceiling probes.
+- The smoke tool now gates speculative starts with
+  `AILA_FOREGROUND_SPECULATIVE_MIN_CHARS` (default 24),
+  `AILA_FOREGROUND_SPECULATIVE_STABLE_TICKS` (default 1), and
+  `AILA_FOREGROUND_SPECULATIVE_MIN_ASCII_WORDS` (default 3). This avoids
+  starting VLM work from wake-word-sized partials such as `"阿利亚。"`.
+- If final ASR arrives while speculative foreground is still running, commit
+  requests abort the speculative worker before falling back, so a miss should
+  not wait for an entire wrong decode to finish.
+- Short-prompt probe on `short_hello_request.wav` showed the useful English
+  request appears only at final ASR; gated speculation therefore does not start
+  on that clip. This keeps the path safe, but real benefit likely needs the host
+  speculative silence window or a richer partial stream.
+- An aggressive cancellation probe with min chars 1 / min ASCII words 0 starts
+  at 1500 ms from `"阿利亚。"`, then misses final ASR and falls back with
+  `foreground_speculative_commit_reason="no speculative text ready"`. This
+  validates the miss path, but it also increases ASR tail because foreground VLM
+  work competes for the shared foreground context.
