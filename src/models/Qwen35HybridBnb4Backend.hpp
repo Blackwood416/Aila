@@ -5,6 +5,7 @@
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -146,9 +147,14 @@ private:
                                       LayerCache& cache,
                                       Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                       Tensor& out_dst);
-    void run_linear_delta_prefill_gpu_batched(Context& ctx, Layer& layer,
+    static constexpr int kMaxInternalPrefillStateSnapshots = 8;
+    bool run_linear_delta_prefill_gpu_batched(Context& ctx, Layer& layer,
                                                LayerCache& cache,
-                                               Tensor& linear_all_src, Tensor& out_dst, int seq_len);
+                                               Tensor& linear_all_src, Tensor& out_dst, int seq_len,
+                                               const std::array<int, kMaxInternalPrefillStateSnapshots>& snapshot_local_tokens,
+                                               const std::array<float*, kMaxInternalPrefillStateSnapshots>& snapshot_state_ptrs,
+                                               const std::array<float*, kMaxInternalPrefillStateSnapshots>& snapshot_conv_ptrs,
+                                               int snapshot_count);
     void run_linear_delta_host(Context& ctx, Layer& layer,
                                 LayerCache& cache,
                                 Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,

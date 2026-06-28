@@ -1386,9 +1386,13 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
     }
 }
 
-void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
+bool Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
     Context& ctx, Layer& layer, LayerCache& cache,
-    Tensor& fused_all, Tensor& out_dst, int seq_len) {
+    Tensor& fused_all, Tensor& out_dst, int seq_len,
+    const std::array<int, kMaxInternalPrefillStateSnapshots>& snapshot_local_tokens,
+    const std::array<float*, kMaxInternalPrefillStateSnapshots>& snapshot_state_ptrs,
+    const std::array<float*, kMaxInternalPrefillStateSnapshots>& snapshot_conv_ptrs,
+    int snapshot_count) {
 
     const int qkv_dim = linear_qkv_dim_;
     const int z_dim = linear_z_dim_;
@@ -1580,6 +1584,45 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
                         }
                         item.barrier(sycl::access::fence_space::local_space);
 
+                        const int processed_tokens = t + 1;
+                        for (int snap = 0; snap < snapshot_count; ++snap) {
+                            if (processed_tokens != snapshot_local_tokens[snap]) {
+                                continue;
+                            }
+
+                            float* snap_state = snapshot_state_ptrs[snap];
+                            if (snap_state && lid < head_dim) {
+                                float* snap_S =
+                                    snap_state + static_cast<size_t>(hv) * head_dim * head_dim;
+                                const int dv = lid;
+                                for (int j = 0; j < head_dim; j += 4) {
+                                    const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
+                                    const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
+                                    const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
+                                    const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
+                                    snap_S[off0] = S[off0];
+                                    snap_S[off1] = S[off1];
+                                    snap_S[off2] = S[off2];
+                                    snap_S[off3] = S[off3];
+                                }
+                            }
+
+                            float* snap_conv = snapshot_conv_ptrs[snap];
+                            if (snap_conv && lid < head_dim) {
+                                for (int r = 0; r < conv_rows; ++r) {
+                                    const size_t row_base = static_cast<size_t>(r) * qkv_dim;
+                                    if (write_shared_qk) {
+                                        snap_conv[row_base + q_base + lid] =
+                                            conv_state_ptr[row_base + q_base + lid];
+                                        snap_conv[row_base + k_base + lid] =
+                                            conv_state_ptr[row_base + k_base + lid];
+                                    }
+                                    snap_conv[row_base + v_base + lid] =
+                                        conv_state_ptr[row_base + v_base + lid];
+                                }
+                            }
+                        }
+
                         local_conv_head = (local_conv_head + 1) % conv_rows;
                     }
                 });
@@ -1587,7 +1630,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
 
         cache.device_state_dirty = true;
         cache.linear_conv_head = (conv_head + seq_len) % conv_rows;
-        return;
+        return true;
     }
 
     // Fallback: per-token iteration for non-standard shapes
@@ -1608,6 +1651,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
         run_linear_delta_decode_gpu(ctx, layer, cache,
                                     qkv_view, z_view, a_view, b_view, out_view);
     }
+    return false;
 }
 
 void Qwen35HybridBnb4Backend::debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
@@ -1964,6 +2008,53 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
     bool use_grouped_linear_gpu = grouped_linear_heads && !force_host_grouped_linear &&
                                   (default_grouped_linear_fastpath || experimental_grouped_linear_gpu);
     bool use_host_grouped_linear = grouped_linear_heads && !use_grouped_linear_gpu;
+
+    int recurrent_checkpoint_step = 64;
+    if (use_delta_linear_) {
+        recurrent_checkpoint_step = aila::env::g_q35_prefill_step_override;
+        if (recurrent_checkpoint_step <= 0) {
+            recurrent_checkpoint_step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
+        }
+        if (recurrent_checkpoint_step <= 0) recurrent_checkpoint_step = 64;
+    }
+
+    static const bool s_device_state_snapshots =
+        aila::env::read_flag("AILA_Q35_DEVICE_STATE_SNAPSHOTS", true);
+    static const bool s_internal_prefill_snapshots =
+        aila::env::read_flag("AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS", true);
+    std::vector<int> internal_snapshot_lengths;
+    std::vector<std::unique_ptr<DeviceStateSnapshot>> internal_snapshots;
+    bool internal_snapshots_complete = true;
+    if (use_delta_linear_ && seq_len > 1 && s_device_state_snapshots &&
+        s_internal_prefill_snapshots && !use_host_grouped_linear) {
+        int first_checkpoint =
+            ((start_pos / recurrent_checkpoint_step) + 1) * recurrent_checkpoint_step;
+        for (int cp = first_checkpoint; cp < cached_len; cp += recurrent_checkpoint_step) {
+            if (cp > start_pos) {
+                internal_snapshot_lengths.push_back(cp);
+            }
+        }
+
+        const int snapshot_limit = std::max(
+            0, aila::env::read_int_raw("AILA_Q35_DEVICE_STATE_SNAPSHOT_LIMIT", 8));
+        const int max_internal_snapshots = std::min(
+            kMaxInternalPrefillStateSnapshots, std::max(0, snapshot_limit - 1));
+        if (static_cast<int>(internal_snapshot_lengths.size()) > max_internal_snapshots) {
+            internal_snapshot_lengths.erase(
+                internal_snapshot_lengths.begin(),
+                internal_snapshot_lengths.end() - max_internal_snapshots);
+        }
+        if (max_internal_snapshots <= 0) {
+            internal_snapshot_lengths.clear();
+        }
+
+        internal_snapshots.reserve(internal_snapshot_lengths.size());
+        for (size_t s = 0; s < internal_snapshot_lengths.size(); ++s) {
+            auto snapshot = std::make_unique<DeviceStateSnapshot>();
+            snapshot->layers.resize(layer_caches_.size());
+            internal_snapshots.push_back(std::move(snapshot));
+        }
+    }
     auto log_row_stats = [&](const char* tag, Tensor& t, int row, int width) {
         if (row < 0) return;
         bf16* ptr = static_cast<bf16*>(t.data()) + (size_t)row * width;
@@ -2068,8 +2159,51 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
                                                   seq_len);
                             return;
                         }
-                        run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
-                                                             buf_.linear_all, buf_.attn_out, seq_len);
+                        std::array<int, kMaxInternalPrefillStateSnapshots> snapshot_local_tokens{};
+                        std::array<float*, kMaxInternalPrefillStateSnapshots> snapshot_state_ptrs{};
+                        std::array<float*, kMaxInternalPrefillStateSnapshots> snapshot_conv_ptrs{};
+                        int snapshot_count = 0;
+                        if (!internal_snapshots.empty()) {
+                            snapshot_count = static_cast<int>(std::min(
+                                internal_snapshots.size(),
+                                static_cast<size_t>(kMaxInternalPrefillStateSnapshots)));
+                            for (int s = 0; s < snapshot_count; ++s) {
+                                const int local_tokens = internal_snapshot_lengths[static_cast<size_t>(s)] - start_pos;
+                                snapshot_local_tokens[static_cast<size_t>(s)] = local_tokens;
+
+                                auto& layer_snapshot =
+                                    internal_snapshots[static_cast<size_t>(s)]->layers[static_cast<size_t>(i)];
+                                if (cache.linear_state.valid()) {
+                                    layer_snapshot.linear_state =
+                                        Tensor::allocate(ctx, cache.linear_state.shape(),
+                                                         cache.linear_state.dtype());
+                                    snapshot_state_ptrs[static_cast<size_t>(s)] =
+                                        static_cast<float*>(layer_snapshot.linear_state.data());
+                                }
+                                if (cache.linear_conv_state.valid()) {
+                                    layer_snapshot.linear_conv_state =
+                                        Tensor::allocate(ctx, cache.linear_conv_state.shape(),
+                                                         cache.linear_conv_state.dtype());
+                                    snapshot_conv_ptrs[static_cast<size_t>(s)] =
+                                        static_cast<float*>(layer_snapshot.linear_conv_state.data());
+                                }
+                                layer_snapshot.linear_conv_head =
+                                    linear_conv_rows > 0
+                                        ? (cache.linear_conv_head + local_tokens) % linear_conv_rows
+                                        : 0;
+                            }
+                        }
+                        const bool captured_internal_snapshots =
+                            run_linear_delta_prefill_gpu_batched(
+                                ctx, layer, cache,
+                                buf_.linear_all, buf_.attn_out, seq_len,
+                                snapshot_local_tokens,
+                                snapshot_state_ptrs,
+                                snapshot_conv_ptrs,
+                                snapshot_count);
+                        if (snapshot_count > 0 && !captured_internal_snapshots) {
+                            internal_snapshots_complete = false;
+                        }
                     });
                 }
             } else {
@@ -2494,14 +2628,15 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
     throw_if_cancelled();
     const int next_len = current_len_ + seq_len;
     if (use_delta_linear_) {
-        int step = aila::env::g_q35_prefill_step_override;
-        if (step <= 0) {
-            step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
-        }
-        if (step <= 0) step = 64;
-
         const bool is_prefill = (seq_len > 1);
-        const bool is_step_boundary = (next_len % step == 0);
+        const bool is_step_boundary = (next_len % recurrent_checkpoint_step == 0);
+        if (is_prefill && internal_snapshots_complete) {
+            for (size_t s = 0; s < internal_snapshots.size(); ++s) {
+                device_snapshots_[internal_snapshot_lengths[s]] =
+                    std::move(internal_snapshots[s]);
+                prune_device_state_snapshots();
+            }
+        }
         if (is_prefill || is_step_boundary) {
             save_recurrent_state_snapshot(ctx, next_len);
         }

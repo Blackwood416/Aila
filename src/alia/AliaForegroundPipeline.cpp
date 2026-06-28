@@ -51,7 +51,8 @@ Tensor* forward_token_span(Context& context,
                            IModelBackend& backend,
                            const int* token_ids,
                            int token_count,
-                           bool use_decode_path) {
+                           bool use_decode_path,
+                           int max_prefill_chunk_tokens = 0) {
     if (token_count <= 0) {
         return nullptr;
     }
@@ -62,6 +63,22 @@ Tensor* forward_token_span(Context& context,
         for (int i = 0; i < token_count; ++i) {
             context.memcpy_h2d(token_device.as<int>(), token_ids + i, sizeof(int));
             logits = &backend.forward(context, token_device.as<int>(), 1);
+        }
+        return logits;
+    }
+
+    if (max_prefill_chunk_tokens > 0 && token_count > max_prefill_chunk_tokens) {
+        DeviceAllocation prompt_device(
+            context, static_cast<size_t>(max_prefill_chunk_tokens) * sizeof(int));
+        int offset = 0;
+        while (offset < token_count) {
+            const int chunk_tokens =
+                std::min(max_prefill_chunk_tokens, token_count - offset);
+            context.memcpy_h2d(prompt_device.as<int>(),
+                               token_ids + offset,
+                               static_cast<size_t>(chunk_tokens) * sizeof(int));
+            logits = &backend.forward(context, prompt_device.as<int>(), chunk_tokens);
+            offset += chunk_tokens;
         }
         return logits;
     }
@@ -500,6 +517,8 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         1, aila::env::read_int_raw("AILA_FOREGROUND_MIN_INCREMENTAL_PREFILL_SUFFIX_TOKENS", 16));
     static const int kMaxDecodePathPrefillSuffixTokens = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
+    static const int kAsrPrefillChunkTokens = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_ASR_PREFILL_CHUNK_TOKENS", 0));
     const auto started = std::chrono::steady_clock::now();
     std::vector<int> target_ids =
         build_alia_user_prefix_prompt(tokenizer, foreground_system_prompt(), user_prefix);
@@ -613,7 +632,8 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
                        *backend,
                        target_ids.data() + already_prefilled,
                        suffix_tokens,
-                       decode_path_suffix);
+                       decode_path_suffix,
+                       kAsrPrefillChunkTokens);
 
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();

@@ -2290,3 +2290,63 @@ Next step:
 - If chunking is too slow, the higher-effort path is exporting intermediate
   GDN states from the batched linear-attention kernel, closer to vLLM's
   block-state model.
+
+### 2026-06-28 Qwen3.5 internal GDN checkpoint export
+
+The foreground-ASR chunked prefill probe confirmed that call-layer chunking can
+create the missing checkpoints, but the cost is too high:
+
+```text
+AILA_FOREGROUND_ASR_PREFILL_CHUNK_TOKENS=4
+Restored device checkpoint 100/104      yes
+asr_stream_vlm_prefill_total_ms         7828
+asr_stream_tick_max_ms                  7869
+simulated_vad_to_first_audio_ms         7373
+```
+
+Implemented the lower-level path instead:
+
+- `Qwen35HybridBnb4Backend` now exports optional internal device recurrent
+  snapshots from the batched GDN prefill fastpath.
+- Internal checkpoints are selected from `AILA_Q35_PREFILL_STEP` boundaries
+  inside a single large prefill, with `AILA_Q35_DEVICE_STATE_SNAPSHOT_LIMIT`
+  capping retained GPU snapshots. The final forward checkpoint still gets a
+  reserved slot.
+- `AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS=1` is default on when device
+  state snapshots are enabled.
+- The previous foreground ASR prefill chunking switch remains default-off as a
+  diagnostic probe (`AILA_FOREGROUND_ASR_PREFILL_CHUNK_TOKENS=0`).
+
+Aggressive guard probe, without call-layer chunking:
+
+```text
+AILA_Q35_PREFILL_STEP=4
+AILA_FOREGROUND_ASR_PREFILL_CHUNK_TOKENS=0
+Restored device checkpoint 100/104      yes
+asr_stream_vlm_prefill_total_ms         632
+asr_stream_tick_max_ms                  673
+foreground_profile_prompt_prefill_ms    221
+simulated_vad_to_first_audio_ms         1533
+```
+
+Default full voice matrix with output ASR also passed:
+
+```text
+scenario             pass  asr_ms  prompt_prefill_ms  first_audio_ms  vad_to_first_audio_ms
+short_hello          true  357     329                1753            2110
+persona_chat         true  417     322                1409            1826
+preference_memory    true  417     323                1172            1589
+task_memory          true  404     323                1541            1945
+long_answer          true  543     328                1020            1563
+```
+
+Interpretation:
+
+- The checkpoint precision gap is now closed for the fast GDN path used by the
+  foreground 4B model.
+- TTFA is still above the 1s short-prompt target because ASR partial text
+  decode and TTS first-audio generation are still material costs, but the
+  previous multi-second full-reset failure mode is gone.
+- Next high-value work should profile whether tighter ASR partial cadence,
+  earlier stable/partial VLM handoff, or TTS backend RTF gives the biggest
+  remaining gain.
