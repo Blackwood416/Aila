@@ -329,6 +329,54 @@ only a few milliseconds per Mimi conv call on this profile. It is not the
 largest TTS RTF lever. Prioritize decoder kernel work, pre-transformer small
 kernel fusion, or pipeline scheduling before a large scratch-buffer rewrite.
 
+Added a default-off pre-transformer residual fusion probe:
+
+```powershell
+$env:AILA_TTS_MIMI_PTFM_FUSED_RESIDUAL = "1"
+```
+
+When enabled for `decode_mimi_incremental`, each pre-transformer layer replaces
+the two local patterns:
+
+```text
+copy x -> residual
+scale update
+residual += update
+copy residual -> x
+```
+
+with one kernel that writes `x = x + update * scale` directly. This removes two
+temporary `[new_frames, 512]` tensors and several small kernels per layer. It is
+kept default-off because it changes bf16 write ordering and should be validated
+with real smoke/matrix plus output ASR before promotion.
+
+Short smoke A/B:
+
+```text
+mode                  pre-transformer cached samples       first_backend_audio_ms  first_audio_ms
+default               18.2-22.4 ms                         456.087                 969
+fused residual probe  14.4-18.7 ms, one 19.7 ms tail call  442.223                 1150
+```
+
+Both runs passed `ALIA_REAL_MODEL_SMOKE_PASS`. The opt-in run generated a
+longer first foreground/TTS chunk, so end-to-end first audio is not a fair A/B
+for this probe. The backend first-audio value stayed in the same range while
+the pre-transformer cached slice improved by roughly 3-5 ms per Mimi callback.
+
+Output ASR checks:
+
+```text
+default:
+Krash, I am Alia, a local companion. I can help with simple tasks.
+
+fused residual probe:
+Kurasho, Aliya is a local companion. I can't be a voice assistant, but I can try to answer as normal text.
+```
+
+The transcripts match their foreground text closely enough for this default-off
+probe. The gain is real but small relative to the conv decoder; keep it as an
+opt-in probe until matrix coverage confirms no audio regressions.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests
@@ -341,6 +389,7 @@ cmake --build build --target AliaEngine --config Release
 
 $env:AILA_TTS_PROFILE = "1"
 $env:AILA_TTS_MIMI_ALLOC_PROFILE = "1"
+$env:AILA_TTS_MIMI_PTFM_FUSED_RESIDUAL = "1"
 .\tools\alia\RunAliaTargetPipeline.ps1 `
   -SkipBuild -SkipToolProbe `
   -AudioPath 'tmp\alia-real-smoke\voice_matrix_stream_500ms_fg_suffix\short_hello_request.wav' `

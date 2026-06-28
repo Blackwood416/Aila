@@ -2155,6 +2155,8 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     MimiStreamState& state, std::vector<float>& out_samples) {
     if (!mimi_loaded_ || new_frames <= 0) return false;
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    static const bool tts_ptfm_fused_residual =
+        aila::env::read_flag("AILA_TTS_MIMI_PTFM_FUSED_RESIDUAL", false);
     const auto t_decode_start = std::chrono::high_resolution_clock::now();
 
     int start_pos = state.total_frames;
@@ -2252,12 +2254,29 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
             });
     };
 
+    auto add_scaled_to_x_gpu = [&](Tensor& update, Tensor& scale, int len, int ch) {
+        auto* xp = x.data_as<bf16>();
+        auto* up = update.data_as<bf16>();
+        auto* sp = scale.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(len * ch)),
+            [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                int c = i % ch;
+                float base = static_cast<float>(xp[i]);
+                float delta = static_cast<float>(up[i]) * static_cast<float>(sp[c]);
+                xp[i] = bf16(base + delta);
+            });
+    };
+
     for (int l = 0; l < 8; ++l) {
         std::string lp = "decoder.pre_transformer.layers." + std::to_string(l) + ".";
 
-        Tensor residual = Tensor::allocate(ctx, {new_frames, 512});
-        ops::copy_tensor(ctx, x, residual, new_frames * 512);
-        ctx.synchronize();
+        Tensor residual;
+        if (!tts_ptfm_fused_residual) {
+            residual = Tensor::allocate(ctx, {new_frames, 512});
+            ops::copy_tensor(ctx, x, residual, new_frames * 512);
+            ctx.synchronize();
+        }
 
         Tensor normed = Tensor::allocate(ctx, {new_frames, 512});
         ops::rms_norm(ctx, x, mimi_weights_.get(lp + "input_layernorm.weight"),
@@ -2297,16 +2316,23 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
         layer_linears.o_proj.forward(ctx, attn_out, proj_out, new_frames);
         ctx.synchronize();
 
-        apply_layer_scale_gpu(proj_out, mimi_weights_.get(lp + "self_attn_layer_scale.scale"), new_frames, 512);
-        ctx.queue().wait();
-
-        ops::residual_add(ctx, residual, proj_out, new_frames * 512);
-        ops::copy_tensor(ctx, residual, x, new_frames * 512);
+        Tensor& attn_scale = mimi_weights_.get(lp + "self_attn_layer_scale.scale");
+        if (tts_ptfm_fused_residual) {
+            add_scaled_to_x_gpu(proj_out, attn_scale, new_frames, 512);
+        } else {
+            apply_layer_scale_gpu(proj_out, attn_scale, new_frames, 512);
+            ctx.queue().wait();
+            ops::residual_add(ctx, residual, proj_out, new_frames * 512);
+            ops::copy_tensor(ctx, residual, x, new_frames * 512);
+        }
         ctx.synchronize();
 
-        Tensor mlp_res = Tensor::allocate(ctx, {new_frames, 512});
-        ops::copy_tensor(ctx, x, mlp_res, new_frames * 512);
-        ctx.synchronize();
+        Tensor mlp_res;
+        if (!tts_ptfm_fused_residual) {
+            mlp_res = Tensor::allocate(ctx, {new_frames, 512});
+            ops::copy_tensor(ctx, x, mlp_res, new_frames * 512);
+            ctx.synchronize();
+        }
 
         Tensor normed_post = Tensor::allocate(ctx, {new_frames, 512});
         ops::rms_norm(ctx, x, mimi_weights_.get(lp + "post_attention_layernorm.weight"),
@@ -2326,11 +2352,15 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
         layer_linears.down_proj.forward(ctx, gate_out, down_out, new_frames);
         ctx.synchronize();
 
-        apply_layer_scale_gpu(down_out, mimi_weights_.get(lp + "mlp_layer_scale.scale"), new_frames, 512);
-        ctx.queue().wait();
-
-        ops::residual_add(ctx, mlp_res, down_out, new_frames * 512);
-        ops::copy_tensor(ctx, mlp_res, x, new_frames * 512);
+        Tensor& mlp_scale = mimi_weights_.get(lp + "mlp_layer_scale.scale");
+        if (tts_ptfm_fused_residual) {
+            add_scaled_to_x_gpu(down_out, mlp_scale, new_frames, 512);
+        } else {
+            apply_layer_scale_gpu(down_out, mlp_scale, new_frames, 512);
+            ctx.queue().wait();
+            ops::residual_add(ctx, mlp_res, down_out, new_frames * 512);
+            ops::copy_tensor(ctx, mlp_res, x, new_frames * 512);
+        }
         ctx.synchronize();
     }
 
