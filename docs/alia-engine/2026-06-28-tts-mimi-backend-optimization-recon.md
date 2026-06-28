@@ -1,0 +1,320 @@
+# 2026-06-28 TTS Mimi backend optimization recon
+
+Scope: reconnaissance for Qwen3-TTS Mimi decode latency/RTF work on
+`src/models/Qwen3TTSBackend.cpp`, with no main-path behavior change. SYCL Graph
+is intentionally out of scope because the current oneAPI 2025.3.3 + Arc A770
+probe only exposes `ext_oneapi_limited_graph`, and graph replay was slower than
+ordinary submit.
+
+## Current hot path shape
+
+Incremental streaming enters `decode_mimi_incremental`:
+
+1. Host codec codes -> `codes_dev`, VQ lookup/add for first/rest codebooks, two
+   Mimi projection linears, then copy/add into `latent_new`.
+2. Append `latent_new` into `MimiStreamState::latent_buffer`.
+3. Run pre-conv over the new frames plus 2 latent frames of causal overlap.
+4. Run pre-transformer on new frames with persistent per-layer K/V cache, then
+   append `pre_tfm_out_new` into `pre_tfm_out_buffer`.
+5. Run `mimi_conv_stages` over a window from
+   `AILA_TTS_MIMI_CONV_WINDOW_FRAMES` history plus new frames, then read back
+   only `new_frames * kMimiSamplesPerFrame`.
+
+The latest useful profile logs show the current split:
+
+- First 8-frame chunk: `Mimi incremental total` around 119-128 ms, with
+  `pre-transformer cached` around 21-25 ms and `conv+readback` around 96-100 ms.
+- 16-frame window: `conv+readback` around 188-194 ms.
+- 24-frame window: `conv+readback` around 277-281 ms, with occasional noisy
+  upsample spikes.
+- 32-frame window / 24+8 history path: `conv+readback` around 370-375 ms.
+- VQ+projection is usually around 1-2 ms and pre-conv around 0.2-0.5 ms after
+  warmup, so they are not first-order TTFA bottlenecks today.
+
+Evidence logs inspected:
+
+- `tmp/alia-real-smoke/tts_fused_residual_embed_short.log`
+- `tmp/alia-real-smoke/tts_initial4_fused_embed_short.log`
+- `tmp/alia-real-smoke/voice_matrix/*.log`
+
+## Ranked candidates
+
+### 1. Reuse Mimi conv-stage scratch buffers
+
+Candidate: add a `MimiConvScratch` or extend `MimiStreamState` with reusable
+buffers for the shapes used by `mimi_conv_stages`: upsample inputs/outputs,
+ConvNeXt intermediate buffers, decoder block residual/activation/conv buffers,
+and final `dec6_out`. The current path allocates many short-lived `Tensor`s per
+chunk; `Tensor::allocate` is a raw `sycl::malloc_device` plus allocation-map
+mutex, and `Tensor` destruction frees immediately.
+
+Expected benefit:
+
+- First 8-frame chunk: likely 5-20 ms, mostly lower launch-side and allocator
+  overhead.
+- Later 24+8 windows: likely 10-40 ms, with less variance from allocation/free.
+
+Risk:
+
+- Numerical/audio content should be unchanged if buffers are only reused and
+  fully overwritten before read.
+- Lifetime risk is real: current synchronizes are partly protecting queued
+  kernels from storage being freed. Reused buffers must be double-buffered or
+  scoped with explicit completion where a buffer is overwritten before dependent
+  work is complete.
+
+Validation needed:
+
+- Build `AliaEngine`.
+- Short smoke with `AILA_TTS_PROFILE=1` and default settings.
+- Voice matrix, because allocator timing interacts with output length and
+  foreground/TTS contention.
+- Mimo-ASR on generated wav and compare against `foreground_assistant_text`.
+
+Default:
+
+- Default-off probe first, for example `AILA_TTS_MIMI_CONV_SCRATCH=1`.
+- Consider default-on only after matrix + Mimo-ASR pass and no tail/window
+  corruption.
+
+### 2. Use existing `snake_causal_conv1d` for decoder residual `act1 + conv1`
+
+Candidate: `src/ops/ConvOps.cpp` already has `ops::snake_causal_conv1d`, but
+Mimi decoder residual blocks still run `snake_beta(xx_cur -> xx_act1)` followed
+by `causal_conv1d(xx_act1 -> conv1_out)`. A default-off switch could route only
+the `conv1` side of each residual block through the fused kernel and remove the
+`xx_act1` write/kernel.
+
+Expected benefit:
+
+- First 8-frame chunk: likely 5-15 ms if the fused kernel is competitive.
+- 24+8 steady window: likely 20-60 ms because there are 4 decoder stages x 3
+  residual blocks.
+
+Risk:
+
+- Medium. The existing fused kernel appears to use the legacy
+  `[out_ch, in_ch, kernel_size]` weight indexing and scalar channel loops. Mimi
+  conv weights are transposed at load to `[out_ch, kernel_size, in_ch]` for vec8
+  access. The fused kernel must either be updated for the transposed layout or
+  guarded to avoid wrong audio.
+- Floating-point order changes inside SnakeBeta + conv. Output should be close
+  but not bit-identical.
+
+Validation needed:
+
+- Build.
+- A/B short smoke with `AILA_TTS_PROFILE=1`.
+- Matrix with `short_hello`, `persona_chat`, and `long_answer`.
+- Mimo-ASR on at least `short_hello` and one longer matrix output.
+- Optional waveform or sample-level comparison against baseline to catch
+  obvious corruption before ASR.
+
+Default:
+
+- Default-off only until the fused kernel has layout-correct tests or real audio
+  validation. Not suitable for immediate default-on.
+
+### 3. Reduce pre-transformer cached-path synchronizations
+
+Candidate: `decode_mimi_incremental` still synchronizes after nearly every
+small pre-transformer operation: residual copies, RMS norms, q/k/v linears,
+RoPE, cache copies, attention, projections, layer scale, MLP linears, SwiGLU,
+and residual copies. Many of these are dependency-ordered on the same queue and
+do not need host waits unless storage is about to be freed or host timing must
+split stages.
+
+Expected benefit:
+
+- First 8-frame chunk: likely 5-15 ms, capped by current 21-25 ms
+  pre-transformer cost.
+- Later chunks: similar per Mimi callback; lower host overhead and less GPU
+  bubble risk.
+
+Risk:
+
+- Low to medium. Math should not change, but removing waits can expose lifetime
+  bugs because many temporaries are destroyed at loop iteration boundaries.
+  This pairs best with reusable scratch or a conservative wait at each layer
+  boundary.
+
+Validation needed:
+
+- Build.
+- Short smoke with `AILA_TTS_PROFILE=1`.
+- Matrix, because queue overlap can change contention with foreground decode.
+- Mimo-ASR for output recognizability.
+
+Default:
+
+- Start as default-off, for example `AILA_TTS_MIMI_PTFM_SYNC_CLEANUP=1`.
+- Could become default-on if the change is only wait removal with proven tensor
+  lifetime safety.
+
+### 4. Fuse scale + residual add + copy in pre-transformer
+
+Candidate: replace patterns such as
+`apply_layer_scale_gpu(proj_out); residual_add(residual, proj_out);
+copy_tensor(residual, x)` and the MLP equivalent with a single kernel writing
+directly to `x`. This is a small-kernel fusion and removes one full copy per
+attention block and one per MLP block.
+
+Expected benefit:
+
+- First 8-frame chunk: likely 2-8 ms.
+- Later chunks: similar per callback; more valuable if sync cleanup exposes
+  kernel-launch overhead.
+
+Risk:
+
+- Low to medium. Numerics may differ only by bf16 write ordering if implemented
+  as `x = residual + scaled`, but that should match the intended value.
+- Needs care where the existing code relies on `residual`/`mlp_res` contents
+  for subsequent operations.
+
+Validation needed:
+
+- Build.
+- Short smoke with profile.
+- Matrix and Mimo-ASR before default-on.
+
+Default:
+
+- Default-off probe first. Default-on is plausible after validation because the
+  semantics are local.
+
+### 5. Fuse VQ lookup/add and latent projection add
+
+Candidate: VQ lookup currently runs one first-codebook lookup, one rest lookup,
+14 rest accumulation kernels, two projection linears, then copy+residual add
+into `latent_new`. VQ is already only around 1-2 ms, but it launches many small
+kernels. Possible probes: combine all rest codebooks in one kernel, and write
+`proj_first + proj_rest` directly into the stream latent buffer instead of
+`latent_new` plus async copy.
+
+Expected benefit:
+
+- First chunk and later chunks: likely 1-4 ms total.
+
+Risk:
+
+- VQ rest accumulation order changes can alter bf16 rounding. Audio content
+  should be nearly identical, but codec-to-audio sensitivity is unknown.
+- Direct write into `latent_buffer` must preserve lifetime and capacity checks.
+
+Validation needed:
+
+- Build.
+- Short smoke with profile.
+- Matrix and Mimo-ASR, because small rounding differences can still be audible.
+
+Default:
+
+- Default-off probe only. Not the best first target because the measured cost is
+  small.
+
+### 6. oneDNN Linear per-call overhead audit
+
+Candidate: Mimi linears already use persistent `Linear` wrappers with cached
+oneDNN primitives, memory objects, args maps, and user scratchpads keyed by
+`seq_len` and bias dtype. For `seq_len > 1`, the primitive is not rebuilt after
+first use. Remaining overhead is mostly `set_data_handle`/arg updates and oneDNN
+execute overhead on small batches.
+
+Expected benefit:
+
+- Unknown but probably low for first-audio Mimi relative to conv decoder:
+  0-10 ms unless a specific per-call stall is measured.
+
+Risk:
+
+- Low for measurement-only probes.
+- Medium if replacing oneDNN with custom small GEMM kernels; high chance of
+  performance regression.
+
+Validation needed:
+
+- Add timing probe around `Linear::forward(_bias)` for Mimi only, default-off.
+- Build and short profile.
+
+Default:
+
+- Measurement probe can be default-off.
+- Do not default-on a custom replacement without strong matrix evidence.
+
+### 7. More exact Mimi conv state carry / smaller tail decode window
+
+Candidate: current incremental conv path replays a fixed input-frame history
+window, default 24. A deeper stateful convolution implementation could carry
+the exact needed residual/decoder state between chunks and decode only the new
+tail. A smaller history window could also be probed.
+
+Expected benefit:
+
+- Potentially large for long answers: later chunks could drop from ~370 ms
+  conv/readback toward first-window scale if exact state carry works.
+- First-audio benefit is limited because the first chunk has no previous state.
+
+Risk:
+
+- High. Prior docs already note the conv-window change needed ASR validation
+  because nonzero matrix audio was not enough. Incorrect receptive field/state
+  produces recognizable but wrong or shifted audio.
+
+Validation needed:
+
+- Build.
+- Short smoke.
+- Full matrix.
+- Mimo-ASR on outputs and comparison to `foreground_assistant_text`.
+- Prefer an offline waveform equivalence harness against full-history decode
+  before any product-path use.
+
+Default:
+
+- Default-off research branch only. Not default-on without strong audio
+  equivalence evidence.
+
+## Recommendation
+
+The next practical probe should be small and default-off:
+
+1. First try the existing `snake_causal_conv1d` route only after fixing/guarding
+   its weight layout for Mimi transposed conv weights. This directly targets the
+   decoder blocks that dominate conv time.
+2. In parallel or next, add reusable conv scratch buffers. This is less likely
+   to change audio but touches lifetimes and should remain default-off until the
+   waits are re-audited.
+3. Keep pre-transformer sync cleanup as a smaller follow-up. It cannot beat the
+   conv decoder by itself but can shave the ~20-25 ms cached path.
+
+No temporary code probe was run in this pass. This was a source/log
+reconnaissance pass only.
+
+## Validation command template
+
+Use the real model path and the worktree-local reference audio. API-only tests
+are not enough for this area.
+
+```powershell
+. .\perf\PerfCommon.ps1
+Initialize-AilaOneApiEnvironment
+cmake --build build --target AliaEngine --config Release
+
+$env:AILA_TTS_PROFILE = "1"
+.\tools\alia\RunAliaTargetPipeline.ps1 `
+  -SkipBuild -SkipToolProbe `
+  -AudioPath 'tmp\alia-real-smoke\voice_matrix_stream_500ms_fg_suffix\short_hello_request.wav' `
+  -OutputWav 'tmp\alia-real-smoke\<probe-name>.wav' `
+  -LogPath 'tmp\alia-real-smoke\<probe-name>.log' `
+  -RequestText 'Alia, please say hello in one short sentence.' `
+  -MaxTokens 48 `
+  -StreamAsrPrefill `
+  -StreamChunkMs 500 `
+  -StreamPrefillIntervalMs 500 `
+  -TimeoutSec 1500
+
+$env:MIMO_API_KEY = [Environment]::GetEnvironmentVariable("MIMO_API_KEY", "Machine")
+powershell -ExecutionPolicy Bypass -File "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1" `
+  -AudioFile "tmp\alia-real-smoke\<probe-name>.wav"
+```
