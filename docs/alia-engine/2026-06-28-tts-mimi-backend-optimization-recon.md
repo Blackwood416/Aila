@@ -489,6 +489,65 @@ from about `63/118/125/247 ms` for `8/15/16/32` frame windows to about
 Krash, I am Alia, a local companion. I can help with simple tasks.
 ```
 
+## Foreground TTS soft flush
+
+After the transpose-conv work, several matrix scenarios showed good backend
+first-audio time once TTS started (`~390-565 ms`) but delayed first enqueue for
+long CJK first sentences. The foreground chunker already had an opt-in soft
+boundary path via:
+
+```powershell
+$env:AILA_TTS_STREAM_TEXT_FIRST_SOFT_MIN_CHARS = "18"
+$env:AILA_TTS_STREAM_TEXT_FIRST_SOFT_MAX_CHARS = "48"
+$env:AILA_TTS_STREAM_TEXT_STEADY_SOFT_MIN_CHARS = "24"
+$env:AILA_TTS_STREAM_TEXT_STEADY_SOFT_MAX_CHARS = "120"
+$env:AILA_TTS_STREAM_TEXT_FIRST_HARD_MIN_CHARS = "0"
+$env:AILA_TTS_STREAM_TEXT_STEADY_HARD_MIN_CHARS = "96"
+```
+
+The legacy `AILA_TTS_STREAM_TEXT_SOFT_MIN_CHARS` and
+`AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS` variables still override both first and
+steady thresholds for A/B runs.
+
+Targeted `preference_memory` real smoke:
+
+```text
+mode              first_tts_enqueue_ms  first_audio_ms  first_text_chars  tts_chunks
+default matrix    904                   1469            102               1
+soft max 72       753                   1156            57                2
+soft max 48       600                   1010            24                5
+```
+
+The soft flush does not shrink the first audio callback; it sends an earlier
+spoken phrase into the existing TTS stream worker. With the faster Mimi decoder,
+the smaller first text chunk still has enough backend headroom for continuous
+playback.
+
+Full matrix with a global `18/48` default passed, but it was too aggressive for
+steady-state playback. It improved TTFA while fragmenting some turns:
+
+```text
+scenario           first_enqueue_ms  first_audio_ms  first_text_chars  chunks  backend_total_ms
+short_hello        419               812             8                 6       5447
+persona_chat       343               951             3                 5       9910
+preference_memory  599               996             24                5       9373
+task_memory        343               957             3                 15      37517
+long_answer        725               1142            46                4       7282
+```
+
+The custom Alia branch therefore defaults to a split policy: `18/48` for the
+first low-latency chunk and `24/120` afterward. It also keeps hard punctuation
+boundaries immediate for the first chunk, then requires at least 96 bytes before
+later hard-boundary flushes. This keeps the TTFA win without encouraging a long
+or repetitive response to become many tiny TTS backend invocations.
+
+Follow-up targeted `task_memory` after adding a hard-boundary floor showed the
+expected TTFA shape (`first_tts_enqueue_ms=395`, `first_audio_ms=780`) and cut
+one matrix run from the pathological `15` chunk global-soft case to `5` chunks.
+However, repeated VLM output can still create too many TTS invocations when the
+steady threshold is too low; the default steady threshold was raised to
+`96/120` to prefer stable post-first chunks.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests

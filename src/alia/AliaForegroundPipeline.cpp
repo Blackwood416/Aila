@@ -341,23 +341,57 @@ size_t common_token_prefix_size(const std::vector<int>& a, const std::vector<int
     return i;
 }
 
-std::vector<std::string> take_ready_tts_chunks(std::string& buffer, bool force) {
-    static const int kSoftMinChars = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MIN_CHARS", 24));
-    static const int kSoftMaxChars = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS", 0));
+std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
+                                               bool force,
+                                               bool low_latency_first_chunk) {
+    static const int kRawSoftMinChars =
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MIN_CHARS", -1);
+    static const int kRawSoftMaxChars =
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MAX_CHARS", -1);
+    static const int kFirstSoftMinChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_SOFT_MIN_CHARS",
+                                kRawSoftMinChars >= 0 ? kRawSoftMinChars : 18));
+    static const int kSteadySoftMinChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_SOFT_MIN_CHARS",
+                                kRawSoftMinChars >= 0 ? kRawSoftMinChars : 24));
+    static const int kFirstSoftMaxChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_SOFT_MAX_CHARS",
+                                kRawSoftMaxChars >= 0 ? kRawSoftMaxChars : 48));
+    static const int kSteadySoftMaxChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_SOFT_MAX_CHARS",
+                                kRawSoftMaxChars >= 0 ? kRawSoftMaxChars : 120));
+    static const int kFirstHardMinChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_HARD_MIN_CHARS", 0));
+    static const int kSteadyHardMinChars = std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_HARD_MIN_CHARS", 96));
+    const int soft_min_chars =
+        low_latency_first_chunk ? kFirstSoftMinChars : kSteadySoftMinChars;
+    const int soft_max_chars =
+        low_latency_first_chunk ? kFirstSoftMaxChars : kSteadySoftMaxChars;
+    const int hard_min_chars =
+        low_latency_first_chunk ? kFirstHardMinChars : kSteadyHardMinChars;
     size_t cutoff = std::string::npos;
     if (force) {
         cutoff = buffer.size();
     } else {
         cutoff = last_tts_chunk_boundary(buffer);
+        if (cutoff != std::string::npos &&
+            static_cast<int>(cutoff) < hard_min_chars) {
+            cutoff = std::string::npos;
+        }
         if (cutoff == std::string::npos &&
-            kSoftMaxChars > 0 &&
-            static_cast<int>(buffer.size()) >= kSoftMaxChars) {
+            soft_max_chars > 0 &&
+            static_cast<int>(buffer.size()) >= soft_max_chars) {
             cutoff = last_tts_soft_chunk_boundary(
                 buffer,
-                static_cast<size_t>(std::min(kSoftMinChars, kSoftMaxChars)),
-                static_cast<size_t>(kSoftMaxChars));
+                static_cast<size_t>(std::min(soft_min_chars, soft_max_chars)),
+                static_cast<size_t>(soft_max_chars));
         }
     }
 
@@ -1235,7 +1269,7 @@ bool AliaForegroundPipeline::synthesize_committed_text(
         }
 
         std::string pending_tts_text = spoken_text;
-        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, true)) {
+        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, true, false)) {
             if (abort_requested()) {
                 break;
             }
@@ -1693,7 +1727,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         if (!tts_pipeline_ || !audio_cb || !tts_config) {
             return;
         }
-        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, force)) {
+        for (const std::string& chunk :
+             take_ready_tts_chunks(pending_tts_text, force, !first_tts_enqueue_seen)) {
             if (abort_requested()) {
                 return;
             }
