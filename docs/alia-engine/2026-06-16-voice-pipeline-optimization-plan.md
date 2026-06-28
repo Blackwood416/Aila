@@ -2462,3 +2462,65 @@ Interpretation:
   than VLM lock competition.
 - Keep the priority path opt-in for now. It trades foreground decode continuity
   for earlier audio and needs matrix coverage before becoming a default.
+
+### 2026-06-28 vllm-omni Qwen3-TTS probe
+
+The vllm-omni Qwen3-TTS implementation confirms the same high-level split we
+use locally:
+
+- Talker AR generates RVQ codec frames.
+- Code2Wav/Mimi decodes codec frames to PCM.
+- "MTP" in this source means the residual codebook predictor for codebook
+  groups 1..15 inside one acoustic frame. The inspected Qwen3-TTS and
+  Qwen3-Omni code did not expose a contract for generating multiple acoustic
+  time frames per Talker step.
+
+Notable implementation differences:
+
+- vllm-omni intentionally removes the code predictor KV cache. It re-prefills
+  the full short predictor sequence on every residual-code step, then relies on
+  `torch.compile` and CUDA graph buckets to reduce small-kernel launch overhead.
+  This is a useful future experiment for Aila, but it is not a mechanical port
+  to the current oneAPI path.
+- Code2Wav mainly uses stable-shape CUDA graph buckets, bounded left-context
+  windows, and reference-code context caching. It does not appear to implement a
+  deeper recurrent-state Mimi carry beyond windowed decode.
+- The first codec chunk can be smaller than the steady chunk in vllm-omni. That
+  improves TTFP, but it is a latency/continuity tradeoff, not a free backend RTF
+  win.
+
+Local experiments:
+
+- A fused residual-embedding accumulation was prototyped from the vllm-omni
+  `stacked_codec_embed` idea. It compiled and passed one short real smoke, but
+  did not materially improve first backend audio (`~458 ms` to `~441 ms` range
+  in noisy samples) and touches the audio numerical path. The change was
+  removed rather than kept without audio-ASR validation.
+- Added default-off first-chunk probes:
+  - `AILA_TTS_INITIAL_STREAM_BATCH_FRAMES`: first backend codec callback size,
+    clamped to the steady `AILA_TTS_STREAM_BATCH_FRAMES`.
+  - `AILA_TTS_FIRST_AUDIO_FRAMES`: Alia's first audio callback buffer size,
+    also clamped to the steady stream batch.
+- A 4-frame probe (`INITIAL_STREAM_BATCH_FRAMES=4`,
+  `FIRST_AUDIO_FRAMES=4`) reduced the first backend audio callback size to
+  7680 samples and moved backend first audio to about `411 ms`, but the
+  end-to-end sample regressed because foreground enqueue was later; the run also
+  ended with an access violation after foreground/TTS output. Do not enable this
+  by default.
+- Default path smoke after reverting the fused embedding experiment passed:
+
+```text
+foreground_first_tts_enqueue_ms       492
+tts_first_audio_ms                    934
+simulated_vad_to_first_audio_ms       1285
+tts_first_backend_frames              15
+tts_first_backend_audio_samples       15360
+tts_first_backend_codes_ms            313.133
+tts_first_backend_audio_ms            441.231
+ALIA_REAL_MODEL_SMOKE_PASS
+```
+
+Validation note: the external Mimo-ASR script could not run in this shell
+because `MIMO_API_KEY` was not set. Do not treat vocoder-path changes as fully
+validated until the generated WAV is recognized by that script or an equivalent
+real ASR check.

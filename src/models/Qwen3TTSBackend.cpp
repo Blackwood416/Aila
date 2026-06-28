@@ -907,6 +907,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     out_codes.reserve(max_tokens * 16);
     const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
+    const int initial_callback_batch_frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_INITIAL_STREAM_BATCH_FRAMES", callback_batch_frames),
+        1,
+        callback_batch_frames);
+    int callback_batches_emitted = 0;
     std::vector<int32_t> pending_callback_codes;
     int pending_callback_frames = 0;
     if (frame_callback) {
@@ -917,6 +922,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             return true;
         }
         const bool ok = frame_callback(pending_callback_codes, pending_callback_frames);
+        ++callback_batches_emitted;
         pending_callback_codes.clear();
         pending_callback_frames = 0;
         return ok;
@@ -1095,7 +1101,9 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         out_n_frames++;
         if (frame_callback) {
             ++pending_callback_frames;
-            if (pending_callback_frames >= callback_batch_frames &&
+            const int callback_threshold =
+                callback_batches_emitted == 0 ? initial_callback_batch_frames : callback_batch_frames;
+            if (pending_callback_frames >= callback_threshold &&
                 !flush_frame_callback()) {
                 return false;
             }
@@ -1114,7 +1122,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         // 查找 predictor 对应的 15 个 embeddings 并累加
         for (int i = 0; i < 15; i++) {
             ops::embedding_lookup(ctx, *predictor_embed_weights_[i], frame_codes_ptr + i + 1, 1, single_emb, H_talker);
-            
+
             // 累加：sum_emb += single_emb
             bf16* sum_ptr = sum_emb.data_as<bf16>();
             bf16* sgl_ptr = single_emb.data_as<bf16>();

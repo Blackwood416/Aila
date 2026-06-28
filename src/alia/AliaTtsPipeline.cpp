@@ -31,7 +31,11 @@ int tts_stream_batch_frames() {
 }
 
 int tts_first_audio_samples() {
-    return tts_stream_batch_frames() * kTtsSamplesPerFrame;
+    static const int frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_FIRST_AUDIO_FRAMES", tts_stream_batch_frames()),
+        1,
+        tts_stream_batch_frames());
+    return frames * kTtsSamplesPerFrame;
 }
 
 GenerationConfig translate_tts_generation_config(const AliaGenConfig& config) {
