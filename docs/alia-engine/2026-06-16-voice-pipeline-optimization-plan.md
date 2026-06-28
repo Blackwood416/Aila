@@ -2520,7 +2520,58 @@ tts_first_backend_audio_ms            441.231
 ALIA_REAL_MODEL_SMOKE_PASS
 ```
 
-Validation note: the external Mimo-ASR script could not run in this shell
-because `MIMO_API_KEY` was not set. Do not treat vocoder-path changes as fully
-validated until the generated WAV is recognized by that script or an equivalent
-real ASR check.
+Validation note: the external Mimo-ASR script uses `MIMO_API_KEY`. In the Codex
+shell the process environment may not inherit the Windows system variable even
+when the Machine-scope variable exists. Import it before invoking the script:
+
+```powershell
+$env:MIMO_API_KEY = [Environment]::GetEnvironmentVariable("MIMO_API_KEY", "Machine")
+powershell -ExecutionPolicy Bypass -File "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1" -AudioFile "<output.wav>"
+```
+
+`RunAliaVoiceScenarioMatrix.ps1 -VerifyOutputAsr` already performs the same
+Machine-scope import without printing the secret.
+
+### 2026-06-28 SYCL Graph TTS backend probe
+
+Explored whether vllm-omni-style graph replay can be transferred to the current
+oneAPI TTS backend. The installed oneAPI compiler exposes the command graph
+headers and feature macro:
+
+- oneAPI DPC++/C++ Compiler `2025.3.3`
+- `SYCL_EXT_ONEAPI_GRAPH=1`
+- headers under `compiler/latest/include/sycl/ext/oneapi/experimental/graph`
+
+A temporary local probe captured and replayed a fixed-shape sequence of 24
+small SYCL kernels on the active device:
+
+```text
+device=Intel(R) Arc(TM) A770 Graphics
+backend=2
+has_ext_oneapi_graph=0
+has_ext_oneapi_limited_graph=1
+iters=2000 kernels_per_iter=24
+normal_ms=329.529
+graph_ms=750.436
+speedup=0.439117
+sync_iters=500
+normal_sync_ms=169
+graph_sync_ms=235.495
+sync_speedup=0.717637
+```
+
+Interpretation:
+
+- Command graph is compile-time available, and recording/finalize/replay works,
+  but the Arc A770 runtime only reports `ext_oneapi_limited_graph`, not full
+  `ext_oneapi_graph`.
+- On this machine, graph replay is slower than ordinary in-order submission for
+  both batched enqueue and execute-then-wait patterns. This is not a useful
+  backend latency optimization target right now.
+- The current Mimi path also mixes pure SYCL kernels with oneDNN matmul
+  primitives. Since the pure SYCL probe is already slower, avoid wrapping the
+  TTS hot path in SYCL Graph unless a future driver/runtime reports full graph
+  support or a focused oneDNN Graph fusion experiment shows independent wins.
+- Keep the vllm-omni graph-bucket idea as a future portability note, but the
+  next practical TTS work should stay on kernel fusion, synchronization removal,
+  allocation reuse, and pipeline scheduling.
