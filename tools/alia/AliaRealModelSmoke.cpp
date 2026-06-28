@@ -697,6 +697,7 @@ int main(int argc, char** argv) {
     gen.top_p = 0.9f;
     gen.max_tokens = opts.max_tokens;
 
+    ctx->runtime->foreground().reset_execution_stats();
     const auto asr_start = Clock::now();
     int rc = ALIA_OK;
     int asr_prefill_calls = 0;
@@ -916,6 +917,8 @@ int main(int argc, char** argv) {
     }
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
+    const Context::ExecutionStats foreground_lock_asr_stats =
+        ctx->runtime->foreground().execution_stats();
     const aila::alia::AliaAsrMetrics asr_metrics = ctx->asr_pipeline->last_metrics();
     std::string user_text = combine_asr_text_for_prompt(stable_text, partial_text);
     std::cout << "asr_ms=" << asr_ms << "\n"
@@ -976,6 +979,16 @@ int main(int argc, char** argv) {
               << "asr_profile_total_ms=" << asr_metrics.total_ms << "\n"
               << "asr_audio_duration_ms=" << asr_audio_duration_ms << "\n"
               << "asr_stream_simulated_tail_ms=" << asr_stream_simulated_tail_ms << "\n"
+              << "foreground_lock_asr_count="
+              << foreground_lock_asr_stats.lock_count << "\n"
+              << "foreground_lock_asr_wait_ms_total="
+              << foreground_lock_asr_stats.wait_ms_total << "\n"
+              << "foreground_lock_asr_wait_ms_max="
+              << foreground_lock_asr_stats.wait_ms_max << "\n"
+              << "foreground_lock_asr_hold_ms_total="
+              << foreground_lock_asr_stats.hold_ms_total << "\n"
+              << "foreground_lock_asr_hold_ms_max="
+              << foreground_lock_asr_stats.hold_ms_max << "\n"
               << "foreground_speculative_enabled="
               << (opts.speculative_foreground ? "true" : "false") << "\n"
               << "foreground_speculative_started="
@@ -1005,6 +1018,7 @@ int main(int argc, char** argv) {
 
     AudioCapture audio_capture;
     audio_capture.turn_start = Clock::now();
+    ctx->runtime->foreground().reset_execution_stats();
     const auto fg_start = Clock::now();
     rc = speculative_foreground_started
         ? alia_commit_speculative_conversation_turn(
@@ -1034,6 +1048,8 @@ int main(int argc, char** argv) {
     ctx->foreground_pipeline->join();
     const auto fg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - fg_start).count();
+    const Context::ExecutionStats foreground_lock_turn_stats =
+        ctx->runtime->foreground().execution_stats();
 
     const auto fg_state = ctx->foreground_pipeline->state();
     const auto fg_mode = ctx->foreground_pipeline->last_decode_mode();
@@ -1096,10 +1112,22 @@ int main(int argc, char** argv) {
               << foreground_metrics.first_content_delta_ms << "\n"
               << "foreground_profile_first_tts_enqueue_ms="
               << foreground_metrics.first_tts_enqueue_ms << "\n"
+              << "foreground_profile_tts_first_audio_priority_wait_ms="
+              << foreground_metrics.tts_first_audio_priority_wait_ms << "\n"
               << "foreground_profile_decode_ms="
               << foreground_metrics.decode_ms << "\n"
               << "foreground_profile_model_ms="
               << foreground_metrics.model_ms << "\n"
+              << "foreground_lock_turn_count="
+              << foreground_lock_turn_stats.lock_count << "\n"
+              << "foreground_lock_turn_wait_ms_total="
+              << foreground_lock_turn_stats.wait_ms_total << "\n"
+              << "foreground_lock_turn_wait_ms_max="
+              << foreground_lock_turn_stats.wait_ms_max << "\n"
+              << "foreground_lock_turn_hold_ms_total="
+              << foreground_lock_turn_stats.hold_ms_total << "\n"
+              << "foreground_lock_turn_hold_ms_max="
+              << foreground_lock_turn_stats.hold_ms_max << "\n"
               << "simulated_vad_asr_tail_ms=" << simulated_vad_asr_tail_ms << "\n"
               << "simulated_vad_to_first_content_ms="
               << simulated_vad_to_first_content_ms << "\n"

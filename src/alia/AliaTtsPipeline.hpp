@@ -55,6 +55,7 @@ public:
 
     bool ready() const;
     size_t pending_text_count() const;
+    bool first_audio_callback_emitted() const;
     AliaTtsMetrics last_metrics() const;
     ModelSlot* slot() const { return slot_; }
 

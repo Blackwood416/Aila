@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cctype>
 #include <functional>
+#include <thread>
 #include <vector>
 
 namespace aila::alia {
@@ -1679,6 +1680,13 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     std::string raw_stream_text;
     std::string pending_tts_text;
     bool paused_on_tool_call = false;
+    bool first_tts_enqueue_seen = false;
+    bool first_tts_priority_wait_done = false;
+    long long first_tts_priority_wait_ms = 0;
+    static const bool s_tts_first_audio_priority =
+        aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", false);
+    static const int s_tts_first_audio_priority_timeout_ms = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     long long first_token_delta_ms = -1;
     const auto decode_started = std::chrono::steady_clock::now();
     auto flush_tts = [&](bool force) {
@@ -1690,6 +1698,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 return;
             }
             if (tts_pipeline_->enqueue_text(chunk)) {
+                if (!first_tts_enqueue_seen) {
+                    first_tts_enqueue_seen = true;
+                }
                 if (record_generation_anchor) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (last_first_tts_enqueue_ms_ < 0) {
@@ -1700,6 +1711,32 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 }
             }
         }
+    };
+    auto wait_for_first_tts_audio_if_requested = [&]() {
+        if (!s_tts_first_audio_priority ||
+            first_tts_priority_wait_done ||
+            !first_tts_enqueue_seen ||
+            !tts_pipeline_ ||
+            !audio_cb ||
+            !tts_config ||
+            s_tts_first_audio_priority_timeout_ms <= 0) {
+            return;
+        }
+
+        first_tts_priority_wait_done = true;
+        const auto wait_started = std::chrono::steady_clock::now();
+        while (!abort_requested() &&
+               !tts_pipeline_->first_audio_callback_emitted()) {
+            const long long waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - wait_started).count();
+            if (waited_ms >= s_tts_first_audio_priority_timeout_ms) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        first_tts_priority_wait_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - wait_started).count();
     };
 
     const int max_new_tokens = std::max(config.max_new_tokens, 1);
@@ -1755,6 +1792,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             logits = &backend->forward(*context, one_token_device.as<int>(), 1);
         }
         flush_tts(false);
+        wait_for_first_tts_audio_if_requested();
         if (ordinary_turn_started_tool_markup) {
             flush_tts(true);
             break;
@@ -1801,6 +1839,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             metrics_.first_token_delta_ms = first_token_delta_ms;
             metrics_.first_content_delta_ms = last_first_content_delta_ms_;
             metrics_.first_tts_enqueue_ms = last_first_tts_enqueue_ms_;
+            metrics_.tts_first_audio_priority_wait_ms = first_tts_priority_wait_ms;
             metrics_.decode_ms = decode_ms;
             metrics_.model_ms = elapsed_ms(model_started);
         } else {

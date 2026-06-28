@@ -2402,3 +2402,63 @@ Initial implementation notes:
   `foreground_speculative_commit_reason="no speculative text ready"`. This
   validates the miss path, but it also increases ASR tail because foreground VLM
   work competes for the shared foreground context.
+
+### 2026-06-28 foreground context scheduling probe
+
+Implemented low-level `Context::ExecutionLock` wait/hold profiling and exposed
+phase deltas in the real smoke output:
+
+- `foreground_lock_asr_*`: foreground context lock usage during ASR streaming
+  and ASR-to-VLM partial prefill.
+- `foreground_lock_turn_*`: foreground context lock usage during final
+  foreground generation plus async TTS.
+
+Baseline short streaming smoke:
+
+```text
+asr_stream_simulated_tail_ms          352
+foreground_first_tts_enqueue_ms       491
+tts_first_audio_ms                    1112
+simulated_vad_to_first_audio_ms       1464
+foreground_lock_asr_wait_ms_total     0.001
+foreground_lock_asr_hold_ms_total     1242.5
+foreground_lock_turn_wait_ms_total    1312.63
+foreground_lock_turn_wait_ms_max      480.831
+foreground_lock_turn_hold_ms_total    7212.22
+```
+
+Interpretation:
+
+- ASR streaming has almost no lock contention, but it holds the foreground
+  context while real partial/final decodes run.
+- The foreground/TTS phase has real lock contention. The async TTS worker is
+  already parallel at the thread level, but it still competes with VLM decode
+  for the same foreground execution lock.
+
+Added an opt-in first-audio scheduling probe:
+
+- `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY=1`
+- `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS=250` by default
+
+When the first TTS text chunk is enqueued, foreground VLM decode briefly yields
+until the first TTS audio callback appears or the timeout expires. This does not
+change default behavior.
+
+Short streaming A/B:
+
+```text
+mode                  priority_wait_ms  tts_first_audio_ms  vad_to_first_audio_ms
+baseline              0                 1112                1464
+priority timeout 250  254               942                 1300
+priority timeout 500  446               942                 1291
+```
+
+Interpretation:
+
+- TTS first-audio priority can reduce short-prompt TTFA by about 160-170 ms on
+  this clip by avoiding VLM/TTS lock contention after first TTS enqueue.
+- Increasing the wait timeout to 500 ms did not improve first audio beyond the
+  250 ms probe, so the remaining gap is mostly TTS first-backend latency rather
+  than VLM lock competition.
+- Keep the priority path opt-in for now. It trades foreground decode continuity
+  for earlier audio and needs matrix coverage before becoming a default.

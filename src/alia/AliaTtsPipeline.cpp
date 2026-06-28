@@ -269,6 +269,11 @@ size_t AliaTtsPipeline::pending_text_count() const {
     return text_queue_.size();
 }
 
+bool AliaTtsPipeline::first_audio_callback_emitted() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return first_audio_callback_emitted_;
+}
+
 AliaTtsMetrics AliaTtsPipeline::last_metrics() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return metrics_;

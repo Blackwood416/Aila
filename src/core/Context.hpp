@@ -3,6 +3,7 @@
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <sycl/sycl.hpp>
+#include <chrono>
 #include <cstddef>
 #include <iostream>
 #include <mutex>
@@ -15,6 +16,14 @@
 // ============================================================
 class Context {
 public:
+    struct ExecutionStats {
+        long long lock_count = 0;
+        double wait_ms_total = 0.0;
+        double wait_ms_max = 0.0;
+        double hold_ms_total = 0.0;
+        double hold_ms_max = 0.0;
+    };
+
     class ExecutionLock {
     public:
         class ScopedUnlock {
@@ -36,14 +45,59 @@ public:
         };
 
         explicit ExecutionLock(Context& ctx)
-            : lock_(ctx.execution_mutex_) {}
+            : ctx_(&ctx),
+              lock_(ctx.execution_mutex_, std::defer_lock) {
+            lock();
+        }
 
-        void unlock() { lock_.unlock(); }
-        void lock() { lock_.lock(); }
+        ExecutionLock(ExecutionLock&& other) noexcept
+            : ctx_(other.ctx_),
+              lock_(std::move(other.lock_)),
+              hold_start_(other.hold_start_) {
+            other.ctx_ = nullptr;
+        }
+
+        ExecutionLock(const ExecutionLock&) = delete;
+        ExecutionLock& operator=(const ExecutionLock&) = delete;
+        ExecutionLock& operator=(ExecutionLock&&) = delete;
+
+        ~ExecutionLock() {
+            if (ctx_ && lock_.owns_lock()) {
+                unlock();
+            }
+        }
+
+        void unlock() {
+            if (!ctx_ || !lock_.owns_lock()) {
+                return;
+            }
+            const auto now = Clock::now();
+            const double hold_ms =
+                std::chrono::duration<double, std::milli>(now - hold_start_).count();
+            ctx_->record_execution_hold(hold_ms);
+            lock_.unlock();
+        }
+
+        void lock() {
+            if (!ctx_ || lock_.owns_lock()) {
+                return;
+            }
+            const auto wait_start = Clock::now();
+            lock_.lock();
+            const auto acquired = Clock::now();
+            const double wait_ms =
+                std::chrono::duration<double, std::milli>(acquired - wait_start).count();
+            ctx_->record_execution_wait(wait_ms);
+            hold_start_ = acquired;
+        }
+
         ScopedUnlock scoped_unlock() { return ScopedUnlock(*this); }
 
     private:
+        using Clock = std::chrono::steady_clock;
+        Context* ctx_ = nullptr;
         std::unique_lock<std::mutex> lock_;
+        Clock::time_point hold_start_{};
     };
 
     Context()
@@ -59,6 +113,16 @@ public:
     dnnl::engine& engine() { return eng_; }
     dnnl::stream& stream() { return stream_; }
     ExecutionLock lock_execution() { return ExecutionLock(*this); }
+
+    ExecutionStats execution_stats() const {
+        std::lock_guard<std::mutex> lock(execution_stats_mutex_);
+        return execution_stats_;
+    }
+
+    void reset_execution_stats() {
+        std::lock_guard<std::mutex> lock(execution_stats_mutex_);
+        execution_stats_ = ExecutionStats{};
+    }
 
     // USM Device memory allocation
     void* alloc_device(size_t bytes) {
@@ -126,10 +190,29 @@ public:
     }
 
 private:
+    void record_execution_wait(double wait_ms) {
+        std::lock_guard<std::mutex> lock(execution_stats_mutex_);
+        ++execution_stats_.lock_count;
+        execution_stats_.wait_ms_total += wait_ms;
+        if (wait_ms > execution_stats_.wait_ms_max) {
+            execution_stats_.wait_ms_max = wait_ms;
+        }
+    }
+
+    void record_execution_hold(double hold_ms) {
+        std::lock_guard<std::mutex> lock(execution_stats_mutex_);
+        execution_stats_.hold_ms_total += hold_ms;
+        if (hold_ms > execution_stats_.hold_ms_max) {
+            execution_stats_.hold_ms_max = hold_ms;
+        }
+    }
+
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
     std::mutex execution_mutex_;
+    mutable std::mutex execution_stats_mutex_;
+    ExecutionStats execution_stats_;
     mutable std::mutex alloc_mutex_;
     std::unordered_map<void*, size_t> alloc_bytes_;
     size_t current_allocated_bytes_ = 0;
