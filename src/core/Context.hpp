@@ -5,64 +5,27 @@
 #include <sycl/sycl.hpp>
 #include <cstddef>
 #include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
-#include <utility>
 
 // ============================================================
 // SYCL + oneDNN 运行时上下文
 // ============================================================
 class Context {
 public:
-    class ExecutionLock {
-    public:
-        class ScopedUnlock {
-        public:
-            explicit ScopedUnlock(ExecutionLock& lock)
-                : lock_(lock) {
-                lock_.unlock();
-            }
-
-            ScopedUnlock(const ScopedUnlock&) = delete;
-            ScopedUnlock& operator=(const ScopedUnlock&) = delete;
-
-            ~ScopedUnlock() {
-                lock_.lock();
-            }
-
-        private:
-            ExecutionLock& lock_;
-        };
-
-        explicit ExecutionLock(Context& ctx)
-            : lock_(ctx.execution_mutex_) {}
-
-        void unlock() { lock_.unlock(); }
-        void lock() { lock_.lock(); }
-        ScopedUnlock scoped_unlock() { return ScopedUnlock(*this); }
-
-    private:
-        std::unique_lock<std::mutex> lock_;
-    };
-
-    Context()
-        : Context(sycl::queue{sycl::default_selector_v, sycl::property::queue::in_order()}) {}
-
-    explicit Context(sycl::queue queue) {
-        q_ = std::move(queue);
+    Context() {
+        q_ = sycl::queue{sycl::default_selector_v, sycl::property::queue::in_order()};
         eng_ = dnnl::sycl_interop::make_engine(q_.get_device(), q_.get_context());
         stream_ = dnnl::sycl_interop::make_stream(eng_, q_);
+
     }
 
     sycl::queue& queue() { return q_; }
     dnnl::engine& engine() { return eng_; }
     dnnl::stream& stream() { return stream_; }
-    ExecutionLock lock_execution() { return ExecutionLock(*this); }
 
     // USM Device memory allocation
     void* alloc_device(size_t bytes) {
-        std::lock_guard<std::mutex> lock(alloc_mutex_);
         void* ptr = sycl::malloc_device(bytes, q_);
         if (!ptr) {
             throw std::runtime_error("GPU memory allocation failed: " + std::to_string(bytes) + " bytes");
@@ -77,7 +40,6 @@ public:
 
     void free_device(void* ptr) {
         if (!ptr) return;
-        std::lock_guard<std::mutex> lock(alloc_mutex_);
         auto it = alloc_bytes_.find(ptr);
         if (it != alloc_bytes_.end()) {
             size_t bytes = it->second;
@@ -115,22 +77,13 @@ public:
         q_.wait_and_throw();
     }
 
-    size_t current_allocated_bytes() const {
-        std::lock_guard<std::mutex> lock(alloc_mutex_);
-        return current_allocated_bytes_;
-    }
-
-    size_t peak_allocated_bytes() const {
-        std::lock_guard<std::mutex> lock(alloc_mutex_);
-        return peak_allocated_bytes_;
-    }
+    size_t current_allocated_bytes() const { return current_allocated_bytes_; }
+    size_t peak_allocated_bytes() const { return peak_allocated_bytes_; }
 
 private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
-    std::mutex execution_mutex_;
-    mutable std::mutex alloc_mutex_;
     std::unordered_map<void*, size_t> alloc_bytes_;
     size_t current_allocated_bytes_ = 0;
     size_t peak_allocated_bytes_ = 0;

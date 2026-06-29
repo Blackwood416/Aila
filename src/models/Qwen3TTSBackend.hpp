@@ -7,7 +7,6 @@
 #include "../memory/KVCache.hpp"
 #include "../utils/SafeTensors.hpp"
 #include "engine/Types.hpp"
-#include <array>
 #include <vector>
 #include <string>
 #include <functional>
@@ -32,9 +31,6 @@ public:
     int get_current_context_len() const override { return current_talker_len_; }
 
     // TTS 专有 C++ API：接收文本 tokens 和 预设/克隆的 speaker_embedding (可选)，直接自回归生成 discrete codes
-    using CodeFrameCallback = std::function<bool(const std::vector<int32_t>& codes,
-                                                 int n_frames)>;
-
     bool synthesize_codes(Context& ctx,
                           const std::vector<int>& text_tokens,
                           const std::vector<float>& speaker_embedding,  // Base: ECAPA-TDNN embedding (empty if not used)
@@ -43,10 +39,7 @@ public:
                           int language_id,                               // codec language token (0 = auto/nothink)
                           const GenerationConfig& gen_config,
                           std::vector<int32_t>& out_codes,
-                          int& out_n_frames,
-                          std::function<bool()> should_cancel = {},
-                          CodeFrameCallback frame_callback = {},
-                          int frame_callback_batch_frames = 0);
+                          int& out_n_frames);
 
     // Streaming synthesis: calls audio_callback for each batch of generated audio
     using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;
@@ -59,18 +52,7 @@ public:
                                   int language_id,
                                   const GenerationConfig& gen_config,
                                   int stream_batch_frames,
-                                  AudioChunkCallback audio_callback,
-                                  std::function<bool()> should_cancel = {});
-
-    bool synthesize_tts_stream(
-        Context& ctx,
-        const std::vector<int>& text_tokens,
-        const GenerationConfig& gen_config,
-        int stream_batch_frames,
-        std::function<void(const std::vector<float>&)> audio_callback,
-        std::string* error_message = nullptr,
-        std::function<bool()> should_cancel = {}) override;
-    TtsBackendTiming last_tts_backend_timing() const override { return last_tts_timing_; }
+                                  AudioChunkCallback audio_callback);
 
     bool load_mimi_vocoder(Context& ctx, const std::string& model_dir, std::string* error_message);
     bool decode_mimi_vocoder(Context& ctx,
@@ -83,15 +65,23 @@ public:
         int total_frames = 0;
         int max_frames = 512;
 
-        // Accumulated latent history for full-history conv/pre-transformer stages.
+        // Pre-transformer KV cache: 8 layers, per-layer [16 heads, max_frames, 64]
+        std::vector<Tensor> k_cache;
+        std::vector<Tensor> v_cache;
+
+        // Accumulated buffers (full history for conv stages)
         Tensor latent_buffer;   // [total_frames, 512]
+        Tensor preconv_buffer;  // [total_frames, 1024]
 
         // Track previous audio output position for incremental slicing
         int last_audio_sample_count = 0;
 
         void reset() {
             total_frames = 0;
+            k_cache.clear();
+            v_cache.clear();
             latent_buffer = Tensor();
+            preconv_buffer = Tensor();
             last_audio_sample_count = 0;
         }
     };
@@ -115,7 +105,6 @@ private:
     // Takes pre-transformer output [n_frames, 1024], produces float PCM audio.
     bool mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
                           std::vector<float>& out_samples);
-    void init_mimi_runtime_linears(Context& ctx);
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);
     void ensure_talker_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
@@ -235,23 +224,6 @@ private:
     // Mimi Decoder (Speech Tokenizer) Vocoder
     bool mimi_loaded_ = false;
     ModelWeights mimi_weights_;
-    bool mimi_runtime_linears_initialized_ = false;
-    Tensor mimi_first_proj_weight_view_;
-    Tensor mimi_rest_proj_weight_view_;
-    Linear mimi_first_proj_;
-    Linear mimi_rest_proj_;
-    Linear mimi_pre_tfm_in_proj_;
-    Linear mimi_pre_tfm_out_proj_;
-    struct MimiPreTransformerLayerLinears {
-        Linear q_proj;
-        Linear k_proj;
-        Linear v_proj;
-        Linear o_proj;
-        Linear gate_proj;
-        Linear up_proj;
-        Linear down_proj;
-    };
-    std::array<MimiPreTransformerLayerLinears, 8> mimi_pre_tfm_linears_;
 
     // TTS model type (Base / CustomVoice / VoiceDesign)
     Qwen3TTSModelType tts_model_type_ = Qwen3TTSModelType::Base;
@@ -262,5 +234,4 @@ private:
     Tensor precomputed_tts_pad_; // [1, H_talker]
     Tensor precomputed_codec_pad_; // [1, H_talker]
     Tensor precomputed_codec_bos_; // [1, H_talker]
-    TtsBackendTiming last_tts_timing_;
 };

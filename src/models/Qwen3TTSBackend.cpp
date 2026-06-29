@@ -417,32 +417,6 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         AILA_LOG_INFO("[TTS] Pre-computed fixed embeddings");
     }
 
-    // Warm the real codec-generation path after fixed embeddings are ready.
-    // The earlier warmup covers representative GEMMs, but the first product
-    // utterance also needs predictor decode/talker decode kernels.
-    {
-        AILA_LOG_INFO("[TTS] Running codec decode warmup...");
-        GenerationConfig warmup_gen{};
-        warmup_gen.max_new_tokens = 2;
-        warmup_gen.temperature = 0.0f;
-        warmup_gen.top_k = 1;
-        warmup_gen.top_p = 1.0f;
-        warmup_gen.do_sample = false;
-        warmup_gen.repetition_penalty = 1.1f;
-
-        std::vector<int> warmup_text = {151644, 77091, 198, 0, 151645};
-        std::vector<int32_t> warmup_codes;
-        int warmup_frames = 0;
-        if (!synthesize_codes(ctx, warmup_text, {}, 0, {}, 0, warmup_gen,
-                              warmup_codes, warmup_frames,
-                              []() { return false; }, {}, 0)) {
-            AILA_LOG_WARN("[TTS] Codec decode warmup failed; first synthesis may pay JIT cost");
-        } else {
-            AILA_LOG_INFO("[TTS] Codec decode warmup complete (frames=%d)", warmup_frames);
-        }
-        reset();
-    }
-
     return true;
 }
 
@@ -478,21 +452,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        int language_id,
                                        const GenerationConfig& gen_config,
                                        std::vector<int32_t>& out_codes,
-                                       int& out_n_frames,
-                                       std::function<bool()> should_cancel,
-                                       CodeFrameCallback frame_callback,
-                                       int frame_callback_batch_frames) {
+                                       int& out_n_frames) {
     out_codes.clear();
     out_n_frames = 0;
-    auto cancelled = [&]() {
-        return should_cancel && should_cancel();
-    };
-    if (cancelled()) {
-        return false;
-    }
 
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
-    static const bool tts_debug = aila::env::read_flag("AILA_TTS_DEBUG", false);
 
     int L = static_cast<int>(text_tokens.size());
     if (L <= 0) return false;
@@ -520,27 +484,27 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     Tensor text_emb = Tensor::allocate(ctx, {L, 2048});
     ops::embedding_lookup(ctx, *talker_text_embed_weight_, text_ids_dev.data_as<int>(), L, text_emb, 2048);
-    if (tts_debug) print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
+    print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
 
     // 对 text_emb 过 ResizeMLP (text_projection)
     Tensor fc1_out = Tensor::allocate(ctx, {L, 2048});
     talker_text_proj_fc1_.forward_bias(ctx, text_emb, *talker_text_proj_fc1_bias_, fc1_out, L);
-    if (tts_debug) print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
+    print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
 
     // SiLU(x) = x * sigmoid(x)
     Tensor silu_out = Tensor::allocate(ctx, {L, 2048});
     ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, L * 2048);
-    if (tts_debug) print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
+    print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
 
     Tensor projected_text = Tensor::allocate(ctx, {L, H_talker});
     talker_text_proj_fc2_.forward_bias(ctx, silu_out, *talker_text_proj_fc2_bias_, projected_text, L);
-    if (tts_debug) print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
+    print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
 
     // Use pre-computed embeddings (computed once during load)
     Tensor& tts_bos_embed = precomputed_tts_bos_;
     Tensor& tts_eos_embed = precomputed_tts_eos_;
     Tensor& tts_pad_embed = precomputed_tts_pad_;
-    if (tts_debug) print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
+    print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
 
     // Codec embedding lookup helper (still needed for dynamic spk_id in CustomVoice)
     auto get_talker_codec_embed = [&](int codec_id) {
@@ -739,24 +703,27 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int trailing_len = trailing_token_count + 1; // +1 for tts_eos_embed at end
     AILA_LOG_INFO("[TTS] text_body_end=%d (detected), trailing_tokens=%d, trailing_len=%d",
                   text_body_end, trailing_token_count, trailing_len);
-    Tensor trailing_text_hidden = Tensor::allocate(ctx, {trailing_len, H_talker});
+    std::vector<bf16> trailing_text_hidden(trailing_len * H_talker);
     if (trailing_token_count > 0) {
+        // 拷贝第 5 个 token (index=4) 起的正文投影
         bf16* all_proj = projected_text.data_as<bf16>();
-        bf16* trailing_ptr = trailing_text_hidden.data_as<bf16>();
+        std::vector<bf16> proj_cpu(L * H_talker);
+        ctx.queue().memcpy(proj_cpu.data(), all_proj, L * H_talker * sizeof(bf16)).wait();
         for (int t = 0; t < trailing_token_count; ++t) {
-            ctx.queue().memcpy(trailing_ptr + t * H_talker,
-                               all_proj + (text_body_start + 1 + t) * H_talker,
-                               H_talker * sizeof(bf16));
+            std::memcpy(trailing_text_hidden.data() + t * H_talker,
+                       proj_cpu.data() + (text_body_start + 1 + t) * H_talker,
+                       H_talker * sizeof(bf16));
         }
     }
     // 末尾追加 tts_eos_embed
     {
-        ctx.queue().memcpy(trailing_text_hidden.data_as<bf16>() + (trailing_len - 1) * H_talker,
-                           tts_eos_embed.data(), H_talker * sizeof(bf16));
+        std::vector<bf16> eos_cpu(H_talker);
+        ctx.queue().memcpy(eos_cpu.data(), tts_eos_embed.data(), H_talker * sizeof(bf16)).wait();
+        std::memcpy(trailing_text_hidden.data() + (trailing_len - 1) * H_talker,
+                   eos_cpu.data(), H_talker * sizeof(bf16));
     }
-    ctx.queue().wait();
 
-    if (tts_debug) print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
+    print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
 
     auto t_talker_setup_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prefill_start).count();
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Text+embed construction: %.1f ms", t_talker_setup_ms);
@@ -877,79 +844,39 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     ctx.queue().memcpy(past_hidden_talker.data(), final_normed.data(), H_talker * sizeof(bf16)).wait();
     // 临时张量用于拼接 Code Predictor 的输入
     Tensor pred_input = Tensor::allocate(ctx, {2, H_talker});
-    Tensor token_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-    Tensor frame_codes_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::s32);
-    Tensor last_id_hidden = Tensor::allocate(ctx, {1, H_talker});
-    Tensor predictor_final_hidden = Tensor::allocate(ctx, {1, H_pred});
-    Tensor predictor_final_normed = Tensor::allocate(ctx, {1, H_pred});
-    Tensor predictor_emb_h = Tensor::allocate(ctx, {1, H_talker});
-    Tensor predictor_emb_pred = Tensor::allocate(ctx, {1, H_pred});
-    Tensor predictor_step_normed = Tensor::allocate(ctx, {1, H_pred});
-    Tensor sum_emb = Tensor::allocate(ctx, {1, H_talker});
-    Tensor single_emb = Tensor::allocate(ctx, {1, H_talker});
-    Tensor step_normed_talker = Tensor::allocate(ctx, {1, H_talker});
-    Tensor final_normed_talker = Tensor::allocate(ctx, {1, H_talker});
 
     int max_tokens = tts_gen.max_new_tokens;
-    std::vector<int> token_upload_storage(static_cast<size_t>(std::max(1, max_tokens) * 16 + 16));
-    size_t token_upload_index = 0;
-    auto upload_token_async = [&](int value) {
-        if (token_upload_index < token_upload_storage.size()) {
-            token_upload_storage[token_upload_index] = value;
-            ctx.queue().memcpy(token_dev.data(), &token_upload_storage[token_upload_index], sizeof(int));
-            ++token_upload_index;
-        } else {
-            ctx.memcpy_h2d(token_dev.data(), &value, sizeof(int));
-        }
-    };
-
     out_codes.reserve(max_tokens * 16);
-    const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
-    std::vector<int32_t> pending_callback_codes;
-    int pending_callback_frames = 0;
-    if (frame_callback) {
-        pending_callback_codes.reserve(static_cast<size_t>(callback_batch_frames) * 16);
-    }
-    auto flush_frame_callback = [&]() -> bool {
-        if (!frame_callback || pending_callback_frames <= 0) {
-            return true;
-        }
-        const bool ok = frame_callback(pending_callback_codes, pending_callback_frames);
-        pending_callback_codes.clear();
-        pending_callback_frames = 0;
-        return ok;
-    };
 
     while (gen_step < max_tokens) {
-        if (cancelled()) {
-            return false;
-        }
         if (token == eos_id) {
             break;
         }
 
         // 收集这帧 codebook 0
-        std::array<int, 16> frame_codes{};
+        std::vector<int> frame_codes(16, 0);
         frame_codes[0] = token;
 
         // 获取首码 embedding
-        upload_token_async(token);
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, token_dev.data_as<int>(), 1, last_id_hidden, H_talker);
+        Tensor first_code_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(first_code_dev.data(), &token, sizeof(int));
+        Tensor last_id_hidden = Tensor::allocate(ctx, {1, H_talker});
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, first_code_dev.data_as<int>(), 1, last_id_hidden, H_talker);
 
         // 拼接 past_hidden_talker 与 last_id_hidden -> pred_input [2, H_talker]
         {
             bf16* dst = pred_input.data_as<bf16>();
             bf16* src_past = past_hidden_talker.data_as<bf16>();
             bf16* src_last = last_id_hidden.data_as<bf16>();
-            ctx.queue().memcpy(dst, src_past, H_talker * sizeof(bf16));
-            ctx.queue().memcpy(dst + H_talker, src_last, H_talker * sizeof(bf16));
+            ctx.queue().memcpy(dst, src_past, H_talker * sizeof(bf16)).wait();
+            ctx.queue().memcpy(dst + H_talker, src_last, H_talker * sizeof(bf16)).wait();
         }
 
         // 输入到 Code Predictor
         if (has_predictor_projection_) {
             predictor_projection_linear_.forward_bias(ctx, pred_input, *predictor_projection_bias_, p_buf_.pred_input_proj, 2);
         } else {
-            ctx.queue().memcpy(p_buf_.pred_input_proj.data(), pred_input.data(), 2 * H_pred * sizeof(bf16));
+            ctx.queue().memcpy(p_buf_.pred_input_proj.data(), pred_input.data(), 2 * H_pred * sizeof(bf16)).wait();
         }
 
         // ==========================================
@@ -958,7 +885,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         predictor_kv_cache_.reset();
 
         // --- Predictor Prefill (seq_len = 2) ---
-        ctx.queue().memcpy(p_buf_.hidden.data(), p_buf_.pred_input_proj.data(), 2 * H_pred * sizeof(bf16));
+        ctx.queue().memcpy(p_buf_.hidden.data(), p_buf_.pred_input_proj.data(), 2 * H_pred * sizeof(bf16)).wait();
         ops::rms_norm(ctx, p_buf_.hidden, *predictor_layers_[0].input_ln_weight,
                       predictor_cfg_.rms_norm_eps, p_buf_.normed, 2, H_pred);
 
@@ -966,9 +893,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         if (rotary_dim_pred & 1) --rotary_dim_pred;
 
         for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
-            if (cancelled()) {
-                return false;
-            }
             auto& L = predictor_layers_[i];
             L.qkv_proj.forward(ctx, p_buf_.normed, p_buf_.qkv, 2);
             ops::split_qkv(ctx, p_buf_.qkv, p_buf_.q, p_buf_.k, p_buf_.v, 2, QD_pred, KVD_pred);
@@ -1002,11 +926,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // Get logits for codebook 1 (cb_idx = 0)
-        ctx.queue().memcpy(predictor_final_hidden.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16));
+        Tensor final_hidden_pred = Tensor::allocate(ctx, {1, H_pred});
+        ctx.queue().memcpy(final_hidden_pred.data(), p_buf_.hidden.data_as<bf16>() + 1 * H_pred, H_pred * sizeof(bf16)).wait();
         
-        ops::rms_norm(ctx, predictor_final_hidden, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
+        Tensor final_normed_pred = Tensor::allocate(ctx, {1, H_pred});
+        ops::rms_norm(ctx, final_hidden_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, final_normed_pred, 1, H_pred);
 
-        predictor_lm_heads_[0].forward(ctx, predictor_final_normed, p_buf_.logits, 1);
+        predictor_lm_heads_[0].forward(ctx, final_normed_pred, p_buf_.logits, 1);
         int tok = ops::sample_with_config(ctx, p_buf_.logits, predictor_cfg_.vocab_size, gen_config, {});
         frame_codes[1] = tok;
 
@@ -1014,32 +940,30 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
         // --- Predictor Decode loop (step 2 to 15, i.e., cb_idx = 1 to 14) ---
         for (int cb_idx = 1; cb_idx < 15; cb_idx++) {
-            if (cancelled()) {
-                return false;
-            }
-            upload_token_async(tok);
-            ops::embedding_lookup(ctx, *predictor_embed_weights_[cb_idx - 1], token_dev.data_as<int>(), 1, predictor_emb_h, H_talker);
+            Tensor tok_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+            ctx.memcpy_h2d(tok_dev.data(), &tok, sizeof(int));
+            Tensor emb_h = Tensor::allocate(ctx, {1, H_talker});
+            ops::embedding_lookup(ctx, *predictor_embed_weights_[cb_idx - 1], tok_dev.data_as<int>(), 1, emb_h, H_talker);
 
+            Tensor emb_pred = Tensor::allocate(ctx, {1, H_pred});
             if (has_predictor_projection_) {
-                predictor_projection_linear_.forward_bias(ctx, predictor_emb_h, *predictor_projection_bias_, predictor_emb_pred, 1);
+                predictor_projection_linear_.forward_bias(ctx, emb_h, *predictor_projection_bias_, emb_pred, 1);
             } else {
-                ctx.queue().memcpy(predictor_emb_pred.data(), predictor_emb_h.data(), H_pred * sizeof(bf16));
+                ctx.queue().memcpy(emb_pred.data(), emb_h.data(), H_pred * sizeof(bf16)).wait();
             }
 
             // Copy to single slot in p_buf_.hidden at position cb_idx + 1 (since prefill took slots 0, 1)
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16));
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, emb_pred.data(), H_pred * sizeof(bf16)).wait();
             
             // Norm
-            ops::rms_norm(ctx, predictor_emb_pred, *predictor_layers_[0].input_ln_weight,
-                          predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
+            Tensor step_normed = Tensor::allocate(ctx, {1, H_pred});
+            ops::rms_norm(ctx, emb_pred, *predictor_layers_[0].input_ln_weight,
+                          predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
 
             // Forward layers with decode path (seq_len = 1)
             for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
-                if (cancelled()) {
-                    return false;
-                }
                 auto& L = predictor_layers_[i];
-                L.qkv_proj.forward(ctx, predictor_step_normed, p_buf_.qkv, 1);
+                L.qkv_proj.forward(ctx, step_normed, p_buf_.qkv, 1);
 
                 bf16* qkv_ptr = p_buf_.qkv.data_as<bf16>();
                 Tensor q_dec = Tensor::view(ctx, qkv_ptr, {1, QD_pred});
@@ -1062,20 +986,20 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                       &p_buf_.decode_attn_partials);
 
                 L.o_proj.forward(ctx, p_buf_.attn_out, p_buf_.gate, 1);
-                ops::fused_add_rms_norm(ctx, predictor_emb_pred, p_buf_.gate, *L.post_attn_ln_weight, predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
+                ops::fused_add_rms_norm(ctx, emb_pred, p_buf_.gate, *L.post_attn_ln_weight, predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
 
-                L.gate_up_proj.forward(ctx, predictor_step_normed, p_buf_.gate_up, 1);
+                L.gate_up_proj.forward(ctx, step_normed, p_buf_.gate_up, 1);
                 ops::fused_gate_up_swiglu(ctx, p_buf_.gate_up, p_buf_.gate, FF_pred);
 
                 L.down_proj.forward(ctx, p_buf_.gate, p_buf_.attn_out, 1);
                 Tensor* next_input_ln = (i < predictor_cfg_.num_hidden_layers - 1) ? predictor_layers_[i + 1].input_ln_weight : predictor_final_norm_weight_;
-                ops::fused_add_rms_norm(ctx, predictor_emb_pred, p_buf_.attn_out, *next_input_ln, predictor_cfg_.rms_norm_eps, predictor_step_normed, 1, H_pred);
+                ops::fused_add_rms_norm(ctx, emb_pred, p_buf_.attn_out, *next_input_ln, predictor_cfg_.rms_norm_eps, step_normed, 1, H_pred);
             }
-            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, predictor_emb_pred.data(), H_pred * sizeof(bf16));
+            ctx.queue().memcpy(p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * H_pred, emb_pred.data(), H_pred * sizeof(bf16)).wait();
 
             // Compute logits and sample tok
-            ops::rms_norm(ctx, predictor_emb_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, predictor_final_normed, 1, H_pred);
-            predictor_lm_heads_[cb_idx].forward(ctx, predictor_final_normed, p_buf_.logits, 1);
+            ops::rms_norm(ctx, emb_pred, *predictor_final_norm_weight_, predictor_cfg_.rms_norm_eps, final_normed_pred, 1, H_pred);
+            predictor_lm_heads_[cb_idx].forward(ctx, final_normed_pred, p_buf_.logits, 1);
             
             tok = ops::sample_with_config(ctx, p_buf_.logits, predictor_cfg_.vocab_size, tts_gen, {});
             frame_codes[cb_idx + 1] = tok;
@@ -1086,32 +1010,34 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         // 保存这帧的 16 个 codes
         for (int c : frame_codes) {
             out_codes.push_back(static_cast<int32_t>(c));
-            if (frame_callback) {
-                pending_callback_codes.push_back(static_cast<int32_t>(c));
-            }
         }
         out_n_frames++;
-        if (frame_callback) {
-            ++pending_callback_frames;
-            if (pending_callback_frames >= callback_batch_frames &&
-                !flush_frame_callback()) {
-                return false;
-            }
-        }
 
         // ==========================================
         // 运行 Talker Decode (seq_len = 1) 并生成下一个首码
         // ==========================================
         
         // 查找 16 个 codes 的 embeddings
+        Tensor frame_tokens_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(frame_tokens_dev.data(), frame_codes.data(), 16 * sizeof(int));
+
+        Tensor sum_emb = Tensor::allocate(ctx, {1, H_talker});
+        
+        // 临时分配用于计算和
+        Tensor single_emb = Tensor::allocate(ctx, {1, H_talker});
+
         // 查找 codebook 0
-        ctx.queue().memcpy(frame_codes_dev.data(), frame_codes.data(), frame_codes.size() * sizeof(int));
-        int* frame_codes_ptr = frame_codes_dev.data_as<int>();
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, frame_codes_ptr, 1, sum_emb, H_talker);
+        int c0 = frame_codes[0];
+        Tensor c0_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(c0_dev.data(), &c0, sizeof(int));
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, c0_dev.data_as<int>(), 1, sum_emb, H_talker);
 
         // 查找 predictor 对应的 15 个 embeddings 并累加
         for (int i = 0; i < 15; i++) {
-            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], frame_codes_ptr + i + 1, 1, single_emb, H_talker);
+            int ci = frame_codes[i + 1];
+            Tensor ci_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+            ctx.memcpy_h2d(ci_dev.data(), &ci, sizeof(int));
+            ops::embedding_lookup(ctx, *predictor_embed_weights_[i], ci_dev.data_as<int>(), 1, single_emb, H_talker);
             
             // 累加：sum_emb += single_emb
             bf16* sum_ptr = sum_emb.data_as<bf16>();
@@ -1119,27 +1045,36 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> idx) {
                 sum_ptr[idx[0]] = sum_ptr[idx[0]] + sgl_ptr[idx[0]];
             });
+            ctx.queue().wait();
         }
 
         // 加上 trailing_text_hidden[gen_step] 或 tts_pad_embed（对齐 ggml）
+        Tensor add_vec = Tensor::allocate(ctx, {1, H_talker});
+        if (gen_step < trailing_len) {
+            // 使用预计算的 trailing text hidden state（正文 token 的 ResizeMLP 投影）
+            ctx.queue().memcpy(add_vec.data(),
+                trailing_text_hidden.data() + gen_step * H_talker,
+                H_talker * sizeof(bf16)).wait();
+        } else {
+            // 超出 trailing text 长度后回落到 tts_pad_embed
+            ctx.queue().memcpy(add_vec.data(), tts_pad_embed.data(), H_talker * sizeof(bf16)).wait();
+        }
+
         bf16* sum_ptr = sum_emb.data_as<bf16>();
-        bf16* add_ptr = gen_step < trailing_len
-            ? trailing_text_hidden.data_as<bf16>() + gen_step * H_talker
-            : tts_pad_embed.data_as<bf16>();
+        bf16* add_ptr = add_vec.data_as<bf16>();
         ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> idx) {
             sum_ptr[idx[0]] = sum_ptr[idx[0]] + add_ptr[idx[0]];
         });
+        ctx.queue().wait();
 
         // 运行 Talker Decode Step (seq_len = 1)
+        Tensor step_normed_talker = Tensor::allocate(ctx, {1, H_talker});
         ops::rms_norm(ctx, sum_emb, *talker_layers_[0].input_ln_weight,
                       talker_cfg_.rms_norm_eps, step_normed_talker, 1, H_talker);
 
         int current_pos = current_talker_len_;
 
         for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
-            if (cancelled()) {
-                return false;
-            }
             auto& L = talker_layers_[i];
             L.qkv_proj.forward(ctx, step_normed_talker, t_buf_.qkv, 1);
 
@@ -1175,10 +1110,11 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         }
 
         // 预测下一个首码
+        Tensor final_normed_talker = Tensor::allocate(ctx, {1, H_talker});
         ops::rms_norm(ctx, sum_emb, *talker_final_norm_weight_, talker_cfg_.rms_norm_eps, final_normed_talker, 1, H_talker);
 
         // 保存新的 past_hidden_talker (保存归一化后的值以对齐 Python)
-        ctx.queue().memcpy(past_hidden_talker.data(), final_normed_talker.data(), H_talker * sizeof(bf16));
+        ctx.queue().memcpy(past_hidden_talker.data(), final_normed_talker.data(), H_talker * sizeof(bf16)).wait();
 
         talker_codec_head_.forward(ctx, final_normed_talker, t_buf_.logits, 1);
         token = ops::sample_with_config(ctx, t_buf_.logits, talker_cfg_.vocab_size, tts_gen, generated_cb0_tokens);
@@ -1198,10 +1134,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                   t_decode_ms, out_n_frames, t_decode_ms / std::max(1, out_n_frames));
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
 
-    if (!flush_frame_callback()) {
-        return false;
-    }
-
     return true;
 }
 
@@ -1213,145 +1145,53 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     int language_id,
     const GenerationConfig& gen_config,
     int stream_batch_frames,
-    AudioChunkCallback audio_callback,
-    std::function<bool()> should_cancel) {
-    auto cancelled = [&]() {
-        return should_cancel && should_cancel();
-    };
-    if (cancelled()) {
+    AudioChunkCallback audio_callback) {
+
+    // 1. Generate all codec tokens (existing blocking call)
+    std::vector<int32_t> all_codes;
+    int total_frames = 0;
+    if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
+                           instruct_tokens, language_id, gen_config,
+                           all_codes, total_frames)) {
         return false;
     }
 
-    last_tts_timing_ = TtsBackendTiming{};
-    const auto timing_start = std::chrono::high_resolution_clock::now();
-
-    // Initialize Mimi before codec generation so the first generated frame batch
-    // can be decoded immediately instead of waiting for the whole utterance.
+    // 2. Initialize Mimi stream
     MimiStreamState mimi_state;
-    const int max_stream_frames = std::max(128, gen_config.max_new_tokens + 16);
-    if (!init_mimi_stream(ctx, mimi_state, max_stream_frames)) {
+    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
         return false;
     }
-    const auto codes_start = std::chrono::high_resolution_clock::now();
-    last_tts_timing_.mimi_init_ms =
-        std::chrono::duration<double, std::milli>(codes_start - timing_start).count();
 
-    auto emit_audio_batch = [&](const std::vector<int32_t>& batch_codes,
-                                int batch_frames) -> bool {
-        if (cancelled()) {
-            return false;
+    // 3. Feed codes in batches to incremental decoder
+    int batch_size = stream_batch_frames;
+    for (int offset = 0; offset < total_frames; offset += batch_size) {
+        int batch_frames = std::min(batch_size, total_frames - offset);
+
+        // Extract batch codes: [batch_frames, 16]
+        std::vector<int32_t> batch_codes;
+        batch_codes.reserve(static_cast<size_t>(batch_frames) * 16);
+        for (int f = 0; f < batch_frames; ++f) {
+            for (int c = 0; c < 16; ++c) {
+                batch_codes.push_back(all_codes[static_cast<size_t>(offset + f) * 16 + c]);
+            }
         }
-        if (last_tts_timing_.total_frames == 0) {
-            last_tts_timing_.codes_ms =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::high_resolution_clock::now() - codes_start).count();
-        }
-        last_tts_timing_.total_frames += batch_frames;
 
         std::vector<float> audio_chunk;
         if (!decode_mimi_incremental(ctx, batch_codes, batch_frames, mimi_state, audio_chunk)) {
             return false;
         }
         if (!audio_chunk.empty()) {
-            if (cancelled()) {
-                return false;
-            }
-            if (last_tts_timing_.callback_count == 0) {
-                last_tts_timing_.first_audio_ms =
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::high_resolution_clock::now() - timing_start).count();
-                last_tts_timing_.first_audio_samples =
-                    static_cast<int>(audio_chunk.size());
-            }
-            ++last_tts_timing_.callback_count;
             audio_callback(audio_chunk);
         }
-        return true;
-    };
+    }
 
-    std::vector<int32_t> all_codes;
-    int total_frames = 0;
-    const int batch_size = std::max(1, stream_batch_frames);
-    if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
-                           instruct_tokens, language_id, gen_config,
-                           all_codes, total_frames, should_cancel,
-                           emit_audio_batch, batch_size)) {
-        return false;
-    }
-    const auto codes_done = std::chrono::high_resolution_clock::now();
-    if (last_tts_timing_.codes_ms < 0.0) {
-        last_tts_timing_.codes_ms =
-            std::chrono::duration<double, std::milli>(codes_done - codes_start).count();
-    }
-    last_tts_timing_.total_frames = total_frames;
-
-    if (cancelled()) {
-        return false;
-    }
+    // 4. Flush
     std::vector<float> flush_samples;
     decode_mimi_flush(ctx, mimi_state, flush_samples);
     if (!flush_samples.empty()) {
-        if (cancelled()) {
-            return false;
-        }
-        if (last_tts_timing_.callback_count == 0) {
-            last_tts_timing_.first_audio_ms =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::high_resolution_clock::now() - timing_start).count();
-            last_tts_timing_.first_audio_samples =
-                static_cast<int>(flush_samples.size());
-        }
-        ++last_tts_timing_.callback_count;
         audio_callback(flush_samples);
     }
 
-    last_tts_timing_.total_ms =
-        std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - timing_start).count();
-    return true;
-}
-
-bool Qwen3TTSBackend::synthesize_tts_stream(
-    Context& ctx,
-    const std::vector<int>& text_tokens,
-    const GenerationConfig& gen_config,
-    int stream_batch_frames,
-    std::function<void(const std::vector<float>&)> audio_callback,
-    std::string* error_message,
-    std::function<bool()> should_cancel) {
-    if (text_tokens.empty()) {
-        if (error_message) {
-            *error_message = "TTS text encoded to zero tokens";
-        }
-        return false;
-    }
-    if (!audio_callback) {
-        if (error_message) {
-            *error_message = "TTS audio callback is empty";
-        }
-        return false;
-    }
-    if (should_cancel && should_cancel()) {
-        if (error_message) {
-            *error_message = "Qwen3-TTS streaming synthesis cancelled";
-        }
-        return false;
-    }
-
-    const int batch_frames = std::max(1, stream_batch_frames);
-    if (!synthesize_codes_stream(ctx, text_tokens, {}, 0, {}, 0, gen_config,
-                                 batch_frames, std::move(audio_callback),
-                                 should_cancel)) {
-        if (error_message) {
-            *error_message = (should_cancel && should_cancel())
-                ? "Qwen3-TTS streaming synthesis cancelled"
-                : "Qwen3-TTS streaming synthesis failed";
-        }
-        return false;
-    }
-    if (error_message) {
-        error_message->clear();
-    }
     return true;
 }
 
@@ -1519,7 +1359,6 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     mimi_loaded_ = true;
-    init_mimi_runtime_linears(ctx);
 
     // Warmup: run minimal mimi decode to trigger conv/attention JIT compilation
     {
@@ -1531,36 +1370,6 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
     }
 
     return true;
-}
-
-void Qwen3TTSBackend::init_mimi_runtime_linears(Context& ctx) {
-    if (mimi_runtime_linears_initialized_) return;
-
-    mimi_first_proj_weight_view_ =
-        mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
-    mimi_rest_proj_weight_view_ =
-        mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
-    mimi_first_proj_.init(ctx, mimi_first_proj_weight_view_, 256, 512, false);
-    mimi_rest_proj_.init(ctx, mimi_rest_proj_weight_view_, 256, 512, false);
-
-    mimi_pre_tfm_in_proj_.init(ctx,
-        mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
-    mimi_pre_tfm_out_proj_.init(ctx,
-        mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
-
-    for (int l = 0; l < 8; ++l) {
-        const std::string layer_prefix = "decoder.pre_transformer.layers." + std::to_string(l) + ".";
-        auto& layer = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
-        layer.q_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.q_proj.weight"), 512, 1024, false);
-        layer.k_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.k_proj.weight"), 512, 1024, false);
-        layer.v_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.v_proj.weight"), 512, 1024, false);
-        layer.o_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.o_proj.weight"), 1024, 512, false);
-        layer.gate_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.gate_proj.weight"), 512, 1024, false);
-        layer.up_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.up_proj.weight"), 512, 1024, false);
-        layer.down_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.down_proj.weight"), 1024, 512, false);
-    }
-
-    mimi_runtime_linears_initialized_ = true;
 }
 
 bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
@@ -1805,8 +1614,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     };
 #pragma pack(pop)
 
-    static const bool tts_debug_wav = aila::env::read_flag("AILA_TTS_DEBUG_WAV", false);
-    if (tts_debug_wav) {
+    {
         std::ofstream wav_file("mimi_output.wav", std::ios::binary);
         if (wav_file.is_open()) {
             WavHeader header;
@@ -1834,7 +1642,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile]   Final conv+tanh: %.1f ms", t_final_ms);
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Conv stages total: %.1f ms (%d frames, %d samples)", t_conv_total_ms, n_frames, L);
 
-    AILA_LOG_DEBUG("[MimiDebug] Decoded into %d samples.", L);
+    AILA_LOG_INFO("[MimiDebug] Successful! Decoded into %d samples.", L);
     return true;
 }
 
@@ -1854,7 +1662,8 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         return false;
     }
 
-    const bool debug_print = aila::env::read_flag("AILA_MIMI_DEBUG", false);
+    const char* env_debug = std::getenv("AILA_MIMI_DEBUG");
+    bool debug_print = (env_debug && std::string(env_debug) == "1");
 
     auto print_stats = [&](const std::string& name, Tensor& t) {
         if (!debug_print) return;
@@ -1925,11 +1734,19 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     }
 
 
+    // 线性投影 MatMul (把 [512, 256, 1] 形状的权重 reshape 成 2D 的 [512, 256])
+    Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
+    Tensor rest_proj_w = mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
+
+    Linear first_proj, rest_proj;
+    first_proj.init(ctx, first_proj_w, 256, 512, false);
+    rest_proj.init(ctx, rest_proj_w, 256, 512, false);
+
     Tensor proj_first = Tensor::allocate(ctx, {n_frames, 512});
     Tensor proj_rest = Tensor::allocate(ctx, {n_frames, 512});
 
-    mimi_first_proj_.forward(ctx, temp_first, proj_first, n_frames);
-    mimi_rest_proj_.forward(ctx, temp_rest, proj_rest, n_frames);
+    first_proj.forward(ctx, temp_first, proj_first, n_frames);
+    rest_proj.forward(ctx, temp_rest, proj_rest, n_frames);
 
 
     // 向量相加得到 latent
@@ -1958,8 +1775,10 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     // ==========================================
     auto t_pretfm_start = std::chrono::high_resolution_clock::now();
     Tensor pre_tfm_in = Tensor::allocate(ctx, {n_frames, 512});
+    Linear pre_tfm_in_proj;
+    pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
     Tensor& pre_tfm_in_proj_b = mimi_weights_.get("decoder.pre_transformer.input_proj.bias");
-    mimi_pre_tfm_in_proj_.forward_bias(ctx, pre_conv_out, pre_tfm_in_proj_b, pre_tfm_in, n_frames);
+    pre_tfm_in_proj.forward_bias(ctx, pre_conv_out, pre_tfm_in_proj_b, pre_tfm_in, n_frames);
 
 
     // 辅助 layer scale 核函数
@@ -1977,7 +1796,7 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         });
     };
 
-    AILA_LOG_DEBUG("[MimiDebug] Step 6: Pre-transformer 8 layers loop");
+    AILA_LOG_INFO("[MimiDebug] Step 6: Pre-transformer 8 layers loop");
     Tensor x = Tensor::allocate(ctx, {n_frames, 512});
     ops::copy_tensor(ctx, pre_tfm_in, x, n_frames * 512);
 
@@ -1994,14 +1813,19 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ops::rms_norm(ctx, x, input_ln_w, 1e-5f, normed, n_frames, 512);
 
 
+        // Q/K/V Linear (无 bias)
+        Linear q_proj, k_proj, v_proj;
+        q_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.q_proj.weight"), 512, 1024, false);
+        k_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.k_proj.weight"), 512, 1024, false);
+        v_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.v_proj.weight"), 512, 1024, false);
+
         Tensor q = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor k = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor v = Tensor::allocate(ctx, {n_frames, 1024});
 
-        auto& layer_linears = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
-        layer_linears.q_proj.forward(ctx, normed, q, n_frames);
-        layer_linears.k_proj.forward(ctx, normed, k, n_frames);
-        layer_linears.v_proj.forward(ctx, normed, v, n_frames);
+        q_proj.forward(ctx, normed, q, n_frames);
+        k_proj.forward(ctx, normed, k, n_frames);
+        v_proj.forward(ctx, normed, v, n_frames);
 
 
         // Apply RoPE positions (num_heads=16, head_dim=64)
@@ -2015,8 +1839,10 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
 
 
         // Out proj
+        Linear o_proj;
+        o_proj.init(ctx, mimi_weights_.get(layer_prefix + "self_attn.o_proj.weight"), 1024, 512, false);
         Tensor proj_out = Tensor::allocate(ctx, {n_frames, 512});
-        layer_linears.o_proj.forward(ctx, attn_out, proj_out, n_frames);
+        o_proj.forward(ctx, attn_out, proj_out, n_frames);
 
 
         // Attention layer scale
@@ -2039,19 +1865,24 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
         ops::rms_norm(ctx, x, post_attn_ln_w, 1e-5f, normed_post, n_frames, 512);
 
 
+        Linear gate_proj, up_proj, down_proj;
+        gate_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.gate_proj.weight"), 512, 1024, false);
+        up_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.up_proj.weight"), 512, 1024, false);
+
         Tensor gate_out = Tensor::allocate(ctx, {n_frames, 1024});
         Tensor up_out = Tensor::allocate(ctx, {n_frames, 1024});
 
-        layer_linears.gate_proj.forward(ctx, normed_post, gate_out, n_frames);
-        layer_linears.up_proj.forward(ctx, normed_post, up_out, n_frames);
+        gate_proj.forward(ctx, normed_post, gate_out, n_frames);
+        up_proj.forward(ctx, normed_post, up_out, n_frames);
 
 
         // SwiGLU activation: gate = silu(gate) * up
         ops::swiglu(ctx, gate_out, up_out, gate_out, n_frames * 1024);
         ctx.synchronize();
 
+        down_proj.init(ctx, mimi_weights_.get(layer_prefix + "mlp.down_proj.weight"), 1024, 512, false);
         Tensor down_out = Tensor::allocate(ctx, {n_frames, 512});
-        layer_linears.down_proj.forward(ctx, gate_out, down_out, n_frames);
+        down_proj.forward(ctx, gate_out, down_out, n_frames);
         ctx.synchronize();
 
         // MLP layer scale
@@ -2072,8 +1903,10 @@ bool Qwen3TTSBackend::decode_mimi_vocoder(Context& ctx,
     ctx.synchronize();
 
     Tensor pre_tfm_out = Tensor::allocate(ctx, {n_frames, 1024});
+    Linear pre_tfm_out_proj;
+    pre_tfm_out_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
     Tensor& pre_tfm_out_proj_b = mimi_weights_.get("decoder.pre_transformer.output_proj.bias");
-    mimi_pre_tfm_out_proj_.forward_bias(ctx, final_normed, pre_tfm_out_proj_b, pre_tfm_out, n_frames);
+    pre_tfm_out_proj.forward_bias(ctx, final_normed, pre_tfm_out_proj_b, pre_tfm_out, n_frames);
     ctx.synchronize();
 
     auto t_pretfm_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
@@ -2087,8 +1920,17 @@ bool Qwen3TTSBackend::init_mimi_stream(Context& ctx, MimiStreamState& state, int
     state.reset();
     state.max_frames = max_frames;
 
-    // Accumulation buffer for full-history Mimi decode stages.
+    // Allocate KV cache: 8 layers x [16 heads, max_frames, 64]
+    state.k_cache.resize(8);
+    state.v_cache.resize(8);
+    for (int l = 0; l < 8; ++l) {
+        state.k_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
+        state.v_cache[l] = Tensor::allocate(ctx, {16, static_cast<int64_t>(max_frames), 64});
+    }
+
+    // Accumulation buffers
     state.latent_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 512});
+    state.preconv_buffer = Tensor::allocate(ctx, {static_cast<int64_t>(max_frames), 1024});
 
     return true;
 }
@@ -2097,14 +1939,11 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     const std::vector<int32_t>& codes, int new_frames,
     MimiStreamState& state, std::vector<float>& out_samples) {
     if (!mimi_loaded_ || new_frames <= 0) return false;
-    static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
-    const auto t_decode_start = std::chrono::high_resolution_clock::now();
 
     int start_pos = state.total_frames;
     int total_frames = start_pos + new_frames;
 
     // === 1. VQ lookup on NEW codes only ===
-    const auto t_vq_start = std::chrono::high_resolution_clock::now();
     Tensor codes_dev = Tensor::allocate(ctx, {new_frames, 16}, dnnl::memory::data_type::s32);
     ctx.memcpy_h2d(codes_dev.data(), codes.data(), new_frames * 16 * sizeof(int32_t));
 
@@ -2122,45 +1961,39 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     }
     ctx.synchronize();
 
+    Linear first_proj, rest_proj;
+    Tensor first_proj_w = mimi_weights_.get("decoder.quantizer.rvq_first.output_proj.weight").reshape_view({512, 256});
+    Tensor rest_proj_w = mimi_weights_.get("decoder.quantizer.rvq_rest.output_proj.weight").reshape_view({512, 256});
+    first_proj.init(ctx, first_proj_w, 256, 512, false);
+    rest_proj.init(ctx, rest_proj_w, 256, 512, false);
     Tensor proj_first = Tensor::allocate(ctx, {new_frames, 512});
     Tensor proj_rest = Tensor::allocate(ctx, {new_frames, 512});
-    mimi_first_proj_.forward(ctx, temp_first, proj_first, new_frames);
-    mimi_rest_proj_.forward(ctx, temp_rest, proj_rest, new_frames);
+    first_proj.forward(ctx, temp_first, proj_first, new_frames);
+    rest_proj.forward(ctx, temp_rest, proj_rest, new_frames);
     ctx.synchronize();
 
     Tensor latent_new = Tensor::allocate(ctx, {new_frames, 512});
     ops::copy_tensor(ctx, proj_first, latent_new, new_frames * 512);
     ops::residual_add(ctx, latent_new, proj_rest, new_frames * 512);
     ctx.synchronize();
-    if (tts_profile) {
-        const auto t_vq_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_vq_start).count();
-        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental VQ+proj: %.1f ms (%d new/%d total frames)",
-                      t_vq_ms, new_frames, total_frames);
-    }
 
     // === 2. Append to latent_buffer ===
     bf16* lat_dst = state.latent_buffer.data_as<bf16>() + start_pos * 512;
     ctx.memcpy_h2d_async(lat_dst, latent_new.data(), new_frames * 512 * sizeof(bf16));
 
     // === 3. Pre-conv on FULL latent ===
-    const auto t_preconv_start = std::chrono::high_resolution_clock::now();
     Tensor preconv_full = Tensor::allocate(ctx, {total_frames, 1024});
     ops::causal_conv1d(ctx, state.latent_buffer,
         mimi_weights_.get("decoder.pre_conv.conv.weight"),
         mimi_weights_.get("decoder.pre_conv.conv.bias"),
         preconv_full, 1, 512, 1024, total_frames, 3, 1);
     ctx.synchronize();
-    if (tts_profile) {
-        const auto t_preconv_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_preconv_start).count();
-        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental pre-conv: %.1f ms", t_preconv_ms);
-    }
 
     // === 4. Pre-transformer with incremental KV cache ===
-    const auto t_pretfm_start = std::chrono::high_resolution_clock::now();
     Tensor pre_tfm_in = Tensor::allocate(ctx, {total_frames, 512});
-    mimi_pre_tfm_in_proj_.forward_bias(ctx, preconv_full,
+    Linear pre_tfm_in_proj;
+    pre_tfm_in_proj.init(ctx, mimi_weights_.get("decoder.pre_transformer.input_proj.weight"), 1024, 512, false);
+    pre_tfm_in_proj.forward_bias(ctx, preconv_full,
         mimi_weights_.get("decoder.pre_transformer.input_proj.bias"), pre_tfm_in, total_frames);
     ctx.synchronize();
 
@@ -2192,29 +2025,49 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
                       1e-5f, normed, total_frames, 512);
         ctx.synchronize();
 
+        // Q/K/V for all tokens (full projection)
+        Linear q_proj, k_proj, v_proj;
+        q_proj.init(ctx, mimi_weights_.get(lp + "self_attn.q_proj.weight"), 512, 1024, false);
+        k_proj.init(ctx, mimi_weights_.get(lp + "self_attn.k_proj.weight"), 512, 1024, false);
+        v_proj.init(ctx, mimi_weights_.get(lp + "self_attn.v_proj.weight"), 512, 1024, false);
         Tensor q = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor k = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor v = Tensor::allocate(ctx, {total_frames, 1024});
-        auto& layer_linears = mimi_pre_tfm_linears_[static_cast<size_t>(l)];
-        layer_linears.q_proj.forward(ctx, normed, q, total_frames);
-        layer_linears.k_proj.forward(ctx, normed, k, total_frames);
-        layer_linears.v_proj.forward(ctx, normed, v, total_frames);
+        q_proj.forward(ctx, normed, q, total_frames);
+        k_proj.forward(ctx, normed, k, total_frames);
+        v_proj.forward(ctx, normed, v, total_frames);
         ctx.synchronize();
 
         // RoPE with position offset for new tokens
         ops::apply_rope(ctx, q, k, total_frames, 0, 16, 16, 64, 10000.0f);
         ctx.synchronize();
 
-        // This path still recomputes full-history Q/K/V, so using direct prefill
-        // attention avoids thousands of tiny K/V cache copies per Mimi chunk.
+        // Copy K/V into cache (16 heads, [max_frames, 64] layout)
+        bf16* k_full = k.data_as<bf16>();
+        bf16* v_full = v.data_as<bf16>();
+        for (int h = 0; h < 16; ++h) {
+            bf16* kc = state.k_cache[l].data_as<bf16>() + h * state.max_frames * 64;
+            bf16* vc = state.v_cache[l].data_as<bf16>() + h * state.max_frames * 64;
+            for (int t = 0; t < total_frames; ++t) {
+                ctx.queue().memcpy(kc + t * 64, k_full + t * 1024 + h * 64, 64 * sizeof(bf16));
+                ctx.queue().memcpy(vc + t * 64, v_full + t * 1024 + h * 64, 64 * sizeof(bf16));
+            }
+        }
+        ctx.queue().wait();
+
+        // Incremental attention: Q for all tokens against cached K/V
         Tensor attn_out = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor scores_buf = Tensor::allocate(ctx, {16, total_frames, total_frames}, dnnl::memory::data_type::f32);
-        ops::attention_prefill(ctx, q, k, v, attn_out, scores_buf, total_frames, 16, 16, 64);
+        ops::attention_prefill_cached(ctx, q, state.k_cache[l], state.v_cache[l],
+                                       attn_out, scores_buf,
+                                       total_frames, 0, 16, 16, 64, state.max_frames);
         ctx.synchronize();
 
         // O projection
+        Linear o_proj;
+        o_proj.init(ctx, mimi_weights_.get(lp + "self_attn.o_proj.weight"), 1024, 512, false);
         Tensor proj_out = Tensor::allocate(ctx, {total_frames, 512});
-        layer_linears.o_proj.forward(ctx, attn_out, proj_out, total_frames);
+        o_proj.forward(ctx, attn_out, proj_out, total_frames);
         ctx.synchronize();
 
         apply_layer_scale_gpu(proj_out, mimi_weights_.get(lp + "self_attn_layer_scale.scale"), total_frames, 512);
@@ -2234,17 +2087,21 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
                       1e-5f, normed_post, total_frames, 512);
         ctx.synchronize();
 
+        Linear gate_proj, up_proj, down_proj;
+        gate_proj.init(ctx, mimi_weights_.get(lp + "mlp.gate_proj.weight"), 512, 1024, false);
+        up_proj.init(ctx, mimi_weights_.get(lp + "mlp.up_proj.weight"), 512, 1024, false);
         Tensor gate_out = Tensor::allocate(ctx, {total_frames, 1024});
         Tensor up_out   = Tensor::allocate(ctx, {total_frames, 1024});
-        layer_linears.gate_proj.forward(ctx, normed_post, gate_out, total_frames);
-        layer_linears.up_proj.forward(ctx, normed_post, up_out, total_frames);
+        gate_proj.forward(ctx, normed_post, gate_out, total_frames);
+        up_proj.forward(ctx, normed_post, up_out, total_frames);
         ctx.synchronize();
 
         ops::swiglu(ctx, gate_out, up_out, gate_out, total_frames * 1024);
         ctx.synchronize();
 
+        down_proj.init(ctx, mimi_weights_.get(lp + "mlp.down_proj.weight"), 1024, 512, false);
         Tensor down_out = Tensor::allocate(ctx, {total_frames, 512});
-        layer_linears.down_proj.forward(ctx, gate_out, down_out, total_frames);
+        down_proj.forward(ctx, gate_out, down_out, total_frames);
         ctx.synchronize();
 
         apply_layer_scale_gpu(down_out, mimi_weights_.get(lp + "mlp_layer_scale.scale"), total_frames, 512);
@@ -2262,28 +2119,16 @@ bool Qwen3TTSBackend::decode_mimi_incremental(Context& ctx,
     ctx.synchronize();
 
     Tensor pre_tfm_out_i = Tensor::allocate(ctx, {total_frames, 1024});
-    mimi_pre_tfm_out_proj_.forward_bias(ctx, final_normed,
+    Linear pre_tfm_out_proj_i;
+    pre_tfm_out_proj_i.init(ctx, mimi_weights_.get("decoder.pre_transformer.output_proj.weight"), 512, 1024, false);
+    pre_tfm_out_proj_i.forward_bias(ctx, final_normed,
         mimi_weights_.get("decoder.pre_transformer.output_proj.bias"), pre_tfm_out_i, total_frames);
     ctx.synchronize();
-    if (tts_profile) {
-        const auto t_pretfm_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_pretfm_start).count();
-        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental pre-transformer: %.1f ms", t_pretfm_ms);
-    }
 
     // === Conv stages (shared with full decode_mimi_vocoder) ===
-    const auto t_conv_start = std::chrono::high_resolution_clock::now();
     std::vector<float> full_samples;
     if (!mimi_conv_stages(ctx, pre_tfm_out_i, total_frames, full_samples)) {
         return false;
-    }
-    if (tts_profile) {
-        const auto t_conv_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_conv_start).count();
-        const auto t_decode_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - t_decode_start).count();
-        AILA_LOG_INFO("[TTS-Profile]   Mimi incremental total: %.1f ms (conv+readback %.1f ms)",
-                      t_decode_ms, t_conv_ms);
     }
 
     // Slice: extract only new audio since last call
