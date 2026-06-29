@@ -947,11 +947,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     out_codes.reserve(max_tokens * 16);
     const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
     const bool playback_aware_steady_batch =
-        aila::env::read_flag("AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH", false);
+        aila::env::read_flag("AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH", true);
+    const int default_steady_callback_batch_frames =
+        std::min(24, std::max(callback_batch_frames, 8));
     const int steady_callback_batch_frames = playback_aware_steady_batch
         ? std::clamp(
               aila::env::read_int_raw("AILA_TTS_STEADY_STREAM_BATCH_FRAMES",
-                                       callback_batch_frames),
+                                       default_steady_callback_batch_frames),
               callback_batch_frames,
               24)
         : callback_batch_frames;

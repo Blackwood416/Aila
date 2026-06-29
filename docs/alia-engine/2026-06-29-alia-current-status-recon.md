@@ -334,9 +334,9 @@ Implemented observability:
   `tts_backend_steady_batch_callback_count`, and
   `tts_backend_playback_aware_steady_batch`.
 
-Default path remains unchanged: first audio is still 4 frames / `7680` samples,
-steady backend batch is still 4 frames, and playback-aware steady batching is
-off by default.
+At this checkpoint the default path remained unchanged: first audio was still
+4 frames / `7680` samples, steady backend batch was still 4 frames, and
+playback-aware steady batching was off by default.
 
 Default full matrix with output ASR:
 
@@ -415,3 +415,87 @@ Hello, I'm Alia, a local companion.
   `preference_memory` and a shortened `long_answer`.
 - Keep this path default-off until a follow-up can tune the transition policy
   and verify output ASR does not truncate or lose later spoken content.
+
+## Backend-only split default follow-up
+
+The combined probe was split into single-variable matrices:
+
+```text
+backend-only:
+AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH=1
+AILA_TTS_STEADY_STREAM_BATCH_FRAMES=8
+AILA_TTS_PLAYBACK_GAP_TRIGGER_MS=0
+
+text-only:
+AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS=1
+```
+
+Average results:
+
+```text
+set          vad_to_first_audio  first_audio  first_enqueue  chunks  callbacks  backend_total  buffer_gap_total
+oldDefault  1085.0              650.4        414.6          5.0     50.0       16094.1        981.6
+backend8    1128.8              696.0        461.2          5.2     36.4       12474.2        296.8
+textOnly    1137.2              704.2        465.8          3.8     46.8       15835.7        1460.2
+combo       1273.0              839.8        601.4          2.6     19.2       7333.5         358.8
+```
+
+`textOnly` is not viable. It did not materially improve backend total time, made
+playback gaps worse, and output ASR showed truncation-like results in
+`preference_memory` and `task_memory`.
+
+`backend8` is the useful variable. It reduced average backend total time by
+about `3.6 s` and buffer-aware playback gap total by about `685 ms`, while first
+backend audio stayed flat:
+
+```text
+set          first_backend_audio  first_backend_total  first_backend_frames  first_backend_callbacks
+oldDefault  235.4                2811.8               30.0                  7.8
+backend8    234.5                1329.1               17.8                  3.8
+```
+
+The follow-up implementation therefore makes playback-aware backend steady
+batching default-on, with a default steady backend batch of 8 frames, but keeps
+the foreground text coalescing path default-off. To preserve the playback-facing
+chunk contract, `AliaTtsPipeline` now splits backend audio into at most
+`AILA_TTS_AUDIO_CALLBACK_MAX_FRAMES` frames per audio callback, defaulting to the
+normal stream batch size of 4 frames.
+
+New observability:
+
+- `tts_audio_callback_max_frames`
+- `tts_playback_buffer_gap_count`
+- `tts_playback_buffer_max_gap_ms`
+- `tts_playback_buffer_total_gap_ms`
+- `tts_playback_buffer_gap_ms`
+
+Default split matrix:
+
+```text
+command:
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr -OutputDir 'tmp\alia-real-smoke\voice_matrix_backend8_split_default'
+
+summary:
+tmp\alia-real-smoke\voice_matrix_backend8_split_default\summary.csv
+
+avg simulated_vad_to_first_audio_ms       1133.6
+avg tts_first_audio_ms                     700.4
+avg foreground_first_tts_enqueue_ms        465.6
+avg tts_chunks_synthesized                   5.0
+avg tts_callback_count                      45.8
+avg tts_backend_total_ms                 12908.9
+avg tts_playback_buffer_gap_count            2.8
+avg tts_playback_buffer_max_gap_ms         254.6
+avg tts_playback_buffer_total_gap_ms       388.6
+```
+
+Interpretation:
+
+- First backend audio remains about `235 ms`; the average TTFA difference versus
+  old default comes from foreground first-enqueue variation, not from backend
+  first-audio cost.
+- The playback-facing chunks remain 4 frames or smaller, while the backend can
+  amortize Mimi decode over 8-frame steady windows once playback debt appears.
+- Output ASR did not show the systematic tail truncation seen in text coalescing
+  probes, though foreground text sampling still varies noticeably between
+  matrices.

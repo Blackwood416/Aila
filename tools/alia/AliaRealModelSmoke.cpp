@@ -125,6 +125,41 @@ PlaybackGapStats compute_playback_gap_stats(const AudioCapture& capture) {
     return stats;
 }
 
+PlaybackGapStats compute_playback_buffer_gap_stats(const AudioCapture& capture) {
+    PlaybackGapStats stats;
+    const size_t n = std::min(capture.callback_times_ms.size(),
+                              capture.chunk_sizes.size());
+    if (n < 2) {
+        return stats;
+    }
+
+    stats.gaps_ms.reserve(n - 1);
+    double buffered_audio_ms = static_cast<double>(audio_ms_for_samples(
+        capture.chunk_sizes[0]));
+    long long previous_time_ms = capture.callback_times_ms[0];
+    for (size_t i = 1; i < n; ++i) {
+        const long long elapsed_ms = capture.callback_times_ms[i] - previous_time_ms;
+        long long gap_ms = 0;
+        if (static_cast<double>(elapsed_ms) > buffered_audio_ms) {
+            gap_ms = static_cast<long long>(
+                std::llround(static_cast<double>(elapsed_ms) - buffered_audio_ms));
+            buffered_audio_ms = 0.0;
+        } else {
+            buffered_audio_ms -= static_cast<double>(elapsed_ms);
+        }
+        stats.gaps_ms.push_back(gap_ms);
+        if (gap_ms > 0) {
+            ++stats.count;
+            stats.total_ms += gap_ms;
+            stats.max_ms = std::max(stats.max_ms, gap_ms);
+        }
+        buffered_audio_ms += static_cast<double>(audio_ms_for_samples(
+            capture.chunk_sizes[i]));
+        previous_time_ms = capture.callback_times_ms[i];
+    }
+    return stats;
+}
+
 bool env_flag_enabled(const char* name, bool default_value = false) {
 #ifdef _WIN32
     char* raw = nullptr;
@@ -1209,6 +1244,8 @@ int main(int argc, char** argv) {
             : -1.0;
         const PlaybackGapStats playback_gap_stats =
             compute_playback_gap_stats(audio_capture);
+        const PlaybackGapStats playback_buffer_gap_stats =
+            compute_playback_buffer_gap_stats(audio_capture);
         std::cout << "tts_callback_count=" << audio_capture.callback_count << "\n"
                   << "tts_first_audio_ms=" << first_audio_ms << "\n"
                   << "simulated_vad_to_first_audio_ms="
@@ -1240,6 +1277,8 @@ int main(int argc, char** argv) {
                   << tts_metrics.backend_steady_batch_callback_count << "\n"
                   << "tts_backend_playback_aware_steady_batch="
                   << tts_metrics.backend_playback_aware_steady_batch << "\n"
+                  << "tts_audio_callback_max_frames="
+                  << tts_metrics.audio_callback_max_frames << "\n"
                   << "tts_first_backend_codes_ms="
                   << tts_metrics.first_backend_codes_ms << "\n"
                   << "tts_first_backend_mimi_init_ms="
@@ -1260,6 +1299,20 @@ int main(int argc, char** argv) {
                 std::cout << ",";
             }
             std::cout << playback_gap_stats.gaps_ms[i];
+        }
+        std::cout << "\n"
+                  << "tts_playback_buffer_gap_count="
+                  << playback_buffer_gap_stats.count << "\n"
+                  << "tts_playback_buffer_max_gap_ms="
+                  << playback_buffer_gap_stats.max_ms << "\n"
+                  << "tts_playback_buffer_total_gap_ms="
+                  << playback_buffer_gap_stats.total_ms << "\n"
+                  << "tts_playback_buffer_gap_ms=";
+        for (size_t i = 0; i < playback_buffer_gap_stats.gaps_ms.size(); ++i) {
+            if (i != 0) {
+                std::cout << ",";
+            }
+            std::cout << playback_buffer_gap_stats.gaps_ms[i];
         }
         std::cout << "\n"
                   << "tts_callback_times_ms=";

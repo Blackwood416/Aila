@@ -29,6 +29,7 @@ struct AliaTtsMetrics {
     int backend_steady_stream_batch_frames = 0;
     int backend_steady_batch_callback_count = 0;
     int backend_playback_aware_steady_batch = 0;
+    int audio_callback_max_frames = 0;
     double reference_embedding_ms = -1.0;
     double first_backend_codes_ms = -1.0;
     double first_backend_mimi_init_ms = -1.0;
