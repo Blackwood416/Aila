@@ -18,6 +18,7 @@
 #include <cctype>
 #include <functional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace aila::alia {
@@ -341,6 +342,136 @@ size_t common_token_prefix_size(const std::vector<int>& a, const std::vector<int
     return i;
 }
 
+struct ActionTagMarker {
+    size_t pos = std::string::npos;
+    size_t open_len = 0;
+    const char* close = nullptr;
+    size_t close_len = 0;
+};
+
+ActionTagMarker find_next_action_open(const std::string& text) {
+    constexpr const char* kAsciiOpen = "(";
+    constexpr const char* kAsciiClose = ")";
+    constexpr const char* kFullOpen = "\xEF\xBC\x88";
+    constexpr const char* kFullClose = "\xEF\xBC\x89";
+
+    ActionTagMarker best;
+    auto consider = [&](size_t pos, size_t open_len, const char* close, size_t close_len) {
+        if (pos != std::string::npos &&
+            (best.pos == std::string::npos || pos < best.pos)) {
+            best.pos = pos;
+            best.open_len = open_len;
+            best.close = close;
+            best.close_len = close_len;
+        }
+    };
+    consider(text.find(kAsciiOpen), 1, kAsciiClose, 1);
+    consider(text.find(kFullOpen), 3, kFullClose, 3);
+    return best;
+}
+
+size_t partial_utf8_marker_suffix_len(const std::string& text,
+                                      const char* marker,
+                                      size_t marker_len) {
+    const size_t max_suffix = std::min(marker_len - 1, text.size());
+    for (size_t len = max_suffix; len > 0; --len) {
+        if (text.compare(text.size() - len, len, marker, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+std::string trim_action_tag(std::string value) {
+    return trim_ascii(std::move(value));
+}
+
+void append_spoken_delta(std::string& spoken, std::string delta) {
+    if (delta.empty()) {
+        return;
+    }
+    spoken += std::move(delta);
+}
+
+class ActionTagStreamFilter {
+public:
+    void push(const std::string& delta,
+              std::string& spoken_delta,
+              std::vector<std::string>& action_tags) {
+        buffer_ += delta;
+        process(false, spoken_delta, action_tags);
+    }
+
+    void finish(std::string& spoken_delta,
+                std::vector<std::string>& action_tags) {
+        process(true, spoken_delta, action_tags);
+    }
+
+private:
+    void process(bool final,
+                 std::string& spoken_delta,
+                 std::vector<std::string>& action_tags) {
+        constexpr const char* kFullOpen = "\xEF\xBC\x88";
+        constexpr size_t kFullOpenLen = 3;
+
+        while (!buffer_.empty()) {
+            const ActionTagMarker open = find_next_action_open(buffer_);
+            if (open.pos == std::string::npos) {
+                size_t hold = 0;
+                if (!final) {
+                    hold = partial_utf8_marker_suffix_len(buffer_, kFullOpen, kFullOpenLen);
+                }
+                if (hold < buffer_.size()) {
+                    append_spoken_delta(spoken_delta, buffer_.substr(0, buffer_.size() - hold));
+                    buffer_.erase(0, buffer_.size() - hold);
+                }
+                return;
+            }
+
+            if (open.pos > 0) {
+                append_spoken_delta(spoken_delta, buffer_.substr(0, open.pos));
+                buffer_.erase(0, open.pos);
+                continue;
+            }
+
+            const size_t close_pos = buffer_.find(open.close, open.open_len);
+            if (close_pos == std::string::npos) {
+                if (final) {
+                    std::string tag = trim_action_tag(buffer_.substr(open.open_len));
+                    if (!tag.empty()) {
+                        action_tags.push_back(std::move(tag));
+                    }
+                    buffer_.clear();
+                }
+                return;
+            }
+
+            std::string tag =
+                trim_action_tag(buffer_.substr(open.open_len, close_pos - open.open_len));
+            if (!tag.empty()) {
+                action_tags.push_back(std::move(tag));
+            }
+            buffer_.erase(0, close_pos + open.close_len);
+        }
+    }
+
+    std::string buffer_;
+};
+
+struct SpokenActionSplit {
+    std::string spoken_text;
+    std::vector<std::string> action_tags;
+};
+
+SpokenActionSplit split_action_tags_from_spoken_text(const std::string& text) {
+    SpokenActionSplit result;
+    ActionTagStreamFilter filter;
+    filter.push(text, result.spoken_text, result.action_tags);
+    filter.finish(result.spoken_text, result.action_tags);
+    result.spoken_text = trim_ascii(std::move(result.spoken_text));
+    return result;
+}
+
 std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
                                                bool force,
                                                bool low_latency_first_chunk) {
@@ -554,6 +685,7 @@ bool AliaForegroundPipeline::start_speculative_turn(
     speculative_ready_ = false;
     speculative_user_text_.clear();
     speculative_assistant_text_.clear();
+    speculative_action_tags_.clear();
     speculative_prompt_ids_.clear();
     speculative_generated_token_ids_.clear();
     last_speculative_commit_hit_ = false;
@@ -1021,6 +1153,11 @@ std::string AliaForegroundPipeline::last_assistant_text() const {
     return last_assistant_text_;
 }
 
+std::vector<std::string> AliaForegroundPipeline::last_action_tags() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_action_tags_;
+}
+
 std::string AliaForegroundPipeline::last_tool_call_json() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_tool_call_json_;
@@ -1125,6 +1262,7 @@ void AliaForegroundPipeline::run_speculative_turn(
             last_generation_config_ = generation_config;
             last_user_text_ = user_text;
             last_assistant_text_.clear();
+            last_action_tags_.clear();
             last_tool_call_json_.clear();
             last_tool_result_text_.clear();
             last_tool_resume_prompt_text_.clear();
@@ -1139,6 +1277,7 @@ void AliaForegroundPipeline::run_speculative_turn(
             speculative_ready_ = false;
             speculative_user_text_.clear();
             speculative_assistant_text_.clear();
+            speculative_action_tags_.clear();
             speculative_prompt_ids_.clear();
             speculative_generated_token_ids_.clear();
             last_decode_mode_ = ForegroundDecodeMode::None;
@@ -1196,14 +1335,17 @@ void AliaForegroundPipeline::run_speculative_turn(
             return;
         }
 
-        const std::string spoken_text =
-            strip_structured_artifacts_from_spoken_text(assistant_text);
+        const SpokenActionSplit split =
+            split_action_tags_from_spoken_text(
+                strip_structured_artifacts_from_spoken_text(assistant_text));
+        const std::string& spoken_text = split.spoken_text;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (abort_requested_) {
                 speculative_ready_ = false;
                 speculative_user_text_.clear();
                 speculative_assistant_text_.clear();
+                speculative_action_tags_.clear();
                 speculative_prompt_ids_.clear();
                 speculative_generated_token_ids_.clear();
                 last_speculative_commit_reason_ = "speculative turn aborted";
@@ -1212,11 +1354,13 @@ void AliaForegroundPipeline::run_speculative_turn(
                 speculative_ready_ = !spoken_text.empty();
                 speculative_user_text_ = user_text;
                 speculative_assistant_text_ = spoken_text;
+                speculative_action_tags_ = split.action_tags;
                 speculative_prompt_ids_ = generation_anchor_prompt_ids_;
                 speculative_generated_token_ids_ = generation_token_ids_;
                 last_speculative_commit_reason_ =
                     speculative_ready_ ? "speculative text ready" : "speculative text empty";
                 last_assistant_text_ = spoken_text;
+                last_action_tags_ = split.action_tags;
                 last_decode_mode_ = ForegroundDecodeMode::LoadedVlm;
                 state_ = ForegroundTurnState::Completed;
             }
@@ -1289,6 +1433,7 @@ bool AliaForegroundPipeline::synthesize_committed_text(
         std::lock_guard<std::mutex> lock(mutex_);
         last_user_text_ = user_text;
         last_assistant_text_ = spoken_text;
+        last_action_tags_.clear();
         last_tool_call_json_.clear();
         last_tool_result_text_.clear();
         last_tool_resume_prompt_text_.clear();
@@ -1315,11 +1460,13 @@ void AliaForegroundPipeline::run_commit_speculative_turn(
     bool can_commit = false;
     std::string speculative_user_text;
     std::string speculative_assistant_text;
+    std::vector<std::string> speculative_action_tags;
     std::string commit_reason;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         speculative_user_text = speculative_user_text_;
         speculative_assistant_text = speculative_assistant_text_;
+        speculative_action_tags = speculative_action_tags_;
         if (!speculative_ready_) {
             commit_reason = "no speculative text ready";
         } else if (final_user_text.empty()) {
@@ -1351,6 +1498,7 @@ void AliaForegroundPipeline::run_commit_speculative_turn(
                                   user_data,
                                   turn_start)) {
         std::lock_guard<std::mutex> lock(mutex_);
+        last_action_tags_ = speculative_action_tags;
         last_speculative_commit_hit_ = true;
         last_speculative_commit_reason_ = commit_reason;
         last_decode_mode_ = ForegroundDecodeMode::LoadedVlm;
@@ -1412,6 +1560,7 @@ void AliaForegroundPipeline::run_turn(
             last_generation_config_ = generation_config;
             last_user_text_ = user_text;
             last_assistant_text_.clear();
+            last_action_tags_.clear();
             last_tool_call_json_.clear();
             last_tool_result_text_.clear();
             last_tool_resume_prompt_text_.clear();
@@ -1426,6 +1575,7 @@ void AliaForegroundPipeline::run_turn(
             speculative_ready_ = false;
             speculative_user_text_.clear();
             speculative_assistant_text_.clear();
+            speculative_action_tags_.clear();
             speculative_prompt_ids_.clear();
             speculative_generated_token_ids_.clear();
             last_decode_mode_ = ForegroundDecodeMode::None;
@@ -1524,7 +1674,16 @@ void AliaForegroundPipeline::run_turn(
                     return;
                 }
                 if (!resumed_text.empty()) {
-                    spoken_text += resumed_text;
+                    SpokenActionSplit resumed_split =
+                        split_action_tags_from_spoken_text(
+                            strip_structured_artifacts_from_spoken_text(resumed_text));
+                    spoken_text += resumed_split.spoken_text;
+                    if (!resumed_split.action_tags.empty()) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        last_action_tags_.insert(last_action_tags_.end(),
+                                                 resumed_split.action_tags.begin(),
+                                                 resumed_split.action_tags.end());
+                    }
                 }
             }
         }
@@ -1710,6 +1869,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     DeviceAllocation one_token_device(*context, sizeof(int));
     std::vector<int> generated_ids;
     aila::chat::StructuredStreamParser stream_parser;
+    ActionTagStreamFilter action_filter;
+    std::vector<std::string> streaming_action_tags;
     const bool allow_tool_calls = stop_on_tool_call && is_explicit_tool_request(user_text);
     std::string raw_stream_text;
     std::string pending_tts_text;
@@ -1806,8 +1967,10 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         stream_parser.push(token_text, events);
         for (const auto& event : events) {
             if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
-                pending_tts_text += event.text;
-                if (record_generation_anchor && !event.text.empty()) {
+                std::string spoken_delta;
+                action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                pending_tts_text += spoken_delta;
+                if (record_generation_anchor && !spoken_delta.empty()) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (last_first_content_delta_ms_ < 0) {
                         last_first_content_delta_ms_ =
@@ -1844,8 +2007,10 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         stream_parser.finish(final_events);
         for (const auto& event : final_events) {
             if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
-                pending_tts_text += event.text;
-                if (record_generation_anchor && !event.text.empty()) {
+                std::string spoken_delta;
+                action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                pending_tts_text += spoken_delta;
+                if (record_generation_anchor && !spoken_delta.empty()) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (last_first_content_delta_ms_ < 0) {
                         last_first_content_delta_ms_ =
@@ -1853,6 +2018,17 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                                 std::chrono::steady_clock::now() - turn_start).count();
                     }
                 }
+            }
+        }
+        std::string final_spoken_delta;
+        action_filter.finish(final_spoken_delta, streaming_action_tags);
+        pending_tts_text += final_spoken_delta;
+        if (record_generation_anchor && !final_spoken_delta.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (last_first_content_delta_ms_ < 0) {
+                last_first_content_delta_ms_ =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - turn_start).count();
             }
         }
         flush_tts(true);
@@ -1902,10 +2078,14 @@ bool AliaForegroundPipeline::process_tool_calls(
 
     aila::chat::AssistantChatResult parsed =
         aila::chat::parse_assistant_output(raw_assistant_text);
-    spoken_text = strip_structured_artifacts_from_spoken_text(parsed.content);
+    SpokenActionSplit split =
+        split_action_tags_from_spoken_text(
+            strip_structured_artifacts_from_spoken_text(parsed.content));
+    spoken_text = split.spoken_text;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        last_action_tags_ = std::move(split.action_tags);
         last_tool_call_json_.clear();
         last_tool_result_text_.clear();
         last_tool_resume_prompt_text_.clear();

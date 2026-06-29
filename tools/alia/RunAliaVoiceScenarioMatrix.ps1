@@ -282,6 +282,8 @@ try {
             foreground_lora_pair_count = Get-ValueOrEmpty $values "foreground_lora_pair_count"
             asr_partial_text = Get-ValueOrEmpty $values "asr_partial_text"
             foreground_assistant_text = Get-ValueOrEmpty $values "foreground_assistant_text"
+            foreground_action_tag_count = Get-ValueOrEmpty $values "foreground_action_tag_count"
+            foreground_action_tags = Get-ValueOrEmpty $values "foreground_action_tags"
             output_asr_text = $outputAsrText
             output_asr_error = $outputAsrError
             background_result_json = Get-ValueOrEmpty $values "background_result_json"

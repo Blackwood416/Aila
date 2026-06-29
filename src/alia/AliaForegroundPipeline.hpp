@@ -82,6 +82,7 @@ public:
     GenerationConfig last_generation_config() const;
     std::string last_user_text() const;
     std::string last_assistant_text() const;
+    std::vector<std::string> last_action_tags() const;
     std::string last_tool_call_json() const;
     std::string last_tool_result_text() const;
     std::string last_tool_resume_prompt_text() const;
@@ -155,6 +156,7 @@ private:
     GenerationConfig last_generation_config_;
     std::string last_user_text_;
     std::string last_assistant_text_;
+    std::vector<std::string> last_action_tags_;
     std::string last_tool_call_json_;
     std::string last_tool_result_text_;
     std::string last_tool_resume_prompt_text_;
@@ -169,6 +171,7 @@ private:
     bool speculative_ready_ = false;
     std::string speculative_user_text_;
     std::string speculative_assistant_text_;
+    std::vector<std::string> speculative_action_tags_;
     std::vector<int> speculative_prompt_ids_;
     std::vector<int> speculative_generated_token_ids_;
     bool last_speculative_commit_hit_ = false;

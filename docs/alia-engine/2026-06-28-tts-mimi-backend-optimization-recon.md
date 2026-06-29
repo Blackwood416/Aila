@@ -603,6 +603,46 @@ The remaining slow scenarios are dominated by delayed foreground text enqueue,
 not by TTS first-backend audio, which is now consistently around `220-230 ms`
 for the first 4-frame callback.
 
+## Foreground action tag filter
+
+The foreground stream now treats parenthesized assistant text as action tags
+rather than spoken text. Both ASCII parentheses and fullwidth CJK parentheses
+are handled:
+
+```text
+Hello. (tail gently sways) Done.
+Hello. （尾巴轻轻摆动）Done.
+```
+
+The streaming path filters `ContentDelta` before appending to the TTS buffer, so
+complete action tags are not enqueued to TTS. If a parenthesized tag is split
+across tokens, the filter holds the partial tag until the closing parenthesis
+arrives; if generation ends while a tag is still open, the buffered tag is kept
+as an action tag and still not spoken. The final post-process path uses the same
+filter so `last_assistant_text` and background memory receive the spoken text
+without action labels, while smoke output exposes:
+
+```text
+foreground_action_tag_count
+foreground_action_tags
+```
+
+Targeted real smoke:
+
+```text
+foreground_assistant_text="那个……父亲大人说过，要诚实回答。虽然我有点紧张，但我会尽力做的。"
+foreground_action_tag_count=1
+foreground_action_tags="小声说"
+```
+
+External Mimo-ASR on the generated audio returned:
+
+```text
+那个，父亲大人说过要诚实回答。虽然我有点紧张，但我会尽力做的。
+```
+
+The action tag did not appear in the spoken audio transcript.
+
 ## Validation command template
 
 Use the real model path and the worktree-local reference audio. API-only tests

@@ -77,6 +77,17 @@ std::string quote(const std::string& value) {
     return out.str();
 }
 
+std::string join_lines(const std::vector<std::string>& values) {
+    std::string joined;
+    for (const std::string& value : values) {
+        if (!joined.empty()) {
+            joined += "\n";
+        }
+        joined += value;
+    }
+    return joined;
+}
+
 bool env_flag_enabled(const char* name, bool default_value = false) {
 #ifdef _WIN32
     char* raw = nullptr;
@@ -1059,6 +1070,8 @@ int main(int argc, char** argv) {
     const auto fg_state = ctx->foreground_pipeline->state();
     const auto fg_mode = ctx->foreground_pipeline->last_decode_mode();
     const std::string assistant_text = ctx->foreground_pipeline->last_assistant_text();
+    const std::vector<std::string> action_tags =
+        ctx->foreground_pipeline->last_action_tags();
     const double simulated_vad_asr_tail_ms = opts.stream_asr_prefill
         ? asr_stream_simulated_tail_ms
         : static_cast<double>(asr_ms);
@@ -1140,6 +1153,8 @@ int main(int argc, char** argv) {
               << simulated_vad_to_first_tts_enqueue_ms << "\n"
               << "foreground_user_text=" << quote(ctx->foreground_pipeline->last_user_text()) << "\n"
               << "foreground_assistant_text=" << quote(assistant_text) << "\n"
+              << "foreground_action_tag_count=" << action_tags.size() << "\n"
+              << "foreground_action_tags=" << quote(join_lines(action_tags)) << "\n"
               << "foreground_tool_call_json=" << quote(ctx->foreground_pipeline->last_tool_call_json()) << "\n"
               << "foreground_tool_result_text=" << quote(ctx->foreground_pipeline->last_tool_result_text()) << "\n"
               << "foreground_error=" << quote(ctx->foreground_pipeline->last_error()) << "\n";
