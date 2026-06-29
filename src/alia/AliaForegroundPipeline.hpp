@@ -19,7 +19,8 @@ class ModelSlot;
 bool is_valid_generation_config(const AliaGenConfig& config);
 GenerationConfig translate_generation_config(const AliaGenConfig* config);
 std::string foreground_system_prompt();
-std::vector<std::string> split_spoken_text_for_tts(const std::string& text);
+std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
+                                                   bool split_sentence_boundaries = true);
 
 enum class ForegroundDecodeMode {
     None,

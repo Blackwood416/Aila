@@ -28,6 +28,11 @@ public:
         int total_frames = 0;
         int callback_count = 0;
         int first_audio_samples = 0;
+        int stream_batch_frames = 0;
+        int initial_stream_batch_frames = 0;
+        int steady_stream_batch_frames = 0;
+        int steady_batch_callback_count = 0;
+        int playback_aware_steady_batch = 0;
     };
 
     virtual ~IModelBackend() = default;

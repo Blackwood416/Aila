@@ -946,25 +946,85 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
 
     out_codes.reserve(max_tokens * 16);
     const int callback_batch_frames = std::max(1, frame_callback_batch_frames);
-    const int initial_callback_batch_frames = std::clamp(
-        aila::env::read_int_raw("AILA_TTS_INITIAL_STREAM_BATCH_FRAMES", callback_batch_frames),
+    const bool playback_aware_steady_batch =
+        aila::env::read_flag("AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH", false);
+    const int steady_callback_batch_frames = playback_aware_steady_batch
+        ? std::clamp(
+              aila::env::read_int_raw("AILA_TTS_STEADY_STREAM_BATCH_FRAMES",
+                                       callback_batch_frames),
+              callback_batch_frames,
+              24)
+        : callback_batch_frames;
+    const int default_initial_callback_batch_frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_STREAM_BATCH_FRAMES", callback_batch_frames),
         1,
         callback_batch_frames);
+    const int initial_callback_batch_frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_INITIAL_STREAM_BATCH_FRAMES",
+                                default_initial_callback_batch_frames),
+        1,
+        callback_batch_frames);
+    const double playback_gap_trigger_ms = static_cast<double>(std::max(
+        0,
+        aila::env::read_int_raw("AILA_TTS_PLAYBACK_GAP_TRIGGER_MS", 0)));
+    last_tts_timing_.stream_batch_frames = callback_batch_frames;
+    last_tts_timing_.initial_stream_batch_frames = initial_callback_batch_frames;
+    last_tts_timing_.steady_stream_batch_frames = steady_callback_batch_frames;
+    last_tts_timing_.playback_aware_steady_batch =
+        playback_aware_steady_batch ? 1 : 0;
+
     int callback_batches_emitted = 0;
     std::vector<int32_t> pending_callback_codes;
     int pending_callback_frames = 0;
+    bool use_steady_callback_batch = false;
+    bool last_callback_time_valid = false;
+    int last_callback_frames = 0;
+    double playback_gap_debt_ms = 0.0;
+    auto last_callback_time = std::chrono::high_resolution_clock::time_point{};
     if (frame_callback) {
-        pending_callback_codes.reserve(static_cast<size_t>(callback_batch_frames) * 16);
+        pending_callback_codes.reserve(static_cast<size_t>(steady_callback_batch_frames) * 16);
     }
-    auto flush_frame_callback = [&]() -> bool {
+    auto flush_frame_callback = [&](bool used_steady_batch) -> bool {
         if (!frame_callback || pending_callback_frames <= 0) {
             return true;
         }
+        const int flushed_frames = pending_callback_frames;
         const bool ok = frame_callback(pending_callback_codes, pending_callback_frames);
+        const auto callback_time = std::chrono::high_resolution_clock::now();
+        if (used_steady_batch) {
+            ++last_tts_timing_.steady_batch_callback_count;
+        }
         ++callback_batches_emitted;
         pending_callback_codes.clear();
         pending_callback_frames = 0;
+        if (playback_aware_steady_batch && ok) {
+            if (last_callback_time_valid) {
+                const double interval_ms = std::chrono::duration<double, std::milli>(
+                                               callback_time - last_callback_time).count();
+                const double previous_audio_ms =
+                    static_cast<double>(last_callback_frames * kMimiSamplesPerFrame) *
+                    1000.0 / 24000.0;
+                playback_gap_debt_ms = std::max(
+                    0.0,
+                    playback_gap_debt_ms + interval_ms - previous_audio_ms);
+                use_steady_callback_batch =
+                    steady_callback_batch_frames > callback_batch_frames &&
+                    playback_gap_debt_ms > playback_gap_trigger_ms;
+            }
+            last_callback_time = callback_time;
+            last_callback_frames = flushed_frames;
+            last_callback_time_valid = true;
+        }
         return ok;
+    };
+    auto callback_threshold = [&]() {
+        if (callback_batches_emitted == 0) {
+            return initial_callback_batch_frames;
+        }
+        if (playback_aware_steady_batch && use_steady_callback_batch) {
+            return steady_callback_batch_frames;
+        }
+        return callback_batch_frames;
     };
 
     while (gen_step < max_tokens) {
@@ -1140,10 +1200,13 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         out_n_frames++;
         if (frame_callback) {
             ++pending_callback_frames;
-            const int callback_threshold =
-                callback_batches_emitted == 0 ? initial_callback_batch_frames : callback_batch_frames;
-            if (pending_callback_frames >= callback_threshold &&
-                !flush_frame_callback()) {
+            const int threshold = callback_threshold();
+            const bool using_steady_threshold =
+                playback_aware_steady_batch &&
+                threshold == steady_callback_batch_frames &&
+                steady_callback_batch_frames > callback_batch_frames;
+            if (pending_callback_frames >= threshold &&
+                !flush_frame_callback(using_steady_threshold)) {
                 return false;
             }
         }
@@ -1247,7 +1310,7 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                   t_decode_ms, out_n_frames, t_decode_ms / std::max(1, out_n_frames));
     if (tts_profile) AILA_LOG_INFO("[TTS-Profile] Talker+CodePredictor total: %.1f ms", t_total_ms);
 
-    if (!flush_frame_callback()) {
+    if (!flush_frame_callback(false)) {
         return false;
     }
 

@@ -319,3 +319,99 @@ playback-aware first/steady chunking experiment:
 
 This directly tests whether the current 4-frame default can keep the TTFA win
 while reducing long-tail backend time and playback risk.
+
+## Playback-aware chunking probe results
+
+Implemented observability:
+
+- Smoke output now reports `tts_playback_gap_count`,
+  `tts_playback_max_gap_ms`, `tts_playback_total_gap_ms`, and
+  `tts_playback_gap_ms`.
+- Matrix summaries now carry those fields plus backend stream-batch metadata:
+  `tts_backend_stream_batch_frames`,
+  `tts_backend_initial_stream_batch_frames`,
+  `tts_backend_steady_stream_batch_frames`,
+  `tts_backend_steady_batch_callback_count`, and
+  `tts_backend_playback_aware_steady_batch`.
+
+Default path remains unchanged: first audio is still 4 frames / `7680` samples,
+steady backend batch is still 4 frames, and playback-aware steady batching is
+off by default.
+
+Default full matrix with output ASR:
+
+```text
+command:
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr -OutputDir 'tmp\alia-real-smoke\voice_matrix_playback_gap_default'
+
+summary:
+tmp\alia-real-smoke\voice_matrix_playback_gap_default\summary.csv
+
+avg simulated_vad_to_first_audio_ms  1085.0
+avg tts_first_audio_ms                650.4
+avg tts_chunks_synthesized              5.0
+avg tts_backend_total_ms            16094.1
+avg tts_playback_gap_count             28.6
+avg tts_playback_max_gap_ms           345.2
+avg tts_playback_total_gap_ms        1740.6
+```
+
+Probe matrix used:
+
+```text
+AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH=1
+AILA_TTS_STEADY_STREAM_BATCH_FRAMES=8
+AILA_TTS_PLAYBACK_GAP_TRIGGER_MS=0
+AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS=1
+```
+
+The probe keeps the first backend callback at 4 frames. The foreground text
+coalescing path is gated so it does not coalesce steady text until the first
+audio callback has actually been emitted.
+
+Probe full matrix with output ASR:
+
+```text
+command:
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 -VerifyOutputAsr -OutputDir 'tmp\alia-real-smoke\voice_matrix_playback_gap_probe8_after_first_audio'
+
+summary:
+tmp\alia-real-smoke\voice_matrix_playback_gap_probe8_after_first_audio\summary.csv
+
+avg simulated_vad_to_first_audio_ms  1273.0
+avg tts_first_audio_ms                839.8
+avg tts_chunks_synthesized              2.6
+avg tts_backend_total_ms             7333.5
+avg tts_playback_gap_count              5.6
+avg tts_playback_max_gap_ms           335.6
+avg tts_playback_total_gap_ms         804.2
+```
+
+Compared with the default matrix, this probe changed the averages by:
+
+```text
+simulated_vad_to_first_audio_ms  +188.0
+tts_first_audio_ms               +189.4
+tts_chunks_synthesized             -2.4
+tts_backend_total_ms            -8760.6
+tts_playback_gap_count            -23.0
+tts_playback_max_gap_ms            -9.6
+tts_playback_total_gap_ms        -936.4
+```
+
+Interpretation:
+
+- The probe substantially lowers backend total time and gap count by reducing
+  TTS text fragmentation and using larger steady Mimi callback windows.
+- It is not ready for default-on. Average TTFA regressed by about `188-189 ms`,
+  and output ASR suggests possible tail truncation on several scenarios. The
+  targeted external Mimo-ASR short probe only transcribed the first sentence:
+
+```text
+Hello, I'm Alia, a local companion.
+```
+
+- The full post-gating matrix also showed truncation-like output ASR for
+  `preference_memory` and a shortened `long_answer`.
+- Keep this path default-off until a follow-up can tune the transition policy
+  and verify output ASR does not truncate or lose later spoken content.

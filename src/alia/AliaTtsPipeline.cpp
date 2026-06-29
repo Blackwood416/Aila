@@ -510,11 +510,20 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
                 backend_timing.first_audio_samples >= tts_first_audio_samples()) {
                 metrics_.first_backend_audio_samples = backend_timing.first_audio_samples;
             }
+            metrics_.backend_stream_batch_frames = backend_timing.stream_batch_frames;
+            metrics_.backend_initial_stream_batch_frames =
+                backend_timing.initial_stream_batch_frames;
+            metrics_.backend_steady_stream_batch_frames =
+                backend_timing.steady_stream_batch_frames;
+            metrics_.backend_playback_aware_steady_batch =
+                backend_timing.playback_aware_steady_batch;
             metrics_.first_backend_codes_ms = backend_timing.codes_ms;
             metrics_.first_backend_mimi_init_ms = backend_timing.mimi_init_ms;
             metrics_.first_backend_audio_ms = backend_timing.first_audio_ms;
             metrics_.first_backend_total_ms = backend_timing.total_ms;
         }
+        metrics_.backend_steady_batch_callback_count +=
+            backend_timing.steady_batch_callback_count;
         ++metrics_.chunks_synthesized;
         if (backend_timing.total_ms > 0.0) {
             metrics_.backend_total_ms += backend_timing.total_ms;

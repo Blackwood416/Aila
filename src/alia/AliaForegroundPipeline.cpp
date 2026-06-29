@@ -22,6 +22,10 @@
 #include <vector>
 
 namespace aila::alia {
+
+std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
+                                                   bool split_sentence_boundaries);
+
 namespace {
 
 class DeviceAllocation {
@@ -501,6 +505,8 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
     static const int kSteadyHardMinChars = std::max(
         0,
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_HARD_MIN_CHARS", 96));
+    static const bool kCoalesceSteadyTextChunks =
+        aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
     const int soft_min_chars =
         low_latency_first_chunk ? kFirstSoftMinChars : kSteadySoftMinChars;
     const int soft_max_chars =
@@ -532,7 +538,9 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
 
     std::string ready = buffer.substr(0, cutoff);
     buffer.erase(0, cutoff);
-    return split_spoken_text_for_tts(ready);
+    const bool split_sentence_boundaries =
+        !(kCoalesceSteadyTextChunks && !low_latency_first_chunk);
+    return split_spoken_text_for_tts(ready, split_sentence_boundaries);
 }
 
 }  // namespace
@@ -549,8 +557,17 @@ std::string foreground_system_prompt() {
            "</function></tool_call>.";
 }
 
-std::vector<std::string> split_spoken_text_for_tts(const std::string& text) {
+std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
+                                                   bool split_sentence_boundaries) {
     std::vector<std::string> chunks;
+    if (!split_sentence_boundaries) {
+        std::string trimmed = trim_ascii(text);
+        if (!trimmed.empty()) {
+            chunks.push_back(std::move(trimmed));
+        }
+        return chunks;
+    }
+
     std::string current;
     auto flush = [&]() {
         size_t begin = 0;
@@ -1882,14 +1899,22 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
     static const int s_tts_first_audio_priority_timeout_ms = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
+    static const bool s_tts_coalesce_steady_text_chunks =
+        aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
     long long first_token_delta_ms = -1;
     const auto decode_started = std::chrono::steady_clock::now();
     auto flush_tts = [&](bool force) {
         if (!tts_pipeline_ || !audio_cb || !tts_config) {
             return;
         }
+        const bool first_audio_pending =
+            s_tts_coalesce_steady_text_chunks &&
+            first_tts_enqueue_seen &&
+            !tts_pipeline_->first_audio_callback_emitted();
+        const bool low_latency_chunking =
+            !first_tts_enqueue_seen || first_audio_pending;
         for (const std::string& chunk :
-             take_ready_tts_chunks(pending_tts_text, force, !first_tts_enqueue_seen)) {
+             take_ready_tts_chunks(pending_tts_text, force, low_latency_chunking)) {
             if (abort_requested()) {
                 return;
             }
