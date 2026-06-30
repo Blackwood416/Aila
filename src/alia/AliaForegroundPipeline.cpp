@@ -25,7 +25,8 @@
 namespace aila::alia {
 
 std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries);
+                                                   bool split_sentence_boundaries,
+                                                   size_t min_first_chunk_chars);
 
 namespace {
 
@@ -487,7 +488,7 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
     static const int kFirstSoftMinChars = std::max(
         0,
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_SOFT_MIN_CHARS",
-                                kRawSoftMinChars >= 0 ? kRawSoftMinChars : 18));
+                                kRawSoftMinChars >= 0 ? kRawSoftMinChars : 8));
     static const int kSteadySoftMinChars = std::max(
         0,
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_SOFT_MIN_CHARS",
@@ -502,7 +503,7 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
                                 kRawSoftMaxChars >= 0 ? kRawSoftMaxChars : 120));
     static const int kFirstHardMinChars = std::max(
         0,
-        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_HARD_MIN_CHARS", 0));
+        aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_FIRST_HARD_MIN_CHARS", 8));
     static const int kSteadyHardMinChars = std::max(
         0,
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_HARD_MIN_CHARS", 96));
@@ -551,7 +552,10 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
     buffer.erase(0, cutoff);
     const bool split_sentence_boundaries =
         !(kCoalesceSteadyTextChunks && !low_latency_first_chunk);
-    return split_spoken_text_for_tts(ready, split_sentence_boundaries);
+    return split_spoken_text_for_tts(
+        ready,
+        split_sentence_boundaries,
+        low_latency_first_chunk ? static_cast<size_t>(hard_min_chars) : 0);
 }
 
 }  // namespace
@@ -569,7 +573,8 @@ std::string foreground_system_prompt() {
 }
 
 std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries) {
+                                                   bool split_sentence_boundaries,
+                                                   size_t min_first_chunk_chars) {
     std::vector<std::string> chunks;
     if (!split_sentence_boundaries) {
         std::string trimmed = trim_ascii(text);
@@ -604,6 +609,31 @@ std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
         }
     }
     flush();
+
+    while (min_first_chunk_chars > 0 &&
+           chunks.size() > 1 &&
+           chunks.front().size() < min_first_chunk_chars) {
+        std::string merged = std::move(chunks[0]);
+        const std::string& next = chunks[1];
+        if (!merged.empty() && !next.empty()) {
+            const unsigned char last =
+                static_cast<unsigned char>(merged.back());
+            const unsigned char first =
+                static_cast<unsigned char>(next.front());
+            const bool ascii_sentence_join =
+                (last == '.' || last == '!' || last == '?' ||
+                 last == ';' || last == ',' || last == ':') &&
+                std::isalnum(first) != 0;
+            const bool ascii_word_join =
+                std::isalnum(last) != 0 && std::isalnum(first) != 0;
+            if (ascii_sentence_join || ascii_word_join) {
+                merged.push_back(' ');
+            }
+        }
+        merged += next;
+        chunks[0] = std::move(merged);
+        chunks.erase(chunks.begin() + 1);
+    }
     return chunks;
 }
 

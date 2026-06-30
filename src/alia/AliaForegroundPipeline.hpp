@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,7 +21,8 @@ bool is_valid_generation_config(const AliaGenConfig& config);
 GenerationConfig translate_generation_config(const AliaGenConfig* config);
 std::string foreground_system_prompt();
 std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries = true);
+                                                   bool split_sentence_boundaries = true,
+                                                   size_t min_first_chunk_chars = 0);
 
 enum class ForegroundDecodeMode {
     None,

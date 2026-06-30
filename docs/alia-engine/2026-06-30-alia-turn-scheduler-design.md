@@ -345,3 +345,79 @@ gap variance, especially when the foreground text shape changes. Treat this as
 a first-enqueue policy win rather than a final playback-continuity solution;
 future scheduler work should still reason about TTS chunk duration, pending
 audio buffer, and steady chunk coalescing together.
+
+## 2026-06-30 first TTS coverage floor
+
+The priority-wait experiment showed that simply disabling
+`AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY` is not a usable default:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_tts_priority_off/summary.csv
+pass: 4/5
+failure: task_memory produced no TTS audio
+notes: persona/preference flushed a 3-byte leading "..." chunk and created
+       immediate playback-buffer gaps around 177-202 ms.
+```
+
+The next policy keeps first-audio priority enabled and gives the first spoken
+TTS chunk a small coverage floor:
+
+```text
+AILA_TTS_STREAM_TEXT_FIRST_SOFT_MIN_CHARS=8
+AILA_TTS_STREAM_TEXT_FIRST_HARD_MIN_CHARS=8
+```
+
+The sentence splitter also merges an over-short leading split chunk into the
+next chunk for the low-latency first TTS enqueue. This prevents strings such as
+`...` or `……` from becoming their own first TTS synthesis job while still
+allowing early comma/space/hard-boundary flushes once the first chunk has enough
+text to carry speech.
+
+Real-model validation:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_tts_first_min8/summary.csv
+pass: 5/5
+avg simulated_vad_to_first_audio_ms: 1129.2
+avg foreground_profile_first_tts_enqueue_ms: 481.2
+avg foreground_profile_tts_first_audio_priority_wait_ms: 222.8
+total playback buffer gap ms: 416
+output ASR: all scenarios returned transcripts
+```
+
+Baseline for comparison:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_tts_first_soft_boundary/summary.csv
+avg simulated_vad_to_first_audio_ms: 1110.6
+avg foreground_profile_first_tts_enqueue_ms: 462.4
+total playback buffer gap ms: 595
+```
+
+The end-to-end TTFA average is slightly worse in this run because
+`task_memory` had a foreground first-content outlier (`344 -> 569 ms`), which is
+upstream of the TTS chunking policy. The metric closest to this change improved:
+
+```text
+avg first_content_to_first_tts_enqueue_ms: 119.6 -> 94.6
+avg first_audio_after_enqueue_ms: 216.0 -> 217.6
+```
+
+Per-scenario comparison:
+
+```text
+scenario           old_ttfa  new_ttfa  delta  new_wait  first_chars  gap_total
+short_hello        1000      1000      0      219       8            165
+persona_chat       1063      1061      -2     220       13           0
+preference_memory  1098      1099      +1     219       24           64
+task_memory        1137      1282      +145   219       21           41
+long_answer        1255      1204      -51    237       12           146
+```
+
+Targeted `task_memory` smoke with an ellipsis-leading response confirmed the
+split-merge fix: the first TTS text chunk was `15` bytes instead of `3`, and
+external Mimo-ASR recognized the output as:
+
+```text
+那个……父亲大人说过要诚实回答，但我不确定具体是什么工具。如果用户请求了，就试着回应。
+```

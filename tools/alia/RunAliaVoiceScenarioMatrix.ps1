@@ -263,6 +263,7 @@ try {
             foreground_profile_first_token_delta_ms = Get-ValueOrEmpty $values "foreground_profile_first_token_delta_ms"
             foreground_profile_first_content_delta_ms = Get-ValueOrEmpty $values "foreground_profile_first_content_delta_ms"
             foreground_profile_first_tts_enqueue_ms = Get-ValueOrEmpty $values "foreground_profile_first_tts_enqueue_ms"
+            foreground_profile_tts_first_audio_priority_wait_ms = Get-ValueOrEmpty $values "foreground_profile_tts_first_audio_priority_wait_ms"
             foreground_profile_decode_ms = Get-ValueOrEmpty $values "foreground_profile_decode_ms"
             foreground_profile_model_ms = Get-ValueOrEmpty $values "foreground_profile_model_ms"
             simulated_vad_asr_tail_ms = Get-ValueOrEmpty $values "simulated_vad_asr_tail_ms"
