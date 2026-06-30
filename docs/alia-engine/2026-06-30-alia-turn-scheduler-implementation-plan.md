@@ -66,6 +66,7 @@ struct AliaAsrSchedulerEvent {
 };
 
 struct AliaPrefillSchedulerState {
+    bool speculative_enabled = false;
     bool speculative_started = false;
     int last_prefill_text_chars = 0;
     int candidate_stable_ticks = 0;
@@ -159,7 +160,8 @@ AliaPrefillDecision decide_asr_prefill(
     decision.prefill = !state.speculative_started;
     decision.reason = event.final_chunk ? "final text prefill" : "partial text prefill";
 
-    if (!event.final_chunk &&
+    if (state.speculative_enabled &&
+        !event.final_chunk &&
         !state.speculative_started &&
         event.combined_chars >= config.speculative_min_chars &&
         state.candidate_stable_ticks >= config.speculative_required_stable_ticks &&

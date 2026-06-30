@@ -3,6 +3,7 @@
 #include "alia/AliaContext.hpp"
 #include "alia/AliaForegroundPipeline.hpp"
 #include "alia/AliaTtsPipeline.hpp"
+#include "alia/AliaTurnScheduler.hpp"
 #include "audio/AudioPreprocessor.hpp"
 
 #include <algorithm>
@@ -809,6 +810,10 @@ int main(int argc, char** argv) {
     double asr_stream_vlm_prefill_max_ms = 0.0;
     double asr_stream_tick_total_ms = 0.0;
     double asr_stream_tick_max_ms = 0.0;
+    int scheduler_prefill_allowed = 0;
+    int scheduler_prefill_skipped = 0;
+    int scheduler_speculative_allowed = 0;
+    std::string scheduler_last_reason = "not evaluated";
     const bool asr_profile_calls = env_flag_enabled("AILA_ASR_PROFILE_CALLS", false);
     int asr_profile_call_index = 0;
     constexpr double kAsrSampleRate = 16000.0;
@@ -840,8 +845,11 @@ int main(int argc, char** argv) {
             std::max(1, static_cast<int>(std::llround(
                 static_cast<double>(opts.stream_chunk_ms) * kAsrSampleRate / 1000.0)));
         double next_prefill_ms = static_cast<double>(opts.stream_prefill_interval_ms);
-        std::string last_prefill_stable_text;
-        std::string last_prefill_partial_text;
+        std::string last_scheduler_stable_text;
+        std::string last_scheduler_partial_text;
+        int last_scheduler_prefill_text_chars = 0;
+        const aila::alia::AliaTurnSchedulerConfig scheduler_config =
+            aila::alia::read_alia_turn_scheduler_config();
         for (size_t offset = 0; offset < mono_16k.size();
              offset += static_cast<size_t>(stream_chunk_samples)) {
             const size_t count = std::min<size_t>(
@@ -891,38 +899,55 @@ int main(int argc, char** argv) {
                 std::max(asr_stream_get_text_max_ms, get_text_ms);
             ++asr_text_calls;
             if (!stable_text.empty() || !partial_text.empty()) {
-                bool speculative_candidate_ready = false;
-                std::string speculative_text;
+                const std::string scheduler_text =
+                    combine_asr_text_for_prompt(stable_text, partial_text);
+                const bool scheduler_text_changed =
+                    stable_text != last_scheduler_stable_text ||
+                    partial_text != last_scheduler_partial_text;
                 if (opts.speculative_foreground &&
                     !speculative_foreground_started &&
                     !final_chunk) {
-                    speculative_text = combine_asr_text_for_prompt(stable_text, partial_text);
-                    if (speculative_text == speculative_last_candidate_text) {
+                    if (scheduler_text == speculative_last_candidate_text) {
                         ++speculative_candidate_stable_ticks;
                     } else {
-                        speculative_last_candidate_text = speculative_text;
+                        speculative_last_candidate_text = scheduler_text;
                         speculative_candidate_stable_ticks = 1;
-                    }
-
-                    const int candidate_ascii_words =
-                        ascii_word_count(speculative_text);
-                    if (static_cast<int>(speculative_text.size()) < speculative_min_chars) {
-                        speculative_skip_reason = "candidate shorter than min chars";
-                    } else if (speculative_candidate_stable_ticks <
-                               speculative_required_stable_ticks) {
-                        speculative_skip_reason = "candidate waiting for stable repeat";
-                    } else if (candidate_ascii_words > 0 &&
-                               candidate_ascii_words < speculative_min_ascii_words) {
-                        speculative_skip_reason = "candidate has too few ASCII words";
-                    } else {
-                        speculative_candidate_ready = true;
                     }
                 }
 
-                if (stable_text == last_prefill_stable_text &&
-                    partial_text == last_prefill_partial_text) {
+                aila::alia::AliaAsrSchedulerEvent scheduler_event;
+                scheduler_event.chunk_end_ms = chunk_end_ms;
+                scheduler_event.final_chunk = final_chunk;
+                scheduler_event.text_changed = scheduler_text_changed;
+                scheduler_event.stable_chars = static_cast<int>(stable_text.size());
+                scheduler_event.partial_chars = static_cast<int>(partial_text.size());
+                scheduler_event.combined_chars = static_cast<int>(scheduler_text.size());
+                scheduler_event.ascii_words = ascii_word_count(scheduler_text);
+                aila::alia::AliaPrefillSchedulerState scheduler_state;
+                scheduler_state.speculative_enabled = opts.speculative_foreground;
+                scheduler_state.speculative_started = speculative_foreground_started;
+                scheduler_state.last_prefill_text_chars = last_scheduler_prefill_text_chars;
+                scheduler_state.candidate_stable_ticks = speculative_candidate_stable_ticks;
+                const aila::alia::AliaPrefillDecision scheduler_decision =
+                    aila::alia::decide_asr_prefill(
+                        scheduler_config, scheduler_event, scheduler_state);
+                scheduler_last_reason = scheduler_decision.reason;
+                std::cout << "scheduler_decision="
+                          << "chunk_end_ms:" << chunk_end_ms
+                          << ",final:" << (final_chunk ? "true" : "false")
+                          << ",prefill:" << (scheduler_decision.prefill ? "true" : "false")
+                          << ",speculative:"
+                          << (scheduler_decision.start_speculative ? "true" : "false")
+                          << ",reason:" << quote(scheduler_decision.reason)
+                          << ",stable_chars:" << stable_text.size()
+                          << ",partial_chars:" << partial_text.size()
+                          << ",combined_chars:" << scheduler_text.size()
+                          << "\n";
+
+                if (!scheduler_text_changed) {
                     ++asr_prefill_skipped_unchanged;
-                } else if (!speculative_foreground_started) {
+                }
+                if (scheduler_decision.prefill) {
                     const auto vlm_prefill_start = Clock::now();
                     rc = alia_vlm_prefill_asr_text(
                         ctx.get(),
@@ -932,9 +957,10 @@ int main(int argc, char** argv) {
                         std::cerr << "alia_vlm_prefill_asr_text_rc=" << rc << "\n";
                         return 1;
                     }
-                    last_prefill_stable_text = stable_text;
-                    last_prefill_partial_text = partial_text;
+                    last_scheduler_prefill_text_chars =
+                        static_cast<int>(scheduler_text.size());
                     ++asr_prefill_calls;
+                    ++scheduler_prefill_allowed;
                     const double vlm_prefill_ms = static_cast<double>(
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             Clock::now() - vlm_prefill_start).count());
@@ -942,8 +968,11 @@ int main(int argc, char** argv) {
                     asr_stream_vlm_prefill_max_ms =
                         std::max(asr_stream_vlm_prefill_max_ms, vlm_prefill_ms);
 
+                } else if (scheduler_text_changed) {
+                    ++scheduler_prefill_skipped;
                 }
-                if (speculative_candidate_ready) {
+                if (scheduler_decision.start_speculative &&
+                    opts.speculative_foreground) {
                     rc = alia_start_speculative_conversation_turn(
                         ctx.get(),
                         stable_text.c_str(),
@@ -956,9 +985,16 @@ int main(int argc, char** argv) {
                     }
                     speculative_foreground_started = true;
                     speculative_foreground_start_audio_ms = chunk_end_ms;
-                    speculative_start_text = speculative_text;
+                    speculative_start_text = scheduler_text;
+                    ++scheduler_speculative_allowed;
                     speculative_skip_reason = "started";
+                } else if (opts.speculative_foreground &&
+                           !speculative_foreground_started &&
+                           !final_chunk) {
+                    speculative_skip_reason = scheduler_decision.reason;
                 }
+                last_scheduler_stable_text = stable_text;
+                last_scheduler_partial_text = partial_text;
             }
             const double chunk_op_ms = static_cast<double>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1024,6 +1060,10 @@ int main(int argc, char** argv) {
               << "asr_stream_vlm_prefill_max_ms=" << asr_stream_vlm_prefill_max_ms << "\n"
               << "asr_stream_tick_total_ms=" << asr_stream_tick_total_ms << "\n"
               << "asr_stream_tick_max_ms=" << asr_stream_tick_max_ms << "\n"
+              << "scheduler_prefill_allowed=" << scheduler_prefill_allowed << "\n"
+              << "scheduler_prefill_skipped=" << scheduler_prefill_skipped << "\n"
+              << "scheduler_speculative_allowed=" << scheduler_speculative_allowed << "\n"
+              << "scheduler_last_reason=" << quote(scheduler_last_reason) << "\n"
               << "asr_partial_full_decode_count="
               << ctx->asr_pipeline->partial_full_decode_count() << "\n"
               << "asr_partial_tail_decode_count="

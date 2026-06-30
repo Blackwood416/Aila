@@ -25,6 +25,7 @@ struct AliaAsrSchedulerEvent {
 };
 
 struct AliaPrefillSchedulerState {
+    bool speculative_enabled = false;
     bool speculative_started = false;
     int last_prefill_text_chars = 0;
     int candidate_stable_ticks = 0;
