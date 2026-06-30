@@ -40,6 +40,7 @@ struct AliaForegroundMetrics {
     int prompt_tokens = 0;
     int prefilled_prompt_tokens = 0;
     int prompt_suffix_tokens = 0;
+    int final_cached_prefix_rejected = 0;
     int generated_tokens = 0;
     long long prompt_build_ms = -1;
     long long prompt_prefill_ms = -1;
@@ -49,6 +50,7 @@ struct AliaForegroundMetrics {
     long long tts_first_audio_priority_wait_ms = 0;
     long long decode_ms = -1;
     long long model_ms = -1;
+    std::string final_cached_prefix_reject_reason;
 };
 
 class AliaForegroundPipeline {

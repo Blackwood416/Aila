@@ -3,6 +3,7 @@
 #include "AliaAsrPipeline.hpp"
 #include "ModelSlot.hpp"
 #include "AliaTtsPipeline.hpp"
+#include "AliaTurnScheduler.hpp"
 #include "../chat/AssistantOutputParser.hpp"
 #include "../chat/ChatJson.hpp"
 #include "../chat/StructuredStreamParser.hpp"
@@ -1820,6 +1821,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
 
     int prompt_tokens_to_forward = 0;
     int effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
+    int final_cached_prefix_rejected = 0;
+    std::string final_cached_prefix_reject_reason;
     long long prompt_prefill_ms = -1;
     Tensor* logits = nullptr;
     {
@@ -1837,10 +1840,24 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         }
 
         const int max_seq_len = backend->max_seq_len();
-        const int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
+        int context_len_before_prompt = reset_session ? 0 : backend->get_current_context_len();
         prompt_tokens_to_forward =
             static_cast<int>(prompt_ids.size()) - prefilled_prompt_tokens;
-        effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
+        const AliaTurnSchedulerConfig scheduler_config =
+            read_alia_turn_scheduler_config();
+        const AliaFinalPrefixDecision prefix_decision =
+            decide_final_cached_prefix(
+                scheduler_config,
+                prefilled_prompt_tokens,
+                prompt_tokens_to_forward);
+        final_cached_prefix_reject_reason = prefix_decision.reason;
+        if (!prefix_decision.use_cached_prefix) {
+            backend->reset();
+            prefilled_prompt_tokens = 0;
+            prompt_tokens_to_forward = static_cast<int>(prompt_ids.size());
+            context_len_before_prompt = 0;
+            final_cached_prefix_rejected = 1;
+        }
         if (max_seq_len > 0 &&
             context_len_before_prompt + prompt_tokens_to_forward +
                 config.max_new_tokens > max_seq_len) {
@@ -1850,6 +1867,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             return false;
         }
 
+        effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
         if (prompt_tokens_to_forward <= 0) {
             last_error_ = "foreground VLM prompt was fully prefetched without cached logits";
             return false;
@@ -2069,6 +2087,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             metrics_.prompt_tokens = static_cast<int>(prompt_ids.size());
             metrics_.prefilled_prompt_tokens = effective_prefilled_prompt_tokens;
             metrics_.prompt_suffix_tokens = prompt_tokens_to_forward;
+            metrics_.final_cached_prefix_rejected = final_cached_prefix_rejected;
+            metrics_.final_cached_prefix_reject_reason =
+                final_cached_prefix_reject_reason;
             metrics_.generated_tokens = static_cast<int>(generated_ids.size());
             metrics_.prompt_build_ms = prompt_build_ms;
             metrics_.prompt_prefill_ms = prompt_prefill_ms;

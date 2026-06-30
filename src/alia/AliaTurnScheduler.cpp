@@ -39,6 +39,10 @@ AliaPrefillDecision decide_asr_prefill(
         decision.reason = "unchanged text";
         return decision;
     }
+    if (event.final_chunk) {
+        decision.reason = "final text handled by foreground turn";
+        return decision;
+    }
     if (event.combined_chars < config.min_prefill_text_chars) {
         decision.reason = "text shorter than prefill minimum";
         return decision;
@@ -53,10 +57,9 @@ AliaPrefillDecision decide_asr_prefill(
     }
 
     decision.prefill = !state.speculative_started;
-    decision.reason = event.final_chunk ? "final text prefill" : "partial text prefill";
+    decision.reason = "partial text prefill";
 
     if (state.speculative_enabled &&
-        !event.final_chunk &&
         !state.speculative_started &&
         event.combined_chars >= config.speculative_min_chars &&
         state.candidate_stable_ticks >= config.speculative_required_stable_ticks &&

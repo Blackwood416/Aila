@@ -83,8 +83,9 @@ when work is worth doing and records why.
 - VLM prefill decision:
   - skip because text is too short
   - skip because only a tiny suffix was added
+  - skip final stream prefill because final text is handled by the foreground
+    turn on the critical path
   - prefill because it can be hidden under remaining audio time
-  - prefill because it is final-critical
   - reject cached prefix on final commit when its suffix is likely slower than a
     fresh full prompt prefill
 - Speculative decision:
@@ -156,3 +157,57 @@ if (-not $env:MIMO_API_KEY) {
 - More aggressive speculative foreground starts from stable partial text.
 - Host-facing scheduler API after the probe has matrix-grade evidence.
 - Tool-call scheduling, vision input, and Computer Use integration.
+
+## 2026-06-30 short smoke results
+
+Implemented the first scheduler slice:
+
+- `AliaTurnScheduler` policy helper.
+- Stream-ASR scheduler decision logs in real smoke.
+- Matrix CSV fields for scheduler decisions.
+- Foreground final cached-prefix gate.
+
+The first scheduler-on probe exposed a bad policy: doing VLM prefill on the
+final ASR stream tick added about `325 ms` to the simulated ASR tail, and the
+foreground then rejected the cached prefix and paid the full prompt prefill
+again. The scheduler now skips final stream prefill and lets the foreground turn
+handle final text.
+
+Short smoke comparison, `short_hello_request.wav`, stream ASR prefill cadence
+`1000 ms`:
+
+```text
+set                 vad_to_audio  asr_tail  stream_prefill  prompt_prefill  first_enqueue
+scheduler on        1007 ms       357 ms    0 ms            328 ms          425 ms
+scheduler off       1275 ms       358 ms    324 ms          443 ms          703 ms
+```
+
+Scheduler-on details:
+
+```text
+scheduler_prefill_allowed=0
+scheduler_prefill_skipped=2
+scheduler_last_reason="final text handled by foreground turn"
+foreground_profile_prefilled_prompt_tokens=0
+foreground_profile_final_cached_prefix_rejected=0
+foreground_profile_final_cached_prefix_reject_reason="no cached prefix"
+```
+
+Scheduler-off fallback details:
+
+```text
+scheduler_prefill_allowed=2
+foreground_profile_prefilled_prompt_tokens=87
+foreground_profile_prompt_suffix_tokens=31
+foreground_profile_final_cached_prefix_reject_reason="scheduler disabled"
+```
+
+External Mimo-ASR on scheduler-on output:
+
+```text
+Hello, I'm Alia, a local companion from the Isla Engine. I can be helpful if you ask.
+```
+
+This matches the foreground response closely enough for the smoke. The next
+validation step is a full matrix with `-StreamAsrPrefill` and output ASR before
+making host-facing scheduling defaults broader than the smoke/probe path.

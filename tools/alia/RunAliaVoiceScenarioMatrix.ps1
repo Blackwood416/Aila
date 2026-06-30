@@ -244,6 +244,8 @@ try {
             foreground_profile_prompt_tokens = Get-ValueOrEmpty $values "foreground_profile_prompt_tokens"
             foreground_profile_prefilled_prompt_tokens = Get-ValueOrEmpty $values "foreground_profile_prefilled_prompt_tokens"
             foreground_profile_prompt_suffix_tokens = Get-ValueOrEmpty $values "foreground_profile_prompt_suffix_tokens"
+            foreground_profile_final_cached_prefix_rejected = Get-ValueOrEmpty $values "foreground_profile_final_cached_prefix_rejected"
+            foreground_profile_final_cached_prefix_reject_reason = Get-ValueOrEmpty $values "foreground_profile_final_cached_prefix_reject_reason"
             foreground_profile_generated_tokens = Get-ValueOrEmpty $values "foreground_profile_generated_tokens"
             foreground_profile_prompt_build_ms = Get-ValueOrEmpty $values "foreground_profile_prompt_build_ms"
             foreground_profile_prompt_prefill_ms = Get-ValueOrEmpty $values "foreground_profile_prompt_prefill_ms"
