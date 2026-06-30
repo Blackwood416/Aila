@@ -126,6 +126,10 @@ set(ALIA_REAL_SMOKE_SOURCES
     tools/alia/AliaRealModelSmoke.cpp
 )
 
+set(COMMAND_SUBMISSION_BENCH_SOURCES
+    tools/perf/CommandSubmissionBench.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -196,6 +200,22 @@ target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
 
 add_custom_target(AliaEngine DEPENDS AilaShared)
 add_dependencies(AliaEngine AilaAliaRealSmoke)
+
+set(AILA_LEVEL_ZERO_SDK_ROOT "C:/level-zero-win-sdk-1.28.2" CACHE PATH
+    "Level Zero SDK root for optional command submission benchmarks")
+if(EXISTS "${AILA_LEVEL_ZERO_SDK_ROOT}/include/level_zero/ze_api.h" AND
+   EXISTS "${AILA_LEVEL_ZERO_SDK_ROOT}/lib/ze_loader.lib")
+    add_executable(AilaCommandSubmissionBench ${COMMAND_SUBMISSION_BENCH_SOURCES})
+    target_compile_definitions(AilaCommandSubmissionBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(AilaCommandSubmissionBench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        "${AILA_LEVEL_ZERO_SDK_ROOT}/include"
+    )
+    target_link_libraries(AilaCommandSubmissionBench PRIVATE
+        "${AILA_LEVEL_ZERO_SDK_ROOT}/lib/ze_loader.lib"
+    )
+endif()
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
@@ -377,6 +397,9 @@ endif()
     endfunction()
 
     copy_runtime_dependencies(AilaAliaRealSmoke EXECUTABLE)
+    if(TARGET AilaCommandSubmissionBench)
+        copy_runtime_dependencies(AilaCommandSubmissionBench EXECUTABLE)
+    endif()
     copy_runtime_dependencies(AilaShared LIBRARY)
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
