@@ -1632,6 +1632,49 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
         AILA_LOG_INFO("[MimiLoader] Conv1d weight transpose complete");
     }
 
+    if (aila::env::read_flag("AILA_TTS_MIMI_TRANSPOSE_CONV_VEC8", true)) {
+        AILA_LOG_INFO("[MimiLoader] Transposing Mimi transpose-conv weights for vec8 access...");
+        auto transpose_conv_transpose_weight = [&](const std::string& name) {
+            if (!mimi_weights_.has(name)) return;
+            Tensor& w = mimi_weights_.get(name);
+            if (w.ndim() != 3) return;
+            const int IC = static_cast<int>(w.shape(0));
+            const int OC = static_cast<int>(w.shape(1));
+            const int KS = static_cast<int>(w.shape(2));
+            if (IC <= 0 || OC <= 0 || KS <= 0) return;
+
+            Tensor w_new = Tensor::allocate(ctx, {OC, KS, IC});
+            auto* old_ptr = w.data_as<bf16>();
+            auto* new_ptr = w_new.data_as<bf16>();
+
+            // w_old[ic, oc, k] -> w_new[oc, k, ic]
+            const int total = IC * OC * KS;
+            ctx.queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                int k = i % KS;
+                int tmp = i / KS;
+                int oc = tmp % OC;
+                int ic = tmp / OC;
+                int new_idx = (oc * KS + k) * IC + ic;
+                new_ptr[new_idx] = old_ptr[i];
+            });
+            ctx.queue().wait();
+            mimi_weights_.replace(name, std::move(w_new));
+        };
+
+        for (int i = 0; i < 2; ++i) {
+            transpose_conv_transpose_weight(
+                "decoder.upsample." + std::to_string(i) + ".0.conv.weight");
+        }
+        for (int i = 1; i <= 4; ++i) {
+            transpose_conv_transpose_weight(
+                "decoder.decoder." + std::to_string(i) + ".block.1.conv.weight");
+        }
+
+        ctx.synchronize();
+        AILA_LOG_INFO("[MimiLoader] Mimi transpose-conv weight transpose complete");
+    }
+
     mimi_loaded_ = true;
     init_mimi_runtime_linears(ctx);
 

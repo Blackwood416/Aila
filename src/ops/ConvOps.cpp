@@ -347,6 +347,14 @@ void causal_conv_transpose1d(Context& ctx,
     const void* b_ptr = bias.data();
     bool bias_is_f32 = (bias.dtype() == dnnl::memory::data_type::f32);
 
+    // Auto-detect transpose-conv weight layout:
+    //   [in_ch, out_ch, kernel_size] -> PyTorch ConvTranspose1d layout
+    //   [out_ch, kernel_size, in_ch] -> vec8-friendly Mimi probe layout
+    const bool w_vec8 = (weight.ndim() == 3 &&
+                         static_cast<int>(weight.shape(0)) == out_ch &&
+                         static_cast<int>(weight.shape(1)) == kernel_size &&
+                         static_cast<int>(weight.shape(2)) == in_ch);
+
     int out_len = in_len * stride;
     int total_out = batch * out_len * out_ch;
 
@@ -373,23 +381,41 @@ void causal_conv_transpose1d(Context& ctx,
 
                 int in_base = (n * in_len + it) * in_ch;
 
-                // input row-major layout: [batch, in_len, in_ch]
-                // weight row-major layout: [in_ch, out_ch, kernel_size]
-                for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
-                    int ic = ic8 * 8;
-                    const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
-                    #pragma unroll
-                    for (int v = 0; v < 8; ++v) {
-                        int icv = ic + v;
-                        int w_idx = (icv * out_ch + oc) * kernel_size + k;
-                        sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_ptr[w_idx]);
+                if (w_vec8) {
+                    const int w_base = (oc * kernel_size + k) * in_ch;
+                    for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                        int ic = ic8 * 8;
+                        const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
+                        const vec8 w_vec = *reinterpret_cast<const vec8*>(w_ptr + w_base + ic);
+                        #pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_vec[v]);
+                        }
                     }
-                }
 
-                for (int ic = in_ch8 * 8; ic < in_ch; ++ic) {
-                    int in_idx = in_base + ic;
-                    int w_idx = (ic * out_ch + oc) * kernel_size + k;
-                    sum += static_cast<float>(in_ptr[in_idx]) * static_cast<float>(w_ptr[w_idx]);
+                    for (int ic = in_ch8 * 8; ic < in_ch; ++ic) {
+                        sum += static_cast<float>(in_ptr[in_base + ic]) *
+                               static_cast<float>(w_ptr[w_base + ic]);
+                    }
+                } else {
+                    // input row-major layout: [batch, in_len, in_ch]
+                    // weight row-major layout: [in_ch, out_ch, kernel_size]
+                    for (int ic8 = 0; ic8 < in_ch8; ++ic8) {
+                        int ic = ic8 * 8;
+                        const vec8 in_vec = *reinterpret_cast<const vec8*>(in_ptr + in_base + ic);
+                        #pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            int icv = ic + v;
+                            int w_idx = (icv * out_ch + oc) * kernel_size + k;
+                            sum += static_cast<float>(in_vec[v]) * static_cast<float>(w_ptr[w_idx]);
+                        }
+                    }
+
+                    for (int ic = in_ch8 * 8; ic < in_ch; ++ic) {
+                        int w_idx = (ic * out_ch + oc) * kernel_size + k;
+                        sum += static_cast<float>(in_ptr[in_base + ic]) *
+                               static_cast<float>(w_ptr[w_idx]);
+                    }
                 }
             }
 
