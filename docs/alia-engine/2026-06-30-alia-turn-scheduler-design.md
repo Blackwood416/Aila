@@ -292,3 +292,56 @@ Next scheduler work:
 - Add the real-VAD speculative silence window TODO: commit ASR text before the
   full VAD silence window, then rollback/recompute suffix if new speech arrives.
 - Keep tool-call, vision input, and Computer Use scheduling deferred.
+
+## 2026-06-30 first TTS soft-boundary flush
+
+The foreground streaming path now allows the first TTS text chunk to flush at
+the last soft boundary once the first soft minimum is met, instead of waiting
+for `AILA_TTS_STREAM_TEXT_FIRST_SOFT_MAX_CHARS`. The behavior is controlled by:
+
+```text
+AILA_TTS_STREAM_TEXT_FIRST_SOFT_BOUNDARY_FLUSH=1
+```
+
+This only changes the first low-latency TTS enqueue path under the default
+steady chunking policy. It is intended to reduce the gap between first
+foreground content and first TTS enqueue when the model emits a useful comma or
+other soft punctuation early.
+
+Real-model matrix:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_tts_first_soft_boundary/summary.csv
+pass: 5/5
+avg simulated_vad_to_first_audio_ms: 1110.6
+avg foreground_profile_first_tts_enqueue_ms: 462.4
+total playback buffer gap ms: 595
+output ASR: all scenarios returned transcripts
+```
+
+Baseline:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_scheduler_combined_budget/summary.csv
+avg simulated_vad_to_first_audio_ms: 1158.6
+avg foreground_profile_first_tts_enqueue_ms: 504.6
+total playback buffer gap ms: 864
+```
+
+Per-scenario comparison:
+
+```text
+scenario           old_ttfa  new_ttfa  delta  old_enqueue  new_enqueue  gap_total
+short_hello        1002      1000      -2     427          425          54
+persona_chat       1081      1063      -18    436          431          0
+preference_memory  1263      1098      -165   612          467          197
+task_memory        1112      1137      +25    492          506          0
+long_answer        1335      1255      -80    556          483          344
+```
+
+The average TTFA and first enqueue improved, and total playback-buffer gap
+decreased on this matrix. Individual scenarios still show generation-dependent
+gap variance, especially when the foreground text shape changes. Treat this as
+a first-enqueue policy win rather than a final playback-continuity solution;
+future scheduler work should still reason about TTS chunk duration, pending
+audio buffer, and steady chunk coalescing together.

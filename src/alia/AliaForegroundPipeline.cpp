@@ -506,6 +506,8 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
     static const int kSteadyHardMinChars = std::max(
         0,
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_STEADY_HARD_MIN_CHARS", 96));
+    static const bool kFirstSoftBoundaryFlush =
+        aila::env::read_flag("AILA_TTS_STREAM_TEXT_FIRST_SOFT_BOUNDARY_FLUSH", true);
     static const bool kCoalesceSteadyTextChunks =
         aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
     const int soft_min_chars =
@@ -522,6 +524,14 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
         if (cutoff != std::string::npos &&
             static_cast<int>(cutoff) < hard_min_chars) {
             cutoff = std::string::npos;
+        }
+        if (cutoff == std::string::npos &&
+            low_latency_first_chunk &&
+            kFirstSoftBoundaryFlush) {
+            cutoff = last_tts_soft_chunk_boundary(
+                buffer,
+                static_cast<size_t>(soft_min_chars),
+                buffer.size());
         }
         if (cutoff == std::string::npos &&
             soft_max_chars > 0 &&
