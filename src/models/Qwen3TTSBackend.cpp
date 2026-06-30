@@ -1745,7 +1745,7 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
     static const bool tts_alloc_profile = aila::env::read_flag("AILA_TTS_MIMI_ALLOC_PROFILE", false);
     static const bool tts_decoder_fused_conv2_residual =
-        aila::env::read_flag("AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL", false);
+        aila::env::read_flag("AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL", true);
     static const bool tts_decoder_block_profile =
         aila::env::read_flag("AILA_TTS_MIMI_DECODER_BLOCK_PROFILE", false);
     ScopedAllocationProfile alloc_profile(ctx, tts_alloc_profile, "Mimi conv stages");
