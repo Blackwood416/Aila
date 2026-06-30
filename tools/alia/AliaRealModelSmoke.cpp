@@ -810,9 +810,20 @@ int main(int argc, char** argv) {
     double asr_stream_vlm_prefill_max_ms = 0.0;
     double asr_stream_tick_total_ms = 0.0;
     double asr_stream_tick_max_ms = 0.0;
+    int scheduler_asr_decode_allowed = 0;
+    int scheduler_asr_decode_skipped = 0;
+    int scheduler_asr_decode_hidden_budget_skipped = 0;
     int scheduler_prefill_allowed = 0;
     int scheduler_prefill_skipped = 0;
+    int scheduler_hidden_budget_skipped = 0;
     int scheduler_speculative_allowed = 0;
+    std::string scheduler_last_asr_decode_phase = "not evaluated";
+    std::string scheduler_last_asr_decode_action = "not evaluated";
+    std::string scheduler_last_asr_decode_lane = "not evaluated";
+    std::string scheduler_last_asr_decode_reason = "not evaluated";
+    std::string scheduler_last_phase = "not evaluated";
+    std::string scheduler_last_action = "not evaluated";
+    std::string scheduler_last_lane = "not evaluated";
     std::string scheduler_last_reason = "not evaluated";
     const bool asr_profile_calls = env_flag_enabled("AILA_ASR_PROFILE_CALLS", false);
     int asr_profile_call_index = 0;
@@ -873,32 +884,65 @@ int main(int argc, char** argv) {
             }
 
             const auto chunk_op_start = Clock::now();
-            const aila::alia::AliaAsrMetrics metrics_before =
-                ctx->asr_pipeline->last_metrics();
-            const auto get_text_start = Clock::now();
-            if (!get_asr_text(stable_text, partial_text, final_chunk)) {
-                return 1;
-            }
-            const double get_text_ms = static_cast<double>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now() - get_text_start).count());
-            if (asr_profile_calls) {
-                const aila::alia::AliaAsrMetrics metrics_after =
+            aila::alia::AliaAsrSchedulerEvent decode_event;
+            decode_event.chunk_end_ms = chunk_end_ms;
+            decode_event.remaining_audio_ms =
+                std::max(0.0, asr_audio_duration_ms - chunk_end_ms);
+            decode_event.final_chunk = final_chunk;
+            const aila::alia::AliaAsrDecodeDecision decode_decision =
+                aila::alia::decide_asr_decode(scheduler_config, decode_event);
+            scheduler_last_asr_decode_phase = decode_decision.phase;
+            scheduler_last_asr_decode_action = decode_decision.action;
+            scheduler_last_asr_decode_lane = decode_decision.lane;
+            scheduler_last_asr_decode_reason = decode_decision.reason;
+            std::cout << "scheduler_asr_decode_decision="
+                      << "chunk_end_ms:" << chunk_end_ms
+                      << ",remaining_audio_ms:" << decode_event.remaining_audio_ms
+                      << ",final:" << (final_chunk ? "true" : "false")
+                      << ",phase:" << quote(decode_decision.phase)
+                      << ",action:" << quote(decode_decision.action)
+                      << ",lane:" << quote(decode_decision.lane)
+                      << ",decode:" << (decode_decision.decode ? "true" : "false")
+                      << ",reason:" << quote(decode_decision.reason)
+                      << "\n";
+
+            bool decoded_text_this_tick = false;
+            double get_text_ms = 0.0;
+            if (decode_decision.decode) {
+                ++scheduler_asr_decode_allowed;
+                const aila::alia::AliaAsrMetrics metrics_before =
                     ctx->asr_pipeline->last_metrics();
-                print_asr_profile_call("asr_profile_call",
-                                       asr_profile_call_index++,
-                                       final_chunk,
-                                       chunk_end_ms,
-                                       get_text_ms,
-                                       subtract_asr_metrics(metrics_after, metrics_before),
-                                       stable_text,
-                                       partial_text);
+                const auto get_text_start = Clock::now();
+                if (!get_asr_text(stable_text, partial_text, decode_decision.force_final)) {
+                    return 1;
+                }
+                get_text_ms = static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - get_text_start).count());
+                if (asr_profile_calls) {
+                    const aila::alia::AliaAsrMetrics metrics_after =
+                        ctx->asr_pipeline->last_metrics();
+                    print_asr_profile_call("asr_profile_call",
+                                           asr_profile_call_index++,
+                                           decode_decision.force_final,
+                                           chunk_end_ms,
+                                           get_text_ms,
+                                           subtract_asr_metrics(metrics_after, metrics_before),
+                                           stable_text,
+                                           partial_text);
+                }
+                asr_stream_get_text_total_ms += get_text_ms;
+                asr_stream_get_text_max_ms =
+                    std::max(asr_stream_get_text_max_ms, get_text_ms);
+                ++asr_text_calls;
+                decoded_text_this_tick = true;
+            } else {
+                ++scheduler_asr_decode_skipped;
+                if (decode_decision.phase == "near_final_partial") {
+                    ++scheduler_asr_decode_hidden_budget_skipped;
+                }
             }
-            asr_stream_get_text_total_ms += get_text_ms;
-            asr_stream_get_text_max_ms =
-                std::max(asr_stream_get_text_max_ms, get_text_ms);
-            ++asr_text_calls;
-            if (!stable_text.empty() || !partial_text.empty()) {
+            if (decoded_text_this_tick && (!stable_text.empty() || !partial_text.empty())) {
                 const std::string scheduler_text =
                     combine_asr_text_for_prompt(stable_text, partial_text);
                 const bool scheduler_text_changed =
@@ -917,6 +961,10 @@ int main(int argc, char** argv) {
 
                 aila::alia::AliaAsrSchedulerEvent scheduler_event;
                 scheduler_event.chunk_end_ms = chunk_end_ms;
+                scheduler_event.remaining_audio_ms =
+                    std::max(0.0, asr_audio_duration_ms - chunk_end_ms);
+                scheduler_event.prefill_audio_budget_ms =
+                    std::max(0.0, scheduler_event.remaining_audio_ms - get_text_ms);
                 scheduler_event.final_chunk = final_chunk;
                 scheduler_event.text_changed = scheduler_text_changed;
                 scheduler_event.stable_chars = static_cast<int>(stable_text.size());
@@ -931,10 +979,20 @@ int main(int argc, char** argv) {
                 const aila::alia::AliaPrefillDecision scheduler_decision =
                     aila::alia::decide_asr_prefill(
                         scheduler_config, scheduler_event, scheduler_state);
+                scheduler_last_phase = scheduler_decision.phase;
+                scheduler_last_action = scheduler_decision.action;
+                scheduler_last_lane = scheduler_decision.lane;
                 scheduler_last_reason = scheduler_decision.reason;
                 std::cout << "scheduler_decision="
                           << "chunk_end_ms:" << chunk_end_ms
+                          << ",remaining_audio_ms:"
+                          << scheduler_event.remaining_audio_ms
+                          << ",prefill_audio_budget_ms:"
+                          << scheduler_event.prefill_audio_budget_ms
                           << ",final:" << (final_chunk ? "true" : "false")
+                          << ",phase:" << quote(scheduler_decision.phase)
+                          << ",action:" << quote(scheduler_decision.action)
+                          << ",lane:" << quote(scheduler_decision.lane)
                           << ",prefill:" << (scheduler_decision.prefill ? "true" : "false")
                           << ",speculative:"
                           << (scheduler_decision.start_speculative ? "true" : "false")
@@ -970,6 +1028,9 @@ int main(int argc, char** argv) {
 
                 } else if (scheduler_text_changed) {
                     ++scheduler_prefill_skipped;
+                    if (scheduler_decision.phase == "near_final_partial") {
+                        ++scheduler_hidden_budget_skipped;
+                    }
                 }
                 if (scheduler_decision.start_speculative &&
                     opts.speculative_foreground) {
@@ -1060,9 +1121,25 @@ int main(int argc, char** argv) {
               << "asr_stream_vlm_prefill_max_ms=" << asr_stream_vlm_prefill_max_ms << "\n"
               << "asr_stream_tick_total_ms=" << asr_stream_tick_total_ms << "\n"
               << "asr_stream_tick_max_ms=" << asr_stream_tick_max_ms << "\n"
+              << "scheduler_asr_decode_allowed=" << scheduler_asr_decode_allowed << "\n"
+              << "scheduler_asr_decode_skipped=" << scheduler_asr_decode_skipped << "\n"
+              << "scheduler_asr_decode_hidden_budget_skipped="
+              << scheduler_asr_decode_hidden_budget_skipped << "\n"
+              << "scheduler_last_asr_decode_phase="
+              << quote(scheduler_last_asr_decode_phase) << "\n"
+              << "scheduler_last_asr_decode_action="
+              << quote(scheduler_last_asr_decode_action) << "\n"
+              << "scheduler_last_asr_decode_lane="
+              << quote(scheduler_last_asr_decode_lane) << "\n"
+              << "scheduler_last_asr_decode_reason="
+              << quote(scheduler_last_asr_decode_reason) << "\n"
               << "scheduler_prefill_allowed=" << scheduler_prefill_allowed << "\n"
               << "scheduler_prefill_skipped=" << scheduler_prefill_skipped << "\n"
+              << "scheduler_hidden_budget_skipped=" << scheduler_hidden_budget_skipped << "\n"
               << "scheduler_speculative_allowed=" << scheduler_speculative_allowed << "\n"
+              << "scheduler_last_phase=" << quote(scheduler_last_phase) << "\n"
+              << "scheduler_last_action=" << quote(scheduler_last_action) << "\n"
+              << "scheduler_last_lane=" << quote(scheduler_last_lane) << "\n"
               << "scheduler_last_reason=" << quote(scheduler_last_reason) << "\n"
               << "asr_partial_full_decode_count="
               << ctx->asr_pipeline->partial_full_decode_count() << "\n"

@@ -211,3 +211,84 @@ Hello, I'm Alia, a local companion from the Isla Engine. I can be helpful if you
 This matches the foreground response closely enough for the smoke. The next
 validation step is a full matrix with `-StreamAsrPrefill` and output ASR before
 making host-facing scheduling defaults broader than the smoke/probe path.
+
+## 2026-06-30 scheduler phase and budget results
+
+The scheduler has been expanded from a prefill-only gate into two explicit
+decisions per stream tick:
+
+- ASR decode decision:
+  - `phase`
+  - `action`
+  - `lane`
+  - `reason`
+- VLM prefill decision:
+  - `phase`
+  - `action`
+  - `lane`
+  - `reason`
+
+Two hidden-work budget guards are now exposed:
+
+- `AILA_TURN_SCHEDULER_MIN_HIDDEN_ASR_DECODE_AUDIO_MS`, default `450`.
+- `AILA_TURN_SCHEDULER_MIN_HIDDEN_PREFILL_AUDIO_MS`, default `400`.
+
+The ASR decode guard skips non-final partial decode near the end of a turn when
+the remaining audio window cannot hide the decode. Final ASR decode is always
+forced. The VLM prefill guard now uses `prefill_audio_budget_ms`, which is the
+remaining audio window after the ASR decode for that tick has already completed.
+This prevents a tick from allowing ASR and VLM work independently when their
+combined cost no longer fits under the remaining audio.
+
+Real-model matrix with ASR-decode budget only:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_scheduler_asr_decode_budget/summary.csv
+pass: 5/5
+avg simulated_vad_to_first_audio_ms: 1192.4
+avg simulated_vad_asr_tail_ms: 423.2
+avg foreground_profile_prompt_prefill_ms: 323.8
+near-final ASR decode skips: 2
+near-final VLM prefill skips: 0
+output ASR: all scenarios returned transcripts
+```
+
+Real-model matrix with combined prefill budget:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_scheduler_combined_budget/summary.csv
+pass: 5/5
+avg simulated_vad_to_first_audio_ms: 1158.6
+avg simulated_vad_asr_tail_ms: 435.2
+avg foreground_profile_prompt_prefill_ms: 330.8
+near-final ASR decode skips: 2
+near-final VLM prefill skips: 2
+output ASR: all scenarios returned transcripts
+```
+
+Per-scenario comparison, combined budget versus ASR-decode budget only:
+
+```text
+scenario           old_ttfa  new_ttfa  delta  decode_skips  prefill_skips
+short_hello        997       1002      +5     0             0
+persona_chat       1046      1081      +35    0             1
+preference_memory  1262      1263      +1     0             1
+task_memory        1366      1112      -254   1             0
+long_answer        1291      1335      +44    1             0
+```
+
+The combined-budget policy is kept because it makes the scheduler's lane
+allocation explicit and avoids known wasted near-final work. The TTFA effect is
+modest and noisy because foreground first-content timing and TTS first-text
+chunk shape now dominate many scenarios. The short prompt is around `1.0s` in
+the best current matrix runs.
+
+Next scheduler work:
+
+- Move this policy out of the smoke harness into a host-facing turn scheduler
+  API once real VAD exposes live silence-window timing.
+- Track per-tick predicted ASR and VLM work cost rather than using fixed hidden
+  budget thresholds.
+- Add the real-VAD speculative silence window TODO: commit ASR text before the
+  full VAD silence window, then rollback/recompute suffix if new speech arrives.
+- Keep tool-call, vision input, and Computer Use scheduling deferred.

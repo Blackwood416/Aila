@@ -9,6 +9,8 @@ struct AliaTurnSchedulerConfig {
     int min_prefill_text_chars = 12;
     int min_incremental_text_chars = 8;
     int max_cached_final_suffix_tokens = 16;
+    int min_hidden_asr_decode_audio_ms = 450;
+    int min_hidden_prefill_audio_ms = 400;
     int speculative_min_chars = 24;
     int speculative_required_stable_ticks = 1;
     int speculative_min_ascii_words = 3;
@@ -16,6 +18,8 @@ struct AliaTurnSchedulerConfig {
 
 struct AliaAsrSchedulerEvent {
     double chunk_end_ms = 0.0;
+    double remaining_audio_ms = -1.0;
+    double prefill_audio_budget_ms = -1.0;
     bool final_chunk = false;
     bool text_changed = false;
     int stable_chars = 0;
@@ -34,6 +38,18 @@ struct AliaPrefillSchedulerState {
 struct AliaPrefillDecision {
     bool prefill = false;
     bool start_speculative = false;
+    std::string phase;
+    std::string action;
+    std::string lane;
+    std::string reason;
+};
+
+struct AliaAsrDecodeDecision {
+    bool decode = true;
+    bool force_final = false;
+    std::string phase;
+    std::string action;
+    std::string lane;
     std::string reason;
 };
 
@@ -43,6 +59,10 @@ struct AliaFinalPrefixDecision {
 };
 
 AliaTurnSchedulerConfig read_alia_turn_scheduler_config();
+
+AliaAsrDecodeDecision decide_asr_decode(
+    const AliaTurnSchedulerConfig& config,
+    const AliaAsrSchedulerEvent& event);
 
 AliaPrefillDecision decide_asr_prefill(
     const AliaTurnSchedulerConfig& config,
