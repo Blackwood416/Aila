@@ -111,6 +111,7 @@ set(ALIA_ENGINE_SOURCES
     src/alia/ModelSlot.cpp
     src/alia/AliaAsrPipeline.cpp
     src/alia/AliaTtsPipeline.cpp
+    src/alia/AliaTurnScheduler.cpp
     src/alia/AliaForegroundPipeline.cpp
     src/alia/AliaBackgroundPipeline.cpp
     src/alia/AliaContext.cpp
