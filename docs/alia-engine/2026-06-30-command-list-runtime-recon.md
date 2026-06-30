@@ -144,3 +144,103 @@ the underlying runtime owns opaque command submission.
   microbench only justifies the direction; it is not enough to claim TTFA wins.
 - Explore FP8 KV cache separately by reading the current KV cache and attention
   paths first. It was not tested in this command-list pass.
+
+## Follow-up: SYCL graph and copy_tensor probe
+
+Added two more benchmark modes on top of the original command-submission bench:
+
+- `queue_kernel_chain`: submit a 16-kernel `parallel_for` chain and wait once.
+  The kernels read a small shared runtime parameter to approximate decode-step
+  scalar parameter updates.
+- `command_graph_kernel_chain`: record the same kernel chain with
+  `sycl::ext::oneapi::experimental::command_graph` and replay it, if the device
+  reports `sycl::aspect::ext_oneapi_graph`.
+
+Latest focused command:
+
+```powershell
+.\tools\perf\RunCommandSubmissionBench.ps1 -SkipBuild -Warmup 100 -Iters 1000 -Bytes 4096 -OpsPerGraph 16
+```
+
+Output:
+
+```text
+tmp\command-submission-bench\20260630-190222\summary.csv
+```
+
+Key 4096-byte / 16-op results:
+
+```text
+env    queue_memset_graph  queue_kernel_chain  l0_replay_graph  l0_immediate_graph
+unset  132.931/262.504     331.729/440.974     8.756/71.802    163.726/772.302
+0      129.416/258.411     319.188/422.197     7.409/66.617    162.005/765.559
+1      283.281/757.849     493.682/936.579     8.799/76.674    136.103/742.452
+2      285.984/769.477     502.175/949.190     7.531/67.485    173.888/752.502
+```
+
+For every env mode in this run, `command_graph_kernel_chain` skipped:
+
+```text
+device does not report ext_oneapi_graph support
+```
+
+Interpretation:
+
+- The installed oneAPI headers expose command graph APIs, but the current Arc
+  A770 runtime/device path does not advertise `ext_oneapi_graph`; existing SYCL
+  lambda kernels cannot currently be wrapped in SYCL graph replay on this stack.
+- `UR_L0_USE_IMMEDIATE_COMMANDLISTS=1/2` is harmful for multi-kernel chain
+  submission here. Keep `unset` or `0` for this workload.
+- The direct Level Zero regular-list replay signal remains strong, but applying
+  it to actual compute kernels would require either L0 module kernels or a
+  runtime path that exposes existing kernels to L0. It is immediately practical
+  only for memory copy/fill style nodes.
+
+### copy_tensor memcpy probe
+
+`ops::copy_tensor` is a pure contiguous tensor copy currently implemented as a
+SYCL kernel. A guarded D2D `queue.memcpy` fast path was added behind:
+
+```text
+AILA_COPY_TENSOR_MEMCPY=1
+```
+
+It stays default-off because the full matrix did not show a clear win.
+
+Short A/B smoke, no TTS profile:
+
+```text
+run                         vad_to_audio  first_audio  backend_audio  codes
+default_noprofile_short     1119 ms       686 ms       247.234 ms     187.643 ms
+memcpy_noprofile_short      1030 ms       670 ms       243.668 ms     186.069 ms
+```
+
+Generated audio was checked with the online Mimo ASR script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1" -AudioFile "E:\RiderProjects\Aila\.worktrees\alia-custom-engine\tmp\alia-real-smoke\copy_tensor_default_on\short.wav"
+```
+
+Recognized text:
+
+```text
+Kura叔，父亲大人教过我，要诚实回答，但我是AI，不是真的能说话，只当虚拟陪玩。
+```
+
+Default-on full matrix probe:
+
+```text
+tmp\alia-real-smoke\voice_matrix_copy_memcpy_default\summary.csv
+```
+
+It passed 5/5 scenarios with non-empty output ASR, but performance was not
+better than the closest prior baseline:
+
+```text
+run                                 avg_vad_to_audio  avg_first_audio  avg_backend_audio  avg_codes
+voice_matrix_backend8_split_default 1133.6 ms         700.4 ms         234.6 ms           177.4 ms
+voice_matrix_copy_memcpy_default    1191.6 ms         758.6 ms         237.5 ms           181.0 ms
+```
+
+Conclusion: keep `AILA_COPY_TENSOR_MEMCPY` as a default-off probe and do not
+promote D2D memcpy for `copy_tensor` yet.

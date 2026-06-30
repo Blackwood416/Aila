@@ -1,4 +1,5 @@
 #include "Ops.hpp"
+#include "../utils/EnvUtils.hpp"
 #include <sycl/sycl.hpp>
 #include <algorithm>
 #include <cmath>
@@ -541,6 +542,14 @@ void residual_add(Context& ctx, Tensor& a, Tensor& b, int n) {
 // ============================================================
 
 void copy_tensor(Context& ctx, Tensor& src, Tensor& dst, int n) {
+    static const bool s_use_memcpy = aila::env::read_flag("AILA_COPY_TENSOR_MEMCPY", false);
+    if (s_use_memcpy && n > 0 &&
+        src.element_size() == dst.element_size() &&
+        src.element_size() > 0) {
+        ctx.queue().memcpy(dst.data(), src.data(), static_cast<size_t>(n) * src.element_size());
+        return;
+    }
+
     using vec8 = sycl::vec<bf16, 8>;
     vec8* s_ptr = reinterpret_cast<vec8*>(src.data());
     vec8* d_ptr = reinterpret_cast<vec8*>(dst.data());

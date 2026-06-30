@@ -1,4 +1,5 @@
 #include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -137,6 +138,15 @@ void print_result(const BenchResult& r) {
               << r.total.max_us << "\n";
 }
 
+template <typename Fn>
+void print_optional_result(const char* mode, Fn&& fn) {
+    try {
+        print_result(fn());
+    } catch (const std::exception& e) {
+        std::cout << "skip," << mode << "," << e.what() << "\n";
+    }
+}
+
 BenchResult run_sycl_memset(const Options& opts) {
     sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
     void* ptr = sycl::malloc_device(opts.bytes, q);
@@ -268,6 +278,143 @@ BenchResult run_sycl_memset_graph(const Options& opts) {
     result.host = summarize(std::move(host_us));
     result.total = summarize(std::move(total_us));
     sycl::free(ptr, q);
+    return result;
+}
+
+BenchResult run_sycl_kernel_chain_batch(const Options& opts) {
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
+    const size_t elems =
+        std::max<size_t>(1, (opts.bytes + sizeof(uint32_t) - 1) / sizeof(uint32_t));
+    auto* data = static_cast<uint32_t*>(
+        sycl::malloc_device(elems * sizeof(uint32_t), q));
+    auto* param = static_cast<uint32_t*>(
+        sycl::malloc_shared(sizeof(uint32_t), q));
+    if (!data || !param) {
+        throw std::runtime_error("sycl USM allocation failed");
+    }
+
+    q.memset(data, 0, elems * sizeof(uint32_t)).wait();
+    *param = 0;
+
+    auto submit_chain = [&](uint32_t seed) {
+        *param = seed;
+        sycl::event last;
+        for (int op = 0; op < opts.ops_per_graph; ++op) {
+            last = q.parallel_for(sycl::range<1>(elems), [=](sycl::id<1> idx) {
+                const uint32_t i = static_cast<uint32_t>(idx[0]);
+                data[i] = data[i] * 1664525u + 1013904223u + param[0] +
+                          static_cast<uint32_t>(op) + i;
+            });
+        }
+        last.wait();
+    };
+
+    for (int i = 0; i < opts.warmup; ++i) {
+        submit_chain(static_cast<uint32_t>(i));
+    }
+
+    std::vector<double> host_us;
+    std::vector<double> total_us;
+    host_us.reserve(static_cast<size_t>(opts.iters));
+    total_us.reserve(static_cast<size_t>(opts.iters));
+    for (int i = 0; i < opts.iters; ++i) {
+        const auto begin = Clock::now();
+        *param = static_cast<uint32_t>(i);
+        sycl::event last;
+        for (int op = 0; op < opts.ops_per_graph; ++op) {
+            last = q.parallel_for(sycl::range<1>(elems), [=](sycl::id<1> idx) {
+                const uint32_t j = static_cast<uint32_t>(idx[0]);
+                data[j] = data[j] * 1664525u + 1013904223u + param[0] +
+                          static_cast<uint32_t>(op) + j;
+            });
+        }
+        const auto submitted = Clock::now();
+        last.wait();
+        const auto done = Clock::now();
+        host_us.push_back(elapsed_us(begin, submitted));
+        total_us.push_back(elapsed_us(begin, done));
+    }
+
+    BenchResult result;
+    result.backend = "sycl";
+    result.mode = "queue_kernel_chain";
+    result.device = q.get_device().get_info<sycl::info::device::name>();
+    result.warmup = opts.warmup;
+    result.iters = opts.iters;
+    result.bytes = opts.bytes;
+    result.ops_per_iter = opts.ops_per_graph;
+    result.host = summarize(std::move(host_us));
+    result.total = summarize(std::move(total_us));
+    sycl::free(data, q);
+    sycl::free(param, q);
+    return result;
+}
+
+BenchResult run_sycl_kernel_chain_command_graph(const Options& opts) {
+    namespace exp = sycl::ext::oneapi::experimental;
+
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
+    if (!q.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error("device does not report ext_oneapi_graph support");
+    }
+
+    const size_t elems =
+        std::max<size_t>(1, (opts.bytes + sizeof(uint32_t) - 1) / sizeof(uint32_t));
+    auto* data = static_cast<uint32_t*>(
+        sycl::malloc_device(elems * sizeof(uint32_t), q));
+    auto* param = static_cast<uint32_t*>(
+        sycl::malloc_shared(sizeof(uint32_t), q));
+    if (!data || !param) {
+        throw std::runtime_error("sycl USM allocation failed");
+    }
+
+    q.memset(data, 0, elems * sizeof(uint32_t)).wait();
+    *param = 0;
+
+    exp::command_graph graph{q};
+    graph.begin_recording(q);
+    for (int op = 0; op < opts.ops_per_graph; ++op) {
+        q.parallel_for(sycl::range<1>(elems), [=](sycl::id<1> idx) {
+            const uint32_t i = static_cast<uint32_t>(idx[0]);
+            data[i] = data[i] * 1664525u + 1013904223u + param[0] +
+                      static_cast<uint32_t>(op) + i;
+        });
+    }
+    graph.end_recording(q);
+    auto executable_graph = graph.finalize();
+
+    for (int i = 0; i < opts.warmup; ++i) {
+        *param = static_cast<uint32_t>(i);
+        q.ext_oneapi_graph(executable_graph).wait();
+    }
+
+    std::vector<double> host_us;
+    std::vector<double> total_us;
+    host_us.reserve(static_cast<size_t>(opts.iters));
+    total_us.reserve(static_cast<size_t>(opts.iters));
+    for (int i = 0; i < opts.iters; ++i) {
+        const auto begin = Clock::now();
+        *param = static_cast<uint32_t>(i);
+        sycl::event ev = q.ext_oneapi_graph(executable_graph);
+        const auto submitted = Clock::now();
+        ev.wait();
+        const auto done = Clock::now();
+        host_us.push_back(elapsed_us(begin, submitted));
+        total_us.push_back(elapsed_us(begin, done));
+    }
+
+    BenchResult result;
+    result.backend = "sycl";
+    result.mode = "command_graph_kernel_chain";
+    result.device = q.get_device().get_info<sycl::info::device::name>();
+    result.warmup = opts.warmup;
+    result.iters = opts.iters;
+    result.bytes = opts.bytes;
+    result.ops_per_iter = opts.ops_per_graph;
+    result.host = summarize(std::move(host_us));
+    result.total = summarize(std::move(total_us));
+    sycl::free(data, q);
+    sycl::free(param, q);
     return result;
 }
 
@@ -656,6 +803,9 @@ int main(int argc, char** argv) {
         print_result(run_sycl_memset(opts));
         print_result(run_sycl_single_task(opts));
         print_result(run_sycl_memset_graph(opts));
+        print_result(run_sycl_kernel_chain_batch(opts));
+        print_optional_result("command_graph_kernel_chain",
+                              [&]() { return run_sycl_kernel_chain_command_graph(opts); });
 
         LevelZeroState l0;
         print_result(run_l0_regular_record_each(l0, opts));
