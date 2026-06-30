@@ -1684,6 +1684,19 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
         std::vector<int32_t> dummy_codes(4 * 16, 0); // 4 frames, 16 codebooks, all token 0
         std::vector<float> dummy_samples;
         decode_mimi_vocoder(ctx, dummy_codes, 4, dummy_samples);
+
+        if (aila::env::read_flag("AILA_TTS_MIMI_STREAM_SHAPE_WARMUP", true)) {
+            const std::array<int, 3> stream_warmup_frames = {17, 28, 32};
+            for (int frames : stream_warmup_frames) {
+                Tensor dummy_pre_tfm = Tensor::allocate(ctx, {frames, 1024});
+                ctx.queue().memset(dummy_pre_tfm.data(), 0, dummy_pre_tfm.size_bytes()).wait();
+                dummy_samples.clear();
+                mimi_conv_stages(ctx, dummy_pre_tfm, frames, dummy_samples,
+                                 frames * kMimiSamplesPerFrame);
+            }
+            AILA_LOG_INFO("[TTS] Mimi stream shape warmup complete (frames=17,28,32)");
+        }
+
         AILA_LOG_INFO("[TTS] Mimi warmup complete");
     }
 
