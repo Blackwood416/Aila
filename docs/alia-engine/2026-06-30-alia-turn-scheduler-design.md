@@ -421,3 +421,57 @@ external Mimo-ASR recognized the output as:
 ```text
 那个……父亲大人说过要诚实回答，但我不确定具体是什么工具。如果用户请求了，就试着回应。
 ```
+
+## 2026-07-03 first spoken foreground delay
+
+The `task_memory` scenario in
+`tmp/alia-real-smoke/voice_matrix_tts_first_min8/summary.csv` exposed a
+foreground-side TTFA outlier:
+
+```text
+scenario     first_token_ms  first_content_ms  first_spoken_delay_ms  action_tags
+task_memory  342             569               227                    1
+```
+
+This means the foreground model was already decoding, but the first decoded
+tokens were action text filtered out of the TTS stream. The smoke and matrix
+tools now export:
+
+```text
+foreground_profile_first_spoken_delay_ms =
+    foreground_profile_first_content_delta_ms -
+    foreground_profile_first_token_delta_ms
+```
+
+Prompt-only experiments were intentionally not retained. A longer system prompt
+removed the delay on `task_memory` but pushed prompt prefill and/or generation
+shape in the wrong direction. A compact `action tags last` prompt stayed within
+the 128-token fast path on one run, but produced an empty foreground response in
+`persona_chat`. Treat prompt wording as too brittle for this control surface.
+
+Useful recon data from the rejected prompt experiments:
+
+```text
+path: tmp/alia-real-smoke/voice_matrix_foreground_spoken_first/summary.csv
+result: 4/5 with output ASR verification; persona_chat failed verification
+first_spoken_delay_ms: 0 on all five scenarios
+task_memory TTFA: 1282 -> 1071 ms
+
+path: tmp/alia-real-smoke/foreground_spoken_first_narrow_prompt_persona/persona.log
+prompt_tokens: 129
+prompt_prefill_ms: 702
+TTFA: 1432 ms
+reason: crossed the 128-token foreground prompt fast-path boundary
+
+path: tmp/alia-real-smoke/foreground_spoken_first_shorter_prompt_persona/persona.log
+prompt_tokens: 128
+prompt_prefill_ms: 324
+failure: empty foreground assistant text, no TTS audio
+```
+
+Next optimization direction: keep the system prompt stable and add a decoding
+side policy before `ActionTagStreamFilter` sees tokens. The precise control
+point is the foreground sampling loop in `generate_with_loaded_vlm`: while no
+spoken text has been emitted to TTS, suppress or retry action-tag opener tokens
+such as leading parenthesized actions. This should target only ordinary voice
+turns and must keep tool-call handling as TODO-only for this branch.

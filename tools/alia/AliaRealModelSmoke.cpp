@@ -1270,6 +1270,12 @@ int main(int argc, char** argv) {
         ctx->foreground_pipeline->last_first_tts_enqueue_ms();
     const aila::alia::AliaForegroundMetrics foreground_metrics =
         ctx->foreground_pipeline->last_metrics();
+    const long long foreground_first_spoken_delay_ms =
+        foreground_metrics.first_token_delta_ms >= 0 &&
+                foreground_metrics.first_content_delta_ms >= 0
+            ? foreground_metrics.first_content_delta_ms -
+                  foreground_metrics.first_token_delta_ms
+            : -1;
     const double simulated_vad_to_first_content_ms =
         foreground_first_content_delta_ms >= 0
             ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_content_delta_ms)
@@ -1321,6 +1327,8 @@ int main(int argc, char** argv) {
               << foreground_metrics.first_token_delta_ms << "\n"
               << "foreground_profile_first_content_delta_ms="
               << foreground_metrics.first_content_delta_ms << "\n"
+              << "foreground_profile_first_spoken_delay_ms="
+              << foreground_first_spoken_delay_ms << "\n"
               << "foreground_profile_first_tts_enqueue_ms="
               << foreground_metrics.first_tts_enqueue_ms << "\n"
               << "foreground_profile_tts_first_audio_priority_wait_ms="

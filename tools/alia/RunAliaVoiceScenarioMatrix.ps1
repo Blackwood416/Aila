@@ -262,6 +262,7 @@ try {
             foreground_profile_prompt_prefill_ms = Get-ValueOrEmpty $values "foreground_profile_prompt_prefill_ms"
             foreground_profile_first_token_delta_ms = Get-ValueOrEmpty $values "foreground_profile_first_token_delta_ms"
             foreground_profile_first_content_delta_ms = Get-ValueOrEmpty $values "foreground_profile_first_content_delta_ms"
+            foreground_profile_first_spoken_delay_ms = Get-ValueOrEmpty $values "foreground_profile_first_spoken_delay_ms"
             foreground_profile_first_tts_enqueue_ms = Get-ValueOrEmpty $values "foreground_profile_first_tts_enqueue_ms"
             foreground_profile_tts_first_audio_priority_wait_ms = Get-ValueOrEmpty $values "foreground_profile_tts_first_audio_priority_wait_ms"
             foreground_profile_decode_ms = Get-ValueOrEmpty $values "foreground_profile_decode_ms"
