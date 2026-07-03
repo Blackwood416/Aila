@@ -475,3 +475,22 @@ point is the foreground sampling loop in `generate_with_loaded_vlm`: while no
 spoken text has been emitted to TTS, suppress or retry action-tag opener tokens
 such as leading parenthesized actions. This should target only ordinary voice
 turns and must keep tool-call handling as TODO-only for this branch.
+
+Follow-up note: a direct sampling-side retry was tested and rejected after the
+`e21ce33` metrics commit. The experiment added a host-side exclusion retry for
+leading `(` / full-width `（` tokens and triggered on `task_memory`, but the
+real smoke produced an empty foreground response after one suppressed token:
+
+```text
+path: tmp/alia-real-smoke/foreground_leading_action_suppress_task/task.log
+foreground_profile_leading_action_token_suppressed_count: 1
+foreground_generated_tokens: 4
+foreground_assistant_text: ""
+tts_callback_count: 0
+result: smoke failed
+```
+
+Do not reintroduce simple token exclusion without a stronger fallback. The
+safer future shape is either a deterministic constrained-decoding contract that
+can fall back to the original token sequence, or a scheduler-level policy that
+can tolerate a short action-tag prefix without mutating model sampling.
