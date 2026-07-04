@@ -98,27 +98,27 @@ try {
     $scenarios = @(
         [pscustomobject]@{
             Name = "short_hello"
-            RequestText = "Alia, please say hello in one short sentence."
+            RequestText = "艾莉亚，请用一句话打个招呼。"
             MaxTokens = 48
         },
         [pscustomobject]@{
             Name = "persona_chat"
-            RequestText = "Alia, I feel tired today. Say something gentle and brief."
+            RequestText = "艾莉亚，我今天有点累，请温柔地简短安慰我。"
             MaxTokens = 64
         },
         [pscustomobject]@{
             Name = "preference_memory"
-            RequestText = "Alia, please remember that I prefer short Chinese replies at night."
+            RequestText = "艾莉亚，请记住我晚上喜欢简短的中文回复。"
             MaxTokens = 64
         },
         [pscustomobject]@{
             Name = "task_memory"
-            RequestText = "Alia, remind me later to stretch my shoulders after work."
+            RequestText = "艾莉亚，下班后提醒我伸展肩膀。"
             MaxTokens = 64
         },
         [pscustomobject]@{
             Name = "long_answer"
-            RequestText = "Alia, explain in three short sentences how you will help me focus tonight."
+            RequestText = "艾莉亚，请用三句短句说明今晚你会怎么帮我专注。"
             MaxTokens = 96
         }
     )

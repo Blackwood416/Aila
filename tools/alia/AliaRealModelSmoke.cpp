@@ -6,6 +6,14 @@
 #include "alia/AliaTurnScheduler.hpp"
 #include "audio/AudioPreprocessor.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -23,16 +31,55 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#ifdef _WIN32
+std::string wide_to_utf8(const wchar_t* value) {
+    if (!value || value[0] == L'\0') {
+        return {};
+    }
+    const int required = WideCharToMultiByte(
+        CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) {
+        return {};
+    }
+    std::string result(static_cast<size_t>(required - 1), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value,
+        -1,
+        result.data(),
+        required,
+        nullptr,
+        nullptr);
+    return result;
+}
+
+std::vector<std::string> windows_command_line_args_utf8() {
+    int wide_argc = 0;
+    LPWSTR* wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (!wide_argv || wide_argc <= 0) {
+        return {};
+    }
+    std::vector<std::string> args;
+    args.reserve(static_cast<size_t>(wide_argc));
+    for (int i = 0; i < wide_argc; ++i) {
+        args.push_back(wide_to_utf8(wide_argv[i]));
+    }
+    LocalFree(wide_argv);
+    return args;
+}
+#endif
+
 struct Options {
     std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
     std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
     std::string foreground_lora =
-        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-1400";
+        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500";
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
     std::string output_wav = "tmp/alia-real-smoke/alia_full_pipeline_target_models.wav";
-    std::string request_text = "Alia, please say hello in one short sentence.";
+    std::string request_text = "艾莉亚，请用一句话打个招呼。";
     std::string tool_probe_text =
         "Call the host tool inspect_window with parameter id equal to 42 now. "
         "Return only the tool call.";
@@ -321,7 +368,7 @@ void print_usage() {
         << "  --tts-model <dir>\n"
         << "  --audio <path>\n"
         << "  --output-wav <path>\n"
-        << "  --request-text <text>  default \"Alia, please say hello in one short sentence.\"\n"
+        << "  --request-text <text>  default \"艾莉亚，请用一句话打个招呼。\"\n"
         << "  --tool-probe-text <text>\n"
         << "  --max-seq <N>          default 2048\n"
         << "  --max-tokens <N>       default 48\n"
@@ -716,6 +763,19 @@ bool run_foreground_tool_probe(AliaContext& ctx, const Options& opts) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    std::vector<std::string> utf8_args = windows_command_line_args_utf8();
+    std::vector<char*> utf8_argv;
+    if (!utf8_args.empty()) {
+        utf8_argv.reserve(utf8_args.size());
+        for (std::string& arg : utf8_args) {
+            utf8_argv.push_back(arg.data());
+        }
+        argc = static_cast<int>(utf8_argv.size());
+        argv = utf8_argv.data();
+    }
+#endif
+
     Options opts;
     if (!parse_args(argc, argv, opts)) {
         print_usage();
