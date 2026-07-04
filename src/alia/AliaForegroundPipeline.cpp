@@ -66,12 +66,17 @@ Tensor* forward_token_span(Context& context,
     }
 
     Tensor* logits = nullptr;
+    // The temporary token-id USM buffer is freed on return; queued kernels may still read it.
+    auto wait_for_token_buffer_use = [&]() {
+        context.synchronize();
+    };
     if (use_decode_path) {
         DeviceAllocation token_device(context, sizeof(int));
         for (int i = 0; i < token_count; ++i) {
             context.memcpy_h2d(token_device.as<int>(), token_ids + i, sizeof(int));
             logits = &backend.forward(context, token_device.as<int>(), 1);
         }
+        wait_for_token_buffer_use();
         return logits;
     }
 
@@ -88,6 +93,7 @@ Tensor* forward_token_span(Context& context,
             logits = &backend.forward(context, prompt_device.as<int>(), chunk_tokens);
             offset += chunk_tokens;
         }
+        wait_for_token_buffer_use();
         return logits;
     }
 
@@ -95,7 +101,9 @@ Tensor* forward_token_span(Context& context,
     context.memcpy_h2d(prompt_device.as<int>(),
                        token_ids,
                        static_cast<size_t>(token_count) * sizeof(int));
-    return &backend.forward(context, prompt_device.as<int>(), token_count);
+    logits = &backend.forward(context, prompt_device.as<int>(), token_count);
+    wait_for_token_buffer_use();
+    return logits;
 }
 
 class BackendCancellationScope {
