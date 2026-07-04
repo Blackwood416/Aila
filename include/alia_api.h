@@ -39,7 +39,8 @@ typedef enum AliaErrorCode {
     ALIA_ERR_RUNTIME = 4,
     ALIA_ERR_ABORTED = 5,
     ALIA_ERR_CONTEXT_OVERFLOW = 6,
-    ALIA_ERR_CALLBACK = 7
+    ALIA_ERR_CALLBACK = 7,
+    ALIA_ERR_TIMEOUT = 8
 } AliaErrorCode;
 
 typedef enum AliaPipelineMask {
@@ -55,6 +56,25 @@ typedef struct AliaGenConfig {
     float top_p;
     int max_tokens;
 } AliaGenConfig;
+
+typedef struct AliaContextConfig {
+    const char* asr_model_dir;
+    const char* vlm_4b_model_dir;
+    const char* vlm_4b_lora_dir;
+    const char* vlm_0_8b_model_dir;
+    const char* tts_model_dir;
+    const char* tts_reference_audio_path;
+    int max_seq_len;
+} AliaContextConfig;
+
+typedef enum AliaAsyncState {
+    ALIA_ASYNC_IDLE = 0,
+    ALIA_ASYNC_RUNNING = 1,
+    ALIA_ASYNC_ABORTING = 2,
+    ALIA_ASYNC_ABORTED = 3,
+    ALIA_ASYNC_COMPLETED = 4,
+    ALIA_ASYNC_FAILED = 5
+} AliaAsyncState;
 
 typedef int (*AliaToolCallCallback)(
     const char* tool_json,
@@ -78,9 +98,11 @@ ALIA_API int alia_context_init(
     const char* vlm_0_8b_model_dir,
     const char* tts_model_dir,
     int max_seq_len);
+ALIA_API int alia_context_init_ex(AliaContext** out_ctx, const AliaContextConfig* config);
 
 ALIA_API void alia_context_destroy(AliaContext* ctx);
 ALIA_API int alia_abort_inference(AliaContext* ctx, int pipeline_mask);
+ALIA_API int alia_get_last_error(AliaContext* ctx, int pipeline_mask, char** out_error);
 ALIA_API int alia_vlm_rollback_kv_cache(AliaContext* ctx, int rollback_tokens);
 ALIA_API int alia_vlm_prefill_asr_text(
     AliaContext* ctx,
@@ -112,7 +134,21 @@ ALIA_API int alia_asr_get_text(AliaContext* ctx, char** out_stable, char** out_p
  * Use alia_asr_get_text() for final/forced turn text.
  */
 ALIA_API int alia_asr_get_partial_text(AliaContext* ctx, char** out_stable, char** out_partial);
+ALIA_API int alia_foreground_get_state(AliaContext* ctx, int* out_state);
+ALIA_API int alia_foreground_wait(AliaContext* ctx, int timeout_ms, int* out_state);
+ALIA_API int alia_foreground_get_last_result(
+    AliaContext* ctx,
+    char** out_user_text,
+    char** out_assistant_text,
+    char** out_action_tags_json);
+ALIA_API int alia_background_get_state(AliaContext* ctx, int* out_state);
+ALIA_API int alia_background_wait(AliaContext* ctx, int timeout_ms, int* out_state);
+ALIA_API int alia_background_get_last_result(AliaContext* ctx, char** out_result_json);
 ALIA_API void alia_register_background_callback(AliaContext* ctx, AliaBackgroundResultCallback callback);
+ALIA_API void alia_register_background_callback_ex(
+    AliaContext* ctx,
+    AliaBackgroundResultCallback callback,
+    void* user_data);
 ALIA_API int alia_trigger_background_processing(AliaContext* ctx, const char* chat_turn_text);
 ALIA_API int alia_start_conversation_turn(
     AliaContext* ctx,

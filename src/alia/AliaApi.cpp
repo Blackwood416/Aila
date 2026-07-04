@@ -2,11 +2,15 @@
 
 #include "../models/IModelBackend.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
 #include <new>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -21,6 +25,122 @@ char* duplicate_c_string(const std::string& value) {
     }
     std::memcpy(out, value.c_str(), value.size() + 1);
     return out;
+}
+
+std::string json_escape(const std::string& value) {
+    std::ostringstream out;
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '\\':
+                out << "\\\\";
+                break;
+            case '"':
+                out << "\\\"";
+                break;
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            default:
+                if (ch < 0x20) {
+                    const char* hex = "0123456789abcdef";
+                    out << "\\u00" << hex[(ch >> 4) & 0x0F] << hex[ch & 0x0F];
+                } else {
+                    out << static_cast<char>(ch);
+                }
+                break;
+        }
+    }
+    return out.str();
+}
+
+std::string string_array_to_json(const std::vector<std::string>& values) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            out << ",";
+        }
+        out << "\"" << json_escape(values[i]) << "\"";
+    }
+    out << "]";
+    return out.str();
+}
+
+int map_foreground_state(aila::alia::ForegroundTurnState state) {
+    switch (state) {
+        case aila::alia::ForegroundTurnState::Idle:
+            return ALIA_ASYNC_IDLE;
+        case aila::alia::ForegroundTurnState::Running:
+            return ALIA_ASYNC_RUNNING;
+        case aila::alia::ForegroundTurnState::Aborting:
+            return ALIA_ASYNC_ABORTING;
+        case aila::alia::ForegroundTurnState::Aborted:
+            return ALIA_ASYNC_ABORTED;
+        case aila::alia::ForegroundTurnState::Completed:
+            return ALIA_ASYNC_COMPLETED;
+        case aila::alia::ForegroundTurnState::Failed:
+            return ALIA_ASYNC_FAILED;
+    }
+    return ALIA_ASYNC_FAILED;
+}
+
+int map_background_state(aila::alia::BackgroundJobState state) {
+    switch (state) {
+        case aila::alia::BackgroundJobState::Idle:
+            return ALIA_ASYNC_IDLE;
+        case aila::alia::BackgroundJobState::Running:
+            return ALIA_ASYNC_RUNNING;
+        case aila::alia::BackgroundJobState::Aborting:
+            return ALIA_ASYNC_ABORTING;
+        case aila::alia::BackgroundJobState::Completed:
+            return ALIA_ASYNC_COMPLETED;
+        case aila::alia::BackgroundJobState::Failed:
+            return ALIA_ASYNC_FAILED;
+    }
+    return ALIA_ASYNC_FAILED;
+}
+
+bool set_process_env(const char* name, const std::string& value) {
+#if defined(_WIN32) || defined(_WIN64)
+    return _putenv_s(name, value.c_str()) == 0;
+#else
+    return setenv(name, value.c_str(), 1) == 0;
+#endif
+}
+
+int init_context_from_config(AliaContext** out_ctx, const AliaContextConfig& config) {
+    if (!out_ctx) {
+        return ALIA_ERR_INVALID_ARGUMENT;
+    }
+
+    *out_ctx = nullptr;
+    if (config.max_seq_len <= 0) {
+        return ALIA_ERR_INVALID_ARGUMENT;
+    }
+
+    if (config.tts_reference_audio_path && config.tts_reference_audio_path[0] != '\0' &&
+        !set_process_env("AILA_TTS_REF_AUDIO", config.tts_reference_audio_path)) {
+        return ALIA_ERR_RUNTIME;
+    }
+
+    auto ctx = std::make_unique<AliaContext>(config.max_seq_len);
+    ctx->asr_model_dir = safe_string(config.asr_model_dir);
+    ctx->vlm_4b_model_dir = safe_string(config.vlm_4b_model_dir);
+    ctx->vlm_4b_lora_dir = safe_string(config.vlm_4b_lora_dir);
+    ctx->vlm_0_8b_model_dir = safe_string(config.vlm_0_8b_model_dir);
+    ctx->tts_model_dir = safe_string(config.tts_model_dir);
+    ctx->configure_model_slots();
+    if (!ctx->load_model_slots()) {
+        return ALIA_ERR_MODEL_LOAD;
+    }
+    *out_ctx = ctx.release();
+    return ALIA_OK;
 }
 
 template <typename Fn>
@@ -56,26 +176,27 @@ ALIA_API int alia_context_init(
     const char* tts_model_dir,
     int max_seq_len) {
     return guarded_alia_call([&]() -> int {
-        if (!out_ctx) {
+        AliaContextConfig config;
+        config.asr_model_dir = asr_model_dir;
+        config.vlm_4b_model_dir = vlm_4b_model_dir;
+        config.vlm_4b_lora_dir = nullptr;
+        config.vlm_0_8b_model_dir = vlm_0_8b_model_dir;
+        config.tts_model_dir = tts_model_dir;
+        config.tts_reference_audio_path = nullptr;
+        config.max_seq_len = max_seq_len;
+        return init_context_from_config(out_ctx, config);
+    });
+}
+
+ALIA_API int alia_context_init_ex(AliaContext** out_ctx, const AliaContextConfig* config) {
+    return guarded_alia_call([&]() -> int {
+        if (!config) {
+            if (out_ctx) {
+                *out_ctx = nullptr;
+            }
             return ALIA_ERR_INVALID_ARGUMENT;
         }
-
-        *out_ctx = nullptr;
-        if (max_seq_len <= 0) {
-            return ALIA_ERR_INVALID_ARGUMENT;
-        }
-
-        auto ctx = std::make_unique<AliaContext>(max_seq_len);
-        ctx->asr_model_dir = safe_string(asr_model_dir);
-        ctx->vlm_4b_model_dir = safe_string(vlm_4b_model_dir);
-        ctx->vlm_0_8b_model_dir = safe_string(vlm_0_8b_model_dir);
-        ctx->tts_model_dir = safe_string(tts_model_dir);
-        ctx->configure_model_slots();
-        if (!ctx->load_model_slots()) {
-            return ALIA_ERR_MODEL_LOAD;
-        }
-        *out_ctx = ctx.release();
-        return ALIA_OK;
+        return init_context_from_config(out_ctx, *config);
     });
 }
 
@@ -102,6 +223,43 @@ ALIA_API int alia_abort_inference(AliaContext* ctx, int pipeline_mask) {
             ctx->background_pipeline->request_abort();
         }
         return ALIA_OK;
+    });
+}
+
+ALIA_API int alia_get_last_error(AliaContext* ctx, int pipeline_mask, char** out_error) {
+    return guarded_alia_call([&]() -> int {
+        if (out_error) {
+            *out_error = nullptr;
+        }
+        if (!ctx || !out_error) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+
+        std::ostringstream message;
+        auto append = [&](const char* prefix, const std::string& value) {
+            if (value.empty()) {
+                return;
+            }
+            if (message.tellp() > 0) {
+                message << "\n";
+            }
+            message << prefix << value;
+        };
+
+        append("", ctx->last_error);
+        if (ctx->foreground_pipeline &&
+            (pipeline_mask == ALIA_PIPELINE_ALL ||
+             (pipeline_mask & (ALIA_PIPELINE_VLM_FOREGROUND | ALIA_PIPELINE_TTS)) != 0)) {
+            append("foreground: ", ctx->foreground_pipeline->last_error_text());
+        }
+        if (ctx->background_pipeline &&
+            (pipeline_mask == ALIA_PIPELINE_ALL ||
+             (pipeline_mask & ALIA_PIPELINE_VLM_BACKGROUND) != 0)) {
+            append("background: ", ctx->background_pipeline->last_error_text());
+        }
+
+        *out_error = duplicate_c_string(message.str());
+        return *out_error ? ALIA_OK : ALIA_ERR_RUNTIME;
     });
 }
 
@@ -287,16 +445,158 @@ ALIA_API int alia_asr_get_partial_text(AliaContext* ctx, char** out_stable, char
     });
 }
 
+ALIA_API int alia_foreground_get_state(AliaContext* ctx, int* out_state) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !out_state) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        *out_state = map_foreground_state(ctx->foreground_pipeline->state());
+        return ALIA_OK;
+    });
+}
+
+ALIA_API int alia_foreground_wait(AliaContext* ctx, int timeout_ms, int* out_state) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || timeout_ms < 0) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        const bool idle = ctx->foreground_pipeline->wait_until_idle_for(
+            std::chrono::milliseconds(timeout_ms));
+        if (out_state) {
+            *out_state = map_foreground_state(ctx->foreground_pipeline->state());
+        }
+        return idle ? ALIA_OK : ALIA_ERR_TIMEOUT;
+    });
+}
+
+ALIA_API int alia_foreground_get_last_result(
+    AliaContext* ctx,
+    char** out_user_text,
+    char** out_assistant_text,
+    char** out_action_tags_json) {
+    return guarded_alia_call([&]() -> int {
+        if (out_user_text) {
+            *out_user_text = nullptr;
+        }
+        if (out_assistant_text) {
+            *out_assistant_text = nullptr;
+        }
+        if (out_action_tags_json) {
+            *out_action_tags_json = nullptr;
+        }
+        if (!ctx) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+
+        if (out_user_text) {
+            *out_user_text = duplicate_c_string(ctx->foreground_pipeline->last_user_text());
+            if (!*out_user_text) {
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        if (out_assistant_text) {
+            *out_assistant_text = duplicate_c_string(
+                ctx->foreground_pipeline->last_assistant_text());
+            if (!*out_assistant_text) {
+                if (out_user_text && *out_user_text) {
+                    alia_free_string(*out_user_text);
+                    *out_user_text = nullptr;
+                }
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        if (out_action_tags_json) {
+            const std::string action_tags_json =
+                string_array_to_json(ctx->foreground_pipeline->last_action_tags());
+            *out_action_tags_json = duplicate_c_string(action_tags_json);
+            if (!*out_action_tags_json) {
+                if (out_user_text && *out_user_text) {
+                    alia_free_string(*out_user_text);
+                    *out_user_text = nullptr;
+                }
+                if (out_assistant_text && *out_assistant_text) {
+                    alia_free_string(*out_assistant_text);
+                    *out_assistant_text = nullptr;
+                }
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        return ALIA_OK;
+    });
+}
+
+ALIA_API int alia_background_get_state(AliaContext* ctx, int* out_state) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !out_state) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->background_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        *out_state = map_background_state(ctx->background_pipeline->state());
+        return ALIA_OK;
+    });
+}
+
+ALIA_API int alia_background_wait(AliaContext* ctx, int timeout_ms, int* out_state) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || timeout_ms < 0) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->background_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        const bool idle = ctx->background_pipeline->wait_until_idle_for(
+            std::chrono::milliseconds(timeout_ms));
+        if (out_state) {
+            *out_state = map_background_state(ctx->background_pipeline->state());
+        }
+        return idle ? ALIA_OK : ALIA_ERR_TIMEOUT;
+    });
+}
+
+ALIA_API int alia_background_get_last_result(AliaContext* ctx, char** out_result_json) {
+    return guarded_alia_call([&]() -> int {
+        if (out_result_json) {
+            *out_result_json = nullptr;
+        }
+        if (!ctx || !out_result_json) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->background_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        *out_result_json = duplicate_c_string(ctx->background_pipeline->last_result_json());
+        return *out_result_json ? ALIA_OK : ALIA_ERR_RUNTIME;
+    });
+}
+
 ALIA_API void alia_register_background_callback(
     AliaContext* ctx,
     AliaBackgroundResultCallback callback) {
+    alia_register_background_callback_ex(ctx, callback, nullptr);
+}
+
+ALIA_API void alia_register_background_callback_ex(
+    AliaContext* ctx,
+    AliaBackgroundResultCallback callback,
+    void* user_data) {
     guarded_alia_void([&]() {
         if (!ctx) {
             return;
         }
 
         if (ctx->background_pipeline) {
-            ctx->background_pipeline->register_callback(callback);
+            ctx->background_pipeline->register_callback(callback, user_data);
         }
     });
 }

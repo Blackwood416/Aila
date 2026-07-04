@@ -37,7 +37,7 @@ public:
     explicit AliaBackgroundPipeline(ModelSlot* slot);
     ~AliaBackgroundPipeline();
 
-    void register_callback(AliaBackgroundResultCallback callback);
+    void register_callback(AliaBackgroundResultCallback callback, void* user_data = nullptr);
     bool trigger(std::string chat_turn_text);
     void request_abort();
     void join();
@@ -47,6 +47,7 @@ public:
     BackgroundDecodeMode last_decode_mode() const;
     std::string last_prompt_text() const;
     std::string last_result_json() const;
+    std::string last_error_text() const;
     int last_schema_retry_count() const;
     bool last_schema_repair_applied() const;
     std::string last_schema_diagnostic() const;
@@ -55,7 +56,7 @@ public:
     const std::string& last_error() const { return last_error_; }
 
 private:
-    void run_job(std::string chat_turn_text, AliaBackgroundResultCallback callback);
+    void run_job(std::string chat_turn_text, AliaBackgroundResultCallback callback, void* user_data);
     bool can_generate_with_loaded_vlm() const;
     bool generate_with_loaded_vlm(const std::string& prompt_text,
                                   std::string& result_json);
@@ -66,6 +67,7 @@ private:
     std::condition_variable cv_;
     std::thread worker_;
     AliaBackgroundResultCallback callback_ = nullptr;
+    void* callback_user_data_ = nullptr;
     BackgroundJobState state_ = BackgroundJobState::Idle;
     bool abort_requested_ = false;
     std::string last_error_;

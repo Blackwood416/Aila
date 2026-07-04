@@ -104,6 +104,7 @@ public:
     AliaForegroundMetrics last_metrics() const;
     bool last_speculative_commit_hit() const;
     std::string last_speculative_commit_reason() const;
+    std::string last_error_text() const;
     const std::string& last_error() const { return last_error_; }
 
 private:

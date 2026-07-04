@@ -336,13 +336,15 @@ AliaBackgroundPipeline::~AliaBackgroundPipeline() {
     join();
 }
 
-void AliaBackgroundPipeline::register_callback(AliaBackgroundResultCallback callback) {
+void AliaBackgroundPipeline::register_callback(AliaBackgroundResultCallback callback, void* user_data) {
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = callback;
+    callback_user_data_ = user_data;
 }
 
 bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     AliaBackgroundResultCallback callback = nullptr;
+    void* callback_user_data = nullptr;
 
     std::unique_lock<std::mutex> lock(mutex_);
     if (is_busy_locked()) {
@@ -356,6 +358,7 @@ bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     }
 
     callback = callback_;
+    callback_user_data = callback_user_data_;
     if (!callback) {
         last_error_ = "background callback is not registered";
         return false;
@@ -370,8 +373,8 @@ bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     last_schema_diagnostic_.clear();
     last_decode_mode_ = BackgroundDecodeMode::None;
     state_ = BackgroundJobState::Running;
-    worker_ = std::thread([this, text = std::move(chat_turn_text), callback]() mutable {
-        run_job(std::move(text), callback);
+    worker_ = std::thread([this, text = std::move(chat_turn_text), callback, callback_user_data]() mutable {
+        run_job(std::move(text), callback, callback_user_data);
     });
     return true;
 }
@@ -418,6 +421,11 @@ std::string AliaBackgroundPipeline::last_result_json() const {
     return last_result_json_;
 }
 
+std::string AliaBackgroundPipeline::last_error_text() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
+}
+
 int AliaBackgroundPipeline::last_schema_retry_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_schema_retry_count_;
@@ -435,7 +443,8 @@ std::string AliaBackgroundPipeline::last_schema_diagnostic() const {
 
 void AliaBackgroundPipeline::run_job(
     std::string chat_turn_text,
-    AliaBackgroundResultCallback callback) {
+    AliaBackgroundResultCallback callback,
+    void* user_data) {
     try {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -532,7 +541,7 @@ void AliaBackgroundPipeline::run_job(
             }
         }
 
-        callback(result_json.c_str(), nullptr);
+        callback(result_json.c_str(), user_data);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);

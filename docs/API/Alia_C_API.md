@@ -45,7 +45,8 @@ typedef enum AliaErrorCode {
     ALIA_ERR_RUNTIME = 4,
     ALIA_ERR_ABORTED = 5,
     ALIA_ERR_CONTEXT_OVERFLOW = 6,
-    ALIA_ERR_CALLBACK = 7
+    ALIA_ERR_CALLBACK = 7,
+    ALIA_ERR_TIMEOUT = 8
 } AliaErrorCode;
 ```
 
@@ -61,6 +62,7 @@ Current implementation behavior:
 | `ALIA_ERR_ABORTED` | A `ModelBackendCancelled` exception escaped into the C wrapper. |
 | `ALIA_ERR_CONTEXT_OVERFLOW` | Foreground ASR prefill would exceed the loaded VLM context length. |
 | `ALIA_ERR_CALLBACK` | Declared in the ABI, but no exported wrapper currently returns it directly. Callback failures normally surface as async foreground failure after the start call has already returned `ALIA_OK`. |
+| `ALIA_ERR_TIMEOUT` | A foreground/background wait call reached its timeout before the worker became idle. The current state is still written when an output state pointer is supplied. |
 
 All exported non-void functions are guarded against C++ exceptions. Exceptions
 are converted to `ALIA_ERR_RUNTIME`, except backend cancellation, which maps to
@@ -119,6 +121,55 @@ The config is translated to the internal generation config as:
 - `do_sample = (temperature > 0.0f)`
 
 So `temperature == 0.0f` selects greedy-style decoding in the current code.
+
+## Context config
+
+New host integrations should prefer `alia_context_init_ex`:
+
+```c
+typedef struct AliaContextConfig {
+    const char* asr_model_dir;
+    const char* vlm_4b_model_dir;
+    const char* vlm_4b_lora_dir;
+    const char* vlm_0_8b_model_dir;
+    const char* tts_model_dir;
+    const char* tts_reference_audio_path;
+    int max_seq_len;
+} AliaContextConfig;
+```
+
+All string fields are UTF-8 paths. Null string pointers are treated as empty
+strings except `tts_reference_audio_path`, which is optional and leaves the
+current TTS reference-audio environment/default behavior unchanged when null or
+empty.
+
+Use the currently preferred Alia model set as:
+
+- ASR: `models/Qwen3-ASR-1.7B-BNB-NF4`
+- Foreground: `models/qwen3.5-4B-bnb-nf4-offline-visiondense`
+- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500`
+- Background: `models/qwen3.5-0.8B-bnb-nf4-offline`
+- TTS: `models/Qwen3-TTS-12Hz-0.6B-Base`
+- TTS reference audio: worktree-local `alia_ref.wav`
+
+## Async states
+
+Foreground and background workers expose a shared C-facing async state enum:
+
+```c
+typedef enum AliaAsyncState {
+    ALIA_ASYNC_IDLE = 0,
+    ALIA_ASYNC_RUNNING = 1,
+    ALIA_ASYNC_ABORTING = 2,
+    ALIA_ASYNC_ABORTED = 3,
+    ALIA_ASYNC_COMPLETED = 4,
+    ALIA_ASYNC_FAILED = 5
+} AliaAsyncState;
+```
+
+Wait functions return `ALIA_OK` when the worker is idle before the timeout and
+`ALIA_ERR_TIMEOUT` when it is still busy. In both cases, the current state is
+written to `out_state` when that pointer is non-null.
 
 ## Callbacks
 
@@ -180,8 +231,9 @@ typedef void (*AliaBackgroundResultCallback)(
 Background extraction invokes this callback from the background worker thread.
 
 - `extracted_json` is a UTF-8 JSON object string.
-- The current implementation always passes `NULL` as `user_data` because
-  `alia_register_background_callback` stores only the function pointer.
+- `user_data` is the pointer registered through
+  `alia_register_background_callback_ex`. The legacy
+  `alia_register_background_callback` wrapper passes `NULL`.
 - The pointer is valid only during the callback.
 
 The background pipeline attempts to return a JSON object with:
@@ -242,8 +294,40 @@ Important implementation details:
   an empty ASR, foreground VLM, or TTS slot will therefore fail initialization.
 - The foreground and ASR/TTS slots share the foreground runtime context. The
   background VLM uses a separate background runtime context.
-- The current C API does not expose a `vlm_4b_lora_dir` parameter. The internal
-  `AliaContext` has such a field, but it is not populated by `alia_context_init`.
+- This legacy initializer does not expose a `vlm_4b_lora_dir` parameter. New
+  host code should call `alia_context_init_ex` so the foreground LoRA is loaded
+  explicitly.
+
+### `alia_context_init_ex`
+
+```c
+ALIA_API int alia_context_init_ex(
+    AliaContext** out_ctx,
+    const AliaContextConfig* config);
+```
+
+Creates an `AliaContext` using the extended config struct. This is the
+recommended initializer for Alia Host.
+
+Additional behavior compared with `alia_context_init`:
+
+- `config->vlm_4b_lora_dir` populates the foreground LoRA directory before
+  model slot configuration.
+- `config->tts_reference_audio_path`, when non-null and non-empty, sets the
+  process-local `AILA_TTS_REF_AUDIO` value before TTS reference voice preload.
+  This lets the host pin the worktree-local `alia_ref.wav` without relying on
+  external environment setup.
+
+Return behavior:
+
+- `ALIA_OK`: all required load and startup steps succeeded and `*out_ctx` owns
+  the new context.
+- `ALIA_ERR_INVALID_ARGUMENT`: `out_ctx == NULL`, `config == NULL`, or
+  `config->max_seq_len <= 0`.
+- `ALIA_ERR_MODEL_LOAD`: model load, warmup, LoRA application, or TTS reference
+  voice preload failed.
+- `ALIA_ERR_RUNTIME`: allocation, environment update, or unexpected exception
+  failed.
 
 ### `alia_context_destroy`
 
@@ -530,6 +614,72 @@ Note that `ALIA_OK` means the commit/fallback worker was accepted. It does not
 prove that the speculative cache was used or that the eventual async turn
 succeeded.
 
+### `alia_foreground_get_state`
+
+```c
+ALIA_API int alia_foreground_get_state(
+    AliaContext* ctx,
+    int* out_state);
+```
+
+Writes the current foreground worker state as an `AliaAsyncState` integer.
+
+Return behavior:
+
+- `ALIA_OK`: state was written.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `out_state == NULL`.
+- `ALIA_ERR_INVALID_STATE`: foreground pipeline is missing.
+- `ALIA_ERR_RUNTIME`: exception caught by wrapper.
+
+### `alia_foreground_wait`
+
+```c
+ALIA_API int alia_foreground_wait(
+    AliaContext* ctx,
+    int timeout_ms,
+    int* out_state);
+```
+
+Waits up to `timeout_ms` for the foreground worker to become idle. Use a small
+timeout for UI/FSM polling or a larger timeout for shutdown/smoke tooling.
+
+Return behavior:
+
+- `ALIA_OK`: foreground is idle; `out_state`, when supplied, contains the final
+  current state.
+- `ALIA_ERR_TIMEOUT`: foreground is still running or aborting after the timeout;
+  `out_state`, when supplied, still contains the current state.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `timeout_ms < 0`.
+- `ALIA_ERR_INVALID_STATE`: foreground pipeline is missing.
+- `ALIA_ERR_RUNTIME`: exception caught by wrapper.
+
+### `alia_foreground_get_last_result`
+
+```c
+ALIA_API int alia_foreground_get_last_result(
+    AliaContext* ctx,
+    char** out_user_text,
+    char** out_assistant_text,
+    char** out_action_tags_json);
+```
+
+Returns malloc-owned UTF-8 copies of the most recent foreground turn result.
+Any output pointer may be null. Non-null outputs must be released with
+`alia_free_string`.
+
+- `out_user_text`: the final user text used for the turn.
+- `out_assistant_text`: the final spoken/assistant text after stripping
+  structured artifacts.
+- `out_action_tags_json`: a JSON string array containing action tags stripped
+  from spoken text, for example `["尾巴轻轻摆动"]`.
+
+Return behavior:
+
+- `ALIA_OK`: requested outputs were produced.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL`.
+- `ALIA_ERR_INVALID_STATE`: foreground pipeline is missing.
+- `ALIA_ERR_RUNTIME`: string allocation failed or exception caught by wrapper.
+
 ### `alia_vlm_rollback_kv_cache`
 
 ```c
@@ -579,6 +729,29 @@ Return behavior:
 This function does not join worker threads. Context destruction and internal
 pipeline cleanup perform joins.
 
+### `alia_get_last_error`
+
+```c
+ALIA_API int alia_get_last_error(
+    AliaContext* ctx,
+    int pipeline_mask,
+    char** out_error);
+```
+
+Returns a malloc-owned UTF-8 error string assembled from the context and the
+selected async pipelines. Release the returned string with `alia_free_string`.
+When no error is present, the function returns an allocated empty string.
+
+Use `ALIA_PIPELINE_ALL` when reporting initialization or unknown failures. Use
+`ALIA_PIPELINE_VLM_FOREGROUND | ALIA_PIPELINE_TTS` for foreground turn failures
+and `ALIA_PIPELINE_VLM_BACKGROUND` for background extraction failures.
+
+Return behavior:
+
+- `ALIA_OK`: `out_error` owns a string.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `out_error == NULL`.
+- `ALIA_ERR_RUNTIME`: string allocation failed or exception caught by wrapper.
+
 ## Background API
 
 ### `alia_register_background_callback`
@@ -593,7 +766,24 @@ Registers the background extraction callback. Passing `ctx == NULL` is safe and
 does nothing. Passing `callback == NULL` clears the callback.
 
 There is no public `user_data` parameter. The callback receives `NULL` as its
-second argument in current code.
+second argument through this legacy wrapper.
+
+### `alia_register_background_callback_ex`
+
+```c
+ALIA_API void alia_register_background_callback_ex(
+    AliaContext* ctx,
+    AliaBackgroundResultCallback callback,
+    void* user_data);
+```
+
+Registers the background extraction callback and an opaque host pointer. The
+callback and `user_data` are snapshotted when `alia_trigger_background_processing`
+accepts a job, so changing the registration later does not affect an already
+running background worker.
+
+Passing `callback == NULL` clears the callback and stores the supplied
+`user_data` pointer for future registrations.
 
 ### `alia_trigger_background_processing`
 
@@ -631,13 +821,68 @@ Return behavior:
 As with foreground work, `ALIA_OK` means the worker was accepted. Generation or
 schema repair can still fail asynchronously.
 
+### `alia_background_get_state`
+
+```c
+ALIA_API int alia_background_get_state(
+    AliaContext* ctx,
+    int* out_state);
+```
+
+Writes the current background worker state as an `AliaAsyncState` integer.
+
+Return behavior:
+
+- `ALIA_OK`: state was written.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `out_state == NULL`.
+- `ALIA_ERR_INVALID_STATE`: background pipeline is missing.
+- `ALIA_ERR_RUNTIME`: exception caught by wrapper.
+
+### `alia_background_wait`
+
+```c
+ALIA_API int alia_background_wait(
+    AliaContext* ctx,
+    int timeout_ms,
+    int* out_state);
+```
+
+Waits up to `timeout_ms` for the background worker to become idle.
+
+Return behavior:
+
+- `ALIA_OK`: background is idle; `out_state`, when supplied, contains the final
+  current state.
+- `ALIA_ERR_TIMEOUT`: background is still running or aborting after the timeout;
+  `out_state`, when supplied, still contains the current state.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `timeout_ms < 0`.
+- `ALIA_ERR_INVALID_STATE`: background pipeline is missing.
+- `ALIA_ERR_RUNTIME`: exception caught by wrapper.
+
+### `alia_background_get_last_result`
+
+```c
+ALIA_API int alia_background_get_last_result(
+    AliaContext* ctx,
+    char** out_result_json);
+```
+
+Returns a malloc-owned UTF-8 copy of the most recent background JSON result.
+Release it with `alia_free_string`.
+
+Return behavior:
+
+- `ALIA_OK`: `out_result_json` owns a string.
+- `ALIA_ERR_INVALID_ARGUMENT`: `ctx == NULL` or `out_result_json == NULL`.
+- `ALIA_ERR_INVALID_STATE`: background pipeline is missing.
+- `ALIA_ERR_RUNTIME`: string allocation failed or exception caught by wrapper.
+
 ## Threading and lifetime notes
 
 - The Alia C API starts foreground and background work on internal `std::thread`
   workers.
-- The C ABI currently has no exported wait/status/error accessor for Alia async
-  work. Internal smoke tools use C++ pipeline methods such as
-  `wait_until_idle_for`, `join`, and `last_error`.
+- Foreground and background async state, wait, result, and error accessors are
+  exported for host FSM integration.
 - Do not call foreground start/prefill/rollback APIs concurrently from multiple
   host threads without external synchronization.
 - `alia_abort_inference` requests cancellation, but does not guarantee that
@@ -658,30 +903,38 @@ static void on_audio(const float* samples, int sample_count, void* user_data) {
 }
 
 static void on_background(const char* extracted_json, void* user_data) {
-    (void)user_data; /* Current implementation passes NULL. */
+    (void)user_data;
     /* Copy extracted_json here if needed. */
 }
 
 int main(void) {
     AliaContext* ctx = NULL;
-    int rc = alia_context_init(
-        &ctx,
-        "models/Qwen3-ASR-1.7B-BNB-NF4",
-        "models/qwen3.5-4B-bnb-nf4-offline-visiondense",
-        "models/qwen3.5-0.8B-bnb-nf4-offline",
-        "models/Qwen3-TTS-12Hz-0.6B-Base",
-        2048);
+    AliaContextConfig init;
+    init.asr_model_dir = "models/Qwen3-ASR-1.7B-BNB-NF4";
+    init.vlm_4b_model_dir = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
+    init.vlm_4b_lora_dir = "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500";
+    init.vlm_0_8b_model_dir = "models/qwen3.5-0.8B-bnb-nf4-offline";
+    init.tts_model_dir = "models/Qwen3-TTS-12Hz-0.6B-Base";
+    init.tts_reference_audio_path = "E:/RiderProjects/Aila/.worktrees/alia-custom-engine/alia_ref.wav";
+    init.max_seq_len = 2048;
+
+    int rc = alia_context_init_ex(&ctx, &init);
     if (rc != ALIA_OK) {
         return rc;
     }
 
-    /* Feed 16 kHz mono float PCM. */
+    /*
+     * VAD_Rise -> UserListening:
+     * feed 16 kHz mono float PCM while speech is active, poll ASR partial text,
+     * and prefill the foreground VLM from stable/partial text.
+     */
     /* alia_asr_feed_audio(ctx, samples, sample_count); */
 
     char* stable = NULL;
     char* partial = NULL;
-    rc = alia_asr_get_text(ctx, &stable, &partial);
+    rc = alia_asr_get_partial_text(ctx, &stable, &partial);
     if (rc == ALIA_OK) {
+        (void)alia_vlm_prefill_asr_text(ctx, stable, partial);
         alia_free_string(stable);
         alia_free_string(partial);
     }
@@ -691,16 +944,34 @@ int main(void) {
     gen.top_p = 0.9f;
     gen.max_tokens = 48;
 
+    /* VAD_Fall -> AiThinking/AiSpeaking. */
     rc = alia_start_conversation_turn(ctx, &gen, NULL, on_audio, NULL);
     if (rc != ALIA_OK) {
         alia_context_destroy(ctx);
         return rc;
     }
 
-    alia_register_background_callback(ctx, on_background);
-    (void)alia_trigger_background_processing(
+    int state = ALIA_ASYNC_RUNNING;
+    while (alia_foreground_wait(ctx, 20, &state) == ALIA_ERR_TIMEOUT) {
+        /* Host UI/audio loop continues here. */
+    }
+
+    char* user_text = NULL;
+    char* assistant_text = NULL;
+    char* action_tags_json = NULL;
+    rc = alia_foreground_get_last_result(
         ctx,
-        "User: hello\nAssistant: hello");
+        &user_text,
+        &assistant_text,
+        &action_tags_json);
+    if (rc == ALIA_OK && state == ALIA_ASYNC_COMPLETED) {
+        /* Send action_tags_json to avatar/action routing if needed. */
+        alia_register_background_callback_ex(ctx, on_background, NULL);
+        /* Compose "User: ...\nAssistant: ..." and trigger background extraction. */
+    }
+    alia_free_string(user_text);
+    alia_free_string(assistant_text);
+    alia_free_string(action_tags_json);
 
     alia_abort_inference(ctx, ALIA_PIPELINE_ALL);
     alia_context_destroy(ctx);
@@ -708,16 +979,40 @@ int main(void) {
 }
 ```
 
+## Host integration notes
+
+The current API is sufficient for the first real host integration pass:
+
+- `alia_context_init_ex` lets the host explicitly select checkpoint-500 LoRA and
+  the worktree-local TTS reference audio.
+- `alia_asr_feed_audio`, `alia_asr_get_partial_text`, and
+  `alia_vlm_prefill_asr_text` support the `UserListening` streaming ASR/prefill
+  phase.
+- `alia_start_conversation_turn` or `alia_commit_speculative_conversation_turn`
+  should be called on the host VAD fall / turn commit boundary.
+- `alia_foreground_wait`, `alia_foreground_get_state`, and
+  `alia_foreground_get_last_result` let the host drive `AiThinking` /
+  `AiSpeaking` and then trigger background memory extraction.
+- `alia_register_background_callback_ex`, `alia_background_wait`, and
+  `alia_background_get_last_result` cover async memory extraction and debugging.
+
+The host skeleton in `E:/RiderProjects/Alia/src/Alia.Host/Program.cs` still
+reflects an older flow where `VAD_Rise` starts a conversation turn immediately.
+For this engine, `VAD_Rise` should enter `UserListening`, feed ASR audio, poll
+partial text for UI/prefill, and only start/commit the foreground turn on
+`VAD_Fall`. `VAD_Rise` during `AiThinking` or `AiSpeaking` should abort
+foreground/TTS, clear playback, reset or continue ASR as appropriate, and return
+to `UserListening`.
+
 ## Current limitations visible from the C ABI
 
-- No exported wait, async status, or last-error accessor exists for `alia_*`
-  async foreground/background work.
-- `AliaBackgroundResultCallback` has a `user_data` parameter, but the C API does
-  not expose registration of a user data pointer and currently passes `NULL`.
 - `ALIA_ERR_CALLBACK` is declared but not returned directly by the exported
-  wrappers in current code.
-- The internal foreground LoRA directory field is not configurable through
-  `alia_context_init`.
+  wrappers in current code. Callback failures normally surface as async
+  foreground failure after the start call has already returned `ALIA_OK`.
+- The legacy `alia_context_init` initializer still cannot set foreground LoRA or
+  TTS reference audio. Host integrations should use `alia_context_init_ex`.
 - The API currently exposes ASR audio input, foreground text/TTS output,
   background extraction, abort, KV rollback, and speculative foreground commit.
-  It does not expose image input or public foreground result strings through C.
+  It does not expose image input; Computer Use / visual input remains a TODO.
+- Tool calls remain callback-based and intentionally minimal for the current
+  real voice-text-voice integration phase.

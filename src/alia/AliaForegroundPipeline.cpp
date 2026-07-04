@@ -1304,6 +1304,11 @@ std::string AliaForegroundPipeline::last_speculative_commit_reason() const {
     return last_speculative_commit_reason_;
 }
 
+std::string AliaForegroundPipeline::last_error_text() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
+}
+
 void AliaForegroundPipeline::run_speculative_turn(
     std::string stable_text,
     std::string partial_text,
