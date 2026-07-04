@@ -20,7 +20,7 @@ short_hello: 艾莉亚，请用一句话打个招呼。
 persona_chat: 艾莉亚，我今天有点累，请温柔地简短安慰我。
 preference_memory: 艾莉亚，请记住我晚上喜欢简短的中文回复。
 task_memory: 艾莉亚，下班后提醒我伸展肩膀。
-long_answer: 艾莉亚，请用三句短句说明今晚你会怎么帮我专注。
+multi_turn_followup: 刚才我说今晚想早点休息。艾莉亚，请用一句短句接着提醒我。
 ```
 
 Historical docs may still mention `checkpoint-1400` and English request text as
@@ -89,5 +89,46 @@ Issues to report for `checkpoint-500`:
   `艾利亚……` until `MaxTokens=96`, creating 63 TTS synthesis jobs and about
   170 s of backend TTS work.
 
-For future LoRA checks, keep this matrix because it separates the solved
-action-tag problem from the remaining repetition/role-drift problem.
+The long-answer scenario is now retired from the default voice matrix. Typical
+Alia voice turns should be short, so the matrix now uses `multi_turn_followup`
+instead: a short Chinese follow-up request that embeds prior context in the
+current turn. This keeps the matrix focused on TTFA, short-answer quality, and
+context continuity without letting long-text repetition dominate TTS runtime.
+Scenario `MaxTokens` values are also capped for short voice turns: 32 for the
+greeting scenario and 48 for the remaining matrix scenarios.
+
+For future LoRA checks, keep the short Chinese matrix because it separates the
+solved action-tag problem from the remaining repetition/role-drift problem.
+
+## Short Multi-Turn Matrix Update
+
+`long_answer` was replaced with `multi_turn_followup` on 2026-07-04 because
+long-form answers are not representative for the current Alia voice assistant
+loop. Validation commands used the same real-model matrix with output ASR:
+
+```powershell
+.\tools\alia\RunAliaVoiceScenarioMatrix.ps1 -SkipBuild -TimeoutSec 1500 `
+  -StreamAsrPrefill -StreamChunkMs 1000 -StreamPrefillIntervalMs 1000 `
+  -VerifyOutputAsr `
+  -OutputDir 'tmp\alia-real-smoke\voice_matrix_lora500_chinese_multiturn'
+```
+
+Result from the first replacement run, before the matrix `MaxTokens` caps were
+tightened: failed, 2/5 pass. `persona_chat` and `preference_memory` completed.
+`short_hello` generated a repeated role/self-description response, hit the
+48-token cap, produced about 23.2 s of TTS backend work, then exited with
+`-1073741819`. `task_memory` and `multi_turn_followup` exited with the same
+code during model/warmup initialization before useful pipeline metrics were
+emitted. After tightening the scenario token caps, a diagnostic single-run of
+`multi_turn_followup` still failed in the same initialization region; repeating
+the diagnostic with `AILA_TTS_REF_AUDIO=0` also failed there, so the crash is
+not explained by `alia_ref.wav` reference embedding alone.
+
+Keep the scenario replacement, but treat the latest validation as exposing two
+separate follow-up issues:
+
+- `checkpoint-500` can still drift or repeat on short Chinese prompts, even
+  though action tags are gone.
+- Repeated real-model smoke processes can hit an access violation around the
+  post-Mimi-warmup foreground buffer initialization path. Investigate this
+  before relying on full matrix results after a runaway TTS turn.

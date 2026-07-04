@@ -99,27 +99,27 @@ try {
         [pscustomobject]@{
             Name = "short_hello"
             RequestText = "艾莉亚，请用一句话打个招呼。"
-            MaxTokens = 48
+            MaxTokens = 32
         },
         [pscustomobject]@{
             Name = "persona_chat"
             RequestText = "艾莉亚，我今天有点累，请温柔地简短安慰我。"
-            MaxTokens = 64
+            MaxTokens = 48
         },
         [pscustomobject]@{
             Name = "preference_memory"
             RequestText = "艾莉亚，请记住我晚上喜欢简短的中文回复。"
-            MaxTokens = 64
+            MaxTokens = 48
         },
         [pscustomobject]@{
             Name = "task_memory"
             RequestText = "艾莉亚，下班后提醒我伸展肩膀。"
-            MaxTokens = 64
+            MaxTokens = 48
         },
         [pscustomobject]@{
-            Name = "long_answer"
-            RequestText = "艾莉亚，请用三句短句说明今晚你会怎么帮我专注。"
-            MaxTokens = 96
+            Name = "multi_turn_followup"
+            RequestText = "刚才我说今晚想早点休息。艾莉亚，请用一句短句接着提醒我。"
+            MaxTokens = 48
         }
     )
 
