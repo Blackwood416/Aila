@@ -131,6 +131,11 @@ set(COMMAND_SUBMISSION_BENCH_SOURCES
     tools/perf/CommandSubmissionBench.cpp
 )
 
+set(ALIA_TURN_SCHEDULER_TEST_SOURCES
+    tests/alia/AliaTurnSchedulerTests.cpp
+    src/alia/AliaTurnScheduler.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -201,6 +206,21 @@ target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
 
 add_custom_target(AliaEngine DEPENDS AilaShared)
 add_dependencies(AliaEngine AilaAliaRealSmoke)
+
+add_executable(AilaAliaTurnSchedulerTests ${ALIA_TURN_SCHEDULER_TEST_SOURCES})
+target_compile_definitions(AilaAliaTurnSchedulerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaAliaTurnSchedulerTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
+target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE DNNL::dnnl simdjson)
 
 set(AILA_LEVEL_ZERO_SDK_ROOT "C:/level-zero-win-sdk-1.28.2" CACHE PATH
     "Level Zero SDK root for optional command submission benchmarks")

@@ -76,8 +76,8 @@ void packed_nf4_gemm_bf16(Context& ctx,
                     // Cooperative load B NF4 bytes for [BK, BN] tile
                     const int b_bytes = a_cols * BN / 2;
                     for (int i = lid; i < b_bytes; i += WG_SIZE) {
-                        const int k_half = i % (a_cols / 2);
-                        const int bn_idx = i / (a_cols / 2);
+                        const int k_half = i / BN;
+                        const int bn_idx = i % BN;
                         const int src_n = n0 + bn_idx;
                         if (src_n < N) {
                             B_nf4_slm[i] = packed_ptr[src_n * packed_bytes_per_row + kb / 2 + k_half];
