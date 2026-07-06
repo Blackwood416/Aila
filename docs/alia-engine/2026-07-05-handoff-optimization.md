@@ -51,6 +51,16 @@ Important previous conclusions:
   deterministic comparison or a TTS-specific sampling contract.
 - Qwen3-TTS has nested transformer structure; some generation variance is
   expected. Focus on whether the module/pipeline is near the practical limit.
+- Qwen3-ASR text decoder profiling showed decode is distributed across
+  attention, qkv/o/ffn/down, and norms; attention/joint_matrix alone was not a
+  clear first target on the short smoke. ASR prefix reuse previously regressed
+  because the 24-token append prefill shape was not warmed. Backend warmup now
+  includes 24 and 32 tokens. In the 2026-07-06 short smoke,
+  `AILA_ASR_PREFIX_REUSE=1` hit reuse of 48 tokens and appended 24 tokens; the
+  final 24-token prefill profile had `o_proj=17.932ms` instead of the earlier
+  100ms+ shape-init spike. Non-profile tail was 317 ms with prefix reuse versus
+  335 ms without prefix reuse on the same build. Keep prefix reuse opt-in until
+  a broader ASR matrix confirms quality and latency across lengths.
 
 ## Latest evidence snapshot
 

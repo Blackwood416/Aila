@@ -17,6 +17,7 @@
 #include <memory>
 #include <sycl/sycl.hpp>
 #include <utility>
+#include <vector>
 
 namespace aila::alia {
 namespace {
@@ -160,6 +161,23 @@ std::string build_asr_language_hint_prefix(std::string language) {
     }
 
     return "language " + normalize_language_name(language);
+}
+
+std::vector<int> asr_backend_warmup_lengths(int target_prompt_tokens) {
+    target_prompt_tokens = std::max(1, target_prompt_tokens);
+    if (target_prompt_tokens < 24) {
+        return {target_prompt_tokens};
+    }
+
+    std::vector<int> lengths;
+    const int candidates[] = {24, 32, 48, 64, 80, target_prompt_tokens};
+    for (int candidate : candidates) {
+        if (candidate <= target_prompt_tokens &&
+            std::find(lengths.begin(), lengths.end(), candidate) == lengths.end()) {
+            lengths.push_back(candidate);
+        }
+    }
+    return lengths;
 }
 
 bool AliaAsrPipeline::feed_audio(const float* samples, int sample_count) {
@@ -526,7 +544,8 @@ bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
                 backend->reset();
             };
 
-            const int warmup_lengths[] = {48, 64, 80, s_warmup_prompt_tokens};
+            const std::vector<int> warmup_lengths =
+                asr_backend_warmup_lengths(s_warmup_prompt_tokens);
             int last_warmup_len = -1;
             for (int requested_len : warmup_lengths) {
                 const int prompt_len = std::min(
