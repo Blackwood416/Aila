@@ -196,6 +196,7 @@ int main() {
         {"asr_short_qkv_like", 69, 4096, 2048},
         {"asr_short_o_like", 69, 2048, 2048},
         {"asr_short_gate_up_like", 69, 12288, 2048},
+        {"asr_real_gate_up_like", 72, 12288, 2048},
         {"asr_short_down_like", 69, 2048, 6144},
     };
 

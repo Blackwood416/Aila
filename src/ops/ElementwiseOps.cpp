@@ -415,6 +415,41 @@ void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up, Tensor& output, int ff_
     });
 }
 
+void fused_gate_up_swiglu_prefill(Context& ctx, Tensor& gate_up,
+                                  Tensor& output, int seq_len, int ff_dim) {
+    using vec8 = sycl::vec<bf16, 8>;
+    bf16* src_ptr = static_cast<bf16*>(gate_up.data());
+    vec8* o_ptr = reinterpret_cast<vec8*>(output.data());
+
+    const int row_vecs = ff_dim / 8;
+    const int total_vecs = seq_len * row_vecs;
+    constexpr int wg_size = 256;
+    const int num_groups = (total_vecs + wg_size - 1) / wg_size;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                const int i = static_cast<int>(item.get_global_id(0));
+                if (i >= total_vecs) return;
+
+                const int row = i / row_vecs;
+                const int col_vec = i - row * row_vecs;
+                const vec8* row_ptr = reinterpret_cast<const vec8*>(
+                    src_ptr + row * (2 * ff_dim));
+                const vec8 g_vec = row_ptr[col_vec];
+                const vec8 u_vec = row_ptr[row_vecs + col_vec];
+                vec8 o_vec;
+                for (int k = 0; k < 8; ++k) {
+                    const float g = static_cast<float>(g_vec[k]);
+                    const float u = static_cast<float>(u_vec[k]);
+                    const float silu_g = g / (1.0f + sycl::native::exp(-g));
+                    o_vec[k] = bf16(silu_g * u);
+                }
+                o_ptr[i] = o_vec;
+            });
+    });
+}
+
 void snake_beta(Context& ctx, Tensor& input, Tensor& alpha, Tensor& beta,
                 Tensor& output, int n, int channels, int seq_len) {
     bf16* in_ptr = static_cast<bf16*>(input.data());

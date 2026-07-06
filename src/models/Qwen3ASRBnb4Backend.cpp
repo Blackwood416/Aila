@@ -441,6 +441,8 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
     static const int s_decode_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q3_DECODE_EVERY", 32));
     static const int s_prefill_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q3_PREFILL_EVERY", 1));
     static const bool s_profile_host_only = aila::env::read_flag("AILA_PROFILE_Q3_HOST_ONLY", false);
+    static const bool s_prefill_fused_swiglu =
+        aila::env::read_flag("AILA_ASR_PREFILL_FUSED_SWIGLU", false);
     bool profile_decode = (seq_len == 1) && s_profile_decode;
     bool profile_prefill = (seq_len > 1) && s_profile_prefill;
     int profile_every = profile_decode ? s_decode_every : s_prefill_every;
@@ -671,8 +673,12 @@ Tensor& Qwen3ASRBnb4Backend::forward(Context& ctx, const int* token_ids_device, 
                 layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
             });
             time_stage(ProfileStage::FfnAct, [&] {
-                ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
-                ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
+                if (s_prefill_fused_swiglu) {
+                    ops::fused_gate_up_swiglu_prefill(ctx, buf_.gate_up, buf_.gate, seq_len, FF);
+                } else {
+                    ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
+                    ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
+                }
             });
         }
 

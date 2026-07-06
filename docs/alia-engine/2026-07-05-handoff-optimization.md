@@ -223,6 +223,55 @@ Always run:
 git diff --check
 ```
 
+## 2026-07-06 ASR text-decoder prefill kernel pass
+
+Prefix reuse should stay default-off. The apparent regression in the earlier
+prefix experiment was mostly JIT/warmup shape coverage, but the stable/partial
+ASR text path is still too complex and not stable enough to justify more work
+there right now.
+
+The current ASR BNB4 text-decoder prefill profile for short Chinese audio is
+dominated by NF4 linear projections, not attention:
+
+- `tokens=72`: `full_qkv ~= 35ms`, `o_proj ~= 18ms`, `ffn_proj ~= 88ms`,
+  `ffn_act ~= 4ms`, `down ~= 37ms`, attention ~= `7ms`.
+- `AILA_BNB4_FUSED_PREFILL=0/1` was essentially tied in real smoke, so the
+  global fused-prefill switch is not a useful lever by itself.
+
+Two default-off diagnostic toggles were added for further measurement:
+
+- `AILA_BNB4_PREFILL_M80_ALL=1` forces the existing M80 tile for all
+  `M <= 80` packed NF4 prefill shapes, including ASR gate_up
+  `(M ~= 72, N=12288, K=2048)`.
+- `AILA_ASR_PREFILL_FUSED_SWIGLU=1` uses a fused prefill
+  `gate_up -> silu(gate) * up` elementwise kernel in the ASR BNB4 backend.
+
+Measurement summary:
+
+- Microbench with `tools/perf/Bnb4PrefillBench.cpp` shows M80-all can improve
+  the isolated ASR gate_up-like shape:
+  `asr_real_gate_up_like (72,12288,2048)` best `133.925ms -> 127.356ms`.
+- Real short smoke did not convert this cleanly into ASR prefill savings:
+  `177.986ms -> 175.941ms` in one non-Q3 run, and Q3 `ffn_proj`
+  `87.918ms -> 87.589ms`.
+- Full 5-scenario matrix, prefix reuse off and fused SwiGLU off:
+  - off: `tmp/alia-real-smoke/asr_prefill_m80_off_matrix/summary.csv`
+  - on: `tmp/alia-real-smoke/asr_prefill_m80_on_matrix/summary.csv`
+  - both passed 5/5
+  - average ASR tail delta: `-4.6ms`
+  - average ASR prefill delta: `-0.16ms`
+  - per-scenario prefill deltas: `+3.70, -1.87, -3.40, -2.23, +3.02ms`
+
+Fused prefill SwiGLU was locally correct and reduced the profiled
+`ffn_act` stage (`4.324ms -> 3.175ms` on the short Q3 smoke), but total ASR
+prefill was worse in that run (`215.873ms -> 218.305ms`). Keep it off by
+default unless a later combined gate_up/SwiGLU/down experiment makes it useful.
+
+Recommended next kernel direction: do not spend more time on attention first.
+Attention is small in this ASR shape. Focus on the packed NF4 gate_up kernel
+for `M<=80, N=12288, K=2048`: add explicit BN/TILE_N or workgroup variants
+and use the prefill bench plus real short/Q3 smoke before any default change.
+
 ## Suggested first task for the next optimization agent
 
 Start with a profiling-only pass on the current build:

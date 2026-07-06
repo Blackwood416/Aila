@@ -13,6 +13,13 @@ int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
 }
 
+int select_packed_nf4_prefill_tile_variant(int M, int N, int K, bool force_m80_all) {
+    if (M <= 80 && (force_m80_all || N <= 4096 || K >= 4096)) {
+        return 80;
+    }
+    return 128;
+}
+
 // Fused NF4 dequant + matmul for prefill (M > 1).
 // Computes C[M,N] = A[M,K] @ dequantize_nf4(B_packed[N,K]), B absmax per block.
 template <int BM, int BN, int BK, int TM, int TN, int TILE_M, int TILE_N>
@@ -139,7 +146,9 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           bf16* output_ptr,
                           int M, int N, int K,
                           int blocksize) {
-    if (M <= 80 && (N <= 4096 || K >= 4096)) {
+    static const bool s_force_m80_all =
+        aila::env::read_flag("AILA_BNB4_PREFILL_M80_ALL", false);
+    if (select_packed_nf4_prefill_tile_variant(M, N, K, s_force_m80_all) == 80) {
         packed_nf4_gemm_bf16_tiled<80, 64, 128, 8, 4, 10, 16>(
             ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
             M, N, K, blocksize);

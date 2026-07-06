@@ -386,6 +386,10 @@ namespace ops {
     // Reads first half as gate, second half as up, computes silu(gate)*up
     void fused_gate_up_swiglu(Context& ctx, Tensor& gate_up,
                                Tensor& output, int ff_dim);
+    // Fused SwiGLU on row-major concatenated [gate|up] tensor.
+    // gate_up: [seq_len, 2 * ff_dim], output: [seq_len, ff_dim]
+    void fused_gate_up_swiglu_prefill(Context& ctx, Tensor& gate_up,
+                                      Tensor& output, int seq_len, int ff_dim);
 
     // SnakeBeta activation: output[i] = input[i] + (1.0 / (exp(beta[c]) + 1e-9)) * sin^2(input[i] * exp(alpha[c]))
     // where c is the channel index of element i: c = (i / seq_len) % channels

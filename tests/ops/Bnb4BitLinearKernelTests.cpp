@@ -1,4 +1,5 @@
 #include "src/ops/Bnb4BitLinear.cpp"
+#include "src/ops/ElementwiseOps.cpp"
 
 #include <cmath>
 #include <iostream>
@@ -106,10 +107,89 @@ int run_packed_nf4_gemm_layout_test() {
     return 0;
 }
 
+int run_prefill_tile_selector_test() {
+    if (select_packed_nf4_prefill_tile_variant(72, 12288, 2048, false) != 128) {
+        std::cerr << "expected gate_up default to use 128-token tile variant\n";
+        return 1;
+    }
+    if (select_packed_nf4_prefill_tile_variant(72, 12288, 2048, true) != 80) {
+        std::cerr << "expected gate_up override to use 80-token tile variant\n";
+        return 1;
+    }
+    if (select_packed_nf4_prefill_tile_variant(72, 4096, 2048, false) != 80) {
+        std::cerr << "expected qkv shape to keep 80-token tile variant\n";
+        return 1;
+    }
+    if (select_packed_nf4_prefill_tile_variant(72, 2048, 6144, false) != 80) {
+        std::cerr << "expected down shape to keep 80-token tile variant\n";
+        return 1;
+    }
+    if (select_packed_nf4_prefill_tile_variant(128, 12288, 2048, true) != 128) {
+        std::cerr << "expected large-M shape to keep 128-token tile variant\n";
+        return 1;
+    }
+
+    std::cout << "prefill tile selector: passed\n";
+    return 0;
+}
+
+int run_prefill_fused_gate_up_swiglu_test() {
+    constexpr int SeqLen = 3;
+    constexpr int FfDim = 32;
+    Context ctx;
+
+    std::vector<bf16> gate_up(static_cast<size_t>(SeqLen * FfDim * 2));
+    for (int s = 0; s < SeqLen; ++s) {
+        for (int c = 0; c < FfDim * 2; ++c) {
+            const int value = ((s + 3) * (c + 5)) % 29 - 14;
+            gate_up[static_cast<size_t>(s * FfDim * 2 + c)] =
+                bf16(static_cast<float>(value) * 0.0625f);
+        }
+    }
+
+    Tensor gate_up_dev = Tensor::allocate(ctx, {SeqLen, 2 * FfDim}, dnnl::memory::data_type::bf16);
+    Tensor gate_ref = Tensor::allocate(ctx, {SeqLen, FfDim}, dnnl::memory::data_type::bf16);
+    Tensor up_ref = Tensor::allocate(ctx, {SeqLen, FfDim}, dnnl::memory::data_type::bf16);
+    Tensor out_ref = Tensor::allocate(ctx, {SeqLen, FfDim}, dnnl::memory::data_type::bf16);
+    Tensor out_fused = Tensor::allocate(ctx, {SeqLen, FfDim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(gate_up_dev.data(), gate_up.data(), gate_up.size() * sizeof(bf16));
+    ops::split_gate_up(ctx, gate_up_dev, gate_ref, up_ref, SeqLen, FfDim);
+    ops::swiglu(ctx, gate_ref, up_ref, out_ref, SeqLen * FfDim);
+    ops::fused_gate_up_swiglu_prefill(ctx, gate_up_dev, out_fused, SeqLen, FfDim);
+    ctx.synchronize();
+
+    std::vector<bf16> ref(static_cast<size_t>(SeqLen * FfDim));
+    std::vector<bf16> fused(static_cast<size_t>(SeqLen * FfDim));
+    ctx.memcpy_d2h(ref.data(), out_ref.data(), ref.size() * sizeof(bf16));
+    ctx.memcpy_d2h(fused.data(), out_fused.data(), fused.size() * sizeof(bf16));
+
+    double max_abs_diff = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        max_abs_diff = std::max(max_abs_diff,
+                                std::abs(static_cast<double>(static_cast<float>(ref[i])) -
+                                         static_cast<double>(static_cast<float>(fused[i]))));
+    }
+    if (max_abs_diff != 0.0) {
+        std::cerr << "fused_gate_up_swiglu_prefill max_abs_diff=" << max_abs_diff
+                  << " expected exact bf16 match\n";
+        return 1;
+    }
+
+    std::cout << "fused_gate_up_swiglu_prefill: passed\n";
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    const int failed = run_packed_nf4_gemm_layout_test();
+    int failed = run_prefill_tile_selector_test();
+    if (failed == 0) {
+        failed = run_prefill_fused_gate_up_swiglu_test();
+    }
+    if (failed == 0) {
+        failed = run_packed_nf4_gemm_layout_test();
+    }
     if (failed != 0) {
         std::cout << "AilaBnb4BitLinearKernelTests: failed\n";
         return failed;
