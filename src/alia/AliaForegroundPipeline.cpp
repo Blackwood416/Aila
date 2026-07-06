@@ -888,6 +888,22 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         return ALIA_OK;
     }
 
+    const AliaTurnSchedulerConfig scheduler_config =
+        read_alia_turn_scheduler_config();
+    const int candidate_suffix_tokens =
+        static_cast<int>(full_candidate_ids.size() - target_ids.size());
+    if (scheduler_config.enabled &&
+        candidate_suffix_tokens > scheduler_config.max_cached_final_suffix_tokens) {
+        const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_asr_prefill_token_count_ = 0;
+        last_asr_prefill_reused_token_count_ = 0;
+        last_asr_prefill_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_ms_ = elapsed_ms;
+        return ALIA_OK;
+    }
+
     const int max_seq_len = backend->max_seq_len();
     if (max_seq_len > 0 && static_cast<int>(target_ids.size()) > max_seq_len) {
         return ALIA_ERR_CONTEXT_OVERFLOW;
