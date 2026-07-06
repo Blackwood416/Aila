@@ -193,6 +193,10 @@ int main() {
         {"gate_up_like", 118, 10240, 2560},
         {"down_like", 118, 2560, 10240},
         {"stream_prefill_gate_up_like", 91, 10240, 2560},
+        {"asr_short_qkv_like", 69, 4096, 2048},
+        {"asr_short_o_like", 69, 2048, 2048},
+        {"asr_short_gate_up_like", 69, 12288, 2048},
+        {"asr_short_down_like", 69, 2048, 6144},
     };
 
     std::cout << "shape,M,N,K,warmup_ms,best_ms,avg_ms,max_abs_diff,tokens_per_s\n";
