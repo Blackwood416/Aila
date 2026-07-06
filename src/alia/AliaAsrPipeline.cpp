@@ -147,6 +147,21 @@ std::string merge_partial_tail(const std::string& prefix, const std::string& tai
 AliaAsrPipeline::AliaAsrPipeline(ModelSlot* slot)
     : slot_(slot) {}
 
+std::string build_asr_language_hint_prefix(std::string language) {
+    language = trim(std::move(language));
+    if (language.empty()) {
+        return "";
+    }
+
+    const std::string lowered = to_lowercase(language);
+    if (lowered == "0" || lowered == "false" || lowered == "off" ||
+        lowered == "none" || lowered == "auto") {
+        return "";
+    }
+
+    return "language " + normalize_language_name(language);
+}
+
 bool AliaAsrPipeline::feed_audio(const float* samples, int sample_count) {
     if (!samples || sample_count <= 0) {
         return false;
@@ -781,6 +796,15 @@ bool AliaAsrPipeline::transcribe_segment_raw(const std::vector<float>& segment,
 
     prompt_ids.push_back(cfg.im_start_id);
     add_text("assistant\n");
+    const std::string language_hint_prefix = build_asr_language_hint_prefix(
+        aila::env::read_string("AILA_ASR_LANGUAGE_HINT", "Chinese"));
+    if (!language_hint_prefix.empty()) {
+        add_text(language_hint_prefix);
+        const int asr_text_id = tokenizer->special_token_id("<asr_text>");
+        if (asr_text_id != -1) {
+            prompt_ids.push_back(asr_text_id);
+        }
+    }
     if (!past_text.empty()) {
         add_text(past_text);
         const int asr_text_id = tokenizer->special_token_id("<asr_text>");

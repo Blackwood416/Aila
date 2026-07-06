@@ -136,6 +136,10 @@ set(ALIA_TURN_SCHEDULER_TEST_SOURCES
     src/alia/AliaTurnScheduler.cpp
 )
 
+set(ALIA_ASR_LANGUAGE_HINT_TEST_SOURCES
+    tests/alia/AliaAsrLanguageHintTests.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -212,6 +216,14 @@ target_compile_definitions(AilaAliaTurnSchedulerTests PRIVATE NOMINMAX WIN32_LEA
 target_include_directories(AilaAliaTurnSchedulerTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+add_executable(AilaAliaAsrLanguageHintTests ${ALIA_ASR_LANGUAGE_HINT_TEST_SOURCES})
+target_compile_definitions(AilaAliaAsrLanguageHintTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaAsrLanguageHintTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaAliaAsrLanguageHintTests PRIVATE AilaLib)
 
 add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
