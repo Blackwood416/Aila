@@ -222,6 +222,15 @@ target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
 )
 target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE DNNL::dnnl simdjson)
 
+add_executable(AilaBnb4PrefillBench tools/perf/Bnb4PrefillBench.cpp)
+target_compile_definitions(AilaBnb4PrefillBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaBnb4PrefillBench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaBnb4PrefillBench PRIVATE DNNL::dnnl simdjson)
+
 set(AILA_LEVEL_ZERO_SDK_ROOT "C:/level-zero-win-sdk-1.28.2" CACHE PATH
     "Level Zero SDK root for optional command submission benchmarks")
 if(EXISTS "${AILA_LEVEL_ZERO_SDK_ROOT}/include/level_zero/ze_api.h" AND

@@ -26,8 +26,8 @@ void packed_nf4_gemm_bf16(Context& ctx,
     const int packed_bytes_per_row = K / 2;
     const int blocks_per_row = K / blocksize;
 
-    constexpr int BM = 128, BN = 128, BK = 128;
-    constexpr int TM = 8, TN = 8;  // per-thread output tile
+    constexpr int BM = 128, BN = 64, BK = 128;
+    constexpr int TM = 8, TN = 4;  // per-thread output tile
     constexpr int TILE_M = 16, TILE_N = 16;  // thread grid in work-group
     constexpr int WG_SIZE = TILE_M * TILE_N;
 
