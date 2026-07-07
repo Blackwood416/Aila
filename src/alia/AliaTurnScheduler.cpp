@@ -156,4 +156,20 @@ AliaFinalPrefixDecision decide_final_cached_prefix(
     return decision;
 }
 
+std::string final_prefix_path_name(const AliaFinalPrefixDecision& decision,
+                                   int prefilled_prompt_tokens,
+                                   int prompt_suffix_tokens,
+                                   int max_decode_suffix_tokens) {
+    if (prefilled_prompt_tokens <= 0) {
+        return "fresh_full";
+    }
+    if (!decision.use_cached_prefix) {
+        return "rejected_large_suffix";
+    }
+    if (prompt_suffix_tokens <= max_decode_suffix_tokens) {
+        return "cached_decode_suffix";
+    }
+    return "cached_batch_suffix";
+}
+
 }  // namespace aila::alia

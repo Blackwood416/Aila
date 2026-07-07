@@ -660,6 +660,14 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     const std::string& partial_text) {
     const std::string user_prefix = combine_asr_text(stable_text, partial_text);
     if (user_prefix.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_asr_prefill_token_count_ = 0;
+        last_asr_prefill_reused_token_count_ = 0;
+        last_asr_prefill_suffix_token_count_ = 0;
+        last_asr_prefill_candidate_token_count_ = 0;
+        last_asr_prefill_candidate_suffix_token_count_ = 0;
+        last_asr_prefill_skip_reason_ = "empty text";
+        last_asr_prefill_ms_ = 0;
         return ALIA_OK;
     }
 
@@ -715,6 +723,18 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         target_ids.pop_back();
     }
     if (target_ids.empty()) {
+        const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_asr_prefill_token_count_ = 0;
+        last_asr_prefill_reused_token_count_ = 0;
+        last_asr_prefill_suffix_token_count_ =
+            static_cast<int>(full_candidate_ids.size());
+        last_asr_prefill_candidate_token_count_ = 0;
+        last_asr_prefill_candidate_suffix_token_count_ =
+            static_cast<int>(full_candidate_ids.size());
+        last_asr_prefill_skip_reason_ = "empty prefill candidate";
+        last_asr_prefill_ms_ = elapsed_ms;
         return ALIA_OK;
     }
 
@@ -730,12 +750,28 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         last_asr_prefill_token_count_ = 0;
         last_asr_prefill_reused_token_count_ = 0;
         last_asr_prefill_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_candidate_token_count_ =
+            static_cast<int>(target_ids.size());
+        last_asr_prefill_candidate_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_skip_reason_ =
+            "candidate suffix exceeds fast threshold";
         last_asr_prefill_ms_ = elapsed_ms;
         return ALIA_OK;
     }
 
     const int max_seq_len = backend->max_seq_len();
     if (max_seq_len > 0 && static_cast<int>(target_ids.size()) > max_seq_len) {
+        const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_asr_prefill_token_count_ = 0;
+        last_asr_prefill_reused_token_count_ = 0;
+        last_asr_prefill_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_candidate_token_count_ =
+            static_cast<int>(target_ids.size());
+        last_asr_prefill_candidate_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_skip_reason_ = "context overflow";
+        last_asr_prefill_ms_ = elapsed_ms;
         return ALIA_ERR_CONTEXT_OVERFLOW;
     }
 
@@ -780,6 +816,11 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
                 static_cast<int>(asr_prefill_prompt_ids_.size());
             last_asr_prefill_reused_token_count_ = reused_tokens;
             last_asr_prefill_suffix_token_count_ = 0;
+            last_asr_prefill_candidate_token_count_ =
+                static_cast<int>(asr_prefill_prompt_ids_.size());
+            last_asr_prefill_candidate_suffix_token_count_ =
+                candidate_suffix_tokens;
+            last_asr_prefill_skip_reason_ = "already prefetched";
             last_asr_prefill_ms_ = elapsed_ms;
         }
         return ALIA_OK;
@@ -807,6 +848,11 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         last_asr_prefill_token_count_ = static_cast<int>(current_prefill.size());
         last_asr_prefill_reused_token_count_ = reused_tokens;
         last_asr_prefill_suffix_token_count_ = static_cast<int>(suffix_count);
+        last_asr_prefill_candidate_token_count_ =
+            static_cast<int>(target_ids.size());
+        last_asr_prefill_candidate_suffix_token_count_ =
+            candidate_suffix_tokens;
+        last_asr_prefill_skip_reason_ = "small incremental suffix skipped";
         last_asr_prefill_ms_ = elapsed_ms;
         return ALIA_OK;
     }
@@ -835,6 +881,12 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         last_asr_prefill_token_count_ = static_cast<int>(asr_prefill_prompt_ids_.size());
         last_asr_prefill_reused_token_count_ = reused_tokens;
         last_asr_prefill_suffix_token_count_ = static_cast<int>(suffix_count);
+        last_asr_prefill_candidate_token_count_ =
+            static_cast<int>(asr_prefill_prompt_ids_.size());
+        last_asr_prefill_candidate_suffix_token_count_ = candidate_suffix_tokens;
+        last_asr_prefill_skip_reason_ =
+            decode_path_suffix ? "executed decode suffix"
+                               : "executed batch suffix";
         last_asr_prefill_ms_ = elapsed_ms;
     }
     return ALIA_OK;
@@ -1113,6 +1165,21 @@ int AliaForegroundPipeline::last_asr_prefill_reused_token_count() const {
 int AliaForegroundPipeline::last_asr_prefill_suffix_token_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_asr_prefill_suffix_token_count_;
+}
+
+int AliaForegroundPipeline::last_asr_prefill_candidate_token_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_candidate_token_count_;
+}
+
+int AliaForegroundPipeline::last_asr_prefill_candidate_suffix_token_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_candidate_suffix_token_count_;
+}
+
+std::string AliaForegroundPipeline::last_asr_prefill_skip_reason() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_asr_prefill_skip_reason_;
 }
 
 int AliaForegroundPipeline::last_asr_prefill_skipped_small_suffix_count() const {
@@ -1738,10 +1805,13 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     int effective_prefilled_prompt_tokens = prefilled_prompt_tokens;
     int final_cached_prefix_rejected = 0;
     std::string final_cached_prefix_reject_reason;
+    std::string final_prefix_path = "fresh_full";
     long long prompt_prefill_ms = -1;
     Tensor* logits = nullptr;
     {
         auto lane_lock = context->lock_execution();
+        static const int kMaxDecodePathPromptSuffixTokens = std::max(
+            0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
         if (reset_session) {
             backend->reset();
             prefilled_prompt_tokens = 0;
@@ -1766,6 +1836,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 prefilled_prompt_tokens,
                 prompt_tokens_to_forward);
         final_cached_prefix_reject_reason = prefix_decision.reason;
+        final_prefix_path =
+            final_prefix_path_name(prefix_decision,
+                                   prefilled_prompt_tokens,
+                                   prompt_tokens_to_forward,
+                                   kMaxDecodePathPromptSuffixTokens);
         if (!prefix_decision.use_cached_prefix) {
             backend->reset();
             prefilled_prompt_tokens = 0;
@@ -1788,8 +1863,6 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             return false;
         }
 
-        static const int kMaxDecodePathPromptSuffixTokens = std::max(
-            0, aila::env::read_int_raw("AILA_FOREGROUND_DECODE_SUFFIX_TOKENS", 16));
         // Keep full initial prompts on the batch path; use decode kernels only
         // for small suffixes after a validated cached prefix.
         const bool decode_path_prompt_suffix =
@@ -2107,6 +2180,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             metrics_.final_cached_prefix_rejected = final_cached_prefix_rejected;
             metrics_.final_cached_prefix_reject_reason =
                 final_cached_prefix_reject_reason;
+            metrics_.final_prefix_path = final_prefix_path;
             metrics_.generated_tokens = static_cast<int>(generated_ids.size());
             metrics_.prompt_build_ms = prompt_build_ms;
             metrics_.prompt_prefill_ms = prompt_prefill_ms;

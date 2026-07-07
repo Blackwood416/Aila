@@ -55,6 +55,7 @@ struct AliaForegroundMetrics {
     long long decode_ms = -1;
     long long model_ms = -1;
     std::string final_cached_prefix_reject_reason;
+    std::string final_prefix_path = "fresh_full";
     std::string first_tts_chunk_reason;
 };
 
@@ -100,6 +101,9 @@ public:
     int last_asr_prefill_token_count() const;
     int last_asr_prefill_reused_token_count() const;
     int last_asr_prefill_suffix_token_count() const;
+    int last_asr_prefill_candidate_token_count() const;
+    int last_asr_prefill_candidate_suffix_token_count() const;
+    std::string last_asr_prefill_skip_reason() const;
     int last_asr_prefill_skipped_small_suffix_count() const;
     long long last_asr_prefill_ms() const;
     long long last_first_content_delta_ms() const;
@@ -190,6 +194,9 @@ private:
     int last_asr_prefill_token_count_ = 0;
     int last_asr_prefill_reused_token_count_ = 0;
     int last_asr_prefill_suffix_token_count_ = 0;
+    int last_asr_prefill_candidate_token_count_ = 0;
+    int last_asr_prefill_candidate_suffix_token_count_ = 0;
+    std::string last_asr_prefill_skip_reason_ = "not evaluated";
     int last_asr_prefill_skipped_small_suffix_count_ = 0;
     long long last_asr_prefill_ms_ = -1;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;

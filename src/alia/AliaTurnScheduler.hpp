@@ -74,4 +74,9 @@ AliaFinalPrefixDecision decide_final_cached_prefix(
     int prefilled_prompt_tokens,
     int prompt_suffix_tokens);
 
+std::string final_prefix_path_name(const AliaFinalPrefixDecision& decision,
+                                   int prefilled_prompt_tokens,
+                                   int prompt_suffix_tokens,
+                                   int max_decode_suffix_tokens);
+
 }  // namespace aila::alia

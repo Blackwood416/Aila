@@ -77,12 +77,52 @@ void final_cached_prefix_keeps_fast_suffix_reason(TestResults& results) {
     AILA_EXPECT_EQ(results, decision.reason, "cached suffix within fast threshold");
 }
 
+void final_prefix_path_names_fresh_prompt(TestResults& results) {
+    aila::alia::AliaFinalPrefixDecision decision;
+    decision.use_cached_prefix = true;
+
+    AILA_EXPECT_EQ(results,
+                   aila::alia::final_prefix_path_name(decision, 0, 118, 16),
+                   "fresh_full");
+}
+
+void final_prefix_path_names_decode_suffix(TestResults& results) {
+    aila::alia::AliaFinalPrefixDecision decision;
+    decision.use_cached_prefix = true;
+
+    AILA_EXPECT_EQ(results,
+                   aila::alia::final_prefix_path_name(decision, 90, 12, 16),
+                   "cached_decode_suffix");
+}
+
+void final_prefix_path_names_batch_suffix(TestResults& results) {
+    aila::alia::AliaFinalPrefixDecision decision;
+    decision.use_cached_prefix = true;
+
+    AILA_EXPECT_EQ(results,
+                   aila::alia::final_prefix_path_name(decision, 90, 20, 16),
+                   "cached_batch_suffix");
+}
+
+void final_prefix_path_names_rejected_suffix(TestResults& results) {
+    aila::alia::AliaFinalPrefixDecision decision;
+    decision.use_cached_prefix = false;
+
+    AILA_EXPECT_EQ(results,
+                   aila::alia::final_prefix_path_name(decision, 90, 28, 16),
+                   "rejected_large_suffix");
+}
+
 }  // namespace
 
 int main() {
     TestResults results;
     final_cached_prefix_rejects_large_suffix_by_default(results);
     final_cached_prefix_keeps_fast_suffix_reason(results);
+    final_prefix_path_names_fresh_prompt(results);
+    final_prefix_path_names_decode_suffix(results);
+    final_prefix_path_names_batch_suffix(results);
+    final_prefix_path_names_rejected_suffix(results);
 
     std::cout << "AilaAliaTurnSchedulerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";
