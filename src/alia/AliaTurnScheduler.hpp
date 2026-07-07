@@ -79,4 +79,9 @@ std::string final_prefix_path_name(const AliaFinalPrefixDecision& decision,
                                    int prompt_suffix_tokens,
                                    int max_decode_suffix_tokens);
 
+bool should_suppress_final_prefill_internal_snapshots(
+    const AliaFinalPrefixDecision& decision,
+    int prefilled_prompt_tokens,
+    int prompt_suffix_tokens);
+
 }  // namespace aila::alia

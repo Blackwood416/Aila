@@ -38,7 +38,7 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 | `AILA_BNB4_GEMV_WG` | int | `256` | Override GEMV SG16 work-group size (min 32). Controls rows-per-WG: rows = WG / 16 |
 | `AILA_FUSE_RESIDUAL_ADD` | bool | `false` | Fuse residual +=hidden into O-proj and down GEMV outputs (experimental, -1.5% decode regression on tested config) |
 | `AILA_BNB4_FUSED_PREFILL` | bool | `true` | Enable fused NF4 dequant + matmul kernel for prefill. Disable only for debugging |
-| `AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS` | bool | `false` | Export intermediate Qwen3.5 linear recurrent-state snapshots inside one batched prefill. Useful for aggressive cached-prefix truncation experiments, but default-off because short foreground fresh prefill does not use those checkpoints. |
+| `AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS` | bool | `true` | Export intermediate Qwen3.5 linear recurrent-state snapshots inside one batched prefill. Final fresh/full foreground prefill temporarily suppresses this work, while cached-prefix and ASR prefill paths keep the default restore granularity. |
 
 ---
 

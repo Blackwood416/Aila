@@ -6,6 +6,7 @@
 #include "../lora/LoraLoader.hpp"
 #include "engine/Types.hpp"
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -60,6 +61,11 @@ public:
 
     virtual void set_cancellation_checker(std::function<bool()> should_cancel) {
         cancellation_checker_ = std::move(should_cancel);
+    }
+
+    virtual void set_internal_prefill_state_snapshots_override(
+        std::optional<bool> enabled) {
+        (void)enabled;
     }
 
     virtual bool synthesize_tts_stream(

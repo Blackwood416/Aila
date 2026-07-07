@@ -113,6 +113,29 @@ void final_prefix_path_names_rejected_suffix(TestResults& results) {
                    "rejected_large_suffix");
 }
 
+void q35_internal_snapshots_suppressed_only_for_final_fresh_full(TestResults& results) {
+    aila::alia::AliaFinalPrefixDecision fresh;
+    fresh.use_cached_prefix = true;
+
+    AILA_EXPECT_TRUE(
+        results,
+        aila::alia::should_suppress_final_prefill_internal_snapshots(fresh, 0, 121));
+
+    aila::alia::AliaFinalPrefixDecision cached;
+    cached.use_cached_prefix = true;
+
+    AILA_EXPECT_TRUE(
+        results,
+        !aila::alia::should_suppress_final_prefill_internal_snapshots(cached, 90, 12));
+
+    aila::alia::AliaFinalPrefixDecision rejected;
+    rejected.use_cached_prefix = false;
+
+    AILA_EXPECT_TRUE(
+        results,
+        aila::alia::should_suppress_final_prefill_internal_snapshots(rejected, 90, 28));
+}
+
 }  // namespace
 
 int main() {
@@ -123,6 +146,7 @@ int main() {
     final_prefix_path_names_decode_suffix(results);
     final_prefix_path_names_batch_suffix(results);
     final_prefix_path_names_rejected_suffix(results);
+    q35_internal_snapshots_suppressed_only_for_final_fresh_full(results);
 
     std::cout << "AilaAliaTurnSchedulerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

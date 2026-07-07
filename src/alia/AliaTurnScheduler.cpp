@@ -172,4 +172,17 @@ std::string final_prefix_path_name(const AliaFinalPrefixDecision& decision,
     return "cached_batch_suffix";
 }
 
+bool should_suppress_final_prefill_internal_snapshots(
+    const AliaFinalPrefixDecision& decision,
+    int prefilled_prompt_tokens,
+    int prompt_suffix_tokens) {
+    if (prompt_suffix_tokens <= 1) {
+        return false;
+    }
+    if (prefilled_prompt_tokens <= 0) {
+        return true;
+    }
+    return !decision.use_cached_prefix;
+}
+
 }  // namespace aila::alia

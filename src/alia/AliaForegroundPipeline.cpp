@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cctype>
 #include <functional>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -123,6 +124,34 @@ public:
 
 private:
     IModelBackend* backend_ = nullptr;
+};
+
+class InternalPrefillSnapshotOverrideScope {
+public:
+    InternalPrefillSnapshotOverrideScope(
+        IModelBackend* backend,
+        std::optional<bool> enabled)
+        : backend_(backend),
+          active_(backend && enabled.has_value()) {
+        if (active_) {
+            backend_->set_internal_prefill_state_snapshots_override(enabled);
+        }
+    }
+
+    ~InternalPrefillSnapshotOverrideScope() {
+        if (active_) {
+            backend_->set_internal_prefill_state_snapshots_override(std::nullopt);
+        }
+    }
+
+    InternalPrefillSnapshotOverrideScope(
+        const InternalPrefillSnapshotOverrideScope&) = delete;
+    InternalPrefillSnapshotOverrideScope& operator=(
+        const InternalPrefillSnapshotOverrideScope&) = delete;
+
+private:
+    IModelBackend* backend_ = nullptr;
+    bool active_ = false;
 };
 
 AliaGenConfig default_alia_generation_config() {
@@ -1841,6 +1870,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                                    prefilled_prompt_tokens,
                                    prompt_tokens_to_forward,
                                    kMaxDecodePathPromptSuffixTokens);
+        const bool suppress_internal_prefill_snapshots =
+            should_suppress_final_prefill_internal_snapshots(
+                prefix_decision,
+                prefilled_prompt_tokens,
+                prompt_tokens_to_forward);
         if (!prefix_decision.use_cached_prefix) {
             backend->reset();
             prefilled_prompt_tokens = 0;
@@ -1870,6 +1904,10 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             prefilled_prompt_tokens > 0 &&
             prompt_tokens_to_forward <= kMaxDecodePathPromptSuffixTokens;
         const auto prompt_prefill_started = std::chrono::steady_clock::now();
+        InternalPrefillSnapshotOverrideScope prefill_snapshot_scope(
+            backend,
+            suppress_internal_prefill_snapshots ? std::optional<bool>(false)
+                                                : std::nullopt);
         logits = forward_token_span(*context,
                                     *backend,
                                     prompt_ids.data() + prefilled_prompt_tokens,

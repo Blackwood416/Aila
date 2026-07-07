@@ -363,6 +363,11 @@ bool Qwen35HybridBnb4Backend::apply_lora(
     return true;
 }
 
+void Qwen35HybridBnb4Backend::set_internal_prefill_state_snapshots_override(
+    std::optional<bool> enabled) {
+    internal_prefill_state_snapshots_override_ = enabled;
+}
+
 bool Qwen35HybridBnb4Backend::load(Context& ctx,
                                    ModelWeights& weights,
                                    const ModelSpec& spec,
@@ -2020,15 +2025,15 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
 
     static const bool s_device_state_snapshots =
         aila::env::read_flag("AILA_Q35_DEVICE_STATE_SNAPSHOTS", true);
-    // Internal prefill checkpoints help aggressive cached-prefix truncation, but
-    // the short foreground fresh-prefill path pays for them without using them.
     static const bool s_internal_prefill_snapshots =
-        aila::env::read_flag("AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS", false);
+        aila::env::read_flag("AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS", true);
+    const bool internal_prefill_snapshots =
+        internal_prefill_state_snapshots_override_.value_or(s_internal_prefill_snapshots);
     std::vector<int> internal_snapshot_lengths;
     std::vector<std::unique_ptr<DeviceStateSnapshot>> internal_snapshots;
     bool internal_snapshots_complete = true;
     if (use_delta_linear_ && seq_len > 1 && s_device_state_snapshots &&
-        s_internal_prefill_snapshots && !use_host_grouped_linear) {
+        internal_prefill_snapshots && !use_host_grouped_linear) {
         int first_checkpoint =
             ((start_pos / recurrent_checkpoint_step) + 1) * recurrent_checkpoint_step;
         for (int cp = first_checkpoint; cp < cached_len; cp += recurrent_checkpoint_step) {

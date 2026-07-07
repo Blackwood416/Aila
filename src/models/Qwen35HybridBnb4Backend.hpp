@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -86,6 +87,8 @@ public:
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
     bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
                     std::string* error_message = nullptr) override;
+    void set_internal_prefill_state_snapshots_override(
+        std::optional<bool> enabled) override;
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,
@@ -194,6 +197,7 @@ private:
     };
     std::unordered_map<int, StateSnapshot> snapshots_;
     std::unordered_map<int, std::unique_ptr<DeviceStateSnapshot>> device_snapshots_;
+    std::optional<bool> internal_prefill_state_snapshots_override_;
     void clear_snapshots();
     void save_recurrent_state_snapshot(Context& ctx, int checkpoint_len);
     bool restore_device_state_snapshot(Context& ctx, int checkpoint_len);
