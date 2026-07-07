@@ -2020,8 +2020,10 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
 
     static const bool s_device_state_snapshots =
         aila::env::read_flag("AILA_Q35_DEVICE_STATE_SNAPSHOTS", true);
+    // Internal prefill checkpoints help aggressive cached-prefix truncation, but
+    // the short foreground fresh-prefill path pays for them without using them.
     static const bool s_internal_prefill_snapshots =
-        aila::env::read_flag("AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS", true);
+        aila::env::read_flag("AILA_Q35_INTERNAL_PREFILL_STATE_SNAPSHOTS", false);
     std::vector<int> internal_snapshot_lengths;
     std::vector<std::unique_ptr<DeviceStateSnapshot>> internal_snapshots;
     bool internal_snapshots_complete = true;
