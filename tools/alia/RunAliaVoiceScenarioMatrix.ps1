@@ -276,6 +276,7 @@ try {
             simulated_vad_to_first_content_ms = Get-ValueOrEmpty $values "simulated_vad_to_first_content_ms"
             simulated_vad_to_first_tts_enqueue_ms = Get-ValueOrEmpty $values "simulated_vad_to_first_tts_enqueue_ms"
             tts_first_audio_ms = Get-ValueOrEmpty $values "tts_first_audio_ms"
+            first_tts_enqueue_to_first_audio_ms = Get-ValueOrEmpty $values "first_tts_enqueue_to_first_audio_ms"
             simulated_vad_to_first_audio_ms = Get-ValueOrEmpty $values "simulated_vad_to_first_audio_ms"
             tts_callback_count = Get-ValueOrEmpty $values "tts_callback_count"
             tts_chunks_synthesized = Get-ValueOrEmpty $values "tts_chunks_synthesized"

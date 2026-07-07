@@ -62,6 +62,7 @@ public:
     bool ready() const;
     size_t pending_text_count() const;
     bool first_audio_callback_emitted() const;
+    bool first_audio_synthesis_active() const;
     AliaTtsMetrics last_metrics() const;
     ModelSlot* slot() const { return slot_; }
 
@@ -90,6 +91,7 @@ private:
     bool reference_voice_loaded_ = false;
     bool reference_voice_failed_ = false;
     bool first_audio_callback_emitted_ = false;
+    bool first_audio_synthesis_active_ = false;
     std::thread worker_;
     bool async_active_ = false;
     bool async_finishing_ = false;

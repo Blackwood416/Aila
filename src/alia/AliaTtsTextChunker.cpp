@@ -1,5 +1,7 @@
 #include "AliaTtsTextChunker.hpp"
 
+#include "../utils/EnvUtils.hpp"
+
 #include <algorithm>
 #include <cctype>
 
@@ -188,6 +190,30 @@ std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
         chunks.erase(chunks.begin() + 1);
     }
     return chunks;
+}
+
+TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config() {
+    TtsFirstChunkEarlyFlushConfig config;
+    config.enabled =
+        aila::env::read_flag("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH", true);
+    config.token_delay = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY", 2));
+    config.delay_ms = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_MS", 80));
+    return config;
+}
+
+TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config() {
+    TtsFirstAudioPriorityConfig config;
+    config.enabled =
+        aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
+    config.base_timeout_ms = std::max(
+        0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
+    config.active_extra_ms = std::max(
+        0,
+        aila::env::read_int_raw(
+            "AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS", 120));
+    return config;
 }
 
 TtsTextChunkResult take_ready_tts_text_chunks(

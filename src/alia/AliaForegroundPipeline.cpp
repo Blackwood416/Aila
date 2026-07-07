@@ -1838,18 +1838,12 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     std::string first_tts_chunk_reason =
         tts_chunk_decision_reason_name(TtsChunkDecisionReason::NoText);
     const TtsTextChunkPolicy tts_chunk_policy = tts_text_chunk_policy_from_env();
-    static const bool s_tts_first_audio_priority =
-        aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
-    static const int s_tts_first_audio_priority_timeout_ms = std::max(
-        0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     static const bool s_tts_coalesce_steady_text_chunks =
         aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
-    static const bool s_tts_first_chunk_early_flush =
-        aila::env::read_flag("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH", false);
-    static const int s_tts_first_chunk_early_token_delay = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY", 2));
-    static const int s_tts_first_chunk_early_delay_ms = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_MS", 80));
+    const TtsFirstChunkEarlyFlushConfig first_chunk_early_flush_config =
+        read_tts_first_chunk_early_flush_config();
+    const TtsFirstAudioPriorityConfig first_audio_priority_config =
+        read_tts_first_audio_priority_config();
     long long first_token_delta_ms = -1;
     const auto decode_started = std::chrono::steady_clock::now();
     auto note_first_spoken_content = [&]() {
@@ -1863,7 +1857,7 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             static_cast<int>(pending_tts_text.size());
     };
     auto early_first_chunk_ready = [&]() {
-        if (!s_tts_first_chunk_early_flush ||
+        if (!first_chunk_early_flush_config.enabled ||
             first_tts_enqueue_seen ||
             !first_content_seen ||
             static_cast<int>(pending_tts_text.size()) <
@@ -1880,11 +1874,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - first_content_at).count();
         const bool token_delay_ready =
-            s_tts_first_chunk_early_token_delay <= 0 ||
-            generated_since_first_content >= s_tts_first_chunk_early_token_delay;
+            first_chunk_early_flush_config.token_delay <= 0 ||
+            generated_since_first_content >= first_chunk_early_flush_config.token_delay;
         const bool time_delay_ready =
-            s_tts_first_chunk_early_delay_ms <= 0 ||
-            ms_since_first_content >= s_tts_first_chunk_early_delay_ms;
+            first_chunk_early_flush_config.delay_ms <= 0 ||
+            ms_since_first_content >= first_chunk_early_flush_config.delay_ms;
         return token_delay_ready || time_delay_ready;
     };
     auto flush_tts = [&](bool force) {
@@ -1946,13 +1940,13 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         }
     };
     auto wait_for_first_tts_audio_if_requested = [&]() {
-        if (!s_tts_first_audio_priority ||
+        if (!first_audio_priority_config.enabled ||
             first_tts_priority_wait_done ||
             !first_tts_enqueue_seen ||
             !tts_pipeline_ ||
             !audio_cb ||
             !tts_config ||
-            s_tts_first_audio_priority_timeout_ms <= 0) {
+            first_audio_priority_config.base_timeout_ms <= 0) {
             return;
         }
 
@@ -1962,7 +1956,15 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                !tts_pipeline_->first_audio_callback_emitted()) {
             const long long waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - wait_started).count();
-            if (waited_ms >= s_tts_first_audio_priority_timeout_ms) {
+            const bool first_audio_work_active =
+                tts_pipeline_->first_audio_synthesis_active() ||
+                tts_pipeline_->pending_text_count() > 0;
+            const int timeout_ms =
+                first_audio_work_active
+                    ? first_audio_priority_config.base_timeout_ms +
+                          first_audio_priority_config.active_extra_ms
+                    : first_audio_priority_config.base_timeout_ms;
+            if (waited_ms >= timeout_ms) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

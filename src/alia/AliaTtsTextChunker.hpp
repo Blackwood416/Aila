@@ -44,10 +44,25 @@ struct TtsTextChunkResult {
     size_t cutoff_chars = 0;
 };
 
+struct TtsFirstChunkEarlyFlushConfig {
+    bool enabled = true;
+    int token_delay = 2;
+    int delay_ms = 80;
+};
+
+struct TtsFirstAudioPriorityConfig {
+    bool enabled = true;
+    int base_timeout_ms = 250;
+    int active_extra_ms = 120;
+};
+
 std::vector<std::string> split_spoken_text_for_tts(
     const std::string& text,
     bool split_sentence_boundaries = true,
     size_t min_first_chunk_chars = 0);
+
+TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config();
+TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config();
 
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,

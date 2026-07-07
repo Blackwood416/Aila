@@ -147,7 +147,7 @@ Use the currently preferred Alia model set as:
 
 - ASR: `models/Qwen3-ASR-1.7B-BNB-NF4`
 - Foreground: `models/qwen3.5-4B-bnb-nf4-offline-visiondense`
-- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500`
+- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750`
 - Background: `models/qwen3.5-0.8B-bnb-nf4-offline`
 - TTS: `models/Qwen3-TTS-12Hz-0.6B-Base`
 - TTS reference audio: worktree-local `alia_ref.wav`
@@ -912,7 +912,7 @@ int main(void) {
     AliaContextConfig init;
     init.asr_model_dir = "models/Qwen3-ASR-1.7B-BNB-NF4";
     init.vlm_4b_model_dir = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
-    init.vlm_4b_lora_dir = "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500";
+    init.vlm_4b_lora_dir = "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750";
     init.vlm_0_8b_model_dir = "models/qwen3.5-0.8B-bnb-nf4-offline";
     init.tts_model_dir = "models/Qwen3-TTS-12Hz-0.6B-Base";
     init.tts_reference_audio_path = "E:/RiderProjects/Aila/.worktrees/alia-custom-engine/alia_ref.wav";
@@ -983,7 +983,7 @@ int main(void) {
 
 The current API is sufficient for the first real host integration pass:
 
-- `alia_context_init_ex` lets the host explicitly select checkpoint-500 LoRA and
+- `alia_context_init_ex` lets the host explicitly select checkpoint-750 LoRA and
   the worktree-local TTS reference audio.
 - `alia_asr_feed_audio`, `alia_asr_get_partial_text`, and
   `alia_vlm_prefill_asr_text` support the `UserListening` streaming ASR/prefill

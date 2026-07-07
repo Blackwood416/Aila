@@ -74,7 +74,7 @@ struct Options {
     std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
     std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
     std::string foreground_lora =
-        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500";
+        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750";
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";
@@ -1438,6 +1438,10 @@ int main(int argc, char** argv) {
             ? static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                   audio_capture.first_audio - audio_capture.turn_start).count())
             : -1.0;
+        const double first_tts_enqueue_to_first_audio_ms =
+            first_audio_ms >= 0.0 && foreground_first_tts_enqueue_ms >= 0
+                ? first_audio_ms - static_cast<double>(foreground_first_tts_enqueue_ms)
+                : -1.0;
         const double simulated_vad_to_first_audio_ms = first_audio_ms >= 0.0
             ? simulated_vad_asr_tail_ms + first_audio_ms
             : -1.0;
@@ -1447,6 +1451,8 @@ int main(int argc, char** argv) {
             compute_playback_buffer_gap_stats(audio_capture);
         std::cout << "tts_callback_count=" << audio_capture.callback_count << "\n"
                   << "tts_first_audio_ms=" << first_audio_ms << "\n"
+                  << "first_tts_enqueue_to_first_audio_ms="
+                  << first_tts_enqueue_to_first_audio_ms << "\n"
                   << "simulated_vad_to_first_audio_ms="
                   << simulated_vad_to_first_audio_ms << "\n"
                   << "tts_chunks_synthesized=" << tts_metrics.chunks_synthesized << "\n"

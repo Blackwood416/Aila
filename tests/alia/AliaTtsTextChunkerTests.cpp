@@ -1,8 +1,14 @@
 #include "alia/AliaTtsTextChunker.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
+
+namespace aila::env {
+int g_q35_prefill_step_override = -1;
+bool g_kv_quant_override = false;
+}
 
 namespace {
 
@@ -69,6 +75,43 @@ void expect_eq_size(
 
 #define AILA_EXPECT_EQ_SIZE(results, left, right) \
     expect_eq_size((results), (left), (right), #left, #right, __FILE__, __LINE__)
+
+void expect_eq_int(
+    TestResults& results,
+    int left,
+    int right,
+    const char* left_expression,
+    const char* right_expression,
+    const char* file,
+    int line) {
+    if (left == right) {
+        ++results.passed;
+        return;
+    }
+    ++results.failed;
+    std::cerr << file << ':' << line << ": expected " << left_expression
+              << " == " << right_expression << ", got " << left
+              << " vs " << right << '\n';
+}
+
+#define AILA_EXPECT_EQ_INT(results, left, right) \
+    expect_eq_int((results), (left), (right), #left, #right, __FILE__, __LINE__)
+
+void set_env_var(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_env_var(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
 
 aila::alia::TtsTextChunkPolicy test_policy() {
     aila::alia::TtsTextChunkPolicy policy;
@@ -181,6 +224,41 @@ void force_flushes_all_text(TestResults& results) {
         "force");
 }
 
+void first_chunk_early_flush_defaults_enabled(TestResults& results) {
+    unset_env_var("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH");
+
+    const aila::alia::TtsFirstChunkEarlyFlushConfig config =
+        aila::alia::read_tts_first_chunk_early_flush_config();
+
+    AILA_EXPECT_TRUE(results, config.enabled);
+}
+
+void first_audio_priority_defaults_to_adaptive_window(TestResults& results) {
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY");
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS");
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS");
+
+    const aila::alia::TtsFirstAudioPriorityConfig config =
+        aila::alia::read_tts_first_audio_priority_config();
+
+    AILA_EXPECT_TRUE(results, config.enabled);
+    AILA_EXPECT_EQ_INT(results, config.base_timeout_ms, 250);
+    AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 120);
+}
+
+void first_audio_priority_env_clamps_negative_windows(TestResults& results) {
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", "0");
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", "-5");
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS", "-7");
+
+    const aila::alia::TtsFirstAudioPriorityConfig config =
+        aila::alia::read_tts_first_audio_priority_config();
+
+    AILA_EXPECT_TRUE(results, !config.enabled);
+    AILA_EXPECT_EQ_INT(results, config.base_timeout_ms, 0);
+    AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 0);
+}
+
 }  // namespace
 
 int main() {
@@ -190,6 +268,9 @@ int main() {
     early_first_chunk_flushes_without_boundary(results);
     steady_chunk_ignores_first_chunk_early_flush(results);
     force_flushes_all_text(results);
+    first_chunk_early_flush_defaults_enabled(results);
+    first_audio_priority_defaults_to_adaptive_window(results);
+    first_audio_priority_env_clamps_negative_windows(results);
 
     std::cout << "AilaAliaTtsTextChunkerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

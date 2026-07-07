@@ -171,6 +171,7 @@ void AliaTtsPipeline::begin_turn_metrics() {
     metrics_ = AliaTtsMetrics{};
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = false;
+    first_audio_synthesis_active_ = false;
 }
 
 bool AliaTtsPipeline::preload_reference_voice(std::string* error_message) {
@@ -203,6 +204,7 @@ bool AliaTtsPipeline::start_async_turn(const AliaGenConfig& config,
         text_queue_.clear();
         first_audio_buffer_.clear();
         first_audio_callback_emitted_ = false;
+        first_audio_synthesis_active_ = false;
         async_config_ = config;
         async_audio_cb_ = audio_cb;
         async_user_data_ = user_data;
@@ -289,6 +291,7 @@ void AliaTtsPipeline::reset() {
     text_queue_.clear();
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = false;
+    first_audio_synthesis_active_ = false;
 }
 
 bool AliaTtsPipeline::ready() const {
@@ -307,6 +310,11 @@ size_t AliaTtsPipeline::pending_text_count() const {
 bool AliaTtsPipeline::first_audio_callback_emitted() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return first_audio_callback_emitted_;
+}
+
+bool AliaTtsPipeline::first_audio_synthesis_active() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return first_audio_synthesis_active_;
 }
 
 AliaTtsMetrics AliaTtsPipeline::last_metrics() const {
@@ -339,6 +347,7 @@ std::vector<std::vector<float>> AliaTtsPipeline::prepare_audio_callbacks(
                            first_audio_buffer_.begin() + first_audio_samples);
     metrics_.first_backend_audio_samples = first_audio_samples;
     first_audio_callback_emitted_ = true;
+    first_audio_synthesis_active_ = false;
     if (first_audio_buffer_.size() > static_cast<size_t>(first_audio_samples)) {
         append_audio_callbacks(callbacks,
                                first_audio_buffer_,
@@ -360,6 +369,7 @@ std::vector<float> AliaTtsPipeline::flush_first_audio_buffer() {
     padded.resize(first_audio_samples, 0.0f);
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = true;
+    first_audio_synthesis_active_ = false;
     metrics_.first_backend_audio_samples = first_audio_samples;
     metrics_.audio_callback_max_frames = tts_audio_callback_max_frames();
     return padded;
@@ -494,6 +504,15 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
     bool emitted_backend_audio = false;
     bool backend_ok = false;
     IModelBackend::TtsBackendTiming backend_timing;
+    bool first_audio_synthesis = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first_audio_synthesis =
+            metrics_.chunks_synthesized == 0 && !first_audio_callback_emitted_;
+        if (first_audio_synthesis) {
+            first_audio_synthesis_active_ = true;
+        }
+    }
     {
         auto lane_lock = context->lock_execution();
         backend_ok = tts_backend->synthesize_codes_stream(
@@ -530,6 +549,10 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
             },
             should_cancel);
         backend_timing = tts_backend->last_tts_backend_timing();
+    }
+    if (first_audio_synthesis) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first_audio_synthesis_active_ = false;
     }
     if (!backend_ok || !emitted_backend_audio) {
         return cancelled();
