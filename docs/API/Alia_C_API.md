@@ -528,6 +528,9 @@ Behavior:
 - Spoken content deltas are chunked and enqueued to TTS while decoding.
 - Action tags enclosed in ASCII or full-width parentheses are removed from
   spoken text and stored internally as action tags.
+- The current checkpoint-750 LoRA normally does not emit action tags on short
+  Chinese turns, and the low-latency stream no longer waits for an action-tag
+  guard before enqueueing spoken text.
 - Structured artifacts such as `<think>` and `<tool_call>` are stripped from
   spoken text before the final assistant text is stored internally.
 - Explicit tool calls are parsed and delivered to `tool_cb`. Tool results are
@@ -672,6 +675,10 @@ Any output pointer may be null. Non-null outputs must be released with
   structured artifacts.
 - `out_action_tags_json`: a JSON string array containing action tags stripped
   from spoken text, for example `["尾巴轻轻摆动"]`.
+
+With the current checkpoint-750 LoRA, this array is usually empty. Hosts should
+still parse it because the ABI field is retained for compatibility and future
+avatar/action routing.
 
 Return behavior:
 

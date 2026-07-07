@@ -1,5 +1,10 @@
 # 2026-07-05 Handoff: Alia Host Integration Agent
 
+> Current status note, 2026-07-07: use
+> `docs/alia-engine/2026-07-07-handoff-current-status.md` for current runtime
+> defaults. The active foreground LoRA is checkpoint-750. This host-integration
+> handoff still describes the intended FSM/API binding flow.
+
 This handoff is for an agent connecting the custom Alia engine to the C# host
 program. The engine ABI is now ready for a first real host integration pass, but
 the host skeleton still reflects an older flow.
@@ -10,7 +15,8 @@ Engine worktree:
 
 - Path: `E:/RiderProjects/Aila/.worktrees/alia-custom-engine`
 - Branch: `codex/alia-custom-engine`
-- Latest known engine commit: `6cef4c1 feat: expose Alia host integration API`
+- Latest known engine commit at original handoff: `6cef4c1 feat: expose Alia host integration API`
+- Latest known performance commit before the July 7 docs update: `70f3f5f perf: scope Q35 snapshot suppression to final prefill`
 - API reference: `E:/RiderProjects/Aila/.worktrees/alia-custom-engine/docs/API/Alia_C_API.md`
 
 Host repository:
@@ -40,7 +46,7 @@ Use:
 
 - ASR: `models/Qwen3-ASR-1.7B-BNB-NF4`
 - Foreground VLM: `models/qwen3.5-4B-bnb-nf4-offline-visiondense`
-- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500`
+- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750`
 - Background VLM: `models/qwen3.5-0.8B-bnb-nf4-offline`
 - TTS: `models/Qwen3-TTS-12Hz-0.6B-Base`
 - TTS reference audio: `E:/RiderProjects/Aila/.worktrees/alia-custom-engine/alia_ref.wav`

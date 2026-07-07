@@ -1,5 +1,11 @@
 # 2026-07-05 Handoff: Alia Engine Optimization Agent
 
+> Current status note, 2026-07-07: this handoff has been superseded as the
+> primary optimization entry point by
+> `docs/alia-engine/2026-07-07-handoff-current-status.md`. Historical evidence
+> below is preserved, but the active foreground LoRA is now checkpoint-750 and
+> performance optimization is paused unless the user reopens it.
+
 This handoff is for an agent continuing performance work on the Alia custom
 engine branch. Keep the branch specialized for the real voice-text-voice
 pipeline. Do not drift back into the generic Aila mainline path.
@@ -8,7 +14,8 @@ pipeline. Do not drift back into the generic Aila mainline path.
 
 - Engine worktree: `E:/RiderProjects/Aila/.worktrees/alia-custom-engine`
 - Branch: `codex/alia-custom-engine`
-- Latest known commit at handoff: `6cef4c1 feat: expose Alia host integration API`
+- Latest known commit at original handoff: `6cef4c1 feat: expose Alia host integration API`
+- Latest known performance commit before the July 7 docs update: `70f3f5f perf: scope Q35 snapshot suppression to final prefill`
 - Main API reference: `docs/API/Alia_C_API.md`
 - Host design docs: `E:/RiderProjects/Alia/docs/design/`
 
@@ -21,7 +28,7 @@ Use these exact models unless the user says otherwise:
 
 - ASR: `models/Qwen3-ASR-1.7B-BNB-NF4`
 - Foreground VLM: `models/qwen3.5-4B-bnb-nf4-offline-visiondense`
-- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-500`
+- Foreground LoRA: `F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750`
 - Background VLM: `models/qwen3.5-0.8B-bnb-nf4-offline`
 - TTS: `models/Qwen3-TTS-12Hz-0.6B-Base`
 - TTS reference audio: `E:/RiderProjects/Aila/.worktrees/alia-custom-engine/alia_ref.wav`
@@ -102,7 +109,8 @@ toward lower latency through pipeline overlap and scheduling.
 ## Current default behavior to preserve
 
 - TTS reference voice loads from the worktree-local `alia_ref.wav`.
-- Foreground LoRA checkpoint-500 is the preferred adapter.
+- Foreground LoRA checkpoint-750 is the preferred adapter. Checkpoint-500
+  appears in older matrix notes as historical evidence only.
 - Matrix scenarios are Chinese and include `multi_turn_followup` instead of
   `long_answer`.
 - Foreground action tags in parentheses are filtered out of spoken text and
@@ -295,8 +303,8 @@ docs/alia-engine/2026-07-05-handoff-optimization.md first and follow it.
 
 Goal: reduce real voice-text-voice TTFA, especially short Chinese prompts,
 without pursuing Computer Use, visual input, or tool-call features. Use the
-fixed model set and checkpoint-500 LoRA. Validate with real model smoke/matrix,
-not API-only tests. Start by profiling the current build and identify the
-largest serialized latency segment before editing code. Commit each useful
-round.
+fixed model set and checkpoint-750 LoRA. Validate with real model smoke/matrix,
+not API-only tests. Read
+docs/alia-engine/2026-07-07-handoff-current-status.md before restarting
+optimization; several 2026-07-06/07 routes have already been A/B tested.
 ```
