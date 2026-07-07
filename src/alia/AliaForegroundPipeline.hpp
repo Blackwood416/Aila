@@ -1,6 +1,7 @@
 #pragma once
 
 #include "alia_api.h"
+#include "AliaTtsTextChunker.hpp"
 #include "engine/Types.hpp"
 
 #include <chrono>
@@ -20,9 +21,6 @@ class ModelSlot;
 bool is_valid_generation_config(const AliaGenConfig& config);
 GenerationConfig translate_generation_config(const AliaGenConfig* config);
 std::string foreground_system_prompt();
-std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries = true,
-                                                   size_t min_first_chunk_chars = 0);
 
 enum class ForegroundDecodeMode {
     None,
@@ -50,9 +48,14 @@ struct AliaForegroundMetrics {
     long long first_content_delta_ms = -1;
     long long first_tts_enqueue_ms = -1;
     long long tts_first_audio_priority_wait_ms = 0;
+    long long first_tts_chunk_wait_ms = -1;
+    int first_tts_chunk_wait_tokens = -1;
+    int first_tts_chunk_pending_chars_at_first_content = -1;
+    int first_tts_chunk_pending_chars_at_enqueue = -1;
     long long decode_ms = -1;
     long long model_ms = -1;
     std::string final_cached_prefix_reject_reason;
+    std::string first_tts_chunk_reason;
 };
 
 class AliaForegroundPipeline {

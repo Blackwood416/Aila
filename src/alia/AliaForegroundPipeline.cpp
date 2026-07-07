@@ -3,6 +3,7 @@
 #include "AliaAsrPipeline.hpp"
 #include "ModelSlot.hpp"
 #include "AliaTtsPipeline.hpp"
+#include "AliaTtsTextChunker.hpp"
 #include "AliaTurnScheduler.hpp"
 #include "../chat/AssistantOutputParser.hpp"
 #include "../chat/ChatJson.hpp"
@@ -23,10 +24,6 @@
 #include <vector>
 
 namespace aila::alia {
-
-std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries,
-                                                   size_t min_first_chunk_chars);
 
 namespace {
 
@@ -161,71 +158,6 @@ std::string build_tool_result_continuation_text(const std::string& tool_result_t
     text += "\n</tool_result>\n";
     text += "Continue the response in concise spoken text.\n";
     return text;
-}
-
-const std::vector<std::string>& tts_chunk_boundary_markers() {
-    static const std::vector<std::string> markers = {
-        ".", "!", "?", ";", "\n",
-        "。", "！", "？", "；", "…",
-    };
-    return markers;
-}
-
-const std::vector<std::string>& tts_soft_chunk_boundary_markers() {
-    static const std::vector<std::string> markers = {
-        ",", ":", ")", "]",
-        "，", "、", "：", "）", "】",
-        " ",
-    };
-    return markers;
-}
-
-bool ends_with_tts_chunk_boundary(const std::string& text) {
-    for (const std::string& marker : tts_chunk_boundary_markers()) {
-        if (text.size() >= marker.size() &&
-            text.compare(text.size() - marker.size(), marker.size(), marker) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-size_t last_tts_chunk_boundary(const std::string& text) {
-    size_t cutoff = std::string::npos;
-    for (const std::string& marker : tts_chunk_boundary_markers()) {
-        size_t pos = text.find(marker);
-        while (pos != std::string::npos) {
-            cutoff = std::max(cutoff == std::string::npos ? 0 : cutoff,
-                              pos + marker.size());
-            pos = text.find(marker, pos + marker.size());
-        }
-    }
-    return cutoff;
-}
-
-size_t last_tts_soft_chunk_boundary(const std::string& text,
-                                    size_t min_cutoff,
-                                    size_t max_cutoff) {
-    if (max_cutoff == 0 || text.size() < max_cutoff) {
-        return std::string::npos;
-    }
-    max_cutoff = std::min(max_cutoff, text.size());
-    size_t cutoff = std::string::npos;
-    for (const std::string& marker : tts_soft_chunk_boundary_markers()) {
-        size_t pos = text.find(marker);
-        while (pos != std::string::npos) {
-            const size_t candidate = pos + marker.size();
-            if (candidate > max_cutoff) {
-                break;
-            }
-            if (candidate >= min_cutoff) {
-                cutoff = std::max(cutoff == std::string::npos ? 0 : cutoff,
-                                  candidate);
-            }
-            pos = text.find(marker, pos + marker.size());
-        }
-    }
-    return cutoff;
 }
 
 std::string trim_ascii(std::string value) {
@@ -486,9 +418,7 @@ SpokenActionSplit split_action_tags_from_spoken_text(const std::string& text) {
     return result;
 }
 
-std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
-                                               bool force,
-                                               bool low_latency_first_chunk) {
+TtsTextChunkPolicy tts_text_chunk_policy_from_env() {
     static const int kRawSoftMinChars =
         aila::env::read_int_raw("AILA_TTS_STREAM_TEXT_SOFT_MIN_CHARS", -1);
     static const int kRawSoftMaxChars =
@@ -519,51 +449,16 @@ std::vector<std::string> take_ready_tts_chunks(std::string& buffer,
         aila::env::read_flag("AILA_TTS_STREAM_TEXT_FIRST_SOFT_BOUNDARY_FLUSH", true);
     static const bool kCoalesceSteadyTextChunks =
         aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
-    const int soft_min_chars =
-        low_latency_first_chunk ? kFirstSoftMinChars : kSteadySoftMinChars;
-    const int soft_max_chars =
-        low_latency_first_chunk ? kFirstSoftMaxChars : kSteadySoftMaxChars;
-    const int hard_min_chars =
-        low_latency_first_chunk ? kFirstHardMinChars : kSteadyHardMinChars;
-    size_t cutoff = std::string::npos;
-    if (force) {
-        cutoff = buffer.size();
-    } else {
-        cutoff = last_tts_chunk_boundary(buffer);
-        if (cutoff != std::string::npos &&
-            static_cast<int>(cutoff) < hard_min_chars) {
-            cutoff = std::string::npos;
-        }
-        if (cutoff == std::string::npos &&
-            low_latency_first_chunk &&
-            kFirstSoftBoundaryFlush) {
-            cutoff = last_tts_soft_chunk_boundary(
-                buffer,
-                static_cast<size_t>(soft_min_chars),
-                buffer.size());
-        }
-        if (cutoff == std::string::npos &&
-            soft_max_chars > 0 &&
-            static_cast<int>(buffer.size()) >= soft_max_chars) {
-            cutoff = last_tts_soft_chunk_boundary(
-                buffer,
-                static_cast<size_t>(std::min(soft_min_chars, soft_max_chars)),
-                static_cast<size_t>(soft_max_chars));
-        }
-    }
-
-    if (cutoff == std::string::npos || cutoff == 0) {
-        return {};
-    }
-
-    std::string ready = buffer.substr(0, cutoff);
-    buffer.erase(0, cutoff);
-    const bool split_sentence_boundaries =
-        !(kCoalesceSteadyTextChunks && !low_latency_first_chunk);
-    return split_spoken_text_for_tts(
-        ready,
-        split_sentence_boundaries,
-        low_latency_first_chunk ? static_cast<size_t>(hard_min_chars) : 0);
+    TtsTextChunkPolicy policy;
+    policy.first_soft_min_chars = kFirstSoftMinChars;
+    policy.steady_soft_min_chars = kSteadySoftMinChars;
+    policy.first_soft_max_chars = kFirstSoftMaxChars;
+    policy.steady_soft_max_chars = kSteadySoftMaxChars;
+    policy.first_hard_min_chars = kFirstHardMinChars;
+    policy.steady_hard_min_chars = kSteadyHardMinChars;
+    policy.first_soft_boundary_flush = kFirstSoftBoundaryFlush;
+    policy.coalesce_steady_text_chunks = kCoalesceSteadyTextChunks;
+    return policy;
 }
 
 }  // namespace
@@ -578,71 +473,6 @@ std::string foreground_system_prompt() {
            "requests, emit only "
            "<tool_call><function=name><parameter=name>value</parameter>"
            "</function></tool_call>.";
-}
-
-std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
-                                                   bool split_sentence_boundaries,
-                                                   size_t min_first_chunk_chars) {
-    std::vector<std::string> chunks;
-    if (!split_sentence_boundaries) {
-        std::string trimmed = trim_ascii(text);
-        if (!trimmed.empty()) {
-            chunks.push_back(std::move(trimmed));
-        }
-        return chunks;
-    }
-
-    std::string current;
-    auto flush = [&]() {
-        size_t begin = 0;
-        while (begin < current.size() &&
-               std::isspace(static_cast<unsigned char>(current[begin]))) {
-            ++begin;
-        }
-        size_t end = current.size();
-        while (end > begin &&
-               std::isspace(static_cast<unsigned char>(current[end - 1]))) {
-            --end;
-        }
-        if (end > begin) {
-            chunks.push_back(current.substr(begin, end - begin));
-        }
-        current.clear();
-    };
-
-    for (char ch : text) {
-        current.push_back(ch);
-        if (ends_with_tts_chunk_boundary(current)) {
-            flush();
-        }
-    }
-    flush();
-
-    while (min_first_chunk_chars > 0 &&
-           chunks.size() > 1 &&
-           chunks.front().size() < min_first_chunk_chars) {
-        std::string merged = std::move(chunks[0]);
-        const std::string& next = chunks[1];
-        if (!merged.empty() && !next.empty()) {
-            const unsigned char last =
-                static_cast<unsigned char>(merged.back());
-            const unsigned char first =
-                static_cast<unsigned char>(next.front());
-            const bool ascii_sentence_join =
-                (last == '.' || last == '!' || last == '?' ||
-                 last == ';' || last == ',' || last == ':') &&
-                std::isalnum(first) != 0;
-            const bool ascii_word_join =
-                std::isalnum(last) != 0 && std::isalnum(first) != 0;
-            if (ascii_sentence_join || ascii_word_join) {
-                merged.push_back(' ');
-            }
-        }
-        merged += next;
-        chunks[0] = std::move(merged);
-        chunks.erase(chunks.begin() + 1);
-    }
-    return chunks;
 }
 
 bool is_valid_generation_config(const AliaGenConfig& config) {
@@ -1488,6 +1318,7 @@ bool AliaForegroundPipeline::synthesize_committed_text(
     }
 
     long long first_enqueue_ms = -1;
+    TtsTextChunkResult first_chunk_result;
     if (tts_pipeline_ && audio_cb) {
         const bool started = tts_pipeline_->start_async_turn(
             config,
@@ -1500,7 +1331,12 @@ bool AliaForegroundPipeline::synthesize_committed_text(
         }
 
         std::string pending_tts_text = spoken_text;
-        for (const std::string& chunk : take_ready_tts_chunks(pending_tts_text, true, false)) {
+        const TtsTextChunkResult chunk_result =
+            take_ready_tts_text_chunks(pending_tts_text,
+                                       tts_text_chunk_policy_from_env(),
+                                       TtsTextChunkRequest{true, false, false});
+        first_chunk_result = chunk_result;
+        for (const std::string& chunk : chunk_result.chunks) {
             if (abort_requested()) {
                 break;
             }
@@ -1528,6 +1364,16 @@ bool AliaForegroundPipeline::synthesize_committed_text(
         last_first_tts_enqueue_ms_ = first_enqueue_ms;
         metrics_.first_content_delta_ms = 0;
         metrics_.first_tts_enqueue_ms = first_enqueue_ms;
+        metrics_.first_tts_chunk_reason =
+            tts_chunk_decision_reason_name(first_chunk_result.reason);
+        metrics_.first_tts_chunk_pending_chars_at_first_content =
+            static_cast<int>(spoken_text.size());
+        metrics_.first_tts_chunk_pending_chars_at_enqueue =
+            first_enqueue_ms >= 0
+                ? static_cast<int>(first_chunk_result.pending_chars_before)
+                : -1;
+        metrics_.first_tts_chunk_wait_tokens = 0;
+        metrics_.first_tts_chunk_wait_ms = 0;
     }
     return true;
 }
@@ -1982,14 +1828,65 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     bool first_tts_enqueue_seen = false;
     bool first_tts_priority_wait_done = false;
     long long first_tts_priority_wait_ms = 0;
+    bool first_content_seen = false;
+    int generated_tokens_at_first_content = -1;
+    std::chrono::steady_clock::time_point first_content_at{};
+    int first_tts_chunk_pending_chars_at_first_content = -1;
+    int first_tts_chunk_pending_chars_at_enqueue = -1;
+    int first_tts_chunk_wait_tokens = -1;
+    long long first_tts_chunk_wait_ms = -1;
+    std::string first_tts_chunk_reason =
+        tts_chunk_decision_reason_name(TtsChunkDecisionReason::NoText);
+    const TtsTextChunkPolicy tts_chunk_policy = tts_text_chunk_policy_from_env();
     static const bool s_tts_first_audio_priority =
         aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
     static const int s_tts_first_audio_priority_timeout_ms = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     static const bool s_tts_coalesce_steady_text_chunks =
         aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
+    static const bool s_tts_first_chunk_early_flush =
+        aila::env::read_flag("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH", false);
+    static const int s_tts_first_chunk_early_token_delay = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY", 2));
+    static const int s_tts_first_chunk_early_delay_ms = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_MS", 80));
     long long first_token_delta_ms = -1;
     const auto decode_started = std::chrono::steady_clock::now();
+    auto note_first_spoken_content = [&]() {
+        if (first_content_seen) {
+            return;
+        }
+        first_content_seen = true;
+        first_content_at = std::chrono::steady_clock::now();
+        generated_tokens_at_first_content = static_cast<int>(generated_ids.size());
+        first_tts_chunk_pending_chars_at_first_content =
+            static_cast<int>(pending_tts_text.size());
+    };
+    auto early_first_chunk_ready = [&]() {
+        if (!s_tts_first_chunk_early_flush ||
+            first_tts_enqueue_seen ||
+            !first_content_seen ||
+            static_cast<int>(pending_tts_text.size()) <
+                tts_chunk_policy.first_hard_min_chars) {
+            return false;
+        }
+        const int generated_since_first_content =
+            generated_tokens_at_first_content >= 0
+                ? std::max(0,
+                           static_cast<int>(generated_ids.size()) -
+                               generated_tokens_at_first_content)
+                : 0;
+        const long long ms_since_first_content =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - first_content_at).count();
+        const bool token_delay_ready =
+            s_tts_first_chunk_early_token_delay <= 0 ||
+            generated_since_first_content >= s_tts_first_chunk_early_token_delay;
+        const bool time_delay_ready =
+            s_tts_first_chunk_early_delay_ms <= 0 ||
+            ms_since_first_content >= s_tts_first_chunk_early_delay_ms;
+        return token_delay_ready || time_delay_ready;
+    };
     auto flush_tts = [&](bool force) {
         if (!tts_pipeline_ || !audio_cb || !tts_config) {
             return;
@@ -2000,14 +1897,42 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             !tts_pipeline_->first_audio_callback_emitted();
         const bool low_latency_chunking =
             !first_tts_enqueue_seen || first_audio_pending;
-        for (const std::string& chunk :
-             take_ready_tts_chunks(pending_tts_text, force, low_latency_chunking)) {
+        const TtsTextChunkResult chunk_result =
+            take_ready_tts_text_chunks(
+                pending_tts_text,
+                tts_chunk_policy,
+                TtsTextChunkRequest{
+                    force,
+                    low_latency_chunking,
+                    low_latency_chunking && early_first_chunk_ready(),
+                });
+        if (!first_tts_enqueue_seen) {
+            first_tts_chunk_reason =
+                tts_chunk_decision_reason_name(chunk_result.reason);
+        }
+        for (const std::string& chunk : chunk_result.chunks) {
             if (abort_requested()) {
                 return;
             }
+            const bool was_first_enqueue = !first_tts_enqueue_seen;
             if (tts_pipeline_->enqueue_text(chunk)) {
-                if (!first_tts_enqueue_seen) {
+                if (was_first_enqueue) {
                     first_tts_enqueue_seen = true;
+                    first_tts_chunk_reason =
+                        tts_chunk_decision_reason_name(chunk_result.reason);
+                    first_tts_chunk_pending_chars_at_enqueue =
+                        static_cast<int>(chunk_result.pending_chars_before);
+                    if (first_content_seen) {
+                        first_tts_chunk_wait_tokens =
+                            generated_tokens_at_first_content >= 0
+                                ? std::max(0,
+                                           static_cast<int>(generated_ids.size()) -
+                                               generated_tokens_at_first_content)
+                                : -1;
+                        first_tts_chunk_wait_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - first_content_at).count();
+                    }
                 }
                 if (record_generation_anchor) {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -2082,12 +2007,15 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 std::string spoken_delta;
                 action_filter.push(event.text, spoken_delta, streaming_action_tags);
                 pending_tts_text += spoken_delta;
-                if (record_generation_anchor && !spoken_delta.empty()) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (last_first_content_delta_ms_ < 0) {
-                        last_first_content_delta_ms_ =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - turn_start).count();
+                if (!spoken_delta.empty()) {
+                    note_first_spoken_content();
+                    if (record_generation_anchor) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (last_first_content_delta_ms_ < 0) {
+                            last_first_content_delta_ms_ =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - turn_start).count();
+                        }
                     }
                 }
             }
@@ -2122,12 +2050,15 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                 std::string spoken_delta;
                 action_filter.push(event.text, spoken_delta, streaming_action_tags);
                 pending_tts_text += spoken_delta;
-                if (record_generation_anchor && !spoken_delta.empty()) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (last_first_content_delta_ms_ < 0) {
-                        last_first_content_delta_ms_ =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - turn_start).count();
+                if (!spoken_delta.empty()) {
+                    note_first_spoken_content();
+                    if (record_generation_anchor) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (last_first_content_delta_ms_ < 0) {
+                            last_first_content_delta_ms_ =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - turn_start).count();
+                        }
                     }
                 }
             }
@@ -2135,12 +2066,15 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         std::string final_spoken_delta;
         action_filter.finish(final_spoken_delta, streaming_action_tags);
         pending_tts_text += final_spoken_delta;
-        if (record_generation_anchor && !final_spoken_delta.empty()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (last_first_content_delta_ms_ < 0) {
-                last_first_content_delta_ms_ =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - turn_start).count();
+        if (!final_spoken_delta.empty()) {
+            note_first_spoken_content();
+            if (record_generation_anchor) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (last_first_content_delta_ms_ < 0) {
+                    last_first_content_delta_ms_ =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - turn_start).count();
+                }
             }
         }
         flush_tts(true);
@@ -2166,6 +2100,13 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             metrics_.first_content_delta_ms = last_first_content_delta_ms_;
             metrics_.first_tts_enqueue_ms = last_first_tts_enqueue_ms_;
             metrics_.tts_first_audio_priority_wait_ms = first_tts_priority_wait_ms;
+            metrics_.first_tts_chunk_reason = first_tts_chunk_reason;
+            metrics_.first_tts_chunk_pending_chars_at_first_content =
+                first_tts_chunk_pending_chars_at_first_content;
+            metrics_.first_tts_chunk_pending_chars_at_enqueue =
+                first_tts_chunk_pending_chars_at_enqueue;
+            metrics_.first_tts_chunk_wait_tokens = first_tts_chunk_wait_tokens;
+            metrics_.first_tts_chunk_wait_ms = first_tts_chunk_wait_ms;
             metrics_.decode_ms = decode_ms;
             metrics_.model_ms = elapsed_ms(model_started);
         } else {

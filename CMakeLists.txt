@@ -111,6 +111,7 @@ set(ALIA_ENGINE_SOURCES
     src/alia/ModelSlot.cpp
     src/alia/AliaAsrPipeline.cpp
     src/alia/AliaTtsPipeline.cpp
+    src/alia/AliaTtsTextChunker.cpp
     src/alia/AliaTurnScheduler.cpp
     src/alia/AliaForegroundPipeline.cpp
     src/alia/AliaBackgroundPipeline.cpp
@@ -134,6 +135,11 @@ set(COMMAND_SUBMISSION_BENCH_SOURCES
 set(ALIA_TURN_SCHEDULER_TEST_SOURCES
     tests/alia/AliaTurnSchedulerTests.cpp
     src/alia/AliaTurnScheduler.cpp
+)
+
+set(ALIA_TTS_TEXT_CHUNKER_TEST_SOURCES
+    tests/alia/AliaTtsTextChunkerTests.cpp
+    src/alia/AliaTtsTextChunker.cpp
 )
 
 set(ALIA_ASR_LANGUAGE_HINT_TEST_SOURCES
@@ -214,6 +220,12 @@ add_dependencies(AliaEngine AilaAliaRealSmoke)
 add_executable(AilaAliaTurnSchedulerTests ${ALIA_TURN_SCHEDULER_TEST_SOURCES})
 target_compile_definitions(AilaAliaTurnSchedulerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaAliaTurnSchedulerTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_executable(AilaAliaTtsTextChunkerTests ${ALIA_TTS_TEXT_CHUNKER_TEST_SOURCES})
+target_compile_definitions(AilaAliaTtsTextChunkerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaAliaTtsTextChunkerTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
