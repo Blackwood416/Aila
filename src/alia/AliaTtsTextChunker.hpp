@@ -56,6 +56,10 @@ struct TtsFirstAudioPriorityConfig {
     int active_extra_ms = 120;
 };
 
+struct TtsStreamActionTagGuardConfig {
+    bool enabled = false;
+};
+
 std::vector<std::string> split_spoken_text_for_tts(
     const std::string& text,
     bool split_sentence_boundaries = true,
@@ -63,6 +67,7 @@ std::vector<std::string> split_spoken_text_for_tts(
 
 TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config();
 TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config();
+TtsStreamActionTagGuardConfig read_tts_stream_action_tag_guard_config();
 
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,

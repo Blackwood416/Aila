@@ -216,6 +216,13 @@ TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config() {
     return config;
 }
 
+TtsStreamActionTagGuardConfig read_tts_stream_action_tag_guard_config() {
+    TtsStreamActionTagGuardConfig config;
+    config.enabled =
+        aila::env::read_flag("AILA_TTS_STREAM_ACTION_TAG_GUARD", false);
+    return config;
+}
+
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,
     const TtsTextChunkPolicy& policy,

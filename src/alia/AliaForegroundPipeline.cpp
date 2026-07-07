@@ -1844,6 +1844,8 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         read_tts_first_chunk_early_flush_config();
     const TtsFirstAudioPriorityConfig first_audio_priority_config =
         read_tts_first_audio_priority_config();
+    const TtsStreamActionTagGuardConfig stream_action_tag_guard_config =
+        read_tts_stream_action_tag_guard_config();
     long long first_token_delta_ms = -1;
     const auto decode_started = std::chrono::steady_clock::now();
     auto note_first_spoken_content = [&]() {
@@ -2007,7 +2009,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         for (const auto& event : events) {
             if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
                 std::string spoken_delta;
-                action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                if (stream_action_tag_guard_config.enabled) {
+                    action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                } else {
+                    spoken_delta = event.text;
+                }
                 pending_tts_text += spoken_delta;
                 if (!spoken_delta.empty()) {
                     note_first_spoken_content();
@@ -2050,7 +2056,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
         for (const auto& event : final_events) {
             if (event.type == aila::chat::StructuredStreamEventType::ContentDelta) {
                 std::string spoken_delta;
-                action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                if (stream_action_tag_guard_config.enabled) {
+                    action_filter.push(event.text, spoken_delta, streaming_action_tags);
+                } else {
+                    spoken_delta = event.text;
+                }
                 pending_tts_text += spoken_delta;
                 if (!spoken_delta.empty()) {
                     note_first_spoken_content();
@@ -2066,7 +2076,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             }
         }
         std::string final_spoken_delta;
-        action_filter.finish(final_spoken_delta, streaming_action_tags);
+        if (stream_action_tag_guard_config.enabled) {
+            action_filter.finish(final_spoken_delta, streaming_action_tags);
+        }
         pending_tts_text += final_spoken_delta;
         if (!final_spoken_delta.empty()) {
             note_first_spoken_content();

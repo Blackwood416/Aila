@@ -259,6 +259,24 @@ void first_audio_priority_env_clamps_negative_windows(TestResults& results) {
     AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 0);
 }
 
+void stream_action_tag_guard_defaults_disabled(TestResults& results) {
+    unset_env_var("AILA_TTS_STREAM_ACTION_TAG_GUARD");
+
+    const aila::alia::TtsStreamActionTagGuardConfig config =
+        aila::alia::read_tts_stream_action_tag_guard_config();
+
+    AILA_EXPECT_TRUE(results, !config.enabled);
+}
+
+void stream_action_tag_guard_can_be_enabled(TestResults& results) {
+    set_env_var("AILA_TTS_STREAM_ACTION_TAG_GUARD", "1");
+
+    const aila::alia::TtsStreamActionTagGuardConfig config =
+        aila::alia::read_tts_stream_action_tag_guard_config();
+
+    AILA_EXPECT_TRUE(results, config.enabled);
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +289,8 @@ int main() {
     first_chunk_early_flush_defaults_enabled(results);
     first_audio_priority_defaults_to_adaptive_window(results);
     first_audio_priority_env_clamps_negative_windows(results);
+    stream_action_tag_guard_defaults_disabled(results);
+    stream_action_tag_guard_can_be_enabled(results);
 
     std::cout << "AilaAliaTtsTextChunkerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";
