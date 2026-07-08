@@ -303,6 +303,8 @@ try {
             tts_backend_steady_batch_callback_count = Get-ValueOrEmpty $values "tts_backend_steady_batch_callback_count"
             tts_backend_playback_aware_steady_batch = Get-ValueOrEmpty $values "tts_backend_playback_aware_steady_batch"
             tts_audio_callback_max_frames = Get-ValueOrEmpty $values "tts_audio_callback_max_frames"
+            tts_pause_silence_segments = Get-ValueOrEmpty $values "tts_pause_silence_segments"
+            tts_pause_silence_ms = Get-ValueOrEmpty $values "tts_pause_silence_ms"
             tts_first_backend_codes_ms = Get-ValueOrEmpty $values "tts_first_backend_codes_ms"
             tts_first_backend_mimi_init_ms = Get-ValueOrEmpty $values "tts_first_backend_mimi_init_ms"
             tts_first_backend_audio_ms = Get-ValueOrEmpty $values "tts_first_backend_audio_ms"

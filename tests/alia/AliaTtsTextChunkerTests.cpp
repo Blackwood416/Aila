@@ -281,6 +281,64 @@ void stream_action_tag_guard_can_be_enabled(TestResults& results) {
     AILA_EXPECT_TRUE(results, config.enabled);
 }
 
+void ellipsis_pause_segments_split_text_and_silence(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const std::vector<aila::alia::TtsPreparedSegment> segments =
+        aila::alia::split_tts_text_pause_segments("我……我有点紧张", config);
+
+    AILA_EXPECT_EQ_SIZE(results, segments.size(), 3);
+    AILA_EXPECT_TRUE(
+        results,
+        segments[0].kind == aila::alia::TtsPreparedSegmentKind::Text);
+    AILA_EXPECT_EQ_STRING(results, segments[0].text, "我");
+    AILA_EXPECT_TRUE(
+        results,
+        segments[1].kind == aila::alia::TtsPreparedSegmentKind::Silence);
+    AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 240);
+    AILA_EXPECT_TRUE(
+        results,
+        segments[2].kind == aila::alia::TtsPreparedSegmentKind::Text);
+    AILA_EXPECT_EQ_STRING(results, segments[2].text, "我有点紧张");
+}
+
+void ascii_ellipsis_pause_segment_uses_single_pause(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const std::vector<aila::alia::TtsPreparedSegment> segments =
+        aila::alia::split_tts_text_pause_segments("I...think", config);
+
+    AILA_EXPECT_EQ_SIZE(results, segments.size(), 3);
+    AILA_EXPECT_EQ_STRING(results, segments[0].text, "I");
+    AILA_EXPECT_TRUE(
+        results,
+        segments[1].kind == aila::alia::TtsPreparedSegmentKind::Silence);
+    AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 160);
+    AILA_EXPECT_EQ_STRING(results, segments[2].text, "think");
+}
+
+void ellipsis_pause_segments_can_be_disabled(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = false;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const std::vector<aila::alia::TtsPreparedSegment> segments =
+        aila::alia::split_tts_text_pause_segments("我……我有点紧张", config);
+
+    AILA_EXPECT_EQ_SIZE(results, segments.size(), 1);
+    AILA_EXPECT_TRUE(
+        results,
+        segments[0].kind == aila::alia::TtsPreparedSegmentKind::Text);
+    AILA_EXPECT_EQ_STRING(results, segments[0].text, "我……我有点紧张");
+}
+
 }  // namespace
 
 int main() {
@@ -295,6 +353,9 @@ int main() {
     first_audio_priority_env_clamps_negative_windows(results);
     stream_action_tag_guard_defaults_disabled(results);
     stream_action_tag_guard_can_be_enabled(results);
+    ellipsis_pause_segments_split_text_and_silence(results);
+    ascii_ellipsis_pause_segment_uses_single_pause(results);
+    ellipsis_pause_segments_can_be_disabled(results);
 
     std::cout << "AilaAliaTtsTextChunkerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

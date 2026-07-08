@@ -1,5 +1,6 @@
 #include "AliaTtsPipeline.hpp"
 
+#include "AliaTtsTextChunker.hpp"
 #include "ModelSlot.hpp"
 #include "../models/IModelBackend.hpp"
 #include "../models/Qwen3TTSBackend.hpp"
@@ -158,9 +159,30 @@ bool AliaTtsPipeline::enqueue_text(std::string text) {
         return false;
     }
 
+    std::vector<TtsPreparedSegment> segments =
+        split_tts_text_pause_segments(text, read_tts_pause_segment_config());
+    if (segments.empty()) {
+        return false;
+    }
+
+    bool queued = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        text_queue_.push_back(std::move(text));
+        for (TtsPreparedSegment& segment : segments) {
+            if (segment.kind == TtsPreparedSegmentKind::Text) {
+                if (segment.text.empty()) {
+                    continue;
+                }
+                text_queue_.push_back(TtsQueueItem{std::move(segment.text), 0});
+                queued = true;
+            } else if (segment.silence_ms > 0) {
+                text_queue_.push_back(TtsQueueItem{{}, segment.silence_ms});
+                queued = true;
+            }
+        }
+    }
+    if (!queued) {
+        return false;
     }
     cv_.notify_all();
     return true;
@@ -252,7 +274,7 @@ bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
         return should_cancel && should_cancel();
     };
 
-    std::deque<std::string> pending;
+    std::deque<TtsQueueItem> pending;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending.swap(text_queue_);
@@ -265,11 +287,14 @@ bool AliaTtsPipeline::synthesize_pending(const AliaGenConfig& config,
         return false;
     }
 
-    for (const auto& text : pending) {
+    for (const auto& item : pending) {
         if (cancelled()) {
             break;
         }
-        if (!synthesize_text(text, config, audio_cb, user_data, should_cancel)) {
+        const bool ok = item.silence_ms > 0
+            ? synthesize_silence(item.silence_ms, audio_cb, user_data, should_cancel)
+            : synthesize_text(item.text, config, audio_cb, user_data, should_cancel);
+        if (!ok) {
             return false;
         }
 
@@ -592,9 +617,48 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
     return true;
 }
 
+bool AliaTtsPipeline::synthesize_silence(int silence_ms,
+                                         AliaAudioCallback audio_cb,
+                                         void* user_data,
+                                         std::function<bool()> should_cancel) {
+    if (!audio_cb || silence_ms <= 0) {
+        return false;
+    }
+
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return true;
+    }
+
+    constexpr int kSampleRate = 24000;
+    const int sample_count = std::max(
+        1,
+        static_cast<int>((static_cast<long long>(silence_ms) * kSampleRate) / 1000));
+    std::vector<float> samples(static_cast<size_t>(sample_count), 0.0f);
+    std::vector<std::vector<float>> callbacks = prepare_audio_callbacks(samples);
+    for (const auto& callback_samples : callbacks) {
+        if (callback_samples.empty() || cancelled()) {
+            break;
+        }
+        audio_cb(callback_samples.data(),
+                 static_cast<int>(callback_samples.size()),
+                 user_data);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++metrics_.pause_silence_segments;
+        metrics_.pause_silence_ms += silence_ms;
+        metrics_.audio_callback_max_frames = tts_audio_callback_max_frames();
+    }
+    return true;
+}
+
 void AliaTtsPipeline::async_worker_loop() {
     while (true) {
-        std::string text;
+        TtsQueueItem item;
         AliaGenConfig config{};
         AliaAudioCallback audio_cb = nullptr;
         void* user_data = nullptr;
@@ -625,7 +689,7 @@ void AliaTtsPipeline::async_worker_loop() {
                 }
                 continue;
             }
-            text = std::move(text_queue_.front());
+            item = std::move(text_queue_.front());
             text_queue_.pop_front();
             config = async_config_;
             audio_cb = async_audio_cb_;
@@ -638,7 +702,10 @@ void AliaTtsPipeline::async_worker_loop() {
             async_failed_ = true;
             continue;
         }
-        if (!synthesize_text(text, config, audio_cb, user_data, should_cancel)) {
+        const bool ok = item.silence_ms > 0
+            ? synthesize_silence(item.silence_ms, audio_cb, user_data, should_cancel)
+            : synthesize_text(item.text, config, audio_cb, user_data, should_cancel);
+        if (!ok) {
             std::lock_guard<std::mutex> lock(mutex_);
             async_failed_ = true;
         }

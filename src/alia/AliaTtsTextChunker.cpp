@@ -223,6 +223,107 @@ TtsStreamActionTagGuardConfig read_tts_stream_action_tag_guard_config() {
     return config;
 }
 
+TtsPauseSegmentConfig read_tts_pause_segment_config() {
+    TtsPauseSegmentConfig config;
+    config.enabled =
+        aila::env::read_flag("AILA_TTS_ELLIPSIS_PAUSE_SEGMENTS", true);
+    config.pause_ms = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_ELLIPSIS_PAUSE_MS", 160));
+    config.max_pause_ms = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_ELLIPSIS_PAUSE_MAX_MS", 240));
+    return config;
+}
+
+std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
+    const std::string& text,
+    const TtsPauseSegmentConfig& config) {
+    std::vector<TtsPreparedSegment> segments;
+    if (text.empty()) {
+        return segments;
+    }
+    if (!config.enabled || config.pause_ms <= 0 || config.max_pause_ms <= 0) {
+        segments.push_back(TtsPreparedSegment{
+            TtsPreparedSegmentKind::Text,
+            text,
+            0,
+        });
+        return segments;
+    }
+
+    constexpr const char* kUtf8Ellipsis = "\xE2\x80\xA6";
+    constexpr size_t kUtf8EllipsisLen = 3;
+    constexpr const char* kAsciiEllipsis = "...";
+    constexpr size_t kAsciiEllipsisLen = 3;
+
+    auto starts_with = [&](size_t pos, const char* marker, size_t marker_len) {
+        return pos + marker_len <= text.size() &&
+               text.compare(pos, marker_len, marker) == 0;
+    };
+    auto append_text = [&](size_t begin, size_t end) {
+        if (begin >= end) {
+            return;
+        }
+        segments.push_back(TtsPreparedSegment{
+            TtsPreparedSegmentKind::Text,
+            text.substr(begin, end - begin),
+            0,
+        });
+    };
+    auto append_silence = [&](int marker_count) {
+        if (marker_count <= 0 || segments.empty()) {
+            return;
+        }
+        const int silence_ms =
+            std::min(config.max_pause_ms, config.pause_ms * marker_count);
+        if (silence_ms <= 0) {
+            return;
+        }
+        if (!segments.empty() &&
+            segments.back().kind == TtsPreparedSegmentKind::Silence) {
+            segments.back().silence_ms =
+                std::min(config.max_pause_ms, segments.back().silence_ms + silence_ms);
+            return;
+        }
+        segments.push_back(TtsPreparedSegment{
+            TtsPreparedSegmentKind::Silence,
+            {},
+            silence_ms,
+        });
+    };
+
+    size_t segment_begin = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        int marker_count = 0;
+        size_t marker_end = pos;
+        while (marker_end < text.size()) {
+            if (starts_with(marker_end, kUtf8Ellipsis, kUtf8EllipsisLen)) {
+                ++marker_count;
+                marker_end += kUtf8EllipsisLen;
+                continue;
+            }
+            if (starts_with(marker_end, kAsciiEllipsis, kAsciiEllipsisLen)) {
+                ++marker_count;
+                marker_end += kAsciiEllipsisLen;
+                continue;
+            }
+            break;
+        }
+        if (marker_count <= 0) {
+            ++pos;
+            continue;
+        }
+
+        append_text(segment_begin, pos);
+        append_silence(marker_count);
+        pos = marker_end;
+        segment_begin = pos;
+    }
+
+    append_text(segment_begin, text.size());
+    return segments;
+}
+
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,
     const TtsTextChunkPolicy& policy,

@@ -30,6 +30,8 @@ struct AliaTtsMetrics {
     int backend_steady_batch_callback_count = 0;
     int backend_playback_aware_steady_batch = 0;
     int audio_callback_max_frames = 0;
+    int pause_silence_segments = 0;
+    int pause_silence_ms = 0;
     double reference_embedding_ms = -1.0;
     double first_backend_codes_ms = -1.0;
     double first_backend_mimi_init_ms = -1.0;
@@ -67,11 +69,20 @@ public:
     ModelSlot* slot() const { return slot_; }
 
 private:
+    struct TtsQueueItem {
+        std::string text;
+        int silence_ms = 0;
+    };
+
     bool synthesize_text(const std::string& text,
                          const AliaGenConfig& config,
                          AliaAudioCallback audio_cb,
                          void* user_data,
                          std::function<bool()> should_cancel);
+    bool synthesize_silence(int silence_ms,
+                            AliaAudioCallback audio_cb,
+                            void* user_data,
+                            std::function<bool()> should_cancel);
     bool ensure_reference_voice_loaded();
     std::vector<std::vector<float>> prepare_audio_callbacks(const std::vector<float>& samples);
     std::vector<float> flush_first_audio_buffer();
@@ -81,7 +92,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::mutex reference_voice_mutex_;
     std::condition_variable cv_;
-    std::deque<std::string> text_queue_;
+    std::deque<TtsQueueItem> text_queue_;
     AliaTtsMetrics metrics_;
     std::vector<float> first_audio_buffer_;
     std::vector<float> reference_speaker_embedding_;

@@ -46,8 +46,8 @@ struct TtsTextChunkResult {
 
 struct TtsFirstChunkEarlyFlushConfig {
     bool enabled = true;
-    int token_delay = 2;
-    int delay_ms = 80;
+    int token_delay = 0;
+    int delay_ms = 0;
 };
 
 struct TtsFirstAudioPriorityConfig {
@@ -60,6 +60,23 @@ struct TtsStreamActionTagGuardConfig {
     bool enabled = false;
 };
 
+struct TtsPauseSegmentConfig {
+    bool enabled = true;
+    int pause_ms = 160;
+    int max_pause_ms = 240;
+};
+
+enum class TtsPreparedSegmentKind {
+    Text,
+    Silence,
+};
+
+struct TtsPreparedSegment {
+    TtsPreparedSegmentKind kind = TtsPreparedSegmentKind::Text;
+    std::string text;
+    int silence_ms = 0;
+};
+
 std::vector<std::string> split_spoken_text_for_tts(
     const std::string& text,
     bool split_sentence_boundaries = true,
@@ -68,6 +85,11 @@ std::vector<std::string> split_spoken_text_for_tts(
 TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config();
 TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config();
 TtsStreamActionTagGuardConfig read_tts_stream_action_tag_guard_config();
+TtsPauseSegmentConfig read_tts_pause_segment_config();
+
+std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
+    const std::string& text,
+    const TtsPauseSegmentConfig& config);
 
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,
