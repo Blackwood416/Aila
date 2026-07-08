@@ -185,6 +185,37 @@ void early_first_chunk_flushes_without_boundary(TestResults& results) {
         "early_first_chunk");
 }
 
+void tiny_first_pause_prefix_waits_for_following_text(TestResults& results) {
+    std::string buffer = "啊……";
+    const aila::alia::TtsTextChunkRequest request{
+        false,
+        true,
+        true,
+    };
+
+    const aila::alia::TtsTextChunkResult result =
+        aila::alia::take_ready_tts_text_chunks(buffer, test_policy(), request);
+
+    AILA_EXPECT_TRUE(results, result.chunks.empty());
+    AILA_EXPECT_EQ_STRING(results, buffer, "啊……");
+}
+
+void tiny_first_pause_prefix_flushes_with_following_text(TestResults& results) {
+    std::string buffer = "啊……那";
+    const aila::alia::TtsTextChunkRequest request{
+        false,
+        true,
+        true,
+    };
+
+    const aila::alia::TtsTextChunkResult result =
+        aila::alia::take_ready_tts_text_chunks(buffer, test_policy(), request);
+
+    AILA_EXPECT_EQ_SIZE(results, result.chunks.size(), 1);
+    AILA_EXPECT_EQ_STRING(results, result.chunks.front(), "啊……那");
+    AILA_EXPECT_TRUE(results, buffer.empty());
+}
+
 void steady_chunk_ignores_first_chunk_early_flush(TestResults& results) {
     std::string buffer = "abcdefgh";
     const aila::alia::TtsTextChunkRequest request{
@@ -346,6 +377,8 @@ int main() {
     hard_boundary_below_first_min_waits(results);
     first_soft_boundary_flushes_after_soft_min(results);
     early_first_chunk_flushes_without_boundary(results);
+    tiny_first_pause_prefix_waits_for_following_text(results);
+    tiny_first_pause_prefix_flushes_with_following_text(results);
     steady_chunk_ignores_first_chunk_early_flush(results);
     force_flushes_all_text(results);
     first_chunk_early_flush_defaults_enabled(results);

@@ -92,6 +92,30 @@ TtsChunkDecisionReason waiting_reason(const std::string& buffer,
     return TtsChunkDecisionReason::NoBoundary;
 }
 
+bool is_tiny_first_pause_prefix_only(const std::string& text,
+                                     size_t min_text_bytes,
+                                     const TtsPauseSegmentConfig& pause_config) {
+    if (text.empty() || min_text_bytes == 0 ||
+        !pause_config.enabled || pause_config.pause_ms <= 0 ||
+        pause_config.max_pause_ms <= 0) {
+        return false;
+    }
+
+    const std::vector<TtsPreparedSegment> segments =
+        split_tts_text_pause_segments(text, pause_config);
+    if (segments.size() < 2 ||
+        segments.front().kind != TtsPreparedSegmentKind::Text ||
+        segments.front().text.size() >= min_text_bytes) {
+        return false;
+    }
+    for (size_t i = 1; i < segments.size(); ++i) {
+        if (segments[i].kind != TtsPreparedSegmentKind::Silence) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 const char* tts_chunk_decision_reason_name(TtsChunkDecisionReason reason) {
@@ -165,9 +189,17 @@ std::vector<std::string> split_spoken_text_for_tts(const std::string& text,
     }
     flush();
 
-    while (min_first_chunk_chars > 0 &&
-           chunks.size() > 1 &&
-           chunks.front().size() < min_first_chunk_chars) {
+    const TtsPauseSegmentConfig pause_config = read_tts_pause_segment_config();
+    auto first_chunk_needs_merge = [&]() {
+        if (min_first_chunk_chars == 0 || chunks.size() <= 1) {
+            return false;
+        }
+        return chunks.front().size() < min_first_chunk_chars ||
+               is_tiny_first_pause_prefix_only(chunks.front(),
+                                               min_first_chunk_chars,
+                                               pause_config);
+    };
+    while (first_chunk_needs_merge()) {
         std::string merged = std::move(chunks[0]);
         const std::string& next = chunks[1];
         if (!merged.empty() && !next.empty()) {
@@ -345,6 +377,11 @@ TtsTextChunkResult take_ready_tts_text_chunks(
                                    soft_min_chars,
                                    request.low_latency_first_chunk,
                                    policy.first_soft_boundary_flush);
+    const TtsPauseSegmentConfig pause_config = read_tts_pause_segment_config();
+    const size_t first_pause_prefix_min_bytes =
+        request.low_latency_first_chunk && hard_min_chars > 0
+            ? static_cast<size_t>(hard_min_chars)
+            : 0;
 
     size_t cutoff = std::string::npos;
     if (request.force) {
@@ -354,8 +391,15 @@ TtsTextChunkResult take_ready_tts_text_chunks(
         const size_t hard_cutoff = last_tts_chunk_boundary(buffer);
         if (hard_cutoff != std::string::npos) {
             if (static_cast<int>(hard_cutoff) >= hard_min_chars) {
-                cutoff = hard_cutoff;
-                result.reason = TtsChunkDecisionReason::HardBoundaryFlush;
+                const bool hold_tiny_pause_prefix =
+                    is_tiny_first_pause_prefix_only(
+                        buffer.substr(0, hard_cutoff),
+                        first_pause_prefix_min_bytes,
+                        pause_config);
+                if (!hold_tiny_pause_prefix) {
+                    cutoff = hard_cutoff;
+                    result.reason = TtsChunkDecisionReason::HardBoundaryFlush;
+                }
             } else {
                 result.reason = TtsChunkDecisionReason::BelowHardMin;
             }
@@ -390,7 +434,10 @@ TtsTextChunkResult take_ready_tts_text_chunks(
         if (cutoff == std::string::npos &&
             request.early_first_chunk &&
             request.low_latency_first_chunk &&
-            static_cast<int>(buffer.size()) >= hard_min_chars) {
+            static_cast<int>(buffer.size()) >= hard_min_chars &&
+            !is_tiny_first_pause_prefix_only(buffer,
+                                             first_pause_prefix_min_bytes,
+                                             pause_config)) {
             cutoff = buffer.size();
             result.reason = TtsChunkDecisionReason::EarlyFirstChunk;
         }
