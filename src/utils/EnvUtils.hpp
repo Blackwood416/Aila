@@ -36,6 +36,39 @@ inline bool read_flag(const char* name, bool default_value) {
 #endif
 }
 
+inline bool read_flag_if_present(const char* name, bool* out_value) {
+#ifdef _WIN32
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) == 0 && value) {
+        if (out_value) {
+            *out_value = (std::atoi(value) != 0);
+        }
+        free(value);
+        return true;
+    }
+    if (value) free(value);
+    return false;
+#else
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    if (out_value) {
+        *out_value = (std::atoi(value) != 0);
+    }
+    return true;
+#endif
+}
+
+inline bool read_scoped_kv_quant(const char* scoped_name) {
+    bool scoped_value = false;
+    if (scoped_name &&
+        scoped_name[0] != '\0' &&
+        read_flag_if_present(scoped_name, &scoped_value)) {
+        return scoped_value;
+    }
+    return read_flag("AILA_KV_QUANT", false);
+}
+
 inline int read_int(const char* name, int default_value) {
 #ifdef _WIN32
     char* value = nullptr;

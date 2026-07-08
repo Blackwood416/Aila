@@ -256,7 +256,10 @@ Environment Variables:
   AILA_STREAM_CHUNK_SIZE   Default stream chunk size
   AILA_THINKING_BUDGET     Default thinking budget (-1=off, 0=no-think)
   AILA_Q35_PREFILL_STEP    Default Qwen3.5 prefill checkpoint step (default: 64)
-  AILA_KV_QUANT            Enable KV cache quantization (0/1, default: 0)
+  AILA_KV_QUANT            Enable global KV cache quantization (0/1, default: 0)
+  AILA_ASR_KV_QUANT        ASR KV quant override, inherits AILA_KV_QUANT
+  AILA_TTS_KV_QUANT        TTS KV quant override, inherits AILA_KV_QUANT
+  AILA_VLM_KV_QUANT        Qwen3.5 VLM KV quant override, inherits AILA_KV_QUANT
 
 Interactive Commands:
   /help                    Show available commands

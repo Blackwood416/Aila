@@ -2,12 +2,15 @@
 #include "profile/Profiling.hpp"
 #include "../utils/EnvUtils.hpp"
 
-void KVCache::init(Context& ctx, const Qwen3Config& config, int max_seq_len) {
+void KVCache::init(Context& ctx,
+                   const Qwen3Config& config,
+                   int max_seq_len,
+                   const char* kv_quant_env) {
     max_len_ = max_seq_len;
     num_kv_heads_ = config.num_key_value_heads;
     head_dim_ = config.head_dim;
     current_len_ = 0;
-    quantized_ = aila::env::read_flag("AILA_KV_QUANT", false);
+    quantized_ = aila::env::read_scoped_kv_quant(kv_quant_env);
 
     layers_.resize(config.num_hidden_layers);
 

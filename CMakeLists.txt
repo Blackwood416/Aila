@@ -146,6 +146,10 @@ set(ALIA_ASR_LANGUAGE_HINT_TEST_SOURCES
     tests/alia/AliaAsrLanguageHintTests.cpp
 )
 
+set(ENV_UTILS_TEST_SOURCES
+    tests/utils/EnvUtilsTests.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -236,6 +240,12 @@ target_include_directories(AilaAliaAsrLanguageHintTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(AilaAliaAsrLanguageHintTests PRIVATE AilaLib)
+
+add_executable(AilaEnvUtilsTests ${ENV_UTILS_TEST_SOURCES})
+target_compile_definitions(AilaEnvUtilsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaEnvUtilsTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

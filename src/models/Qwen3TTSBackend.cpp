@@ -258,7 +258,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
     Tensor* lw = transpose_weight("talker.codec_head.weight");
     talker_codec_head_.init(ctx, *lw, H_talker, talker_cfg_.vocab_size, true);
 
-    talker_kv_cache_.init(ctx, talker_cfg_, max_seq_len_);
+    talker_kv_cache_.init(ctx, talker_cfg_, max_seq_len_, "AILA_TTS_KV_QUANT");
 
     // ============================================================
     // Load Code Predictor weights
@@ -325,7 +325,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         predictor_lm_heads_[i].init(ctx, *lhw, H_pred, predictor_cfg_.vocab_size, true);
     }
 
-    predictor_kv_cache_.init(ctx, predictor_cfg_, 17);
+    predictor_kv_cache_.init(ctx, predictor_cfg_, 17, "AILA_TTS_KV_QUANT");
 
     // ============================================================
     // Allocate runtime buffers

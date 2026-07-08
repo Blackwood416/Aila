@@ -230,7 +230,7 @@ bool Qwen3ASRBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
     lm_head_.init(ctx, *lw, H, cfg_.vocab_size, true);
 
     // KV Cache
-    kv_cache_.init(ctx, cfg_, max_seq_len);
+    kv_cache_.init(ctx, cfg_, max_seq_len, "AILA_ASR_KV_QUANT");
 
     runtime_seq_capacity_ = prefill_scores_capacity_ = 0;
     incr_prefill_seq_cap_ = incr_prefill_total_cap_ = 0;

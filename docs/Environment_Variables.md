@@ -42,6 +42,17 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 
 ---
 
+## KV Cache Quantization
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_KV_QUANT` | bool | `false` | Legacy global FP8 E4M3 KV cache quantization switch. Scoped switches below inherit this value when unset. |
+| `AILA_ASR_KV_QUANT` | bool | inherits `AILA_KV_QUANT` | ASR Qwen3 KV cache quantization override. Set `0` to keep ASR bf16 while global KV quant is enabled. |
+| `AILA_TTS_KV_QUANT` | bool | inherits `AILA_KV_QUANT` | TTS talker/predictor Qwen3 KV cache quantization override. Set `0` to keep TTS bf16 while global KV quant is enabled. |
+| `AILA_VLM_KV_QUANT` | bool | inherits `AILA_KV_QUANT` | Qwen3.5 foreground/background VLM KV cache quantization override. Use this for VLM-only KV quant experiments. |
+
+---
+
 ## Decode Attention (AILA_ATTN_*)
 
 | Variable | Type | Default | Description |
