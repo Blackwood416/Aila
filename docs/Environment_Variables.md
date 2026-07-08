@@ -129,8 +129,8 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | `AILA_TURN_SCHEDULER_MAX_CACHED_FINAL_SUFFIX_TOKENS` | int | `16` | Maximum final prompt suffix allowed for cached-prefix reuse. Larger suffixes are reset to fresh/full prefill by default |
 | `AILA_FOREGROUND_DECODE_SUFFIX_TOKENS` | int | `16` | Maximum cached prompt suffix sent through decode kernels instead of batch prefill |
 | `AILA_TTS_FIRST_CHUNK_EARLY_FLUSH` | bool | `true` | Allow first spoken TTS chunk to flush after the hard minimum when no boundary arrives within the token/time delay |
-| `AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY` | int | `2` | Generated-token delay after first spoken content before early first-chunk flush can fire |
-| `AILA_TTS_FIRST_CHUNK_EARLY_MS` | int | `80` | Millisecond delay after first spoken content before early first-chunk flush can fire |
+| `AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY` | int | `0` | Generated-token delay after first spoken content before early first-chunk flush can fire |
+| `AILA_TTS_FIRST_CHUNK_EARLY_MS` | int | `0` | Millisecond delay after first spoken content before early first-chunk flush can fire |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY` | bool | `true` | Let foreground decoding yield briefly after first TTS enqueue so TTS can produce first audio |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS` | int | `250` | Base first-audio priority wait budget |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS` | int | `120` | Extra bounded wait when the first TTS backend job is active but has not emitted audio yet |

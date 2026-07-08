@@ -197,9 +197,9 @@ TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config() {
     config.enabled =
         aila::env::read_flag("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH", true);
     config.token_delay = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY", 2));
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY", 0));
     config.delay_ms = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_MS", 80));
+        0, aila::env::read_int_raw("AILA_TTS_FIRST_CHUNK_EARLY_MS", 0));
     return config;
 }
 

@@ -74,7 +74,7 @@ struct Options {
     std::string asr_model = "models/Qwen3-ASR-1.7B-BNB-NF4";
     std::string foreground_model = "models/qwen3.5-4B-bnb-nf4-offline-visiondense";
     std::string foreground_lora =
-        "F:/unsloth/qwen35_4b_alia_identity_r16_lr1e5/checkpoint-750";
+        "F:/unsloth/qwen35_4b_alia_identity_r16_lr5e4/checkpoint-350";
     std::string background_model = "models/qwen3.5-0.8B-bnb-nf4-offline";
     std::string tts_model = "models/Qwen3-TTS-12Hz-0.6B-Base";
     std::string audio_path = "tmp/alia-real-smoke/alia_request.wav";

@@ -226,11 +226,15 @@ void force_flushes_all_text(TestResults& results) {
 
 void first_chunk_early_flush_defaults_enabled(TestResults& results) {
     unset_env_var("AILA_TTS_FIRST_CHUNK_EARLY_FLUSH");
+    unset_env_var("AILA_TTS_FIRST_CHUNK_EARLY_TOKEN_DELAY");
+    unset_env_var("AILA_TTS_FIRST_CHUNK_EARLY_MS");
 
     const aila::alia::TtsFirstChunkEarlyFlushConfig config =
         aila::alia::read_tts_first_chunk_early_flush_config();
 
     AILA_EXPECT_TRUE(results, config.enabled);
+    AILA_EXPECT_EQ_INT(results, config.token_delay, 0);
+    AILA_EXPECT_EQ_INT(results, config.delay_ms, 0);
 }
 
 void first_audio_priority_defaults_to_adaptive_window(TestResults& results) {

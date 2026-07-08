@@ -2,6 +2,7 @@ param(
     [string]$BuildDir = "build",
     [string]$OutputDir = "tmp\alia-real-smoke\voice_matrix",
     [string]$ModelRoot = "",
+    [string]$ForegroundLora = "F:\unsloth\qwen35_4b_alia_identity_r16_lr5e4\checkpoint-350",
     [int]$TimeoutSec = 1500,
     [int]$StreamChunkMs = 1000,
     [int]$StreamPrefillIntervalMs = 0,
@@ -143,6 +144,7 @@ try {
                 OutputWav = $wavPath
                 LogPath = $logPath
                 ModelRoot = $ModelRoot
+                ForegroundLora = $ForegroundLora
                 RequestText = $scenario.RequestText
                 MaxTokens = $scenario.MaxTokens
                 TimeoutSec = $TimeoutSec
