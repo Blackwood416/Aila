@@ -1,10 +1,14 @@
 #pragma once
 
+#include "BackgroundMemoryExtractor.hpp"
 #include "alia_api.h"
 #include "engine/Types.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,8 +20,13 @@ class ModelSlot;
 
 std::string background_system_prompt();
 std::string build_background_extraction_prompt(const std::string& chat_turn_text);
+std::string build_background_schema_repair_prompt(const std::string& chat_turn_text,
+                                                  const std::string& invalid_output);
 std::string enforce_background_result_schema(const std::string& raw_result_json,
                                              const std::string& chat_turn_text);
+std::string normalize_background_model_json(const std::string& raw_result_json);
+std::string cleanup_background_result_json(const std::string& raw_result_json,
+                                           const std::string& chat_turn_text);
 
 enum class BackgroundDecodeMode {
     None,
@@ -35,6 +44,8 @@ enum class BackgroundJobState {
 class AliaBackgroundPipeline {
 public:
     explicit AliaBackgroundPipeline(ModelSlot* slot);
+    explicit AliaBackgroundPipeline(std::unique_ptr<IBackgroundMemoryExtractor> extractor,
+                                    size_t queue_capacity = 8);
     ~AliaBackgroundPipeline();
 
     void register_callback(AliaBackgroundResultCallback callback, void* user_data = nullptr);
@@ -57,19 +68,19 @@ public:
 
 private:
     void run_job(std::string chat_turn_text, AliaBackgroundResultCallback callback, void* user_data);
-    bool can_generate_with_loaded_vlm() const;
-    bool generate_with_loaded_vlm(const std::string& prompt_text,
-                                  std::string& result_json);
+    void worker_loop(AliaBackgroundResultCallback callback, void* user_data);
     bool is_busy_locked() const;
 
-    ModelSlot* slot_ = nullptr;
+    std::unique_ptr<IBackgroundMemoryExtractor> extractor_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::thread worker_;
+    std::deque<std::string> queued_jobs_;
     AliaBackgroundResultCallback callback_ = nullptr;
     void* callback_user_data_ = nullptr;
     BackgroundJobState state_ = BackgroundJobState::Idle;
-    bool abort_requested_ = false;
+    std::atomic_bool abort_requested_{false};
+    size_t queue_capacity_ = 8;
     std::string last_error_;
     std::string last_prompt_text_;
     std::string last_result_json_;

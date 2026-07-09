@@ -1,9 +1,6 @@
 #include "AliaBackgroundPipeline.hpp"
 
-#include "ModelSlot.hpp"
-#include "../models/IModelBackend.hpp"
-#include "../ops/Ops.hpp"
-#include "../utils/Tokenizer.hpp"
+#include "GpuVlmBackgroundExtractor.hpp"
 
 #include "simdjson.h"
 
@@ -18,31 +15,6 @@
 namespace aila::alia {
 namespace {
 
-class DeviceAllocation {
-public:
-    DeviceAllocation(Context& ctx, size_t bytes)
-        : ctx_(&ctx),
-          ptr_(ctx.alloc_device(bytes)) {}
-
-    ~DeviceAllocation() {
-        if (ctx_ && ptr_) {
-            ctx_->free_device(ptr_);
-        }
-    }
-
-    DeviceAllocation(const DeviceAllocation&) = delete;
-    DeviceAllocation& operator=(const DeviceAllocation&) = delete;
-
-    template <typename T>
-    T* as() const {
-        return static_cast<T*>(ptr_);
-    }
-
-private:
-    Context* ctx_ = nullptr;
-    void* ptr_ = nullptr;
-};
-
 bool has_string_field(simdjson::dom::object object, const char* key) {
     simdjson::dom::element element;
     std::string_view value;
@@ -55,20 +27,6 @@ bool has_array_field(simdjson::dom::object object, const char* key) {
     simdjson::dom::array value;
     return object.at_key(key).get(element) == simdjson::SUCCESS &&
            element.get_array().get(value) == simdjson::SUCCESS;
-}
-
-std::vector<int> apply_alia_chat_template(
-    Tokenizer* tokenizer,
-    const std::string& system_prompt,
-    const std::string& user_message) {
-    std::vector<int> prompt_ids =
-        tokenizer->apply_chat_template(system_prompt, user_message);
-    const std::vector<int> closed_think_ids =
-        tokenizer->encode("<think>\n\n</think>\n\n");
-    prompt_ids.insert(prompt_ids.end(),
-                      closed_think_ids.begin(),
-                      closed_think_ids.end());
-    return prompt_ids;
 }
 
 std::string trim(std::string value) {
@@ -329,7 +287,14 @@ std::string cleanup_background_result_json(const std::string& raw_result_json,
 }
 
 AliaBackgroundPipeline::AliaBackgroundPipeline(ModelSlot* slot)
-    : slot_(slot) {}
+    : extractor_(std::make_unique<GpuVlmBackgroundExtractor>(slot)),
+      queue_capacity_(8) {}
+
+AliaBackgroundPipeline::AliaBackgroundPipeline(
+    std::unique_ptr<IBackgroundMemoryExtractor> extractor,
+    size_t queue_capacity)
+    : extractor_(std::move(extractor)),
+      queue_capacity_(std::max<size_t>(1, queue_capacity)) {}
 
 AliaBackgroundPipeline::~AliaBackgroundPipeline() {
     request_abort();
@@ -347,24 +312,29 @@ bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     void* callback_user_data = nullptr;
 
     std::unique_lock<std::mutex> lock(mutex_);
-    if (is_busy_locked()) {
-        return false;
-    }
-
-    if (worker_.joinable()) {
-        lock.unlock();
-        worker_.join();
-        lock.lock();
-    }
-
     callback = callback_;
     callback_user_data = callback_user_data_;
     if (!callback) {
         last_error_ = "background callback is not registered";
         return false;
     }
+    if (state_ == BackgroundJobState::Aborting) {
+        last_error_ = "background queue is aborting";
+        return false;
+    }
+    if (queued_jobs_.size() >= queue_capacity_) {
+        last_error_ = "background queue is full";
+        return false;
+    }
 
-    abort_requested_ = false;
+    if (worker_.joinable() && !is_busy_locked()) {
+        lock.unlock();
+        worker_.join();
+        lock.lock();
+    }
+
+    queued_jobs_.push_back(std::move(chat_turn_text));
+    abort_requested_.store(false);
     last_error_.clear();
     last_prompt_text_.clear();
     last_result_json_.clear();
@@ -372,17 +342,21 @@ bool AliaBackgroundPipeline::trigger(std::string chat_turn_text) {
     last_schema_repair_applied_ = false;
     last_schema_diagnostic_.clear();
     last_decode_mode_ = BackgroundDecodeMode::None;
-    state_ = BackgroundJobState::Running;
-    worker_ = std::thread([this, text = std::move(chat_turn_text), callback, callback_user_data]() mutable {
-        run_job(std::move(text), callback, callback_user_data);
-    });
+    if (!worker_.joinable()) {
+        state_ = BackgroundJobState::Running;
+        worker_ = std::thread([this, callback, callback_user_data]() {
+            worker_loop(callback, callback_user_data);
+        });
+    }
+    cv_.notify_all();
     return true;
 }
 
 void AliaBackgroundPipeline::request_abort() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        abort_requested_ = true;
+        abort_requested_.store(true);
+        queued_jobs_.clear();
         if (state_ == BackgroundJobState::Running) {
             state_ = BackgroundJobState::Aborting;
         }
@@ -448,93 +422,50 @@ void AliaBackgroundPipeline::run_job(
     try {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (abort_requested_) {
+            if (abort_requested_.load()) {
                 state_ = BackgroundJobState::Completed;
                 cv_.notify_all();
                 return;
             }
         }
 
-        const std::string prompt_text = build_background_extraction_prompt(chat_turn_text);
-        std::string final_prompt_text = prompt_text;
-        std::string result_json;
-        int schema_retry_count = 0;
-        bool schema_repair_applied = false;
-        std::string schema_diagnostic;
-        BackgroundDecodeMode decode_mode = BackgroundDecodeMode::LoadedVlm;
-        if (!can_generate_with_loaded_vlm()) {
+        if (!extractor_ || !extractor_->ready()) {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_error_ = "background VLM slot is not loaded";
+            last_error_ = "background extractor is not ready";
             state_ = BackgroundJobState::Failed;
             cv_.notify_all();
             return;
         }
-        if (!generate_with_loaded_vlm(prompt_text, result_json)) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (last_error_.empty()) {
-                last_error_ = "background VLM generation failed";
-            }
-            state_ = BackgroundJobState::Failed;
-            cv_.notify_all();
-            return;
-        }
-        result_json = normalize_background_model_json(result_json);
-        if (!AliaBackgroundPipeline::has_required_schema_keys(result_json)) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (abort_requested_) {
-                    state_ = BackgroundJobState::Completed;
-                    cv_.notify_all();
-                    return;
-                }
-            }
 
-            const std::string repair_prompt =
-                build_background_schema_repair_prompt(chat_turn_text, result_json);
-            schema_retry_count = 1;
-            final_prompt_text = repair_prompt;
-            std::string repaired_json;
-            if (!generate_with_loaded_vlm(repair_prompt, repaired_json)) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (last_error_.empty()) {
-                    last_error_ = "background VLM schema repair generation failed";
-                }
-                state_ = BackgroundJobState::Failed;
-                cv_.notify_all();
-                return;
-            }
-            result_json = normalize_background_model_json(repaired_json);
-            schema_diagnostic = AliaBackgroundPipeline::has_required_schema_keys(result_json)
-                ? "retry accepted schema-valid background JSON"
-                : "retry failed schema validation; applying schema repair wrapper";
-        } else {
-            schema_diagnostic = "initial background JSON accepted";
+        BackgroundExtractionRequest request;
+        request.chat_turn_text = std::move(chat_turn_text);
+        BackgroundExtractionResult extraction =
+            extractor_->extract(request, abort_requested_);
+        if (!extraction.ok) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = extraction.error.empty()
+                ? "background extraction failed"
+                : extraction.error;
+            state_ = BackgroundJobState::Failed;
+            cv_.notify_all();
+            return;
         }
-        schema_repair_applied = !AliaBackgroundPipeline::has_required_schema_keys(result_json);
-        result_json = enforce_background_result_schema(result_json, chat_turn_text);
-        if (!schema_repair_applied) {
-            const std::string cleaned_json =
-                cleanup_background_result_json(result_json, chat_turn_text);
-            if (cleaned_json != result_json &&
-                AliaBackgroundPipeline::has_required_schema_keys(cleaned_json)) {
-                result_json = cleaned_json;
-                if (!schema_diagnostic.empty()) {
-                    schema_diagnostic += "; post cleanup applied";
-                } else {
-                    schema_diagnostic = "post cleanup applied";
-                }
-            }
-        }
+
+        const BackgroundDecodeMode decode_mode =
+            std::string(extractor_->backend_name()) == "LoadedVlm"
+                ? BackgroundDecodeMode::LoadedVlm
+                : BackgroundDecodeMode::None;
+        const std::string result_json = extraction.result_json;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_prompt_text_ = final_prompt_text;
+            last_prompt_text_ = extraction.prompt_text;
             last_result_json_ = result_json;
-            last_schema_retry_count_ = schema_retry_count;
-            last_schema_repair_applied_ = schema_repair_applied;
-            last_schema_diagnostic_ = schema_diagnostic;
+            last_schema_retry_count_ = extraction.schema_retry_count;
+            last_schema_repair_applied_ = extraction.schema_repair_applied;
+            last_schema_diagnostic_ = extraction.schema_diagnostic;
             last_decode_mode_ = decode_mode;
-            if (abort_requested_) {
+            if (abort_requested_.load()) {
                 state_ = BackgroundJobState::Completed;
                 cv_.notify_all();
                 return;
@@ -560,95 +491,60 @@ void AliaBackgroundPipeline::run_job(
     cv_.notify_all();
 }
 
-bool AliaBackgroundPipeline::can_generate_with_loaded_vlm() const {
-    return slot_ &&
-           slot_->state() == ModelSlotState::Loaded &&
-           slot_->context() &&
-           slot_->tokenizer() &&
-           slot_->backend();
-}
-
-bool AliaBackgroundPipeline::generate_with_loaded_vlm(
-    const std::string& prompt_text,
-    std::string& result_json) {
-    result_json.clear();
-    if (!can_generate_with_loaded_vlm()) {
-        return false;
-    }
-
-    Context* context = slot_->context();
-    Tokenizer* tokenizer = slot_->tokenizer();
-    IModelBackend* backend = slot_->backend();
-    if (!context || !tokenizer || !backend) {
-        last_error_ = "background VLM slot is incomplete";
-        return false;
-    }
-
-    std::vector<int> prompt_ids =
-        apply_alia_chat_template(tokenizer, background_system_prompt(), prompt_text);
-    if (prompt_ids.empty()) {
-        last_error_ = "background VLM prompt encoded to zero tokens";
-        return false;
-    }
-
-    const int max_new_tokens = 384;
-    const int max_seq_len = backend->max_seq_len();
-    if (max_seq_len > 0 &&
-        static_cast<int>(prompt_ids.size()) + max_new_tokens > max_seq_len) {
-        last_error_ = "background VLM prompt would exceed max sequence length";
-        return false;
-    }
-
-    const int vocab_size = backend->vocab_size() > 0
-        ? backend->vocab_size()
-        : tokenizer->vocab_size();
-    if (vocab_size <= 0) {
-        last_error_ = "background VLM vocab size is invalid";
-        return false;
-    }
-
-    GenerationConfig config;
-    config.max_new_tokens = max_new_tokens;
-    config.temperature = 0.0f;
-    config.top_p = 1.0f;
-    config.do_sample = false;
-
-    backend->reset();
-    DeviceAllocation prompt_device(*context, prompt_ids.size() * sizeof(int));
-    context->memcpy_h2d(prompt_device.as<int>(), prompt_ids.data(),
-                        prompt_ids.size() * sizeof(int));
-    Tensor* logits = &backend->forward(*context, prompt_device.as<int>(),
-                                       static_cast<int>(prompt_ids.size()));
-
-    DeviceAllocation one_token_device(*context, sizeof(int));
-    std::vector<int> generated_ids;
-    for (int step = 0; step < config.max_new_tokens; ++step) {
+void AliaBackgroundPipeline::worker_loop(
+    AliaBackgroundResultCallback callback,
+    void* user_data) {
+    while (true) {
+        std::string chat_turn_text;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (abort_requested_) {
-                break;
+            if (abort_requested_.load()) {
+                queued_jobs_.clear();
+                state_ = BackgroundJobState::Completed;
+                cv_.notify_all();
+                return;
             }
+            if (queued_jobs_.empty()) {
+                state_ = BackgroundJobState::Completed;
+                cv_.notify_all();
+                return;
+            }
+            chat_turn_text = std::move(queued_jobs_.front());
+            queued_jobs_.pop_front();
+            state_ = BackgroundJobState::Running;
         }
 
-        int next_token = ops::sample_with_config(
-            *context, *logits, vocab_size, config, generated_ids);
-        if (tokenizer->is_eos(next_token)) {
-            break;
-        }
+        run_job(std::move(chat_turn_text), callback, user_data);
 
-        generated_ids.push_back(next_token);
-        context->memcpy_h2d(one_token_device.as<int>(), &next_token, sizeof(int));
-        logits = &backend->forward(*context, one_token_device.as<int>(), 1);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (abort_requested_.load()) {
+                queued_jobs_.clear();
+                if (state_ == BackgroundJobState::Aborting) {
+                    state_ = BackgroundJobState::Completed;
+                }
+                cv_.notify_all();
+                return;
+            }
+            if (state_ == BackgroundJobState::Failed) {
+                queued_jobs_.clear();
+                cv_.notify_all();
+                return;
+            }
+            if (queued_jobs_.empty()) {
+                state_ = BackgroundJobState::Completed;
+                cv_.notify_all();
+                return;
+            }
+            state_ = BackgroundJobState::Running;
+        }
     }
-
-    result_json = tokenizer->decode(generated_ids);
-    last_error_.clear();
-    return true;
 }
 
 bool AliaBackgroundPipeline::is_busy_locked() const {
     return state_ == BackgroundJobState::Running ||
-           state_ == BackgroundJobState::Aborting;
+           state_ == BackgroundJobState::Aborting ||
+           !queued_jobs_.empty();
 }
 
 std::string AliaBackgroundPipeline::json_escape(const std::string& value) {
