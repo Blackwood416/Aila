@@ -80,6 +80,9 @@ set(COMMON_ENGINE_SOURCES
     src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp
     src/models/Qwen35HybridBnb4Backend.cpp
+    src/models/cpu/CpuSafetensorsStore.cpp
+    src/models/cpu/CpuBnb4.cpp
+    src/models/cpu/CpuQ35HybridModel.cpp
     src/models/Qwen3ASRBackend.cpp
     src/models/Qwen3ASRBnb4Backend.cpp
     src/models/Qwen3ForceAlignerBackend.cpp
@@ -168,6 +171,27 @@ set(SAFE_TENSORS_TEST_SOURCES
     src/utils/SafeTensors.cpp
     src/utils/MemoryMappedFile.cpp
     src/profile/Profiling.cpp
+)
+
+set(CPU_SAFETENSORS_STORE_TEST_SOURCES
+    tests/models/CpuSafetensorsStoreTests.cpp
+    src/models/cpu/CpuSafetensorsStore.cpp
+    src/utils/MemoryMappedFile.cpp
+)
+
+set(CPU_BNB4_TEST_SOURCES
+    tests/models/CpuBnb4Tests.cpp
+    src/models/cpu/CpuBnb4.cpp
+    src/models/cpu/CpuSafetensorsStore.cpp
+    src/utils/MemoryMappedFile.cpp
+)
+
+set(CPU_Q35_HYBRID_MODEL_TEST_SOURCES
+    tests/models/CpuQ35HybridModelTests.cpp
+    src/models/cpu/CpuQ35HybridModel.cpp
+    src/models/cpu/CpuBnb4.cpp
+    src/models/cpu/CpuSafetensorsStore.cpp
+    src/utils/MemoryMappedFile.cpp
 )
 
 set(QWEN3_TTS_WARMUP_TEST_SOURCES
@@ -300,6 +324,33 @@ target_include_directories(AilaSafeTensorsTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaSafeTensorsTests PRIVATE DNNL::dnnl simdjson)
+
+add_executable(AilaCpuSafetensorsStoreTests ${CPU_SAFETENSORS_STORE_TEST_SOURCES})
+target_compile_definitions(AilaCpuSafetensorsStoreTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaCpuSafetensorsStoreTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaCpuSafetensorsStoreTests PRIVATE simdjson)
+
+add_executable(AilaCpuBnb4Tests ${CPU_BNB4_TEST_SOURCES})
+target_compile_definitions(AilaCpuBnb4Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaCpuBnb4Tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaCpuBnb4Tests PRIVATE simdjson)
+
+add_executable(AilaCpuQ35HybridModelTests ${CPU_Q35_HYBRID_MODEL_TEST_SOURCES})
+target_compile_definitions(AilaCpuQ35HybridModelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaCpuQ35HybridModelTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaCpuQ35HybridModelTests PRIVATE simdjson)
 
 add_executable(AilaQwen3TTSWarmupTests ${QWEN3_TTS_WARMUP_TEST_SOURCES})
 target_compile_definitions(AilaQwen3TTSWarmupTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

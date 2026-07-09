@@ -2,6 +2,7 @@
 
 #include "BackgroundMemoryExtractor.hpp"
 #include "engine/Types.hpp"
+#include "models/cpu/CpuQ35HybridModel.hpp"
 
 #include <memory>
 #include <string>
@@ -25,10 +26,16 @@ public:
     const std::string& last_error() const { return last_error_; }
 
 private:
+    bool generate_once(const std::string& prompt_text,
+                       const std::atomic_bool& abort_requested,
+                       std::string& result_json,
+                       std::string& error);
+
     std::string model_dir_;
     int max_seq_len_ = 0;
     ModelSpec spec_{};
     std::unique_ptr<Tokenizer> tokenizer_;
+    std::unique_ptr<CpuQ35HybridModel> model_;
     bool loaded_ = false;
     std::string last_error_;
 };

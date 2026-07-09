@@ -1652,7 +1652,8 @@ int main(int argc, char** argv) {
               << "background_error=" << quote(ctx->background_pipeline->last_error()) << "\n";
 
     if (bg_state != aila::alia::BackgroundJobState::Completed ||
-        bg_mode != aila::alia::BackgroundDecodeMode::LoadedVlm ||
+        (bg_mode != aila::alia::BackgroundDecodeMode::LoadedVlm &&
+         bg_mode != aila::alia::BackgroundDecodeMode::NativeCpuQ35) ||
         !bg_schema_valid ||
         callback_json.empty()) {
         std::cerr << "background_validation_failed=true\n";
