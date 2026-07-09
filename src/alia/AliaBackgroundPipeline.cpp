@@ -29,6 +29,17 @@ bool has_array_field(simdjson::dom::object object, const char* key) {
            element.get_array().get(value) == simdjson::SUCCESS;
 }
 
+BackgroundDecodeMode decode_mode_from_backend_name(const char* backend_name) {
+    const std::string name = backend_name ? backend_name : "";
+    if (name == "LoadedVlm") {
+        return BackgroundDecodeMode::LoadedVlm;
+    }
+    if (name == "NativeCpuQ35") {
+        return BackgroundDecodeMode::NativeCpuQ35;
+    }
+    return BackgroundDecodeMode::None;
+}
+
 std::string trim(std::string value) {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
         value.erase(0, 1);
@@ -429,9 +440,14 @@ void AliaBackgroundPipeline::run_job(
             }
         }
 
+        const BackgroundDecodeMode decode_mode = extractor_
+            ? decode_mode_from_backend_name(extractor_->backend_name())
+            : BackgroundDecodeMode::None;
+
         if (!extractor_ || !extractor_->ready()) {
             std::lock_guard<std::mutex> lock(mutex_);
             last_error_ = "background extractor is not ready";
+            last_decode_mode_ = decode_mode;
             state_ = BackgroundJobState::Failed;
             cv_.notify_all();
             return;
@@ -446,15 +462,12 @@ void AliaBackgroundPipeline::run_job(
             last_error_ = extraction.error.empty()
                 ? "background extraction failed"
                 : extraction.error;
+            last_decode_mode_ = decode_mode;
             state_ = BackgroundJobState::Failed;
             cv_.notify_all();
             return;
         }
 
-        const BackgroundDecodeMode decode_mode =
-            std::string(extractor_->backend_name()) == "LoadedVlm"
-                ? BackgroundDecodeMode::LoadedVlm
-                : BackgroundDecodeMode::None;
         const std::string result_json = extraction.result_json;
 
         {

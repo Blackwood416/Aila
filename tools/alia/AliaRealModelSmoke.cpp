@@ -570,6 +570,7 @@ std::string background_mode_name(aila::alia::BackgroundDecodeMode mode) {
     switch (mode) {
         case aila::alia::BackgroundDecodeMode::None: return "None";
         case aila::alia::BackgroundDecodeMode::LoadedVlm: return "LoadedVlm";
+        case aila::alia::BackgroundDecodeMode::NativeCpuQ35: return "NativeCpuQ35";
     }
     return "Unknown";
 }

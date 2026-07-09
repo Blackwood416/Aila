@@ -60,6 +60,7 @@ class FakeExtractor : public aila::alia::IBackgroundMemoryExtractor {
 public:
     aila::alia::BackgroundExtractionResult next_result;
     std::string seen_text;
+    std::string backend_name_value = "fake";
     int calls = 0;
     int sleep_ms = 0;
     std::mutex mutex;
@@ -67,7 +68,7 @@ public:
     int started_calls = 0;
 
     bool ready() const override { return ready_; }
-    const char* backend_name() const override { return "fake"; }
+    const char* backend_name() const override { return backend_name_value.c_str(); }
 
     void wait_for_started(int expected) {
         std::unique_lock<std::mutex> lock(mutex);
@@ -141,6 +142,28 @@ void fake_extractor_failure_sets_failed_state(TestResults& results) {
     AILA_EXPECT_TRUE(results, pipeline.state() == aila::alia::BackgroundJobState::Failed);
 }
 
+void cpu_extractor_failure_keeps_decode_mode_diagnostic(TestResults& results) {
+    auto fake = std::make_unique<FakeExtractor>();
+    fake->backend_name_value = "NativeCpuQ35";
+    fake->next_result.ok = false;
+    fake->next_result.error = "native CPU Qwen3.5 background extractor inference is not implemented";
+
+    aila::alia::AliaBackgroundPipeline pipeline(std::move(fake), 4);
+    CallbackCapture capture;
+    pipeline.register_callback(capture_callback, &capture);
+
+    AILA_EXPECT_TRUE(results, pipeline.trigger("User: hi"));
+    AILA_EXPECT_TRUE(results, pipeline.wait_until_idle_for(std::chrono::seconds(2)));
+    AILA_EXPECT_TRUE(results, capture.calls == 0);
+    AILA_EXPECT_TRUE(results,
+                     pipeline.last_decode_mode() ==
+                         aila::alia::BackgroundDecodeMode::NativeCpuQ35);
+    AILA_EXPECT_EQ_STRING(
+        results,
+        pipeline.last_error_text(),
+        "native CPU Qwen3.5 background extractor inference is not implemented");
+}
+
 void bounded_queue_rejects_when_pending_capacity_is_full(TestResults& results) {
     auto fake = std::make_unique<FakeExtractor>();
     FakeExtractor* raw_fake = fake.get();
@@ -191,6 +214,7 @@ int main() {
     TestResults results;
     fake_extractor_success_updates_result_and_callback(results);
     fake_extractor_failure_sets_failed_state(results);
+    cpu_extractor_failure_keeps_decode_mode_diagnostic(results);
     bounded_queue_rejects_when_pending_capacity_is_full(results);
     abort_clears_pending_jobs(results);
 

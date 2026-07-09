@@ -115,6 +115,8 @@ set(ALIA_ENGINE_SOURCES
     src/alia/AliaTurnScheduler.cpp
     src/alia/AliaForegroundPipeline.cpp
     src/alia/AliaBackgroundPipeline.cpp
+    src/alia/BackgroundExtractorFactory.cpp
+    src/alia/CpuQ35BackgroundExtractor.cpp
     src/alia/GpuVlmBackgroundExtractor.cpp
     src/alia/AliaContext.cpp
     src/alia/AliaApi.cpp
@@ -151,6 +153,10 @@ set(ALIA_BACKGROUND_PIPELINE_TEST_SOURCES
     tests/alia/AliaBackgroundPipelineTests.cpp
     src/alia/AliaBackgroundPipeline.cpp
     src/alia/GpuVlmBackgroundExtractor.cpp
+)
+
+set(ALIA_BACKGROUND_EXTRACTOR_TEST_SOURCES
+    tests/alia/AliaBackgroundExtractorTests.cpp
 )
 
 set(ENV_UTILS_TEST_SOURCES
@@ -271,6 +277,15 @@ target_include_directories(AilaAliaBackgroundPipelineTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaAliaBackgroundPipelineTests PRIVATE AilaLib)
+
+add_executable(AilaAliaBackgroundExtractorTests ${ALIA_BACKGROUND_EXTRACTOR_TEST_SOURCES})
+target_compile_definitions(AilaAliaBackgroundExtractorTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaAliaBackgroundExtractorTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaAliaBackgroundExtractorTests PRIVATE AilaLib)
 
 add_executable(AilaEnvUtilsTests ${ENV_UTILS_TEST_SOURCES})
 target_compile_definitions(AilaEnvUtilsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

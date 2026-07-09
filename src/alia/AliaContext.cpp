@@ -1,5 +1,7 @@
 #include "AliaContext.hpp"
 
+#include "BackgroundExtractorFactory.hpp"
+
 #include "../utils/EnvUtils.hpp"
 
 AliaContext::AliaContext(int max_seq_len_in)
@@ -41,6 +43,8 @@ bool AliaContext::load_model_metadata() {
 
 bool AliaContext::load_model_slots() {
     last_error.clear();
+    const aila::alia::BackgroundExtractorKind background_kind =
+        aila::alia::read_background_extractor_kind_from_env();
 
     auto load_slot = [&](aila::alia::ModelSlot& slot) {
         if (slot.load_model(max_seq_len)) {
@@ -51,11 +55,40 @@ bool AliaContext::load_model_slots() {
     };
 
     if (!load_slot(asr) ||
-        !load_slot(foreground_vlm) ||
-        !load_slot(background_vlm) ||
-        !load_slot(tts)) {
+        !load_slot(foreground_vlm)) {
         return false;
     }
+
+    if (aila::alia::should_load_gpu_model_slot(
+            aila::alia::ModelRole::BackgroundVlm, background_kind)) {
+        if (!load_slot(background_vlm)) {
+            return false;
+        }
+    } else if (!background_vlm.load_metadata()) {
+        last_error = background_vlm.last_error();
+        return false;
+    }
+
+    if (!load_slot(tts)) {
+        return false;
+    }
+
+    std::string background_extractor_error;
+    std::unique_ptr<aila::alia::IBackgroundMemoryExtractor> background_extractor =
+        aila::alia::create_background_memory_extractor(
+            background_kind,
+            &background_vlm,
+            vlm_0_8b_model_dir,
+            max_seq_len,
+            &background_extractor_error);
+    if (!background_extractor) {
+        last_error = background_extractor_error.empty()
+            ? "failed to create Alia background extractor"
+            : background_extractor_error;
+        return false;
+    }
+    background_pipeline = std::make_unique<aila::alia::AliaBackgroundPipeline>(
+        std::move(background_extractor));
 
     if (asr_pipeline &&
         aila::env::read_flag("AILA_ASR_GPU_MEL", true) &&

@@ -30,7 +30,8 @@ std::string cleanup_background_result_json(const std::string& raw_result_json,
 
 enum class BackgroundDecodeMode {
     None,
-    LoadedVlm
+    LoadedVlm,
+    NativeCpuQ35
 };
 
 enum class BackgroundJobState {
