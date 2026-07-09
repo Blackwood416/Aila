@@ -77,6 +77,18 @@ struct TtsPauseSegmentConfig {
     int max_pause_ms = 240;
 };
 
+struct TtsSilenceLookaheadPrefetchConfig {
+    bool enabled = false;
+    int min_text_bytes = 12;
+};
+
+struct TtsSilenceLookaheadPrefetchRequest {
+    bool first_audio_callback_emitted = false;
+    int silence_ms = 0;
+    bool next_queue_item_is_text = false;
+    int next_text_bytes = 0;
+};
+
 enum class TtsPreparedSegmentKind {
     Text,
     Silence,
@@ -97,10 +109,15 @@ TtsFirstChunkEarlyFlushConfig read_tts_first_chunk_early_flush_config();
 TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config();
 TtsStreamActionTagGuardConfig read_tts_stream_action_tag_guard_config();
 TtsPauseSegmentConfig read_tts_pause_segment_config();
+TtsSilenceLookaheadPrefetchConfig read_tts_silence_lookahead_prefetch_config();
 
 std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
     const std::string& text,
     const TtsPauseSegmentConfig& config);
+
+bool should_prefetch_tts_silence_lookahead(
+    const TtsSilenceLookaheadPrefetchConfig& config,
+    const TtsSilenceLookaheadPrefetchRequest& request);
 
 TtsFirstAudioPriorityWaitHint analyze_tts_first_audio_priority_wait_hint(
     const std::string& text,

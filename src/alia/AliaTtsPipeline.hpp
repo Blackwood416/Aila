@@ -32,12 +32,21 @@ struct AliaTtsMetrics {
     int audio_callback_max_frames = 0;
     int pause_silence_segments = 0;
     int pause_silence_ms = 0;
+    int silence_lookahead_prefetch_enabled = 0;
+    int silence_lookahead_prefetch_min_text_bytes = 0;
+    int silence_lookahead_prefetch_attempts = 0;
+    int silence_lookahead_prefetch_hits = 0;
+    int silence_lookahead_prefetch_tiny_skips = 0;
+    int silence_lookahead_prefetch_text_bytes = 0;
+    int silence_lookahead_prefetch_audio_callbacks = 0;
+    int silence_lookahead_prefetch_audio_samples = 0;
     double reference_embedding_ms = -1.0;
     double first_backend_codes_ms = -1.0;
     double first_backend_mimi_init_ms = -1.0;
     double first_backend_audio_ms = -1.0;
     double first_backend_total_ms = -1.0;
     double backend_total_ms = 0.0;
+    double silence_lookahead_prefetch_backend_ms = 0.0;
     std::string reference_audio_path;
     std::string reference_audio_error;
 };
@@ -74,15 +83,31 @@ private:
         int silence_ms = 0;
     };
 
+    struct TtsBufferedAudio {
+        std::vector<std::vector<float>> callbacks;
+        int sample_count = 0;
+    };
+
     bool synthesize_text(const std::string& text,
                          const AliaGenConfig& config,
                          AliaAudioCallback audio_cb,
                          void* user_data,
                          std::function<bool()> should_cancel);
+    bool synthesize_text_to_buffered_callbacks(
+        const std::string& text,
+        const AliaGenConfig& config,
+        TtsBufferedAudio& buffered_audio,
+        std::function<bool()> should_cancel);
     bool synthesize_silence(int silence_ms,
                             AliaAudioCallback audio_cb,
                             void* user_data,
                             std::function<bool()> should_cancel);
+    bool synthesize_silence_with_lookahead(
+        int silence_ms,
+        const AliaGenConfig& config,
+        AliaAudioCallback audio_cb,
+        void* user_data,
+        std::function<bool()> should_cancel);
     bool ensure_reference_voice_loaded();
     std::vector<std::vector<float>> prepare_audio_callbacks(const std::vector<float>& samples);
     std::vector<float> flush_first_audio_buffer();

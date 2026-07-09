@@ -84,7 +84,7 @@ non-tiny first chunks report `deferred_count=0`, and the matrix average TTFA is
 flat. The target short Chinese tiny-prefix case trades roughly 30 ms TTFA for
 removing the playback gap.
 
-Direction 2, TTS worker prefetch after synthetic silence, remains unstarted.
-It is still the next structural path if the remaining total-gap variance needs
-more work, but it should be validated separately because it touches TTS worker
-scheduling rather than foreground enqueue timing.
+Direction 2, TTS worker prefetch after synthetic silence, was tested next and
+is documented in `docs/alia-engine/2026-07-09-tts-silence-lookahead-prefetch.md`.
+Keep that probe default-off; real matrix evidence showed worse playback gaps
+when the worker withheld silence to prefetch the following text.

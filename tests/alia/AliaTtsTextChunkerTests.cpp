@@ -436,6 +436,89 @@ void ellipsis_pause_segments_can_be_disabled(TestResults& results) {
     AILA_EXPECT_EQ_STRING(results, segments[0].text, "我……我有点紧张");
 }
 
+void silence_lookahead_prefetch_defaults_disabled(TestResults& results) {
+    unset_env_var("AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH");
+    unset_env_var("AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH_MIN_TEXT_BYTES");
+
+    const aila::alia::TtsSilenceLookaheadPrefetchConfig config =
+        aila::alia::read_tts_silence_lookahead_prefetch_config();
+
+    AILA_EXPECT_TRUE(results, !config.enabled);
+    AILA_EXPECT_EQ_INT(results, config.min_text_bytes, 12);
+}
+
+void silence_lookahead_prefetch_can_be_enabled(TestResults& results) {
+    set_env_var("AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH", "1");
+    set_env_var("AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH_MIN_TEXT_BYTES", "0");
+
+    const aila::alia::TtsSilenceLookaheadPrefetchConfig config =
+        aila::alia::read_tts_silence_lookahead_prefetch_config();
+
+    AILA_EXPECT_TRUE(results, config.enabled);
+    AILA_EXPECT_EQ_INT(results, config.min_text_bytes, 0);
+}
+
+void silence_lookahead_prefetch_requires_ready_following_text(TestResults& results) {
+    aila::alia::TtsSilenceLookaheadPrefetchConfig config;
+    config.enabled = true;
+    config.min_text_bytes = 12;
+
+    AILA_EXPECT_TRUE(
+        results,
+        aila::alia::should_prefetch_tts_silence_lookahead(
+            config,
+            aila::alia::TtsSilenceLookaheadPrefetchRequest{
+                true,
+                160,
+                true,
+                15,
+            }));
+
+    AILA_EXPECT_TRUE(
+        results,
+        !aila::alia::should_prefetch_tts_silence_lookahead(
+            config,
+            aila::alia::TtsSilenceLookaheadPrefetchRequest{
+                false,
+                160,
+                true,
+                15,
+            }));
+
+    AILA_EXPECT_TRUE(
+        results,
+        !aila::alia::should_prefetch_tts_silence_lookahead(
+            config,
+            aila::alia::TtsSilenceLookaheadPrefetchRequest{
+                true,
+                0,
+                true,
+                15,
+            }));
+
+    AILA_EXPECT_TRUE(
+        results,
+        !aila::alia::should_prefetch_tts_silence_lookahead(
+            config,
+            aila::alia::TtsSilenceLookaheadPrefetchRequest{
+                true,
+                160,
+                false,
+                15,
+            }));
+
+    AILA_EXPECT_TRUE(
+        results,
+        !aila::alia::should_prefetch_tts_silence_lookahead(
+            config,
+            aila::alia::TtsSilenceLookaheadPrefetchRequest{
+                true,
+                160,
+                true,
+                3,
+            }));
+}
+
 }  // namespace
 
 int main() {
@@ -458,6 +541,9 @@ int main() {
     ellipsis_pause_segments_split_text_and_silence(results);
     ascii_ellipsis_pause_segment_uses_single_pause(results);
     ellipsis_pause_segments_can_be_disabled(results);
+    silence_lookahead_prefetch_defaults_disabled(results);
+    silence_lookahead_prefetch_can_be_enabled(results);
+    silence_lookahead_prefetch_requires_ready_following_text(results);
 
     std::cout << "AilaAliaTtsTextChunkerTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

@@ -280,6 +280,29 @@ TtsPauseSegmentConfig read_tts_pause_segment_config() {
     return config;
 }
 
+TtsSilenceLookaheadPrefetchConfig read_tts_silence_lookahead_prefetch_config() {
+    TtsSilenceLookaheadPrefetchConfig config;
+    config.enabled =
+        aila::env::read_flag("AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH", false);
+    config.min_text_bytes = std::max(
+        0,
+        aila::env::read_int_raw(
+            "AILA_TTS_SILENCE_LOOKAHEAD_PREFETCH_MIN_TEXT_BYTES",
+            12));
+    return config;
+}
+
+bool should_prefetch_tts_silence_lookahead(
+    const TtsSilenceLookaheadPrefetchConfig& config,
+    const TtsSilenceLookaheadPrefetchRequest& request) {
+    return config.enabled &&
+           request.first_audio_callback_emitted &&
+           request.silence_ms > 0 &&
+           request.next_queue_item_is_text &&
+           request.next_text_bytes > 0 &&
+           request.next_text_bytes >= config.min_text_bytes;
+}
+
 std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
     const std::string& text,
     const TtsPauseSegmentConfig& config) {

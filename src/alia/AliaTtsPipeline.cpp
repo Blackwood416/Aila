@@ -191,6 +191,12 @@ bool AliaTtsPipeline::enqueue_text(std::string text) {
 void AliaTtsPipeline::begin_turn_metrics() {
     std::lock_guard<std::mutex> lock(mutex_);
     metrics_ = AliaTtsMetrics{};
+    const TtsSilenceLookaheadPrefetchConfig prefetch_config =
+        read_tts_silence_lookahead_prefetch_config();
+    metrics_.silence_lookahead_prefetch_enabled =
+        prefetch_config.enabled ? 1 : 0;
+    metrics_.silence_lookahead_prefetch_min_text_bytes =
+        prefetch_config.min_text_bytes;
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = false;
     first_audio_synthesis_active_ = false;
@@ -617,6 +623,41 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
     return true;
 }
 
+bool AliaTtsPipeline::synthesize_text_to_buffered_callbacks(
+    const std::string& text,
+    const AliaGenConfig& config,
+    TtsBufferedAudio& buffered_audio,
+    std::function<bool()> should_cancel) {
+    buffered_audio.callbacks.clear();
+    buffered_audio.sample_count = 0;
+
+    const auto started = std::chrono::high_resolution_clock::now();
+    const bool ok = synthesize_text(
+        text,
+        config,
+        [](const float* samples, int sample_count, void* user_data) {
+            if (!samples || sample_count <= 0 || !user_data) {
+                return;
+            }
+            auto* audio = static_cast<TtsBufferedAudio*>(user_data);
+            audio->callbacks.emplace_back(samples, samples + sample_count);
+            audio->sample_count += sample_count;
+        },
+        &buffered_audio,
+        should_cancel);
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - started).count();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    metrics_.silence_lookahead_prefetch_backend_ms += elapsed_ms;
+    metrics_.silence_lookahead_prefetch_audio_callbacks +=
+        static_cast<int>(buffered_audio.callbacks.size());
+    metrics_.silence_lookahead_prefetch_audio_samples +=
+        buffered_audio.sample_count;
+    return ok;
+}
+
 bool AliaTtsPipeline::synthesize_silence(int silence_ms,
                                          AliaAudioCallback audio_cb,
                                          void* user_data,
@@ -652,6 +693,99 @@ bool AliaTtsPipeline::synthesize_silence(int silence_ms,
         ++metrics_.pause_silence_segments;
         metrics_.pause_silence_ms += silence_ms;
         metrics_.audio_callback_max_frames = tts_audio_callback_max_frames();
+    }
+    return true;
+}
+
+bool AliaTtsPipeline::synthesize_silence_with_lookahead(
+    int silence_ms,
+    const AliaGenConfig& config,
+    AliaAudioCallback audio_cb,
+    void* user_data,
+    std::function<bool()> should_cancel) {
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+
+    TtsQueueItem lookahead_text;
+    bool prefetch = false;
+    const TtsSilenceLookaheadPrefetchConfig prefetch_config =
+        read_tts_silence_lookahead_prefetch_config();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        metrics_.silence_lookahead_prefetch_enabled =
+            prefetch_config.enabled ? 1 : 0;
+        metrics_.silence_lookahead_prefetch_min_text_bytes =
+            prefetch_config.min_text_bytes;
+        if (prefetch_config.enabled && silence_ms > 0) {
+            ++metrics_.silence_lookahead_prefetch_attempts;
+        }
+
+        const bool next_is_text =
+            !text_queue_.empty() &&
+            text_queue_.front().silence_ms <= 0 &&
+            !text_queue_.front().text.empty();
+        const int next_text_bytes = next_is_text
+            ? static_cast<int>(text_queue_.front().text.size())
+            : 0;
+        const TtsSilenceLookaheadPrefetchRequest request{
+            first_audio_callback_emitted_,
+            silence_ms,
+            next_is_text,
+            next_text_bytes,
+        };
+        prefetch =
+            should_prefetch_tts_silence_lookahead(prefetch_config, request);
+        if (!prefetch &&
+            prefetch_config.enabled &&
+            next_text_bytes > 0 &&
+            next_text_bytes < prefetch_config.min_text_bytes) {
+            ++metrics_.silence_lookahead_prefetch_tiny_skips;
+        }
+        if (prefetch) {
+            lookahead_text = std::move(text_queue_.front());
+            text_queue_.pop_front();
+            ++metrics_.silence_lookahead_prefetch_hits;
+            metrics_.silence_lookahead_prefetch_text_bytes +=
+                static_cast<int>(lookahead_text.text.size());
+        }
+    }
+
+    if (!prefetch) {
+        return synthesize_silence(silence_ms, audio_cb, user_data, should_cancel);
+    }
+
+    TtsBufferedAudio buffered_audio;
+    const bool text_ok =
+        synthesize_text_to_buffered_callbacks(
+            lookahead_text.text,
+            config,
+            buffered_audio,
+            should_cancel);
+    if (!text_ok) {
+        return cancelled();
+    }
+    if (cancelled()) {
+        return true;
+    }
+
+    if (!synthesize_silence(silence_ms, audio_cb, user_data, should_cancel)) {
+        return false;
+    }
+    if (cancelled()) {
+        return true;
+    }
+
+    for (const auto& callback_samples : buffered_audio.callbacks) {
+        if (callback_samples.empty()) {
+            continue;
+        }
+        if (cancelled()) {
+            return true;
+        }
+        audio_cb(callback_samples.data(),
+                 static_cast<int>(callback_samples.size()),
+                 user_data);
     }
     return true;
 }
@@ -703,7 +837,12 @@ void AliaTtsPipeline::async_worker_loop() {
             continue;
         }
         const bool ok = item.silence_ms > 0
-            ? synthesize_silence(item.silence_ms, audio_cb, user_data, should_cancel)
+            ? synthesize_silence_with_lookahead(
+                  item.silence_ms,
+                  config,
+                  audio_cb,
+                  user_data,
+                  should_cancel)
             : synthesize_text(item.text, config, audio_cb, user_data, should_cancel);
         if (!ok) {
             std::lock_guard<std::mutex> lock(mutex_);
