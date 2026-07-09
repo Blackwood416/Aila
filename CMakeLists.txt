@@ -161,6 +161,10 @@ set(QWEN3_TTS_WARMUP_TEST_SOURCES
     tests/models/Qwen3TTSWarmupTests.cpp
 )
 
+set(QWEN35_VISION_WEIGHTS_TEST_SOURCES
+    tests/vision/Qwen35VisionWeightsTests.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -269,6 +273,13 @@ target_link_libraries(AilaSafeTensorsTests PRIVATE DNNL::dnnl simdjson)
 add_executable(AilaQwen3TTSWarmupTests ${QWEN3_TTS_WARMUP_TEST_SOURCES})
 target_compile_definitions(AilaQwen3TTSWarmupTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQwen3TTSWarmupTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_executable(AilaQwen35VisionWeightsTests ${QWEN35_VISION_WEIGHTS_TEST_SOURCES})
+target_compile_definitions(AilaQwen35VisionWeightsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQwen35VisionWeightsTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
