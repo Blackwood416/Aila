@@ -272,6 +272,8 @@ try {
             foreground_profile_first_spoken_delay_ms = Get-ValueOrEmpty $values "foreground_profile_first_spoken_delay_ms"
             foreground_profile_first_tts_enqueue_ms = Get-ValueOrEmpty $values "foreground_profile_first_tts_enqueue_ms"
             foreground_profile_tts_first_audio_priority_wait_ms = Get-ValueOrEmpty $values "foreground_profile_tts_first_audio_priority_wait_ms"
+            foreground_profile_tts_first_audio_priority_wait_deferred_count = Get-ValueOrEmpty $values "foreground_profile_tts_first_audio_priority_wait_deferred_count"
+            foreground_profile_tts_first_audio_priority_following_text_bytes = Get-ValueOrEmpty $values "foreground_profile_tts_first_audio_priority_following_text_bytes"
             foreground_profile_first_tts_chunk_reason = Get-ValueOrEmpty $values "foreground_profile_first_tts_chunk_reason"
             foreground_profile_first_tts_chunk_pending_chars_at_first_content = Get-ValueOrEmpty $values "foreground_profile_first_tts_chunk_pending_chars_at_first_content"
             foreground_profile_first_tts_chunk_pending_chars_at_enqueue = Get-ValueOrEmpty $values "foreground_profile_first_tts_chunk_pending_chars_at_enqueue"

@@ -52,8 +52,19 @@ struct TtsFirstChunkEarlyFlushConfig {
 
 struct TtsFirstAudioPriorityConfig {
     bool enabled = true;
+    bool queue_aware_tiny_first_text = true;
+    int tiny_following_min_bytes = 16;
+    int tiny_max_deferred_steps = 2;
     int base_timeout_ms = 250;
     int active_extra_ms = 120;
+};
+
+struct TtsFirstAudioPriorityWaitHint {
+    bool tiny_first_text = false;
+    bool has_following_text = false;
+    int first_text_bytes = 0;
+    int following_text_bytes = 0;
+    int total_text_bytes = 0;
 };
 
 struct TtsStreamActionTagGuardConfig {
@@ -90,6 +101,11 @@ TtsPauseSegmentConfig read_tts_pause_segment_config();
 std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
     const std::string& text,
     const TtsPauseSegmentConfig& config);
+
+TtsFirstAudioPriorityWaitHint analyze_tts_first_audio_priority_wait_hint(
+    const std::string& text,
+    const TtsPauseSegmentConfig& config,
+    size_t tiny_text_max_bytes);
 
 TtsTextChunkResult take_ready_tts_text_chunks(
     std::string& buffer,

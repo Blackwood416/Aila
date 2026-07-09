@@ -48,6 +48,8 @@ struct AliaForegroundMetrics {
     long long first_content_delta_ms = -1;
     long long first_tts_enqueue_ms = -1;
     long long tts_first_audio_priority_wait_ms = 0;
+    int tts_first_audio_priority_wait_deferred_count = 0;
+    int tts_first_audio_priority_following_text_bytes = 0;
     long long first_tts_chunk_wait_ms = -1;
     int first_tts_chunk_wait_tokens = -1;
     int first_tts_chunk_pending_chars_at_first_content = -1;

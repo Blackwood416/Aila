@@ -1939,6 +1939,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     bool first_tts_enqueue_seen = false;
     bool first_tts_priority_wait_done = false;
     long long first_tts_priority_wait_ms = 0;
+    int first_tts_priority_wait_deferred_count = 0;
+    bool first_tts_enqueue_tiny_first_text = false;
+    int first_tts_following_text_bytes_queued = 0;
     bool first_content_seen = false;
     int generated_tokens_at_first_content = -1;
     std::chrono::steady_clock::time_point first_content_at{};
@@ -2023,8 +2026,18 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             }
             const bool was_first_enqueue = !first_tts_enqueue_seen;
             if (tts_pipeline_->enqueue_text(chunk)) {
+                const TtsFirstAudioPriorityWaitHint wait_hint =
+                    analyze_tts_first_audio_priority_wait_hint(
+                        chunk,
+                        read_tts_pause_segment_config(),
+                        static_cast<size_t>(
+                            std::max(0, tts_chunk_policy.first_hard_min_chars)));
                 if (was_first_enqueue) {
                     first_tts_enqueue_seen = true;
+                    first_tts_enqueue_tiny_first_text =
+                        wait_hint.tiny_first_text;
+                    first_tts_following_text_bytes_queued =
+                        wait_hint.following_text_bytes;
                     first_tts_chunk_reason =
                         tts_chunk_decision_reason_name(chunk_result.reason);
                     first_tts_chunk_pending_chars_at_enqueue =
@@ -2040,6 +2053,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                             std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - first_content_at).count();
                     }
+                } else if (first_tts_enqueue_tiny_first_text) {
+                    first_tts_following_text_bytes_queued +=
+                        wait_hint.total_text_bytes;
                 }
                 if (record_generation_anchor) {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -2060,6 +2076,16 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             !audio_cb ||
             !tts_config ||
             first_audio_priority_config.base_timeout_ms <= 0) {
+            return;
+        }
+
+        if (first_audio_priority_config.queue_aware_tiny_first_text &&
+            first_tts_enqueue_tiny_first_text &&
+            first_tts_following_text_bytes_queued <
+                first_audio_priority_config.tiny_following_min_bytes &&
+            first_tts_priority_wait_deferred_count <
+                first_audio_priority_config.tiny_max_deferred_steps) {
+            ++first_tts_priority_wait_deferred_count;
             return;
         }
 
@@ -2226,6 +2252,10 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             metrics_.first_content_delta_ms = last_first_content_delta_ms_;
             metrics_.first_tts_enqueue_ms = last_first_tts_enqueue_ms_;
             metrics_.tts_first_audio_priority_wait_ms = first_tts_priority_wait_ms;
+            metrics_.tts_first_audio_priority_wait_deferred_count =
+                first_tts_priority_wait_deferred_count;
+            metrics_.tts_first_audio_priority_following_text_bytes =
+                first_tts_following_text_bytes_queued;
             metrics_.first_tts_chunk_reason = first_tts_chunk_reason;
             metrics_.first_tts_chunk_pending_chars_at_first_content =
                 first_tts_chunk_pending_chars_at_first_content;

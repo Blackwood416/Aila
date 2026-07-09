@@ -216,6 +216,60 @@ void tiny_first_pause_prefix_flushes_with_following_text(TestResults& results) {
     AILA_EXPECT_TRUE(results, buffer.empty());
 }
 
+void first_audio_wait_hint_detects_tiny_pause_without_following_text(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const aila::alia::TtsFirstAudioPriorityWaitHint hint =
+        aila::alia::analyze_tts_first_audio_priority_wait_hint("啊……", config, 8);
+
+    AILA_EXPECT_TRUE(results, hint.tiny_first_text);
+    AILA_EXPECT_TRUE(results, !hint.has_following_text);
+    AILA_EXPECT_EQ_INT(results, hint.first_text_bytes, 3);
+    AILA_EXPECT_EQ_INT(results, hint.following_text_bytes, 0);
+    AILA_EXPECT_EQ_INT(results, hint.total_text_bytes, 3);
+}
+
+void first_audio_wait_hint_detects_tiny_pause_with_following_text(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const aila::alia::TtsFirstAudioPriorityWaitHint hint =
+        aila::alia::analyze_tts_first_audio_priority_wait_hint(
+            "啊……肩膀好酸呢。",
+            config,
+            8);
+
+    AILA_EXPECT_TRUE(results, hint.tiny_first_text);
+    AILA_EXPECT_TRUE(results, hint.has_following_text);
+    AILA_EXPECT_EQ_INT(results, hint.first_text_bytes, 3);
+    AILA_EXPECT_EQ_INT(results, hint.following_text_bytes, 18);
+    AILA_EXPECT_EQ_INT(results, hint.total_text_bytes, 21);
+}
+
+void first_audio_wait_hint_ignores_normal_first_text(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const aila::alia::TtsFirstAudioPriorityWaitHint hint =
+        aila::alia::analyze_tts_first_audio_priority_wait_hint(
+            "父亲大人说过，",
+            config,
+            8);
+
+    AILA_EXPECT_TRUE(results, !hint.tiny_first_text);
+    AILA_EXPECT_TRUE(results, !hint.has_following_text);
+    AILA_EXPECT_EQ_INT(results, hint.first_text_bytes, 21);
+    AILA_EXPECT_EQ_INT(results, hint.following_text_bytes, 0);
+    AILA_EXPECT_EQ_INT(results, hint.total_text_bytes, 21);
+}
+
 void steady_chunk_ignores_first_chunk_early_flush(TestResults& results) {
     std::string buffer = "abcdefgh";
     const aila::alia::TtsTextChunkRequest request{
@@ -272,6 +326,9 @@ void first_audio_priority_defaults_to_adaptive_window(TestResults& results) {
     unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY");
     unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS");
     unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS");
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_QUEUE_AWARE_TINY");
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_FOLLOWING_MIN_BYTES");
+    unset_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_MAX_DEFERRED_STEPS");
 
     const aila::alia::TtsFirstAudioPriorityConfig config =
         aila::alia::read_tts_first_audio_priority_config();
@@ -279,12 +336,18 @@ void first_audio_priority_defaults_to_adaptive_window(TestResults& results) {
     AILA_EXPECT_TRUE(results, config.enabled);
     AILA_EXPECT_EQ_INT(results, config.base_timeout_ms, 250);
     AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 120);
+    AILA_EXPECT_TRUE(results, config.queue_aware_tiny_first_text);
+    AILA_EXPECT_EQ_INT(results, config.tiny_following_min_bytes, 16);
+    AILA_EXPECT_EQ_INT(results, config.tiny_max_deferred_steps, 2);
 }
 
 void first_audio_priority_env_clamps_negative_windows(TestResults& results) {
     set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", "0");
     set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", "-5");
     set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS", "-7");
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_QUEUE_AWARE_TINY", "0");
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_FOLLOWING_MIN_BYTES", "-9");
+    set_env_var("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_MAX_DEFERRED_STEPS", "-3");
 
     const aila::alia::TtsFirstAudioPriorityConfig config =
         aila::alia::read_tts_first_audio_priority_config();
@@ -292,6 +355,9 @@ void first_audio_priority_env_clamps_negative_windows(TestResults& results) {
     AILA_EXPECT_TRUE(results, !config.enabled);
     AILA_EXPECT_EQ_INT(results, config.base_timeout_ms, 0);
     AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 0);
+    AILA_EXPECT_TRUE(results, !config.queue_aware_tiny_first_text);
+    AILA_EXPECT_EQ_INT(results, config.tiny_following_min_bytes, 0);
+    AILA_EXPECT_EQ_INT(results, config.tiny_max_deferred_steps, 0);
 }
 
 void stream_action_tag_guard_defaults_disabled(TestResults& results) {
@@ -379,6 +445,9 @@ int main() {
     early_first_chunk_flushes_without_boundary(results);
     tiny_first_pause_prefix_waits_for_following_text(results);
     tiny_first_pause_prefix_flushes_with_following_text(results);
+    first_audio_wait_hint_detects_tiny_pause_without_following_text(results);
+    first_audio_wait_hint_detects_tiny_pause_with_following_text(results);
+    first_audio_wait_hint_ignores_normal_first_text(results);
     steady_chunk_ignores_first_chunk_early_flush(results);
     force_flushes_all_text(results);
     first_chunk_early_flush_defaults_enabled(results);

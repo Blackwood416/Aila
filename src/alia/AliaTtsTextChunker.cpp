@@ -239,6 +239,20 @@ TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config() {
     TtsFirstAudioPriorityConfig config;
     config.enabled =
         aila::env::read_flag("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY", true);
+    config.queue_aware_tiny_first_text =
+        aila::env::read_flag(
+            "AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_QUEUE_AWARE_TINY",
+            true);
+    config.tiny_following_min_bytes = std::max(
+        0,
+        aila::env::read_int_raw(
+            "AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_FOLLOWING_MIN_BYTES",
+            16));
+    config.tiny_max_deferred_steps = std::max(
+        0,
+        aila::env::read_int_raw(
+            "AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_MAX_DEFERRED_STEPS",
+            2));
     config.base_timeout_ms = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     config.active_extra_ms = std::max(
@@ -354,6 +368,36 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
 
     append_text(segment_begin, text.size());
     return segments;
+}
+
+TtsFirstAudioPriorityWaitHint analyze_tts_first_audio_priority_wait_hint(
+    const std::string& text,
+    const TtsPauseSegmentConfig& config,
+    size_t tiny_text_max_bytes) {
+    TtsFirstAudioPriorityWaitHint hint;
+    if (text.empty() || tiny_text_max_bytes == 0) {
+        return hint;
+    }
+
+    const std::vector<TtsPreparedSegment> segments =
+        split_tts_text_pause_segments(text, config);
+    bool first_text_seen = false;
+    for (const TtsPreparedSegment& segment : segments) {
+        if (segment.kind != TtsPreparedSegmentKind::Text ||
+            segment.text.empty()) {
+            continue;
+        }
+        if (!first_text_seen) {
+            first_text_seen = true;
+            hint.first_text_bytes = static_cast<int>(segment.text.size());
+            hint.tiny_first_text = segment.text.size() < tiny_text_max_bytes;
+        } else {
+            hint.has_following_text = true;
+            hint.following_text_bytes += static_cast<int>(segment.text.size());
+        }
+        hint.total_text_bytes += static_cast<int>(segment.text.size());
+    }
+    return hint;
 }
 
 TtsTextChunkResult take_ready_tts_text_chunks(
