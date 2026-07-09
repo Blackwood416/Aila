@@ -150,6 +150,13 @@ set(ENV_UTILS_TEST_SOURCES
     tests/utils/EnvUtilsTests.cpp
 )
 
+set(SAFE_TENSORS_TEST_SOURCES
+    tests/utils/SafeTensorsTests.cpp
+    src/utils/SafeTensors.cpp
+    src/utils/MemoryMappedFile.cpp
+    src/profile/Profiling.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -246,6 +253,14 @@ target_compile_definitions(AilaEnvUtilsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEA
 target_include_directories(AilaEnvUtilsTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+add_executable(AilaSafeTensorsTests ${SAFE_TENSORS_TEST_SOURCES})
+target_compile_definitions(AilaSafeTensorsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaSafeTensorsTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaSafeTensorsTests PRIVATE DNNL::dnnl simdjson)
 
 add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

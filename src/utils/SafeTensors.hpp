@@ -37,6 +37,11 @@ struct TensorMeta {
     size_t byte_offset_end;
 };
 
+struct ModelWeightsEraseStats {
+    size_t count = 0;
+    size_t bytes = 0;
+};
+
 struct Bnb4BitQuantState {
     std::string quant_type;
     std::string dtype;
@@ -106,6 +111,7 @@ public:
 
     // 删除已有 tensor，释放其设备内存
     void erase(const std::string& name);
+    ModelWeightsEraseStats erase_with_prefix(const std::string& prefix);
 
     // 获取所有名称
     std::vector<std::string> names() const;

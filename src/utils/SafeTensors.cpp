@@ -44,6 +44,27 @@ void ModelWeights::erase(const std::string& name) {
     tensors_.erase(name);
 }
 
+ModelWeightsEraseStats ModelWeights::erase_with_prefix(const std::string& prefix) {
+    ModelWeightsEraseStats stats;
+    if (prefix.empty()) {
+        return stats;
+    }
+
+    std::vector<std::string> erased_names;
+    for (const auto& pair : tensors_) {
+        if (pair.first.rfind(prefix, 0) == 0) {
+            stats.bytes += pair.second.size_bytes();
+            erased_names.push_back(pair.first);
+        }
+    }
+
+    stats.count = erased_names.size();
+    for (const std::string& name : erased_names) {
+        tensors_.erase(name);
+    }
+    return stats;
+}
+
 std::vector<std::string> ModelWeights::names() const {
     std::vector<std::string> result;
     result.reserve(tensors_.size());

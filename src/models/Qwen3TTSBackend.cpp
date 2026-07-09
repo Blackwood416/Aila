@@ -18,6 +18,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 namespace {
 int round_up_seq(int v, int g) { return ((v + g - 1) / g) * g; }
 constexpr int kMimiSamplesPerFrame = 1920;
+constexpr const char* kTtsUnusedSpeakerEncoderWeightPrefix = "speaker_encoder.";
 
 class ScopedAllocationProfile {
 public:
@@ -326,6 +327,20 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
     }
 
     predictor_kv_cache_.init(ctx, predictor_cfg_, 17, "AILA_TTS_KV_QUANT");
+
+    ctx.synchronize();
+    const ModelWeightsEraseStats speaker_encoder_erased =
+        weights.erase_with_prefix(kTtsUnusedSpeakerEncoderWeightPrefix);
+    if (speaker_encoder_erased.count > 0) {
+        const double erased_mb =
+            static_cast<double>(speaker_encoder_erased.bytes) / (1024.0 * 1024.0);
+        const double current_mb =
+            static_cast<double>(ctx.current_allocated_bytes()) / (1024.0 * 1024.0);
+        AILA_LOG_INFO("[TTS] Erased unused speaker_encoder GPU weights: %zu tensors, %.2f MB freed (current tracked %.2f MB)",
+                      speaker_encoder_erased.count,
+                      erased_mb,
+                      current_mb);
+    }
 
     // ============================================================
     // Allocate runtime buffers
