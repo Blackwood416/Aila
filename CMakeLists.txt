@@ -157,6 +157,10 @@ set(SAFE_TENSORS_TEST_SOURCES
     src/profile/Profiling.cpp
 )
 
+set(QWEN3_TTS_WARMUP_TEST_SOURCES
+    tests/models/Qwen3TTSWarmupTests.cpp
+)
+
 # Third-party
 set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
@@ -261,6 +265,13 @@ target_include_directories(AilaSafeTensorsTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaSafeTensorsTests PRIVATE DNNL::dnnl simdjson)
+
+add_executable(AilaQwen3TTSWarmupTests ${QWEN3_TTS_WARMUP_TEST_SOURCES})
+target_compile_definitions(AilaQwen3TTSWarmupTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQwen3TTSWarmupTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

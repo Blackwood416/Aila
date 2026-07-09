@@ -1,4 +1,5 @@
 #include "Qwen3TTSBackend.hpp"
+#include "Qwen3TTSWarmup.hpp"
 #include "../ops/ConvOps.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
@@ -424,7 +425,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         // (2048→2048, 2048→1024) than the talker layers. Pre-compile them at
         // prefill batch size to avoid JIT during the first real prefill.
         {
-            int wb = 4;
+            int wb = static_cast<int>(qwen3_tts_minimal_warmup_text_tokens().size());
             Tensor wt = Tensor::allocate(ctx, {wb, 2048});
             ctx.queue().memset(wt.data(), 0, wb * 2048 * sizeof(bf16));
             Tensor wf1 = Tensor::allocate(ctx, {wb, 2048});
@@ -486,15 +487,20 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         warmup_gen.do_sample = false;
         warmup_gen.repetition_penalty = 1.1f;
 
-        std::vector<int> warmup_text = {151644, 77091, 198, 0, 151645};
+        std::vector<int> warmup_text = qwen3_tts_minimal_warmup_text_tokens();
+        std::vector<float> warmup_speaker_embedding =
+            qwen3_tts_warmup_speaker_embedding(tts_model_type_, H_talker);
         std::vector<int32_t> warmup_codes;
         int warmup_frames = 0;
-        if (!synthesize_codes(ctx, warmup_text, {}, 0, {}, 0, warmup_gen,
+        if (!synthesize_codes(ctx, warmup_text, warmup_speaker_embedding, 0, {}, 0, warmup_gen,
                               warmup_codes, warmup_frames,
                               []() { return false; }, {}, 0)) {
             AILA_LOG_WARN("[TTS] Codec decode warmup failed; first synthesis may pay JIT cost");
         } else {
-            AILA_LOG_INFO("[TTS] Codec decode warmup complete (frames=%d)", warmup_frames);
+            AILA_LOG_INFO("[TTS] Codec decode warmup complete (frames=%d text_tokens=%zu speaker_dim=%zu)",
+                          warmup_frames,
+                          warmup_text.size(),
+                          warmup_speaker_embedding.size());
         }
         reset();
     }
