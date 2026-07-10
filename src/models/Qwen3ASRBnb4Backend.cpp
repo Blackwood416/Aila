@@ -357,7 +357,7 @@ bool Qwen3ASRBnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelS
 
     final_norm_weight_ = &weights.get("thinker.model.norm.weight");
 
-    kv_cache_.init(ctx, cfg_, max_seq_len);
+    kv_cache_.init(ctx, cfg_, max_seq_len, "AILA_ASR_KV_QUANT");
 
     if (weights.has("thinker.lm_head.weight") &&
         !weights.has("thinker.lm_head.weight.quant_state.bitsandbytes__nf4") &&

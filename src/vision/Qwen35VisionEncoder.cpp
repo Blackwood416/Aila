@@ -1,5 +1,6 @@
 #include "Qwen35VisionEncoder.hpp"
 
+#include "Qwen35VisionWeights.hpp"
 #include "core/Context.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
@@ -274,6 +275,16 @@ bool Qwen35VisionEncoder::prepare_patch_weight(Context& ctx,
     }
 
     patch_weight_ = &fused;
+    if (qwen35_visual_temporal_patch_weight_can_release(
+            numel, hidden_size_, patch_size_)) {
+        // The fuse kernel reads src asynchronously. Ensure it has completed
+        // before erasing the owning Tensor and releasing its device storage.
+        ctx.synchronize();
+        const size_t source_bytes = src->size_bytes();
+        weights.erase(kName);
+        AILA_LOG_INFO("[Vision] Erased temporal patch source GPU weight after 2D fuse: %.2f MB freed",
+                      static_cast<double>(source_bytes) / (1024.0 * 1024.0));
+    }
     return true;
 }
 

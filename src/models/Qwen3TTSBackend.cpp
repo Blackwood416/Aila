@@ -217,7 +217,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
     Tensor* lw = transpose_weight("talker.codec_head.weight");
     talker_codec_head_.init(ctx, *lw, H_talker, talker_cfg_.vocab_size, true);
 
-    talker_kv_cache_.init(ctx, talker_cfg_, max_seq_len_);
+    talker_kv_cache_.init(ctx, talker_cfg_, max_seq_len_, "AILA_TTS_KV_QUANT");
 
     // ============================================================
     // Load Code Predictor weights
@@ -284,7 +284,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
         predictor_lm_heads_[i].init(ctx, *lhw, H_pred, predictor_cfg_.vocab_size, true);
     }
 
-    predictor_kv_cache_.init(ctx, predictor_cfg_, 17);
+    predictor_kv_cache_.init(ctx, predictor_cfg_, 17, "AILA_TTS_KV_QUANT");
 
     // ============================================================
     // Allocate runtime buffers
@@ -1358,6 +1358,49 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
         AILA_LOG_INFO("[MimiLoader] Conv1d weight transpose complete");
     }
 
+    if (aila::env::read_flag("AILA_TTS_MIMI_TRANSPOSE_CONV_VEC8", true)) {
+        AILA_LOG_INFO("[MimiLoader] Transposing Mimi transpose-conv weights for vec8 access...");
+        auto transpose_conv_transpose_weight = [&](const std::string& name) {
+            if (!mimi_weights_.has(name)) return;
+            Tensor& w = mimi_weights_.get(name);
+            if (w.ndim() != 3) return;
+            const int IC = static_cast<int>(w.shape(0));
+            const int OC = static_cast<int>(w.shape(1));
+            const int KS = static_cast<int>(w.shape(2));
+            if (IC <= 0 || OC <= 0 || KS <= 0) return;
+
+            Tensor w_new = Tensor::allocate(ctx, {OC, KS, IC});
+            auto* old_ptr = w.data_as<bf16>();
+            auto* new_ptr = w_new.data_as<bf16>();
+
+            // w_old[ic, oc, k] -> w_new[oc, k, ic]
+            const int total = IC * OC * KS;
+            ctx.queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+                int i = static_cast<int>(idx[0]);
+                int k = i % KS;
+                int tmp = i / KS;
+                int oc = tmp % OC;
+                int ic = tmp / OC;
+                int new_idx = (oc * KS + k) * IC + ic;
+                new_ptr[new_idx] = old_ptr[i];
+            });
+            ctx.queue().wait();
+            mimi_weights_.replace(name, std::move(w_new));
+        };
+
+        for (int i = 0; i < 2; ++i) {
+            transpose_conv_transpose_weight(
+                "decoder.upsample." + std::to_string(i) + ".0.conv.weight");
+        }
+        for (int i = 1; i <= 4; ++i) {
+            transpose_conv_transpose_weight(
+                "decoder.decoder." + std::to_string(i) + ".block.1.conv.weight");
+        }
+
+        ctx.synchronize();
+        AILA_LOG_INFO("[MimiLoader] Mimi transpose-conv weight transpose complete");
+    }
+
     mimi_loaded_ = true;
 
     // Warmup: run minimal mimi decode to trigger conv/attention JIT compilation
@@ -1375,6 +1418,8 @@ bool Qwen3TTSBackend::load_mimi_vocoder(Context& ctx, const std::string& model_d
 bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
     std::vector<float>& out_samples) {
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
+    static const bool tts_decoder_fused_conv2_residual =
+        aila::env::read_flag("AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL", true);
     auto t_conv_start = std::chrono::high_resolution_clock::now();
 
     // 辅助 layer scale 核函数
@@ -1513,7 +1558,10 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
         Tensor res_in  = Tensor::allocate(ctx, {Ls, out_d});
         Tensor xx_act1 = Tensor::allocate(ctx, {Ls, out_d});
         Tensor conv1_out = Tensor::allocate(ctx, {Ls, out_d});
-        Tensor conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+        Tensor conv2_out;
+        if (!tts_decoder_fused_conv2_residual) {
+            conv2_out = Tensor::allocate(ctx, {Ls, out_d});
+        }
 
         for (int r = 0; r < 3; ++r) {
             std::string res_prefix = dec_prefix + std::to_string(r + 2) + ".";
@@ -1538,10 +1586,18 @@ bool Qwen3TTSBackend::mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_
             // conv2: conv(conv1_out) -> conv2_out (kernel=1, pointwise)
             Tensor& conv2_w = mimi_weights_.get(res_prefix + "conv2.conv.weight");
             Tensor& conv2_b = mimi_weights_.get(res_prefix + "conv2.conv.bias");
-            ops::causal_conv1d(ctx, conv1_out, conv2_w, conv2_b, conv2_out, 1, out_d, out_d, Ls, 1, 1);
+            if (tts_decoder_fused_conv2_residual) {
+                ops::causal_conv1d_k1_residual_add(
+                    ctx, conv1_out, conv2_w, conv2_b, res_in,
+                    1, out_d, out_d, Ls);
+            } else {
+                ops::causal_conv1d(
+                    ctx, conv1_out, conv2_w, conv2_b, conv2_out,
+                    1, out_d, out_d, Ls, 1, 1);
+                ops::residual_add(ctx, res_in, conv2_out, res_elems);
+            }
 
-            // Fused: residual_add + copy: xx[i] = res_in[i] + conv2_out[i]
-            ops::residual_add(ctx, res_in, conv2_out, res_elems);
+            // Copy the fused or unfused residual result into the next block input.
             ops::copy_tensor(ctx, res_in, xx, res_elems);
             ctx.synchronize();  // barrier between residual blocks
         }

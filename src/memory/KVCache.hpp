@@ -14,7 +14,10 @@ public:
     KVCache() = default;
 
     // 初始化: 为所有层预分配 GPU 内存
-    void init(Context& ctx, const Qwen3Config& config, int max_seq_len);
+    void init(Context& ctx,
+              const Qwen3Config& config,
+              int max_seq_len,
+              const char* kv_quant_env = nullptr);
 
     // 获取指定层的 K/V cache
     Tensor& k_cache(int layer_idx) { return layers_[layer_idx].k; }

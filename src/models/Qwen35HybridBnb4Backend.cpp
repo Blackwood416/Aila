@@ -619,7 +619,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
                     0.0f);
                 cache.linear_conv_head = 0;
             } else {
-                auto kv_dtype = aila::env::read_flag("AILA_KV_QUANT", false) ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
+                auto kv_dtype = aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
                 cache.k = Tensor::allocate(ctx,
                                            {(int64_t)linear_q_heads_, (int64_t)max_seq_len_, (int64_t)linear_head_dim_},
                                            kv_dtype);
@@ -655,7 +655,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
             layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
             layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
 
-            auto kv_dtype = aila::env::read_flag("AILA_KV_QUANT", false) ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
+            auto kv_dtype = aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
             cache.k = Tensor::allocate(ctx,
                                        {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
                                        kv_dtype);
@@ -829,7 +829,7 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
             AILA_LOG_INFO("[Qwen3.5 BnB4] Set AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU=1 to try the generic grouped GPU path");
         }
     }
-    AILA_LOG_INFO("[Qwen3.5 BnB4] KV Cache config: quantized=%s", aila::env::read_flag("AILA_KV_QUANT", false) ? "true" : "false");
+    AILA_LOG_INFO("[Qwen3.5 BnB4] KV Cache config: quantized=%s", aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? "true" : "false");
     AILA_LOG_INFO("[Qwen3.5 DEBUG] Qwen35HybridBnb4Backend::load returning true");
     return true;
 }

@@ -201,6 +201,54 @@ target_include_directories(AilaChatTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/chat
 )
 target_link_libraries(AilaChatTests PRIVATE simdjson)
+enable_testing()
+add_test(NAME AilaChatTests COMMAND AilaChatTests)
+
+add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
+target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE DNNL::dnnl simdjson)
+add_test(NAME AilaBnb4BitLinearKernelTests COMMAND AilaBnb4BitLinearKernelTests)
+
+add_executable(AilaConvOpsKernelTests tests/ops/ConvOpsKernelTests.cpp)
+target_compile_definitions(AilaConvOpsKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaConvOpsKernelTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaConvOpsKernelTests PRIVATE DNNL::dnnl simdjson)
+add_test(NAME AilaConvOpsKernelTests COMMAND AilaConvOpsKernelTests)
+
+add_executable(AilaEnvUtilsTests tests/utils/EnvUtilsTests.cpp)
+target_compile_definitions(AilaEnvUtilsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaEnvUtilsTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaEnvUtilsTests PRIVATE AilaLib)
+add_test(NAME AilaEnvUtilsTests COMMAND AilaEnvUtilsTests)
+
+add_executable(AilaSafeTensorsTests tests/utils/SafeTensorsTests.cpp)
+target_compile_definitions(AilaSafeTensorsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaSafeTensorsTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaSafeTensorsTests PRIVATE AilaLib)
+add_test(NAME AilaSafeTensorsTests COMMAND AilaSafeTensorsTests)
+
+add_executable(AilaQwen35VisionWeightsTests tests/vision/Qwen35VisionWeightsTests.cpp)
+target_compile_definitions(AilaQwen35VisionWeightsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQwen35VisionWeightsTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+add_test(NAME AilaQwen35VisionWeightsTests COMMAND AilaQwen35VisionWeightsTests)
 
 # ============================================================
 # Post-build: Copy runtime DLL dependencies

@@ -15,20 +15,18 @@ int round_up_seq(int value, int granularity) {
 
 // Fused NF4 dequant + matmul for prefill (M > 1).
 // Computes C[M,N] = A[M,K] @ dequantize_nf4(B_packed[N,K]), B absmax per block.
-void packed_nf4_gemm_bf16(Context& ctx,
-                          const uint8_t* packed_ptr,
-                          const float* quant_map_ptr,
-                          const float* absmax_ptr,
-                          const bf16* input_ptr,
-                          bf16* output_ptr,
-                          int M, int N, int K,
-                          int blocksize) {
+template <int BM, int BN, int BK, int TM, int TN, int TILE_M, int TILE_N>
+void packed_nf4_gemm_bf16_tiled(Context& ctx,
+                                const uint8_t* packed_ptr,
+                                const float* quant_map_ptr,
+                                const float* absmax_ptr,
+                                const bf16* input_ptr,
+                                bf16* output_ptr,
+                                int M, int N, int K,
+                                int blocksize) {
     const int packed_bytes_per_row = K / 2;
     const int blocks_per_row = K / blocksize;
 
-    constexpr int BM = 128, BN = 128, BK = 128;
-    constexpr int TM = 8, TN = 8;  // per-thread output tile
-    constexpr int TILE_M = 16, TILE_N = 16;  // thread grid in work-group
     constexpr int WG_SIZE = TILE_M * TILE_N;
 
     const int grid_m = (M + BM - 1) / BM;
@@ -56,9 +54,6 @@ void packed_nf4_gemm_bf16(Context& ctx,
 
                 if (lid < 16) qmap[lid] = quant_map_ptr[lid];
 
-                const int rows_per_thr = BM / TILE_M;
-                const int cols_per_thr = BN / TILE_N;
-
                 // Thread-local accumulators for output tile elements
                 float C[TM][TN] = {};
 
@@ -76,8 +71,8 @@ void packed_nf4_gemm_bf16(Context& ctx,
                     // Cooperative load B NF4 bytes for [BK, BN] tile
                     const int b_bytes = a_cols * BN / 2;
                     for (int i = lid; i < b_bytes; i += WG_SIZE) {
-                        const int k_half = i % (a_cols / 2);
-                        const int bn_idx = i / (a_cols / 2);
+                        const int k_half = i / BN;
+                        const int bn_idx = i % BN;
                         const int src_n = n0 + bn_idx;
                         if (src_n < N) {
                             B_nf4_slm[i] = packed_ptr[src_n * packed_bytes_per_row + kb / 2 + k_half];
@@ -134,6 +129,25 @@ void packed_nf4_gemm_bf16(Context& ctx,
                 }
             });
     });
+}
+
+void packed_nf4_gemm_bf16(Context& ctx,
+                          const uint8_t* packed_ptr,
+                          const float* quant_map_ptr,
+                          const float* absmax_ptr,
+                          const bf16* input_ptr,
+                          bf16* output_ptr,
+                          int M, int N, int K,
+                          int blocksize) {
+    if (M <= 80 && (N <= 4096 || K >= 4096)) {
+        packed_nf4_gemm_bf16_tiled<80, 64, 128, 8, 4, 10, 16>(
+            ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
+            M, N, K, blocksize);
+        return;
+    }
+    packed_nf4_gemm_bf16_tiled<128, 64, 128, 8, 4, 16, 16>(
+        ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
+        M, N, K, blocksize);
 }
 
 // Fused gate+up gemv with SiLU activation for decode (seq_len == 1).

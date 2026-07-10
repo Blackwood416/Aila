@@ -30,6 +30,17 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 
 ---
 
+## KV Cache Quantization
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_KV_QUANT` | bool | `false` | Global KV cache quantization fallback for all model backends |
+| `AILA_ASR_KV_QUANT` | bool | inherits global | ASR-specific override; can enable or disable quantization independently |
+| `AILA_TTS_KV_QUANT` | bool | inherits global | TTS-specific override; applies to talker and predictor caches |
+| `AILA_VLM_KV_QUANT` | bool | inherits global | Qwen3.5 VLM-specific override for full and linear attention caches |
+
+---
+
 ## Bitsandbytes 4-bit (AILA_BNB4_*)
 
 | Variable | Type | Default | Description |
@@ -113,6 +124,8 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 |----------|------|---------|-------------|
 | `AILA_BF16_GEMV` | int | `1` | Enable native bf16 GEMV kernel for TTS decode (SG=16, vec8+FMA). Set to `0` to fall back to oneDNN matmul. Provides ~9x TTS throughput improvement |
 | `AILA_TTS_STREAM_BATCH` | int | `4` | Number of audio frames per streaming TTS callback chunk. Higher values reduce callback overhead at the cost of increased latency |
+| `AILA_TTS_MIMI_TRANSPOSE_CONV_VEC8` | bool | `true` | Reorder Mimi transpose-conv weights for contiguous vec8 input/weight loads |
+| `AILA_TTS_MIMI_DECODER_FUSED_CONV2_RESIDUAL` | bool | `true` | Fuse Mimi decoder kernel-1 conv2 output with residual accumulation |
 
 ## TTS Reference Embedding Cache (AILA_REF_*)
 
