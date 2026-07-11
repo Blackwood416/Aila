@@ -111,6 +111,10 @@ private:
     bool forward_one_impl(int token_id,
                           std::vector<float>* logits,
                           std::string* error);
+    bool prefill_micro_batch(const int* token_ids,
+                             int batch,
+                             std::vector<float>* final_logits,
+                             std::string* error);
 
     const CpuSafetensorsStore* store_ = nullptr;
     std::unique_ptr<CpuSafetensorsStore> owned_store_;

@@ -118,7 +118,7 @@ void prefill_batch_parser_accepts_supported_values(TestResults& results) {
     AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("1") == 1);
     AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("2") == 2);
     AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("4") == 4);
-    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("8") == 8);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("8") == 1);
     AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("3") == 1);
     AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("invalid") == 1);
 }

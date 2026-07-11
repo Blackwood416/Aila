@@ -290,7 +290,7 @@ bool CpuQ35BackgroundExtractor::generate_once(
     const bool profile_cpu =
         aila::env::read_flag("AILA_PROFILE_CPU_Q35_BACKGROUND", false);
     const int prefill_batch = parse_cpu_q35_prefill_batch(
-        aila::env::read_string("AILA_CPU_Q35_PREFILL_BATCH", "1"));
+        aila::env::read_string("AILA_CPU_Q35_PREFILL_BATCH", "4"));
     const auto prompt_t0 = std::chrono::high_resolution_clock::now();
     if (!model_->prefill(
             prompt_ids, prefill_batch, &abort_requested, &logits, &error)) {

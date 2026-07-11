@@ -226,7 +226,7 @@ void apply_rope_partial_one(std::vector<float>& q,
 int parse_cpu_q35_prefill_batch(std::string_view value) {
     try {
         const int parsed = std::stoi(std::string(value));
-        return parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8 ? parsed : 1;
+        return parsed == 1 || parsed == 2 || parsed == 4 ? parsed : 1;
     } catch (...) {
         return 1;
     }
@@ -600,14 +600,32 @@ bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
         set_error(error, "CPU Qwen3.5 prefill called before load");
         return false;
     }
-    if (micro_batch != 1) {
-        set_error(error, "CPU Qwen3.5 optimized prefill batch is not implemented");
+    if (micro_batch != 1 && micro_batch != 2 && micro_batch != 4) {
+        set_error(error, "CPU Qwen3.5 prefill batch must be 1, 2, or 4");
         return false;
     }
     if (token_ids.empty()) {
         set_error(error, "CPU Qwen3.5 prefill requires at least one token");
         return false;
     }
+    if (micro_batch > 1) {
+        for (size_t begin = 0; begin < token_ids.size(); begin += micro_batch) {
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 prefill aborted");
+                return false;
+            }
+            const int batch = static_cast<int>(std::min<size_t>(
+                static_cast<size_t>(micro_batch), token_ids.size() - begin));
+            std::vector<float>* batch_logits =
+                begin + static_cast<size_t>(batch) == token_ids.size() ? logits : nullptr;
+            if (!prefill_micro_batch(
+                    token_ids.data() + begin, batch, batch_logits, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     for (size_t i = 0; i < token_ids.size(); ++i) {
         if (abort_requested && abort_requested->load()) {
             set_error(error, "CPU Qwen3.5 prefill aborted");
@@ -622,6 +640,152 @@ bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
         }
     }
     return true;
+}
+
+bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
+                                             int batch,
+                                             std::vector<float>* final_logits,
+                                             std::string* error) {
+    if (batch <= 0 || batch > 4 || current_len_ + batch > max_seq_len_) {
+        set_error(error, "CPU Qwen3.5 prefill micro-batch exceeds model limits");
+        return false;
+    }
+    for (int item = 0; item < batch; ++item) {
+        if (token_ids[item] < 0 || token_ids[item] >= cfg_.vocab_size) {
+            set_error(error, "CPU Qwen3.5 token id is outside vocabulary");
+            return false;
+        }
+    }
+
+    const int base_len = current_len_;
+    const size_t hidden_batch_size =
+        static_cast<size_t>(batch) * static_cast<size_t>(hidden_size_);
+    std::vector<float> hidden_batch(hidden_batch_size, 0.0f);
+    std::vector<float> normed_batch(hidden_batch_size, 0.0f);
+    std::vector<float> mixer_batch(hidden_batch_size, 0.0f);
+    std::vector<float> mlp_batch(hidden_batch_size, 0.0f);
+
+    try {
+        for (int item = 0; item < batch; ++item) {
+            float* hidden_row = hidden_batch.data() +
+                                static_cast<size_t>(item) * hidden_size_;
+            float* normed_row = normed_batch.data() +
+                                static_cast<size_t>(item) * hidden_size_;
+            const uint16_t* embed_row = embedding_f16_.data() +
+                static_cast<size_t>(token_ids[item]) * hidden_size_;
+            cpu_f16_to_f32(embed_row, hidden_row, hidden_size_);
+            cpu_q35::q35_rms_norm(hidden_row,
+                                  layers_[0].input_ln_weight.data(),
+                                  hidden_size_,
+                                  cfg_.rms_norm_eps,
+                                  normed_row);
+        }
+
+        std::vector<float> mixer_input(static_cast<size_t>(hidden_size_));
+        std::vector<float> mixer_output;
+        std::vector<float> gate_batch(
+            static_cast<size_t>(batch) * static_cast<size_t>(ff_dim_));
+        std::vector<float> up_batch(gate_batch.size());
+        std::vector<float> activated_batch(gate_batch.size());
+
+        for (int layer_index = 0;
+             layer_index < cfg_.num_hidden_layers;
+             ++layer_index) {
+            CpuQ35Layer& layer = layers_[static_cast<size_t>(layer_index)];
+            CpuQ35LayerCache& cache =
+                layer_caches_[static_cast<size_t>(layer_index)];
+
+            for (int item = 0; item < batch; ++item) {
+                current_len_ = base_len + item;
+                const float* normed_row = normed_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                std::copy(normed_row,
+                          normed_row + hidden_size_,
+                          mixer_input.begin());
+                const bool ok = layer.is_linear
+                    ? run_linear_attention(layer, cache, mixer_input, mixer_output)
+                    : run_full_attention(layer, cache, mixer_input, mixer_output);
+                if (!ok) {
+                    set_error(error, "CPU Qwen3.5 batch prefill mixer failed");
+                    current_len_ = base_len;
+                    return false;
+                }
+                std::copy(mixer_output.begin(),
+                          mixer_output.end(),
+                          mixer_batch.begin() +
+                              static_cast<size_t>(item) * hidden_size_);
+            }
+
+            for (int item = 0; item < batch; ++item) {
+                float* hidden_row = hidden_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                float* normed_row = normed_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                const float* mixer_row = mixer_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                for (int h = 0; h < hidden_size_; ++h) {
+                    hidden_row[h] += mixer_row[h];
+                }
+                cpu_q35::q35_rms_norm(hidden_row,
+                                      layer.post_attn_ln_weight.data(),
+                                      hidden_size_,
+                                      cfg_.rms_norm_eps,
+                                      normed_row);
+            }
+
+            cpu_bnb4_matmul(layer.mlp_gate_proj,
+                            normed_batch.data(),
+                            batch,
+                            gate_batch.data());
+            cpu_bnb4_matmul(layer.mlp_up_proj,
+                            normed_batch.data(),
+                            batch,
+                            up_batch.data());
+            for (size_t i = 0; i < activated_batch.size(); ++i) {
+                activated_batch[i] =
+                    cpu_q35::silu(gate_batch[i]) * up_batch[i];
+            }
+            cpu_bnb4_matmul(layer.mlp_down_proj,
+                            activated_batch.data(),
+                            batch,
+                            mlp_batch.data());
+
+            const std::vector<float>& next_weight =
+                layer_index < cfg_.num_hidden_layers - 1
+                    ? layers_[static_cast<size_t>(layer_index + 1)].input_ln_weight
+                    : final_norm_weight_;
+            for (int item = 0; item < batch; ++item) {
+                float* hidden_row = hidden_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                float* normed_row = normed_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                const float* mlp_row = mlp_batch.data() +
+                    static_cast<size_t>(item) * hidden_size_;
+                for (int h = 0; h < hidden_size_; ++h) {
+                    hidden_row[h] += mlp_row[h];
+                }
+                cpu_q35::q35_rms_norm(hidden_row,
+                                      next_weight.data(),
+                                      hidden_size_,
+                                      cfg_.rms_norm_eps,
+                                      normed_row);
+            }
+        }
+
+        current_len_ = base_len + batch;
+        if (final_logits) {
+            std::vector<float> final_hidden(
+                normed_batch.end() - hidden_size_, normed_batch.end());
+            if (!compute_logits(final_hidden, *final_logits, error)) {
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        current_len_ = base_len;
+        set_error(error, std::string("CPU Qwen3.5 batch prefill failed: ") + e.what());
+        return false;
+    }
 }
 
 bool CpuQ35HybridModel::forward_one_impl(int token_id,
