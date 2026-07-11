@@ -9,6 +9,8 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <immintrin.h>
+#include <intrin.h>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -18,6 +20,12 @@
 #endif
 
 namespace {
+
+#if defined(__clang__) && (defined(_M_X64) || defined(__x86_64__))
+#define AILA_TARGET_F16C __attribute__((target("avx2,f16c,fma")))
+#else
+#define AILA_TARGET_F16C
+#endif
 
 void set_error(std::string* error, const std::string& message) {
     if (error) {
@@ -101,6 +109,67 @@ float effective_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) 
     return tensor_f32_at(*weight.nested_quant_map, qv) *
                tensor_f32_at(*weight.nested_absmax, nested_block) +
            weight.quant_state.nested_offset;
+}
+
+bool has_f16c() {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const bool supported = []() {
+        int regs[4] = {};
+        __cpuid(regs, 1);
+        const bool osxsave = (regs[2] & (1 << 27)) != 0;
+        const bool avx = (regs[2] & (1 << 28)) != 0;
+        const bool f16c = (regs[2] & (1 << 29)) != 0;
+        if (!osxsave || !avx || !f16c || (_xgetbv(0) & 0x6) != 0x6) {
+            return false;
+        }
+        __cpuidex(regs, 7, 0);
+        return (regs[1] & (1 << 5)) != 0;
+    }();
+    return supported;
+#else
+    return false;
+#endif
+}
+
+AILA_TARGET_F16C void f16_to_f32_f16c(
+    const uint16_t* input, float* output, int64_t count) {
+    int64_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const __m128i packed =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + i));
+        _mm256_storeu_ps(output + i, _mm256_cvtph_ps(packed));
+    }
+    for (; i < count; ++i) {
+        output[i] = cpu_f16_to_float(input[i]);
+    }
+}
+
+AILA_TARGET_F16C float f16_dot_f32_f16c(
+    const uint16_t* weights, const float* input, int64_t count) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const __m128i packed0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + i));
+        const __m128i packed1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + i + 8));
+        acc0 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(packed0), _mm256_loadu_ps(input + i), acc0);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(packed1), _mm256_loadu_ps(input + i + 8), acc1);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    const __m128 lo = _mm256_castps256_ps128(acc0);
+    const __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float result = _mm_cvtss_f32(sum);
+    for (; i < count; ++i) {
+        result += cpu_f16_to_float(weights[i]) * input[i];
+    }
+    return result;
 }
 
 void lower_worker_priority() {
@@ -294,24 +363,129 @@ void dequantize_dense_weight(CpuBnb4WeightRef& weight) {
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
 
-    weight.dense_weight.assign(static_cast<size_t>(total), 0.0f);
+    weight.dense_weight_f16.assign(static_cast<size_t>(total), 0);
     cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
         for (int64_t row = row_begin; row < row_end; ++row) {
-            float* dst = weight.dense_weight.data() + static_cast<size_t>(row) * cols;
+            uint16_t* dst =
+                weight.dense_weight_f16.data() + static_cast<size_t>(row) * cols;
             for (int64_t col = 0; col < cols; ++col) {
                 const int64_t flat = row * cols + col;
                 const uint8_t byte = packed[static_cast<size_t>(flat / 2)];
                 const uint8_t code =
                     (flat % 2 == 0) ? static_cast<uint8_t>((byte >> 4) & 0x0f)
                                     : static_cast<uint8_t>(byte & 0x0f);
-                dst[col] = quant_map[static_cast<size_t>(code)] *
-                           effective_absmax_for_block(weight, flat / blocksize);
+                dst[col] = cpu_float_to_f16(
+                    quant_map[static_cast<size_t>(code)] *
+                    effective_absmax_for_block(weight, flat / blocksize));
             }
         }
     });
 }
 
 }  // namespace
+
+uint16_t cpu_float_to_f16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    const uint32_t mantissa = bits & 0x7fffffu;
+
+    if (exponent == 0xffu) {
+        if (mantissa == 0) {
+            return static_cast<uint16_t>(sign | 0x7c00u);
+        }
+        return static_cast<uint16_t>(sign | 0x7e00u);
+    }
+
+    const int32_t half_exponent = static_cast<int32_t>(exponent) - 127 + 15;
+    if (half_exponent >= 31) {
+        return static_cast<uint16_t>(sign | 0x7c00u);
+    }
+    if (half_exponent <= 0) {
+        if (half_exponent < -10) {
+            return static_cast<uint16_t>(sign);
+        }
+        const uint32_t normalized = mantissa | 0x800000u;
+        const int shift = 14 - half_exponent;
+        uint32_t rounded = normalized >> shift;
+        const uint32_t remainder = normalized & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1u))) {
+            ++rounded;
+        }
+        return static_cast<uint16_t>(sign | rounded);
+    }
+
+    uint32_t rounded_mantissa = mantissa >> 13;
+    const uint32_t remainder = mantissa & 0x1fffu;
+    if (remainder > 0x1000u ||
+        (remainder == 0x1000u && (rounded_mantissa & 1u))) {
+        ++rounded_mantissa;
+        if (rounded_mantissa == 0x400u) {
+            rounded_mantissa = 0;
+            const uint32_t bumped_exponent = static_cast<uint32_t>(half_exponent + 1);
+            if (bumped_exponent >= 31) {
+                return static_cast<uint16_t>(sign | 0x7c00u);
+            }
+            return static_cast<uint16_t>(sign | (bumped_exponent << 10));
+        }
+    }
+    return static_cast<uint16_t>(
+        sign | (static_cast<uint32_t>(half_exponent) << 10) | rounded_mantissa);
+}
+
+float cpu_f16_to_float(uint16_t value) {
+    const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
+    int32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x03ffu;
+    uint32_t bits = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            exponent = 1;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x03ffu;
+            bits = sign |
+                   (static_cast<uint32_t>(exponent + 127 - 15) << 23) |
+                   (mantissa << 13);
+        }
+    } else if (exponent == 0x1fu) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign |
+               (static_cast<uint32_t>(exponent + 127 - 15) << 23) |
+               (mantissa << 13);
+    }
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void cpu_f16_to_f32(const uint16_t* input, float* output, int64_t count) {
+    if (has_f16c()) {
+        f16_to_f32_f16c(input, output, count);
+        return;
+    }
+    for (int64_t i = 0; i < count; ++i) {
+        output[i] = cpu_f16_to_float(input[i]);
+    }
+}
+
+float cpu_f16_dot_f32(const uint16_t* weights, const float* input, int64_t count) {
+    if (has_f16c()) {
+        return f16_dot_f32_f16c(weights, input, count);
+    }
+    float result = 0.0f;
+    for (int64_t i = 0; i < count; ++i) {
+        result += cpu_f16_to_float(weights[i]) * input[i];
+    }
+    return result;
+}
 
 bool CpuBnb4WeightRef::valid() const {
     return packed_weight != nullptr && absmax != nullptr && quant_map != nullptr &&
@@ -549,15 +723,13 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
 
-    if (!weight.dense_weight.empty()) {
+    if (!weight.dense_weight_f16.empty()) {
         cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
             for (int64_t row = row_begin; row < row_end; ++row) {
-                const float* w = weight.dense_weight.data() + static_cast<size_t>(row) * cols;
-                float sum = 0.0f;
-                for (int64_t col = 0; col < cols; ++col) {
-                    sum += input[static_cast<size_t>(col)] * w[col];
-                }
-                output[static_cast<size_t>(row)] = sum;
+                const uint16_t* w =
+                    weight.dense_weight_f16.data() + static_cast<size_t>(row) * cols;
+                output[static_cast<size_t>(row)] =
+                    cpu_f16_dot_f32(w, input, cols);
             }
         });
         return;

@@ -73,6 +73,7 @@ public:
                          std::string* error);
 
     bool loaded() const { return loaded_; }
+    size_t dense_weight_cache_bytes() const;
     void reset();
 
     bool consume_one(int token_id, std::string* error);
@@ -132,7 +133,7 @@ private:
     std::vector<CpuQ35Layer> layers_;
     std::vector<CpuQ35LayerCache> layer_caches_;
     std::vector<float> final_norm_weight_;
-    std::vector<float> embedding_f32_;
+    std::vector<uint16_t> embedding_f16_;
 
     std::vector<float> hidden_;
     std::vector<float> normed_;

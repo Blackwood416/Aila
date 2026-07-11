@@ -146,6 +146,29 @@ void nf4_matvec_matches_hand_computed_fixture(TestResults& results) {
     AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
 }
 
+void fp16_conversion_and_dot_match_reference(TestResults& results) {
+    const float values[6] = {0.0f, 1.0f, -2.0f, 0.33325f, 65504.0f, 0.00006103515625f};
+    uint16_t packed[6] = {};
+    float unpacked[6] = {};
+    for (int i = 0; i < 6; ++i) {
+        packed[i] = cpu_float_to_f16(values[i]);
+    }
+    cpu_f16_to_f32(packed, unpacked, 6);
+    for (int i = 0; i < 6; ++i) {
+        AILA_EXPECT_NEAR(results, unpacked[i], values[i], 0.0005f);
+    }
+    const float smallest_subnormal = 0.000000059604644775390625f;
+    AILA_EXPECT_EQ_I64(results, cpu_float_to_f16(smallest_subnormal), 1);
+    AILA_EXPECT_NEAR(results, cpu_f16_to_float(1), smallest_subnormal, 1e-12f);
+
+    const float input[6] = {1.0f, 2.0f, 3.0f, 4.0f, 0.001f, -2.0f};
+    float expected = 0.0f;
+    for (int i = 0; i < 6; ++i) {
+        expected += unpacked[i] * input[i];
+    }
+    AILA_EXPECT_NEAR(results, cpu_f16_dot_f32(packed, input, 6), expected, 0.01f);
+}
+
 void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
     constexpr int kRows = 256;
     constexpr int kCols = 256;
@@ -171,7 +194,8 @@ void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
     weight.quant_state.quant_type = "nf4";
     weight.quant_state.blocksize = 64;
     weight.quant_state.shape = {kRows, kCols};
-    weight.dense_weight.assign(static_cast<size_t>(kRows * kCols), 1.0f);
+    weight.dense_weight_f16.assign(
+        static_cast<size_t>(kRows * kCols), cpu_float_to_f16(1.0f));
 
     const std::vector<float> input(kCols, 1.0f);
     std::vector<float> output(kRows, 0.0f);
@@ -189,6 +213,7 @@ int main() {
     TestResults results;
     parse_quant_state_reads_nested_fields(results);
     nf4_matvec_matches_hand_computed_fixture(results);
+    fp16_conversion_and_dot_match_reference(results);
     repeated_parallel_dense_matvec_matches_reference(results);
 
     std::cout << "AilaCpuBnb4Tests: " << results.passed

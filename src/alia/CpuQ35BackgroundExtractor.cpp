@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace aila::alia {
 namespace {
 
@@ -46,6 +50,35 @@ int argmax_token(const std::vector<float>& logits, int vocab_size) {
     }
     return best;
 }
+
+class ScopedBackgroundThreadPriority {
+public:
+    ScopedBackgroundThreadPriority() {
+#ifdef _WIN32
+        thread_ = GetCurrentThread();
+        previous_priority_ = GetThreadPriority(thread_);
+        if (previous_priority_ != THREAD_PRIORITY_ERROR_RETURN) {
+            changed_ =
+                SetThreadPriority(thread_, THREAD_PRIORITY_BELOW_NORMAL) != FALSE;
+        }
+#endif
+    }
+
+    ~ScopedBackgroundThreadPriority() {
+#ifdef _WIN32
+        if (changed_) {
+            SetThreadPriority(thread_, previous_priority_);
+        }
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE thread_ = nullptr;
+    int previous_priority_ = THREAD_PRIORITY_NORMAL;
+    bool changed_ = false;
+#endif
+};
 
 }  // namespace
 
@@ -117,6 +150,11 @@ bool CpuQ35BackgroundExtractor::load(std::string* error_message) {
     spec_ = loaded_spec;
     tokenizer_ = std::move(tokenizer);
     model_ = std::move(model);
+    const double cache_mib =
+        static_cast<double>(model_->dense_weight_cache_bytes()) / (1024.0 * 1024.0);
+    std::cout << "[CpuQ35] FP16 dense weight cache: "
+              << static_cast<int>(cache_mib) << " MiB"
+              << " (F32 equivalent " << static_cast<int>(cache_mib * 2.0) << " MiB)\n";
     loaded_ = true;
     set_error(error_message, "");
     return true;
@@ -125,6 +163,7 @@ bool CpuQ35BackgroundExtractor::load(std::string* error_message) {
 BackgroundExtractionResult CpuQ35BackgroundExtractor::extract(
     const BackgroundExtractionRequest& request,
     const std::atomic_bool& abort_requested) {
+    ScopedBackgroundThreadPriority background_priority;
     BackgroundExtractionResult out;
     if (abort_requested.load()) {
         out.error = "native CPU Qwen3.5 background extraction aborted";

@@ -347,11 +347,11 @@ bool CpuQ35HybridModel::load_from_store(const CpuSafetensorsStore& store,
 
     const int64_t embed_numel =
         static_cast<int64_t>(cfg_.vocab_size) * static_cast<int64_t>(hidden_size_);
-    embedding_f32_.resize(static_cast<size_t>(embed_numel));
+    embedding_f16_.resize(static_cast<size_t>(embed_numel));
     try {
         for (int64_t i = 0; i < embed_numel; ++i) {
-            embedding_f32_[static_cast<size_t>(i)] =
-                tensor_value_as_float(*embed_weight_, i);
+            embedding_f16_[static_cast<size_t>(i)] =
+                cpu_float_to_f16(tensor_value_as_float(*embed_weight_, i));
         }
     } catch (const std::exception& e) {
         set_error(error, e.what());
@@ -376,6 +376,31 @@ void CpuQ35HybridModel::reset() {
     if (loaded_) {
         reset_runtime_state();
     }
+}
+
+size_t CpuQ35HybridModel::dense_weight_cache_bytes() const {
+    size_t bytes = embedding_f16_.size() * sizeof(uint16_t);
+    const auto add_weight = [&bytes](const CpuBnb4WeightRef& weight) {
+        bytes += weight.dense_weight_f16.size() * sizeof(uint16_t);
+    };
+    for (const CpuQ35Layer& layer : layers_) {
+        if (layer.is_linear) {
+            add_weight(layer.linear_qkv_proj);
+            add_weight(layer.linear_z_proj);
+            add_weight(layer.linear_a_proj);
+            add_weight(layer.linear_b_proj);
+            add_weight(layer.linear_o_proj);
+        } else {
+            add_weight(layer.full_q_proj);
+            add_weight(layer.full_k_proj);
+            add_weight(layer.full_v_proj);
+            add_weight(layer.full_o_proj);
+        }
+        add_weight(layer.mlp_gate_proj);
+        add_weight(layer.mlp_up_proj);
+        add_weight(layer.mlp_down_proj);
+    }
+    return bytes;
 }
 
 void CpuQ35HybridModel::clear_loaded() {
@@ -409,7 +434,7 @@ void CpuQ35HybridModel::clear_loaded() {
     layers_.clear();
     layer_caches_.clear();
     final_norm_weight_.clear();
-    embedding_f32_.clear();
+    embedding_f16_.clear();
     hidden_.clear();
     normed_.clear();
     mixer_out_.clear();
@@ -561,9 +586,9 @@ bool CpuQ35HybridModel::forward_one_impl(int token_id,
     }
 
     try {
-        const float* embed_row =
-            embedding_f32_.data() + static_cast<size_t>(token_id) * hidden_size_;
-        std::copy(embed_row, embed_row + hidden_size_, hidden_.begin());
+        const uint16_t* embed_row =
+            embedding_f16_.data() + static_cast<size_t>(token_id) * hidden_size_;
+        cpu_f16_to_f32(embed_row, hidden_.data(), hidden_size_);
         cpu_q35::q35_rms_norm(hidden_.data(),
                               layers_[0].input_ln_weight.data(),
                               hidden_size_,
@@ -874,13 +899,10 @@ bool CpuQ35HybridModel::compute_logits(const std::vector<float>& hidden,
 
     auto compute_rows = [&](int token_begin, int token_end) {
         for (int token = token_begin; token < token_end; ++token) {
-            const float* row =
-                embedding_f32_.data() + static_cast<size_t>(token) * hidden_size_;
-            float sum = 0.0f;
-            for (int h = 0; h < hidden_size_; ++h) {
-                sum += hidden[static_cast<size_t>(h)] * row[h];
-            }
-            logits[static_cast<size_t>(token)] = sum;
+            const uint16_t* row =
+                embedding_f16_.data() + static_cast<size_t>(token) * hidden_size_;
+            logits[static_cast<size_t>(token)] =
+                cpu_f16_dot_f32(row, hidden.data(), hidden_size_);
         }
     };
 

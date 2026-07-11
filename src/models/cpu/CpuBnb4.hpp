@@ -28,7 +28,7 @@ struct CpuBnb4WeightRef {
     const CpuTensorView* packed_quant_state = nullptr;
     CpuBnb4QuantState quant_state{};
     std::vector<float> decoded_absmax;
-    std::vector<float> dense_weight;
+    std::vector<uint16_t> dense_weight_f16;
 
     bool valid() const;
     int64_t out_features() const;
@@ -45,6 +45,11 @@ bool load_cpu_bnb4_weight_ref(const CpuSafetensorsStore& store,
                               const std::string& name,
                               CpuBnb4WeightRef& out,
                               std::string* error);
+
+uint16_t cpu_float_to_f16(float value);
+float cpu_f16_to_float(uint16_t value);
+void cpu_f16_to_f32(const uint16_t* input, float* output, int64_t count);
+float cpu_f16_dot_f32(const uint16_t* weights, const float* input, int64_t count);
 
 void cpu_q35_parallel_rows(int64_t rows,
                            int64_t cols,
