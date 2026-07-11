@@ -5,7 +5,15 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
+
+enum class CpuBnb4CacheMode {
+    Fp16,
+    PackedNf4,
+};
+
+CpuBnb4CacheMode parse_cpu_bnb4_cache_mode(std::string_view value);
 
 struct CpuBnb4QuantState {
     std::string quant_type;

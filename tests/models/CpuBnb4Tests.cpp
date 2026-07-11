@@ -111,6 +111,21 @@ void parse_quant_state_reads_nested_fields(TestResults& results) {
     AILA_EXPECT_NEAR(results, state.nested_offset, 0.5f, 0.0001f);
 }
 
+void cache_mode_parser_defaults_to_fp16(TestResults& results) {
+    AILA_EXPECT_EQ_I64(
+        results,
+        static_cast<int>(parse_cpu_bnb4_cache_mode("fp16")),
+        static_cast<int>(CpuBnb4CacheMode::Fp16));
+    AILA_EXPECT_EQ_I64(
+        results,
+        static_cast<int>(parse_cpu_bnb4_cache_mode("PACKED_NF4")),
+        static_cast<int>(CpuBnb4CacheMode::PackedNf4));
+    AILA_EXPECT_EQ_I64(
+        results,
+        static_cast<int>(parse_cpu_bnb4_cache_mode("invalid")),
+        static_cast<int>(CpuBnb4CacheMode::Fp16));
+}
+
 void nf4_matvec_matches_hand_computed_fixture(TestResults& results) {
     const std::vector<uint8_t> packed = {0x12, 0x34, 0x56, 0x78};
     const std::vector<float> absmax = {0.1f, 0.2f};
@@ -212,6 +227,7 @@ void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
 int main() {
     TestResults results;
     parse_quant_state_reads_nested_fields(results);
+    cache_mode_parser_defaults_to_fp16(results);
     nf4_matvec_matches_hand_computed_fixture(results);
     fp16_conversion_and_dot_match_reference(results);
     repeated_parallel_dense_matvec_matches_reference(results);

@@ -4,6 +4,7 @@
 #include "utils/EnvUtils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -383,6 +384,14 @@ void dequantize_dense_weight(CpuBnb4WeightRef& weight) {
 }
 
 }  // namespace
+
+CpuBnb4CacheMode parse_cpu_bnb4_cache_mode(std::string_view value) {
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return normalized == "packed_nf4" ? CpuBnb4CacheMode::PackedNf4
+                                      : CpuBnb4CacheMode::Fp16;
+}
 
 uint16_t cpu_float_to_f16(float value) {
     uint32_t bits = 0;
