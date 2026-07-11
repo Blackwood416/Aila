@@ -101,14 +101,16 @@ private:
                               const float* projected_qkv = nullptr,
                               const float* projected_z = nullptr,
                               const float* projected_a = nullptr,
-                              const float* projected_b = nullptr);
+                              const float* projected_b = nullptr,
+                              float* pre_o_output = nullptr);
     bool run_full_attention(CpuQ35Layer& layer,
                             CpuQ35LayerCache& cache,
                             const std::vector<float>& input,
                             std::vector<float>& output,
                             const float* projected_q = nullptr,
                             const float* projected_k = nullptr,
-                            const float* projected_v = nullptr);
+                            const float* projected_v = nullptr,
+                            float* pre_o_output = nullptr);
     bool run_mlp(CpuQ35Layer& layer,
                  const std::vector<float>& input,
                  std::vector<float>& output);
