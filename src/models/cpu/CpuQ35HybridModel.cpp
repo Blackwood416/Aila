@@ -1,4 +1,5 @@
 #include "models/cpu/CpuQ35HybridModel.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -105,8 +106,9 @@ bool load_float_vector(const CpuSafetensorsStore& store,
 bool load_bnb_ref(const CpuSafetensorsStore& store,
                   const std::string& name,
                   CpuBnb4WeightRef& out,
+                  CpuBnb4CacheMode cache_mode,
                   std::string* error) {
-    if (!load_cpu_bnb4_weight_ref(store, name, out, error)) {
+    if (!load_cpu_bnb4_weight_ref(store, name, out, error, cache_mode)) {
         return false;
     }
     return true;
@@ -310,6 +312,8 @@ bool CpuQ35HybridModel::load_from_store(const CpuSafetensorsStore& store,
     spec_ = spec;
     cfg_ = spec.qwen35_text;
     max_seq_len_ = max_seq_len;
+    weight_cache_mode_ = parse_cpu_bnb4_cache_mode(
+        aila::env::read_string("AILA_CPU_Q35_WEIGHT_CACHE", "fp16"));
 
     hidden_size_ = cfg_.hidden_size;
     ff_dim_ = cfg_.intermediate_size;
@@ -381,7 +385,7 @@ void CpuQ35HybridModel::reset() {
 size_t CpuQ35HybridModel::dense_weight_cache_bytes() const {
     size_t bytes = embedding_f16_.size() * sizeof(uint16_t);
     const auto add_weight = [&bytes](const CpuBnb4WeightRef& weight) {
-        bytes += weight.dense_weight_f16.size() * sizeof(uint16_t);
+        bytes += weight.cache_bytes();
     };
     for (const CpuQ35Layer& layer : layers_) {
         if (layer.is_linear) {
@@ -405,6 +409,7 @@ size_t CpuQ35HybridModel::dense_weight_cache_bytes() const {
 
 void CpuQ35HybridModel::clear_loaded() {
     loaded_ = false;
+    weight_cache_mode_ = CpuBnb4CacheMode::Fp16;
     store_ = nullptr;
     owned_store_.reset();
     embed_weight_ = nullptr;
@@ -485,15 +490,15 @@ bool CpuQ35HybridModel::load_layers(std::string* error) {
 
         if (is_linear) {
             if (!load_bnb_ref(*store_, prefix + "linear_attn.in_proj_qkv.weight",
-                              layer.linear_qkv_proj, error) ||
+                              layer.linear_qkv_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "linear_attn.in_proj_z.weight",
-                              layer.linear_z_proj, error) ||
+                              layer.linear_z_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "linear_attn.in_proj_a.weight",
-                              layer.linear_a_proj, error) ||
+                              layer.linear_a_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "linear_attn.in_proj_b.weight",
-                              layer.linear_b_proj, error) ||
+                              layer.linear_b_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "linear_attn.out_proj.weight",
-                              layer.linear_o_proj, error) ||
+                              layer.linear_o_proj, weight_cache_mode_, error) ||
                 !load_float_vector(*store_, prefix + "linear_attn.A_log",
                                    linear_kv_heads_, layer.linear_A_negexp, error) ||
                 !load_float_vector(*store_, prefix + "linear_attn.dt_bias",
@@ -521,13 +526,13 @@ bool CpuQ35HybridModel::load_layers(std::string* error) {
                 0.0f);
         } else {
             if (!load_bnb_ref(*store_, prefix + "self_attn.q_proj.weight",
-                              layer.full_q_proj, error) ||
+                              layer.full_q_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "self_attn.k_proj.weight",
-                              layer.full_k_proj, error) ||
+                              layer.full_k_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "self_attn.v_proj.weight",
-                              layer.full_v_proj, error) ||
+                              layer.full_v_proj, weight_cache_mode_, error) ||
                 !load_bnb_ref(*store_, prefix + "self_attn.o_proj.weight",
-                              layer.full_o_proj, error) ||
+                              layer.full_o_proj, weight_cache_mode_, error) ||
                 !load_float_vector(*store_, prefix + "self_attn.q_norm.weight",
                                    full_head_dim_, layer.q_norm_weight, error) ||
                 !load_float_vector(*store_, prefix + "self_attn.k_norm.weight",
@@ -543,11 +548,11 @@ bool CpuQ35HybridModel::load_layers(std::string* error) {
         }
 
         if (!load_bnb_ref(*store_, prefix + "mlp.gate_proj.weight",
-                          layer.mlp_gate_proj, error) ||
+                          layer.mlp_gate_proj, weight_cache_mode_, error) ||
             !load_bnb_ref(*store_, prefix + "mlp.up_proj.weight",
-                          layer.mlp_up_proj, error) ||
+                          layer.mlp_up_proj, weight_cache_mode_, error) ||
             !load_bnb_ref(*store_, prefix + "mlp.down_proj.weight",
-                          layer.mlp_down_proj, error)) {
+                          layer.mlp_down_proj, weight_cache_mode_, error)) {
             return false;
         }
     }

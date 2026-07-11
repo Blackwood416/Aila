@@ -109,6 +109,7 @@ private:
     int max_seq_len_ = 0;
     int current_len_ = 0;
     bool loaded_ = false;
+    CpuBnb4CacheMode weight_cache_mode_ = CpuBnb4CacheMode::Fp16;
 
     int hidden_size_ = 0;
     int ff_dim_ = 0;

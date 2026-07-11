@@ -356,13 +356,28 @@ void cpu_q35_parallel_rows(
 
 namespace {
 
-void dequantize_dense_weight(CpuBnb4WeightRef& weight) {
+void build_dense_weight_cache(CpuBnb4WeightRef& weight) {
     const int64_t rows = weight.out_features();
     const int64_t cols = weight.in_features();
     const int64_t total = weight.logical_numel();
     const uint8_t* packed = weight.packed_weight->u8_data();
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
+
+    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4) {
+        weight.packed_nf4_codes.assign(static_cast<size_t>((total + 1) / 2), 0);
+        weight.packed_nf4_absmax = weight.decoded_absmax;
+        for (int64_t flat = 0; flat < total; flat += 2) {
+            const uint8_t source = packed[static_cast<size_t>(flat / 2)];
+            const uint8_t first = static_cast<uint8_t>((source >> 4) & 0x0f);
+            const uint8_t second = static_cast<uint8_t>(source & 0x0f);
+            weight.packed_nf4_codes[static_cast<size_t>(flat / 2)] =
+                static_cast<uint8_t>(first | (second << 4));
+        }
+        weight.decoded_absmax.clear();
+        weight.decoded_absmax.shrink_to_fit();
+        return;
+    }
 
     weight.dense_weight_f16.assign(static_cast<size_t>(total), 0);
     cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
@@ -517,6 +532,12 @@ int64_t CpuBnb4WeightRef::packed_num_bytes() const {
     return tensor_numel(packed_weight);
 }
 
+size_t CpuBnb4WeightRef::cache_bytes() const {
+    return dense_weight_f16.size() * sizeof(uint16_t) +
+           packed_nf4_codes.size() * sizeof(uint8_t) +
+           packed_nf4_absmax.size() * sizeof(float);
+}
+
 bool parse_cpu_bnb4_quant_state_json(const std::string& json_text,
                                      CpuBnb4QuantState& out,
                                      std::string* error) {
@@ -582,9 +603,11 @@ bool parse_cpu_bnb4_quant_state_json(const std::string& json_text,
 bool load_cpu_bnb4_weight_ref(const CpuSafetensorsStore& store,
                               const std::string& name,
                               CpuBnb4WeightRef& out,
-                              std::string* error) {
+                              std::string* error,
+                              CpuBnb4CacheMode cache_mode) {
     out = {};
     out.name = name;
+    out.cache_mode = cache_mode;
     if (error) {
         error->clear();
     }
@@ -710,9 +733,34 @@ bool load_cpu_bnb4_weight_ref(const CpuSafetensorsStore& store,
         out.decoded_absmax[static_cast<size_t>(block)] =
             effective_absmax_for_block(out, block);
     }
-    dequantize_dense_weight(out);
+    build_dense_weight_cache(out);
 
     return true;
+}
+
+void cpu_nf4_matvec_scalar(const CpuBnb4WeightRef& weight,
+                           const float* quant_map,
+                           const float* input,
+                           float* output) {
+    const int64_t rows = weight.out_features();
+    const int64_t cols = weight.in_features();
+    const int blocksize = weight.quant_state.blocksize;
+    for (int64_t row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+        const int64_t row_offset = row * cols;
+        for (int64_t col = 0; col < cols; ++col) {
+            const int64_t flat = row_offset + col;
+            const uint8_t packed =
+                weight.packed_nf4_codes[static_cast<size_t>(flat / 2)];
+            const uint8_t code = (flat & 1)
+                                     ? static_cast<uint8_t>((packed >> 4) & 0x0f)
+                                     : static_cast<uint8_t>(packed & 0x0f);
+            const float scale = weight.packed_nf4_absmax[
+                static_cast<size_t>(flat / blocksize)];
+            sum += quant_map[static_cast<size_t>(code)] * scale * input[col];
+        }
+        output[row] = sum;
+    }
 }
 
 void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
@@ -731,6 +779,11 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
     const uint8_t* packed = weight.packed_weight->u8_data();
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
+
+    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4) {
+        cpu_nf4_matvec_scalar(weight, quant_map, input, output);
+        return;
+    }
 
     if (!weight.dense_weight_f16.empty()) {
         cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {

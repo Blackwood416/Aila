@@ -161,6 +161,34 @@ void nf4_matvec_matches_hand_computed_fixture(TestResults& results) {
     AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
 }
 
+void packed_nf4_cache_matches_hand_computed_fixture(TestResults& results) {
+    const std::vector<uint8_t> packed = {0x21, 0x43, 0x65, 0x87};
+    const std::vector<float> absmax = {0.1f, 0.2f};
+    std::vector<float> quant_map(16);
+    for (int i = 0; i < 16; ++i) {
+        quant_map[static_cast<size_t>(i)] = static_cast<float>(i);
+    }
+
+    CpuBnb4WeightRef weight;
+    weight.cache_mode = CpuBnb4CacheMode::PackedNf4;
+    weight.quant_state.blocksize = 4;
+    weight.quant_state.shape = {2, 4};
+    weight.packed_nf4_codes = packed;
+    weight.packed_nf4_absmax = absmax;
+    weight.quant_map = nullptr;
+
+    AILA_EXPECT_TRUE(results, weight.dense_weight_f16.empty());
+    AILA_EXPECT_EQ_I64(results, weight.packed_nf4_codes.size(), 4);
+    AILA_EXPECT_EQ_I64(results, weight.packed_nf4_absmax.size(), 2);
+    AILA_EXPECT_EQ_I64(results, weight.cache_bytes(), 12);
+
+    const float input[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float output[2] = {};
+    cpu_nf4_matvec_scalar(weight, quant_map.data(), input, output);
+    AILA_EXPECT_NEAR(results, output[0], (1.0f + 2.0f + 3.0f + 4.0f) * 0.1f, 0.0001f);
+    AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
+}
+
 void fp16_conversion_and_dot_match_reference(TestResults& results) {
     const float values[6] = {0.0f, 1.0f, -2.0f, 0.33325f, 65504.0f, 0.00006103515625f};
     uint16_t packed[6] = {};
@@ -229,6 +257,7 @@ int main() {
     parse_quant_state_reads_nested_fields(results);
     cache_mode_parser_defaults_to_fp16(results);
     nf4_matvec_matches_hand_computed_fixture(results);
+    packed_nf4_cache_matches_hand_computed_fixture(results);
     fp16_conversion_and_dot_match_reference(results);
     repeated_parallel_dense_matvec_matches_reference(results);
 
