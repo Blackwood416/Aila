@@ -695,6 +695,59 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
             CpuQ35LayerCache& cache =
                 layer_caches_[static_cast<size_t>(layer_index)];
 
+            std::vector<float> projected_qkv;
+            std::vector<float> projected_z;
+            std::vector<float> projected_a;
+            std::vector<float> projected_b;
+            std::vector<float> projected_q;
+            std::vector<float> projected_k;
+            std::vector<float> projected_v;
+            if (layer.is_linear) {
+                projected_qkv.resize(
+                    static_cast<size_t>(batch) * linear_qkv_dim_);
+                projected_z.resize(
+                    static_cast<size_t>(batch) * linear_z_dim_);
+                projected_a.resize(
+                    static_cast<size_t>(batch) * linear_kv_heads_);
+                projected_b.resize(
+                    static_cast<size_t>(batch) * linear_kv_heads_);
+                cpu_bnb4_matmul(layer.linear_qkv_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_qkv.data());
+                cpu_bnb4_matmul(layer.linear_z_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_z.data());
+                cpu_bnb4_matmul(layer.linear_a_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_a.data());
+                cpu_bnb4_matmul(layer.linear_b_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_b.data());
+            } else {
+                projected_q.resize(
+                    static_cast<size_t>(batch) * full_q_proj_dim_);
+                projected_k.resize(
+                    static_cast<size_t>(batch) * full_kv_dim_);
+                projected_v.resize(
+                    static_cast<size_t>(batch) * full_kv_dim_);
+                cpu_bnb4_matmul(layer.full_q_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_q.data());
+                cpu_bnb4_matmul(layer.full_k_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_k.data());
+                cpu_bnb4_matmul(layer.full_v_proj,
+                                normed_batch.data(),
+                                batch,
+                                projected_v.data());
+            }
+
             for (int item = 0; item < batch; ++item) {
                 current_len_ = base_len + item;
                 const float* normed_row = normed_batch.data() +
@@ -703,8 +756,30 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
                           normed_row + hidden_size_,
                           mixer_input.begin());
                 const bool ok = layer.is_linear
-                    ? run_linear_attention(layer, cache, mixer_input, mixer_output)
-                    : run_full_attention(layer, cache, mixer_input, mixer_output);
+                    ? run_linear_attention(
+                          layer,
+                          cache,
+                          mixer_input,
+                          mixer_output,
+                          projected_qkv.data() +
+                              static_cast<size_t>(item) * linear_qkv_dim_,
+                          projected_z.data() +
+                              static_cast<size_t>(item) * linear_z_dim_,
+                          projected_a.data() +
+                              static_cast<size_t>(item) * linear_kv_heads_,
+                          projected_b.data() +
+                              static_cast<size_t>(item) * linear_kv_heads_)
+                    : run_full_attention(
+                          layer,
+                          cache,
+                          mixer_input,
+                          mixer_output,
+                          projected_q.data() +
+                              static_cast<size_t>(item) * full_q_proj_dim_,
+                          projected_k.data() +
+                              static_cast<size_t>(item) * full_kv_dim_,
+                          projected_v.data() +
+                              static_cast<size_t>(item) * full_kv_dim_);
                 if (!ok) {
                     set_error(error, "CPU Qwen3.5 batch prefill mixer failed");
                     current_len_ = base_len;
@@ -864,16 +939,27 @@ bool CpuQ35HybridModel::forward_one_impl(int token_id,
 bool CpuQ35HybridModel::run_linear_attention(CpuQ35Layer& layer,
                                              CpuQ35LayerCache& cache,
                                              const std::vector<float>& input,
-                                             std::vector<float>& output) {
+                                             std::vector<float>& output,
+                                             const float* projected_qkv,
+                                             const float* projected_z,
+                                             const float* projected_a,
+                                             const float* projected_b) {
     scratch_a_.assign(static_cast<size_t>(linear_qkv_dim_), 0.0f);
     scratch_b_.assign(static_cast<size_t>(linear_z_dim_), 0.0f);
     scratch_c_.assign(static_cast<size_t>(linear_kv_heads_), 0.0f);
     scratch_d_.assign(static_cast<size_t>(linear_kv_heads_), 0.0f);
 
-    cpu_bnb4_matvec(layer.linear_qkv_proj, input.data(), scratch_a_.data());
-    cpu_bnb4_matvec(layer.linear_z_proj, input.data(), scratch_b_.data());
-    cpu_bnb4_matvec(layer.linear_a_proj, input.data(), scratch_c_.data());
-    cpu_bnb4_matvec(layer.linear_b_proj, input.data(), scratch_d_.data());
+    if (projected_qkv && projected_z && projected_a && projected_b) {
+        std::copy(projected_qkv, projected_qkv + linear_qkv_dim_, scratch_a_.begin());
+        std::copy(projected_z, projected_z + linear_z_dim_, scratch_b_.begin());
+        std::copy(projected_a, projected_a + linear_kv_heads_, scratch_c_.begin());
+        std::copy(projected_b, projected_b + linear_kv_heads_, scratch_d_.begin());
+    } else {
+        cpu_bnb4_matvec(layer.linear_qkv_proj, input.data(), scratch_a_.data());
+        cpu_bnb4_matvec(layer.linear_z_proj, input.data(), scratch_b_.data());
+        cpu_bnb4_matvec(layer.linear_a_proj, input.data(), scratch_c_.data());
+        cpu_bnb4_matvec(layer.linear_b_proj, input.data(), scratch_d_.data());
+    }
 
     std::vector<float>& conv_out = scratch_e_;
     conv_out.assign(static_cast<size_t>(linear_qkv_dim_), 0.0f);
@@ -995,16 +1081,25 @@ bool CpuQ35HybridModel::run_linear_attention(CpuQ35Layer& layer,
 bool CpuQ35HybridModel::run_full_attention(CpuQ35Layer& layer,
                                            CpuQ35LayerCache& cache,
                                            const std::vector<float>& input,
-                                           std::vector<float>& output) {
+                                           std::vector<float>& output,
+                                           const float* projected_q,
+                                           const float* projected_k,
+                                           const float* projected_v) {
     std::vector<float> q_proj(static_cast<size_t>(full_q_proj_dim_), 0.0f);
     std::vector<float> q(static_cast<size_t>(full_q_dim_), 0.0f);
     std::vector<float> gate(static_cast<size_t>(full_q_dim_), 0.0f);
     std::vector<float> k(static_cast<size_t>(full_kv_dim_), 0.0f);
     std::vector<float> v(static_cast<size_t>(full_kv_dim_), 0.0f);
 
-    cpu_bnb4_matvec(layer.full_q_proj, input.data(), q_proj.data());
-    cpu_bnb4_matvec(layer.full_k_proj, input.data(), k.data());
-    cpu_bnb4_matvec(layer.full_v_proj, input.data(), v.data());
+    if (projected_q && projected_k && projected_v) {
+        std::copy(projected_q, projected_q + full_q_proj_dim_, q_proj.begin());
+        std::copy(projected_k, projected_k + full_kv_dim_, k.begin());
+        std::copy(projected_v, projected_v + full_kv_dim_, v.begin());
+    } else {
+        cpu_bnb4_matvec(layer.full_q_proj, input.data(), q_proj.data());
+        cpu_bnb4_matvec(layer.full_k_proj, input.data(), k.data());
+        cpu_bnb4_matvec(layer.full_v_proj, input.data(), v.data());
+    }
 
     if (cfg_.attn_output_gate) {
         std::memcpy(q.data(), q_proj.data(), static_cast<size_t>(full_q_dim_) * sizeof(float));
