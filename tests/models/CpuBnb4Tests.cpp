@@ -163,6 +163,20 @@ void nf4_matvec_matches_hand_computed_fixture(TestResults& results) {
 
     AILA_EXPECT_NEAR(results, output[0], (1.0f + 2.0f + 3.0f + 4.0f) * 0.1f, 0.0001f);
     AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
+
+    const float batch_input[16] = {
+        1, 1, 1, 1,
+        2, 2, 2, 2,
+        -1, -1, -1, -1,
+        0.5f, 0.5f, 0.5f, 0.5f};
+    float batch_output[8] = {};
+    cpu_bnb4_matmul(weight, batch_input, 4, batch_output);
+    for (int batch = 0; batch < 4; ++batch) {
+        float reference[2] = {};
+        cpu_bnb4_matvec(weight, batch_input + batch * 4, reference);
+        AILA_EXPECT_NEAR(results, batch_output[batch * 2], reference[0], 0.0001f);
+        AILA_EXPECT_NEAR(results, batch_output[batch * 2 + 1], reference[1], 0.0001f);
+    }
 }
 
 void packed_nf4_cache_matches_hand_computed_fixture(TestResults& results) {

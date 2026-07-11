@@ -955,3 +955,19 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
 
     cpu_q35_parallel_rows(rows, cols, 64, compute_rows);
 }
+
+void cpu_bnb4_matmul(const CpuBnb4WeightRef& weight,
+                     const float* input,
+                     int64_t batch,
+                     float* output) {
+    if (batch <= 0) {
+        return;
+    }
+    const int64_t cols = weight.in_features();
+    const int64_t rows = weight.out_features();
+    for (int64_t item = 0; item < batch; ++item) {
+        cpu_bnb4_matvec(weight,
+                        input + item * cols,
+                        output + item * rows);
+    }
+}
