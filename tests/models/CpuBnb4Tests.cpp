@@ -187,6 +187,11 @@ void packed_nf4_cache_matches_hand_computed_fixture(TestResults& results) {
     cpu_nf4_matvec_scalar(weight, quant_map.data(), input, output);
     AILA_EXPECT_NEAR(results, output[0], (1.0f + 2.0f + 3.0f + 4.0f) * 0.1f, 0.0001f);
     AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
+
+    float dispatched[2] = {};
+    cpu_nf4_matvec(weight, quant_map.data(), input, dispatched);
+    AILA_EXPECT_NEAR(results, dispatched[0], output[0], 0.0002f);
+    AILA_EXPECT_NEAR(results, dispatched[1], output[1], 0.0002f);
 }
 
 void fp16_conversion_and_dot_match_reference(TestResults& results) {

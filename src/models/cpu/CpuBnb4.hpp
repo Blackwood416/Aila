@@ -67,6 +67,10 @@ void cpu_nf4_matvec_scalar(const CpuBnb4WeightRef& weight,
                            const float* quant_map,
                            const float* input,
                            float* output);
+void cpu_nf4_matvec(const CpuBnb4WeightRef& weight,
+                    const float* quant_map,
+                    const float* input,
+                    float* output);
 
 void cpu_q35_parallel_rows(int64_t rows,
                            int64_t cols,

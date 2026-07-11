@@ -173,6 +173,56 @@ AILA_TARGET_F16C float f16_dot_f32_f16c(
     return result;
 }
 
+AILA_TARGET_F16C float nf4_row_dot_avx2(const CpuBnb4WeightRef& weight,
+                                        const float* quant_map,
+                                        const float* input,
+                                        int64_t row) {
+    const int64_t cols = weight.in_features();
+    const int64_t row_offset = row * cols;
+    const int blocksize = weight.quant_state.blocksize;
+    __m256 acc = _mm256_setzero_ps();
+    int64_t col = 0;
+    alignas(32) int32_t indices[8];
+    alignas(32) float scales[8];
+    for (; col + 8 <= cols; col += 8) {
+        for (int lane = 0; lane < 8; ++lane) {
+            const int64_t flat = row_offset + col + lane;
+            const uint8_t packed =
+                weight.packed_nf4_codes[static_cast<size_t>(flat / 2)];
+            indices[lane] = (flat & 1) ? ((packed >> 4) & 0x0f)
+                                       : (packed & 0x0f);
+            scales[lane] = weight.packed_nf4_absmax[
+                static_cast<size_t>(flat / blocksize)];
+        }
+        const __m256 values = _mm256_mul_ps(
+            _mm256_i32gather_ps(quant_map,
+                                _mm256_load_si256(
+                                    reinterpret_cast<const __m256i*>(indices)),
+                                4),
+            _mm256_load_ps(scales));
+        acc = _mm256_fmadd_ps(values, _mm256_loadu_ps(input + col), acc);
+    }
+
+    const __m128 lo = _mm256_castps256_ps128(acc);
+    const __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    float sum = _mm_cvtss_f32(sum4);
+    for (; col < cols; ++col) {
+        const int64_t flat = row_offset + col;
+        const uint8_t packed =
+            weight.packed_nf4_codes[static_cast<size_t>(flat / 2)];
+        const uint8_t code = (flat & 1)
+                                 ? static_cast<uint8_t>((packed >> 4) & 0x0f)
+                                 : static_cast<uint8_t>(packed & 0x0f);
+        sum += quant_map[static_cast<size_t>(code)] *
+               weight.packed_nf4_absmax[static_cast<size_t>(flat / blocksize)] *
+               input[col];
+    }
+    return sum;
+}
+
 void lower_worker_priority() {
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -763,6 +813,23 @@ void cpu_nf4_matvec_scalar(const CpuBnb4WeightRef& weight,
     }
 }
 
+void cpu_nf4_matvec(const CpuBnb4WeightRef& weight,
+                    const float* quant_map,
+                    const float* input,
+                    float* output) {
+    if (!has_f16c()) {
+        cpu_nf4_matvec_scalar(weight, quant_map, input, output);
+        return;
+    }
+    const int64_t rows = weight.out_features();
+    const int64_t cols = weight.in_features();
+    cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
+        for (int64_t row = row_begin; row < row_end; ++row) {
+            output[row] = nf4_row_dot_avx2(weight, quant_map, input, row);
+        }
+    });
+}
+
 void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
                      const float* input,
                      float* output) {
@@ -781,7 +848,7 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
     const int blocksize = weight.quant_state.blocksize;
 
     if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4) {
-        cpu_nf4_matvec_scalar(weight, quant_map, input, output);
+        cpu_nf4_matvec(weight, quant_map, input, output);
         return;
     }
 
