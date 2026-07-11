@@ -250,7 +250,7 @@ private:
 };
 
 int configured_cpu_threads() {
-    const int env_threads = aila::env::read_int_raw("AILA_CPU_Q35_THREADS", 2);
+    const int env_threads = aila::env::read_int_raw("AILA_CPU_Q35_THREADS", 4);
     return static_cast<int>(std::max(
         1u,
         static_cast<unsigned>(env_threads > 0
