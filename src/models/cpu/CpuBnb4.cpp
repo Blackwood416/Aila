@@ -897,6 +897,92 @@ void cpu_nf4_matvec(const CpuBnb4WeightRef& weight,
     });
 }
 
+AILA_TARGET_F16C void nf4_i8_matmul_rows_avx2(
+    const CpuBnb4WeightRef& weight,
+    const float* input,
+    int64_t batch,
+    int64_t row_begin,
+    int64_t row_end,
+    float* output) {
+    const int64_t rows = weight.out_features();
+    const int64_t cols = weight.in_features();
+    const __m128i table_i8 = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(weight.packed_nf4_lut_i8.data()));
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    for (int64_t row = row_begin; row < row_end; ++row) {
+        __m256 acc[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps()};
+        const int64_t row_offset = row * cols;
+        for (int64_t block_col = 0; block_col < cols; block_col += 64) {
+            const float block_scale =
+                weight.packed_nf4_absmax[static_cast<size_t>(
+                    (row_offset + block_col) / 64)] *
+                weight.packed_nf4_lut_scale;
+            const __m256 scale = _mm256_set1_ps(block_scale);
+            for (int64_t lane_col = 0; lane_col < 64; lane_col += 32) {
+                const int64_t flat = row_offset + block_col + lane_col;
+                const __m128i bytes = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(
+                        weight.packed_nf4_codes.data() + flat / 2));
+                const __m128i low = _mm_and_si128(bytes, nibble_mask);
+                const __m128i high =
+                    _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+                const __m128i codes0 = _mm_unpacklo_epi8(low, high);
+                const __m128i codes1 = _mm_unpackhi_epi8(low, high);
+                const __m128i groups[4] = {
+                    codes0, _mm_srli_si128(codes0, 8),
+                    codes1, _mm_srli_si128(codes1, 8)};
+                for (int group = 0; group < 4; ++group) {
+                    const __m128i quantized =
+                        _mm_shuffle_epi8(table_i8, groups[group]);
+                    const __m256 values = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(quantized)),
+                        scale);
+                    const int64_t col = block_col + lane_col + group * 8;
+                    for (int64_t item = 0; item < batch; ++item) {
+                        acc[item] = _mm256_fmadd_ps(
+                            values,
+                            _mm256_loadu_ps(input + item * cols + col),
+                            acc[item]);
+                    }
+                }
+            }
+        }
+        for (int64_t item = 0; item < batch; ++item) {
+            const __m128 lo = _mm256_castps256_ps128(acc[item]);
+            const __m128 hi = _mm256_extractf128_ps(acc[item], 1);
+            __m128 sum = _mm_add_ps(lo, hi);
+            sum = _mm_hadd_ps(sum, sum);
+            sum = _mm_hadd_ps(sum, sum);
+            output[item * rows + row] = _mm_cvtss_f32(sum);
+        }
+    }
+}
+
+void cpu_nf4_matmul(const CpuBnb4WeightRef& weight,
+                    const float* quant_map,
+                    const float* input,
+                    int64_t batch,
+                    float* output) {
+    const int64_t rows = weight.out_features();
+    const int64_t cols = weight.in_features();
+    if (has_f16c() && weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8 &&
+        (batch == 2 || batch == 4) && weight.quant_state.blocksize == 64 &&
+        (cols % 64) == 0) {
+        cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t begin, int64_t end) {
+            nf4_i8_matmul_rows_avx2(weight, input, batch, begin, end, output);
+        });
+        return;
+    }
+    for (int64_t item = 0; item < batch; ++item) {
+        cpu_nf4_matvec(weight,
+                       quant_map,
+                       input + item * cols,
+                       output + item * rows);
+    }
+}
+
 void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
                      const float* input,
                      float* output) {
@@ -965,6 +1051,12 @@ void cpu_bnb4_matmul(const CpuBnb4WeightRef& weight,
     }
     const int64_t cols = weight.in_features();
     const int64_t rows = weight.out_features();
+    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4 ||
+        weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8) {
+        cpu_nf4_matmul(
+            weight, weight.quant_map->f32_data(), input, batch, output);
+        return;
+    }
     for (int64_t item = 0; item < batch; ++item) {
         cpu_bnb4_matvec(weight,
                         input + item * cols,

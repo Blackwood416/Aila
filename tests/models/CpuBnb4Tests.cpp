@@ -221,6 +221,20 @@ void packed_nf4_cache_matches_hand_computed_fixture(TestResults& results) {
     cpu_nf4_matvec(weight, quant_map.data(), input, i8_output);
     AILA_EXPECT_NEAR(results, i8_output[0], output[0], 0.05f);
     AILA_EXPECT_NEAR(results, i8_output[1], output[1], 0.05f);
+
+    const float batch_input[16] = {
+        1, 1, 1, 1,
+        2, 2, 2, 2,
+        -1, -1, -1, -1,
+        0.5f, 0.5f, 0.5f, 0.5f};
+    float batch_output[8] = {};
+    cpu_nf4_matmul(weight, quant_map.data(), batch_input, 4, batch_output);
+    for (int batch = 0; batch < 4; ++batch) {
+        float reference[2] = {};
+        cpu_nf4_matvec(weight, quant_map.data(), batch_input + batch * 4, reference);
+        AILA_EXPECT_NEAR(results, batch_output[batch * 2], reference[0], 0.0002f);
+        AILA_EXPECT_NEAR(results, batch_output[batch * 2 + 1], reference[1], 0.0002f);
+    }
 }
 
 void fp16_conversion_and_dot_match_reference(TestResults& results) {
@@ -283,6 +297,7 @@ void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
         AILA_EXPECT_NEAR(results, value, static_cast<float>(kCols), 0.0001f);
     }
 }
+
 
 
 }  // namespace
