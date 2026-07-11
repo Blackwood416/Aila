@@ -289,28 +289,21 @@ bool CpuQ35BackgroundExtractor::generate_once(
     std::vector<float> logits;
     const bool profile_cpu =
         aila::env::read_flag("AILA_PROFILE_CPU_Q35_BACKGROUND", false);
+    const int prefill_batch = parse_cpu_q35_prefill_batch(
+        aila::env::read_string("AILA_CPU_Q35_PREFILL_BATCH", "1"));
     const auto prompt_t0 = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < prompt_ids.size(); ++i) {
-        if (abort_requested.load()) {
-            error = "native CPU Qwen3.5 background extraction aborted";
-            return false;
-        }
-        const int token_id = prompt_ids[i];
-        const bool is_last_prompt_token = (i + 1 == prompt_ids.size());
-        const bool ok = is_last_prompt_token
-            ? model_->forward_one(token_id, logits, &error)
-            : model_->consume_one(token_id, &error);
-        if (!ok) {
-            return false;
-        }
-        if (profile_cpu && (((i + 1) % 16) == 0 || i + 1 == prompt_ids.size())) {
-            const auto now = std::chrono::high_resolution_clock::now();
-            const double ms =
-                std::chrono::duration<double, std::milli>(now - prompt_t0).count();
-            std::cout << "cpu_background_prompt_tokens=" << (i + 1)
-                      << " cpu_background_prompt_ms=" << static_cast<int>(ms)
-                      << "\n";
-        }
+    if (!model_->prefill(
+            prompt_ids, prefill_batch, &abort_requested, &logits, &error)) {
+        return false;
+    }
+    if (profile_cpu) {
+        const auto now = std::chrono::high_resolution_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - prompt_t0).count();
+        std::cout << "cpu_background_prompt_tokens=" << prompt_ids.size()
+                  << " cpu_background_prefill_batch=" << prefill_batch
+                  << " cpu_background_prompt_ms=" << static_cast<int>(ms)
+                  << "\n";
     }
 
     std::vector<int> generated_ids;

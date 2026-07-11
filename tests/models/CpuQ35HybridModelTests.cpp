@@ -1,6 +1,7 @@
 #include "models/cpu/CpuQ35HybridModel.hpp"
 
 #include <cmath>
+#include <atomic>
 #include <iostream>
 #include <string>
 
@@ -101,6 +102,27 @@ void sigmoid_gate_matches_reference(TestResults& results) {
     AILA_EXPECT_TRUE(results, std::abs(output[0] - 1.5f) < 0.0001f);
 }
 
+void prefill_before_load_reports_error(TestResults& results) {
+    CpuQ35HybridModel model;
+    const std::vector<int> tokens = {1, 2};
+    std::vector<float> logits;
+    std::atomic_bool abort_requested{false};
+    std::string error;
+    const bool ok = model.prefill(
+        tokens, 1, &abort_requested, &logits, &error);
+    AILA_EXPECT_TRUE(results, !ok);
+    AILA_EXPECT_CONTAINS(results, error, "before load");
+}
+
+void prefill_batch_parser_accepts_supported_values(TestResults& results) {
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("1") == 1);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("2") == 2);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("4") == 4);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("8") == 8);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("3") == 1);
+    AILA_EXPECT_TRUE(results, parse_cpu_q35_prefill_batch("invalid") == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -109,6 +131,8 @@ int main() {
     load_missing_required_weight_reports_name(results);
     rms_norm_q35_adds_one_to_weight(results);
     sigmoid_gate_matches_reference(results);
+    prefill_before_load_reports_error(results);
+    prefill_batch_parser_accepts_supported_values(results);
 
     std::cout << "AilaCpuQ35HybridModelTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

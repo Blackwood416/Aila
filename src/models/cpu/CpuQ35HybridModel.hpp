@@ -4,6 +4,7 @@
 #include "engine/Types.hpp"
 
 #include <memory>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,8 @@ void sigmoid_gate(const float* input,
 float silu(float x);
 
 }  // namespace cpu_q35
+
+int parse_cpu_q35_prefill_batch(std::string_view value);
 
 struct CpuQ35Layer {
     bool is_linear = false;
@@ -81,6 +84,11 @@ public:
 
     bool consume_one(int token_id, std::string* error);
     bool forward_one(int token_id, std::vector<float>& logits, std::string* error);
+    bool prefill(const std::vector<int>& token_ids,
+                 int micro_batch,
+                 const std::atomic_bool* abort_requested,
+                 std::vector<float>* logits,
+                 std::string* error);
 
 private:
     void clear_loaded();

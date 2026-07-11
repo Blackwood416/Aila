@@ -223,6 +223,15 @@ void apply_rope_partial_one(std::vector<float>& q,
 
 }  // namespace
 
+int parse_cpu_q35_prefill_batch(std::string_view value) {
+    try {
+        const int parsed = std::stoi(std::string(value));
+        return parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8 ? parsed : 1;
+    } catch (...) {
+        return 1;
+    }
+}
+
 namespace cpu_q35 {
 
 float silu(float x) {
@@ -580,6 +589,39 @@ bool CpuQ35HybridModel::forward_one(int token_id,
                                     std::vector<float>& logits,
                                     std::string* error) {
     return forward_one_impl(token_id, &logits, error);
+}
+
+bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
+                                int micro_batch,
+                                const std::atomic_bool* abort_requested,
+                                std::vector<float>* logits,
+                                std::string* error) {
+    if (!loaded_) {
+        set_error(error, "CPU Qwen3.5 prefill called before load");
+        return false;
+    }
+    if (micro_batch != 1) {
+        set_error(error, "CPU Qwen3.5 optimized prefill batch is not implemented");
+        return false;
+    }
+    if (token_ids.empty()) {
+        set_error(error, "CPU Qwen3.5 prefill requires at least one token");
+        return false;
+    }
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        if (abort_requested && abort_requested->load()) {
+            set_error(error, "CPU Qwen3.5 prefill aborted");
+            return false;
+        }
+        const bool is_last = i + 1 == token_ids.size();
+        const bool ok = is_last && logits
+                            ? forward_one_impl(token_ids[i], logits, error)
+                            : forward_one_impl(token_ids[i], nullptr, error);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool CpuQ35HybridModel::forward_one_impl(int token_id,
