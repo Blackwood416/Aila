@@ -122,6 +122,10 @@ void cache_mode_parser_defaults_to_fp16(TestResults& results) {
         static_cast<int>(CpuBnb4CacheMode::PackedNf4));
     AILA_EXPECT_EQ_I64(
         results,
+        static_cast<int>(parse_cpu_bnb4_cache_mode("packed_nf4_i8")),
+        static_cast<int>(CpuBnb4CacheMode::PackedNf4I8));
+    AILA_EXPECT_EQ_I64(
+        results,
         static_cast<int>(parse_cpu_bnb4_cache_mode("invalid")),
         static_cast<int>(CpuBnb4CacheMode::Fp16));
 }
@@ -192,6 +196,17 @@ void packed_nf4_cache_matches_hand_computed_fixture(TestResults& results) {
     cpu_nf4_matvec(weight, quant_map.data(), input, dispatched);
     AILA_EXPECT_NEAR(results, dispatched[0], output[0], 0.0002f);
     AILA_EXPECT_NEAR(results, dispatched[1], output[1], 0.0002f);
+
+    weight.cache_mode = CpuBnb4CacheMode::PackedNf4I8;
+    weight.packed_nf4_lut_scale = 15.0f / 127.0f;
+    for (int code = 0; code < 16; ++code) {
+        weight.packed_nf4_lut_i8[static_cast<size_t>(code)] =
+            static_cast<int8_t>(std::lrint(code / weight.packed_nf4_lut_scale));
+    }
+    float i8_output[2] = {};
+    cpu_nf4_matvec(weight, quant_map.data(), input, i8_output);
+    AILA_EXPECT_NEAR(results, i8_output[0], output[0], 0.05f);
+    AILA_EXPECT_NEAR(results, i8_output[1], output[1], 0.05f);
 }
 
 void fp16_conversion_and_dot_match_reference(TestResults& results) {

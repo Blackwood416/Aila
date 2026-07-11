@@ -197,11 +197,17 @@ AILA_TARGET_F16C float nf4_row_dot_avx2(const CpuBnb4WeightRef& weight,
 
     const __m256 table_lo = _mm256_loadu_ps(quant_map);
     const __m256 table_hi = _mm256_loadu_ps(quant_map + 8);
+    const bool use_i8_lut = weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8;
+    const __m128i table_i8 = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(weight.packed_nf4_lut_i8.data()));
     __m256 acc = _mm256_setzero_ps();
     for (int64_t block_col = 0; block_col < cols; block_col += blocksize) {
         const int64_t count = std::min<int64_t>(blocksize, cols - block_col);
-        const __m256 scale = _mm256_set1_ps(weight.packed_nf4_absmax[
-            static_cast<size_t>((row_offset + block_col) / blocksize)]);
+        const float block_absmax = weight.packed_nf4_absmax[
+            static_cast<size_t>((row_offset + block_col) / blocksize)];
+        const __m256 scale = _mm256_set1_ps(block_absmax);
+        const __m256 i8_scale =
+            _mm256_set1_ps(block_absmax * weight.packed_nf4_lut_scale);
         const __m256 scaled_table_lo = _mm256_mul_ps(table_lo, scale);
         const __m256 scaled_table_hi = _mm256_mul_ps(table_hi, scale);
         int64_t lane_col = 0;
@@ -218,6 +224,16 @@ AILA_TARGET_F16C float nf4_row_dot_avx2(const CpuBnb4WeightRef& weight,
                 codes0, _mm_srli_si128(codes0, 8),
                 codes1, _mm_srli_si128(codes1, 8)};
             for (int group = 0; group < 4; ++group) {
+                if (use_i8_lut) {
+                    const __m128i quantized = _mm_shuffle_epi8(table_i8, groups[group]);
+                    const __m256 values = _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(quantized)), i8_scale);
+                    acc = _mm256_fmadd_ps(
+                        values,
+                        _mm256_loadu_ps(input + block_col + lane_col + group * 8),
+                        acc);
+                    continue;
+                }
                 const __m256i indices = _mm256_cvtepu8_epi32(groups[group]);
                 const __m256i low_indices =
                     _mm256_and_si256(indices, _mm256_set1_epi32(7));
@@ -449,9 +465,22 @@ void build_dense_weight_cache(CpuBnb4WeightRef& weight) {
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
 
-    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4) {
+    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4 ||
+        weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8) {
         weight.packed_nf4_codes.assign(static_cast<size_t>((total + 1) / 2), 0);
         weight.packed_nf4_absmax = weight.decoded_absmax;
+        if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8) {
+            float max_abs = 0.0f;
+            for (int code = 0; code < 16; ++code) {
+                max_abs = std::max(max_abs, std::abs(quant_map[code]));
+            }
+            weight.packed_nf4_lut_scale = max_abs / 127.0f;
+            for (int code = 0; code < 16; ++code) {
+                weight.packed_nf4_lut_i8[static_cast<size_t>(code)] =
+                    static_cast<int8_t>(std::lrint(
+                        quant_map[code] / weight.packed_nf4_lut_scale));
+            }
+        }
         for (int64_t flat = 0; flat < total; flat += 2) {
             const uint8_t source = packed[static_cast<size_t>(flat / 2)];
             const uint8_t first = static_cast<uint8_t>((source >> 4) & 0x0f);
@@ -489,6 +518,9 @@ CpuBnb4CacheMode parse_cpu_bnb4_cache_mode(std::string_view value) {
     std::string normalized(value);
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "packed_nf4_i8") {
+        return CpuBnb4CacheMode::PackedNf4I8;
+    }
     return normalized == "packed_nf4" ? CpuBnb4CacheMode::PackedNf4
                                       : CpuBnb4CacheMode::Fp16;
 }
@@ -882,7 +914,8 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
     const float* quant_map = weight.quant_map->f32_data();
     const int blocksize = weight.quant_state.blocksize;
 
-    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4) {
+    if (weight.cache_mode == CpuBnb4CacheMode::PackedNf4 ||
+        weight.cache_mode == CpuBnb4CacheMode::PackedNf4I8) {
         cpu_nf4_matvec(weight, quant_map, input, output);
         return;
     }

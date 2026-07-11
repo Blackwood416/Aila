@@ -3,6 +3,7 @@
 #include "CpuSafetensorsStore.hpp"
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -11,6 +12,7 @@
 enum class CpuBnb4CacheMode {
     Fp16,
     PackedNf4,
+    PackedNf4I8,
 };
 
 CpuBnb4CacheMode parse_cpu_bnb4_cache_mode(std::string_view value);
@@ -40,6 +42,8 @@ struct CpuBnb4WeightRef {
     std::vector<uint16_t> dense_weight_f16;
     std::vector<uint8_t> packed_nf4_codes;
     std::vector<float> packed_nf4_absmax;
+    std::array<int8_t, 16> packed_nf4_lut_i8{};
+    float packed_nf4_lut_scale = 0.0f;
 
     bool valid() const;
     int64_t out_features() const;
