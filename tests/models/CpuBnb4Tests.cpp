@@ -146,12 +146,50 @@ void nf4_matvec_matches_hand_computed_fixture(TestResults& results) {
     AILA_EXPECT_NEAR(results, output[1], (5.0f + 6.0f + 7.0f + 8.0f) * 0.2f, 0.0001f);
 }
 
+void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
+    constexpr int kRows = 256;
+    constexpr int kCols = 256;
+    const std::vector<uint8_t> packed(static_cast<size_t>(kRows * kCols / 2), 0);
+    const std::vector<float> absmax(static_cast<size_t>(kRows * kCols / 64), 1.0f);
+    const std::vector<float> quant_map(16, 0.0f);
+    const CpuTensorView packed_view =
+        make_view("parallel.weight", CpuDataType::U8, {kRows * kCols / 2},
+                  packed.data(), packed.size());
+    const CpuTensorView absmax_view =
+        make_view("parallel.weight.absmax", CpuDataType::F32,
+                  {static_cast<int64_t>(absmax.size())}, absmax.data(),
+                  absmax.size() * sizeof(float));
+    const CpuTensorView quant_map_view =
+        make_view("parallel.weight.quant_map", CpuDataType::F32, {16},
+                  quant_map.data(), quant_map.size() * sizeof(float));
+
+    CpuBnb4WeightRef weight;
+    weight.name = "parallel.weight";
+    weight.packed_weight = &packed_view;
+    weight.absmax = &absmax_view;
+    weight.quant_map = &quant_map_view;
+    weight.quant_state.quant_type = "nf4";
+    weight.quant_state.blocksize = 64;
+    weight.quant_state.shape = {kRows, kCols};
+    weight.dense_weight.assign(static_cast<size_t>(kRows * kCols), 1.0f);
+
+    const std::vector<float> input(kCols, 1.0f);
+    std::vector<float> output(kRows, 0.0f);
+    cpu_bnb4_matvec(weight, input.data(), output.data());
+    cpu_bnb4_matvec(weight, input.data(), output.data());
+
+    for (float value : output) {
+        AILA_EXPECT_NEAR(results, value, static_cast<float>(kCols), 0.0001f);
+    }
+}
+
 }  // namespace
 
 int main() {
     TestResults results;
     parse_quant_state_reads_nested_fields(results);
     nf4_matvec_matches_hand_computed_fixture(results);
+    repeated_parallel_dense_matvec_matches_reference(results);
 
     std::cout << "AilaCpuBnb4Tests: " << results.passed
               << " passed, " << results.failed << " failed\n";

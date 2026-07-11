@@ -3,6 +3,7 @@
 #include "CpuSafetensorsStore.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,11 @@ bool load_cpu_bnb4_weight_ref(const CpuSafetensorsStore& store,
                               const std::string& name,
                               CpuBnb4WeightRef& out,
                               std::string* error);
+
+void cpu_q35_parallel_rows(int64_t rows,
+                           int64_t cols,
+                           int64_t min_rows_per_thread,
+                           const std::function<void(int64_t, int64_t)>& fn);
 
 void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
                      const float* input,

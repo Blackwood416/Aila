@@ -1,13 +1,10 @@
 #include "models/cpu/CpuQ35HybridModel.hpp"
 
-#include "utils/EnvUtils.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace {
@@ -887,32 +884,6 @@ bool CpuQ35HybridModel::compute_logits(const std::vector<float>& hidden,
         }
     };
 
-    const int env_threads = aila::env::read_int_raw("AILA_CPU_Q35_THREADS", 2);
-    const unsigned hw_threads = std::max(
-        1u,
-        static_cast<unsigned>(env_threads > 0
-            ? env_threads
-            : static_cast<int>(std::thread::hardware_concurrency())));
-    const int desired_threads =
-        std::min<int>(static_cast<int>(hw_threads),
-                      std::max(1, cfg_.vocab_size / 4096));
-    if (desired_threads <= 1) {
-        compute_rows(0, cfg_.vocab_size);
-        return true;
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<size_t>(desired_threads - 1));
-    const int rows_per_thread = (cfg_.vocab_size + desired_threads - 1) / desired_threads;
-    int row_begin = 0;
-    for (int t = 1; t < desired_threads; ++t) {
-        const int row_end = std::min(cfg_.vocab_size, row_begin + rows_per_thread);
-        workers.emplace_back(compute_rows, row_begin, row_end);
-        row_begin = row_end;
-    }
-    compute_rows(row_begin, cfg_.vocab_size);
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
+    cpu_q35_parallel_rows(cfg_.vocab_size, hidden_size_, 4096, compute_rows);
     return true;
 }

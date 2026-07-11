@@ -5,9 +5,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -95,20 +103,177 @@ float effective_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) 
            weight.quant_state.nested_offset;
 }
 
-template <typename Fn>
-void parallel_rows(int64_t rows,
-                   int64_t cols,
-                   int64_t min_rows_per_thread,
-                   Fn&& fn) {
+void lower_worker_priority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
+class PersistentRowPool {
+public:
+    explicit PersistentRowPool(int total_threads) {
+        const int worker_count = std::max(0, total_threads - 1);
+        workers_.reserve(static_cast<size_t>(worker_count));
+        for (int worker_index = 0; worker_index < worker_count; ++worker_index) {
+            workers_.emplace_back([this, worker_index]() { worker_loop(worker_index); });
+        }
+    }
+
+    ~PersistentRowPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        task_cv_.notify_all();
+        for (std::thread& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    PersistentRowPool(const PersistentRowPool&) = delete;
+    PersistentRowPool& operator=(const PersistentRowPool&) = delete;
+
+    void run(int64_t rows,
+             int desired_threads,
+             const std::function<void(int64_t, int64_t)>& fn) {
+        if (desired_threads <= 1 || workers_.empty()) {
+            fn(0, rows);
+            return;
+        }
+
+        desired_threads = std::min<int>(
+            desired_threads, static_cast<int>(workers_.size()) + 1);
+        const int desired_workers = desired_threads - 1;
+        const int64_t rows_per_thread =
+            (rows + desired_threads - 1) / desired_threads;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            idle_cv_.wait(lock, [this]() { return !in_flight_; });
+            in_flight_ = true;
+            task_ = fn;
+            task_rows_ = rows;
+            task_rows_per_thread_ = rows_per_thread;
+            task_worker_count_ = desired_workers;
+            active_workers_ = desired_workers;
+            worker_exception_ = nullptr;
+            ++generation_;
+        }
+        task_cv_.notify_all();
+
+        std::exception_ptr caller_exception;
+        const int64_t caller_begin =
+            static_cast<int64_t>(desired_workers) * rows_per_thread;
+        try {
+            fn(caller_begin, rows);
+        } catch (...) {
+            caller_exception = std::current_exception();
+        }
+
+        std::exception_ptr worker_exception;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            done_cv_.wait(lock, [this]() { return active_workers_ == 0; });
+            worker_exception = worker_exception_;
+            task_ = {};
+            in_flight_ = false;
+        }
+        idle_cv_.notify_one();
+
+        if (caller_exception) {
+            std::rethrow_exception(caller_exception);
+        }
+        if (worker_exception) {
+            std::rethrow_exception(worker_exception);
+        }
+    }
+
+private:
+    void worker_loop(int worker_index) {
+        lower_worker_priority();
+        uint64_t observed_generation = 0;
+        while (true) {
+            std::function<void(int64_t, int64_t)> task;
+            int64_t row_begin = 0;
+            int64_t row_end = 0;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                task_cv_.wait(lock, [this, observed_generation]() {
+                    return stopping_ || generation_ != observed_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                observed_generation = generation_;
+                if (worker_index >= task_worker_count_) {
+                    continue;
+                }
+                task = task_;
+                row_begin = static_cast<int64_t>(worker_index) * task_rows_per_thread_;
+                row_end = std::min(task_rows_, row_begin + task_rows_per_thread_);
+            }
+
+            try {
+                task(row_begin, row_end);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!worker_exception_) {
+                    worker_exception_ = std::current_exception();
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --active_workers_;
+                if (active_workers_ == 0) {
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable task_cv_;
+    std::condition_variable done_cv_;
+    std::condition_variable idle_cv_;
+    std::function<void(int64_t, int64_t)> task_;
+    int64_t task_rows_ = 0;
+    int64_t task_rows_per_thread_ = 0;
+    int task_worker_count_ = 0;
+    int active_workers_ = 0;
+    uint64_t generation_ = 0;
+    bool in_flight_ = false;
+    bool stopping_ = false;
+    std::exception_ptr worker_exception_;
+};
+
+int configured_cpu_threads() {
     const int env_threads = aila::env::read_int_raw("AILA_CPU_Q35_THREADS", 2);
-    const unsigned hw_threads = std::max(
+    return static_cast<int>(std::max(
         1u,
         static_cast<unsigned>(env_threads > 0
             ? env_threads
-            : static_cast<int>(std::thread::hardware_concurrency())));
+            : static_cast<int>(std::thread::hardware_concurrency()))));
+}
+
+PersistentRowPool& persistent_row_pool() {
+    static PersistentRowPool pool(configured_cpu_threads());
+    return pool;
+}
+
+}  // namespace
+
+void cpu_q35_parallel_rows(
+    int64_t rows,
+    int64_t cols,
+    int64_t min_rows_per_thread,
+    const std::function<void(int64_t, int64_t)>& fn) {
+    const int configured_threads = configured_cpu_threads();
     const int64_t desired_threads =
         (rows >= min_rows_per_thread * 2 && cols >= 256)
-            ? std::min<int64_t>(static_cast<int64_t>(hw_threads),
+            ? std::min<int64_t>(static_cast<int64_t>(configured_threads),
                                 std::max<int64_t>(1, rows / min_rows_per_thread))
             : 1;
     if (desired_threads <= 1) {
@@ -116,20 +281,10 @@ void parallel_rows(int64_t rows,
         return;
     }
 
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<size_t>(desired_threads - 1));
-    const int64_t rows_per_thread = (rows + desired_threads - 1) / desired_threads;
-    int64_t row_begin = 0;
-    for (int64_t t = 1; t < desired_threads; ++t) {
-        const int64_t row_end = std::min(rows, row_begin + rows_per_thread);
-        workers.emplace_back(fn, row_begin, row_end);
-        row_begin = row_end;
-    }
-    fn(row_begin, rows);
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
+    persistent_row_pool().run(rows, static_cast<int>(desired_threads), fn);
 }
+
+namespace {
 
 void dequantize_dense_weight(CpuBnb4WeightRef& weight) {
     const int64_t rows = weight.out_features();
@@ -140,7 +295,7 @@ void dequantize_dense_weight(CpuBnb4WeightRef& weight) {
     const int blocksize = weight.quant_state.blocksize;
 
     weight.dense_weight.assign(static_cast<size_t>(total), 0.0f);
-    parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
+    cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
         for (int64_t row = row_begin; row < row_end; ++row) {
             float* dst = weight.dense_weight.data() + static_cast<size_t>(row) * cols;
             for (int64_t col = 0; col < cols; ++col) {
@@ -395,7 +550,7 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
     const int blocksize = weight.quant_state.blocksize;
 
     if (!weight.dense_weight.empty()) {
-        parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
+        cpu_q35_parallel_rows(rows, cols, 64, [&](int64_t row_begin, int64_t row_end) {
             for (int64_t row = row_begin; row < row_end; ++row) {
                 const float* w = weight.dense_weight.data() + static_cast<size_t>(row) * cols;
                 float sum = 0.0f;
@@ -429,5 +584,5 @@ void cpu_bnb4_matvec(const CpuBnb4WeightRef& weight,
         }
     };
 
-    parallel_rows(rows, cols, 64, compute_rows);
+    cpu_q35_parallel_rows(rows, cols, 64, compute_rows);
 }
