@@ -383,7 +383,15 @@ void CpuQ35HybridModel::reset() {
 }
 
 size_t CpuQ35HybridModel::dense_weight_cache_bytes() const {
-    size_t bytes = embedding_f16_.size() * sizeof(uint16_t);
+    return embedding_cache_bytes() + projection_cache_bytes();
+}
+
+size_t CpuQ35HybridModel::embedding_cache_bytes() const {
+    return embedding_f16_.size() * sizeof(uint16_t);
+}
+
+size_t CpuQ35HybridModel::projection_cache_bytes() const {
+    size_t bytes = 0;
     const auto add_weight = [&bytes](const CpuBnb4WeightRef& weight) {
         bytes += weight.cache_bytes();
     };

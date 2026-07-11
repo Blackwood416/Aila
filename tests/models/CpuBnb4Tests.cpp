@@ -255,6 +255,7 @@ void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
     }
 }
 
+
 }  // namespace
 
 int main() {

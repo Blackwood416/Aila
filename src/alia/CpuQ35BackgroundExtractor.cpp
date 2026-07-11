@@ -152,9 +152,17 @@ bool CpuQ35BackgroundExtractor::load(std::string* error_message) {
     model_ = std::move(model);
     const double cache_mib =
         static_cast<double>(model_->dense_weight_cache_bytes()) / (1024.0 * 1024.0);
-    std::cout << "[CpuQ35] FP16 dense weight cache: "
-              << static_cast<int>(cache_mib) << " MiB"
-              << " (F32 equivalent " << static_cast<int>(cache_mib * 2.0) << " MiB)\n";
+    const double embedding_mib =
+        static_cast<double>(model_->embedding_cache_bytes()) / (1024.0 * 1024.0);
+    const double projection_mib =
+        static_cast<double>(model_->projection_cache_bytes()) / (1024.0 * 1024.0);
+    const char* cache_mode = model_->weight_cache_mode() == CpuBnb4CacheMode::PackedNf4
+                                 ? "packed_nf4"
+                                 : "fp16";
+    std::cout << "[CpuQ35] weight_cache=" << cache_mode
+              << " total_mib=" << static_cast<int>(cache_mib)
+              << " embedding_mib=" << static_cast<int>(embedding_mib)
+              << " projection_mib=" << static_cast<int>(projection_mib) << '\n';
     loaded_ = true;
     set_error(error_message, "");
     return true;

@@ -74,6 +74,9 @@ public:
 
     bool loaded() const { return loaded_; }
     size_t dense_weight_cache_bytes() const;
+    size_t embedding_cache_bytes() const;
+    size_t projection_cache_bytes() const;
+    CpuBnb4CacheMode weight_cache_mode() const { return weight_cache_mode_; }
     void reset();
 
     bool consume_one(int token_id, std::string* error);

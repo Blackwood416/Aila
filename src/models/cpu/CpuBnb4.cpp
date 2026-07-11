@@ -180,27 +180,74 @@ AILA_TARGET_F16C float nf4_row_dot_avx2(const CpuBnb4WeightRef& weight,
     const int64_t cols = weight.in_features();
     const int64_t row_offset = row * cols;
     const int blocksize = weight.quant_state.blocksize;
+    if (blocksize != 64 || (row_offset % blocksize) != 0) {
+        float output = 0.0f;
+        CpuBnb4WeightRef one_row = weight;
+        one_row.quant_state.shape = {1, cols};
+        one_row.packed_nf4_codes.assign(
+            weight.packed_nf4_codes.begin() + row_offset / 2,
+            weight.packed_nf4_codes.begin() + (row_offset + cols + 1) / 2);
+        one_row.packed_nf4_absmax.assign(
+            weight.packed_nf4_absmax.begin() + row_offset / blocksize,
+            weight.packed_nf4_absmax.begin() +
+                (row_offset + cols + blocksize - 1) / blocksize);
+        cpu_nf4_matvec_scalar(one_row, quant_map, input, &output);
+        return output;
+    }
+
+    const __m256 table_lo = _mm256_loadu_ps(quant_map);
+    const __m256 table_hi = _mm256_loadu_ps(quant_map + 8);
     __m256 acc = _mm256_setzero_ps();
-    int64_t col = 0;
-    alignas(32) int32_t indices[8];
-    alignas(32) float scales[8];
-    for (; col + 8 <= cols; col += 8) {
-        for (int lane = 0; lane < 8; ++lane) {
-            const int64_t flat = row_offset + col + lane;
+    for (int64_t block_col = 0; block_col < cols; block_col += blocksize) {
+        const int64_t count = std::min<int64_t>(blocksize, cols - block_col);
+        const __m256 scale = _mm256_set1_ps(weight.packed_nf4_absmax[
+            static_cast<size_t>((row_offset + block_col) / blocksize)]);
+        const __m256 scaled_table_lo = _mm256_mul_ps(table_lo, scale);
+        const __m256 scaled_table_hi = _mm256_mul_ps(table_hi, scale);
+        int64_t lane_col = 0;
+        for (; lane_col + 32 <= count; lane_col += 32) {
+            const int64_t flat = row_offset + block_col + lane_col;
+            const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                weight.packed_nf4_codes.data() + static_cast<size_t>(flat / 2)));
+            const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+            const __m128i low = _mm_and_si128(bytes, nibble_mask);
+            const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+            const __m128i codes0 = _mm_unpacklo_epi8(low, high);
+            const __m128i codes1 = _mm_unpackhi_epi8(low, high);
+            const __m128i groups[4] = {
+                codes0, _mm_srli_si128(codes0, 8),
+                codes1, _mm_srli_si128(codes1, 8)};
+            for (int group = 0; group < 4; ++group) {
+                const __m256i indices = _mm256_cvtepu8_epi32(groups[group]);
+                const __m256i low_indices =
+                    _mm256_and_si256(indices, _mm256_set1_epi32(7));
+                const __m256 low_values =
+                    _mm256_permutevar8x32_ps(scaled_table_lo, low_indices);
+                const __m256 high_values =
+                    _mm256_permutevar8x32_ps(scaled_table_hi, low_indices);
+                const __m256 high_mask = _mm256_castsi256_ps(
+                    _mm256_cmpgt_epi32(indices, _mm256_set1_epi32(7)));
+                const __m256 values =
+                    _mm256_blendv_ps(low_values, high_values, high_mask);
+                acc = _mm256_fmadd_ps(
+                    values,
+                    _mm256_loadu_ps(input + block_col + lane_col + group * 8),
+                    acc);
+            }
+        }
+        for (; lane_col < count; ++lane_col) {
+            const int64_t flat = row_offset + block_col + lane_col;
             const uint8_t packed =
                 weight.packed_nf4_codes[static_cast<size_t>(flat / 2)];
-            indices[lane] = (flat & 1) ? ((packed >> 4) & 0x0f)
-                                       : (packed & 0x0f);
-            scales[lane] = weight.packed_nf4_absmax[
-                static_cast<size_t>(flat / blocksize)];
+            const uint8_t code = (flat & 1)
+                                     ? static_cast<uint8_t>((packed >> 4) & 0x0f)
+                                     : static_cast<uint8_t>(packed & 0x0f);
+            const float value = quant_map[static_cast<size_t>(code)] *
+                                weight.packed_nf4_absmax[
+                                    static_cast<size_t>(flat / blocksize)];
+            acc = _mm256_add_ps(acc, _mm256_setr_ps(
+                value * input[block_col + lane_col], 0, 0, 0, 0, 0, 0, 0));
         }
-        const __m256 values = _mm256_mul_ps(
-            _mm256_i32gather_ps(quant_map,
-                                _mm256_load_si256(
-                                    reinterpret_cast<const __m256i*>(indices)),
-                                4),
-            _mm256_load_ps(scales));
-        acc = _mm256_fmadd_ps(values, _mm256_loadu_ps(input + col), acc);
     }
 
     const __m128 lo = _mm256_castps256_ps128(acc);
@@ -208,19 +255,7 @@ AILA_TARGET_F16C float nf4_row_dot_avx2(const CpuBnb4WeightRef& weight,
     __m128 sum4 = _mm_add_ps(lo, hi);
     sum4 = _mm_hadd_ps(sum4, sum4);
     sum4 = _mm_hadd_ps(sum4, sum4);
-    float sum = _mm_cvtss_f32(sum4);
-    for (; col < cols; ++col) {
-        const int64_t flat = row_offset + col;
-        const uint8_t packed =
-            weight.packed_nf4_codes[static_cast<size_t>(flat / 2)];
-        const uint8_t code = (flat & 1)
-                                 ? static_cast<uint8_t>((packed >> 4) & 0x0f)
-                                 : static_cast<uint8_t>(packed & 0x0f);
-        sum += quant_map[static_cast<size_t>(code)] *
-               weight.packed_nf4_absmax[static_cast<size_t>(flat / blocksize)] *
-               input[col];
-    }
-    return sum;
+    return _mm_cvtss_f32(sum4);
 }
 
 void lower_worker_priority() {
