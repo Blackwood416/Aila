@@ -37,6 +37,30 @@ function Invoke-Test([string]$Name, [scriptblock]$Test) {
     }
 }
 
+function Get-NormalizedTestPath([string]$Path) {
+    return [System.IO.Path]::GetFullPath($Path.Trim().Trim('"')).TrimEnd([char[]]@('\', '/'))
+}
+
+function Assert-PathContainsSegment([string]$PathValue, [string]$Expected, [string]$Message) {
+    $expectedNormalized = Get-NormalizedTestPath -Path $Expected
+    $segments = @($PathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object {
+        Get-NormalizedTestPath -Path $_
+    })
+    if ($segments -notcontains $expectedNormalized) {
+        throw "$Message expected PATH segment='$expectedNormalized'"
+    }
+}
+
+function Assert-PathSegmentsUnique([string]$PathValue, [string]$Message) {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($segment in ($PathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $normalized = Get-NormalizedTestPath -Path $segment
+        if (-not $seen.Add($normalized)) {
+            throw "$Message duplicate PATH segment='$normalized'"
+        }
+    }
+}
+
 function New-TestStack([string]$Root) {
     return [pscustomobject]@{
         role                    = 'test'
@@ -67,6 +91,12 @@ $unsupportedSchemaPath = Join-Path $tempRoot 'unsupported-schema.json'
 Set-Content -LiteralPath $unsupportedSchemaPath -Value '{"schemaVersion":2,"stacks":{}}' -Encoding UTF8
 $missingSchemaPath = Join-Path $tempRoot 'missing-schema.json'
 Set-Content -LiteralPath $missingSchemaPath -Value '{"stacks":{}}' -Encoding UTF8
+$failingBatchPath = Join-Path $tempRoot 'fail-with-37.bat'
+Set-Content -LiteralPath $failingBatchPath -Value "@echo off`r`nexit /b 37" -Encoding ASCII
+$partialBatchPath = Join-Path $tempRoot 'missing-compiler-root.bat'
+Set-Content -LiteralPath $partialBatchPath -Value "@echo off`r`nset CMPLR_ROOT=`r`nexit /b 0" -Encoding ASCII
+$missingPathBatchPath = Join-Path $tempRoot 'missing-path.bat'
+Set-Content -LiteralPath $missingPathBatchPath -Value "@echo off`r`nset PATH=`r`nset CMPLR_ROOT=C:\compiler`r`nexit /b 0" -Encoding ASCII
 
 try {
     Invoke-Test 'loads the complete real stack contract' {
@@ -175,6 +205,18 @@ try {
         if ($envMap.PATH -match 'compiler\\2026\.1') {
             throw 'baseline PATH contains candidate compiler'
         }
+        if ($envMap.PATH.Contains('System.Object[]')) {
+            throw 'baseline PATH contains a stringified nested array'
+        }
+        Assert-PathContainsSegment $envMap.PATH (Join-Path $env:SystemRoot 'System32') 'baseline inherited system path'
+        Assert-PathContainsSegment $envMap.PATH (Join-Path $baseline.compilerRoot 'lib\ocloc') 'baseline selected compiler ocloc path'
+        Assert-PathSegmentsUnique $envMap.PATH 'baseline PATH'
+        Assert-Equal (Get-NormalizedTestPath $baseline.umfRoot) (Get-NormalizedTestPath $envMap.UMF_ROOT) 'baseline UMF root'
+        foreach ($key in @('PATH', 'LIB', 'INCLUDE', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')) {
+            if ($envMap.ContainsKey($key) -and $envMap[$key] -match '(?i)umf[\\/](latest|1\.1)') {
+                throw "baseline $key retains a non-selected UMF path"
+            }
+        }
     }
 
     Invoke-Test 'imports an isolated candidate oneAPI environment' {
@@ -189,6 +231,42 @@ try {
         if ($envMap.PATH -match 'compiler\\2025\.3') {
             throw 'candidate PATH contains baseline compiler'
         }
+        if ($envMap.PATH.Contains('System.Object[]')) {
+            throw 'candidate PATH contains a stringified nested array'
+        }
+        Assert-PathContainsSegment $envMap.PATH (Join-Path $env:SystemRoot 'System32') 'candidate inherited system path'
+        Assert-PathContainsSegment $envMap.PATH (Join-Path $candidate.compilerRoot 'lib\ocloc') 'candidate selected compiler ocloc path'
+        Assert-PathSegmentsUnique $envMap.PATH 'candidate PATH'
+        Assert-Equal (Get-NormalizedTestPath $candidate.umfRoot) (Get-NormalizedTestPath $envMap.UMF_ROOT) 'candidate UMF root'
+        foreach ($key in @('PATH', 'LIB', 'INCLUDE', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')) {
+            if ($envMap.ContainsKey($key) -and $envMap[$key] -match '(?i)umf[\\/]latest') {
+                throw "candidate $key retains an unresolved UMF latest path"
+            }
+        }
+    }
+
+    Invoke-Test 'propagates a failing batch script exit code' {
+        Assert-Throws {
+            Import-AilaBatchEnvironment -Scripts @($failingBatchPath)
+        } 'exit code 37' 'failing batch script'
+    }
+
+    Invoke-Test 'rejects a partial batch environment' {
+        Assert-Throws {
+            Import-AilaBatchEnvironment -Scripts @($partialBatchPath)
+        } 'missing required variable: CMPLR_ROOT' 'partial batch environment'
+    }
+
+    Invoke-Test 'rejects a batch environment without PATH' {
+        Assert-Throws {
+            Import-AilaBatchEnvironment -Scripts @($missingPathBatchPath)
+        } 'missing required variable: PATH' 'missing PATH batch environment'
+    }
+
+    Invoke-Test 'recognizes selected compiler paths in a custom installation root' {
+        $selectedRoot = 'D:\oneAPI\compiler\2026.1'
+        Assert-Equal $true (Test-AilaPathWithinRoot -Path 'D:\oneAPI\compiler\2026.1\lib\ocloc' -Root $selectedRoot) 'selected custom compiler path'
+        Assert-Equal $false (Test-AilaPathWithinRoot -Path 'D:\oneAPI\compiler\2025.3\bin' -Root $selectedRoot) 'other custom compiler path'
     }
 
     Invoke-Test 'sets process environment entries without leaking test state' {

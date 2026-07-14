@@ -66,6 +66,43 @@ function Get-AilaOneApiStack {
     return [pscustomobject]$result
 }
 
+function Get-AilaWindowsPathKey {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $cleaned = $Path.Trim().Trim('"').Replace('/', '\')
+    return [System.IO.Path]::GetFullPath($cleaned).TrimEnd('\')
+}
+
+function Test-AilaPathWithinRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    $pathKey = Get-AilaWindowsPathKey -Path $Path
+    $rootKey = Get-AilaWindowsPathKey -Path $Root
+    return $pathKey.Equals($rootKey, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $pathKey.StartsWith($rootKey + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-AilaUniquePathSegments {
+    param([Parameter(Mandatory = $true)][string[]]$Segments)
+
+    $result = New-Object System.Collections.Generic.List[string]
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($segment in $Segments) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+
+        $trimmed = $segment.Trim()
+        if ($seen.Add((Get-AilaWindowsPathKey -Path $trimmed))) {
+            $result.Add($trimmed)
+        }
+    }
+    return $result.ToArray()
+}
+
 function Import-AilaBatchEnvironment {
     param([Parameter(Mandatory = $true)][string[]]$Scripts)
 
@@ -87,9 +124,20 @@ function Import-AilaBatchEnvironment {
     $calls.Add('set')
 
     $result = @{}
-    cmd.exe /d /s /c ($calls -join ' && ') | ForEach-Object {
+    $output = @(cmd.exe /d /s /c ($calls -join ' && ') 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "Batch environment import failed with exit code $exitCode."
+    }
+
+    $output | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') {
             $result[$matches[1]] = $matches[2]
+        }
+    }
+    foreach ($required in @('PATH', 'CMPLR_ROOT')) {
+        if (-not $result.ContainsKey($required) -or [string]::IsNullOrWhiteSpace([string]$result[$required])) {
+            throw "Batch environment import missing required variable: $required"
         }
     }
     return $result
@@ -105,17 +153,38 @@ function Get-AilaOneApiStackEnvironment {
         (Join-Path $Stack.compilerRoot 'env\vars.bat')
     )
     $envMap = Import-AilaBatchEnvironment -Scripts $scripts
+    $umfRoot = [System.IO.Path]::GetFullPath([string]$Stack.umfRoot)
+    $umfLatest = Join-Path (Split-Path -Parent $umfRoot) 'latest'
+    $umfLatestPattern = [regex]::Escape($umfLatest)
+    foreach ($key in @('PATH', 'LIB', 'INCLUDE', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')) {
+        if ($envMap.ContainsKey($key)) {
+            $envMap[$key] = [regex]::Replace(
+                [string]$envMap[$key],
+                $umfLatestPattern,
+                $umfRoot,
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+        }
+    }
+    $envMap['UMF_ROOT'] = $umfRoot
+
+    $compilerRoot = [System.IO.Path]::GetFullPath([string]$Stack.compilerRoot)
+    $compilerFamilyRoot = Split-Path -Parent $compilerRoot
     $inheritedPath = @($envMap['PATH'] -split ';' | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_) -and
-        $_ -notmatch '(?i)[\\/]Intel[\\/]oneAPI[\\/]compiler[\\/]'
+        if ([string]::IsNullOrWhiteSpace($_)) {
+            return $false
+        }
+
+        return -not (Test-AilaPathWithinRoot -Path $_ -Root $compilerFamilyRoot) -or
+            (Test-AilaPathWithinRoot -Path $_ -Root $compilerRoot)
     })
-    $envMap['PATH'] = [string]::Join(';', @(
+    $pathSegments = @(
         (Join-Path $Stack.compilerRoot 'bin'),
         (Join-Path $Stack.dnnlRoot 'bin'),
         (Join-Path $Stack.tbbRoot 'bin'),
-        (Join-Path $Stack.umfRoot 'bin'),
-        $inheritedPath
-    ))
+        (Join-Path $Stack.umfRoot 'bin')
+    ) + $inheritedPath
+    $envMap['PATH'] = [string]::Join(';', (Get-AilaUniquePathSegments -Segments $pathSegments))
     return $envMap
 }
 
