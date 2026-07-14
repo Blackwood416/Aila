@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "stacks": {
+    "oneapi-2025.3": {
+      "role": "baseline",
+      "compilerRoot": "C:/Program Files (x86)/Intel/oneAPI/compiler/2025.3",
+      "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2025.3",
+      "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2022.3",
+      "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.0",
+      "expectedCompilerVersion": "2025.3.3",
+      "expectedDnnlVersion": "3.9.1",
+      "expectedSyclDll": "sycl8.dll",
+      "allowLegacyCompiler": true
+    },
+    "oneapi-2026.1": {
+      "role": "candidate",
+      "compilerRoot": "C:/Program Files (x86)/Intel/oneAPI/compiler/2026.1",
+      "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+      "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+      "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+      "expectedCompilerVersion": "2026.1.0",
+      "expectedDnnlVersion": "3.11.2",
+      "expectedSyclDll": "sycl9.dll",
+      "allowLegacyCompiler": false
+    }
+  }
+}

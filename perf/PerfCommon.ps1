@@ -7,6 +7,40 @@ function Get-AilaRepoRoot {
     return [System.IO.Path]::GetFullPath($perfDir)
 }
 
+function Get-AilaOneApiStackConfig {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [string]$Path = 'perf\oneapi-stacks.json'
+    )
+
+    $fullPath = Resolve-AilaPath -RepoRoot $RepoRoot -Path $Path
+    $config = Read-AilaJsonFile -Path $fullPath
+    if ($config.schemaVersion -ne 1) {
+        throw "Unsupported oneAPI stack config schema: $($config.schemaVersion)"
+    }
+    return $config
+}
+
+function Get-AilaOneApiStack {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $stack = $Config.stacks.$Name
+    if ($null -eq $stack) {
+        throw "oneAPI stack '$Name' not found."
+    }
+    foreach ($property in @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')) {
+        $path = [string]$stack.$property
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "oneAPI stack '$Name' is missing $property at '$path'."
+        }
+    }
+    $stack | Add-Member -NotePropertyName name -NotePropertyValue $Name -Force
+    return $stack
+}
+
 function Resolve-AilaPath {
     param(
         [Parameter(Mandatory = $true)]
