@@ -66,6 +66,67 @@ function Get-AilaOneApiStack {
     return [pscustomobject]$result
 }
 
+function Import-AilaBatchEnvironment {
+    param([Parameter(Mandatory = $true)][string[]]$Scripts)
+
+    $vsDevCmd = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat'
+    if (-not (Test-Path -LiteralPath $vsDevCmd)) {
+        throw "Visual Studio environment script not found: $vsDevCmd"
+    }
+
+    $calls = New-Object System.Collections.Generic.List[string]
+    $calls.Add("call `"$vsDevCmd`" amd64 >nul")
+    $oneApiRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Scripts[0])))
+    $calls.Add("set `"ONEAPI_ROOT=$oneApiRoot`"")
+    foreach ($script in $Scripts) {
+        if (-not (Test-Path -LiteralPath $script)) {
+            throw "Environment script not found: $script"
+        }
+        $calls.Add("call `"$script`" >nul")
+    }
+    $calls.Add('set')
+
+    $result = @{}
+    cmd.exe /d /s /c ($calls -join ' && ') | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') {
+            $result[$matches[1]] = $matches[2]
+        }
+    }
+    return $result
+}
+
+function Get-AilaOneApiStackEnvironment {
+    param([Parameter(Mandatory = $true)]$Stack)
+
+    $scripts = @(
+        (Join-Path $Stack.umfRoot 'env\vars.bat'),
+        (Join-Path $Stack.tbbRoot 'env\vars.bat'),
+        (Join-Path $Stack.dnnlRoot 'env\vars.bat'),
+        (Join-Path $Stack.compilerRoot 'env\vars.bat')
+    )
+    $envMap = Import-AilaBatchEnvironment -Scripts $scripts
+    $inheritedPath = @($envMap['PATH'] -split ';' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        $_ -notmatch '(?i)[\\/]Intel[\\/]oneAPI[\\/]compiler[\\/]'
+    })
+    $envMap['PATH'] = [string]::Join(';', @(
+        (Join-Path $Stack.compilerRoot 'bin'),
+        (Join-Path $Stack.dnnlRoot 'bin'),
+        (Join-Path $Stack.tbbRoot 'bin'),
+        (Join-Path $Stack.umfRoot 'bin'),
+        $inheritedPath
+    ))
+    return $envMap
+}
+
+function Set-AilaProcessEnvironment {
+    param([Parameter(Mandatory = $true)][hashtable]$Environment)
+
+    foreach ($entry in $Environment.GetEnumerator()) {
+        [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+    }
+}
+
 function Resolve-AilaPath {
     param(
         [Parameter(Mandatory = $true)]

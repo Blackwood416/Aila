@@ -162,6 +162,47 @@ try {
             throw 'source stack unexpectedly contains an injected name property'
         }
     }
+
+    Invoke-Test 'imports an isolated baseline oneAPI environment' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $baseline = Get-AilaOneApiStack -Config $config -Name 'oneapi-2025.3'
+        $envMap = Get-AilaOneApiStackEnvironment -Stack $baseline
+
+        Assert-Equal '2025.3' (Split-Path $envMap.CMPLR_ROOT -Leaf) 'baseline compiler root'
+        if ($envMap.PATH -notmatch [regex]::Escape('compiler\2025.3\bin')) {
+            throw 'baseline PATH does not contain compiler 2025.3 bin'
+        }
+        if ($envMap.PATH -match 'compiler\\2026\.1') {
+            throw 'baseline PATH contains candidate compiler'
+        }
+    }
+
+    Invoke-Test 'imports an isolated candidate oneAPI environment' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+        $envMap = Get-AilaOneApiStackEnvironment -Stack $candidate
+
+        Assert-Equal '2026.1' (Split-Path $envMap.CMPLR_ROOT -Leaf) 'candidate compiler root'
+        if ($envMap.PATH -notmatch [regex]::Escape('compiler\2026.1\bin')) {
+            throw 'candidate PATH does not contain compiler 2026.1 bin'
+        }
+        if ($envMap.PATH -match 'compiler\\2025\.3') {
+            throw 'candidate PATH contains baseline compiler'
+        }
+    }
+
+    Invoke-Test 'sets process environment entries without leaking test state' {
+        $variableName = "AILA_PERF_COMMON_TEST_$([guid]::NewGuid().ToString('N'))"
+        $previousValue = [System.Environment]::GetEnvironmentVariable($variableName, 'Process')
+        try {
+            [System.Environment]::SetEnvironmentVariable($variableName, 'before', 'Process')
+            Set-AilaProcessEnvironment -Environment @{ $variableName = 'after' }
+            Assert-Equal 'after' ([System.Environment]::GetEnvironmentVariable($variableName, 'Process')) 'process environment value'
+        }
+        finally {
+            [System.Environment]::SetEnvironmentVariable($variableName, $previousValue, 'Process')
+        }
+    }
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {
