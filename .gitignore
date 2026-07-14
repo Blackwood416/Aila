@@ -1,6 +1,7 @@
 llama.cpp/
 oneDNN/
 vllm/
+vllm-omni/
 transformers/
 peft/
 Qwen3-ASR/
