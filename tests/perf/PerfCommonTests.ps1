@@ -97,6 +97,15 @@ $partialBatchPath = Join-Path $tempRoot 'missing-compiler-root.bat'
 Set-Content -LiteralPath $partialBatchPath -Value "@echo off`r`nset CMPLR_ROOT=`r`nexit /b 0" -Encoding ASCII
 $missingPathBatchPath = Join-Path $tempRoot 'missing-path.bat'
 Set-Content -LiteralPath $missingPathBatchPath -Value "@echo off`r`nset PATH=`r`nset CMPLR_ROOT=C:\compiler`r`nexit /b 0" -Encoding ASCII
+$invalidDnnlRoot = Join-Path $tempRoot 'invalid-dnnl'
+$invalidDnnlVersionDir = Join-Path $invalidDnnlRoot 'lib\cmake\dnnl'
+New-Item -ItemType Directory -Path $invalidDnnlVersionDir -Force | Out-Null
+$invalidDnnlVersionPath = Join-Path $invalidDnnlVersionDir 'dnnl-config-version.cmake'
+Set-Content -LiteralPath $invalidDnnlVersionPath -Value 'set(PACKAGE_VERSION_BROKEN "0.0.0")' -Encoding UTF8
+$failingCompilerRoot = Join-Path $tempRoot 'failing-compiler'
+$failingCompilerBin = Join-Path $failingCompilerRoot 'bin'
+New-Item -ItemType Directory -Path $failingCompilerBin -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\where.exe') -Destination (Join-Path $failingCompilerBin 'icx-cl.exe')
 
 try {
     Invoke-Test 'loads the complete real stack contract' {
@@ -123,6 +132,83 @@ try {
         Assert-Equal '3.11.2' $candidate.expectedDnnlVersion 'candidate oneDNN'
         Assert-Equal 'sycl9.dll' $candidate.expectedSyclDll 'candidate SYCL ABI'
         Assert-Equal $false $candidate.allowLegacyCompiler 'candidate legacy compiler policy'
+
+        $baselineMeta = Get-AilaOneApiStackMetadata -Stack $baseline
+        Assert-Equal 'oneapi-2025.3' $baselineMeta.name 'baseline metadata name'
+        Assert-Equal 'baseline' $baselineMeta.role 'baseline metadata role'
+        Assert-Equal (Join-Path $baseline.compilerRoot 'bin\icx-cl.exe') $baselineMeta.compilerPath 'baseline compiler path'
+        Assert-Equal '2025.3.3' $baselineMeta.compilerVersion 'baseline compiler version'
+        Assert-Equal $baseline.dnnlRoot $baselineMeta.dnnlRoot 'baseline oneDNN root'
+        Assert-Equal '3.9.1' $baselineMeta.dnnlVersion 'baseline oneDNN version'
+        Assert-Equal $baseline.tbbRoot $baselineMeta.tbbRoot 'baseline TBB root'
+        Assert-Equal '2022.3' $baselineMeta.tbbVersion 'baseline TBB version'
+        Assert-Equal $baseline.umfRoot $baselineMeta.umfRoot 'baseline UMF root'
+        Assert-Equal 'sycl8.dll' $baselineMeta.expectedSyclDll 'baseline SYCL DLL'
+        Assert-Equal $true $baselineMeta.allowLegacyCompiler 'baseline legacy flag'
+
+        $candidateMeta = Get-AilaOneApiStackMetadata -Stack $candidate
+        Assert-Equal 'oneapi-2026.1' $candidateMeta.name 'candidate metadata name'
+        Assert-Equal 'candidate' $candidateMeta.role 'candidate metadata role'
+        Assert-Equal (Join-Path $candidate.compilerRoot 'bin\icx-cl.exe') $candidateMeta.compilerPath 'candidate compiler path'
+        Assert-Equal '2026.1.0' $candidateMeta.compilerVersion 'compiler version'
+        Assert-Equal $candidate.dnnlRoot $candidateMeta.dnnlRoot 'candidate oneDNN root'
+        Assert-Equal '3.11.2' $candidateMeta.dnnlVersion 'oneDNN version'
+        Assert-Equal $candidate.tbbRoot $candidateMeta.tbbRoot 'candidate TBB root'
+        Assert-Equal '2023.1' $candidateMeta.tbbVersion 'TBB version'
+        Assert-Equal $candidate.umfRoot $candidateMeta.umfRoot 'candidate UMF root'
+        Assert-Equal 'sycl9.dll' $candidateMeta.expectedSyclDll 'SYCL DLL'
+        Assert-Equal $false $candidateMeta.allowLegacyCompiler 'candidate legacy flag'
+    }
+
+    Invoke-Test 'rejects a missing compiler metadata executable' {
+        $stack = New-TestStack -Root $validRoot
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $stack
+        } 'Compiler executable not found:' 'missing compiler executable'
+    }
+
+    Invoke-Test 'rejects a failed compiler metadata query' {
+        $stack = New-TestStack -Root $validRoot
+        $stack.compilerRoot = $failingCompilerRoot
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $stack
+        } 'Compiler version query failed' 'failed compiler query'
+    }
+
+    Invoke-Test 'rejects a missing oneDNN metadata version file' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+        $candidate.dnnlRoot = $validRoot
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $candidate
+        } 'oneDNN version file not found:' 'missing oneDNN version file'
+    }
+
+    Invoke-Test 'rejects an invalid oneDNN metadata version file' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+        $candidate.dnnlRoot = $invalidDnnlRoot
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $candidate
+        } 'Unable to parse oneDNN version from' 'invalid oneDNN version file'
+    }
+
+    Invoke-Test 'rejects an installed compiler version that does not match the stack' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+        $candidate.expectedCompilerVersion = '0.0.0'
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $candidate
+        } "Compiler version mismatch for oneAPI stack 'oneapi-2026.1'" 'compiler version mismatch'
+    }
+
+    Invoke-Test 'rejects an installed oneDNN version that does not match the stack' {
+        $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+        $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+        $candidate.expectedDnnlVersion = '0.0.0'
+        Assert-Throws {
+            Get-AilaOneApiStackMetadata -Stack $candidate
+        } "oneDNN version mismatch for oneAPI stack 'oneapi-2026.1'" 'oneDNN version mismatch'
     }
 
     Invoke-Test 'rejects an unknown dotted stack name explicitly' {

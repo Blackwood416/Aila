@@ -2,6 +2,8 @@ param(
     [string]$BuildDir = 'build',
     [ValidateSet('Release', 'RelWithDebInfo', 'Debug', 'MinSizeRel')]
     [string]$Config = 'Release',
+    [string]$OneApiStack = 'oneapi-2026.1',
+    [string]$OneApiStacksFile = 'perf\oneapi-stacks.json',
     [switch]$Clean,
     [int]$Jobs = 36
 )
@@ -23,11 +25,19 @@ if ($Clean -and (Test-Path -LiteralPath $buildDirPath)) {
 }
 
 Ensure-AilaDirectory -Path $buildDirPath
-Initialize-AilaOneApiEnvironment
+$stackConfig = Get-AilaOneApiStackConfig -RepoRoot $repoRoot -Path $OneApiStacksFile
+$stack = Get-AilaOneApiStack -Config $stackConfig -Name $OneApiStack
+$stackEnv = Get-AilaOneApiStackEnvironment -Stack $stack
+Set-AilaProcessEnvironment -Environment $stackEnv
+$stackMeta = Get-AilaOneApiStackMetadata -Stack $stack
 
 Push-Location $repoRoot
 try {
-    & cmake -S $repoRoot -B $buildDirPath -G Ninja "-DCMAKE_BUILD_TYPE=$Config"
+    $cmakeArgs = @('-S', $repoRoot, '-B', $buildDirPath, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Config")
+    if ($stack.allowLegacyCompiler) {
+        $cmakeArgs += '-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=ON'
+    }
+    & cmake @cmakeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed with exit code $LASTEXITCODE."
     }
@@ -39,6 +49,7 @@ try {
     Write-Host ("   git commit   : {0} ({1})" -f $gitInfo.shortCommit, $gitInfo.branch)
     Write-Host ("   build dir    : {0}" -f $buildDirPath)
     Write-Host ("   build type   : {0}" -f $buildMeta.buildType)
+    Write-Host ("   oneAPI stack : {0} ({1})" -f $stackMeta.name, $stackMeta.role)
     Write-Host ("   compiler     : {0}" -f $buildMeta.compiler)
     Write-Host ("   generator    : {0}" -f $buildMeta.generator)
 
@@ -53,7 +64,7 @@ finally {
 
 $buildInfoPath = Join-Path $buildDirPath 'build_info.json'
 Write-AilaJsonFile -Path $buildInfoPath -Data ([ordered]@{
-    schemaVersion  = 1
+    schemaVersion  = 2
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
     git            = [ordered]@{
         shortCommit = $gitInfo.shortCommit
@@ -63,9 +74,10 @@ Write-AilaJsonFile -Path $buildInfoPath -Data ([ordered]@{
     build          = [ordered]@{
         buildDir  = $buildDirPath
         buildType = $Config
-        compiler  = (Get-AilaBuildMetadata -BuildDir $buildDirPath).compiler
-        generator = (Get-AilaBuildMetadata -BuildDir $buildDirPath).generator
+        compiler  = $buildMeta.compiler
+        generator = $buildMeta.generator
     }
+    oneApi          = $stackMeta
 })
 
 Write-Host (":: build metadata written to {0} ::" -f $buildInfoPath) -ForegroundColor Green

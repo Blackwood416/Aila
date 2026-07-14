@@ -66,6 +66,59 @@ function Get-AilaOneApiStack {
     return [pscustomobject]$result
 }
 
+function Get-AilaOneApiStackMetadata {
+    param([Parameter(Mandatory = $true)]$Stack)
+
+    $compiler = Join-Path $Stack.compilerRoot 'bin\icx-cl.exe'
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        throw "Compiler executable not found: $compiler"
+    }
+
+    $versionText = (& $compiler --version 2>&1 | Out-String)
+    $compilerExitCode = $LASTEXITCODE
+    if ($compilerExitCode -ne 0) {
+        throw "Compiler version query failed for $compiler with exit code $compilerExitCode."
+    }
+
+    $compilerVersionMatch = [regex]::Match($versionText, 'Version\s+(\d+\.\d+\.\d+)')
+    if (-not $compilerVersionMatch.Success) {
+        throw "Unable to parse compiler version from $compiler"
+    }
+    $compilerVersion = $compilerVersionMatch.Groups[1].Value
+    if ($compilerVersion -ne [string]$Stack.expectedCompilerVersion) {
+        throw "Compiler version mismatch for oneAPI stack '$($Stack.name)': expected '$($Stack.expectedCompilerVersion)', actual '$compilerVersion'."
+    }
+
+    $dnnlVersionFile = Join-Path $Stack.dnnlRoot 'lib\cmake\dnnl\dnnl-config-version.cmake'
+    if (-not (Test-Path -LiteralPath $dnnlVersionFile -PathType Leaf)) {
+        throw "oneDNN version file not found: $dnnlVersionFile"
+    }
+
+    $dnnlText = Get-Content -LiteralPath $dnnlVersionFile -Raw
+    $dnnlVersionMatch = [regex]::Match($dnnlText, 'set\(PACKAGE_VERSION\s+"([^"]+)"\)')
+    if (-not $dnnlVersionMatch.Success) {
+        throw "Unable to parse oneDNN version from $dnnlVersionFile"
+    }
+    $dnnlVersion = $dnnlVersionMatch.Groups[1].Value
+    if ($dnnlVersion -ne [string]$Stack.expectedDnnlVersion) {
+        throw "oneDNN version mismatch for oneAPI stack '$($Stack.name)': expected '$($Stack.expectedDnnlVersion)', actual '$dnnlVersion'."
+    }
+
+    return [pscustomobject]@{
+        name                = $Stack.name
+        role                = $Stack.role
+        compilerPath        = $compiler
+        compilerVersion     = $compilerVersion
+        dnnlRoot            = [string]$Stack.dnnlRoot
+        dnnlVersion         = $dnnlVersion
+        tbbRoot             = [string]$Stack.tbbRoot
+        tbbVersion          = Split-Path $Stack.tbbRoot -Leaf
+        umfRoot             = [string]$Stack.umfRoot
+        expectedSyclDll     = [string]$Stack.expectedSyclDll
+        allowLegacyCompiler = [bool]$Stack.allowLegacyCompiler
+    }
+}
+
 function Get-AilaWindowsPathKey {
     param([Parameter(Mandatory = $true)][string]$Path)
 
