@@ -15,8 +15,14 @@ function Get-AilaOneApiStackConfig {
 
     $fullPath = Resolve-AilaPath -RepoRoot $RepoRoot -Path $Path
     $config = Read-AilaJsonFile -Path $fullPath
-    if ($config.schemaVersion -ne 1) {
-        throw "Unsupported oneAPI stack config schema: $($config.schemaVersion)"
+    $schemaProperty = if ($null -eq $config) { $null } else { $config.PSObject.Properties['schemaVersion'] }
+    if ($null -eq $schemaProperty) {
+        throw 'Unsupported oneAPI stack config schema: <missing>'
+    }
+
+    $schemaVersion = $schemaProperty.Value
+    if ($schemaVersion -ne 1) {
+        throw "Unsupported oneAPI stack config schema: $schemaVersion"
     }
     return $config
 }
@@ -27,18 +33,37 @@ function Get-AilaOneApiStack {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
-    $stack = $Config.stacks.$Name
-    if ($null -eq $stack) {
+    $stacksProperty = $Config.PSObject.Properties['stacks']
+    if ($null -eq $stacksProperty -or $null -eq $stacksProperty.Value) {
         throw "oneAPI stack '$Name' not found."
     }
+
+    $stackProperty = $stacksProperty.Value.PSObject.Properties[$Name]
+    if ($null -eq $stackProperty -or $null -eq $stackProperty.Value) {
+        throw "oneAPI stack '$Name' not found."
+    }
+    $stack = $stackProperty.Value
+
     foreach ($property in @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')) {
-        $path = [string]$stack.$property
-        if (-not (Test-Path -LiteralPath $path)) {
-            throw "oneAPI stack '$Name' is missing $property at '$path'."
+        $rootProperty = $stack.PSObject.Properties[$property]
+        if ($null -eq $rootProperty) {
+            throw "oneAPI stack '$Name' is missing required root property '$property'."
+        }
+
+        $path = [string]$rootProperty.Value
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            throw "oneAPI stack '$Name' has blank $property."
+        }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            throw "oneAPI stack '$Name' $property is not a directory: '$path'."
         }
     }
-    $stack | Add-Member -NotePropertyName name -NotePropertyValue $Name -Force
-    return $stack
+
+    $result = [ordered]@{ name = $Name }
+    foreach ($sourceProperty in $stack.PSObject.Properties) {
+        $result[$sourceProperty.Name] = $sourceProperty.Value
+    }
+    return [pscustomobject]$result
 }
 
 function Resolve-AilaPath {
