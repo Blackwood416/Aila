@@ -19,6 +19,20 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project (Aila CXX)
 
+option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
+    "Allow the temporary oneAPI 2025.3 comparison build" OFF)
+
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "Aila requires the Intel oneAPI DPC++/C++ Compiler")
+endif()
+
+if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "2026.1" AND
+   NOT AILA_ALLOW_LEGACY_ONEAPI_BASELINE)
+    message(FATAL_ERROR
+        "Aila requires IntelLLVM >= 2026.1; use "
+        "-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=ON only for the controlled 2025.3 comparison build")
+endif()
+
 if(MSVC)
     # --- Base flags ---
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl /Qstd=c++17 /EHsc /Qftz")
@@ -260,11 +274,18 @@ if(WIN32)
     endif()
 
     get_filename_component(AILA_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    set(AILA_RUNTIME_SEARCH_DIRS "${AILA_COMPILER_BIN_DIR}")
+    find_package(TBB CONFIG REQUIRED)
+    get_filename_component(AILA_TBB_ROOT "${TBB_DIR}/../../.." ABSOLUTE)
+    set(AILA_TBB_BIN_DIR "${AILA_TBB_ROOT}/bin")
 
-    get_filename_component(AILA_ONEAPI_ROOT "${AILA_COMPILER_BIN_DIR}/../../.." ABSOLUTE)
-    file(GLOB AILA_TBB_BIN_DIRS "${AILA_ONEAPI_ROOT}/tbb/*/bin")
-    list(APPEND AILA_RUNTIME_SEARCH_DIRS ${AILA_TBB_BIN_DIRS})
+    if(NOT EXISTS "${AILA_TBB_BIN_DIR}/tbb12.dll")
+        message(FATAL_ERROR "Resolved TBB runtime directory is invalid: ${AILA_TBB_BIN_DIR}")
+    endif()
+
+    set(AILA_RUNTIME_SEARCH_DIRS
+        "${AILA_COMPILER_BIN_DIR}"
+        "${AILA_TBB_BIN_DIR}"
+    )
 
     set(AILA_ONEAPI_RUNTIME_ROOT_PATTERNS
         "ur_loader.dll"
@@ -289,12 +310,13 @@ if(WIN32)
     )
     set(AILA_ONEAPI_RUNTIME_ROOT_DLLS)
     foreach(pattern IN LISTS AILA_ONEAPI_RUNTIME_ROOT_PATTERNS)
-        file(GLOB AILA_ONEAPI_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_COMPILER_BIN_DIR}/${pattern}")
-        list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_ONEAPI_RUNTIME_MATCHES})
-        foreach(AILA_TBB_BIN_DIR IN LISTS AILA_TBB_BIN_DIRS)
-            file(GLOB AILA_TBB_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_TBB_BIN_DIR}/${pattern}")
-            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_TBB_RUNTIME_MATCHES})
-        endforeach()
+        file(GLOB AILA_COMPILER_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
+            "${AILA_COMPILER_BIN_DIR}/${pattern}")
+        file(GLOB AILA_TBB_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
+            "${AILA_TBB_BIN_DIR}/${pattern}")
+        list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS
+            ${AILA_COMPILER_RUNTIME_MATCHES}
+            ${AILA_TBB_RUNTIME_MATCHES})
     endforeach()
     list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
 
