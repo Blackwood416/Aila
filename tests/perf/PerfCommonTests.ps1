@@ -241,6 +241,66 @@ New-Item -ItemType Directory -Path $failingCompilerBin -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\where.exe') -Destination (Join-Path $failingCompilerBin 'icx-cl.exe')
 
 try {
+    Invoke-Test 'verifier rejects a missing build directory' {
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', 'missing-build', '-OneApiStack', 'oneapi-2026.1') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'Build directory not found:' 'missing build verification'
+    }
+
+    Invoke-Test 'verifier rejects a missing build info file' {
+        $buildDir = Join-Path $tempRoot 'verifier-missing-build-info'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'Build info file not found:' 'missing build info verification'
+    }
+
+    Invoke-Test 'verifier rejects a different requested stack without writing output' {
+        $buildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
+            throw "Required verifier fixture build directory not found: $buildDir"
+        }
+        $outputPath = Join-Path $tempRoot 'wrong-stack-verification.json'
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @(
+                    '-BuildDir', $buildDir,
+                    '-OneApiStack', 'oneapi-2026.1',
+                    '-OutputPath', $outputPath
+                ) `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } "but 'oneapi-2026.1'" 'wrong stack verification'
+        Assert-Equal $false (Test-Path -LiteralPath $outputPath) 'wrong stack output must not be written'
+    }
+
     Invoke-Test 'loads the complete real stack contract' {
         $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
         $baseline = Get-AilaOneApiStack -Config $config -Name 'oneapi-2025.3'
