@@ -17,7 +17,9 @@ param(
     [double]$TopP = 0.95,
     [UInt64]$Seed = 42,
     [hashtable]$EnvOverrides = @{},
-    [int]$WaitTimeoutSec = 3600
+    [int]$WaitTimeoutSec = 3600,
+    [string]$OneApiStack = '',
+    [string]$OneApiStacksFile = 'perf\oneapi-stacks.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +96,59 @@ $repoRoot = Get-AilaRepoRoot
 $gitInfo = Get-AilaGitInfo -RepoRoot $repoRoot
 $buildDirPath = Resolve-AilaPath -RepoRoot $repoRoot -Path $BuildDir
 $buildMeta = Get-AilaBuildMetadata -BuildDir $buildDirPath
+$buildInfoPath = Join-Path $buildDirPath 'build_info.json'
+$buildInfo = if (Test-Path -LiteralPath $buildInfoPath) { Read-AilaJsonFile -Path $buildInfoPath } else { $null }
+
+if (-not [string]::IsNullOrWhiteSpace($OneApiStack)) {
+    $schemaProperty = if ($null -eq $buildInfo) { $null } else { $buildInfo.PSObject.Properties['schemaVersion'] }
+    if ($null -eq $schemaProperty) {
+        throw "Unsupported build info schema in '$buildInfoPath': <missing>"
+    }
+    if ($schemaProperty.Value -ne 2) {
+        throw "Unsupported build info schema in '$buildInfoPath': $($schemaProperty.Value)"
+    }
+
+    $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot -Path $OneApiStacksFile
+    $stack = Get-AilaOneApiStack -Config $config -Name $OneApiStack
+    $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
+    if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
+        throw "Build info '$buildInfoPath' is missing oneApi metadata."
+    }
+    $nameProperty = $oneApiProperty.Value.PSObject.Properties['name']
+    if ($null -eq $nameProperty -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+        throw "Build info '$buildInfoPath' is missing oneApi name metadata."
+    }
+    if ([string]$nameProperty.Value -ne $OneApiStack) {
+        throw "Build '$BuildDir' belongs to '$($nameProperty.Value)', not '$OneApiStack'."
+    }
+
+    Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack
+    Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack -RequireValues
+    Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $stack)
+}
+else {
+    Initialize-AilaOneApiEnvironment
+}
+
+if ($null -eq $buildInfo) {
+    $buildInfo = [pscustomobject]@{
+        build = [ordered]@{
+            buildDir  = $buildMeta.buildDir
+            buildType = $buildMeta.buildType
+            compiler  = $buildMeta.compiler
+            generator = $buildMeta.generator
+        }
+        oneApi = $null
+    }
+}
+else {
+    if ($null -eq $buildInfo.PSObject.Properties['build']) {
+        $buildInfo | Add-Member -NotePropertyName build -NotePropertyValue $null
+    }
+    if ($null -eq $buildInfo.PSObject.Properties['oneApi']) {
+        $buildInfo | Add-Member -NotePropertyName oneApi -NotePropertyValue $null
+    }
+}
 
 if ($buildMeta.buildType -and $buildMeta.buildType -ne 'Release') {
     Write-Host ":: warning: build dir is configured as $($buildMeta.buildType); benchmark numbers may be much slower than Release ::" -ForegroundColor Yellow
@@ -167,7 +222,6 @@ Ensure-AilaDirectory -Path $OutputDir
 Ensure-AilaDirectory -Path (Join-Path $OutputDir 'bench_logs')
 
 $globalLogPath = Join-Path $repoRoot 'bench_log.txt'
-Initialize-AilaOneApiEnvironment
 
 $hasMutex = Acquire-BenchMutex -Mutex $mutex -TimeoutSec $WaitTimeoutSec
 if (-not $hasMutex) {
@@ -238,12 +292,8 @@ try {
             fullCommit  = $gitInfo.fullCommit
             branch      = $gitInfo.branch
         }
-        build         = [ordered]@{
-            buildDir   = $buildMeta.buildDir
-            buildType  = $buildMeta.buildType
-            compiler   = $buildMeta.compiler
-            generator  = $buildMeta.generator
-        }
+        build         = $buildInfo.build
+        oneApi        = $buildInfo.oneApi
         model         = [ordered]@{
             alias      = $resolvedModel.alias
             path       = $resolvedModel.path

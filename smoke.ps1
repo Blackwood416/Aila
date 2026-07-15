@@ -8,7 +8,9 @@ param(
     [string]$Phase = 'smoke',
     [string[]]$CaseNames = @(),
     [int]$MaxSeqLen = 0,
-    [hashtable]$EnvOverrides = @{}
+    [hashtable]$EnvOverrides = @{},
+    [string]$OneApiStack = '',
+    [string]$OneApiStacksFile = 'perf\oneapi-stacks.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -193,6 +195,52 @@ $buildDirPath = Resolve-AilaPath -RepoRoot $repoRoot -Path $BuildDir
 $buildInfoPath = Join-Path $buildDirPath 'build_info.json'
 $buildInfo = if (Test-Path -LiteralPath $buildInfoPath) { Read-AilaJsonFile -Path $buildInfoPath } else { $null }
 
+if (-not [string]::IsNullOrWhiteSpace($OneApiStack)) {
+    $schemaProperty = if ($null -eq $buildInfo) { $null } else { $buildInfo.PSObject.Properties['schemaVersion'] }
+    if ($null -eq $schemaProperty) {
+        throw "Unsupported build info schema in '$buildInfoPath': <missing>"
+    }
+    if ($schemaProperty.Value -ne 2) {
+        throw "Unsupported build info schema in '$buildInfoPath': $($schemaProperty.Value)"
+    }
+
+    $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot -Path $OneApiStacksFile
+    $stack = Get-AilaOneApiStack -Config $config -Name $OneApiStack
+    $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
+    if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
+        throw "Build info '$buildInfoPath' is missing oneApi metadata."
+    }
+    $nameProperty = $oneApiProperty.Value.PSObject.Properties['name']
+    if ($null -eq $nameProperty -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+        throw "Build info '$buildInfoPath' is missing oneApi name metadata."
+    }
+    if ([string]$nameProperty.Value -ne $OneApiStack) {
+        throw "Build '$BuildDir' belongs to '$($nameProperty.Value)', not '$OneApiStack'."
+    }
+
+    Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack
+    Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack -RequireValues
+    Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $stack)
+}
+else {
+    Initialize-AilaOneApiEnvironment
+}
+
+if ($null -eq $buildInfo) {
+    $buildInfo = [pscustomobject]@{
+        build  = $null
+        oneApi = $null
+    }
+}
+else {
+    if ($null -eq $buildInfo.PSObject.Properties['build']) {
+        $buildInfo | Add-Member -NotePropertyName build -NotePropertyValue $null
+    }
+    if ($null -eq $buildInfo.PSObject.Properties['oneApi']) {
+        $buildInfo | Add-Member -NotePropertyName oneApi -NotePropertyValue $null
+    }
+}
+
 $config = Get-AilaPerfConfig -RepoRoot $repoRoot -PresetsFile $PresetsFile
 $presetConfig = Get-AilaPreset -Config $config -PresetName $Preset
 $smokeCases = @($presetConfig.smokes)
@@ -221,7 +269,6 @@ else {
 
 Ensure-AilaDirectory -Path $OutputDir
 Ensure-AilaDirectory -Path (Join-Path $OutputDir 'smoke_logs')
-Initialize-AilaOneApiEnvironment
 
 $results = @()
 foreach ($smokeCase in $smokeCases) {
@@ -263,7 +310,8 @@ Write-AilaJsonFile -Path $smokesPath -Data ([ordered]@{
         fullCommit  = $gitInfo.fullCommit
         branch      = $gitInfo.branch
     }
-    build         = if ($null -ne $buildInfo) { $buildInfo.build } else { $null }
+    build         = $buildInfo.build
+    oneApi        = $buildInfo.oneApi
     model         = [ordered]@{
         label = if ([string]::IsNullOrWhiteSpace($resolvedModelLabel)) { $null } else { $resolvedModelLabel }
         path  = if ([string]::IsNullOrWhiteSpace($resolvedModelPath)) { $null } else { $resolvedModelPath }
