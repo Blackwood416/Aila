@@ -776,7 +776,10 @@ function Invoke-AilaProcess {
 
         [string]$LogPath,
 
-        [hashtable]$EnvOverrides = @{}
+        [hashtable]$EnvOverrides = @{},
+
+        [ValidateRange(0, 86400)]
+        [int]$TimeoutSeconds = 0
     )
 
     $previousEnv = @{}
@@ -797,6 +800,10 @@ function Invoke-AilaProcess {
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $captured = New-Object System.Collections.Generic.List[string]
     $process = $null
+    $stdout = ''
+    $stderr = ''
+    $exitCode = $null
+    $timedOut = $false
 
     try {
         $process = New-Object System.Diagnostics.Process
@@ -811,7 +818,23 @@ function Invoke-AilaProcess {
         [void]$process.Start()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
+        $completed = if ($TimeoutSeconds -gt 0) {
+            $process.WaitForExit([int]([math]::Min([int]::MaxValue, [int64]$TimeoutSeconds * 1000)))
+        }
+        else {
+            $process.WaitForExit()
+            $true
+        }
+        if (-not $completed) {
+            $timedOut = $true
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                try { $process.Kill() } catch { }
+            }
+            $process.WaitForExit()
+        }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
@@ -844,6 +867,8 @@ function Invoke-AilaProcess {
         outputText   = $outputText
         logPath      = $LogPath
         durationMs   = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 3)
+        timedOut     = $timedOut
+        timeoutSeconds = $TimeoutSeconds
         commandLine  = ($Executable + ' ' + ($ArgumentList -join ' ')).Trim()
         envOverrides = [pscustomobject]$EnvOverrides
     }
@@ -957,6 +982,101 @@ function Parse-AilaAlignmentOutput {
         })
     }
     return $rows.ToArray()
+}
+
+function Get-AilaWavMetadata {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $reader = [System.IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 12) { throw "WAV output is too small: $Path" }
+        $riff = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
+        $riffSize = [long]$reader.ReadUInt32()
+        $wave = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
+        if ($riff -ne 'RIFF' -or $wave -ne 'WAVE') { throw "Invalid WAV RIFF/WAVE header: $Path" }
+        if ($riffSize -lt 4 -or $riffSize + 8 -ne $stream.Length) { throw "Invalid WAV RIFF chunk bounds: $Path" }
+
+        $fmt = $null
+        $dataOffset = $null
+        $dataBytes = $null
+        while ($stream.Position + 8 -le $stream.Length) {
+            $chunkId = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
+            $chunkSize = [long]$reader.ReadUInt32()
+            $chunkStart = $stream.Position
+            if ($chunkStart + $chunkSize -gt $stream.Length) {
+                throw "Invalid WAV chunk bounds: $Path"
+            }
+            if ($chunkId -eq 'fmt ') {
+                if ($chunkSize -lt 16) { throw "Invalid WAV fmt chunk: $Path" }
+                $fmt = [ordered]@{
+                    audioFormat   = [int]$reader.ReadUInt16()
+                    channels      = [int]$reader.ReadUInt16()
+                    sampleRate    = [long]$reader.ReadUInt32()
+                    byteRate      = [long]$reader.ReadUInt32()
+                    blockAlign    = [int]$reader.ReadUInt16()
+                    bitsPerSample = [int]$reader.ReadUInt16()
+                }
+            }
+            elseif ($chunkId -eq 'data' -and $null -eq $dataOffset) {
+                $dataOffset = $chunkStart
+                $dataBytes = $chunkSize
+            }
+            $next = $chunkStart + $chunkSize + ($chunkSize % 2)
+            if ($next -gt $stream.Length) { throw "Invalid WAV padded chunk bounds: $Path" }
+            $stream.Position = $next
+        }
+
+        if ($null -eq $fmt -or $null -eq $dataOffset -or $null -eq $dataBytes) {
+            throw "WAV output is missing fmt or data chunk: $Path"
+        }
+        if ($fmt.audioFormat -ne 1 -and $fmt.audioFormat -ne 3) {
+            throw "Unsupported WAV format '$($fmt.audioFormat)': $Path"
+        }
+        if ($fmt.channels -le 0 -or $fmt.sampleRate -le 0) {
+            throw "WAV channels and sampleRate must be positive: $Path"
+        }
+        $supportedBits = if ($fmt.audioFormat -eq 1) { @(8, 16, 24, 32) } else { @(32, 64) }
+        if ($supportedBits -notcontains $fmt.bitsPerSample) {
+            throw "Unsupported WAV bitsPerSample '$($fmt.bitsPerSample)': $Path"
+        }
+        $expectedBlockAlign = [int64]$fmt.channels * [int64]($fmt.bitsPerSample / 8)
+        $expectedByteRate = [int64]$fmt.sampleRate * $expectedBlockAlign
+        if ($fmt.blockAlign -ne $expectedBlockAlign) {
+            throw "WAV blockAlign mismatch: expected $expectedBlockAlign, actual $($fmt.blockAlign): $Path"
+        }
+        if ($fmt.byteRate -ne $expectedByteRate) {
+            throw "WAV byteRate mismatch: expected $expectedByteRate, actual $($fmt.byteRate): $Path"
+        }
+        if ($dataBytes -le 0 -or $dataBytes % $fmt.blockAlign -ne 0) {
+            throw "WAV data chunk is empty or not frame-aligned: $Path"
+        }
+
+        $frameCount = [long]($dataBytes / $fmt.blockAlign)
+        $duration = [double]$frameCount / [double]$fmt.sampleRate
+        if ([double]::IsNaN($duration) -or [double]::IsInfinity($duration) -or $duration -le 0) {
+            throw "WAV output has invalid duration: $Path"
+        }
+        if ($fmt.audioFormat -eq 3) {
+            $stream.Position = $dataOffset
+            $sampleCount = [long]$dataBytes / [long]($fmt.bitsPerSample / 8)
+            for ($index = 0L; $index -lt $sampleCount; $index++) {
+                $sample = if ($fmt.bitsPerSample -eq 32) { [double]$reader.ReadSingle() } else { $reader.ReadDouble() }
+                if ([double]::IsNaN($sample) -or [double]::IsInfinity($sample)) {
+                    throw "WAV float sample is non-finite at index ${index}: $Path"
+                }
+            }
+        }
+
+        $fmt['dataBytes'] = [long]$dataBytes
+        $fmt['frameCount'] = $frameCount
+        $fmt['durationSeconds'] = [math]::Round($duration, 6)
+        return [pscustomobject]$fmt
+    }
+    finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Parse-AilaBenchmarkOutput {

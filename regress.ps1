@@ -3,12 +3,14 @@ param(
     [Parameter(Mandatory = $true)][string]$OneApiStack,
     [string]$CasesFile = 'perf\oneapi-regression-cases.json',
     [string[]]$CaseNames = @(),
-    [string]$OutputDir = ''
+    [string]$OutputDir = '',
+    [ValidateRange(1, 86400)][int]$CaseTimeoutSeconds = 600
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'perf\PerfCommon.ps1')
+$script:AilaRegressionModelIdentityCache = @{}
 
 function Get-AilaRegressionProperty {
     param(
@@ -203,23 +205,94 @@ function Assert-AilaRegressionBuildStack {
     }
 }
 
+function Test-AilaRegressionIntegerValue {
+    param($Value)
+
+    return $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+}
+
+function Assert-AilaRegressionAllowedFields {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string[]]$AllowedFields,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [switch]$TopLevel
+    )
+
+    $allowed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($field in $AllowedFields) { $null = $allowed.Add($field) }
+    foreach ($property in $Object.PSObject.Properties) {
+        if (-not $allowed.Contains($property.Name)) {
+            if ($TopLevel) { throw "Accuracy cases config has unknown top-level field '$($property.Name)'." }
+            throw "$Context has unknown field '$($property.Name)'."
+        }
+    }
+}
+
+function Assert-AilaRegressionCaseSchema {
+    param([Parameter(Mandatory = $true)]$Case)
+
+    if ($Case -isnot [pscustomobject]) { throw 'Each accuracy case must be a JSON object.' }
+    $name = Get-AilaRegressionString -Object $Case -Name 'name' -Context 'Accuracy case'
+    $context = "Accuracy case '$name'"
+    $kind = (Get-AilaRegressionString -Object $Case -Name 'kind' -Context $context).ToLowerInvariant()
+    if ($kind -notin @('chat', 'asr', 'align', 'tts')) { throw "$context has unsupported kind '$kind'." }
+
+    $specific = switch ($kind) {
+        'chat' { @('input', 'maxTokens', 'mode', 'expectRegex') }
+        'asr' { @('audio', 'forcedLanguage', 'expectedText') }
+        'align' { @('audio', 'text', 'language', 'timestampFrameMs', 'timestampToleranceMs') }
+        'tts' { @('text', 'referenceAudio', 'language', 'maxTokens') }
+    }
+    Assert-AilaRegressionAllowedFields -Object $Case -AllowedFields (@('name', 'kind', 'model') + $specific) -Context $context
+    $null = Get-AilaRegressionString -Object $Case -Name 'model' -Context $context
+
+    switch ($kind) {
+        'chat' {
+            $null = Get-AilaRegressionString -Object $Case -Name 'input' -Context $context
+            $null = Get-AilaRegressionPositiveInt -Object $Case -Name 'maxTokens' -Context $context
+            $mode = Get-AilaRegressionString -Object $Case -Name 'mode' -Context $context
+            if ($mode -ne 'greedy') { throw "$context property 'mode' must be the string 'greedy'." }
+            if ($null -ne $Case.PSObject.Properties['expectRegex']) {
+                $pattern = Get-AilaRegressionString -Object $Case -Name 'expectRegex' -Context $context
+                try { $null = [regex]::new($pattern) } catch { throw "$context property 'expectRegex' is invalid: $($_.Exception.Message)" }
+            }
+        }
+        'asr' {
+            foreach ($field in @('audio', 'forcedLanguage', 'expectedText')) { $null = Get-AilaRegressionString -Object $Case -Name $field -Context $context }
+        }
+        'align' {
+            foreach ($field in @('audio', 'text', 'language')) { $null = Get-AilaRegressionString -Object $Case -Name $field -Context $context }
+            $null = Get-AilaRegressionPositiveInt -Object $Case -Name 'timestampFrameMs' -Context $context
+            $null = Get-AilaRegressionPositiveInt -Object $Case -Name 'timestampToleranceMs' -Context $context
+        }
+        'tts' {
+            foreach ($field in @('text', 'referenceAudio', 'language')) { $null = Get-AilaRegressionString -Object $Case -Name $field -Context $context }
+            $null = Get-AilaRegressionPositiveInt -Object $Case -Name 'maxTokens' -Context $context
+        }
+    }
+}
+
 function Get-AilaRegressionSelection {
     param(
         [Parameter(Mandatory = $true)]$CasesConfig,
         [string[]]$RequestedNames = @()
     )
 
+    if ($CasesConfig -isnot [pscustomobject]) { throw 'Accuracy cases config must be a JSON object.' }
+    Assert-AilaRegressionAllowedFields -Object $CasesConfig -AllowedFields @('schemaVersion', 'cases') -Context 'Accuracy cases config' -TopLevel
     $schemaProperty = $CasesConfig.PSObject.Properties['schemaVersion']
-    if ($null -eq $schemaProperty) {
-        throw 'Unsupported accuracy cases schema: <missing>'
-    }
-    if ($schemaProperty.Value -ne 1) {
+    if ($null -eq $schemaProperty) { throw 'Unsupported accuracy cases schema: <missing>' }
+    if (-not (Test-AilaRegressionIntegerValue -Value $schemaProperty.Value) -or $schemaProperty.Value -ne 1) {
         throw "Unsupported accuracy cases schema: $($schemaProperty.Value)"
     }
     $casesProperty = $CasesConfig.PSObject.Properties['cases']
     if ($null -eq $casesProperty -or $null -eq $casesProperty.Value) {
         throw "Accuracy cases config is missing required property 'cases'."
     }
+    if ($casesProperty.Value -isnot [System.Array]) { throw 'Accuracy cases must be a JSON array.' }
     $allCases = @($casesProperty.Value)
     if ($allCases.Count -eq 0) {
         throw 'Accuracy cases config contains no cases.'
@@ -227,6 +300,7 @@ function Get-AilaRegressionSelection {
 
     $byName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($case in $allCases) {
+        Assert-AilaRegressionCaseSchema -Case $case
         $name = Get-AilaRegressionString -Object $case -Name 'name' -Context 'Accuracy case'
         if (-not $byName.TryAdd($name, $case)) {
             throw "Duplicate accuracy case name in cases file: '$name'."
@@ -283,10 +357,11 @@ function Resolve-AilaRegressionCases {
         $modelPath = Resolve-AilaRegressionInputPath -RepoRoot $RepoRoot -ApprovedRoots $ApprovedRoots -Path $modelValue -Label "$context model" -PathType Container
 
         $resolved = [ordered]@{
-            name      = $name
-            kind      = $kind
-            config    = $case
-            modelPath = $modelPath
+            name          = $name
+            kind          = $kind
+            config        = $case
+            modelPath     = $modelPath
+            modelIdentity = Get-AilaRegressionModelIdentity -ModelPath $modelPath -ApprovedRoots $ApprovedRoots
         }
         switch ($kind) {
             'chat' {
@@ -377,7 +452,15 @@ function Get-AilaRegressionFileArtifact {
 }
 
 function Get-AilaRegressionModelIdentity {
-    param([Parameter(Mandatory = $true)][string]$ModelPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ModelPath,
+        [Parameter(Mandatory = $true)][string[]]$ApprovedRoots
+    )
+
+    $modelKey = Get-AilaCanonicalWindowsPathKey -Path $ModelPath
+    if ($script:AilaRegressionModelIdentityCache.ContainsKey($modelKey)) {
+        return $script:AilaRegressionModelIdentityCache[$modelKey]
+    }
 
     $metadataNames = @(
         'config.json', 'generation_config.json', 'tokenizer_config.json', 'processor_config.json',
@@ -400,61 +483,43 @@ function Get-AilaRegressionModelIdentity {
         $artifact['name'] = $name
         $files.Add([pscustomobject]$artifact)
     }
-    return [ordered]@{
-        path          = $ModelPath
-        metadataFiles = $files.ToArray()
-    }
-}
-
-function Get-AilaRegressionWavMetadata {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-    $reader = [System.IO.BinaryReader]::new($stream)
-    try {
-        if ($stream.Length -lt 44) { throw "WAV output is too small: $Path" }
-        $riff = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
-        $null = $reader.ReadUInt32()
-        $wave = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
-        if ($riff -ne 'RIFF' -or $wave -ne 'WAVE') { throw "Invalid WAV RIFF header: $Path" }
-
-        $format = $null
-        $dataBytes = 0L
-        while ($stream.Position + 8 -le $stream.Length) {
-            $chunkId = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
-            $chunkSize = [long]$reader.ReadUInt32()
-            $chunkStart = $stream.Position
-            if ($chunkStart + $chunkSize -gt $stream.Length) { throw "Invalid WAV chunk size in: $Path" }
-            if ($chunkId -eq 'fmt ' -and $chunkSize -ge 16) {
-                $format = [ordered]@{
-                    audioFormat   = [int]$reader.ReadUInt16()
-                    channels      = [int]$reader.ReadUInt16()
-                    sampleRate    = [long]$reader.ReadUInt32()
-                    byteRate      = [long]$reader.ReadUInt32()
-                    blockAlign    = [int]$reader.ReadUInt16()
-                    bitsPerSample = [int]$reader.ReadUInt16()
-                }
-            }
-            elseif ($chunkId -eq 'data') {
-                $dataBytes = $chunkSize
-            }
-            $stream.Position = $chunkStart + $chunkSize + ($chunkSize % 2)
+    $weightExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @('.safetensors', '.bin', '.gguf', '.pt', '.pth')) { $null = $weightExtensions.Add($extension) }
+    $weightManifest = New-Object System.Collections.Generic.List[object]
+    foreach ($directory in @(Get-ChildItem -LiteralPath $ModelPath -Directory -Recurse -Force -ErrorAction Stop)) {
+        if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -and
+            (-not (Test-AilaPathWithinRoot -Path $directory.FullName -Root $ModelPath) -or
+             -not (Test-AilaRegressionPathInApprovedRoots -Path $directory.FullName -Roots $ApprovedRoots))) {
+            throw "Model weight directory escapes approved model root: $($directory.FullName)"
         }
-        if ($null -eq $format -or $dataBytes -le 0 -or $format.sampleRate -le 0 -or $format.blockAlign -le 0) {
-            throw "WAV output is missing valid format or audio data: $Path"
-        }
-        $duration = [double]$dataBytes / ([double]$format.sampleRate * [double]$format.blockAlign)
-        if ([double]::IsNaN($duration) -or [double]::IsInfinity($duration) -or $duration -le 0) {
-            throw "WAV output has invalid duration: $Path"
-        }
-        $format['dataBytes'] = $dataBytes
-        $format['durationSeconds'] = [math]::Round($duration, 6)
-        return [pscustomobject]$format
     }
-    finally {
-        $reader.Dispose()
-        $stream.Dispose()
+    $weightFiles = @(Get-ChildItem -LiteralPath $ModelPath -File -Recurse -Force -ErrorAction Stop | Where-Object {
+        $weightExtensions.Contains($_.Extension) -and $_.FullName -notmatch '[\\/](cache|outputs?|output)[\\/]'
+    } | Sort-Object -Property FullName)
+    if ($weightFiles.Count -eq 0) {
+        throw "Model '$ModelPath' contains no supported weight files."
     }
+    Write-Host (":: hashing {0} model weight file(s): {1} ::" -f $weightFiles.Count, $ModelPath)
+    foreach ($weightFile in $weightFiles) {
+        if (-not (Test-AilaPathWithinRoot -Path $weightFile.FullName -Root $ModelPath) -or
+            -not (Test-AilaRegressionPathInApprovedRoots -Path $weightFile.FullName -Roots $ApprovedRoots)) {
+            throw "Model weight escapes approved model root: $($weightFile.FullName)"
+        }
+        $relativePath = [System.IO.Path]::GetRelativePath($ModelPath, $weightFile.FullName).Replace('\', '/')
+        $weightManifest.Add([pscustomobject]@{
+            relativePath = $relativePath
+            size         = [long]$weightFile.Length
+            sha256       = (Get-FileHash -LiteralPath $weightFile.FullName -Algorithm SHA256).Hash
+        })
+    }
+
+    $identity = [ordered]@{
+        path           = $ModelPath
+        metadataFiles  = $files.ToArray()
+        weightManifest = @($weightManifest.ToArray() | Sort-Object -Property relativePath)
+    }
+    $script:AilaRegressionModelIdentityCache[$modelKey] = $identity
+    return $identity
 }
 
 function Remove-AilaRegressionOwnedCaseFiles {
@@ -488,8 +553,8 @@ $buildDirPath = Resolve-AilaRegressionInputPath -RepoRoot $repoRoot -ApprovedRoo
 $casesPath = Resolve-AilaRegressionInputPath -RepoRoot $repoRoot -ApprovedRoots $approvedInputRoots -Path $CasesFile -Label 'Accuracy cases' -PathType Leaf
 $casesConfig = Read-AilaJsonFile -Path $casesPath
 $selectedCases = @(Get-AilaRegressionSelection -CasesConfig $casesConfig -RequestedNames $CaseNames)
-$buildContext = Assert-AilaRegressionBuildStack -RepoRoot $repoRoot -BuildDirPath $buildDirPath -StackName $OneApiStack
 $resolvedCases = @(Resolve-AilaRegressionCases -Cases $selectedCases -RepoRoot $repoRoot -ApprovedRoots $approvedInputRoots)
+$buildContext = Assert-AilaRegressionBuildStack -RepoRoot $repoRoot -BuildDirPath $buildDirPath -StackName $OneApiStack
 
 $logsDir = Join-Path $outputDirPath 'case_logs'
 $outputsDir = Join-Path $outputDirPath 'outputs'
@@ -528,12 +593,42 @@ foreach ($case in $resolvedCases) {
         default { throw "Unsupported accuracy case kind '$($case.kind)'." }
     }
 
-    $run = Invoke-AilaProcess -Executable '.\Aila.exe' -ArgumentList $args -WorkingDirectory $buildDirPath
+    $caseResultPath = Join-Path $resultsDir "$($case.name).json"
+    $run = Invoke-AilaProcess -Executable '.\Aila.exe' -ArgumentList $args -WorkingDirectory $buildDirPath -TimeoutSeconds $CaseTimeoutSeconds
     Write-AilaRegressionAtomicText -Path $stdoutPath -Text ([string]$run.stdoutText)
     Write-AilaRegressionAtomicText -Path $stderrPath -Text ([string]$run.stderrText)
     $logArtifacts = [ordered]@{
         stdout = Get-AilaRegressionFileArtifact -Path $stdoutPath
         stderr = Get-AilaRegressionFileArtifact -Path $stderrPath
+    }
+    $processResult = [ordered]@{
+        executable     = $buildContext.executable
+        arguments      = $args
+        commandLine    = $run.commandLine
+        exitCode       = $run.exitCode
+        durationMs     = $run.durationMs
+        timedOut       = $run.timedOut
+        timeoutSeconds = $run.timeoutSeconds
+    }
+    if ($run.timedOut) {
+        $diagnostic = [ordered]@{
+            schemaVersion        = 1
+            name                 = $case.name
+            kind                 = $case.kind
+            config               = $case.config
+            model                = $case.modelIdentity
+            executionPassed      = $false
+            expectationPassed    = $null
+            passed               = $false
+            status               = 'timed-out'
+            manualReviewRequired = $true
+            process              = $processResult
+            logs                 = $logArtifacts
+            diagnostic           = "Case exceeded timeout of $CaseTimeoutSeconds second(s); the process tree was terminated."
+        }
+        Write-AilaRegressionAtomicJson -Path $caseResultPath -Data $diagnostic
+        Write-Host (":: accuracy TIMED OUT {0} ({1}) ::" -f $case.name, $case.kind) -ForegroundColor Red
+        throw "Accuracy case '$($case.name)' timed out after $CaseTimeoutSeconds second(s). See '$caseResultPath'."
     }
     if ($run.exitCode -ne 0) {
         throw "Accuracy case '$($case.name)' failed with exit code $($run.exitCode). See '$stdoutPath' and '$stderrPath'."
@@ -545,15 +640,15 @@ foreach ($case in $resolvedCases) {
         name          = $case.name
         kind          = $case.kind
         config        = $case.config
-        model         = Get-AilaRegressionModelIdentity -ModelPath $case.modelPath
-        process       = [ordered]@{
-            executable  = $buildContext.executable
-            arguments   = $args
-            commandLine = $run.commandLine
-            exitCode    = $run.exitCode
-            durationMs  = $run.durationMs
-        }
+        model         = $case.modelIdentity
+        executionPassed = $true
+        expectationPassed = $null
+        passed         = $true
+        status         = 'passed'
+        manualReviewRequired = $false
+        process        = $processResult
         logs          = $logArtifacts
+        expectation   = $null
     }
 
     switch ($case.kind) {
@@ -615,23 +710,48 @@ foreach ($case in $resolvedCases) {
             if (-not (Test-Path -LiteralPath $wavPath -PathType Leaf) -or (Get-Item -LiteralPath $wavPath).Length -le 0) {
                 throw "Accuracy TTS case '$($case.name)' did not produce a non-empty WAV file: $wavPath"
             }
-            $wavMetadata = Get-AilaRegressionWavMetadata -Path $wavPath
+            $wavMetadata = Get-AilaWavMetadata -Path $wavPath
             $result['referenceAudio'] = Get-AilaRegressionFileArtifact -Path $case.referenceAudioPath
             $result['wav'] = $wavMetadata
             $result['output'] = Get-AilaRegressionFileArtifact -Path $wavPath
         }
     }
 
-    $caseResultPath = Join-Path $resultsDir "$($case.name).json"
+    $expectationPassed = if ($null -eq $result.expectation) { $null } else { [bool]$result.expectation.passed }
+    $result['expectationPassed'] = $expectationPassed
+    $result['passed'] = ($expectationPassed -ne $false)
+    $result['status'] = if ($expectationPassed -eq $false) { 'expectation-failed' } else { 'passed' }
+    $result['manualReviewRequired'] = ($expectationPassed -eq $false)
     Write-AilaRegressionAtomicJson -Path $caseResultPath -Data $result
     $result['caseResult'] = Get-AilaRegressionFileArtifact -Path $caseResultPath
     $results.Add([pscustomobject]$result)
-    Write-Host (":: accuracy PASS {0} ({1}) ::" -f $case.name, $case.kind) -ForegroundColor Green
+    if ($expectationPassed -eq $false) {
+        Write-Host (":: accuracy EXPECTATION FAILED {0} ({1}) ::" -f $case.name, $case.kind) -ForegroundColor Yellow
+    }
+    else {
+        Write-Host (":: accuracy PASSED {0} ({1}) ::" -f $case.name, $case.kind) -ForegroundColor Green
+    }
 }
 
 $gitInfo = Get-AilaGitInfo -RepoRoot $repoRoot
+$expectationValues = @($results | ForEach-Object { $_.expectationPassed } | Where-Object { $null -ne $_ })
+$combinedExpectationPassed = if (@($expectationValues | Where-Object { $_ -eq $false }).Count -gt 0) {
+    $false
+}
+elseif ($expectationValues.Count -gt 0) {
+    $true
+}
+else {
+    $null
+}
+$combinedPassed = ($combinedExpectationPassed -ne $false)
 $payload = [ordered]@{
     schemaVersion     = 1
+    executionPassed   = $true
+    expectationPassed = $combinedExpectationPassed
+    passed            = $combinedPassed
+    status            = if ($combinedPassed) { 'passed' } else { 'completed-with-expectation-failures' }
+    manualReviewRequired = (-not $combinedPassed)
     generatedAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
     git               = [ordered]@{
         shortCommit = $gitInfo.shortCommit
@@ -648,4 +768,9 @@ $payload = [ordered]@{
     cases             = $results.ToArray()
 }
 Write-AilaRegressionAtomicJson -Path $accuracyPath -Data $payload
-Write-Host (":: accuracy results written to {0} ::" -f $accuracyPath) -ForegroundColor Green
+if ($combinedPassed) {
+    Write-Host (":: accuracy PASSED; results written to {0} ::" -f $accuracyPath) -ForegroundColor Green
+}
+else {
+    Write-Host (":: accuracy COMPLETE WITH EXPECTATION FAILURES; results written to {0} ::" -f $accuracyPath) -ForegroundColor Yellow
+}

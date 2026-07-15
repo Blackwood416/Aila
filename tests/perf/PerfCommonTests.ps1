@@ -203,12 +203,62 @@ function New-AccuracyBuildFixture {
     $sourcePath = Join-Path $DestinationBuildDir 'FakeAila.cs'
     Set-Content -LiteralPath $sourcePath -Encoding UTF8 -Value @'
 using System;
+using System.IO;
+using System.Text;
 
 public static class FakeAila
 {
+    private static bool Has(string[] args, string value)
+    {
+        foreach (string arg in args) if (arg == value) return true;
+        return false;
+    }
+
+    private static string ValueAfter(string[] args, string value)
+    {
+        for (int i = 0; i + 1 < args.Length; i++) if (args[i] == value) return args[i + 1];
+        return "";
+    }
+
+    private static void WriteFloatWav(string path)
+    {
+        byte[] data = BitConverter.GetBytes(0.25f);
+        using (var stream = File.Create(path))
+        using (var writer = new BinaryWriter(stream, Encoding.ASCII))
+        {
+            writer.Write(Encoding.ASCII.GetBytes("RIFF"));
+            writer.Write(36 + data.Length);
+            writer.Write(Encoding.ASCII.GetBytes("WAVE"));
+            writer.Write(Encoding.ASCII.GetBytes("fmt "));
+            writer.Write(16);
+            writer.Write((short)3);
+            writer.Write((short)1);
+            writer.Write(24000);
+            writer.Write(96000);
+            writer.Write((short)4);
+            writer.Write((short)32);
+            writer.Write(Encoding.ASCII.GetBytes("data"));
+            writer.Write(data.Length);
+            writer.Write(data);
+        }
+    }
+
     public static int Main(string[] args)
     {
         Console.Error.WriteLine("[fake diagnostic]");
+        if (Has(args, "--transcribe"))
+        {
+            Console.WriteLine("expected transcript");
+            Console.WriteLine("[Language] English");
+            Console.WriteLine("[Audio: 1.0s, Latency: 10ms, Speed: 100.0x, 8 tok/s]");
+            return 0;
+        }
+        if (Has(args, "--synthesize"))
+        {
+            WriteFloatWav(ValueAfter(args, "--output-wav"));
+            Console.WriteLine("TTS synthesis succeeded");
+            return 0;
+        }
         Console.WriteLine("Hello, WORLD!");
         return 0;
     }
@@ -225,6 +275,91 @@ public static class FakeAila
     }
     Remove-Item -LiteralPath $sourcePath -Force
     return $DestinationBuildDir
+}
+
+function New-HangingAilaExecutable {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    $sourcePath = Join-Path $Directory 'HangingAila.cs'
+    Set-Content -LiteralPath $sourcePath -Encoding UTF8 -Value @'
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+public static class HangingAila
+{
+    public static int Main(string[] args)
+    {
+        var child = Process.Start(new ProcessStartInfo {
+            FileName = "pwsh.exe",
+            Arguments = "-NoProfile -Command Start-Sleep -Seconds 120",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
+        Console.WriteLine("CHILD_PID=" + child.Id);
+        Console.Error.WriteLine("HANGING_STDERR");
+        Console.Out.Flush();
+        Console.Error.Flush();
+        Thread.Sleep(120000);
+        return 0;
+    }
+}
+'@
+    $compiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $exePath = Join-Path $Directory 'HangingAila.exe'
+    $compilerOutput = (& $compiler /nologo /target:exe "/out:$exePath" $sourcePath 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+        throw "Failed to compile hanging Aila fixture: $compilerOutput"
+    }
+    Remove-Item -LiteralPath $sourcePath -Force
+    return $exePath
+}
+
+function New-TestWavFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$AudioFormat = 3,
+        [int]$Channels = 1,
+        [int]$SampleRate = 24000,
+        [int]$BitsPerSample = 32,
+        [int]$BlockAlign = 0,
+        [int]$ByteRate = 0,
+        [byte[]]$Payload = $null,
+        [int]$DeclaredDataBytes = -1,
+        [int]$DeclaredRiffSize = -1
+    )
+
+    if ($BlockAlign -eq 0) { $BlockAlign = $Channels * [int]($BitsPerSample / 8) }
+    if ($ByteRate -eq 0) { $ByteRate = $SampleRate * $BlockAlign }
+    if ($null -eq $Payload) {
+        $Payload = [byte[]](0, 0, 0, 0)
+    }
+    if ($DeclaredDataBytes -lt 0) { $DeclaredDataBytes = $Payload.Length }
+    $stream = [System.IO.File]::Create($Path)
+    $writer = [System.IO.BinaryWriter]::new($stream, [System.Text.Encoding]::ASCII)
+    try {
+        $writer.Write([System.Text.Encoding]::ASCII.GetBytes('RIFF'))
+        $actualRiffSize = [int](36 + $Payload.Length + ($Payload.Length % 2))
+        $riffSizeValue = if ($DeclaredRiffSize -ge 0) { $DeclaredRiffSize } else { $actualRiffSize }
+        $writer.Write([int]$riffSizeValue)
+        $writer.Write([System.Text.Encoding]::ASCII.GetBytes('WAVE'))
+        $writer.Write([System.Text.Encoding]::ASCII.GetBytes('fmt '))
+        $writer.Write(16)
+        $writer.Write([short]$AudioFormat)
+        $writer.Write([short]$Channels)
+        $writer.Write($SampleRate)
+        $writer.Write($ByteRate)
+        $writer.Write([short]$BlockAlign)
+        $writer.Write([short]$BitsPerSample)
+        $writer.Write([System.Text.Encoding]::ASCII.GetBytes('data'))
+        $writer.Write($DeclaredDataBytes)
+        $writer.Write($Payload)
+        if ($Payload.Length % 2 -ne 0) { $writer.Write([byte]0) }
+    }
+    finally {
+        $writer.Dispose()
+        $stream.Dispose()
+    }
 }
 
 $repoRoot = Get-AilaRepoRoot
@@ -356,6 +491,19 @@ try {
         Assert-Equal 0 $aligned.Count 'empty alignment count'
     }
 
+    Invoke-Test 'Invoke-AilaProcess times out and kills the entire process tree while draining both streams' {
+        $hangingDir = Join-Path $repoScratch 'hanging-process'
+        New-Item -ItemType Directory -Path $hangingDir -Force | Out-Null
+        $hangingExe = New-HangingAilaExecutable -Directory $hangingDir
+        $run = Invoke-AilaProcess -Executable $hangingExe -ArgumentList @('--noop') -WorkingDirectory $hangingDir -TimeoutSeconds 1
+        Assert-Equal $true $run.timedOut 'process timeout flag'
+        Assert-Equal $true ([string]$run.stdoutText -match 'CHILD_PID=\d+') 'timeout stdout drain'
+        Assert-Equal $true ([string]$run.stderrText.Contains('HANGING_STDERR')) 'timeout stderr drain'
+        $childPid = [int]([regex]::Match([string]$run.stdoutText, 'CHILD_PID=(\d+)').Groups[1].Value)
+        Start-Sleep -Milliseconds 500
+        Assert-Equal $false ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) 'timeout child process terminated'
+    }
+
     $accuracySourceBuild = Join-Path $repoRoot 'build-oneapi-2025.3'
     $accuracyBuild = New-AccuracyBuildFixture `
         -SourceBuildDir $accuracySourceBuild `
@@ -363,10 +511,15 @@ try {
     $accuracyModel = Join-Path $repoScratch 'accuracy-model'
     New-Item -ItemType Directory -Path $accuracyModel -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $accuracyModel 'config.json') -Value '{"model_type":"fake"}' -Encoding UTF8
+    $accuracyWeights = Join-Path $accuracyModel 'weights'
+    New-Item -ItemType Directory -Path $accuracyWeights -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $accuracyWeights 'fake.safetensors') -Value 'fake-weight-v1' -Encoding ASCII
     $accuracyInputOne = Join-Path $repoScratch 'accuracy-input-one.json'
     $accuracyInputTwo = Join-Path $repoScratch 'accuracy-input-two.json'
+    $accuracyAudio = Join-Path $repoScratch 'accuracy-audio.wav'
     Set-Content -LiteralPath $accuracyInputOne -Value '{"messages":[{"role":"user","content":"one"}]}' -Encoding UTF8
     Set-Content -LiteralPath $accuracyInputTwo -Value '{"messages":[{"role":"user","content":"two"}]}' -Encoding UTF8
+    Set-Content -LiteralPath $accuracyAudio -Value 'fake-audio' -Encoding ASCII
     $accuracyCasesPath = Join-Path $repoScratch 'accuracy-cases.json'
     Write-AilaJsonFile -Path $accuracyCasesPath -Data ([ordered]@{
         schemaVersion = 1
@@ -457,6 +610,140 @@ try {
         Assert-Equal 'missing-input-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'missing input sentinel'
     }
 
+    Invoke-Test 'accuracy runner rejects strict schema and type violations before execution' {
+        $invalidCases = @(
+            [pscustomobject]@{ label = 'extra-top'; json = '{"schemaVersion":1,"cases":[],"extra":true}'; expected = 'unknown top-level field' },
+            [pscustomobject]@{ label = 'schema-string'; json = '{"schemaVersion":"1","cases":[]}'; expected = 'unsupported accuracy cases schema' },
+            [pscustomobject]@{ label = 'cases-object'; json = '{"schemaVersion":1,"cases":{}}'; expected = 'cases must be a json array' },
+            [pscustomobject]@{ label = 'wrong-kind-field'; json = ('{"schemaVersion":1,"cases":[{"name":"bad","kind":"asr","model":"' + $accuracyModel.Replace('\','\\') + '","audio":"' + $accuracyAudio.Replace('\','\\') + '","forcedLanguage":"English","maxTokens":4}]}'); expected = 'unknown field' },
+            [pscustomobject]@{ label = 'typo'; json = ('{"schemaVersion":1,"cases":[{"name":"bad","kind":"chat","model":"' + $accuracyModel.Replace('\','\\') + '","input":"' + $accuracyInputOne.Replace('\','\\') + '","maxTokens":4,"mode":"greedy","expectedTex":"x"}]}'); expected = 'unknown field' },
+            [pscustomobject]@{ label = 'max-token-typo'; json = ('{"schemaVersion":1,"cases":[{"name":"bad","kind":"chat","model":"' + $accuracyModel.Replace('\','\\') + '","input":"' + $accuracyInputOne.Replace('\','\\') + '","maxToken":4,"mode":"greedy"}]}'); expected = 'unknown field' },
+            [pscustomobject]@{ label = 'bad-number-type'; json = ('{"schemaVersion":1,"cases":[{"name":"bad","kind":"chat","model":"' + $accuracyModel.Replace('\','\\') + '","input":"' + $accuracyInputOne.Replace('\','\\') + '","maxTokens":"4","mode":"greedy"}]}'); expected = 'positive integer' }
+        )
+        foreach ($invalid in $invalidCases) {
+            $casesPath = Join-Path $repoScratch ("strict-{0}.json" -f $invalid.label)
+            Set-Content -LiteralPath $casesPath -Value $invalid.json -Encoding UTF8
+            $outputDir = Join-Path $accuracyScratch ("strict-{0}" -f $invalid.label)
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $sentinelPath = Join-Path $outputDir 'accuracy.json'
+            Set-Content -LiteralPath $sentinelPath -Value "strict-$($invalid.label)-sentinel" -Encoding UTF8
+            $result = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $casesPath, '-OutputDir', $outputDir) -TimeoutMs 60000
+            Assert-Equal $true $result.completed "strict $($invalid.label) completion"
+            if ($result.exitCode -eq 0) { throw "Strict case '$($invalid.label)' unexpectedly succeeded." }
+            Assert-Equal $true (($result.stderr + $result.stdout).ToLowerInvariant().Contains($invalid.expected)) "strict $($invalid.label) diagnostic"
+            Assert-Equal "strict-$($invalid.label)-sentinel" (Get-Content -LiteralPath $sentinelPath -Raw).Trim() "strict $($invalid.label) sentinel"
+        }
+    }
+
+    Invoke-Test 'accuracy runner records expectation failures without failing execution' {
+        $casesPath = Join-Path $repoScratch 'accuracy-expectation-cases.json'
+        Write-AilaJsonFile -Path $casesPath -Data ([ordered]@{
+            schemaVersion = 1
+            cases = @(
+                [ordered]@{ name = 'expect_chat'; kind = 'chat'; model = $accuracyModel; input = $accuracyInputOne; maxTokens = 4; mode = 'greedy'; expectRegex = '^never$' },
+                [ordered]@{ name = 'expect_asr'; kind = 'asr'; model = $accuracyModel; audio = $accuracyAudio; forcedLanguage = 'English'; expectedText = 'never expected' }
+            )
+        })
+        $outputDir = Join-Path $accuracyScratch 'expectation-failures'
+        $result = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $casesPath, '-OutputDir', $outputDir) -TimeoutMs 60000
+        Assert-Equal $true $result.completed 'expectation runner completion'
+        Assert-Equal 0 $result.exitCode "expectation runner exit stderr='$($result.stderr)'"
+        $combined = Read-AilaJsonFile -Path (Join-Path $outputDir 'accuracy.json')
+        Assert-Equal 'completed-with-expectation-failures' $combined.status 'combined expectation status'
+        Assert-Equal $true $combined.executionPassed 'combined execution passed'
+        Assert-Equal $false $combined.expectationPassed 'combined expectation failed'
+        Assert-Equal $false $combined.passed 'combined passed'
+        Assert-Equal $true $combined.manualReviewRequired 'combined manual review'
+        foreach ($name in @('expect_chat', 'expect_asr')) {
+            $caseResult = Read-AilaJsonFile -Path (Join-Path $outputDir "case_results\$name.json")
+            Assert-Equal $true $caseResult.executionPassed "$name execution passed"
+            Assert-Equal $false $caseResult.expectationPassed "$name expectation failed"
+            Assert-Equal $false $caseResult.passed "$name passed"
+            Assert-Equal 'expectation-failed' $caseResult.status "$name status"
+            Assert-Equal $true $caseResult.manualReviewRequired "$name manual review"
+        }
+    }
+
+    Invoke-Test 'accuracy runner records deterministic recursive weight manifests and detects changed hashes' {
+        $outputDir = Join-Path $accuracyScratch 'weight-manifest'
+        $result = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', 'case_one,case_two', '-OutputDir', $outputDir) -TimeoutMs 60000
+        Assert-Equal 0 $result.exitCode "weight manifest initial run stderr='$($result.stderr)'"
+        $first = Read-AilaJsonFile -Path (Join-Path $outputDir 'case_results\case_one.json')
+        Assert-Equal 1 $first.model.weightManifest.Count 'weight manifest count'
+        Assert-Equal 'weights/fake.safetensors' $first.model.weightManifest[0].relativePath 'weight manifest path'
+        $firstHash = $first.model.weightManifest[0].sha256
+        Add-Content -LiteralPath (Join-Path $accuracyModel 'weights\fake.safetensors') -Value 'changed' -Encoding ASCII
+        $rerun = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', 'case_one', '-OutputDir', $outputDir) -TimeoutMs 60000
+        Assert-Equal 0 $rerun.exitCode "weight manifest rerun stderr='$($rerun.stderr)'"
+        $second = Read-AilaJsonFile -Path (Join-Path $outputDir 'case_results\case_one.json')
+        if ($firstHash -eq $second.model.weightManifest[0].sha256) { throw 'Weight manifest hash did not change after weight mutation.' }
+    }
+
+    Invoke-Test 'accuracy runner rejects model weight junction escapes during pure preflight' {
+        $outsideWeights = Join-Path $tempRoot 'outside-model-weights'
+        New-Item -ItemType Directory -Path $outsideWeights -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $outsideWeights 'escaped.safetensors') -Value 'escaped-weight' -Encoding ASCII
+        $junctionPath = Join-Path $accuracyModel 'escaped-weights'
+        try {
+            New-Item -ItemType Junction -Path $junctionPath -Target $outsideWeights | Out-Null
+            $outputDir = Join-Path $accuracyScratch 'weight-junction-escape'
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $sentinelPath = Join-Path $outputDir 'accuracy.json'
+            Set-Content -LiteralPath $sentinelPath -Value 'weight-junction-sentinel' -Encoding UTF8
+            $result = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', 'case_one', '-OutputDir', $outputDir) -TimeoutMs 60000
+            Assert-Equal $true $result.completed 'weight junction runner completion'
+            if ($result.exitCode -eq 0) { throw 'Weight junction escape unexpectedly succeeded.' }
+            Assert-Equal $true (($result.stderr + $result.stdout).Contains('escapes approved model root')) 'weight junction diagnostic'
+            Assert-Equal 'weight-junction-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'weight junction sentinel'
+        }
+        finally {
+            if (Test-Path -LiteralPath $junctionPath) { Remove-Item -LiteralPath $junctionPath -Force }
+        }
+    }
+
+    Invoke-Test 'strict WAV validation rejects malformed structure and non-finite float samples' {
+        $wavScript = Join-Path $repoScratch 'inspect-wav.ps1'
+        Set-Content -LiteralPath $wavScript -Encoding UTF8 -Value @'
+param([Parameter(Mandatory=$true)][string]$PerfCommonPath,[Parameter(Mandatory=$true)][string]$WavPath)
+$ErrorActionPreference = 'Stop'
+. $PerfCommonPath
+$metadata = Get-AilaWavMetadata -Path $WavPath
+$metadata | ConvertTo-Json -Depth 8
+'@
+        $validPath = Join-Path $repoScratch 'valid-float.wav'
+        New-TestWavFile -Path $validPath -Payload ([System.BitConverter]::GetBytes([single]0.25))
+        $valid = Invoke-ChildPowerShellWithTimeout -ScriptPath $wavScript -ArgumentList @('-PerfCommonPath', (Join-Path $repoRoot 'perf\PerfCommon.ps1'), '-WavPath', $validPath) -TimeoutMs 30000
+        Assert-Equal 0 $valid.exitCode "valid WAV exit stderr='$($valid.stderr)'"
+        $validMetadata = $valid.stdout | ConvertFrom-Json
+        Assert-Equal 3 $validMetadata.audioFormat 'valid WAV format'
+        Assert-Equal 1 $validMetadata.frameCount 'valid WAV frame count'
+        Assert-Equal 32 $validMetadata.bitsPerSample 'valid WAV bits'
+
+        $adversarial = @(
+            [pscustomobject]@{ name = 'nan'; payload = [System.BitConverter]::GetBytes([single]::NaN); expected = 'non-finite' },
+            [pscustomobject]@{ name = 'infinity'; payload = [System.BitConverter]::GetBytes([single]::PositiveInfinity); expected = 'non-finite' },
+            [pscustomobject]@{ name = 'block-align'; blockAlign = 2; expected = 'blockAlign' },
+            [pscustomobject]@{ name = 'byte-rate'; byteRate = 1; expected = 'byteRate' },
+            [pscustomobject]@{ name = 'misaligned'; payload = [byte[]](1, 2, 3); expected = 'data' },
+            [pscustomobject]@{ name = 'truncated'; declaredDataBytes = 8; expected = 'chunk' },
+            [pscustomobject]@{ name = 'riff-bounds'; declaredRiffSize = 12; expected = 'riff' },
+            [pscustomobject]@{ name = 'unsupported'; audioFormat = 6; expected = 'format' }
+        )
+        foreach ($variant in $adversarial) {
+            $path = Join-Path $repoScratch ("{0}.wav" -f $variant.name)
+            $params = @{ Path = $path }
+            foreach ($propertyName in @('payload', 'blockAlign', 'byteRate', 'declaredDataBytes', 'declaredRiffSize', 'audioFormat')) {
+                $property = $variant.PSObject.Properties[$propertyName]
+                if ($null -ne $property) { $params[$propertyName] = $property.Value }
+            }
+            New-TestWavFile @params
+            $invalid = Invoke-ChildPowerShellWithTimeout -ScriptPath $wavScript -ArgumentList @('-PerfCommonPath', (Join-Path $repoRoot 'perf\PerfCommon.ps1'), '-WavPath', $path) -TimeoutMs 30000
+            Assert-Equal $true $invalid.completed "invalid WAV $($variant.name) completion"
+            if ($invalid.exitCode -eq 0) { throw "Invalid WAV '$($variant.name)' unexpectedly passed." }
+            Assert-Equal $true (($invalid.stderr + $invalid.stdout).ToLowerInvariant().Contains($variant.expected.ToLowerInvariant())) "invalid WAV $($variant.name) diagnostic"
+        }
+    }
+
     Invoke-Test 'accuracy runner rejects output outside repository tmp without modifying it' {
         $outputDir = Join-Path $repoScratch 'accuracy-outside-tmp'
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -472,6 +759,39 @@ try {
         }
         Assert-Equal $true (($result.stderr + $result.stdout).Contains('inside repository tmp')) 'outside tmp diagnostic'
         Assert-Equal 'outside-tmp-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'outside tmp sentinel'
+    }
+
+    Invoke-Test 'accuracy runner times out a hanging case, kills its tree, and writes diagnostic artifacts' {
+        $buildDir = Join-Path $repoScratch 'accuracy-hanging-build'
+        New-AccuracyBuildFixture -SourceBuildDir $accuracySourceBuild -DestinationBuildDir $buildDir | Out-Null
+        $hangingExe = New-HangingAilaExecutable -Directory $buildDir
+        Copy-Item -LiteralPath $hangingExe -Destination (Join-Path $buildDir 'Aila.exe') -Force
+        $casesPath = Join-Path $repoScratch 'accuracy-hanging-cases.json'
+        Write-AilaJsonFile -Path $casesPath -Data ([ordered]@{
+            schemaVersion = 1
+            cases = @([ordered]@{ name = 'hang_case'; kind = 'chat'; model = $accuracyModel; input = $accuracyInputOne; maxTokens = 4; mode = 'greedy' })
+        })
+        $outputDir = Join-Path $accuracyScratch 'hanging'
+        $unrelatedPath = Join-Path $outputDir 'outputs\keep.local'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $unrelatedPath) -Force | Out-Null
+        Set-Content -LiteralPath $unrelatedPath -Value 'keep-timeout' -Encoding UTF8
+        $result = Invoke-ChildPowerShellWithTimeout -ScriptPath $regressPath -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $casesPath, '-OutputDir', $outputDir, '-CaseTimeoutSeconds', '1') -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'hanging runner outer completion'
+        if ($result.exitCode -eq 0) { throw 'Hanging runner unexpectedly succeeded.' }
+        Assert-Equal $true (($result.stderr + $result.stdout).Contains('timed out')) 'hanging runner diagnostic'
+        Assert-Equal $false (Test-Path -LiteralPath (Join-Path $outputDir 'accuracy.json')) 'hanging runner combined absent'
+        Assert-Equal 'keep-timeout' (Get-Content -LiteralPath $unrelatedPath -Raw).Trim() 'hanging runner unrelated output'
+        $caseResult = Read-AilaJsonFile -Path (Join-Path $outputDir 'case_results\hang_case.json')
+        Assert-Equal 'timed-out' $caseResult.status 'hanging case status'
+        Assert-Equal $false $caseResult.executionPassed 'hanging execution status'
+        Assert-Equal $true $caseResult.process.timedOut 'hanging process timeout flag'
+        $stdout = Get-Content -Raw -LiteralPath $caseResult.logs.stdout.path
+        $stderr = Get-Content -Raw -LiteralPath $caseResult.logs.stderr.path
+        Assert-Equal $true ($stdout -match 'CHILD_PID=\d+') 'hanging stdout saved'
+        Assert-Equal $true $stderr.Contains('HANGING_STDERR') 'hanging stderr saved'
+        $childPid = [int]([regex]::Match($stdout, 'CHILD_PID=(\d+)').Groups[1].Value)
+        Start-Sleep -Milliseconds 500
+        Assert-Equal $false ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) 'hanging runner child terminated'
     }
 
     Invoke-Test 'accuracy runner writes typed subset artifacts and preserves unrelated files across reruns' {
