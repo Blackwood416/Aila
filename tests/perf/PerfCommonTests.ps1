@@ -176,7 +176,25 @@ function New-TestStack([string]$Root) {
     }
 }
 
+function New-VerifierBuildFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceBuildDir,
+        [Parameter(Mandatory = $true)][string]$DestinationBuildDir
+    )
+
+    New-Item -ItemType Directory -Path $DestinationBuildDir -Force | Out-Null
+    foreach ($fileName in @('Aila.exe', 'build_info.json', 'CMakeCache.txt')) {
+        Copy-Item -LiteralPath (Join-Path $SourceBuildDir $fileName) -Destination (Join-Path $DestinationBuildDir $fileName)
+    }
+    return $DestinationBuildDir
+}
+
 $repoRoot = Get-AilaRepoRoot
+$repoScratch = Join-Path $repoRoot "build-verifier-tests-$([guid]::NewGuid().ToString('N'))"
+if (-not (Test-AilaPathWithinRoot -Path $repoScratch -Root $repoRoot)) {
+    throw "Refusing to create verifier test files outside the repository: $repoScratch"
+}
+New-Item -ItemType Directory -Path $repoScratch -Force | Out-Null
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $tempRoot = [System.IO.Path]::GetFullPath((Join-Path $tempBase "Aila-PerfCommonTests-$([guid]::NewGuid().ToString('N'))"))
 if (-not $tempRoot.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -258,7 +276,7 @@ try {
     }
 
     Invoke-Test 'verifier rejects a missing build info file' {
-        $buildDir = Join-Path $tempRoot 'verifier-missing-build-info'
+        $buildDir = Join-Path $repoScratch 'verifier-missing-build-info'
         New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
@@ -280,7 +298,7 @@ try {
         if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
             throw "Required verifier fixture build directory not found: $buildDir"
         }
-        $outputPath = Join-Path $tempRoot 'wrong-stack-verification.json'
+        $outputPath = Join-Path $repoScratch 'wrong-stack-verification.json'
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
@@ -299,6 +317,167 @@ try {
             }
         } "but 'oneapi-2026.1'" 'wrong stack verification'
         Assert-Equal $false (Test-Path -LiteralPath $outputPath) 'wrong stack output must not be written'
+    }
+
+    Invoke-Test 'verifier rejects an outside output path without modifying its sentinel' {
+        $outputPath = Join-Path $tempRoot 'outside-verification.json'
+        Set-Content -LiteralPath $outputPath -Value 'outside-sentinel' -Encoding UTF8
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @(
+                    '-BuildDir', 'missing-build',
+                    '-OneApiStack', 'oneapi-2026.1',
+                    '-OutputPath', $outputPath
+                ) `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'outside repository' 'outside output path verification'
+        Assert-Equal 'outside-sentinel' (Get-Content -LiteralPath $outputPath -Raw).Trim() 'outside sentinel content'
+    }
+
+    Invoke-Test 'verifier removes stale output when role metadata is missing' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'missing-role')
+        $buildInfoPath = Join-Path $buildDir 'build_info.json'
+        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
+        $buildInfo.oneApi.PSObject.Properties.Remove('role')
+        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
+        $outputPath = Join-Path $buildDir 'oneapi_verification.json'
+        Set-Content -LiteralPath $outputPath -Value '{"stale":true}' -Encoding UTF8
+
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } "missing required property 'role'" 'missing role verification'
+        Assert-Equal $false (Test-Path -LiteralPath $outputPath) 'missing role must invalidate stale output'
+    }
+
+    Invoke-Test 'verifier removes stale output when role metadata is wrong' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'wrong-role')
+        $buildInfoPath = Join-Path $buildDir 'build_info.json'
+        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
+        $buildInfo.oneApi.role = 'candidate'
+        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
+        $outputPath = Join-Path $buildDir 'oneapi_verification.json'
+        Set-Content -LiteralPath $outputPath -Value '{"stale":true}' -Encoding UTF8
+
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } "metadata mismatch for 'role'" 'wrong role verification'
+        Assert-Equal $false (Test-Path -LiteralPath $outputPath) 'wrong role must invalidate stale output'
+    }
+
+    Invoke-Test 'verifier atomically replaces stale output with complete JSON' {
+        $outputDir = Join-Path $repoScratch 'atomic-success'
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        $outputPath = Join-Path $outputDir 'verification.json'
+        Set-Content -LiteralPath $outputPath -Value 'stale-sentinel' -Encoding UTF8
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $verifierPath `
+            -ArgumentList @(
+                '-BuildDir', (Join-Path $repoRoot 'build-oneapi-2025.3'),
+                '-OneApiStack', 'oneapi-2025.3',
+                '-OutputPath', $outputPath
+            ) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'atomic verifier completion'
+        Assert-Equal 0 $result.exitCode "atomic verifier exit stderr='$($result.stderr)'"
+
+        $verification = Read-AilaJsonFile -Path $outputPath
+        Assert-Equal 1 $verification.schemaVersion 'atomic verification schema'
+        Assert-Equal 'oneapi-2025.3' $verification.stack.name 'atomic verification stack'
+        Assert-Equal 1 @($verification.dependencies).Count 'atomic verification dependency count'
+        Assert-Equal 'sycl8.dll' $verification.dependencies[0] 'atomic verification dependency'
+        Assert-Equal (Get-FileHash -LiteralPath (Join-Path $repoRoot 'build-oneapi-2025.3\Aila.exe') -Algorithm SHA256).Hash $verification.executableSha256 'atomic verification hash'
+        $tempFiles = @(Get-ChildItem -LiteralPath $outputDir -Filter '.verification.json.*.tmp' -Force)
+        Assert-Equal 0 $tempFiles.Count 'atomic verification temp cleanup'
+    }
+
+    Invoke-Test 'verifier rejects an executable that changes during dependency inspection' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'identity-change')
+        $outputPath = Join-Path $buildDir 'oneapi_verification.json'
+        Set-Content -LiteralPath $outputPath -Value '{"stale":true}' -Encoding UTF8
+        $childScriptPath = Join-Path $tempRoot 'invoke-verifier-identity-change.ps1'
+        Set-Content -LiteralPath $childScriptPath -Encoding UTF8 -Value @'
+param(
+    [Parameter(Mandatory = $true)][string]$VerifierPath,
+    [Parameter(Mandatory = $true)][string]$BuildDir,
+    [Parameter(Mandatory = $true)][string]$OutputPath
+)
+$ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $VerifierPath) 'perf\PerfCommon.ps1')
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($VerifierPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) {
+    throw "Unable to parse verifier functions: $($parseErrors[0].Message)"
+}
+$functionDefinitions = $ast.FindAll({
+    param($node)
+    return $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $false)
+foreach ($definition in $functionDefinitions) {
+    Invoke-Expression $definition.Extent.Text
+}
+$inspector = {
+    param([Parameter(Mandatory = $true)][string]$Executable)
+    [System.IO.File]::AppendAllText($Executable, 'identity-change')
+    return "    sycl8.dll`r`n"
+}
+Invoke-AilaOneApiBuildVerification `
+    -BuildDir $BuildDir `
+    -OneApiStack 'oneapi-2025.3' `
+    -OutputPath $OutputPath `
+    -RepoRoot (Split-Path -Parent $VerifierPath) `
+    -DependencyInspector $inspector
+'@
+
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $childScriptPath `
+                -ArgumentList @(
+                    '-VerifierPath', (Join-Path $repoRoot 'verify_oneapi_build.ps1'),
+                    '-BuildDir', $buildDir,
+                    '-OutputPath', $outputPath
+                ) `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier identity child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'changed during dependency inspection' 'executable identity verification'
+        Assert-Equal $false (Test-Path -LiteralPath $outputPath) 'identity change must invalidate stale output'
     }
 
     Invoke-Test 'loads the complete real stack contract' {
@@ -983,6 +1162,9 @@ try {
 finally {
     if (Test-Path -LiteralPath $tempRoot) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $repoScratch) {
+        Remove-Item -LiteralPath $repoScratch -Recurse -Force
     }
 }
 
