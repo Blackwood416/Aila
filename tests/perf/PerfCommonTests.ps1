@@ -33,6 +33,66 @@ function Restore-ProcessEnvironmentVariable {
     [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
 }
 
+function Get-ProcessEnvironmentSnapshot {
+    $snapshot = @{}
+    [System.Environment]::GetEnvironmentVariables('Process').GetEnumerator() | ForEach-Object {
+        $snapshot[[string]$_.Key] = [string]$_.Value
+    }
+    return $snapshot
+}
+
+function Restore-ProcessEnvironmentSnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+
+    $currentKeys = @([System.Environment]::GetEnvironmentVariables('Process').Keys | ForEach-Object { [string]$_ })
+    foreach ($key in $currentKeys) {
+        if (-not $Snapshot.ContainsKey($key)) {
+            Restore-ProcessEnvironmentVariable -Name $key -Value $null
+        }
+    }
+    foreach ($entry in $Snapshot.GetEnumerator()) {
+        Restore-ProcessEnvironmentVariable -Name $entry.Key -Value $entry.Value
+    }
+}
+
+function Invoke-ChildPowerShellWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in @('-NoProfile', '-File', $ScriptPath) + $ArgumentList) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start child PowerShell process: $($startInfo.FileName)"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $completed = $process.WaitForExit($TimeoutMs)
+    if (-not $completed) {
+        $process.Kill($true)
+        $process.WaitForExit()
+    }
+
+    return [pscustomobject]@{
+        completed = $completed
+        exitCode = if ($completed) { $process.ExitCode } else { $null }
+        stdout = $stdoutTask.GetAwaiter().GetResult()
+        stderr = $stderrTask.GetAwaiter().GetResult()
+    }
+}
+
 function Assert-Throws([scriptblock]$Action, [string]$ExpectedMessageFragment, [string]$Message) {
     $caught = $null
     try {
@@ -135,7 +195,37 @@ Set-Content -LiteralPath $missingSchemaPath -Value '{"stacks":{}}' -Encoding UTF
 $failingBatchPath = Join-Path $tempRoot 'fail-with-37.bat'
 Set-Content -LiteralPath $failingBatchPath -Value "@echo off`r`nexit /b 37" -Encoding ASCII
 $diagnosticBatchPath = Join-Path $tempRoot 'fail-with-diagnostic.bat'
-Set-Content -LiteralPath $diagnosticBatchPath -Value "@echo off`r`n>&2 echo diagnostic-from-batch`r`nexit /b 23" -Encoding ASCII
+Set-Content -LiteralPath $diagnosticBatchPath -Value @(
+    '@echo off'
+    'echo diagnostic-from-stdout'
+    '>&2 echo diagnostic-from-batch'
+    'exit /b 23'
+) -Encoding ASCII
+$saturationBatchPath = Join-Path $tempRoot 'saturate-batch-pipes.bat'
+Set-Content -LiteralPath $saturationBatchPath -Value @(
+    '@echo off'
+    'for /L %%i in (1,1,8000) do ('
+    '  echo saturation-stdout-%%i-abcdefghijklmnopqrstuvwxyz-0123456789'
+    '  >&2 echo saturation-stderr-%%i-abcdefghijklmnopqrstuvwxyz-0123456789'
+    ')'
+    'set CMPLR_ROOT=C:\saturation-compiler'
+    'exit /b 0'
+) -Encoding ASCII
+$saturationChildPath = Join-Path $tempRoot 'invoke-saturation-import.ps1'
+Set-Content -LiteralPath $saturationChildPath -Value @'
+param(
+    [Parameter(Mandatory = $true)][string]$PerfCommonPath,
+    [Parameter(Mandatory = $true)][string]$BatchPath
+)
+$ErrorActionPreference = 'Stop'
+. $PerfCommonPath
+$environment = Import-AilaBatchEnvironment -Scripts @($BatchPath)
+if ([string]::IsNullOrWhiteSpace([string]$environment.PATH) -or
+    [string]::IsNullOrWhiteSpace([string]$environment.CMPLR_ROOT)) {
+    throw 'Saturation import did not return required PATH and CMPLR_ROOT values.'
+}
+Write-Output 'SATURATION_IMPORT_PASS'
+'@ -Encoding UTF8
 $partialBatchPath = Join-Path $tempRoot 'missing-compiler-root.bat'
 Set-Content -LiteralPath $partialBatchPath -Value "@echo off`r`nset CMPLR_ROOT=`r`nexit /b 0" -Encoding ASCII
 $missingPathBatchPath = Join-Path $tempRoot 'missing-path.bat'
@@ -358,6 +448,7 @@ try {
             compilerRoot = Join-Path $selectedRoot 'compiler\1'
             dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
             tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $false
         }
         Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
             "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $otherRoot 'compiler\2\bin\icx-cl.exe')"
@@ -380,6 +471,7 @@ try {
             compilerRoot = Join-Path $selectedRoot 'compiler\1'
             dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
             tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $false
         }
         Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
             "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
@@ -402,6 +494,7 @@ try {
             compilerRoot = Join-Path $selectedRoot 'compiler\1'
             dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
             tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $false
         }
         Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
             "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
@@ -423,6 +516,7 @@ try {
             compilerRoot = Join-Path $selectedRoot 'compiler\1'
             dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
             tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $true
         }
         Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
             "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
@@ -432,6 +526,74 @@ try {
         Assert-Throws {
             Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack -RequireValues
         } 'missing TBB_DIR' 'missing configured TBB value'
+    }
+
+    Invoke-Test 'rejects candidate cache with legacy baseline mode enabled' {
+        $buildDir = Join-Path $tempRoot 'candidate-legacy-cache-on'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'candidate-legacy-selected'
+        $stack = [pscustomobject]@{
+            name = 'candidate'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $false
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $stack.tbbRoot 'lib\cmake\tbb')"
+            'AILA_ALLOW_LEGACY_ONEAPI_BASELINE:BOOL=ON'
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } 'AILA_ALLOW_LEGACY_ONEAPI_BASELINE' 'candidate cached legacy mode'
+    }
+
+    Invoke-Test 'rejects baseline cache with legacy baseline mode disabled' {
+        $buildDir = Join-Path $tempRoot 'baseline-legacy-cache-off'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'baseline-legacy-selected'
+        $stack = [pscustomobject]@{
+            name = 'baseline'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $true
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $stack.tbbRoot 'lib\cmake\tbb')"
+            'AILA_ALLOW_LEGACY_ONEAPI_BASELINE:BOOL=OFF'
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } 'AILA_ALLOW_LEGACY_ONEAPI_BASELINE' 'baseline cached legacy mode'
+    }
+
+    Invoke-Test 'requires the legacy baseline cache option after configure' {
+        $buildDir = Join-Path $tempRoot 'baseline-legacy-cache-missing'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'baseline-legacy-missing-selected'
+        $stack = [pscustomobject]@{
+            name = 'baseline'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+            allowLegacyCompiler = $true
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $stack.tbbRoot 'lib\cmake\tbb')"
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack -RequireValues
+        } 'missing AILA_ALLOW_LEGACY_ONEAPI_BASELINE' 'missing cached legacy option'
     }
 
     Invoke-Test 'imports an isolated baseline oneAPI environment' {
@@ -505,10 +667,43 @@ try {
             throw 'diagnostic batch expected an exception'
         }
         $message = [string]$caught.Exception.Message
-        foreach ($fragment in @('exit code 23', 'diagnostic-from-batch', 'fail-with-diagnostic.bat')) {
+        foreach ($fragment in @('exit code 23', 'stdout: <empty>', 'stderr: diagnostic-from-batch', 'fail-with-diagnostic.bat')) {
             if (-not $message.Contains($fragment)) {
                 throw "diagnostic batch expected message containing='$fragment' actual='$message'"
             }
+        }
+        if ($message.Length -gt 7000) {
+            throw "diagnostic batch error was not bounded: length=$($message.Length)"
+        }
+    }
+
+    Invoke-Test 'bounds native diagnostic text before adding it to errors' {
+        $bounded = Get-AilaBoundedDiagnosticText -Text ('x' * 5000) -MaxLength 256
+        if ($bounded.Length -gt 400) {
+            throw "bounded diagnostic remained too large: length=$($bounded.Length)"
+        }
+        if (-not $bounded.Contains('<truncated')) {
+            throw "bounded diagnostic did not report truncation: '$bounded'"
+        }
+        if ($bounded.Contains('x' * 1000)) {
+            throw 'bounded diagnostic retained an unbounded payload.'
+        }
+    }
+
+    Invoke-Test 'drains saturated batch stdout and stderr pipes without deadlock' {
+        $child = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $saturationChildPath `
+            -ArgumentList @('-PerfCommonPath', (Join-Path $repoRoot 'perf\PerfCommon.ps1'), '-BatchPath', $saturationBatchPath) `
+            -TimeoutMs 15000
+
+        if (-not $child.completed) {
+            throw 'Saturation import child timed out after 15000 ms; batch output pipes were not drained concurrently.'
+        }
+        if ($child.exitCode -ne 0) {
+            throw "Saturation import child failed with exit code $($child.exitCode). stdout='$($child.stdout)' stderr='$($child.stderr)'"
+        }
+        if (-not $child.stdout.Contains('SATURATION_IMPORT_PASS')) {
+            throw "Saturation import child did not report success. stdout='$($child.stdout)' stderr='$($child.stderr)'"
         }
     }
 
@@ -530,6 +725,73 @@ try {
         Assert-Equal $false (Test-AilaPathWithinRoot -Path 'D:\oneAPI\compiler\2025.3\bin' -Root $selectedRoot) 'other custom compiler path'
     }
 
+    Invoke-Test 'rejects a lexical child that traverses a junction outside the selected root' {
+        $selectedRoot = Join-Path $tempRoot 'junction-selected-root'
+        $outsideRoot = Join-Path $tempRoot 'junction-outside-root'
+        $realChild = Join-Path $selectedRoot 'real-child'
+        $junctionPath = Join-Path $selectedRoot 'escape'
+        New-Item -ItemType Directory -Path $realChild,$outsideRoot -Force | Out-Null
+
+        try {
+            try {
+                New-Item -ItemType Junction -Path $junctionPath -Target $outsideRoot | Out-Null
+            }
+            catch {
+                Write-Host "SKIP junction containment test: junction creation unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+                return
+            }
+
+            Assert-Equal $true (Test-AilaPathWithinRoot -Path $realChild -Root $selectedRoot) 'real selected-root child'
+            $escapedPath = Join-Path $junctionPath 'nonexistent-tail'
+            Assert-Equal $false (Test-AilaPathWithinRoot -Path $escapedPath -Root $selectedRoot) 'junction escape path'
+        }
+        finally {
+            if (Test-Path -LiteralPath $junctionPath) {
+                Remove-Item -LiteralPath $junctionPath -Force
+            }
+        }
+    }
+
+    Invoke-Test 'rejects an in-repo build directory junction resolving outside the repo' {
+        $outsideBuildRoot = Join-Path $tempRoot 'outside-build-junction-target'
+        New-Item -ItemType Directory -Path $outsideBuildRoot -Force | Out-Null
+        $sentinelPath = Join-Path $outsideBuildRoot 'must-survive.txt'
+        Set-Content -LiteralPath $sentinelPath -Value 'keep' -Encoding UTF8
+        $junctionPath = Join-Path $repoRoot ('.aila-build-junction-test-' + [guid]::NewGuid().ToString('N'))
+
+        try {
+            try {
+                New-Item -ItemType Junction -Path $junctionPath -Target $outsideBuildRoot | Out-Null
+            }
+            catch {
+                Write-Host "SKIP build-dir junction test: junction creation unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+                return
+            }
+
+            $caught = $null
+            try {
+                Assert-AilaPathWithinRepo -RepoRoot $repoRoot -CandidatePath $junctionPath
+            }
+            catch {
+                $caught = $_
+            }
+            if (-not (Test-Path -LiteralPath $sentinelPath -PathType Leaf)) {
+                throw 'Build-dir containment guard removed data through the junction.'
+            }
+            if ($null -eq $caught) {
+                throw "Build-dir containment guard accepted junction '$junctionPath' resolving outside '$repoRoot'."
+            }
+            if (-not ([string]$caught.Exception.Message).Contains('outside repo')) {
+                throw "Build-dir containment guard returned unexpected error: $($caught.Exception.Message)"
+            }
+        }
+        finally {
+            if (Test-Path -LiteralPath $junctionPath) {
+                Remove-Item -LiteralPath $junctionPath -Force
+            }
+        }
+    }
+
     Invoke-Test 'removes the UMF transitive TCM path without clearing unrelated oneAPI paths' {
         $oneApiRoot = Join-Path $tempRoot 'oneapi-path-filter'
         $systemPath = Join-Path $tempRoot 'system-bin'
@@ -544,26 +806,43 @@ try {
 
     Invoke-Test 'sets process environment entries without leaking test state' {
         $variableName = "AILA_PERF_COMMON_TEST_$([guid]::NewGuid().ToString('N'))"
-        $previousValue = [System.Environment]::GetEnvironmentVariable($variableName, 'Process')
+        $environmentSnapshot = Get-ProcessEnvironmentSnapshot
         try {
             [System.Environment]::SetEnvironmentVariable($variableName, 'before', 'Process')
             Set-AilaProcessEnvironment -Environment @{ $variableName = 'after' }
             Assert-Equal 'after' ([System.Environment]::GetEnvironmentVariable($variableName, 'Process')) 'process environment value'
         }
         finally {
-            Restore-ProcessEnvironmentVariable -Name $variableName -Value $previousValue
+            Restore-ProcessEnvironmentSnapshot -Snapshot $environmentSnapshot
         }
     }
 
     Invoke-Test 'clears a previously managed environment key when the next stack omits it' {
-        $previousDnnlRoot = [System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process')
+        $environmentSnapshot = Get-ProcessEnvironmentSnapshot
         try {
             Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH; DNNLROOT = 'stale-dnnl-root' }
             Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH }
             Assert-IsNull -Actual ([System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process')) -Message 'cleared managed DNNLROOT'
         }
         finally {
-            Restore-ProcessEnvironmentVariable -Name 'DNNLROOT' -Value $previousDnnlRoot
+            Restore-ProcessEnvironmentSnapshot -Snapshot $environmentSnapshot
+        }
+    }
+
+    Invoke-Test 'clears omitted managed keys after PerfCommon is dot-sourced again' {
+        $environmentSnapshot = Get-ProcessEnvironmentSnapshot
+        $sentinelName = "AILA_UNRELATED_SENTINEL_$([guid]::NewGuid().ToString('N'))"
+        try {
+            [System.Environment]::SetEnvironmentVariable($sentinelName, 'keep-me', 'Process')
+            Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH; DNNLROOT = 'stale-after-redot' }
+            . (Join-Path $repoRoot 'perf\PerfCommon.ps1')
+            Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH }
+
+            Assert-IsNull -Actual ([System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process')) -Message 're-dot-source cleared managed DNNLROOT'
+            Assert-Equal 'keep-me' ([System.Environment]::GetEnvironmentVariable($sentinelName, 'Process')) 're-dot-source preserves unrelated sentinel'
+        }
+        finally {
+            Restore-ProcessEnvironmentSnapshot -Snapshot $environmentSnapshot
         }
     }
 

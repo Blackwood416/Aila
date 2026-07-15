@@ -35,6 +35,7 @@ $stackMeta = Get-AilaOneApiStackMetadata -Stack $stack
 $stackCompilerPath = Join-Path $stack.compilerRoot 'bin\icx-cl.exe'
 $stackDnnlCMakeDir = Join-Path $stack.dnnlRoot 'lib\cmake\dnnl'
 $stackTbbCMakeDir = Join-Path $stack.tbbRoot 'lib\cmake\tbb'
+$stackLegacyOption = if ($stack.allowLegacyCompiler) { 'ON' } else { 'OFF' }
 
 Push-Location $repoRoot
 try {
@@ -45,11 +46,9 @@ try {
         "-DCMAKE_BUILD_TYPE=$Config",
         "-DCMAKE_CXX_COMPILER=$stackCompilerPath",
         "-Ddnnl_DIR=$stackDnnlCMakeDir",
-        "-DTBB_DIR=$stackTbbCMakeDir"
+        "-DTBB_DIR=$stackTbbCMakeDir",
+        "-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=$stackLegacyOption"
     )
-    if ($stack.allowLegacyCompiler) {
-        $cmakeArgs += '-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=ON'
-    }
     & cmake @cmakeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed with exit code $LASTEXITCODE."

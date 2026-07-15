@@ -1,7 +1,6 @@
 Set-StrictMode -Version Latest
 
 $script:AilaOneApiInitialized = $false
-$script:AilaManagedProcessEnvironmentKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 function Get-AilaRepoRoot {
     $perfDir = Split-Path -Parent $PSScriptRoot
@@ -183,6 +182,25 @@ function Assert-AilaCMakeCacheMatchesOneApiStack {
             throw "Build directory '$BuildDir' has $($check.key) '$value' outside selected oneAPI stack '$($Stack.name)' root '$($check.root)'. Use -Clean or a different BuildDir."
         }
     }
+
+    $legacyKey = 'AILA_ALLOW_LEGACY_ONEAPI_BASELINE'
+    $legacyValue = [string](Read-AilaCMakeCacheValue -CachePath $cachePath -Key $legacyKey)
+    if ([string]::IsNullOrWhiteSpace($legacyValue)) {
+        if ($RequireValues) {
+            throw "Configured build directory '$BuildDir' is missing $legacyKey."
+        }
+        return
+    }
+
+    $normalizedLegacyValue = switch -Regex ($legacyValue.Trim().ToUpperInvariant()) {
+        '^(1|ON|TRUE|YES|Y)$' { 'ON'; break }
+        '^(0|OFF|FALSE|NO|N)$' { 'OFF'; break }
+        default { $null }
+    }
+    $expectedLegacyValue = if ([bool]$Stack.allowLegacyCompiler) { 'ON' } else { 'OFF' }
+    if ($normalizedLegacyValue -ne $expectedLegacyValue) {
+        throw "Build directory '$BuildDir' has $legacyKey '$legacyValue', but selected oneAPI stack '$($Stack.name)' requires '$expectedLegacyValue'. Use -Clean or a different BuildDir."
+    }
 }
 
 function Get-AilaWindowsPathKey {
@@ -192,16 +210,74 @@ function Get-AilaWindowsPathKey {
     return [System.IO.Path]::GetFullPath($cleaned).TrimEnd('\')
 }
 
+function Get-AilaCanonicalWindowsPathKey {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $cleaned = $Path.Trim().Trim('"').Replace('/', '\')
+    $fullPath = [System.IO.Path]::GetFullPath($cleaned)
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($pathRoot)) {
+        throw "Path has no filesystem root: $Path"
+    }
+
+    $current = $pathRoot
+    $relative = $fullPath.Substring($pathRoot.Length)
+    $segments = @($relative -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        $candidate = Join-Path $current $segments[$index]
+        try {
+            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            for ($tailIndex = $index; $tailIndex -lt $segments.Count; $tailIndex++) {
+                $current = Join-Path $current $segments[$tailIndex]
+            }
+            break
+        }
+        catch {
+            throw "Failed to inspect path component '$candidate': $($_.Exception.Message)"
+        }
+
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            try {
+                $target = $item.ResolveLinkTarget($true)
+            }
+            catch {
+                throw "Failed to resolve reparse point '$candidate': $($_.Exception.Message)"
+            }
+            if ($null -eq $target) {
+                throw "Failed to resolve reparse point '$candidate'."
+            }
+            $current = [System.IO.Path]::GetFullPath($target.FullName)
+            continue
+        }
+
+        $current = $item.FullName
+    }
+
+    return [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($current))
+}
+
+function Test-AilaCanonicalPathKeyWithinRootKey {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathKey,
+        [Parameter(Mandatory = $true)][string]$RootKey
+    )
+
+    $rootPrefix = if ([System.IO.Path]::EndsInDirectorySeparator($RootKey)) { $RootKey } else { $RootKey + '\' }
+    return $PathKey.Equals($RootKey, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $PathKey.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-AilaPathWithinRoot {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Root
     )
 
-    $pathKey = Get-AilaWindowsPathKey -Path $Path
-    $rootKey = Get-AilaWindowsPathKey -Path $Root
-    return $pathKey.Equals($rootKey, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $pathKey.StartsWith($rootKey + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    $pathKey = Get-AilaCanonicalWindowsPathKey -Path $Path
+    $rootKey = Get-AilaCanonicalWindowsPathKey -Path $Root
+    return Test-AilaCanonicalPathKeyWithinRootKey -PathKey $pathKey -RootKey $rootKey
 }
 
 function Get-AilaUniquePathSegments {
@@ -261,6 +337,25 @@ function Remove-AilaManagedOneApiPathSegments {
     return [string]::Join(';', (Get-AilaUniquePathSegments -Segments $kept.ToArray()))
 }
 
+function Get-AilaBoundedDiagnosticText {
+    param(
+        [AllowNull()][string]$Text,
+        [ValidateRange(64, 65536)][int]$MaxLength = 2048
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return '<empty>'
+    }
+
+    $trimmed = $Text.Trim()
+    if ($trimmed.Length -le $MaxLength) {
+        return $trimmed
+    }
+
+    $omitted = $trimmed.Length - $MaxLength
+    return $trimmed.Substring(0, $MaxLength) + "... <truncated $omitted characters>"
+}
+
 function Import-AilaBatchEnvironment {
     param([Parameter(Mandatory = $true)][string[]]$Scripts)
 
@@ -305,17 +400,17 @@ function Import-AilaBatchEnvironment {
     if (-not $process.Start()) {
         throw "Failed to start batch environment process: $cmdPath"
     }
-    $standardOutput = $process.StandardOutput.ReadToEnd()
-    $standardError = $process.StandardError.ReadToEnd()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
+    $standardOutput = $stdoutTask.GetAwaiter().GetResult()
+    $standardError = $stderrTask.GetAwaiter().GetResult()
     $exitCode = $process.ExitCode
     if ($exitCode -ne 0) {
         $scriptContext = [string]::Join(', ', @($Scripts | ForEach-Object { "'$_'" }))
-        $errorContext = $standardError.Trim()
-        if ([string]::IsNullOrWhiteSpace($errorContext)) {
-            $errorContext = '<empty>'
-        }
-        throw "Batch environment import failed with exit code $exitCode while running cmd.exe /d /s /c for scripts: $scriptContext. stderr: $errorContext"
+        $outputContext = Get-AilaBoundedDiagnosticText -Text $standardOutput
+        $errorContext = Get-AilaBoundedDiagnosticText -Text $standardError
+        throw "Batch environment import failed with exit code $exitCode while running cmd.exe /d /s /c for scripts: $scriptContext. stdout: $outputContext. stderr: $errorContext"
     }
 
     $standardOutput -split '\r?\n' | ForEach-Object {
@@ -381,23 +476,13 @@ function Get-AilaOneApiStackEnvironment {
 function Set-AilaProcessEnvironment {
     param([Parameter(Mandatory = $true)][hashtable]$Environment)
 
-    $incomingManagedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($key in ((Get-AilaOneApiPathListVariableNames) + (Get-AilaOneApiRootVariableNames))) {
-        if ($Environment.ContainsKey($key)) {
-            $incomingManagedKeys.Add($key) | Out-Null
-        }
-    }
-    foreach ($key in @($script:AilaManagedProcessEnvironmentKeys)) {
-        if (-not $incomingManagedKeys.Contains($key)) {
+        if (-not $Environment.ContainsKey($key)) {
             [System.Environment]::SetEnvironmentVariable($key, [System.Management.Automation.Language.NullString]::Value, 'Process')
         }
     }
     foreach ($entry in $Environment.GetEnumerator()) {
         [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
-    }
-    $script:AilaManagedProcessEnvironmentKeys.Clear()
-    foreach ($key in $incomingManagedKeys) {
-        $script:AilaManagedProcessEnvironmentKeys.Add($key) | Out-Null
     }
 }
 
@@ -426,11 +511,13 @@ function Assert-AilaPathWithinRepo {
         [string]$CandidatePath
     )
 
-    $repoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\') + '\'
     $candidateFull = [System.IO.Path]::GetFullPath($CandidatePath)
+    $repoKey = Get-AilaCanonicalWindowsPathKey -Path $RepoRoot
+    $candidateKey = Get-AilaCanonicalWindowsPathKey -Path $candidateFull
 
-    if (-not $candidateFull.StartsWith($repoFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to operate on path outside repo: $candidateFull"
+    if ($candidateKey.Equals($repoKey, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-AilaCanonicalPathKeyWithinRootKey -PathKey $candidateKey -RootKey $repoKey)) {
+        throw "Refusing to operate on path outside repo: $candidateFull (resolved: $candidateKey)"
     }
 
     return $candidateFull
