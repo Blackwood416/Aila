@@ -9,6 +9,30 @@ function Assert-Equal($Expected, $Actual, [string]$Message) {
     }
 }
 
+function Assert-IsNull {
+    param(
+        [AllowNull()]$Actual,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    if ($null -ne $Actual) {
+        throw "$Message expected a null value but received type '$($Actual.GetType().FullName)' with value '$Actual'"
+    }
+}
+
+function Restore-ProcessEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()]$Value
+    )
+
+    if ($null -eq $Value) {
+        [System.Environment]::SetEnvironmentVariable($Name, [System.Management.Automation.Language.NullString]::Value, 'Process')
+        return
+    }
+    [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
+}
+
 function Assert-Throws([scriptblock]$Action, [string]$ExpectedMessageFragment, [string]$Message) {
     $caught = $null
     try {
@@ -61,6 +85,23 @@ function Assert-PathSegmentsUnique([string]$PathValue, [string]$Message) {
     }
 }
 
+function Assert-PathContainsRoot([string]$PathValue, [string]$ExpectedRoot, [string]$Message) {
+    foreach ($segment in ($PathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        if (Test-AilaPathWithinRoot -Path $segment -Root $ExpectedRoot) {
+            return
+        }
+    }
+    throw "$Message expected a path under '$ExpectedRoot'"
+}
+
+function Assert-PathExcludesRoot([string]$PathValue, [string]$ExcludedRoot, [string]$Message) {
+    foreach ($segment in ($PathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        if (Test-AilaPathWithinRoot -Path $segment -Root $ExcludedRoot) {
+            throw "$Message contains path from excluded root '$ExcludedRoot': '$segment'"
+        }
+    }
+}
+
 function New-TestStack([string]$Root) {
     return [pscustomobject]@{
         role                    = 'test'
@@ -93,6 +134,8 @@ $missingSchemaPath = Join-Path $tempRoot 'missing-schema.json'
 Set-Content -LiteralPath $missingSchemaPath -Value '{"stacks":{}}' -Encoding UTF8
 $failingBatchPath = Join-Path $tempRoot 'fail-with-37.bat'
 Set-Content -LiteralPath $failingBatchPath -Value "@echo off`r`nexit /b 37" -Encoding ASCII
+$diagnosticBatchPath = Join-Path $tempRoot 'fail-with-diagnostic.bat'
+Set-Content -LiteralPath $diagnosticBatchPath -Value "@echo off`r`n>&2 echo diagnostic-from-batch`r`nexit /b 23" -Encoding ASCII
 $partialBatchPath = Join-Path $tempRoot 'missing-compiler-root.bat'
 Set-Content -LiteralPath $partialBatchPath -Value "@echo off`r`nset CMPLR_ROOT=`r`nexit /b 0" -Encoding ASCII
 $missingPathBatchPath = Join-Path $tempRoot 'missing-path.bat'
@@ -279,6 +322,118 @@ try {
         }
     }
 
+    Invoke-Test 'rejects build metadata from a different oneAPI stack' {
+        $buildDir = Join-Path $tempRoot 'build-info-mismatch'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        Write-AilaJsonFile -Path (Join-Path $buildDir 'build_info.json') -Data ([ordered]@{
+            schemaVersion = 2
+            oneApi = [ordered]@{ name = 'oneapi-2025.3' }
+        })
+        $stack = [pscustomobject]@{ name = 'oneapi-2026.1' }
+
+        Assert-Throws {
+            Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } "contains oneAPI stack 'oneapi-2025.3'" 'build info stack mismatch'
+    }
+
+    Invoke-Test 'accepts build metadata for the selected oneAPI stack' {
+        $buildDir = Join-Path $tempRoot 'build-info-match'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        Write-AilaJsonFile -Path (Join-Path $buildDir 'build_info.json') -Data ([ordered]@{
+            schemaVersion = 2
+            oneApi = [ordered]@{ name = 'oneapi-2026.1' }
+        })
+        $stack = [pscustomobject]@{ name = 'oneapi-2026.1' }
+
+        Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+    }
+
+    Invoke-Test 'rejects a cached compiler outside the selected stack' {
+        $buildDir = Join-Path $tempRoot 'compiler-cache-mismatch'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'selected'
+        $otherRoot = Join-Path $tempRoot 'other'
+        $stack = [pscustomobject]@{
+            name = 'selected'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $otherRoot 'compiler\2\bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $stack.tbbRoot 'lib\cmake\tbb')"
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } 'CMAKE_CXX_COMPILER' 'cached compiler mismatch'
+    }
+
+    Invoke-Test 'rejects a cached oneDNN directory outside the selected stack' {
+        $buildDir = Join-Path $tempRoot 'dnnl-cache-mismatch'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'selected-dnnl'
+        $otherRoot = Join-Path $tempRoot 'other-dnnl'
+        $stack = [pscustomobject]@{
+            name = 'selected'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $otherRoot 'dnnl\2\lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $stack.tbbRoot 'lib\cmake\tbb')"
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } 'dnnl_DIR' 'cached oneDNN mismatch'
+    }
+
+    Invoke-Test 'rejects a cached TBB directory outside the selected stack' {
+        $buildDir = Join-Path $tempRoot 'tbb-cache-mismatch'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'selected-tbb'
+        $otherRoot = Join-Path $tempRoot 'other-tbb'
+        $stack = [pscustomobject]@{
+            name = 'selected'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+            "TBB_DIR:PATH=$(Join-Path $otherRoot 'tbb\2\lib\cmake\tbb')"
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack
+        } 'TBB_DIR' 'cached TBB mismatch'
+    }
+
+    Invoke-Test 'requires all selected stack cache values after configure' {
+        $buildDir = Join-Path $tempRoot 'cache-missing-tbb'
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+        $selectedRoot = Join-Path $tempRoot 'selected-required'
+        $stack = [pscustomobject]@{
+            name = 'selected'
+            compilerRoot = Join-Path $selectedRoot 'compiler\1'
+            dnnlRoot = Join-Path $selectedRoot 'dnnl\1'
+            tbbRoot = Join-Path $selectedRoot 'tbb\1'
+        }
+        Set-Content -LiteralPath (Join-Path $buildDir 'CMakeCache.txt') -Encoding UTF8 -Value @(
+            "CMAKE_CXX_COMPILER:FILEPATH=$(Join-Path $stack.compilerRoot 'bin\icx-cl.exe')"
+            "dnnl_DIR:PATH=$(Join-Path $stack.dnnlRoot 'lib\cmake\dnnl')"
+        )
+
+        Assert-Throws {
+            Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDir -Stack $stack -RequireValues
+        } 'missing TBB_DIR' 'missing configured TBB value'
+    }
+
     Invoke-Test 'imports an isolated baseline oneAPI environment' {
         $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
         $baseline = Get-AilaOneApiStack -Config $config -Name 'oneapi-2025.3'
@@ -337,6 +492,26 @@ try {
         } 'exit code 37' 'failing batch script'
     }
 
+    Invoke-Test 'reports stderr and script context for a failing batch import' {
+        $caught = $null
+        try {
+            Import-AilaBatchEnvironment -Scripts @($diagnosticBatchPath)
+        }
+        catch {
+            $caught = $_
+        }
+
+        if ($null -eq $caught) {
+            throw 'diagnostic batch expected an exception'
+        }
+        $message = [string]$caught.Exception.Message
+        foreach ($fragment in @('exit code 23', 'diagnostic-from-batch', 'fail-with-diagnostic.bat')) {
+            if (-not $message.Contains($fragment)) {
+                throw "diagnostic batch expected message containing='$fragment' actual='$message'"
+            }
+        }
+    }
+
     Invoke-Test 'rejects a partial batch environment' {
         Assert-Throws {
             Import-AilaBatchEnvironment -Scripts @($partialBatchPath)
@@ -355,6 +530,18 @@ try {
         Assert-Equal $false (Test-AilaPathWithinRoot -Path 'D:\oneAPI\compiler\2025.3\bin' -Root $selectedRoot) 'other custom compiler path'
     }
 
+    Invoke-Test 'removes the UMF transitive TCM path without clearing unrelated oneAPI paths' {
+        $oneApiRoot = Join-Path $tempRoot 'oneapi-path-filter'
+        $systemPath = Join-Path $tempRoot 'system-bin'
+        $tcmPath = Join-Path $oneApiRoot 'tcm\latest\lib'
+        $unrelatedPath = Join-Path $oneApiRoot 'mkl\latest\lib'
+        $filtered = Remove-AilaManagedOneApiPathSegments -Value ([string]::Join(';', @($systemPath, $tcmPath, $unrelatedPath))) -OneApiRoot $oneApiRoot
+
+        Assert-PathContainsSegment $filtered $systemPath 'oneAPI path filter system path'
+        Assert-PathContainsSegment $filtered $unrelatedPath 'oneAPI path filter unrelated component'
+        Assert-PathExcludesRoot $filtered (Join-Path $oneApiRoot 'tcm') 'oneAPI path filter transitive TCM path'
+    }
+
     Invoke-Test 'sets process environment entries without leaking test state' {
         $variableName = "AILA_PERF_COMMON_TEST_$([guid]::NewGuid().ToString('N'))"
         $previousValue = [System.Environment]::GetEnvironmentVariable($variableName, 'Process')
@@ -364,7 +551,93 @@ try {
             Assert-Equal 'after' ([System.Environment]::GetEnvironmentVariable($variableName, 'Process')) 'process environment value'
         }
         finally {
-            [System.Environment]::SetEnvironmentVariable($variableName, $previousValue, 'Process')
+            Restore-ProcessEnvironmentVariable -Name $variableName -Value $previousValue
+        }
+    }
+
+    Invoke-Test 'clears a previously managed environment key when the next stack omits it' {
+        $previousDnnlRoot = [System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process')
+        try {
+            Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH; DNNLROOT = 'stale-dnnl-root' }
+            Set-AilaProcessEnvironment -Environment @{ PATH = $env:PATH }
+            Assert-IsNull -Actual ([System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process')) -Message 'cleared managed DNNLROOT'
+        }
+        finally {
+            Restore-ProcessEnvironmentVariable -Name 'DNNLROOT' -Value $previousDnnlRoot
+        }
+    }
+
+    Invoke-Test 'switches baseline candidate baseline without stale oneAPI paths' {
+        $environmentSnapshot = @{}
+        [System.Environment]::GetEnvironmentVariables('Process').GetEnumerator() | ForEach-Object {
+            $environmentSnapshot[[string]$_.Key] = [string]$_.Value
+        }
+        $pathVariables = @('PATH', 'LIB', 'INCLUDE', 'CMAKE_PREFIX_PATH', 'PKG_CONFIG_PATH', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')
+        $rootVariables = @('CMPLR_ROOT', 'DNNLROOT', 'TBBROOT', 'UMF_ROOT', 'ONEAPI_ROOT')
+        $expectedComponents = @{
+            PATH                = @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')
+            LIB                 = @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')
+            INCLUDE             = @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')
+            CMAKE_PREFIX_PATH   = @('compilerRoot', 'dnnlRoot', 'tbbRoot')
+            PKG_CONFIG_PATH     = @('compilerRoot', 'dnnlRoot', 'tbbRoot')
+            CPATH               = @('umfRoot')
+            C_INCLUDE_PATH      = @('compilerRoot', 'tbbRoot', 'umfRoot')
+            CPLUS_INCLUDE_PATH  = @('compilerRoot', 'tbbRoot', 'umfRoot')
+        }
+
+        $assertSelectedStack = {
+            param($Selected, $Other, [string]$Label)
+
+            foreach ($variable in $pathVariables) {
+                $value = [System.Environment]::GetEnvironmentVariable($variable, 'Process')
+                Assert-PathSegmentsUnique $value "$Label $variable"
+                foreach ($property in $expectedComponents[$variable]) {
+                    Assert-PathContainsRoot $value ([string]$Selected.$property) "$Label $variable selected $property"
+                }
+                foreach ($property in @('compilerRoot', 'dnnlRoot', 'tbbRoot', 'umfRoot')) {
+                    Assert-PathExcludesRoot $value ([string]$Other.$property) "$Label $variable"
+                }
+            }
+
+            Assert-Equal (Get-NormalizedTestPath $Selected.compilerRoot) (Get-NormalizedTestPath ([System.Environment]::GetEnvironmentVariable('CMPLR_ROOT', 'Process'))) "$Label compiler root"
+            Assert-Equal (Get-NormalizedTestPath $Selected.dnnlRoot) (Get-NormalizedTestPath ([System.Environment]::GetEnvironmentVariable('DNNLROOT', 'Process'))) "$Label oneDNN root"
+            Assert-Equal (Get-NormalizedTestPath $Selected.tbbRoot) (Get-NormalizedTestPath ([System.Environment]::GetEnvironmentVariable('TBBROOT', 'Process'))) "$Label TBB root"
+            Assert-Equal (Get-NormalizedTestPath $Selected.umfRoot) (Get-NormalizedTestPath ([System.Environment]::GetEnvironmentVariable('UMF_ROOT', 'Process'))) "$Label UMF root"
+            $oneApiRoot = Split-Path -Parent (Split-Path -Parent $Selected.compilerRoot)
+            Assert-Equal (Get-NormalizedTestPath $oneApiRoot) (Get-NormalizedTestPath ([System.Environment]::GetEnvironmentVariable('ONEAPI_ROOT', 'Process'))) "$Label oneAPI root"
+        }
+
+        try {
+            $config = Get-AilaOneApiStackConfig -RepoRoot $repoRoot
+            $baseline = Get-AilaOneApiStack -Config $config -Name 'oneapi-2025.3'
+            $candidate = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
+
+            Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $baseline)
+            & $assertSelectedStack $baseline $candidate 'baseline first switch'
+            $baselineFirst = @{}
+            foreach ($variable in ($pathVariables + $rootVariables)) {
+                $baselineFirst[$variable] = [System.Environment]::GetEnvironmentVariable($variable, 'Process')
+            }
+
+            Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $candidate)
+            & $assertSelectedStack $candidate $baseline 'candidate switch'
+
+            Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $baseline)
+            & $assertSelectedStack $baseline $candidate 'baseline second switch'
+            foreach ($variable in ($pathVariables + $rootVariables)) {
+                Assert-Equal $baselineFirst[$variable] ([System.Environment]::GetEnvironmentVariable($variable, 'Process')) "stable repeated baseline $variable"
+            }
+        }
+        finally {
+            $currentKeys = @([System.Environment]::GetEnvironmentVariables('Process').Keys | ForEach-Object { [string]$_ })
+            foreach ($key in $currentKeys) {
+                if (-not $environmentSnapshot.ContainsKey($key)) {
+                    Restore-ProcessEnvironmentVariable -Name $key -Value $null
+                }
+            }
+            foreach ($entry in $environmentSnapshot.GetEnumerator()) {
+                Restore-ProcessEnvironmentVariable -Name $entry.Key -Value $entry.Value
+            }
         }
     }
 }

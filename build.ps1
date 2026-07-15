@@ -27,13 +27,26 @@ if ($Clean -and (Test-Path -LiteralPath $buildDirPath)) {
 Ensure-AilaDirectory -Path $buildDirPath
 $stackConfig = Get-AilaOneApiStackConfig -RepoRoot $repoRoot -Path $OneApiStacksFile
 $stack = Get-AilaOneApiStack -Config $stackConfig -Name $OneApiStack
+Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack
+Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack
 $stackEnv = Get-AilaOneApiStackEnvironment -Stack $stack
 Set-AilaProcessEnvironment -Environment $stackEnv
 $stackMeta = Get-AilaOneApiStackMetadata -Stack $stack
+$stackCompilerPath = Join-Path $stack.compilerRoot 'bin\icx-cl.exe'
+$stackDnnlCMakeDir = Join-Path $stack.dnnlRoot 'lib\cmake\dnnl'
+$stackTbbCMakeDir = Join-Path $stack.tbbRoot 'lib\cmake\tbb'
 
 Push-Location $repoRoot
 try {
-    $cmakeArgs = @('-S', $repoRoot, '-B', $buildDirPath, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Config")
+    $cmakeArgs = @(
+        '-S', $repoRoot,
+        '-B', $buildDirPath,
+        '-G', 'Ninja',
+        "-DCMAKE_BUILD_TYPE=$Config",
+        "-DCMAKE_CXX_COMPILER=$stackCompilerPath",
+        "-Ddnnl_DIR=$stackDnnlCMakeDir",
+        "-DTBB_DIR=$stackTbbCMakeDir"
+    )
     if ($stack.allowLegacyCompiler) {
         $cmakeArgs += '-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=ON'
     }
@@ -42,6 +55,7 @@ try {
         throw "CMake configure failed with exit code $LASTEXITCODE."
     }
 
+    Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack -RequireValues
     $buildMeta = Get-AilaBuildMetadata -BuildDir $buildDirPath
 
     Write-Host ":: build info ::" -ForegroundColor Cyan
@@ -57,6 +71,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "CMake build failed with exit code $LASTEXITCODE."
     }
+    Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack -RequireValues
 }
 finally {
     Pop-Location

@@ -1,6 +1,7 @@
 Set-StrictMode -Version Latest
 
 $script:AilaOneApiInitialized = $false
+$script:AilaManagedProcessEnvironmentKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 function Get-AilaRepoRoot {
     $perfDir = Split-Path -Parent $PSScriptRoot
@@ -119,6 +120,71 @@ function Get-AilaOneApiStackMetadata {
     }
 }
 
+function Assert-AilaBuildInfoMatchesOneApiStack {
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildDir,
+        [Parameter(Mandatory = $true)]$Stack
+    )
+
+    $buildInfoPath = Join-Path $BuildDir 'build_info.json'
+    if (-not (Test-Path -LiteralPath $buildInfoPath -PathType Leaf)) {
+        return
+    }
+
+    $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
+    $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
+    if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
+        return
+    }
+
+    $nameProperty = $oneApiProperty.Value.PSObject.Properties['name']
+    if ($null -eq $nameProperty -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+        return
+    }
+
+    $existingName = [string]$nameProperty.Value
+    if ($existingName -ne [string]$Stack.name) {
+        throw "Build directory '$BuildDir' contains oneAPI stack '$existingName', but '$($Stack.name)' was requested. Use -Clean or a different BuildDir."
+    }
+}
+
+function Assert-AilaCMakeCacheMatchesOneApiStack {
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildDir,
+        [Parameter(Mandatory = $true)]$Stack,
+        [switch]$RequireValues
+    )
+
+    $cachePath = Join-Path $BuildDir 'CMakeCache.txt'
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        if ($RequireValues) {
+            throw "Configured build directory '$BuildDir' is missing CMakeCache.txt."
+        }
+        return
+    }
+
+    $buildMeta = Get-AilaBuildMetadata -BuildDir $BuildDir
+    $checks = @(
+        [pscustomobject]@{ key = 'CMAKE_CXX_COMPILER'; value = $buildMeta.compiler; root = [string]$Stack.compilerRoot },
+        [pscustomobject]@{ key = 'dnnl_DIR'; value = Read-AilaCMakeCacheValue -CachePath $cachePath -Key 'dnnl_DIR'; root = [string]$Stack.dnnlRoot },
+        [pscustomobject]@{ key = 'TBB_DIR'; value = Read-AilaCMakeCacheValue -CachePath $cachePath -Key 'TBB_DIR'; root = [string]$Stack.tbbRoot }
+    )
+
+    foreach ($check in $checks) {
+        $value = [string]$check.value
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            if ($RequireValues) {
+                throw "Configured build directory '$BuildDir' is missing $($check.key)."
+            }
+            continue
+        }
+
+        if (-not (Test-AilaPathWithinRoot -Path $value -Root $check.root)) {
+            throw "Build directory '$BuildDir' has $($check.key) '$value' outside selected oneAPI stack '$($Stack.name)' root '$($check.root)'. Use -Clean or a different BuildDir."
+        }
+    }
+}
+
 function Get-AilaWindowsPathKey {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -156,6 +222,45 @@ function Get-AilaUniquePathSegments {
     return $result.ToArray()
 }
 
+function Get-AilaOneApiPathListVariableNames {
+    return @('PATH', 'LIB', 'INCLUDE', 'CMAKE_PREFIX_PATH', 'PKG_CONFIG_PATH', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')
+}
+
+function Get-AilaOneApiRootVariableNames {
+    return @('CMPLR_ROOT', 'DNNLROOT', 'TBBROOT', 'UMF_ROOT', 'ONEAPI_ROOT')
+}
+
+function Remove-AilaManagedOneApiPathSegments {
+    param(
+        [AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory = $true)][string]$OneApiRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $familyRoots = @('compiler', 'dnnl', 'tbb', 'umf', 'tcm') | ForEach-Object { Join-Path $OneApiRoot $_ }
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($segment in ($Value -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $isManaged = $false
+        foreach ($familyRoot in $familyRoots) {
+            if (Test-AilaPathWithinRoot -Path $segment -Root $familyRoot) {
+                $isManaged = $true
+                break
+            }
+        }
+        if (-not $isManaged) {
+            $kept.Add($segment.Trim())
+        }
+    }
+
+    if ($kept.Count -eq 0) {
+        return ''
+    }
+    return [string]::Join(';', (Get-AilaUniquePathSegments -Segments $kept.ToArray()))
+}
+
 function Import-AilaBatchEnvironment {
     param([Parameter(Mandatory = $true)][string[]]$Scripts)
 
@@ -176,14 +281,44 @@ function Import-AilaBatchEnvironment {
     }
     $calls.Add('set')
 
+    $cmdPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $cmdPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($key in (Get-AilaOneApiPathListVariableNames)) {
+        if ($startInfo.Environment.ContainsKey($key)) {
+            $startInfo.Environment[$key] = Remove-AilaManagedOneApiPathSegments -Value $startInfo.Environment[$key] -OneApiRoot $oneApiRoot
+        }
+    }
+    foreach ($key in (Get-AilaOneApiRootVariableNames)) {
+        $startInfo.Environment.Remove($key) | Out-Null
+    }
+    $compoundCommand = $calls -join ' && '
+    $startInfo.Arguments = '/d /s /c "' + $compoundCommand + '"'
+
     $result = @{}
-    $output = @(cmd.exe /d /s /c ($calls -join ' && ') 2>&1)
-    $exitCode = $LASTEXITCODE
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start batch environment process: $cmdPath"
+    }
+    $standardOutput = $process.StandardOutput.ReadToEnd()
+    $standardError = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
     if ($exitCode -ne 0) {
-        throw "Batch environment import failed with exit code $exitCode."
+        $scriptContext = [string]::Join(', ', @($Scripts | ForEach-Object { "'$_'" }))
+        $errorContext = $standardError.Trim()
+        if ([string]::IsNullOrWhiteSpace($errorContext)) {
+            $errorContext = '<empty>'
+        }
+        throw "Batch environment import failed with exit code $exitCode while running cmd.exe /d /s /c for scripts: $scriptContext. stderr: $errorContext"
     }
 
-    $output | ForEach-Object {
+    $standardOutput -split '\r?\n' | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') {
             $result[$matches[1]] = $matches[2]
         }
@@ -209,14 +344,16 @@ function Get-AilaOneApiStackEnvironment {
     $umfRoot = [System.IO.Path]::GetFullPath([string]$Stack.umfRoot)
     $umfLatest = Join-Path (Split-Path -Parent $umfRoot) 'latest'
     $umfLatestPattern = [regex]::Escape($umfLatest)
-    foreach ($key in @('PATH', 'LIB', 'INCLUDE', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH')) {
+    foreach ($key in (Get-AilaOneApiPathListVariableNames)) {
         if ($envMap.ContainsKey($key)) {
-            $envMap[$key] = [regex]::Replace(
+            $normalizedValue = [regex]::Replace(
                 [string]$envMap[$key],
                 $umfLatestPattern,
                 $umfRoot,
                 [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
             )
+            $segments = @($normalizedValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $envMap[$key] = if ($segments.Count -eq 0) { '' } else { [string]::Join(';', (Get-AilaUniquePathSegments -Segments $segments)) }
         }
     }
     $envMap['UMF_ROOT'] = $umfRoot
@@ -244,8 +381,23 @@ function Get-AilaOneApiStackEnvironment {
 function Set-AilaProcessEnvironment {
     param([Parameter(Mandatory = $true)][hashtable]$Environment)
 
+    $incomingManagedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in ((Get-AilaOneApiPathListVariableNames) + (Get-AilaOneApiRootVariableNames))) {
+        if ($Environment.ContainsKey($key)) {
+            $incomingManagedKeys.Add($key) | Out-Null
+        }
+    }
+    foreach ($key in @($script:AilaManagedProcessEnvironmentKeys)) {
+        if (-not $incomingManagedKeys.Contains($key)) {
+            [System.Environment]::SetEnvironmentVariable($key, [System.Management.Automation.Language.NullString]::Value, 'Process')
+        }
+    }
     foreach ($entry in $Environment.GetEnumerator()) {
         [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+    }
+    $script:AilaManagedProcessEnvironmentKeys.Clear()
+    foreach ($key in $incomingManagedKeys) {
+        $script:AilaManagedProcessEnvironmentKeys.Add($key) | Out-Null
     }
 }
 
