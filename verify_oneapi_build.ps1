@@ -22,6 +22,28 @@ function Get-RequiredOneApiMetadataValue {
     return $property.Value
 }
 
+function Assert-AilaVerificationPathOwnership {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$BuildDirPath,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $leaf = Split-Path -Leaf $Path
+    if (-not $leaf.Equals('oneapi_verification.json', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Verification output file must be named 'oneapi_verification.json': $Path"
+    }
+    if (-not (Test-AilaPathWithinRoot -Path $Path -Root $BuildDirPath)) {
+        throw "Verification output path is outside selected build directory '$BuildDirPath': $Path"
+    }
+    if (-not (Test-AilaPathWithinRoot -Path $Path -Root $RepoRoot)) {
+        throw "Verification output path is outside repository '$RepoRoot': $Path"
+    }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        throw "Verification output path is a directory: $Path"
+    }
+}
+
 function Get-AilaApprovedVerificationPath {
     param(
         [Parameter(Mandatory = $true)][string]$RepoRoot,
@@ -36,13 +58,7 @@ function Get-AilaApprovedVerificationPath {
         Resolve-AilaPath -RepoRoot $RepoRoot -Path $RequestedOutputPath
     }
     $verificationPath = [System.IO.Path]::GetFullPath($verificationPath)
-
-    if (-not (Test-AilaPathWithinRoot -Path $verificationPath -Root $RepoRoot)) {
-        throw "Verification output path is outside repository '$RepoRoot': $verificationPath"
-    }
-    if (Test-Path -LiteralPath $verificationPath -PathType Container) {
-        throw "Verification output path is a directory: $verificationPath"
-    }
+    Assert-AilaVerificationPathOwnership -RepoRoot $RepoRoot -BuildDirPath $BuildDirPath -Path $verificationPath
 
     return $verificationPath
 }
@@ -58,15 +74,14 @@ function Remove-AilaPreviousVerification {
 function Write-AilaAtomicVerificationJson {
     param(
         [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$BuildDirPath,
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)]$Data
     )
 
     $parent = Split-Path -Parent $Path
     Ensure-AilaDirectory -Path $parent
-    if (-not (Test-AilaPathWithinRoot -Path $Path -Root $RepoRoot)) {
-        throw "Verification output path escaped repository before publication: $Path"
-    }
+    Assert-AilaVerificationPathOwnership -RepoRoot $RepoRoot -BuildDirPath $BuildDirPath -Path $Path
 
     $leaf = Split-Path -Leaf $Path
     $tempPath = Join-Path $parent ".$leaf.$([guid]::NewGuid().ToString('N')).tmp"
@@ -257,7 +272,7 @@ function Invoke-AilaOneApiBuildVerification {
         dependencies     = @($inspection.dependencies)
         executableSha256 = $inspection.executableSha256
     }
-    Write-AilaAtomicVerificationJson -RepoRoot $repoRoot -Path $verificationPath -Data $payload
+    Write-AilaAtomicVerificationJson -RepoRoot $repoRoot -BuildDirPath $buildDirPath -Path $verificationPath -Data $payload
 
     Write-Host "Verification PASS: $OneApiStack -> $($inspection.dependencies[0])"
 }

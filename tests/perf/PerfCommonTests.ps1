@@ -298,7 +298,8 @@ try {
         if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
             throw "Required verifier fixture build directory not found: $buildDir"
         }
-        $outputPath = Join-Path $repoScratch 'wrong-stack-verification.json'
+        $wrongStackOutputDir = Join-Path $buildDir 'wrong-stack-output'
+        $outputPath = Join-Path $wrongStackOutputDir 'oneapi_verification.json'
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
@@ -320,7 +321,9 @@ try {
     }
 
     Invoke-Test 'verifier rejects an outside output path without modifying its sentinel' {
-        $outputPath = Join-Path $tempRoot 'outside-verification.json'
+        $outsideOutputDir = Join-Path $tempRoot 'outside-output'
+        New-Item -ItemType Directory -Path $outsideOutputDir -Force | Out-Null
+        $outputPath = Join-Path $outsideOutputDir 'oneapi_verification.json'
         Set-Content -LiteralPath $outputPath -Value 'outside-sentinel' -Encoding UTF8
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
@@ -338,8 +341,123 @@ try {
             if ($result.exitCode -ne 0) {
                 throw ($result.stderr + $result.stdout).Trim()
             }
-        } 'outside repository' 'outside output path verification'
+        } 'outside selected build directory' 'outside output path verification'
         Assert-Equal 'outside-sentinel' (Get-Content -LiteralPath $outputPath -Raw).Trim() 'outside sentinel content'
+    }
+
+    Invoke-Test 'verifier rejects owned filename outside the selected build without modifying it' {
+        $unrelatedDir = Join-Path $repoScratch 'unrelated-output'
+        New-Item -ItemType Directory -Path $unrelatedDir -Force | Out-Null
+        $outputPath = Join-Path $unrelatedDir 'oneapi_verification.json'
+        Set-Content -LiteralPath $outputPath -Value 'inside-repo-sentinel' -Encoding UTF8
+        $sentinelHash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @(
+                    '-BuildDir', (Join-Path $repoScratch 'missing-selected-build'),
+                    '-OneApiStack', 'oneapi-2026.1',
+                    '-OutputPath', $outputPath
+                ) `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'outside selected build directory' 'selected build output boundary'
+        Assert-Equal 'inside-repo-sentinel' (Get-Content -LiteralPath $outputPath -Raw).Trim() 'inside repo sentinel content'
+        Assert-Equal $sentinelHash (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash 'inside repo sentinel hash'
+    }
+
+    Invoke-Test 'verifier rejects a wrong output filename inside the selected build' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'wrong-output-name')
+        $outputPath = Join-Path $buildDir 'not-owned.json'
+        Set-Content -LiteralPath $outputPath -Value 'wrong-name-sentinel' -Encoding UTF8
+        $sentinelHash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @(
+                    '-BuildDir', $buildDir,
+                    '-OneApiStack', 'oneapi-2025.3',
+                    '-OutputPath', $outputPath
+                ) `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } "must be named 'oneapi_verification.json'" 'owned output filename'
+        Assert-Equal 'wrong-name-sentinel' (Get-Content -LiteralPath $outputPath -Raw).Trim() 'wrong filename sentinel content'
+        Assert-Equal $sentinelHash (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash 'wrong filename sentinel hash'
+    }
+
+    Invoke-Test 'verifier publishes owned output in a selected build subdirectory' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'owned-subdirectory')
+        $outputPath = Join-Path $buildDir 'attestations\oneapi_verification.json'
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $verifierPath `
+            -ArgumentList @(
+                '-BuildDir', $buildDir,
+                '-OneApiStack', 'oneapi-2025.3',
+                '-OutputPath', $outputPath
+            ) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'owned subdirectory verifier completion'
+        Assert-Equal 0 $result.exitCode "owned subdirectory verifier exit stderr='$($result.stderr)'"
+        $verification = Read-AilaJsonFile -Path $outputPath
+        Assert-Equal 1 $verification.schemaVersion 'owned subdirectory schema'
+        Assert-Equal 'oneapi-2025.3' $verification.stack.name 'owned subdirectory stack'
+        Assert-Equal 'sycl8.dll' $verification.dependencies[0] 'owned subdirectory dependency'
+        $tempFiles = @(Get-ChildItem -LiteralPath (Split-Path -Parent $outputPath) -Filter '.oneapi_verification.json.*.tmp' -Force)
+        Assert-Equal 0 $tempFiles.Count 'owned subdirectory temp cleanup'
+    }
+
+    Invoke-Test 'verifier rejects a junction output escaping the selected build' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'junction-output')
+        $outsideDir = Join-Path $tempRoot 'junction-output-target'
+        New-Item -ItemType Directory -Path $outsideDir -Force | Out-Null
+        $outsideSentinel = Join-Path $outsideDir 'oneapi_verification.json'
+        Set-Content -LiteralPath $outsideSentinel -Value 'junction-outside-sentinel' -Encoding UTF8
+        $sentinelHash = (Get-FileHash -LiteralPath $outsideSentinel -Algorithm SHA256).Hash
+        $junctionPath = Join-Path $buildDir 'junction-out'
+        New-Item -ItemType Junction -Path $junctionPath -Target $outsideDir | Out-Null
+        try {
+            $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+            Assert-Throws {
+                $result = Invoke-ChildPowerShellWithTimeout `
+                    -ScriptPath $verifierPath `
+                    -ArgumentList @(
+                        '-BuildDir', $buildDir,
+                        '-OneApiStack', 'oneapi-2025.3',
+                        '-OutputPath', (Join-Path $junctionPath 'oneapi_verification.json')
+                    ) `
+                    -TimeoutMs 30000
+                if (-not $result.completed) {
+                    throw 'Verifier child process timed out.'
+                }
+                if ($result.exitCode -ne 0) {
+                    throw ($result.stderr + $result.stdout).Trim()
+                }
+            } 'outside selected build directory' 'junction output boundary'
+            Assert-Equal 'junction-outside-sentinel' (Get-Content -LiteralPath $outsideSentinel -Raw).Trim() 'junction sentinel content'
+            Assert-Equal $sentinelHash (Get-FileHash -LiteralPath $outsideSentinel -Algorithm SHA256).Hash 'junction sentinel hash'
+        }
+        finally {
+            if (Test-Path -LiteralPath $junctionPath) {
+                Remove-Item -LiteralPath $junctionPath -Force
+            }
+        }
     }
 
     Invoke-Test 'verifier removes stale output when role metadata is missing' {
@@ -395,15 +513,17 @@ try {
     }
 
     Invoke-Test 'verifier atomically replaces stale output with complete JSON' {
-        $outputDir = Join-Path $repoScratch 'atomic-success'
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'atomic-success')
+        $outputDir = Join-Path $buildDir 'attestations'
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-        $outputPath = Join-Path $outputDir 'verification.json'
+        $outputPath = Join-Path $outputDir 'oneapi_verification.json'
         Set-Content -LiteralPath $outputPath -Value 'stale-sentinel' -Encoding UTF8
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         $result = Invoke-ChildPowerShellWithTimeout `
             -ScriptPath $verifierPath `
             -ArgumentList @(
-                '-BuildDir', (Join-Path $repoRoot 'build-oneapi-2025.3'),
+                '-BuildDir', $buildDir,
                 '-OneApiStack', 'oneapi-2025.3',
                 '-OutputPath', $outputPath
             ) `
@@ -416,8 +536,8 @@ try {
         Assert-Equal 'oneapi-2025.3' $verification.stack.name 'atomic verification stack'
         Assert-Equal 1 @($verification.dependencies).Count 'atomic verification dependency count'
         Assert-Equal 'sycl8.dll' $verification.dependencies[0] 'atomic verification dependency'
-        Assert-Equal (Get-FileHash -LiteralPath (Join-Path $repoRoot 'build-oneapi-2025.3\Aila.exe') -Algorithm SHA256).Hash $verification.executableSha256 'atomic verification hash'
-        $tempFiles = @(Get-ChildItem -LiteralPath $outputDir -Filter '.verification.json.*.tmp' -Force)
+        Assert-Equal (Get-FileHash -LiteralPath (Join-Path $buildDir 'Aila.exe') -Algorithm SHA256).Hash $verification.executableSha256 'atomic verification hash'
+        $tempFiles = @(Get-ChildItem -LiteralPath $outputDir -Filter '.oneapi_verification.json.*.tmp' -Force)
         Assert-Equal 0 $tempFiles.Count 'atomic verification temp cleanup'
     }
 
