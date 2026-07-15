@@ -838,6 +838,8 @@ function Invoke-AilaProcess {
     $outputText = [string]::Join("`n", $captured.ToArray())
     return [pscustomobject]@{
         exitCode     = $exitCode
+        stdoutText   = $stdout
+        stderrText   = $stderr
         outputLines  = $captured.ToArray()
         outputText   = $outputText
         logPath      = $LogPath
@@ -889,6 +891,72 @@ function Format-AilaProcessArgument {
     $escaped = $Value -replace '(\\*)"', '$1$1\"'
     $escaped = $escaped -replace '(\\+)$', '$1$1'
     return '"' + $escaped + '"'
+}
+
+function Normalize-AilaText {
+    param([AllowEmptyString()][string]$Text)
+
+    return (($Text.ToLowerInvariant() -replace '[\p{P}\p{S}\s]+', ' ').Trim())
+}
+
+function Parse-AilaAsrOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputText
+    )
+
+    $metricPattern = '(?m)^\s*\[Audio:\s*(?<audio>\d+(?:\.\d+)?)s,\s*Latency:\s*(?<latency>\d+(?:\.\d+)?)ms,\s*Speed:\s*(?<speed>\d+(?:\.\d+)?)x,\s*(?<tokps>\d+(?:\.\d+)?)\s+tok/s\]\s*$'
+    $metricMatch = [regex]::Match($OutputText, $metricPattern)
+    if (-not $metricMatch.Success) {
+        throw 'Failed to parse ASR metrics from Aila output.'
+    }
+
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    try {
+        $audioSeconds = [double]::Parse($metricMatch.Groups['audio'].Value, $culture)
+        $latencyMs = [double]::Parse($metricMatch.Groups['latency'].Value, $culture)
+        $speed = [double]::Parse($metricMatch.Groups['speed'].Value, $culture)
+        $tokensPerSecond = [double]::Parse($metricMatch.Groups['tokps'].Value, $culture)
+    }
+    catch {
+        throw "Failed to parse ASR metrics from Aila output: $($_.Exception.Message)"
+    }
+
+    $languageMatch = [regex]::Match($OutputText, '(?m)^\s*\[Language\]\s*(?<language>[^\r\n]*)\s*$')
+    $transcriptLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($OutputText -split '\r?\n')) {
+        if ($line -match '^\s*\[[^\]]+\]') {
+            continue
+        }
+        $transcriptLines.Add($line)
+    }
+
+    return [pscustomobject]@{
+        text            = ([string]::Join("`n", $transcriptLines.ToArray())).Trim()
+        language        = if ($languageMatch.Success) { $languageMatch.Groups['language'].Value.Trim() } else { '' }
+        audioSeconds    = $audioSeconds
+        latencyMs       = $latencyMs
+        speed           = $speed
+        tokensPerSecond = $tokensPerSecond
+    }
+}
+
+function Parse-AilaAlignmentOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputText
+    )
+
+    $pattern = '(?m)^\s*"(?<text>.*)"\s+(?<start>\d+)ms\s+-\s+(?<end>\d+)ms\s*$'
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($match in [regex]::Matches($OutputText, $pattern)) {
+        $rows.Add([pscustomobject]@{
+            text    = $match.Groups['text'].Value
+            startMs = [int]$match.Groups['start'].Value
+            endMs   = [int]$match.Groups['end'].Value
+        })
+    }
+    return $rows.ToArray()
 }
 
 function Parse-AilaBenchmarkOutput {

@@ -189,12 +189,55 @@ function New-VerifierBuildFixture {
     return $DestinationBuildDir
 }
 
+function New-AccuracyBuildFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceBuildDir,
+        [Parameter(Mandatory = $true)][string]$DestinationBuildDir
+    )
+
+    New-Item -ItemType Directory -Path $DestinationBuildDir -Force | Out-Null
+    foreach ($fileName in @('build_info.json', 'CMakeCache.txt')) {
+        Copy-Item -LiteralPath (Join-Path $SourceBuildDir $fileName) -Destination (Join-Path $DestinationBuildDir $fileName)
+    }
+
+    $sourcePath = Join-Path $DestinationBuildDir 'FakeAila.cs'
+    Set-Content -LiteralPath $sourcePath -Encoding UTF8 -Value @'
+using System;
+
+public static class FakeAila
+{
+    public static int Main(string[] args)
+    {
+        Console.Error.WriteLine("[fake diagnostic]");
+        Console.WriteLine("Hello, WORLD!");
+        return 0;
+    }
+}
+'@
+    $compiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        throw "C# fixture compiler not found: $compiler"
+    }
+    $exePath = Join-Path $DestinationBuildDir 'Aila.exe'
+    $compilerOutput = (& $compiler /nologo /target:exe "/out:$exePath" $sourcePath 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+        throw "Failed to compile fake Aila fixture: $compilerOutput"
+    }
+    Remove-Item -LiteralPath $sourcePath -Force
+    return $DestinationBuildDir
+}
+
 $repoRoot = Get-AilaRepoRoot
 $repoScratch = Join-Path $repoRoot "build-verifier-tests-$([guid]::NewGuid().ToString('N'))"
 if (-not (Test-AilaPathWithinRoot -Path $repoScratch -Root $repoRoot)) {
     throw "Refusing to create verifier test files outside the repository: $repoScratch"
 }
 New-Item -ItemType Directory -Path $repoScratch -Force | Out-Null
+$accuracyScratch = Join-Path $repoRoot "tmp\perf\accuracy-runner-tests-$([guid]::NewGuid().ToString('N'))"
+if (-not (Test-AilaPathWithinRoot -Path $accuracyScratch -Root (Join-Path $repoRoot 'tmp'))) {
+    throw "Refusing to create accuracy test files outside repository tmp: $accuracyScratch"
+}
+New-Item -ItemType Directory -Path $accuracyScratch -Force | Out-Null
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $tempRoot = [System.IO.Path]::GetFullPath((Join-Path $tempBase "Aila-PerfCommonTests-$([guid]::NewGuid().ToString('N'))"))
 if (-not $tempRoot.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -259,6 +302,224 @@ New-Item -ItemType Directory -Path $failingCompilerBin -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\where.exe') -Destination (Join-Path $failingCompilerBin 'icx-cl.exe')
 
 try {
+    Invoke-Test 'normalizes Aila text across punctuation case and whitespace' {
+        Assert-Equal 'hello world 中文 测试' (Normalize-AilaText -Text "  HELLO,`tWorld!  中文—测试。 ") 'normalized text'
+        Assert-Equal '' (Normalize-AilaText -Text '') 'empty normalized text'
+    }
+
+    Invoke-Test 'parses typed ASR transcript and metrics' {
+        $asr = Parse-AilaAsrOutput -OutputText "这是一个测试`n[Language] Chinese`n[Audio: 1.0s, Latency: 500ms, Speed: 2.0x, 8 tok/s]"
+        Assert-Equal '这是一个测试' $asr.text 'ASR text'
+        Assert-Equal 500.0 $asr.latencyMs 'ASR latency'
+        Assert-Equal 'Chinese' $asr.language 'ASR language'
+        Assert-Equal 1.0 $asr.audioSeconds 'ASR audio duration'
+        Assert-Equal 2.0 $asr.speed 'ASR speed'
+        Assert-Equal 8.0 $asr.tokensPerSecond 'ASR token rate'
+    }
+
+    Invoke-Test 'preserves multiline ASR transcript while excluding bracketed diagnostics' {
+        $asr = Parse-AilaAsrOutput -OutputText "First line.`n第二行！`n[Language] Chinese`n[Audio: 2.5s, Latency: 1250.25ms, Speed: 2.0x, 12.5 tok/s]"
+        Assert-Equal "First line.`n第二行！" $asr.text 'multiline ASR text'
+        Assert-Equal 1250.25 $asr.latencyMs 'fractional ASR latency'
+    }
+
+    Invoke-Test 'rejects ASR output with a missing metric line clearly' {
+        Assert-Throws {
+            Parse-AilaAsrOutput -OutputText "transcript`n[Language] English"
+        } 'Failed to parse ASR metrics' 'missing ASR metrics'
+    }
+
+    Invoke-Test 'rejects ASR output with invalid metric values clearly' {
+        Assert-Throws {
+            Parse-AilaAsrOutput -OutputText "transcript`n[Language] English`n[Audio: 1.0s, Latency: nope, Speed: 2.0x, 8 tok/s]"
+        } 'Failed to parse ASR metrics' 'invalid ASR metrics'
+    }
+
+    Invoke-Test 'parses typed alignment rows including escaped and Unicode text' {
+        $aligned = Parse-AilaAlignmentOutput -OutputText '  "这"  0ms - 80ms'
+        Assert-Equal 1 $aligned.Count 'alignment count'
+        Assert-Equal 80 $aligned[0].endMs 'alignment end'
+
+        $rows = Parse-AilaAlignmentOutput -OutputText @'
+  "a \"quoted\" 字"  80ms - 160ms
+"第二行" 160ms - 320ms
+'@
+        Assert-Equal 2 $rows.Count 'multiple alignment count'
+        Assert-Equal 'a \"quoted\" 字' $rows[0].text 'escaped alignment text'
+        Assert-Equal 80 $rows[0].startMs 'first alignment start'
+        Assert-Equal 320 $rows[1].endMs 'second alignment end'
+        Assert-Equal 'System.Int32' $rows[0].startMs.GetType().FullName 'alignment start type'
+    }
+
+    Invoke-Test 'returns an empty array when alignment output has no matching rows' {
+        $aligned = @(Parse-AilaAlignmentOutput -OutputText "no timestamps here`n[diagnostic]")
+        Assert-Equal 0 $aligned.Count 'empty alignment count'
+    }
+
+    $accuracySourceBuild = Join-Path $repoRoot 'build-oneapi-2025.3'
+    $accuracyBuild = New-AccuracyBuildFixture `
+        -SourceBuildDir $accuracySourceBuild `
+        -DestinationBuildDir (Join-Path $repoScratch 'accuracy-build')
+    $accuracyModel = Join-Path $repoScratch 'accuracy-model'
+    New-Item -ItemType Directory -Path $accuracyModel -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $accuracyModel 'config.json') -Value '{"model_type":"fake"}' -Encoding UTF8
+    $accuracyInputOne = Join-Path $repoScratch 'accuracy-input-one.json'
+    $accuracyInputTwo = Join-Path $repoScratch 'accuracy-input-two.json'
+    Set-Content -LiteralPath $accuracyInputOne -Value '{"messages":[{"role":"user","content":"one"}]}' -Encoding UTF8
+    Set-Content -LiteralPath $accuracyInputTwo -Value '{"messages":[{"role":"user","content":"two"}]}' -Encoding UTF8
+    $accuracyCasesPath = Join-Path $repoScratch 'accuracy-cases.json'
+    Write-AilaJsonFile -Path $accuracyCasesPath -Data ([ordered]@{
+        schemaVersion = 1
+        cases = @(
+            [ordered]@{ name = 'case_one'; kind = 'chat'; model = $accuracyModel; input = $accuracyInputOne; maxTokens = 4; mode = 'greedy'; expectRegex = 'hello' },
+            [ordered]@{ name = 'case_two'; kind = 'chat'; model = $accuracyModel; input = $accuracyInputTwo; maxTokens = 8; mode = 'greedy' }
+        )
+    })
+    $regressPath = Join-Path $repoRoot 'regress.ps1'
+
+    Invoke-Test 'accuracy runner preserves sentinel on wrong stack preflight failure' {
+        $outputDir = Join-Path $accuracyScratch 'wrong-stack'
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        $sentinelPath = Join-Path $outputDir 'accuracy.json'
+        Set-Content -LiteralPath $sentinelPath -Value 'wrong-stack-sentinel' -Encoding UTF8
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2026.1', '-CasesFile', $accuracyCasesPath, '-OutputDir', $outputDir) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'wrong stack runner completion'
+        if ($result.exitCode -eq 0) {
+            throw 'Wrong stack runner unexpectedly succeeded.'
+        }
+        Assert-Equal $true (($result.stderr + $result.stdout).Contains("belongs to 'oneapi-2025.3'")) 'wrong stack diagnostic'
+        Assert-Equal 'wrong-stack-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'wrong stack sentinel'
+    }
+
+    Invoke-Test 'accuracy runner preserves sentinel on missing build schema failure' {
+        $buildDir = Join-Path $repoScratch 'accuracy-missing-schema'
+        New-AccuracyBuildFixture -SourceBuildDir $accuracySourceBuild -DestinationBuildDir $buildDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $buildDir 'build_info.json') -Value '{"oneApi":{"name":"oneapi-2025.3"}}' -Encoding UTF8
+        $outputDir = Join-Path $accuracyScratch 'missing-schema'
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        $sentinelPath = Join-Path $outputDir 'accuracy.json'
+        Set-Content -LiteralPath $sentinelPath -Value 'missing-schema-sentinel' -Encoding UTF8
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-OutputDir', $outputDir) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'missing schema runner completion'
+        if ($result.exitCode -eq 0) {
+            throw 'Missing schema runner unexpectedly succeeded.'
+        }
+        Assert-Equal $true (($result.stderr + $result.stdout).Contains('Unsupported build info schema')) 'missing schema diagnostic'
+        Assert-Equal 'missing-schema-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'missing schema sentinel'
+    }
+
+    Invoke-Test 'accuracy runner preserves sentinel on unknown and duplicate selections' {
+        foreach ($selection in @('missing_case', 'case_one,case_one')) {
+            $label = $selection.Replace(',', '-')
+            $outputDir = Join-Path $accuracyScratch "selection-$label"
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            $sentinelPath = Join-Path $outputDir 'accuracy.json'
+            Set-Content -LiteralPath $sentinelPath -Value "selection-$label-sentinel" -Encoding UTF8
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $regressPath `
+                -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', $selection, '-OutputDir', $outputDir) `
+                -TimeoutMs 30000
+            Assert-Equal $true $result.completed "selection $selection runner completion"
+            if ($result.exitCode -eq 0) {
+                throw "Selection '$selection' unexpectedly succeeded."
+            }
+            $expected = if ($selection -eq 'missing_case') { 'Unknown accuracy case selection' } else { 'Duplicate accuracy case selection' }
+            Assert-Equal $true (($result.stderr + $result.stdout).Contains($expected)) "selection $selection diagnostic"
+            Assert-Equal "selection-$label-sentinel" (Get-Content -LiteralPath $sentinelPath -Raw).Trim() "selection $selection sentinel"
+        }
+    }
+
+    Invoke-Test 'accuracy runner preserves sentinel on missing input preflight failure' {
+        $casesPath = Join-Path $repoScratch 'accuracy-missing-input-cases.json'
+        Write-AilaJsonFile -Path $casesPath -Data ([ordered]@{
+            schemaVersion = 1
+            cases = @([ordered]@{ name = 'missing_input'; kind = 'chat'; model = $accuracyModel; input = (Join-Path $repoScratch 'absent.json'); maxTokens = 4; mode = 'greedy' })
+        })
+        $outputDir = Join-Path $accuracyScratch 'missing-input'
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        $sentinelPath = Join-Path $outputDir 'accuracy.json'
+        Set-Content -LiteralPath $sentinelPath -Value 'missing-input-sentinel' -Encoding UTF8
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $casesPath, '-OutputDir', $outputDir) `
+            -TimeoutMs 60000
+        Assert-Equal $true $result.completed 'missing input runner completion'
+        if ($result.exitCode -eq 0) {
+            throw 'Missing input runner unexpectedly succeeded.'
+        }
+        Assert-Equal $true (($result.stderr + $result.stdout).Contains('input file not found')) 'missing input diagnostic'
+        Assert-Equal 'missing-input-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'missing input sentinel'
+    }
+
+    Invoke-Test 'accuracy runner rejects output outside repository tmp without modifying it' {
+        $outputDir = Join-Path $repoScratch 'accuracy-outside-tmp'
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        $sentinelPath = Join-Path $outputDir 'accuracy.json'
+        Set-Content -LiteralPath $sentinelPath -Value 'outside-tmp-sentinel' -Encoding UTF8
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-OutputDir', $outputDir) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'outside tmp runner completion'
+        if ($result.exitCode -eq 0) {
+            throw 'Outside tmp runner unexpectedly succeeded.'
+        }
+        Assert-Equal $true (($result.stderr + $result.stdout).Contains('inside repository tmp')) 'outside tmp diagnostic'
+        Assert-Equal 'outside-tmp-sentinel' (Get-Content -LiteralPath $sentinelPath -Raw).Trim() 'outside tmp sentinel'
+    }
+
+    Invoke-Test 'accuracy runner writes typed subset artifacts and preserves unrelated files across reruns' {
+        $outputDir = Join-Path $accuracyScratch 'success'
+        $unrelatedPath = Join-Path $outputDir 'outputs\keep.local'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $unrelatedPath) -Force | Out-Null
+        Set-Content -LiteralPath $unrelatedPath -Value 'keep-me' -Encoding UTF8
+        $parentCompilerRoot = [System.Environment]::GetEnvironmentVariable('CMPLR_ROOT', 'Process')
+
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', 'case_one,case_two', '-OutputDir', $outputDir) `
+            -TimeoutMs 60000
+        Assert-Equal $true $result.completed 'successful runner completion'
+        Assert-Equal 0 $result.exitCode "successful runner exit stderr='$($result.stderr)' stdout='$($result.stdout)'"
+        Assert-Equal $parentCompilerRoot ([System.Environment]::GetEnvironmentVariable('CMPLR_ROOT', 'Process')) 'runner child environment isolation'
+        Assert-Equal 'keep-me' (Get-Content -LiteralPath $unrelatedPath -Raw).Trim() 'unrelated output preserved after first run'
+
+        $accuracy = Read-AilaJsonFile -Path (Join-Path $outputDir 'accuracy.json')
+        Assert-Equal 1 $accuracy.schemaVersion 'accuracy schema'
+        Assert-Equal 'oneapi-2025.3' $accuracy.oneApi.name 'accuracy stack'
+        Assert-Equal 2 $accuracy.cases.Count 'accuracy selected case count'
+        foreach ($caseName in @('case_one', 'case_two')) {
+            $caseResultPath = Join-Path $outputDir "case_results\$caseName.json"
+            Assert-Equal $true (Test-Path -LiteralPath $caseResultPath -PathType Leaf) "$caseName result path"
+            $caseResult = Read-AilaJsonFile -Path $caseResultPath
+            Assert-Equal 'chat' $caseResult.kind "$caseName result kind"
+            Assert-Equal 'hello world' $caseResult.normalizedText "$caseName normalized text"
+            Assert-Equal 0 $caseResult.process.exitCode "$caseName exit code"
+            Assert-Equal $true (Test-Path -LiteralPath $caseResult.output.path -PathType Leaf) "$caseName output artifact"
+            Assert-Equal $caseResult.output.sha256 (Get-FileHash -LiteralPath $caseResult.output.path -Algorithm SHA256).Hash "$caseName output hash"
+            Assert-Equal $true (Test-Path -LiteralPath $caseResult.logs.stdout.path -PathType Leaf) "$caseName stdout log"
+            Assert-Equal $true (Test-Path -LiteralPath $caseResult.logs.stderr.path -PathType Leaf) "$caseName stderr log"
+        }
+
+        $rerun = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $regressPath `
+            -ArgumentList @('-BuildDir', $accuracyBuild, '-OneApiStack', 'oneapi-2025.3', '-CasesFile', $accuracyCasesPath, '-CaseNames', 'case_one', '-OutputDir', $outputDir) `
+            -TimeoutMs 60000
+        Assert-Equal $true $rerun.completed 'rerun completion'
+        Assert-Equal 0 $rerun.exitCode "rerun exit stderr='$($rerun.stderr)' stdout='$($rerun.stdout)'"
+        Assert-Equal 'keep-me' (Get-Content -LiteralPath $unrelatedPath -Raw).Trim() 'unrelated output preserved after rerun'
+        Assert-Equal $true (Test-Path -LiteralPath (Join-Path $outputDir 'case_results\case_two.json') -PathType Leaf) 'unselected result preserved after rerun'
+        $rerunAccuracy = Read-AilaJsonFile -Path (Join-Path $outputDir 'accuracy.json')
+        Assert-Equal 1 $rerunAccuracy.cases.Count 'rerun selected case count'
+        Assert-Equal 'case_one' $rerunAccuracy.cases[0].name 'rerun selected case name'
+    }
+
     Invoke-Test 'verifier rejects a missing build directory' {
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
@@ -1285,6 +1546,9 @@ finally {
     }
     if (Test-Path -LiteralPath $repoScratch) {
         Remove-Item -LiteralPath $repoScratch -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $accuracyScratch) {
+        Remove-Item -LiteralPath $accuracyScratch -Recurse -Force
     }
 }
 
