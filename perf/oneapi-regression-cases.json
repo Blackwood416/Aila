@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "q35_08_dense_text",
+      "kind": "chat",
+      "model": "models/Qwen3.5-0.8B",
+      "input": "perf/fixtures/smoke_text_qa.json",
+      "maxTokens": 16,
+      "mode": "greedy"
+    },
+    {
+      "name": "q35_08_nf4_text",
+      "kind": "chat",
+      "model": "models/qwen3.5-0.8B-bnb-nf4-offline",
+      "input": "perf/fixtures/smoke_text_qa.json",
+      "maxTokens": 16,
+      "mode": "greedy"
+    },
+    {
+      "name": "q35_4_nf4_text",
+      "kind": "chat",
+      "model": "models/qwen3.5-4B-bnb-nf4-offline",
+      "input": "perf/fixtures/smoke_multi_turn.json",
+      "maxTokens": 24,
+      "mode": "greedy"
+    },
+    {
+      "name": "q35_vision_ocr",
+      "kind": "chat",
+      "model": "models/qwen3.5-0.8B-bnb-nf4-offline-visiondense",
+      "input": "tmp/ocr_test_messages.json",
+      "maxTokens": 24,
+      "mode": "greedy",
+      "expectRegex": "1\\s*\\+\\s*1\\s*=\\s*2"
+    },
+    {
+      "name": "q35_vision_count",
+      "kind": "chat",
+      "model": "models/qwen3.5-0.8B-bnb-nf4-offline-visiondense",
+      "input": "tmp/crane_count.json",
+      "maxTokens": 24,
+      "mode": "greedy",
+      "expectRegex": "^\\s*(2|二|两)"
+    },
+    {
+      "name": "qwen3_asr_zh_nf4",
+      "kind": "asr",
+      "model": "models/Qwen3-ASR-0.6B-BNB-NF4",
+      "audio": "这是一个测试.wav",
+      "forcedLanguage": "Chinese",
+      "expectedText": "这是一个测试"
+    },
+    {
+      "name": "qwen3_asr_en_nf4",
+      "kind": "asr",
+      "model": "models/Qwen3-ASR-0.6B-BNB-NF4",
+      "audio": "This is an English test.wav",
+      "forcedLanguage": "English",
+      "expectedText": "this is an english test"
+    },
+    {
+      "name": "qwen3_aligner_zh_nf4",
+      "kind": "align",
+      "model": "models/Qwen3-ForcedAligner-0.6B-BNB-NF4",
+      "audio": "这是一个测试.wav",
+      "text": "这是一个测试",
+      "language": "Chinese",
+      "timestampFrameMs": 80,
+      "timestampToleranceMs": 80
+    },
+    {
+      "name": "qwen3_tts_06_base",
+      "kind": "tts",
+      "model": "models/Qwen3-TTS-12Hz-0.6B-Base",
+      "text": "今天天气真好。",
+      "referenceAudio": "ref.wav",
+      "language": "chinese",
+      "maxTokens": 256
+    }
+  ]
+}
