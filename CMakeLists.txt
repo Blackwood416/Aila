@@ -264,6 +264,17 @@ target_include_directories(AilaQwen35VisionWeightsTests PRIVATE
 )
 add_test(NAME AilaQwen35VisionWeightsTests COMMAND AilaQwen35VisionWeightsTests)
 
+add_executable(AilaIpcProtocolTests
+    tests/runtime/IpcProtocolTests.cpp
+    src/ipc/IpcProtocol.cpp
+)
+target_compile_definitions(AilaIpcProtocolTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaIpcProtocolTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaIpcProtocolTests PRIVATE simdjson)
+add_test(NAME AilaIpcProtocolTests COMMAND AilaIpcProtocolTests)
+
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
 # ============================================================
