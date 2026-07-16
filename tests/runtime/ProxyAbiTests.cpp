@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -264,6 +266,8 @@ struct Api {
     using Destroy = void (*)(AilaEngine*);
     using DefaultConfig = AilaGenConfig (*)();
     using DefaultConfigV2 = AilaGenConfigV2 (*)();
+    using Generate = char* (*)(AilaEngine*, const char*, const AilaGenConfig*);
+    using GenerateEx = char* (*)(AilaEngine*, const char*, const AilaGenConfigV2*);
     using Reset = void (*)(AilaEngine*);
     using ContextLength = int (*)(AilaEngine*);
     using LastErrorCode = int (*)(AilaEngine*);
@@ -281,6 +285,11 @@ struct Api {
           destroy(library.symbol<Destroy>("aila_engine_destroy")),
           default_config(library.symbol<DefaultConfig>("aila_default_gen_config")),
           default_config_v2(library.symbol<DefaultConfigV2>("aila_default_gen_config_v2")),
+          generate(library.symbol<Generate>("aila_generate")),
+          generate_messages(library.symbol<Generate>("aila_generate_messages")),
+          generate_chat_json(library.symbol<Generate>("aila_generate_chat_json")),
+          generate_chat_json_ex(
+              library.symbol<GenerateEx>("aila_generate_chat_json_ex")),
           reset(library.symbol<Reset>("aila_engine_reset_context")),
           context_length(library.symbol<ContextLength>("aila_engine_context_length")),
           last_error_code(library.symbol<LastErrorCode>("aila_last_error_code")),
@@ -298,6 +307,10 @@ struct Api {
     Destroy destroy;
     DefaultConfig default_config;
     DefaultConfigV2 default_config_v2;
+    Generate generate;
+    Generate generate_messages;
+    Generate generate_chat_json;
+    GenerateEx generate_chat_json_ex;
     Reset reset;
     ContextLength context_length;
     LastErrorCode last_error_code;
@@ -419,6 +432,208 @@ void verify_defaults(const Api& api) {
     }
 }
 
+std::string take_string(const Api& api, char* value, std::string_view operation) {
+    expect(value != nullptr, std::string(operation) + " returned NULL");
+    const std::string result(value);
+    api.free_string(value);
+    return result;
+}
+
+void expect_contains(
+    std::string_view value,
+    std::string_view expected,
+    std::string_view message) {
+    expect(value.find(expected) != std::string_view::npos,
+           std::string(message) + ": " + std::string(value));
+}
+
+void verify_synchronous_generation(const Api& api, AilaEngine* engine) {
+    const std::string generated = take_string(
+        api,
+        api.generate(engine, u8"Unicode 输入 🌍", nullptr),
+        "aila_generate");
+    expect_contains(generated, R"("method":"generate")", "generate method missing");
+    expect_contains(generated, u8R"("input":"Unicode 输入 🌍")", "Unicode input changed");
+    expect_contains(generated, R"("config":null)", "NULL config semantics changed");
+
+    AilaGenConfig config{};
+    config.max_new_tokens = 17;
+    config.temperature = 0.25f;
+    config.top_k = 7;
+    config.top_p = 0.75f;
+    config.repetition_penalty = 1.125f;
+    config.presence_penalty = 0.375f;
+    config.frequency_penalty = 0.625f;
+    config.do_sample = 0;
+    config.decode_chunk_size = 3;
+    config.stream_chunk_size = 5;
+    const std::string messages = take_string(
+        api,
+        api.generate_messages(engine, R"([{"role":"user","content":"hi"}])", &config),
+        "aila_generate_messages");
+    expect_contains(messages, R"("method":"generate.messages")", "messages method missing");
+    expect_contains(messages, R"("max_new_tokens":17)", "max_new_tokens changed");
+    expect_contains(messages, R"("temperature":0.25)", "temperature changed");
+    expect_contains(messages, R"("top_k":7)", "top_k changed");
+    expect_contains(messages, R"("top_p":0.75)", "top_p changed");
+    expect_contains(messages, R"("repetition_penalty":1.125)", "repetition penalty changed");
+    expect_contains(messages, R"("presence_penalty":0.375)", "presence penalty changed");
+    expect_contains(messages, R"("frequency_penalty":0.625)", "frequency penalty changed");
+    expect_contains(messages, R"("do_sample":0)", "do_sample changed");
+    expect_contains(messages, R"("decode_chunk_size":3)", "decode chunk changed");
+    expect_contains(messages, R"("stream_chunk_size":5)", "stream chunk changed");
+
+    const std::string chat = take_string(
+        api,
+        api.generate_chat_json(engine, R"({"messages":[]})", nullptr),
+        "aila_generate_chat_json");
+    expect_contains(chat, R"("method":"generate.chat_json")", "chat method missing");
+    expect_contains(chat, R"("config":null)", "chat NULL config changed");
+
+    AilaGenConfigV2 v2{};
+    v2.struct_size = sizeof(v2);
+    v2.max_new_tokens = 31;
+    v2.temperature = 0.5f;
+    v2.top_k = 11;
+    v2.top_p = 0.875f;
+    v2.repetition_penalty = 1.25f;
+    v2.presence_penalty = 0.125f;
+    v2.frequency_penalty = 0.25f;
+    v2.do_sample = 1;
+    v2.decode_chunk_size = 9;
+    v2.stream_chunk_size = 6;
+    v2.thinking_budget_tokens = 77;
+    v2.sampling_seed = 123456789;
+    v2.use_fixed_seed = 1;
+    for (int& reserved : v2.reserved) {
+        reserved = 0x55555555;
+    }
+    const std::string extended = take_string(
+        api,
+        api.generate_chat_json_ex(engine, R"({"messages":[]})", &v2),
+        "aila_generate_chat_json_ex");
+    expect_contains(extended, R"("method":"generate.chat_json_ex")", "chat ex method missing");
+    expect_contains(extended, R"("thinking_budget_tokens":77)", "thinking budget changed");
+    expect_contains(extended, R"("sampling_seed":123456789)", "sampling seed changed");
+    expect_contains(extended, R"("use_fixed_seed":1)", "fixed seed changed");
+    expect(extended.find("reserved") == std::string::npos, "reserved V2 fields crossed proxy");
+
+    AilaGenConfigV2 zero_size{};
+    const std::string zero = take_string(
+        api,
+        api.generate_chat_json_ex(engine, "zero-size", &zero_size),
+        "zero-size V2 config");
+    expect_contains(zero, R"("struct_size":0)", "zero struct size was not preserved");
+    expect(zero.find("max_new_tokens") == std::string::npos,
+           "zero-sized V2 config read a later field");
+}
+
+void verify_v2_prefix_does_not_read_past_struct_size(const Api& api, AilaEngine* engine) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t page_size = info.dwPageSize;
+    auto* pages = static_cast<unsigned char*>(VirtualAlloc(
+        nullptr, page_size * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    expect(pages != nullptr, "VirtualAlloc for V2 guard pages failed");
+    DWORD old_protection = 0;
+    expect(VirtualProtect(pages + page_size, page_size, PAGE_NOACCESS, &old_protection) != FALSE,
+           "VirtualProtect for V2 guard page failed");
+
+    constexpr uint32_t prefix_size = offsetof(AilaGenConfigV2, top_k);
+    static_assert(prefix_size == offsetof(AilaGenConfigV2, temperature) + sizeof(float));
+    unsigned char* prefix = pages + page_size - prefix_size;
+    const uint32_t declared_size = prefix_size;
+    const int max_new_tokens = 44;
+    const float temperature = 0.375f;
+    std::memcpy(prefix + offsetof(AilaGenConfigV2, struct_size), &declared_size, sizeof(declared_size));
+    std::memcpy(prefix + offsetof(AilaGenConfigV2, max_new_tokens), &max_new_tokens, sizeof(max_new_tokens));
+    std::memcpy(prefix + offsetof(AilaGenConfigV2, temperature), &temperature, sizeof(temperature));
+
+    char* raw = api.generate_chat_json_ex(
+        engine,
+        "guarded-prefix",
+        reinterpret_cast<const AilaGenConfigV2*>(prefix));
+    const std::string result = take_string(api, raw, "prefix-sized V2 config");
+    expect_contains(result, R"("struct_size":12)", "prefix struct size changed");
+    expect_contains(result, R"("max_new_tokens":44)", "prefix token count changed");
+    expect_contains(result, R"("temperature":0.375)", "prefix temperature changed");
+    expect(result.find("top_k") == std::string::npos, "proxy read beyond declared V2 prefix");
+    VirtualFree(pages, 0, MEM_RELEASE);
+}
+
+void verify_generation_errors_and_allocations(const Api& api, AilaEngine* engine) {
+    expect(api.generate(nullptr, "x", nullptr) == nullptr, "NULL engine generation succeeded");
+    expect(api.generate(engine, nullptr, nullptr) == nullptr, "NULL input generation succeeded");
+    expect(api.last_error_code(engine) == AILA_ERR_INVALID_ARGUMENT,
+           "NULL input returned the wrong error code");
+
+    char* first = api.generate(engine, "repeat", nullptr);
+    char* second = api.generate(engine, "repeat", nullptr);
+    expect(first != nullptr && second != nullptr, "repeat generation returned NULL");
+    expect(first != second, "repeat generation aliased returned allocations");
+    expect(std::string(first) == std::string(second), "repeat generation bytes changed");
+    api.free_string(first);
+    api.free_string(second);
+
+    char* empty = api.generate(engine, "__aila_empty__", nullptr);
+    expect(empty != nullptr, "successful empty result returned NULL");
+    expect(*empty == '\0', "successful empty result was not NUL-terminated");
+    api.free_string(empty);
+
+    expect(api.generate(engine, "__aila_error__", nullptr) == nullptr,
+           "worker generation error became success");
+    expect(api.last_error_code(engine) == AILA_ERR_CONTEXT_OVERFLOW,
+           "worker generation error code changed");
+    expect(std::string(api.last_error_message(engine)) == "synthetic generation failure",
+           "worker generation error message changed");
+}
+
+void verify_uninitialized_generation(const Api& api) {
+    EngineHandle engine(api);
+    expect(api.generate(engine.get(), "x", nullptr) == nullptr,
+           "uninitialized generation succeeded");
+    expect(api.last_error_code(engine.get()) == AILA_ERR_INVALID_ARGUMENT,
+           "uninitialized generation returned the wrong error");
+}
+
+void verify_malformed_generation_response_reaps_worker(const Api& api) {
+    const auto before = child_worker_processes();
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "malformed-generation", 1024) == 0,
+           "malformed-response test init failed");
+    const auto started = child_worker_processes();
+    DWORD worker_pid = 0;
+    for (DWORD pid : started) {
+        if (before.find(pid) == before.end()) {
+            worker_pid = pid;
+            break;
+        }
+    }
+    expect(worker_pid != 0, "malformed-response worker PID was not observable");
+
+    expect(api.generate(engine.get(), "__aila_malformed_attachment__", nullptr) == nullptr,
+           "malformed response attachment became success");
+    expect(api.last_error_code(engine.get()) == AILA_ERR_RUNTIME,
+           "malformed response returned the wrong error code");
+    expect_contains(
+        api.last_error_message(engine.get()),
+        "embedded NUL",
+        "malformed response error was not actionable");
+    for (int attempt = 0; attempt != 100; ++attempt) {
+        const auto current = child_worker_processes();
+        if (current.find(worker_pid) == current.end()) {
+            break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto remaining = child_worker_processes();
+    expect(remaining.find(worker_pid) == remaining.end(), "malformed response did not reap worker");
+    expect(api.generate(engine.get(), "after-malformed", nullptr) == nullptr,
+           "generation succeeded after malformed worker shutdown");
+    expect(api.last_error_code(engine.get()) == AILA_ERR_INVALID_ARGUMENT,
+           "post-malformed generation did not report uninitialized engine");
+}
+
 void test_proxy_abi_and_lifecycle() {
     TempDirectory temp;
     const fs::path integration_root = temp.path() / L"split root";
@@ -449,6 +664,7 @@ void test_proxy_abi_and_lifecycle() {
 
     Api api(library);
     verify_defaults(api);
+    verify_uninitialized_generation(api);
     api.destroy(nullptr);
     api.reset(nullptr);
     expect(api.context_length(nullptr) == 0, "NULL context length was not zero");
@@ -474,6 +690,9 @@ void test_proxy_abi_and_lifecycle() {
            "successful init did not clear last error");
     expect(api.context_length(relative.get()) == 4096,
            "fake context length was not deterministic after init");
+    verify_synchronous_generation(api, relative.get());
+    verify_v2_prefix_does_not_read_past_struct_size(api, relative.get());
+    verify_generation_errors_and_allocations(api, relative.get());
     auto lines = read_marker(marker);
     const auto relative_pid = marker_pid(lines, model, 4096);
     expect(relative_pid.has_value(), "fake worker did not receive UTF-8 model/max length");
@@ -515,6 +734,7 @@ void test_proxy_abi_and_lifecycle() {
     }
 
     runtime_directory.set(runtime.wstring());
+    verify_malformed_generation_response_reaps_worker(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

@@ -15,6 +15,8 @@ namespace {
 using aila::ipc::Frame;
 using aila::worker::WorkerDispatcher;
 using aila::worker::WorkerEngineApi;
+using aila::worker::TextGenerationMethod;
+using aila::worker::TextGenerationRequest;
 
 [[noreturn]] void fail(const char* test_name, const std::string& message) {
     throw std::runtime_error(std::string("FAILED: ") + test_name + ": " + message);
@@ -98,6 +100,10 @@ struct EngineState {
     std::string model;
     int max_seq_len = 0;
     bool throw_on_context_length = false;
+    int generate_calls = 0;
+    bool generate_result = true;
+    std::string generated_text = u8"worker 输出";
+    TextGenerationRequest generation_request;
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -126,6 +132,15 @@ public:
     int last_error_code() const override { return state_.last_error_code; }
     std::string last_error_message() const override { return state_.last_error_message; }
 
+    bool generate_text(
+        const TextGenerationRequest& request,
+        std::string& output) override {
+        ++state_.generate_calls;
+        state_.generation_request = request;
+        output = state_.generated_text;
+        return state_.generate_result;
+    }
+
 private:
     EngineState& state_;
     int& destruction_count_;
@@ -133,6 +148,19 @@ private:
 
 std::unique_ptr<WorkerEngineApi> fake_engine(EngineState& state, int& destruction_count) {
     return std::make_unique<FakeEngine>(state, destruction_count);
+}
+
+void initialize(WorkerDispatcher& dispatcher, const char* test_name) {
+    bool should_shutdown = false;
+    const Frame command = request(1, "engine.init", R"({"model":"m","maxSeqLen":1024})");
+    const Frame response = dispatcher.dispatch(command, should_shutdown);
+    expect(response.header.kind == "result", test_name, "test engine init failed");
+}
+
+std::string attachment_string(const Frame& frame) {
+    return std::string(
+        reinterpret_cast<const char*>(frame.attachment.data()),
+        frame.attachment.size());
 }
 
 void test_init_forwards_utf8_model_and_sequence_length() {
@@ -364,6 +392,190 @@ void test_ping_and_exception_containment() {
            "exception message was not preserved");
 }
 
+void test_generation_methods_forward_unicode_and_return_exact_attachment() {
+    constexpr const char* name = "generation methods forward Unicode and exact attachment";
+    struct Case {
+        const char* wire_method;
+        TextGenerationMethod engine_method;
+    };
+    constexpr Case cases[] = {
+        {"generate", TextGenerationMethod::Generate},
+        {"generate.messages", TextGenerationMethod::GenerateMessages},
+        {"generate.chat_json", TextGenerationMethod::GenerateChatJson},
+        {"generate.chat_json_ex", TextGenerationMethod::GenerateChatJsonEx},
+    };
+
+    for (const Case& test_case : cases) {
+        EngineState state;
+        int destructions = 0;
+        WorkerDispatcher dispatcher(fake_engine(state, destructions));
+        initialize(dispatcher, name);
+        bool should_shutdown = false;
+        const Frame command = request(
+            120,
+            test_case.wire_method,
+            u8R"({"input":"你好 🌍","config":null})");
+
+        const Frame response = dispatcher.dispatch(command, should_shutdown);
+
+        expect(response.header.kind == "result", name, "generation did not return result");
+        expect(response.header.method == test_case.wire_method, name, "method was not echoed");
+        expect(attachment_string(response) == state.generated_text, name, "output bytes changed");
+        expect(payload_integer(response, "byteCount", name) ==
+                   static_cast<int64_t>(state.generated_text.size()),
+               name,
+               "byte count changed");
+        expect(state.generate_calls == 1, name, "adapter was not called exactly once");
+        expect(state.generation_request.method == test_case.engine_method,
+               name,
+               "adapter method changed");
+        expect(state.generation_request.input == u8"你好 🌍", name, "Unicode input changed");
+        expect(!state.generation_request.has_config, name, "NULL legacy config became present");
+        expect(!state.generation_request.has_v2_config, name, "NULL V2 config became present");
+    }
+}
+
+void test_generation_forwards_every_legacy_config_field() {
+    constexpr const char* name = "generation forwards every legacy config field";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+    const Frame command = request(
+        130,
+        "generate.chat_json",
+        R"({"input":"request","config":{"max_new_tokens":17,"temperature":0.25,"top_k":7,"top_p":0.75,"repetition_penalty":1.125,"presence_penalty":0.375,"frequency_penalty":0.625,"do_sample":0,"decode_chunk_size":3,"stream_chunk_size":5}})");
+
+    const Frame response = dispatcher.dispatch(command, should_shutdown);
+
+    expect(response.header.kind == "result", name, "legacy config request failed");
+    expect(state.generation_request.has_config, name, "legacy config was not present");
+    expect(!state.generation_request.has_v2_config, name, "legacy config became V2");
+    const AilaGenConfig& config = state.generation_request.config;
+    expect(config.max_new_tokens == 17, name, "max_new_tokens changed");
+    expect(config.temperature == 0.25f, name, "temperature changed");
+    expect(config.top_k == 7, name, "top_k changed");
+    expect(config.top_p == 0.75f, name, "top_p changed");
+    expect(config.repetition_penalty == 1.125f, name, "repetition_penalty changed");
+    expect(config.presence_penalty == 0.375f, name, "presence_penalty changed");
+    expect(config.frequency_penalty == 0.625f, name, "frequency_penalty changed");
+    expect(config.do_sample == 0, name, "do_sample changed");
+    expect(config.decode_chunk_size == 3, name, "decode_chunk_size changed");
+    expect(config.stream_chunk_size == 5, name, "stream_chunk_size changed");
+}
+
+void test_generation_forwards_size_gated_v2_config_without_reserved_fields() {
+    constexpr const char* name = "generation forwards size-gated V2 config";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+    const Frame command = request(
+        140,
+        "generate.chat_json_ex",
+        R"({"input":"request","config":{"struct_size":64,"max_new_tokens":31,"temperature":0.5,"top_k":11,"top_p":0.875,"repetition_penalty":1.25,"presence_penalty":0.125,"frequency_penalty":0.25,"do_sample":1,"decode_chunk_size":9,"stream_chunk_size":6,"thinking_budget_tokens":77,"sampling_seed":123456789,"use_fixed_seed":1}})");
+
+    const Frame response = dispatcher.dispatch(command, should_shutdown);
+
+    expect(response.header.kind == "result", name, "V2 config request failed");
+    expect(!state.generation_request.has_config, name, "V2 config became legacy");
+    expect(state.generation_request.has_v2_config, name, "V2 config was not present");
+    const AilaGenConfigV2& config = state.generation_request.config_v2;
+    expect(config.struct_size == 64, name, "struct_size changed");
+    expect(config.max_new_tokens == 31, name, "max_new_tokens changed");
+    expect(config.temperature == 0.5f, name, "temperature changed");
+    expect(config.top_k == 11, name, "top_k changed");
+    expect(config.top_p == 0.875f, name, "top_p changed");
+    expect(config.repetition_penalty == 1.25f, name, "repetition_penalty changed");
+    expect(config.presence_penalty == 0.125f, name, "presence_penalty changed");
+    expect(config.frequency_penalty == 0.25f, name, "frequency_penalty changed");
+    expect(config.do_sample == 1, name, "do_sample changed");
+    expect(config.decode_chunk_size == 9, name, "decode_chunk_size changed");
+    expect(config.stream_chunk_size == 6, name, "stream_chunk_size changed");
+    expect(config.thinking_budget_tokens == 77, name, "thinking budget changed");
+    expect(config.sampling_seed == 123456789, name, "sampling seed changed");
+    expect(config.use_fixed_seed == 1, name, "fixed seed changed");
+    for (int reserved : config.reserved) {
+        expect(reserved == 0, name, "reserved field was accepted from the wire");
+    }
+
+    const Frame prefix = request(
+        141,
+        "generate.chat_json_ex",
+        R"({"input":"prefix","config":{"struct_size":12,"max_new_tokens":44,"temperature":0.375}})");
+    expect(dispatcher.dispatch(prefix, should_shutdown).header.kind == "result",
+           name,
+           "prefix-sized V2 config failed");
+    expect(state.generation_request.config_v2.struct_size == 12, name, "prefix size changed");
+    expect(state.generation_request.config_v2.max_new_tokens == 44,
+           name,
+           "prefix max_new_tokens changed");
+    expect(state.generation_request.config_v2.temperature == 0.375f,
+           name,
+           "prefix temperature changed");
+    expect(state.generation_request.config_v2.top_k == 0,
+           name,
+           "absent later V2 field was synthesized");
+}
+
+void test_generation_rejects_malformed_payload_before_adapter() {
+    constexpr const char* name = "generation rejects malformed payload before adapter";
+    const char* payloads[] = {
+        R"([])",
+        R"({"input":3,"config":null})",
+        R"({"input":"safe\u0000suffix","config":null})",
+        R"({"input":"x","config":[]})",
+        R"({"input":"x","config":{"max_new_tokens":"bad"}})",
+    };
+    for (const char* payload : payloads) {
+        EngineState state;
+        int destructions = 0;
+        WorkerDispatcher dispatcher(fake_engine(state, destructions));
+        initialize(dispatcher, name);
+        bool should_shutdown = false;
+        const Frame command = request(150, "generate", payload);
+        const Frame response = dispatcher.dispatch(command, should_shutdown);
+        expect(response.header.kind == "error", name, "malformed generation payload succeeded");
+        expect(payload_integer(response, "code", name) == AILA_ERR_INVALID_ARGUMENT,
+               name,
+               "malformed payload returned the wrong code");
+        expect(state.generate_calls == 0, name, "malformed payload reached adapter");
+    }
+}
+
+void test_generation_propagates_adapter_error_and_rejects_embedded_nul_output() {
+    constexpr const char* name = "generation propagates adapter errors and rejects NUL output";
+    EngineState state;
+    state.generate_result = false;
+    state.last_error_code = AILA_ERR_CONTEXT_OVERFLOW;
+    state.last_error_message = "synthetic context overflow";
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+    const Frame command = request(160, "generate", R"({"input":"x","config":null})");
+
+    const Frame failed = dispatcher.dispatch(command, should_shutdown);
+    expect(failed.header.kind == "error", name, "adapter failure became success");
+    expect(payload_integer(failed, "code", name) == AILA_ERR_CONTEXT_OVERFLOW,
+           name,
+           "adapter error code changed");
+    expect(payload_string(failed, "message", name) == state.last_error_message,
+           name,
+           "adapter error message changed");
+
+    state.generate_result = true;
+    state.generated_text = std::string("left\0right", 10);
+    const Frame malformed = dispatcher.dispatch(command, should_shutdown);
+    expect(malformed.header.kind == "error", name, "embedded NUL output succeeded");
+    expect(payload_integer(malformed, "code", name) == AILA_ERR_RUNTIME,
+           name,
+           "embedded NUL output returned the wrong code");
+    expect(malformed.attachment.empty(), name, "embedded NUL output was attached");
+}
+
 } // namespace
 
 int main() {
@@ -376,6 +588,11 @@ int main() {
         test_shutdown_sets_flag_and_destroys_engine_once();
         test_protocol_and_abi_mismatches_are_rejected();
         test_ping_and_exception_containment();
+        test_generation_methods_forward_unicode_and_return_exact_attachment();
+        test_generation_forwards_every_legacy_config_field();
+        test_generation_forwards_size_gated_v2_config_without_reserved_fields();
+        test_generation_rejects_malformed_payload_before_adapter();
+        test_generation_propagates_adapter_error_and_rejects_embedded_nul_output();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

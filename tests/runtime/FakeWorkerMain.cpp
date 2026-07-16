@@ -202,6 +202,23 @@ aila::ipc::Frame lifecycle_error(
     return response;
 }
 
+bool is_generation_method(std::string_view method) {
+    return method == "generate" ||
+        method == "generate.messages" ||
+        method == "generate.chat_json" ||
+        method == "generate.chat_json_ex";
+}
+
+void attach_text(aila::ipc::Frame& frame, std::string_view text) {
+    frame.attachment.clear();
+    frame.attachment.reserve(text.size());
+    for (const unsigned char byte : text) {
+        frame.attachment.push_back(static_cast<std::byte>(byte));
+    }
+    frame.header.payload_json =
+        std::string("{\"byteCount\":") + std::to_string(text.size()) + "}";
+}
+
 uintptr_t parse_handle_value(const wchar_t* value) {
     if (value == nullptr || *value == L'\0' || *value == L'-') {
         throw std::runtime_error("missing or invalid inherited handle value");
@@ -365,6 +382,33 @@ int run(const Handles& handles) {
                 std::string("{\"contextLength\":") +
                 std::to_string(context_length) + "}";
             response.attachment.clear();
+        }
+        if (is_generation_method(command.header.method)) {
+            if (!initialized) {
+                send_frame(
+                    handles.response_write,
+                    lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            if (command.header.payload_json.find("__aila_error__") != std::string::npos) {
+                send_frame(
+                    handles.response_write,
+                    lifecycle_error(command, 5, "synthetic generation failure"));
+                continue;
+            }
+            if (command.header.payload_json.find("__aila_malformed_attachment__") !=
+                std::string::npos) {
+                const std::string malformed("left\0right", 10);
+                attach_text(response, malformed);
+            } else if (command.header.payload_json.find("__aila_empty__") !=
+                       std::string::npos) {
+                attach_text(response, {});
+            } else {
+                const std::string generated =
+                    std::string("{\"method\":") + json_string(command.header.method) +
+                    ",\"request\":" + command.header.payload_json + "}";
+                attach_text(response, generated);
+            }
         }
         send_frame(handles.response_write, response);
         if (command.header.method == "shutdown") {

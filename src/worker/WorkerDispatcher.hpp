@@ -1,11 +1,28 @@
 #pragma once
 
+#include "aila_api.h"
 #include "ipc/IpcProtocol.hpp"
 
 #include <memory>
 #include <string>
 
 namespace aila::worker {
+
+enum class TextGenerationMethod {
+    Generate,
+    GenerateMessages,
+    GenerateChatJson,
+    GenerateChatJsonEx,
+};
+
+struct TextGenerationRequest {
+    TextGenerationMethod method = TextGenerationMethod::Generate;
+    std::string input;
+    bool has_config = false;
+    AilaGenConfig config{};
+    bool has_v2_config = false;
+    AilaGenConfigV2 config_v2{};
+};
 
 class WorkerEngineApi {
 public:
@@ -16,6 +33,9 @@ public:
     virtual int context_length() const = 0;
     virtual int last_error_code() const = 0;
     virtual std::string last_error_message() const = 0;
+    virtual bool generate_text(
+        const TextGenerationRequest& request,
+        std::string& output) = 0;
 };
 
 class WorkerDispatcher {

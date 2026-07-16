@@ -7,7 +7,12 @@
 #include <windows.h>
 
 #include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <iomanip>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -58,8 +63,91 @@ std::string json_string(std::string_view value) {
 }
 
 std::runtime_error malformed_response(std::string_view detail) {
-    return std::runtime_error("worker lifecycle response was invalid: " + std::string(detail));
+    return std::runtime_error("worker response was invalid: " + std::string(detail));
 }
+
+std::string json_float(float value) {
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << std::setprecision((std::numeric_limits<float>::max_digits10)) << value;
+    return stream.str();
+}
+
+std::string legacy_config_json(const AilaGenConfig* config) {
+    if (!config) {
+        return "null";
+    }
+    return std::string("{") +
+        "\"max_new_tokens\":" + std::to_string(config->max_new_tokens) + "," +
+        "\"temperature\":" + json_float(config->temperature) + "," +
+        "\"top_k\":" + std::to_string(config->top_k) + "," +
+        "\"top_p\":" + json_float(config->top_p) + "," +
+        "\"repetition_penalty\":" + json_float(config->repetition_penalty) + "," +
+        "\"presence_penalty\":" + json_float(config->presence_penalty) + "," +
+        "\"frequency_penalty\":" + json_float(config->frequency_penalty) + "," +
+        "\"do_sample\":" + std::to_string(config->do_sample) + "," +
+        "\"decode_chunk_size\":" + std::to_string(config->decode_chunk_size) + "," +
+        "\"stream_chunk_size\":" + std::to_string(config->stream_chunk_size) + "}";
+}
+
+bool v2_has_field(uint32_t struct_size, size_t offset, size_t field_size) {
+    return struct_size >= offset + field_size;
+}
+
+#define AILA_PROXY_V2_HAS(config, field) \
+    v2_has_field((config)->struct_size, offsetof(AilaGenConfigV2, field), sizeof((config)->field))
+
+std::string v2_config_json(const AilaGenConfigV2* config) {
+    if (!config) {
+        return "null";
+    }
+    const uint32_t struct_size = config->struct_size;
+    std::string result = "{\"struct_size\":" + std::to_string(struct_size);
+    if (AILA_PROXY_V2_HAS(config, max_new_tokens)) {
+        result += ",\"max_new_tokens\":" + std::to_string(config->max_new_tokens);
+    }
+    if (AILA_PROXY_V2_HAS(config, temperature)) {
+        result += ",\"temperature\":" + json_float(config->temperature);
+    }
+    if (AILA_PROXY_V2_HAS(config, top_k)) {
+        result += ",\"top_k\":" + std::to_string(config->top_k);
+    }
+    if (AILA_PROXY_V2_HAS(config, top_p)) {
+        result += ",\"top_p\":" + json_float(config->top_p);
+    }
+    if (AILA_PROXY_V2_HAS(config, repetition_penalty)) {
+        result += ",\"repetition_penalty\":" + json_float(config->repetition_penalty);
+    }
+    if (AILA_PROXY_V2_HAS(config, presence_penalty)) {
+        result += ",\"presence_penalty\":" + json_float(config->presence_penalty);
+    }
+    if (AILA_PROXY_V2_HAS(config, frequency_penalty)) {
+        result += ",\"frequency_penalty\":" + json_float(config->frequency_penalty);
+    }
+    if (AILA_PROXY_V2_HAS(config, do_sample)) {
+        result += ",\"do_sample\":" + std::to_string(config->do_sample);
+    }
+    if (AILA_PROXY_V2_HAS(config, decode_chunk_size)) {
+        result += ",\"decode_chunk_size\":" + std::to_string(config->decode_chunk_size);
+    }
+    if (AILA_PROXY_V2_HAS(config, stream_chunk_size)) {
+        result += ",\"stream_chunk_size\":" + std::to_string(config->stream_chunk_size);
+    }
+    if (AILA_PROXY_V2_HAS(config, thinking_budget_tokens)) {
+        result += ",\"thinking_budget_tokens\":" +
+            std::to_string(config->thinking_budget_tokens);
+    }
+    if (AILA_PROXY_V2_HAS(config, sampling_seed)) {
+        result += ",\"sampling_seed\":" + std::to_string(config->sampling_seed);
+    }
+    if (AILA_PROXY_V2_HAS(config, use_fixed_seed)) {
+        result += ",\"use_fixed_seed\":" + std::to_string(config->use_fixed_seed);
+    }
+    result += "}";
+    return result;
+}
+
+#undef AILA_PROXY_V2_HAS
 
 } // namespace
 
@@ -183,6 +271,68 @@ int ProxyEngine::context_length() {
     }
 }
 
+bool ProxyEngine::generate_text(
+    std::string_view method,
+    std::string_view input,
+    const AilaGenConfig* config,
+    std::string& output) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+        return false;
+    }
+    if (input.find('\0') != std::string_view::npos) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
+        return false;
+    }
+    try {
+        return generate_payload_locked(
+            method,
+            std::string("{\"input\":") + json_string(input) +
+                ",\"config\":" + legacy_config_json(config) + "}",
+            output);
+    } catch (const std::exception& exception) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, exception.what());
+        return false;
+    } catch (...) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, "unknown proxy generation failure");
+        return false;
+    }
+}
+
+bool ProxyEngine::generate_text_v2(
+    std::string_view method,
+    std::string_view input,
+    const AilaGenConfigV2* config,
+    std::string& output) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+        return false;
+    }
+    if (input.find('\0') != std::string_view::npos) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
+        return false;
+    }
+    try {
+        return generate_payload_locked(
+            method,
+            std::string("{\"input\":") + json_string(input) +
+                ",\"config\":" + v2_config_json(config) + "}",
+            output);
+    } catch (const std::exception& exception) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, exception.what());
+        return false;
+    } catch (...) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, "unknown proxy generation failure");
+        return false;
+    }
+}
+
 int ProxyEngine::last_error_code() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return error_code_;
@@ -221,17 +371,33 @@ ipc::Frame ProxyEngine::request_locked(std::string method, std::string payload_j
 bool ProxyEngine::accept_lifecycle_response_locked(
     const ipc::Frame& response,
     std::string_view expected_method) {
-    if (response.header.method != expected_method) {
-        throw malformed_response("method did not match the request");
-    }
     if (!response.attachment.empty()) {
         throw malformed_response("lifecycle response contained an attachment");
     }
     if (response.header.kind == "result") {
+        if (response.header.method != expected_method) {
+            throw malformed_response("method did not match the request");
+        }
         return true;
+    }
+    return accept_error_response_locked(
+        response,
+        expected_method,
+        "worker lifecycle request failed");
+}
+
+bool ProxyEngine::accept_error_response_locked(
+    const ipc::Frame& response,
+    std::string_view expected_method,
+    std::string_view fallback_message) {
+    if (response.header.method != expected_method) {
+        throw malformed_response("method did not match the request");
     }
     if (response.header.kind != "error") {
         throw malformed_response("kind was neither result nor error");
+    }
+    if (!response.attachment.empty()) {
+        throw malformed_response("error response contained an attachment");
     }
 
     simdjson::dom::parser parser;
@@ -246,8 +412,43 @@ bool ProxyEngine::accept_lifecycle_response_locked(
     }
     set_error_locked(
         code == AILA_OK ? AILA_ERR_RUNTIME : static_cast<int>(code),
-        message.empty() ? "worker lifecycle request failed" : std::string(message));
+        message.empty() ? std::string(fallback_message) : std::string(message));
     return false;
+}
+
+bool ProxyEngine::generate_payload_locked(
+    std::string_view method,
+    std::string payload_json,
+    std::string& output) {
+    const ipc::Frame response = request_locked(std::string(method), std::move(payload_json));
+    if (response.header.kind == "error") {
+        return accept_error_response_locked(response, method, "worker generation failed");
+    }
+    if (response.header.method != method || response.header.kind != "result") {
+        throw malformed_response("generation result identity did not match request");
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element payload;
+    uint64_t byte_count = 0;
+    if (parser.parse(response.header.payload_json).get(payload) != simdjson::SUCCESS ||
+        payload["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+        byte_count != response.attachment.size()) {
+        throw malformed_response("generation byteCount did not match attachment");
+    }
+    for (const std::byte byte : response.attachment) {
+        if (byte == std::byte{0}) {
+            throw malformed_response("generation attachment contained an embedded NUL");
+        }
+    }
+    if (response.attachment.empty()) {
+        output.clear();
+    } else {
+        output.assign(
+            reinterpret_cast<const char*>(response.attachment.data()),
+            response.attachment.size());
+    }
+    clear_error_locked();
+    return true;
 }
 
 void ProxyEngine::set_error_locked(int code, std::string message) {

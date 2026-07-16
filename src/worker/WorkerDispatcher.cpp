@@ -4,6 +4,10 @@
 #include "simdjson.h"
 
 #include <exception>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -65,6 +69,122 @@ ipc::Frame error(const ipc::Frame& request, int code, std::string_view message) 
     response.header.payload_json =
         std::string("{\"code\":") + std::to_string(code) +
         ",\"message\":" + json_string(message) + "}";
+    return response;
+}
+
+bool generation_method(std::string_view method, TextGenerationMethod& result) {
+    if (method == "generate") {
+        result = TextGenerationMethod::Generate;
+    } else if (method == "generate.messages") {
+        result = TextGenerationMethod::GenerateMessages;
+    } else if (method == "generate.chat_json") {
+        result = TextGenerationMethod::GenerateChatJson;
+    } else if (method == "generate.chat_json_ex") {
+        result = TextGenerationMethod::GenerateChatJsonEx;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool object_integer(
+    simdjson::dom::object object,
+    const char* name,
+    int& value) {
+    int64_t parsed = 0;
+    if (object[name].get_int64().get(parsed) != simdjson::SUCCESS ||
+        parsed < (std::numeric_limits<int>::min)() ||
+        parsed > (std::numeric_limits<int>::max)()) {
+        return false;
+    }
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+bool object_float(
+    simdjson::dom::object object,
+    const char* name,
+    float& value) {
+    double parsed = 0.0;
+    if (object[name].get_double().get(parsed) != simdjson::SUCCESS ||
+        !std::isfinite(parsed) ||
+        parsed < -(std::numeric_limits<float>::max)() ||
+        parsed > (std::numeric_limits<float>::max)()) {
+        return false;
+    }
+    value = static_cast<float>(parsed);
+    return true;
+}
+
+bool parse_legacy_config(simdjson::dom::object object, AilaGenConfig& config) {
+    return object_integer(object, "max_new_tokens", config.max_new_tokens) &&
+        object_float(object, "temperature", config.temperature) &&
+        object_integer(object, "top_k", config.top_k) &&
+        object_float(object, "top_p", config.top_p) &&
+        object_float(object, "repetition_penalty", config.repetition_penalty) &&
+        object_float(object, "presence_penalty", config.presence_penalty) &&
+        object_float(object, "frequency_penalty", config.frequency_penalty) &&
+        object_integer(object, "do_sample", config.do_sample) &&
+        object_integer(object, "decode_chunk_size", config.decode_chunk_size) &&
+        object_integer(object, "stream_chunk_size", config.stream_chunk_size);
+}
+
+bool v2_has_field(uint32_t size, size_t offset, size_t field_size) {
+    return size >= offset + field_size;
+}
+
+#define AILA_WORKER_V2_FIELD(config, field) \
+    v2_has_field((config).struct_size, offsetof(AilaGenConfigV2, field), sizeof((config).field))
+
+bool parse_v2_config(simdjson::dom::object object, AilaGenConfigV2& config) {
+    uint64_t size = 0;
+    if (object["struct_size"].get_uint64().get(size) != simdjson::SUCCESS ||
+        size > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    config = {};
+    config.struct_size = static_cast<uint32_t>(size);
+    if (AILA_WORKER_V2_FIELD(config, max_new_tokens) &&
+        !object_integer(object, "max_new_tokens", config.max_new_tokens)) return false;
+    if (AILA_WORKER_V2_FIELD(config, temperature) &&
+        !object_float(object, "temperature", config.temperature)) return false;
+    if (AILA_WORKER_V2_FIELD(config, top_k) &&
+        !object_integer(object, "top_k", config.top_k)) return false;
+    if (AILA_WORKER_V2_FIELD(config, top_p) &&
+        !object_float(object, "top_p", config.top_p)) return false;
+    if (AILA_WORKER_V2_FIELD(config, repetition_penalty) &&
+        !object_float(object, "repetition_penalty", config.repetition_penalty)) return false;
+    if (AILA_WORKER_V2_FIELD(config, presence_penalty) &&
+        !object_float(object, "presence_penalty", config.presence_penalty)) return false;
+    if (AILA_WORKER_V2_FIELD(config, frequency_penalty) &&
+        !object_float(object, "frequency_penalty", config.frequency_penalty)) return false;
+    if (AILA_WORKER_V2_FIELD(config, do_sample) &&
+        !object_integer(object, "do_sample", config.do_sample)) return false;
+    if (AILA_WORKER_V2_FIELD(config, decode_chunk_size) &&
+        !object_integer(object, "decode_chunk_size", config.decode_chunk_size)) return false;
+    if (AILA_WORKER_V2_FIELD(config, stream_chunk_size) &&
+        !object_integer(object, "stream_chunk_size", config.stream_chunk_size)) return false;
+    if (AILA_WORKER_V2_FIELD(config, thinking_budget_tokens) &&
+        !object_integer(object, "thinking_budget_tokens", config.thinking_budget_tokens)) return false;
+    if (AILA_WORKER_V2_FIELD(config, sampling_seed) &&
+        object["sampling_seed"].get_uint64().get(config.sampling_seed) != simdjson::SUCCESS) return false;
+    if (AILA_WORKER_V2_FIELD(config, use_fixed_seed) &&
+        !object_integer(object, "use_fixed_seed", config.use_fixed_seed)) return false;
+    return true;
+}
+
+#undef AILA_WORKER_V2_FIELD
+
+ipc::Frame generation_result(
+    const ipc::Frame& request,
+    std::string_view output) {
+    ipc::Frame response = result(
+        request,
+        std::string("{\"byteCount\":") + std::to_string(output.size()) + "}");
+    response.attachment.reserve(output.size());
+    for (const unsigned char byte : output) {
+        response.attachment.push_back(static_cast<std::byte>(byte));
+    }
     return response;
 }
 
@@ -166,6 +286,69 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
         if (request.header.method == "engine.reset") {
             engine_->reset_context();
             return result(request, "{\"ok\":true}");
+        }
+
+        TextGenerationMethod text_method;
+        if (generation_method(request.header.method, text_method)) {
+            if (!initialized_) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            }
+            simdjson::dom::object object;
+            if (payload.get_object().get(object) != simdjson::SUCCESS) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "generation payload must be an object");
+            }
+            std::string_view input;
+            if (object["input"].get_string().get(input) != simdjson::SUCCESS) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "generation field 'input' must be a string");
+            }
+            if (!require_c_string_safe(input)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
+            }
+
+            simdjson::dom::element config_element;
+            if (object.at_key("config").get(config_element) != simdjson::SUCCESS) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "generation field 'config' is required");
+            }
+            TextGenerationRequest generation;
+            generation.method = text_method;
+            generation.input.assign(input.data(), input.size());
+            if (!config_element.is_null()) {
+                simdjson::dom::object config_object;
+                if (config_element.get_object().get(config_object) != simdjson::SUCCESS) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "generation config must be null or an object");
+                }
+                if (text_method == TextGenerationMethod::GenerateChatJsonEx) {
+                    generation.has_v2_config = true;
+                    if (!parse_v2_config(config_object, generation.config_v2)) {
+                        return error(request, AILA_ERR_INVALID_ARGUMENT, "generation V2 config is malformed");
+                    }
+                } else {
+                    generation.has_config = true;
+                    if (!parse_legacy_config(config_object, generation.config)) {
+                        return error(request, AILA_ERR_INVALID_ARGUMENT, "generation config is malformed");
+                    }
+                }
+            }
+
+            std::string output;
+            if (!engine_->generate_text(generation, output)) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) {
+                    code = AILA_ERR_RUNTIME;
+                }
+                std::string message = engine_->last_error_message();
+                if (message.empty()) {
+                    message = "generation failed";
+                }
+                return error(request, code, message);
+            }
+            if (output.find('\0') != std::string::npos) {
+                return error(request, AILA_ERR_RUNTIME, "generation result contained an embedded NUL");
+            }
+            if (output.size() > ipc::kMaxAttachmentBytes) {
+                return error(request, AILA_ERR_RUNTIME, "generation result exceeded attachment limit");
+            }
+            return generation_result(request, output);
         }
 
         if (request.header.method == "shutdown") {

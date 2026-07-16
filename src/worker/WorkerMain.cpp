@@ -301,6 +301,50 @@ public:
         return message == nullptr ? std::string{} : std::string(message);
     }
 
+    bool generate_text(
+        const aila::worker::TextGenerationRequest& request,
+        std::string& output) override {
+        char* result = nullptr;
+        switch (request.method) {
+            case aila::worker::TextGenerationMethod::Generate:
+                result = aila_generate(
+                    engine_,
+                    request.input.c_str(),
+                    request.has_config ? &request.config : nullptr);
+                break;
+            case aila::worker::TextGenerationMethod::GenerateMessages:
+                result = aila_generate_messages(
+                    engine_,
+                    request.input.c_str(),
+                    request.has_config ? &request.config : nullptr);
+                break;
+            case aila::worker::TextGenerationMethod::GenerateChatJson:
+                result = aila_generate_chat_json(
+                    engine_,
+                    request.input.c_str(),
+                    request.has_config ? &request.config : nullptr);
+                break;
+            case aila::worker::TextGenerationMethod::GenerateChatJsonEx:
+                result = aila_generate_chat_json_ex(
+                    engine_,
+                    request.input.c_str(),
+                    request.has_v2_config ? &request.config_v2 : nullptr);
+                break;
+        }
+        if (!result) {
+            output.clear();
+            return false;
+        }
+        try {
+            output.assign(result);
+        } catch (...) {
+            aila_free_string(result);
+            throw;
+        }
+        aila_free_string(result);
+        return true;
+    }
+
 private:
     AilaEngine* engine_ = nullptr;
 };

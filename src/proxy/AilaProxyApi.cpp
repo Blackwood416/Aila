@@ -3,7 +3,9 @@
 #include "proxy/ProxyEngine.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <string>
@@ -30,6 +32,85 @@ void record_boundary_failure(AilaEngine* engine, const char* operation) noexcept
         engine->proxy.record_runtime_error(
             std::string(operation) + " failed at the C ABI boundary");
     } catch (...) {
+    }
+}
+
+char* allocate_result(const std::string& value) {
+    if (value.size() == (std::numeric_limits<size_t>::max)()) {
+        return nullptr;
+    }
+    char* result = static_cast<char*>(std::malloc(value.size() + 1));
+    if (!result) {
+        return nullptr;
+    }
+    if (!value.empty()) {
+        std::memcpy(result, value.data(), value.size());
+    }
+    result[value.size()] = '\0';
+    return result;
+}
+
+char* generate_legacy(
+    AilaEngine* engine,
+    const char* input,
+    const AilaGenConfig* config,
+    const char* method,
+    const char* operation) noexcept {
+    if (!engine) {
+        return nullptr;
+    }
+    if (!input) {
+        try {
+            engine->proxy.record_invalid_argument("generation input must not be NULL");
+        } catch (...) {
+        }
+        return nullptr;
+    }
+    try {
+        std::string output;
+        if (!engine->proxy.generate_text(method, input, config, output)) {
+            return nullptr;
+        }
+        char* result = allocate_result(output);
+        if (!result) {
+            engine->proxy.record_runtime_error("could not allocate generation result");
+        }
+        return result;
+    } catch (...) {
+        record_boundary_failure(engine, operation);
+        return nullptr;
+    }
+}
+
+char* generate_v2(
+    AilaEngine* engine,
+    const char* input,
+    const AilaGenConfigV2* config,
+    const char* method,
+    const char* operation) noexcept {
+    if (!engine) {
+        return nullptr;
+    }
+    if (!input) {
+        try {
+            engine->proxy.record_invalid_argument("generation input must not be NULL");
+        } catch (...) {
+        }
+        return nullptr;
+    }
+    try {
+        std::string output;
+        if (!engine->proxy.generate_text_v2(method, input, config, output)) {
+            return nullptr;
+        }
+        char* result = allocate_result(output);
+        if (!result) {
+            engine->proxy.record_runtime_error("could not allocate generation result");
+        }
+        return result;
+    } catch (...) {
+        record_boundary_failure(engine, operation);
+        return nullptr;
     }
 }
 
@@ -106,6 +187,49 @@ AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void) {
     config.sampling_seed = 42;
     config.use_fixed_seed = 0;
     return config;
+}
+
+AILA_API char* aila_generate(
+    AilaEngine* engine,
+    const char* prompt,
+    const AilaGenConfig* config) {
+    return generate_legacy(engine, prompt, config, "generate", "aila_generate");
+}
+
+AILA_API char* aila_generate_messages(
+    AilaEngine* engine,
+    const char* messages_json,
+    const AilaGenConfig* config) {
+    return generate_legacy(
+        engine,
+        messages_json,
+        config,
+        "generate.messages",
+        "aila_generate_messages");
+}
+
+AILA_API char* aila_generate_chat_json(
+    AilaEngine* engine,
+    const char* chat_request_json,
+    const AilaGenConfig* config) {
+    return generate_legacy(
+        engine,
+        chat_request_json,
+        config,
+        "generate.chat_json",
+        "aila_generate_chat_json");
+}
+
+AILA_API char* aila_generate_chat_json_ex(
+    AilaEngine* engine,
+    const char* chat_request_json,
+    const AilaGenConfigV2* config) {
+    return generate_v2(
+        engine,
+        chat_request_json,
+        config,
+        "generate.chat_json_ex",
+        "aila_generate_chat_json_ex");
 }
 
 AILA_API void aila_engine_reset_context(AilaEngine* engine) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "aila_api.h"
 #include "runtime/WorkerProcess.hpp"
 
 #include <cstdint>
@@ -20,6 +21,16 @@ public:
     bool init(std::string_view model_directory, int max_seq_len);
     void reset_context();
     int context_length();
+    bool generate_text(
+        std::string_view method,
+        std::string_view input,
+        const AilaGenConfig* config,
+        std::string& output);
+    bool generate_text_v2(
+        std::string_view method,
+        std::string_view input,
+        const AilaGenConfigV2* config,
+        std::string& output);
 
     int last_error_code() const;
     const char* last_error_message() const;
@@ -31,6 +42,14 @@ private:
     bool accept_lifecycle_response_locked(
         const ipc::Frame& response,
         std::string_view expected_method);
+    bool accept_error_response_locked(
+        const ipc::Frame& response,
+        std::string_view expected_method,
+        std::string_view fallback_message);
+    bool generate_payload_locked(
+        std::string_view method,
+        std::string payload_json,
+        std::string& output);
     void set_error_locked(int code, std::string message);
     void clear_error_locked();
     void shutdown_locked() noexcept;
