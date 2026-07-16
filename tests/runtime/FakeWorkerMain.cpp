@@ -400,6 +400,10 @@ int run(const Handles& handles) {
                 std::string::npos) {
                 const std::string malformed("left\0right", 10);
                 attach_text(response, malformed);
+            } else if (command.header.payload_json.find("__aila_invalid_utf8__") !=
+                       std::string::npos) {
+                const std::string invalid_utf8("\xc3\x28", 2);
+                attach_text(response, invalid_utf8);
             } else if (command.header.payload_json.find("__aila_empty__") !=
                        std::string::npos) {
                 attach_text(response, {});

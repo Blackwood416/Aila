@@ -518,6 +518,20 @@ void test_generation_forwards_size_gated_v2_config_without_reserved_fields() {
     expect(state.generation_request.config_v2.top_k == 0,
            name,
            "absent later V2 field was synthesized");
+
+    const int calls_before_zero_size = state.generate_calls;
+    const Frame zero_size = request(
+        142,
+        "generate.chat_json_ex",
+        R"({"input":"zero","config":{"struct_size":0}})");
+    const Frame zero_response = dispatcher.dispatch(zero_size, should_shutdown);
+    expect(zero_response.header.kind == "error", name, "zero-sized V2 config succeeded");
+    expect(payload_integer(zero_response, "code", name) == AILA_ERR_INVALID_ARGUMENT,
+           name,
+           "zero-sized V2 config returned the wrong code");
+    expect(state.generate_calls == calls_before_zero_size,
+           name,
+           "zero-sized V2 config reached adapter");
 }
 
 void test_generation_rejects_malformed_payload_before_adapter() {
@@ -528,6 +542,7 @@ void test_generation_rejects_malformed_payload_before_adapter() {
         R"({"input":"safe\u0000suffix","config":null})",
         R"({"input":"x","config":[]})",
         R"({"input":"x","config":{"max_new_tokens":"bad"}})",
+        "{\"input\":\"\xc3\x28\",\"config\":null}",
     };
     for (const char* payload : payloads) {
         EngineState state;
@@ -574,6 +589,14 @@ void test_generation_propagates_adapter_error_and_rejects_embedded_nul_output() 
            name,
            "embedded NUL output returned the wrong code");
     expect(malformed.attachment.empty(), name, "embedded NUL output was attached");
+
+    state.generated_text = std::string("\xc3\x28", 2);
+    const Frame invalid_utf8 = dispatcher.dispatch(command, should_shutdown);
+    expect(invalid_utf8.header.kind == "error", name, "invalid UTF-8 output succeeded");
+    expect(payload_integer(invalid_utf8, "code", name) == AILA_ERR_RUNTIME,
+           name,
+           "invalid UTF-8 output returned the wrong code");
+    expect(invalid_utf8.attachment.empty(), name, "invalid UTF-8 output was attached");
 }
 
 } // namespace

@@ -144,6 +144,9 @@ bool parse_v2_config(simdjson::dom::object object, AilaGenConfigV2& config) {
     }
     config = {};
     config.struct_size = static_cast<uint32_t>(size);
+    if (config.struct_size == 0) {
+        return false;
+    }
     if (AILA_WORKER_V2_FIELD(config, max_new_tokens) &&
         !object_integer(object, "max_new_tokens", config.max_new_tokens)) return false;
     if (AILA_WORKER_V2_FIELD(config, temperature) &&
@@ -208,6 +211,9 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
         }
         if (request.header.abi != ipc::kPublicAbiVersion) {
             return error(request, AILA_ERR_INVALID_ARGUMENT, "unsupported public ABI version");
+        }
+        if (!simdjson::validate_utf8(request.header.payload_json)) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "request payload must be valid UTF-8");
         }
 
         simdjson::dom::parser parser;
@@ -304,6 +310,9 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             if (!require_c_string_safe(input)) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
             }
+            if (!simdjson::validate_utf8(input)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "generation input must be valid UTF-8");
+            }
 
             simdjson::dom::element config_element;
             if (object.at_key("config").get(config_element) != simdjson::SUCCESS) {
@@ -344,6 +353,9 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             }
             if (output.find('\0') != std::string::npos) {
                 return error(request, AILA_ERR_RUNTIME, "generation result contained an embedded NUL");
+            }
+            if (!simdjson::validate_utf8(output)) {
+                return error(request, AILA_ERR_RUNTIME, "generation result was not valid UTF-8");
             }
             if (output.size() > ipc::kMaxAttachmentBytes) {
                 return error(request, AILA_ERR_RUNTIME, "generation result exceeded attachment limit");

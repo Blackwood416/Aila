@@ -519,13 +519,15 @@ void verify_synchronous_generation(const Api& api, AilaEngine* engine) {
     expect(extended.find("reserved") == std::string::npos, "reserved V2 fields crossed proxy");
 
     AilaGenConfigV2 zero_size{};
-    const std::string zero = take_string(
-        api,
-        api.generate_chat_json_ex(engine, "zero-size", &zero_size),
-        "zero-size V2 config");
-    expect_contains(zero, R"("struct_size":0)", "zero struct size was not preserved");
-    expect(zero.find("max_new_tokens") == std::string::npos,
-           "zero-sized V2 config read a later field");
+    expect(api.generate_chat_json_ex(engine, "zero-size", &zero_size) == nullptr,
+           "zero-sized V2 config succeeded");
+    expect(api.last_error_code(engine) == AILA_ERR_INVALID_ARGUMENT,
+           "zero-sized V2 config returned the wrong error");
+    expect_contains(
+        api.last_error_message(engine),
+        "struct_size",
+        "zero-sized V2 error was not actionable");
+    take_string(api, api.generate(engine, "after-zero-size", nullptr), "call after zero-size V2");
 }
 
 void verify_v2_prefix_does_not_read_past_struct_size(const Api& api, AilaEngine* engine) {
@@ -566,6 +568,18 @@ void verify_generation_errors_and_allocations(const Api& api, AilaEngine* engine
     expect(api.generate(engine, nullptr, nullptr) == nullptr, "NULL input generation succeeded");
     expect(api.last_error_code(engine) == AILA_ERR_INVALID_ARGUMENT,
            "NULL input returned the wrong error code");
+
+    const char invalid_utf8[] = {static_cast<char>(0xc3), static_cast<char>(0x28), '\0'};
+    expect(api.generate(engine, invalid_utf8, nullptr) == nullptr,
+           "invalid UTF-8 input succeeded");
+    expect(api.last_error_code(engine) == AILA_ERR_INVALID_ARGUMENT,
+           "invalid UTF-8 input returned the wrong error code");
+    expect_contains(
+        api.last_error_message(engine),
+        "UTF-8",
+        "invalid UTF-8 input error was not actionable");
+    take_string(api, api.generate(engine, "after-invalid-UTF-8", nullptr),
+                "valid call after invalid UTF-8 input");
 
     char* first = api.generate(engine, "repeat", nullptr);
     char* second = api.generate(engine, "repeat", nullptr);
@@ -632,6 +646,41 @@ void verify_malformed_generation_response_reaps_worker(const Api& api) {
            "generation succeeded after malformed worker shutdown");
     expect(api.last_error_code(engine.get()) == AILA_ERR_INVALID_ARGUMENT,
            "post-malformed generation did not report uninitialized engine");
+}
+
+void verify_invalid_utf8_generation_response_reaps_worker(const Api& api) {
+    const auto before = child_worker_processes();
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "invalid-utf8-generation", 1024) == 0,
+           "invalid-UTF-8-response test init failed");
+    const auto started = child_worker_processes();
+    DWORD worker_pid = 0;
+    for (DWORD pid : started) {
+        if (before.find(pid) == before.end()) {
+            worker_pid = pid;
+            break;
+        }
+    }
+    expect(worker_pid != 0, "invalid-UTF-8-response worker PID was not observable");
+
+    expect(api.generate(engine.get(), "__aila_invalid_utf8__", nullptr) == nullptr,
+           "invalid UTF-8 response attachment became success");
+    expect(api.last_error_code(engine.get()) == AILA_ERR_RUNTIME,
+           "invalid UTF-8 response returned the wrong error code");
+    expect_contains(
+        api.last_error_message(engine.get()),
+        "UTF-8",
+        "invalid UTF-8 response error was not actionable");
+    for (int attempt = 0; attempt != 100; ++attempt) {
+        const auto current = child_worker_processes();
+        if (current.find(worker_pid) == current.end()) {
+            break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto remaining = child_worker_processes();
+    expect(remaining.find(worker_pid) == remaining.end(),
+           "invalid UTF-8 response did not reap worker");
 }
 
 void test_proxy_abi_and_lifecycle() {
@@ -735,6 +784,7 @@ void test_proxy_abi_and_lifecycle() {
 
     runtime_directory.set(runtime.wstring());
     verify_malformed_generation_response_reaps_worker(api);
+    verify_invalid_utf8_generation_response_reaps_worker(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

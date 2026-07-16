@@ -285,6 +285,10 @@ bool ProxyEngine::generate_text(
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
         return false;
     }
+    if (!simdjson::validate_utf8(input)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must be valid UTF-8");
+        return false;
+    }
     try {
         return generate_payload_locked(
             method,
@@ -312,8 +316,18 @@ bool ProxyEngine::generate_text_v2(
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
         return false;
     }
+    if (config && config->struct_size == 0) {
+        set_error_locked(
+            AILA_ERR_INVALID_ARGUMENT,
+            "generation V2 config struct_size must not be zero");
+        return false;
+    }
     if (input.find('\0') != std::string_view::npos) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must not contain an embedded NUL");
+        return false;
+    }
+    if (!simdjson::validate_utf8(input)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "generation input must be valid UTF-8");
         return false;
     }
     try {
@@ -439,6 +453,12 @@ bool ProxyEngine::generate_payload_locked(
         if (byte == std::byte{0}) {
             throw malformed_response("generation attachment contained an embedded NUL");
         }
+    }
+    if (!response.attachment.empty() &&
+        !simdjson::validate_utf8(
+            reinterpret_cast<const char*>(response.attachment.data()),
+            response.attachment.size())) {
+        throw malformed_response("generation attachment was not valid UTF-8");
     }
     if (response.attachment.empty()) {
         output.clear();
