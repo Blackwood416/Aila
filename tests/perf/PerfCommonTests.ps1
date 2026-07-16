@@ -437,6 +437,13 @@ New-Item -ItemType Directory -Path $failingCompilerBin -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\where.exe') -Destination (Join-Path $failingCompilerBin 'icx-cl.exe')
 
 try {
+    Invoke-Test 'compares median throughput samples using normalized delta' {
+        $summary = Get-AilaMetricComparison -Baseline @(100, 101, 99, 100, 100) -Candidate @(96, 95, 97, 96, 96) -HigherIsBetter
+        Assert-Equal 100.0 $summary.baselineMedian 'baseline median'
+        Assert-Equal 96.0 $summary.candidateMedian 'candidate median'
+        Assert-Equal ([double]-4.0) $summary.deltaPercent 'throughput delta'
+    }
+
     Invoke-Test 'normalizes Aila text across punctuation case and whitespace' {
         Assert-Equal 'hello world 中文 测试' (Normalize-AilaText -Text "  HELLO,`tWorld!  中文—测试。 ") 'normalized text'
         Assert-Equal '' (Normalize-AilaText -Text '') 'empty normalized text'

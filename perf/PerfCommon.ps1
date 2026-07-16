@@ -1108,6 +1108,47 @@ function Parse-AilaBenchmarkOutput {
     }
 }
 
+function Get-AilaMedian {
+    param([Parameter(Mandatory = $true)][double[]]$Values)
+
+    if ($Values.Count -eq 0) {
+        throw 'Cannot calculate median of an empty set.'
+    }
+    foreach ($value in $Values) {
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+            throw 'Median samples must be finite numbers.'
+        }
+    }
+
+    $sorted = @($Values | Sort-Object)
+    $middle = [int]($sorted.Count / 2)
+    if (($sorted.Count % 2) -eq 1) {
+        return [double]$sorted[$middle]
+    }
+    return ([double]$sorted[$middle - 1] + [double]$sorted[$middle]) / 2.0
+}
+
+function Get-AilaMetricComparison {
+    param(
+        [Parameter(Mandatory = $true)][double[]]$Baseline,
+        [Parameter(Mandatory = $true)][double[]]$Candidate,
+        [switch]$HigherIsBetter
+    )
+
+    $baselineMedian = Get-AilaMedian -Values $Baseline
+    $candidateMedian = Get-AilaMedian -Values $Candidate
+    if ($baselineMedian -eq 0.0) {
+        throw 'Cannot compare metrics when the baseline median is zero.'
+    }
+
+    $rawDelta = (($candidateMedian - $baselineMedian) / $baselineMedian) * 100.0
+    return [pscustomobject]@{
+        baselineMedian = [math]::Round($baselineMedian, 4)
+        candidateMedian = [math]::Round($candidateMedian, 4)
+        deltaPercent = [math]::Round($(if ($HigherIsBetter) { $rawDelta } else { -$rawDelta }), 4)
+    }
+}
+
 function Parse-AilaDecodeProfiles {
     param(
         [Parameter(Mandatory = $true)]
