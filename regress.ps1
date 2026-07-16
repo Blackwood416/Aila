@@ -12,6 +12,28 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'perf\PerfCommon.ps1')
 $script:AilaRegressionModelIdentityCache = @{}
 
+function Get-AilaRegressionTokenTrace {
+    param([Parameter(Mandatory = $true)][string]$StderrText)
+    $matches = [regex]::Matches($StderrText, '(?m)^.*\[DebugToken\] step=(?<step>\d+) id=(?<id>-?\d+)')
+    $steps = @($matches | ForEach-Object { [int]$_.Groups['step'].Value })
+    $ids = @($matches | ForEach-Object { [int]$_.Groups['id'].Value })
+    $generated = [regex]::Match($StderrText, '\[GenerateMessages\] Prompt=\d+ Generated=(?<count>\d+)')
+    $generatedCount = if ($generated.Success) { [int]$generated.Groups['count'].Value } else { -1 }
+    $complete = $generated.Success -and $steps.Count -eq $generatedCount -and $ids.Count -eq $generatedCount
+    if ($complete) {
+        for ($i = 0; $i -lt $generatedCount; $i++) {
+            if ($steps[$i] -ne $i -or $ids[$i] -lt 0) { $complete = $false; break }
+        }
+    }
+    return [pscustomobject]@{
+        tokenIds = $ids
+        steps = $steps
+        generatedCount = $generatedCount
+        complete = [bool]$complete
+        source = 'AILA_DEBUG_TOKEN_IDS'
+    }
+}
+
 function Get-AilaRegressionProperty {
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -346,7 +368,7 @@ function Resolve-AilaRegressionCases {
     foreach ($case in $Cases) {
         $name = Get-AilaRegressionString -Object $case -Name 'name' -Context 'Accuracy case'
         $context = "Accuracy case '$name'"
-        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $name.Contains('..')) {
             throw "$context has an unsafe name. Use only letters, digits, dot, underscore, and hyphen."
         }
         $kind = (Get-AilaRegressionString -Object $case -Name 'kind' -Context $context).ToLowerInvariant()
@@ -594,7 +616,15 @@ foreach ($case in $resolvedCases) {
     }
 
     $caseResultPath = Join-Path $resultsDir "$($case.name).json"
-    $run = Invoke-AilaProcess -Executable '.\Aila.exe' -ArgumentList $args -WorkingDirectory $buildDirPath -TimeoutSeconds $CaseTimeoutSeconds
+    $envOverrides = @{}
+    if ($case.kind -eq 'chat') {
+        # Engine.hpp emits prompt/generated token IDs under this diagnostic
+        # flag.  It is bounded to the first 64 generated steps by the engine;
+        # the result records availability so comparison never claims strict
+        # token equality when the trace is incomplete.
+        $envOverrides['AILA_DEBUG_TOKEN_IDS'] = '1'
+    }
+    $run = Invoke-AilaProcess -Executable '.\Aila.exe' -ArgumentList $args -WorkingDirectory $buildDirPath -EnvOverrides $envOverrides -TimeoutSeconds $CaseTimeoutSeconds
     Write-AilaRegressionAtomicText -Path $stdoutPath -Text ([string]$run.stdoutText)
     Write-AilaRegressionAtomicText -Path $stderrPath -Text ([string]$run.stderrText)
     $logArtifacts = [ordered]@{
@@ -665,6 +695,10 @@ foreach ($case in $resolvedCases) {
             $result['rawText'] = $responseText
             $result['normalizedText'] = Normalize-AilaText -Text $responseText
             $result['output'] = $outputArtifact
+            $tokenTrace = Get-AilaRegressionTokenTrace -StderrText ([string]$run.stderrText)
+            $result['generatedTokenIds'] = @($tokenTrace.tokenIds)
+            $result['tokenSequenceAvailable'] = [bool]$tokenTrace.complete
+            $result['tokenSequenceTrace'] = [ordered]@{ source = $tokenTrace.source; tracedCount = $tokenTrace.tokenIds.Count; generatedCount = if ($tokenTrace.generatedCount -ge 0) { $tokenTrace.generatedCount } else { $null }; steps = @($tokenTrace.steps); complete = [bool]$tokenTrace.complete }
             $expectRegexProperty = $case.config.PSObject.Properties['expectRegex']
             $result['expectation'] = if ($null -eq $expectRegexProperty) { $null } else {
                 [ordered]@{ type = 'regex'; pattern = [string]$expectRegexProperty.Value; passed = ($responseText -match [string]$expectRegexProperty.Value) }
