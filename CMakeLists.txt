@@ -267,8 +267,10 @@ add_test(NAME AilaQwen35VisionWeightsTests COMMAND AilaQwen35VisionWeightsTests)
 add_executable(AilaIpcProtocolTests
     tests/runtime/IpcProtocolTests.cpp
     src/ipc/IpcProtocol.cpp
-    src/ipc/Win32Pipe.cpp
 )
+if(WIN32)
+    target_sources(AilaIpcProtocolTests PRIVATE src/ipc/Win32Pipe.cpp)
+endif()
 target_compile_definitions(AilaIpcProtocolTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaIpcProtocolTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

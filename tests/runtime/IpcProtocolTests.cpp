@@ -1,13 +1,20 @@
 #include "ipc/IpcProtocol.hpp"
-#include "ipc/Win32Pipe.hpp"
 
+#ifdef _WIN32
+#include "ipc/Win32Pipe.hpp"
+#endif
+
+#ifdef _WIN32
 #include <algorithm>
 #include <array>
+#endif
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#ifdef _WIN32
 #include <thread>
 #include <utility>
+#endif
 #include <vector>
 
 namespace {
@@ -24,6 +31,7 @@ void expect(bool condition, const char* test_name, const std::string& message) {
     }
 }
 
+#ifdef _WIN32
 class UniqueHandle {
 public:
     UniqueHandle() = default;
@@ -128,6 +136,7 @@ bool write_fragmented(
     }
     return true;
 }
+#endif
 
 std::vector<std::byte> make_raw_frame(
     const std::string& header_json,
@@ -223,6 +232,7 @@ void test_oversized_attachment_is_rejected_from_prefix() {
     expect(error.find("attachment") != std::string::npos, name, "error did not identify attachment bound");
 }
 
+#ifdef _WIN32
 void test_pipe_reads_consecutive_fragmented_frames() {
     constexpr const char* name = "consecutive fragmented pipe frames";
     auto [reader, writer] = create_pipe(name);
@@ -330,6 +340,7 @@ void test_pipe_rejects_truncated_frame_at_eof() {
     expect(sentinel.header.method == original_sentinel.header.method, name, "failed read changed method");
     expect(sentinel.attachment == original_sentinel.attachment, name, "failed read changed attachment");
 }
+#endif
 
 } // namespace
 
@@ -341,9 +352,11 @@ int main() {
         test_oversized_header_is_rejected_from_prefix();
         test_malformed_json_is_rejected();
         test_oversized_attachment_is_rejected_from_prefix();
+#ifdef _WIN32
         test_pipe_reads_consecutive_fragmented_frames();
         test_pipe_write_frame_round_trip();
         test_pipe_rejects_truncated_frame_at_eof();
+#endif
         std::cout << "AilaIpcProtocolTests passed\n";
         return 0;
     } catch (const std::exception& exception) {
