@@ -21,6 +21,12 @@ struct ExpectedHandshake {
 
 using EventHandler = std::function<void(const ipc::Frame&)>;
 
+namespace detail {
+
+bool worker_file_attributes_are_safe(DWORD attributes) noexcept;
+
+} // namespace detail
+
 class WorkerProcess {
 public:
     WorkerProcess();
@@ -37,7 +43,8 @@ public:
         const std::filesystem::path& runtime_directory,
         const std::filesystem::path& worker_executable,
         const ExpectedHandshake& expected,
-        EventHandler event_handler = {});
+        EventHandler event_handler = {},
+        std::chrono::milliseconds handshake_timeout = std::chrono::seconds(2));
 
     ipc::Frame request(
         const ipc::Frame& frame,

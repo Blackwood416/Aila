@@ -783,6 +783,128 @@ void test_worker_crash_fails_request_without_hanging() {
     process.shutdown(500ms);
 }
 
+void test_worker_partial_response_obeys_request_deadline() {
+    constexpr const char* name = "worker partial response deadline";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            (void)process.request(
+                request_frame(78, "test.partial-response"),
+                200ms);
+        },
+        name);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    expect(elapsed < 2s, name, "partial response exceeded the request deadline bound");
+    expect(error.find("timed out") != std::string::npos, name, "error omitted timeout detail");
+    expect(!process.healthy(), name, "timed-out partial-response worker was not reaped");
+    expect(process.exit_code().has_value(), name, "reaped worker exit code was not retained");
+    process.shutdown(500ms);
+}
+
+void test_worker_blocked_write_obeys_request_deadline() {
+    constexpr const char* name = "worker blocked write deadline";
+    EnvironmentRestore mode_restore(L"AILA_FAKE_WORKER_MODE");
+    expect(
+        SetEnvironmentVariableW(L"AILA_FAKE_WORKER_MODE", L"stop-reading") != FALSE,
+        name,
+        "could not configure fake worker mode");
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+
+    std::vector<std::byte> attachment(8 * 1024 * 1024, std::byte{0x5a});
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            (void)process.request(
+                request_frame(79, "test.ping", "{}", std::move(attachment)),
+                200ms);
+        },
+        name);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    expect(elapsed < 2s, name, "blocked request write exceeded the deadline bound");
+    expect(error.find("timed out") != std::string::npos, name, "error omitted timeout detail");
+    expect(!process.healthy(), name, "timed-out blocked-write worker was not reaped");
+    expect(process.exit_code().has_value(), name, "reaped worker exit code was not retained");
+    process.shutdown(500ms);
+}
+
+void test_worker_partial_handshake_obeys_start_deadline() {
+    constexpr const char* name = "worker partial handshake deadline";
+    EnvironmentRestore mode_restore(L"AILA_FAKE_WORKER_MODE");
+    expect(
+        SetEnvironmentVariableW(L"AILA_FAKE_WORKER_MODE", L"partial-handshake") != FALSE,
+        name,
+        "could not configure fake worker mode");
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            process.start(
+                temp.path(),
+                worker,
+                expected_fake_handshake(),
+                {},
+                200ms);
+        },
+        name);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    expect(elapsed < 2s, name, "partial handshake exceeded the start deadline bound");
+    expect(error.find("timed out") != std::string::npos, name, "error omitted timeout detail");
+    expect(!process.healthy(), name, "timed-out handshake worker was not reaped");
+    expect(process.exit_code().has_value(), name, "reaped worker exit code was not retained");
+    process.shutdown(500ms);
+}
+
+void test_worker_executable_reparse_points_are_rejected() {
+    constexpr const char* name = "worker executable reparse containment";
+    expect(
+        aila::runtime::detail::worker_file_attributes_are_safe(FILE_ATTRIBUTE_ARCHIVE),
+        name,
+        "ordinary worker file attributes were rejected");
+    expect(
+        !aila::runtime::detail::worker_file_attributes_are_safe(
+            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_REPARSE_POINT),
+        name,
+        "reparse-point worker attributes were accepted");
+    expect(
+        !aila::runtime::detail::worker_file_attributes_are_safe(FILE_ATTRIBUTE_DIRECTORY),
+        name,
+        "directory worker attributes were accepted");
+    expect(
+        !aila::runtime::detail::worker_file_attributes_are_safe(INVALID_FILE_ATTRIBUTES),
+        name,
+        "invalid worker attributes were accepted");
+
+    TempDirectory temp;
+    const fs::path link = temp.path() / L"AilaWorker.exe";
+    const fs::path target = fs::absolute(fs::path(AILA_FAKE_WORKER_PATH)).lexically_normal();
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    BOOL created = CreateSymbolicLinkW(link.c_str(), target.c_str(), flags);
+    if (created == FALSE && GetLastError() == ERROR_INVALID_PARAMETER) {
+        created = CreateSymbolicLinkW(link.c_str(), target.c_str(), 0);
+    }
+    if (created != FALSE) {
+        aila::runtime::WorkerProcess process;
+        const std::string error = expect_runtime_error(
+            [&] { process.start(temp.path(), link, expected_fake_handshake()); },
+            name);
+        expect(
+            error.find("reparse") != std::string::npos,
+            name,
+            "reparse rejection diagnostic was not actionable: " + error);
+    }
+}
+
 void test_worker_handshake_mismatch_reaps_process() {
     constexpr const char* name = "worker handshake mismatch";
     TempDirectory temp;
@@ -827,6 +949,10 @@ int main() {
         test_worker_request_framing_is_repeatable();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();
+        test_worker_blocked_write_obeys_request_deadline();
+        test_worker_partial_response_obeys_request_deadline();
+        test_worker_partial_handshake_obeys_start_deadline();
+        test_worker_executable_reparse_points_are_rejected();
         test_worker_handshake_mismatch_reaps_process();
         std::cout << "AilaRuntimeIsolationTests passed\n";
         return 0;

@@ -209,6 +209,22 @@ void send_frame(HANDLE handle, const aila::ipc::Frame& frame) {
     }
 }
 
+void send_partial_frame_and_exit(
+    HANDLE handle,
+    const aila::ipc::Frame& frame,
+    UINT exit_code) {
+    const std::vector<std::byte> encoded = aila::ipc::encode_frame(frame);
+    if (encoded.size() < 12) {
+        throw std::runtime_error("encoded fake frame was unexpectedly short");
+    }
+    std::string error;
+    if (!aila::ipc::write_all(handle, encoded.data(), 12, error)) {
+        throw std::runtime_error(error);
+    }
+    Sleep(3000);
+    ExitProcess(exit_code);
+}
+
 int exit_code_from_payload(const std::string& payload_json) {
     simdjson::dom::parser parser;
     simdjson::dom::element root;
@@ -225,6 +241,9 @@ int run(const Handles& handles) {
     aila::ipc::Frame handshake;
     handshake.header.kind = "handshake";
     handshake.header.payload_json = inspection_payload();
+    if (environment_value(L"AILA_FAKE_WORKER_MODE") == L"partial-handshake") {
+        send_partial_frame_and_exit(handles.response_write, handshake, 87);
+    }
     send_frame(handles.response_write, handshake);
 
     aila::ipc::Frame event;
@@ -232,6 +251,11 @@ int run(const Handles& handles) {
     event.header.method = "log";
     event.header.payload_json = "{\"message\":\"fake worker ready\"}";
     send_frame(handles.event_write, event);
+
+    if (environment_value(L"AILA_FAKE_WORKER_MODE") == L"stop-reading") {
+        Sleep(3000);
+        ExitProcess(89);
+    }
 
     for (;;) {
         aila::ipc::Frame command;
@@ -245,6 +269,9 @@ int run(const Handles& handles) {
 
         aila::ipc::Frame response = command;
         response.header.kind = "result";
+        if (command.header.method == "test.partial-response") {
+            send_partial_frame_and_exit(handles.response_write, response, 88);
+        }
         if (command.header.method == "test.inspect") {
             response.header.payload_json = inspection_payload();
             response.attachment.clear();

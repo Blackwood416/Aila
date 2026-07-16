@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -18,6 +19,12 @@
 #include <vector>
 
 namespace aila::runtime {
+
+bool detail::worker_file_attributes_are_safe(DWORD attributes) noexcept {
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -340,46 +347,159 @@ struct WorkerProcess::Impl {
         }
     }
 
-    void wait_for_response_data(Clock::time_point deadline, const char* context) {
-        for (;;) {
-            DWORD available = 0;
-            if (PeekNamedPipe(response_read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE) {
-                fail(std::string(context) + ": " + win32_error("PeekNamedPipe"));
-            }
-            if (available != 0) {
-                return;
-            }
+    struct IoState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool done = false;
+        bool succeeded = false;
+        std::string error;
+        ipc::Frame frame;
+    };
 
-            HANDLE process_handle = nullptr;
+    struct IoOutcome {
+        bool succeeded = false;
+        bool timed_out = false;
+        bool process_exited = false;
+        std::string error;
+        ipc::Frame frame;
+    };
+
+    void terminate_active_process(DWORD code) noexcept {
+        HANDLE process_handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            process_handle = process.get();
+        }
+        if (process_handle == nullptr) {
+            return;
+        }
+        DWORD current_code = 0;
+        if (GetExitCodeProcess(process_handle, &current_code) != FALSE &&
+            current_code == STILL_ACTIVE) {
+            (void)TerminateProcess(process_handle, code);
+        }
+    }
+
+    template <typename Operation>
+    IoOutcome run_cancellable_io(Operation operation, Clock::time_point deadline) {
+        const auto state = std::make_shared<IoState>();
+        std::thread io_thread([state, operation = std::move(operation)]() mutable {
+            ipc::Frame frame;
+            std::string error;
+            bool succeeded = false;
+            try {
+                succeeded = operation(frame, error);
+            } catch (const std::exception& exception) {
+                error = std::string("pipe operation threw: ") + exception.what();
+            } catch (...) {
+                error = "pipe operation threw an unknown exception";
+            }
             {
-                std::lock_guard<std::mutex> lock(state_mutex);
-                process_handle = process.get();
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->succeeded = succeeded;
+                state->error = std::move(error);
+                state->frame = std::move(frame);
+                state->done = true;
             }
-            if (process_handle == nullptr) {
-                fail(std::string(context) + ": worker process is not available");
+            state->condition.notify_all();
+        });
+
+        bool timed_out = false;
+        bool process_exited = false;
+        for (;;) {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            if (state->done) {
+                break;
             }
-            const DWORD wait = bounded_wait_milliseconds(deadline, 10);
-            if (wait == 0) {
-                fail(std::string(context) + " timed out waiting for a response frame");
+            const Clock::time_point now = Clock::now();
+            if (now >= deadline) {
+                timed_out = true;
+                break;
             }
-            const DWORD result = WaitForSingleObject(process_handle, wait);
-            if (result == WAIT_OBJECT_0) {
-                fail(std::string(context) + ": worker exited before responding");
+            const Clock::time_point wake = (std::min)(deadline, now + std::chrono::milliseconds(10));
+            if (state->condition.wait_until(lock, wake, [&] { return state->done; })) {
+                break;
             }
-            if (result == WAIT_FAILED) {
-                fail(std::string(context) + ": " + win32_error("WaitForSingleObject"));
+            lock.unlock();
+
+            if (!is_active()) {
+                std::unique_lock<std::mutex> completion_lock(state->mutex);
+                if (!state->condition.wait_for(
+                        completion_lock,
+                        std::chrono::milliseconds(20),
+                        [&] { return state->done; })) {
+                    process_exited = true;
+                }
+                break;
             }
+        }
+
+        if (timed_out || process_exited) {
+            (void)CancelSynchronousIo(io_thread.native_handle());
+            if (timed_out) {
+                terminate_active_process(ERROR_TIMEOUT);
+            }
+        }
+        io_thread.join();
+
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return {
+            state->succeeded,
+            timed_out,
+            process_exited,
+            std::move(state->error),
+            std::move(state->frame),
+        };
+    }
+
+    [[noreturn]] void timeout_failure(std::string context) {
+        cleanup(true, ERROR_TIMEOUT);
+        context += " timed out";
+        if (const std::optional<DWORD> code = query_exit_code()) {
+            context += "; worker exited with code " + std::to_string(*code);
+        }
+        set_error(context);
+        throw std::runtime_error(context);
+    }
+
+    void write_request(
+        const ipc::Frame& frame,
+        Clock::time_point deadline,
+        const char* context) {
+        const HANDLE handle = command_write.get();
+        IoOutcome outcome = run_cancellable_io(
+            [handle, &frame](ipc::Frame&, std::string& error) {
+                return ipc::write_frame(handle, frame, error);
+            },
+            deadline);
+        if (outcome.timed_out) {
+            timeout_failure(std::string(context) + " while writing");
+        }
+        if (outcome.process_exited) {
+            fail(std::string(context) + ": worker exited during request write");
+        }
+        if (!outcome.succeeded) {
+            fail(std::string(context) + ": " + outcome.error);
         }
     }
 
     ipc::Frame read_response(Clock::time_point deadline, const char* context) {
-        wait_for_response_data(deadline, context);
-        ipc::Frame frame;
-        std::string read_error;
-        if (!ipc::read_frame(response_read.get(), frame, read_error)) {
-            fail(std::string(context) + ": " + read_error);
+        const HANDLE handle = response_read.get();
+        IoOutcome outcome = run_cancellable_io(
+            [handle](ipc::Frame& frame, std::string& error) {
+                return ipc::read_frame(handle, frame, error);
+            },
+            deadline);
+        if (outcome.timed_out) {
+            timeout_failure(std::string(context) + " while reading");
         }
-        return frame;
+        if (outcome.process_exited) {
+            fail(std::string(context) + ": worker exited before completing its response");
+        }
+        if (!outcome.succeeded) {
+            fail(std::string(context) + ": " + outcome.error);
+        }
+        return std::move(outcome.frame);
     }
 
     void validate_handshake(
@@ -488,7 +608,8 @@ void WorkerProcess::start(
     const fs::path& runtime_directory,
     const fs::path& worker_executable,
     const ExpectedHandshake& expected,
-    EventHandler event_handler) {
+    EventHandler event_handler,
+    std::chrono::milliseconds handshake_timeout) {
     std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
     {
         std::lock_guard<std::mutex> state_lock(impl_->state_mutex);
@@ -501,6 +622,9 @@ void WorkerProcess::start(
     }
 
     try {
+        if (handshake_timeout.count() <= 0) {
+            throw std::runtime_error("worker handshake timeout must be positive");
+        }
         const fs::path normalized_runtime = normalized_absolute(runtime_directory);
         const fs::path normalized_worker = normalized_absolute(worker_executable);
         std::error_code filesystem_error;
@@ -508,6 +632,18 @@ void WorkerProcess::start(
             throw std::runtime_error(
                 "worker runtime directory is not an existing directory: '" +
                 utf8(normalized_runtime.wstring()) + "'");
+        }
+        const DWORD worker_attributes = GetFileAttributesW(normalized_worker.c_str());
+        if ((worker_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
+            worker_attributes != INVALID_FILE_ATTRIBUTES) {
+            throw std::runtime_error(
+                "worker executable must not be a reparse point: '" +
+                utf8(normalized_worker.wstring()) + "'");
+        }
+        if (!detail::worker_file_attributes_are_safe(worker_attributes)) {
+            throw std::runtime_error(
+                "worker executable is not a contained regular file: '" +
+                utf8(normalized_worker.wstring()) + "'");
         }
         filesystem_error.clear();
         if (!fs::is_regular_file(normalized_worker, filesystem_error) || filesystem_error) {
@@ -610,7 +746,7 @@ void WorkerProcess::start(
         });
 
         const ipc::Frame handshake = impl_->read_response(
-            Clock::now() + std::chrono::seconds(2),
+            Clock::now() + handshake_timeout,
             "worker handshake");
         impl_->validate_handshake(
             handshake,
@@ -636,14 +772,9 @@ ipc::Frame WorkerProcess::request(
         impl_->fail("cannot send a request because the worker is not healthy");
     }
 
-    std::string write_error;
-    if (!ipc::write_frame(impl_->command_write.get(), frame, write_error)) {
-        impl_->fail("could not write worker request: " + write_error);
-    }
-
-    const ipc::Frame response = impl_->read_response(
-        Clock::now() + timeout,
-        "worker request");
+    const Clock::time_point deadline = Clock::now() + timeout;
+    impl_->write_request(frame, deadline, "worker request");
+    const ipc::Frame response = impl_->read_response(deadline, "worker request");
     if (response.header.protocol != impl_->expected.protocol) {
         impl_->fail("worker response protocol did not match the handshake");
     }
@@ -695,8 +826,17 @@ void WorkerProcess::shutdown(std::chrono::milliseconds timeout) {
         shutdown_frame.header.request_id = (std::numeric_limits<uint64_t>::max)();
         shutdown_frame.header.kind = "request";
         shutdown_frame.header.method = "shutdown";
-        std::string ignored_error;
-        (void)ipc::write_frame(impl_->command_write.get(), shutdown_frame, ignored_error);
+        const HANDLE command_handle = impl_->command_write.get();
+        Impl::IoOutcome outcome = impl_->run_cancellable_io(
+            [command_handle, &shutdown_frame](ipc::Frame&, std::string& error) {
+                return ipc::write_frame(command_handle, shutdown_frame, error);
+            },
+            deadline);
+        if (outcome.timed_out) {
+            impl_->set_error("worker shutdown timed out while writing; process was terminated");
+        } else if (!outcome.succeeded && !outcome.process_exited) {
+            impl_->set_error("worker shutdown write failed: " + outcome.error);
+        }
     }
     impl_->command_write.reset();
 
