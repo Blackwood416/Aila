@@ -365,6 +365,7 @@ void test_hidden_drive_environment_entries_are_preserved() {
     constexpr const char* name = "hidden drive environment entries";
     const std::vector<wchar_t> source = make_environment_block({
         L"=D:=D:\\work",
+        L"=ExitCode=00000000",
         L"AILA_LOG_LEVEL=debug",
         L"Path=C:\\HostPython",
     });
@@ -373,6 +374,10 @@ void test_hidden_drive_environment_entries_are_preserved() {
 
     expect(inherited.size() == 3, name, "synthetic environment entry count changed");
     expect(inherited.at(L"=d:") == L"D:\\work", name, "hidden drive entry was not parsed");
+    expect(
+        inherited.find(L"=ExitCode") == inherited.end(),
+        name,
+        "non-drive native pseudo entry was not skipped");
     expect(inherited.at(L"aila_log_level") == L"debug", name, "ordinary entry was not parsed");
 
     const std::vector<wchar_t> isolated = aila::runtime::build_isolated_environment(
