@@ -278,6 +278,19 @@ target_include_directories(AilaIpcProtocolTests PRIVATE
 target_link_libraries(AilaIpcProtocolTests PRIVATE simdjson)
 add_test(NAME AilaIpcProtocolTests COMMAND AilaIpcProtocolTests)
 
+if(WIN32)
+    add_executable(AilaRuntimeIsolationTests
+        tests/runtime/RuntimeIsolationTests.cpp
+        src/runtime/RuntimeDirectory.cpp
+        src/runtime/ChildEnvironment.cpp
+    )
+    target_compile_definitions(AilaRuntimeIsolationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(AilaRuntimeIsolationTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME AilaRuntimeIsolationTests COMMAND AilaRuntimeIsolationTests)
+endif()
+
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
 # ============================================================
