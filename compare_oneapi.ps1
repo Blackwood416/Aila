@@ -29,7 +29,7 @@ $script:ReportSchemaVersion = 1
 function Invoke-CheckedPwsh {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
-    & pwsh -NoProfile @Arguments
+    & pwsh -NoProfile @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "Child PowerShell failed: pwsh $($Arguments -join ' ')"
     }
@@ -520,6 +520,9 @@ function Invoke-AilaFullComparison {
 function Invoke-SelfTest {
     $failures = [System.Collections.Generic.List[string]]::new()
     function Check([bool]$Condition, [string]$Name) { if (-not $Condition) { $failures.Add($Name) } }
+
+    $childOutput = @(Invoke-CheckedPwsh -Arguments @('-Command', "'child-output'"))
+    Check ($childOutput.Count -eq 0) 'child PowerShell output does not pollute function return values'
 
     $throughput = Get-AilaMetricComparison -Baseline @(100, 101, 99, 100, 100) -Candidate @(96, 95, 97, 96, 96) -HigherIsBetter
     Check ($throughput.deltaPercent -eq -4.0 -and (Test-AilaGate $throughput -MinimumDeltaPercent -5.0)) 'median -4 throughput pass'
