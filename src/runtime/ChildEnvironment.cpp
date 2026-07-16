@@ -26,15 +26,27 @@ struct EnvironmentStringsDeleter {
 
 using EnvironmentStrings = std::unique_ptr<wchar_t, EnvironmentStringsDeleter>;
 
+bool is_hidden_drive_name(const std::wstring& name) {
+    return name.size() == 3 && name[0] == L'=' &&
+        ((name[1] >= L'A' && name[1] <= L'Z') ||
+         (name[1] >= L'a' && name[1] <= L'z')) &&
+        name[2] == L':';
+}
+
 void validate_entry(const std::wstring& name, const std::wstring& value) {
     if (name.empty()) {
         throw std::runtime_error("child environment contains an empty variable name");
     }
-    if (name.find(L'=') != std::wstring::npos) {
-        throw std::runtime_error("child environment variable name contains '='");
-    }
     if (name.find(L'\0') != std::wstring::npos) {
         throw std::runtime_error("child environment variable name contains an embedded NUL");
+    }
+    if (name.front() == L'=') {
+        if (!is_hidden_drive_name(name)) {
+            throw std::runtime_error(
+                "hidden drive environment name must have the form =<ASCII drive letter>:");
+        }
+    } else if (name.find(L'=') != std::wstring::npos) {
+        throw std::runtime_error("child environment variable name contains '='");
     }
     if (value.find(L'\0') != std::wstring::npos) {
         throw std::runtime_error("child environment variable value contains an embedded NUL");
@@ -76,6 +88,46 @@ bool CaseInsensitiveLess::operator()(
     return left.size() < right.size();
 }
 
+EnvironmentMap parse_environment_block(const std::vector<wchar_t>& block) {
+    if (block.size() < 2 || block[block.size() - 1] != L'\0' ||
+        block[block.size() - 2] != L'\0') {
+        throw std::runtime_error("environment block is not double-NUL terminated");
+    }
+    EnvironmentMap result;
+    size_t offset = 0;
+    while (offset + 1 < block.size() && block[offset] != L'\0') {
+        const auto terminator =
+            std::find(block.begin() + static_cast<std::ptrdiff_t>(offset), block.end(), L'\0');
+        if (terminator == block.end()) {
+            throw std::runtime_error("environment block entry is not NUL terminated");
+        }
+        const std::wstring entry(
+            block.begin() + static_cast<std::ptrdiff_t>(offset),
+            terminator);
+        const size_t separator =
+            entry.front() == L'=' ? entry.find(L'=', 1) : entry.find(L'=');
+        if (separator == std::wstring::npos) {
+            throw std::runtime_error("environment block entry has no value separator");
+        }
+        const std::wstring name = entry.substr(0, separator);
+        const std::wstring value = entry.substr(separator + 1);
+        // cmd.exe can add private '='-prefixed entries that are not per-drive
+        // current directories; keep omitting those legacy pseudo variables.
+        if (name.front() == L'=' && !is_hidden_drive_name(name)) {
+            offset += entry.size() + 1;
+            continue;
+        }
+        validate_entry(name, value);
+        result.insert_or_assign(name, value);
+        offset += entry.size() + 1;
+    }
+    if ((block.size() != 2 || block.front() != L'\0') &&
+        offset != block.size() - 1) {
+        throw std::runtime_error("environment block contains an early terminator");
+    }
+    return result;
+}
+
 EnvironmentMap current_environment() {
     EnvironmentStrings strings(GetEnvironmentStringsW());
     if (!strings) {
@@ -85,22 +137,17 @@ EnvironmentMap current_environment() {
             "GetEnvironmentStringsW failed");
     }
 
-    EnvironmentMap result;
-    const wchar_t* entry = strings.get();
-    while (*entry != L'\0') {
-        const std::wstring value(entry);
-        entry += value.size() + 1;
-
-        if (value.empty() || value.front() == L'=') {
-            continue;
-        }
-        const size_t equals = value.find(L'=');
-        if (equals == std::wstring::npos || equals == 0) {
-            continue;
-        }
-        result.insert_or_assign(value.substr(0, equals), value.substr(equals + 1));
+    const wchar_t* begin = strings.get();
+    const wchar_t* end = begin;
+    while (*end != L'\0') {
+        end += std::wstring(end).size() + 1;
     }
-    return result;
+    ++end;
+    std::vector<wchar_t> block(begin, end);
+    if (block.size() == 1) {
+        block.push_back(L'\0');
+    }
+    return parse_environment_block(block);
 }
 
 fs::path system_root_directory() {

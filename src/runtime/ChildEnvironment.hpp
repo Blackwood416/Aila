@@ -13,6 +13,8 @@ struct CaseInsensitiveLess {
 
 using EnvironmentMap = std::map<std::wstring, std::wstring, CaseInsensitiveLess>;
 
+EnvironmentMap parse_environment_block(const std::vector<wchar_t>& block);
+
 EnvironmentMap current_environment();
 
 std::filesystem::path system_root_directory();

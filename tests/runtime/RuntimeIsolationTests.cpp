@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -281,7 +282,7 @@ struct ParsedEnvironment {
     std::vector<std::wstring> names;
 };
 
-ParsedEnvironment parse_environment_block(
+ParsedEnvironment parse_serialized_environment(
     const std::vector<wchar_t>& block,
     const char* test_name) {
     expect(block.size() >= 2, test_name, "environment block was too small");
@@ -297,8 +298,9 @@ ParsedEnvironment parse_environment_block(
         const auto end = std::find(block.begin() + static_cast<std::ptrdiff_t>(offset), block.end(), L'\0');
         expect(end != block.end(), test_name, "entry lacked terminator");
         const std::wstring entry(block.begin() + static_cast<std::ptrdiff_t>(offset), end);
-        const size_t equals = entry.find(L'=');
-        expect(equals != std::wstring::npos && equals != 0, test_name, "malformed environment entry");
+        const size_t equals =
+            entry.front() == L'=' ? entry.find(L'=', 1) : entry.find(L'=');
+        expect(equals != std::wstring::npos, test_name, "malformed environment entry");
         const std::wstring key = entry.substr(0, equals);
         const std::wstring value = entry.substr(equals + 1);
         expect(parsed.values.emplace(key, value).second, test_name, "duplicate case-insensitive key");
@@ -307,6 +309,20 @@ ParsedEnvironment parse_environment_block(
     }
     expect(offset == block.size() - 1, test_name, "block terminated before its final NUL");
     return parsed;
+}
+
+std::vector<wchar_t> make_environment_block(
+    std::initializer_list<std::wstring> entries) {
+    std::vector<wchar_t> block;
+    for (const std::wstring& entry : entries) {
+        block.insert(block.end(), entry.begin(), entry.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    if (block.size() == 1) {
+        block.push_back(L'\0');
+    }
+    return block;
 }
 
 void test_isolated_environment_replaces_path() {
@@ -324,7 +340,7 @@ void test_isolated_environment_replaces_path() {
 
     const std::vector<wchar_t> block =
         aila::runtime::build_isolated_environment(inherited, runtime, system_root);
-    const ParsedEnvironment parsed = parse_environment_block(block, name);
+    const ParsedEnvironment parsed = parse_serialized_environment(block, name);
 
     expect(parsed.values.size() == 3, name, "variable count changed unexpectedly");
     expect(parsed.values.at(L"AILA_LOG_LEVEL") == L"debug", name, "AILA variable changed");
@@ -345,6 +361,34 @@ void test_isolated_environment_replaces_path() {
     }
 }
 
+void test_hidden_drive_environment_entries_are_preserved() {
+    constexpr const char* name = "hidden drive environment entries";
+    const std::vector<wchar_t> source = make_environment_block({
+        L"=D:=D:\\work",
+        L"AILA_LOG_LEVEL=debug",
+        L"Path=C:\\HostPython",
+    });
+    const aila::runtime::EnvironmentMap inherited =
+        aila::runtime::parse_environment_block(source);
+
+    expect(inherited.size() == 3, name, "synthetic environment entry count changed");
+    expect(inherited.at(L"=d:") == L"D:\\work", name, "hidden drive entry was not parsed");
+    expect(inherited.at(L"aila_log_level") == L"debug", name, "ordinary entry was not parsed");
+
+    const std::vector<wchar_t> isolated = aila::runtime::build_isolated_environment(
+        inherited,
+        fs::path(L"C:\\Aila Runtime"),
+        fs::path(L"C:\\Windows"));
+    const ParsedEnvironment parsed = parse_serialized_environment(isolated, name);
+    expect(parsed.values.size() == 3, name, "hidden drive entry changed variable count");
+    expect(parsed.values.at(L"=D:") == L"D:\\work", name, "hidden drive entry changed");
+    expect(parsed.values.at(L"AILA_LOG_LEVEL") == L"debug", name, "AILA entry changed");
+    expect(parsed.names.front() == L"=D:", name, "hidden drive entry was not sorted first");
+
+    const std::wstring first_entry(isolated.data());
+    expect(first_entry == L"=D:=D:\\work", name, "hidden drive entry was not serialized exactly");
+}
+
 void test_isolated_environment_validates_entries() {
     constexpr const char* name = "isolated child environment validation";
     const fs::path runtime = L"C:\\runtime";
@@ -353,6 +397,16 @@ void test_isolated_environment_validates_entries() {
     aila::runtime::EnvironmentMap bad_equals{{L"BAD=NAME", L"value"}};
     (void)expect_runtime_error(
         [&] { (void)aila::runtime::build_isolated_environment(bad_equals, runtime, system_root); },
+        name);
+
+    aila::runtime::EnvironmentMap bad_hidden_drive{{L"=1:", L"C:\\work"}};
+    (void)expect_runtime_error(
+        [&] {
+            (void)aila::runtime::build_isolated_environment(
+                bad_hidden_drive,
+                runtime,
+                system_root);
+        },
         name);
 
     aila::runtime::EnvironmentMap bad_name_nul;
@@ -368,7 +422,7 @@ void test_isolated_environment_validates_entries() {
         name);
 
     aila::runtime::EnvironmentMap equals_in_value{{L"LEGAL", L"left=right"}};
-    const ParsedEnvironment parsed = parse_environment_block(
+    const ParsedEnvironment parsed = parse_serialized_environment(
         aila::runtime::build_isolated_environment(equals_in_value, runtime, system_root),
         name);
     expect(parsed.values.at(L"LEGAL") == L"left=right", name, "equals in value was not preserved");
@@ -407,6 +461,7 @@ int main() {
         test_worker_validation();
         test_runtime_directory_override_reads_unicode();
         test_isolated_environment_replaces_path();
+        test_hidden_drive_environment_entries_are_preserved();
         test_isolated_environment_validates_entries();
         test_current_environment_and_system_root();
         test_proxy_module_path();
