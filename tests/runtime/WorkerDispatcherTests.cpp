@@ -268,6 +268,29 @@ void test_init_failure_propagates_engine_error() {
            "engine error message changed");
 }
 
+void test_init_rejects_embedded_nul_model() {
+    constexpr const char* name = "engine.init rejects embedded NUL model path";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    const Frame command = request(
+        75,
+        "engine.init",
+        R"({"model":"safe\u0000suffix","maxSeqLen":1024})");
+
+    bool should_shutdown = false;
+    const Frame response = dispatcher.dispatch(command, should_shutdown);
+
+    expect_response_identity(response, command, "error", name);
+    expect(payload_integer(response, "code", name) == AILA_ERR_INVALID_ARGUMENT,
+           name,
+           "embedded NUL returned the wrong code");
+    expect(payload_string(response, "message", name).find("NUL") != std::string::npos,
+           name,
+           "embedded NUL message was not useful");
+    expect(state.init_calls == 0, name, "embedded NUL model reached engine init");
+}
+
 void test_shutdown_sets_flag_and_destroys_engine_once() {
     constexpr const char* name = "shutdown sets flag and destroys engine once";
     EngineState state;
@@ -349,6 +372,7 @@ int main() {
         test_context_reset_and_second_init_are_deterministic();
         test_invalid_requests_return_structured_errors();
         test_init_failure_propagates_engine_error();
+        test_init_rejects_embedded_nul_model();
         test_shutdown_sets_flag_and_destroys_engine_once();
         test_protocol_and_abi_mismatches_are_rejected();
         test_ping_and_exception_containment();

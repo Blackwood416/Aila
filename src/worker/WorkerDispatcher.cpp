@@ -40,6 +40,10 @@ std::string json_string(std::string_view value) {
     return result;
 }
 
+bool require_c_string_safe(std::string_view value) {
+    return value.find('\0') == std::string_view::npos;
+}
+
 ipc::Frame response_base(const ipc::Frame& request, std::string kind) {
     ipc::Frame response;
     response.header.protocol = request.header.protocol;
@@ -118,6 +122,12 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
                     request,
                     AILA_ERR_INVALID_ARGUMENT,
                     "engine.init field 'model' must be a non-empty UTF-8 string");
+            }
+            if (!require_c_string_safe(model)) {
+                return error(
+                    request,
+                    AILA_ERR_INVALID_ARGUMENT,
+                    "engine.init field 'model' must not contain an embedded NUL");
             }
 
             int64_t max_seq_len = 0;
