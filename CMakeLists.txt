@@ -22,6 +22,34 @@ project (Aila CXX)
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
 
+set(AILA_PUBLIC_API_VERSION "0.1.6")
+set(AILA_PUBLIC_ABI_VERSION "1")
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE AILA_GIT_REVISION_RESULT
+        OUTPUT_VARIABLE AILA_GIT_REVISION
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+endif()
+string(LENGTH "${AILA_GIT_REVISION}" AILA_GIT_REVISION_LENGTH)
+if(NOT Git_FOUND OR
+   NOT AILA_GIT_REVISION_RESULT EQUAL 0 OR
+   NOT AILA_GIT_REVISION MATCHES "^[0-9a-fA-F]+$" OR
+   NOT AILA_GIT_REVISION_LENGTH EQUAL 40)
+    set(AILA_GIT_REVISION "git-unavailable")
+    message(WARNING
+        "Git revision is unavailable; using deterministic AILA_BUILD_ID fallback")
+endif()
+set(AILA_BUILD_ID
+    "aila-${AILA_PUBLIC_API_VERSION}-abi${AILA_PUBLIC_ABI_VERSION}-${AILA_GIT_REVISION}")
+add_library(AilaBuildIdentity INTERFACE)
+target_compile_definitions(AilaBuildIdentity INTERFACE
+    "AILA_BUILD_ID=\"${AILA_BUILD_ID}\"")
+
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
     message(FATAL_ERROR "Aila requires the Intel oneAPI DPC++/C++ Compiler")
 endif()
@@ -279,6 +307,48 @@ target_link_libraries(AilaIpcProtocolTests PRIVATE simdjson)
 add_test(NAME AilaIpcProtocolTests COMMAND AilaIpcProtocolTests)
 
 if(WIN32)
+    get_filename_component(AILA_WORKER_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(AILA_WORKER_COMPILER_ROOT
+        "${AILA_WORKER_COMPILER_BIN_DIR}/.." ABSOLUTE)
+
+    add_executable(AilaWorker
+        src/worker/WorkerMain.cpp
+        src/worker/WorkerDispatcher.cpp
+        src/ipc/IpcProtocol.cpp
+        src/ipc/Win32Pipe.cpp
+    )
+    target_compile_definitions(AilaWorker PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        AILA_STATIC_LIB
+    )
+    target_include_directories(AilaWorker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_directories(AilaWorker PRIVATE
+        "${AILA_WORKER_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaWorker PRIVATE AilaLib simdjson AilaBuildIdentity)
+
+    add_executable(AilaWorkerDispatcherTests
+        tests/runtime/WorkerDispatcherTests.cpp
+        src/worker/WorkerDispatcher.cpp
+        src/ipc/IpcProtocol.cpp
+    )
+    target_compile_definitions(AilaWorkerDispatcherTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaWorkerDispatcherTests PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaWorkerDispatcherTests PRIVATE -fno-sycl)
+    target_include_directories(AilaWorkerDispatcherTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_directories(AilaWorkerDispatcherTests PRIVATE
+        "${AILA_WORKER_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaWorkerDispatcherTests PRIVATE simdjson)
+    add_test(NAME AilaWorkerDispatcherTests COMMAND AilaWorkerDispatcherTests)
+
     add_executable(AilaFakeWorker
         tests/runtime/FakeWorkerMain.cpp
         src/ipc/IpcProtocol.cpp
