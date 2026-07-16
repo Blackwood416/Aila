@@ -707,6 +707,42 @@ void test_worker_request_framing_is_repeatable() {
     process.shutdown(2s);
 }
 
+void test_worker_stream_preserves_unrelated_log_events() {
+    constexpr const char* name = "worker stream preserves unrelated logs";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+    aila::ipc::Frame initialized;
+    try {
+        initialized = process.request(
+            request_frame(51, "engine.init", R"({"model":"m","maxSeqLen":1024})"), 2s);
+    } catch (const std::exception& exception) {
+        fail(name, std::string("engine init transport failed: ") + exception.what());
+    }
+    expect(initialized.header.kind == "result", name, "fake engine init failed");
+
+    size_t stream_events = 0;
+    const aila::ipc::Frame response = process.request_stream(
+        request_frame(52, "generate.stream", R"({"input":"x","config":null})"),
+        [&](const aila::ipc::Frame& event) {
+            ++stream_events;
+            if (event.header.payload_json.find("\"event\":\"end\"") != std::string::npos) {
+                return aila::runtime::WorkerProcess::StreamEventAction::End;
+            }
+            return aila::runtime::WorkerProcess::StreamEventAction::Continue;
+        },
+        2s);
+    expect(response.header.kind == "result", name, "stream request failed");
+    expect(stream_events == 3, name, "stream event count changed");
+    const auto unrelated = process.take_events();
+    expect(unrelated.size() == 1 && unrelated.front().header.method == "log" &&
+               unrelated.front().header.request_id == 0,
+           name,
+           "unrelated ready log was consumed by active stream");
+    process.shutdown(2s);
+}
+
 void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
     constexpr const char* name = "worker graceful shutdown";
     const DWORD handles_before = process_handle_count();
@@ -984,6 +1020,7 @@ int main() {
         test_proxy_module_path();
         test_worker_start_isolates_process_context_and_queues_events();
         test_worker_request_framing_is_repeatable();
+        test_worker_stream_preserves_unrelated_log_events();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();
         test_worker_blocked_write_obeys_request_deadline();

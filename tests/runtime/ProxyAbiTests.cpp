@@ -527,6 +527,17 @@ void verify_streaming_generation(const Api& api, AilaEngine* engine) {
     take_string(api, api.generate(engine, "after-stream-abort", nullptr),
                 "worker use after cooperative stream abort");
 
+    TokenStreamCapture short_abort{std::this_thread::get_id()};
+    short_abort.abort_first = true;
+    expect(api.generate_stream(
+               engine, "__aila_stream_short_abort__", nullptr,
+               capture_token, &short_abort) == 1,
+           "naturally completed callback abort did not return 1");
+    expect(short_abort.tokens.size() == 1,
+           "short stream invoked host callback after abort");
+    take_string(api, api.generate(engine, "after-short-stream-abort", nullptr),
+                "worker use after short stream abort race");
+
     AilaGenConfigV2 v2 = api.default_config_v2();
     StructuredCapture structured{std::this_thread::get_id()};
     const int structured_status = api.generate_chat_json_stream_ex(
@@ -812,9 +823,13 @@ void verify_malformed_stream_events_reap_worker(const Api& api) {
         "__aila_stream_bad_byte_count__",
         "__aila_stream_bad_utf8__",
         "__aila_stream_bad_identity__",
+        "__aila_stream_bad_request_id__",
         "__aila_stream_bad_protocol__",
         "__aila_stream_bad_nul__",
         "__aila_stream_bad_schema__",
+        "__aila_stream_duplicate_end__",
+        "__aila_stream_post_end_data__",
+        "__aila_stream_unsolicited_abort__",
         "__aila_stream_early_exit__",
     };
     for (const char* marker : token_cases) {
@@ -828,8 +843,11 @@ void verify_malformed_stream_events_reap_worker(const Api& api) {
         }
         expect(pid != 0, "malformed stream worker PID was not observable");
         TokenStreamCapture capture{std::this_thread::get_id()};
+        const auto started_at = std::chrono::steady_clock::now();
         expect(api.generate_stream(engine.get(), marker, nullptr, capture_token, &capture) == -1,
                std::string("malformed stream event succeeded: ") + marker);
+        expect(std::chrono::steady_clock::now() - started_at < 2s,
+               std::string("malformed stream failure was not prompt: ") + marker);
         expect(api.last_error_code(engine.get()) == AILA_ERR_RUNTIME,
                "malformed stream event returned the wrong error");
         for (int attempt = 0; attempt != 100; ++attempt) {

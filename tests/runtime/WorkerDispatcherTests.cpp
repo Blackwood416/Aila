@@ -644,6 +644,8 @@ void test_stream_dispatcher_emits_correlated_token_and_structured_events() {
             cancelled);
         expect(response.header.kind == "result", name, "token stream failed");
         expect(payload_integer(response, "status", name) == 0, name, "token status changed");
+        expect(payload_integer(response, "eventCount", name) == 3,
+               name, "token eventCount did not include terminal event");
         expect(events.size() == 2, name, "token event count changed");
         expect(events[0].header.request_id == 170 && events[0].header.method == entry.first,
                name, "token event identity changed");
@@ -666,6 +668,8 @@ void test_stream_dispatcher_emits_correlated_token_and_structured_events() {
         cancelled);
     expect(payload_integer(structured_response, "status", name) == 0,
            name, "structured status changed");
+    expect(payload_integer(structured_response, "eventCount", name) == 2,
+           name, "structured eventCount did not include terminal event");
     expect(structured.size() == 1, name, "structured event count changed");
     expect(payload_string(structured[0], "event", name) == "structured",
            name, "structured event kind changed");
@@ -678,6 +682,16 @@ void test_stream_dispatcher_emits_correlated_token_and_structured_events() {
     expect(payload["argumentsDelta"].get_string().get(arguments) == simdjson::SUCCESS &&
                arguments.empty(),
            name, "empty string became NULL");
+
+    cancelled.store(true);
+    const Frame cancelled_response = dispatcher.dispatch_stream(
+        request(172, "generate.stream", R"({"input":"cancel","config":null})"),
+        [](const Frame&) { return true; },
+        cancelled);
+    expect(payload_integer(cancelled_response, "status", name) == 1,
+           name, "pre-observed cancellation status changed");
+    expect(payload_integer(cancelled_response, "eventCount", name) == 1,
+           name, "cancelled eventCount omitted terminal event");
 }
 
 } // namespace

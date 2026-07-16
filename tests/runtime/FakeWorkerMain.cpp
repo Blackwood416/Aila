@@ -355,6 +355,10 @@ int run(const Handles& handles) {
         if (command.header.method == "test.exit") {
             ExitProcess(static_cast<UINT>(exit_code_from_payload(command.header.payload_json)));
         }
+        if (command.header.method == "cancel" &&
+            command.header.payload_json.find("requestId") != std::string::npos) {
+            continue;
+        }
 
         aila::ipc::Frame response = command;
         response.header.kind = "result";
@@ -409,6 +413,11 @@ int run(const Handles& handles) {
                            lifecycle_error(command, 1, "engine is not initialized"));
                 continue;
             }
+            size_t event_count = 0;
+            auto send_stream_event = [&](const aila::ipc::Frame& value) {
+                send_frame(handles.event_write, value);
+                ++event_count;
+            };
             if (command.header.method == "generate.chat_json_stream_ex") {
                 aila::ipc::Frame structured = stream_event(
                     command,
@@ -417,7 +426,7 @@ int run(const Handles& handles) {
                     structured.header.payload_json =
                         R"({"event":"structured","structSize":64,"type":99,"text":null,"toolCallId":null,"toolName":null,"argumentsDelta":null,"finishReason":null,"warningsJson":null,"toolCallsJson":null})";
                 }
-                send_frame(handles.event_write, structured);
+                send_stream_event(structured);
             } else {
                 aila::ipc::Frame first = stream_event(
                     command, R"({"event":"token","byteCount":5})", "first");
@@ -428,6 +437,8 @@ int run(const Handles& handles) {
                     first = stream_event(command, R"({"event":"token","byteCount":2})", invalid);
                 } else if (command.header.payload_json.find("__aila_stream_bad_identity__") != std::string::npos) {
                     first.header.method = "wrong.stream";
+                } else if (command.header.payload_json.find("__aila_stream_bad_request_id__") != std::string::npos) {
+                    ++first.header.request_id;
                 } else if (command.header.payload_json.find("__aila_stream_bad_protocol__") != std::string::npos) {
                     ++first.header.protocol;
                 } else if (command.header.payload_json.find("__aila_stream_bad_nul__") != std::string::npos) {
@@ -437,7 +448,7 @@ int run(const Handles& handles) {
                 } else if (command.header.payload_json.find("__aila_stream_bad_schema__") != std::string::npos) {
                     first.header.payload_json = R"({"event":"token"})";
                 }
-                send_frame(handles.event_write, first);
+                send_stream_event(first);
             }
 
             if (command.header.payload_json.find("__aila_stream_early_exit__") != std::string::npos) {
@@ -448,15 +459,22 @@ int run(const Handles& handles) {
                 command.header.payload_json.find("__aila_stream_response_before_end__") !=
                 std::string::npos;
             if (response_before_end) {
-                response.header.payload_json = "{\"status\":0}";
+                response.header.payload_json = "{\"status\":0,\"eventCount\":3}";
                 response.attachment.clear();
                 send_frame(handles.response_write, response);
             }
 
-            Sleep(30);
+            const bool short_abort_race =
+                command.header.payload_json.find("__aila_stream_short_abort__") !=
+                std::string::npos;
+            if (!short_abort_race) {
+                Sleep(30);
+            }
             bool cancelled = false;
             DWORD pending = 0;
-            if (PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) && pending != 0) {
+            if (!short_abort_race &&
+                PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) &&
+                pending != 0) {
                 aila::ipc::Frame control;
                 if (aila::ipc::read_frame(handles.command_read, control, error) &&
                     control.header.method == "cancel" &&
@@ -465,16 +483,34 @@ int run(const Handles& handles) {
                 }
             }
             if (!cancelled && command.header.method != "generate.chat_json_stream_ex") {
-                send_frame(
-                    handles.event_write,
+                send_stream_event(
                     stream_event(command, R"({"event":"token","byteCount":7})", u8" 第二"));
             }
-            send_frame(handles.event_write, stream_event(command, R"({"event":"end"})"));
+            const uint64_t terminal_count = static_cast<uint64_t>(event_count + 1);
+            send_stream_event(stream_event(
+                command,
+                std::string("{\"event\":\"end\",\"eventCount\":") +
+                    std::to_string(terminal_count) + "}"));
+            if (command.header.payload_json.find("__aila_stream_duplicate_end__") !=
+                std::string::npos) {
+                send_stream_event(stream_event(
+                    command,
+                    std::string("{\"event\":\"end\",\"eventCount\":") +
+                        std::to_string(event_count + 1) + "}"));
+            }
+            if (command.header.payload_json.find("__aila_stream_post_end_data__") !=
+                std::string::npos) {
+                send_stream_event(
+                    stream_event(command, R"({"event":"token","byteCount":4})", "late"));
+            }
             if (response_before_end) {
                 continue;
             }
             response.header.payload_json =
-                std::string("{\"status\":") + (cancelled ? "1" : "0") + "}";
+                std::string("{\"status\":") +
+                ((cancelled || command.header.payload_json.find(
+                    "__aila_stream_unsolicited_abort__") != std::string::npos) ? "1" : "0") +
+                ",\"eventCount\":" + std::to_string(event_count) + "}";
             response.attachment.clear();
             send_frame(handles.response_write, response);
             continue;

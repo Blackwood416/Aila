@@ -495,9 +495,23 @@ int run(const Handles& handles) {
                 cancelled.store(true, std::memory_order_release);
             }
             inference.join();
+            uint64_t terminal_count = 1;
+            if (stream_response.header.kind == "result") {
+                simdjson::dom::parser parser;
+                simdjson::dom::element payload;
+                if (parser.parse(stream_response.header.payload_json).get(payload) !=
+                        simdjson::SUCCESS ||
+                    payload["eventCount"].get_uint64().get(terminal_count) !=
+                        simdjson::SUCCESS ||
+                    terminal_count == 0) {
+                    throw std::runtime_error("stream result omitted terminal eventCount");
+                }
+            }
             aila::ipc::Frame end = command;
             end.header.kind = "event";
-            end.header.payload_json = "{\"event\":\"end\"}";
+            end.header.payload_json =
+                std::string("{\"event\":\"end\",\"eventCount\":") +
+                std::to_string(terminal_count) + "}";
             end.attachment.clear();
             send_frame(handles.event_write.get(), end);
             if (!aila::ipc::write_frame(handles.response_write.get(), stream_response, error)) {

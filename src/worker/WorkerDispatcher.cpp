@@ -309,7 +309,13 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
         }
 
         bool emitter_failed = false;
+        uint64_t event_count = 0;
         auto can_emit = [&] { return !cancelled.load(std::memory_order_acquire) && !emitter_failed; };
+        auto emit_counted = [&](const ipc::Frame& event) {
+            if (!emit(event)) return false;
+            ++event_count;
+            return true;
+        };
         const int status = engine_->generate_stream(
             generation,
             [&](std::string_view token) {
@@ -319,7 +325,7 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
                     emitter_failed = true;
                     return false;
                 }
-                if (!emit(token_event(request, token))) {
+                if (!emit_counted(token_event(request, token))) {
                     emitter_failed = true;
                     return false;
                 }
@@ -343,7 +349,7 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
                         return false;
                     }
                 }
-                if (!emit(structured_event(request, event))) {
+                if (!emit_counted(structured_event(request, event))) {
                     emitter_failed = true;
                     return false;
                 }
@@ -353,7 +359,10 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
             return error(request, AILA_ERR_RUNTIME, "streaming event was invalid or could not be written");
         }
         if (cancelled.load(std::memory_order_acquire)) {
-            return result(request, "{\"status\":1}");
+            return result(
+                request,
+                std::string("{\"status\":1,\"eventCount\":") +
+                    std::to_string(event_count + 1) + "}");
         }
         if (status < -1 || status > 1) {
             return error(request, AILA_ERR_RUNTIME, "streaming adapter returned an invalid status");
@@ -366,7 +375,8 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
             return error(request, code, message);
         }
         return result(request, std::string("{\"status\":") +
-                                  std::to_string(cancelled.load() ? 1 : status) + "}");
+                                  std::to_string(cancelled.load() ? 1 : status) +
+                                  ",\"eventCount\":" + std::to_string(event_count + 1) + "}");
     } catch (const std::exception& exception) {
         return error(request, AILA_ERR_RUNTIME, exception.what());
     } catch (...) {

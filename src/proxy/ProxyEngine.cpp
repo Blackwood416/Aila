@@ -565,13 +565,18 @@ int ProxyEngine::stream_payload_locked(
     request.header.payload_json = std::move(payload_json);
 
     bool aborted = false;
+    bool terminal_seen = false;
     const ipc::Frame response = worker_.request_stream(
         request,
         [&](const ipc::Frame& event) {
             if (event.header.kind != "event" || event.header.method != method ||
+                event.header.request_id != request.header.request_id ||
                 event.header.protocol != ipc::kProtocolVersion ||
                 event.header.abi != ipc::kPublicAbiVersion) {
                 throw malformed_response("stream event identity did not match request");
+            }
+            if (terminal_seen) {
+                throw malformed_response("stream emitted data or a duplicate end after terminal event");
             }
             simdjson::dom::parser parser;
             simdjson::dom::element root;
@@ -586,9 +591,14 @@ int ProxyEngine::stream_payload_locked(
             size_t field_count = 0;
             for (auto field : object) { (void)field; ++field_count; }
             if (event_kind == "end") {
-                if (field_count != 1 || !event.attachment.empty()) {
+                uint64_t terminal_count = 0;
+                if (field_count != 2 || !event.attachment.empty() ||
+                    object["eventCount"].get_uint64().get(terminal_count) !=
+                        simdjson::SUCCESS ||
+                    terminal_count == 0) {
                     throw malformed_response("stream terminal event schema was invalid");
                 }
+                terminal_seen = true;
                 return runtime::WorkerProcess::StreamEventAction::End;
             }
             if (event_kind == "token") {
@@ -676,19 +686,21 @@ int ProxyEngine::stream_payload_locked(
     simdjson::dom::element root;
     simdjson::dom::object object;
     int64_t status = -1;
+    uint64_t event_count = 0;
     if (parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
         root.get_object().get(object) != simdjson::SUCCESS ||
         object["status"].get_int64().get(status) != simdjson::SUCCESS ||
-        status < 0 || status > 1) {
+        object["eventCount"].get_uint64().get(event_count) != simdjson::SUCCESS ||
+        event_count == 0 || status < 0 || status > 1) {
         throw malformed_response("stream result status was invalid");
     }
     size_t field_count = 0;
     for (auto field : object) { (void)field; ++field_count; }
-    if (field_count != 1 || (aborted && status != 1)) {
-        throw malformed_response("stream result did not acknowledge callback cancellation");
+    if (field_count != 2 || !terminal_seen || (!aborted && status != 0)) {
+        throw malformed_response("stream result cancellation status did not match the host callback");
     }
     clear_error_locked();
-    return static_cast<int>(status);
+    return aborted ? 1 : 0;
 }
 
 void ProxyEngine::set_error_locked(int code, std::string message) {
