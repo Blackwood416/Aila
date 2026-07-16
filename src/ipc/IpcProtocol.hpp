@@ -11,6 +11,7 @@ inline constexpr uint32_t kProtocolVersion = 1;
 inline constexpr uint32_t kPublicAbiVersion = 1;
 inline constexpr uint32_t kMaxHeaderBytes = 1024 * 1024;
 inline constexpr uint32_t kMaxAttachmentBytes = 512 * 1024 * 1024;
+inline constexpr uint64_t kMaxStreamEventCount = 1'000'000;
 
 struct FrameHeader {
     uint32_t protocol = kProtocolVersion;

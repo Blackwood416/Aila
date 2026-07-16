@@ -1049,7 +1049,7 @@ ipc::Frame WorkerProcess::request_stream(
                     if (parser.parse(event.header.payload_json).get(payload) !=
                             simdjson::SUCCESS ||
                         payload["eventCount"].get_uint64().get(count) != simdjson::SUCCESS ||
-                        count != observed_event_count) {
+                        count != observed_event_count || count > ipc::kMaxStreamEventCount) {
                         throw std::runtime_error(
                             "worker stream terminal eventCount did not match observed events");
                     }
@@ -1082,7 +1082,8 @@ ipc::Frame WorkerProcess::request_stream(
             response_done = response_state->done;
             response_failed = response_state->failure != nullptr;
             if (response_done && !response_failed && !expected_event_count &&
-                response_state->response.header.kind == "result") {
+                (response_state->response.header.kind == "result" ||
+                 response_state->response.header.kind == "error")) {
                 try {
                     simdjson::dom::parser parser;
                     simdjson::dom::element payload;
@@ -1090,15 +1091,19 @@ ipc::Frame WorkerProcess::request_stream(
                     if (parser.parse(response_state->response.header.payload_json).get(payload) !=
                             simdjson::SUCCESS ||
                         payload["eventCount"].get_uint64().get(count) != simdjson::SUCCESS ||
-                        count == 0) {
+                        count == 0 || count > ipc::kMaxStreamEventCount) {
                         throw std::runtime_error(
-                            "worker stream result requires a positive eventCount");
+                            "worker stream response requires a bounded positive eventCount");
                     }
                     expected_event_count = count;
                 } catch (...) {
                     callback_failure = std::current_exception();
                     impl_->terminate_active_process(ERROR_BAD_FORMAT);
                 }
+            } else if (response_done && !response_failed && !expected_event_count) {
+                callback_failure = std::make_exception_ptr(std::runtime_error(
+                    "worker stream response kind was neither result nor error"));
+                impl_->terminate_active_process(ERROR_BAD_FORMAT);
             }
         }
         if (expected_event_count && observed_event_count > *expected_event_count) {
@@ -1112,10 +1117,9 @@ ipc::Frame WorkerProcess::request_stream(
                 "worker stream response eventCount did not match terminal event"));
             impl_->terminate_active_process(ERROR_BAD_FORMAT);
         }
-        const bool complete_result = response_done && expected_event_count && saw_end &&
+        const bool complete_response = response_done && expected_event_count && saw_end &&
             observed_event_count == *expected_event_count;
-        const bool complete_error = response_done && !expected_event_count && saw_end;
-        if (callback_failure || response_failed || complete_result || complete_error) {
+        if (callback_failure || response_failed || complete_response) {
             break;
         }
         if (Clock::now() >= deadline) {

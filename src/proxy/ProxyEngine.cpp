@@ -507,6 +507,41 @@ bool ProxyEngine::accept_error_response_locked(
     return false;
 }
 
+bool ProxyEngine::accept_stream_error_response_locked(
+    const ipc::Frame& response,
+    std::string_view expected_method,
+    std::string_view fallback_message) {
+    if (response.header.method != expected_method || response.header.kind != "error" ||
+        !response.attachment.empty()) {
+        throw malformed_response("stream error response identity was invalid");
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element payload;
+    simdjson::dom::object object;
+    int64_t code = 0;
+    uint64_t event_count = 0;
+    std::string_view message;
+    if (parser.parse(response.header.payload_json).get(payload) != simdjson::SUCCESS ||
+        payload.get_object().get(object) != simdjson::SUCCESS ||
+        object["code"].get_int64().get(code) != simdjson::SUCCESS ||
+        object["message"].get_string().get(message) != simdjson::SUCCESS ||
+        object["eventCount"].get_uint64().get(event_count) != simdjson::SUCCESS ||
+        code < AILA_OK || code > (std::numeric_limits<int>::max)() ||
+        event_count == 0 || event_count > ipc::kMaxStreamEventCount) {
+        throw malformed_response(
+            "stream error payload requires code, message, and bounded eventCount");
+    }
+    size_t field_count = 0;
+    for (auto field : object) { (void)field; ++field_count; }
+    if (field_count != 3) {
+        throw malformed_response("stream error payload contained unexpected fields");
+    }
+    set_error_locked(
+        code == AILA_OK ? AILA_ERR_RUNTIME : static_cast<int>(code),
+        message.empty() ? std::string(fallback_message) : std::string(message));
+    return false;
+}
+
 bool ProxyEngine::generate_payload_locked(
     std::string_view method,
     std::string payload_json,
@@ -595,7 +630,7 @@ int ProxyEngine::stream_payload_locked(
                 if (field_count != 2 || !event.attachment.empty() ||
                     object["eventCount"].get_uint64().get(terminal_count) !=
                         simdjson::SUCCESS ||
-                    terminal_count == 0) {
+                    terminal_count == 0 || terminal_count > ipc::kMaxStreamEventCount) {
                     throw malformed_response("stream terminal event schema was invalid");
                 }
                 terminal_seen = true;
@@ -675,7 +710,8 @@ int ProxyEngine::stream_payload_locked(
         },
         std::chrono::minutes(10));
     if (response.header.kind == "error") {
-        accept_error_response_locked(response, method, "worker streaming generation failed");
+        accept_stream_error_response_locked(
+            response, method, "worker streaming generation failed");
         return -1;
     }
     if (response.header.kind != "result" || response.header.method != method ||
@@ -691,7 +727,8 @@ int ProxyEngine::stream_payload_locked(
         root.get_object().get(object) != simdjson::SUCCESS ||
         object["status"].get_int64().get(status) != simdjson::SUCCESS ||
         object["eventCount"].get_uint64().get(event_count) != simdjson::SUCCESS ||
-        event_count == 0 || status < 0 || status > 1) {
+        event_count == 0 || event_count > ipc::kMaxStreamEventCount ||
+        status < 0 || status > 1) {
         throw malformed_response("stream result status was invalid");
     }
     size_t field_count = 0;

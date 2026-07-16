@@ -538,6 +538,19 @@ void verify_streaming_generation(const Api& api, AilaEngine* engine) {
     take_string(api, api.generate(engine, "after-short-stream-abort", nullptr),
                 "worker use after short stream abort race");
 
+    TokenStreamCapture engine_error{std::this_thread::get_id()};
+    expect(api.generate_stream(
+               engine, "__aila_stream_engine_error__", nullptr,
+               capture_token, &engine_error) == -1,
+           "stream engine error became success");
+    expect(engine_error.tokens == tokens.tokens,
+           "valid callbacks before stream engine error changed");
+    expect(api.last_error_code(engine) == AILA_ERR_CONTEXT_OVERFLOW &&
+               std::string(api.last_error_message(engine)) == "synthetic stream failure",
+           "stream engine error code/message changed");
+    take_string(api, api.generate(engine, "after-stream-engine-error", nullptr),
+                "worker use after ordinary stream engine error");
+
     AilaGenConfigV2 v2 = api.default_config_v2();
     StructuredCapture structured{std::this_thread::get_id()};
     const int structured_status = api.generate_chat_json_stream_ex(
@@ -830,6 +843,11 @@ void verify_malformed_stream_events_reap_worker(const Api& api) {
         "__aila_stream_duplicate_end__",
         "__aila_stream_post_end_data__",
         "__aila_stream_unsolicited_abort__",
+        "__aila_stream_error_missing_count__",
+        "__aila_stream_error_bad_count_type__",
+        "__aila_stream_error_oversized_count__",
+        "__aila_stream_error_zero_count__",
+        "__aila_stream_error_post_end__",
         "__aila_stream_early_exit__",
     };
     for (const char* marker : token_cases) {
@@ -849,7 +867,7 @@ void verify_malformed_stream_events_reap_worker(const Api& api) {
         expect(std::chrono::steady_clock::now() - started_at < 2s,
                std::string("malformed stream failure was not prompt: ") + marker);
         expect(api.last_error_code(engine.get()) == AILA_ERR_RUNTIME,
-               "malformed stream event returned the wrong error");
+               std::string("malformed stream event returned the wrong error: ") + marker);
         for (int attempt = 0; attempt != 100; ++attempt) {
             const auto current = child_worker_processes();
             if (current.find(pid) == current.end()) break;

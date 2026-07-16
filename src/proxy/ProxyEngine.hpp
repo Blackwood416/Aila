@@ -58,6 +58,10 @@ private:
         const ipc::Frame& response,
         std::string_view expected_method,
         std::string_view fallback_message);
+    bool accept_stream_error_response_locked(
+        const ipc::Frame& response,
+        std::string_view expected_method,
+        std::string_view fallback_message);
     bool generate_payload_locked(
         std::string_view method,
         std::string payload_json,

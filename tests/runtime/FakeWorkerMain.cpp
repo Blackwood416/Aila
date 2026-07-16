@@ -499,11 +499,43 @@ int run(const Handles& handles) {
                         std::to_string(event_count + 1) + "}"));
             }
             if (command.header.payload_json.find("__aila_stream_post_end_data__") !=
-                std::string::npos) {
+                    std::string::npos ||
+                command.header.payload_json.find("__aila_stream_error_post_end__") !=
+                    std::string::npos) {
                 send_stream_event(
                     stream_event(command, R"({"event":"token","byteCount":4})", "late"));
             }
             if (response_before_end) {
+                continue;
+            }
+            if (command.header.payload_json.find("__aila_stream_engine_error__") !=
+                    std::string::npos ||
+                command.header.payload_json.find("__aila_stream_error_") !=
+                    std::string::npos) {
+                response.header.kind = "error";
+                if (command.header.payload_json.find("__aila_stream_error_missing_count__") !=
+                    std::string::npos) {
+                    response.header.payload_json =
+                        R"({"code":5,"message":"synthetic stream failure"})";
+                } else if (command.header.payload_json.find("__aila_stream_error_bad_count_type__") !=
+                           std::string::npos) {
+                    response.header.payload_json =
+                        R"({"code":5,"message":"synthetic stream failure","eventCount":"bad"})";
+                } else if (command.header.payload_json.find("__aila_stream_error_oversized_count__") !=
+                           std::string::npos) {
+                    response.header.payload_json =
+                        R"({"code":5,"message":"synthetic stream failure","eventCount":1000001})";
+                } else if (command.header.payload_json.find("__aila_stream_error_zero_count__") !=
+                           std::string::npos) {
+                    response.header.payload_json =
+                        R"({"code":5,"message":"synthetic stream failure","eventCount":0})";
+                } else {
+                    response.header.payload_json =
+                        std::string("{\"code\":5,\"message\":\"synthetic stream failure\",\"eventCount\":") +
+                        std::to_string(event_count) + "}";
+                }
+                response.attachment.clear();
+                send_frame(handles.response_write, response);
                 continue;
             }
             response.header.payload_json =

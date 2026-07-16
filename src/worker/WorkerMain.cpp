@@ -454,12 +454,14 @@ int run(const Handles& handles) {
         if (aila::worker::WorkerDispatcher::is_stream_method(command.header.method)) {
             std::atomic_bool cancelled = false;
             std::atomic_bool finished = false;
+            uint64_t emitted_event_count = 0;
             aila::ipc::Frame stream_response;
             std::thread inference([&] {
                 stream_response = dispatcher.dispatch_stream(
                     command,
                     [&](const aila::ipc::Frame& stream_event) {
                         send_frame(handles.event_write.get(), stream_event);
+                        ++emitted_event_count;
                         return !cancelled.load(std::memory_order_acquire);
                     },
                     cancelled);
@@ -495,17 +497,39 @@ int run(const Handles& handles) {
                 cancelled.store(true, std::memory_order_release);
             }
             inference.join();
-            uint64_t terminal_count = 1;
+            const uint64_t terminal_count = emitted_event_count + 1;
+            if (terminal_count == 0 || terminal_count > aila::ipc::kMaxStreamEventCount) {
+                throw std::runtime_error("stream emitted too many events");
+            }
             if (stream_response.header.kind == "result") {
                 simdjson::dom::parser parser;
                 simdjson::dom::element payload;
+                uint64_t declared_count = 0;
                 if (parser.parse(stream_response.header.payload_json).get(payload) !=
                         simdjson::SUCCESS ||
-                    payload["eventCount"].get_uint64().get(terminal_count) !=
+                    payload["eventCount"].get_uint64().get(declared_count) !=
                         simdjson::SUCCESS ||
-                    terminal_count == 0) {
+                    declared_count != terminal_count) {
                     throw std::runtime_error("stream result omitted terminal eventCount");
                 }
+            } else if (stream_response.header.kind == "error") {
+                simdjson::dom::parser parser;
+                simdjson::dom::element payload;
+                int64_t code = 0;
+                std::string_view message;
+                if (parser.parse(stream_response.header.payload_json).get(payload) !=
+                        simdjson::SUCCESS ||
+                    payload["code"].get_int64().get(code) != simdjson::SUCCESS ||
+                    payload["message"].get_string().get(message) != simdjson::SUCCESS ||
+                    message.find('\0') != std::string_view::npos) {
+                    throw std::runtime_error("stream error response schema was invalid");
+                }
+                stream_response.header.payload_json =
+                    std::string("{\"code\":") + std::to_string(code) +
+                    ",\"message\":" + json_string(message) +
+                    ",\"eventCount\":" + std::to_string(terminal_count) + "}";
+            } else {
+                throw std::runtime_error("stream dispatcher returned an invalid response kind");
             }
             aila::ipc::Frame end = command;
             end.header.kind = "event";
