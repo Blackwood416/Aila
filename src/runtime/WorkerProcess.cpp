@@ -524,10 +524,6 @@ struct WorkerProcess::Impl {
             if (!ipc::read_frame(event_read.get(), frame, read_error)) {
                 return;
             }
-            if (frame.header.protocol != expected.protocol || frame.header.abi != expected.abi) {
-                set_error("event frame protocol or ABI did not match the worker handshake");
-                continue;
-            }
             {
                 std::lock_guard<std::mutex> lock(event_mutex);
                 events.push_back(std::move(frame));
@@ -971,6 +967,129 @@ ipc::Frame WorkerProcess::request(
         impl_->fail(
             "worker response kind must be 'result' or 'error', received '" +
             response.header.kind + "'");
+    }
+    return response;
+}
+
+ipc::Frame WorkerProcess::request_stream(
+    const ipc::Frame& frame,
+    const StreamEventCallback& callback,
+    std::chrono::milliseconds timeout) {
+    std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
+    if (timeout.count() <= 0) {
+        impl_->fail("worker stream timeout must be positive");
+    }
+    if (!callback) {
+        impl_->fail("worker stream callback must be present");
+    }
+    if (!impl_->is_active()) {
+        impl_->fail("cannot stream because the worker is not healthy");
+    }
+
+    const Clock::time_point deadline = Clock::now() + timeout;
+    impl_->write_request(frame, deadline, "worker stream request");
+
+    struct ResponseState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool done = false;
+        ipc::Frame response;
+        std::exception_ptr failure;
+    };
+    const auto response_state = std::make_shared<ResponseState>();
+    std::thread response_thread([implementation = impl_.get(), response_state, deadline] {
+        try {
+            response_state->response =
+                implementation->read_response(deadline, "worker stream request");
+        } catch (...) {
+            response_state->failure = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(response_state->mutex);
+            response_state->done = true;
+        }
+        response_state->condition.notify_all();
+    });
+
+    bool saw_end = false;
+    bool sent_cancel = false;
+    std::exception_ptr callback_failure;
+    for (;;) {
+        std::vector<ipc::Frame> matching;
+        {
+            std::lock_guard<std::mutex> lock(impl_->event_mutex);
+            auto iterator = impl_->events.begin();
+            while (iterator != impl_->events.end()) {
+                if (iterator->header.request_id == frame.header.request_id) {
+                    matching.push_back(std::move(*iterator));
+                    iterator = impl_->events.erase(iterator);
+                } else {
+                    ++iterator;
+                }
+            }
+        }
+        for (const ipc::Frame& event : matching) {
+            try {
+                const StreamEventAction action = callback(event);
+                if (action == StreamEventAction::End) {
+                    saw_end = true;
+                } else if (action == StreamEventAction::Cancel && !sent_cancel) {
+                    ipc::Frame cancel_frame;
+                    cancel_frame.header.protocol = impl_->expected.protocol;
+                    cancel_frame.header.abi = impl_->expected.abi;
+                    cancel_frame.header.request_id = frame.header.request_id;
+                    cancel_frame.header.kind = "request";
+                    cancel_frame.header.method = "cancel";
+                    cancel_frame.header.payload_json =
+                        std::string("{\"requestId\":") +
+                        std::to_string(frame.header.request_id) + "}";
+                    impl_->write_request(cancel_frame, deadline, "worker stream cancellation");
+                    sent_cancel = true;
+                }
+            } catch (...) {
+                callback_failure = std::current_exception();
+                impl_->terminate_active_process(ERROR_BAD_FORMAT);
+                break;
+            }
+        }
+
+        bool response_done = false;
+        bool response_failed = false;
+        {
+            std::lock_guard<std::mutex> lock(response_state->mutex);
+            response_done = response_state->done;
+            response_failed = response_state->failure != nullptr;
+        }
+        if (callback_failure || response_failed || (response_done && saw_end)) {
+            break;
+        }
+        if (Clock::now() >= deadline) {
+            impl_->terminate_active_process(ERROR_TIMEOUT);
+            break;
+        }
+        std::unique_lock<std::mutex> lock(impl_->event_mutex);
+        impl_->event_condition.wait_for(lock, std::chrono::milliseconds(10));
+    }
+
+    response_thread.join();
+    if (callback_failure) {
+        std::rethrow_exception(callback_failure);
+    }
+    {
+        std::lock_guard<std::mutex> lock(response_state->mutex);
+        if (response_state->failure) {
+            std::rethrow_exception(response_state->failure);
+        }
+        if (!saw_end) {
+            impl_->fail("worker stream ended without a terminal event");
+        }
+    }
+    const ipc::Frame response = std::move(response_state->response);
+    if (response.header.protocol != impl_->expected.protocol ||
+        response.header.abi != impl_->expected.abi ||
+        response.header.request_id != frame.header.request_id ||
+        (response.header.kind != "result" && response.header.kind != "error")) {
+        impl_->fail("worker stream response identity did not match the request");
     }
     return response;
 }

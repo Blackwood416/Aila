@@ -232,6 +232,69 @@ AILA_API char* aila_generate_chat_json_ex(
         "aila_generate_chat_json_ex");
 }
 
+AILA_API int aila_generate_stream(
+    AilaEngine* engine,
+    const char* prompt,
+    const AilaGenConfig* config,
+    AilaTokenCallback callback,
+    void* user_data) {
+    if (!engine) return -1;
+    if (!prompt || !callback) {
+        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        catch (...) {}
+        return -1;
+    }
+    try {
+        return engine->proxy.generate_stream(
+            "generate.stream", prompt, config, callback, user_data);
+    } catch (...) {
+        record_boundary_failure(engine, "aila_generate_stream");
+        return -1;
+    }
+}
+
+AILA_API int aila_generate_messages_stream(
+    AilaEngine* engine,
+    const char* messages_json,
+    const AilaGenConfig* config,
+    AilaTokenCallback callback,
+    void* user_data) {
+    if (!engine) return -1;
+    if (!messages_json || !callback) {
+        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        catch (...) {}
+        return -1;
+    }
+    try {
+        return engine->proxy.generate_stream(
+            "generate.messages_stream", messages_json, config, callback, user_data);
+    } catch (...) {
+        record_boundary_failure(engine, "aila_generate_messages_stream");
+        return -1;
+    }
+}
+
+AILA_API int aila_generate_chat_json_stream_ex(
+    AilaEngine* engine,
+    const char* chat_request_json,
+    const AilaGenConfigV2* config,
+    AilaChatStreamCallback callback,
+    void* user_data) {
+    if (!engine) return -1;
+    if (!chat_request_json || !callback) {
+        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        catch (...) {}
+        return -1;
+    }
+    try {
+        return engine->proxy.generate_stream_v2(
+            "generate.chat_json_stream_ex", chat_request_json, config, callback, user_data);
+    } catch (...) {
+        record_boundary_failure(engine, "aila_generate_chat_json_stream_ex");
+        return -1;
+    }
+}
+
 AILA_API void aila_engine_reset_context(AilaEngine* engine) {
     if (!engine) {
         return;

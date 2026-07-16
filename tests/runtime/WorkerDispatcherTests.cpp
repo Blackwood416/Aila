@@ -4,11 +4,13 @@
 #include "simdjson.h"
 
 #include <cstdint>
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -104,6 +106,7 @@ struct EngineState {
     bool generate_result = true;
     std::string generated_text = u8"worker 输出";
     TextGenerationRequest generation_request;
+    int stream_calls = 0;
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -139,6 +142,29 @@ public:
         state_.generation_request = request;
         output = state_.generated_text;
         return state_.generate_result;
+    }
+
+    int generate_stream(
+        const TextGenerationRequest& request,
+        const aila::worker::TokenStreamCallback& token_callback,
+        const aila::worker::StructuredStreamCallback& structured_callback) override {
+        ++state_.stream_calls;
+        state_.generation_request = request;
+        if (request.method == TextGenerationMethod::GenerateChatJsonStreamEx) {
+            AilaChatStreamEvent event{};
+            event.struct_size = sizeof(event);
+            event.type = AILA_CHAT_STREAM_TOOL_CALL_DELTA;
+            event.text = u8"工具";
+            event.tool_call_id = nullptr;
+            event.tool_name = "search";
+            event.arguments_delta = "";
+            event.finish_reason = nullptr;
+            event.warnings_json = "[]";
+            event.tool_calls_json = nullptr;
+            return structured_callback(event) ? 0 : 1;
+        }
+        if (!token_callback(u8"第一")) return 1;
+        return token_callback(" second") ? 0 : 1;
     }
 
 private:
@@ -599,6 +625,61 @@ void test_generation_propagates_adapter_error_and_rejects_embedded_nul_output() 
     expect(invalid_utf8.attachment.empty(), name, "invalid UTF-8 output was attached");
 }
 
+void test_stream_dispatcher_emits_correlated_token_and_structured_events() {
+    constexpr const char* name = "stream dispatcher emits correlated events";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    std::atomic_bool cancelled = false;
+
+    for (const auto& entry : std::vector<std::pair<const char*, TextGenerationMethod>>{
+             {"generate.stream", TextGenerationMethod::GenerateStream},
+             {"generate.messages_stream", TextGenerationMethod::GenerateMessagesStream}}) {
+        std::vector<Frame> events;
+        const Frame command = request(170, entry.first, u8R"({"input":"流式","config":null})");
+        const Frame response = dispatcher.dispatch_stream(
+            command,
+            [&](const Frame& event) { events.push_back(event); return true; },
+            cancelled);
+        expect(response.header.kind == "result", name, "token stream failed");
+        expect(payload_integer(response, "status", name) == 0, name, "token status changed");
+        expect(events.size() == 2, name, "token event count changed");
+        expect(events[0].header.request_id == 170 && events[0].header.method == entry.first,
+               name, "token event identity changed");
+        expect(payload_string(events[0], "event", name) == "token", name, "token kind changed");
+        expect(payload_integer(events[0], "byteCount", name) ==
+                   static_cast<int64_t>(events[0].attachment.size()),
+               name, "token byteCount changed");
+        expect(attachment_string(events[0]) == u8"第一", name, "token bytes changed");
+        expect(state.generation_request.method == entry.second, name, "stream method changed");
+    }
+
+    std::vector<Frame> structured;
+    const Frame structured_command = request(
+        171,
+        "generate.chat_json_stream_ex",
+        R"({"input":"{}","config":{"struct_size":4}})");
+    const Frame structured_response = dispatcher.dispatch_stream(
+        structured_command,
+        [&](const Frame& event) { structured.push_back(event); return true; },
+        cancelled);
+    expect(payload_integer(structured_response, "status", name) == 0,
+           name, "structured status changed");
+    expect(structured.size() == 1, name, "structured event count changed");
+    expect(payload_string(structured[0], "event", name) == "structured",
+           name, "structured event kind changed");
+    expect(payload_integer(structured[0], "type", name) == AILA_CHAT_STREAM_TOOL_CALL_DELTA,
+           name, "structured type changed");
+    simdjson::dom::parser parser;
+    const simdjson::dom::element payload = parse_payload(structured[0], parser, name);
+    expect(payload["toolCallId"].is_null(), name, "NULL string became empty");
+    std::string_view arguments;
+    expect(payload["argumentsDelta"].get_string().get(arguments) == simdjson::SUCCESS &&
+               arguments.empty(),
+           name, "empty string became NULL");
+}
+
 } // namespace
 
 int main() {
@@ -616,6 +697,7 @@ int main() {
         test_generation_forwards_size_gated_v2_config_without_reserved_fields();
         test_generation_rejects_malformed_payload_before_adapter();
         test_generation_propagates_adapter_error_and_rejects_embedded_nul_output();
+        test_stream_dispatcher_emits_correlated_token_and_structured_events();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

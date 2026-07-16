@@ -347,6 +347,83 @@ bool ProxyEngine::generate_text_v2(
     }
 }
 
+int ProxyEngine::generate_stream(
+    std::string_view method,
+    std::string_view input,
+    const AilaGenConfig* config,
+    AilaTokenCallback callback,
+    void* user_data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || !callback) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT,
+                         !initialized_ ? "engine is not initialized" : "stream callback must not be NULL");
+        return -1;
+    }
+    if (input.find('\0') != std::string_view::npos || !simdjson::validate_utf8(input)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT,
+                         "stream input must be C-string-safe valid UTF-8");
+        return -1;
+    }
+    try {
+        return stream_payload_locked(
+            method,
+            std::string("{\"input\":") + json_string(input) +
+                ",\"config\":" + legacy_config_json(config) + "}",
+            callback,
+            nullptr,
+            user_data);
+    } catch (const std::exception& exception) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, exception.what());
+        return -1;
+    } catch (...) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, "unknown proxy streaming failure");
+        return -1;
+    }
+}
+
+int ProxyEngine::generate_stream_v2(
+    std::string_view method,
+    std::string_view input,
+    const AilaGenConfigV2* config,
+    AilaChatStreamCallback callback,
+    void* user_data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || !callback) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT,
+                         !initialized_ ? "engine is not initialized" : "stream callback must not be NULL");
+        return -1;
+    }
+    if (config && config->struct_size == 0) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT,
+                         "generation V2 config struct_size must not be zero");
+        return -1;
+    }
+    if (input.find('\0') != std::string_view::npos || !simdjson::validate_utf8(input)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT,
+                         "stream input must be C-string-safe valid UTF-8");
+        return -1;
+    }
+    try {
+        return stream_payload_locked(
+            method,
+            std::string("{\"input\":") + json_string(input) +
+                ",\"config\":" + v2_config_json(config) + "}",
+            nullptr,
+            callback,
+            user_data);
+    } catch (const std::exception& exception) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, exception.what());
+        return -1;
+    } catch (...) {
+        shutdown_locked();
+        set_error_locked(AILA_ERR_RUNTIME, "unknown proxy structured streaming failure");
+        return -1;
+    }
+}
+
 int ProxyEngine::last_error_code() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return error_code_;
@@ -469,6 +546,149 @@ bool ProxyEngine::generate_payload_locked(
     }
     clear_error_locked();
     return true;
+}
+
+int ProxyEngine::stream_payload_locked(
+    std::string_view method,
+    std::string payload_json,
+    AilaTokenCallback token_callback,
+    AilaChatStreamCallback structured_callback,
+    void* user_data) {
+    ipc::Frame request;
+    request.header.protocol = ipc::kProtocolVersion;
+    request.header.abi = ipc::kPublicAbiVersion;
+    request.header.request_id = next_request_id_++;
+    if (next_request_id_ == 0 ||
+        next_request_id_ == (std::numeric_limits<uint64_t>::max)()) next_request_id_ = 1;
+    request.header.kind = "request";
+    request.header.method = std::string(method);
+    request.header.payload_json = std::move(payload_json);
+
+    bool aborted = false;
+    const ipc::Frame response = worker_.request_stream(
+        request,
+        [&](const ipc::Frame& event) {
+            if (event.header.kind != "event" || event.header.method != method ||
+                event.header.protocol != ipc::kProtocolVersion ||
+                event.header.abi != ipc::kPublicAbiVersion) {
+                throw malformed_response("stream event identity did not match request");
+            }
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            simdjson::dom::object object;
+            std::string_view event_kind;
+            if (!simdjson::validate_utf8(event.header.payload_json) ||
+                parser.parse(event.header.payload_json).get(root) != simdjson::SUCCESS ||
+                root.get_object().get(object) != simdjson::SUCCESS ||
+                object["event"].get_string().get(event_kind) != simdjson::SUCCESS) {
+                throw malformed_response("stream event payload schema was invalid");
+            }
+            size_t field_count = 0;
+            for (auto field : object) { (void)field; ++field_count; }
+            if (event_kind == "end") {
+                if (field_count != 1 || !event.attachment.empty()) {
+                    throw malformed_response("stream terminal event schema was invalid");
+                }
+                return runtime::WorkerProcess::StreamEventAction::End;
+            }
+            if (event_kind == "token") {
+                uint64_t byte_count = 0;
+                if (!token_callback || field_count != 2 ||
+                    object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                    byte_count != event.attachment.size()) {
+                    throw malformed_response("token stream event byteCount or method was invalid");
+                }
+                for (std::byte byte : event.attachment) {
+                    if (byte == std::byte{0}) {
+                        throw malformed_response("token stream event contained an embedded NUL");
+                    }
+                }
+                const std::string token(
+                    reinterpret_cast<const char*>(event.attachment.data()),
+                    event.attachment.size());
+                if (!simdjson::validate_utf8(token)) {
+                    throw malformed_response("token stream event was not valid UTF-8");
+                }
+                if (!aborted && token_callback(token.c_str(), user_data) != 0) {
+                    aborted = true;
+                    return runtime::WorkerProcess::StreamEventAction::Cancel;
+                }
+                return runtime::WorkerProcess::StreamEventAction::Continue;
+            }
+            if (event_kind != "structured" || !structured_callback ||
+                field_count != 10 || !event.attachment.empty()) {
+                throw malformed_response("structured stream event schema was invalid");
+            }
+            uint64_t struct_size = 0;
+            int64_t type = 0;
+            if (object["structSize"].get_uint64().get(struct_size) != simdjson::SUCCESS ||
+                struct_size != sizeof(AilaChatStreamEvent) ||
+                object["type"].get_int64().get(type) != simdjson::SUCCESS ||
+                type < AILA_CHAT_STREAM_REASONING_DELTA || type > AILA_CHAT_STREAM_FINAL) {
+                throw malformed_response("structured stream event size or type was invalid");
+            }
+            auto optional_string = [&](const char* name) -> std::optional<std::string> {
+                simdjson::dom::element value;
+                if (object.at_key(name).get(value) != simdjson::SUCCESS) {
+                    throw malformed_response("structured stream event omitted a field");
+                }
+                if (value.is_null()) return std::nullopt;
+                std::string_view text;
+                if (value.get_string().get(text) != simdjson::SUCCESS ||
+                    text.find('\0') != std::string_view::npos || !simdjson::validate_utf8(text)) {
+                    throw malformed_response("structured stream string field was invalid");
+                }
+                return std::string(text);
+            };
+            const auto text = optional_string("text");
+            const auto tool_call_id = optional_string("toolCallId");
+            const auto tool_name = optional_string("toolName");
+            const auto arguments_delta = optional_string("argumentsDelta");
+            const auto finish_reason = optional_string("finishReason");
+            const auto warnings_json = optional_string("warningsJson");
+            const auto tool_calls_json = optional_string("toolCallsJson");
+            AilaChatStreamEvent abi_event{};
+            abi_event.struct_size = sizeof(abi_event);
+            abi_event.type = static_cast<int>(type);
+            abi_event.text = text ? text->c_str() : nullptr;
+            abi_event.tool_call_id = tool_call_id ? tool_call_id->c_str() : nullptr;
+            abi_event.tool_name = tool_name ? tool_name->c_str() : nullptr;
+            abi_event.arguments_delta = arguments_delta ? arguments_delta->c_str() : nullptr;
+            abi_event.finish_reason = finish_reason ? finish_reason->c_str() : nullptr;
+            abi_event.warnings_json = warnings_json ? warnings_json->c_str() : nullptr;
+            abi_event.tool_calls_json = tool_calls_json ? tool_calls_json->c_str() : nullptr;
+            if (!aborted && structured_callback(&abi_event, user_data) != 0) {
+                aborted = true;
+                return runtime::WorkerProcess::StreamEventAction::Cancel;
+            }
+            return runtime::WorkerProcess::StreamEventAction::Continue;
+        },
+        std::chrono::minutes(10));
+    if (response.header.kind == "error") {
+        accept_error_response_locked(response, method, "worker streaming generation failed");
+        return -1;
+    }
+    if (response.header.kind != "result" || response.header.method != method ||
+        !response.attachment.empty()) {
+        throw malformed_response("stream result identity was invalid");
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    simdjson::dom::object object;
+    int64_t status = -1;
+    if (parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
+        root.get_object().get(object) != simdjson::SUCCESS ||
+        object["status"].get_int64().get(status) != simdjson::SUCCESS ||
+        status < 0 || status > 1) {
+        throw malformed_response("stream result status was invalid");
+    }
+    size_t field_count = 0;
+    for (auto field : object) { (void)field; ++field_count; }
+    if (field_count != 1 || (aborted && status != 1)) {
+        throw malformed_response("stream result did not acknowledge callback cancellation");
+    }
+    clear_error_locked();
+    return static_cast<int>(status);
 }
 
 void ProxyEngine::set_error_locked(int code, std::string message) {

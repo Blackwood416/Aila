@@ -4,7 +4,10 @@
 #include "ipc/IpcProtocol.hpp"
 
 #include <memory>
+#include <atomic>
+#include <functional>
 #include <string>
+#include <string_view>
 
 namespace aila::worker {
 
@@ -13,7 +16,14 @@ enum class TextGenerationMethod {
     GenerateMessages,
     GenerateChatJson,
     GenerateChatJsonEx,
+    GenerateStream,
+    GenerateMessagesStream,
+    GenerateChatJsonStreamEx,
 };
+
+using TokenStreamCallback = std::function<bool(std::string_view)>;
+using StructuredStreamCallback = std::function<bool(const AilaChatStreamEvent&)>;
+using WorkerStreamEmitter = std::function<bool(const ipc::Frame&)>;
 
 struct TextGenerationRequest {
     TextGenerationMethod method = TextGenerationMethod::Generate;
@@ -36,6 +46,10 @@ public:
     virtual bool generate_text(
         const TextGenerationRequest& request,
         std::string& output) = 0;
+    virtual int generate_stream(
+        const TextGenerationRequest& request,
+        const TokenStreamCallback& token_callback,
+        const StructuredStreamCallback& structured_callback) = 0;
 };
 
 class WorkerDispatcher {
@@ -43,6 +57,11 @@ public:
     explicit WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine);
 
     ipc::Frame dispatch(const ipc::Frame& request, bool& should_shutdown);
+    ipc::Frame dispatch_stream(
+        const ipc::Frame& request,
+        const WorkerStreamEmitter& emit,
+        const std::atomic_bool& cancelled);
+    static bool is_stream_method(std::string_view method) noexcept;
 
 private:
     std::unique_ptr<WorkerEngineApi> engine_;

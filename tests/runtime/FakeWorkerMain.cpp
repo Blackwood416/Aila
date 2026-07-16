@@ -209,6 +209,26 @@ bool is_generation_method(std::string_view method) {
         method == "generate.chat_json_ex";
 }
 
+bool is_stream_generation_method(std::string_view method) {
+    return method == "generate.stream" ||
+        method == "generate.messages_stream" ||
+        method == "generate.chat_json_stream_ex";
+}
+
+aila::ipc::Frame stream_event(
+    const aila::ipc::Frame& command,
+    std::string payload,
+    std::string_view attachment = {}) {
+    aila::ipc::Frame event = command;
+    event.header.kind = "event";
+    event.header.payload_json = std::move(payload);
+    event.attachment.clear();
+    for (unsigned char byte : attachment) {
+        event.attachment.push_back(static_cast<std::byte>(byte));
+    }
+    return event;
+}
+
 void attach_text(aila::ipc::Frame& frame, std::string_view text) {
     frame.attachment.clear();
     frame.attachment.reserve(text.size());
@@ -382,6 +402,82 @@ int run(const Handles& handles) {
                 std::string("{\"contextLength\":") +
                 std::to_string(context_length) + "}";
             response.attachment.clear();
+        }
+        if (is_stream_generation_method(command.header.method)) {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            if (command.header.method == "generate.chat_json_stream_ex") {
+                aila::ipc::Frame structured = stream_event(
+                    command,
+                    u8R"({"event":"structured","structSize":64,"type":2,"text":"工具","toolCallId":null,"toolName":"search","argumentsDelta":"","finishReason":null,"warningsJson":"[]","toolCallsJson":null})");
+                if (command.header.payload_json.find("__aila_stream_bad_type__") != std::string::npos) {
+                    structured.header.payload_json =
+                        R"({"event":"structured","structSize":64,"type":99,"text":null,"toolCallId":null,"toolName":null,"argumentsDelta":null,"finishReason":null,"warningsJson":null,"toolCallsJson":null})";
+                }
+                send_frame(handles.event_write, structured);
+            } else {
+                aila::ipc::Frame first = stream_event(
+                    command, R"({"event":"token","byteCount":5})", "first");
+                if (command.header.payload_json.find("__aila_stream_bad_byte_count__") != std::string::npos) {
+                    first.header.payload_json = R"({"event":"token","byteCount":6})";
+                } else if (command.header.payload_json.find("__aila_stream_bad_utf8__") != std::string::npos) {
+                    const std::string invalid("\xc3\x28", 2);
+                    first = stream_event(command, R"({"event":"token","byteCount":2})", invalid);
+                } else if (command.header.payload_json.find("__aila_stream_bad_identity__") != std::string::npos) {
+                    first.header.method = "wrong.stream";
+                } else if (command.header.payload_json.find("__aila_stream_bad_protocol__") != std::string::npos) {
+                    ++first.header.protocol;
+                } else if (command.header.payload_json.find("__aila_stream_bad_nul__") != std::string::npos) {
+                    first = stream_event(
+                        command, R"({"event":"token","byteCount":3})",
+                        std::string_view("a\0b", 3));
+                } else if (command.header.payload_json.find("__aila_stream_bad_schema__") != std::string::npos) {
+                    first.header.payload_json = R"({"event":"token"})";
+                }
+                send_frame(handles.event_write, first);
+            }
+
+            if (command.header.payload_json.find("__aila_stream_early_exit__") != std::string::npos) {
+                ExitProcess(91);
+            }
+
+            const bool response_before_end =
+                command.header.payload_json.find("__aila_stream_response_before_end__") !=
+                std::string::npos;
+            if (response_before_end) {
+                response.header.payload_json = "{\"status\":0}";
+                response.attachment.clear();
+                send_frame(handles.response_write, response);
+            }
+
+            Sleep(30);
+            bool cancelled = false;
+            DWORD pending = 0;
+            if (PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) && pending != 0) {
+                aila::ipc::Frame control;
+                if (aila::ipc::read_frame(handles.command_read, control, error) &&
+                    control.header.method == "cancel" &&
+                    control.header.request_id == command.header.request_id) {
+                    cancelled = true;
+                }
+            }
+            if (!cancelled && command.header.method != "generate.chat_json_stream_ex") {
+                send_frame(
+                    handles.event_write,
+                    stream_event(command, R"({"event":"token","byteCount":7})", u8" 第二"));
+            }
+            send_frame(handles.event_write, stream_event(command, R"({"event":"end"})"));
+            if (response_before_end) {
+                continue;
+            }
+            response.header.payload_json =
+                std::string("{\"status\":") + (cancelled ? "1" : "0") + "}";
+            response.attachment.clear();
+            send_frame(handles.response_write, response);
+            continue;
         }
         if (is_generation_method(command.header.method)) {
             if (!initialized) {

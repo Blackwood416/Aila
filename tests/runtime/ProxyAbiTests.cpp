@@ -268,6 +268,10 @@ struct Api {
     using DefaultConfigV2 = AilaGenConfigV2 (*)();
     using Generate = char* (*)(AilaEngine*, const char*, const AilaGenConfig*);
     using GenerateEx = char* (*)(AilaEngine*, const char*, const AilaGenConfigV2*);
+    using GenerateStream = int (*)(AilaEngine*, const char*, const AilaGenConfig*,
+                                   AilaTokenCallback, void*);
+    using GenerateStreamEx = int (*)(AilaEngine*, const char*, const AilaGenConfigV2*,
+                                     AilaChatStreamCallback, void*);
     using Reset = void (*)(AilaEngine*);
     using ContextLength = int (*)(AilaEngine*);
     using LastErrorCode = int (*)(AilaEngine*);
@@ -290,6 +294,11 @@ struct Api {
           generate_chat_json(library.symbol<Generate>("aila_generate_chat_json")),
           generate_chat_json_ex(
               library.symbol<GenerateEx>("aila_generate_chat_json_ex")),
+          generate_stream(library.symbol<GenerateStream>("aila_generate_stream")),
+          generate_messages_stream(
+              library.symbol<GenerateStream>("aila_generate_messages_stream")),
+          generate_chat_json_stream_ex(
+              library.symbol<GenerateStreamEx>("aila_generate_chat_json_stream_ex")),
           reset(library.symbol<Reset>("aila_engine_reset_context")),
           context_length(library.symbol<ContextLength>("aila_engine_context_length")),
           last_error_code(library.symbol<LastErrorCode>("aila_last_error_code")),
@@ -311,6 +320,9 @@ struct Api {
     Generate generate_messages;
     Generate generate_chat_json;
     GenerateEx generate_chat_json_ex;
+    GenerateStream generate_stream;
+    GenerateStream generate_messages_stream;
+    GenerateStreamEx generate_chat_json_stream_ex;
     Reset reset;
     ContextLength context_length;
     LastErrorCode last_error_code;
@@ -445,6 +457,118 @@ void expect_contains(
     std::string_view message) {
     expect(value.find(expected) != std::string_view::npos,
            std::string(message) + ": " + std::string(value));
+}
+
+struct TokenStreamCapture {
+    std::thread::id caller;
+    std::vector<std::string> tokens;
+    bool abort_first = false;
+    bool wrong_thread = false;
+};
+
+int capture_token(const char* token, void* opaque) {
+    auto& capture = *static_cast<TokenStreamCapture*>(opaque);
+    capture.wrong_thread = capture.wrong_thread || std::this_thread::get_id() != capture.caller;
+    capture.tokens.emplace_back(token ? token : "<NULL>");
+    return capture.abort_first && capture.tokens.size() == 1 ? 1 : 0;
+}
+
+struct StructuredCapture {
+    std::thread::id caller;
+    bool wrong_thread = false;
+    int calls = 0;
+    uint32_t struct_size = 0;
+    int type = -1;
+    std::optional<std::string> text;
+    std::optional<std::string> tool_call_id;
+    std::optional<std::string> tool_name;
+    std::optional<std::string> arguments_delta;
+    std::optional<std::string> warnings_json;
+};
+
+int capture_structured(const AilaChatStreamEvent* event, void* opaque) {
+    auto& capture = *static_cast<StructuredCapture*>(opaque);
+    capture.wrong_thread = capture.wrong_thread || std::this_thread::get_id() != capture.caller;
+    ++capture.calls;
+    capture.struct_size = event->struct_size;
+    capture.type = event->type;
+    auto copy = [](const char* value) -> std::optional<std::string> {
+        return value ? std::optional<std::string>(value) : std::nullopt;
+    };
+    capture.text = copy(event->text);
+    capture.tool_call_id = copy(event->tool_call_id);
+    capture.tool_name = copy(event->tool_name);
+    capture.arguments_delta = copy(event->arguments_delta);
+    capture.warnings_json = copy(event->warnings_json);
+    return 0;
+}
+
+void verify_streaming_generation(const Api& api, AilaEngine* engine) {
+    TokenStreamCapture tokens{std::this_thread::get_id()};
+    expect(api.generate_stream(engine, u8"流式", nullptr, capture_token, &tokens) == 0,
+           "token stream failed");
+    expect(!tokens.wrong_thread, "token callback did not run on caller thread");
+    expect(tokens.tokens == std::vector<std::string>({"first", u8" 第二"}),
+           "token event order or bytes changed");
+
+    TokenStreamCapture messages{std::this_thread::get_id()};
+    expect(api.generate_messages_stream(
+               engine, R"([{"role":"user","content":"hi"}])", nullptr,
+               capture_token, &messages) == 0,
+           "messages stream failed");
+    expect(messages.tokens == tokens.tokens, "messages stream event order changed");
+
+    TokenStreamCapture aborted{std::this_thread::get_id()};
+    aborted.abort_first = true;
+    expect(api.generate_stream(engine, "abort", nullptr, capture_token, &aborted) == 1,
+           "callback abort status changed");
+    expect(aborted.tokens.size() == 1, "callback received tokens after abort");
+    expect(!aborted.wrong_thread, "aborting callback ran on wrong thread");
+    take_string(api, api.generate(engine, "after-stream-abort", nullptr),
+                "worker use after cooperative stream abort");
+
+    AilaGenConfigV2 v2 = api.default_config_v2();
+    StructuredCapture structured{std::this_thread::get_id()};
+    const int structured_status = api.generate_chat_json_stream_ex(
+        engine, "{}", &v2, capture_structured, &structured);
+    expect(structured_status == 0,
+           std::string("structured stream failed: ") + api.last_error_message(engine));
+    expect(structured.calls == 1 && !structured.wrong_thread,
+           "structured callback count or thread changed");
+    expect(structured.struct_size == sizeof(AilaChatStreamEvent) &&
+               structured.type == AILA_CHAT_STREAM_TOOL_CALL_DELTA,
+           "structured event ABI metadata changed");
+    expect(structured.text == std::optional<std::string>(u8"工具"),
+           "structured Unicode text changed");
+    expect(!structured.tool_call_id.has_value(), "structured NULL became non-NULL");
+    expect(structured.tool_name == std::optional<std::string>("search"),
+           "structured tool name changed");
+    expect(structured.arguments_delta == std::optional<std::string>(""),
+           "structured empty string became NULL");
+    expect(structured.warnings_json == std::optional<std::string>("[]"),
+           "structured warnings JSON changed");
+
+    expect(api.generate_stream(engine, nullptr, nullptr, capture_token, &tokens) == -1,
+           "NULL stream input succeeded");
+    expect(api.generate_stream(engine, "x", nullptr, nullptr, nullptr) == -1,
+           "NULL stream callback succeeded");
+    const char invalid_utf8[] = {static_cast<char>(0xc3), static_cast<char>(0x28), 0};
+    expect(api.generate_stream(engine, invalid_utf8, nullptr, capture_token, &tokens) == -1,
+           "invalid UTF-8 stream input succeeded");
+    AilaGenConfigV2 zero{};
+    expect(api.generate_chat_json_stream_ex(
+               engine, "{}", &zero, capture_structured, &structured) == -1,
+           "zero-sized streaming V2 config succeeded");
+    take_string(api, api.generate(engine, "after-local-stream-errors", nullptr),
+                "worker after local streaming argument errors");
+
+    TokenStreamCapture reordered{std::this_thread::get_id()};
+    expect(api.generate_stream(
+               engine, "__aila_stream_response_before_end__", nullptr,
+               capture_token, &reordered) == 0,
+           "response-before-event stream failed");
+    expect(reordered.tokens == tokens.tokens,
+           "final response was accepted before preceding stream events");
 }
 
 void verify_synchronous_generation(const Api& api, AilaEngine* engine) {
@@ -683,6 +807,65 @@ void verify_invalid_utf8_generation_response_reaps_worker(const Api& api) {
            "invalid UTF-8 response did not reap worker");
 }
 
+void verify_malformed_stream_events_reap_worker(const Api& api) {
+    const char* token_cases[] = {
+        "__aila_stream_bad_byte_count__",
+        "__aila_stream_bad_utf8__",
+        "__aila_stream_bad_identity__",
+        "__aila_stream_bad_protocol__",
+        "__aila_stream_bad_nul__",
+        "__aila_stream_bad_schema__",
+        "__aila_stream_early_exit__",
+    };
+    for (const char* marker : token_cases) {
+        const auto before = child_worker_processes();
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), marker, 1024) == 0,
+               std::string("stream malformed init failed: ") + marker);
+        DWORD pid = 0;
+        for (DWORD candidate : child_worker_processes()) {
+            if (before.find(candidate) == before.end()) { pid = candidate; break; }
+        }
+        expect(pid != 0, "malformed stream worker PID was not observable");
+        TokenStreamCapture capture{std::this_thread::get_id()};
+        expect(api.generate_stream(engine.get(), marker, nullptr, capture_token, &capture) == -1,
+               std::string("malformed stream event succeeded: ") + marker);
+        expect(api.last_error_code(engine.get()) == AILA_ERR_RUNTIME,
+               "malformed stream event returned the wrong error");
+        for (int attempt = 0; attempt != 100; ++attempt) {
+            const auto current = child_worker_processes();
+            if (current.find(pid) == current.end()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+        const auto remaining = child_worker_processes();
+        expect(remaining.find(pid) == remaining.end(),
+               std::string("malformed stream event did not reap worker: ") + marker);
+    }
+
+    const auto before = child_worker_processes();
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "bad-structured-stream", 1024) == 0,
+           "bad structured stream init failed");
+    DWORD pid = 0;
+    for (DWORD candidate : child_worker_processes()) {
+        if (before.find(candidate) == before.end()) { pid = candidate; break; }
+    }
+    StructuredCapture capture{std::this_thread::get_id()};
+    AilaGenConfigV2 config = api.default_config_v2();
+    expect(api.generate_chat_json_stream_ex(
+               engine.get(), "__aila_stream_bad_type__", &config,
+               capture_structured, &capture) == -1,
+           "invalid structured stream type succeeded");
+    for (int attempt = 0; attempt != 100; ++attempt) {
+        const auto current = child_worker_processes();
+        if (current.find(pid) == current.end()) break;
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto remaining = child_worker_processes();
+    expect(pid != 0 && remaining.find(pid) == remaining.end(),
+           "invalid structured stream type did not reap worker");
+}
+
 void test_proxy_abi_and_lifecycle() {
     TempDirectory temp;
     const fs::path integration_root = temp.path() / L"split root";
@@ -740,6 +923,7 @@ void test_proxy_abi_and_lifecycle() {
     expect(api.context_length(relative.get()) == 4096,
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
+    verify_streaming_generation(api, relative.get());
     verify_v2_prefix_does_not_read_past_struct_size(api, relative.get());
     verify_generation_errors_and_allocations(api, relative.get());
     auto lines = read_marker(marker);
@@ -785,6 +969,7 @@ void test_proxy_abi_and_lifecycle() {
     runtime_directory.set(runtime.wstring());
     verify_malformed_generation_response_reaps_worker(api);
     verify_invalid_utf8_generation_response_reaps_worker(api);
+    verify_malformed_stream_events_reap_worker(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

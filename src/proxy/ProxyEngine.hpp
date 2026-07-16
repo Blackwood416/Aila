@@ -31,6 +31,18 @@ public:
         std::string_view input,
         const AilaGenConfigV2* config,
         std::string& output);
+    int generate_stream(
+        std::string_view method,
+        std::string_view input,
+        const AilaGenConfig* config,
+        AilaTokenCallback callback,
+        void* user_data);
+    int generate_stream_v2(
+        std::string_view method,
+        std::string_view input,
+        const AilaGenConfigV2* config,
+        AilaChatStreamCallback callback,
+        void* user_data);
 
     int last_error_code() const;
     const char* last_error_message() const;
@@ -50,6 +62,12 @@ private:
         std::string_view method,
         std::string payload_json,
         std::string& output);
+    int stream_payload_locked(
+        std::string_view method,
+        std::string payload_json,
+        AilaTokenCallback token_callback,
+        AilaChatStreamCallback structured_callback,
+        void* user_data);
     void set_error_locked(int code, std::string message);
     void clear_error_locked();
     void shutdown_locked() noexcept;

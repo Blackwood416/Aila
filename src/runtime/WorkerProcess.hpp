@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,8 @@ bool runtime_component_attributes_are_safe(DWORD attributes) noexcept;
 
 class WorkerProcess {
 public:
+    enum class StreamEventAction { Continue, Cancel, End };
+    using StreamEventCallback = std::function<StreamEventAction(const ipc::Frame&)>;
     WorkerProcess();
     ~WorkerProcess() noexcept;
 
@@ -46,6 +49,11 @@ public:
 
     ipc::Frame request(
         const ipc::Frame& frame,
+        std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
+    ipc::Frame request_stream(
+        const ipc::Frame& frame,
+        const StreamEventCallback& callback,
         std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
     bool cancel(

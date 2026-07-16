@@ -87,6 +87,19 @@ bool generation_method(std::string_view method, TextGenerationMethod& result) {
     return true;
 }
 
+bool stream_generation_method(std::string_view method, TextGenerationMethod& result) {
+    if (method == "generate.stream") {
+        result = TextGenerationMethod::GenerateStream;
+    } else if (method == "generate.messages_stream") {
+        result = TextGenerationMethod::GenerateMessagesStream;
+    } else if (method == "generate.chat_json_stream_ex") {
+        result = TextGenerationMethod::GenerateChatJsonStreamEx;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 bool object_integer(
     simdjson::dom::object object,
     const char* name,
@@ -191,12 +204,173 @@ ipc::Frame generation_result(
     return response;
 }
 
+std::string nullable_json_string(const char* value) {
+    return value == nullptr ? "null" : json_string(value);
+}
+
+ipc::Frame token_event(const ipc::Frame& request, std::string_view token) {
+    ipc::Frame event = response_base(request, "event");
+    event.header.payload_json =
+        std::string("{\"event\":\"token\",\"byteCount\":") +
+        std::to_string(token.size()) + "}";
+    event.attachment.reserve(token.size());
+    for (const unsigned char byte : token) {
+        event.attachment.push_back(static_cast<std::byte>(byte));
+    }
+    return event;
+}
+
+ipc::Frame structured_event(const ipc::Frame& request, const AilaChatStreamEvent& value) {
+    ipc::Frame event = response_base(request, "event");
+    event.header.payload_json =
+        std::string("{\"event\":\"structured\",\"structSize\":") +
+        std::to_string(value.struct_size) +
+        ",\"type\":" + std::to_string(value.type) +
+        ",\"text\":" + nullable_json_string(value.text) +
+        ",\"toolCallId\":" + nullable_json_string(value.tool_call_id) +
+        ",\"toolName\":" + nullable_json_string(value.tool_name) +
+        ",\"argumentsDelta\":" + nullable_json_string(value.arguments_delta) +
+        ",\"finishReason\":" + nullable_json_string(value.finish_reason) +
+        ",\"warningsJson\":" + nullable_json_string(value.warnings_json) +
+        ",\"toolCallsJson\":" + nullable_json_string(value.tool_calls_json) + "}";
+    return event;
+}
+
 } // namespace
 
 WorkerDispatcher::WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine)
     : engine_(std::move(engine)) {
     if (!engine_) {
         throw std::invalid_argument("worker dispatcher requires an engine API");
+    }
+}
+
+bool WorkerDispatcher::is_stream_method(std::string_view method) noexcept {
+    TextGenerationMethod ignored;
+    return stream_generation_method(method, ignored);
+}
+
+ipc::Frame WorkerDispatcher::dispatch_stream(
+    const ipc::Frame& request,
+    const WorkerStreamEmitter& emit,
+    const std::atomic_bool& cancelled) {
+    try {
+        TextGenerationMethod method;
+        if (!is_stream_method(request.header.method) ||
+            !stream_generation_method(request.header.method, method)) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "unsupported streaming method");
+        }
+        if (request.header.kind != "request" ||
+            request.header.protocol != ipc::kProtocolVersion ||
+            request.header.abi != ipc::kPublicAbiVersion) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid streaming request identity");
+        }
+        if (!initialized_) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+        }
+        if (!simdjson::validate_utf8(request.header.payload_json)) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "request payload must be valid UTF-8");
+        }
+        simdjson::dom::parser parser;
+        simdjson::dom::element payload;
+        if (parser.parse(request.header.payload_json).get(payload) != simdjson::SUCCESS) {
+            return error(request, AILA_ERR_JSON_PARSE, "streaming payload JSON parse failed");
+        }
+        simdjson::dom::object object;
+        std::string_view input;
+        if (payload.get_object().get(object) != simdjson::SUCCESS ||
+            object["input"].get_string().get(input) != simdjson::SUCCESS ||
+            !require_c_string_safe(input) || !simdjson::validate_utf8(input)) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "streaming input must be a C-string-safe UTF-8 string");
+        }
+        simdjson::dom::element config_element;
+        if (object.at_key("config").get(config_element) != simdjson::SUCCESS) {
+            return error(request, AILA_ERR_INVALID_ARGUMENT, "streaming field 'config' is required");
+        }
+        TextGenerationRequest generation;
+        generation.method = method;
+        generation.input.assign(input.data(), input.size());
+        if (!config_element.is_null()) {
+            simdjson::dom::object config_object;
+            if (config_element.get_object().get(config_object) != simdjson::SUCCESS) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "streaming config must be null or an object");
+            }
+            if (method == TextGenerationMethod::GenerateChatJsonStreamEx) {
+                generation.has_v2_config = true;
+                if (!parse_v2_config(config_object, generation.config_v2)) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "streaming V2 config is malformed");
+                }
+            } else {
+                generation.has_config = true;
+                if (!parse_legacy_config(config_object, generation.config)) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "streaming config is malformed");
+                }
+            }
+        }
+
+        bool emitter_failed = false;
+        auto can_emit = [&] { return !cancelled.load(std::memory_order_acquire) && !emitter_failed; };
+        const int status = engine_->generate_stream(
+            generation,
+            [&](std::string_view token) {
+                if (!can_emit()) return false;
+                if (token.find('\0') != std::string_view::npos ||
+                    !simdjson::validate_utf8(token) || token.size() > ipc::kMaxAttachmentBytes) {
+                    emitter_failed = true;
+                    return false;
+                }
+                if (!emit(token_event(request, token))) {
+                    emitter_failed = true;
+                    return false;
+                }
+                return can_emit();
+            },
+            [&](const AilaChatStreamEvent& event) {
+                if (!can_emit()) return false;
+                if (event.struct_size != sizeof(AilaChatStreamEvent) ||
+                    event.type < AILA_CHAT_STREAM_REASONING_DELTA ||
+                    event.type > AILA_CHAT_STREAM_FINAL) {
+                    emitter_failed = true;
+                    return false;
+                }
+                const char* fields[] = {event.text, event.tool_call_id, event.tool_name,
+                                        event.arguments_delta, event.finish_reason,
+                                        event.warnings_json, event.tool_calls_json};
+                for (const char* field : fields) {
+                    if (field != nullptr &&
+                        !simdjson::validate_utf8(std::string_view(field))) {
+                        emitter_failed = true;
+                        return false;
+                    }
+                }
+                if (!emit(structured_event(request, event))) {
+                    emitter_failed = true;
+                    return false;
+                }
+                return can_emit();
+            });
+        if (emitter_failed) {
+            return error(request, AILA_ERR_RUNTIME, "streaming event was invalid or could not be written");
+        }
+        if (cancelled.load(std::memory_order_acquire)) {
+            return result(request, "{\"status\":1}");
+        }
+        if (status < -1 || status > 1) {
+            return error(request, AILA_ERR_RUNTIME, "streaming adapter returned an invalid status");
+        }
+        if (status < 0) {
+            int code = engine_->last_error_code();
+            if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+            std::string message = engine_->last_error_message();
+            if (message.empty()) message = "streaming generation failed";
+            return error(request, code, message);
+        }
+        return result(request, std::string("{\"status\":") +
+                                  std::to_string(cancelled.load() ? 1 : status) + "}");
+    } catch (const std::exception& exception) {
+        return error(request, AILA_ERR_RUNTIME, exception.what());
+    } catch (...) {
+        return error(request, AILA_ERR_RUNTIME, "unknown streaming dispatcher failure");
     }
 }
 

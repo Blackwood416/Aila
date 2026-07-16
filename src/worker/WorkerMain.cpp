@@ -4,8 +4,10 @@
 #include "ipc/IpcProtocol.hpp"
 #include "ipc/Win32Pipe.hpp"
 #include "worker/WorkerDispatcher.hpp"
+#include "simdjson.h"
 
 #include <cerrno>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <thread>
 
 #ifndef AILA_BUILD_ID
 #error "AilaWorker requires the deterministic AILA_BUILD_ID compile definition"
@@ -330,6 +333,10 @@ public:
                     request.input.c_str(),
                     request.has_v2_config ? &request.config_v2 : nullptr);
                 break;
+            case aila::worker::TextGenerationMethod::GenerateStream:
+            case aila::worker::TextGenerationMethod::GenerateMessagesStream:
+            case aila::worker::TextGenerationMethod::GenerateChatJsonStreamEx:
+                return false;
         }
         if (!result) {
             output.clear();
@@ -343,6 +350,52 @@ public:
         }
         aila_free_string(result);
         return true;
+    }
+
+    int generate_stream(
+        const aila::worker::TextGenerationRequest& request,
+        const aila::worker::TokenStreamCallback& token_callback,
+        const aila::worker::StructuredStreamCallback& structured_callback) override {
+        struct TokenContext {
+            const aila::worker::TokenStreamCallback* callback;
+        } token_context{&token_callback};
+        struct StructuredContext {
+            const aila::worker::StructuredStreamCallback* callback;
+        } structured_context{&structured_callback};
+        const auto token_adapter = [](const char* text, void* opaque) -> int {
+            auto* context = static_cast<TokenContext*>(opaque);
+            if (text == nullptr || !(*context->callback)(text)) {
+                // The legacy in-process token API only suppresses later callbacks after
+                // abort. Unwinding here also stops the underlying generation promptly;
+                // dispatch_stream converts this caught C-API error to status 1 when the
+                // control pipe cancellation flag is set.
+                throw std::runtime_error("stream generation cancelled");
+            }
+            return 0;
+        };
+        const auto structured_adapter = [](const AilaChatStreamEvent* event, void* opaque) -> int {
+            auto* context = static_cast<StructuredContext*>(opaque);
+            return event != nullptr && (*context->callback)(*event) ? 0 : 1;
+        };
+        switch (request.method) {
+            case aila::worker::TextGenerationMethod::GenerateStream:
+                return aila_generate_stream(
+                    engine_, request.input.c_str(),
+                    request.has_config ? &request.config : nullptr,
+                    token_adapter, &token_context);
+            case aila::worker::TextGenerationMethod::GenerateMessagesStream:
+                return aila_generate_messages_stream(
+                    engine_, request.input.c_str(),
+                    request.has_config ? &request.config : nullptr,
+                    token_adapter, &token_context);
+            case aila::worker::TextGenerationMethod::GenerateChatJsonStreamEx:
+                return aila_generate_chat_json_stream_ex(
+                    engine_, request.input.c_str(),
+                    request.has_v2_config ? &request.config_v2 : nullptr,
+                    structured_adapter, &structured_context);
+            default:
+                return -1;
+        }
     }
 
 private:
@@ -390,6 +443,67 @@ int run(const Handles& handles) {
                 return 0;
             }
             return 3;
+        }
+        // Stream cancellation is one-way. A very short stream may finish just
+        // before its control frame is observed; discard that stale control
+        // frame instead of producing an unpaired response on the shared pipe.
+        if (command.header.method == "cancel") {
+            continue;
+        }
+
+        if (aila::worker::WorkerDispatcher::is_stream_method(command.header.method)) {
+            std::atomic_bool cancelled = false;
+            std::atomic_bool finished = false;
+            aila::ipc::Frame stream_response;
+            std::thread inference([&] {
+                stream_response = dispatcher.dispatch_stream(
+                    command,
+                    [&](const aila::ipc::Frame& stream_event) {
+                        send_frame(handles.event_write.get(), stream_event);
+                        return !cancelled.load(std::memory_order_acquire);
+                    },
+                    cancelled);
+                finished.store(true, std::memory_order_release);
+            });
+            while (!finished.load(std::memory_order_acquire)) {
+                DWORD pending = 0;
+                if (PeekNamedPipe(
+                        handles.command_read.get(), nullptr, 0, nullptr, &pending, nullptr) == FALSE) {
+                    cancelled.store(true, std::memory_order_release);
+                    break;
+                }
+                if (pending == 0) {
+                    Sleep(1);
+                    continue;
+                }
+                aila::ipc::Frame control;
+                if (!aila::ipc::read_frame(handles.command_read.get(), control, error)) {
+                    cancelled.store(true, std::memory_order_release);
+                    break;
+                }
+                simdjson::dom::parser parser;
+                simdjson::dom::element payload;
+                uint64_t target = 0;
+                if (control.header.kind != "request" || control.header.method != "cancel" ||
+                    control.header.request_id != command.header.request_id ||
+                    parser.parse(control.header.payload_json).get(payload) != simdjson::SUCCESS ||
+                    payload["requestId"].get_uint64().get(target) != simdjson::SUCCESS ||
+                    target != command.header.request_id) {
+                    cancelled.store(true, std::memory_order_release);
+                    break;
+                }
+                cancelled.store(true, std::memory_order_release);
+            }
+            inference.join();
+            aila::ipc::Frame end = command;
+            end.header.kind = "event";
+            end.header.payload_json = "{\"event\":\"end\"}";
+            end.attachment.clear();
+            send_frame(handles.event_write.get(), end);
+            if (!aila::ipc::write_frame(handles.response_write.get(), stream_response, error)) {
+                return 4;
+            }
+            continue;
         }
 
         bool should_shutdown = false;
