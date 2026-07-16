@@ -1,0 +1,46 @@
+#pragma once
+
+#include "runtime/WorkerProcess.hpp"
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+
+namespace aila::proxy {
+
+class ProxyEngine {
+public:
+    ProxyEngine() = default;
+    ~ProxyEngine() noexcept;
+
+    ProxyEngine(const ProxyEngine&) = delete;
+    ProxyEngine& operator=(const ProxyEngine&) = delete;
+
+    bool init(std::string_view model_directory, int max_seq_len);
+    void reset_context();
+    int context_length();
+
+    int last_error_code() const;
+    const char* last_error_message() const;
+    void record_invalid_argument(std::string message);
+    void record_runtime_error(std::string message);
+
+private:
+    ipc::Frame request_locked(std::string method, std::string payload_json);
+    bool accept_lifecycle_response_locked(
+        const ipc::Frame& response,
+        std::string_view expected_method);
+    void set_error_locked(int code, std::string message);
+    void clear_error_locked();
+    void shutdown_locked() noexcept;
+
+    mutable std::mutex mutex_;
+    runtime::WorkerProcess worker_;
+    uint64_t next_request_id_ = 1;
+    bool initialized_ = false;
+    int error_code_ = 0;
+    std::string error_message_;
+};
+
+} // namespace aila::proxy

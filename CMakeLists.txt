@@ -104,17 +104,18 @@ endif()
 
 if(MSVC)
     # --- Base flags ---
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl /Qstd=c++17 /EHsc /Qftz")
-    # Match DG2 native SIMD width: all subgroup-aware kernels benefit (+2.8% decode).
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-default-sub-group-size 16")
-    # Per-kernel code split: each kernel in its own module for fast incremental build.
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-device-code-split=per_kernel")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math /Qstd=c++17 /EHsc /Qftz")
 else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl -std=c++17 -fsycl-device-code-split=per_kernel")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -std=c++17")
 endif()
 
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsycl")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsycl")
+add_library(AilaSyclOptions INTERFACE)
+target_compile_options(AilaSyclOptions INTERFACE
+    -fsycl
+    -fsycl-device-code-split=per_kernel
+    $<$<BOOL:${MSVC}>:-fsycl-default-sub-group-size=16>
+)
+target_link_options(AilaSyclOptions INTERFACE -fsycl)
 # Enable >4GB device allocations on Intel GPUs (passed through to IGC via -Xs)
 # NOTE: regresses decode ~10% on Arc A770.  Keep for reference; enable only if
 # >4GB buffers are actually needed (e.g. >13B models on 16GB GPUs).
@@ -236,13 +237,26 @@ include_directories(${PROJECT_SOURCE_DIR}/src/templates/jinja)
 find_package(dnnl REQUIRED)
 add_library(simdjson STATIC ${SIMDJSON_SOURCES})
 target_include_directories(simdjson PUBLIC ${PROJECT_SOURCE_DIR}/third_party/simdjson)
+if(WIN32)
+    get_filename_component(AILA_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(AILA_COMPILER_ROOT
+        "${AILA_COMPILER_BIN_DIR}/.." ABSOLUTE)
+    add_library(simdjson_proxy STATIC ${SIMDJSON_SOURCES})
+    target_compile_options(simdjson_proxy PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    set_target_properties(simdjson_proxy PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(simdjson_proxy PUBLIC
+        ${PROJECT_SOURCE_DIR}/third_party/simdjson)
+endif()
 
 # ============================================================
 # Static Library: AilaLib
 # ============================================================
 add_library(AilaLib STATIC ${LIB_SOURCES})
 target_compile_definitions(AilaLib PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson)
+target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson AilaSyclOptions)
 if(WIN32)
     target_link_libraries(AilaLib PUBLIC windowscodecs ole32)
 endif()
@@ -254,12 +268,29 @@ target_include_directories(AilaLib PUBLIC
 # ============================================================
 # Shared Library: AilaShared
 # ============================================================
-add_library(AilaShared SHARED ${LIB_SOURCES})
-target_compile_definitions(AilaShared PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_BUILDING_DLL)
-target_link_libraries(AilaShared PUBLIC DNNL::dnnl simdjson)
 if(WIN32)
-    target_link_libraries(AilaShared PUBLIC windowscodecs ole32)
+    add_library(AilaShared SHARED
+        src/proxy/AilaProxyApi.cpp
+        src/proxy/ProxyEngine.cpp
+        src/runtime/RuntimeDirectory.cpp
+        src/runtime/ChildEnvironment.cpp
+        src/runtime/WorkerProcess.cpp
+        src/ipc/IpcProtocol.cpp
+        src/ipc/Win32Pipe.cpp
+    )
+    target_compile_options(AilaShared PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaShared PRIVATE -fno-sycl)
+    set_target_properties(AilaShared PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_link_directories(AilaShared PRIVATE "${AILA_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaShared PRIVATE simdjson_proxy AilaBuildIdentity)
+else()
+    add_library(AilaShared SHARED ${LIB_SOURCES})
+    target_link_libraries(AilaShared PUBLIC DNNL::dnnl simdjson AilaSyclOptions)
 endif()
+target_compile_definitions(AilaShared PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_BUILDING_DLL)
 target_include_directories(AilaShared PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
@@ -294,7 +325,8 @@ target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
-target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE DNNL::dnnl simdjson)
+target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
 add_test(NAME AilaBnb4BitLinearKernelTests COMMAND AilaBnb4BitLinearKernelTests)
 
 add_executable(AilaConvOpsKernelTests tests/ops/ConvOpsKernelTests.cpp)
@@ -304,7 +336,8 @@ target_include_directories(AilaConvOpsKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
-target_link_libraries(AilaConvOpsKernelTests PRIVATE DNNL::dnnl simdjson)
+target_link_libraries(AilaConvOpsKernelTests PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
 add_test(NAME AilaConvOpsKernelTests COMMAND AilaConvOpsKernelTests)
 
 add_executable(AilaEnvUtilsTests tests/utils/EnvUtilsTests.cpp)
@@ -442,6 +475,31 @@ if(WIN32)
     target_link_libraries(AilaRuntimeIsolationTests PRIVATE simdjson)
     add_dependencies(AilaRuntimeIsolationTests AilaFakeWorker)
     add_test(NAME AilaRuntimeIsolationTests COMMAND AilaRuntimeIsolationTests)
+
+    add_executable(AilaProxyAbiTests tests/runtime/ProxyAbiTests.cpp)
+    target_compile_definitions(AilaProxyAbiTests PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        AILA_STATIC_LIB
+        AILA_PROXY_DLL_PATH="$<TARGET_FILE:AilaShared>"
+        AILA_FAKE_WORKER_PATH="$<TARGET_FILE:AilaFakeWorker>"
+    )
+    target_compile_options(AilaRuntimeIsolationTests PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaRuntimeIsolationTests PRIVATE -fno-sycl)
+    target_compile_options(AilaProxyAbiTests PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaProxyAbiTests PRIVATE -fno-sycl)
+    set_target_properties(AilaProxyAbiTests PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(AilaProxyAbiTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(AilaProxyAbiTests PRIVATE AilaBuildIdentity)
+    add_dependencies(AilaProxyAbiTests AilaShared AilaFakeWorker)
+    add_test(NAME AilaProxyAbiTests COMMAND AilaProxyAbiTests)
 endif()
 
 # ============================================================
@@ -632,7 +690,6 @@ endif()
     endfunction()
 
     copy_runtime_dependencies(Aila EXECUTABLE)
-    copy_runtime_dependencies(AilaShared LIBRARY)
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
 
@@ -645,11 +702,6 @@ endif()
             "-DTARGET_PATH=$<TARGET_FILE:Aila>"
             "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
             "-DTARGET_KIND=EXECUTABLE"
-            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
-        COMMAND ${CMAKE_COMMAND}
-            "-DTARGET_PATH=$<TARGET_FILE:AilaShared>"
-            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
-            "-DTARGET_KIND=LIBRARY"
             -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
         COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM

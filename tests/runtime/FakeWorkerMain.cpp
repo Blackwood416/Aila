@@ -142,14 +142,64 @@ std::string inspection_payload() {
     const fs::path executable = fs::absolute(module_path()).lexically_normal();
     const fs::path runtime = executable.parent_path().lexically_normal();
     const fs::path cwd = fs::absolute(current_directory()).lexically_normal();
+    const std::wstring configured_build_id =
+        environment_value(L"AILA_FAKE_WORKER_BUILD_ID");
+    const std::string build_id = configured_build_id.empty()
+        ? "fake-worker-v1"
+        : utf8(configured_build_id);
     return std::string("{") +
-        "\"buildId\":\"fake-worker-v1\"," +
+        "\"buildId\":" + json_string(build_id) + "," +
         "\"executable\":" + json_string(utf8(executable.wstring())) + "," +
         "\"runtimeDirectory\":" + json_string(utf8(runtime.wstring())) + "," +
         "\"currentDirectory\":" + json_string(utf8(cwd.wstring())) + "," +
         "\"path\":" + json_string(utf8(environment_value(L"PATH"))) + "," +
         "\"sentinel\":" + json_string(utf8(environment_value(L"AILA_TEST_SENTINEL"))) +
         "}";
+}
+
+void append_lifecycle_marker(std::string_view model, int max_seq_len) {
+    const std::wstring marker = environment_value(L"AILA_FAKE_WORKER_LIFECYCLE_MARKER");
+    if (marker.empty()) {
+        return;
+    }
+    HANDLE file = CreateFileW(
+        marker.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("could not open fake worker lifecycle marker");
+    }
+    const std::string line = std::to_string(GetCurrentProcessId()) + "|" +
+        std::string(model) + "|" + std::to_string(max_seq_len) + "\n";
+    DWORD written = 0;
+    const bool ok = line.size() <= (std::numeric_limits<DWORD>::max)() &&
+        WriteFile(
+            file,
+            line.data(),
+            static_cast<DWORD>(line.size()),
+            &written,
+            nullptr) != FALSE &&
+        written == line.size();
+    CloseHandle(file);
+    if (!ok) {
+        throw std::runtime_error("could not write fake worker lifecycle marker");
+    }
+}
+
+aila::ipc::Frame lifecycle_error(
+    const aila::ipc::Frame& command,
+    int code,
+    std::string_view message) {
+    aila::ipc::Frame response = command;
+    response.header.kind = "error";
+    response.header.payload_json = std::string("{\"code\":") + std::to_string(code) +
+        ",\"message\":" + json_string(message) + "}";
+    response.attachment.clear();
+    return response;
 }
 
 uintptr_t parse_handle_value(const wchar_t* value) {
@@ -257,6 +307,8 @@ int run(const Handles& handles) {
         ExitProcess(89);
     }
 
+    bool initialized = false;
+    int context_length = 0;
     for (;;) {
         aila::ipc::Frame command;
         std::string error;
@@ -274,6 +326,44 @@ int run(const Handles& handles) {
         }
         if (command.header.method == "test.inspect") {
             response.header.payload_json = inspection_payload();
+            response.attachment.clear();
+        }
+        if (command.header.method == "engine.init") {
+            if (initialized) {
+                send_frame(
+                    handles.response_write,
+                    lifecycle_error(command, 1, "engine is already initialized"));
+                continue;
+            }
+            simdjson::dom::parser parser;
+            simdjson::dom::element payload;
+            std::string_view model;
+            int64_t max_seq_len = 0;
+            if (parser.parse(command.header.payload_json).get(payload) != simdjson::SUCCESS ||
+                payload["model"].get_string().get(model) != simdjson::SUCCESS ||
+                model.empty() || model.find('\0') != std::string_view::npos ||
+                payload["maxSeqLen"].get_int64().get(max_seq_len) != simdjson::SUCCESS ||
+                max_seq_len <= 0 || max_seq_len > (std::numeric_limits<int>::max)()) {
+                send_frame(
+                    handles.response_write,
+                    lifecycle_error(command, 1, "invalid engine.init payload"));
+                continue;
+            }
+            append_lifecycle_marker(model, static_cast<int>(max_seq_len));
+            initialized = true;
+            context_length = static_cast<int>(max_seq_len);
+            response.header.payload_json = "{\"ok\":true}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "engine.reset") {
+            context_length = 0;
+            response.header.payload_json = "{\"ok\":true}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "engine.context_length") {
+            response.header.payload_json =
+                std::string("{\"contextLength\":") +
+                std::to_string(context_length) + "}";
             response.attachment.clear();
         }
         send_frame(handles.response_write, response);

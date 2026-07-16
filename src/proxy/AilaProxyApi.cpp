@@ -1,0 +1,192 @@
+#include "aila_api.h"
+
+#include "proxy/ProxyEngine.hpp"
+
+#include <cstdlib>
+#include <exception>
+#include <mutex>
+#include <new>
+#include <string>
+
+struct AilaEngine {
+    aila::proxy::ProxyEngine proxy;
+};
+
+namespace {
+
+constexpr const char* kVersion = "0.1.6";
+constexpr const char* kEmpty = "";
+
+std::mutex log_mutex;
+AilaLogCallback log_callback = nullptr;
+void* log_user_data = nullptr;
+int log_level = 1;
+
+void record_boundary_failure(AilaEngine* engine, const char* operation) noexcept {
+    if (!engine) {
+        return;
+    }
+    try {
+        engine->proxy.record_runtime_error(
+            std::string(operation) + " failed at the C ABI boundary");
+    } catch (...) {
+    }
+}
+
+} // namespace
+
+AILA_API const char* aila_version(void) {
+    return kVersion;
+}
+
+AILA_API AilaEngine* aila_engine_create(void) {
+    try {
+        return new AilaEngine();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+AILA_API int aila_engine_init(AilaEngine* engine, const char* model_dir, int max_seq_len) {
+    if (!engine) {
+        return -1;
+    }
+    if (!model_dir) {
+        try {
+            engine->proxy.record_invalid_argument("model_dir must not be NULL");
+        } catch (...) {
+        }
+        return -1;
+    }
+    try {
+        return engine->proxy.init(model_dir, max_seq_len) ? 0 : -1;
+    } catch (...) {
+        record_boundary_failure(engine, "aila_engine_init");
+        return -1;
+    }
+}
+
+AILA_API void aila_engine_destroy(AilaEngine* engine) {
+    try {
+        delete engine;
+    } catch (...) {
+    }
+}
+
+AILA_API AilaGenConfig aila_default_gen_config(void) {
+    AilaGenConfig config{};
+    config.max_new_tokens = 512;
+    config.temperature = 0.6f;
+    config.top_k = 20;
+    config.top_p = 0.95f;
+    config.repetition_penalty = 1.0f;
+    config.presence_penalty = 0.0f;
+    config.frequency_penalty = 0.0f;
+    config.do_sample = 1;
+    config.decode_chunk_size = 12;
+    config.stream_chunk_size = 4;
+    return config;
+}
+
+AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void) {
+    const AilaGenConfig base = aila_default_gen_config();
+    AilaGenConfigV2 config{};
+    config.struct_size = sizeof(AilaGenConfigV2);
+    config.max_new_tokens = base.max_new_tokens;
+    config.temperature = base.temperature;
+    config.top_k = base.top_k;
+    config.top_p = base.top_p;
+    config.repetition_penalty = base.repetition_penalty;
+    config.presence_penalty = base.presence_penalty;
+    config.frequency_penalty = base.frequency_penalty;
+    config.do_sample = base.do_sample;
+    config.decode_chunk_size = base.decode_chunk_size;
+    config.stream_chunk_size = base.stream_chunk_size;
+    config.thinking_budget_tokens = -1;
+    config.sampling_seed = 42;
+    config.use_fixed_seed = 0;
+    return config;
+}
+
+AILA_API void aila_engine_reset_context(AilaEngine* engine) {
+    if (!engine) {
+        return;
+    }
+    try {
+        engine->proxy.reset_context();
+    } catch (...) {
+        record_boundary_failure(engine, "aila_engine_reset_context");
+    }
+}
+
+AILA_API int aila_engine_context_length(AilaEngine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    try {
+        return engine->proxy.context_length();
+    } catch (...) {
+        record_boundary_failure(engine, "aila_engine_context_length");
+        return 0;
+    }
+}
+
+AILA_API int aila_last_error_code(AilaEngine* engine) {
+    if (!engine) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        return engine->proxy.last_error_code();
+    } catch (...) {
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API const char* aila_last_error_message(AilaEngine* engine) {
+    if (!engine) {
+        return kEmpty;
+    }
+    try {
+        return engine->proxy.last_error_message();
+    } catch (...) {
+        return kEmpty;
+    }
+}
+
+AILA_API void aila_free_string(char* string) {
+    std::free(string);
+}
+
+AILA_API void aila_free_samples(float* samples) {
+    std::free(samples);
+}
+
+AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count) {
+    if (!words) {
+        return;
+    }
+    for (int index = 0; index < count; ++index) {
+        std::free(const_cast<char*>(words[index].text));
+    }
+    std::free(words);
+}
+
+AILA_API void aila_set_log_callback(AilaLogCallback callback, void* user_data) {
+    try {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        log_callback = callback;
+        log_user_data = user_data;
+    } catch (...) {
+    }
+}
+
+AILA_API void aila_set_log_level(int level) {
+    if (level < 0 || level > 3) {
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        log_level = level;
+    } catch (...) {
+    }
+}
