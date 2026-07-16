@@ -8,13 +8,11 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -248,30 +246,6 @@ private:
     HANDLE handle_;
 };
 
-class EventRecorder {
-public:
-    void record(const aila::ipc::Frame& frame) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            events_.push_back(frame);
-        }
-        condition_.notify_all();
-    }
-
-    std::optional<aila::ipc::Frame> wait_for_event(std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!condition_.wait_for(lock, timeout, [&] { return !events_.empty(); })) {
-            return std::nullopt;
-        }
-        return events_.front();
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::vector<aila::ipc::Frame> events_;
-};
-
 DWORD process_handle_count() {
     DWORD count = 0;
     if (GetProcessHandleCount(GetCurrentProcess(), &count) == FALSE) {
@@ -289,6 +263,23 @@ void create_empty_file(const fs::path& path) {
 
 fs::path normalized_absolute(const fs::path& path) {
     return fs::absolute(path).lexically_normal();
+}
+
+fs::path long_existing_path(const fs::path& path) {
+    const fs::path normalized = normalized_absolute(path);
+    const DWORD required = GetLongPathNameW(normalized.c_str(), nullptr, 0);
+    if (required == 0) {
+        throw std::runtime_error("GetLongPathNameW size query failed");
+    }
+    std::vector<wchar_t> buffer(static_cast<size_t>(required) + 1);
+    const DWORD copied = GetLongPathNameW(
+        normalized.c_str(),
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()));
+    if (copied == 0 || copied >= buffer.size()) {
+        throw std::runtime_error("GetLongPathNameW failed");
+    }
+    return fs::path(std::wstring(buffer.data(), copied)).lexically_normal();
 }
 
 void expect_path_error(
@@ -596,8 +587,8 @@ void test_proxy_module_path() {
     expect(fs::is_regular_file(module_path), name, "module path did not name the test executable");
 }
 
-void test_worker_start_isolates_process_context_and_consumes_events() {
-    constexpr const char* name = "worker start isolation and event pipe";
+void test_worker_start_isolates_process_context_and_queues_events() {
+    constexpr const char* name = "worker start isolation and queued event pipe";
     EnvironmentRestore path_restore(L"PATH");
     EnvironmentRestore sentinel_restore(L"AILA_TEST_SENTINEL");
     EnvironmentRestore unrelated_handle_restore(L"AILA_TEST_UNRELATED_HANDLE");
@@ -633,13 +624,10 @@ void test_worker_start_isolates_process_context_and_consumes_events() {
     TempDirectory temp;
     const fs::path worker = stage_fake_worker(temp);
     const fs::path runtime = normalized_absolute(temp.path());
-    EventRecorder recorder;
+    const fs::path expected_runtime = long_existing_path(runtime);
+    const fs::path expected_worker = long_existing_path(worker);
     aila::runtime::WorkerProcess process;
-    process.start(
-        runtime,
-        worker,
-        expected_fake_handshake(),
-        [&](const aila::ipc::Frame& event) { recorder.record(event); });
+    process.start(runtime, worker, expected_fake_handshake());
 
     expect(process.healthy(), name, "worker was not healthy after its handshake");
     const aila::ipc::Frame response =
@@ -647,18 +635,22 @@ void test_worker_start_isolates_process_context_and_consumes_events() {
     const Inspection inspection = parse_inspection(response.header.payload_json, name);
     const fs::path system_root = aila::runtime::system_root_directory();
     const std::wstring expected_path =
-        runtime.wstring() + L";" +
+        expected_runtime.wstring() + L";" +
         (system_root / L"System32").lexically_normal().wstring() + L";" +
         system_root.wstring();
 
     expect(inspection.build_id == "fake-worker-v1", name, "fake build ID changed");
-    expect(inspection.executable == utf8(worker.wstring()), name, "worker executable changed");
     expect(
-        inspection.runtime_directory == utf8(runtime.wstring()),
+        inspection.executable == utf8(expected_worker.wstring()),
+        name,
+        "worker executable changed: expected '" + utf8(expected_worker.wstring()) +
+            "', received '" + inspection.executable + "'");
+    expect(
+        inspection.runtime_directory == utf8(expected_runtime.wstring()),
         name,
         "worker runtime directory changed");
     expect(
-        inspection.current_directory == utf8(runtime.wstring()),
+        inspection.current_directory == utf8(expected_runtime.wstring()),
         name,
         "worker current directory was not the runtime directory");
     expect(inspection.path == utf8(expected_path), name, "isolated PATH was not exact");
@@ -676,15 +668,16 @@ void test_worker_start_isolates_process_context_and_consumes_events() {
         name,
         "STARTUPINFOEX handle list leaked an unrelated inheritable handle");
 
-    const std::optional<aila::ipc::Frame> event = recorder.wait_for_event(2s);
-    expect(event.has_value(), name, "event pipe did not deliver the fake log event");
-    expect(event->header.kind == "event", name, "event kind changed");
-    expect(event->header.method == "log", name, "event method changed");
+    process.shutdown(2s);
+    const std::vector<aila::ipc::Frame> events = process.take_events();
+    expect(events.size() == 1, name, "event pipe did not queue exactly one fake log event");
+    expect(events.front().header.kind == "event", name, "event kind changed");
+    expect(events.front().header.method == "log", name, "event method changed");
     expect(
-        event->header.payload_json.find("fake worker ready") != std::string::npos,
+        events.front().header.payload_json.find("fake worker ready") != std::string::npos,
         name,
         "event payload changed");
-    process.shutdown(2s);
+    expect(process.take_events().empty(), name, "take_events did not drain the queue");
 }
 
 void test_worker_request_framing_is_repeatable() {
@@ -853,7 +846,6 @@ void test_worker_partial_handshake_obeys_start_deadline() {
                 temp.path(),
                 worker,
                 expected_fake_handshake(),
-                {},
                 200ms);
         },
         name);
@@ -884,6 +876,20 @@ void test_worker_executable_reparse_points_are_rejected() {
         !aila::runtime::detail::worker_file_attributes_are_safe(INVALID_FILE_ATTRIBUTES),
         name,
         "invalid worker attributes were accepted");
+    expect(
+        aila::runtime::detail::runtime_component_attributes_are_safe(
+            FILE_ATTRIBUTE_DIRECTORY),
+        name,
+        "ordinary runtime directory attributes were rejected");
+    expect(
+        !aila::runtime::detail::runtime_component_attributes_are_safe(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT),
+        name,
+        "reparse runtime component attributes were accepted");
+    expect(
+        !aila::runtime::detail::runtime_component_attributes_are_safe(FILE_ATTRIBUTE_ARCHIVE),
+        name,
+        "non-directory runtime component attributes were accepted");
 
     TempDirectory temp;
     const fs::path link = temp.path() / L"AilaWorker.exe";
@@ -902,6 +908,37 @@ void test_worker_executable_reparse_points_are_rejected() {
             error.find("reparse") != std::string::npos,
             name,
             "reparse rejection diagnostic was not actionable: " + error);
+    }
+
+    const fs::path real_runtime = temp.path() / L"real runtime";
+    fs::create_directories(real_runtime);
+    fs::copy_file(
+        target,
+        real_runtime / L"AilaWorker.exe",
+        fs::copy_options::overwrite_existing);
+    const fs::path runtime_link = temp.path() / L"runtime link";
+    flags = SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    created = CreateSymbolicLinkW(runtime_link.c_str(), real_runtime.c_str(), flags);
+    if (created == FALSE && GetLastError() == ERROR_INVALID_PARAMETER) {
+        created = CreateSymbolicLinkW(
+            runtime_link.c_str(),
+            real_runtime.c_str(),
+            SYMBOLIC_LINK_FLAG_DIRECTORY);
+    }
+    if (created != FALSE) {
+        aila::runtime::WorkerProcess process;
+        const std::string error = expect_runtime_error(
+            [&] {
+                process.start(
+                    runtime_link,
+                    runtime_link / L"AilaWorker.exe",
+                    expected_fake_handshake());
+            },
+            name);
+        expect(
+            error.find("reparse") != std::string::npos,
+            name,
+            "runtime ancestor reparse diagnostic was not actionable: " + error);
     }
 }
 
@@ -945,7 +982,7 @@ int main() {
         test_isolated_environment_validates_entries();
         test_current_environment_and_system_root();
         test_proxy_module_path();
-        test_worker_start_isolates_process_context_and_consumes_events();
+        test_worker_start_isolates_process_context_and_queues_events();
         test_worker_request_framing_is_repeatable();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();

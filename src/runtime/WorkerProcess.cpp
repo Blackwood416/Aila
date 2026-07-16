@@ -25,6 +25,12 @@ bool detail::worker_file_attributes_are_safe(DWORD attributes) noexcept {
         (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
 }
 
+bool detail::runtime_component_attributes_are_safe(DWORD attributes) noexcept {
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -144,6 +150,192 @@ fs::path normalized_absolute(const fs::path& path) {
     return fs::absolute(path).lexically_normal();
 }
 
+bool paths_equal_case_insensitively(const fs::path& left, const fs::path& right) {
+    const std::wstring left_value = left.lexically_normal().wstring();
+    const std::wstring right_value = right.lexically_normal().wstring();
+    if (left_value.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+        right_value.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+    return CompareStringOrdinal(
+               left_value.data(),
+               static_cast<int>(left_value.size()),
+               right_value.data(),
+               static_cast<int>(right_value.size()),
+               TRUE) == CSTR_EQUAL;
+}
+
+fs::path remove_extended_path_prefix(std::wstring value) {
+    constexpr std::wstring_view unc_prefix = L"\\\\?\\UNC\\";
+    constexpr std::wstring_view local_prefix = L"\\\\?\\";
+    if (value.compare(0, unc_prefix.size(), unc_prefix) == 0) {
+        value = L"\\\\" + value.substr(unc_prefix.size());
+    } else if (value.compare(0, local_prefix.size(), local_prefix) == 0) {
+        value.erase(0, local_prefix.size());
+    }
+    return fs::path(std::move(value)).lexically_normal();
+}
+
+fs::path final_path_from_handle(HANDLE handle, const char* context) {
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD copied = GetFinalPathNameByHandleW(
+            handle,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (copied == 0) {
+            throw std::runtime_error(win32_error(context));
+        }
+        if (copied < buffer.size()) {
+            return remove_extended_path_prefix(std::wstring(buffer.data(), copied));
+        }
+        buffer.resize(static_cast<size_t>(copied) + 1);
+    }
+}
+
+DWORD attributes_from_handle(HANDLE handle, const char* context) {
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (GetFileInformationByHandle(handle, &information) == FALSE) {
+        throw std::runtime_error(win32_error(context));
+    }
+    return information.dwFileAttributes;
+}
+
+void validate_runtime_components(const fs::path& runtime_directory) {
+    fs::path current = runtime_directory.root_path();
+    auto validate = [&](const fs::path& component) {
+        const DWORD attributes = GetFileAttributesW(component.c_str());
+        if (!detail::runtime_component_attributes_are_safe(attributes)) {
+            const std::string reason =
+                attributes != INVALID_FILE_ATTRIBUTES &&
+                    (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                ? "runtime path contains a reparse point: '"
+                : "runtime path component is not an ordinary directory: '";
+            throw std::runtime_error(reason + utf8(component.wstring()) + "'");
+        }
+    };
+
+    if (current.empty()) {
+        throw std::runtime_error("worker runtime directory must be absolute");
+    }
+    validate(current);
+    for (const fs::path& component : runtime_directory.relative_path()) {
+        current /= component;
+        validate(current);
+    }
+}
+
+UniqueHandle open_validation_handle(
+    const fs::path& path,
+    DWORD flags,
+    const char* context) {
+    UniqueHandle handle(CreateFileW(
+        path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        flags,
+        nullptr));
+    if (!handle) {
+        throw std::runtime_error(win32_error(context));
+    }
+    return handle;
+}
+
+struct ValidatedLaunchPaths {
+    fs::path runtime_directory;
+    fs::path worker_executable;
+    UniqueHandle runtime_lock;
+    UniqueHandle worker_lock;
+
+    void release_locks() noexcept {
+        worker_lock.reset();
+        runtime_lock.reset();
+    }
+};
+
+ValidatedLaunchPaths validate_launch_paths(
+    const fs::path& runtime_directory,
+    const fs::path& worker_executable) {
+    const fs::path normalized_runtime = normalized_absolute(runtime_directory);
+    const fs::path normalized_worker = normalized_absolute(worker_executable);
+    validate_runtime_components(normalized_runtime);
+    if (!paths_equal_case_insensitively(
+            normalized_worker.parent_path(),
+            normalized_runtime)) {
+        throw std::runtime_error(
+            "worker executable must reside directly in the isolated runtime directory");
+    }
+
+    ValidatedLaunchPaths validated;
+    validated.runtime_lock = open_validation_handle(
+        normalized_runtime,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        "CreateFileW(runtime validation)");
+    if (!detail::runtime_component_attributes_are_safe(
+            attributes_from_handle(
+                validated.runtime_lock.get(),
+                "GetFileInformationByHandle(runtime validation)"))) {
+        throw std::runtime_error("worker runtime directory handle resolved to a reparse point");
+    }
+
+    const DWORD worker_attributes = GetFileAttributesW(normalized_worker.c_str());
+    if (!detail::worker_file_attributes_are_safe(worker_attributes)) {
+        const std::string reason =
+            worker_attributes != INVALID_FILE_ATTRIBUTES &&
+                (worker_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            ? "worker executable must not be a reparse point: '"
+            : "worker executable is not a contained regular file: '";
+        throw std::runtime_error(reason + utf8(normalized_worker.wstring()) + "'");
+    }
+    validated.worker_lock = open_validation_handle(
+        normalized_worker,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        "CreateFileW(worker validation)");
+    if (!detail::worker_file_attributes_are_safe(
+            attributes_from_handle(
+                validated.worker_lock.get(),
+                "GetFileInformationByHandle(worker validation)"))) {
+        throw std::runtime_error("worker executable handle resolved to a reparse point");
+    }
+
+    validated.runtime_directory = final_path_from_handle(
+        validated.runtime_lock.get(),
+        "GetFinalPathNameByHandleW(runtime validation)");
+    validated.worker_executable = final_path_from_handle(
+        validated.worker_lock.get(),
+        "GetFinalPathNameByHandleW(worker validation)");
+    validate_runtime_components(validated.runtime_directory);
+    if (!paths_equal_case_insensitively(
+            validated.worker_executable.parent_path(),
+            validated.runtime_directory)) {
+        throw std::runtime_error(
+            "worker executable handle did not resolve inside the validated runtime directory");
+    }
+    return validated;
+}
+
+fs::path process_image_path(HANDLE process) {
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        DWORD size = static_cast<DWORD>(buffer.size());
+        if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size) != FALSE) {
+            return remove_extended_path_prefix(std::wstring(buffer.data(), size));
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            throw std::runtime_error(win32_error("QueryFullProcessImageNameW"));
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+}
+
+void terminate_and_wait(HANDLE process, DWORD exit_code) noexcept {
+    (void)TerminateProcess(process, exit_code);
+    (void)WaitForSingleObject(process, 2000);
+}
+
 std::wstring quote_argument(std::wstring_view argument) {
     std::wstring quoted = L"\"";
     size_t backslashes = 0;
@@ -253,7 +445,9 @@ struct WorkerProcess::Impl {
     UniqueHandle event_read;
     UniqueHandle process;
     std::thread event_thread;
-    EventHandler event_handler;
+    std::mutex event_mutex;
+    std::condition_variable event_condition;
+    std::vector<ipc::Frame> events;
     ExpectedHandshake expected;
     mutable std::optional<DWORD> cached_exit_code;
     std::string error;
@@ -334,16 +528,11 @@ struct WorkerProcess::Impl {
                 set_error("event frame protocol or ABI did not match the worker handshake");
                 continue;
             }
-            if (!event_handler) {
-                continue;
+            {
+                std::lock_guard<std::mutex> lock(event_mutex);
+                events.push_back(std::move(frame));
             }
-            try {
-                event_handler(frame);
-            } catch (const std::exception& exception) {
-                set_error(std::string("event handler threw: ") + exception.what());
-            } catch (...) {
-                set_error("event handler threw an unknown exception");
-            }
+            event_condition.notify_all();
         }
     }
 
@@ -587,7 +776,6 @@ struct WorkerProcess::Impl {
         }
         response_read.reset();
         event_read.reset();
-        event_handler = {};
         {
             std::lock_guard<std::mutex> lock(state_mutex);
             process.reset();
@@ -608,7 +796,6 @@ void WorkerProcess::start(
     const fs::path& runtime_directory,
     const fs::path& worker_executable,
     const ExpectedHandshake& expected,
-    EventHandler event_handler,
     std::chrono::milliseconds handshake_timeout) {
     std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
     {
@@ -625,38 +812,10 @@ void WorkerProcess::start(
         if (handshake_timeout.count() <= 0) {
             throw std::runtime_error("worker handshake timeout must be positive");
         }
-        const fs::path normalized_runtime = normalized_absolute(runtime_directory);
-        const fs::path normalized_worker = normalized_absolute(worker_executable);
-        std::error_code filesystem_error;
-        if (!fs::is_directory(normalized_runtime, filesystem_error) || filesystem_error) {
-            throw std::runtime_error(
-                "worker runtime directory is not an existing directory: '" +
-                utf8(normalized_runtime.wstring()) + "'");
-        }
-        const DWORD worker_attributes = GetFileAttributesW(normalized_worker.c_str());
-        if ((worker_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
-            worker_attributes != INVALID_FILE_ATTRIBUTES) {
-            throw std::runtime_error(
-                "worker executable must not be a reparse point: '" +
-                utf8(normalized_worker.wstring()) + "'");
-        }
-        if (!detail::worker_file_attributes_are_safe(worker_attributes)) {
-            throw std::runtime_error(
-                "worker executable is not a contained regular file: '" +
-                utf8(normalized_worker.wstring()) + "'");
-        }
-        filesystem_error.clear();
-        if (!fs::is_regular_file(normalized_worker, filesystem_error) || filesystem_error) {
-            throw std::runtime_error(
-                "worker executable is not a regular file: '" +
-                utf8(normalized_worker.wstring()) + "'");
-        }
-        filesystem_error.clear();
-        if (!fs::equivalent(normalized_worker.parent_path(), normalized_runtime, filesystem_error) ||
-            filesystem_error) {
-            throw std::runtime_error(
-                "worker executable must reside directly in the isolated runtime directory");
-        }
+        ValidatedLaunchPaths validated =
+            validate_launch_paths(runtime_directory, worker_executable);
+        const fs::path& normalized_runtime = validated.runtime_directory;
+        const fs::path& normalized_worker = validated.worker_executable;
 
         const fs::path system_root = system_root_directory();
         std::vector<wchar_t> environment = build_isolated_environment(
@@ -711,7 +870,8 @@ void WorkerProcess::start(
         startup.lpAttributeList = attributes.get();
         PROCESS_INFORMATION process_information{};
         const DWORD flags =
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW |
+            CREATE_SUSPENDED;
         if (CreateProcessW(
                 normalized_worker.c_str(),
                 mutable_command.data(),
@@ -732,11 +892,31 @@ void WorkerProcess::start(
         response_write.reset();
         event_write.reset();
 
+        try {
+            const fs::path launched_image = process_image_path(child_process.get());
+            if (!paths_equal_case_insensitively(launched_image, normalized_worker)) {
+                throw std::runtime_error(
+                    "suspended worker image mismatch: expected '" +
+                    utf8(normalized_worker.wstring()) + "', received '" +
+                    utf8(launched_image.wstring()) + "'");
+            }
+            if (ResumeThread(child_thread.get()) == (std::numeric_limits<DWORD>::max)()) {
+                throw std::runtime_error(win32_error("ResumeThread"));
+            }
+            validated.release_locks();
+        } catch (...) {
+            terminate_and_wait(child_process.get(), ERROR_BAD_EXE_FORMAT);
+            throw;
+        }
+
         impl_->command_write = std::move(command_write);
         impl_->response_read = std::move(response_read);
         impl_->event_read = std::move(event_read);
-        impl_->event_handler = std::move(event_handler);
         impl_->expected = expected;
+        {
+            std::lock_guard<std::mutex> event_lock(impl_->event_mutex);
+            impl_->events.clear();
+        }
         {
             std::lock_guard<std::mutex> state_lock(impl_->state_mutex);
             impl_->process = std::move(child_process);
@@ -805,6 +985,13 @@ bool WorkerProcess::cancel(uint64_t request_id, std::chrono::milliseconds timeou
     return request(frame, timeout).header.kind == "result";
 }
 
+std::vector<ipc::Frame> WorkerProcess::take_events() {
+    std::lock_guard<std::mutex> lock(impl_->event_mutex);
+    std::vector<ipc::Frame> result;
+    result.swap(impl_->events);
+    return result;
+}
+
 void WorkerProcess::shutdown(std::chrono::milliseconds timeout) {
     std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
     HANDLE process_handle = nullptr;
@@ -862,7 +1049,6 @@ void WorkerProcess::shutdown(std::chrono::milliseconds timeout) {
     }
     impl_->response_read.reset();
     impl_->event_read.reset();
-    impl_->event_handler = {};
     {
         std::lock_guard<std::mutex> state_lock(impl_->state_mutex);
         impl_->process.reset();

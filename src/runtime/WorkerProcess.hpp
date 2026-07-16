@@ -6,10 +6,10 @@
 
 #include <chrono>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace aila::runtime {
 
@@ -19,11 +19,10 @@ struct ExpectedHandshake {
     std::string build_id;
 };
 
-using EventHandler = std::function<void(const ipc::Frame&)>;
-
 namespace detail {
 
 bool worker_file_attributes_are_safe(DWORD attributes) noexcept;
+bool runtime_component_attributes_are_safe(DWORD attributes) noexcept;
 
 } // namespace detail
 
@@ -43,7 +42,6 @@ public:
         const std::filesystem::path& runtime_directory,
         const std::filesystem::path& worker_executable,
         const ExpectedHandshake& expected,
-        EventHandler event_handler = {},
         std::chrono::milliseconds handshake_timeout = std::chrono::seconds(2));
 
     ipc::Frame request(
@@ -53,6 +51,8 @@ public:
     bool cancel(
         uint64_t request_id,
         std::chrono::milliseconds timeout = std::chrono::seconds(2));
+
+    std::vector<ipc::Frame> take_events();
 
     void shutdown(std::chrono::milliseconds timeout = std::chrono::seconds(2));
 
