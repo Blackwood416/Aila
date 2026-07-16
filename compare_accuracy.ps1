@@ -70,6 +70,53 @@ function Get-OptionalPropertyValue {
     return $property.Value
 }
 
+function Test-FiniteNumber {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $false }
+    $numeric = $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [short] -or $Value -is [ushort] -or
+        $Value -is [int] -or $Value -is [uint] -or $Value -is [long] -or $Value -is [ulong] -or
+        $Value -is [float] -or $Value -is [double] -or $Value -is [decimal]
+    if (-not $numeric) { return $false }
+    try { $number = [double]$Value } catch { return $false }
+    return -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number)
+}
+
+function Test-IntegerNumber {
+    param([AllowNull()]$Value)
+    if (-not (Test-FiniteNumber $Value)) { return $false }
+    if($Value -is [decimal]){return $Value -eq [decimal]::Truncate($Value)}
+    if($Value -is [float]){return [double]$Value -eq [Math]::Truncate([double]$Value)}
+    if($Value -is [double]){return $Value -eq [Math]::Truncate($Value)}
+    return $true
+}
+
+function Test-Int64Integer {
+    param([AllowNull()]$Value)
+    if (-not (Test-IntegerNumber $Value)) { return $false }
+    try { $null = [int64]$Value; return $true } catch { return $false }
+}
+
+function Test-TtsNumericProperty {
+    param($Result,$Object,[string]$Name,[string]$Context,[AllowNull()]$Minimum=$null,[AllowNull()]$Maximum=$null,[switch]$Integer,[switch]$Required)
+    $value=Get-OptionalPropertyValue $Object $Name
+    if($null -eq $value){
+        if($Required){Set-CaseFailure $Result "$Context '$Name' is missing or null";return $false}
+        return $true
+    }
+    if(-not (Test-FiniteNumber $value)){Set-CaseFailure $Result "$Context '$Name' must be a finite number";return $false}
+    if($Integer -and -not (Test-IntegerNumber $value)){Set-CaseFailure $Result "$Context '$Name' must be an integer";return $false}
+    if($Integer){
+        try{$number=[decimal]$value}catch{Set-CaseFailure $Result "$Context '$Name' is outside the supported integer range";return $false}
+        if($null -ne $Minimum -and $number -lt [decimal]$Minimum){Set-CaseFailure $Result "$Context '$Name' must be at least $Minimum";return $false}
+        if($null -ne $Maximum -and $number -gt [decimal]$Maximum){Set-CaseFailure $Result "$Context '$Name' must be at most $Maximum";return $false}
+    }else{
+        $number=[double]$value
+        if($null -ne $Minimum -and $number -lt [double]$Minimum){Set-CaseFailure $Result "$Context '$Name' must be at least $Minimum";return $false}
+        if($null -ne $Maximum -and $number -gt [double]$Maximum){Set-CaseFailure $Result "$Context '$Name' must be at most $Maximum";return $false}
+    }
+    return $true
+}
+
 function Assert-IntegerOne {
     param($Value, [string]$Context)
     if ($Value -isnot [int] -and $Value -isnot [long]) { throw "$Context must be integer 1." }
@@ -285,8 +332,9 @@ function Set-CaseManual { param($Result,[string]$Reason) $Result.manualReviewReq
 
 function Test-VisionCase {
     param($Case)
-    if ($null -ne $Case.config.PSObject.Properties['expectRegex']) { return $true }
-    return ([string]$Case.name -match '(?i)vision|ocr')
+    $config=Get-OptionalPropertyValue $Case 'config'
+    $pattern=Get-OptionalPropertyValue $config 'expectRegex'
+    return -not [string]::IsNullOrWhiteSpace([string]$pattern)
 }
 
 function Compare-ChatCase {
@@ -338,12 +386,20 @@ function Compare-AlignCase {
     $Result.metrics.timestampToleranceMs=$tol; $Result.metrics.boundaryMarginMs=$margin; $Result.metrics.wordCountEqual=($a.Count -eq $b.Count)
     if ($a.Count -eq 0 -or $b.Count -eq 0) { Set-CaseFailure $Result 'aligner output is empty'; return }
     if ($a.Count -ne $b.Count) { Set-CaseFailure $Result 'aligner word counts differ'; return }
-    $maxStart=0; $maxEnd=0; $boundary=$false
+    [int64]$maxStart=0; [int64]$maxEnd=0; $boundary=$false
     for($i=0;$i -lt $a.Count;$i++){
+        $baseStart=Get-OptionalPropertyValue $a[$i] 'startMs';$baseEnd=Get-OptionalPropertyValue $a[$i] 'endMs';$candidateStart=Get-OptionalPropertyValue $b[$i] 'startMs';$candidateEnd=Get-OptionalPropertyValue $b[$i] 'endMs'
+        foreach($timestamp in @(
+            [pscustomobject]@{label='baseline startMs';value=$baseStart},[pscustomobject]@{label='baseline endMs';value=$baseEnd},
+            [pscustomobject]@{label='candidate startMs';value=$candidateStart},[pscustomobject]@{label='candidate endMs';value=$candidateEnd}
+        )){
+            if(-not (Test-Int64Integer $timestamp.value) -or [int64]$timestamp.value -lt 0){Set-CaseFailure $Result "aligner $($timestamp.label) must be a nonnegative integer within Int64 range at index $i";return}
+        }
+        $baseStart=[int64]$baseStart;$baseEnd=[int64]$baseEnd;$candidateStart=[int64]$candidateStart;$candidateEnd=[int64]$candidateEnd
         if ([string]$a[$i].text -cne [string]$b[$i].text) { Set-CaseFailure $Result "aligner word mismatch at index $i"; return }
-        if([int]$a[$i].endMs -lt [int]$a[$i].startMs -or [int]$b[$i].endMs -lt [int]$b[$i].startMs){Set-CaseFailure $Result "aligner interval has end before start at index $i";return}
-        if($i -gt 0 -and (([int]$a[$i].startMs -lt [int]$a[$i-1].startMs) -or ([int]$a[$i].endMs -lt [int]$a[$i-1].endMs) -or ([int]$b[$i].startMs -lt [int]$b[$i-1].startMs) -or ([int]$b[$i].endMs -lt [int]$b[$i-1].endMs))){Set-CaseFailure $Result "aligner timestamps are nonmonotonic at index $i";return}
-        $sd=[Math]::Abs([int]$a[$i].startMs-[int]$b[$i].startMs); $ed=[Math]::Abs([int]$a[$i].endMs-[int]$b[$i].endMs)
+        if($baseEnd -lt $baseStart -or $candidateEnd -lt $candidateStart){Set-CaseFailure $Result "aligner interval has end before start at index $i";return}
+        if($i -gt 0 -and (($baseStart -lt [int64]$a[$i-1].startMs) -or ($baseEnd -lt [int64]$a[$i-1].endMs) -or ($candidateStart -lt [int64]$b[$i-1].startMs) -or ($candidateEnd -lt [int64]$b[$i-1].endMs))){Set-CaseFailure $Result "aligner timestamps are nonmonotonic at index $i";return}
+        $sd=[Math]::Abs($baseStart-$candidateStart); $ed=[Math]::Abs($baseEnd-$candidateEnd)
         $maxStart=[Math]::Max($maxStart,$sd); $maxEnd=[Math]::Max($maxEnd,$ed); if(($sd -ge ($tol-$margin) -and $sd -le $tol) -or ($ed -ge ($tol-$margin) -and $ed -le $tol)){$boundary=$true}
         if($sd -gt $tol -or $ed -gt $tol){Set-CaseFailure $Result "aligner timestamp delta exceeds ${tol}ms at index $i"; return}
     }
@@ -371,8 +427,30 @@ function Extract-SpeakerEmbedding {
 }
 
 function Apply-TtsMetricGates {
-    param($Result,$Metrics,[bool]$AudioHashEqual,[AllowNull()][Nullable[double]]$SpeakerCosine,[switch]$SkipEmbedding)
-    if([int]$Metrics.duration_delta_frames -gt $script:AudioThresholds.durationDeltaFramesMaximum){Set-CaseFailure $Result 'TTS duration delta exceeds 2000 frames'}
+    param($Result,$Metrics,[bool]$AudioHashEqual,[AllowNull()]$SpeakerCosine,[switch]$SkipEmbedding)
+    $valid=$true
+    foreach($spec in @(
+        [pscustomobject]@{name='duration_delta_frames';min=0;max=[int64]::MaxValue;integer=$true;required=$true},
+        [pscustomobject]@{name='correlation';min=-1;max=1;integer=$false;required=$true},
+        [pscustomobject]@{name='relative_rms_delta';min=0;max=$null;integer=$false;required=$true},
+        [pscustomobject]@{name='log_mel_mae';min=0;max=$null;integer=$false;required=$true},
+        [pscustomobject]@{name='clipping_ratio_delta';min=0;max=1;integer=$false;required=$true},
+        [pscustomobject]@{name='silence_ratio_delta';min=0;max=1;integer=$false;required=$true},
+        [pscustomobject]@{name='sample_rate';min=1;max=[int]::MaxValue;integer=$true;required=$false},
+        [pscustomobject]@{name='reference_frames';min=1;max=[int64]::MaxValue;integer=$true;required=$false},
+        [pscustomobject]@{name='candidate_frames';min=1;max=[int64]::MaxValue;integer=$true;required=$false},
+        [pscustomobject]@{name='reference_rms';min=0;max=$null;integer=$false;required=$false},
+        [pscustomobject]@{name='candidate_rms';min=0;max=$null;integer=$false;required=$false},
+        [pscustomobject]@{name='reference_clipping_ratio';min=0;max=1;integer=$false;required=$false},
+        [pscustomobject]@{name='candidate_clipping_ratio';min=0;max=1;integer=$false;required=$false},
+        [pscustomobject]@{name='reference_silence_ratio';min=0;max=1;integer=$false;required=$false},
+        [pscustomobject]@{name='candidate_silence_ratio';min=0;max=1;integer=$false;required=$false}
+    )){
+        if(-not (Test-TtsNumericProperty $Result $Metrics $spec.name 'TTS audio metric' $spec.min $spec.max -Integer:$spec.integer -Required:$spec.required)){$valid=$false}
+    }
+    if($null -ne $SpeakerCosine -and (-not (Test-FiniteNumber $SpeakerCosine) -or [double]$SpeakerCosine -lt -1 -or [double]$SpeakerCosine -gt 1)){Set-CaseFailure $Result 'TTS speaker embedding cosine must be finite and within [-1, 1]';$valid=$false}
+    if(-not $valid){return}
+    if([int64]$Metrics.duration_delta_frames -gt $script:AudioThresholds.durationDeltaFramesMaximum){Set-CaseFailure $Result 'TTS duration delta exceeds 2000 frames'}
     $embeddingMaterial=(-not $SkipEmbedding -and $null -ne $SpeakerCosine -and [double]$SpeakerCosine -lt $script:AudioThresholds.speakerEmbeddingCosineManualBelow)
     if(-not $AudioHashEqual -or $embeddingMaterial){
         $material=([double]$Metrics.correlation -lt $script:AudioThresholds.correlationManualBelow -or [double]$Metrics.relative_rms_delta -gt $script:AudioThresholds.relativeRmsDeltaManualAbove -or [double]$Metrics.log_mel_mae -gt $script:AudioThresholds.logMelMaeManualAbove -or [double]$Metrics.clipping_ratio_delta -gt $script:AudioThresholds.clippingRatioDeltaManualAbove -or [double]$Metrics.silence_ratio_delta -gt $script:AudioThresholds.silenceRatioDeltaManualAbove)
@@ -383,6 +461,23 @@ function Apply-TtsMetricGates {
 
 function Apply-TtsFormatGates {
     param($Result,$Reference,$Candidate)
+    $valid=$true
+    foreach($side in @([pscustomobject]@{label='reference';value=$Reference},[pscustomobject]@{label='candidate';value=$Candidate})){
+        foreach($spec in @(
+            [pscustomobject]@{name='channels';min=1;required=$true},[pscustomobject]@{name='audioFormat';min=$null;required=$true},[pscustomobject]@{name='bitsPerSample';min=1;required=$true},
+            [pscustomobject]@{name='sampleRate';min=1;required=$false},[pscustomobject]@{name='frameCount';min=1;required=$false},[pscustomobject]@{name='blockAlign';min=1;required=$false},[pscustomobject]@{name='byteRate';min=1;required=$false}
+        )){
+            if(-not (Test-TtsNumericProperty $Result $side.value $spec.name "TTS WAV $($side.label)" $spec.min ([int]::MaxValue) -Integer -Required:$spec.required)){$valid=$false}
+        }
+        $format=Get-OptionalPropertyValue $side.value 'audioFormat';$bits=Get-OptionalPropertyValue $side.value 'bitsPerSample'
+        $formatSafe=(Test-IntegerNumber $format) -and [double]$format -ge [int]::MinValue -and [double]$format -le [int]::MaxValue
+        $bitsSafe=(Test-IntegerNumber $bits) -and [double]$bits -ge [int]::MinValue -and [double]$bits -le [int]::MaxValue
+        if($formatSafe -and [int]$format -notin @(1,3)){Set-CaseFailure $Result "TTS WAV $($side.label) audioFormat is unsupported: $format";$valid=$false}
+        if($formatSafe -and $bitsSafe){
+            if(([int]$format -eq 1 -and [int]$bits -notin @(8,16,24,32)) -or ([int]$format -eq 3 -and [int]$bits -notin @(32,64))){Set-CaseFailure $Result "TTS WAV $($side.label) bit depth $bits is unsupported for audioFormat $format";$valid=$false}
+        }
+    }
+    if(-not $valid){return}
     if([int]$Reference.channels -ne [int]$Candidate.channels){Set-CaseFailure $Result 'TTS WAV channel counts differ'}
     if([int]$Reference.audioFormat -ne [int]$Candidate.audioFormat){Set-CaseFailure $Result 'TTS WAV audio formats differ'}
     if([int]$Reference.bitsPerSample -ne [int]$Candidate.bitsPerSample){Set-CaseFailure $Result 'TTS WAV bit depths differ'}
@@ -458,6 +553,7 @@ function Invoke-SelfTest {
     function Check([bool]$Condition,[string]$Name){if(-not $Condition){$failures.Add($Name)}}
     Check ((Get-CharacterErrorRate '这是错事' '这是测试') -gt 0) 'Unicode CER'
     Check ((Normalize-Text ' A，B。 ') -ceq 'a b') 'Unicode normalization'
+    Check (-not (Test-FiniteNumber $null)) 'finite-number helper rejects null safely'
     $base=[pscustomobject]@{name='chat';kind='chat';status='passed';executionPassed=$true;expectationPassed=$null;manualReviewRequired=$false;normalizedText='same';config=[pscustomobject]@{};output=[pscustomobject]@{sha256='A'}}
     $cand=$base.PSObject.Copy(); $r=New-CaseResult $base $cand; Compare-ChatCase $base $cand $r; Check $r.passed 'exact chat pass'
     $cand=$base.PSObject.Copy();$cand.normalizedText='different';$cand.output=[pscustomobject]@{sha256='B'};$r=New-CaseResult $base $cand;Compare-ChatCase $base $cand $r;Check (-not $r.passed) 'chat mismatch fail'
@@ -476,6 +572,8 @@ function Invoke-SelfTest {
     $visionBase=$base.PSObject.Copy();$visionBase.name='vision';$visionBase.config=[pscustomobject]@{expectRegex='ok'};$visionBase.expectationPassed=$true;$visionBase|Add-Member -NotePropertyName rawText -NotePropertyValue 'ok one';$visionBase|Add-Member -NotePropertyName tokenSequenceAvailable -NotePropertyValue $true;$visionBase|Add-Member -NotePropertyName generatedTokenIds -NotePropertyValue @(1,2)
     $visionCand=$visionBase.PSObject.Copy();$visionCand.normalizedText='other';$visionCand.rawText='ok two';$visionCand.output=[pscustomobject]@{sha256='B'};$visionCand.generatedTokenIds=@(1,3);$r=New-CaseResult $visionBase $visionCand;Compare-ChatCase $visionBase $visionCand $r;Check ($r.passed -and $r.manualReviewRequired -and $r.status -eq 'manual-review-required') 'vision valid-different text-artifact-token manual'
     $visionCand=$visionBase.PSObject.Copy();$visionCand.expectationPassed=$false;$visionCand.rawText='no';$r=New-CaseResult $visionBase $visionCand;Compare-ChatCase $visionBase $visionCand $r;Check (-not $r.passed) 'vision regex fail'
+    $visionLike=$tokenBase.PSObject.Copy();$visionLike.name='vision_like_chat';$r=New-CaseResult $visionLike $visionLike;try{Compare-ChatCase $visionLike $visionLike $r;Check ($r.passed -and -not $r.manualReviewRequired) 'vision-like ordinary chat exact pass'}catch{$failures.Add("vision-like ordinary chat threw: $($_.Exception.Message)")}
+    $visionLikeCandidate=$visionLike.PSObject.Copy();$visionLikeCandidate.normalizedText='different';$visionLikeCandidate.output=[pscustomobject]@{sha256='B'};$visionLikeCandidate.generatedTokenIds=@(1,3);$r=New-CaseResult $visionLike $visionLikeCandidate;try{Compare-ChatCase $visionLike $visionLikeCandidate $r;Check (-not $r.passed -and $r.status -eq 'failed' -and $r.reasons.Count -gt 0) 'vision-like ordinary chat mismatch structured fail'}catch{$failures.Add("vision-like ordinary chat mismatch threw: $($_.Exception.Message)")}
     $asrBase=[pscustomobject]@{name='asr';kind='asr';status='expectation-failed';executionPassed=$true;expectationPassed=$false;manualReviewRequired=$true;normalizedText='错';config=[pscustomobject]@{expectedText='对'};output=[pscustomobject]@{}}
     $asrCand=$asrBase.PSObject.Copy();$r=New-CaseResult $asrBase $asrCand;Compare-AsrCase $asrBase $asrCand $r;Check ($r.passed -and $r.automaticPassed -and $r.manualReviewRequired -and $r.status -eq 'manual-review-required') 'ASR equal-wrong manual pass'
     $asrCand=$asrBase.PSObject.Copy();$asrCand.normalizedText='更错';$r=New-CaseResult $asrBase $asrCand;Compare-AsrCase $asrBase $asrCand $r;Check (-not $r.passed) 'ASR worse CER fail'
@@ -484,14 +582,32 @@ function Invoke-SelfTest {
     $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=81;endMs=80});$r=New-CaseResult $alignBase $alignCand;Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed) 'align over boundary fail'
     $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=71;endMs=151});$r=New-CaseResult $alignBase $alignCand;Compare-AlignCase $alignBase $alignCand $r;Check ($r.passed -and -not $r.manualReviewRequired) 'align ordinary delta pass'
     foreach($delta in 72,79,80){$alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=$delta;endMs=$delta+80});$r=New-CaseResult $alignBase $alignCand;Compare-AlignCase $alignBase $alignCand $r;Check ($r.passed -and $r.manualReviewRequired) "align near-boundary $delta manual"}
+    $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=-1;endMs=80});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and $r.status -eq 'failed' -and [string]$r.reasons[0] -match 'nonnegative integer') 'align first-row negative start structured fail'}catch{$failures.Add("align first-row negative start threw: $($_.Exception.Message)")}
+    $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=0;endMs=-1});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and $r.status -eq 'failed' -and [string]$r.reasons[0] -match 'endMs must be a nonnegative integer') 'align negative end structured fail'}catch{$failures.Add("align negative end threw: $($_.Exception.Message)")}
+    $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=1e100;endMs=1e100});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and $r.status -eq 'failed') 'align oversized integer structured fail'}catch{$failures.Add("align oversized integer threw: $($_.Exception.Message)")}
+    $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=[Math]::Pow(2,63);endMs=[Math]::Pow(2,63)});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and $r.status -eq 'failed') 'align Int64 boundary overflow structured fail'}catch{$failures.Add("align Int64 boundary overflow threw: $($_.Exception.Message)")}
+    $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=[int64]3000000000;endMs=[int64]3000000080});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and $r.status -eq 'failed' -and [string]$r.reasons[0] -match 'delta exceeds') 'align large Int64 delta structured fail'}catch{$failures.Add("align large Int64 delta threw: $($_.Exception.Message)")}
+    $largeFraction=[decimal]::Parse('9007199254740992.1',[Globalization.CultureInfo]::InvariantCulture);$alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=$largeFraction;endMs=$largeFraction});$r=New-CaseResult $alignBase $alignCand;try{Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed -and [string]$r.reasons[0] -match 'nonnegative integer') 'align large fractional decimal structured fail'}catch{$failures.Add("align large fractional decimal threw: $($_.Exception.Message)")}
     $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='字';startMs=0;endMs=80},[pscustomobject]@{text='二';startMs=-1;endMs=90});$alignBase.alignment=@([pscustomobject]@{text='字';startMs=0;endMs=80},[pscustomobject]@{text='二';startMs=80;endMs=160});$r=New-CaseResult $alignBase $alignCand;Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed) 'align nonmonotonic fail'
     $alignCand=$alignBase.PSObject.Copy();$alignCand.alignment=@([pscustomobject]@{text='词';startMs=0;endMs=80});$r=New-CaseResult $alignBase $alignCand;Compare-AlignCase $alignBase $alignCand $r;Check (-not $r.passed) 'align word mismatch fail'
     $ttsBase=[pscustomobject]@{name='tts';kind='tts';status='passed';executionPassed=$true;expectationPassed=$null;manualReviewRequired=$false;output=[pscustomobject]@{}}
     $ttsResult=New-CaseResult $ttsBase $ttsBase;$identical=[pscustomobject]@{duration_delta_frames=0;correlation=1.0;relative_rms_delta=0.0;log_mel_mae=0.0;clipping_ratio_delta=0.0;silence_ratio_delta=0.0};Apply-TtsMetricGates $ttsResult $identical $true $null -SkipEmbedding;Check ($ttsResult.passed -and -not $ttsResult.manualReviewRequired) 'TTS identical metrics'
     $ttsResult=New-CaseResult $ttsBase $ttsBase;$long=$identical.PSObject.Copy();$long.duration_delta_frames=2001;Apply-TtsMetricGates $ttsResult $long $false $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS duration fail'
     $ttsResult=New-CaseResult $ttsBase $ttsBase;$material=$identical.PSObject.Copy();$material.correlation=0.9;Apply-TtsMetricGates $ttsResult $material $false $null -SkipEmbedding;Check ($ttsResult.passed -and $ttsResult.manualReviewRequired) 'TTS material manual'
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.correlation=[double]::NaN;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS NaN correlation structured fail'}catch{$failures.Add("TTS NaN correlation threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.log_mel_mae=[double]::PositiveInfinity;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS infinite log-mel structured fail'}catch{$failures.Add("TTS infinite log-mel threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;try{Apply-TtsMetricGates $ttsResult $identical $true 1.1;Check (-not $ttsResult.passed) 'TTS out-of-range speaker cosine structured fail'}catch{$failures.Add("TTS out-of-range speaker cosine threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.duration_delta_frames=-1;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS negative duration structured fail'}catch{$failures.Add("TTS negative duration threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.duration_delta_frames=1e100;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS oversized duration structured fail'}catch{$failures.Add("TTS oversized duration threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.duration_delta_frames=[Math]::Pow(2,63);try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS Int64 boundary duration structured fail'}catch{$failures.Add("TTS Int64 boundary duration threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid.relative_rms_delta=-0.1;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS negative RMS delta structured fail'}catch{$failures.Add("TTS negative RMS delta threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid|Add-Member -NotePropertyName sample_rate -NotePropertyValue 0;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS nonpositive sample rate structured fail'}catch{$failures.Add("TTS nonpositive sample rate threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid|Add-Member -NotePropertyName reference_frames -NotePropertyValue $largeFraction;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS large fractional frame count structured fail'}catch{$failures.Add("TTS large fractional frame count threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;$invalid=$identical.PSObject.Copy();$invalid|Add-Member -NotePropertyName reference_clipping_ratio -NotePropertyValue 1.1;try{Apply-TtsMetricGates $ttsResult $invalid $true $null -SkipEmbedding;Check (-not $ttsResult.passed) 'TTS out-of-range clipping ratio structured fail'}catch{$failures.Add("TTS out-of-range clipping ratio threw: $($_.Exception.Message)")}
     $ttsResult=New-CaseResult $ttsBase $ttsBase;Apply-TtsFormatGates $ttsResult ([pscustomobject]@{channels=1;audioFormat=3;bitsPerSample=32}) ([pscustomobject]@{channels=2;audioFormat=3;bitsPerSample=32});Check (-not $ttsResult.passed) 'TTS channel mismatch fail'
     $ttsResult=New-CaseResult $ttsBase $ttsBase;Apply-TtsFormatGates $ttsResult ([pscustomobject]@{channels=1;audioFormat=1;bitsPerSample=16;blockAlign=2}) ([pscustomobject]@{channels=1;audioFormat=3;bitsPerSample=32;blockAlign=4});Check (-not $ttsResult.passed) 'TTS PCM-float format mismatch fail'
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;try{Apply-TtsFormatGates $ttsResult ([pscustomobject]@{channels=1;audioFormat=9;bitsPerSample=16}) ([pscustomobject]@{channels=1;audioFormat=9;bitsPerSample=16});Check (-not $ttsResult.passed) 'TTS unsupported WAV format structured fail'}catch{$failures.Add("TTS unsupported WAV format threw: $($_.Exception.Message)")}
+    $ttsResult=New-CaseResult $ttsBase $ttsBase;try{Apply-TtsFormatGates $ttsResult ([pscustomobject]@{channels=1;audioFormat=1e100;bitsPerSample=16}) ([pscustomobject]@{channels=1;audioFormat=1;bitsPerSample=16});Check (-not $ttsResult.passed) 'TTS oversized WAV format structured fail'}catch{$failures.Add("TTS oversized WAV format threw: $($_.Exception.Message)")}
     $ttsResult=New-CaseResult $ttsBase $ttsBase;$ttsResult.metrics.speakerEmbeddingCosine=$null;$ttsResult.metrics.speaker_embedding_cosine=$null;Compare-SpeakerEmbeddings $ttsResult ([pscustomobject]@{dimension=2;values=@(1,0);sha256='a';norm=1}) ([pscustomobject]@{dimension=3;values=@(1,0,0);sha256='b';norm=1}) $script:TmpRoot 'dimension-test';Check (-not $ttsResult.passed -and $null -eq $ttsResult.metrics.speaker_embedding_cosine) 'embedding dimension structured fail'
     $ttsResult=New-CaseResult $ttsBase $ttsBase;Apply-TtsMetricGates $ttsResult $identical $true 0.9;Check ($ttsResult.passed -and $ttsResult.manualReviewRequired) 'exact TTS WAV low cosine manual'
     $badWav=Join-Path $script:TmpRoot ('bad-wav-'+[guid]::NewGuid().ToString('N')+'.wav');New-Item -ItemType Directory -Path $script:TmpRoot -Force|Out-Null;Set-Content -LiteralPath $badWav -Value 'not wav' -Encoding ascii
