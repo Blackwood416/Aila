@@ -279,15 +279,46 @@ target_link_libraries(AilaIpcProtocolTests PRIVATE simdjson)
 add_test(NAME AilaIpcProtocolTests COMMAND AilaIpcProtocolTests)
 
 if(WIN32)
+    add_executable(AilaFakeWorker
+        tests/runtime/FakeWorkerMain.cpp
+        src/ipc/IpcProtocol.cpp
+        src/ipc/Win32Pipe.cpp
+    )
+    target_compile_definitions(AilaFakeWorker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaFakeWorker PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaFakeWorker PRIVATE -fno-sycl)
+    target_include_directories(AilaFakeWorker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    get_filename_component(AILA_FAKE_WORKER_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(AILA_FAKE_WORKER_COMPILER_ROOT
+        "${AILA_FAKE_WORKER_COMPILER_BIN_DIR}/.." ABSOLUTE)
+    target_link_directories(AilaFakeWorker PRIVATE
+        "${AILA_FAKE_WORKER_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaFakeWorker PRIVATE simdjson)
+
     add_executable(AilaRuntimeIsolationTests
         tests/runtime/RuntimeIsolationTests.cpp
         src/runtime/RuntimeDirectory.cpp
         src/runtime/ChildEnvironment.cpp
+        src/runtime/WorkerProcess.cpp
+        src/ipc/IpcProtocol.cpp
+        src/ipc/Win32Pipe.cpp
     )
-    target_compile_definitions(AilaRuntimeIsolationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(AilaRuntimeIsolationTests PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        AILA_FAKE_WORKER_PATH=\"$<TARGET_FILE:AilaFakeWorker>\"
+    )
     target_include_directories(AilaRuntimeIsolationTests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
+    target_link_directories(AilaRuntimeIsolationTests PRIVATE
+        "${AILA_FAKE_WORKER_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaRuntimeIsolationTests PRIVATE simdjson)
+    add_dependencies(AilaRuntimeIsolationTests AilaFakeWorker)
     add_test(NAME AilaRuntimeIsolationTests COMMAND AilaRuntimeIsolationTests)
 endif()
 

@@ -2,22 +2,35 @@
 
 #include "runtime/ChildEnvironment.hpp"
 #include "runtime/RuntimeDirectory.hpp"
+#include "runtime/WorkerProcess.hpp"
+
+#include "simdjson.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace {
 
 namespace fs = std::filesystem;
+
+#ifndef AILA_FAKE_WORKER_PATH
+#error AILA_FAKE_WORKER_PATH must name the built fake worker
+#endif
+
+using namespace std::chrono_literals;
 
 [[noreturn]] void fail(const char* test_name, const std::string& message) {
     throw std::runtime_error(std::string("FAILED: ") + test_name + ": " + message);
@@ -141,6 +154,131 @@ private:
     std::wstring name_;
     std::optional<std::wstring> original_;
 };
+
+fs::path stage_fake_worker(const TempDirectory& temp) {
+    const fs::path source = fs::path(AILA_FAKE_WORKER_PATH);
+    const fs::path destination = temp.path() / L"AilaWorker.exe";
+    std::error_code error;
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing, error);
+    if (error) {
+        throw std::runtime_error("could not stage fake worker: " + error.message());
+    }
+    return fs::absolute(destination).lexically_normal();
+}
+
+aila::runtime::ExpectedHandshake expected_fake_handshake(std::string build_id = "fake-worker-v1") {
+    return {
+        aila::ipc::kProtocolVersion,
+        aila::ipc::kPublicAbiVersion,
+        std::move(build_id),
+    };
+}
+
+aila::ipc::Frame request_frame(
+    uint64_t request_id,
+    std::string method,
+    std::string payload_json = "{}",
+    std::vector<std::byte> attachment = {}) {
+    aila::ipc::Frame frame;
+    frame.header.request_id = request_id;
+    frame.header.kind = "request";
+    frame.header.method = std::move(method);
+    frame.header.payload_json = std::move(payload_json);
+    frame.attachment = std::move(attachment);
+    return frame;
+}
+
+std::vector<std::byte> bytes(std::initializer_list<unsigned int> values) {
+    std::vector<std::byte> result;
+    result.reserve(values.size());
+    for (const unsigned int value : values) {
+        result.push_back(static_cast<std::byte>(value));
+    }
+    return result;
+}
+
+struct Inspection {
+    std::string build_id;
+    std::string executable;
+    std::string runtime_directory;
+    std::string current_directory;
+    std::string path;
+    std::string sentinel;
+};
+
+Inspection parse_inspection(const std::string& payload_json, const char* test_name) {
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    expect(
+        parser.parse(payload_json).get(root) == simdjson::SUCCESS,
+        test_name,
+        "worker inspection payload was not valid JSON");
+
+    auto required_string = [&](const char* field) {
+        std::string_view value;
+        expect(
+            root[field].get_string().get(value) == simdjson::SUCCESS,
+            test_name,
+            std::string("inspection payload omitted string field '") + field + "'");
+        return std::string(value);
+    };
+    return {
+        required_string("buildId"),
+        required_string("executable"),
+        required_string("runtimeDirectory"),
+        required_string("currentDirectory"),
+        required_string("path"),
+        required_string("sentinel"),
+    };
+}
+
+class TestHandle {
+public:
+    explicit TestHandle(HANDLE handle) : handle_(handle) {}
+    ~TestHandle() {
+        if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+        }
+    }
+    TestHandle(const TestHandle&) = delete;
+    TestHandle& operator=(const TestHandle&) = delete;
+    HANDLE get() const { return handle_; }
+
+private:
+    HANDLE handle_;
+};
+
+class EventRecorder {
+public:
+    void record(const aila::ipc::Frame& frame) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            events_.push_back(frame);
+        }
+        condition_.notify_all();
+    }
+
+    std::optional<aila::ipc::Frame> wait_for_event(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!condition_.wait_for(lock, timeout, [&] { return !events_.empty(); })) {
+            return std::nullopt;
+        }
+        return events_.front();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<aila::ipc::Frame> events_;
+};
+
+DWORD process_handle_count() {
+    DWORD count = 0;
+    if (GetProcessHandleCount(GetCurrentProcess(), &count) == FALSE) {
+        throw std::runtime_error("GetProcessHandleCount failed");
+    }
+    return count;
+}
 
 void create_empty_file(const fs::path& path) {
     std::ofstream stream(path, std::ios::binary);
@@ -458,6 +596,221 @@ void test_proxy_module_path() {
     expect(fs::is_regular_file(module_path), name, "module path did not name the test executable");
 }
 
+void test_worker_start_isolates_process_context_and_consumes_events() {
+    constexpr const char* name = "worker start isolation and event pipe";
+    EnvironmentRestore path_restore(L"PATH");
+    EnvironmentRestore sentinel_restore(L"AILA_TEST_SENTINEL");
+    EnvironmentRestore unrelated_handle_restore(L"AILA_TEST_UNRELATED_HANDLE");
+    expect(
+        SetEnvironmentVariableW(L"PATH", L"C:\\HostPython;C:\\Intel\\oneAPI") != FALSE,
+        name,
+        "could not install synthetic host PATH");
+    expect(
+        SetEnvironmentVariableW(L"AILA_TEST_SENTINEL", L"retained-插件") != FALSE,
+        name,
+        "could not install inherited sentinel");
+    SECURITY_ATTRIBUTES inheritable_security{};
+    inheritable_security.nLength = sizeof(inheritable_security);
+    inheritable_security.bInheritHandle = TRUE;
+    const std::wstring unrelated_event_name =
+        L"Local\\AilaNoInherit-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count());
+    TestHandle unrelated_handle(CreateEventW(
+        &inheritable_security,
+        TRUE,
+        FALSE,
+        unrelated_event_name.c_str()));
+    expect(unrelated_handle.get() != nullptr, name, "could not create unrelated test handle");
+    const std::wstring unrelated_handle_value =
+        std::to_wstring(reinterpret_cast<uintptr_t>(unrelated_handle.get()));
+    expect(
+        SetEnvironmentVariableW(
+            L"AILA_TEST_UNRELATED_HANDLE",
+            unrelated_handle_value.c_str()) != FALSE,
+        name,
+        "could not publish unrelated test handle value");
+
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    const fs::path runtime = normalized_absolute(temp.path());
+    EventRecorder recorder;
+    aila::runtime::WorkerProcess process;
+    process.start(
+        runtime,
+        worker,
+        expected_fake_handshake(),
+        [&](const aila::ipc::Frame& event) { recorder.record(event); });
+
+    expect(process.healthy(), name, "worker was not healthy after its handshake");
+    const aila::ipc::Frame response =
+        process.request(request_frame(10, "test.inspect"), 2s);
+    const Inspection inspection = parse_inspection(response.header.payload_json, name);
+    const fs::path system_root = aila::runtime::system_root_directory();
+    const std::wstring expected_path =
+        runtime.wstring() + L";" +
+        (system_root / L"System32").lexically_normal().wstring() + L";" +
+        system_root.wstring();
+
+    expect(inspection.build_id == "fake-worker-v1", name, "fake build ID changed");
+    expect(inspection.executable == utf8(worker.wstring()), name, "worker executable changed");
+    expect(
+        inspection.runtime_directory == utf8(runtime.wstring()),
+        name,
+        "worker runtime directory changed");
+    expect(
+        inspection.current_directory == utf8(runtime.wstring()),
+        name,
+        "worker current directory was not the runtime directory");
+    expect(inspection.path == utf8(expected_path), name, "isolated PATH was not exact");
+    expect(
+        inspection.path.find("HostPython") == std::string::npos &&
+            inspection.path.find("oneAPI") == std::string::npos,
+        name,
+        "synthetic host toolchain PATH leaked into worker");
+    expect(
+        inspection.sentinel == utf8(L"retained-插件"),
+        name,
+        "inherited sentinel was not retained");
+    expect(
+        WaitForSingleObject(unrelated_handle.get(), 0) == WAIT_TIMEOUT,
+        name,
+        "STARTUPINFOEX handle list leaked an unrelated inheritable handle");
+
+    const std::optional<aila::ipc::Frame> event = recorder.wait_for_event(2s);
+    expect(event.has_value(), name, "event pipe did not deliver the fake log event");
+    expect(event->header.kind == "event", name, "event kind changed");
+    expect(event->header.method == "log", name, "event method changed");
+    expect(
+        event->header.payload_json.find("fake worker ready") != std::string::npos,
+        name,
+        "event payload changed");
+    process.shutdown(2s);
+}
+
+void test_worker_request_framing_is_repeatable() {
+    constexpr const char* name = "worker request framing";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+
+    const aila::ipc::Frame first_request =
+        request_frame(41, "test.ping", "{\"sequence\":1}", bytes({0, 1, 127, 255}));
+    const aila::ipc::Frame first = process.request(first_request, 2s);
+    expect(first.header.request_id == 41, name, "first response request ID changed");
+    expect(first.header.kind == "result", name, "first response kind was not result");
+    expect(first.header.method == "test.ping", name, "first response method changed");
+    expect(first.header.payload_json == "{\"sequence\":1}", name, "first payload changed");
+    expect(first.attachment == first_request.attachment, name, "first attachment changed");
+
+    const aila::ipc::Frame second_request =
+        request_frame(42, "test.ping", "{\"sequence\":2}", bytes({9, 8, 7}));
+    const aila::ipc::Frame second = process.request(second_request, 2s);
+    expect(second.header.request_id == 42, name, "second response request ID changed");
+    expect(second.header.kind == "result", name, "second response kind was not result");
+    expect(second.header.payload_json == "{\"sequence\":2}", name, "second payload changed");
+    expect(second.attachment == second_request.attachment, name, "second attachment changed");
+    expect(process.cancel(99, 2s), name, "cancel command was not acknowledged");
+    process.shutdown(2s);
+}
+
+void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
+    constexpr const char* name = "worker graceful shutdown";
+    const DWORD handles_before = process_handle_count();
+    {
+        TempDirectory temp;
+        const fs::path worker = stage_fake_worker(temp);
+        aila::runtime::WorkerProcess process;
+        process.start(temp.path(), worker, expected_fake_handshake());
+        const auto started = std::chrono::steady_clock::now();
+        process.shutdown(2s);
+        expect(
+            std::chrono::steady_clock::now() - started < 3s,
+            name,
+            "explicit shutdown exceeded its bound");
+        process.shutdown(2s);
+        expect(process.exit_code() == std::optional<DWORD>{0}, name, "exit code was not zero");
+    }
+    expect(
+        process_handle_count() == handles_before,
+        name,
+        "explicit shutdown leaked a process, thread, or pipe handle");
+
+    const DWORD destructor_handles_before = process_handle_count();
+    const auto started = std::chrono::steady_clock::now();
+    {
+        TempDirectory temp;
+        const fs::path worker = stage_fake_worker(temp);
+        aila::runtime::WorkerProcess process;
+        process.start(temp.path(), worker, expected_fake_handshake());
+    }
+    expect(
+        std::chrono::steady_clock::now() - started < 4s,
+        name,
+        "destructor shutdown exceeded its bound");
+    expect(
+        process_handle_count() == destructor_handles_before,
+        name,
+        "destructor leaked a process, thread, or pipe handle");
+}
+
+void test_worker_crash_fails_request_without_hanging() {
+    constexpr const char* name = "worker crash request failure";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            (void)process.request(
+                request_frame(77, "test.exit", "{\"code\":23}"),
+                2s);
+        },
+        name);
+    expect(
+        std::chrono::steady_clock::now() - started < 3s,
+        name,
+        "crashed worker request exceeded its deadline");
+    expect(!process.healthy(), name, "crashed worker still reported healthy");
+    expect(process.exit_code() == std::optional<DWORD>{23}, name, "crash exit code changed");
+    expect(error.find("23") != std::string::npos, name, "request error omitted exit code 23");
+    expect(
+        process.last_error().find("23") != std::string::npos,
+        name,
+        "last_error omitted exit code 23");
+    process.shutdown(500ms);
+}
+
+void test_worker_handshake_mismatch_reaps_process() {
+    constexpr const char* name = "worker handshake mismatch";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            process.start(
+                temp.path(),
+                worker,
+                expected_fake_handshake("expected-production-build"));
+        },
+        name);
+    expect(
+        std::chrono::steady_clock::now() - started < 3s,
+        name,
+        "handshake mismatch cleanup exceeded its bound");
+    expect(!process.healthy(), name, "mismatched worker was left healthy");
+    expect(
+        error.find("build ID") != std::string::npos &&
+            error.find("expected-production-build") != std::string::npos &&
+            error.find("fake-worker-v1") != std::string::npos,
+        name,
+        "handshake mismatch diagnostic was not actionable: " + error);
+    process.shutdown(500ms);
+}
+
 } // namespace
 
 int main() {
@@ -470,6 +823,11 @@ int main() {
         test_isolated_environment_validates_entries();
         test_current_environment_and_system_root();
         test_proxy_module_path();
+        test_worker_start_isolates_process_context_and_consumes_events();
+        test_worker_request_framing_is_repeatable();
+        test_worker_shutdown_is_bounded_idempotent_and_leak_free();
+        test_worker_crash_fails_request_without_hanging();
+        test_worker_handshake_mismatch_reaps_process();
         std::cout << "AilaRuntimeIsolationTests passed\n";
         return 0;
     } catch (const std::exception& exception) {
