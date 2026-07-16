@@ -211,7 +211,7 @@ function Get-AilaTtsObservation {
     }
     return [pscustomobject]@{
         stack = $Stack
-        samples = if ($null -eq $rtf) { @() } else { @([math]::Round($rtf, 6)) }
+        samples = if ($null -eq $rtf) { ,@() } else { ,@([math]::Round($rtf, 6)) }
         sampleCount = if ($null -eq $rtf) { 0 } else { 1 }
         source = $source
         resultPath = $resultPath
@@ -540,6 +540,17 @@ function Invoke-SelfTest {
     $selfRoot = Join-Path (Get-AilaOwnedReportRoot $ReportRoot) 'selftest'
     Remove-Item -LiteralPath $selfRoot -Recurse -Force -ErrorAction SilentlyContinue
     Ensure-AilaDirectory $selfRoot
+    $ttsCaseDir = Join-Path $selfRoot 'tts-fixture\case_results'
+    Ensure-AilaDirectory $ttsCaseDir
+    $ttsLogPath = Join-Path $selfRoot 'tts-fixture\tts.stderr.log'
+    Set-Content -LiteralPath $ttsLogPath -Value '[TTS] Synthesis complete: 800 ms, 1.00 s audio, RTF=0.800' -Encoding UTF8
+    [pscustomobject]@{
+        logs = [pscustomobject]@{ stderr = [pscustomobject]@{ path = $ttsLogPath } }
+        process = [pscustomobject]@{ durationMs = 800 }
+        wav = [pscustomobject]@{ durationSeconds = 1.0 }
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $ttsCaseDir 'qwen3_tts_06_base.json') -Encoding UTF8
+    $ttsFixture = Get-AilaTtsObservation -AccuracyDir (Join-Path $selfRoot 'tts-fixture') -Stack 'fixture'
+    Check ($ttsFixture.samples -is [object[]] -and $ttsFixture.samples.Count -eq 1) 'single TTS RTF remains an array under strict mode'
     Set-Content -LiteralPath (Join-Path $selfRoot 'report.json') -Value '{"status":"stale-pass"}' -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $selfRoot 'report.md') -Value 'stale pass' -Encoding UTF8
     Reset-AilaOwnedReports -Root $selfRoot
