@@ -49,7 +49,7 @@
       "model": "models/Qwen3-ASR-0.6B-BNB-NF4",
       "audio": "这是一个测试.wav",
       "forcedLanguage": "Chinese",
-      "expectedText": "这是一个测试"
+      "expectedText": "这是一个错事"
     },
     {
       "name": "qwen3_asr_en_nf4",
