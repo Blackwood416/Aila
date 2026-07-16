@@ -25,6 +25,34 @@ option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
 set(AILA_PUBLIC_API_VERSION "0.1.6")
 set(AILA_PUBLIC_ABI_VERSION "1")
 find_package(Git QUIET)
+
+function(aila_register_git_configure_dependency git_path_name)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path "${git_path_name}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE path_result
+        OUTPUT_VARIABLE metadata_path
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT path_result EQUAL 0 OR metadata_path STREQUAL "")
+        return()
+    endif()
+
+    cmake_path(SET metadata_path NORMALIZE "${metadata_path}")
+    if(NOT IS_ABSOLUTE "${metadata_path}")
+        cmake_path(
+            ABSOLUTE_PATH metadata_path
+            BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            NORMALIZE
+        )
+    endif()
+    if(EXISTS "${metadata_path}")
+        set_property(DIRECTORY APPEND PROPERTY
+            CMAKE_CONFIGURE_DEPENDS "${metadata_path}")
+    endif()
+endfunction()
+
 if(Git_FOUND)
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
@@ -34,6 +62,19 @@ if(Git_FOUND)
         ERROR_QUIET
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
+    aila_register_git_configure_dependency(HEAD)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" symbolic-ref -q HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE AILA_GIT_SYMBOLIC_REF_RESULT
+        OUTPUT_VARIABLE AILA_GIT_SYMBOLIC_REF
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(AILA_GIT_SYMBOLIC_REF_RESULT EQUAL 0)
+        aila_register_git_configure_dependency("${AILA_GIT_SYMBOLIC_REF}")
+    endif()
+    aila_register_git_configure_dependency(packed-refs)
 endif()
 string(LENGTH "${AILA_GIT_REVISION}" AILA_GIT_REVISION_LENGTH)
 if(NOT Git_FOUND OR
@@ -329,6 +370,17 @@ if(WIN32)
     target_link_directories(AilaWorker PRIVATE
         "${AILA_WORKER_COMPILER_ROOT}/lib")
     target_link_libraries(AilaWorker PRIVATE AilaLib simdjson AilaBuildIdentity)
+    if(CMAKE_GENERATOR MATCHES "Ninja" AND Git_FOUND)
+        add_test(
+            NAME AilaBuildIdentityCMakeTests
+            COMMAND ${CMAKE_COMMAND}
+                "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+                "-DWORKER_FILE=$<TARGET_FILE:AilaWorker>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/BuildIdentityCMakeTests.cmake"
+        )
+    endif()
 
     add_executable(AilaWorkerDispatcherTests
         tests/runtime/WorkerDispatcherTests.cpp
