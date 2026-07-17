@@ -94,6 +94,41 @@ bool read_string_field(
     return true;
 }
 
+bool serialize_header_json(const FrameHeader& header, std::string& header_json) {
+    header_json.clear();
+    if (header.payload_json.size() > kMaxHeaderBytes ||
+        header.kind.size() > kMaxHeaderBytes ||
+        header.method.size() > kMaxHeaderBytes) {
+        return false;
+    }
+
+    simdjson::dom::parser payload_parser;
+    simdjson::dom::element payload;
+    if (payload_parser.parse(header.payload_json).get(payload) != simdjson::SUCCESS) {
+        return false;
+    }
+    const std::string normalized_payload = simdjson::minify(payload);
+
+    if (!(append_bounded(header_json, "{\"protocol\":") &&
+        append_bounded(header_json, std::to_string(header.protocol)) &&
+        append_bounded(header_json, ",\"abi\":") &&
+        append_bounded(header_json, std::to_string(header.abi)) &&
+        append_bounded(header_json, ",\"requestId\":") &&
+        append_bounded(header_json, std::to_string(header.request_id)) &&
+        append_bounded(header_json, ",\"kind\":") &&
+        append_json_string(header_json, header.kind) &&
+        append_bounded(header_json, ",\"method\":") &&
+        append_json_string(header_json, header.method) &&
+        append_bounded(header_json, ",\"payload\":") &&
+        append_bounded(header_json, normalized_payload) &&
+        append_bounded(header_json, "}"))) {
+        return false;
+    }
+    simdjson::dom::parser header_parser;
+    simdjson::dom::element validated_header;
+    return header_parser.parse(header_json).get(validated_header) == simdjson::SUCCESS;
+}
+
 } // namespace
 
 void write_u32_le(std::byte* destination, uint32_t value) {
@@ -110,42 +145,27 @@ uint32_t read_u32_le(const std::byte* source) {
         (static_cast<uint32_t>(source[3]) << 24);
 }
 
+bool encoded_header_size(const FrameHeader& header, size_t& size) {
+    size = 0;
+    try {
+        std::string header_json;
+        if (!serialize_header_json(header, header_json)) return false;
+        size = header_json.size();
+        return true;
+    } catch (...) {
+        size = 0;
+        return false;
+    }
+}
+
 std::vector<std::byte> encode_frame(const Frame& frame) {
     try {
-        if (frame.attachment.size() > kMaxAttachmentBytes ||
-            frame.header.payload_json.size() > kMaxHeaderBytes ||
-            frame.header.kind.size() > kMaxHeaderBytes ||
-            frame.header.method.size() > kMaxHeaderBytes) {
+        if (frame.attachment.size() > kMaxAttachmentBytes) {
             return {};
         }
-
-        simdjson::dom::parser payload_parser;
-        simdjson::dom::element payload;
-        if (payload_parser.parse(frame.header.payload_json).get(payload) != simdjson::SUCCESS) {
-            return {};
-        }
-        const std::string normalized_payload = simdjson::minify(payload);
 
         std::string header_json;
-        if (!append_bounded(header_json, "{\"protocol\":") ||
-            !append_bounded(header_json, std::to_string(frame.header.protocol)) ||
-            !append_bounded(header_json, ",\"abi\":") ||
-            !append_bounded(header_json, std::to_string(frame.header.abi)) ||
-            !append_bounded(header_json, ",\"requestId\":") ||
-            !append_bounded(header_json, std::to_string(frame.header.request_id)) ||
-            !append_bounded(header_json, ",\"kind\":") ||
-            !append_json_string(header_json, frame.header.kind) ||
-            !append_bounded(header_json, ",\"method\":") ||
-            !append_json_string(header_json, frame.header.method) ||
-            !append_bounded(header_json, ",\"payload\":") ||
-            !append_bounded(header_json, normalized_payload) ||
-            !append_bounded(header_json, "}")) {
-            return {};
-        }
-
-        simdjson::dom::parser header_parser;
-        simdjson::dom::element validated_header;
-        if (header_parser.parse(header_json).get(validated_header) != simdjson::SUCCESS) {
+        if (!serialize_header_json(frame.header, header_json)) {
             return {};
         }
 

@@ -1084,6 +1084,19 @@ void test_alignment_wire_methods_validate_and_preserve_inputs() {
                state.alignment_calls == calls,
            name, "huge sampleCount was allocated before attachment validation");
 
+    state.alignment_result.assign(20000, AlignedWordResult{"", 0, 0});
+    align.header.request_id++;
+    const Frame oversized_metadata = dispatcher.dispatch(align, should_shutdown);
+    expect(oversized_metadata.header.kind == "error" &&
+               oversized_metadata.header.method == "align" &&
+               oversized_metadata.attachment.empty() &&
+               payload_integer(oversized_metadata, "code", name) == AILA_ERR_RUNTIME &&
+               state.alignment_calls == calls + 1,
+           name, "oversized alignment metadata was not returned as a structured error");
+    expect(dispatcher.dispatch(
+               request(325, "engine.context_length"), should_shutdown).header.kind == "result",
+           name, "dispatcher was not usable after oversized alignment metadata cleanup");
+
     state.alignment_result = {{std::string("bad\0word", 8), 1, 2}};
     align.header.request_id++;
     expect(dispatcher.dispatch(align, should_shutdown).header.kind == "error",

@@ -129,12 +129,15 @@ bool encoded_request_header_fits(
     std::string_view method,
     std::string_view payload,
     uint64_t request_id) {
-    const std::string header = std::string("{\"protocol\":") +
-        std::to_string(ipc::kProtocolVersion) + ",\"abi\":" +
-        std::to_string(ipc::kPublicAbiVersion) + ",\"requestId\":" +
-        std::to_string(request_id) + ",\"kind\":\"request\",\"method\":" +
-        json_string(method) + ",\"payload\":" + std::string(payload) + "}";
-    return header.size() <= ipc::kMaxHeaderBytes;
+    ipc::FrameHeader header;
+    header.protocol = ipc::kProtocolVersion;
+    header.abi = ipc::kPublicAbiVersion;
+    header.request_id = request_id;
+    header.kind = "request";
+    header.method.assign(method);
+    header.payload_json.assign(payload);
+    size_t ignored = 0;
+    return ipc::encoded_header_size(header, ignored);
 }
 
 bool v2_has_field(uint32_t struct_size, size_t offset, size_t field_size) {

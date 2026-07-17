@@ -183,6 +183,43 @@ void test_round_trip() {
     expect(output.attachment == input.attachment, name, "attachment changed");
 }
 
+void test_header_preflight_exactly_matches_encoder_boundary() {
+    constexpr const char* name = "header preflight matches encoder boundary";
+    Frame frame;
+    frame.header.request_id = 987654321;
+    frame.header.kind = "result";
+    frame.header.method = "align";
+
+    auto set_payload_size = [&](size_t text_bytes) {
+        frame.header.payload_json = "\"" + std::string(text_bytes, 'x') + "\"";
+    };
+    size_t low = 0;
+    size_t high = aila::ipc::kMaxHeaderBytes;
+    while (low < high) {
+        const size_t middle = low + (high - low + 1) / 2;
+        set_payload_size(middle);
+        size_t encoded_header_bytes = 0;
+        if (aila::ipc::encoded_header_size(frame.header, encoded_header_bytes)) low = middle;
+        else high = middle - 1;
+    }
+
+    set_payload_size(low);
+    size_t preflight_bytes = 0;
+    expect(aila::ipc::encoded_header_size(frame.header, preflight_bytes),
+           name, "largest fitting header failed preflight");
+    const std::vector<std::byte> encoded = aila::ipc::encode_frame(frame);
+    expect(!encoded.empty() && aila::ipc::read_u32_le(encoded.data()) == preflight_bytes,
+           name, "preflight size differed from encoded prefix");
+    expect(preflight_bytes == aila::ipc::kMaxHeaderBytes,
+           name, "boundary fixture did not exactly fill the header limit");
+
+    set_payload_size(low + 1);
+    preflight_bytes = 123;
+    expect(!aila::ipc::encoded_header_size(frame.header, preflight_bytes) &&
+               preflight_bytes == 0 && aila::ipc::encode_frame(frame).empty(),
+           name, "one-byte oversized header disagreed with encoder");
+}
+
 void test_truncated_frame_is_rejected() {
     constexpr const char* name = "truncated frame";
     Frame input;
@@ -348,6 +385,7 @@ int main() {
     try {
         test_little_endian_helpers();
         test_round_trip();
+        test_header_preflight_exactly_matches_encoder_boundary();
         test_truncated_frame_is_rejected();
         test_oversized_header_is_rejected_from_prefix();
         test_malformed_json_is_rejected();

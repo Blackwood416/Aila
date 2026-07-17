@@ -331,6 +331,18 @@ ipc::Frame alignment_result(
         std::string("{\"wordCount\":") + std::to_string(words.size()) +
             ",\"textByteCount\":" + std::to_string(text_bytes) +
             ",\"words\":" + entries + "}");
+    size_t header_bytes = 0;
+    if (!ipc::encoded_header_size(response.header, header_bytes)) {
+        ipc::Frame failure = error(
+            request,
+            AILA_ERR_RUNTIME,
+            "alignment result metadata exceeded the IPC header limit");
+        size_t failure_header_bytes = 0;
+        if (!ipc::encoded_header_size(failure.header, failure_header_bytes)) {
+            throw std::runtime_error("bounded alignment error header could not be encoded");
+        }
+        return failure;
+    }
     response.attachment.reserve(text_bytes);
     for (const AlignedWordResult& word : words) {
         for (const unsigned char byte : word.text) {

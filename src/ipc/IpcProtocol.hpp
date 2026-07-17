@@ -30,6 +30,7 @@ struct Frame {
 void write_u32_le(std::byte* destination, uint32_t value);
 uint32_t read_u32_le(const std::byte* source);
 
+bool encoded_header_size(const FrameHeader& header, size_t& size);
 std::vector<std::byte> encode_frame(const Frame& frame);
 bool decode_frame(const std::vector<std::byte>& bytes, Frame& frame, std::string& error);
 
