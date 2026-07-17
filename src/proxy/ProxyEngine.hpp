@@ -59,11 +59,14 @@ public:
         const AilaGenConfig* config,
         const char* forced_language,
         const char* system_prompt,
+        uint64_t& worker_session,
         uint64_t& stream_id);
-    int transcribe_stream_feed(uint64_t stream_id, const float* samples, int sample_count);
+    int transcribe_stream_feed(
+        uint64_t worker_session, uint64_t stream_id, const float* samples, int sample_count);
     int transcribe_stream_get_text(
-        uint64_t stream_id, std::string& stable, std::string& partial);
-    void transcribe_stream_destroy(uint64_t stream_id) noexcept;
+        uint64_t worker_session, uint64_t stream_id,
+        std::string& stable, std::string& partial);
+    void transcribe_stream_destroy(uint64_t worker_session, uint64_t stream_id) noexcept;
 
     int last_error_code() const;
     const char* last_error_message() const;
@@ -101,11 +104,16 @@ private:
     void set_error_locked(int code, std::string message);
     void set_stream_busy_error_locked();
     void clear_error_locked();
+    bool asr_stream_is_active_locked(uint64_t worker_session, uint64_t stream_id) const;
+    void remove_asr_stream_locked(uint64_t stream_id);
     void shutdown_locked() noexcept;
 
     mutable std::mutex mutex_;
     runtime::WorkerProcess worker_;
     uint64_t next_request_id_ = 1;
+    uint64_t worker_session_generation_ = 0;
+    uint64_t last_remote_asr_id_ = 0;
+    std::vector<uint64_t> active_asr_stream_ids_;
     bool initialized_ = false;
     bool stream_active_ = false;
     int error_code_ = 0;

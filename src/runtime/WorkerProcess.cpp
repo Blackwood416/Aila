@@ -1144,6 +1144,14 @@ ipc::Frame WorkerProcess::request_stream(
             }
         }
         impl_->event_condition.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(impl_->event_mutex);
+            if (!impl_->event_transport_error.empty()) {
+                callback_failure = std::make_exception_ptr(std::runtime_error(
+                    impl_->event_transport_error));
+                impl_->terminate_active_process(ERROR_BAD_FORMAT);
+            }
+        }
         for (const ipc::Frame& event : matching) {
             ++observed_event_count;
             try {

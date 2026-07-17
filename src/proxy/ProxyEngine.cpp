@@ -109,6 +109,15 @@ __declspec(noinline) bool finite_float_bits(const volatile float& value) {
     return (bits & 0x7f800000u) != 0x7f800000u;
 }
 
+bool valid_asr_legacy_config(const AilaGenConfig* config) {
+    return config == nullptr ||
+        (finite_float_bits(config->temperature) &&
+         finite_float_bits(config->top_p) &&
+         finite_float_bits(config->repetition_penalty) &&
+         finite_float_bits(config->presence_penalty) &&
+         finite_float_bits(config->frequency_penalty));
+}
+
 bool v2_has_field(uint32_t struct_size, size_t offset, size_t field_size) {
     return struct_size >= offset + field_size;
 }
@@ -229,6 +238,10 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
             return false;
         }
         initialized_ = true;
+        ++worker_session_generation_;
+        if (worker_session_generation_ == 0) ++worker_session_generation_;
+        last_remote_asr_id_ = 0;
+        active_asr_stream_ids_.clear();
         clear_error_locked();
         return true;
     } catch (const std::exception& exception) {
@@ -501,7 +514,8 @@ bool ProxyEngine::transcribe(
     }
     if (!initialized_ || wav_path.empty() || wav_path.find('\0') != std::string_view::npos ||
         !simdjson::validate_utf8(wav_path) || !valid_optional_c_string(forced_language) ||
-        !valid_optional_c_string(system_prompt) || !finite_float_bits(segment_sec) || segment_sec < 0.0f) {
+        !valid_optional_c_string(system_prompt) || !valid_asr_legacy_config(config) ||
+        !finite_float_bits(segment_sec) || segment_sec < 0.0f) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR transcription arguments are invalid");
         return false;
     }
@@ -527,7 +541,9 @@ bool ProxyEngine::transcribe(
         const ipc::Frame response = worker_.request_stream(
             request,
             [&](const ipc::Frame& event) {
-                if (event.header.kind != "event" || event.header.method != "asr.transcribe" ||
+                if (event.header.protocol != ipc::kProtocolVersion ||
+                    event.header.abi != ipc::kPublicAbiVersion ||
+                    event.header.kind != "event" || event.header.method != "asr.transcribe" ||
                     event.header.request_id != request.header.request_id || terminal_seen) {
                     throw malformed_response("ASR token event identity was invalid");
                 }
@@ -623,11 +639,14 @@ bool ProxyEngine::transcribe_stream_create(
     const AilaGenConfig* config,
     const char* forced_language,
     const char* system_prompt,
+    uint64_t& worker_session,
     uint64_t& stream_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    worker_session = 0;
     stream_id = 0;
     if (stream_active_) { set_stream_busy_error_locked(); return false; }
-    if (!initialized_ || !valid_optional_c_string(forced_language) ||
+    if (!initialized_ || !valid_asr_legacy_config(config) ||
+        !valid_optional_c_string(forced_language) ||
         !valid_optional_c_string(system_prompt)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream arguments are invalid");
         return false;
@@ -647,7 +666,8 @@ bool ProxyEngine::transcribe_stream_create(
         if (response.header.kind != "result" || response.header.method != "asr.stream.create" ||
             !response.attachment.empty() ||
             parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
-            root["streamId"].get_uint64().get(id) != simdjson::SUCCESS || id == 0) {
+            root["streamId"].get_uint64().get(id) != simdjson::SUCCESS || id == 0 ||
+            id <= last_remote_asr_id_) {
             throw malformed_response("ASR stream create response was invalid");
         }
         simdjson::dom::object object;
@@ -657,6 +677,14 @@ bool ProxyEngine::transcribe_stream_create(
         size_t fields = 0;
         for (auto field : object) { (void)field; ++fields; }
         if (fields != 1) throw malformed_response("ASR stream create result contained extra fields");
+        for (const uint64_t active_id : active_asr_stream_ids_) {
+            if (active_id == id) {
+                throw malformed_response("ASR stream create reused an active remote ID");
+            }
+        }
+        active_asr_stream_ids_.push_back(id);
+        last_remote_asr_id_ = id;
+        worker_session = worker_session_generation_;
         stream_id = id;
         clear_error_locked();
         return true;
@@ -667,10 +695,12 @@ bool ProxyEngine::transcribe_stream_create(
     }
 }
 
-int ProxyEngine::transcribe_stream_feed(uint64_t stream_id, const float* samples, int sample_count) {
+int ProxyEngine::transcribe_stream_feed(
+    uint64_t worker_session, uint64_t stream_id, const float* samples, int sample_count) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stream_active_) { set_stream_busy_error_locked(); return AILA_ERR_INVALID_ARGUMENT; }
-    if (!initialized_ || stream_id == 0 || !samples || sample_count <= 0 ||
+    if (!asr_stream_is_active_locked(worker_session, stream_id) ||
+        !samples || sample_count <= 0 ||
         static_cast<size_t>(sample_count) > ipc::kMaxAttachmentBytes / sizeof(float)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream audio arguments are invalid");
         return AILA_ERR_INVALID_ARGUMENT;
@@ -714,11 +744,12 @@ int ProxyEngine::transcribe_stream_feed(uint64_t stream_id, const float* samples
 }
 
 int ProxyEngine::transcribe_stream_get_text(
-    uint64_t stream_id, std::string& stable, std::string& partial) {
+    uint64_t worker_session, uint64_t stream_id,
+    std::string& stable, std::string& partial) {
     std::lock_guard<std::mutex> lock(mutex_);
     stable.clear(); partial.clear();
     if (stream_active_) { set_stream_busy_error_locked(); return AILA_ERR_INVALID_ARGUMENT; }
-    if (!initialized_ || stream_id == 0) {
+    if (!asr_stream_is_active_locked(worker_session, stream_id)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream handle is invalid");
         return AILA_ERR_INVALID_ARGUMENT;
     }
@@ -764,11 +795,16 @@ int ProxyEngine::transcribe_stream_get_text(
     }
 }
 
-void ProxyEngine::transcribe_stream_destroy(uint64_t stream_id) noexcept {
-    if (stream_id == 0) return;
+void ProxyEngine::transcribe_stream_destroy(
+    uint64_t worker_session, uint64_t stream_id) noexcept {
+    if (worker_session == 0 || stream_id == 0) return;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!initialized_) return;
+        if (!asr_stream_is_active_locked(worker_session, stream_id)) {
+            set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream handle is stale or invalid");
+            return;
+        }
+        remove_asr_stream_locked(stream_id);
         const ipc::Frame response = request_locked(
             "asr.stream.destroy", "{\"streamId\":" + std::to_string(stream_id) + "}");
         if (response.header.kind == "error") {
@@ -1171,8 +1207,32 @@ void ProxyEngine::clear_error_locked() {
     error_message_.clear();
 }
 
+bool ProxyEngine::asr_stream_is_active_locked(
+    uint64_t worker_session, uint64_t stream_id) const {
+    if (!initialized_ || worker_session == 0 ||
+        worker_session != worker_session_generation_ || stream_id == 0) {
+        return false;
+    }
+    for (const uint64_t active_id : active_asr_stream_ids_) {
+        if (active_id == stream_id) return true;
+    }
+    return false;
+}
+
+void ProxyEngine::remove_asr_stream_locked(uint64_t stream_id) {
+    for (auto iterator = active_asr_stream_ids_.begin();
+         iterator != active_asr_stream_ids_.end(); ++iterator) {
+        if (*iterator == stream_id) {
+            active_asr_stream_ids_.erase(iterator);
+            return;
+        }
+    }
+}
+
 void ProxyEngine::shutdown_locked() noexcept {
     initialized_ = false;
+    active_asr_stream_ids_.clear();
+    last_remote_asr_id_ = 0;
     try {
         worker_.shutdown(std::chrono::seconds(2));
     } catch (...) {

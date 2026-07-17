@@ -831,6 +831,24 @@ void test_asr_wire_methods_are_dispatched() {
                state.asr_request.segment_sec == 12.5f &&
                state.asr_request.past_text_conditioning == 3,
            name, "offline ASR arguments were not forwarded exactly");
+
+    Frame attached_transcription = request(
+        208, "asr.transcribe",
+        R"({"wavPath":"a.wav","config":null,"forcedLanguage":null,"systemPrompt":null,"segmentSec":0,"pastTextConditioning":0})");
+    attached_transcription.attachment.push_back(std::byte{1});
+    const Frame attached_transcription_response = dispatcher.dispatch_stream(
+        attached_transcription, [](const Frame&) { return true; }, cancelled);
+    expect(attached_transcription_response.header.kind == "error" &&
+               state.asr_transcribe_calls == 1,
+           name, "offline ASR accepted an unexpected attachment");
+
+    Frame attached_create = request(
+        209, "asr.stream.create",
+        R"({"config":null,"forcedLanguage":null,"systemPrompt":null})");
+    attached_create.attachment.push_back(std::byte{2});
+    const Frame attached_create_response = dispatcher.dispatch(attached_create, should_shutdown);
+    expect(attached_create_response.header.kind == "error" && state.asr_create_calls == 1,
+           name, "ASR stream create accepted an unexpected attachment");
 }
 
 } // namespace

@@ -437,8 +437,13 @@ int run(const Handles& handles) {
                 continue;
             }
             size_t event_count = 0;
-            send_frame(handles.event_write, stream_event(
-                command, R"({"event":"token","byteCount":6})", u8"识别"));
+            aila::ipc::Frame first_asr_event = stream_event(
+                command, R"({"event":"token","byteCount":6})", u8"识别");
+            if (command.header.payload_json.find("__aila_asr_bad_event_protocol__") !=
+                std::string::npos) {
+                ++first_asr_event.header.protocol;
+            }
+            send_frame(handles.event_write, first_asr_event);
             ++event_count;
             send_frame(handles.event_write, stream_event(
                 command, R"({"event":"token","byteCount":6})", " token"));
@@ -479,10 +484,15 @@ int run(const Handles& handles) {
                            lifecycle_error(command, 1, "engine is not initialized"));
                 continue;
             }
-            const uint64_t id = asr_streams.size() + 1;
+            const bool duplicate =
+                command.header.payload_json.find("duplicate-id") != std::string::npos &&
+                !asr_streams.empty();
+            const uint64_t id = duplicate ? asr_streams.size() : asr_streams.size() + 1;
+            if (!duplicate) {
             asr_streams.push_back(AsrStreamState{true,
                 command.header.payload_json.find("expect-floats") != std::string::npos,
                 command.header.payload_json.find("malformed-text") != std::string::npos});
+            }
             response.header.payload_json = "{\"streamId\":" + std::to_string(id) + "}";
             response.attachment.clear();
         }

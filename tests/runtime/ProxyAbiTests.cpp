@@ -533,6 +533,27 @@ void verify_asr_proxy(const Api& api, AilaEngine* engine) {
     expect(api.context_length(engine) != 0,
            "non-finite local ASR input reaped the healthy worker");
 
+    const uint32_t nan_bits = 0x7fc00000u;
+    float nan_value = 0.0f;
+    std::memcpy(&nan_value, &nan_bits, sizeof(nan_value));
+    for (int field = 0; field != 5; ++field) {
+        AilaGenConfig invalid = api.default_config();
+        switch (field) {
+            case 0: invalid.temperature = nan_value; break;
+            case 1: invalid.top_p = nan_value; break;
+            case 2: invalid.repetition_penalty = nan_value; break;
+            case 3: invalid.presence_penalty = nan_value; break;
+            case 4: invalid.frequency_penalty = nan_value; break;
+        }
+        expect(api.transcribe(engine, "finite-config.wav", &invalid, nullptr, nullptr,
+                              0.0f, 0, nullptr, nullptr, nullptr) == nullptr,
+               "offline ASR accepted a non-finite legacy config field");
+        expect(api.asr_stream_create(engine, &invalid, nullptr, nullptr) == nullptr,
+               "ASR stream create accepted a non-finite legacy config field");
+        expect(api.context_length(engine) != 0,
+               "non-finite ASR config contacted or reaped the healthy worker");
+    }
+
     AilaTranscribeStream* stream =
         api.asr_stream_create(engine, &config, "expect-floats", u8"系统");
     expect(stream != nullptr, "ASR stream create failed");
@@ -622,6 +643,82 @@ void verify_malformed_asr_reaps_worker(const Api& api) {
                "malformed ASR stream text did not reap worker");
         api.asr_stream_destroy(stream);
     }
+}
+
+void verify_asr_event_identity_and_remote_ids(const Api& api) {
+    {
+        const auto before = child_worker_processes();
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), "bad-asr-event", 710) == 0,
+               "ASR event identity engine init failed");
+        DWORD pid = 0;
+        for (DWORD candidate : child_worker_processes()) {
+            if (before.find(candidate) == before.end()) { pid = candidate; break; }
+        }
+        expect(api.transcribe(engine.get(), "__aila_asr_bad_event_protocol__", nullptr,
+                              nullptr, nullptr, 0.0f, 0, nullptr, nullptr, nullptr) == nullptr,
+               "ASR event with wrong protocol reached the host");
+        for (int attempt = 0; attempt != 100; ++attempt) {
+            const auto current = child_worker_processes();
+            if (current.find(pid) == current.end()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+        const auto remaining = child_worker_processes();
+        expect(pid != 0 && remaining.find(pid) == remaining.end(),
+               "wrong-protocol ASR event did not reap worker");
+    }
+    {
+        const auto before = child_worker_processes();
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), "duplicate-asr-id", 711) == 0,
+               "duplicate ASR ID engine init failed");
+        DWORD pid = 0;
+        for (DWORD candidate : child_worker_processes()) {
+            if (before.find(candidate) == before.end()) { pid = candidate; break; }
+        }
+        AilaTranscribeStream* first = api.asr_stream_create(engine.get(), nullptr, nullptr, nullptr);
+        expect(first != nullptr, "first ASR ID creation failed");
+        AilaTranscribeStream* duplicate =
+            api.asr_stream_create(engine.get(), nullptr, nullptr, "duplicate-id");
+        expect(duplicate == nullptr, "duplicate/decreasing remote ASR ID was accepted");
+        for (int attempt = 0; attempt != 100; ++attempt) {
+            const auto current = child_worker_processes();
+            if (current.find(pid) == current.end()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+        const auto remaining = child_worker_processes();
+        expect(pid != 0 && remaining.find(pid) == remaining.end(),
+               "duplicate remote ASR ID did not reap worker");
+        api.asr_stream_destroy(first);
+    }
+}
+
+void verify_stale_asr_handle_cannot_alias_reinitialized_worker(const Api& api) {
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "stale-asr-one", 720) == 0,
+           "stale ASR first init failed");
+    AilaTranscribeStream* stale = api.asr_stream_create(engine.get(), nullptr, nullptr, nullptr);
+    expect(stale != nullptr, "stale ASR handle creation failed");
+    expect(api.transcribe(engine.get(), "__aila_asr_bad_lengths__", nullptr,
+                          nullptr, nullptr, 0.0f, 0, nullptr, nullptr, nullptr) == nullptr,
+           "forced ASR worker failure did not fail");
+    expect(api.init(engine.get(), "stale-asr-two", 721) == 0,
+           "ASR engine could not reinitialize after worker failure");
+    AilaTranscribeStream* current = api.asr_stream_create(engine.get(), nullptr, nullptr, nullptr);
+    expect(current != nullptr, "ASR stream creation after reinit failed");
+    const float sample = 0.5f;
+    expect(api.asr_stream_feed(stale, &sample, 1) == AILA_ERR_INVALID_ARGUMENT,
+           "stale ASR handle aliased a reused remote ID");
+    expect(api.context_length(engine.get()) == 721,
+           "stale ASR handle contacted/reaped the reinitialized worker");
+    expect(api.asr_stream_feed(current, &sample, 1) == AILA_OK,
+           "current ASR handle was invalidated by stale-handle rejection");
+    api.asr_stream_destroy(stale);
+    char* stable = nullptr;
+    expect(api.asr_stream_get_text(current, &stable, nullptr) == AILA_OK && stable != nullptr,
+           "stale ASR destroy targeted the current reused remote ID");
+    api.free_string(stable);
+    api.asr_stream_destroy(current);
 }
 
 std::string take_string(const Api& api, char* value, std::string_view operation) {
@@ -1210,6 +1307,8 @@ void test_proxy_abi_and_lifecycle() {
     verify_malformed_stream_events_reap_worker(api);
     verify_asr_stream_outlives_engine(api);
     verify_malformed_asr_reaps_worker(api);
+    verify_asr_event_identity_and_remote_ids(api);
+    verify_stale_asr_handle_cannot_alias_reinitialized_worker(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

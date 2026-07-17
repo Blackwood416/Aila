@@ -322,6 +322,7 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
             if (request.header.kind != "request" ||
                 request.header.protocol != ipc::kProtocolVersion ||
                 request.header.abi != ipc::kPublicAbiVersion || !initialized_ ||
+                !request.attachment.empty() ||
                 !simdjson::validate_utf8(request.header.payload_json)) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid ASR transcription request");
             }
@@ -620,6 +621,10 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
         if (request.header.method == "asr.stream.create") {
             if (!initialized_) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            }
+            if (!request.attachment.empty()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT,
+                             "ASR stream create must not contain an attachment");
             }
             simdjson::dom::object object;
             AsrStreamConfig config;

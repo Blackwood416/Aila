@@ -18,6 +18,7 @@ struct AilaEngine {
 
 struct AilaTranscribeStream {
     std::shared_ptr<aila::proxy::ProxyEngine> owner;
+    uint64_t worker_session = 0;
     uint64_t remote_id = 0;
 };
 
@@ -401,13 +402,14 @@ AILA_API AilaTranscribeStream* aila_transcribe_stream_create(
     const char* system_prompt) {
     if (!engine) return nullptr;
     try {
+        uint64_t session = 0;
         uint64_t id = 0;
         if (!engine->proxy->transcribe_stream_create(
-                config, forced_language, system_prompt, id)) return nullptr;
+                config, forced_language, system_prompt, session, id)) return nullptr;
         try {
-            return new AilaTranscribeStream{engine->proxy, id};
+            return new AilaTranscribeStream{engine->proxy, session, id};
         } catch (...) {
-            engine->proxy->transcribe_stream_destroy(id);
+            engine->proxy->transcribe_stream_destroy(session, id);
             throw;
         }
     } catch (...) {
@@ -422,7 +424,8 @@ AILA_API int aila_transcribe_stream_feed(
     int sample_count) {
     if (!stream || !samples || sample_count <= 0) return AILA_ERR_INVALID_ARGUMENT;
     try {
-        return stream->owner->transcribe_stream_feed(stream->remote_id, samples, sample_count);
+        return stream->owner->transcribe_stream_feed(
+            stream->worker_session, stream->remote_id, samples, sample_count);
     } catch (...) {
         return AILA_ERR_RUNTIME;
     }
@@ -439,7 +442,7 @@ AILA_API int aila_transcribe_stream_get_text(
         std::string stable;
         std::string partial;
         const int status = stream->owner->transcribe_stream_get_text(
-            stream->remote_id, stable, partial);
+            stream->worker_session, stream->remote_id, stable, partial);
         if (status != AILA_OK) return status;
         char* stable_result = nullptr;
         char* partial_result = nullptr;
@@ -468,7 +471,9 @@ AILA_API int aila_transcribe_stream_get_text(
 
 AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream) {
     if (!stream) return;
-    try { stream->owner->transcribe_stream_destroy(stream->remote_id); } catch (...) {}
+    try {
+        stream->owner->transcribe_stream_destroy(stream->worker_session, stream->remote_id);
+    } catch (...) {}
     try { delete stream; } catch (...) {}
 }
 
