@@ -1127,20 +1127,41 @@ ipc::Frame WorkerProcess::request_stream(
     std::optional<uint64_t> expected_event_count;
     std::optional<uint64_t> terminal_event_count;
     std::exception_ptr callback_failure;
+    auto issue_cancel = [&] {
+        if (sent_cancel) return;
+        const Clock::time_point now = Clock::now();
+        const auto grace =
+            (std::max)(cancellation_grace, std::chrono::milliseconds::zero());
+        Clock::time_point bounded_cancel_deadline = deadline;
+        if (grace == std::chrono::milliseconds::zero()) {
+            bounded_cancel_deadline = (std::min)(deadline, now);
+        } else if (deadline > now && deadline - now > grace) {
+            bounded_cancel_deadline = now + grace;
+        }
+        cancel_deadline = bounded_cancel_deadline;
+
+        ipc::Frame cancel_frame;
+        cancel_frame.header.protocol = impl_->expected.protocol;
+        cancel_frame.header.abi = impl_->expected.abi;
+        cancel_frame.header.request_id = frame.header.request_id;
+        cancel_frame.header.kind = "request";
+        cancel_frame.header.method = "cancel";
+        cancel_frame.header.payload_json =
+            std::string("{\"requestId\":") + std::to_string(frame.header.request_id) + "}";
+        try {
+            impl_->write_request(
+                cancel_frame,
+                bounded_cancel_deadline,
+                "worker stream cancellation");
+        } catch (...) {
+            impl_->terminate_active_process(ERROR_OPERATION_ABORTED);
+            throw;
+        }
+        sent_cancel = true;
+    };
     for (;;) {
         if (!sent_cancel && cancellation_requested && cancellation_requested()) {
-            ipc::Frame cancel_frame;
-            cancel_frame.header.protocol = impl_->expected.protocol;
-            cancel_frame.header.abi = impl_->expected.abi;
-            cancel_frame.header.request_id = frame.header.request_id;
-            cancel_frame.header.kind = "request";
-            cancel_frame.header.method = "cancel";
-            cancel_frame.header.payload_json =
-                std::string("{\"requestId\":") + std::to_string(frame.header.request_id) + "}";
-            impl_->write_request(cancel_frame, deadline, "worker stream cancellation");
-            sent_cancel = true;
-            cancel_deadline = Clock::now() +
-                (std::max)(cancellation_grace, std::chrono::milliseconds::zero());
+            issue_cancel();
         }
         std::vector<ipc::Frame> matching;
         {
@@ -1193,19 +1214,7 @@ ipc::Frame WorkerProcess::request_stream(
                         throw std::runtime_error(
                             "worker stream timed out before cancellation could be sent");
                     }
-                    ipc::Frame cancel_frame;
-                    cancel_frame.header.protocol = impl_->expected.protocol;
-                    cancel_frame.header.abi = impl_->expected.abi;
-                    cancel_frame.header.request_id = frame.header.request_id;
-                    cancel_frame.header.kind = "request";
-                    cancel_frame.header.method = "cancel";
-                    cancel_frame.header.payload_json =
-                        std::string("{\"requestId\":") +
-                        std::to_string(frame.header.request_id) + "}";
-                    impl_->write_request(cancel_frame, deadline, "worker stream cancellation");
-                    sent_cancel = true;
-                    cancel_deadline = Clock::now() +
-                        (std::max)(cancellation_grace, std::chrono::milliseconds::zero());
+                    issue_cancel();
                 }
             } catch (...) {
                 callback_failure = std::current_exception();

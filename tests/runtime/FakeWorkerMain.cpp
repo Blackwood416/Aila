@@ -611,11 +611,14 @@ int run(const Handles& handles) {
             };
             send_audio({0.25f, -0.5f});
             bool cancelled = false;
+            const bool ignore_cancel =
+                command.header.payload_json.find("__aila_tts_ignore_cancel__") != std::string::npos;
             const bool slow = command.header.payload_json.find("__aila_tts_slow__") != std::string::npos;
-            const int attempts = slow ? 1000 : 6;
+            const int attempts = ignore_cancel ? 1000 : (slow ? 1000 : 6);
             for (int attempt = 0; attempt < attempts && !cancelled; ++attempt) {
                 DWORD pending = 0;
-                if (PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) && pending) {
+                if (!ignore_cancel &&
+                    PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) && pending) {
                     aila::ipc::Frame control;
                     if (aila::ipc::read_frame(handles.command_read, control, error) &&
                         control.header.method == "cancel") cancelled = true;
@@ -815,6 +818,17 @@ int run(const Handles& handles) {
             if (!initialized) {
                 send_frame(handles.response_write,
                            lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            if (command.header.payload_json.find("__aila_expect_empty_embedding__") !=
+                    std::string::npos &&
+                (command.header.payload_json.find("\"embeddingCount\":0") ==
+                     std::string::npos ||
+                 command.header.payload_json.find("\"byteCount\":0") ==
+                     std::string::npos ||
+                 !command.attachment.empty())) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "embedding was not normalized to empty"));
                 continue;
             }
             attach_floats(response, {0.25f, -0.5f, 1.0f});

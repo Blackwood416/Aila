@@ -1089,6 +1089,24 @@ void verify_audio_proxy(const Api& api, AilaEngine* engine) {
            "synthesize_wav changed caller inputs");
     api.free_samples(samples);
 
+    for (const auto& weird : std::vector<std::pair<const float*, int>>{
+             {nullptr, 17}, {speaker, 0}, {speaker, -7}}) {
+        samples = nullptr;
+        count = 0;
+        expect(api.synthesize_wav(
+                   engine, tokens, 2, weird.first, weird.second, nullptr,
+                   &samples, &count) == AILA_OK && count == 3,
+               "synthesize_wav did not normalize a non-present embedding");
+        api.free_samples(samples);
+        samples = nullptr;
+        count = 0;
+        expect(api.synthesize_text(
+                   engine, "__aila_expect_empty_embedding__", weird.first, weird.second,
+                   nullptr, &samples, &count) == AILA_OK && count == 3,
+               "synthesize_text_to_wav did not normalize a non-present embedding");
+        api.free_samples(samples);
+    }
+
     samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
     count = -1;
     expect(api.synthesize_text(engine, u8"你好", speaker, 2, nullptr, &samples, &count) == AILA_OK &&
@@ -1113,6 +1131,14 @@ void verify_audio_proxy(const Api& api, AilaEngine* engine) {
     expect(api.synthesize_file(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr,
                                u8R"(C:\输出\结果.wav)") == AILA_OK,
            "worker-side WAV synthesis failed");
+    expect(api.synthesize_file(engine, "empty output path", nullptr, nullptr, nullptr, nullptr,
+                               nullptr, "") == AILA_OK,
+           "non-NULL empty WAV path was rejected locally");
+    samples = nullptr;
+    count = 0;
+    expect(api.extract_embedding(engine, "", &samples, &count) == AILA_OK && count == 3,
+           "non-NULL empty embedding path was rejected locally");
+    api.free_samples(samples);
 
     samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
     count = 19;

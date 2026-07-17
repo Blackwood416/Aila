@@ -818,7 +818,7 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             if (payload.get_object().get(object) != simdjson::SUCCESS ||
                 !parse_tts_text_request(object, audio) ||
                 object["outputWavPath"].get_string().get(output_path) != simdjson::SUCCESS ||
-                output_path.empty() || !require_c_string_safe(output_path) ||
+                !require_c_string_safe(output_path) ||
                 !simdjson::validate_utf8(output_path)) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "TTS file request is malformed");
             }
@@ -871,7 +871,7 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             AudioRequest audio;
             audio.method = AudioMethod::ExtractEmbedding;
             if (payload.get_object().get(object) != simdjson::SUCCESS ||
-                object["audioPath"].get_string().get(path) != simdjson::SUCCESS || path.empty() ||
+                object["audioPath"].get_string().get(path) != simdjson::SUCCESS ||
                 !require_c_string_safe(path) || !simdjson::validate_utf8(path)) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "embedding audio path is malformed");
             }

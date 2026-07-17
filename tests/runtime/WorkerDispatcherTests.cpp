@@ -928,6 +928,22 @@ void test_audio_wire_methods_validate_and_preserve_binary_arguments() {
                state.audio_request.method == aila::worker::AudioMethod::ExtractEmbedding &&
                state.audio_request.audio_path == u8R"(C:\声音\参考.wav)",
            name, "Unicode embedding path changed");
+
+    const Frame empty_embedding_path = dispatcher.dispatch(
+        request(304, "tts.extract_embedding", R"({"audioPath":""})"), should_shutdown);
+    expect(empty_embedding_path.header.kind == "result" &&
+               state.audio_request.method == aila::worker::AudioMethod::ExtractEmbedding &&
+               state.audio_request.audio_path.empty(),
+           name, "non-NULL empty embedding path was rejected before the adapter");
+
+    const Frame empty_output_path = dispatcher.dispatch(
+        request(305, "tts.synthesize",
+                R"({"text":"x","referenceAudioPath":null,"speakerName":null,"instructText":null,"language":null,"config":null,"outputWavPath":""})"),
+        should_shutdown);
+    expect(empty_output_path.header.kind == "result" &&
+               state.audio_request.method == aila::worker::AudioMethod::SynthesizeFile &&
+               state.audio_request.output_wav_path.empty(),
+           name, "non-NULL empty output path was rejected before the adapter");
 }
 
 void test_tts_stream_emits_typed_audio_chunks() {

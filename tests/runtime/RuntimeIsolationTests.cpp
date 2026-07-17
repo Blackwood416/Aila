@@ -805,6 +805,43 @@ void test_stream_timeout_during_slow_callback_is_bounded() {
     process.shutdown(500ms);
 }
 
+void test_external_stream_cancel_reaps_worker_that_stops_draining_commands() {
+    constexpr const char* name = "external stream cancel with non-draining worker";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+    expect(process.request(
+               request_frame(64, "engine.init", R"({"model":"m","maxSeqLen":1024})"),
+               2s).header.kind == "result",
+           name, "fake engine init failed");
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            (void)process.request_stream(
+                request_frame(
+                    65, "tts.synthesize_stream",
+                    R"({"text":"__aila_tts_ignore_cancel__","referenceAudioPath":null,"speakerName":null,"instructText":null,"language":null,"config":null})"),
+                [](const aila::ipc::Frame& event) {
+                    return event.header.payload_json.find("\"event\":\"end\"") !=
+                            std::string::npos
+                        ? aila::runtime::WorkerProcess::StreamEventAction::End
+                        : aila::runtime::WorkerProcess::StreamEventAction::Continue;
+                },
+                10s,
+                [] { return true; },
+                75ms);
+        },
+        name);
+    expect(std::chrono::steady_clock::now() - started < 1s,
+           name, "external cancellation waited for the overall stream timeout");
+    expect(error.find("cancellation grace") != std::string::npos,
+           name, "external cancellation diagnostic was not actionable: " + error);
+    expect(!process.healthy(), name, "non-draining cancelled worker remained healthy");
+    process.shutdown(500ms);
+}
+
 void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
     constexpr const char* name = "worker graceful shutdown";
     const DWORD handles_before = process_handle_count();
@@ -1085,6 +1122,7 @@ int main() {
         test_worker_stream_preserves_unrelated_log_events();
         test_event_transport_rejects_invalid_protocol_and_abi();
         test_stream_timeout_during_slow_callback_is_bounded();
+        test_external_stream_cancel_reaps_worker_that_stops_draining_commands();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();
         test_worker_blocked_write_obeys_request_deadline();

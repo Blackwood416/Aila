@@ -524,8 +524,7 @@ AILA_API int aila_synthesize_wav(
     const AilaGenConfig* config, float** out_samples, int* out_sample_count) {
     if (out_samples) *out_samples = nullptr;
     if (out_sample_count) *out_sample_count = 0;
-    if (!engine || !text_tokens || text_tokens_len <= 0 || !out_samples || !out_sample_count ||
-        speaker_embedding_len < 0 || (speaker_embedding_len > 0 && !speaker_embedding)) {
+    if (!engine || !text_tokens || text_tokens_len <= 0 || !out_samples || !out_sample_count) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS synthesis arguments are invalid"); } catch (...) {}
         return AILA_ERR_INVALID_ARGUMENT;
     }
@@ -546,8 +545,7 @@ AILA_API int aila_synthesize_text_to_wav(
     float** out_samples, int* out_sample_count) {
     if (out_samples) *out_samples = nullptr;
     if (out_sample_count) *out_sample_count = 0;
-    if (!engine || !text || !out_samples || !out_sample_count || speaker_embedding_len < 0 ||
-        (speaker_embedding_len > 0 && !speaker_embedding)) {
+    if (!engine || !text || !out_samples || !out_sample_count) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS text synthesis arguments are invalid"); } catch (...) {}
         return AILA_ERR_INVALID_ARGUMENT;
     }

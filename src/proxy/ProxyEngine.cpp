@@ -879,14 +879,16 @@ int ProxyEngine::synthesize_wav(
     std::lock_guard<std::mutex> lock(mutex_);
     samples.clear();
     if (stream_active_ || !initialized_ || !text_tokens || text_tokens_len <= 0 ||
-        speaker_embedding_len < 0 || (speaker_embedding_len > 0 && !speaker_embedding) ||
         !valid_asr_legacy_config(config)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS synthesis arguments are invalid");
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
+        const int normalized_embedding_len =
+            speaker_embedding != nullptr && speaker_embedding_len > 0 ? speaker_embedding_len : 0;
         const size_t token_bytes = static_cast<size_t>(text_tokens_len) * sizeof(int32_t);
-        const size_t embedding_bytes = static_cast<size_t>(speaker_embedding_len) * sizeof(float);
+        const size_t embedding_bytes =
+            static_cast<size_t>(normalized_embedding_len) * sizeof(float);
         if (token_bytes > ipc::kMaxAttachmentBytes ||
             embedding_bytes > ipc::kMaxAttachmentBytes - token_bytes) {
             set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS synthesis attachment is too large");
@@ -897,7 +899,7 @@ int ProxyEngine::synthesize_wav(
         if (embedding_bytes) std::memcpy(attachment.data() + token_bytes, speaker_embedding, embedding_bytes);
         const std::string payload =
             std::string("{\"tokenCount\":") + std::to_string(text_tokens_len) +
-            ",\"embeddingCount\":" + std::to_string(speaker_embedding_len) +
+            ",\"embeddingCount\":" + std::to_string(normalized_embedding_len) +
             ",\"tokenOffset\":0,\"embeddingOffset\":" + std::to_string(token_bytes) +
             ",\"elementSize\":4,\"byteCount\":" + std::to_string(attachment.size()) +
             ",\"config\":" + legacy_config_json(config) + "}";
@@ -919,19 +921,20 @@ int ProxyEngine::synthesize_text_to_wav(
     std::lock_guard<std::mutex> lock(mutex_);
     samples.clear();
     if (stream_active_ || !initialized_ || text.find('\0') != std::string_view::npos ||
-        !simdjson::validate_utf8(text) || speaker_embedding_len < 0 ||
-        (speaker_embedding_len > 0 && !speaker_embedding) || !valid_asr_legacy_config(config)) {
+        !simdjson::validate_utf8(text) || !valid_asr_legacy_config(config)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS text synthesis arguments are invalid");
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
-        const size_t bytes = static_cast<size_t>(speaker_embedding_len) * sizeof(float);
+        const int normalized_embedding_len =
+            speaker_embedding != nullptr && speaker_embedding_len > 0 ? speaker_embedding_len : 0;
+        const size_t bytes = static_cast<size_t>(normalized_embedding_len) * sizeof(float);
         if (bytes > ipc::kMaxAttachmentBytes) {
             set_error_locked(AILA_ERR_INVALID_ARGUMENT, "speaker embedding is too large");
             return AILA_ERR_INVALID_ARGUMENT;
         }
         const std::string payload = std::string("{\"text\":") + json_string(text) +
-            ",\"embeddingCount\":" + std::to_string(speaker_embedding_len) +
+            ",\"embeddingCount\":" + std::to_string(normalized_embedding_len) +
             ",\"elementSize\":4,\"byteCount\":" + std::to_string(bytes) +
             ",\"config\":" + legacy_config_json(config) + "}";
         const ipc::Frame response = request_locked(
@@ -953,7 +956,7 @@ int ProxyEngine::synthesize_file(
     std::string_view output_wav_path) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stream_active_ || !initialized_ || text.find('\0') != std::string_view::npos ||
-        output_wav_path.empty() || output_wav_path.find('\0') != std::string_view::npos ||
+        output_wav_path.find('\0') != std::string_view::npos ||
         !simdjson::validate_utf8(text) || !simdjson::validate_utf8(output_wav_path) ||
         !valid_optional_c_string(reference_audio_path) || !valid_optional_c_string(speaker_name) ||
         !valid_optional_c_string(instruct_text) || !valid_optional_c_string(language) ||
@@ -1007,7 +1010,7 @@ int ProxyEngine::extract_speaker_embedding(
     std::string_view audio_path, std::vector<float>& embedding) {
     std::lock_guard<std::mutex> lock(mutex_);
     embedding.clear();
-    if (stream_active_ || !initialized_ || audio_path.empty() ||
+    if (stream_active_ || !initialized_ ||
         audio_path.find('\0') != std::string_view::npos || !simdjson::validate_utf8(audio_path)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "speaker embedding path is invalid");
         return AILA_ERR_INVALID_ARGUMENT;
