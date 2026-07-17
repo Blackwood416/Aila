@@ -152,6 +152,112 @@ function Invoke-AilaStableDependencyInspection {
     }
 }
 
+function Invoke-AilaStableProxyDependencyInspection {
+    param(
+        [Parameter(Mandatory = $true)][string]$Proxy,
+        [Parameter(Mandatory = $true)][scriptblock]$DependencyInspector
+    )
+
+    $hashBefore = (Get-FileHash -LiteralPath $Proxy -Algorithm SHA256).Hash
+    $dependenciesText = (& $DependencyInspector $Proxy | Out-String)
+    $hashAfter = (Get-FileHash -LiteralPath $Proxy -Algorithm SHA256).Hash
+    if ($hashBefore -ne $hashAfter) {
+        throw "Aila proxy changed during dependency inspection: '$Proxy' (before '$hashBefore', after '$hashAfter')."
+    }
+
+    $forbidden = @(
+        [regex]::Matches(
+            $dependenciesText,
+            '(?im)^\s*((?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll))\s*$') |
+            ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } |
+            Sort-Object -Unique
+    )
+    if ($forbidden.Count -ne 0) {
+        throw "AilaShared.dll has forbidden oneAPI imports: $([string]::Join(', ', $forbidden))."
+    }
+
+    return [pscustomobject]@{
+        dependencies = @()
+        sha256        = $hashAfter
+    }
+}
+
+function Get-AilaBuildArtifactMetadata {
+    param(
+        [Parameter(Mandatory = $true)]$BuildInfo,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    $artifactsProperty = $BuildInfo.PSObject.Properties['artifacts']
+    $matches = @(if ($null -eq $artifactsProperty -or $null -eq $artifactsProperty.Value) {
+            @()
+        }
+        else {
+            $artifactsProperty.Value | Where-Object { $_.role -eq $Role }
+        })
+    if ($matches.Count -ne 1) {
+        throw "Build info must contain exactly one '$Role' artifact; found $($matches.Count)."
+    }
+    return $matches[0]
+}
+
+function Assert-AilaStagedArtifactMetadata {
+    param(
+        [Parameter(Mandatory = $true)]$BuildInfo,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath,
+        [Parameter(Mandatory = $true)][string]$ArtifactPath
+    )
+
+    $artifact = Get-AilaBuildArtifactMetadata -BuildInfo $BuildInfo -Role $Role
+    $relativePath = [string](Get-RequiredOneApiMetadataValue -Metadata $artifact -PropertyName 'relativePath' -Context "Build info $Role artifact")
+    if (-not $relativePath.Equals($ExpectedRelativePath, [System.StringComparison]::Ordinal)) {
+        throw "Build info $Role artifact path mismatch: expected '$ExpectedRelativePath', found '$relativePath'."
+    }
+    $recordedHash = [string](Get-RequiredOneApiMetadataValue -Metadata $artifact -PropertyName 'sha256' -Context "Build info $Role artifact")
+    $actualHash = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256).Hash
+    if (-not $recordedHash.Equals($actualHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build info $Role artifact SHA256 mismatch: recorded '$recordedHash', staged '$actualHash'."
+    }
+}
+
+function Test-AilaOneApiRuntimeDllName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    return $Name -match '^(?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll)$'
+}
+
+function Get-AilaDumpbinPath {
+    param([Parameter(Mandatory = $true)][string]$BuildDirPath)
+
+    $command = Get-Command 'dumpbin.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
+        $candidates.Add((Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\dumpbin.exe'))
+    }
+    $cachePath = Join-Path $BuildDirPath 'CMakeCache.txt'
+    if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+        $linkerLine = Get-Content -LiteralPath $cachePath |
+            Where-Object { $_ -match '^CMAKE_LINKER:FILEPATH=' } |
+            Select-Object -First 1
+        if ($null -ne $linkerLine) {
+            $linkerPath = $linkerLine.Substring($linkerLine.IndexOf('=') + 1)
+            $candidates.Add((Join-Path (Split-Path -Parent $linkerPath) 'dumpbin.exe'))
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    throw 'dumpbin.exe was not found on PATH, under VCToolsInstallDir, or beside CMAKE_LINKER.'
+}
+
 function Invoke-AilaOneApiBuildVerification {
     param(
         [Parameter(Mandatory = $true)][string]$BuildDir,
@@ -184,10 +290,11 @@ function Invoke-AilaOneApiBuildVerification {
         throw "Build info file not found: $buildInfoPath"
     }
 
-    $exe = Join-Path $buildDirPath 'Aila.exe'
-    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-        throw "Aila executable not found: $exe"
-    }
+    $releaseRoot = Join-Path $buildDirPath 'Release\bin'
+    $runtimeDir = Join-Path $releaseRoot 'aila_runtime'
+    $proxy = Join-Path $releaseRoot 'AilaShared.dll'
+    $worker = Join-Path $runtimeDir 'AilaWorker.exe'
+    $exe = Join-Path $runtimeDir 'Aila.exe'
 
     $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
     $schemaProperty = if ($null -eq $buildInfo) { $null } else { $buildInfo.PSObject.Properties['schemaVersion'] }
@@ -203,6 +310,33 @@ function Invoke-AilaOneApiBuildVerification {
 
     Assert-AilaBuildInfoMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack
     Assert-AilaCMakeCacheMatchesOneApiStack -BuildDir $buildDirPath -Stack $stack -RequireValues
+
+    foreach ($artifactPath in @($proxy, $worker, $exe)) {
+        if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+            throw "Staged release artifact not found: $artifactPath"
+        }
+    }
+    foreach ($forbiddenRootExecutable in @('AilaWorker.exe', 'Aila.exe')) {
+        $candidate = Join-Path $releaseRoot $forbiddenRootExecutable
+        if (Test-Path -LiteralPath $candidate) {
+            throw "Runtime executable must be staged below aila_runtime, not beside the proxy: $candidate"
+        }
+    }
+    $rootRuntimeDlls = @(Get-ChildItem -LiteralPath $releaseRoot -File |
+        Where-Object { Test-AilaOneApiRuntimeDllName -Name $_.Name })
+    if ($rootRuntimeDlls.Count -ne 0) {
+        throw "Found oneAPI runtime DLLs beside the proxy: $($rootRuntimeDlls.Name -join ', ')."
+    }
+    Assert-AilaStagedArtifactMetadata `
+        -BuildInfo $buildInfo `
+        -Role 'proxy' `
+        -ExpectedRelativePath 'AilaShared.dll' `
+        -ArtifactPath $proxy
+    Assert-AilaStagedArtifactMetadata `
+        -BuildInfo $buildInfo `
+        -Role 'worker' `
+        -ExpectedRelativePath 'aila_runtime/AilaWorker.exe' `
+        -ArtifactPath $worker
 
     $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
     if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
@@ -244,12 +378,22 @@ function Invoke-AilaOneApiBuildVerification {
         throw "Build info oneApi metadata mismatch for 'allowLegacyCompiler': recorded '$recordedLegacy', current '$currentLegacy'."
     }
 
+    $stagedBuildInfoPath = Join-Path $releaseRoot 'build_info.json'
+    if (-not (Test-Path -LiteralPath $stagedBuildInfoPath -PathType Leaf)) {
+        throw "Staged build info file not found: $stagedBuildInfoPath"
+    }
+    $sourceMetadataHash = (Get-FileHash -LiteralPath $buildInfoPath -Algorithm SHA256).Hash
+    $stagedMetadataHash = (Get-FileHash -LiteralPath $stagedBuildInfoPath -Algorithm SHA256).Hash
+    if ($sourceMetadataHash -ne $stagedMetadataHash) {
+        throw "Staged build_info.json does not match '$buildInfoPath'."
+    }
+
     if ($null -eq $DependencyInspector) {
+        $dumpbinPath = Get-AilaDumpbinPath -BuildDirPath $buildDirPath
         $DependencyInspector = {
             param([Parameter(Mandatory = $true)][string]$Executable)
 
-            $dumpbinCommand = Get-Command 'dumpbin.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
-            $output = (& $dumpbinCommand.Source /dependents $Executable 2>&1 | Out-String)
+            $output = (& $dumpbinPath /dependents $Executable 2>&1 | Out-String)
             $dumpbinExitCode = $LASTEXITCODE
             if ($dumpbinExitCode -ne 0) {
                 $diagnostic = Get-AilaBoundedDiagnosticText -Text $output
@@ -263,6 +407,13 @@ function Invoke-AilaOneApiBuildVerification {
         -Executable $exe `
         -ExpectedSyclDll $currentSyclDll `
         -DependencyInspector $DependencyInspector
+    $workerInspection = Invoke-AilaStableDependencyInspection `
+        -Executable $worker `
+        -ExpectedSyclDll $currentSyclDll `
+        -DependencyInspector $DependencyInspector
+    $proxyInspection = Invoke-AilaStableProxyDependencyInspection `
+        -Proxy $proxy `
+        -DependencyInspector $DependencyInspector
 
     $payload = [ordered]@{
         schemaVersion    = 1
@@ -271,10 +422,30 @@ function Invoke-AilaOneApiBuildVerification {
         stack            = $buildOneApi
         dependencies     = @($inspection.dependencies)
         executableSha256 = $inspection.executableSha256
+        artifacts        = @(
+            [ordered]@{
+                role         = 'cli'
+                relativePath = 'aila_runtime/Aila.exe'
+                dependencies = @($inspection.dependencies)
+                sha256       = $inspection.executableSha256
+            },
+            [ordered]@{
+                role         = 'worker'
+                relativePath = 'aila_runtime/AilaWorker.exe'
+                dependencies = @($workerInspection.dependencies)
+                sha256       = $workerInspection.executableSha256
+            },
+            [ordered]@{
+                role         = 'proxy'
+                relativePath = 'AilaShared.dll'
+                dependencies = @($proxyInspection.dependencies)
+                sha256       = $proxyInspection.sha256
+            }
+        )
     }
     Write-AilaAtomicVerificationJson -RepoRoot $repoRoot -BuildDirPath $buildDirPath -Path $verificationPath -Data $payload
 
-    Write-Host "Verification PASS: $OneApiStack -> $($inspection.dependencies[0])"
+    Write-Host "Verification PASS: $OneApiStack worker -> $($workerInspection.dependencies[0]); proxy -> isolated"
 }
 
 Invoke-AilaOneApiBuildVerification @PSBoundParameters

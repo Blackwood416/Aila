@@ -710,19 +710,27 @@ endif()
     copy_runtime_dependencies(Aila EXECUTABLE)
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
+    set(AILA_RELEASE_RUNTIME_DIR "${AILA_RELEASE_BIN_DIR}/aila_runtime")
 
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_BIN_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaWorker>" "${AILA_RELEASE_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/build_info.json" "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND}
             "-DTARGET_PATH=$<TARGET_FILE:Aila>"
-            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
+            "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
+            "-DTARGET_KIND=EXECUTABLE"
+            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        COMMAND ${CMAKE_COMMAND}
+            "-DTARGET_PATH=$<TARGET_FILE:AilaWorker>"
+            "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
             "-DTARGET_KIND=EXECUTABLE"
             -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
         COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )
-    add_dependencies(release Aila AilaShared)
+    add_dependencies(release Aila AilaShared AilaWorker)
 endif()
