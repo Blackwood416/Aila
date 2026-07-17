@@ -1238,6 +1238,61 @@ void verify_tts_stream_destroy_cancels_promptly(const Api& api) {
     }
 }
 
+struct ReentrantTtsDestroyContext {
+    const Api* api = nullptr;
+    std::atomic<AilaTTSStream*> published{nullptr};
+    std::atomic<int> callback_count{0};
+    std::atomic<int> wait_status{AILA_OK};
+    std::atomic_bool destroy_returned{false};
+};
+
+void destroy_tts_stream_on_later_chunk(const float*, int, void* opaque) {
+    auto* context = static_cast<ReentrantTtsDestroyContext*>(opaque);
+    const int call = context->callback_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (call < 2) return;
+    AilaTTSStream* stream = context->published.load(std::memory_order_acquire);
+    if (!stream || context->destroy_returned.load(std::memory_order_acquire)) return;
+    context->wait_status.store(
+        context->api->stream_wait(stream), std::memory_order_release);
+    context->api->stream_destroy(stream);
+    context->destroy_returned.store(true, std::memory_order_release);
+}
+
+void verify_tts_stream_reentrant_destroy(const Api& api) {
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "tts-reentrant-destroy", 1024) == 0,
+           "reentrant TTS engine init failed");
+    ReentrantTtsDestroyContext context;
+    context.api = &api;
+    AilaTTSStream* stream = api.synthesize_stream(
+        engine.get(), "__aila_tts_reentrant_destroy__", nullptr, nullptr, nullptr, nullptr,
+        nullptr, destroy_tts_stream_on_later_chunk, &context);
+    expect(stream != nullptr, "reentrant TTS stream creation failed");
+    context.published.store(stream, std::memory_order_release);
+
+    for (int attempt = 0; attempt != 200 &&
+         !context.destroy_returned.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(5ms);
+    }
+    expect(context.destroy_returned.load(std::memory_order_acquire),
+           "reentrant TTS destroy did not return");
+    expect(context.wait_status.load(std::memory_order_acquire) == AILA_ERR_RUNTIME,
+           "reentrant TTS wait attempted to join its own callback thread");
+    const int callbacks_after_destroy = context.callback_count.load(std::memory_order_acquire);
+    std::this_thread::sleep_for(100ms);
+    expect(context.callback_count.load(std::memory_order_acquire) == callbacks_after_destroy,
+           "TTS callback ran after reentrant destroy returned");
+
+    char* generated = nullptr;
+    for (int attempt = 0; attempt != 200 && !generated; ++attempt) {
+        generated = api.generate(engine.get(), "after-reentrant-TTS-destroy", nullptr);
+        if (!generated) std::this_thread::sleep_for(5ms);
+    }
+    expect(generated != nullptr,
+           "engine did not recover after reentrant TTS cancellation");
+    api.free_string(generated);
+}
+
 void verify_v2_prefix_does_not_read_past_struct_size(const Api& api, AilaEngine* engine) {
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
@@ -1578,6 +1633,7 @@ void test_proxy_abi_and_lifecycle() {
     verify_tts_stream_outlives_engine(api);
     verify_malformed_audio_results_reap_worker(api);
     verify_tts_stream_destroy_cancels_promptly(api);
+    verify_tts_stream_reentrant_destroy(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

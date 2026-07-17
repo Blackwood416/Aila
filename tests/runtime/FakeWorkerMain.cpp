@@ -611,10 +611,16 @@ int run(const Handles& handles) {
             };
             send_audio({0.25f, -0.5f});
             bool cancelled = false;
+            const bool reentrant_destroy = command.header.payload_json.find(
+                "__aila_tts_reentrant_destroy__") != std::string::npos;
             const bool ignore_cancel =
                 command.header.payload_json.find("__aila_tts_ignore_cancel__") != std::string::npos;
             const bool slow = command.header.payload_json.find("__aila_tts_slow__") != std::string::npos;
-            const int attempts = ignore_cancel ? 1000 : (slow ? 1000 : 6);
+            if (reentrant_destroy) {
+                Sleep(100);
+                send_audio({1.0f});
+            }
+            const int attempts = (ignore_cancel || slow || reentrant_destroy) ? 1000 : 6;
             for (int attempt = 0; attempt < attempts && !cancelled; ++attempt) {
                 DWORD pending = 0;
                 if (!ignore_cancel &&
@@ -625,7 +631,7 @@ int run(const Handles& handles) {
                 }
                 if (!cancelled) Sleep(5);
             }
-            if (!cancelled) send_audio({1.0f});
+            if (!cancelled && !reentrant_destroy) send_audio({1.0f});
             const uint64_t terminal_count = event_count + 1;
             send_frame(handles.event_write, stream_event(
                 command, std::string("{\"event\":\"end\",\"eventCount\":") +

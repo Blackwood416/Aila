@@ -39,6 +39,7 @@ struct AilaTTSStream {
     bool done = false;
     bool joining = false;
     bool joined = false;
+    bool destroy_requested = false;
     int status = AILA_ERR_RUNTIME;
 };
 
@@ -661,12 +662,23 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
             } catch (...) {
                 try { raw->owner->record_runtime_error("TTS stream failed at background boundary"); } catch (...) {}
             }
+            bool delete_self = false;
             {
                 std::lock_guard<std::mutex> lock(raw->mutex);
                 raw->status = status;
                 raw->done = true;
+                delete_self = raw->destroy_requested;
             }
             raw->condition.notify_all();
+            if (delete_self) {
+                try {
+                    if (raw->worker.joinable()) raw->worker.detach();
+                } catch (...) {
+                    return;
+                }
+                delete raw;
+                return;
+            }
         });
         {
             std::unique_lock<std::mutex> lock(raw->mutex);
@@ -688,6 +700,9 @@ AILA_API int aila_stream_wait(AilaTTSStream* stream) {
     if (!stream) return AILA_ERR_INVALID_ARGUMENT;
     try {
         std::unique_lock<std::mutex> lock(stream->mutex);
+        if (!stream->joined && stream->worker.get_id() == std::this_thread::get_id()) {
+            return AILA_ERR_RUNTIME;
+        }
         while (stream->joining && !stream->joined) stream->condition.wait(lock);
         if (!stream->joined) {
             stream->joining = true;
@@ -707,6 +722,13 @@ AILA_API int aila_stream_wait(AilaTTSStream* stream) {
 AILA_API void aila_stream_destroy(AilaTTSStream* stream) {
     if (!stream) return;
     stream->cancel_requested.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(stream->mutex);
+        if (!stream->joined && stream->worker.get_id() == std::this_thread::get_id()) {
+            stream->destroy_requested = true;
+            return;
+        }
+    }
     (void)aila_stream_wait(stream);
     try { delete stream; } catch (...) {}
 }
