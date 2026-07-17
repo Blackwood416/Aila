@@ -441,6 +441,20 @@ struct ReentrantDestroyCapture {
     std::atomic_bool destroyed{false};
 };
 
+struct FailureReentrantCapture {
+    const Api* api = nullptr;
+    AilaEngine* engine = nullptr;
+    std::atomic_bool entered{false};
+    std::atomic_bool completed{false};
+};
+
+void failure_reentrant_log(int, const char*, void* user_data) {
+    auto& capture = *static_cast<FailureReentrantCapture*>(user_data);
+    capture.entered.store(true, std::memory_order_release);
+    (void)capture.api->context_length(capture.engine);
+    capture.completed.store(true, std::memory_order_release);
+}
+
 void reentrant_destroy_log(int, const char*, void* user_data) {
     auto& capture = *static_cast<ReentrantDestroyCapture*>(user_data);
     while (!capture.generation_returned.load(std::memory_order_acquire)) {
@@ -2026,10 +2040,86 @@ void test_proxy_abi_and_lifecycle() {
     }
 }
 
+void run_reentrant_failure_child(bool partial_response) {
+    TempDirectory temp;
+    const fs::path integration_root = temp.path() / L"failure root";
+    const fs::path runtime = integration_root / L"aila_runtime";
+    copy_test_file(fs::path(wide(AILA_PROXY_DLL_PATH)), integration_root / L"AilaShared.dll");
+    copy_test_file(fs::path(wide(AILA_FAKE_WORKER_PATH)), runtime / L"AilaWorker.exe");
+    ScopedEnvironment runtime_directory(L"AILA_RUNTIME_DLL_DIR", L"aila_runtime");
+    ScopedEnvironment build_id(L"AILA_FAKE_WORKER_BUILD_ID", wide(AILA_BUILD_ID));
+    LoadedLibrary library(integration_root / L"AilaShared.dll");
+    Api api(library);
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "reentrant-failure", 1024) == 0,
+           "reentrant failure child init failed");
+    api.set_log_level(3);
+    FailureReentrantCapture capture{&api, engine.get()};
+    api.set_log_callback(failure_reentrant_log, &capture);
+    const char* marker = partial_response
+        ? "__aila_logs____aila_proxy_partial_response__"
+        : "__aila_logs____aila_malformed_attachment__";
+    char* generated = api.generate(
+        engine.get(), marker, nullptr);
+    expect(generated == nullptr, "failing generation unexpectedly succeeded");
+    expect(capture.entered.load(std::memory_order_acquire),
+           "reentrant failure callback was not entered");
+    for (int attempt = 0; attempt != 200 &&
+         !capture.completed.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(5ms);
+    }
+    expect(capture.completed.load(std::memory_order_acquire),
+           "reentrant failure callback did not complete");
+    api.set_log_callback(nullptr, nullptr);
+}
+
+void test_reentrant_log_failure_shutdown_is_bounded() {
+    wchar_t executable[MAX_PATH + 1]{};
+    const DWORD copied = GetModuleFileNameW(nullptr, executable, MAX_PATH + 1);
+    expect(copied != 0 && copied <= MAX_PATH, "could not locate ProxyAbi test executable");
+    auto run_child = [&](std::wstring_view argument, const char* context) {
+        std::wstring command = L"\"" + std::wstring(executable, copied) +
+            L"\" " + std::wstring(argument);
+        std::vector<wchar_t> mutable_command(command.begin(), command.end());
+        mutable_command.push_back(L'\0');
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        expect(CreateProcessW(
+                   executable, mutable_command.data(), nullptr, nullptr, FALSE,
+                   CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != FALSE,
+               "could not launch reentrant failure child");
+        CloseHandle(process.hThread);
+        const DWORD wait = WaitForSingleObject(process.hProcess, 7000);
+        if (wait == WAIT_TIMEOUT) {
+            TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+            WaitForSingleObject(process.hProcess, 1000);
+            CloseHandle(process.hProcess);
+            fail(std::string("reentrant log callback deadlocked ") + context);
+        }
+        DWORD exit_code = 1;
+        expect(wait == WAIT_OBJECT_0 &&
+                   GetExitCodeProcess(process.hProcess, &exit_code) != FALSE,
+               "could not observe reentrant failure child exit");
+        CloseHandle(process.hProcess);
+        expect(exit_code == 0, "reentrant failure child reported failure");
+    };
+    run_child(L"--reentrant-log-failure-child", "malformed-response shutdown");
+    run_child(L"--reentrant-log-timeout-child", "partial-response timeout shutdown");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 &&
+            (std::string_view(argv[1]) == "--reentrant-log-failure-child" ||
+             std::string_view(argv[1]) == "--reentrant-log-timeout-child")) {
+            run_reentrant_failure_child(
+                std::string_view(argv[1]) == "--reentrant-log-timeout-child");
+            return 0;
+        }
+        test_reentrant_log_failure_shutdown_is_bounded();
         test_proxy_abi_and_lifecycle();
         std::cout << "Aila proxy ABI tests passed\n";
         return 0;

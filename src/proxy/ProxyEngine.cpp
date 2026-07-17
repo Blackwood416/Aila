@@ -201,19 +201,30 @@ std::string v2_config_json(const AilaGenConfigV2* config) {
 
 } // namespace
 
-ProxyEngine::ProxyEngine() : log_source_(logging::create_source()) {
-    worker_.set_log_handler([source = log_source_](int level, std::string_view message) {
-        logging::enqueue(source, level, message);
-    });
-}
+ProxyEngine::ProxyEngine() = default;
 
 ProxyEngine::~ProxyEngine() noexcept {
-    logging::deactivate(log_source_);
+    logging::Source sources;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_locked();
+        logging::retire(log_source_, retired_log_sources_);
+        sources = std::move(retired_log_sources_);
     } catch (...) {
     }
+    logging::await_quiescent_chain(sources);
+}
+
+void ProxyEngine::prepare_destroy() noexcept {
+    logging::Source sources;
+    try {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            retire_log_source_locked();
+            sources = std::move(retired_log_sources_);
+        }
+        logging::await_quiescent_chain(sources);
+    } catch (...) {}
 }
 
 bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
@@ -1803,7 +1814,7 @@ void ProxyEngine::flush_deferred_asr_destroys_locked() {
 }
 
 void ProxyEngine::shutdown_locked() noexcept {
-    logging::deactivate(log_source_);
+    retire_log_source_locked();
     initialized_ = false;
     active_asr_stream_ids_.clear();
     deferred_asr_destroy_ids_.clear();
@@ -1812,6 +1823,10 @@ void ProxyEngine::shutdown_locked() noexcept {
         worker_.shutdown(std::chrono::seconds(2));
     } catch (...) {
     }
+}
+
+void ProxyEngine::retire_log_source_locked() noexcept {
+    logging::retire(log_source_, retired_log_sources_);
 }
 
 void ProxyEngine::set_log_level(int level) noexcept {

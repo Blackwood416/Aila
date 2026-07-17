@@ -21,6 +21,9 @@
 
 struct AilaEngine {
     AilaEngine() : proxy(std::make_shared<aila::proxy::ProxyEngine>()) {}
+    ~AilaEngine() {
+        if (proxy) proxy->prepare_destroy();
+    }
     std::shared_ptr<aila::proxy::ProxyEngine> proxy;
 };
 

@@ -858,6 +858,10 @@ int run(const Handles& handles) {
                     send_frame(handles.event_write, log);
                 }
             }
+            if (command.header.payload_json.find("__aila_proxy_partial_response__") !=
+                std::string::npos) {
+                send_partial_frame_and_exit(handles.response_write, response, 88);
+            }
             if (command.header.payload_json.find("__aila_malformed_attachment__") !=
                 std::string::npos) {
                 const std::string malformed("left\0right", 10);

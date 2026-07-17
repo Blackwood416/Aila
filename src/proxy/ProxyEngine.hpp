@@ -110,6 +110,7 @@ public:
     void record_invalid_argument(std::string message);
     void record_runtime_error(std::string message);
     void set_log_level(int level) noexcept;
+    void prepare_destroy() noexcept;
 
 private:
     ipc::Frame request_locked(std::string method, std::string payload_json);
@@ -146,6 +147,7 @@ private:
     void remove_asr_stream_locked(uint64_t stream_id);
     void destroy_remote_asr_stream_locked(uint64_t stream_id);
     void flush_deferred_asr_destroys_locked();
+    void retire_log_source_locked() noexcept;
     void shutdown_locked() noexcept;
 
     mutable std::mutex mutex_;
@@ -160,6 +162,7 @@ private:
     int error_code_ = 0;
     std::string error_message_;
     logging::Source log_source_;
+    logging::Source retired_log_sources_;
 };
 
 } // namespace aila::proxy

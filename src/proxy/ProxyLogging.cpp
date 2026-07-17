@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace aila::proxy::logging {
 
@@ -18,6 +19,7 @@ struct SourceState {
     std::condition_variable condition;
     bool active = true;
     size_t callbacks_in_flight = 0;
+    Source retired_next;
 };
 
 namespace {
@@ -184,15 +186,41 @@ Dispatcher& dispatcher() {
 
 Source create_source() { return std::make_shared<SourceState>(); }
 
-void deactivate(const Source& source) noexcept {
+void invalidate(const Source& source) noexcept {
     if (!source) return;
     try {
-        std::unique_lock<std::mutex> lock(source->mutex);
+        std::lock_guard<std::mutex> lock(source->mutex);
         source->active = false;
-        if (current_callback_source != source.get()) {
-            source->condition.wait(lock, [&] { return source->callbacks_in_flight == 0; });
-        }
     } catch (...) {}
+}
+
+void await_quiescent(const Source& source) noexcept {
+    if (!source || current_callback_source == source.get()) return;
+    try {
+        std::unique_lock<std::mutex> lock(source->mutex);
+        source->condition.wait(lock, [&] { return source->callbacks_in_flight == 0; });
+    } catch (...) {}
+}
+
+void retire(Source& current, Source& retired_head) noexcept {
+    if (!current) return;
+    invalidate(current);
+    current->retired_next = std::move(retired_head);
+    retired_head = std::move(current);
+}
+
+void await_quiescent_chain(const Source& retired_head) noexcept {
+    for (Source source = retired_head; source; source = source->retired_next) {
+        // The dispatcher is single-threaded. During callback-reentrant destroy,
+        // only the current source can have a callback in flight; older retired
+        // sources are therefore already quiescent and cannot self-deadlock.
+        await_quiescent(source);
+    }
+}
+
+void deactivate(const Source& source) noexcept {
+    invalidate(source);
+    await_quiescent(source);
 }
 
 void set_callback(AilaLogCallback callback, void* user_data) noexcept {

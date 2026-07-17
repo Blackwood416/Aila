@@ -12,6 +12,10 @@ struct SourceState;
 using Source = std::shared_ptr<SourceState>;
 
 Source create_source();
+void invalidate(const Source& source) noexcept;
+void await_quiescent(const Source& source) noexcept;
+void retire(Source& current, Source& retired_head) noexcept;
+void await_quiescent_chain(const Source& retired_head) noexcept;
 void deactivate(const Source& source) noexcept;
 void set_callback(AilaLogCallback callback, void* user_data) noexcept;
 void set_level(int level) noexcept;
