@@ -905,34 +905,6 @@ $metadata | ConvertTo-Json -Depth 8
         } 'Build info file not found:' 'missing build info verification'
     }
 
-    Invoke-Test 'runtime isolation policy covers every collected oneAPI DLL family' {
-        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
-        $tokens = $null
-        $parseErrors = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($verifierPath, [ref]$tokens, [ref]$parseErrors)
-        Assert-Equal 0 $parseErrors.Count 'verifier policy parse errors'
-        $definition = $ast.Find({
-            param($node)
-            return $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $node.Name -eq 'Test-AilaOneApiRuntimeDllName'
-        }, $true)
-        if ($null -eq $definition) {
-            throw 'Test-AilaOneApiRuntimeDllName was not found in verifier.'
-        }
-        Invoke-Expression $definition.Extent.Text
-
-        foreach ($runtimeName in @(
-                'sycl9.dll', 'sycl-jit.dll', 'dnnl.dll', 'tbb12.dll', 'umf.dll', 'ur_loader.dll',
-                'libmmd.dll', 'libmmdmd.dll', 'OpenCL.dll', 'intelocl64.dll', 'common_clang64.dll',
-                'xptifw.dll', 'libhwloc-15.dll', 'tcm.dll'
-            )) {
-            Assert-Equal $true (Test-AilaOneApiRuntimeDllName -Name $runtimeName) "runtime policy $runtimeName"
-        }
-        foreach ($ordinaryName in @('AilaShared.dll', 'build_info.json')) {
-            Assert-Equal $false (Test-AilaOneApiRuntimeDllName -Name $ordinaryName) "ordinary release file $ordinaryName"
-        }
-    }
-
     Invoke-Test 'release metadata refresh replaces stale hashes and git provenance' {
         $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'stale-release-metadata')
@@ -1032,10 +1004,10 @@ $metadata | ConvertTo-Json -Depth 8
         } 'forbidden oneAPI imports' 'proxy dependency isolation verification'
     }
 
-    Invoke-Test 'verifier rejects oneAPI runtime DLLs staged beside the proxy' {
+    Invoke-Test 'verifier rejects any extra file staged beside the proxy' {
         $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'root-runtime-dll')
-        Set-Content -LiteralPath (Join-Path $buildDir 'Release\bin\libmmd.dll') -Value 'sentinel' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $buildDir 'Release\bin\svml_dispmd.dll') -Value 'sentinel' -Encoding UTF8
 
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
@@ -1049,7 +1021,27 @@ $metadata | ConvertTo-Json -Depth 8
             if ($result.exitCode -ne 0) {
                 throw ($result.stderr + $result.stdout).Trim()
             }
-        } 'oneAPI runtime DLLs beside the proxy' 'root runtime isolation verification'
+        } "Unexpected release root file 'svml_dispmd.dll'" 'release root file allowlist verification'
+    }
+
+    Invoke-Test 'verifier rejects any extra directory beside the runtime directory' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'extra-root-directory')
+        New-Item -ItemType Directory -Path (Join-Path $buildDir 'Release\bin\unexpected') -Force | Out-Null
+
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } "Unexpected release root directory 'unexpected'" 'release root directory allowlist verification'
     }
 
     Invoke-Test 'verifier rejects a different requested stack without writing output' {

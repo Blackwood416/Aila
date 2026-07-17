@@ -221,10 +221,27 @@ function Assert-AilaStagedArtifactMetadata {
     }
 }
 
-function Test-AilaOneApiRuntimeDllName {
-    param([Parameter(Mandatory = $true)][string]$Name)
+function Assert-AilaReleaseRootLayout {
+    param([Parameter(Mandatory = $true)][string]$ReleaseRoot)
 
-    return $Name -match '^(?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll$'
+    $allowedFiles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $null = $allowedFiles.Add('AilaShared.dll')
+    $null = $allowedFiles.Add('build_info.json')
+    $allowedDirectories = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $null = $allowedDirectories.Add('aila_runtime')
+
+    foreach ($entry in (Get-ChildItem -LiteralPath $ReleaseRoot -Force)) {
+        if ($entry.PSIsContainer) {
+            if (-not $allowedDirectories.Contains($entry.Name)) {
+                throw "Unexpected release root directory '$($entry.Name)'; only 'aila_runtime' is allowed."
+            }
+        }
+        elseif (-not $allowedFiles.Contains($entry.Name)) {
+            throw "Unexpected release root file '$($entry.Name)'; allowed files are 'AilaShared.dll' and 'build_info.json'."
+        }
+    }
 }
 
 function Get-AilaDumpbinPath {
@@ -322,11 +339,7 @@ function Invoke-AilaOneApiBuildVerification {
             throw "Runtime executable must be staged below aila_runtime, not beside the proxy: $candidate"
         }
     }
-    $rootRuntimeDlls = @(Get-ChildItem -LiteralPath $releaseRoot -File |
-        Where-Object { Test-AilaOneApiRuntimeDllName -Name $_.Name })
-    if ($rootRuntimeDlls.Count -ne 0) {
-        throw "Found oneAPI runtime DLLs beside the proxy: $($rootRuntimeDlls.Name -join ', ')."
-    }
+    Assert-AilaReleaseRootLayout -ReleaseRoot $releaseRoot
     Assert-AilaStagedArtifactMetadata `
         -BuildInfo $buildInfo `
         -Role 'proxy' `

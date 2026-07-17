@@ -38,12 +38,6 @@ function Resolve-DumpbinPath {
     throw 'dumpbin.exe was not found on PATH, under VCToolsInstallDir, or beside CMAKE_LINKER.'
 }
 
-function Test-OneApiRuntimeName {
-    param([Parameter(Mandatory = $true)][string]$Name)
-
-    return $Name -match '^(?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll$'
-}
-
 function Get-ArtifactMetadata {
     param(
         [Parameter(Mandatory = $true)]$BuildInfo,
@@ -55,33 +49,6 @@ function Get-ArtifactMetadata {
         throw "build_info.json must contain exactly one '$Role' artifact; found $($matches.Count)."
     }
     return $matches[0]
-}
-
-$expectedRuntimeNames = @(
-    'sycl9.dll',
-    'sycl-jit.dll',
-    'dnnl.dll',
-    'tbb12.dll',
-    'umf.dll',
-    'ur_loader.dll',
-    'libmmd.dll',
-    'libmmdmd.dll',
-    'OpenCL.dll',
-    'intelocl64.dll',
-    'common_clang64.dll',
-    'xptifw.dll',
-    'libhwloc-15.dll',
-    'tcm.dll'
-)
-foreach ($runtimeName in $expectedRuntimeNames) {
-    if (-not (Test-OneApiRuntimeName -Name $runtimeName)) {
-        throw "Runtime isolation policy does not classify '$runtimeName' as a oneAPI runtime DLL."
-    }
-}
-foreach ($ordinaryName in @('AilaShared.dll', 'build_info.json')) {
-    if (Test-OneApiRuntimeName -Name $ordinaryName) {
-        throw "Runtime isolation policy incorrectly classifies '$ordinaryName'."
-    }
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -115,10 +82,22 @@ foreach ($forbiddenRootExecutable in @('AilaWorker.exe', 'Aila.exe')) {
     }
 }
 
-$rootRuntimeDlls = @(Get-ChildItem -LiteralPath $releaseRoot -File |
-    Where-Object { Test-OneApiRuntimeName -Name $_.Name })
-if ($rootRuntimeDlls.Count -ne 0) {
-    throw "oneAPI runtime DLLs must not be staged beside AilaShared.dll: $($rootRuntimeDlls.Name -join ', ')"
+$allowedRootFiles = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+$null = $allowedRootFiles.Add('AilaShared.dll')
+$null = $allowedRootFiles.Add('build_info.json')
+$allowedRootDirectories = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+$null = $allowedRootDirectories.Add('aila_runtime')
+foreach ($entry in (Get-ChildItem -LiteralPath $releaseRoot -Force)) {
+    if ($entry.PSIsContainer) {
+        if (-not $allowedRootDirectories.Contains($entry.Name)) {
+            throw "Unexpected release root directory '$($entry.Name)'; only 'aila_runtime' is allowed."
+        }
+    }
+    elseif (-not $allowedRootFiles.Contains($entry.Name)) {
+        throw "Unexpected release root file '$($entry.Name)'; allowed files are 'AilaShared.dll' and 'build_info.json'."
+    }
 }
 
 $dumpbinPath = Resolve-DumpbinPath -BuildDirPath $buildDirPath
