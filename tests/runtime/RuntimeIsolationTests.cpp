@@ -770,6 +770,41 @@ void test_event_transport_rejects_invalid_protocol_and_abi() {
     }
 }
 
+void test_stream_timeout_during_slow_callback_is_bounded() {
+    constexpr const char* name = "stream timeout during slow callback";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+    const aila::ipc::Frame initialized = process.request(
+        request_frame(62, "engine.init", R"({"model":"m","maxSeqLen":1024})"), 2s);
+    expect(initialized.header.kind == "result", name, "fake engine init failed");
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::string error = expect_runtime_error(
+        [&] {
+            (void)process.request_stream(
+                request_frame(
+                    63,
+                    "generate.stream",
+                    R"({"input":"__aila_stream_slow_response__","config":null})"),
+                [&](const aila::ipc::Frame&) {
+                    std::this_thread::sleep_for(150ms);
+                    return aila::runtime::WorkerProcess::StreamEventAction::Cancel;
+                },
+                50ms);
+        },
+        name);
+    expect(std::chrono::steady_clock::now() - started < 1s,
+           name,
+           "slow callback timeout was not bounded");
+    expect(error.find("timed out") != std::string::npos,
+           name,
+           "slow callback timeout diagnostic was not actionable: " + error);
+    expect(!process.healthy(), name, "timed-out stream left worker healthy");
+    process.shutdown(500ms);
+}
+
 void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
     constexpr const char* name = "worker graceful shutdown";
     const DWORD handles_before = process_handle_count();
@@ -1049,6 +1084,7 @@ int main() {
         test_worker_request_framing_is_repeatable();
         test_worker_stream_preserves_unrelated_log_events();
         test_event_transport_rejects_invalid_protocol_and_abi();
+        test_stream_timeout_during_slow_callback_is_bounded();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();
         test_worker_blocked_write_obeys_request_deadline();

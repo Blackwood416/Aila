@@ -484,7 +484,10 @@ int run(const Handles& handles) {
                 command.header.payload_json.find("__aila_stream_short_abort__") !=
                 std::string::npos;
             if (!short_abort_race) {
-                Sleep(30);
+                const bool slow_response =
+                    command.header.payload_json.find("__aila_stream_slow_response__") !=
+                    std::string::npos;
+                Sleep(slow_response ? 250 : 30);
             }
             bool cancelled = false;
             DWORD pending = 0;

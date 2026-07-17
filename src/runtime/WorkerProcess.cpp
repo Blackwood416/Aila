@@ -734,7 +734,10 @@ struct WorkerProcess::Impl {
         }
     }
 
-    ipc::Frame read_response(Clock::time_point deadline, const char* context) {
+    ipc::Frame read_response(
+        Clock::time_point deadline,
+        const char* context,
+        bool cleanup_on_timeout = true) {
         const HANDLE handle = response_read.get();
         IoOutcome outcome = run_cancellable_io(
             [handle](ipc::Frame& frame, std::string& error) {
@@ -742,7 +745,12 @@ struct WorkerProcess::Impl {
             },
             deadline);
         if (outcome.timed_out) {
-            timeout_failure(std::string(context) + " while reading");
+            if (cleanup_on_timeout) {
+                timeout_failure(std::string(context) + " while reading");
+            }
+            const std::string message = std::string(context) + " while reading timed out";
+            set_error(message);
+            throw std::runtime_error(message);
         }
         if (outcome.process_exited) {
             fail(std::string(context) + ": worker exited before completing its response");
@@ -1075,7 +1083,10 @@ ipc::Frame WorkerProcess::request_stream(
         ipc::Frame response;
         std::exception_ptr failure;
         try {
-            response = implementation->read_response(deadline, "worker stream request");
+            response = implementation->read_response(
+                deadline,
+                "worker stream request",
+                false);
         } catch (...) {
             failure = std::current_exception();
         }
@@ -1151,6 +1162,10 @@ ipc::Frame WorkerProcess::request_stream(
                     terminal_event_count = count;
                     saw_end = true;
                 } else if (action == StreamEventAction::Cancel && !sent_cancel) {
+                    if (Clock::now() >= deadline) {
+                        throw std::runtime_error(
+                            "worker stream timed out before cancellation could be sent");
+                    }
                     ipc::Frame cancel_frame;
                     cancel_frame.header.protocol = impl_->expected.protocol;
                     cancel_frame.header.abi = impl_->expected.abi;
