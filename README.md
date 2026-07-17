@@ -88,8 +88,11 @@ initialized engine runs inference in its own `AilaWorker.exe` worker process.
 For C API embedding, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before loading the
 proxy. Relative values resolve **relative to AilaShared.dll**; absolute paths are
 also accepted and are normalized internally. If the variable is unset or empty,
-the proxy looks beside itself, preserving the legacy flat layout. Non-Windows
-builds continue to use in-process inference.
+the proxy looks beside itself, preserving the legacy flat layout. That fallback
+is for old deployment compatibility, not DLL-search isolation: exposing a flat
+directory exposes both the proxy and private runtime. Python, ComfyUI, and other
+embedding hosts must use the split layout and explicitly set
+`AILA_RUNTIME_DLL_DIR`. Non-Windows builds continue to use in-process inference.
 
 Python example:
 
@@ -115,6 +118,11 @@ functions. Failed operations are not automatically retried. Keep
 `AilaShared.dll` and `AilaWorker.exe` from the same release; cross-version worker
 compatibility is not guaranteed. CLI examples below assume `Aila.exe` is run
 from `aila_runtime/` or is otherwise addressed by its full path.
+
+ASR and TTS stream handles retain shared ownership of their engine. Destroy ASR
+streams, and wait for or cancel then destroy TTS streams, before destroying
+`AilaEngine`; otherwise, worker shutdown can be delayed until the final stream
+handle is destroyed.
 
 ## 📊 Benchmark
 

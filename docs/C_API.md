@@ -7,8 +7,13 @@ The C API (`aila_api.h`) is the stable public interface for integrating Aila int
 On Windows, `AilaShared.dll` is a lightweight C ABI proxy. It does not import the
 oneAPI inference runtime. When `aila_engine_init` succeeds, that engine owns a
 separate `AilaWorker.exe` worker process that loads the model and the oneAPI
-runtime. Destroying the engine shuts down its worker. Non-Windows builds retain
-the in-process implementation.
+runtime. Non-Windows builds retain the in-process implementation.
+
+ASR and TTS stream handles retain shared ownership of the proxy engine. Destroying
+the `AilaEngine` handle while one of those derived handles still exists therefore
+does not necessarily stop the worker immediately; shutdown can be deferred until
+the final derived handle is destroyed. Finish or cancel and destroy all ASR/TTS
+streams before calling `aila_engine_destroy`.
 
 The public function signatures and caller-visible allocation rules are unchanged.
 In particular, memory returned by Aila must still be released with the matching
@@ -33,6 +38,10 @@ working directory. An absolute directory is also accepted. The proxy normalizes
 the selected directory to an absolute path internally. If the variable is unset
 or empty, the proxy uses the directory containing `AilaShared.dll`; this supports
 the legacy flat layout where the proxy, worker, and runtime DLLs are colocated.
+That fallback is deployment compatibility only: because the proxy and private
+runtime share one directory, a host that exposes that directory to its DLL search
+path cannot keep the runtime hidden. Python, ComfyUI, and other embedding hosts
+must use the split layout and set `AILA_RUNTIME_DLL_DIR` explicitly.
 
 Python hosts should expose only the directory containing `AilaShared.dll` to the
 host DLL loader:
@@ -68,6 +77,7 @@ same release; cross-version worker compatibility is not promised.
 
 ```c
 #include "aila_api.h"
+#include <stdio.h>
 
 int main() {
     // Create engine
@@ -132,6 +142,11 @@ void aila_engine_destroy(AilaEngine* engine);
 ```
 
 Destroys the engine and frees all resources. Passing `NULL` is safe.
+
+Destroy every `AilaTranscribeStream` derived from this engine first. Also wait
+for or cancel, then destroy, every derived `AilaTTSStream`. Those handles retain
+shared engine ownership, so worker process shutdown may otherwise be delayed
+until the last stream handle is destroyed.
 
 ### Generation (Blocking)
 
@@ -476,6 +491,8 @@ void aila_transcribe_stream_destroy(AilaTranscribeStream* stream);
 ```
 
 Destroys the streaming ASR context and frees all associated memory. Passing `NULL` is safe.
+The stream retains shared ownership of its proxy engine; destroy every ASR stream
+before destroying its originating `AilaEngine` to avoid delaying worker shutdown.
 
 ### Text-to-Speech (TTS)
 
@@ -542,6 +559,8 @@ For advanced use cases (custom audio post-processing, pre-tokenized input, separ
 
 For real-time streaming speech synthesis with low-latency audio output.
 
+`AilaTTSStream` is an opaque handle representing one asynchronous synthesis job.
+
 ##### `AilaAudioCallback`
 
 ```c
@@ -557,7 +576,9 @@ Callback invoked whenever a chunk of audio samples is ready. The `samples` point
 ##### `aila_synthesize_stream`
 
 ```c
-int aila_synthesize_stream(
+typedef struct AilaTTSStream AilaTTSStream;
+
+AilaTTSStream* aila_synthesize_stream(
     AilaEngine* engine,
     const char* text,
     const char* reference_audio_path,
@@ -576,28 +597,37 @@ Parameters match `aila_synthesize` with two additions:
 - `callback` — Called for each audio chunk as it is generated. Must not be `NULL`.
 - `user_data` — Opaque pointer passed to each callback invocation.
 
-Returns `0` on success (synthesis started), non-zero on error.
+Returns a new stream handle when synthesis starts, or `NULL` on error. The caller
+must eventually pass every returned handle to `aila_stream_destroy`.
 
 ##### `aila_stream_wait`
 
 ```c
-int aila_stream_wait(AilaEngine* engine);
+int aila_stream_wait(AilaTTSStream* stream);
 ```
 
-Blocks until the current streaming TTS synthesis completes. Returns `0` on success, non-zero on error. Must be called after `aila_synthesize_stream` before starting another stream or destroying the engine.
+Blocks until that stream completes. Returns `0` on success, non-zero on error.
+It is valid to destroy a stream without calling wait explicitly; destroy requests
+cancellation and waits for the background operation to finish.
 
 ##### `aila_stream_destroy`
 
 ```c
-void aila_stream_destroy(AilaEngine* engine);
+void aila_stream_destroy(AilaTTSStream* stream);
 ```
 
-Cancels any in-progress streaming synthesis and frees associated resources. Safe to call at any time. Does not destroy the engine itself.
+Requests cancellation if synthesis is still in progress and frees the stream
+handle. From a thread other than the stream's callback thread, it waits for the
+background operation first. A reentrant call from the callback defers deletion
+until that operation exits. Passing `NULL` is safe. This does not destroy the
+`AilaEngine` handle. Destroy TTS streams before destroying their engine so worker
+shutdown is deterministic.
 
 #### Streaming Example
 
 ```c
 #include "aila_api.h"
+#include <stdio.h>
 
 void audio_chunk(const float* samples, int count, void* user_data) {
     // Write PCM samples to audio device or file
@@ -611,7 +641,7 @@ int main() {
 
     FILE* pcm_out = fopen("output.pcm", "wb");
 
-    int rc = aila_synthesize_stream(engine,
+    AilaTTSStream* stream = aila_synthesize_stream(engine,
         "Hello world!",        // text
         NULL,                  // reference_audio_path (default voice)
         "vivian",              // speaker_name (CustomVoice)
@@ -621,12 +651,15 @@ int main() {
         audio_chunk,           // callback
         pcm_out);              // user_data
 
-    if (rc == 0) {
-        aila_stream_wait(engine); // block until done
+    if (stream != NULL) {
+        int rc = aila_stream_wait(stream); // block until done
+        if (rc != 0) {
+            fprintf(stderr, "Streaming TTS failed: %d\n", rc);
+        }
+        aila_stream_destroy(stream);
     }
 
     fclose(pcm_out);
-    aila_stream_destroy(engine);
     aila_engine_destroy(engine);
     return 0;
 }
@@ -1046,18 +1079,22 @@ class AilaGenConfigV2(ctypes.Structure):
     ]
 
 # Bind functions
+TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
 lib.aila_engine_create.restype = ctypes.c_void_p
 lib.aila_engine_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.aila_engine_init.restype = ctypes.c_int
-lib.aila_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+lib.aila_generate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(AilaGenConfig)]
 lib.aila_generate.restype = ctypes.c_void_p
+lib.aila_default_gen_config.argtypes = []
+lib.aila_default_gen_config.restype = AilaGenConfig
+lib.aila_default_gen_config_v2.argtypes = []
 lib.aila_default_gen_config_v2.restype = AilaGenConfigV2
-lib.aila_generate_chat_json_ex.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+lib.aila_generate_chat_json_ex.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(AilaGenConfigV2)]
 lib.aila_generate_chat_json_ex.restype = ctypes.c_void_p
 lib.aila_transcribe.argtypes = [
     ctypes.c_void_p,          # engine
     ctypes.c_char_p,          # wav_path
-    ctypes.c_void_p,          # config
+    ctypes.POINTER(AilaGenConfig), # config
     ctypes.c_char_p,          # forced_language
     ctypes.c_char_p,          # system_prompt
     ctypes.c_float,           # segment_sec
@@ -1067,7 +1104,7 @@ lib.aila_transcribe.argtypes = [
     ctypes.POINTER(ctypes.c_char_p) # language_out
 ]
 lib.aila_transcribe.restype = ctypes.c_void_p
-lib.aila_transcribe_stream_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+lib.aila_transcribe_stream_create.argtypes = [ctypes.c_void_p, ctypes.POINTER(AilaGenConfig), ctypes.c_char_p, ctypes.c_char_p]
 lib.aila_transcribe_stream_create.restype = ctypes.c_void_p
 lib.aila_transcribe_stream_feed.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 lib.aila_transcribe_stream_feed.restype = ctypes.c_int
@@ -1076,7 +1113,9 @@ lib.aila_transcribe_stream_get_text.restype = ctypes.c_int
 lib.aila_transcribe_stream_destroy.argtypes = [ctypes.c_void_p]
 lib.aila_transcribe_stream_destroy.restype = None
 lib.aila_free_string.argtypes = [ctypes.c_void_p]
+lib.aila_free_string.restype = None
 lib.aila_engine_destroy.argtypes = [ctypes.c_void_p]
+lib.aila_engine_destroy.restype = None
 
 # TTS (simplified)
 lib.aila_synthesize.argtypes = [
@@ -1086,7 +1125,7 @@ lib.aila_synthesize.argtypes = [
     ctypes.c_char_p,          # speaker_name
     ctypes.c_char_p,          # instruct_text
     ctypes.c_char_p,          # language
-    ctypes.c_void_p,          # config
+    ctypes.POINTER(AilaGenConfig), # config
     ctypes.c_char_p,          # output_wav_path
 ]
 lib.aila_synthesize.restype = ctypes.c_int
@@ -1100,14 +1139,14 @@ lib.aila_synthesize_stream.argtypes = [
     ctypes.c_char_p,          # speaker_name
     ctypes.c_char_p,          # instruct_text
     ctypes.c_char_p,          # language
-    ctypes.c_void_p,          # config
+    ctypes.POINTER(AilaGenConfig), # config
     AilaAudioCallback,        # callback
     ctypes.c_void_p,          # user_data
 ]
-lib.aila_synthesize_stream.restype = ctypes.c_int
-lib.aila_stream_wait.argtypes = [ctypes.c_void_p]
+lib.aila_synthesize_stream.restype = ctypes.c_void_p  # AilaTTSStream*
+lib.aila_stream_wait.argtypes = [ctypes.c_void_p]     # AilaTTSStream*
 lib.aila_stream_wait.restype = ctypes.c_int
-lib.aila_stream_destroy.argtypes = [ctypes.c_void_p]
+lib.aila_stream_destroy.argtypes = [ctypes.c_void_p]  # AilaTTSStream*
 lib.aila_stream_destroy.restype = None
 
 # TTS (low-level)
@@ -1124,7 +1163,7 @@ lib.aila_synthesize_wav.argtypes = [
     ctypes.c_int,             # text_tokens_len
     ctypes.POINTER(ctypes.c_float),  # speaker_embedding
     ctypes.c_int,             # speaker_embedding_len
-    ctypes.c_void_p,          # config
+    ctypes.POINTER(AilaGenConfig), # config
     ctypes.POINTER(ctypes.POINTER(ctypes.c_float)), # out_samples
     ctypes.POINTER(ctypes.c_int)     # out_sample_count
 ]
@@ -1145,13 +1184,13 @@ class AilaAlignedWord(ctypes.Structure):
     _fields_ = [("text", ctypes.c_char_p), ("start_ms", ctypes.c_int), ("end_ms", ctypes.c_int)]
 
 lib.aila_align.argtypes = [
-    ctypes.c_void_p, POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
     ctypes.c_char_p, ctypes.c_char_p,
     ctypes.POINTER(ctypes.POINTER(AilaAlignedWord)), ctypes.POINTER(ctypes.c_int)
 ]
 lib.aila_align.restype = ctypes.c_int
 lib.aila_align_words.argtypes = [
-    ctypes.c_void_p, POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
     ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
     ctypes.POINTER(ctypes.POINTER(AilaAlignedWord)), ctypes.POINTER(ctypes.c_int)
 ]
@@ -1163,8 +1202,7 @@ lib.aila_free_aligned_words.restype = None
 engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/qwen3.5-0.8B-bnb-nf4-offline", 4096)
 
-cfg = AilaGenConfig()
-lib.aila_default_gen_config(ctypes.byref(cfg))  # or set fields manually
+cfg = lib.aila_default_gen_config()
 cfg.max_new_tokens = 32
 cfg.do_sample = 0
 
@@ -1184,8 +1222,7 @@ engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-Base", 4096)
 
 # 2. One-shot synthesis with voice cloning
-cfg = AilaGenConfig()
-lib.aila_default_gen_config(ctypes.byref(cfg))
+cfg = lib.aila_default_gen_config()
 rc = lib.aila_synthesize(engine,
     b"Hello world!",                     # text
     b"./reference_speaker.wav",          # reference_audio_path (NULL for default)
@@ -1209,14 +1246,14 @@ pcm_data = bytearray()
 @AilaAudioCallback
 def on_audio(samples_ptr, sample_count, user_data):
     # Accumulate PCM samples
-    buf = ctypes.cast(samples_ptr, ctypes.POINTER(ctypes.c_float * sample_count))
-    pcm_data.extend(bytearray(buf.contents))
+    pcm_data.extend(ctypes.string_at(
+        samples_ptr, sample_count * ctypes.sizeof(ctypes.c_float)))
 
 # Start streaming synthesis
 engine = lib.aila_engine_create()
 lib.aila_engine_init(engine, b"./models/Qwen3-TTS-12Hz-0.6B-CustomVoice", 4096)
 
-rc = lib.aila_synthesize_stream(engine,
+stream = lib.aila_synthesize_stream(engine,
     b"Hello world!",       # text
     None,                  # reference_audio_path
     b"vivian",             # speaker_name (CustomVoice)
@@ -1225,10 +1262,12 @@ rc = lib.aila_synthesize_stream(engine,
     None,                  # config
     on_audio,              # callback
     None)                  # user_data
-if rc == 0:
-    lib.aila_stream_wait(engine)   # block until complete
+if stream:
+    rc = lib.aila_stream_wait(stream)   # block until complete
+    lib.aila_stream_destroy(stream)
+    if rc != 0:
+        raise RuntimeError(f"Streaming TTS failed: {rc}")
 
-lib.aila_stream_destroy(engine)
 lib.aila_engine_destroy(engine)
 ```
 
@@ -1255,6 +1294,7 @@ struct AilaGenConfig {
 }
 
 class Aila {
+    delegate int AilaTokenCallback(IntPtr tokenText, IntPtr userData);
     [DllImport("AilaShared.dll")] static extern IntPtr aila_engine_create();
     [DllImport("AilaShared.dll")] static extern int aila_engine_init(IntPtr e, string dir, int maxSeq);
     [DllImport("AilaShared.dll")] static extern IntPtr aila_generate(IntPtr e, string prompt, ref AilaGenConfig cfg);
@@ -1292,9 +1332,9 @@ class Aila {
 
     // TTS Streaming
     delegate void AilaAudioCallback(IntPtr samples, int sampleCount, IntPtr userData);
-    [DllImport("AilaShared.dll")] static extern int aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
-    [DllImport("AilaShared.dll")] static extern int aila_stream_wait(IntPtr e);
-    [DllImport("AilaShared.dll")] static extern void aila_stream_destroy(IntPtr e);
+    [DllImport("AilaShared.dll")] static extern IntPtr aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
+    [DllImport("AilaShared.dll")] static extern int aila_stream_wait(IntPtr stream);
+    [DllImport("AilaShared.dll")] static extern void aila_stream_destroy(IntPtr stream);
     // ... etc
 }
 ```
@@ -1302,10 +1342,33 @@ class Aila {
 ### Rust (FFI)
 
 ```rust
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void};
 
 #[repr(C)]
 struct AilaGenConfig { /* ... same fields ... */ }
+
+#[repr(C)]
+struct AilaAlignedWord {
+    text: *const c_char,
+    start_ms: c_int,
+    end_ms: c_int,
+}
+
+#[repr(C)]
+struct AilaTTSStream {
+    _private: [u8; 0],
+}
+
+type AilaTokenCallback = Option<unsafe extern "C" fn(
+    token_text: *const c_char,
+    user_data: *mut c_void,
+) -> c_int>;
+
+type AilaAudioCallback = unsafe extern "C" fn(
+    samples: *const f32,
+    sample_count: c_int,
+    user_data: *mut c_void,
+);
 
 extern "C" {
     fn aila_engine_create() -> *mut c_void;
@@ -1372,7 +1435,6 @@ extern "C" {
     ) -> c_int;
 
     // ForceAligner
-    type AilaAlignedWord = extern "C" { fn free(words: *mut AilaAlignedWord, count: c_int); }
     fn aila_align(
         engine: *mut c_void,
         audio_samples: *const f32,
@@ -1396,7 +1458,6 @@ extern "C" {
     fn aila_free_aligned_words(words: *mut AilaAlignedWord, count: c_int);
 
     // TTS Streaming
-    type AilaAudioCallback = extern "C" fn(samples: *const f32, sample_count: c_int, user_data: *mut c_void);
     fn aila_synthesize_stream(
         engine: *mut c_void,
         text: *const c_char,
@@ -1407,9 +1468,9 @@ extern "C" {
         config: *const AilaGenConfig,
         callback: AilaAudioCallback,
         user_data: *mut c_void,
-    ) -> c_int;
-    fn aila_stream_wait(engine: *mut c_void) -> c_int;
-    fn aila_stream_destroy(engine: *mut c_void);
+    ) -> *mut AilaTTSStream;
+    fn aila_stream_wait(stream: *mut AilaTTSStream) -> c_int;
+    fn aila_stream_destroy(stream: *mut AilaTTSStream);
 }
 ```
 

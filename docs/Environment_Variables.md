@@ -10,6 +10,12 @@ Aila supports the following environment variables for runtime configuration. Boo
 |----------|------|---------|-------------|
 | `AILA_RUNTIME_DLL_DIR` | directory path | directory containing `AilaShared.dll` | Directory containing `AilaWorker.exe` and the private oneAPI runtime. Relative values resolve relative to AilaShared.dll; absolute values are accepted. The selected path is normalized to an absolute path internally. An unset or empty value enables the legacy flat layout. |
 
+The unset/empty fallback exists only for compatibility with legacy deployments.
+When the proxy and runtime DLLs share one directory, exposing the proxy directory
+to the host DLL loader also exposes the private runtime, so the flat layout does
+not provide host DLL-search isolation. Python, ComfyUI, and other embedding hosts
+must use the split layout and explicitly set `AILA_RUNTIME_DLL_DIR`.
+
 The recommended release/integration layout keeps `AilaShared.dll` and
 `build_info.json` in the integration root, with `AilaWorker.exe`, `Aila.exe`, and
 the oneAPI runtime DLLs under `aila_runtime/`:
@@ -29,6 +35,11 @@ For this layout, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before the host loads
 starts in the selected directory with a child-only `PATH` containing that
 directory and Windows system directories. The host's DLL search path remains
 unchanged.
+
+ASR and TTS stream handles keep shared ownership of their proxy engine. Destroy
+ASR streams, and wait for or cancel then destroy TTS streams, before destroying
+`AilaEngine`. Otherwise, worker shutdown can be deferred until the final stream
+is destroyed.
 
 Python and other embedding hosts must add only the directory containing the
 proxy to their DLL search path. Do not call

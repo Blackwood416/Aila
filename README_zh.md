@@ -88,8 +88,10 @@ integration_root/
 通过 C API 集成时，请在加载转接层前设置
 `AILA_RUNTIME_DLL_DIR=aila_runtime`。相对路径以 `AilaShared.dll` 所在目录为
 基准；也支持绝对路径，内部会统一规范化为绝对路径。如果变量未设置或为空，
-转接层会使用自身所在目录，从而兼容旧的平铺布局。非 Windows 构建仍在进程内
-执行推理。
+转接层会使用自身所在目录，从而兼容旧的平铺布局。此回退只用于兼容旧部署，
+不提供宿主 DLL 搜索隔离：平铺目录一旦暴露给宿主，转接层和私有运行时都会被
+暴露。Python、ComfyUI 及其他嵌入式宿主必须使用拆分布局，并显式设置
+`AILA_RUNTIME_DLL_DIR`。非 Windows 构建仍在进程内执行推理。
 
 Python 示例：
 
@@ -114,6 +116,10 @@ engine = lib.aila_engine_create()
 同一发行包中的 `AilaShared.dll` 与 `AilaWorker.exe`，不保证跨版本 worker
 兼容。下方 CLI 示例假定从 `aila_runtime/` 中运行 `Aila.exe`，或使用其完整
 路径。
+
+ASR 和 TTS stream handle 会共享其引擎的所有权。销毁 `AilaEngine` 前，应先
+销毁 ASR stream，并等待或取消后销毁 TTS stream；否则 worker 的关闭可能
+延迟到最后一个 stream handle 被销毁。
 
 ## 📊 性能基准
 
