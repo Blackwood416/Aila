@@ -1080,6 +1080,8 @@ class AilaGenConfigV2(ctypes.Structure):
 
 # Bind functions
 TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+# For an optional NULL token callback, pass TokenCallback(), not None.
+# Python 3.13 rejects None when argtypes contains a CFUNCTYPE.
 lib.aila_engine_create.restype = ctypes.c_void_p
 lib.aila_engine_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.aila_engine_init.restype = ctypes.c_int
@@ -1214,6 +1216,34 @@ if result:
 lib.aila_engine_destroy(engine)
 ```
 
+##### ASR Without a Token Callback (Python)
+
+When `TokenCallback` appears in `argtypes`, Python 3.13 does not accept `None`
+for that argument. Construct a typed null function pointer with
+`TokenCallback()` instead:
+
+```python
+# engine must already be initialized with an ASR model
+cfg = lib.aila_default_gen_config()
+language_out = ctypes.c_char_p()
+transcript = lib.aila_transcribe(
+    engine,
+    b"input.wav",
+    ctypes.byref(cfg),
+    None,                 # forced_language: auto-detect
+    None,                 # system_prompt
+    0.0,                  # segment_sec
+    0,                    # past_text_conditioning
+    TokenCallback(),      # typed NULL: no token callback
+    None,                 # user_data
+    ctypes.byref(language_out),
+)
+if transcript:
+    lib.aila_free_string(transcript)
+if language_out.value:
+    lib.aila_free_string(ctypes.cast(language_out, ctypes.c_void_p))
+```
+
 ##### TTS Voice Cloning (Python)
 
 ```python
@@ -1331,13 +1361,56 @@ class Aila {
     [DllImport("AilaShared.dll")] static extern void aila_free_aligned_words(IntPtr words, int count);
 
     // TTS Streaming
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     delegate void AilaAudioCallback(IntPtr samples, int sampleCount, IntPtr userData);
-    [DllImport("AilaShared.dll")] static extern IntPtr aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
-    [DllImport("AilaShared.dll")] static extern int aila_stream_wait(IntPtr stream);
-    [DllImport("AilaShared.dll")] static extern void aila_stream_destroy(IntPtr stream);
+    [DllImport("AilaShared.dll", CallingConvention = CallingConvention.Cdecl)] static extern IntPtr aila_synthesize_stream(IntPtr e, string text, string speakerAudioPath, string speakerName, string instructText, string language, ref AilaGenConfig cfg, AilaAudioCallback callback, IntPtr userData);
+    [DllImport("AilaShared.dll", CallingConvention = CallingConvention.Cdecl)] static extern int aila_stream_wait(IntPtr stream);
+    [DllImport("AilaShared.dll", CallingConvention = CallingConvention.Cdecl)] static extern void aila_stream_destroy(IntPtr stream);
+
+    static int RunStreamingTts(
+        IntPtr engine,
+        ref AilaGenConfig cfg,
+        Action<IntPtr, int> consumeAudio
+    ) {
+        GCHandle userDataHandle = GCHandle.Alloc(consumeAudio);
+        AilaAudioCallback callback = (samples, count, userData) => {
+            var consume = (Action<IntPtr, int>)GCHandle.FromIntPtr(userData).Target;
+            try {
+                consume(samples, count);
+            }
+            catch {
+                // Record/report the error; never throw through the native callback.
+            }
+        };
+        IntPtr stream = IntPtr.Zero;
+        try {
+            stream = aila_synthesize_stream(
+                engine, "Hello world!", null, null, null, null,
+                ref cfg, callback, GCHandle.ToIntPtr(userDataHandle));
+            if (stream == IntPtr.Zero) return -1;
+            return aila_stream_wait(stream);
+        }
+        finally {
+            try {
+                if (stream != IntPtr.Zero) aila_stream_destroy(stream);
+            }
+            finally {
+                GC.KeepAlive(callback); // keep the delegate rooted through destroy
+                if (userDataHandle.IsAllocated) userDataHandle.Free();
+            }
+        }
+    }
     // ... etc
 }
 ```
+
+Native code does not create a managed strong reference to an
+`AilaAudioCallback` delegate or to an object represented by `userData`. Keep both
+alive until `aila_stream_wait` has returned and `aila_stream_destroy` has
+completed. The example keeps the delegate in a local variable and places
+`GC.KeepAlive(callback)` after destroy; it roots managed state with `GCHandle`
+and frees that handle only after destroy. Apply the same lifetime rule when
+destroy cancels a stream instead of waiting for normal completion.
 
 ### Rust (FFI)
 
