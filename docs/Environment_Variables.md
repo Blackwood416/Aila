@@ -60,6 +60,7 @@ continue to run inference in-process.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_MODEL_DIR` | string | `""` | Default model directory (fallback for `-m` CLI argument) |
+| `AILA_LORA_DIR` | string | `""` | Default LoRA adapter directory (fallback for `--lora`) |
 | `AILA_MAX_SEQ_LEN` | int | `4096` | Maximum context window length |
 | `AILA_DECODE_CHUNK_SIZE` | int | `12` | Non-streaming greedy decode chunk size (tokens per host sync) |
 | `AILA_STREAM_CHUNK_SIZE` | int | `4` | Streaming greedy decode chunk size |
@@ -165,6 +166,7 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_Q35_PREFILL_CHUNK` | int | `512` | Qwen3.5 prompt prefill chunk size. Caps temporary attention/runtime scratch memory during long prompt or incremental prefill. Set to `0` to disable chunking |
+| `AILA_Q35_PREFILL_STEP` | int | `64` | Qwen3.5 DeltaNet recurrent-state checkpoint interval used for context rollback; must be positive. Overridden by `--q35-prefill-step` |
 | `AILA_Q35_PREFILL_TOKENWISE` | bool | `false` | Tokenwise prefill mode (debug only — feeds tokens one at a time) |
 
 ---
@@ -201,6 +203,11 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 | `AILA_PROFILE_Q35_DECODE` | bool | `false` | Profile Qwen3.5 decode (logs timing per step) |
 | `AILA_PROFILE_Q35_DECODE_EVERY` | int | `32` | Profile every Nth decode step |
 | `AILA_PROFILE_Q35_HOST_ONLY` | bool | `false` | Measure host submission time only (skip GPU sync). Diagnostic only |
+| `AILA_PROFILE_Q3_PREFILL` | bool | `false` | Profile Qwen3/Qwen3-ASR prefill operations |
+| `AILA_PROFILE_Q3_PREFILL_EVERY` | int | `1` | Profile every Nth Qwen3/Qwen3-ASR prefill |
+| `AILA_PROFILE_Q3_DECODE` | bool | `false` | Profile Qwen3/Qwen3-ASR decode operations |
+| `AILA_PROFILE_Q3_DECODE_EVERY` | int | `32` | Profile every Nth Qwen3/Qwen3-ASR decode step |
+| `AILA_PROFILE_Q3_HOST_ONLY` | bool | `false` | Measure Qwen3/Qwen3-ASR host submission time only. Diagnostic only |
 | `AILA_Q35_VISION_PROFILE` | bool | `false` | Profile vision encoder |
 | `AILA_Q35_VISION_PROFILE_BLOCKS` | bool | `false` | Profile individual vision transformer blocks |
 | `AILA_Q35_VISION_PROFILE_PREP` | bool | `false` | Profile vision image preprocessing |
@@ -213,6 +220,7 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 | `AILA_DEBUG_PROMPT_TEXT` | bool | `false` | Log the fully rendered prompt text before prefill, including chat-template special markers such as `<|im_start|>` and `<|im_end|>` |
 | `AILA_DEBUG_CHAT_TEMPLATE` | bool | `false` | Log the selected chat template source/version without dumping the full prompt |
 | `AILA_DEBUG_PROMPT_TEXT_MAX_CHARS` | int | `20000` | Maximum rendered prompt characters to log when `AILA_DEBUG_PROMPT_TEXT=1`. Set to `0` for unlimited output |
+| `AILA_DUMP_LOGITS` | bool | `false` | Dump intermediate Qwen3-ASR audio-encoder tensors as `debug_cpp_*.bin` files in the process/worker working directory. Diagnostic only |
 | `AILA_DEBUG_TOKEN_IDS` | bool | `false` | Log token IDs during generation |
 | `AILA_DEBUG_Q35_LOGITS` | bool | `false` | Log top-N logits after prefill |
 | `AILA_DEBUG_Q35_LAYER_STATS` | bool | `false` | Log per-layer statistics |
@@ -229,6 +237,7 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 |----------|------|---------|-------------|
 | `AILA_DEVICE_SAMPLING` | bool | `true` | Device-side sampling: `0` = force host fallback, `1` = allow GPU sampling |
 | `AILA_PRINT_MATRIX_COMBOS` | bool | `false` | Print all supported joint-matrix (XMX) tile combinations at startup |
+| `AILA_NO_MROPE` | bool | `false` | Disable multimodal rotary position IDs for embedded media inputs. Debug/compatibility use only |
 
 ---
 

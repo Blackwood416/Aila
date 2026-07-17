@@ -108,7 +108,10 @@ engine = lib.aila_engine_create()
 Only add the proxy directory to the host's DLL search path. Never call
 `os.add_dll_directory("aila_runtime")` or add `aila_runtime` to the host `PATH`;
 that would expose Aila's private oneAPI DLLs to Python and defeat isolation. The
-C API signatures and Aila free functions remain unchanged.
+existing generation, ASR, alignment, and Aila-owned memory-release entry points
+remain source-compatible. The TTS streaming API has changed in 0.1.7: it now
+returns an `AilaTTSStream*`, and wait/destroy operate on that stream handle; see
+[docs/C_API.md](docs/C_API.md) for the migration.
 
 The worker uses the runtime directory as its working directory and receives an
 isolated child `PATH`. Missing `AilaWorker.exe`, proxy/worker build ID mismatch,
@@ -206,10 +209,12 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--messages-json <path>` | JSON prompt file (`-` = stdin) | (none) |
 | `--chat-output-json` | With `--messages-json`, print structured assistant JSON instead of raw text | off |
 | `--chat-stream-jsonl` | With `--messages-json`, print structured stream events as JSONL | off |
+| `--lora <path>` | LoRA adapter directory | `AILA_LORA_DIR` env |
 | `--transcribe <path>` | Transcription mode for audio WAV files | (none) |
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
-| `--ref, --speaker <name_or_path>` | TTS voice: reference audio path or named voice (e.g., vivian, ryan) | (none) |
+| `--ref <path>` | Reference audio for TTS voice cloning | (none) |
+| `--speaker <name>` | TTS named voice (e.g., vivian, ryan) | (none) |
 | `--instruct <text>` | VoiceDesign style description for TTS (e.g., "deep warm voice") | (none) |
 | `--language <lang>` | TTS language: chinese, english, japanese, korean, auto | auto |
 | `--ref-cache-dir <dir>` | Speaker embedding cache directory | `AILA_REF_CACHE_DIR` env |
@@ -222,6 +227,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--asr-system <prompt>` | ASR system prompt text bias | (none) |
 | `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
 | `--asr-past` / `--no-asr-past` | Toggle past-text conditioning for ASR segments | no-asr-past |
+| `--q35-prefill-step <N>` | Qwen3.5 recurrent-state checkpoint interval | 64 |
+| `--kv-quant` | Enable FP8 E4M3 KV-cache quantization | off |
 | `-h, --help` | Show help | — |
 | `-v, --version` | Show version | — |
 
@@ -392,7 +399,7 @@ Requirements: `torch`, `transformers`, `bitsandbytes` with Intel XPU backend.
 ## 🛠️ Build from Source
 
 ```powershell
-# Requires: Intel oneAPI Base Toolkit, CMake 3.24+, Ninja
+# Requires: Intel oneAPI Base Toolkit 2026.1+, CMake 3.24+, Ninja
 .\build.ps1
 
 # Clean build

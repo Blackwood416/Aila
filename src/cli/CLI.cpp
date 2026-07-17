@@ -280,7 +280,7 @@ Interactive Commands:
 }
 
 void print_version() {
-    std::cout << "Aila v0.1.6" << std::endl;
+    std::cout << "Aila v0.1.7" << std::endl;
 }
 
 bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {

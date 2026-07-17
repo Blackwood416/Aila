@@ -51,7 +51,7 @@ struct AilaTTSStream {
 
 namespace {
 
-constexpr const char* kVersion = "0.1.6";
+constexpr const char* kVersion = "0.1.7";
 constexpr const char* kEmpty = "";
 
 std::mutex engine_registry_mutex;

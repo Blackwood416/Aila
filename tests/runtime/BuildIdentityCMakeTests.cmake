@@ -86,7 +86,7 @@ require_ninja_dependency("${packed_refs_path}" "packed refs")
 if(NOT EXISTS "${WORKER_FILE}")
     message(FATAL_ERROR "worker executable does not exist: ${WORKER_FILE}")
 endif()
-set(expected_build_id "aila-0.1.6-abi1-${current_revision}")
+set(expected_build_id "aila-0.1.7-abi1-${current_revision}")
 file(STRINGS "${WORKER_FILE}" matching_build_ids REGEX "${expected_build_id}")
 if(NOT matching_build_ids)
     message(FATAL_ERROR

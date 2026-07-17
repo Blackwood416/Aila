@@ -67,7 +67,7 @@
 ## 📥 安装
 
 1. 安装 **Intel Arc显卡驱动**。
-2. 从 [Releases](https://github.com/Blackwood416/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
+2. 从 [Releases](https://github.com/Blackwood416/Aila/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
 3. 解压到任意目录。
 4. 将模型文件放入目录中（如 `./models/qwen3.5-0.8B-bnb-nf4-offline/`）。
 
@@ -106,8 +106,10 @@ engine = lib.aila_engine_create()
 
 宿主的 DLL 搜索路径只能加入转接层所在目录。不要调用
 `os.add_dll_directory("aila_runtime")`，也不要把 `aila_runtime` 加入宿主
-`PATH`；否则会让 Python 看到 Aila 私有的 oneAPI DLL，破坏隔离。C API 函数
-签名以及 Aila 提供的内存释放函数均保持不变。
+`PATH`；否则会让 Python 看到 Aila 私有的 oneAPI DLL，破坏隔离。现有生成、
+ASR、强制对齐以及 Aila 自有内存释放接口保持源码兼容。0.1.7 的 TTS 流式
+接口有一项 ABI 变更：现在返回 `AilaTTSStream*`，wait/destroy 也改为接收该
+stream handle；迁移方法见 [docs/C_API.md](docs/C_API.md)。
 
 工作进程以 runtime 目录作为工作目录，并使用隔离的子进程 `PATH`。缺少
 `AilaWorker.exe`、转接层与 worker build ID 不匹配、启动超时或工作进程退出
@@ -203,10 +205,12 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--messages-json <path>` | JSON prompt 文件（`-` = stdin） | 无 |
 | `--chat-output-json` | 与 `--messages-json` 配合，输出结构化 assistant JSON 而非原始文本 | 关闭 |
 | `--chat-stream-jsonl` | 与 `--messages-json` 配合，以 JSONL 输出结构化流事件 | 关闭 |
+| `--lora <path>` | LoRA adapter 目录 | `AILA_LORA_DIR` 环境变量 |
 | `--transcribe <path>` | 语音 WAV 音频转录模式 | 无 |
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
-| `--ref, --speaker <name_or_path>` | TTS 音色：参考音频路径或命名音色（如 vivian、ryan） | 无 |
+| `--ref <path>` | TTS 语音克隆参考音频 | 无 |
+| `--speaker <name>` | TTS 命名音色（如 vivian、ryan） | 无 |
 | `--instruct <text>` | VoiceDesign 音色风格描述（如 "深沉温暖的声音"） | 无 |
 | `--language <lang>` | TTS 语言：chinese、english、japanese、korean、auto | auto |
 | `--ref-cache-dir <dir>` | 说话人嵌入缓存目录 | `AILA_REF_CACHE_DIR` 环境变量 |
@@ -219,6 +223,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--asr-system <prompt>` | ASR 偏置的系统提示词（system prompt） | 无 |
 | `--asr-segment <sec>` | ASR 音频分段切片秒数大小 | 0.0 (禁用) |
 | `--asr-past` / `--no-asr-past` | 启用/禁用 ASR 分段上文偏置（past-text conditioning） | no-asr-past |
+| `--q35-prefill-step <N>` | Qwen3.5 循环状态 checkpoint 间隔 | 64 |
+| `--kv-quant` | 启用 FP8 E4M3 KV cache 量化 | 关闭 |
 | `-h, --help` | 显示帮助 | — |
 | `-v, --version` | 显示版本 | — |
 
@@ -387,7 +393,7 @@ python export_bnb_nf4.py \
 ## 🛠️ 从源码构建
 
 ```powershell
-# 需要：Intel oneAPI Base Toolkit、CMake 3.24+、Ninja
+# 需要：Intel oneAPI Base Toolkit 2026.1+、CMake 3.24+、Ninja
 .\build.ps1
 
 # 清理构建

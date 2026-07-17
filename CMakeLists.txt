@@ -24,7 +24,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
 
-set(AILA_PUBLIC_API_VERSION "0.1.6")
+set(AILA_PUBLIC_API_VERSION "0.1.7")
 set(AILA_PUBLIC_ABI_VERSION "1")
 find_package(Git QUIET)
 

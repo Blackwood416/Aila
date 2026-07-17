@@ -193,7 +193,8 @@ AILA_API char* aila_generate_messages(AilaEngine* engine, const char* messages_j
  * `tool_calls`, `raw_text`, `finish_reason`, and `warnings`. Aila formats and
  * parses tool calls but does not execute tools; callers should execute returned
  * tool calls externally and feed tool results back as `tool` messages.
- * `finish_reason` may be "stop", "length", "loop_guard", or "tool_calls".
+ * `finish_reason` may be "stop", "length", "loop_guard", "tool_calls", or
+ * "tool_policy" for a strict tool-policy violation.
  *
  * @param engine            Initialized engine handle
  * @param chat_request_json UTF-8 JSON chat request string

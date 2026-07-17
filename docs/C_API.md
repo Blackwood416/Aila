@@ -15,10 +15,13 @@ does not necessarily stop the worker immediately; shutdown can be deferred until
 the final derived handle is destroyed. Finish or cancel and destroy all ASR/TTS
 streams before calling `aila_engine_destroy`.
 
-The public function signatures and caller-visible allocation rules are unchanged.
-In particular, memory returned by Aila must still be released with the matching
-`aila_free_string`, `aila_free_samples`, or `aila_free_aligned_words` function.
-Do not free it with the host language's allocator.
+Existing generation, ASR, forced-alignment, and caller-visible allocation rules
+remain source-compatible. Memory returned by Aila must still be released with
+the matching `aila_free_string`, `aila_free_samples`, or
+`aila_free_aligned_words` function; do not free it with the host language's
+allocator. The TTS streaming ABI changed in 0.1.7: `aila_synthesize_stream`
+returns an `AilaTTSStream*`, and `aila_stream_wait` / `aila_stream_destroy` take
+that stream handle instead of an `AilaEngine*`.
 
 A recommended integration layout is:
 
@@ -71,6 +74,11 @@ failed or crashed worker is torn down; the proxy does not automatically retry an
 operation. Callers may handle the error and explicitly initialize again where
 their own recovery policy permits. Always deploy the proxy and worker from the
 same release; cross-version worker compatibility is not promised.
+
+The worker's current directory is the selected runtime directory. For embedded
+hosts, pass an absolute `model_dir` to `aila_engine_init`; otherwise a relative
+model path is interpreted relative to `AILA_RUNTIME_DLL_DIR`, not the host's
+current directory.
 
 ## Quick Example
 
@@ -1000,7 +1008,14 @@ Returns a human-readable error message. The pointer is valid until the next API 
 void aila_set_log_callback(AilaLogCallback callback, void* user_data);
 ```
 
-Sets a global log callback. Pass `NULL` for `callback` to restore default (stdout/stderr) logging.
+Sets a global log callback. Pass `NULL` for `callback` to restore default stderr
+logging. On Windows, worker log messages are delivered serially on a proxy-owned
+dispatcher thread, not necessarily on the thread that made the API call. The
+message pointer is valid only for the duration of the callback. Keep both the
+callback and `user_data` alive until a later `aila_set_log_callback` call has
+returned; when called outside the callback, replacement/unregistration waits for
+an in-flight callback to finish. The callback must not let exceptions cross the
+C ABI boundary.
 
 #### `aila_set_log_level`
 
@@ -1031,7 +1046,7 @@ typedef void (*AilaLogCallback)(int level, const char* message, void* user_data)
 const char* aila_version(void);
 ```
 
-Returns the library version string (e.g. `"0.1.0"`). The pointer is static and must not be freed.
+Returns the library version string (currently `"0.1.7"`). The pointer is static and must not be freed.
 
 ## Language Bindings
 
