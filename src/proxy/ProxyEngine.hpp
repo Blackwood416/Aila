@@ -106,6 +106,8 @@ private:
     void clear_error_locked();
     bool asr_stream_is_active_locked(uint64_t worker_session, uint64_t stream_id) const;
     void remove_asr_stream_locked(uint64_t stream_id);
+    void destroy_remote_asr_stream_locked(uint64_t stream_id);
+    void flush_deferred_asr_destroys_locked();
     void shutdown_locked() noexcept;
 
     mutable std::mutex mutex_;
@@ -114,6 +116,7 @@ private:
     uint64_t worker_session_generation_ = 0;
     uint64_t last_remote_asr_id_ = 0;
     std::vector<uint64_t> active_asr_stream_ids_;
+    std::vector<uint64_t> deferred_asr_destroy_ids_;
     bool initialized_ = false;
     bool stream_active_ = false;
     int error_code_ = 0;

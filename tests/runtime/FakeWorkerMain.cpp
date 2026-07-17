@@ -351,6 +351,7 @@ int run(const Handles& handles) {
         bool active = true;
         bool expect_floats = false;
         bool malformed_text = false;
+        bool empty_text = false;
     };
     std::vector<AsrStreamState> asr_streams;
     for (;;) {
@@ -437,26 +438,31 @@ int run(const Handles& handles) {
                 continue;
             }
             size_t event_count = 0;
-            aila::ipc::Frame first_asr_event = stream_event(
-                command, R"({"event":"token","byteCount":6})", u8"识别");
+            const bool all_empty =
+                command.header.payload_json.find("__aila_asr_all_empty__") != std::string::npos;
+            aila::ipc::Frame first_asr_event = all_empty
+                ? stream_event(command, R"({"event":"token","byteCount":0})", {})
+                : stream_event(command, R"({"event":"token","byteCount":6})", u8"识别");
             if (command.header.payload_json.find("__aila_asr_bad_event_protocol__") !=
                 std::string::npos) {
                 ++first_asr_event.header.protocol;
             }
             send_frame(handles.event_write, first_asr_event);
             ++event_count;
-            send_frame(handles.event_write, stream_event(
-                command, R"({"event":"token","byteCount":6})", " token"));
-            ++event_count;
+            if (!all_empty) {
+                send_frame(handles.event_write, stream_event(
+                    command, R"({"event":"token","byteCount":6})", " token"));
+                ++event_count;
+            }
             const uint64_t terminal_count = event_count + 1;
             send_frame(handles.event_write, stream_event(
                 command, "{\"event\":\"end\",\"eventCount\":" +
                     std::to_string(terminal_count) + "}"));
             const std::string transcript =
-                command.header.payload_json.find("__aila_asr_empty__") != std::string::npos
+                all_empty || command.header.payload_json.find("__aila_asr_empty__") != std::string::npos
                     ? std::string{} : std::string(u8"完整转录|") + command.header.payload_json;
             const std::string language =
-                command.header.payload_json.find("__aila_asr_empty_language__") != std::string::npos
+                all_empty || command.header.payload_json.find("__aila_asr_empty_language__") != std::string::npos
                     ? std::string{} : "Chinese";
             response.header.payload_json =
                 "{\"transcriptBytes\":" + std::to_string(transcript.size()) +
@@ -484,14 +490,26 @@ int run(const Handles& handles) {
                            lifecycle_error(command, 1, "engine is not initialized"));
                 continue;
             }
+            if (command.header.payload_json.find("require-no-active") != std::string::npos) {
+                bool has_active = false;
+                for (const AsrStreamState& state : asr_streams) {
+                    has_active = has_active || state.active;
+                }
+                if (has_active) {
+                    send_frame(handles.response_write,
+                               lifecycle_error(command, 6, "ASR remote stream was not destroyed"));
+                    continue;
+                }
+            }
             const bool duplicate =
                 command.header.payload_json.find("duplicate-id") != std::string::npos &&
                 !asr_streams.empty();
             const uint64_t id = duplicate ? asr_streams.size() : asr_streams.size() + 1;
             if (!duplicate) {
-            asr_streams.push_back(AsrStreamState{true,
-                command.header.payload_json.find("expect-floats") != std::string::npos,
-                command.header.payload_json.find("malformed-text") != std::string::npos});
+                asr_streams.push_back(AsrStreamState{true,
+                    command.header.payload_json.find("expect-floats") != std::string::npos,
+                    command.header.payload_json.find("malformed-text") != std::string::npos,
+                    command.header.payload_json.find("empty-text") != std::string::npos});
             }
             response.header.payload_json = "{\"streamId\":" + std::to_string(id) + "}";
             response.attachment.clear();
@@ -535,8 +553,9 @@ int run(const Handles& handles) {
                 send_frame(handles.response_write, lifecycle_error(command, 1, "unknown ASR stream ID"));
                 continue;
             }
-            const std::string stable = u8"稳定";
-            const std::string partial = u8"临时";
+            const bool empty_text = asr_streams[static_cast<size_t>(id - 1)].empty_text;
+            const std::string stable = empty_text ? std::string{} : std::string(u8"稳定");
+            const std::string partial = empty_text ? std::string{} : std::string(u8"临时");
             response.attachment.clear();
             for (unsigned char byte : stable) response.attachment.push_back(static_cast<std::byte>(byte));
             for (unsigned char byte : partial) response.attachment.push_back(static_cast<std::byte>(byte));

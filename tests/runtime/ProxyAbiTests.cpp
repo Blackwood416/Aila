@@ -509,6 +509,32 @@ void verify_asr_proxy(const Api& api, AilaEngine* engine) {
     api.free_string(transcript);
     api.free_string(language);
 
+    struct EmptyCapture { int calls = 0; bool saw_empty = false; } empty_capture;
+    const auto empty_callback = [](const char* token, void* opaque) -> int {
+        auto& capture = *static_cast<EmptyCapture*>(opaque);
+        ++capture.calls;
+        capture.saw_empty = token != nullptr && *token == '\0';
+        return 0;
+    };
+    language = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    transcript = api.transcribe(
+        engine, "__aila_asr_all_empty__", nullptr, nullptr, nullptr, 0.0f, 0,
+        empty_callback, &empty_capture, &language);
+    expect(transcript != nullptr && *transcript == '\0' && language == nullptr &&
+               empty_capture.calls == 1 && empty_capture.saw_empty,
+           "zero-length offline ASR token/result was not preserved safely");
+    api.free_string(transcript);
+
+    AilaTranscribeStream* empty_stream =
+        api.asr_stream_create(engine, nullptr, nullptr, "empty-text");
+    expect(empty_stream != nullptr, "empty ASR stream create failed");
+    char* empty_stable = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    char* empty_partial = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    expect(api.asr_stream_get_text(empty_stream, &empty_stable, &empty_partial) == AILA_OK &&
+               empty_stable == nullptr && empty_partial == nullptr,
+           "zero-length ASR stream text did not map to NULL outputs");
+    api.asr_stream_destroy(empty_stream);
+
     language = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
     transcript = api.transcribe(
         engine, "__aila_asr_empty_language__", nullptr, nullptr, "", 0.0f, 0,
@@ -592,6 +618,50 @@ void verify_asr_stream_outlives_engine(const Api& api) {
            "ASR stream had a dangling engine owner");
     api.free_string(stable);
     api.asr_stream_destroy(stream);
+}
+
+void verify_reentrant_asr_destroy_is_deferred(const Api& api, AilaEngine* engine) {
+    AilaTranscribeStream* stream = api.asr_stream_create(engine, nullptr, nullptr, nullptr);
+    expect(stream != nullptr, "reentrant ASR stream create failed");
+    struct Context {
+        const Api* api;
+        AilaTranscribeStream* stream;
+        int calls = 0;
+    } context{&api, stream};
+    const auto callback = [](const char*, void* opaque) -> int {
+        auto& context = *static_cast<Context*>(opaque);
+        if (context.calls++ == 0) {
+            context.api->asr_stream_destroy(context.stream);
+            context.stream = nullptr;
+        }
+        return 0;
+    };
+    expect(api.generate_stream(engine, "destroy-asr-in-callback", nullptr,
+                               callback, &context) == 0 && context.calls == 2,
+           "reentrant ASR destroy deadlocked or failed outer generation");
+    AilaTranscribeStream* confirmed =
+        api.asr_stream_create(engine, nullptr, nullptr, "require-no-active");
+    expect(confirmed != nullptr,
+           "deferred ASR destroy was not flushed before stream completion");
+    api.asr_stream_destroy(confirmed);
+    expect(api.context_length(engine) != 0,
+           "reentrant ASR destroy made the worker unusable");
+
+    AilaTranscribeStream* offline_stream =
+        api.asr_stream_create(engine, nullptr, nullptr, nullptr);
+    expect(offline_stream != nullptr, "offline reentrant ASR stream create failed");
+    Context offline_context{&api, offline_stream};
+    char* transcript = api.transcribe(
+        engine, "offline-reentrant.wav", nullptr, nullptr, nullptr, 0.0f, 0,
+        callback, &offline_context, nullptr);
+    expect(transcript != nullptr && offline_context.calls == 2,
+           "reentrant destroy from offline ASR callback failed");
+    api.free_string(transcript);
+    AilaTranscribeStream* offline_confirmed =
+        api.asr_stream_create(engine, nullptr, nullptr, "require-no-active");
+    expect(offline_confirmed != nullptr,
+           "offline ASR deferred destroy was not flushed before completion");
+    api.asr_stream_destroy(offline_confirmed);
 }
 
 void verify_malformed_asr_reaps_worker(const Api& api) {
@@ -1259,6 +1329,7 @@ void test_proxy_abi_and_lifecycle() {
     verify_synchronous_generation(api, relative.get());
     verify_streaming_generation(api, relative.get());
     verify_asr_proxy(api, relative.get());
+    verify_reentrant_asr_destroy_is_deferred(api, relative.get());
     verify_v2_prefix_does_not_read_past_struct_size(api, relative.get());
     verify_generation_errors_and_allocations(api, relative.get());
     auto lines = read_marker(marker);

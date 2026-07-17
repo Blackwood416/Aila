@@ -67,6 +67,13 @@ std::runtime_error malformed_response(std::string_view detail) {
     return std::runtime_error("worker response was invalid: " + std::string(detail));
 }
 
+std::string attachment_text(
+    const std::vector<std::byte>& attachment, size_t offset, size_t count) {
+    if (count == 0) return {};
+    return std::string(
+        reinterpret_cast<const char*>(attachment.data() + offset), count);
+}
+
 std::string json_float(float value) {
     std::ostringstream stream;
     stream.imbue(std::locale::classic());
@@ -575,9 +582,8 @@ bool ProxyEngine::transcribe(
                     bytes != event.attachment.size()) {
                     throw malformed_response("ASR token event attachment was invalid");
                 }
-                const std::string token(
-                    reinterpret_cast<const char*>(event.attachment.data()),
-                    event.attachment.size());
+                const std::string token = attachment_text(
+                    event.attachment, 0, event.attachment.size());
                 if (token.find('\0') != std::string::npos || !simdjson::validate_utf8(token)) {
                     throw malformed_response("ASR token event was not valid UTF-8");
                 }
@@ -590,6 +596,7 @@ bool ProxyEngine::transcribe(
                 return runtime::WorkerProcess::StreamEventAction::Continue;
             },
             std::chrono::minutes(10));
+        flush_deferred_asr_destroys_locked();
         stream_active_ = false;
         if (response.header.kind == "error") {
             accept_stream_error_response_locked(response, "asr.transcribe", "ASR transcription failed");
@@ -612,10 +619,11 @@ bool ProxyEngine::transcribe(
         size_t fields = 0;
         for (auto field : object) { (void)field; ++fields; }
         if (fields != 3) throw malformed_response("ASR result contained unexpected fields");
-        transcript.assign(reinterpret_cast<const char*>(response.attachment.data()),
-                          static_cast<size_t>(transcript_bytes));
-        language.assign(reinterpret_cast<const char*>(response.attachment.data() + transcript_bytes),
-                        static_cast<size_t>(language_bytes));
+        transcript = attachment_text(
+            response.attachment, 0, static_cast<size_t>(transcript_bytes));
+        language = attachment_text(
+            response.attachment, static_cast<size_t>(transcript_bytes),
+            static_cast<size_t>(language_bytes));
         if (transcript.find('\0') != std::string::npos || language.find('\0') != std::string::npos ||
             !simdjson::validate_utf8(transcript) || !simdjson::validate_utf8(language)) {
             throw malformed_response("ASR result strings were invalid");
@@ -778,10 +786,10 @@ int ProxyEngine::transcribe_stream_get_text(
         size_t fields = 0;
         for (auto field : object) { (void)field; ++fields; }
         if (fields != 2) throw malformed_response("ASR stream text result contained extra fields");
-        stable.assign(reinterpret_cast<const char*>(response.attachment.data()),
-                      static_cast<size_t>(stable_bytes));
-        partial.assign(reinterpret_cast<const char*>(response.attachment.data() + stable_bytes),
-                       static_cast<size_t>(partial_bytes));
+        stable = attachment_text(response.attachment, 0, static_cast<size_t>(stable_bytes));
+        partial = attachment_text(
+            response.attachment, static_cast<size_t>(stable_bytes),
+            static_cast<size_t>(partial_bytes));
         if (stable.find('\0') != std::string::npos || partial.find('\0') != std::string::npos ||
             !simdjson::validate_utf8(stable) || !simdjson::validate_utf8(partial)) {
             throw malformed_response("ASR stream text was invalid UTF-8");
@@ -801,31 +809,20 @@ void ProxyEngine::transcribe_stream_destroy(
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!asr_stream_is_active_locked(worker_session, stream_id)) {
-            set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream handle is stale or invalid");
+            if (!stream_active_) {
+                set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR stream handle is stale or invalid");
+            }
             return;
         }
         remove_asr_stream_locked(stream_id);
-        const ipc::Frame response = request_locked(
-            "asr.stream.destroy", "{\"streamId\":" + std::to_string(stream_id) + "}");
-        if (response.header.kind == "error") {
-            (void)accept_error_response_locked(
-                response, "asr.stream.destroy", "ASR stream destroy failed");
+        if (stream_active_) {
+            for (const uint64_t deferred_id : deferred_asr_destroy_ids_) {
+                if (deferred_id == stream_id) return;
+            }
+            deferred_asr_destroy_ids_.push_back(stream_id);
             return;
         }
-        simdjson::dom::parser parser;
-        simdjson::dom::element root;
-        simdjson::dom::object object;
-        bool ok = false;
-        if (response.header.kind != "result" || response.header.method != "asr.stream.destroy" ||
-            !response.attachment.empty() ||
-            parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
-            root.get_object().get(object) != simdjson::SUCCESS ||
-            object["ok"].get_bool().get(ok) != simdjson::SUCCESS || !ok) {
-            throw malformed_response("ASR stream destroy response was invalid");
-        }
-        size_t fields = 0;
-        for (auto field : object) { (void)field; ++fields; }
-        if (fields != 1) throw malformed_response("ASR stream destroy response contained extra fields");
+        destroy_remote_asr_stream_locked(stream_id);
         clear_error_locked();
     } catch (const std::exception& exception) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1077,9 +1074,8 @@ int ProxyEngine::stream_payload_locked(
                         throw malformed_response("token stream event contained an embedded NUL");
                     }
                 }
-                const std::string token(
-                    reinterpret_cast<const char*>(event.attachment.data()),
-                    event.attachment.size());
+                const std::string token = attachment_text(
+                    event.attachment, 0, event.attachment.size());
                 if (!simdjson::validate_utf8(token)) {
                     throw malformed_response("token stream event was not valid UTF-8");
                 }
@@ -1160,6 +1156,7 @@ int ProxyEngine::stream_payload_locked(
             return runtime::WorkerProcess::StreamEventAction::Continue;
         },
         std::chrono::minutes(10));
+    flush_deferred_asr_destroys_locked();
     if (response.header.kind == "error") {
         accept_stream_error_response_locked(
             response, method, "worker streaming generation failed");
@@ -1229,9 +1226,46 @@ void ProxyEngine::remove_asr_stream_locked(uint64_t stream_id) {
     }
 }
 
+void ProxyEngine::destroy_remote_asr_stream_locked(uint64_t stream_id) {
+    const ipc::Frame response = request_locked(
+        "asr.stream.destroy", "{\"streamId\":" + std::to_string(stream_id) + "}");
+    if (response.header.kind == "error") {
+        (void)accept_error_response_locked(
+            response, "asr.stream.destroy", "ASR stream destroy failed");
+        throw std::runtime_error(error_message_.empty()
+                                     ? "ASR stream destroy failed"
+                                     : error_message_);
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    simdjson::dom::object object;
+    bool ok = false;
+    if (response.header.kind != "result" || response.header.method != "asr.stream.destroy" ||
+        !response.attachment.empty() ||
+        parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
+        root.get_object().get(object) != simdjson::SUCCESS ||
+        object["ok"].get_bool().get(ok) != simdjson::SUCCESS || !ok) {
+        throw malformed_response("ASR stream destroy response was invalid");
+    }
+    size_t fields = 0;
+    for (auto field : object) { (void)field; ++fields; }
+    if (fields != 1) {
+        throw malformed_response("ASR stream destroy response contained extra fields");
+    }
+}
+
+void ProxyEngine::flush_deferred_asr_destroys_locked() {
+    std::vector<uint64_t> pending;
+    pending.swap(deferred_asr_destroy_ids_);
+    for (const uint64_t stream_id : pending) {
+        destroy_remote_asr_stream_locked(stream_id);
+    }
+}
+
 void ProxyEngine::shutdown_locked() noexcept {
     initialized_ = false;
     active_asr_stream_ids_.clear();
+    deferred_asr_destroy_ids_.clear();
     last_remote_asr_id_ = 0;
     try {
         worker_.shutdown(std::chrono::seconds(2));
