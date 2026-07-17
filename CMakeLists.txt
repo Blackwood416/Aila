@@ -789,7 +789,6 @@ endif()
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
     set(AILA_RELEASE_RUNTIME_DIR "${AILA_RELEASE_BIN_DIR}/aila_runtime")
-    find_program(AILA_PWSH_EXECUTABLE NAMES pwsh REQUIRED)
 
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
@@ -807,11 +806,6 @@ endif()
             "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
             "-DTARGET_KIND=EXECUTABLE"
             -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
-        COMMAND "${AILA_PWSH_EXECUTABLE}" -NoProfile
-            -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/WriteReleaseBuildInfo.ps1"
-            -BuildDir "${CMAKE_BINARY_DIR}"
-            -ReleaseRoot "${AILA_RELEASE_BIN_DIR}"
-            -RepoRoot "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )

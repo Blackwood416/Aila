@@ -25,7 +25,6 @@ A recommended integration layout is:
 ```text
 integration_root/
 |-- AilaShared.dll
-|-- build_info.json
 `-- aila_runtime/
     |-- AilaWorker.exe
     |-- Aila.exe

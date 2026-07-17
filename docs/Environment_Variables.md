@@ -16,14 +16,13 @@ to the host DLL loader also exposes the private runtime, so the flat layout does
 not provide host DLL-search isolation. Python, ComfyUI, and other embedding hosts
 must use the split layout and explicitly set `AILA_RUNTIME_DLL_DIR`.
 
-The recommended release/integration layout keeps `AilaShared.dll` and
-`build_info.json` in the integration root, with `AilaWorker.exe`, `Aila.exe`, and
-the oneAPI runtime DLLs under `aila_runtime/`:
+The recommended release/integration layout keeps only `AilaShared.dll` in the
+integration root, with `AilaWorker.exe`, `Aila.exe`, and the oneAPI runtime DLLs
+under `aila_runtime/`:
 
 ```text
 integration_root/
 |-- AilaShared.dll
-|-- build_info.json
 `-- aila_runtime/
     |-- AilaWorker.exe
     |-- Aila.exe

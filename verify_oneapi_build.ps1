@@ -182,52 +182,12 @@ function Invoke-AilaStableProxyDependencyInspection {
     }
 }
 
-function Get-AilaBuildArtifactMetadata {
-    param(
-        [Parameter(Mandatory = $true)]$BuildInfo,
-        [Parameter(Mandatory = $true)][string]$Role
-    )
-
-    $artifactsProperty = $BuildInfo.PSObject.Properties['artifacts']
-    $matches = @(if ($null -eq $artifactsProperty -or $null -eq $artifactsProperty.Value) {
-            @()
-        }
-        else {
-            $artifactsProperty.Value | Where-Object { $_.role -eq $Role }
-        })
-    if ($matches.Count -ne 1) {
-        throw "Build info must contain exactly one '$Role' artifact; found $($matches.Count)."
-    }
-    return $matches[0]
-}
-
-function Assert-AilaStagedArtifactMetadata {
-    param(
-        [Parameter(Mandatory = $true)]$BuildInfo,
-        [Parameter(Mandatory = $true)][string]$Role,
-        [Parameter(Mandatory = $true)][string]$ExpectedRelativePath,
-        [Parameter(Mandatory = $true)][string]$ArtifactPath
-    )
-
-    $artifact = Get-AilaBuildArtifactMetadata -BuildInfo $BuildInfo -Role $Role
-    $relativePath = [string](Get-RequiredOneApiMetadataValue -Metadata $artifact -PropertyName 'relativePath' -Context "Build info $Role artifact")
-    if (-not $relativePath.Equals($ExpectedRelativePath, [System.StringComparison]::Ordinal)) {
-        throw "Build info $Role artifact path mismatch: expected '$ExpectedRelativePath', found '$relativePath'."
-    }
-    $recordedHash = [string](Get-RequiredOneApiMetadataValue -Metadata $artifact -PropertyName 'sha256' -Context "Build info $Role artifact")
-    $actualHash = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256).Hash
-    if (-not $recordedHash.Equals($actualHash, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Build info $Role artifact SHA256 mismatch: recorded '$recordedHash', staged '$actualHash'."
-    }
-}
-
 function Assert-AilaReleaseRootLayout {
     param([Parameter(Mandatory = $true)][string]$ReleaseRoot)
 
     $allowedFiles = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
     $null = $allowedFiles.Add('AilaShared.dll')
-    $null = $allowedFiles.Add('build_info.json')
     $allowedDirectories = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
     $null = $allowedDirectories.Add('aila_runtime')
@@ -239,7 +199,7 @@ function Assert-AilaReleaseRootLayout {
             }
         }
         elseif (-not $allowedFiles.Contains($entry.Name)) {
-            throw "Unexpected release root file '$($entry.Name)'; allowed files are 'AilaShared.dll' and 'build_info.json'."
+            throw "Unexpected release root file '$($entry.Name)'; only 'AilaShared.dll' is allowed."
         }
     }
 }
@@ -340,21 +300,6 @@ function Invoke-AilaOneApiBuildVerification {
         }
     }
     Assert-AilaReleaseRootLayout -ReleaseRoot $releaseRoot
-    Assert-AilaStagedArtifactMetadata `
-        -BuildInfo $buildInfo `
-        -Role 'proxy' `
-        -ExpectedRelativePath 'AilaShared.dll' `
-        -ArtifactPath $proxy
-    Assert-AilaStagedArtifactMetadata `
-        -BuildInfo $buildInfo `
-        -Role 'worker' `
-        -ExpectedRelativePath 'aila_runtime/AilaWorker.exe' `
-        -ArtifactPath $worker
-    Assert-AilaStagedArtifactMetadata `
-        -BuildInfo $buildInfo `
-        -Role 'cli' `
-        -ExpectedRelativePath 'aila_runtime/Aila.exe' `
-        -ArtifactPath $exe
 
     $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
     if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
@@ -394,16 +339,6 @@ function Invoke-AilaOneApiBuildVerification {
     $currentLegacy = Get-RequiredOneApiMetadataValue -Metadata $currentMetadata -PropertyName 'allowLegacyCompiler' -Context 'Current oneAPI stack metadata'
     if ($recordedLegacy -isnot [bool] -or $currentLegacy -isnot [bool] -or $recordedLegacy -ne $currentLegacy) {
         throw "Build info oneApi metadata mismatch for 'allowLegacyCompiler': recorded '$recordedLegacy', current '$currentLegacy'."
-    }
-
-    $stagedBuildInfoPath = Join-Path $releaseRoot 'build_info.json'
-    if (-not (Test-Path -LiteralPath $stagedBuildInfoPath -PathType Leaf)) {
-        throw "Staged build info file not found: $stagedBuildInfoPath"
-    }
-    $sourceMetadataHash = (Get-FileHash -LiteralPath $buildInfoPath -Algorithm SHA256).Hash
-    $stagedMetadataHash = (Get-FileHash -LiteralPath $stagedBuildInfoPath -Algorithm SHA256).Hash
-    if ($sourceMetadataHash -ne $stagedMetadataHash) {
-        throw "Staged build_info.json does not match '$buildInfoPath'."
     }
 
     if ($null -eq $DependencyInspector) {

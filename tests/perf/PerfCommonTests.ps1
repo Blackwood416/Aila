@@ -202,27 +202,6 @@ function New-VerifierBuildFixture {
     }
     Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\kernel32.dll') -Destination (Join-Path $releaseRoot 'AilaShared.dll')
 
-    $buildInfoPath = Join-Path $DestinationBuildDir 'build_info.json'
-    $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
-    $buildInfo | Add-Member -NotePropertyName artifacts -NotePropertyValue @(
-        [pscustomobject]@{
-            role         = 'proxy'
-            relativePath = 'AilaShared.dll'
-            sha256       = (Get-FileHash -LiteralPath (Join-Path $releaseRoot 'AilaShared.dll') -Algorithm SHA256).Hash
-        },
-        [pscustomobject]@{
-            role         = 'worker'
-            relativePath = 'aila_runtime/AilaWorker.exe'
-            sha256       = (Get-FileHash -LiteralPath (Join-Path $runtimeDir 'AilaWorker.exe') -Algorithm SHA256).Hash
-        },
-        [pscustomobject]@{
-            role         = 'cli'
-            relativePath = 'aila_runtime/Aila.exe'
-            sha256       = (Get-FileHash -LiteralPath (Join-Path $runtimeDir 'Aila.exe') -Algorithm SHA256).Hash
-        }
-    ) -Force
-    Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
-    Copy-Item -LiteralPath $buildInfoPath -Destination (Join-Path $releaseRoot 'build_info.json')
     return $DestinationBuildDir
 }
 
@@ -918,116 +897,17 @@ $metadata | ConvertTo-Json -Depth 8
         } 'Build info file not found:' 'missing build info verification'
     }
 
-    Invoke-Test 'release metadata refresh replaces stale hashes and git provenance' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
-        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'stale-release-metadata')
-        $releaseRoot = Join-Path $buildDir 'Release\bin'
-        $buildInfoPath = Join-Path $buildDir 'build_info.json'
-        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
-        $preservedBuildJson = $buildInfo.build | ConvertTo-Json -Depth 8 -Compress
-        $preservedOneApiJson = $buildInfo.oneApi | ConvertTo-Json -Depth 8 -Compress
-        $buildInfo.git.shortCommit = 'stale00'
-        $buildInfo.git.fullCommit = ('0' * 40)
-        $buildInfo.git.branch = 'stale-branch'
-        foreach ($artifact in $buildInfo.artifacts) {
-            $artifact.sha256 = ('0' * 64)
-        }
-        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
-        Copy-Item -LiteralPath $buildInfoPath -Destination (Join-Path $releaseRoot 'build_info.json') -Force
-
-        $refreshPath = Join-Path $repoRoot 'tools\WriteReleaseBuildInfo.ps1'
-        $result = Invoke-ChildPowerShellWithTimeout `
-            -ScriptPath $refreshPath `
-            -ArgumentList @('-BuildDir', $buildDir, '-ReleaseRoot', $releaseRoot, '-RepoRoot', $repoRoot) `
-            -TimeoutMs 30000
-        Assert-Equal $true $result.completed 'release metadata refresh completion'
-        Assert-Equal 0 $result.exitCode "release metadata refresh exit stderr='$($result.stderr)' stdout='$($result.stdout)'"
-
-        $refreshed = Read-AilaJsonFile -Path $buildInfoPath
-        $stagedBuildInfoPath = Join-Path $releaseRoot 'build_info.json'
-        Assert-Equal (Get-FileHash -LiteralPath $buildInfoPath -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $stagedBuildInfoPath -Algorithm SHA256).Hash 'source and staged metadata identity'
-        Assert-Equal $preservedBuildJson ($refreshed.build | ConvertTo-Json -Depth 8 -Compress) 'preserved build provenance'
-        Assert-Equal $preservedOneApiJson ($refreshed.oneApi | ConvertTo-Json -Depth 8 -Compress) 'preserved oneAPI provenance'
-        $expectedFullCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
-        $expectedShortCommit = (& git -C $repoRoot rev-parse --short HEAD).Trim()
-        $expectedBranch = (& git -C $repoRoot branch --show-current).Trim()
-        Assert-Equal $expectedFullCommit $refreshed.git.fullCommit 'refreshed full commit'
-        Assert-Equal $expectedShortCommit $refreshed.git.shortCommit 'refreshed short commit'
-        Assert-Equal $expectedBranch $refreshed.git.branch 'refreshed branch'
-        foreach ($expectation in @(
-                @{ role = 'proxy'; relativePath = 'AilaShared.dll' },
-                @{ role = 'worker'; relativePath = 'aila_runtime/AilaWorker.exe' },
-                @{ role = 'cli'; relativePath = 'aila_runtime/Aila.exe' }
-            )) {
-            $artifacts = @($refreshed.artifacts | Where-Object { $_.role -eq $expectation.role })
-            Assert-Equal 1 $artifacts.Count "refreshed $($expectation.role) artifact count"
-            Assert-Equal $expectation.relativePath $artifacts[0].relativePath "refreshed $($expectation.role) path"
-            $artifactPath = Join-Path $releaseRoot ($expectation.relativePath -replace '/', '\')
-            Assert-Equal (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash $artifacts[0].sha256 "refreshed $($expectation.role) hash"
-        }
-    }
-
-    Invoke-Test 'verifier requires worker artifact metadata for the staged release' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
-        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'missing-worker-metadata')
-        $buildInfoPath = Join-Path $buildDir 'build_info.json'
-        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
-        $buildInfo.artifacts = @($buildInfo.artifacts | Where-Object { $_.role -ne 'worker' })
-        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
-
-        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
-        Assert-Throws {
-            $result = Invoke-ChildPowerShellWithTimeout `
-                -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
-                -TimeoutMs 30000
-            if (-not $result.completed) {
-                throw 'Verifier child process timed out.'
-            }
-            if ($result.exitCode -ne 0) {
-                throw ($result.stderr + $result.stdout).Trim()
-            }
-        } "exactly one 'worker' artifact" 'missing worker metadata verification'
-    }
-
-    Invoke-Test 'verifier rejects staged CLI bytes that do not match CLI metadata' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
-        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'mismatched-cli-hash')
-        $runtimeDir = Join-Path $buildDir 'Release\bin\aila_runtime'
-        Copy-Item -LiteralPath (Join-Path $runtimeDir 'AilaWorker.exe') -Destination (Join-Path $runtimeDir 'Aila.exe') -Force
-
-        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
-        Assert-Throws {
-            $result = Invoke-ChildPowerShellWithTimeout `
-                -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
-                -TimeoutMs 30000
-            if (-not $result.completed) {
-                throw 'Verifier child process timed out.'
-            }
-            if ($result.exitCode -ne 0) {
-                throw ($result.stderr + $result.stdout).Trim()
-            }
-        } 'Build info cli artifact SHA256 mismatch' 'mismatched CLI metadata verification'
-    }
-
     Invoke-Test 'verifier rejects a staged proxy with a oneAPI import' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'proxy-oneapi-import')
         $releaseRoot = Join-Path $buildDir 'Release\bin'
         $proxyPath = Join-Path $releaseRoot 'AilaShared.dll'
         Copy-Item -LiteralPath (Join-Path $sourceBuildDir 'Aila.exe') -Destination $proxyPath -Force
-        $buildInfoPath = Join-Path $buildDir 'build_info.json'
-        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
-        ($buildInfo.artifacts | Where-Object { $_.role -eq 'proxy' }).sha256 = (Get-FileHash -LiteralPath $proxyPath -Algorithm SHA256).Hash
-        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
-        Copy-Item -LiteralPath $buildInfoPath -Destination (Join-Path $releaseRoot 'build_info.json') -Force
-
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
                 -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
                 -TimeoutMs 30000
             if (-not $result.completed) {
                 throw 'Verifier child process timed out.'
@@ -1039,7 +919,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier rejects any extra file staged beside the proxy' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'root-runtime-dll')
         Set-Content -LiteralPath (Join-Path $buildDir 'Release\bin\svml_dispmd.dll') -Value 'sentinel' -Encoding UTF8
 
@@ -1047,7 +927,7 @@ $metadata | ConvertTo-Json -Depth 8
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
                 -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
                 -TimeoutMs 30000
             if (-not $result.completed) {
                 throw 'Verifier child process timed out.'
@@ -1059,7 +939,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier rejects any extra directory beside the runtime directory' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'extra-root-directory')
         New-Item -ItemType Directory -Path (Join-Path $buildDir 'Release\bin\unexpected') -Force | Out-Null
 
@@ -1067,7 +947,7 @@ $metadata | ConvertTo-Json -Depth 8
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
                 -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
                 -TimeoutMs 30000
             if (-not $result.completed) {
                 throw 'Verifier child process timed out.'
@@ -1079,7 +959,11 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier rejects a different requested stack without writing output' {
-        $buildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir (Join-Path $repoRoot 'build') -DestinationBuildDir (Join-Path $repoScratch 'wrong-stack')
+        $buildInfoPath = Join-Path $buildDir 'build_info.json'
+        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
+        $buildInfo.oneApi.name = 'oneapi-2025.3'
+        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
         if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
             throw "Required verifier fixture build directory not found: $buildDir"
         }
@@ -1158,7 +1042,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier rejects a wrong output filename inside the selected build' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'wrong-output-name')
         $outputPath = Join-Path $buildDir 'not-owned.json'
         Set-Content -LiteralPath $outputPath -Value 'wrong-name-sentinel' -Encoding UTF8
@@ -1169,7 +1053,7 @@ $metadata | ConvertTo-Json -Depth 8
                 -ScriptPath $verifierPath `
                 -ArgumentList @(
                     '-BuildDir', $buildDir,
-                    '-OneApiStack', 'oneapi-2025.3',
+                    '-OneApiStack', 'oneapi-2026.1',
                     '-OutputPath', $outputPath
                 ) `
                 -TimeoutMs 30000
@@ -1185,7 +1069,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier publishes owned output in a selected build subdirectory' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'owned-subdirectory')
         $outputPath = Join-Path $buildDir 'attestations\oneapi_verification.json'
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
@@ -1193,7 +1077,7 @@ $metadata | ConvertTo-Json -Depth 8
             -ScriptPath $verifierPath `
             -ArgumentList @(
                 '-BuildDir', $buildDir,
-                '-OneApiStack', 'oneapi-2025.3',
+                '-OneApiStack', 'oneapi-2026.1',
                 '-OutputPath', $outputPath
             ) `
             -TimeoutMs 30000
@@ -1201,14 +1085,14 @@ $metadata | ConvertTo-Json -Depth 8
         Assert-Equal 0 $result.exitCode "owned subdirectory verifier exit stderr='$($result.stderr)'"
         $verification = Read-AilaJsonFile -Path $outputPath
         Assert-Equal 1 $verification.schemaVersion 'owned subdirectory schema'
-        Assert-Equal 'oneapi-2025.3' $verification.stack.name 'owned subdirectory stack'
-        Assert-Equal 'sycl8.dll' $verification.dependencies[0] 'owned subdirectory dependency'
+        Assert-Equal 'oneapi-2026.1' $verification.stack.name 'owned subdirectory stack'
+        Assert-Equal 'sycl9.dll' $verification.dependencies[0] 'owned subdirectory dependency'
         $tempFiles = @(Get-ChildItem -LiteralPath (Split-Path -Parent $outputPath) -Filter '.oneapi_verification.json.*.tmp' -Force)
         Assert-Equal 0 $tempFiles.Count 'owned subdirectory temp cleanup'
     }
 
     Invoke-Test 'verifier rejects a junction output escaping the selected build' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'junction-output')
         $outsideDir = Join-Path $tempRoot 'junction-output-target'
         New-Item -ItemType Directory -Path $outsideDir -Force | Out-Null
@@ -1224,7 +1108,7 @@ $metadata | ConvertTo-Json -Depth 8
                     -ScriptPath $verifierPath `
                     -ArgumentList @(
                         '-BuildDir', $buildDir,
-                        '-OneApiStack', 'oneapi-2025.3',
+                        '-OneApiStack', 'oneapi-2026.1',
                         '-OutputPath', (Join-Path $junctionPath 'oneapi_verification.json')
                     ) `
                     -TimeoutMs 30000
@@ -1246,7 +1130,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier removes stale output when role metadata is missing' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'missing-role')
         $buildInfoPath = Join-Path $buildDir 'build_info.json'
         $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
@@ -1259,7 +1143,7 @@ $metadata | ConvertTo-Json -Depth 8
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
                 -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
                 -TimeoutMs 30000
             if (-not $result.completed) {
                 throw 'Verifier child process timed out.'
@@ -1272,11 +1156,11 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier removes stale output when role metadata is wrong' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'wrong-role')
         $buildInfoPath = Join-Path $buildDir 'build_info.json'
         $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
-        $buildInfo.oneApi.role = 'candidate'
+        $buildInfo.oneApi.role = 'baseline'
         Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
         $outputPath = Join-Path $buildDir 'oneapi_verification.json'
         Set-Content -LiteralPath $outputPath -Value '{"stale":true}' -Encoding UTF8
@@ -1285,7 +1169,7 @@ $metadata | ConvertTo-Json -Depth 8
         Assert-Throws {
             $result = Invoke-ChildPowerShellWithTimeout `
                 -ScriptPath $verifierPath `
-                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2026.1') `
                 -TimeoutMs 30000
             if (-not $result.completed) {
                 throw 'Verifier child process timed out.'
@@ -1298,7 +1182,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier atomically replaces stale output with complete JSON' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'atomic-success')
         $outputDir = Join-Path $buildDir 'attestations'
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -1309,7 +1193,7 @@ $metadata | ConvertTo-Json -Depth 8
             -ScriptPath $verifierPath `
             -ArgumentList @(
                 '-BuildDir', $buildDir,
-                '-OneApiStack', 'oneapi-2025.3',
+                '-OneApiStack', 'oneapi-2026.1',
                 '-OutputPath', $outputPath
             ) `
             -TimeoutMs 30000
@@ -1318,14 +1202,14 @@ $metadata | ConvertTo-Json -Depth 8
 
         $verification = Read-AilaJsonFile -Path $outputPath
         Assert-Equal 1 $verification.schemaVersion 'atomic verification schema'
-        Assert-Equal 'oneapi-2025.3' $verification.stack.name 'atomic verification stack'
+        Assert-Equal 'oneapi-2026.1' $verification.stack.name 'atomic verification stack'
         Assert-Equal 1 @($verification.dependencies).Count 'atomic verification dependency count'
-        Assert-Equal 'sycl8.dll' $verification.dependencies[0] 'atomic verification dependency'
+        Assert-Equal 'sycl9.dll' $verification.dependencies[0] 'atomic verification dependency'
         Assert-Equal (Get-FileHash -LiteralPath (Join-Path $buildDir 'Aila.exe') -Algorithm SHA256).Hash $verification.executableSha256 'atomic verification hash'
         $workerVerification = @($verification.artifacts | Where-Object { $_.role -eq 'worker' })
         Assert-Equal 1 $workerVerification.Count 'atomic worker verification count'
         Assert-Equal 'aila_runtime/AilaWorker.exe' $workerVerification[0].relativePath 'atomic worker relative path'
-        Assert-Equal 'sycl8.dll' $workerVerification[0].dependencies[0] 'atomic worker dependency'
+        Assert-Equal 'sycl9.dll' $workerVerification[0].dependencies[0] 'atomic worker dependency'
         $proxyVerification = @($verification.artifacts | Where-Object { $_.role -eq 'proxy' })
         Assert-Equal 1 $proxyVerification.Count 'atomic proxy verification count'
         Assert-Equal 'AilaShared.dll' $proxyVerification[0].relativePath 'atomic proxy relative path'
@@ -1335,7 +1219,7 @@ $metadata | ConvertTo-Json -Depth 8
     }
 
     Invoke-Test 'verifier rejects an executable that changes during dependency inspection' {
-        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $sourceBuildDir = Join-Path $repoRoot 'build'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'identity-change')
         $outputPath = Join-Path $buildDir 'oneapi_verification.json'
         Set-Content -LiteralPath $outputPath -Value '{"stale":true}' -Encoding UTF8
@@ -1364,11 +1248,11 @@ foreach ($definition in $functionDefinitions) {
 $inspector = {
     param([Parameter(Mandatory = $true)][string]$Executable)
     [System.IO.File]::AppendAllText($Executable, 'identity-change')
-    return "    sycl8.dll`r`n"
+    return "    sycl9.dll`r`n"
 }
 Invoke-AilaOneApiBuildVerification `
     -BuildDir $BuildDir `
-    -OneApiStack 'oneapi-2025.3' `
+    -OneApiStack 'oneapi-2026.1' `
     -OutputPath $OutputPath `
     -RepoRoot (Split-Path -Parent $VerifierPath) `
     -DependencyInspector $inspector

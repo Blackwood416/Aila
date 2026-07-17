@@ -76,7 +76,6 @@ Windows 发行包采用拆分运行时布局：
 ```text
 integration_root/
 |-- AilaShared.dll
-|-- build_info.json
 `-- aila_runtime/
     |-- AilaWorker.exe
     |-- Aila.exe
@@ -405,10 +404,11 @@ python export_bnb_nf4.py \
 | `build/AilaShared.dll` | 动态链接库（C API） |
 | `build/AilaWorker.exe` | Windows 隔离推理工作进程 |
 | `build/AilaLib.lib` | 静态库 |
+| `build/build_info.json` | 本地构建与 oneAPI 工具链来源信息 |
 
 在 Windows 上，`cmake --build build --target release` 会把集成布局 staging
-到 `build/Release/bin`：根目录包含转接层和 `build_info.json`，CLI、工作进程
-与运行时 DLL 位于 `aila_runtime/`。
+到 `build/Release/bin`：根目录只包含转接层，CLI、工作进程与运行时 DLL 位于
+`aila_runtime/`。构建来源信息仍保存在 `build/build_info.json`，不属于发行包。
 
 ## 📁 项目结构
 

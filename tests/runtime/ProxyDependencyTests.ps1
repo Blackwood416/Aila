@@ -38,19 +38,6 @@ function Resolve-DumpbinPath {
     throw 'dumpbin.exe was not found on PATH, under VCToolsInstallDir, or beside CMAKE_LINKER.'
 }
 
-function Get-ArtifactMetadata {
-    param(
-        [Parameter(Mandatory = $true)]$BuildInfo,
-        [Parameter(Mandatory = $true)][string]$Role
-    )
-
-    $matches = @($BuildInfo.artifacts | Where-Object { $_.role -eq $Role })
-    if ($matches.Count -ne 1) {
-        throw "build_info.json must contain exactly one '$Role' artifact; found $($matches.Count)."
-    }
-    return $matches[0]
-}
-
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $buildDirPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) {
     [System.IO.Path]::GetFullPath($BuildDir)
@@ -85,7 +72,6 @@ foreach ($forbiddenRootExecutable in @('AilaWorker.exe', 'Aila.exe')) {
 $allowedRootFiles = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase)
 $null = $allowedRootFiles.Add('AilaShared.dll')
-$null = $allowedRootFiles.Add('build_info.json')
 $allowedRootDirectories = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase)
 $null = $allowedRootDirectories.Add('aila_runtime')
@@ -96,7 +82,7 @@ foreach ($entry in (Get-ChildItem -LiteralPath $releaseRoot -Force)) {
         }
     }
     elseif (-not $allowedRootFiles.Contains($entry.Name)) {
-        throw "Unexpected release root file '$($entry.Name)'; allowed files are 'AilaShared.dll' and 'build_info.json'."
+        throw "Unexpected release root file '$($entry.Name)'; only 'AilaShared.dll' is allowed."
     }
 }
 
@@ -147,37 +133,6 @@ $forbiddenImports = @([regex]::Matches(
     Sort-Object -Unique)
 if ($forbiddenImports.Count -ne 0) {
     throw "AilaShared.dll imports forbidden oneAPI runtime DLLs: $($forbiddenImports -join ', ')"
-}
-
-$releaseBuildInfoPath = Join-Path $releaseRoot 'build_info.json'
-if (-not (Test-Path -LiteralPath $releaseBuildInfoPath -PathType Leaf)) {
-    throw "Staged build metadata not found: $releaseBuildInfoPath"
-}
-$buildInfo = Get-Content -LiteralPath $releaseBuildInfoPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($buildInfo.schemaVersion -ne 2) {
-    throw "Unsupported build_info.json schema: $($buildInfo.schemaVersion)"
-}
-$expectedFullCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to resolve current git commit for '$repoRoot'."
-}
-if (-not ([string]$buildInfo.git.fullCommit).Equals($expectedFullCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Staged build metadata git commit '$($buildInfo.git.fullCommit)' does not match current HEAD '$expectedFullCommit'."
-}
-
-foreach ($expectation in @(
-        @{ role = 'proxy'; relativePath = 'AilaShared.dll'; fullPath = $proxyPath },
-        @{ role = 'worker'; relativePath = 'aila_runtime/AilaWorker.exe'; fullPath = $workerPath },
-        @{ role = 'cli'; relativePath = 'aila_runtime/Aila.exe'; fullPath = $cliPath }
-    )) {
-    $artifact = Get-ArtifactMetadata -BuildInfo $buildInfo -Role $expectation.role
-    if ($artifact.relativePath -cne $expectation.relativePath) {
-        throw "Unexpected $($expectation.role) relative path: '$($artifact.relativePath)'"
-    }
-    $expectedHash = (Get-FileHash -LiteralPath $expectation.fullPath -Algorithm SHA256).Hash
-    if (-not ([string]$artifact.sha256).Equals($expectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$($expectation.role) SHA256 does not match staged artifact."
-    }
 }
 
 Write-Host 'ProxyDependencyTests PASS'

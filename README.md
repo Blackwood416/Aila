@@ -76,7 +76,6 @@ The Windows release uses a split runtime layout:
 ```text
 integration_root/
 |-- AilaShared.dll
-|-- build_info.json
 `-- aila_runtime/
     |-- AilaWorker.exe
     |-- Aila.exe
@@ -410,10 +409,12 @@ Outputs:
 | `build/AilaShared.dll` | Shared library (C API) |
 | `build/AilaWorker.exe` | Windows isolated inference worker |
 | `build/AilaLib.lib` | Static library |
+| `build/build_info.json` | Local build and oneAPI toolchain provenance |
 
 On Windows, `cmake --build build --target release` stages the integration layout
-under `build/Release/bin`: the proxy and `build_info.json` are at the root, and
-the CLI, worker, and runtime DLLs are under `aila_runtime/`.
+under `build/Release/bin`: only the proxy is at the root, and the CLI, worker,
+and runtime DLLs are under `aila_runtime/`. Build provenance remains in
+`build/build_info.json` and is not part of the release bundle.
 
 ## 📁 Project Structure
 

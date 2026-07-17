@@ -77,33 +77,6 @@ finally {
 }
 
 $buildInfoPath = Join-Path $buildDirPath 'build_info.json'
-$artifactDefinitions = @(
-    [ordered]@{
-        role         = 'proxy'
-        relativePath = 'AilaShared.dll'
-        sourcePath   = (Join-Path $buildDirPath 'AilaShared.dll')
-    },
-    [ordered]@{
-        role         = 'worker'
-        relativePath = 'aila_runtime/AilaWorker.exe'
-        sourcePath   = (Join-Path $buildDirPath 'AilaWorker.exe')
-    },
-    [ordered]@{
-        role         = 'cli'
-        relativePath = 'aila_runtime/Aila.exe'
-        sourcePath   = (Join-Path $buildDirPath 'Aila.exe')
-    }
-)
-$artifacts = @($artifactDefinitions | ForEach-Object {
-    if (-not (Test-Path -LiteralPath $_.sourcePath -PathType Leaf)) {
-        throw "Required build artifact not found while writing metadata: $($_.sourcePath)"
-    }
-    [ordered]@{
-        role         = $_.role
-        relativePath = $_.relativePath
-        sha256       = (Get-FileHash -LiteralPath $_.sourcePath -Algorithm SHA256).Hash
-    }
-})
 Write-AilaJsonFile -Path $buildInfoPath -Data ([ordered]@{
     schemaVersion  = 2
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -119,7 +92,6 @@ Write-AilaJsonFile -Path $buildInfoPath -Data ([ordered]@{
         generator = $buildMeta.generator
     }
     oneApi          = $stackMeta
-    artifacts       = $artifacts
 })
 
 Write-Host (":: build metadata written to {0} ::" -f $buildInfoPath) -ForegroundColor Green
