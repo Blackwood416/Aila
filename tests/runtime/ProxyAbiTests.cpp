@@ -853,6 +853,11 @@ struct TokenStreamCapture {
     AilaEngine* reentrant_engine = nullptr;
     int reentrant_error_code = -999;
     int reentrant_context_length = -999;
+    int reentrant_align_status = -999;
+    AilaAlignedWord* reentrant_align_words = reinterpret_cast<AilaAlignedWord*>(
+        static_cast<uintptr_t>(1));
+    int reentrant_align_count = -999;
+    std::string reentrant_align_error;
     bool did_reentrant_check = false;
 };
 
@@ -866,6 +871,12 @@ int capture_token(const char* token, void* opaque) {
             capture.reentrant_api->last_error_code(capture.reentrant_engine);
         capture.reentrant_context_length =
             capture.reentrant_api->context_length(capture.reentrant_engine);
+        const float sample = 0.0f;
+        capture.reentrant_align_status = capture.reentrant_api->align(
+            capture.reentrant_engine, &sample, 1, 16000, "busy", "English",
+            &capture.reentrant_align_words, &capture.reentrant_align_count);
+        capture.reentrant_align_error =
+            capture.reentrant_api->last_error_message(capture.reentrant_engine);
     }
     capture.tokens.emplace_back(token ? token : "<NULL>");
     return capture.abort_first && capture.tokens.size() == 1 ? 1 : 0;
@@ -912,6 +923,11 @@ void verify_streaming_generation(const Api& api, AilaEngine* engine) {
            "reentrant last_error_code could not observe stream state");
     expect(tokens.reentrant_context_length == 0,
            "reentrant context_length did not fail promptly as busy");
+    expect(tokens.reentrant_align_status == AILA_ERR_INVALID_ARGUMENT &&
+               tokens.reentrant_align_words == nullptr &&
+               tokens.reentrant_align_count == 0 &&
+               tokens.reentrant_align_error.find("streaming callback") != std::string::npos,
+           "reentrant alignment did not preserve stream-busy semantics");
     expect(tokens.tokens == std::vector<std::string>({"first", u8" 第二"}),
            "token event order or bytes changed");
 
@@ -1200,6 +1216,16 @@ void verify_alignment_proxy(const Api& api, AilaEngine* engine) {
            "NULL pre-tokenized word array succeeded");
     take_string(api, api.generate(engine, "after-local-align-error", nullptr),
                 "worker after local alignment validation");
+
+    const std::string huge_escaped_text(200000, '\x01');
+    words = reinterpret_cast<AilaAlignedWord*>(static_cast<uintptr_t>(1));
+    count = 19;
+    expect(api.align(engine, audio, 3, 16000, huge_escaped_text.c_str(), "English",
+                     &words, &count) == AILA_ERR_INVALID_ARGUMENT &&
+               words == nullptr && count == 0,
+           "oversized escaped alignment header was not rejected locally");
+    take_string(api, api.generate(engine, "after-huge-align-header", nullptr),
+                "worker after oversized alignment header rejection");
 }
 
 void verify_malformed_alignment_results_reap_worker(const Api& api) {

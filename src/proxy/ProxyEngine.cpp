@@ -125,6 +125,18 @@ bool valid_asr_legacy_config(const AilaGenConfig* config) {
          finite_float_bits(config->frequency_penalty));
 }
 
+bool encoded_request_header_fits(
+    std::string_view method,
+    std::string_view payload,
+    uint64_t request_id) {
+    const std::string header = std::string("{\"protocol\":") +
+        std::to_string(ipc::kProtocolVersion) + ",\"abi\":" +
+        std::to_string(ipc::kPublicAbiVersion) + ",\"requestId\":" +
+        std::to_string(request_id) + ",\"kind\":\"request\",\"method\":" +
+        json_string(method) + ",\"payload\":" + std::string(payload) + "}";
+    return header.size() <= ipc::kMaxHeaderBytes;
+}
+
 bool v2_has_field(uint32_t struct_size, size_t offset, size_t field_size) {
     return struct_size >= offset + field_size;
 }
@@ -1100,7 +1112,11 @@ int ProxyEngine::align(
     std::vector<AlignmentWord>& words) {
     std::lock_guard<std::mutex> lock(mutex_);
     words.clear();
-    if (stream_active_ || !initialized_ || !samples || sample_count <= 0 ||
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (!initialized_ || !samples || sample_count <= 0 ||
         text.find('\0') != std::string_view::npos ||
         language.find('\0') != std::string_view::npos ||
         !simdjson::validate_utf8(text) || !simdjson::validate_utf8(language) ||
@@ -1116,6 +1132,10 @@ int ProxyEngine::align(
             std::to_string(sizeof(float)) + ",\"byteCount\":" +
             std::to_string(byte_count) + ",\"text\":" + json_string(text) +
             ",\"language\":" + json_string(language) + "}";
+        if (!encoded_request_header_fits("align", payload, next_request_id_)) {
+            set_error_locked(AILA_ERR_INVALID_ARGUMENT, "alignment request metadata is too large");
+            return AILA_ERR_INVALID_ARGUMENT;
+        }
         const ipc::Frame response = request_locked(
             "align", payload, bytes_from(samples, byte_count));
         if (response.header.kind == "error") {
@@ -1144,7 +1164,11 @@ int ProxyEngine::align_words(
     std::vector<AlignmentWord>& words) {
     std::lock_guard<std::mutex> lock(mutex_);
     words.clear();
-    if (stream_active_ || !initialized_ || !samples || sample_count <= 0 ||
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (!initialized_ || !samples || sample_count <= 0 ||
         input_words.empty() || input_words.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
         static_cast<size_t>(sample_count) > ipc::kMaxAttachmentBytes / sizeof(float)) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "pre-tokenized alignment arguments are invalid");
@@ -1152,30 +1176,20 @@ int ProxyEngine::align_words(
     }
     const size_t audio_bytes = static_cast<size_t>(sample_count) * sizeof(float);
     size_t total_bytes = audio_bytes;
-    size_t payload_estimate = 160;
     for (const std::string& word : input_words) {
         if (word.find('\0') != std::string::npos || !simdjson::validate_utf8(word) ||
-            word.size() > ipc::kMaxAttachmentBytes - total_bytes ||
-            payload_estimate > ipc::kMaxHeaderBytes - 24) {
+            word.size() > ipc::kMaxAttachmentBytes - total_bytes) {
             set_error_locked(AILA_ERR_INVALID_ARGUMENT, "pre-tokenized alignment words are invalid or too large");
             return AILA_ERR_INVALID_ARGUMENT;
         }
         total_bytes += word.size();
-        payload_estimate += 24;
     }
     try {
-        std::vector<std::byte> attachment(total_bytes);
-        std::memcpy(attachment.data(), samples, audio_bytes);
-        size_t offset = audio_bytes;
         std::string lengths = "[";
         for (size_t index = 0; index < input_words.size(); ++index) {
             const std::string& word = input_words[index];
             if (index != 0) lengths += ',';
             lengths += std::to_string(word.size());
-            if (!word.empty()) {
-                std::memcpy(attachment.data() + offset, word.data(), word.size());
-                offset += word.size();
-            }
         }
         lengths += ']';
         const std::string payload = std::string("{\"sampleCount\":") +
@@ -1185,9 +1199,18 @@ int ProxyEngine::align_words(
             std::to_string(audio_bytes) + ",\"wordCount\":" +
             std::to_string(input_words.size()) + ",\"wordByteLengths\":" + lengths +
             ",\"byteCount\":" + std::to_string(total_bytes) + "}";
-        if (payload.size() > ipc::kMaxHeaderBytes / 2) {
+        if (!encoded_request_header_fits("align.words", payload, next_request_id_)) {
             set_error_locked(AILA_ERR_INVALID_ARGUMENT, "pre-tokenized alignment metadata is too large");
             return AILA_ERR_INVALID_ARGUMENT;
+        }
+        std::vector<std::byte> attachment(total_bytes);
+        std::memcpy(attachment.data(), samples, audio_bytes);
+        size_t offset = audio_bytes;
+        for (const std::string& word : input_words) {
+            if (!word.empty()) {
+                std::memcpy(attachment.data() + offset, word.data(), word.size());
+                offset += word.size();
+            }
         }
         const ipc::Frame response = request_locked("align.words", payload, std::move(attachment));
         if (response.header.kind == "error") {

@@ -4,14 +4,35 @@
 #include "simdjson.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace {
+std::atomic_size_t allocation_failure_threshold{(std::numeric_limits<size_t>::max)()};
+}
+
+void* operator new(size_t size) {
+    if (size >= allocation_failure_threshold.load(std::memory_order_relaxed)) {
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(size)) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](size_t size) { return ::operator new(size); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -1049,6 +1070,19 @@ void test_alignment_wire_methods_validate_and_preserve_inputs() {
     expect(dispatcher.dispatch(bad_words, should_shutdown).header.kind == "error" &&
                state.alignment_calls == calls,
            name, "ambiguous word metadata reached adapter");
+
+    Frame huge_shape = request(
+        324, "align",
+        R"({"sampleCount":134217728,"sampleRate":16000,"elementSize":4,"byteCount":4,"text":"x","language":"y"})");
+    huge_shape.attachment.resize(sizeof(float));
+    allocation_failure_threshold.store(128u * 1024u * 1024u, std::memory_order_relaxed);
+    const Frame huge_response = dispatcher.dispatch(huge_shape, should_shutdown);
+    allocation_failure_threshold.store((std::numeric_limits<size_t>::max)(),
+                                       std::memory_order_relaxed);
+    expect(huge_response.header.kind == "error" &&
+               payload_integer(huge_response, "code", name) == AILA_ERR_INVALID_ARGUMENT &&
+               state.alignment_calls == calls,
+           name, "huge sampleCount was allocated before attachment validation");
 
     state.alignment_result = {{std::string("bad\0word", 8), 1, 2}};
     align.header.request_id++;

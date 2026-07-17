@@ -780,7 +780,6 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             }
             const size_t audio_bytes = static_cast<size_t>(sample_count) * sizeof(float);
             alignment.sample_rate = sample_rate;
-            alignment.samples.resize(static_cast<size_t>(sample_count));
             if (request.header.method == "align") {
                 std::string_view text;
                 std::string_view language;
@@ -808,13 +807,26 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
                     return error(request, AILA_ERR_INVALID_ARGUMENT, "alignment word request is malformed");
                 }
                 alignment.method = AlignmentMethod::Words;
-                alignment.words.reserve(static_cast<size_t>(word_count));
                 size_t offset = audio_bytes;
+                size_t parsed_word_count = 0;
                 for (simdjson::dom::element length_element : lengths) {
                     uint64_t length = 0;
                     if (length_element.get_uint64().get(length) != simdjson::SUCCESS ||
-                        alignment.words.size() >= word_count ||
+                        parsed_word_count >= word_count ||
                         length > request.attachment.size() - offset) {
+                        return error(request, AILA_ERR_INVALID_ARGUMENT, "alignment word lengths are malformed");
+                    }
+                    ++parsed_word_count;
+                    offset += static_cast<size_t>(length);
+                }
+                if (parsed_word_count != word_count || offset != request.attachment.size()) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "alignment word count is malformed");
+                }
+                alignment.words.reserve(static_cast<size_t>(word_count));
+                offset = audio_bytes;
+                for (simdjson::dom::element length_element : lengths) {
+                    uint64_t length = 0;
+                    if (length_element.get_uint64().get(length) != simdjson::SUCCESS) {
                         return error(request, AILA_ERR_INVALID_ARGUMENT, "alignment word lengths are malformed");
                     }
                     const std::string_view word(
@@ -826,10 +838,8 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
                     alignment.words.emplace_back(word);
                     offset += static_cast<size_t>(length);
                 }
-                if (alignment.words.size() != word_count || offset != request.attachment.size()) {
-                    return error(request, AILA_ERR_INVALID_ARGUMENT, "alignment word count is malformed");
-                }
             }
+            alignment.samples.resize(static_cast<size_t>(sample_count));
             std::memcpy(alignment.samples.data(), request.attachment.data(), audio_bytes);
             std::vector<AlignedWordResult> output;
             if (!engine_->align(alignment, output)) {
