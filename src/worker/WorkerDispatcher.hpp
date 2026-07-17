@@ -87,6 +87,26 @@ struct AsrStreamConfig {
     std::string system_prompt;
 };
 
+enum class AlignmentMethod {
+    Text,
+    Words,
+};
+
+struct AlignmentRequest {
+    AlignmentMethod method = AlignmentMethod::Text;
+    std::vector<float> samples;
+    int sample_rate = 0;
+    std::string text;
+    std::string language;
+    std::vector<std::string> words;
+};
+
+struct AlignedWordResult {
+    std::string text;
+    int start_ms = 0;
+    int end_ms = 0;
+};
+
 struct TextGenerationRequest {
     TextGenerationMethod method = TextGenerationMethod::Generate;
     std::string input;
@@ -125,6 +145,9 @@ public:
     virtual bool process_audio(const AudioRequest& request, std::vector<float>& output) = 0;
     virtual int synthesize_stream(
         const AudioRequest& request, const AudioStreamCallback& callback) = 0;
+    virtual bool align(
+        const AlignmentRequest& request,
+        std::vector<AlignedWordResult>& output) = 0;
 };
 
 class WorkerDispatcher {

@@ -1,6 +1,7 @@
 #include "aila_api.h"
 
 #include "proxy/ProxyEngine.hpp"
+#include "simdjson.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -96,6 +97,42 @@ int allocate_float_result(
     if (!allocated) return AILA_ERR_RUNTIME;
     std::memcpy(allocated, values.data(), values.size() * sizeof(float));
     *out_values = allocated;
+    *out_count = static_cast<int>(values.size());
+    return AILA_OK;
+}
+
+int allocate_alignment_result(
+    const std::vector<aila::proxy::AlignmentWord>& values,
+    AilaAlignedWord** out_words,
+    int* out_count) {
+    if (values.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        return AILA_ERR_RUNTIME;
+    }
+    if (values.empty()) {
+        *out_words = nullptr;
+        *out_count = 0;
+        return AILA_OK;
+    }
+    if (values.size() > (std::numeric_limits<size_t>::max)() / sizeof(AilaAlignedWord)) {
+        return AILA_ERR_RUNTIME;
+    }
+    auto* allocated = static_cast<AilaAlignedWord*>(
+        std::calloc(values.size(), sizeof(AilaAlignedWord)));
+    if (!allocated) return AILA_ERR_RUNTIME;
+    for (size_t index = 0; index < values.size(); ++index) {
+        char* text = allocate_result(values[index].text);
+        if (!text) {
+            for (size_t prior = 0; prior < index; ++prior) {
+                std::free(const_cast<char*>(allocated[prior].text));
+            }
+            std::free(allocated);
+            return AILA_ERR_RUNTIME;
+        }
+        allocated[index].text = text;
+        allocated[index].start_ms = values[index].start_ms;
+        allocated[index].end_ms = values[index].end_ms;
+    }
+    *out_words = allocated;
     *out_count = static_cast<int>(values.size());
     return AILA_OK;
 }
@@ -739,6 +776,81 @@ AILA_API void aila_free_string(char* string) {
 
 AILA_API void aila_free_samples(float* samples) {
     std::free(samples);
+}
+
+AILA_API int aila_align(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* text, const char* language,
+    AilaAlignedWord** out_words, int* out_count) {
+    if (out_words) *out_words = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !audio_samples || num_samples <= 0 || !text || !language ||
+        !out_words || !out_count) {
+        if (engine) try { engine->proxy->record_invalid_argument("alignment arguments are invalid"); }
+        catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const std::string_view text_view(text);
+        const std::string_view language_view(language);
+        if (!simdjson::validate_utf8(text_view) || !simdjson::validate_utf8(language_view)) {
+            engine->proxy->record_invalid_argument("alignment text and language must be valid UTF-8");
+            return AILA_ERR_INVALID_ARGUMENT;
+        }
+        std::vector<aila::proxy::AlignmentWord> values;
+        const int status = engine->proxy->align(
+            audio_samples, num_samples, sample_rate, text_view, language_view, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_alignment_result(values, out_words, out_count);
+        if (allocated != AILA_OK) {
+            engine->proxy->record_runtime_error("could not allocate aligned words");
+        }
+        return allocated;
+    } catch (...) {
+        record_boundary_failure(engine, "aila_align");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_align_words(
+    AilaEngine* engine,
+    const float* audio_samples, int num_samples, int sample_rate,
+    const char* const* words, int num_words,
+    AilaAlignedWord** out_words, int* out_count) {
+    if (out_words) *out_words = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !audio_samples || num_samples <= 0 || !words || num_words <= 0 ||
+        !out_words || !out_count) {
+        if (engine) try { engine->proxy->record_invalid_argument("pre-tokenized alignment arguments are invalid"); }
+        catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<std::string> input_words;
+        input_words.reserve(static_cast<size_t>(num_words));
+        for (int index = 0; index < num_words; ++index) {
+            const char* word = words[index] ? words[index] : "";
+            const std::string_view view(word);
+            if (!simdjson::validate_utf8(view)) {
+                engine->proxy->record_invalid_argument("alignment words must be valid UTF-8");
+                return AILA_ERR_INVALID_ARGUMENT;
+            }
+            input_words.emplace_back(view);
+        }
+        std::vector<aila::proxy::AlignmentWord> values;
+        const int status = engine->proxy->align_words(
+            audio_samples, num_samples, sample_rate, input_words, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_alignment_result(values, out_words, out_count);
+        if (allocated != AILA_OK) {
+            engine->proxy->record_runtime_error("could not allocate pre-tokenized aligned words");
+        }
+        return allocated;
+    } catch (...) {
+        record_boundary_failure(engine, "aila_align_words");
+        return AILA_ERR_RUNTIME;
+    }
 }
 
 AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count) {

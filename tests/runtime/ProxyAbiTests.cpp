@@ -288,6 +288,10 @@ struct Api {
                                    const char*, const char*, const AilaGenConfig*, const char*);
     using DecodeMimi = int (*)(AilaEngine*, const int32_t*, int, float**, int*);
     using ExtractEmbedding = int (*)(AilaEngine*, const char*, float**, int*);
+    using Align = int (*)(AilaEngine*, const float*, int, int, const char*, const char*,
+                          AilaAlignedWord**, int*);
+    using AlignWords = int (*)(AilaEngine*, const float*, int, int, const char* const*, int,
+                               AilaAlignedWord**, int*);
     using SynthesizeStream = AilaTTSStream* (*)(AilaEngine*, const char*, const char*,
                                                 const char*, const char*, const char*,
                                                 const AilaGenConfig*, AilaAudioCallback, void*);
@@ -330,6 +334,8 @@ struct Api {
           synthesize_file(library.symbol<SynthesizeFile>("aila_synthesize")),
           decode_mimi(library.symbol<DecodeMimi>("aila_decode_mimi_vocoder")),
           extract_embedding(library.symbol<ExtractEmbedding>("aila_extract_speaker_embedding")),
+          align(library.symbol<Align>("aila_align")),
+          align_words(library.symbol<AlignWords>("aila_align_words")),
           synthesize_stream(library.symbol<SynthesizeStream>("aila_synthesize_stream")),
           stream_wait(library.symbol<StreamWait>("aila_stream_wait")),
           stream_destroy(library.symbol<StreamDestroy>("aila_stream_destroy")),
@@ -367,6 +373,8 @@ struct Api {
     SynthesizeFile synthesize_file;
     DecodeMimi decode_mimi;
     ExtractEmbedding extract_embedding;
+    Align align;
+    AlignWords align_words;
     SynthesizeStream synthesize_stream;
     StreamWait stream_wait;
     StreamDestroy stream_destroy;
@@ -1149,6 +1157,72 @@ void verify_audio_proxy(const Api& api, AilaEngine* engine) {
                 "worker after local audio validation");
 }
 
+void verify_alignment_proxy(const Api& api, AilaEngine* engine) {
+    const float audio[]{0.25f, -0.5f, 1.0f};
+    const float original[]{0.25f, -0.5f, 1.0f};
+    AilaAlignedWord* words = reinterpret_cast<AilaAlignedWord*>(static_cast<uintptr_t>(1));
+    int count = -1;
+    expect(api.align(engine, audio, 3, 0, u8"Unicode 原文", "", &words, &count) == AILA_OK,
+           "aila_align failed");
+    expect(count == 3 && words && std::string(words[0].text) == u8"相同" &&
+               std::string(words[1].text) == u8"相同" && std::string(words[2].text).empty() &&
+               words[0].start_ms == -7 && words[0].end_ms == 11 &&
+               words[1].start_ms == 12 && words[1].end_ms == 24,
+           "aligned words/timestamps changed");
+    expect(words[0].text != words[1].text && words[1].text != words[2].text,
+           "equal/empty aligned texts did not receive independent host allocations");
+    expect(std::memcmp(audio, original, sizeof(audio)) == 0,
+           "alignment changed caller audio");
+    api.free_aligned_words(words, count);
+    api.free_aligned_words(nullptr, 7);
+
+    const char* input_words[]{u8"猫", nullptr, u8"dog🐕"};
+    words = nullptr;
+    count = 0;
+    expect(api.align_words(engine, audio, 3, -1, input_words, 3, &words, &count) == AILA_OK &&
+               count == 3 && words != nullptr,
+           "aila_align_words failed or NULL word was not normalized to empty");
+    api.free_aligned_words(words, count);
+
+    words = reinterpret_cast<AilaAlignedWord*>(static_cast<uintptr_t>(1));
+    count = 99;
+    expect(api.align(engine, audio, 3, 16000, "__aila_align_empty__", "English",
+                     &words, &count) == AILA_OK && words == nullptr && count == 0,
+           "empty alignment result was not normalized");
+
+    words = reinterpret_cast<AilaAlignedWord*>(static_cast<uintptr_t>(1));
+    count = 19;
+    expect(api.align(engine, nullptr, 3, 16000, "x", "y", &words, &count) ==
+               AILA_ERR_INVALID_ARGUMENT && words == nullptr && count == 0,
+           "invalid alignment arguments did not clear outputs");
+    expect(api.align_words(engine, audio, 3, 16000, nullptr, 1, &words, &count) ==
+               AILA_ERR_INVALID_ARGUMENT,
+           "NULL pre-tokenized word array succeeded");
+    take_string(api, api.generate(engine, "after-local-align-error", nullptr),
+                "worker after local alignment validation");
+}
+
+void verify_malformed_alignment_results_reap_worker(const Api& api) {
+    for (const char* marker : {
+             "__aila_align_count_overflow__", "__aila_align_count_mismatch__",
+             "__aila_align_bad_utf8__", "__aila_align_bad_nul__",
+             "__aila_align_missing_text__", "__aila_align_bad_attachment__",
+             "__aila_align_bad_identity__"}) {
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), marker, 1024) == 0,
+               std::string("alignment malformed init failed: ") + marker);
+        const float audio[]{0.0f};
+        AilaAlignedWord* words = reinterpret_cast<AilaAlignedWord*>(static_cast<uintptr_t>(1));
+        int count = 9;
+        expect(api.align(engine.get(), audio, 1, 16000, marker, "English", &words, &count) ==
+                   AILA_ERR_RUNTIME && words == nullptr && count == 0,
+               std::string("malformed alignment response succeeded: ") + marker);
+        expect(api.generate(engine.get(), "after-malformed-align", nullptr) == nullptr &&
+                   api.last_error_code(engine.get()) == AILA_ERR_INVALID_ARGUMENT,
+               std::string("malformed alignment response did not reap worker: ") + marker);
+    }
+}
+
 struct AudioCapture {
     std::mutex mutex;
     std::vector<float> samples;
@@ -1577,6 +1651,7 @@ void test_proxy_abi_and_lifecycle() {
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
     verify_audio_proxy(api, relative.get());
+    verify_alignment_proxy(api, relative.get());
     verify_streaming_generation(api, relative.get());
     verify_asr_proxy(api, relative.get());
     verify_reentrant_asr_destroy_is_deferred(api, relative.get());
@@ -1632,6 +1707,7 @@ void test_proxy_abi_and_lifecycle() {
     verify_stale_asr_handle_cannot_alias_reinitialized_worker(api);
     verify_tts_stream_outlives_engine(api);
     verify_malformed_audio_results_reap_worker(api);
+    verify_malformed_alignment_results_reap_worker(api);
     verify_tts_stream_destroy_cancels_promptly(api);
     verify_tts_stream_reentrant_destroy(api);
     build_id.set(L"wrong-build-id");

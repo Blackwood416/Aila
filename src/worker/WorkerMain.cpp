@@ -589,6 +589,50 @@ public:
         return context.accepted.load(std::memory_order_acquire) ? 0 : 1;
     }
 
+    bool align(
+        const aila::worker::AlignmentRequest& request,
+        std::vector<aila::worker::AlignedWordResult>& output) override {
+        AilaAlignedWord* words = nullptr;
+        int count = 0;
+        int status = AILA_ERR_RUNTIME;
+        if (request.method == aila::worker::AlignmentMethod::Text) {
+            status = aila_align(
+                engine_, request.samples.data(), static_cast<int>(request.samples.size()),
+                request.sample_rate, request.text.c_str(), request.language.c_str(),
+                &words, &count);
+        } else {
+            std::vector<const char*> pointers;
+            pointers.reserve(request.words.size());
+            for (const std::string& word : request.words) pointers.push_back(word.c_str());
+            status = aila_align_words(
+                engine_, request.samples.data(), static_cast<int>(request.samples.size()),
+                request.sample_rate, pointers.data(), static_cast<int>(pointers.size()),
+                &words, &count);
+        }
+        if (status != AILA_OK || count < 0 || (count > 0 && words == nullptr)) {
+            if (words) aila_free_aligned_words(words, count > 0 ? count : 0);
+            output.clear();
+            return false;
+        }
+        try {
+            output.clear();
+            output.reserve(static_cast<size_t>(count));
+            for (int index = 0; index < count; ++index) {
+                if (!words[index].text) {
+                    aila_free_aligned_words(words, count);
+                    output.clear();
+                    return false;
+                }
+                output.push_back({words[index].text, words[index].start_ms, words[index].end_ms});
+            }
+        } catch (...) {
+            if (words) aila_free_aligned_words(words, count);
+            throw;
+        }
+        if (words) aila_free_aligned_words(words, count);
+        return true;
+    }
+
 private:
     AilaEngine* engine_ = nullptr;
     std::unordered_map<uint64_t, AilaTranscribeStream*> asr_streams_;

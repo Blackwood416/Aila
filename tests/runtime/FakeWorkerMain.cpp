@@ -817,6 +817,64 @@ int run(const Handles& handles) {
                 attach_text(response, generated);
             }
         }
+        if (command.header.method == "align" || command.header.method == "align.words") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            if (command.header.method == "align.words") {
+                const std::string expected_words = std::string(u8"猫") + std::string() + u8"dog🐕";
+                if (command.header.payload_json.find("\"wordCount\":3") == std::string::npos ||
+                    command.header.payload_json.find("\"wordByteLengths\":[3,0,7]") == std::string::npos ||
+                    command.attachment.size() != 3 * sizeof(float) + expected_words.size() ||
+                    std::memcmp(command.attachment.data() + 3 * sizeof(float),
+                                expected_words.data(), expected_words.size()) != 0) {
+                    send_frame(handles.response_write,
+                               lifecycle_error(command, 1, "alignment words were not packed exactly"));
+                    continue;
+                }
+            }
+            const std::string marker = command.header.payload_json;
+            response.attachment.clear();
+            if (marker.find("__aila_align_empty__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":0,"textByteCount":0,"words":[]})";
+            } else {
+                const std::string texts = std::string(u8"相同") + u8"相同";
+                response.attachment.resize(texts.size());
+                std::memcpy(response.attachment.data(), texts.data(), texts.size());
+                response.header.payload_json =
+                    R"({"wordCount":3,"textByteCount":12,"words":[{"textOffset":0,"textBytes":6,"startMs":-7,"endMs":11},{"textOffset":6,"textBytes":6,"startMs":12,"endMs":24},{"textOffset":12,"textBytes":0,"startMs":25,"endMs":25}]})";
+            }
+            if (marker.find("__aila_align_count_overflow__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":2147483648,"textByteCount":0,"words":[]})";
+                response.attachment.clear();
+            } else if (marker.find("__aila_align_count_mismatch__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":2,"textByteCount":0,"words":[{"textOffset":0,"textBytes":0,"startMs":0,"endMs":0}]})";
+                response.attachment.clear();
+            } else if (marker.find("__aila_align_bad_utf8__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":1,"textByteCount":2,"words":[{"textOffset":0,"textBytes":2,"startMs":0,"endMs":1}]})";
+                response.attachment = {std::byte{0xc3}, std::byte{0x28}};
+            } else if (marker.find("__aila_align_bad_nul__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":1,"textByteCount":3,"words":[{"textOffset":0,"textBytes":3,"startMs":0,"endMs":1}]})";
+                response.attachment = {std::byte{'a'}, std::byte{0}, std::byte{'b'}};
+            } else if (marker.find("__aila_align_missing_text__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":1,"textByteCount":0,"words":[{"textOffset":0,"startMs":0,"endMs":1}]})";
+                response.attachment.clear();
+            } else if (marker.find("__aila_align_bad_attachment__") != std::string::npos) {
+                response.header.payload_json =
+                    R"({"wordCount":0,"textByteCount":99,"words":[]})";
+                response.attachment.clear();
+            } else if (marker.find("__aila_align_bad_identity__") != std::string::npos) {
+                response.header.method = "wrong.align";
+            }
+        }
         if (command.header.method == "tts.synthesize_wav" ||
             command.header.method == "tts.synthesize_text_to_wav" ||
             command.header.method == "mimi.decode" ||

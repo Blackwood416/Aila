@@ -13,6 +13,12 @@
 
 namespace aila::proxy {
 
+struct AlignmentWord {
+    std::string text;
+    int start_ms = 0;
+    int end_ms = 0;
+};
+
 class ProxyEngine {
 public:
     ProxyEngine() = default;
@@ -89,6 +95,14 @@ public:
         AilaAudioCallback callback, void* user_data,
         const std::atomic_bool& cancellation_requested,
         const std::function<void()>& request_started);
+    int align(
+        const float* samples, int sample_count, int sample_rate,
+        std::string_view text, std::string_view language,
+        std::vector<AlignmentWord>& words);
+    int align_words(
+        const float* samples, int sample_count, int sample_rate,
+        const std::vector<std::string>& input_words,
+        std::vector<AlignmentWord>& words);
 
     int last_error_code() const;
     const char* last_error_message() const;

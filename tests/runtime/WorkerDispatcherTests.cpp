@@ -20,6 +20,9 @@ using aila::worker::WorkerDispatcher;
 using aila::worker::WorkerEngineApi;
 using aila::worker::TextGenerationMethod;
 using aila::worker::TextGenerationRequest;
+using aila::worker::AlignmentMethod;
+using aila::worker::AlignmentRequest;
+using aila::worker::AlignedWordResult;
 
 [[noreturn]] void fail(const char* test_name, const std::string& message) {
     throw std::runtime_error(std::string("FAILED: ") + test_name + ": " + message);
@@ -118,6 +121,10 @@ struct EngineState {
     int audio_calls = 0;
     aila::worker::AudioRequest audio_request;
     std::vector<float> audio_result{0.25f, -0.5f, 1.0f};
+    int alignment_calls = 0;
+    AlignmentRequest alignment_request;
+    std::vector<AlignedWordResult> alignment_result{
+        {u8"你", 10, 20}, {u8"好", 21, 42}};
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -232,6 +239,15 @@ public:
         const float second[]{1.0f};
         if (!callback(first, 2)) return 1;
         return callback(second, 1) ? 0 : 1;
+    }
+
+    bool align(
+        const AlignmentRequest& request,
+        std::vector<AlignedWordResult>& output) override {
+        ++state_.alignment_calls;
+        state_.alignment_request = request;
+        output = state_.alignment_result;
+        return true;
     }
 
 private:
@@ -971,6 +987,79 @@ void test_tts_stream_emits_typed_audio_chunks() {
            name, "nullable versus empty TTS fields changed");
 }
 
+void test_alignment_wire_methods_validate_and_preserve_inputs() {
+    constexpr const char* name = "alignment wire methods validate and preserve inputs";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+
+    const float samples[]{0.25f, -0.5f, 1.0f};
+    Frame align = request(
+        320, "align",
+        u8R"({"sampleCount":3,"sampleRate":0,"elementSize":4,"byteCount":12,"text":"原文","language":"中文"})");
+    align.attachment.resize(sizeof(samples));
+    std::memcpy(align.attachment.data(), samples, sizeof(samples));
+    const Frame aligned = dispatcher.dispatch(align, should_shutdown);
+    expect(aligned.header.kind == "result" && state.alignment_calls == 1,
+           name, "valid align request failed");
+    expect(state.alignment_request.method == AlignmentMethod::Text &&
+               state.alignment_request.samples == std::vector<float>({0.25f, -0.5f, 1.0f}) &&
+               state.alignment_request.sample_rate == 0 &&
+               state.alignment_request.text == u8"原文" &&
+               state.alignment_request.language == u8"中文",
+           name, "align arguments changed");
+    expect(payload_integer(aligned, "wordCount", name) == 2 &&
+               payload_integer(aligned, "textByteCount", name) == 6 &&
+               aligned.attachment.size() == 6,
+           name, "aligned result shape changed");
+    expect(attachment_string(aligned) == u8"你好", name, "aligned result text changed");
+
+    const std::string packed_words = std::string(u8"猫") + std::string() + u8"dog🐕";
+    Frame words = request(
+        321, "align.words",
+        R"({"sampleCount":3,"sampleRate":-1,"elementSize":4,"audioByteCount":12,"wordCount":3,"wordByteLengths":[3,0,7],"byteCount":22})");
+    words.attachment.resize(sizeof(samples) + packed_words.size());
+    std::memcpy(words.attachment.data(), samples, sizeof(samples));
+    std::memcpy(words.attachment.data() + sizeof(samples), packed_words.data(), packed_words.size());
+    expect(dispatcher.dispatch(words, should_shutdown).header.kind == "result" &&
+               state.alignment_calls == 2,
+           name, "valid align.words request failed");
+    expect(state.alignment_request.method == AlignmentMethod::Words &&
+               state.alignment_request.sample_rate == -1 &&
+               state.alignment_request.words ==
+                   std::vector<std::string>({u8"猫", "", u8"dog🐕"}),
+           name, "pre-tokenized words changed");
+
+    const int calls = state.alignment_calls;
+    for (std::string payload : {
+             R"({"sampleCount":4,"sampleRate":1,"elementSize":4,"byteCount":12,"text":"x","language":"y"})",
+             R"({"sampleCount":3,"sampleRate":1,"elementSize":8,"byteCount":12,"text":"x","language":"y"})",
+             R"({"sampleCount":3,"sampleRate":1,"elementSize":4,"byteCount":13,"text":"x","language":"y"})"}) {
+        Frame malformed = request(322, "align", std::move(payload));
+        malformed.attachment.resize(sizeof(samples));
+        expect(dispatcher.dispatch(malformed, should_shutdown).header.kind == "error",
+               name, "malformed audio attachment succeeded");
+    }
+    Frame bad_words = request(
+        323, "align.words",
+        R"({"sampleCount":3,"sampleRate":1,"elementSize":4,"audioByteCount":12,"wordCount":2,"wordByteLengths":[3],"byteCount":15})");
+    bad_words.attachment.resize(15);
+    expect(dispatcher.dispatch(bad_words, should_shutdown).header.kind == "error" &&
+               state.alignment_calls == calls,
+           name, "ambiguous word metadata reached adapter");
+
+    state.alignment_result = {{std::string("bad\0word", 8), 1, 2}};
+    align.header.request_id++;
+    expect(dispatcher.dispatch(align, should_shutdown).header.kind == "error",
+           name, "embedded-NUL adapter result succeeded");
+    state.alignment_result = {{std::string("\xc3\x28", 2), 1, 2}};
+    align.header.request_id++;
+    expect(dispatcher.dispatch(align, should_shutdown).header.kind == "error",
+           name, "invalid UTF-8 adapter result succeeded");
+}
+
 } // namespace
 
 int main() {
@@ -993,6 +1082,7 @@ int main() {
         test_asr_wire_methods_are_dispatched();
         test_audio_wire_methods_validate_and_preserve_binary_arguments();
         test_tts_stream_emits_typed_audio_chunks();
+        test_alignment_wire_methods_validate_and_preserve_inputs();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {
