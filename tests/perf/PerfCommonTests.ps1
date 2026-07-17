@@ -191,7 +191,15 @@ function New-VerifierBuildFixture {
     $runtimeDir = Join-Path $releaseRoot 'aila_runtime'
     New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $SourceBuildDir 'Aila.exe') -Destination (Join-Path $runtimeDir 'Aila.exe')
-    Copy-Item -LiteralPath (Join-Path $SourceBuildDir 'Aila.exe') -Destination (Join-Path $runtimeDir 'AilaWorker.exe')
+    $workerPath = Join-Path $runtimeDir 'AilaWorker.exe'
+    Copy-Item -LiteralPath (Join-Path $SourceBuildDir 'Aila.exe') -Destination $workerPath
+    $workerStream = [System.IO.File]::Open($workerPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $workerStream.WriteByte(0xA1)
+    }
+    finally {
+        $workerStream.Dispose()
+    }
     Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\kernel32.dll') -Destination (Join-Path $releaseRoot 'AilaShared.dll')
 
     $buildInfoPath = Join-Path $DestinationBuildDir 'build_info.json'
@@ -206,6 +214,11 @@ function New-VerifierBuildFixture {
             role         = 'worker'
             relativePath = 'aila_runtime/AilaWorker.exe'
             sha256       = (Get-FileHash -LiteralPath (Join-Path $runtimeDir 'AilaWorker.exe') -Algorithm SHA256).Hash
+        },
+        [pscustomobject]@{
+            role         = 'cli'
+            relativePath = 'aila_runtime/Aila.exe'
+            sha256       = (Get-FileHash -LiteralPath (Join-Path $runtimeDir 'Aila.exe') -Algorithm SHA256).Hash
         }
     ) -Force
     Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
@@ -975,6 +988,27 @@ $metadata | ConvertTo-Json -Depth 8
                 throw ($result.stderr + $result.stdout).Trim()
             }
         } "exactly one 'worker' artifact" 'missing worker metadata verification'
+    }
+
+    Invoke-Test 'verifier rejects staged CLI bytes that do not match CLI metadata' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'mismatched-cli-hash')
+        $runtimeDir = Join-Path $buildDir 'Release\bin\aila_runtime'
+        Copy-Item -LiteralPath (Join-Path $runtimeDir 'AilaWorker.exe') -Destination (Join-Path $runtimeDir 'Aila.exe') -Force
+
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        Assert-Throws {
+            $result = Invoke-ChildPowerShellWithTimeout `
+                -ScriptPath $verifierPath `
+                -ArgumentList @('-BuildDir', $buildDir, '-OneApiStack', 'oneapi-2025.3') `
+                -TimeoutMs 30000
+            if (-not $result.completed) {
+                throw 'Verifier child process timed out.'
+            }
+            if ($result.exitCode -ne 0) {
+                throw ($result.stderr + $result.stdout).Trim()
+            }
+        } 'Build info cli artifact SHA256 mismatch' 'mismatched CLI metadata verification'
     }
 
     Invoke-Test 'verifier rejects a staged proxy with a oneAPI import' {

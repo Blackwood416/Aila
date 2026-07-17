@@ -19,6 +19,8 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project (Aila CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
+
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
 
@@ -318,6 +320,10 @@ target_include_directories(AilaChatTests PRIVATE
 target_link_libraries(AilaChatTests PRIVATE simdjson)
 enable_testing()
 add_test(NAME AilaChatTests COMMAND AilaChatTests)
+add_test(
+    NAME AilaRuntimeDllSelectionCMakeTests
+    COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/RuntimeDllSelectionTests.cmake"
+)
 
 add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -550,53 +556,18 @@ if(WIN32)
         message(FATAL_ERROR "Resolved TBB runtime directory is invalid: ${AILA_TBB_BIN_DIR}")
     endif()
 
-    set(AILA_RUNTIME_SEARCH_DIRS
-        "${AILA_COMPILER_BIN_DIR}"
+    set(AILA_RUNTIME_SOURCE_DIRS
         "${AILA_ONEAPI_SHARED_BIN_DIR}"
+        "${AILA_COMPILER_BIN_DIR}"
         "${AILA_TBB_BIN_DIR}"
     )
-
-    set(AILA_ONEAPI_RUNTIME_ROOT_PATTERNS
-        "ur_loader.dll"
-        "ur_win_proxy_loader.dll"
-        "ur_adapter_opencl.dll"
-        "ur_adapter_level_zero.dll"
-        "ur_adapter_level_zero_v2.dll"
-        "umf.dll"
-        "xptifw.dll"
-        "sycl-jit.dll"
-        "OpenCL.dll"
-        "intelocl64.dll"
-        "common_clang64.dll"
-        "libmmd*.dll"
-        "libhwloc-*.dll"
-        "tbb12.dll"
-        "tbbbind.dll"
-        "tbbbind_2_0.dll"
-        "tbbbind_2_5.dll"
-        "tbbmalloc.dll"
-        "tbbmalloc_proxy.dll"
-        "tcm.dll"
-    )
-    set(AILA_ONEAPI_RUNTIME_ROOT_DLLS)
-    set(AILA_ONEAPI_RUNTIME_ROOT_DIRS
-        "${AILA_COMPILER_BIN_DIR}"
-        "${AILA_ONEAPI_SHARED_BIN_DIR}"
-        "${AILA_TBB_BIN_DIR}"
-    )
-    foreach(AILA_RUNTIME_ROOT_DIR IN LISTS AILA_ONEAPI_RUNTIME_ROOT_DIRS)
-        foreach(pattern IN LISTS AILA_ONEAPI_RUNTIME_ROOT_PATTERNS)
-            file(GLOB AILA_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
-                "${AILA_RUNTIME_ROOT_DIR}/${pattern}")
-            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_RUNTIME_MATCHES})
-        endforeach()
-    endforeach()
-    list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
+    if(DNNL_DLL_LOCATION)
+        get_filename_component(DNNL_DLL_DIR "${DNNL_DLL_LOCATION}" DIRECTORY)
+        list(APPEND AILA_RUNTIME_SOURCE_DIRS "${DNNL_DLL_DIR}")
+    endif()
 
     get_filename_component(AILA_LINKER_BIN_DIR "${CMAKE_LINKER}" DIRECTORY)
     if(EXISTS "${AILA_LINKER_BIN_DIR}/msvcp140.dll")
-        list(APPEND AILA_RUNTIME_SEARCH_DIRS "${AILA_LINKER_BIN_DIR}")
-
         get_filename_component(AILA_MSVC_DIR "${AILA_LINKER_BIN_DIR}/../../../../../.." ABSOLUTE)
         get_filename_component(AILA_MSVC_TOOLS_VERSION "${AILA_LINKER_BIN_DIR}/../../.." NAME)
         string(REGEX MATCH "^[0-9]+\\.[0-9]+" AILA_MSVC_VERSION_PREFIX "${AILA_MSVC_TOOLS_VERSION}")
@@ -607,39 +578,109 @@ if(WIN32)
         if(NOT AILA_MSVC_REDIST_DIRS)
             file(GLOB AILA_MSVC_REDIST_DIRS "${AILA_MSVC_DIR}/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
         endif()
-
-        set(AILA_MSVC_RUNTIME_ROOT_DIRS)
         if(AILA_MSVC_REDIST_DIRS)
             list(SORT AILA_MSVC_REDIST_DIRS)
             list(REVERSE AILA_MSVC_REDIST_DIRS)
-            list(GET AILA_MSVC_REDIST_DIRS 0 AILA_MSVC_REDIST_DIR)
-            set(AILA_MSVC_REDIST_DIRS "${AILA_MSVC_REDIST_DIR}")
-            list(APPEND AILA_RUNTIME_SEARCH_DIRS ${AILA_MSVC_REDIST_DIRS})
-            list(APPEND AILA_MSVC_RUNTIME_ROOT_DIRS ${AILA_MSVC_REDIST_DIRS})
+            list(GET AILA_MSVC_REDIST_DIRS 0 AILA_MSVC_RUNTIME_DIR)
         else()
-            list(APPEND AILA_MSVC_RUNTIME_ROOT_DIRS "${AILA_LINKER_BIN_DIR}")
+            set(AILA_MSVC_RUNTIME_DIR "${AILA_LINKER_BIN_DIR}")
+        endif()
+        list(APPEND AILA_RUNTIME_SOURCE_DIRS "${AILA_MSVC_RUNTIME_DIR}")
+    endif()
+    list(REMOVE_DUPLICATES AILA_RUNTIME_SOURCE_DIRS)
+
+    aila_select_runtime_dlls(
+        OUTPUT_FILES AILA_SELECTED_RUNTIME_DLLS
+        DIRECTORIES ${AILA_RUNTIME_SOURCE_DIRS}
+    )
+
+    set(AILA_RUNTIME_SEARCH_DIRS)
+    set(AILA_RUNTIME_OVERLAY_SOURCE_DLLS)
+    set(AILA_RUNTIME_LOOKUP_DIR "${CMAKE_CURRENT_BINARY_DIR}/runtime_dependency_lookup")
+    foreach(AILA_RUNTIME_SOURCE_DIR IN LISTS AILA_RUNTIME_SOURCE_DIRS)
+        file(GLOB AILA_RUNTIME_SOURCE_DLLS LIST_DIRECTORIES FALSE
+            "${AILA_RUNTIME_SOURCE_DIR}/*.dll")
+        list(SORT AILA_RUNTIME_SOURCE_DLLS CASE INSENSITIVE)
+        set(AILA_RUNTIME_SELECTED_FROM_DIR)
+        foreach(AILA_RUNTIME_SOURCE_DLL IN LISTS AILA_RUNTIME_SOURCE_DLLS)
+            list(FIND AILA_SELECTED_RUNTIME_DLLS "${AILA_RUNTIME_SOURCE_DLL}" AILA_RUNTIME_SELECTED_INDEX)
+            if(NOT AILA_RUNTIME_SELECTED_INDEX EQUAL -1)
+                list(APPEND AILA_RUNTIME_SELECTED_FROM_DIR "${AILA_RUNTIME_SOURCE_DLL}")
+            endif()
+        endforeach()
+
+        list(LENGTH AILA_RUNTIME_SOURCE_DLLS AILA_RUNTIME_SOURCE_COUNT)
+        list(LENGTH AILA_RUNTIME_SELECTED_FROM_DIR AILA_RUNTIME_SELECTED_COUNT)
+        if(AILA_RUNTIME_SOURCE_COUNT GREATER 0 AND
+                AILA_RUNTIME_SELECTED_COUNT EQUAL AILA_RUNTIME_SOURCE_COUNT)
+            list(APPEND AILA_RUNTIME_SEARCH_DIRS "${AILA_RUNTIME_SOURCE_DIR}")
+        elseif(AILA_RUNTIME_SELECTED_COUNT GREATER 0)
+            list(APPEND AILA_RUNTIME_OVERLAY_SOURCE_DLLS ${AILA_RUNTIME_SELECTED_FROM_DIR})
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES AILA_RUNTIME_SEARCH_DIRS)
+    list(REMOVE_DUPLICATES AILA_RUNTIME_OVERLAY_SOURCE_DLLS)
+
+    if(AILA_RUNTIME_OVERLAY_SOURCE_DLLS)
+        set(AILA_RUNTIME_LOOKUP_STAMP "${AILA_RUNTIME_LOOKUP_DIR}/.ready")
+        set(AILA_PREPARE_RUNTIME_LOOKUP_TEMPLATE [=[
+set(source_dlls [==[@AILA_RUNTIME_OVERLAY_SOURCE_DLLS@]==])
+set(lookup_dir [==[@AILA_RUNTIME_LOOKUP_DIR@]==])
+set(stamp_path [==[@AILA_RUNTIME_LOOKUP_STAMP@]==])
+file(REMOVE_RECURSE "${lookup_dir}")
+file(MAKE_DIRECTORY "${lookup_dir}")
+foreach(source_dll IN LISTS source_dlls)
+    if(NOT EXISTS "${source_dll}")
+        message(FATAL_ERROR "Selected runtime DLL no longer exists: ${source_dll}")
+    endif()
+    get_filename_component(source_name "${source_dll}" NAME)
+    execute_process(
+        COMMAND "@CMAKE_COMMAND@" -E copy_if_different
+            "${source_dll}" "${lookup_dir}/${source_name}"
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+endforeach()
+file(WRITE "${stamp_path}" "ready\n")
+]=])
+        string(CONFIGURE "${AILA_PREPARE_RUNTIME_LOOKUP_TEMPLATE}" AILA_PREPARE_RUNTIME_LOOKUP_SCRIPT @ONLY)
+        file(GENERATE
+            OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/prepare_runtime_dependency_lookup.cmake"
+            CONTENT "${AILA_PREPARE_RUNTIME_LOOKUP_SCRIPT}"
+        )
+        add_custom_command(
+            OUTPUT "${AILA_RUNTIME_LOOKUP_STAMP}"
+            COMMAND "${CMAKE_COMMAND}" -P
+                "${CMAKE_CURRENT_BINARY_DIR}/prepare_runtime_dependency_lookup.cmake"
+            DEPENDS
+                "${CMAKE_CURRENT_BINARY_DIR}/prepare_runtime_dependency_lookup.cmake"
+                ${AILA_RUNTIME_OVERLAY_SOURCE_DLLS}
+            COMMENT "Preparing conflict-free runtime DLL lookup directory"
+            VERBATIM
+        )
+        add_custom_target(AilaRuntimeDependencyLookup
+            DEPENDS "${AILA_RUNTIME_LOOKUP_STAMP}")
+        list(APPEND AILA_RUNTIME_SEARCH_DIRS "${AILA_RUNTIME_LOOKUP_DIR}")
+    endif()
+
+    set(AILA_ONEAPI_RUNTIME_ROOT_DLLS)
+    foreach(AILA_SELECTED_RUNTIME_DLL IN LISTS AILA_SELECTED_RUNTIME_DLLS)
+        get_filename_component(AILA_SELECTED_RUNTIME_NAME "${AILA_SELECTED_RUNTIME_DLL}" NAME)
+        string(TOLOWER "${AILA_SELECTED_RUNTIME_NAME}" AILA_SELECTED_RUNTIME_KEY)
+        if(NOT AILA_SELECTED_RUNTIME_KEY MATCHES
+                "^(ur_loader|ur_win_proxy_loader|ur_adapter_opencl|ur_adapter_level_zero|ur_adapter_level_zero_v2|umf|xptifw|sycl-jit|opencl|intelocl64|common_clang64|libmmd.*|libhwloc-.*|tbb12|tbbbind|tbbbind_2_0|tbbbind_2_5|tbbmalloc|tbbmalloc_proxy|tcm|concrt140|msvcp140.*|vccorlib140|vcruntime140.*)\\.dll$")
+            continue()
         endif()
 
-        set(AILA_MSVC_RUNTIME_ROOT_PATTERNS
-            "concrt140.dll"
-            "msvcp140*.dll"
-            "vccorlib140.dll"
-            "vcruntime140*.dll"
-        )
-        foreach(AILA_MSVC_RUNTIME_DIR IN LISTS AILA_MSVC_RUNTIME_ROOT_DIRS)
-            foreach(pattern IN LISTS AILA_MSVC_RUNTIME_ROOT_PATTERNS)
-                file(GLOB AILA_MSVC_RUNTIME_MATCHES LIST_DIRECTORIES FALSE "${AILA_MSVC_RUNTIME_DIR}/${pattern}")
-                list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_MSVC_RUNTIME_MATCHES})
-            endforeach()
-        endforeach()
-        list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
-    endif()
-
-    if(DNNL_DLL_LOCATION)
-        get_filename_component(DNNL_DLL_DIR "${DNNL_DLL_LOCATION}" DIRECTORY)
-        list(APPEND AILA_RUNTIME_SEARCH_DIRS "${DNNL_DLL_DIR}")
-    endif()
-    list(REMOVE_DUPLICATES AILA_RUNTIME_SEARCH_DIRS)
+        get_filename_component(AILA_SELECTED_RUNTIME_DIR "${AILA_SELECTED_RUNTIME_DLL}" DIRECTORY)
+        list(FIND AILA_RUNTIME_SEARCH_DIRS "${AILA_SELECTED_RUNTIME_DIR}" AILA_RUNTIME_DIRECT_DIR_INDEX)
+        if(AILA_RUNTIME_DIRECT_DIR_INDEX EQUAL -1)
+            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS
+                "${AILA_RUNTIME_LOOKUP_DIR}/${AILA_SELECTED_RUNTIME_NAME}")
+        else()
+            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS "${AILA_SELECTED_RUNTIME_DLL}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
 
     set(AILA_COPY_RUNTIME_DEPENDENCIES_TEMPLATE [=[
 set(target_path "${TARGET_PATH}")
@@ -648,7 +689,24 @@ set(target_kind "${TARGET_KIND}")
 
 set(search_dirs [==[@AILA_RUNTIME_SEARCH_DIRS@]==])
 set(extra_root_dlls [==[@AILA_ONEAPI_RUNTIME_ROOT_DLLS@]==])
-list(APPEND search_dirs "${target_dir}")
+
+set(search_dll_names)
+foreach(search_dir IN LISTS search_dirs)
+    if(NOT IS_DIRECTORY "${search_dir}")
+        message(FATAL_ERROR "Runtime dependency search directory does not exist: ${search_dir}")
+    endif()
+    file(GLOB search_dlls LIST_DIRECTORIES FALSE "${search_dir}/*.dll")
+    foreach(search_dll IN LISTS search_dlls)
+        get_filename_component(search_name "${search_dll}" NAME)
+        string(TOLOWER "${search_name}" search_key)
+        list(FIND search_dll_names "${search_key}" duplicate_index)
+        if(NOT duplicate_index EQUAL -1)
+            message(FATAL_ERROR
+                "Runtime dependency search directories contain duplicate basename '${search_name}'.")
+        endif()
+        list(APPEND search_dll_names "${search_key}")
+    endforeach()
+endforeach()
 
 set(common_dependency_args
     DIRECTORIES ${search_dirs}
@@ -713,6 +771,9 @@ endif()
     )
 
     function(copy_runtime_dependencies target target_kind)
+        if(TARGET AilaRuntimeDependencyLookup)
+            add_dependencies(${target} AilaRuntimeDependencyLookup)
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                 "-DTARGET_PATH=$<TARGET_FILE:${target}>"

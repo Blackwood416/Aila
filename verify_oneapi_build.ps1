@@ -350,6 +350,11 @@ function Invoke-AilaOneApiBuildVerification {
         -Role 'worker' `
         -ExpectedRelativePath 'aila_runtime/AilaWorker.exe' `
         -ArtifactPath $worker
+    Assert-AilaStagedArtifactMetadata `
+        -BuildInfo $buildInfo `
+        -Role 'cli' `
+        -ExpectedRelativePath 'aila_runtime/Aila.exe' `
+        -ArtifactPath $exe
 
     $oneApiProperty = $buildInfo.PSObject.Properties['oneApi']
     if ($null -eq $oneApiProperty -or $null -eq $oneApiProperty.Value) {
