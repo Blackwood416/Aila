@@ -69,7 +69,51 @@
 1. 安装 **Intel Arc显卡驱动**。
 2. 从 [Releases](https://github.com/Blackwood416/releases) 页面下载 `Aila-vX.Y.Z-win64.zip`。
 3. 解压到任意目录。
-5. 将模型文件放入目录中（如 `./models/qwen3.5-0.8B-bnb-nf4-offline/`）。
+4. 将模型文件放入目录中（如 `./models/qwen3.5-0.8B-bnb-nf4-offline/`）。
+
+Windows 发行包采用拆分运行时布局：
+
+```text
+integration_root/
+|-- AilaShared.dll
+|-- build_info.json
+`-- aila_runtime/
+    |-- AilaWorker.exe
+    |-- Aila.exe
+    `-- <oneAPI 及其他运行时 DLL>
+```
+
+`AilaShared.dll` 是不导入 oneAPI 推理运行时的 C ABI 转接层。每个成功初始化
+的引擎都在独立的 `AilaWorker.exe` worker process（工作进程）中执行推理。
+通过 C API 集成时，请在加载转接层前设置
+`AILA_RUNTIME_DLL_DIR=aila_runtime`。相对路径以 `AilaShared.dll` 所在目录为
+基准；也支持绝对路径，内部会统一规范化为绝对路径。如果变量未设置或为空，
+转接层会使用自身所在目录，从而兼容旧的平铺布局。非 Windows 构建仍在进程内
+执行推理。
+
+Python 示例：
+
+```python
+import ctypes
+import os
+
+os.environ["AILA_RUNTIME_DLL_DIR"] = "aila_runtime"
+lib = ctypes.CDLL(r".\AilaShared.dll")
+lib.aila_engine_create.restype = ctypes.c_void_p
+engine = lib.aila_engine_create()
+```
+
+宿主的 DLL 搜索路径只能加入转接层所在目录。不要调用
+`os.add_dll_directory("aila_runtime")`，也不要把 `aila_runtime` 加入宿主
+`PATH`；否则会让 Python 看到 Aila 私有的 oneAPI DLL，破坏隔离。C API 函数
+签名以及 Aila 提供的内存释放函数均保持不变。
+
+工作进程以 runtime 目录作为工作目录，并使用隔离的子进程 `PATH`。缺少
+`AilaWorker.exe`、转接层与 worker build ID 不匹配、启动超时或工作进程退出
+时，现有 C API 错误接口会返回诊断信息；失败操作不会自动重试。请始终部署
+同一发行包中的 `AilaShared.dll` 与 `AilaWorker.exe`，不保证跨版本 worker
+兼容。下方 CLI 示例假定从 `aila_runtime/` 中运行 `Aila.exe`，或使用其完整
+路径。
 
 ## 📊 性能基准
 
@@ -353,7 +397,12 @@ python export_bnb_nf4.py \
 |------|------|
 | `build/Aila.exe` | CLI 可执行文件 |
 | `build/AilaShared.dll` | 动态链接库（C API） |
+| `build/AilaWorker.exe` | Windows 隔离推理工作进程 |
 | `build/AilaLib.lib` | 静态库 |
+
+在 Windows 上，`cmake --build build --target release` 会把集成布局 staging
+到 `build/Release/bin`：根目录包含转接层和 `build_info.json`，CLI、工作进程
+与运行时 DLL 位于 `aila_runtime/`。
 
 ## 📁 项目结构
 

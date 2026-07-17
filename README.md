@@ -71,6 +71,51 @@ Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architect
 3. Extract to a directory of your choice.
 4. Place your model files in a directory (e.g. `./models/qwen3.5-0.8B-bnb-nf4-offline/`).
 
+The Windows release uses a split runtime layout:
+
+```text
+integration_root/
+|-- AilaShared.dll
+|-- build_info.json
+`-- aila_runtime/
+    |-- AilaWorker.exe
+    |-- Aila.exe
+    `-- <oneAPI and other runtime DLLs>
+```
+
+`AilaShared.dll` is a C ABI proxy without oneAPI inference imports. Each
+initialized engine runs inference in its own `AilaWorker.exe` worker process.
+For C API embedding, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before loading the
+proxy. Relative values resolve **relative to AilaShared.dll**; absolute paths are
+also accepted and are normalized internally. If the variable is unset or empty,
+the proxy looks beside itself, preserving the legacy flat layout. Non-Windows
+builds continue to use in-process inference.
+
+Python example:
+
+```python
+import ctypes
+import os
+
+os.environ["AILA_RUNTIME_DLL_DIR"] = "aila_runtime"
+lib = ctypes.CDLL(r".\AilaShared.dll")
+lib.aila_engine_create.restype = ctypes.c_void_p
+engine = lib.aila_engine_create()
+```
+
+Only add the proxy directory to the host's DLL search path. Never call
+`os.add_dll_directory("aila_runtime")` or add `aila_runtime` to the host `PATH`;
+that would expose Aila's private oneAPI DLLs to Python and defeat isolation. The
+C API signatures and Aila free functions remain unchanged.
+
+The worker uses the runtime directory as its working directory and receives an
+isolated child `PATH`. Missing `AilaWorker.exe`, proxy/worker build ID mismatch,
+startup timeout, and worker exit are returned by the existing C API error
+functions. Failed operations are not automatically retried. Keep
+`AilaShared.dll` and `AilaWorker.exe` from the same release; cross-version worker
+compatibility is not guaranteed. CLI examples below assume `Aila.exe` is run
+from `aila_runtime/` or is otherwise addressed by its full path.
+
 ## 📊 Benchmark
 
 Benchmark on Intel Arc A770 16 GB, Qwen3.5-4B, pp=2048 tg=1024:
@@ -355,7 +400,12 @@ Outputs:
 |------|-------------|
 | `build/Aila.exe` | CLI executable |
 | `build/AilaShared.dll` | Shared library (C API) |
+| `build/AilaWorker.exe` | Windows isolated inference worker |
 | `build/AilaLib.lib` | Static library |
+
+On Windows, `cmake --build build --target release` stages the integration layout
+under `build/Release/bin`: the proxy and `build_info.json` are at the root, and
+the CLI, worker, and runtime DLLs are under `aila_runtime/`.
 
 ## 📁 Project Structure
 

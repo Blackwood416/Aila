@@ -4,6 +4,47 @@ Aila supports the following environment variables for runtime configuration. Boo
 
 ---
 
+## Windows Runtime Isolation
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_RUNTIME_DLL_DIR` | directory path | directory containing `AilaShared.dll` | Directory containing `AilaWorker.exe` and the private oneAPI runtime. Relative values resolve relative to AilaShared.dll; absolute values are accepted. The selected path is normalized to an absolute path internally. An unset or empty value enables the legacy flat layout. |
+
+The recommended release/integration layout keeps `AilaShared.dll` and
+`build_info.json` in the integration root, with `AilaWorker.exe`, `Aila.exe`, and
+the oneAPI runtime DLLs under `aila_runtime/`:
+
+```text
+integration_root/
+|-- AilaShared.dll
+|-- build_info.json
+`-- aila_runtime/
+    |-- AilaWorker.exe
+    |-- Aila.exe
+    `-- <oneAPI and other runtime DLLs>
+```
+
+For this layout, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before the host loads
+`AilaShared.dll`. Each initialized engine uses its own worker process. The worker
+starts in the selected directory with a child-only `PATH` containing that
+directory and Windows system directories. The host's DLL search path remains
+unchanged.
+
+Python and other embedding hosts must add only the directory containing the
+proxy to their DLL search path. Do not call
+`os.add_dll_directory("aila_runtime")`, and do not append `aila_runtime` to the
+host `PATH`; doing so mixes Aila's private oneAPI DLLs back into the host runtime.
+
+If the directory or `AilaWorker.exe` is missing, or if the worker does not match
+the proxy's protocol, ABI, or build identity, engine initialization fails with a
+diagnostic available through the C API. Worker failures are not automatically
+retried. Deploy `AilaShared.dll` and `AilaWorker.exe` from the same release.
+
+This variable controls the Windows proxy/worker architecture. Non-Windows builds
+continue to run inference in-process.
+
+---
+
 ## General
 
 | Variable | Type | Default | Description |

@@ -2,6 +2,68 @@
 
 The C API (`aila_api.h`) is the stable public interface for integrating Aila into any language with C FFI support. The shared library is `AilaShared.dll` (Windows).
 
+## Windows Runtime Isolation
+
+On Windows, `AilaShared.dll` is a lightweight C ABI proxy. It does not import the
+oneAPI inference runtime. When `aila_engine_init` succeeds, that engine owns a
+separate `AilaWorker.exe` worker process that loads the model and the oneAPI
+runtime. Destroying the engine shuts down its worker. Non-Windows builds retain
+the in-process implementation.
+
+The public function signatures and caller-visible allocation rules are unchanged.
+In particular, memory returned by Aila must still be released with the matching
+`aila_free_string`, `aila_free_samples`, or `aila_free_aligned_words` function.
+Do not free it with the host language's allocator.
+
+A recommended integration layout is:
+
+```text
+integration_root/
+|-- AilaShared.dll
+|-- build_info.json
+`-- aila_runtime/
+    |-- AilaWorker.exe
+    |-- Aila.exe
+    `-- <oneAPI and other runtime DLLs>
+```
+
+Set `AILA_RUNTIME_DLL_DIR=aila_runtime` before loading the proxy. A relative
+value is resolved **relative to AilaShared.dll**, not relative to the process
+working directory. An absolute directory is also accepted. The proxy normalizes
+the selected directory to an absolute path internally. If the variable is unset
+or empty, the proxy uses the directory containing `AilaShared.dll`; this supports
+the legacy flat layout where the proxy, worker, and runtime DLLs are colocated.
+
+Python hosts should expose only the directory containing `AilaShared.dll` to the
+host DLL loader:
+
+```python
+import ctypes
+import os
+
+os.environ["AILA_RUNTIME_DLL_DIR"] = "aila_runtime"
+lib = ctypes.CDLL(r".\AilaShared.dll")
+lib.aila_engine_create.restype = ctypes.c_void_p
+engine = lib.aila_engine_create()
+```
+
+Set the environment variable before `ctypes.CDLL`. Do **not** call
+`os.add_dll_directory("aila_runtime")` and do not add `aila_runtime` to the host
+`PATH`: either action exposes the private oneAPI runtime to Python and defeats
+the isolation. If the proxy itself is elsewhere, adding its directory with
+`os.add_dll_directory` is acceptable; the runtime directory is not.
+
+The child starts with its working directory set to the runtime directory and an
+isolated `PATH` containing that directory plus Windows system directories. At
+startup the proxy verifies the protocol, public ABI, build identity, executable
+path, runtime directory, and child `PATH`. `aila_engine_init` reports missing
+`AilaWorker.exe`, launch errors, handshake/build ID mismatch, timeout, and early
+worker exit through `aila_last_error_code` and `aila_last_error_message`. A
+failed or crashed worker is torn down; the proxy does not automatically retry an
+operation. Callers may handle the error and explicitly initialize again where
+their own recovery policy permits. Always deploy the proxy and worker from the
+same release; cross-version worker compatibility is not promised.
+
 ## Quick Example
 
 ```c
@@ -946,8 +1008,8 @@ Returns the library version string (e.g. `"0.1.0"`). The pointer is static and m
 ```python
 import ctypes, json, os
 
-os.add_dll_directory("./build")
-lib = ctypes.cdll.LoadLibrary("./build/AilaShared.dll")
+os.environ["AILA_RUNTIME_DLL_DIR"] = "aila_runtime"
+lib = ctypes.CDLL(r".\AilaShared.dll")
 
 # Define AilaGenConfig
 class AilaGenConfig(ctypes.Structure):
