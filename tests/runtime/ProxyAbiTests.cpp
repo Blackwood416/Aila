@@ -464,11 +464,24 @@ struct TokenStreamCapture {
     std::vector<std::string> tokens;
     bool abort_first = false;
     bool wrong_thread = false;
+    const Api* reentrant_api = nullptr;
+    AilaEngine* reentrant_engine = nullptr;
+    int reentrant_error_code = -999;
+    int reentrant_context_length = -999;
+    bool did_reentrant_check = false;
 };
 
 int capture_token(const char* token, void* opaque) {
     auto& capture = *static_cast<TokenStreamCapture*>(opaque);
     capture.wrong_thread = capture.wrong_thread || std::this_thread::get_id() != capture.caller;
+    if (capture.reentrant_api && capture.reentrant_engine &&
+        !capture.did_reentrant_check) {
+        capture.did_reentrant_check = true;
+        capture.reentrant_error_code =
+            capture.reentrant_api->last_error_code(capture.reentrant_engine);
+        capture.reentrant_context_length =
+            capture.reentrant_api->context_length(capture.reentrant_engine);
+    }
     capture.tokens.emplace_back(token ? token : "<NULL>");
     return capture.abort_first && capture.tokens.size() == 1 ? 1 : 0;
 }
@@ -505,9 +518,15 @@ int capture_structured(const AilaChatStreamEvent* event, void* opaque) {
 
 void verify_streaming_generation(const Api& api, AilaEngine* engine) {
     TokenStreamCapture tokens{std::this_thread::get_id()};
+    tokens.reentrant_api = &api;
+    tokens.reentrant_engine = engine;
     expect(api.generate_stream(engine, u8"流式", nullptr, capture_token, &tokens) == 0,
            "token stream failed");
     expect(!tokens.wrong_thread, "token callback did not run on caller thread");
+    expect(tokens.reentrant_error_code == AILA_OK,
+           "reentrant last_error_code could not observe stream state");
+    expect(tokens.reentrant_context_length == 0,
+           "reentrant context_length did not fail promptly as busy");
     expect(tokens.tokens == std::vector<std::string>({"first", u8" 第二"}),
            "token event order or bytes changed");
 

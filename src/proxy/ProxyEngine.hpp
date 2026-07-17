@@ -71,8 +71,10 @@ private:
         std::string payload_json,
         AilaTokenCallback token_callback,
         AilaChatStreamCallback structured_callback,
-        void* user_data);
+        void* user_data,
+        std::unique_lock<std::mutex>& engine_lock);
     void set_error_locked(int code, std::string message);
+    void set_stream_busy_error_locked();
     void clear_error_locked();
     void shutdown_locked() noexcept;
 
@@ -80,6 +82,7 @@ private:
     runtime::WorkerProcess worker_;
     uint64_t next_request_id_ = 1;
     bool initialized_ = false;
+    bool stream_active_ = false;
     int error_code_ = 0;
     std::string error_message_;
 };

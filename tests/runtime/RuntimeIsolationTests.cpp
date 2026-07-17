@@ -743,6 +743,33 @@ void test_worker_stream_preserves_unrelated_log_events() {
     process.shutdown(2s);
 }
 
+void test_event_transport_rejects_invalid_protocol_and_abi() {
+    constexpr const char* name = "event transport rejects invalid protocol and ABI";
+    for (const char* method : {"test.invalid-event-protocol", "test.invalid-event-abi"}) {
+        TempDirectory temp;
+        const fs::path worker = stage_fake_worker(temp);
+        aila::runtime::WorkerProcess process;
+        process.start(temp.path(), worker, expected_fake_handshake());
+        const auto started = std::chrono::steady_clock::now();
+        const std::string error = expect_runtime_error(
+            [&] { (void)process.request(request_frame(61, method), 2s); }, name);
+        expect(std::chrono::steady_clock::now() - started < 1s,
+               name,
+               "invalid event did not fail transport promptly");
+        expect(error.find("event") != std::string::npos,
+               name,
+               "invalid event error was not actionable: " + error);
+        for (const auto& queued : process.take_events()) {
+            expect(queued.header.protocol == aila::ipc::kProtocolVersion &&
+                       queued.header.abi == aila::ipc::kPublicAbiVersion,
+                   name,
+                   "invalid event escaped through take_events");
+        }
+        expect(!process.healthy(), name, "invalid event left worker healthy");
+        process.shutdown(500ms);
+    }
+}
+
 void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
     constexpr const char* name = "worker graceful shutdown";
     const DWORD handles_before = process_handle_count();
@@ -1021,6 +1048,7 @@ int main() {
         test_worker_start_isolates_process_context_and_queues_events();
         test_worker_request_framing_is_repeatable();
         test_worker_stream_preserves_unrelated_log_events();
+        test_event_transport_rejects_invalid_protocol_and_abi();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
         test_worker_crash_fails_request_without_hanging();
         test_worker_blocked_write_obeys_request_deadline();

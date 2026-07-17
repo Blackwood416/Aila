@@ -448,6 +448,8 @@ struct WorkerProcess::Impl {
     std::mutex event_mutex;
     std::condition_variable event_condition;
     std::vector<ipc::Frame> events;
+    bool stop_event_thread = false;
+    std::string event_transport_error;
     ExpectedHandshake expected;
     mutable std::optional<DWORD> cached_exit_code;
     std::string error;
@@ -512,23 +514,87 @@ struct WorkerProcess::Impl {
     }
 
     [[noreturn]] void fail(std::string message) {
+        {
+            std::lock_guard<std::mutex> lock(event_mutex);
+            if (!event_transport_error.empty()) {
+                message = event_transport_error + "; " + message;
+            }
+        }
         message = exit_diagnostic(std::move(message), 200);
         set_error(message);
         throw std::runtime_error(message);
     }
 
-    void event_loop() noexcept {
-        for (;;) {
-            ipc::Frame frame;
-            std::string read_error;
-            if (!ipc::read_frame(event_read.get(), frame, read_error)) {
-                return;
-            }
+    static bool is_unrelated_log(const ipc::Frame& frame) noexcept {
+        return frame.header.kind == "event" && frame.header.method == "log" &&
+            frame.header.request_id == 0;
+    }
+
+    void fail_event_transport(std::string message) noexcept {
+        try {
             {
                 std::lock_guard<std::mutex> lock(event_mutex);
-                events.push_back(std::move(frame));
+                event_transport_error = message;
+                stop_event_thread = true;
             }
-            event_condition.notify_all();
+            set_error(message);
+        } catch (...) {
+        }
+        terminate_active_process(ERROR_BAD_FORMAT);
+        event_condition.notify_all();
+    }
+
+    void event_loop() noexcept {
+        try {
+            constexpr size_t kMaxQueuedEvents = 1024;
+            for (;;) {
+                ipc::Frame frame;
+                std::string read_error;
+                if (!ipc::read_frame(event_read.get(), frame, read_error)) {
+                    return;
+                }
+                if (frame.header.protocol != expected.protocol ||
+                    frame.header.abi != expected.abi) {
+                    fail_event_transport(
+                        "worker event frame protocol or ABI did not match the handshake");
+                    return;
+                }
+
+                std::unique_lock<std::mutex> lock(event_mutex);
+                if (stop_event_thread) {
+                    return;
+                }
+                while (events.size() >= kMaxQueuedEvents) {
+                    const auto log = std::find_if(
+                        events.begin(), events.end(),
+                        [](const ipc::Frame& queued) { return is_unrelated_log(queued); });
+                    if (log != events.end()) {
+                        events.erase(log);
+                        break;
+                    }
+                    if (is_unrelated_log(frame)) {
+                        lock.unlock();
+                        event_condition.notify_all();
+                        break;
+                    }
+                    event_condition.wait(lock, [&] {
+                        return stop_event_thread || events.size() < kMaxQueuedEvents;
+                    });
+                    if (stop_event_thread) {
+                        return;
+                    }
+                }
+                if (lock.owns_lock() && events.size() < kMaxQueuedEvents) {
+                    events.push_back(std::move(frame));
+                    lock.unlock();
+                    event_condition.notify_all();
+                }
+            }
+        } catch (const std::exception& exception) {
+            fail_event_transport(
+                std::string("worker event transport failed: ") + exception.what());
+        } catch (...) {
+            fail_event_transport("worker event transport failed with an unknown exception");
         }
     }
 
@@ -749,6 +815,12 @@ struct WorkerProcess::Impl {
     void cleanup(bool force, DWORD forced_exit_code) noexcept {
         command_write.reset();
 
+        {
+            std::lock_guard<std::mutex> lock(event_mutex);
+            stop_event_thread = true;
+        }
+        event_condition.notify_all();
+
         HANDLE process_handle = nullptr;
         {
             std::lock_guard<std::mutex> lock(state_mutex);
@@ -912,6 +984,8 @@ void WorkerProcess::start(
         {
             std::lock_guard<std::mutex> event_lock(impl_->event_mutex);
             impl_->events.clear();
+            impl_->stop_event_thread = false;
+            impl_->event_transport_error.clear();
         }
         {
             std::lock_guard<std::mutex> state_lock(impl_->state_mutex);
@@ -998,18 +1072,38 @@ ipc::Frame WorkerProcess::request_stream(
     };
     const auto response_state = std::make_shared<ResponseState>();
     std::thread response_thread([implementation = impl_.get(), response_state, deadline] {
+        ipc::Frame response;
+        std::exception_ptr failure;
         try {
-            response_state->response =
-                implementation->read_response(deadline, "worker stream request");
+            response = implementation->read_response(deadline, "worker stream request");
         } catch (...) {
-            response_state->failure = std::current_exception();
+            failure = std::current_exception();
         }
         {
             std::lock_guard<std::mutex> lock(response_state->mutex);
+            response_state->response = std::move(response);
+            response_state->failure = std::move(failure);
             response_state->done = true;
         }
         response_state->condition.notify_all();
     });
+    struct ResponseThreadGuard {
+        std::thread& thread;
+        Impl* implementation;
+
+        ~ResponseThreadGuard() noexcept {
+            if (thread.joinable()) {
+                implementation->terminate_active_process(ERROR_OPERATION_ABORTED);
+                thread.join();
+            }
+        }
+
+        void join() {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } response_thread_guard{response_thread, impl_.get()};
 
     bool saw_end = false;
     bool sent_cancel = false;
@@ -1038,6 +1132,7 @@ ipc::Frame WorkerProcess::request_stream(
                 }
             }
         }
+        impl_->event_condition.notify_all();
         for (const ipc::Frame& event : matching) {
             ++observed_event_count;
             try {
@@ -1130,7 +1225,7 @@ ipc::Frame WorkerProcess::request_stream(
         impl_->event_condition.wait_for(lock, std::chrono::milliseconds(10));
     }
 
-    response_thread.join();
+    response_thread_guard.join();
     if (callback_failure) {
         std::rethrow_exception(callback_failure);
     }
@@ -1167,6 +1262,7 @@ std::vector<ipc::Frame> WorkerProcess::take_events() {
     std::lock_guard<std::mutex> lock(impl_->event_mutex);
     std::vector<ipc::Frame> result;
     result.swap(impl_->events);
+    impl_->event_condition.notify_all();
     return result;
 }
 
@@ -1222,6 +1318,11 @@ void WorkerProcess::shutdown(std::chrono::milliseconds timeout) {
     }
 
     if (impl_->event_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> event_lock(impl_->event_mutex);
+            impl_->stop_event_thread = true;
+        }
+        impl_->event_condition.notify_all();
         (void)CancelSynchronousIo(impl_->event_thread.native_handle());
         impl_->event_thread.join();
     }

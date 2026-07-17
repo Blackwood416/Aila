@@ -161,6 +161,10 @@ ProxyEngine::~ProxyEngine() noexcept {
 
 bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return false;
+    }
     if (initialized_) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is already initialized");
         return false;
@@ -221,6 +225,10 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
 
 void ProxyEngine::reset_context() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return;
+    }
     if (!initialized_) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
         return;
@@ -241,6 +249,10 @@ void ProxyEngine::reset_context() {
 
 int ProxyEngine::context_length() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return 0;
+    }
     if (!initialized_) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
         return 0;
@@ -277,6 +289,10 @@ bool ProxyEngine::generate_text(
     const AilaGenConfig* config,
     std::string& output) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return false;
+    }
     if (!initialized_) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
         return false;
@@ -312,6 +328,10 @@ bool ProxyEngine::generate_text_v2(
     const AilaGenConfigV2* config,
     std::string& output) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return false;
+    }
     if (!initialized_) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
         return false;
@@ -353,7 +373,11 @@ int ProxyEngine::generate_stream(
     const AilaGenConfig* config,
     AilaTokenCallback callback,
     void* user_data) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return -1;
+    }
     if (!initialized_ || !callback) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT,
                          !initialized_ ? "engine is not initialized" : "stream callback must not be NULL");
@@ -364,19 +388,25 @@ int ProxyEngine::generate_stream(
                          "stream input must be C-string-safe valid UTF-8");
         return -1;
     }
+    stream_active_ = true;
     try {
-        return stream_payload_locked(
+        const int result = stream_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
                 ",\"config\":" + legacy_config_json(config) + "}",
             callback,
             nullptr,
-            user_data);
+            user_data,
+            lock);
+        stream_active_ = false;
+        return result;
     } catch (const std::exception& exception) {
+        stream_active_ = false;
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, exception.what());
         return -1;
     } catch (...) {
+        stream_active_ = false;
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, "unknown proxy streaming failure");
         return -1;
@@ -389,7 +419,11 @@ int ProxyEngine::generate_stream_v2(
     const AilaGenConfigV2* config,
     AilaChatStreamCallback callback,
     void* user_data) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return -1;
+    }
     if (!initialized_ || !callback) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT,
                          !initialized_ ? "engine is not initialized" : "stream callback must not be NULL");
@@ -405,19 +439,25 @@ int ProxyEngine::generate_stream_v2(
                          "stream input must be C-string-safe valid UTF-8");
         return -1;
     }
+    stream_active_ = true;
     try {
-        return stream_payload_locked(
+        const int result = stream_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
                 ",\"config\":" + v2_config_json(config) + "}",
             nullptr,
             callback,
-            user_data);
+            user_data,
+            lock);
+        stream_active_ = false;
+        return result;
     } catch (const std::exception& exception) {
+        stream_active_ = false;
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, exception.what());
         return -1;
     } catch (...) {
+        stream_active_ = false;
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, "unknown proxy structured streaming failure");
         return -1;
@@ -436,11 +476,19 @@ const char* ProxyEngine::last_error_message() const {
 
 void ProxyEngine::record_invalid_argument(std::string message) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return;
+    }
     set_error_locked(AILA_ERR_INVALID_ARGUMENT, std::move(message));
 }
 
 void ProxyEngine::record_runtime_error(std::string message) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_) {
+        set_stream_busy_error_locked();
+        return;
+    }
     set_error_locked(AILA_ERR_RUNTIME, std::move(message));
 }
 
@@ -588,7 +636,8 @@ int ProxyEngine::stream_payload_locked(
     std::string payload_json,
     AilaTokenCallback token_callback,
     AilaChatStreamCallback structured_callback,
-    void* user_data) {
+    void* user_data,
+    std::unique_lock<std::mutex>& engine_lock) {
     ipc::Frame request;
     request.header.protocol = ipc::kProtocolVersion;
     request.header.abi = ipc::kPublicAbiVersion;
@@ -654,7 +703,18 @@ int ProxyEngine::stream_payload_locked(
                 if (!simdjson::validate_utf8(token)) {
                     throw malformed_response("token stream event was not valid UTF-8");
                 }
-                if (!aborted && token_callback(token.c_str(), user_data) != 0) {
+                int callback_result = 0;
+                if (!aborted) {
+                    engine_lock.unlock();
+                    try {
+                        callback_result = token_callback(token.c_str(), user_data);
+                    } catch (...) {
+                        engine_lock.lock();
+                        throw;
+                    }
+                    engine_lock.lock();
+                }
+                if (!aborted && callback_result != 0) {
                     aborted = true;
                     return runtime::WorkerProcess::StreamEventAction::Cancel;
                 }
@@ -702,7 +762,18 @@ int ProxyEngine::stream_payload_locked(
             abi_event.finish_reason = finish_reason ? finish_reason->c_str() : nullptr;
             abi_event.warnings_json = warnings_json ? warnings_json->c_str() : nullptr;
             abi_event.tool_calls_json = tool_calls_json ? tool_calls_json->c_str() : nullptr;
-            if (!aborted && structured_callback(&abi_event, user_data) != 0) {
+            int callback_result = 0;
+            if (!aborted) {
+                engine_lock.unlock();
+                try {
+                    callback_result = structured_callback(&abi_event, user_data);
+                } catch (...) {
+                    engine_lock.lock();
+                    throw;
+                }
+                engine_lock.lock();
+            }
+            if (!aborted && callback_result != 0) {
                 aborted = true;
                 return runtime::WorkerProcess::StreamEventAction::Cancel;
             }
@@ -743,6 +814,12 @@ int ProxyEngine::stream_payload_locked(
 void ProxyEngine::set_error_locked(int code, std::string message) {
     error_code_ = code;
     error_message_ = std::move(message);
+}
+
+void ProxyEngine::set_stream_busy_error_locked() {
+    set_error_locked(
+        AILA_ERR_INVALID_ARGUMENT,
+        "engine operation is unavailable while a streaming callback is active");
 }
 
 void ProxyEngine::clear_error_locked() {

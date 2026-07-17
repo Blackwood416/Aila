@@ -312,6 +312,10 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
         uint64_t event_count = 0;
         auto can_emit = [&] { return !cancelled.load(std::memory_order_acquire) && !emitter_failed; };
         auto emit_counted = [&](const ipc::Frame& event) {
+            if (!detail::stream_data_event_can_emit(event_count)) {
+                emitter_failed = true;
+                return false;
+            }
             if (!emit(event)) return false;
             ++event_count;
             return true;

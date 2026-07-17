@@ -369,6 +369,22 @@ int run(const Handles& handles) {
             response.header.payload_json = inspection_payload();
             response.attachment.clear();
         }
+        if (command.header.method == "test.invalid-event-protocol" ||
+            command.header.method == "test.invalid-event-abi") {
+            aila::ipc::Frame invalid;
+            invalid.header.kind = "event";
+            invalid.header.method = "log";
+            invalid.header.payload_json = R"({"message":"invalid transport event"})";
+            if (command.header.method == "test.invalid-event-protocol") {
+                ++invalid.header.protocol;
+            } else {
+                ++invalid.header.abi;
+            }
+            send_frame(handles.event_write, invalid);
+            Sleep(500);
+            response.header.payload_json = "{\"unexpected\":true}";
+            response.attachment.clear();
+        }
         if (command.header.method == "engine.init") {
             if (initialized) {
                 send_frame(

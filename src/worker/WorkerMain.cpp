@@ -462,7 +462,10 @@ int run(const Handles& handles) {
                     [&](const aila::ipc::Frame& stream_event) {
                         send_frame(handles.event_write.get(), stream_event);
                         ++emitted_event_count;
-                        return !cancelled.load(std::memory_order_acquire);
+                        // A successfully written event must be counted even if a cancel
+                        // arrives immediately afterwards. The dispatcher checks the
+                        // cancellation flag again after this emitter returns.
+                        return true;
                     },
                     cancelled);
                 finished.store(true, std::memory_order_release);

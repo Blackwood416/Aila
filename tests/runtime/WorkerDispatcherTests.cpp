@@ -694,6 +694,20 @@ void test_stream_dispatcher_emits_correlated_token_and_structured_events() {
            name, "cancelled eventCount omitted terminal event");
 }
 
+void test_stream_event_limit_reserves_terminal_slot() {
+    constexpr const char* name = "stream event limit reserves terminal slot";
+    expect(
+        aila::worker::detail::stream_data_event_can_emit(
+            aila::ipc::kMaxStreamEventCount - 2),
+        name,
+        "last legal data event was rejected");
+    expect(
+        !aila::worker::detail::stream_data_event_can_emit(
+            aila::ipc::kMaxStreamEventCount - 1),
+        name,
+        "data event consumed the reserved terminal slot");
+}
+
 } // namespace
 
 int main() {
@@ -712,6 +726,7 @@ int main() {
         test_generation_rejects_malformed_payload_before_adapter();
         test_generation_propagates_adapter_error_and_rejects_embedded_nul_output();
         test_stream_dispatcher_emits_correlated_token_and_structured_events();
+        test_stream_event_limit_reserves_terminal_slot();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

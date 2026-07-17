@@ -11,6 +11,14 @@
 
 namespace aila::worker {
 
+namespace detail {
+
+inline constexpr bool stream_data_event_can_emit(uint64_t emitted_data_events) noexcept {
+    return emitted_data_events < ipc::kMaxStreamEventCount - 1;
+}
+
+} // namespace detail
+
 enum class TextGenerationMethod {
     Generate,
     GenerateMessages,
