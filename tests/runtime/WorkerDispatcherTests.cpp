@@ -126,6 +126,7 @@ struct EngineState {
     std::string last_error_message;
     std::string model;
     int max_seq_len = 0;
+    int log_level = -1;
     bool throw_on_context_length = false;
     int generate_calls = 0;
     bool generate_result = true;
@@ -173,6 +174,7 @@ public:
 
     int last_error_code() const override { return state_.last_error_code; }
     std::string last_error_message() const override { return state_.last_error_message; }
+    void set_log_level(int level) override { state_.log_level = level; }
 
     bool generate_text(
         const TextGenerationRequest& request,
@@ -1107,6 +1109,30 @@ void test_alignment_wire_methods_validate_and_preserve_inputs() {
            name, "invalid UTF-8 adapter result succeeded");
 }
 
+void test_log_level_command_validates_and_applies_level() {
+    constexpr const char* name = "log level command validates and applies level";
+    EngineState state;
+    int destruction_count = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destruction_count));
+    bool should_shutdown = false;
+
+    const Frame accepted = dispatcher.dispatch(
+        request(400, "log.set_level", R"({"level":2})"), should_shutdown);
+    expect_response_identity(accepted, request(400, "log.set_level", R"({"level":2})"),
+                             "result", name);
+    expect(payload_boolean(accepted, "ok", name), name, "accepted level was not acknowledged");
+    expect(state.log_level == 2, name, "accepted level was not applied to the engine");
+
+    for (const char* payload : {R"({"level":-1})", R"({"level":4})",
+                                R"({"level":"info"})", R"({"level":2,"extra":true})"}) {
+        const Frame rejected = dispatcher.dispatch(
+            request(401, "log.set_level", payload), should_shutdown);
+        expect(rejected.header.kind == "error" &&
+                   payload_integer(rejected, "code", name) == AILA_ERR_INVALID_ARGUMENT,
+               name, "invalid log level payload was accepted");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1130,6 +1156,7 @@ int main() {
         test_audio_wire_methods_validate_and_preserve_binary_arguments();
         test_tts_stream_emits_typed_audio_chunks();
         test_alignment_wire_methods_validate_and_preserve_inputs();
+        test_log_level_command_validates_and_applies_level();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

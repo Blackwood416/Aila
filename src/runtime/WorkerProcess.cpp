@@ -450,6 +450,8 @@ struct WorkerProcess::Impl {
     std::vector<ipc::Frame> events;
     bool stop_event_thread = false;
     std::string event_transport_error;
+    std::mutex log_handler_mutex;
+    WorkerProcess::LogHandler log_handler;
     ExpectedHandshake expected;
     mutable std::optional<DWORD> cached_exit_code;
     std::string error;
@@ -530,6 +532,42 @@ struct WorkerProcess::Impl {
             frame.header.request_id == 0;
     }
 
+    bool dispatch_log(const ipc::Frame& frame) {
+        if (!is_unrelated_log(frame)) return false;
+        if (!frame.attachment.empty()) {
+            throw std::runtime_error("worker log event must not contain an attachment");
+        }
+        simdjson::dom::parser parser;
+        simdjson::dom::element root;
+        simdjson::dom::object object;
+        int64_t level = -1;
+        std::string_view message;
+        if (parser.parse(frame.header.payload_json).get(root) != simdjson::SUCCESS ||
+            root.get_object().get(object) != simdjson::SUCCESS ||
+            object["level"].get_int64().get(level) != simdjson::SUCCESS ||
+            level < 0 || level > 3 ||
+            object["message"].get_string().get(message) != simdjson::SUCCESS ||
+            message.find('\0') != std::string_view::npos ||
+            !simdjson::validate_utf8(message)) {
+            throw std::runtime_error("worker log event schema was invalid");
+        }
+        size_t fields = 0;
+        for (auto field : object) { (void)field; ++fields; }
+        if (fields != 2) {
+            throw std::runtime_error("worker log event contained extra fields");
+        }
+        WorkerProcess::LogHandler handler;
+        {
+            std::lock_guard<std::mutex> lock(log_handler_mutex);
+            handler = log_handler;
+        }
+        if (handler) {
+            try { handler(static_cast<int>(level), message); } catch (...) {}
+            return true;
+        }
+        return false;
+    }
+
     void fail_event_transport(std::string message) noexcept {
         try {
             {
@@ -558,6 +596,14 @@ struct WorkerProcess::Impl {
                     fail_event_transport(
                         "worker event frame protocol or ABI did not match the handshake");
                     return;
+                }
+                if (frame.header.method == "log" && !is_unrelated_log(frame)) {
+                    fail_event_transport(
+                        "worker log event identity must use request ID zero and event kind");
+                    return;
+                }
+                if (is_unrelated_log(frame) && dispatch_log(frame)) {
+                    continue;
                 }
 
                 std::unique_lock<std::mutex> lock(event_mutex);
@@ -1323,6 +1369,11 @@ std::vector<ipc::Frame> WorkerProcess::take_events() {
     result.swap(impl_->events);
     impl_->event_condition.notify_all();
     return result;
+}
+
+void WorkerProcess::set_log_handler(LogHandler handler) {
+    std::lock_guard<std::mutex> lock(impl_->log_handler_mutex);
+    impl_->log_handler = std::move(handler);
 }
 
 void WorkerProcess::shutdown(std::chrono::milliseconds timeout) {

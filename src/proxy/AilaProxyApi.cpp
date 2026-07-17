@@ -1,10 +1,12 @@
 #include "aila_api.h"
 
 #include "proxy/ProxyEngine.hpp"
+#include "proxy/ProxyLogging.hpp"
 #include "simdjson.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -49,10 +51,33 @@ namespace {
 constexpr const char* kVersion = "0.1.6";
 constexpr const char* kEmpty = "";
 
-std::mutex log_mutex;
-AilaLogCallback log_callback = nullptr;
-void* log_user_data = nullptr;
-int log_level = 1;
+std::mutex engine_registry_mutex;
+std::vector<std::weak_ptr<aila::proxy::ProxyEngine>> engine_registry;
+
+void register_engine(const std::shared_ptr<aila::proxy::ProxyEngine>& engine) {
+    std::lock_guard<std::mutex> lock(engine_registry_mutex);
+    engine_registry.erase(
+        std::remove_if(
+            engine_registry.begin(), engine_registry.end(),
+            [](const auto& entry) { return entry.expired(); }),
+        engine_registry.end());
+    engine_registry.emplace_back(engine);
+}
+
+std::vector<std::shared_ptr<aila::proxy::ProxyEngine>> live_engines() {
+    std::vector<std::shared_ptr<aila::proxy::ProxyEngine>> result;
+    std::lock_guard<std::mutex> lock(engine_registry_mutex);
+    auto iterator = engine_registry.begin();
+    while (iterator != engine_registry.end()) {
+        if (auto engine = iterator->lock()) {
+            result.push_back(std::move(engine));
+            ++iterator;
+        } else {
+            iterator = engine_registry.erase(iterator);
+        }
+    }
+    return result;
+}
 
 void record_boundary_failure(AilaEngine* engine, const char* operation) noexcept {
     if (!engine) {
@@ -209,7 +234,9 @@ AILA_API const char* aila_version(void) {
 
 AILA_API AilaEngine* aila_engine_create(void) {
     try {
-        return new AilaEngine();
+        std::unique_ptr<AilaEngine> engine(new AilaEngine());
+        register_engine(engine->proxy);
+        return engine.release();
     } catch (...) {
         return nullptr;
     }
@@ -864,21 +891,16 @@ AILA_API void aila_free_aligned_words(AilaAlignedWord* words, int count) {
 }
 
 AILA_API void aila_set_log_callback(AilaLogCallback callback, void* user_data) {
-    try {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        log_callback = callback;
-        log_user_data = user_data;
-    } catch (...) {
-    }
+    aila::proxy::logging::set_callback(callback, user_data);
 }
 
 AILA_API void aila_set_log_level(int level) {
     if (level < 0 || level > 3) {
         return;
     }
+    aila::proxy::logging::set_level(level);
     try {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        log_level = level;
-    } catch (...) {
-    }
+        const auto engines = live_engines();
+        for (const auto& engine : engines) engine->set_log_level(level);
+    } catch (...) {}
 }

@@ -125,6 +125,7 @@ public:
     virtual int context_length() const = 0;
     virtual int last_error_code() const = 0;
     virtual std::string last_error_message() const = 0;
+    virtual void set_log_level(int level) = 0;
     virtual bool generate_text(
         const TextGenerationRequest& request,
         std::string& output) = 0;

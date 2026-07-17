@@ -346,7 +346,7 @@ int run(const Handles& handles) {
     aila::ipc::Frame event;
     event.header.kind = "event";
     event.header.method = "log";
-    event.header.payload_json = "{\"message\":\"fake worker ready\"}";
+    event.header.payload_json = "{\"level\":1,\"message\":\"fake worker ready\"}";
     send_frame(handles.event_write, event);
 
     if (environment_value(L"AILA_FAKE_WORKER_MODE") == L"stop-reading") {
@@ -356,6 +356,7 @@ int run(const Handles& handles) {
 
     bool initialized = false;
     int context_length = 0;
+    int log_level = 1;
     struct AsrStreamState {
         bool active = true;
         bool expect_floats = false;
@@ -402,6 +403,25 @@ int run(const Handles& handles) {
             response.header.payload_json = "{\"unexpected\":true}";
             response.attachment.clear();
         }
+        if (command.header.method == "test.log") {
+            aila::ipc::Frame log;
+            log.header.kind = "event";
+            log.header.method = "log";
+            log.header.payload_json = R"({"level":2,"message":"worker warning"})";
+            send_frame(handles.event_write, log);
+            response.header.payload_json = "{\"ok\":true}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "test.malformed-log") {
+            aila::ipc::Frame log;
+            log.header.kind = "event";
+            log.header.method = "log";
+            log.header.payload_json = R"({"level":1,"message":"bad","extra":true})";
+            send_frame(handles.event_write, log);
+            Sleep(500);
+            response.header.payload_json = "{\"unexpected\":true}";
+            response.attachment.clear();
+        }
         if (command.header.method == "engine.init") {
             if (initialized) {
                 send_frame(
@@ -438,6 +458,21 @@ int run(const Handles& handles) {
             response.header.payload_json =
                 std::string("{\"contextLength\":") +
                 std::to_string(context_length) + "}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "log.set_level") {
+            simdjson::dom::parser parser;
+            simdjson::dom::element payload;
+            int64_t level = -1;
+            if (parser.parse(command.header.payload_json).get(payload) != simdjson::SUCCESS ||
+                payload["level"].get_int64().get(level) != simdjson::SUCCESS ||
+                level < 0 || level > 3) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "invalid log level"));
+                continue;
+            }
+            log_level = static_cast<int>(level);
+            response.header.payload_json = "{\"ok\":true}";
             response.attachment.clear();
         }
         if (command.header.method == "asr.transcribe") {
@@ -799,6 +834,30 @@ int run(const Handles& handles) {
                     lifecycle_error(command, 5, "synthetic generation failure"));
                 continue;
             }
+            if (command.header.payload_json.find("__aila_logs__") != std::string::npos) {
+                constexpr const char* messages[] = {
+                    "debug message", "info message", "warning message", "error message"};
+                for (int level = log_level; level <= 3; ++level) {
+                    aila::ipc::Frame log;
+                    log.header.kind = "event";
+                    log.header.method = "log";
+                    log.header.payload_json =
+                        std::string("{\"level\":") + std::to_string(level) +
+                        ",\"message\":" + json_string(messages[level]) + "}";
+                    send_frame(handles.event_write, log);
+                }
+            }
+            if (command.header.payload_json.find("__aila_log_flood__") != std::string::npos) {
+                for (int index = 0; index != 512; ++index) {
+                    aila::ipc::Frame log;
+                    log.header.kind = "event";
+                    log.header.method = "log";
+                    log.header.payload_json =
+                        std::string("{\"level\":3,\"message\":\"flood-") +
+                        std::to_string(index) + "\"}";
+                    send_frame(handles.event_write, log);
+                }
+            }
             if (command.header.payload_json.find("__aila_malformed_attachment__") !=
                 std::string::npos) {
                 const std::string malformed("left\0right", 10);
@@ -920,6 +979,9 @@ int run(const Handles& handles) {
         }
         send_frame(handles.response_write, response);
         if (command.header.method == "shutdown") {
+            if (environment_value(L"AILA_FAKE_WORKER_MODE") == L"ignore-shutdown") {
+                Sleep(3000);
+            }
             return 0;
         }
     }

@@ -711,6 +711,27 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
             return result(request, "{\"pong\":true}");
         }
 
+        if (request.header.method == "log.set_level") {
+            simdjson::dom::object object;
+            int64_t level = -1;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["level"].get_int64().get(level) != simdjson::SUCCESS ||
+                level < 0 || level > 3) {
+                return error(
+                    request, AILA_ERR_INVALID_ARGUMENT,
+                    "log.set_level requires an integer level from 0 through 3");
+            }
+            size_t fields = 0;
+            for (auto field : object) { (void)field; ++fields; }
+            if (fields != 1) {
+                return error(
+                    request, AILA_ERR_INVALID_ARGUMENT,
+                    "log.set_level payload contained extra fields");
+            }
+            engine_->set_log_level(static_cast<int>(level));
+            return result(request, "{\"ok\":true}");
+        }
+
         if (request.header.method == "engine.init") {
             if (initialized_) {
                 return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is already initialized");

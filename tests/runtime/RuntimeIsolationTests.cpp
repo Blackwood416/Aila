@@ -7,6 +7,7 @@
 #include "simdjson.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <mutex>
 
 namespace {
 
@@ -770,6 +772,43 @@ void test_event_transport_rejects_invalid_protocol_and_abi() {
     }
 }
 
+void test_worker_log_handler_receives_valid_logs_and_rejects_malformed_logs() {
+    constexpr const char* name = "worker log event validation";
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    std::mutex capture_mutex;
+    std::vector<std::pair<int, std::string>> captured;
+    process.set_log_handler([&](int level, std::string_view message) {
+        std::lock_guard<std::mutex> lock(capture_mutex);
+        captured.emplace_back(level, message);
+    });
+    process.start(temp.path(), worker, expected_fake_handshake());
+    (void)process.request(request_frame(64, "test.log"), 2s);
+    for (int attempt = 0; attempt != 100; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lock(capture_mutex);
+            if (captured.size() >= 2) break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    {
+        std::lock_guard<std::mutex> lock(capture_mutex);
+        expect(captured.size() == 2, name, "valid log events were not delivered");
+        expect(captured[0] == std::pair<int, std::string>{1, "fake worker ready"},
+               name, "ready log changed");
+        expect(captured[1] == std::pair<int, std::string>{2, "worker warning"},
+               name, "warning log changed");
+    }
+
+    const std::string error = expect_runtime_error(
+        [&] { (void)process.request(request_frame(65, "test.malformed-log"), 2s); }, name);
+    expect(error.find("log") != std::string::npos, name,
+           "malformed log diagnostic was not actionable: " + error);
+    expect(!process.healthy(), name, "malformed log left worker healthy");
+    process.shutdown(500ms);
+}
+
 void test_stream_timeout_during_slow_callback_is_bounded() {
     constexpr const char* name = "stream timeout during slow callback";
     TempDirectory temp;
@@ -880,6 +919,29 @@ void test_worker_shutdown_is_bounded_idempotent_and_leak_free() {
         process_handle_count() == destructor_handles_before,
         name,
         "destructor leaked a process, thread, or pipe handle");
+}
+
+void test_worker_shutdown_escalates_when_worker_ignores_request() {
+    constexpr const char* name = "worker ignored shutdown escalation";
+    EnvironmentRestore mode_restore(L"AILA_FAKE_WORKER_MODE");
+    expect(SetEnvironmentVariableW(L"AILA_FAKE_WORKER_MODE", L"ignore-shutdown") != FALSE,
+           name, "could not configure fake worker mode");
+    const DWORD handles_before = process_handle_count();
+    {
+        TempDirectory temp;
+        const fs::path worker = stage_fake_worker(temp);
+        aila::runtime::WorkerProcess process;
+        process.start(temp.path(), worker, expected_fake_handshake());
+        const auto started = std::chrono::steady_clock::now();
+        process.shutdown(200ms);
+        expect(std::chrono::steady_clock::now() - started < 2s,
+               name, "ignored shutdown exceeded its escalation bound");
+        expect(process.exit_code().has_value(), name, "forced exit code was not retained");
+        expect(process.last_error().find("timed out") != std::string::npos,
+               name, "shutdown timeout diagnostic was not actionable");
+    }
+    expect(process_handle_count() == handles_before, name,
+           "ignored shutdown escalation leaked handles");
 }
 
 void test_worker_crash_fails_request_without_hanging() {
@@ -1121,9 +1183,11 @@ int main() {
         test_worker_request_framing_is_repeatable();
         test_worker_stream_preserves_unrelated_log_events();
         test_event_transport_rejects_invalid_protocol_and_abi();
+        test_worker_log_handler_receives_valid_logs_and_rejects_malformed_logs();
         test_stream_timeout_during_slow_callback_is_bounded();
         test_external_stream_cancel_reaps_worker_that_stops_draining_commands();
         test_worker_shutdown_is_bounded_idempotent_and_leak_free();
+        test_worker_shutdown_escalates_when_worker_ignores_request();
         test_worker_crash_fails_request_without_hanging();
         test_worker_blocked_write_obeys_request_deadline();
         test_worker_partial_response_obeys_request_deadline();

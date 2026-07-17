@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cctype>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <mutex>
 
 namespace {
 
@@ -404,6 +406,137 @@ private:
     const Api* api_;
     AilaEngine* engine_;
 };
+
+struct LogCapture {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<std::pair<int, std::string>> entries;
+    const Api* api = nullptr;
+    AilaEngine* engine = nullptr;
+    bool reenter = false;
+    bool reenter_set_level = false;
+    int delay_ms = 0;
+    std::atomic_bool reentered{false};
+};
+
+void capture_log(int level, const char* message, void* user_data) {
+    auto& capture = *static_cast<LogCapture*>(user_data);
+    if (capture.delay_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(capture.delay_ms));
+    }
+    if (capture.reenter && capture.api && capture.engine) {
+        (void)capture.api->context_length(capture.engine);
+        if (capture.reenter_set_level) capture.api->set_log_level(1);
+        capture.reentered.store(true, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        capture.entries.emplace_back(level, message ? message : "");
+    }
+    capture.condition.notify_all();
+}
+
+void wait_for_logs(LogCapture& capture, size_t count, const char* context) {
+    std::unique_lock<std::mutex> lock(capture.mutex);
+    expect(capture.condition.wait_for(lock, 2s, [&] { return capture.entries.size() >= count; }),
+           std::string(context) + " timed out waiting for logs");
+}
+
+void verify_proxy_logging(const Api& api, AilaEngine* engine) {
+    LogCapture capture;
+    capture.api = &api;
+    capture.engine = engine;
+    api.set_log_callback(capture_log, &capture);
+    api.set_log_level(2);
+    char* generated = api.generate(engine, "__aila_logs__", nullptr);
+    expect(generated != nullptr, "generation used to trigger logs failed");
+    api.free_string(generated);
+    wait_for_logs(capture, 2, "level-filtered logging");
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        expect(capture.entries == std::vector<std::pair<int, std::string>>{
+                   {2, "warning message"}, {3, "error message"}},
+               "worker log levels/messages or filtering changed");
+        capture.entries.clear();
+    }
+
+    LogCapture replacement;
+    replacement.api = &api;
+    replacement.engine = engine;
+    api.set_log_callback(capture_log, &replacement);
+    api.set_log_level(3);
+    generated = api.generate(engine, "__aila_logs__", nullptr);
+    expect(generated != nullptr, "generation after callback replacement failed");
+    api.free_string(generated);
+    wait_for_logs(replacement, 1, "replacement logging");
+    {
+        std::lock_guard<std::mutex> lock(replacement.mutex);
+        expect(replacement.entries ==
+                   std::vector<std::pair<int, std::string>>{{3, "error message"}},
+               "replacement callback received the wrong log");
+    }
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        expect(capture.entries.empty(), "replaced callback was invoked again");
+    }
+
+    capture.reenter = true;
+    capture.reenter_set_level = true;
+    api.set_log_callback(capture_log, &capture);
+    generated = api.generate(engine, "__aila_logs__", nullptr);
+    expect(generated != nullptr, "reentrant log generation failed");
+    api.free_string(generated);
+    wait_for_logs(capture, 1, "reentrant logging");
+    expect(capture.reentered.load(std::memory_order_acquire),
+           "log callback could not safely call context_length/set_log_level");
+
+    capture.reenter = false;
+    api.set_log_level(3);
+    capture.delay_ms = 500;
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        capture.entries.clear();
+    }
+    const auto started = std::chrono::steady_clock::now();
+    generated = api.generate(engine, "__aila_logs__", nullptr);
+    expect(generated != nullptr, "slow callback log generation failed");
+    api.free_string(generated);
+    expect(std::chrono::steady_clock::now() - started < 300ms,
+           "slow user log callback stalled worker IPC/generation");
+
+    api.set_log_callback(nullptr, nullptr);
+    capture.delay_ms = 0;
+    std::this_thread::sleep_for(600ms);
+    size_t before = 0;
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        before = capture.entries.size();
+    }
+    generated = api.generate(engine, "__aila_logs__", nullptr);
+    expect(generated != nullptr, "generation after callback removal failed");
+    api.free_string(generated);
+    std::this_thread::sleep_for(100ms);
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        expect(capture.entries.size() == before,
+               "NULL log callback did not disable user dispatch");
+    }
+
+    LogCapture flood;
+    flood.delay_ms = 10;
+    api.set_log_callback(capture_log, &flood);
+    generated = api.generate(engine, "__aila_log_flood__", nullptr);
+    expect(generated != nullptr, "log flood generation failed");
+    api.free_string(generated);
+    std::this_thread::sleep_for(3200ms);
+    {
+        std::lock_guard<std::mutex> lock(flood.mutex);
+        expect(!flood.entries.empty(), "log flood delivered no entries");
+        expect(flood.entries.size() <= 270,
+               "bounded log queue did not deterministically drop newest flood entries");
+    }
+    api.set_log_callback(nullptr, nullptr);
+}
 
 void copy_test_file(const fs::path& source, const fs::path& destination) {
     fs::create_directories(destination.parent_path());
@@ -1676,6 +1809,7 @@ void test_proxy_abi_and_lifecycle() {
     expect(api.context_length(relative.get()) == 4096,
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
+    verify_proxy_logging(api, relative.get());
     verify_audio_proxy(api, relative.get());
     verify_alignment_proxy(api, relative.get());
     verify_streaming_generation(api, relative.get());
@@ -1694,6 +1828,19 @@ void test_proxy_abi_and_lifecycle() {
         EngineHandle absolute(api);
         expect(api.init(absolute.get(), "absolute-model", 3072) == 0,
                "absolute runtime directory initialization failed");
+        LogCapture new_worker_logs;
+        api.set_log_callback(capture_log, &new_worker_logs);
+        char* generated = api.generate(absolute.get(), "__aila_logs__", nullptr);
+        expect(generated != nullptr, "new-worker log generation failed");
+        api.free_string(generated);
+        wait_for_logs(new_worker_logs, 1, "new-worker logging");
+        {
+            std::lock_guard<std::mutex> lock(new_worker_logs.mutex);
+            expect(new_worker_logs.entries ==
+                       std::vector<std::pair<int, std::string>>{{3, "error message"}},
+                   "new worker did not inherit the current log level");
+        }
+        api.set_log_callback(nullptr, nullptr);
     }
 
     copy_test_file(

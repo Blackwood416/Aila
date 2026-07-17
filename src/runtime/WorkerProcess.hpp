@@ -31,6 +31,7 @@ class WorkerProcess {
 public:
     enum class StreamEventAction { Continue, Cancel, End };
     using StreamEventCallback = std::function<StreamEventAction(const ipc::Frame&)>;
+    using LogHandler = std::function<void(int, std::string_view)>;
     WorkerProcess();
     ~WorkerProcess() noexcept;
 
@@ -64,6 +65,10 @@ public:
         std::chrono::milliseconds timeout = std::chrono::seconds(2));
 
     std::vector<ipc::Frame> take_events();
+
+    // The handler runs on the internal event reader thread and must remain
+    // non-blocking. Proxy user callbacks are dispatched separately.
+    void set_log_handler(LogHandler handler);
 
     void shutdown(std::chrono::milliseconds timeout = std::chrono::seconds(2));
 

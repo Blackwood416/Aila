@@ -20,6 +20,7 @@
 #include <vector>
 #include <thread>
 #include <unordered_map>
+#include <mutex>
 
 #ifndef AILA_BUILD_ID
 #error "AilaWorker requires the deterministic AILA_BUILD_ID compile definition"
@@ -279,6 +280,49 @@ void send_frame(HANDLE handle, const aila::ipc::Frame& frame) {
     }
 }
 
+class EventWriter {
+public:
+    explicit EventWriter(HANDLE handle) : handle_(handle) {}
+
+    void send(const aila::ipc::Frame& frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        send_frame(handle_, frame);
+    }
+
+    void log(int level, const char* message) noexcept {
+        if (level < 0 || level > 3 || message == nullptr) return;
+        try {
+            const std::string_view view(message);
+            if (!simdjson::validate_utf8(view)) return;
+            aila::ipc::Frame event;
+            event.header.kind = "event";
+            event.header.method = "log";
+            event.header.payload_json =
+                std::string("{\"level\":") + std::to_string(level) +
+                ",\"message\":" + json_string(view) + "}";
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::string error;
+            (void)aila::ipc::write_frame(handle_, event, error);
+        } catch (...) {}
+    }
+
+private:
+    HANDLE handle_;
+    std::mutex mutex_;
+};
+
+void worker_log_callback(int level, const char* message, void* user_data) noexcept {
+    static_cast<EventWriter*>(user_data)->log(level, message);
+}
+
+class WorkerLogRegistration {
+public:
+    explicit WorkerLogRegistration(EventWriter& writer) {
+        aila_set_log_callback(worker_log_callback, &writer);
+    }
+    ~WorkerLogRegistration() { aila_set_log_callback(nullptr, nullptr); }
+};
+
 class CApiWorkerEngine final : public aila::worker::WorkerEngineApi {
 public:
     CApiWorkerEngine() : engine_(aila_engine_create()) {
@@ -309,6 +353,8 @@ public:
         const char* message = aila_last_error_message(engine_);
         return message == nullptr ? std::string{} : std::string(message);
     }
+
+    void set_log_level(int level) override { aila_set_log_level(level); }
 
     bool generate_text(
         const aila::worker::TextGenerationRequest& request,
@@ -647,6 +693,8 @@ bool clean_command_eof(DWORD available_before_read) {
 }
 
 int run(const Handles& handles) {
+    EventWriter event_writer(handles.event_write.get());
+    WorkerLogRegistration log_registration(event_writer);
     aila::worker::WorkerDispatcher dispatcher(std::make_unique<CApiWorkerEngine>());
 
     aila::ipc::Frame handshake;
@@ -657,8 +705,8 @@ int run(const Handles& handles) {
     aila::ipc::Frame event;
     event.header.kind = "event";
     event.header.method = "log";
-    event.header.payload_json = "{\"level\":\"info\",\"message\":\"Aila worker ready\"}";
-    send_frame(handles.event_write.get(), event);
+    event.header.payload_json = "{\"level\":1,\"message\":\"Aila worker ready\"}";
+    event_writer.send(event);
 
     for (;;) {
         DWORD available = 0;
@@ -696,7 +744,7 @@ int run(const Handles& handles) {
                 stream_response = dispatcher.dispatch_stream(
                     command,
                     [&](const aila::ipc::Frame& stream_event) {
-                        send_frame(handles.event_write.get(), stream_event);
+                        event_writer.send(stream_event);
                         ++emitted_event_count;
                         // A successfully written event must be counted even if a cancel
                         // arrives immediately afterwards. The dispatcher checks the
@@ -776,7 +824,7 @@ int run(const Handles& handles) {
                 std::string("{\"event\":\"end\",\"eventCount\":") +
                 std::to_string(terminal_count) + "}";
             end.attachment.clear();
-            send_frame(handles.event_write.get(), end);
+            event_writer.send(end);
             if (!aila::ipc::write_frame(handles.response_write.get(), stream_response, error)) {
                 return 4;
             }

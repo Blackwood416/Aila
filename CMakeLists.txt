@@ -272,6 +272,7 @@ if(WIN32)
     add_library(AilaShared SHARED
         src/proxy/AilaProxyApi.cpp
         src/proxy/ProxyEngine.cpp
+        src/proxy/ProxyLogging.cpp
         src/runtime/RuntimeDirectory.cpp
         src/runtime/ChildEnvironment.cpp
         src/runtime/WorkerProcess.cpp
@@ -500,6 +501,23 @@ if(WIN32)
     target_link_libraries(AilaProxyAbiTests PRIVATE AilaBuildIdentity)
     add_dependencies(AilaProxyAbiTests AilaShared AilaFakeWorker)
     add_test(NAME AilaProxyAbiTests COMMAND AilaProxyAbiTests)
+
+    add_executable(AilaProxyLoggingTests
+        tests/runtime/ProxyLoggingTests.cpp
+        src/proxy/ProxyLogging.cpp)
+    target_compile_definitions(AilaProxyLoggingTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+    target_compile_options(AilaProxyLoggingTests PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+    target_link_options(AilaProxyLoggingTests PRIVATE -fno-sycl)
+    set_target_properties(AilaProxyLoggingTests PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(AilaProxyLoggingTests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_directories(AilaProxyLoggingTests PRIVATE
+        "${AILA_WORKER_COMPILER_ROOT}/lib")
+    add_test(NAME AilaProxyLoggingTests COMMAND AilaProxyLoggingTests)
 endif()
 
 # ============================================================

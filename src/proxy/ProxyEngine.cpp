@@ -201,7 +201,14 @@ std::string v2_config_json(const AilaGenConfigV2* config) {
 
 } // namespace
 
+ProxyEngine::ProxyEngine() : log_source_(logging::create_source()) {
+    worker_.set_log_handler([source = log_source_](int level, std::string_view message) {
+        logging::enqueue(source, level, message);
+    });
+}
+
 ProxyEngine::~ProxyEngine() noexcept {
+    logging::deactivate(log_source_);
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_locked();
@@ -236,6 +243,10 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
 
     shutdown_locked();
     try {
+        log_source_ = logging::create_source();
+        worker_.set_log_handler([source = log_source_](int level, std::string_view message) {
+            logging::enqueue(source, level, message);
+        });
         const std::filesystem::path module_path =
             runtime::proxy_module_path(this_proxy_module());
         const std::filesystem::path runtime_directory = runtime::resolve_runtime_directory(
@@ -250,6 +261,14 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
                 ipc::kPublicAbiVersion,
                 AILA_BUILD_ID,
             });
+
+        const ipc::Frame log_response = request_locked(
+            "log.set_level",
+            std::string("{\"level\":") + std::to_string(logging::level()) + "}");
+        if (!accept_lifecycle_response_locked(log_response, "log.set_level")) {
+            shutdown_locked();
+            return false;
+        }
 
         const std::string payload =
             std::string("{\"model\":") + json_string(model_directory) +
@@ -1784,6 +1803,7 @@ void ProxyEngine::flush_deferred_asr_destroys_locked() {
 }
 
 void ProxyEngine::shutdown_locked() noexcept {
+    logging::deactivate(log_source_);
     initialized_ = false;
     active_asr_stream_ids_.clear();
     deferred_asr_destroy_ids_.clear();
@@ -1791,6 +1811,24 @@ void ProxyEngine::shutdown_locked() noexcept {
     try {
         worker_.shutdown(std::chrono::seconds(2));
     } catch (...) {
+    }
+}
+
+void ProxyEngine::set_log_level(int level) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!worker_.healthy()) return;
+        const ipc::Frame response = request_locked(
+            "log.set_level",
+            std::string("{\"level\":") + std::to_string(level) + "}");
+        if (!accept_lifecycle_response_locked(response, "log.set_level")) {
+            shutdown_locked();
+        }
+    } catch (...) {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            shutdown_locked();
+        } catch (...) {}
     }
 }
 

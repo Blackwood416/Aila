@@ -2,6 +2,7 @@
 
 #include "aila_api.h"
 #include "runtime/WorkerProcess.hpp"
+#include "proxy/ProxyLogging.hpp"
 
 #include <cstdint>
 #include <atomic>
@@ -21,7 +22,7 @@ struct AlignmentWord {
 
 class ProxyEngine {
 public:
-    ProxyEngine() = default;
+    ProxyEngine();
     ~ProxyEngine() noexcept;
 
     ProxyEngine(const ProxyEngine&) = delete;
@@ -108,6 +109,7 @@ public:
     const char* last_error_message() const;
     void record_invalid_argument(std::string message);
     void record_runtime_error(std::string message);
+    void set_log_level(int level) noexcept;
 
 private:
     ipc::Frame request_locked(std::string method, std::string payload_json);
@@ -157,6 +159,7 @@ private:
     bool stream_active_ = false;
     int error_code_ = 0;
     std::string error_message_;
+    logging::Source log_source_;
 };
 
 } // namespace aila::proxy
