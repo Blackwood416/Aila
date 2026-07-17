@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -279,6 +280,19 @@ struct Api {
     using AsrStreamFeed = int (*)(AilaTranscribeStream*, const float*, int);
     using AsrStreamGetText = int (*)(AilaTranscribeStream*, char**, char**);
     using AsrStreamDestroy = void (*)(AilaTranscribeStream*);
+    using SynthesizeWav = int (*)(AilaEngine*, const int*, int, const float*, int,
+                                  const AilaGenConfig*, float**, int*);
+    using SynthesizeText = int (*)(AilaEngine*, const char*, const float*, int,
+                                   const AilaGenConfig*, float**, int*);
+    using SynthesizeFile = int (*)(AilaEngine*, const char*, const char*, const char*,
+                                   const char*, const char*, const AilaGenConfig*, const char*);
+    using DecodeMimi = int (*)(AilaEngine*, const int32_t*, int, float**, int*);
+    using ExtractEmbedding = int (*)(AilaEngine*, const char*, float**, int*);
+    using SynthesizeStream = AilaTTSStream* (*)(AilaEngine*, const char*, const char*,
+                                                const char*, const char*, const char*,
+                                                const AilaGenConfig*, AilaAudioCallback, void*);
+    using StreamWait = int (*)(AilaTTSStream*);
+    using StreamDestroy = void (*)(AilaTTSStream*);
     using Reset = void (*)(AilaEngine*);
     using ContextLength = int (*)(AilaEngine*);
     using LastErrorCode = int (*)(AilaEngine*);
@@ -311,6 +325,14 @@ struct Api {
           asr_stream_feed(library.symbol<AsrStreamFeed>("aila_transcribe_stream_feed")),
           asr_stream_get_text(library.symbol<AsrStreamGetText>("aila_transcribe_stream_get_text")),
           asr_stream_destroy(library.symbol<AsrStreamDestroy>("aila_transcribe_stream_destroy")),
+          synthesize_wav(library.symbol<SynthesizeWav>("aila_synthesize_wav")),
+          synthesize_text(library.symbol<SynthesizeText>("aila_synthesize_text_to_wav")),
+          synthesize_file(library.symbol<SynthesizeFile>("aila_synthesize")),
+          decode_mimi(library.symbol<DecodeMimi>("aila_decode_mimi_vocoder")),
+          extract_embedding(library.symbol<ExtractEmbedding>("aila_extract_speaker_embedding")),
+          synthesize_stream(library.symbol<SynthesizeStream>("aila_synthesize_stream")),
+          stream_wait(library.symbol<StreamWait>("aila_stream_wait")),
+          stream_destroy(library.symbol<StreamDestroy>("aila_stream_destroy")),
           reset(library.symbol<Reset>("aila_engine_reset_context")),
           context_length(library.symbol<ContextLength>("aila_engine_context_length")),
           last_error_code(library.symbol<LastErrorCode>("aila_last_error_code")),
@@ -340,6 +362,14 @@ struct Api {
     AsrStreamFeed asr_stream_feed;
     AsrStreamGetText asr_stream_get_text;
     AsrStreamDestroy asr_stream_destroy;
+    SynthesizeWav synthesize_wav;
+    SynthesizeText synthesize_text;
+    SynthesizeFile synthesize_file;
+    DecodeMimi decode_mimi;
+    ExtractEmbedding extract_embedding;
+    SynthesizeStream synthesize_stream;
+    StreamWait stream_wait;
+    StreamDestroy stream_destroy;
     Reset reset;
     ContextLength context_length;
     LastErrorCode last_error_code;
@@ -1044,6 +1074,144 @@ void verify_synchronous_generation(const Api& api, AilaEngine* engine) {
     take_string(api, api.generate(engine, "after-zero-size", nullptr), "call after zero-size V2");
 }
 
+void verify_audio_proxy(const Api& api, AilaEngine* engine) {
+    const int tokens[]{17, -3};
+    const int tokens_copy[]{17, -3};
+    const float speaker[]{0.125f, -0.75f};
+    float* samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
+    int count = -1;
+    expect(api.synthesize_wav(engine, tokens, 2, speaker, 2, nullptr, &samples, &count) == AILA_OK,
+           "synthesize_wav failed");
+    expect(count == 3 && samples && samples[0] == 0.25f && samples[1] == -0.5f && samples[2] == 1.0f,
+           "synthesize_wav result bytes changed");
+    expect(std::memcmp(tokens, tokens_copy, sizeof(tokens)) == 0 &&
+               speaker[0] == 0.125f && speaker[1] == -0.75f,
+           "synthesize_wav changed caller inputs");
+    api.free_samples(samples);
+
+    samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
+    count = -1;
+    expect(api.synthesize_text(engine, u8"你好", speaker, 2, nullptr, &samples, &count) == AILA_OK &&
+               count == 3 && samples != nullptr,
+           "synthesize_text_to_wav failed");
+    api.free_samples(samples);
+
+    int32_t codes[32]{};
+    samples = nullptr;
+    count = 0;
+    expect(api.decode_mimi(engine, codes, 2, &samples, &count) == AILA_OK && count == 3,
+           "Mimi decode failed");
+    api.free_samples(samples);
+
+    samples = nullptr;
+    count = 0;
+    expect(api.extract_embedding(engine, u8R"(C:\声音\参考.wav)", &samples, &count) == AILA_OK &&
+               count == 3,
+           "speaker embedding extraction failed");
+    api.free_samples(samples);
+
+    expect(api.synthesize_file(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr,
+                               u8R"(C:\输出\结果.wav)") == AILA_OK,
+           "worker-side WAV synthesis failed");
+
+    samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
+    count = 19;
+    expect(api.synthesize_wav(engine, nullptr, 2, nullptr, 0, nullptr, &samples, &count) ==
+               AILA_ERR_INVALID_ARGUMENT && samples == nullptr && count == 0,
+           "invalid audio arguments did not clear outputs");
+    take_string(api, api.generate(engine, "after-local-audio-error", nullptr),
+                "worker after local audio validation");
+}
+
+struct AudioCapture {
+    std::mutex mutex;
+    std::vector<float> samples;
+    std::thread::id callback_thread;
+};
+
+void capture_audio(const float* samples, int count, void* opaque) {
+    auto* capture = static_cast<AudioCapture*>(opaque);
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    capture->callback_thread = std::this_thread::get_id();
+    capture->samples.insert(capture->samples.end(), samples, samples + count);
+}
+
+void verify_tts_stream_outlives_engine(const Api& api) {
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "tts-stream-owner", 1024) == 0, "TTS stream engine init failed");
+    AudioCapture capture;
+    const std::thread::id caller = std::this_thread::get_id();
+    AilaTTSStream* stream = api.synthesize_stream(
+        engine.get(), u8"流式语音", nullptr, "", nullptr, "chinese", nullptr,
+        capture_audio, &capture);
+    expect(stream != nullptr, "TTS stream creation failed");
+    api.destroy(engine.release());
+    expect(api.stream_wait(stream) == AILA_OK && api.stream_wait(stream) == AILA_OK,
+           "TTS stream wait was not idempotent");
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        expect(capture.samples == std::vector<float>({0.25f, -0.5f, 1.0f}),
+               "TTS stream chunk order/content changed");
+        expect(capture.callback_thread != caller, "TTS callback ran on caller thread");
+    }
+    api.stream_destroy(stream);
+    api.stream_destroy(nullptr);
+    expect(api.stream_wait(nullptr) == AILA_ERR_INVALID_ARGUMENT,
+           "NULL TTS stream wait returned wrong status");
+}
+
+void verify_malformed_audio_results_reap_worker(const Api& api) {
+    for (const char* marker : {
+             "__aila_audio_bad_count__", "__aila_audio_bad_element__",
+             "__aila_audio_nan__", "__aila_audio_bad_identity__"}) {
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), marker, 1024) == 0,
+               std::string("malformed audio init failed: ") + marker);
+        float* values = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
+        int count = 19;
+        expect(api.synthesize_text(engine.get(), marker, nullptr, 0, nullptr,
+                                   &values, &count) == AILA_ERR_RUNTIME &&
+                   values == nullptr && count == 0,
+               std::string("malformed audio result succeeded: ") + marker);
+        expect(api.generate(engine.get(), "after-malformed-audio", nullptr) == nullptr &&
+                   api.last_error_code(engine.get()) == AILA_ERR_INVALID_ARGUMENT,
+               std::string("malformed audio result did not reap worker: ") + marker);
+    }
+}
+
+void verify_tts_stream_destroy_cancels_promptly(const Api& api) {
+    EngineHandle engine(api);
+    expect(api.init(engine.get(), "tts-stream-cancel", 1024) == 0,
+           "TTS cancellation engine init failed");
+    AudioCapture capture;
+    AilaTTSStream* stream = api.synthesize_stream(
+        engine.get(), "__aila_tts_slow__", nullptr, nullptr, nullptr, nullptr, nullptr,
+        capture_audio, &capture);
+    expect(stream != nullptr, "slow TTS stream creation failed");
+    for (int attempt = 0; attempt != 100; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lock(capture.mutex);
+            if (!capture.samples.empty()) break;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    api.stream_destroy(stream);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    expect(elapsed < 3s, "TTS stream destroy was not bounded");
+    size_t after_destroy = 0;
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        after_destroy = capture.samples.size();
+    }
+    std::this_thread::sleep_for(50ms);
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        expect(capture.samples.size() == after_destroy,
+               "TTS callback ran after stream destroy returned");
+    }
+}
+
 void verify_v2_prefix_does_not_read_past_struct_size(const Api& api, AilaEngine* engine) {
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
@@ -1327,6 +1495,7 @@ void test_proxy_abi_and_lifecycle() {
     expect(api.context_length(relative.get()) == 4096,
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
+    verify_audio_proxy(api, relative.get());
     verify_streaming_generation(api, relative.get());
     verify_asr_proxy(api, relative.get());
     verify_reentrant_asr_destroy_is_deferred(api, relative.get());
@@ -1380,6 +1549,9 @@ void test_proxy_abi_and_lifecycle() {
     verify_malformed_asr_reaps_worker(api);
     verify_asr_event_identity_and_remote_ids(api);
     verify_stale_asr_handle_cannot_alias_reinitialized_worker(api);
+    verify_tts_stream_outlives_engine(api);
+    verify_malformed_audio_results_reap_worker(api);
+    verify_tts_stream_destroy_cancels_promptly(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

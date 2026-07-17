@@ -833,6 +833,317 @@ void ProxyEngine::transcribe_stream_destroy(
     }
 }
 
+namespace {
+
+void parse_float_result(
+    const ipc::Frame& response, std::string_view method, std::vector<float>& output) {
+    if (response.header.kind != "result" || response.header.method != method) {
+        throw malformed_response("audio result identity did not match request");
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    simdjson::dom::object object;
+    uint64_t count = 0, element_size = 0, bytes = 0;
+    if (parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
+        root.get_object().get(object) != simdjson::SUCCESS ||
+        object["sampleCount"].get_uint64().get(count) != simdjson::SUCCESS ||
+        object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+        object["byteCount"].get_uint64().get(bytes) != simdjson::SUCCESS ||
+        count > (std::numeric_limits<int>::max)() || element_size != sizeof(float) ||
+        count > (std::numeric_limits<size_t>::max)() / sizeof(float) ||
+        bytes != count * sizeof(float) || bytes != response.attachment.size()) {
+        throw malformed_response("audio result shape did not match float32 attachment");
+    }
+    size_t fields = 0;
+    for (auto field : object) { (void)field; ++fields; }
+    if (fields != 3) throw malformed_response("audio result contained unexpected fields");
+    output.resize(static_cast<size_t>(count));
+    if (!output.empty()) std::memcpy(output.data(), response.attachment.data(), response.attachment.size());
+    for (const float& value : output) {
+        if (!finite_float_bits(value)) throw malformed_response("audio result contained non-finite samples");
+    }
+}
+
+std::vector<std::byte> bytes_from(const void* data, size_t size) {
+    std::vector<std::byte> result(size);
+    if (size != 0) std::memcpy(result.data(), data, size);
+    return result;
+}
+
+} // namespace
+
+int ProxyEngine::synthesize_wav(
+    const int* text_tokens, int text_tokens_len,
+    const float* speaker_embedding, int speaker_embedding_len,
+    const AilaGenConfig* config, std::vector<float>& samples) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples.clear();
+    if (stream_active_ || !initialized_ || !text_tokens || text_tokens_len <= 0 ||
+        speaker_embedding_len < 0 || (speaker_embedding_len > 0 && !speaker_embedding) ||
+        !valid_asr_legacy_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS synthesis arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const size_t token_bytes = static_cast<size_t>(text_tokens_len) * sizeof(int32_t);
+        const size_t embedding_bytes = static_cast<size_t>(speaker_embedding_len) * sizeof(float);
+        if (token_bytes > ipc::kMaxAttachmentBytes ||
+            embedding_bytes > ipc::kMaxAttachmentBytes - token_bytes) {
+            set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS synthesis attachment is too large");
+            return AILA_ERR_INVALID_ARGUMENT;
+        }
+        std::vector<std::byte> attachment(token_bytes + embedding_bytes);
+        std::memcpy(attachment.data(), text_tokens, token_bytes);
+        if (embedding_bytes) std::memcpy(attachment.data() + token_bytes, speaker_embedding, embedding_bytes);
+        const std::string payload =
+            std::string("{\"tokenCount\":") + std::to_string(text_tokens_len) +
+            ",\"embeddingCount\":" + std::to_string(speaker_embedding_len) +
+            ",\"tokenOffset\":0,\"embeddingOffset\":" + std::to_string(token_bytes) +
+            ",\"elementSize\":4,\"byteCount\":" + std::to_string(attachment.size()) +
+            ",\"config\":" + legacy_config_json(config) + "}";
+        const ipc::Frame response = request_locked("tts.synthesize_wav", payload, std::move(attachment));
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "tts.synthesize_wav", "TTS synthesis failed");
+            return error_code_;
+        }
+        parse_float_result(response, "tts.synthesize_wav", samples);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& exception) {
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::synthesize_text_to_wav(
+    std::string_view text, const float* speaker_embedding, int speaker_embedding_len,
+    const AilaGenConfig* config, std::vector<float>& samples) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples.clear();
+    if (stream_active_ || !initialized_ || text.find('\0') != std::string_view::npos ||
+        !simdjson::validate_utf8(text) || speaker_embedding_len < 0 ||
+        (speaker_embedding_len > 0 && !speaker_embedding) || !valid_asr_legacy_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS text synthesis arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const size_t bytes = static_cast<size_t>(speaker_embedding_len) * sizeof(float);
+        if (bytes > ipc::kMaxAttachmentBytes) {
+            set_error_locked(AILA_ERR_INVALID_ARGUMENT, "speaker embedding is too large");
+            return AILA_ERR_INVALID_ARGUMENT;
+        }
+        const std::string payload = std::string("{\"text\":") + json_string(text) +
+            ",\"embeddingCount\":" + std::to_string(speaker_embedding_len) +
+            ",\"elementSize\":4,\"byteCount\":" + std::to_string(bytes) +
+            ",\"config\":" + legacy_config_json(config) + "}";
+        const ipc::Frame response = request_locked(
+            "tts.synthesize_text_to_wav", payload, bytes_from(speaker_embedding, bytes));
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "tts.synthesize_text_to_wav", "TTS synthesis failed");
+            return error_code_;
+        }
+        parse_float_result(response, "tts.synthesize_text_to_wav", samples);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& exception) {
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::synthesize_file(
+    std::string_view text, const char* reference_audio_path, const char* speaker_name,
+    const char* instruct_text, const char* language, const AilaGenConfig* config,
+    std::string_view output_wav_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stream_active_ || !initialized_ || text.find('\0') != std::string_view::npos ||
+        output_wav_path.empty() || output_wav_path.find('\0') != std::string_view::npos ||
+        !simdjson::validate_utf8(text) || !simdjson::validate_utf8(output_wav_path) ||
+        !valid_optional_c_string(reference_audio_path) || !valid_optional_c_string(speaker_name) ||
+        !valid_optional_c_string(instruct_text) || !valid_optional_c_string(language) ||
+        !valid_asr_legacy_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS file synthesis arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const std::string payload = std::string("{\"text\":") + json_string(text) +
+            ",\"referenceAudioPath\":" + nullable_c_string_json(reference_audio_path) +
+            ",\"speakerName\":" + nullable_c_string_json(speaker_name) +
+            ",\"instructText\":" + nullable_c_string_json(instruct_text) +
+            ",\"language\":" + nullable_c_string_json(language) +
+            ",\"config\":" + legacy_config_json(config) +
+            ",\"outputWavPath\":" + json_string(output_wav_path) + "}";
+        const ipc::Frame response = request_locked("tts.synthesize", payload);
+        if (!accept_lifecycle_response_locked(response, "tts.synthesize")) return error_code_;
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& exception) {
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::decode_mimi(const int32_t* codes, int n_frames, std::vector<float>& samples) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples.clear();
+    if (stream_active_ || !initialized_ || !codes || n_frames <= 0 ||
+        static_cast<size_t>(n_frames) > ipc::kMaxAttachmentBytes / (16 * sizeof(int32_t))) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "Mimi decode arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const size_t count = static_cast<size_t>(n_frames) * 16;
+        const size_t bytes = count * sizeof(int32_t);
+        const std::string payload = std::string("{\"frameCount\":") + std::to_string(n_frames) +
+            ",\"codeCount\":" + std::to_string(count) +
+            ",\"elementSize\":4,\"byteCount\":" + std::to_string(bytes) + "}";
+        const ipc::Frame response = request_locked("mimi.decode", payload, bytes_from(codes, bytes));
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "mimi.decode", "Mimi decode failed");
+            return error_code_;
+        }
+        parse_float_result(response, "mimi.decode", samples);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& exception) {
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::extract_speaker_embedding(
+    std::string_view audio_path, std::vector<float>& embedding) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    embedding.clear();
+    if (stream_active_ || !initialized_ || audio_path.empty() ||
+        audio_path.find('\0') != std::string_view::npos || !simdjson::validate_utf8(audio_path)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "speaker embedding path is invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const ipc::Frame response = request_locked(
+            "tts.extract_embedding", std::string("{\"audioPath\":") + json_string(audio_path) + "}");
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "tts.extract_embedding", "speaker embedding failed");
+            return error_code_;
+        }
+        parse_float_result(response, "tts.extract_embedding", embedding);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& exception) {
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::synthesize_stream(
+    std::string_view text, const char* reference_audio_path, const char* speaker_name,
+    const char* instruct_text, const char* language, const AilaGenConfig* config,
+    AilaAudioCallback callback, void* user_data,
+    const std::atomic_bool& cancellation_requested,
+    const std::function<void()>& request_started) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stream_active_ || !initialized_ || !callback || text.find('\0') != std::string_view::npos ||
+        !simdjson::validate_utf8(text) || !valid_optional_c_string(reference_audio_path) ||
+        !valid_optional_c_string(speaker_name) || !valid_optional_c_string(instruct_text) ||
+        !valid_optional_c_string(language) || !valid_asr_legacy_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS stream arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    stream_active_ = true;
+    try {
+        ipc::Frame request;
+        request.header.protocol = ipc::kProtocolVersion;
+        request.header.abi = ipc::kPublicAbiVersion;
+        request.header.request_id = next_request_id_++;
+        if (next_request_id_ == 0 || next_request_id_ == (std::numeric_limits<uint64_t>::max)()) next_request_id_ = 1;
+        request.header.kind = "request";
+        request.header.method = "tts.synthesize_stream";
+        request.header.payload_json = std::string("{\"text\":") + json_string(text) +
+            ",\"referenceAudioPath\":" + nullable_c_string_json(reference_audio_path) +
+            ",\"speakerName\":" + nullable_c_string_json(speaker_name) +
+            ",\"instructText\":" + nullable_c_string_json(instruct_text) +
+            ",\"language\":" + nullable_c_string_json(language) +
+            ",\"config\":" + legacy_config_json(config) + "}";
+        bool terminal_seen = false;
+        const ipc::Frame response = worker_.request_stream(
+            request,
+            [&](const ipc::Frame& event) {
+                if (event.header.kind != "event" || event.header.method != request.header.method ||
+                    event.header.request_id != request.header.request_id ||
+                    event.header.protocol != ipc::kProtocolVersion ||
+                    event.header.abi != ipc::kPublicAbiVersion || terminal_seen) {
+                    throw malformed_response("TTS stream event identity was invalid");
+                }
+                simdjson::dom::parser parser;
+                simdjson::dom::element root;
+                simdjson::dom::object object;
+                std::string_view kind;
+                if (parser.parse(event.header.payload_json).get(root) != simdjson::SUCCESS ||
+                    root.get_object().get(object) != simdjson::SUCCESS ||
+                    object["event"].get_string().get(kind) != simdjson::SUCCESS) {
+                    throw malformed_response("TTS stream event schema was invalid");
+                }
+                if (kind == "end") {
+                    uint64_t count = 0;
+                    size_t fields = 0; for (auto field : object) { (void)field; ++fields; }
+                    if (fields != 2 || !event.attachment.empty() ||
+                        object["eventCount"].get_uint64().get(count) != simdjson::SUCCESS || count == 0) {
+                        throw malformed_response("TTS terminal event was invalid");
+                    }
+                    terminal_seen = true;
+                    return runtime::WorkerProcess::StreamEventAction::End;
+                }
+                uint64_t count = 0, element_size = 0, bytes = 0;
+                size_t fields = 0; for (auto field : object) { (void)field; ++fields; }
+                if (kind != "audio" || fields != 4 ||
+                    object["sampleCount"].get_uint64().get(count) != simdjson::SUCCESS ||
+                    object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+                    object["byteCount"].get_uint64().get(bytes) != simdjson::SUCCESS ||
+                    count == 0 || count > (std::numeric_limits<int>::max)() ||
+                    element_size != sizeof(float) ||
+                    count > (std::numeric_limits<size_t>::max)() / sizeof(float) ||
+                    bytes != count * sizeof(float) || bytes != event.attachment.size()) {
+                    throw malformed_response("TTS audio event shape was invalid");
+                }
+                std::vector<float> values(static_cast<size_t>(count));
+                std::memcpy(values.data(), event.attachment.data(), event.attachment.size());
+                for (const float& value : values) if (!finite_float_bits(value))
+                    throw malformed_response("TTS audio event contained non-finite samples");
+                if (!cancellation_requested.load(std::memory_order_acquire)) {
+                    lock.unlock();
+                    try { callback(values.data(), static_cast<int>(values.size()), user_data); }
+                    catch (...) { lock.lock(); throw; }
+                    lock.lock();
+                }
+                return cancellation_requested.load(std::memory_order_acquire)
+                    ? runtime::WorkerProcess::StreamEventAction::Cancel
+                    : runtime::WorkerProcess::StreamEventAction::Continue;
+            },
+            std::chrono::minutes(10),
+            [&] { return cancellation_requested.load(std::memory_order_acquire); },
+            std::chrono::seconds(2), request_started);
+        stream_active_ = false;
+        flush_deferred_asr_destroys_locked();
+        if (response.header.kind == "error") {
+            accept_stream_error_response_locked(response, "tts.synthesize_stream", "TTS stream failed");
+            return error_code_;
+        }
+        simdjson::dom::parser parser;
+        simdjson::dom::element root;
+        simdjson::dom::object object;
+        int64_t status = 0;
+        uint64_t event_count = 0;
+        if (response.header.kind != "result" || response.header.method != "tts.synthesize_stream" ||
+            !response.attachment.empty() ||
+            parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
+            root.get_object().get(object) != simdjson::SUCCESS ||
+            object["status"].get_int64().get(status) != simdjson::SUCCESS ||
+            object["eventCount"].get_uint64().get(event_count) != simdjson::SUCCESS ||
+            status < 0 || status > 1 || event_count == 0 || !terminal_seen) {
+            throw malformed_response("TTS stream result was invalid");
+        }
+        clear_error_locked();
+        return status == 0 ? AILA_OK : AILA_ERR_RUNTIME;
+    } catch (const std::exception& exception) {
+        stream_active_ = false;
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, exception.what()); return AILA_ERR_RUNTIME;
+    } catch (...) {
+        stream_active_ = false;
+        shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, "unknown TTS stream failure"); return AILA_ERR_RUNTIME;
+    }
+}
+
 int ProxyEngine::last_error_code() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return error_code_;

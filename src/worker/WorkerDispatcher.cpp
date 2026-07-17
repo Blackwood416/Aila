@@ -293,6 +293,53 @@ ipc::Frame two_text_result(
     return response;
 }
 
+ipc::Frame float_result(const ipc::Frame& request, const std::vector<float>& values) {
+    ipc::Frame response = result(
+        request,
+        std::string("{\"sampleCount\":") + std::to_string(values.size()) +
+            ",\"elementSize\":" + std::to_string(sizeof(float)) +
+            ",\"byteCount\":" + std::to_string(values.size() * sizeof(float)) + "}");
+    response.attachment.resize(values.size() * sizeof(float));
+    if (!values.empty()) std::memcpy(response.attachment.data(), values.data(), response.attachment.size());
+    return response;
+}
+
+ipc::Frame audio_event(const ipc::Frame& request, const float* samples, size_t count) {
+    ipc::Frame event = response_base(request, "event");
+    event.header.payload_json =
+        std::string("{\"event\":\"audio\",\"sampleCount\":") + std::to_string(count) +
+        ",\"elementSize\":" + std::to_string(sizeof(float)) +
+        ",\"byteCount\":" + std::to_string(count * sizeof(float)) + "}";
+    event.attachment.resize(count * sizeof(float));
+    if (count != 0) std::memcpy(event.attachment.data(), samples, event.attachment.size());
+    return event;
+}
+
+bool finite_values(const std::vector<float>& values) {
+    for (const float value : values) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if ((bits & 0x7f800000u) == 0x7f800000u) return false;
+    }
+    return true;
+}
+
+bool parse_tts_text_request(simdjson::dom::object object, AudioRequest& audio) {
+    std::string_view text;
+    if (object["text"].get_string().get(text) != simdjson::SUCCESS ||
+        !require_c_string_safe(text) || !simdjson::validate_utf8(text) ||
+        !optional_string_field(object, "referenceAudioPath", audio.has_reference_audio_path,
+                               audio.reference_audio_path) ||
+        !optional_string_field(object, "speakerName", audio.has_speaker_name,
+                               audio.speaker_name) ||
+        !optional_string_field(object, "instructText", audio.has_instruct_text,
+                               audio.instruct_text) ||
+        !optional_string_field(object, "language", audio.has_language, audio.language) ||
+        !parse_optional_legacy_config(object, audio.has_config, audio.config)) return false;
+    audio.text.assign(text.data(), text.size());
+    return true;
+}
+
 } // namespace
 
 WorkerDispatcher::WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine)
@@ -310,7 +357,8 @@ WorkerDispatcher::~WorkerDispatcher() noexcept {
 
 bool WorkerDispatcher::is_stream_method(std::string_view method) noexcept {
     TextGenerationMethod ignored;
-    return method == "asr.transcribe" || stream_generation_method(method, ignored);
+    return method == "asr.transcribe" || method == "tts.synthesize_stream" ||
+        stream_generation_method(method, ignored);
 }
 
 ipc::Frame WorkerDispatcher::dispatch_stream(
@@ -318,6 +366,65 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
     const WorkerStreamEmitter& emit,
     const std::atomic_bool& cancelled) {
     try {
+        if (request.header.method == "tts.synthesize_stream") {
+            if (request.header.kind != "request" ||
+                request.header.protocol != ipc::kProtocolVersion ||
+                request.header.abi != ipc::kPublicAbiVersion || !initialized_ ||
+                !request.attachment.empty() ||
+                !simdjson::validate_utf8(request.header.payload_json)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid TTS stream request");
+            }
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            simdjson::dom::object object;
+            AudioRequest audio;
+            audio.method = AudioMethod::SynthesizeStream;
+            if (parser.parse(request.header.payload_json).get(root) != simdjson::SUCCESS ||
+                root.get_object().get(object) != simdjson::SUCCESS ||
+                !parse_tts_text_request(object, audio)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "TTS stream payload is malformed");
+            }
+            bool event_failed = false;
+            uint64_t event_count = 0;
+            const int status = engine_->synthesize_stream(
+                audio,
+                [&](const float* samples, size_t count) {
+                    if (cancelled.load(std::memory_order_acquire)) return false;
+                    if (!samples || count == 0 ||
+                        count > ipc::kMaxAttachmentBytes / sizeof(float) ||
+                        !detail::stream_data_event_can_emit(event_count)) {
+                        event_failed = true;
+                        return false;
+                    }
+                    for (size_t index = 0; index < count; ++index) {
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, &samples[index], sizeof(bits));
+                        if ((bits & 0x7f800000u) == 0x7f800000u) {
+                            event_failed = true; return false;
+                        }
+                    }
+                    if (!emit(audio_event(request, samples, count))) {
+                        event_failed = true;
+                        return false;
+                    }
+                    ++event_count;
+                    return !cancelled.load(std::memory_order_acquire);
+                });
+            if (event_failed) {
+                return error(request, AILA_ERR_RUNTIME, "TTS stream emitted invalid audio");
+            }
+            if (status < -1 || status > 1) {
+                return error(request, AILA_ERR_RUNTIME, "TTS stream adapter returned invalid status");
+            }
+            if (status < 0) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            return result(request, std::string("{\"status\":") +
+                std::to_string(cancelled.load() ? 1 : status) +
+                ",\"eventCount\":" + std::to_string(event_count + 1) + "}");
+        }
         if (request.header.method == "asr.transcribe") {
             if (request.header.kind != "request" ||
                 request.header.protocol != ipc::kProtocolVersion ||
@@ -616,6 +723,169 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
         if (request.header.method == "engine.reset") {
             engine_->reset_context();
             return result(request, "{\"ok\":true}");
+        }
+
+        if (request.header.method == "tts.synthesize_wav") {
+            if (!initialized_) return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            simdjson::dom::object object;
+            uint64_t token_count = 0, embedding_count = 0, token_offset = 0;
+            uint64_t embedding_offset = 0, element_size = 0, byte_count = 0;
+            AudioRequest audio;
+            audio.method = AudioMethod::SynthesizeWav;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["tokenCount"].get_uint64().get(token_count) != simdjson::SUCCESS ||
+                object["embeddingCount"].get_uint64().get(embedding_count) != simdjson::SUCCESS ||
+                object["tokenOffset"].get_uint64().get(token_offset) != simdjson::SUCCESS ||
+                object["embeddingOffset"].get_uint64().get(embedding_offset) != simdjson::SUCCESS ||
+                object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+                object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                !parse_optional_legacy_config(object, audio.has_config, audio.config) ||
+                token_count == 0 || token_count > (std::numeric_limits<int>::max)() ||
+                embedding_count > (std::numeric_limits<int>::max)() ||
+                element_size != sizeof(int32_t) || token_offset != 0 ||
+                token_count > (std::numeric_limits<size_t>::max)() / sizeof(int32_t) ||
+                embedding_count > (std::numeric_limits<size_t>::max)() / sizeof(float) ||
+                embedding_offset != token_count * sizeof(int32_t) ||
+                embedding_offset > ipc::kMaxAttachmentBytes ||
+                embedding_count * sizeof(float) > ipc::kMaxAttachmentBytes - embedding_offset ||
+                byte_count != embedding_offset + embedding_count * sizeof(float) ||
+                byte_count != request.attachment.size()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "TTS token/embedding attachment is malformed");
+            }
+            audio.text_tokens.resize(static_cast<size_t>(token_count));
+            audio.embedding.resize(static_cast<size_t>(embedding_count));
+            std::memcpy(audio.text_tokens.data(), request.attachment.data(),
+                        audio.text_tokens.size() * sizeof(int32_t));
+            if (!audio.embedding.empty()) {
+                std::memcpy(audio.embedding.data(), request.attachment.data() + embedding_offset,
+                            audio.embedding.size() * sizeof(float));
+            }
+            std::vector<float> output;
+            if (!engine_->process_audio(audio, output)) {
+                int code = engine_->last_error_code(); if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            if (output.size() > (std::numeric_limits<int>::max)() ||
+                output.size() > ipc::kMaxAttachmentBytes / sizeof(float) || !finite_values(output)) {
+                return error(request, AILA_ERR_RUNTIME, "TTS audio result is malformed");
+            }
+            return float_result(request, output);
+        }
+
+        if (request.header.method == "tts.synthesize_text_to_wav") {
+            if (!initialized_) return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            simdjson::dom::object object;
+            std::string_view text;
+            uint64_t embedding_count = 0, element_size = 0, byte_count = 0;
+            AudioRequest audio;
+            audio.method = AudioMethod::SynthesizeTextToWav;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["text"].get_string().get(text) != simdjson::SUCCESS ||
+                !require_c_string_safe(text) || !simdjson::validate_utf8(text) ||
+                object["embeddingCount"].get_uint64().get(embedding_count) != simdjson::SUCCESS ||
+                object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+                object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                !parse_optional_legacy_config(object, audio.has_config, audio.config) ||
+                embedding_count > (std::numeric_limits<int>::max)() ||
+                element_size != sizeof(float) ||
+                embedding_count > ipc::kMaxAttachmentBytes / sizeof(float) ||
+                byte_count != embedding_count * sizeof(float) ||
+                byte_count != request.attachment.size()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "TTS text/embedding request is malformed");
+            }
+            audio.text.assign(text.data(), text.size());
+            audio.embedding.resize(static_cast<size_t>(embedding_count));
+            if (!audio.embedding.empty()) std::memcpy(audio.embedding.data(), request.attachment.data(), request.attachment.size());
+            std::vector<float> output;
+            if (!engine_->process_audio(audio, output)) {
+                int code = engine_->last_error_code(); if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            if (output.size() > (std::numeric_limits<int>::max)() ||
+                output.size() > ipc::kMaxAttachmentBytes / sizeof(float) || !finite_values(output)) {
+                return error(request, AILA_ERR_RUNTIME, "TTS audio result is malformed");
+            }
+            return float_result(request, output);
+        }
+
+        if (request.header.method == "tts.synthesize") {
+            if (!initialized_ || !request.attachment.empty())
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid TTS file request");
+            simdjson::dom::object object;
+            std::string_view output_path;
+            AudioRequest audio;
+            audio.method = AudioMethod::SynthesizeFile;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                !parse_tts_text_request(object, audio) ||
+                object["outputWavPath"].get_string().get(output_path) != simdjson::SUCCESS ||
+                output_path.empty() || !require_c_string_safe(output_path) ||
+                !simdjson::validate_utf8(output_path)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "TTS file request is malformed");
+            }
+            audio.output_wav_path.assign(output_path.data(), output_path.size());
+            std::vector<float> ignored;
+            if (!engine_->process_audio(audio, ignored)) {
+                int code = engine_->last_error_code(); if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            return result(request, "{\"ok\":true}");
+        }
+
+        if (request.header.method == "mimi.decode") {
+            if (!initialized_) return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            simdjson::dom::object object;
+            uint64_t frames = 0, codes = 0, element_size = 0, byte_count = 0;
+            AudioRequest audio;
+            audio.method = AudioMethod::DecodeMimi;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["frameCount"].get_uint64().get(frames) != simdjson::SUCCESS ||
+                object["codeCount"].get_uint64().get(codes) != simdjson::SUCCESS ||
+                object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+                object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                frames == 0 || frames > (std::numeric_limits<int>::max)() ||
+                frames > (std::numeric_limits<uint64_t>::max)() / 16 || codes != frames * 16 ||
+                element_size != sizeof(int32_t) || codes > ipc::kMaxAttachmentBytes / sizeof(int32_t) ||
+                byte_count != codes * sizeof(int32_t) || byte_count != request.attachment.size()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "Mimi code attachment is malformed");
+            }
+            audio.frame_count = static_cast<int>(frames);
+            audio.codes.resize(static_cast<size_t>(codes));
+            std::memcpy(audio.codes.data(), request.attachment.data(), request.attachment.size());
+            std::vector<float> output;
+            if (!engine_->process_audio(audio, output)) {
+                int code = engine_->last_error_code(); if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            if (output.size() > (std::numeric_limits<int>::max)() ||
+                output.size() > ipc::kMaxAttachmentBytes / sizeof(float) || !finite_values(output)) {
+                return error(request, AILA_ERR_RUNTIME, "Mimi audio result is malformed");
+            }
+            return float_result(request, output);
+        }
+
+        if (request.header.method == "tts.extract_embedding") {
+            if (!initialized_ || !request.attachment.empty())
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid embedding request");
+            simdjson::dom::object object;
+            std::string_view path;
+            AudioRequest audio;
+            audio.method = AudioMethod::ExtractEmbedding;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["audioPath"].get_string().get(path) != simdjson::SUCCESS || path.empty() ||
+                !require_c_string_safe(path) || !simdjson::validate_utf8(path)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "embedding audio path is malformed");
+            }
+            audio.audio_path.assign(path.data(), path.size());
+            std::vector<float> output;
+            if (!engine_->process_audio(audio, output)) {
+                int code = engine_->last_error_code(); if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            if (output.size() > (std::numeric_limits<int>::max)() ||
+                output.size() > ipc::kMaxAttachmentBytes / sizeof(float) || !finite_values(output)) {
+                return error(request, AILA_ERR_RUNTIME, "speaker embedding result is malformed");
+            }
+            return float_result(request, output);
         }
 
         if (request.header.method == "asr.stream.create") {

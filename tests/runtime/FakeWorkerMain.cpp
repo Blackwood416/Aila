@@ -240,6 +240,15 @@ void attach_text(aila::ipc::Frame& frame, std::string_view text) {
         std::string("{\"byteCount\":") + std::to_string(text.size()) + "}";
 }
 
+void attach_floats(aila::ipc::Frame& frame, const std::vector<float>& values) {
+    frame.attachment.resize(values.size() * sizeof(float));
+    if (!values.empty()) std::memcpy(frame.attachment.data(), values.data(), frame.attachment.size());
+    frame.header.payload_json =
+        std::string("{\"sampleCount\":") + std::to_string(values.size()) +
+        ",\"elementSize\":4,\"byteCount\":" +
+        std::to_string(frame.attachment.size()) + "}";
+}
+
 uintptr_t parse_handle_value(const wchar_t* value) {
     if (value == nullptr || *value == L'\0' || *value == L'-') {
         throw std::runtime_error("missing or invalid inherited handle value");
@@ -581,6 +590,50 @@ int run(const Handles& handles) {
             response.header.payload_json = "{\"ok\":true}";
             response.attachment.clear();
         }
+        if (command.header.method == "tts.synthesize_stream") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            size_t event_count = 0;
+            auto send_audio = [&](const std::vector<float>& values) {
+                aila::ipc::Frame chunk = stream_event(
+                    command,
+                    std::string("{\"event\":\"audio\",\"sampleCount\":") +
+                        std::to_string(values.size()) +
+                        ",\"elementSize\":4,\"byteCount\":" +
+                        std::to_string(values.size() * sizeof(float)) + "}");
+                chunk.attachment.resize(values.size() * sizeof(float));
+                std::memcpy(chunk.attachment.data(), values.data(), chunk.attachment.size());
+                send_frame(handles.event_write, chunk);
+                ++event_count;
+            };
+            send_audio({0.25f, -0.5f});
+            bool cancelled = false;
+            const bool slow = command.header.payload_json.find("__aila_tts_slow__") != std::string::npos;
+            const int attempts = slow ? 1000 : 6;
+            for (int attempt = 0; attempt < attempts && !cancelled; ++attempt) {
+                DWORD pending = 0;
+                if (PeekNamedPipe(handles.command_read, nullptr, 0, nullptr, &pending, nullptr) && pending) {
+                    aila::ipc::Frame control;
+                    if (aila::ipc::read_frame(handles.command_read, control, error) &&
+                        control.header.method == "cancel") cancelled = true;
+                }
+                if (!cancelled) Sleep(5);
+            }
+            if (!cancelled) send_audio({1.0f});
+            const uint64_t terminal_count = event_count + 1;
+            send_frame(handles.event_write, stream_event(
+                command, std::string("{\"event\":\"end\",\"eventCount\":") +
+                    std::to_string(terminal_count) + "}"));
+            response.header.payload_json = std::string("{\"status\":") +
+                (cancelled ? "1" : "0") + ",\"eventCount\":" +
+                std::to_string(terminal_count) + "}";
+            response.attachment.clear();
+            send_frame(handles.response_write, response);
+            continue;
+        }
         if (is_stream_generation_method(command.header.method)) {
             if (!initialized) {
                 send_frame(handles.response_write,
@@ -754,6 +807,38 @@ int run(const Handles& handles) {
                     ",\"request\":" + command.header.payload_json + "}";
                 attach_text(response, generated);
             }
+        }
+        if (command.header.method == "tts.synthesize_wav" ||
+            command.header.method == "tts.synthesize_text_to_wav" ||
+            command.header.method == "mimi.decode" ||
+            command.header.method == "tts.extract_embedding") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            attach_floats(response, {0.25f, -0.5f, 1.0f});
+            if (command.header.payload_json.find("__aila_audio_bad_count__") != std::string::npos) {
+                response.header.payload_json =
+                    "{\"sampleCount\":4,\"elementSize\":4,\"byteCount\":12}";
+            } else if (command.header.payload_json.find("__aila_audio_bad_element__") != std::string::npos) {
+                response.header.payload_json =
+                    "{\"sampleCount\":3,\"elementSize\":8,\"byteCount\":12}";
+            } else if (command.header.payload_json.find("__aila_audio_nan__") != std::string::npos) {
+                const uint32_t nan_bits = 0x7fc00000u;
+                std::memcpy(response.attachment.data(), &nan_bits, sizeof(nan_bits));
+            } else if (command.header.payload_json.find("__aila_audio_bad_identity__") != std::string::npos) {
+                response.header.method = "wrong.audio";
+            }
+        }
+        if (command.header.method == "tts.synthesize") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            response.header.payload_json = "{\"ok\":true}";
+            response.attachment.clear();
         }
         send_frame(handles.response_write, response);
         if (command.header.method == "shutdown") {

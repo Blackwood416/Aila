@@ -4,12 +4,17 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <memory>
 #include <new>
 #include <string>
+#include <thread>
+#include <vector>
 
 struct AilaEngine {
     AilaEngine() : proxy(std::make_shared<aila::proxy::ProxyEngine>()) {}
@@ -20,6 +25,21 @@ struct AilaTranscribeStream {
     std::shared_ptr<aila::proxy::ProxyEngine> owner;
     uint64_t worker_session = 0;
     uint64_t remote_id = 0;
+};
+
+struct AilaTTSStream {
+    std::shared_ptr<aila::proxy::ProxyEngine> owner;
+    AilaAudioCallback callback = nullptr;
+    void* user_data = nullptr;
+    std::atomic_bool cancel_requested{false};
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::thread worker;
+    bool started = false;
+    bool done = false;
+    bool joining = false;
+    bool joined = false;
+    int status = AILA_ERR_RUNTIME;
 };
 
 namespace {
@@ -56,6 +76,27 @@ char* allocate_result(const std::string& value) {
     }
     result[value.size()] = '\0';
     return result;
+}
+
+int allocate_float_result(
+    const std::vector<float>& values, float** out_values, int* out_count) {
+    if (values.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        return AILA_ERR_RUNTIME;
+    }
+    if (values.empty()) {
+        *out_values = nullptr;
+        *out_count = 0;
+        return AILA_OK;
+    }
+    if (values.size() > (std::numeric_limits<size_t>::max)() / sizeof(float)) {
+        return AILA_ERR_RUNTIME;
+    }
+    auto* allocated = static_cast<float*>(std::malloc(values.size() * sizeof(float)));
+    if (!allocated) return AILA_ERR_RUNTIME;
+    std::memcpy(allocated, values.data(), values.size() * sizeof(float));
+    *out_values = allocated;
+    *out_count = static_cast<int>(values.size());
+    return AILA_OK;
 }
 
 char* generate_legacy(
@@ -474,6 +515,201 @@ AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream) {
     try {
         stream->owner->transcribe_stream_destroy(stream->worker_session, stream->remote_id);
     } catch (...) {}
+    try { delete stream; } catch (...) {}
+}
+
+AILA_API int aila_synthesize_wav(
+    AilaEngine* engine, const int* text_tokens, int text_tokens_len,
+    const float* speaker_embedding, int speaker_embedding_len,
+    const AilaGenConfig* config, float** out_samples, int* out_sample_count) {
+    if (out_samples) *out_samples = nullptr;
+    if (out_sample_count) *out_sample_count = 0;
+    if (!engine || !text_tokens || text_tokens_len <= 0 || !out_samples || !out_sample_count ||
+        speaker_embedding_len < 0 || (speaker_embedding_len > 0 && !speaker_embedding)) {
+        if (engine) try { engine->proxy->record_invalid_argument("TTS synthesis arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<float> values;
+        const int status = engine->proxy->synthesize_wav(
+            text_tokens, text_tokens_len, speaker_embedding, speaker_embedding_len, config, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_float_result(values, out_samples, out_sample_count);
+        if (allocated != AILA_OK) engine->proxy->record_runtime_error("could not allocate TTS samples");
+        return allocated;
+    } catch (...) { record_boundary_failure(engine, "aila_synthesize_wav"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_synthesize_text_to_wav(
+    AilaEngine* engine, const char* text, const float* speaker_embedding,
+    int speaker_embedding_len, const AilaGenConfig* config,
+    float** out_samples, int* out_sample_count) {
+    if (out_samples) *out_samples = nullptr;
+    if (out_sample_count) *out_sample_count = 0;
+    if (!engine || !text || !out_samples || !out_sample_count || speaker_embedding_len < 0 ||
+        (speaker_embedding_len > 0 && !speaker_embedding)) {
+        if (engine) try { engine->proxy->record_invalid_argument("TTS text synthesis arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<float> values;
+        const int status = engine->proxy->synthesize_text_to_wav(
+            text, speaker_embedding, speaker_embedding_len, config, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_float_result(values, out_samples, out_sample_count);
+        if (allocated != AILA_OK) engine->proxy->record_runtime_error("could not allocate TTS samples");
+        return allocated;
+    } catch (...) { record_boundary_failure(engine, "aila_synthesize_text_to_wav"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_synthesize(
+    AilaEngine* engine, const char* text, const char* reference_audio_path,
+    const char* speaker_name, const char* instruct_text, const char* language,
+    const AilaGenConfig* config, const char* output_wav_path) {
+    if (!engine || !text || !output_wav_path) {
+        if (engine) try { engine->proxy->record_invalid_argument("TTS file arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        return engine->proxy->synthesize_file(
+            text, reference_audio_path, speaker_name, instruct_text, language, config,
+            output_wav_path);
+    } catch (...) { record_boundary_failure(engine, "aila_synthesize"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_decode_mimi_vocoder(
+    AilaEngine* engine, const int32_t* codes, int n_frames,
+    float** out_samples, int* out_sample_count) {
+    if (out_samples) *out_samples = nullptr;
+    if (out_sample_count) *out_sample_count = 0;
+    if (!engine || !codes || n_frames <= 0 || !out_samples || !out_sample_count) {
+        if (engine) try { engine->proxy->record_invalid_argument("Mimi decode arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<float> values;
+        const int status = engine->proxy->decode_mimi(codes, n_frames, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_float_result(values, out_samples, out_sample_count);
+        if (allocated != AILA_OK) engine->proxy->record_runtime_error("could not allocate Mimi samples");
+        return allocated;
+    } catch (...) { record_boundary_failure(engine, "aila_decode_mimi_vocoder"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_extract_speaker_embedding(
+    AilaEngine* engine, const char* audio_path,
+    float** out_embedding, int* out_embedding_dim) {
+    if (out_embedding) *out_embedding = nullptr;
+    if (out_embedding_dim) *out_embedding_dim = 0;
+    if (!engine || !audio_path || !out_embedding || !out_embedding_dim) {
+        if (engine) try { engine->proxy->record_invalid_argument("speaker embedding arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<float> values;
+        const int status = engine->proxy->extract_speaker_embedding(audio_path, values);
+        if (status != AILA_OK) return status;
+        const int allocated = allocate_float_result(values, out_embedding, out_embedding_dim);
+        if (allocated != AILA_OK) engine->proxy->record_runtime_error("could not allocate speaker embedding");
+        return allocated;
+    } catch (...) { record_boundary_failure(engine, "aila_extract_speaker_embedding"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API AilaTTSStream* aila_synthesize_stream(
+    AilaEngine* engine, const char* text, const char* reference_audio_path,
+    const char* speaker_name, const char* instruct_text, const char* language,
+    const AilaGenConfig* config, AilaAudioCallback callback, void* user_data) {
+    if (!engine || !text || !callback) {
+        if (engine) try { engine->proxy->record_invalid_argument("TTS stream arguments are invalid"); } catch (...) {}
+        return nullptr;
+    }
+    try {
+        auto stream = std::make_unique<AilaTTSStream>();
+        stream->owner = engine->proxy;
+        stream->callback = callback;
+        stream->user_data = user_data;
+        const std::string text_copy(text);
+        const bool has_reference = reference_audio_path != nullptr;
+        const bool has_speaker = speaker_name != nullptr;
+        const bool has_instruct = instruct_text != nullptr;
+        const bool has_language = language != nullptr;
+        const std::string reference_copy = has_reference ? reference_audio_path : "";
+        const std::string speaker_copy = has_speaker ? speaker_name : "";
+        const std::string instruct_copy = has_instruct ? instruct_text : "";
+        const std::string language_copy = has_language ? language : "";
+        const bool has_config = config != nullptr;
+        const AilaGenConfig config_copy = has_config ? *config : AilaGenConfig{};
+        AilaTTSStream* raw = stream.get();
+        raw->worker = std::thread([
+            raw, text_copy, has_reference, reference_copy, has_speaker, speaker_copy,
+            has_instruct, instruct_copy, has_language, language_copy, has_config, config_copy] {
+            int status = AILA_ERR_RUNTIME;
+            try {
+                status = raw->owner->synthesize_stream(
+                    text_copy,
+                    has_reference ? reference_copy.c_str() : nullptr,
+                    has_speaker ? speaker_copy.c_str() : nullptr,
+                    has_instruct ? instruct_copy.c_str() : nullptr,
+                    has_language ? language_copy.c_str() : nullptr,
+                    has_config ? &config_copy : nullptr,
+                    raw->callback, raw->user_data, raw->cancel_requested,
+                    [raw] {
+                        {
+                            std::lock_guard<std::mutex> lock(raw->mutex);
+                            raw->started = true;
+                        }
+                        raw->condition.notify_all();
+                    });
+            } catch (...) {
+                try { raw->owner->record_runtime_error("TTS stream failed at background boundary"); } catch (...) {}
+            }
+            {
+                std::lock_guard<std::mutex> lock(raw->mutex);
+                raw->status = status;
+                raw->done = true;
+            }
+            raw->condition.notify_all();
+        });
+        {
+            std::unique_lock<std::mutex> lock(raw->mutex);
+            raw->condition.wait(lock, [&] { return raw->started || raw->done; });
+            if (!raw->started) {
+                lock.unlock();
+                if (raw->worker.joinable()) raw->worker.join();
+                return nullptr;
+            }
+        }
+        return stream.release();
+    } catch (...) {
+        record_boundary_failure(engine, "aila_synthesize_stream");
+        return nullptr;
+    }
+}
+
+AILA_API int aila_stream_wait(AilaTTSStream* stream) {
+    if (!stream) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::unique_lock<std::mutex> lock(stream->mutex);
+        while (stream->joining && !stream->joined) stream->condition.wait(lock);
+        if (!stream->joined) {
+            stream->joining = true;
+            lock.unlock();
+            if (stream->worker.joinable()) stream->worker.join();
+            lock.lock();
+            stream->joined = true;
+            stream->joining = false;
+            stream->condition.notify_all();
+        }
+        return stream->status;
+    } catch (...) {
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API void aila_stream_destroy(AilaTTSStream* stream) {
+    if (!stream) return;
+    stream->cancel_requested.store(true, std::memory_order_release);
+    (void)aila_stream_wait(stream);
     try { delete stream; } catch (...) {}
 }
 

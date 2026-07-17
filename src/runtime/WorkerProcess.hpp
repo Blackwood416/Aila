@@ -54,7 +54,10 @@ public:
     ipc::Frame request_stream(
         const ipc::Frame& frame,
         const StreamEventCallback& callback,
-        std::chrono::milliseconds timeout = std::chrono::seconds(30));
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        std::function<bool()> cancellation_requested = {},
+        std::chrono::milliseconds cancellation_grace = std::chrono::seconds(2),
+        std::function<void()> request_started = {});
 
     bool cancel(
         uint64_t request_id,

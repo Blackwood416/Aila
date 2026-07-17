@@ -4,6 +4,8 @@
 #include "runtime/WorkerProcess.hpp"
 
 #include <cstdint>
+#include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -67,6 +69,26 @@ public:
         uint64_t worker_session, uint64_t stream_id,
         std::string& stable, std::string& partial);
     void transcribe_stream_destroy(uint64_t worker_session, uint64_t stream_id) noexcept;
+    int synthesize_wav(
+        const int* text_tokens, int text_tokens_len,
+        const float* speaker_embedding, int speaker_embedding_len,
+        const AilaGenConfig* config, std::vector<float>& samples);
+    int synthesize_text_to_wav(
+        std::string_view text, const float* speaker_embedding, int speaker_embedding_len,
+        const AilaGenConfig* config, std::vector<float>& samples);
+    int synthesize_file(
+        std::string_view text, const char* reference_audio_path, const char* speaker_name,
+        const char* instruct_text, const char* language, const AilaGenConfig* config,
+        std::string_view output_wav_path);
+    int decode_mimi(
+        const int32_t* codes, int n_frames, std::vector<float>& samples);
+    int extract_speaker_embedding(std::string_view audio_path, std::vector<float>& embedding);
+    int synthesize_stream(
+        std::string_view text, const char* reference_audio_path, const char* speaker_name,
+        const char* instruct_text, const char* language, const AilaGenConfig* config,
+        AilaAudioCallback callback, void* user_data,
+        const std::atomic_bool& cancellation_requested,
+        const std::function<void()>& request_started);
 
     int last_error_code() const;
     const char* last_error_message() const;

@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 namespace aila::worker {
 
@@ -32,7 +33,38 @@ enum class TextGenerationMethod {
 
 using TokenStreamCallback = std::function<bool(std::string_view)>;
 using StructuredStreamCallback = std::function<bool(const AilaChatStreamEvent&)>;
+using AudioStreamCallback = std::function<bool(const float*, size_t)>;
 using WorkerStreamEmitter = std::function<bool(const ipc::Frame&)>;
+
+enum class AudioMethod {
+    SynthesizeWav,
+    SynthesizeTextToWav,
+    SynthesizeFile,
+    DecodeMimi,
+    ExtractEmbedding,
+    SynthesizeStream,
+};
+
+struct AudioRequest {
+    AudioMethod method = AudioMethod::SynthesizeWav;
+    std::vector<int32_t> text_tokens;
+    std::vector<int32_t> codes;
+    std::vector<float> embedding;
+    int frame_count = 0;
+    std::string text;
+    std::string audio_path;
+    bool has_reference_audio_path = false;
+    std::string reference_audio_path;
+    bool has_speaker_name = false;
+    std::string speaker_name;
+    bool has_instruct_text = false;
+    std::string instruct_text;
+    bool has_language = false;
+    std::string language;
+    std::string output_wav_path;
+    bool has_config = false;
+    AilaGenConfig config{};
+};
 
 struct AsrRequest {
     std::string wav_path;
@@ -90,6 +122,9 @@ public:
     virtual bool transcribe_stream_get_text(
         uint64_t id, std::string& stable, std::string& partial) = 0;
     virtual bool transcribe_stream_destroy(uint64_t id) noexcept = 0;
+    virtual bool process_audio(const AudioRequest& request, std::vector<float>& output) = 0;
+    virtual int synthesize_stream(
+        const AudioRequest& request, const AudioStreamCallback& callback) = 0;
 };
 
 class WorkerDispatcher {

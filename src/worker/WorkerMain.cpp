@@ -496,6 +496,99 @@ public:
         return true;
     }
 
+    bool process_audio(
+        const aila::worker::AudioRequest& request,
+        std::vector<float>& output) override {
+        float* values = nullptr;
+        int count = 0;
+        int status = AILA_ERR_RUNTIME;
+        switch (request.method) {
+            case aila::worker::AudioMethod::SynthesizeWav:
+                status = aila_synthesize_wav(
+                    engine_, reinterpret_cast<const int*>(request.text_tokens.data()),
+                    static_cast<int>(request.text_tokens.size()),
+                    request.embedding.empty() ? nullptr : request.embedding.data(),
+                    static_cast<int>(request.embedding.size()),
+                    request.has_config ? &request.config : nullptr, &values, &count);
+                break;
+            case aila::worker::AudioMethod::SynthesizeTextToWav:
+                status = aila_synthesize_text_to_wav(
+                    engine_, request.text.c_str(),
+                    request.embedding.empty() ? nullptr : request.embedding.data(),
+                    static_cast<int>(request.embedding.size()),
+                    request.has_config ? &request.config : nullptr, &values, &count);
+                break;
+            case aila::worker::AudioMethod::SynthesizeFile:
+                output.clear();
+                return aila_synthesize(
+                    engine_, request.text.c_str(),
+                    request.has_reference_audio_path ? request.reference_audio_path.c_str() : nullptr,
+                    request.has_speaker_name ? request.speaker_name.c_str() : nullptr,
+                    request.has_instruct_text ? request.instruct_text.c_str() : nullptr,
+                    request.has_language ? request.language.c_str() : nullptr,
+                    request.has_config ? &request.config : nullptr,
+                    request.output_wav_path.c_str()) == AILA_OK;
+            case aila::worker::AudioMethod::DecodeMimi:
+                status = aila_decode_mimi_vocoder(
+                    engine_, request.codes.data(), request.frame_count, &values, &count);
+                break;
+            case aila::worker::AudioMethod::ExtractEmbedding:
+                status = aila_extract_speaker_embedding(
+                    engine_, request.audio_path.c_str(), &values, &count);
+                break;
+            case aila::worker::AudioMethod::SynthesizeStream:
+                return false;
+        }
+        if (status != AILA_OK || count < 0 || (count > 0 && values == nullptr)) {
+            if (values) aila_free_samples(values);
+            output.clear();
+            return false;
+        }
+        try {
+            if (count == 0) output.clear();
+            else output.assign(values, values + count);
+        } catch (...) {
+            if (values) aila_free_samples(values);
+            throw;
+        }
+        if (values) aila_free_samples(values);
+        return true;
+    }
+
+    int synthesize_stream(
+        const aila::worker::AudioRequest& request,
+        const aila::worker::AudioStreamCallback& callback) override {
+        struct Context {
+            const aila::worker::AudioStreamCallback* callback;
+            std::atomic_bool accepted{true};
+        } context{&callback};
+        const auto adapter = [](const float* samples, int count, void* opaque) {
+            auto* context = static_cast<Context*>(opaque);
+            if (!context->accepted.load(std::memory_order_acquire)) return;
+            bool accepted = false;
+            try {
+                accepted = samples != nullptr && count > 0 &&
+                    (*context->callback)(samples, static_cast<size_t>(count));
+            } catch (...) {
+                accepted = false;
+            }
+            context->accepted.store(accepted, std::memory_order_release);
+        };
+        AilaTTSStream* stream = aila_synthesize_stream(
+            engine_, request.text.c_str(),
+            request.has_reference_audio_path ? request.reference_audio_path.c_str() : nullptr,
+            request.has_speaker_name ? request.speaker_name.c_str() : nullptr,
+            request.has_instruct_text ? request.instruct_text.c_str() : nullptr,
+            request.has_language ? request.language.c_str() : nullptr,
+            request.has_config ? &request.config : nullptr,
+            adapter, &context);
+        if (!stream) return -1;
+        const int status = aila_stream_wait(stream);
+        aila_stream_destroy(stream);
+        if (status != AILA_OK) return -1;
+        return context.accepted.load(std::memory_order_acquire) ? 0 : 1;
+    }
+
 private:
     AilaEngine* engine_ = nullptr;
     std::unordered_map<uint64_t, AilaTranscribeStream*> asr_streams_;

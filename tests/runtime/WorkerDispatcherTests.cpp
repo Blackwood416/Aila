@@ -4,6 +4,7 @@
 #include "simdjson.h"
 
 #include <cstdint>
+#include <cstring>
 #include <atomic>
 #include <iostream>
 #include <memory>
@@ -114,6 +115,9 @@ struct EngineState {
     int asr_transcribe_calls = 0;
     int asr_create_calls = 0;
     int asr_destroy_calls = 0;
+    int audio_calls = 0;
+    aila::worker::AudioRequest audio_request;
+    std::vector<float> audio_result{0.25f, -0.5f, 1.0f};
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -208,6 +212,26 @@ public:
     bool transcribe_stream_destroy(uint64_t id) noexcept override {
         ++state_.asr_destroy_calls;
         return id == state_.asr_stream_id;
+    }
+
+    bool process_audio(
+        const aila::worker::AudioRequest& request,
+        std::vector<float>& output) override {
+        ++state_.audio_calls;
+        state_.audio_request = request;
+        output = state_.audio_result;
+        return true;
+    }
+
+    int synthesize_stream(
+        const aila::worker::AudioRequest& request,
+        const aila::worker::AudioStreamCallback& callback) override {
+        ++state_.audio_calls;
+        state_.audio_request = request;
+        const float first[]{0.25f, -0.5f};
+        const float second[]{1.0f};
+        if (!callback(first, 2)) return 1;
+        return callback(second, 1) ? 0 : 1;
     }
 
 private:
@@ -851,6 +875,86 @@ void test_asr_wire_methods_are_dispatched() {
            name, "ASR stream create accepted an unexpected attachment");
 }
 
+void test_audio_wire_methods_validate_and_preserve_binary_arguments() {
+    constexpr const char* name = "audio wire methods validate binary arguments";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+
+    Frame wav = request(
+        300, "tts.synthesize_wav",
+        R"({"tokenCount":2,"embeddingCount":2,"tokenOffset":0,"embeddingOffset":8,"elementSize":4,"byteCount":16,"config":null})");
+    const int32_t packed[]{17, -3};
+    const float embedding[]{0.125f, -0.75f};
+    wav.attachment.resize(sizeof(packed) + sizeof(embedding));
+    std::memcpy(wav.attachment.data(), packed, sizeof(packed));
+    std::memcpy(wav.attachment.data() + sizeof(packed), embedding, sizeof(embedding));
+    const Frame wav_response = dispatcher.dispatch(wav, should_shutdown);
+    expect(wav_response.header.kind == "result", name, "packed TTS request failed");
+    expect(state.audio_request.method == aila::worker::AudioMethod::SynthesizeWav &&
+               state.audio_request.text_tokens == std::vector<int32_t>({17, -3}) &&
+               state.audio_request.embedding == std::vector<float>({0.125f, -0.75f}),
+           name, "packed token/embedding bytes changed");
+    expect(payload_integer(wav_response, "sampleCount", name) == 3 &&
+               payload_integer(wav_response, "elementSize", name) == sizeof(float) &&
+               payload_integer(wav_response, "byteCount", name) == 3 * sizeof(float),
+           name, "audio result shape changed");
+    expect(wav_response.attachment.size() == 3 * sizeof(float), name, "audio bytes changed");
+
+    const int calls = state.audio_calls;
+    wav.header.request_id++;
+    wav.header.payload_json =
+        R"({"tokenCount":18446744073709551615,"embeddingCount":0,"tokenOffset":0,"embeddingOffset":0,"elementSize":4,"byteCount":16,"config":null})";
+    expect(dispatcher.dispatch(wav, should_shutdown).header.kind == "error" &&
+               state.audio_calls == calls,
+           name, "overflowing token count reached adapter");
+
+    Frame mimi = request(
+        302, "mimi.decode",
+        R"({"frameCount":2,"codeCount":32,"elementSize":4,"byteCount":128})");
+    mimi.attachment.resize(128);
+    expect(dispatcher.dispatch(mimi, should_shutdown).header.kind == "result",
+           name, "valid Mimi request failed");
+    expect(state.audio_request.method == aila::worker::AudioMethod::DecodeMimi &&
+               state.audio_request.frame_count == 2 && state.audio_request.codes.size() == 32,
+           name, "Mimi dimensions changed");
+
+    const Frame embedding_response = dispatcher.dispatch(
+        request(303, "tts.extract_embedding", u8R"({"audioPath":"C:\\声音\\参考.wav"})"),
+        should_shutdown);
+    expect(embedding_response.header.kind == "result" &&
+               state.audio_request.method == aila::worker::AudioMethod::ExtractEmbedding &&
+               state.audio_request.audio_path == u8R"(C:\声音\参考.wav)",
+           name, "Unicode embedding path changed");
+}
+
+void test_tts_stream_emits_typed_audio_chunks() {
+    constexpr const char* name = "TTS stream emits typed audio chunks";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    std::atomic_bool cancelled = false;
+    std::vector<Frame> events;
+    const Frame response = dispatcher.dispatch_stream(
+        request(310, "tts.synthesize_stream",
+                u8R"({"text":"你好","referenceAudioPath":null,"speakerName":"","instructText":null,"language":"chinese","config":null})"),
+        [&](const Frame& event) { events.push_back(event); return true; }, cancelled);
+    expect(response.header.kind == "result" && payload_integer(response, "status", name) == 0,
+           name, "TTS stream failed");
+    expect(events.size() == 2, name, "TTS chunk count changed");
+    expect(payload_string(events[0], "event", name) == "audio" &&
+               payload_integer(events[0], "sampleCount", name) == 2 &&
+               payload_integer(events[0], "elementSize", name) == sizeof(float) &&
+               payload_integer(events[0], "byteCount", name) == 2 * sizeof(float),
+           name, "TTS audio event schema changed");
+    expect(state.audio_request.has_speaker_name && state.audio_request.speaker_name.empty() &&
+               !state.audio_request.has_reference_audio_path,
+           name, "nullable versus empty TTS fields changed");
+}
+
 } // namespace
 
 int main() {
@@ -871,6 +975,8 @@ int main() {
         test_stream_dispatcher_emits_correlated_token_and_structured_events();
         test_stream_event_limit_reserves_terminal_slot();
         test_asr_wire_methods_are_dispatched();
+        test_audio_wire_methods_validate_and_preserve_binary_arguments();
+        test_tts_stream_emits_typed_audio_chunks();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

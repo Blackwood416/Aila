@@ -1056,7 +1056,10 @@ ipc::Frame WorkerProcess::request(
 ipc::Frame WorkerProcess::request_stream(
     const ipc::Frame& frame,
     const StreamEventCallback& callback,
-    std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout,
+    std::function<bool()> cancellation_requested,
+    std::chrono::milliseconds cancellation_grace,
+    std::function<void()> request_started) {
     std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
     if (timeout.count() <= 0) {
         impl_->fail("worker stream timeout must be positive");
@@ -1070,6 +1073,7 @@ ipc::Frame WorkerProcess::request_stream(
 
     const Clock::time_point deadline = Clock::now() + timeout;
     impl_->write_request(frame, deadline, "worker stream request");
+    if (request_started) request_started();
 
     struct ResponseState {
         std::mutex mutex;
@@ -1118,11 +1122,26 @@ ipc::Frame WorkerProcess::request_stream(
 
     bool saw_end = false;
     bool sent_cancel = false;
+    std::optional<Clock::time_point> cancel_deadline;
     uint64_t observed_event_count = 0;
     std::optional<uint64_t> expected_event_count;
     std::optional<uint64_t> terminal_event_count;
     std::exception_ptr callback_failure;
     for (;;) {
+        if (!sent_cancel && cancellation_requested && cancellation_requested()) {
+            ipc::Frame cancel_frame;
+            cancel_frame.header.protocol = impl_->expected.protocol;
+            cancel_frame.header.abi = impl_->expected.abi;
+            cancel_frame.header.request_id = frame.header.request_id;
+            cancel_frame.header.kind = "request";
+            cancel_frame.header.method = "cancel";
+            cancel_frame.header.payload_json =
+                std::string("{\"requestId\":") + std::to_string(frame.header.request_id) + "}";
+            impl_->write_request(cancel_frame, deadline, "worker stream cancellation");
+            sent_cancel = true;
+            cancel_deadline = Clock::now() +
+                (std::max)(cancellation_grace, std::chrono::milliseconds::zero());
+        }
         std::vector<ipc::Frame> matching;
         {
             std::lock_guard<std::mutex> lock(impl_->event_mutex);
@@ -1185,6 +1204,8 @@ ipc::Frame WorkerProcess::request_stream(
                         std::to_string(frame.header.request_id) + "}";
                     impl_->write_request(cancel_frame, deadline, "worker stream cancellation");
                     sent_cancel = true;
+                    cancel_deadline = Clock::now() +
+                        (std::max)(cancellation_grace, std::chrono::milliseconds::zero());
                 }
             } catch (...) {
                 callback_failure = std::current_exception();
@@ -1242,6 +1263,12 @@ ipc::Frame WorkerProcess::request_stream(
         }
         if (Clock::now() >= deadline) {
             impl_->terminate_active_process(ERROR_TIMEOUT);
+            break;
+        }
+        if (cancel_deadline && Clock::now() >= *cancel_deadline) {
+            callback_failure = std::make_exception_ptr(std::runtime_error(
+                "worker stream did not stop within the cancellation grace period"));
+            impl_->terminate_active_process(ERROR_OPERATION_ABORTED);
             break;
         }
         std::unique_lock<std::mutex> lock(impl_->event_mutex);
