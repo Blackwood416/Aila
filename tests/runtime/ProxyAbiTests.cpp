@@ -419,6 +419,37 @@ struct LogCapture {
     std::atomic_bool reentered{false};
 };
 
+struct BlockingDestroyCapture {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool release = false;
+};
+
+void blocking_destroy_log(int, const char*, void* user_data) {
+    auto& capture = *static_cast<BlockingDestroyCapture*>(user_data);
+    std::unique_lock<std::mutex> lock(capture.mutex);
+    capture.entered = true;
+    capture.condition.notify_all();
+    capture.condition.wait(lock, [&] { return capture.release; });
+}
+
+struct ReentrantDestroyCapture {
+    const Api* api = nullptr;
+    AilaEngine* engine = nullptr;
+    std::atomic_bool generation_returned{false};
+    std::atomic_bool destroyed{false};
+};
+
+void reentrant_destroy_log(int, const char*, void* user_data) {
+    auto& capture = *static_cast<ReentrantDestroyCapture*>(user_data);
+    while (!capture.generation_returned.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(1ms);
+    }
+    capture.api->destroy(capture.engine);
+    capture.destroyed.store(true, std::memory_order_release);
+}
+
 void capture_log(int level, const char* message, void* user_data) {
     auto& capture = *static_cast<LogCapture*>(user_data);
     if (capture.delay_ms > 0) {
@@ -435,6 +466,8 @@ void capture_log(int level, const char* message, void* user_data) {
     }
     capture.condition.notify_all();
 }
+
+void discard_log(int, const char*, void*) {}
 
 void wait_for_logs(LogCapture& capture, size_t count, const char* context) {
     std::unique_lock<std::mutex> lock(capture.mutex);
@@ -534,6 +567,66 @@ void verify_proxy_logging(const Api& api, AilaEngine* engine) {
         expect(!flood.entries.empty(), "log flood delivered no entries");
         expect(flood.entries.size() <= 270,
                "bounded log queue did not deterministically drop newest flood entries");
+    }
+    api.set_log_callback(discard_log, nullptr);
+    std::this_thread::sleep_for(100ms);
+    api.set_log_callback(nullptr, nullptr);
+}
+
+void verify_log_source_lifecycle(const Api& api) {
+    api.set_log_level(3);
+    {
+        EngineHandle holder(api);
+        expect(api.init(holder.get(), "external-log-destroy", 1024) == 0,
+               "external log-destroy engine init failed");
+        AilaEngine* engine = holder.release();
+        BlockingDestroyCapture capture;
+        api.set_log_callback(blocking_destroy_log, &capture);
+        char* generated = api.generate(engine, "__aila_logs__", nullptr);
+        expect(generated != nullptr, "external log-destroy generation failed");
+        api.free_string(generated);
+        {
+            std::unique_lock<std::mutex> lock(capture.mutex);
+            expect(capture.condition.wait_for(lock, 1s, [&] { return capture.entered; }),
+                   "blocking destroy callback was not entered");
+        }
+        std::atomic_bool destroy_returned{false};
+        std::thread destroy([&] {
+            api.destroy(engine);
+            destroy_returned.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(50ms);
+        expect(!destroy_returned.load(std::memory_order_acquire),
+               "engine destroy returned while log callback user_data was in flight");
+        {
+            std::lock_guard<std::mutex> lock(capture.mutex);
+            capture.release = true;
+        }
+        capture.condition.notify_all();
+        destroy.join();
+        expect(destroy_returned.load(std::memory_order_acquire),
+               "engine destroy did not finish after callback returned");
+        api.set_log_callback(nullptr, nullptr);
+    }
+
+    {
+        EngineHandle holder(api);
+        expect(api.init(holder.get(), "reentrant-log-destroy", 1024) == 0,
+               "reentrant log-destroy engine init failed");
+        ReentrantDestroyCapture capture;
+        capture.api = &api;
+        capture.engine = holder.release();
+        api.set_log_callback(reentrant_destroy_log, &capture);
+        char* generated = api.generate(capture.engine, "__aila_logs__", nullptr);
+        expect(generated != nullptr, "reentrant log-destroy generation failed");
+        api.free_string(generated);
+        capture.generation_returned.store(true, std::memory_order_release);
+        for (int attempt = 0; attempt != 200 &&
+             !capture.destroyed.load(std::memory_order_acquire); ++attempt) {
+            std::this_thread::sleep_for(5ms);
+        }
+        expect(capture.destroyed.load(std::memory_order_acquire),
+               "log callback reentrant engine destroy deadlocked");
     }
     api.set_log_callback(nullptr, nullptr);
 }
@@ -1810,6 +1903,7 @@ void test_proxy_abi_and_lifecycle() {
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
     verify_proxy_logging(api, relative.get());
+    verify_log_source_lifecycle(api);
     verify_audio_proxy(api, relative.get());
     verify_alignment_proxy(api, relative.get());
     verify_streaming_generation(api, relative.get());

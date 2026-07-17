@@ -2,15 +2,12 @@
 
 #include "aila_api.h"
 
-#include <atomic>
 #include <memory>
 #include <string_view>
 
 namespace aila::proxy::logging {
 
-struct SourceState {
-    std::atomic_bool active{true};
-};
+struct SourceState;
 
 using Source = std::shared_ptr<SourceState>;
 

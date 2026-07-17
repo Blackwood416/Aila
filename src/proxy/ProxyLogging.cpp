@@ -1,25 +1,82 @@
 #include "proxy/ProxyLogging.hpp"
 
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 
 namespace aila::proxy::logging {
+
+struct SourceState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool active = true;
+    size_t callbacks_in_flight = 0;
+};
+
 namespace {
+
+thread_local SourceState* current_callback_source = nullptr;
+
+bool acquire_source(const Source& source) noexcept {
+    if (!source) return false;
+    try {
+        std::lock_guard<std::mutex> lock(source->mutex);
+        if (!source->active) return false;
+        ++source->callbacks_in_flight;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void release_source(const Source& source) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(source->mutex);
+        if (source->callbacks_in_flight != 0) --source->callbacks_in_flight;
+        source->condition.notify_all();
+    } catch (...) {}
+}
+
+void default_log_output(std::string_view message) noexcept {
+    try {
+        const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
+        if (handle == nullptr || handle == INVALID_HANDLE_VALUE) return;
+        auto write = [&](const char* data, size_t size) {
+            while (size != 0) {
+                const DWORD chunk = static_cast<DWORD>((std::min)(
+                    size, static_cast<size_t>((std::numeric_limits<DWORD>::max)())));
+                DWORD written = 0;
+                if (WriteFile(handle, data, chunk, &written, nullptr) == FALSE || written == 0) {
+                    return false;
+                }
+                data += written;
+                size -= written;
+            }
+            return true;
+        };
+        if (!write(message.data(), message.size())) return;
+        constexpr char newline = '\n';
+        (void)write(&newline, 1);
+    } catch (...) {}
+}
 
 class Dispatcher {
 public:
     Dispatcher() : thread_([this] { run(); }) {}
 
     ~Dispatcher() {
+        set_callback(nullptr, nullptr);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
             queue_.clear();
-            callback_ = nullptr;
-            user_data_ = nullptr;
         }
         condition_.notify_all();
         if (thread_.joinable()) thread_.join();
@@ -27,10 +84,13 @@ public:
 
     void set_callback(AilaLogCallback callback, void* user_data) noexcept {
         try {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
             callback_ = callback;
             user_data_ = callback ? user_data : nullptr;
-            if (!callback) queue_.clear();
+            const bool called_from_dispatch = std::this_thread::get_id() == thread_.get_id();
+            if (!called_from_dispatch) {
+                callback_condition_.wait(lock, [&] { return callbacks_in_flight_ == 0; });
+            }
         } catch (...) {}
     }
 
@@ -41,13 +101,14 @@ public:
     int level() const noexcept { return level_.load(std::memory_order_acquire); }
 
     void enqueue(const Source& source, int message_level, std::string_view message) noexcept {
-        if (!source || !source->active.load(std::memory_order_acquire) ||
-            message_level < level()) {
-            return;
-        }
+        if (!source || message_level < level()) return;
         try {
+            {
+                std::lock_guard<std::mutex> source_lock(source->mutex);
+                if (!source->active) return;
+            }
             std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_ || !callback_ || queue_.size() >= kCapacity) return;
+            if (stopping_ || queue_.size() >= kCapacity) return;
             queue_.push_back({source, message_level, std::string(message)});
             condition_.notify_one();
         } catch (...) {}
@@ -71,24 +132,44 @@ private:
                 if (stopping_) return;
                 entry = std::move(queue_.front());
                 queue_.pop_front();
-                callback = callback_;
-                user_data = user_data_;
             }
             const auto source = entry.source.lock();
-            if (!source || !source->active.load(std::memory_order_acquire) || !callback ||
-                entry.level < level()) {
-                continue;
+            if (!source || entry.level < level() || !acquire_source(source)) continue;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                callback = callback_;
+                user_data = user_data_;
+                if (callback) ++callbacks_in_flight_;
             }
-            try { callback(entry.level, entry.message.c_str(), user_data); } catch (...) {}
+
+            if (callback) {
+                current_callback_source = source.get();
+                try { callback(entry.level, entry.message.c_str(), user_data); } catch (...) {}
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (callbacks_in_flight_ != 0) --callbacks_in_flight_;
+                    callback_condition_.notify_all();
+                }
+                current_callback_source = nullptr;
+                release_source(source);
+            } else {
+                // Default output owns no host callback/user_data. Release the
+                // source lease first so a redirected or slow stderr cannot
+                // delay engine destruction.
+                release_source(source);
+                default_log_output(entry.message);
+            }
         }
     }
 
     static constexpr size_t kCapacity = 256;
     mutable std::mutex mutex_;
     std::condition_variable condition_;
+    std::condition_variable callback_condition_;
     std::deque<Entry> queue_;
     AilaLogCallback callback_ = nullptr;
     void* user_data_ = nullptr;
+    size_t callbacks_in_flight_ = 0;
     std::atomic_int level_{1};
     bool stopping_ = false;
     std::thread thread_;
@@ -104,7 +185,14 @@ Dispatcher& dispatcher() {
 Source create_source() { return std::make_shared<SourceState>(); }
 
 void deactivate(const Source& source) noexcept {
-    if (source) source->active.store(false, std::memory_order_release);
+    if (!source) return;
+    try {
+        std::unique_lock<std::mutex> lock(source->mutex);
+        source->active = false;
+        if (current_callback_source != source.get()) {
+            source->condition.wait(lock, [&] { return source->callbacks_in_flight == 0; });
+        }
+    } catch (...) {}
 }
 
 void set_callback(AilaLogCallback callback, void* user_data) noexcept {
