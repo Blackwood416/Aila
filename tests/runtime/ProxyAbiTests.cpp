@@ -272,6 +272,13 @@ struct Api {
                                    AilaTokenCallback, void*);
     using GenerateStreamEx = int (*)(AilaEngine*, const char*, const AilaGenConfigV2*,
                                      AilaChatStreamCallback, void*);
+    using Transcribe = char* (*)(AilaEngine*, const char*, const AilaGenConfig*, const char*,
+                                 const char*, float, int, AilaTokenCallback, void*, char**);
+    using AsrStreamCreate = AilaTranscribeStream* (*)(AilaEngine*, const AilaGenConfig*,
+                                                       const char*, const char*);
+    using AsrStreamFeed = int (*)(AilaTranscribeStream*, const float*, int);
+    using AsrStreamGetText = int (*)(AilaTranscribeStream*, char**, char**);
+    using AsrStreamDestroy = void (*)(AilaTranscribeStream*);
     using Reset = void (*)(AilaEngine*);
     using ContextLength = int (*)(AilaEngine*);
     using LastErrorCode = int (*)(AilaEngine*);
@@ -299,6 +306,11 @@ struct Api {
               library.symbol<GenerateStream>("aila_generate_messages_stream")),
           generate_chat_json_stream_ex(
               library.symbol<GenerateStreamEx>("aila_generate_chat_json_stream_ex")),
+          transcribe(library.symbol<Transcribe>("aila_transcribe")),
+          asr_stream_create(library.symbol<AsrStreamCreate>("aila_transcribe_stream_create")),
+          asr_stream_feed(library.symbol<AsrStreamFeed>("aila_transcribe_stream_feed")),
+          asr_stream_get_text(library.symbol<AsrStreamGetText>("aila_transcribe_stream_get_text")),
+          asr_stream_destroy(library.symbol<AsrStreamDestroy>("aila_transcribe_stream_destroy")),
           reset(library.symbol<Reset>("aila_engine_reset_context")),
           context_length(library.symbol<ContextLength>("aila_engine_context_length")),
           last_error_code(library.symbol<LastErrorCode>("aila_last_error_code")),
@@ -323,6 +335,11 @@ struct Api {
     GenerateStream generate_stream;
     GenerateStream generate_messages_stream;
     GenerateStreamEx generate_chat_json_stream_ex;
+    Transcribe transcribe;
+    AsrStreamCreate asr_stream_create;
+    AsrStreamFeed asr_stream_feed;
+    AsrStreamGetText asr_stream_get_text;
+    AsrStreamDestroy asr_stream_destroy;
     Reset reset;
     ContextLength context_length;
     LastErrorCode last_error_code;
@@ -441,6 +458,169 @@ void verify_defaults(const Api& api) {
     expect(v2.use_fixed_seed == 0, "V2 fixed-seed default changed");
     for (int value : v2.reserved) {
         expect(value == 0, "V2 reserved field was not zero");
+    }
+}
+
+void verify_asr_proxy(const Api& api, AilaEngine* engine) {
+    AilaGenConfig config = api.default_config();
+    config.max_new_tokens = 321;
+    config.temperature = 0.25f;
+    config.top_k = 17;
+    config.top_p = 0.75f;
+    config.repetition_penalty = 1.125f;
+    config.presence_penalty = 0.5f;
+    config.frequency_penalty = -0.25f;
+    config.do_sample = 0;
+    config.decode_chunk_size = 9;
+    config.stream_chunk_size = 3;
+
+    struct Capture { std::thread::id caller; int calls = 0; bool wrong_thread = false; };
+    Capture capture{std::this_thread::get_id()};
+    const auto callback = [](const char*, void* opaque) -> int {
+        auto& capture = *static_cast<Capture*>(opaque);
+        capture.wrong_thread = capture.wrong_thread ||
+            std::this_thread::get_id() != capture.caller;
+        ++capture.calls;
+        return 1; // Offline ASR intentionally ignores the callback return.
+    };
+    char* language = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    char* transcript = api.transcribe(
+        engine, u8R"(C:\音频\说话.wav)", &config, "", nullptr, 12.5f, 7,
+        callback, &capture, &language);
+    expect(transcript != nullptr, "offline ASR returned NULL");
+    expect(language != nullptr && transcript != language,
+           "offline ASR transcript/language allocations were not independent");
+    const std::string transcript_text(transcript);
+    expect(transcript_text.find(u8R"("wavPath":"C:\\音频\\说话.wav")") != std::string::npos,
+           "offline ASR changed Unicode path");
+    expect(transcript_text.find(R"("max_new_tokens":321)") != std::string::npos,
+           "offline ASR dropped legacy config");
+    expect(transcript_text.find(R"("forcedLanguage":"")") != std::string::npos,
+           "offline ASR changed empty forced language");
+    expect(transcript_text.find(R"("systemPrompt":null)") != std::string::npos,
+           "offline ASR changed nullable system prompt");
+    expect(transcript_text.find(R"("segmentSec":12.5)") != std::string::npos,
+           "offline ASR changed segment length");
+    expect(transcript_text.find(R"("pastTextConditioning":7)") != std::string::npos,
+           "offline ASR changed conditioning flag");
+    expect(std::string(language) == "Chinese", "offline ASR language changed");
+    expect(!capture.wrong_thread && capture.calls == 2,
+           "offline ASR callbacks did not run completely on caller thread");
+    api.free_string(transcript);
+    api.free_string(language);
+
+    language = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    transcript = api.transcribe(
+        engine, "__aila_asr_empty_language__", nullptr, nullptr, "", 0.0f, 0,
+        nullptr, nullptr, &language);
+    expect(transcript != nullptr && language == nullptr,
+           "empty ASR language did not map to NULL output");
+    api.free_string(transcript);
+
+    language = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+    expect(api.transcribe(engine, nullptr, nullptr, nullptr, nullptr, 0.0f, 0,
+                          nullptr, nullptr, &language) == nullptr && language == nullptr,
+           "invalid offline ASR did not clear language_out");
+    expect(api.context_length(engine) != 0,
+           "local invalid ASR input reaped the healthy worker");
+    const uint32_t infinity_bits = 0x7f800000u;
+    float infinity = 0.0f;
+    std::memcpy(&infinity, &infinity_bits, sizeof(infinity));
+    expect(api.transcribe(engine, "finite.wav", nullptr, nullptr, nullptr,
+                          infinity, 0,
+                          nullptr, nullptr, nullptr) == nullptr,
+           "offline ASR accepted a non-finite segment length");
+    expect(api.context_length(engine) != 0,
+           "non-finite local ASR input reaped the healthy worker");
+
+    AilaTranscribeStream* stream =
+        api.asr_stream_create(engine, &config, "expect-floats", u8"系统");
+    expect(stream != nullptr, "ASR stream create failed");
+    expect(api.asr_stream_feed(stream, nullptr, 3) == AILA_ERR_INVALID_ARGUMENT,
+           "ASR stream accepted NULL samples");
+    const float samples[] = {1.25f, -2.5f, 0.0f};
+    expect(api.asr_stream_feed(stream, samples, 3) == AILA_OK,
+           "ASR stream changed raw float attachment");
+    char* stable = nullptr;
+    char* partial = nullptr;
+    expect(api.asr_stream_get_text(stream, &stable, &partial) == AILA_OK,
+           "ASR stream get_text failed");
+    expect(stable && partial && stable != partial && std::string(stable) == u8"稳定" &&
+               std::string(partial) == u8"临时",
+           "ASR stream stable/partial outputs changed");
+    api.free_string(stable);
+    api.free_string(partial);
+    expect(api.asr_stream_get_text(stream, nullptr, nullptr) == AILA_OK,
+           "ASR stream optional outputs were not optional");
+    api.asr_stream_destroy(stream);
+    api.asr_stream_destroy(nullptr);
+}
+
+void verify_asr_stream_outlives_engine(const Api& api) {
+    AilaEngine* engine = api.create();
+    expect(engine != nullptr && api.init(engine, "asr-owner", 640) == 0,
+           "ASR owner engine init failed");
+    AilaTranscribeStream* stream = api.asr_stream_create(engine, nullptr, nullptr, nullptr);
+    expect(stream != nullptr, "ASR owner stream creation failed");
+    api.destroy(engine);
+    const float sample = 0.5f;
+    expect(api.asr_stream_feed(stream, &sample, 1) == AILA_OK,
+           "destroying engine invalidated its live ASR stream");
+    char* stable = nullptr;
+    expect(api.asr_stream_get_text(stream, &stable, nullptr) == AILA_OK && stable != nullptr,
+           "ASR stream had a dangling engine owner");
+    api.free_string(stable);
+    api.asr_stream_destroy(stream);
+}
+
+void verify_malformed_asr_reaps_worker(const Api& api) {
+    {
+        const auto before = child_worker_processes();
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), "bad-asr-result", 700) == 0,
+               "malformed ASR engine init failed");
+        DWORD pid = 0;
+        for (DWORD candidate : child_worker_processes()) {
+            if (before.find(candidate) == before.end()) { pid = candidate; break; }
+        }
+        expect(api.transcribe(engine.get(), "__aila_asr_bad_lengths__", nullptr,
+                              nullptr, nullptr, 0.0f, 0, nullptr, nullptr, nullptr) == nullptr,
+               "malformed offline ASR lengths succeeded");
+        for (int attempt = 0; attempt != 100; ++attempt) {
+            const auto current = child_worker_processes();
+            if (current.find(pid) == current.end()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+        const auto remaining = child_worker_processes();
+        expect(pid != 0 && remaining.find(pid) == remaining.end(),
+               "malformed offline ASR result did not reap worker");
+    }
+    {
+        const auto before = child_worker_processes();
+        EngineHandle engine(api);
+        expect(api.init(engine.get(), "bad-asr-stream-text", 701) == 0,
+               "malformed ASR stream engine init failed");
+        DWORD pid = 0;
+        for (DWORD candidate : child_worker_processes()) {
+            if (before.find(candidate) == before.end()) { pid = candidate; break; }
+        }
+        AilaTranscribeStream* stream =
+            api.asr_stream_create(engine.get(), nullptr, nullptr, "malformed-text");
+        expect(stream != nullptr, "malformed ASR text stream creation failed");
+        char* stable = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+        char* partial = reinterpret_cast<char*>(static_cast<uintptr_t>(1));
+        expect(api.asr_stream_get_text(stream, &stable, &partial) == AILA_ERR_RUNTIME &&
+                   stable == nullptr && partial == nullptr,
+               "malformed ASR text lengths succeeded or leaked outputs");
+        for (int attempt = 0; attempt != 100; ++attempt) {
+            const auto current = child_worker_processes();
+            if (current.find(pid) == current.end()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+        const auto remaining = child_worker_processes();
+        expect(pid != 0 && remaining.find(pid) == remaining.end(),
+               "malformed ASR stream text did not reap worker");
+        api.asr_stream_destroy(stream);
     }
 }
 
@@ -971,14 +1151,17 @@ void test_proxy_abi_and_lifecycle() {
     EngineHandle relative(api);
     expect(child_worker_processes() == workers_before_create,
            "aila_engine_create launched a worker process");
-    expect(api.init(relative.get(), model.data(), 4096) == 0,
-           "relative split-layout initialization failed");
+    const int relative_init = api.init(relative.get(), model.data(), 4096);
+    expect(relative_init == 0,
+           std::string("relative split-layout initialization failed: ") +
+               api.last_error_message(relative.get()));
     expect(api.last_error_code(relative.get()) == AILA_OK,
            "successful init did not clear last error");
     expect(api.context_length(relative.get()) == 4096,
            "fake context length was not deterministic after init");
     verify_synchronous_generation(api, relative.get());
     verify_streaming_generation(api, relative.get());
+    verify_asr_proxy(api, relative.get());
     verify_v2_prefix_does_not_read_past_struct_size(api, relative.get());
     verify_generation_errors_and_allocations(api, relative.get());
     auto lines = read_marker(marker);
@@ -1025,6 +1208,8 @@ void test_proxy_abi_and_lifecycle() {
     verify_malformed_generation_response_reaps_worker(api);
     verify_invalid_utf8_generation_response_reaps_worker(api);
     verify_malformed_stream_events_reap_worker(api);
+    verify_asr_stream_outlives_engine(api);
+    verify_malformed_asr_reaps_worker(api);
     build_id.set(L"wrong-build-id");
     {
         EngineHandle retry(api);

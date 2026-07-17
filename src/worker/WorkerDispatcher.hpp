@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 namespace aila::worker {
 
@@ -32,6 +33,27 @@ enum class TextGenerationMethod {
 using TokenStreamCallback = std::function<bool(std::string_view)>;
 using StructuredStreamCallback = std::function<bool(const AilaChatStreamEvent&)>;
 using WorkerStreamEmitter = std::function<bool(const ipc::Frame&)>;
+
+struct AsrRequest {
+    std::string wav_path;
+    bool has_config = false;
+    AilaGenConfig config{};
+    bool has_forced_language = false;
+    std::string forced_language;
+    bool has_system_prompt = false;
+    std::string system_prompt;
+    float segment_sec = 0.0f;
+    int past_text_conditioning = 0;
+};
+
+struct AsrStreamConfig {
+    bool has_config = false;
+    AilaGenConfig config{};
+    bool has_forced_language = false;
+    std::string forced_language;
+    bool has_system_prompt = false;
+    std::string system_prompt;
+};
 
 struct TextGenerationRequest {
     TextGenerationMethod method = TextGenerationMethod::Generate;
@@ -58,11 +80,22 @@ public:
         const TextGenerationRequest& request,
         const TokenStreamCallback& token_callback,
         const StructuredStreamCallback& structured_callback) = 0;
+    virtual bool transcribe(
+        const AsrRequest& request,
+        const std::function<void(std::string_view)>& token_callback,
+        std::string& transcript,
+        std::string& language) = 0;
+    virtual bool transcribe_stream_create(uint64_t id, const AsrStreamConfig& config) = 0;
+    virtual bool transcribe_stream_feed(uint64_t id, const float* samples, size_t count) = 0;
+    virtual bool transcribe_stream_get_text(
+        uint64_t id, std::string& stable, std::string& partial) = 0;
+    virtual bool transcribe_stream_destroy(uint64_t id) noexcept = 0;
 };
 
 class WorkerDispatcher {
 public:
     explicit WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine);
+    ~WorkerDispatcher() noexcept;
 
     ipc::Frame dispatch(const ipc::Frame& request, bool& should_shutdown);
     ipc::Frame dispatch_stream(
@@ -74,6 +107,8 @@ public:
 private:
     std::unique_ptr<WorkerEngineApi> engine_;
     bool initialized_ = false;
+    uint64_t next_asr_stream_id_ = 1;
+    std::unordered_set<uint64_t> asr_stream_ids_;
 };
 
 } // namespace aila::worker

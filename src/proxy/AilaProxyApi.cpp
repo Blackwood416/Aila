@@ -7,11 +7,18 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <new>
 #include <string>
 
 struct AilaEngine {
-    aila::proxy::ProxyEngine proxy;
+    AilaEngine() : proxy(std::make_shared<aila::proxy::ProxyEngine>()) {}
+    std::shared_ptr<aila::proxy::ProxyEngine> proxy;
+};
+
+struct AilaTranscribeStream {
+    std::shared_ptr<aila::proxy::ProxyEngine> owner;
+    uint64_t remote_id = 0;
 };
 
 namespace {
@@ -29,7 +36,7 @@ void record_boundary_failure(AilaEngine* engine, const char* operation) noexcept
         return;
     }
     try {
-        engine->proxy.record_runtime_error(
+        engine->proxy->record_runtime_error(
             std::string(operation) + " failed at the C ABI boundary");
     } catch (...) {
     }
@@ -61,19 +68,19 @@ char* generate_legacy(
     }
     if (!input) {
         try {
-            engine->proxy.record_invalid_argument("generation input must not be NULL");
+            engine->proxy->record_invalid_argument("generation input must not be NULL");
         } catch (...) {
         }
         return nullptr;
     }
     try {
         std::string output;
-        if (!engine->proxy.generate_text(method, input, config, output)) {
+        if (!engine->proxy->generate_text(method, input, config, output)) {
             return nullptr;
         }
         char* result = allocate_result(output);
         if (!result) {
-            engine->proxy.record_runtime_error("could not allocate generation result");
+            engine->proxy->record_runtime_error("could not allocate generation result");
         }
         return result;
     } catch (...) {
@@ -93,19 +100,19 @@ char* generate_v2(
     }
     if (!input) {
         try {
-            engine->proxy.record_invalid_argument("generation input must not be NULL");
+            engine->proxy->record_invalid_argument("generation input must not be NULL");
         } catch (...) {
         }
         return nullptr;
     }
     try {
         std::string output;
-        if (!engine->proxy.generate_text_v2(method, input, config, output)) {
+        if (!engine->proxy->generate_text_v2(method, input, config, output)) {
             return nullptr;
         }
         char* result = allocate_result(output);
         if (!result) {
-            engine->proxy.record_runtime_error("could not allocate generation result");
+            engine->proxy->record_runtime_error("could not allocate generation result");
         }
         return result;
     } catch (...) {
@@ -134,13 +141,13 @@ AILA_API int aila_engine_init(AilaEngine* engine, const char* model_dir, int max
     }
     if (!model_dir) {
         try {
-            engine->proxy.record_invalid_argument("model_dir must not be NULL");
+            engine->proxy->record_invalid_argument("model_dir must not be NULL");
         } catch (...) {
         }
         return -1;
     }
     try {
-        return engine->proxy.init(model_dir, max_seq_len) ? 0 : -1;
+        return engine->proxy->init(model_dir, max_seq_len) ? 0 : -1;
     } catch (...) {
         record_boundary_failure(engine, "aila_engine_init");
         return -1;
@@ -240,12 +247,12 @@ AILA_API int aila_generate_stream(
     void* user_data) {
     if (!engine) return -1;
     if (!prompt || !callback) {
-        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        try { engine->proxy->record_invalid_argument("stream input and callback must not be NULL"); }
         catch (...) {}
         return -1;
     }
     try {
-        return engine->proxy.generate_stream(
+        return engine->proxy->generate_stream(
             "generate.stream", prompt, config, callback, user_data);
     } catch (...) {
         record_boundary_failure(engine, "aila_generate_stream");
@@ -261,12 +268,12 @@ AILA_API int aila_generate_messages_stream(
     void* user_data) {
     if (!engine) return -1;
     if (!messages_json || !callback) {
-        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        try { engine->proxy->record_invalid_argument("stream input and callback must not be NULL"); }
         catch (...) {}
         return -1;
     }
     try {
-        return engine->proxy.generate_stream(
+        return engine->proxy->generate_stream(
             "generate.messages_stream", messages_json, config, callback, user_data);
     } catch (...) {
         record_boundary_failure(engine, "aila_generate_messages_stream");
@@ -282,12 +289,12 @@ AILA_API int aila_generate_chat_json_stream_ex(
     void* user_data) {
     if (!engine) return -1;
     if (!chat_request_json || !callback) {
-        try { engine->proxy.record_invalid_argument("stream input and callback must not be NULL"); }
+        try { engine->proxy->record_invalid_argument("stream input and callback must not be NULL"); }
         catch (...) {}
         return -1;
     }
     try {
-        return engine->proxy.generate_stream_v2(
+        return engine->proxy->generate_stream_v2(
             "generate.chat_json_stream_ex", chat_request_json, config, callback, user_data);
     } catch (...) {
         record_boundary_failure(engine, "aila_generate_chat_json_stream_ex");
@@ -300,7 +307,7 @@ AILA_API void aila_engine_reset_context(AilaEngine* engine) {
         return;
     }
     try {
-        engine->proxy.reset_context();
+        engine->proxy->reset_context();
     } catch (...) {
         record_boundary_failure(engine, "aila_engine_reset_context");
     }
@@ -311,7 +318,7 @@ AILA_API int aila_engine_context_length(AilaEngine* engine) {
         return 0;
     }
     try {
-        return engine->proxy.context_length();
+        return engine->proxy->context_length();
     } catch (...) {
         record_boundary_failure(engine, "aila_engine_context_length");
         return 0;
@@ -323,7 +330,7 @@ AILA_API int aila_last_error_code(AilaEngine* engine) {
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
-        return engine->proxy.last_error_code();
+        return engine->proxy->last_error_code();
     } catch (...) {
         return AILA_ERR_RUNTIME;
     }
@@ -334,10 +341,135 @@ AILA_API const char* aila_last_error_message(AilaEngine* engine) {
         return kEmpty;
     }
     try {
-        return engine->proxy.last_error_message();
+        return engine->proxy->last_error_message();
     } catch (...) {
         return kEmpty;
     }
+}
+
+AILA_API char* aila_transcribe(
+    AilaEngine* engine,
+    const char* wav_path,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt,
+    float segment_sec,
+    int past_text_conditioning,
+    AilaTokenCallback token_callback,
+    void* user_data,
+    char** language_out) {
+    if (language_out) *language_out = nullptr;
+    if (!engine) return nullptr;
+    if (!wav_path) {
+        try { engine->proxy->record_invalid_argument("wav_path must not be NULL"); } catch (...) {}
+        return nullptr;
+    }
+    try {
+        std::string transcript;
+        std::string language;
+        if (!engine->proxy->transcribe(
+                wav_path, config, forced_language, system_prompt, segment_sec,
+                past_text_conditioning, token_callback, user_data, transcript, language)) {
+            return nullptr;
+        }
+        char* allocated_language = nullptr;
+        if (language_out && !language.empty()) {
+            allocated_language = allocate_result(language);
+            if (!allocated_language) {
+                engine->proxy->record_runtime_error("could not allocate ASR language result");
+                return nullptr;
+            }
+        }
+        char* allocated_transcript = allocate_result(transcript);
+        if (!allocated_transcript) {
+            std::free(allocated_language);
+            engine->proxy->record_runtime_error("could not allocate ASR transcript result");
+            return nullptr;
+        }
+        if (language_out) *language_out = allocated_language;
+        return allocated_transcript;
+    } catch (...) {
+        record_boundary_failure(engine, "aila_transcribe");
+        return nullptr;
+    }
+}
+
+AILA_API AilaTranscribeStream* aila_transcribe_stream_create(
+    AilaEngine* engine,
+    const AilaGenConfig* config,
+    const char* forced_language,
+    const char* system_prompt) {
+    if (!engine) return nullptr;
+    try {
+        uint64_t id = 0;
+        if (!engine->proxy->transcribe_stream_create(
+                config, forced_language, system_prompt, id)) return nullptr;
+        try {
+            return new AilaTranscribeStream{engine->proxy, id};
+        } catch (...) {
+            engine->proxy->transcribe_stream_destroy(id);
+            throw;
+        }
+    } catch (...) {
+        record_boundary_failure(engine, "aila_transcribe_stream_create");
+        return nullptr;
+    }
+}
+
+AILA_API int aila_transcribe_stream_feed(
+    AilaTranscribeStream* stream,
+    const float* samples,
+    int sample_count) {
+    if (!stream || !samples || sample_count <= 0) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        return stream->owner->transcribe_stream_feed(stream->remote_id, samples, sample_count);
+    } catch (...) {
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_transcribe_stream_get_text(
+    AilaTranscribeStream* stream,
+    char** out_stable,
+    char** out_partial) {
+    if (out_stable) *out_stable = nullptr;
+    if (out_partial) *out_partial = nullptr;
+    if (!stream) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::string stable;
+        std::string partial;
+        const int status = stream->owner->transcribe_stream_get_text(
+            stream->remote_id, stable, partial);
+        if (status != AILA_OK) return status;
+        char* stable_result = nullptr;
+        char* partial_result = nullptr;
+        if (out_stable && !stable.empty()) {
+            stable_result = allocate_result(stable);
+            if (!stable_result) {
+                stream->owner->record_runtime_error("could not allocate stable ASR text");
+                return AILA_ERR_RUNTIME;
+            }
+        }
+        if (out_partial && !partial.empty()) {
+            partial_result = allocate_result(partial);
+            if (!partial_result) {
+                std::free(stable_result);
+                stream->owner->record_runtime_error("could not allocate partial ASR text");
+                return AILA_ERR_RUNTIME;
+            }
+        }
+        if (out_stable) *out_stable = stable_result;
+        if (out_partial) *out_partial = partial_result;
+        return AILA_OK;
+    } catch (...) {
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API void aila_transcribe_stream_destroy(AilaTranscribeStream* stream) {
+    if (!stream) return;
+    try { stream->owner->transcribe_stream_destroy(stream->remote_id); } catch (...) {}
+    try { delete stream; } catch (...) {}
 }
 
 AILA_API void aila_free_string(char* string) {

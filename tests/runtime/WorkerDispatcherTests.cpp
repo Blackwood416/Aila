@@ -107,6 +107,13 @@ struct EngineState {
     std::string generated_text = u8"worker 输出";
     TextGenerationRequest generation_request;
     int stream_calls = 0;
+    uint64_t asr_stream_id = 0;
+    std::vector<float> asr_samples;
+    aila::worker::AsrRequest asr_request;
+    aila::worker::AsrStreamConfig asr_stream_config;
+    int asr_transcribe_calls = 0;
+    int asr_create_calls = 0;
+    int asr_destroy_calls = 0;
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -165,6 +172,42 @@ public:
         }
         if (!token_callback(u8"第一")) return 1;
         return token_callback(" second") ? 0 : 1;
+    }
+
+    bool transcribe(
+        const aila::worker::AsrRequest& request,
+        const std::function<void(std::string_view)>& callback,
+        std::string& transcript,
+        std::string& language) override {
+        ++state_.asr_transcribe_calls;
+        state_.asr_request = request;
+        callback(u8"词");
+        transcript = u8"转录";
+        language = "Chinese";
+        return true;
+    }
+    bool transcribe_stream_create(
+        uint64_t id, const aila::worker::AsrStreamConfig& config) override {
+        ++state_.asr_create_calls;
+        state_.asr_stream_id = id;
+        state_.asr_stream_config = config;
+        return true;
+    }
+    bool transcribe_stream_feed(uint64_t id, const float* samples, size_t count) override {
+        if (id != state_.asr_stream_id) return false;
+        state_.asr_samples.assign(samples, samples + count);
+        return true;
+    }
+    bool transcribe_stream_get_text(
+        uint64_t id, std::string& stable, std::string& partial) override {
+        if (id != state_.asr_stream_id) return false;
+        stable = u8"稳定";
+        partial = u8"部分";
+        return true;
+    }
+    bool transcribe_stream_destroy(uint64_t id) noexcept override {
+        ++state_.asr_destroy_calls;
+        return id == state_.asr_stream_id;
     }
 
 private:
@@ -708,6 +751,88 @@ void test_stream_event_limit_reserves_terminal_slot() {
         "data event consumed the reserved terminal slot");
 }
 
+void test_asr_wire_methods_are_dispatched() {
+    constexpr const char* name = "ASR wire methods are dispatched";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+    const Frame create_response = dispatcher.dispatch(
+        request(201, "asr.stream.create",
+                R"({"config":{"max_new_tokens":8,"temperature":0.5,"top_k":9,"top_p":0.8,"repetition_penalty":1.1,"presence_penalty":0.2,"frequency_penalty":-0.3,"do_sample":0,"decode_chunk_size":7,"stream_chunk_size":2},"forcedLanguage":"","systemPrompt":null})"),
+        should_shutdown);
+    expect(create_response.header.kind == "result", name,
+           "ASR stream create was not handled by the dispatcher");
+    expect(payload_integer(create_response, "streamId", name) == 1,
+           name, "ASR remote stream ID did not start at one");
+    expect(state.asr_create_calls == 1 && state.asr_stream_config.has_config &&
+               state.asr_stream_config.has_forced_language &&
+               state.asr_stream_config.forced_language.empty() &&
+               !state.asr_stream_config.has_system_prompt,
+           name, "ASR stream nullable/empty config semantics changed");
+
+    const float samples[] = {1.25f, -2.5f, 0.0f};
+    Frame feed = request(
+        202, "asr.stream.feed",
+        R"({"streamId":1,"sampleCount":3,"elementSize":4,"byteCount":12})");
+    feed.attachment.resize(sizeof(samples));
+    std::memcpy(feed.attachment.data(), samples, sizeof(samples));
+    expect(dispatcher.dispatch(feed, should_shutdown).header.kind == "result",
+           name, "valid ASR float attachment was rejected");
+    expect(state.asr_samples.size() == 3 &&
+               std::memcmp(state.asr_samples.data(), samples, sizeof(samples)) == 0,
+           name, "ASR float attachment bytes changed");
+
+    Frame malformed = feed;
+    malformed.header.request_id = 203;
+    malformed.header.payload_json =
+        R"({"streamId":1,"sampleCount":18446744073709551615,"elementSize":4,"byteCount":12})";
+    expect(dispatcher.dispatch(malformed, should_shutdown).header.kind == "error",
+           name, "overflowing ASR sample count reached the adapter");
+
+    const Frame text_response = dispatcher.dispatch(
+        request(204, "asr.stream.get_text", R"({"streamId":1})"), should_shutdown);
+    expect(text_response.header.kind == "result" &&
+               attachment_string(text_response) == std::string(u8"稳定部分"),
+           name, "ASR stable/partial attachment changed");
+    expect(payload_integer(text_response, "stableBytes", name) == 6 &&
+               payload_integer(text_response, "partialBytes", name) == 6,
+           name, "ASR stable/partial lengths changed");
+
+    expect(dispatcher.dispatch(
+               request(205, "asr.stream.destroy", R"({"streamId":1})"),
+               should_shutdown).header.kind == "result",
+           name, "ASR stream destroy failed");
+    expect(state.asr_destroy_calls == 1, name, "ASR stream was not destroyed exactly once");
+    expect(dispatcher.dispatch(
+               request(206, "asr.stream.get_text", R"({"streamId":1})"),
+               should_shutdown).header.kind == "error",
+           name, "destroyed ASR stream ID remained usable");
+
+    std::vector<Frame> events;
+    std::atomic_bool cancelled = false;
+    const Frame transcription = dispatcher.dispatch_stream(
+        request(207, "asr.transcribe",
+                R"({"wavPath":"C:\\音频\\说话.wav","config":null,"forcedLanguage":null,"systemPrompt":"","segmentSec":12.5,"pastTextConditioning":3})"),
+        [&](const Frame& event) { events.push_back(event); return true; }, cancelled);
+    expect(transcription.header.kind == "result" && events.size() == 1,
+           name, "offline ASR did not emit token/result frames");
+    expect(payload_integer(transcription, "transcriptBytes", name) == 6 &&
+               payload_integer(transcription, "languageBytes", name) == 7 &&
+               payload_integer(transcription, "eventCount", name) == 2,
+           name, "offline ASR result lengths/event barrier changed");
+    expect(attachment_string(transcription) == std::string(u8"转录Chinese"),
+           name, "offline ASR transcript/language attachment changed");
+    expect(state.asr_transcribe_calls == 1 &&
+               state.asr_request.wav_path == u8R"(C:\音频\说话.wav)" &&
+               !state.asr_request.has_forced_language &&
+               state.asr_request.has_system_prompt && state.asr_request.system_prompt.empty() &&
+               state.asr_request.segment_sec == 12.5f &&
+               state.asr_request.past_text_conditioning == 3,
+           name, "offline ASR arguments were not forwarded exactly");
+}
+
 } // namespace
 
 int main() {
@@ -727,6 +852,7 @@ int main() {
         test_generation_propagates_adapter_error_and_rejects_embedded_nul_output();
         test_stream_dispatcher_emits_correlated_token_and_structured_events();
         test_stream_event_limit_reserves_terminal_slot();
+        test_asr_wire_methods_are_dispatched();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;
     } catch (const std::exception& exception) {

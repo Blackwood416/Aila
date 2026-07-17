@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aila::proxy {
 
@@ -43,6 +44,26 @@ public:
         const AilaGenConfigV2* config,
         AilaChatStreamCallback callback,
         void* user_data);
+    bool transcribe(
+        std::string_view wav_path,
+        const AilaGenConfig* config,
+        const char* forced_language,
+        const char* system_prompt,
+        float segment_sec,
+        int past_text_conditioning,
+        AilaTokenCallback callback,
+        void* user_data,
+        std::string& transcript,
+        std::string& language);
+    bool transcribe_stream_create(
+        const AilaGenConfig* config,
+        const char* forced_language,
+        const char* system_prompt,
+        uint64_t& stream_id);
+    int transcribe_stream_feed(uint64_t stream_id, const float* samples, int sample_count);
+    int transcribe_stream_get_text(
+        uint64_t stream_id, std::string& stable, std::string& partial);
+    void transcribe_stream_destroy(uint64_t stream_id) noexcept;
 
     int last_error_code() const;
     const char* last_error_message() const;
@@ -51,6 +72,10 @@ public:
 
 private:
     ipc::Frame request_locked(std::string method, std::string payload_json);
+    ipc::Frame request_locked(
+        std::string method,
+        std::string payload_json,
+        std::vector<std::byte> attachment);
     bool accept_lifecycle_response_locked(
         const ipc::Frame& response,
         std::string_view expected_method);

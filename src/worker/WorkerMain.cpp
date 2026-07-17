@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <unordered_map>
 
 #ifndef AILA_BUILD_ID
 #error "AilaWorker requires the deterministic AILA_BUILD_ID compile definition"
@@ -287,6 +288,11 @@ public:
     }
 
     ~CApiWorkerEngine() override {
+        for (auto& [id, stream] : asr_streams_) {
+            (void)id;
+            aila_transcribe_stream_destroy(stream);
+        }
+        asr_streams_.clear();
         aila_engine_destroy(engine_);
         engine_ = nullptr;
     }
@@ -398,8 +404,101 @@ public:
         }
     }
 
+    bool transcribe(
+        const aila::worker::AsrRequest& request,
+        const std::function<void(std::string_view)>& token_callback,
+        std::string& transcript,
+        std::string& language) override {
+        struct Context {
+            const std::function<void(std::string_view)>* callback;
+        } context{&token_callback};
+        const auto adapter = [](const char* text, void* opaque) -> int {
+            auto* context = static_cast<Context*>(opaque);
+            if (text != nullptr) (*context->callback)(text);
+            return 0; // The public offline-ASR callback return is intentionally ignored.
+        };
+        char* language_result = nullptr;
+        char* text = aila_transcribe(
+            engine_, request.wav_path.c_str(), request.has_config ? &request.config : nullptr,
+            request.has_forced_language ? request.forced_language.c_str() : nullptr,
+            request.has_system_prompt ? request.system_prompt.c_str() : nullptr,
+            request.segment_sec, request.past_text_conditioning,
+            token_callback ? adapter : nullptr, &context, &language_result);
+        if (!text) {
+            if (language_result) aila_free_string(language_result);
+            transcript.clear();
+            language.clear();
+            return false;
+        }
+        try {
+            transcript.assign(text);
+            language = language_result ? std::string(language_result) : std::string{};
+        } catch (...) {
+            aila_free_string(text);
+            if (language_result) aila_free_string(language_result);
+            throw;
+        }
+        aila_free_string(text);
+        if (language_result) aila_free_string(language_result);
+        return true;
+    }
+
+    bool transcribe_stream_create(
+        uint64_t id, const aila::worker::AsrStreamConfig& config) override {
+        if (asr_streams_.find(id) != asr_streams_.end()) return false;
+        AilaTranscribeStream* stream = aila_transcribe_stream_create(
+            engine_, config.has_config ? &config.config : nullptr,
+            config.has_forced_language ? config.forced_language.c_str() : nullptr,
+            config.has_system_prompt ? config.system_prompt.c_str() : nullptr);
+        if (!stream) return false;
+        asr_streams_.emplace(id, stream);
+        return true;
+    }
+
+    bool transcribe_stream_feed(uint64_t id, const float* samples, size_t count) override {
+        const auto found = asr_streams_.find(id);
+        if (found == asr_streams_.end() || count > (std::numeric_limits<int>::max)()) return false;
+        return aila_transcribe_stream_feed(
+                   found->second, samples, static_cast<int>(count)) == AILA_OK;
+    }
+
+    bool transcribe_stream_get_text(
+        uint64_t id, std::string& stable, std::string& partial) override {
+        const auto found = asr_streams_.find(id);
+        if (found == asr_streams_.end()) return false;
+        char* stable_result = nullptr;
+        char* partial_result = nullptr;
+        const int status = aila_transcribe_stream_get_text(
+            found->second, &stable_result, &partial_result);
+        if (status != AILA_OK) {
+            if (stable_result) aila_free_string(stable_result);
+            if (partial_result) aila_free_string(partial_result);
+            return false;
+        }
+        try {
+            stable = stable_result ? std::string(stable_result) : std::string{};
+            partial = partial_result ? std::string(partial_result) : std::string{};
+        } catch (...) {
+            if (stable_result) aila_free_string(stable_result);
+            if (partial_result) aila_free_string(partial_result);
+            throw;
+        }
+        if (stable_result) aila_free_string(stable_result);
+        if (partial_result) aila_free_string(partial_result);
+        return true;
+    }
+
+    bool transcribe_stream_destroy(uint64_t id) noexcept override {
+        const auto found = asr_streams_.find(id);
+        if (found == asr_streams_.end()) return false;
+        aila_transcribe_stream_destroy(found->second);
+        asr_streams_.erase(found);
+        return true;
+    }
+
 private:
     AilaEngine* engine_ = nullptr;
+    std::unordered_map<uint64_t, AilaTranscribeStream*> asr_streams_;
 };
 
 bool clean_command_eof(DWORD available_before_read) {

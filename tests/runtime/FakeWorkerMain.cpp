@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -346,6 +347,12 @@ int run(const Handles& handles) {
 
     bool initialized = false;
     int context_length = 0;
+    struct AsrStreamState {
+        bool active = true;
+        bool expect_floats = false;
+        bool malformed_text = false;
+    };
+    std::vector<AsrStreamState> asr_streams;
     for (;;) {
         aila::ipc::Frame command;
         std::string error;
@@ -421,6 +428,128 @@ int run(const Handles& handles) {
             response.header.payload_json =
                 std::string("{\"contextLength\":") +
                 std::to_string(context_length) + "}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "asr.transcribe") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            size_t event_count = 0;
+            send_frame(handles.event_write, stream_event(
+                command, R"({"event":"token","byteCount":6})", u8"识别"));
+            ++event_count;
+            send_frame(handles.event_write, stream_event(
+                command, R"({"event":"token","byteCount":6})", " token"));
+            ++event_count;
+            const uint64_t terminal_count = event_count + 1;
+            send_frame(handles.event_write, stream_event(
+                command, "{\"event\":\"end\",\"eventCount\":" +
+                    std::to_string(terminal_count) + "}"));
+            const std::string transcript =
+                command.header.payload_json.find("__aila_asr_empty__") != std::string::npos
+                    ? std::string{} : std::string(u8"完整转录|") + command.header.payload_json;
+            const std::string language =
+                command.header.payload_json.find("__aila_asr_empty_language__") != std::string::npos
+                    ? std::string{} : "Chinese";
+            response.header.payload_json =
+                "{\"transcriptBytes\":" + std::to_string(transcript.size()) +
+                ",\"languageBytes\":" + std::to_string(language.size()) +
+                ",\"eventCount\":" + std::to_string(terminal_count) + "}";
+            response.attachment.clear();
+            for (unsigned char byte : transcript) response.attachment.push_back(static_cast<std::byte>(byte));
+            for (unsigned char byte : language) response.attachment.push_back(static_cast<std::byte>(byte));
+            if (command.header.payload_json.find("__aila_asr_bad_lengths__") != std::string::npos) {
+                response.header.payload_json =
+                    "{\"transcriptBytes\":999,\"languageBytes\":0,\"eventCount\":" +
+                    std::to_string(terminal_count) + "}";
+            } else if (command.header.payload_json.find("__aila_asr_bad_utf8__") != std::string::npos) {
+                response.attachment = {std::byte{0xc3}, std::byte{0x28}};
+                response.header.payload_json =
+                    "{\"transcriptBytes\":2,\"languageBytes\":0,\"eventCount\":" +
+                    std::to_string(terminal_count) + "}";
+            }
+            send_frame(handles.response_write, response);
+            continue;
+        }
+        if (command.header.method == "asr.stream.create") {
+            if (!initialized) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "engine is not initialized"));
+                continue;
+            }
+            const uint64_t id = asr_streams.size() + 1;
+            asr_streams.push_back(AsrStreamState{true,
+                command.header.payload_json.find("expect-floats") != std::string::npos,
+                command.header.payload_json.find("malformed-text") != std::string::npos});
+            response.header.payload_json = "{\"streamId\":" + std::to_string(id) + "}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "asr.stream.feed") {
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            int64_t id = 0, count = 0, element = 0, bytes = 0;
+            const bool valid =
+                parser.parse(command.header.payload_json).get(root) == simdjson::SUCCESS &&
+                root["streamId"].get_int64().get(id) == simdjson::SUCCESS &&
+                root["sampleCount"].get_int64().get(count) == simdjson::SUCCESS &&
+                root["elementSize"].get_int64().get(element) == simdjson::SUCCESS &&
+                root["byteCount"].get_int64().get(bytes) == simdjson::SUCCESS &&
+                id > 0 && count > 0 && bytes >= 0 &&
+                static_cast<uint64_t>(id) <= asr_streams.size() &&
+                asr_streams[static_cast<size_t>(id - 1)].active && element == 4 &&
+                bytes == count * 4 && static_cast<uint64_t>(bytes) == command.attachment.size();
+            bool exact = true;
+            if (valid && asr_streams[static_cast<size_t>(id - 1)].expect_floats) {
+                const uint32_t expected[] = {0x3fa00000u, 0xc0200000u, 0x00000000u};
+                exact = command.attachment.size() == sizeof(expected) &&
+                    std::memcmp(command.attachment.data(), expected, sizeof(expected)) == 0;
+            }
+            if (!valid || !exact) {
+                send_frame(handles.response_write,
+                           lifecycle_error(command, 1, "invalid ASR float attachment"));
+                continue;
+            }
+            response.header.payload_json = "{\"ok\":true}";
+            response.attachment.clear();
+        }
+        if (command.header.method == "asr.stream.get_text") {
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            int64_t id = 0;
+            if (parser.parse(command.header.payload_json).get(root) != simdjson::SUCCESS ||
+                root["streamId"].get_int64().get(id) != simdjson::SUCCESS || id <= 0 ||
+                static_cast<uint64_t>(id) > asr_streams.size() ||
+                !asr_streams[static_cast<size_t>(id - 1)].active) {
+                send_frame(handles.response_write, lifecycle_error(command, 1, "unknown ASR stream ID"));
+                continue;
+            }
+            const std::string stable = u8"稳定";
+            const std::string partial = u8"临时";
+            response.attachment.clear();
+            for (unsigned char byte : stable) response.attachment.push_back(static_cast<std::byte>(byte));
+            for (unsigned char byte : partial) response.attachment.push_back(static_cast<std::byte>(byte));
+            response.header.payload_json =
+                "{\"stableBytes\":" + std::to_string(stable.size()) +
+                ",\"partialBytes\":" + std::to_string(partial.size()) + "}";
+            if (asr_streams[static_cast<size_t>(id - 1)].malformed_text) {
+                response.header.payload_json = "{\"stableBytes\":999,\"partialBytes\":0}";
+            }
+        }
+        if (command.header.method == "asr.stream.destroy") {
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            int64_t id = 0;
+            if (parser.parse(command.header.payload_json).get(root) != simdjson::SUCCESS ||
+                root["streamId"].get_int64().get(id) != simdjson::SUCCESS || id <= 0 ||
+                static_cast<uint64_t>(id) > asr_streams.size() ||
+                !asr_streams[static_cast<size_t>(id - 1)].active) {
+                send_frame(handles.response_write, lifecycle_error(command, 1, "unknown ASR stream ID"));
+                continue;
+            }
+            asr_streams[static_cast<size_t>(id - 1)].active = false;
+            response.header.payload_json = "{\"ok\":true}";
             response.attachment.clear();
         }
         if (is_stream_generation_method(command.header.method)) {

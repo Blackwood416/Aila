@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_set>
 
 namespace aila::worker {
 namespace {
@@ -236,6 +237,62 @@ ipc::Frame structured_event(const ipc::Frame& request, const AilaChatStreamEvent
     return event;
 }
 
+bool optional_string_field(
+    simdjson::dom::object object,
+    const char* name,
+    bool& present,
+    std::string& value) {
+    simdjson::dom::element element;
+    if (object.at_key(name).get(element) != simdjson::SUCCESS) return false;
+    if (element.is_null()) {
+        present = false;
+        value.clear();
+        return true;
+    }
+    std::string_view text;
+    if (element.get_string().get(text) != simdjson::SUCCESS ||
+        !require_c_string_safe(text) || !simdjson::validate_utf8(text)) return false;
+    present = true;
+    value.assign(text.data(), text.size());
+    return true;
+}
+
+bool parse_optional_legacy_config(
+    simdjson::dom::object object,
+    bool& has_config,
+    AilaGenConfig& config) {
+    simdjson::dom::element element;
+    if (object.at_key("config").get(element) != simdjson::SUCCESS) return false;
+    if (element.is_null()) {
+        has_config = false;
+        config = {};
+        return true;
+    }
+    simdjson::dom::object config_object;
+    if (element.get_object().get(config_object) != simdjson::SUCCESS ||
+        !parse_legacy_config(config_object, config)) return false;
+    has_config = true;
+    return true;
+}
+
+ipc::Frame two_text_result(
+    const ipc::Frame& request,
+    std::string_view first_name,
+    std::string_view first,
+    std::string_view second_name,
+    std::string_view second,
+    std::string suffix = {}) {
+    ipc::Frame response = result(
+        request,
+        std::string("{\"") + std::string(first_name) + "\":" +
+            std::to_string(first.size()) + ",\"" + std::string(second_name) +
+            "\":" + std::to_string(second.size()) + suffix + "}");
+    response.attachment.reserve(first.size() + second.size());
+    for (unsigned char byte : first) response.attachment.push_back(static_cast<std::byte>(byte));
+    for (unsigned char byte : second) response.attachment.push_back(static_cast<std::byte>(byte));
+    return response;
+}
+
 } // namespace
 
 WorkerDispatcher::WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine)
@@ -245,9 +302,15 @@ WorkerDispatcher::WorkerDispatcher(std::unique_ptr<WorkerEngineApi> engine)
     }
 }
 
+WorkerDispatcher::~WorkerDispatcher() noexcept {
+    for (const uint64_t id : asr_stream_ids_) {
+        engine_->transcribe_stream_destroy(id);
+    }
+}
+
 bool WorkerDispatcher::is_stream_method(std::string_view method) noexcept {
     TextGenerationMethod ignored;
-    return stream_generation_method(method, ignored);
+    return method == "asr.transcribe" || stream_generation_method(method, ignored);
 }
 
 ipc::Frame WorkerDispatcher::dispatch_stream(
@@ -255,6 +318,78 @@ ipc::Frame WorkerDispatcher::dispatch_stream(
     const WorkerStreamEmitter& emit,
     const std::atomic_bool& cancelled) {
     try {
+        if (request.header.method == "asr.transcribe") {
+            if (request.header.kind != "request" ||
+                request.header.protocol != ipc::kProtocolVersion ||
+                request.header.abi != ipc::kPublicAbiVersion || !initialized_ ||
+                !simdjson::validate_utf8(request.header.payload_json)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "invalid ASR transcription request");
+            }
+            simdjson::dom::parser parser;
+            simdjson::dom::element root;
+            simdjson::dom::object object;
+            std::string_view wav_path;
+            double segment = 0.0;
+            int past = 0;
+            AsrRequest asr;
+            if (parser.parse(request.header.payload_json).get(root) != simdjson::SUCCESS ||
+                root.get_object().get(object) != simdjson::SUCCESS ||
+                object["wavPath"].get_string().get(wav_path) != simdjson::SUCCESS ||
+                wav_path.empty() || !require_c_string_safe(wav_path) ||
+                !simdjson::validate_utf8(wav_path) ||
+                object["segmentSec"].get_double().get(segment) != simdjson::SUCCESS ||
+                !std::isfinite(segment) || segment < 0.0 ||
+                segment > (std::numeric_limits<float>::max)() ||
+                !object_integer(object, "pastTextConditioning", past) ||
+                !parse_optional_legacy_config(object, asr.has_config, asr.config) ||
+                !optional_string_field(object, "forcedLanguage", asr.has_forced_language,
+                                       asr.forced_language) ||
+                !optional_string_field(object, "systemPrompt", asr.has_system_prompt,
+                                       asr.system_prompt)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "ASR transcription payload is malformed");
+            }
+            asr.wav_path.assign(wav_path.data(), wav_path.size());
+            asr.segment_sec = static_cast<float>(segment);
+            asr.past_text_conditioning = past;
+            bool event_failed = false;
+            uint64_t event_count = 0;
+            std::string transcript;
+            std::string language;
+            const bool ok = engine_->transcribe(
+                asr,
+                [&](std::string_view token) {
+                    if (event_failed || cancelled.load(std::memory_order_acquire) ||
+                        token.find('\0') != std::string_view::npos ||
+                        !simdjson::validate_utf8(token) ||
+                        !detail::stream_data_event_can_emit(event_count) ||
+                        !emit(token_event(request, token))) {
+                        event_failed = true;
+                        return;
+                    }
+                    ++event_count;
+                },
+                transcript,
+                language);
+            if (event_failed) {
+                return error(request, AILA_ERR_RUNTIME, "ASR token event was invalid or could not be written");
+            }
+            if (!ok) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                std::string message = engine_->last_error_message();
+                return error(request, code, message.empty() ? "ASR transcription failed" : message);
+            }
+            if (transcript.find('\0') != std::string::npos ||
+                language.find('\0') != std::string::npos ||
+                !simdjson::validate_utf8(transcript) || !simdjson::validate_utf8(language) ||
+                language.size() > ipc::kMaxAttachmentBytes ||
+                transcript.size() > ipc::kMaxAttachmentBytes - language.size()) {
+                return error(request, AILA_ERR_RUNTIME, "ASR result was invalid");
+            }
+            return two_text_result(
+                request, "transcriptBytes", transcript, "languageBytes", language,
+                ",\"eventCount\":" + std::to_string(event_count + 1));
+        }
         TextGenerationMethod method;
         if (!is_stream_method(request.header.method) ||
             !stream_generation_method(request.header.method, method)) {
@@ -479,6 +614,103 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
 
         if (request.header.method == "engine.reset") {
             engine_->reset_context();
+            return result(request, "{\"ok\":true}");
+        }
+
+        if (request.header.method == "asr.stream.create") {
+            if (!initialized_) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            }
+            simdjson::dom::object object;
+            AsrStreamConfig config;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                !parse_optional_legacy_config(object, config.has_config, config.config) ||
+                !optional_string_field(object, "forcedLanguage", config.has_forced_language,
+                                       config.forced_language) ||
+                !optional_string_field(object, "systemPrompt", config.has_system_prompt,
+                                       config.system_prompt)) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "ASR stream config is malformed");
+            }
+            if (next_asr_stream_id_ == 0 ||
+                next_asr_stream_id_ == (std::numeric_limits<uint64_t>::max)()) {
+                return error(request, AILA_ERR_RUNTIME, "ASR stream ID space is exhausted");
+            }
+            const uint64_t id = next_asr_stream_id_++;
+            if (!engine_->transcribe_stream_create(id, config)) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            asr_stream_ids_.insert(id);
+            return result(request, "{\"streamId\":" + std::to_string(id) + "}");
+        }
+
+        if (request.header.method == "asr.stream.feed") {
+            simdjson::dom::object object;
+            uint64_t id = 0, sample_count = 0, element_size = 0, byte_count = 0;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["streamId"].get_uint64().get(id) != simdjson::SUCCESS ||
+                object["sampleCount"].get_uint64().get(sample_count) != simdjson::SUCCESS ||
+                object["elementSize"].get_uint64().get(element_size) != simdjson::SUCCESS ||
+                object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                id == 0 || sample_count == 0 || element_size != sizeof(float) ||
+                sample_count > (std::numeric_limits<size_t>::max)() / sizeof(float) ||
+                byte_count != sample_count * sizeof(float) ||
+                byte_count != request.attachment.size()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "ASR stream audio attachment is malformed");
+            }
+            if (asr_stream_ids_.find(id) == asr_stream_ids_.end()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "unknown ASR stream ID");
+            }
+            std::vector<float> samples(static_cast<size_t>(sample_count));
+            std::memcpy(samples.data(), request.attachment.data(), request.attachment.size());
+            if (!engine_->transcribe_stream_feed(id, samples.data(), samples.size())) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            return result(request, "{\"ok\":true}");
+        }
+
+        if (request.header.method == "asr.stream.get_text") {
+            simdjson::dom::object object;
+            uint64_t id = 0;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["streamId"].get_uint64().get(id) != simdjson::SUCCESS || id == 0) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "ASR stream ID is malformed");
+            }
+            if (!request.attachment.empty() || asr_stream_ids_.find(id) == asr_stream_ids_.end()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "unknown ASR stream ID");
+            }
+            std::string stable, partial;
+            if (!engine_->transcribe_stream_get_text(id, stable, partial)) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
+            if (stable.find('\0') != std::string::npos || partial.find('\0') != std::string::npos ||
+                !simdjson::validate_utf8(stable) || !simdjson::validate_utf8(partial) ||
+                partial.size() > ipc::kMaxAttachmentBytes ||
+                stable.size() > ipc::kMaxAttachmentBytes - partial.size()) {
+                return error(request, AILA_ERR_RUNTIME, "ASR stream text was invalid");
+            }
+            return two_text_result(request, "stableBytes", stable, "partialBytes", partial);
+        }
+
+        if (request.header.method == "asr.stream.destroy") {
+            simdjson::dom::object object;
+            uint64_t id = 0;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                object["streamId"].get_uint64().get(id) != simdjson::SUCCESS || id == 0 ||
+                !request.attachment.empty() || asr_stream_ids_.find(id) == asr_stream_ids_.end()) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "unknown ASR stream ID");
+            }
+            asr_stream_ids_.erase(id);
+            if (!engine_->transcribe_stream_destroy(id)) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                return error(request, code, engine_->last_error_message());
+            }
             return result(request, "{\"ok\":true}");
         }
 
