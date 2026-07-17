@@ -530,6 +530,18 @@ if(WIN32)
     endif()
 
     get_filename_component(AILA_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(AILA_COMPILER_VERSION_ROOT "${AILA_COMPILER_BIN_DIR}/.." ABSOLUTE)
+    get_filename_component(AILA_COMPILER_VERSION "${AILA_COMPILER_VERSION_ROOT}" NAME)
+    get_filename_component(AILA_COMPILER_COMPONENT_ROOT "${AILA_COMPILER_VERSION_ROOT}/.." ABSOLUTE)
+    get_filename_component(AILA_ONEAPI_INSTALL_ROOT "${AILA_COMPILER_COMPONENT_ROOT}/.." ABSOLUTE)
+    set(AILA_ONEAPI_SHARED_BIN_DIR "${AILA_ONEAPI_INSTALL_ROOT}/${AILA_COMPILER_VERSION}/bin")
+    file(GLOB AILA_ONEAPI_SHARED_HWLOC_DLLS LIST_DIRECTORIES FALSE
+        "${AILA_ONEAPI_SHARED_BIN_DIR}/libhwloc-*.dll")
+    if(NOT IS_DIRECTORY "${AILA_ONEAPI_SHARED_BIN_DIR}" OR NOT AILA_ONEAPI_SHARED_HWLOC_DLLS)
+        message(FATAL_ERROR
+            "Resolved oneAPI shared runtime directory is invalid: ${AILA_ONEAPI_SHARED_BIN_DIR}")
+    endif()
+
     find_package(TBB CONFIG REQUIRED)
     get_filename_component(AILA_TBB_ROOT "${TBB_DIR}/../../.." ABSOLUTE)
     set(AILA_TBB_BIN_DIR "${AILA_TBB_ROOT}/bin")
@@ -540,6 +552,7 @@ if(WIN32)
 
     set(AILA_RUNTIME_SEARCH_DIRS
         "${AILA_COMPILER_BIN_DIR}"
+        "${AILA_ONEAPI_SHARED_BIN_DIR}"
         "${AILA_TBB_BIN_DIR}"
     )
 
@@ -555,6 +568,7 @@ if(WIN32)
         "OpenCL.dll"
         "intelocl64.dll"
         "common_clang64.dll"
+        "libmmd*.dll"
         "libhwloc-*.dll"
         "tbb12.dll"
         "tbbbind.dll"
@@ -565,14 +579,17 @@ if(WIN32)
         "tcm.dll"
     )
     set(AILA_ONEAPI_RUNTIME_ROOT_DLLS)
-    foreach(pattern IN LISTS AILA_ONEAPI_RUNTIME_ROOT_PATTERNS)
-        file(GLOB AILA_COMPILER_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
-            "${AILA_COMPILER_BIN_DIR}/${pattern}")
-        file(GLOB AILA_TBB_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
-            "${AILA_TBB_BIN_DIR}/${pattern}")
-        list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS
-            ${AILA_COMPILER_RUNTIME_MATCHES}
-            ${AILA_TBB_RUNTIME_MATCHES})
+    set(AILA_ONEAPI_RUNTIME_ROOT_DIRS
+        "${AILA_COMPILER_BIN_DIR}"
+        "${AILA_ONEAPI_SHARED_BIN_DIR}"
+        "${AILA_TBB_BIN_DIR}"
+    )
+    foreach(AILA_RUNTIME_ROOT_DIR IN LISTS AILA_ONEAPI_RUNTIME_ROOT_DIRS)
+        foreach(pattern IN LISTS AILA_ONEAPI_RUNTIME_ROOT_PATTERNS)
+            file(GLOB AILA_RUNTIME_MATCHES LIST_DIRECTORIES FALSE
+                "${AILA_RUNTIME_ROOT_DIR}/${pattern}")
+            list(APPEND AILA_ONEAPI_RUNTIME_ROOT_DLLS ${AILA_RUNTIME_MATCHES})
+        endforeach()
     endforeach()
     list(REMOVE_DUPLICATES AILA_ONEAPI_RUNTIME_ROOT_DLLS)
 
@@ -686,7 +703,7 @@ endforeach()
 if(unresolved_deps)
     list(SORT unresolved_deps)
     list(REMOVE_DUPLICATES unresolved_deps)
-    message(WARNING "Unresolved runtime dependencies for ${target_path}: ${unresolved_deps}")
+    message(FATAL_ERROR "Unresolved runtime dependencies for ${target_path}: ${unresolved_deps}")
 endif()
 ]=])
     string(CONFIGURE "${AILA_COPY_RUNTIME_DEPENDENCIES_TEMPLATE}" AILA_COPY_RUNTIME_DEPENDENCIES_SCRIPT @ONLY)
@@ -711,6 +728,7 @@ endif()
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
     set(AILA_RELEASE_RUNTIME_DIR "${AILA_RELEASE_BIN_DIR}/aila_runtime")
+    find_program(AILA_PWSH_EXECUTABLE NAMES pwsh REQUIRED)
 
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
@@ -718,7 +736,6 @@ endif()
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaWorker>" "${AILA_RELEASE_RUNTIME_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/build_info.json" "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND}
             "-DTARGET_PATH=$<TARGET_FILE:Aila>"
             "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
@@ -729,6 +746,11 @@ endif()
             "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
             "-DTARGET_KIND=EXECUTABLE"
             -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
+        COMMAND "${AILA_PWSH_EXECUTABLE}" -NoProfile
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/WriteReleaseBuildInfo.ps1"
+            -BuildDir "${CMAKE_BINARY_DIR}"
+            -ReleaseRoot "${AILA_RELEASE_BIN_DIR}"
+            -RepoRoot "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )

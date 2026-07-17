@@ -41,7 +41,7 @@ function Resolve-DumpbinPath {
 function Test-OneApiRuntimeName {
     param([Parameter(Mandatory = $true)][string]$Name)
 
-    return $Name -match '^(?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll)$'
+    return $Name -match '^(?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll$'
 }
 
 function Get-ArtifactMetadata {
@@ -55,6 +55,33 @@ function Get-ArtifactMetadata {
         throw "build_info.json must contain exactly one '$Role' artifact; found $($matches.Count)."
     }
     return $matches[0]
+}
+
+$expectedRuntimeNames = @(
+    'sycl9.dll',
+    'sycl-jit.dll',
+    'dnnl.dll',
+    'tbb12.dll',
+    'umf.dll',
+    'ur_loader.dll',
+    'libmmd.dll',
+    'libmmdmd.dll',
+    'OpenCL.dll',
+    'intelocl64.dll',
+    'common_clang64.dll',
+    'xptifw.dll',
+    'libhwloc-15.dll',
+    'tcm.dll'
+)
+foreach ($runtimeName in $expectedRuntimeNames) {
+    if (-not (Test-OneApiRuntimeName -Name $runtimeName)) {
+        throw "Runtime isolation policy does not classify '$runtimeName' as a oneAPI runtime DLL."
+    }
+}
+foreach ($ordinaryName in @('AilaShared.dll', 'build_info.json')) {
+    if (Test-OneApiRuntimeName -Name $ordinaryName) {
+        throw "Runtime isolation policy incorrectly classifies '$ordinaryName'."
+    }
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -95,13 +122,48 @@ if ($rootRuntimeDlls.Count -ne 0) {
 }
 
 $dumpbinPath = Resolve-DumpbinPath -BuildDirPath $buildDirPath
+$hwlocFiles = @(Get-ChildItem -LiteralPath $runtimeDir -File -Filter 'libhwloc-*.dll')
+if ($hwlocFiles.Count -eq 0) {
+    throw "Staged runtime dependency closure is missing libhwloc-*.dll in '$runtimeDir'."
+}
+
+$system32 = Join-Path $env:SystemRoot 'System32'
+$missingDependencies = [System.Collections.Generic.List[string]]::new()
+$runtimeImages = @(
+    Get-ChildItem -LiteralPath $runtimeDir -File |
+        Where-Object { $_.Extension -in @('.dll', '.exe') }
+)
+foreach ($image in $runtimeImages) {
+    $imageDependencies = (& $dumpbinPath /dependents $image.FullName 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "dumpbin /dependents failed for '$($image.FullName)' with exit code $LASTEXITCODE. Output: $imageDependencies"
+    }
+    $dependencyNames = @([regex]::Matches($imageDependencies, '(?im)^\s+([^\s]+\.dll)\s*$') |
+        ForEach-Object { $_.Groups[1].Value } |
+        Sort-Object -Unique)
+    foreach ($dependencyName in $dependencyNames) {
+        if ($dependencyName -match '^(?:api-ms-|ext-ms-)') {
+            continue
+        }
+        $runtimeCandidate = Join-Path $runtimeDir $dependencyName
+        $systemCandidate = Join-Path $system32 $dependencyName
+        if (-not (Test-Path -LiteralPath $runtimeCandidate -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $systemCandidate -PathType Leaf)) {
+            $missingDependencies.Add("$($image.Name) -> $dependencyName")
+        }
+    }
+}
+if ($missingDependencies.Count -ne 0) {
+    throw "Staged runtime dependency closure is incomplete: $([string]::Join(', ', $missingDependencies))."
+}
+
 $dependencyOutput = (& $dumpbinPath /dependents $proxyPath 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) {
     throw "dumpbin /dependents failed for '$proxyPath' with exit code $LASTEXITCODE. Output: $dependencyOutput"
 }
 $forbiddenImports = @([regex]::Matches(
         $dependencyOutput,
-        '(?im)^\s*((?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll))\s*$') |
+        '(?im)^\s*((?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll)\s*$') |
     ForEach-Object { $_.Groups[1].Value } |
     Sort-Object -Unique)
 if ($forbiddenImports.Count -ne 0) {
@@ -116,10 +178,18 @@ $buildInfo = Get-Content -LiteralPath $releaseBuildInfoPath -Raw -Encoding UTF8 
 if ($buildInfo.schemaVersion -ne 2) {
     throw "Unsupported build_info.json schema: $($buildInfo.schemaVersion)"
 }
+$expectedFullCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to resolve current git commit for '$repoRoot'."
+}
+if (-not ([string]$buildInfo.git.fullCommit).Equals($expectedFullCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Staged build metadata git commit '$($buildInfo.git.fullCommit)' does not match current HEAD '$expectedFullCommit'."
+}
 
 foreach ($expectation in @(
         @{ role = 'proxy'; relativePath = 'AilaShared.dll'; fullPath = $proxyPath },
-        @{ role = 'worker'; relativePath = 'aila_runtime/AilaWorker.exe'; fullPath = $workerPath }
+        @{ role = 'worker'; relativePath = 'aila_runtime/AilaWorker.exe'; fullPath = $workerPath },
+        @{ role = 'cli'; relativePath = 'aila_runtime/Aila.exe'; fullPath = $cliPath }
     )) {
     $artifact = Get-ArtifactMetadata -BuildInfo $buildInfo -Role $expectation.role
     if ($artifact.relativePath -cne $expectation.relativePath) {

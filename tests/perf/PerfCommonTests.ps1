@@ -905,6 +905,83 @@ $metadata | ConvertTo-Json -Depth 8
         } 'Build info file not found:' 'missing build info verification'
     }
 
+    Invoke-Test 'runtime isolation policy covers every collected oneAPI DLL family' {
+        $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($verifierPath, [ref]$tokens, [ref]$parseErrors)
+        Assert-Equal 0 $parseErrors.Count 'verifier policy parse errors'
+        $definition = $ast.Find({
+            param($node)
+            return $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-AilaOneApiRuntimeDllName'
+        }, $true)
+        if ($null -eq $definition) {
+            throw 'Test-AilaOneApiRuntimeDllName was not found in verifier.'
+        }
+        Invoke-Expression $definition.Extent.Text
+
+        foreach ($runtimeName in @(
+                'sycl9.dll', 'sycl-jit.dll', 'dnnl.dll', 'tbb12.dll', 'umf.dll', 'ur_loader.dll',
+                'libmmd.dll', 'libmmdmd.dll', 'OpenCL.dll', 'intelocl64.dll', 'common_clang64.dll',
+                'xptifw.dll', 'libhwloc-15.dll', 'tcm.dll'
+            )) {
+            Assert-Equal $true (Test-AilaOneApiRuntimeDllName -Name $runtimeName) "runtime policy $runtimeName"
+        }
+        foreach ($ordinaryName in @('AilaShared.dll', 'build_info.json')) {
+            Assert-Equal $false (Test-AilaOneApiRuntimeDllName -Name $ordinaryName) "ordinary release file $ordinaryName"
+        }
+    }
+
+    Invoke-Test 'release metadata refresh replaces stale hashes and git provenance' {
+        $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
+        $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'stale-release-metadata')
+        $releaseRoot = Join-Path $buildDir 'Release\bin'
+        $buildInfoPath = Join-Path $buildDir 'build_info.json'
+        $buildInfo = Read-AilaJsonFile -Path $buildInfoPath
+        $preservedBuildJson = $buildInfo.build | ConvertTo-Json -Depth 8 -Compress
+        $preservedOneApiJson = $buildInfo.oneApi | ConvertTo-Json -Depth 8 -Compress
+        $buildInfo.git.shortCommit = 'stale00'
+        $buildInfo.git.fullCommit = ('0' * 40)
+        $buildInfo.git.branch = 'stale-branch'
+        foreach ($artifact in $buildInfo.artifacts) {
+            $artifact.sha256 = ('0' * 64)
+        }
+        Write-AilaJsonFile -Path $buildInfoPath -Data $buildInfo
+        Copy-Item -LiteralPath $buildInfoPath -Destination (Join-Path $releaseRoot 'build_info.json') -Force
+
+        $refreshPath = Join-Path $repoRoot 'tools\WriteReleaseBuildInfo.ps1'
+        $result = Invoke-ChildPowerShellWithTimeout `
+            -ScriptPath $refreshPath `
+            -ArgumentList @('-BuildDir', $buildDir, '-ReleaseRoot', $releaseRoot, '-RepoRoot', $repoRoot) `
+            -TimeoutMs 30000
+        Assert-Equal $true $result.completed 'release metadata refresh completion'
+        Assert-Equal 0 $result.exitCode "release metadata refresh exit stderr='$($result.stderr)' stdout='$($result.stdout)'"
+
+        $refreshed = Read-AilaJsonFile -Path $buildInfoPath
+        $stagedBuildInfoPath = Join-Path $releaseRoot 'build_info.json'
+        Assert-Equal (Get-FileHash -LiteralPath $buildInfoPath -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $stagedBuildInfoPath -Algorithm SHA256).Hash 'source and staged metadata identity'
+        Assert-Equal $preservedBuildJson ($refreshed.build | ConvertTo-Json -Depth 8 -Compress) 'preserved build provenance'
+        Assert-Equal $preservedOneApiJson ($refreshed.oneApi | ConvertTo-Json -Depth 8 -Compress) 'preserved oneAPI provenance'
+        $expectedFullCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+        $expectedShortCommit = (& git -C $repoRoot rev-parse --short HEAD).Trim()
+        $expectedBranch = (& git -C $repoRoot branch --show-current).Trim()
+        Assert-Equal $expectedFullCommit $refreshed.git.fullCommit 'refreshed full commit'
+        Assert-Equal $expectedShortCommit $refreshed.git.shortCommit 'refreshed short commit'
+        Assert-Equal $expectedBranch $refreshed.git.branch 'refreshed branch'
+        foreach ($expectation in @(
+                @{ role = 'proxy'; relativePath = 'AilaShared.dll' },
+                @{ role = 'worker'; relativePath = 'aila_runtime/AilaWorker.exe' },
+                @{ role = 'cli'; relativePath = 'aila_runtime/Aila.exe' }
+            )) {
+            $artifacts = @($refreshed.artifacts | Where-Object { $_.role -eq $expectation.role })
+            Assert-Equal 1 $artifacts.Count "refreshed $($expectation.role) artifact count"
+            Assert-Equal $expectation.relativePath $artifacts[0].relativePath "refreshed $($expectation.role) path"
+            $artifactPath = Join-Path $releaseRoot ($expectation.relativePath -replace '/', '\')
+            Assert-Equal (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash $artifacts[0].sha256 "refreshed $($expectation.role) hash"
+        }
+    }
+
     Invoke-Test 'verifier requires worker artifact metadata for the staged release' {
         $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'missing-worker-metadata')
@@ -958,7 +1035,7 @@ $metadata | ConvertTo-Json -Depth 8
     Invoke-Test 'verifier rejects oneAPI runtime DLLs staged beside the proxy' {
         $sourceBuildDir = Join-Path $repoRoot 'build-oneapi-2025.3'
         $buildDir = New-VerifierBuildFixture -SourceBuildDir $sourceBuildDir -DestinationBuildDir (Join-Path $repoScratch 'root-runtime-dll')
-        Set-Content -LiteralPath (Join-Path $buildDir 'Release\bin\sycl8.dll') -Value 'sentinel' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $buildDir 'Release\bin\libmmd.dll') -Value 'sentinel' -Encoding UTF8
 
         $verifierPath = Join-Path $repoRoot 'verify_oneapi_build.ps1'
         Assert-Throws {

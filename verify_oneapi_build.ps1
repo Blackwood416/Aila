@@ -168,7 +168,7 @@ function Invoke-AilaStableProxyDependencyInspection {
     $forbidden = @(
         [regex]::Matches(
             $dependenciesText,
-            '(?im)^\s*((?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll))\s*$') |
+            '(?im)^\s*((?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll)\s*$') |
             ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } |
             Sort-Object -Unique
     )
@@ -224,7 +224,7 @@ function Assert-AilaStagedArtifactMetadata {
 function Test-AilaOneApiRuntimeDllName {
     param([Parameter(Mandatory = $true)][string]$Name)
 
-    return $Name -match '^(?:sycl.*\.dll|dnnl\.dll|tbb.*\.dll|umf\.dll|ur_.*\.dll)$'
+    return $Name -match '^(?:sycl.*|dnnl|tbb.*|umf|ur_.*|libmmd.*|OpenCL|intelocl64|common_clang64|xptifw|libhwloc-.*|tcm)\.dll$'
 }
 
 function Get-AilaDumpbinPath {
