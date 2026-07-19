@@ -208,6 +208,29 @@ void abort_clears_pending_jobs(TestResults& results) {
     AILA_EXPECT_TRUE(results, capture.calls <= 1);
 }
 
+void aborted_extractor_failure_is_not_reported_as_pipeline_failure(TestResults& results) {
+    auto fake = std::make_unique<FakeExtractor>();
+    FakeExtractor* raw_fake = fake.get();
+    raw_fake->sleep_ms = 300;
+    raw_fake->next_result.ok = false;
+    raw_fake->next_result.error = "inference aborted";
+
+    aila::alia::AliaBackgroundPipeline pipeline(std::move(fake), 1);
+    CallbackCapture capture;
+    pipeline.register_callback(capture_callback, &capture);
+
+    AILA_EXPECT_TRUE(results, pipeline.trigger("turn 1"));
+    raw_fake->wait_for_started(1);
+    pipeline.request_abort();
+    pipeline.join();
+
+    AILA_EXPECT_TRUE(results, raw_fake->calls == 1);
+    AILA_EXPECT_TRUE(results, capture.calls == 0);
+    AILA_EXPECT_TRUE(results,
+                     pipeline.state() == aila::alia::BackgroundJobState::Completed);
+    AILA_EXPECT_EQ_STRING(results, pipeline.last_error_text(), "");
+}
+
 }  // namespace
 
 int main() {
@@ -217,6 +240,7 @@ int main() {
     cpu_extractor_failure_keeps_decode_mode_diagnostic(results);
     bounded_queue_rejects_when_pending_capacity_is_full(results);
     abort_clears_pending_jobs(results);
+    aborted_extractor_failure_is_not_reported_as_pipeline_failure(results);
 
     std::cout << "AilaAliaBackgroundPipelineTests: " << results.passed
               << " passed, " << results.failed << " failed\n";

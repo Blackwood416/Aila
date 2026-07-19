@@ -459,6 +459,13 @@ void AliaBackgroundPipeline::run_job(
             extractor_->extract(request, abort_requested_);
         if (!extraction.ok) {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (abort_requested_.load()) {
+                last_error_.clear();
+                last_decode_mode_ = decode_mode;
+                state_ = BackgroundJobState::Completed;
+                cv_.notify_all();
+                return;
+            }
             last_error_ = extraction.error.empty()
                 ? "background extraction failed"
                 : extraction.error;
