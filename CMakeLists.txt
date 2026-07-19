@@ -19,6 +19,25 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project (Aila CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
+
+option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
+    "Allow the temporary oneAPI 2025.3 comparison build" OFF)
+
+option(AILA_USE_LEGACY_RUNTIME_COPY
+    "Use the pre-2026.1 runtime DLL globber (compatibility fallback)" OFF)
+
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "Aila requires the Intel oneAPI DPC++/C++ Compiler")
+endif()
+
+if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "2026.1" AND
+   NOT AILA_ALLOW_LEGACY_ONEAPI_BASELINE)
+    message(FATAL_ERROR
+        "Aila requires IntelLLVM >= 2026.1; use "
+        "-DAILA_ALLOW_LEGACY_ONEAPI_BASELINE=ON only for a controlled legacy comparison build")
+endif()
+
 if(MSVC)
     # --- Base flags ---
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fsycl /Qstd=c++17 /EHsc /Qftz")
@@ -403,7 +422,7 @@ endif()
 # ============================================================
 # Post-build: Copy runtime DLL dependencies
 # ============================================================
-if(WIN32)
+if(WIN32 AND AILA_USE_LEGACY_RUNTIME_COPY)
     get_target_property(DNNL_DLL_LOCATION DNNL::dnnl IMPORTED_LOCATION_RELEASE)
     if(NOT DNNL_DLL_LOCATION)
         get_target_property(DNNL_DLL_LOCATION DNNL::dnnl IMPORTED_LOCATION)
@@ -530,6 +549,7 @@ elseif(target_kind STREQUAL "LIBRARY")
 else()
     message(FATAL_ERROR "Unsupported target kind: ${target_kind}")
 endif()
+
 list(APPEND resolved_deps ${target_resolved_deps})
 list(APPEND unresolved_deps ${target_unresolved_deps})
 
@@ -615,3 +635,6 @@ endif()
     )
     add_dependencies(release ${AILA_RELEASE_TARGETS})
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDependencies.cmake")
+aila_configure_runtime_dependencies()
