@@ -84,6 +84,10 @@ public:
 
     bool consume_one(int token_id, std::string* error);
     bool forward_one(int token_id, std::vector<float>& logits, std::string* error);
+    bool forward_one(int token_id,
+                     std::vector<float>& logits,
+                     const std::atomic_bool* abort_requested,
+                     std::string* error);
     bool prefill(const std::vector<int>& token_ids,
                  int micro_batch,
                  const std::atomic_bool* abort_requested,
@@ -119,10 +123,12 @@ private:
                         std::string* error) const;
     bool forward_one_impl(int token_id,
                           std::vector<float>* logits,
+                          const std::atomic_bool* abort_requested,
                           std::string* error);
     bool prefill_micro_batch(const int* token_ids,
                              int batch,
                              std::vector<float>* final_logits,
+                             const std::atomic_bool* abort_requested,
                              std::string* error);
 
     const CpuSafetensorsStore* store_ = nullptr;

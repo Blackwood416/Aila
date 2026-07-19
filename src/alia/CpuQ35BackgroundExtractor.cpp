@@ -320,7 +320,7 @@ bool CpuQ35BackgroundExtractor::generate_once(
         }
 
         generated_ids.push_back(next_token);
-        if (!model_->forward_one(next_token, logits, &error)) {
+        if (!model_->forward_one(next_token, logits, &abort_requested, &error)) {
             return false;
         }
         if (profile_cpu && (((step + 1) % 8) == 0 || step + 1 == kMaxNewTokens)) {

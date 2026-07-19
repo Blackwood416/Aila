@@ -582,13 +582,20 @@ bool CpuQ35HybridModel::load_layers(std::string* error) {
 }
 
 bool CpuQ35HybridModel::consume_one(int token_id, std::string* error) {
-    return forward_one_impl(token_id, nullptr, error);
+    return forward_one_impl(token_id, nullptr, nullptr, error);
 }
 
 bool CpuQ35HybridModel::forward_one(int token_id,
                                     std::vector<float>& logits,
                                     std::string* error) {
-    return forward_one_impl(token_id, &logits, error);
+    return forward_one_impl(token_id, &logits, nullptr, error);
+}
+
+bool CpuQ35HybridModel::forward_one(int token_id,
+                                    std::vector<float>& logits,
+                                    const std::atomic_bool* abort_requested,
+                                    std::string* error) {
+    return forward_one_impl(token_id, &logits, abort_requested, error);
 }
 
 bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
@@ -619,7 +626,11 @@ bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
             std::vector<float>* batch_logits =
                 begin + static_cast<size_t>(batch) == token_ids.size() ? logits : nullptr;
             if (!prefill_micro_batch(
-                    token_ids.data() + begin, batch, batch_logits, error)) {
+                    token_ids.data() + begin,
+                    batch,
+                    batch_logits,
+                    abort_requested,
+                    error)) {
                 return false;
             }
         }
@@ -633,8 +644,8 @@ bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
         }
         const bool is_last = i + 1 == token_ids.size();
         const bool ok = is_last && logits
-                            ? forward_one_impl(token_ids[i], logits, error)
-                            : forward_one_impl(token_ids[i], nullptr, error);
+                            ? forward_one_impl(token_ids[i], logits, abort_requested, error)
+                            : forward_one_impl(token_ids[i], nullptr, abort_requested, error);
         if (!ok) {
             return false;
         }
@@ -645,6 +656,7 @@ bool CpuQ35HybridModel::prefill(const std::vector<int>& token_ids,
 bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
                                              int batch,
                                              std::vector<float>* final_logits,
+                                             const std::atomic_bool* abort_requested,
                                              std::string* error) {
     if (batch <= 0 || batch > 4 || current_len_ + batch > max_seq_len_) {
         set_error(error, "CPU Qwen3.5 prefill micro-batch exceeds model limits");
@@ -691,6 +703,11 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
         for (int layer_index = 0;
              layer_index < cfg_.num_hidden_layers;
              ++layer_index) {
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 prefill aborted");
+                current_len_ = base_len;
+                return false;
+            }
             CpuQ35Layer& layer = layers_[static_cast<size_t>(layer_index)];
             CpuQ35LayerCache& cache =
                 layer_caches_[static_cast<size_t>(layer_index)];
@@ -752,6 +769,11 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
             }
 
             for (int item = 0; item < batch; ++item) {
+                if (abort_requested && abort_requested->load()) {
+                    set_error(error, "CPU Qwen3.5 prefill aborted");
+                    current_len_ = base_len;
+                    return false;
+                }
                 current_len_ = base_len + item;
                 const float* normed_row = normed_batch.data() +
                     static_cast<size_t>(item) * hidden_size_;
@@ -833,6 +855,12 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
                             batch,
                             mlp_batch.data());
 
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 prefill aborted");
+                current_len_ = base_len;
+                return false;
+            }
+
             const std::vector<float>& next_weight =
                 layer_index < cfg_.num_hidden_layers - 1
                     ? layers_[static_cast<size_t>(layer_index + 1)].input_ln_weight
@@ -857,6 +885,11 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
 
         current_len_ = base_len + batch;
         if (final_logits) {
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 prefill aborted");
+                current_len_ = base_len;
+                return false;
+            }
             std::vector<float> final_hidden(
                 normed_batch.end() - hidden_size_, normed_batch.end());
             if (!compute_logits(final_hidden, *final_logits, error)) {
@@ -873,6 +906,7 @@ bool CpuQ35HybridModel::prefill_micro_batch(const int* token_ids,
 
 bool CpuQ35HybridModel::forward_one_impl(int token_id,
                                          std::vector<float>* logits,
+                                         const std::atomic_bool* abort_requested,
                                          std::string* error) {
     if (!loaded_) {
         set_error(error, "CPU Qwen3.5 forward_one called before load");
@@ -884,6 +918,10 @@ bool CpuQ35HybridModel::forward_one_impl(int token_id,
     }
     if (current_len_ >= max_seq_len_) {
         set_error(error, "CPU Qwen3.5 context window exceeded");
+        return false;
+    }
+    if (abort_requested && abort_requested->load()) {
+        set_error(error, "CPU Qwen3.5 forward aborted");
         return false;
     }
 
@@ -898,6 +936,10 @@ bool CpuQ35HybridModel::forward_one_impl(int token_id,
                               normed_.data());
 
         for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 forward aborted");
+                return false;
+            }
             CpuQ35Layer& layer = layers_[static_cast<size_t>(i)];
             CpuQ35LayerCache& cache = layer_caches_[static_cast<size_t>(i)];
 
@@ -932,6 +974,10 @@ bool CpuQ35HybridModel::forward_one_impl(int token_id,
         }
 
         if (logits) {
+            if (abort_requested && abort_requested->load()) {
+                set_error(error, "CPU Qwen3.5 forward aborted");
+                return false;
+            }
             if (!compute_logits(normed_, *logits, error)) {
                 return false;
             }
