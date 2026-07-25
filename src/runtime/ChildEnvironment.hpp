@@ -17,6 +17,12 @@ EnvironmentMap parse_environment_block(const std::vector<wchar_t>& block);
 
 EnvironmentMap current_environment();
 
+// True when `name` belongs to a GPU-runtime instrumentation family that the
+// isolated worker must not inherit from its host process (XPTI/UR tracing
+// layers, Level Zero sysman/metrics toggles, OpenCL ICD overrides). Hosts that
+// need one of these forwarded can list it in AILA_WORKER_ENV_PASSTHROUGH.
+bool is_scrubbed_runtime_variable(const std::wstring& name) noexcept;
+
 std::filesystem::path system_root_directory();
 
 std::vector<wchar_t> build_isolated_environment(

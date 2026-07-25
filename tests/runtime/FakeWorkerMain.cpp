@@ -154,7 +154,9 @@ std::string inspection_payload() {
         "\"runtimeDirectory\":" + json_string(utf8(runtime.wstring())) + "," +
         "\"currentDirectory\":" + json_string(utf8(cwd.wstring())) + "," +
         "\"path\":" + json_string(utf8(environment_value(L"PATH"))) + "," +
-        "\"sentinel\":" + json_string(utf8(environment_value(L"AILA_TEST_SENTINEL"))) +
+        "\"sentinel\":" + json_string(utf8(environment_value(L"AILA_TEST_SENTINEL"))) + "," +
+        "\"xptiSubscribers\":" + json_string(utf8(environment_value(L"XPTI_SUBSCRIBERS"))) + "," +
+        "\"urLayers\":" + json_string(utf8(environment_value(L"UR_ENABLE_LAYERS"))) +
         "}";
 }
 

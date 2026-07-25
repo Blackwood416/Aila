@@ -204,6 +204,8 @@ struct Inspection {
     std::string current_directory;
     std::string path;
     std::string sentinel;
+    std::string xpti_subscribers;
+    std::string ur_layers;
 };
 
 Inspection parse_inspection(const std::string& payload_json, const char* test_name) {
@@ -229,6 +231,8 @@ Inspection parse_inspection(const std::string& payload_json, const char* test_na
         required_string("currentDirectory"),
         required_string("path"),
         required_string("sentinel"),
+        required_string("xptiSubscribers"),
+        required_string("urLayers"),
     };
 }
 
@@ -492,6 +496,113 @@ void test_isolated_environment_replaces_path() {
     }
 }
 
+void test_isolated_environment_scrubs_runtime_instrumentation() {
+    constexpr const char* name = "isolated child environment runtime instrumentation scrub";
+    aila::runtime::EnvironmentMap inherited{
+        // torch.xpu-style host instrumentation that must not reach the worker.
+        {L"XPTI_TRACE_ENABLE", L"1"},
+        {L"XPTI_FRAMEWORK_DISPATCHER", L"xptifw.dll"},
+        {L"XPTI_SUBSCRIBERS", L"C:\\HostPython\\Library\\bin\\pti_view-0.dll"},
+        {L"UR_ENABLE_LAYERS", L"UR_LAYER_TRACING"},
+        {L"ur_adapters_force_load", L"C:\\HostPython\\injected_adapter.dll"},
+        {L"ZES_ENABLE_SYSMAN", L"1"},
+        {L"ZET_ENABLE_PROGRAM_INSTRUMENTATION", L"1"},
+        {L"ZE_ENABLE_TRACING_LAYER", L"1"},
+        {L"OCL_ICD_FILENAMES", L"C:\\HostPython\\injected_icd.dll"},
+        {L"__KMP_REGISTERED_LIB_16532", L"00007FF95F503298-cafe4431-libiomp5md.dll"},
+        // Tuning and engine variables that must keep flowing to the worker.
+        {L"AILA_LOG_LEVEL", L"debug"},
+        {L"SYCL_CACHE_PERSISTENT", L"1"},
+        {L"ONEAPI_DEVICE_SELECTOR", L"level_zero:0"},
+        {L"ZE_AFFINITY_MASK", L"0"},
+        {L"ZE_FLAT_DEVICE_HIERARCHY", L"COMPOSITE"},
+        {L"URSULA", L"not a UR_ variable prefix match victim"},
+    };
+    const fs::path runtime = L"C:\\Aila Runtime";
+    const fs::path system_root = L"C:\\Windows";
+
+    const ParsedEnvironment parsed = parse_serialized_environment(
+        aila::runtime::build_isolated_environment(inherited, runtime, system_root),
+        name);
+
+    for (const wchar_t* scrubbed : {
+             L"XPTI_TRACE_ENABLE",
+             L"XPTI_FRAMEWORK_DISPATCHER",
+             L"XPTI_SUBSCRIBERS",
+             L"UR_ENABLE_LAYERS",
+             L"UR_ADAPTERS_FORCE_LOAD",
+             L"ZES_ENABLE_SYSMAN",
+             L"ZET_ENABLE_PROGRAM_INSTRUMENTATION",
+             L"ZE_ENABLE_TRACING_LAYER",
+             L"OCL_ICD_FILENAMES",
+             L"__KMP_REGISTERED_LIB_16532",
+         }) {
+        expect(
+            parsed.values.find(scrubbed) == parsed.values.end(),
+            name,
+            "host instrumentation variable leaked into worker: " + utf8(scrubbed));
+    }
+    expect(parsed.values.at(L"AILA_LOG_LEVEL") == L"debug", name, "AILA variable was dropped");
+    expect(
+        parsed.values.at(L"SYCL_CACHE_PERSISTENT") == L"1",
+        name,
+        "SYCL tuning variable was dropped");
+    expect(
+        parsed.values.at(L"ONEAPI_DEVICE_SELECTOR") == L"level_zero:0",
+        name,
+        "device selector variable was dropped");
+    expect(parsed.values.at(L"ZE_AFFINITY_MASK") == L"0", name, "ZE affinity variable was dropped");
+    expect(
+        parsed.values.at(L"ZE_FLAT_DEVICE_HIERARCHY") == L"COMPOSITE",
+        name,
+        "ZE topology variable was dropped");
+    expect(
+        parsed.values.at(L"URSULA") == L"not a UR_ variable prefix match victim",
+        name,
+        "non-prefix variable was scrubbed");
+    expect(
+        aila::runtime::is_scrubbed_runtime_variable(L"xpti_subscribers") &&
+            aila::runtime::is_scrubbed_runtime_variable(L"Ur_Enable_Layers") &&
+            !aila::runtime::is_scrubbed_runtime_variable(L"ZE_AFFINITY_MASK") &&
+            !aila::runtime::is_scrubbed_runtime_variable(L"SYCL_CACHE_PERSISTENT"),
+        name,
+        "scrub predicate did not match case-insensitively");
+}
+
+void test_isolated_environment_passthrough_restores_variables() {
+    constexpr const char* name = "isolated child environment passthrough";
+    aila::runtime::EnvironmentMap inherited{
+        {L"AILA_WORKER_ENV_PASSTHROUGH", L" ZES_ENABLE_SYSMAN ;; ur_l0_use_copy_engine\t"},
+        {L"ZES_ENABLE_SYSMAN", L"1"},
+        {L"UR_L0_USE_COPY_ENGINE", L"0"},
+        {L"XPTI_TRACE_ENABLE", L"1"},
+    };
+    const fs::path runtime = L"C:\\Aila Runtime";
+    const fs::path system_root = L"C:\\Windows";
+
+    const ParsedEnvironment parsed = parse_serialized_environment(
+        aila::runtime::build_isolated_environment(inherited, runtime, system_root),
+        name);
+
+    expect(
+        parsed.values.at(L"ZES_ENABLE_SYSMAN") == L"1",
+        name,
+        "passthrough-listed variable was not forwarded");
+    expect(
+        parsed.values.at(L"UR_L0_USE_COPY_ENGINE") == L"0",
+        name,
+        "case-insensitive passthrough entry was not forwarded");
+    expect(
+        parsed.values.find(L"XPTI_TRACE_ENABLE") == parsed.values.end(),
+        name,
+        "unlisted instrumentation variable was forwarded");
+    expect(
+        parsed.values.at(L"AILA_WORKER_ENV_PASSTHROUGH") ==
+            L" ZES_ENABLE_SYSMAN ;; ur_l0_use_copy_engine\t",
+        name,
+        "passthrough configuration variable itself was dropped");
+}
+
 void test_hidden_drive_environment_entries_are_preserved() {
     constexpr const char* name = "hidden drive environment entries";
     const std::vector<wchar_t> source = make_environment_block({
@@ -594,6 +705,8 @@ void test_worker_start_isolates_process_context_and_queues_events() {
     EnvironmentRestore path_restore(L"PATH");
     EnvironmentRestore sentinel_restore(L"AILA_TEST_SENTINEL");
     EnvironmentRestore unrelated_handle_restore(L"AILA_TEST_UNRELATED_HANDLE");
+    EnvironmentRestore xpti_restore(L"XPTI_SUBSCRIBERS");
+    EnvironmentRestore ur_restore(L"UR_ENABLE_LAYERS");
     expect(
         SetEnvironmentVariableW(L"PATH", L"C:\\HostPython;C:\\Intel\\oneAPI") != FALSE,
         name,
@@ -602,6 +715,16 @@ void test_worker_start_isolates_process_context_and_queues_events() {
         SetEnvironmentVariableW(L"AILA_TEST_SENTINEL", L"retained-插件") != FALSE,
         name,
         "could not install inherited sentinel");
+    expect(
+        SetEnvironmentVariableW(
+            L"XPTI_SUBSCRIBERS",
+            L"C:\\HostPython\\Library\\bin\\pti_view-0.dll") != FALSE,
+        name,
+        "could not install synthetic host XPTI subscriber");
+    expect(
+        SetEnvironmentVariableW(L"UR_ENABLE_LAYERS", L"UR_LAYER_TRACING") != FALSE,
+        name,
+        "could not install synthetic host UR layer");
     SECURITY_ATTRIBUTES inheritable_security{};
     inheritable_security.nLength = sizeof(inheritable_security);
     inheritable_security.bInheritHandle = TRUE;
@@ -666,6 +789,14 @@ void test_worker_start_isolates_process_context_and_queues_events() {
         name,
         "inherited sentinel was not retained");
     expect(
+        inspection.xpti_subscribers.empty(),
+        name,
+        "host XPTI subscriber leaked into worker: " + inspection.xpti_subscribers);
+    expect(
+        inspection.ur_layers.empty(),
+        name,
+        "host UR layer configuration leaked into worker: " + inspection.ur_layers);
+    expect(
         WaitForSingleObject(unrelated_handle.get(), 0) == WAIT_TIMEOUT,
         name,
         "STARTUPINFOEX handle list leaked an unrelated inheritable handle");
@@ -680,6 +811,44 @@ void test_worker_start_isolates_process_context_and_queues_events() {
         name,
         "event payload changed");
     expect(process.take_events().empty(), name, "take_events did not drain the queue");
+}
+
+void test_worker_start_passthrough_forwards_requested_variable() {
+    constexpr const char* name = "worker start environment passthrough";
+    EnvironmentRestore passthrough_restore(L"AILA_WORKER_ENV_PASSTHROUGH");
+    EnvironmentRestore xpti_restore(L"XPTI_SUBSCRIBERS");
+    EnvironmentRestore ur_restore(L"UR_ENABLE_LAYERS");
+    expect(
+        SetEnvironmentVariableW(L"AILA_WORKER_ENV_PASSTHROUGH", L"UR_ENABLE_LAYERS") != FALSE,
+        name,
+        "could not configure passthrough list");
+    expect(
+        SetEnvironmentVariableW(
+            L"XPTI_SUBSCRIBERS",
+            L"C:\\HostPython\\Library\\bin\\pti_view-0.dll") != FALSE,
+        name,
+        "could not install synthetic host XPTI subscriber");
+    expect(
+        SetEnvironmentVariableW(L"UR_ENABLE_LAYERS", L"UR_LAYER_TRACING") != FALSE,
+        name,
+        "could not install synthetic host UR layer");
+
+    TempDirectory temp;
+    const fs::path worker = stage_fake_worker(temp);
+    aila::runtime::WorkerProcess process;
+    process.start(temp.path(), worker, expected_fake_handshake());
+    const aila::ipc::Frame response =
+        process.request(request_frame(11, "test.inspect"), 2s);
+    const Inspection inspection = parse_inspection(response.header.payload_json, name);
+    expect(
+        inspection.ur_layers == "UR_LAYER_TRACING",
+        name,
+        "passthrough-listed variable was not forwarded to the worker");
+    expect(
+        inspection.xpti_subscribers.empty(),
+        name,
+        "unlisted instrumentation variable leaked into worker: " + inspection.xpti_subscribers);
+    process.shutdown(2s);
 }
 
 void test_worker_request_framing_is_repeatable() {
@@ -1175,11 +1344,14 @@ int main() {
         test_worker_validation();
         test_runtime_directory_override_reads_unicode();
         test_isolated_environment_replaces_path();
+        test_isolated_environment_scrubs_runtime_instrumentation();
+        test_isolated_environment_passthrough_restores_variables();
         test_hidden_drive_environment_entries_are_preserved();
         test_isolated_environment_validates_entries();
         test_current_environment_and_system_root();
         test_proxy_module_path();
         test_worker_start_isolates_process_context_and_queues_events();
+        test_worker_start_passthrough_forwards_requested_variable();
         test_worker_request_framing_is_repeatable();
         test_worker_stream_preserves_unrelated_log_events();
         test_event_transport_rejects_invalid_protocol_and_abi();

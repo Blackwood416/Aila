@@ -6,7 +6,9 @@
 #include <climits>
 #include <limits>
 #include <memory>
+#include <set>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 
 namespace aila::runtime {
@@ -15,6 +17,66 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr size_t kMaximumEnvironmentBlockCharacters = 32767;
+
+constexpr wchar_t kPassthroughVariable[] = L"AILA_WORKER_ENV_PASSTHROUGH";
+
+// GPU hosts (torch.xpu, IPEX, profilers) install these instrumentation and
+// loader-override variables for their own runtime. Inherited by the worker,
+// they reconfigure the private oneAPI runtime and can load foreign DLLs into
+// the isolated process (XPTI_SUBSCRIBERS, UR_ENABLE_LAYERS, OCL_ICD_FILENAMES),
+// so the child environment drops them unless explicitly passed through.
+constexpr std::wstring_view kScrubbedRuntimePrefixes[] = {
+    L"XPTI_",                  // XPTI trace framework: dispatcher/subscriber DLL loading
+    L"UR_",                    // oneAPI Unified Runtime loader: layers, forced adapters
+    L"ZES_",                   // Level Zero sysman instrumentation
+    L"ZET_",                   // Level Zero tools/metrics instrumentation
+    L"ZE_ENABLE_",             // Level Zero loader layer toggles (tracing/validation/alt drivers)
+    L"OCL_ICD_",               // OpenCL ICD loader overrides
+    L"__KMP_REGISTERED_LIB_",  // host-process OpenMP registration bookkeeping
+};
+
+bool starts_with_case_insensitively(const std::wstring& value, std::wstring_view prefix) {
+    if (value.size() < prefix.size() ||
+        prefix.size() > static_cast<size_t>(INT_MAX)) {
+        return false;
+    }
+    return CompareStringOrdinal(
+               value.data(),
+               static_cast<int>(prefix.size()),
+               prefix.data(),
+               static_cast<int>(prefix.size()),
+               TRUE) == CSTR_EQUAL;
+}
+
+std::set<std::wstring, CaseInsensitiveLess> parse_passthrough_names(
+    const EnvironmentMap& inherited) {
+    std::set<std::wstring, CaseInsensitiveLess> names;
+    const auto configured = inherited.find(kPassthroughVariable);
+    if (configured == inherited.end()) {
+        return names;
+    }
+    const std::wstring& value = configured->second;
+    size_t offset = 0;
+    while (offset <= value.size()) {
+        size_t separator = value.find(L';', offset);
+        if (separator == std::wstring::npos) {
+            separator = value.size();
+        }
+        size_t begin = offset;
+        size_t end = separator;
+        while (begin < end && (value[begin] == L' ' || value[begin] == L'\t')) {
+            ++begin;
+        }
+        while (end > begin && (value[end - 1] == L' ' || value[end - 1] == L'\t')) {
+            --end;
+        }
+        if (end > begin) {
+            names.emplace(value.substr(begin, end - begin));
+        }
+        offset = separator + 1;
+    }
+    return names;
+}
 
 struct EnvironmentStringsDeleter {
     void operator()(wchar_t* strings) const noexcept {
@@ -170,6 +232,15 @@ fs::path system_root_directory() {
     }
 }
 
+bool is_scrubbed_runtime_variable(const std::wstring& name) noexcept {
+    for (const std::wstring_view prefix : kScrubbedRuntimePrefixes) {
+        if (starts_with_case_insensitively(name, prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<wchar_t> build_isolated_environment(
     const EnvironmentMap& inherited,
     const fs::path& runtime_directory,
@@ -177,6 +248,17 @@ std::vector<wchar_t> build_isolated_environment(
     EnvironmentMap isolated = inherited;
     for (const auto& [name, value] : isolated) {
         validate_entry(name, value);
+    }
+
+    const std::set<std::wstring, CaseInsensitiveLess> passthrough =
+        parse_passthrough_names(isolated);
+    for (auto entry = isolated.begin(); entry != isolated.end();) {
+        if (is_scrubbed_runtime_variable(entry->first) &&
+            passthrough.find(entry->first) == passthrough.end()) {
+            entry = isolated.erase(entry);
+        } else {
+            ++entry;
+        }
     }
 
     const fs::path normalized_runtime = absolute_normalized(runtime_directory);

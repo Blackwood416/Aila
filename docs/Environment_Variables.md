@@ -9,6 +9,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_RUNTIME_DLL_DIR` | directory path | directory containing `AilaShared.dll` | Directory containing `AilaWorker.exe` and the private oneAPI runtime. Relative values resolve relative to AilaShared.dll; absolute values are accepted. The selected path is normalized to an absolute path internally. An unset or empty value enables the legacy flat layout. |
+| `AILA_WORKER_ENV_PASSTHROUGH` | `;`-separated variable names | `""` | Names of scrubbed GPU-runtime variables (see below) that the host explicitly wants forwarded to the worker anyway. Matched case-insensitively; surrounding spaces are ignored. Example: `AILA_WORKER_ENV_PASSTHROUGH=ZES_ENABLE_SYSMAN;UR_L0_USE_COPY_ENGINE`. |
 
 The unset/empty fallback exists only for compatibility with legacy deployments.
 When the proxy and runtime DLLs share one directory, exposing the proxy directory
@@ -34,6 +35,20 @@ For this layout, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before the host loads
 starts in the selected directory with a child-only `PATH` containing that
 directory and Windows system directories. The host's DLL search path remains
 unchanged.
+
+The worker also does not inherit host GPU-runtime instrumentation variables.
+GPU hosts such as PyTorch XPU set tracing and instrumentation variables in
+their own process (`UR_ENABLE_LAYERS`, `XPTI_TRACE_ENABLE`,
+`XPTI_FRAMEWORK_DISPATCHER`, `XPTI_SUBSCRIBERS`, `ZES_ENABLE_SYSMAN`, ...).
+Inherited by the worker, these reconfigure the private oneAPI runtime and can
+load the host's profiling DLLs into the isolated process, which has crashed the
+worker under ComfyUI and other torch-based hosts. The proxy therefore removes
+variables matching these prefixes from the worker environment: `XPTI_`, `UR_`,
+`ZES_`, `ZET_`, `ZE_ENABLE_`, `OCL_ICD_`, and `__KMP_REGISTERED_LIB_`. All other
+variables — including `AILA_*`, `SYCL_*`, `ONEAPI_DEVICE_SELECTOR`,
+`ZE_AFFINITY_MASK`, and `ZE_FLAT_DEVICE_HIERARCHY` — are inherited unchanged.
+To forward a scrubbed variable deliberately, list its name in
+`AILA_WORKER_ENV_PASSTHROUGH`.
 
 ASR and TTS stream handles keep shared ownership of their proxy engine. Destroy
 ASR streams, and wait for or cancel then destroy TTS streams, before destroying
