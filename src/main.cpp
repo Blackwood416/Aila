@@ -6,6 +6,7 @@
 #include "AudioPreprocessor.hpp"
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
+#include "utils/EnvUtils.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -53,6 +54,12 @@ void convert_args_to_utf8(int& argc, char**& argv) {
 #endif
 
 int main(int argc, char** argv) {
+    if (aila::env::disable_persistent_sycl_cache()) {
+        std::fprintf(
+            stderr,
+            "[Aila] SYCL_CACHE_PERSISTENT was inherited enabled; forcing 0 "
+            "(known runtime crash; set AILA_KEEP_SYCL_CACHE_PERSISTENT=1 to keep)\n");
+    }
 #ifdef _WIN32
     // 如果 stdin/stdout/stderr 被重定向（非交互模式），设置为二进制模式，
     // 从而防止 Windows CRT 做本地化字符集转换和换行符翻译（如 \n -> \r\n），确保管道中传输的是原始 UTF-8 字节。

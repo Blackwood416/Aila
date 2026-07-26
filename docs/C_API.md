@@ -67,10 +67,12 @@ the isolation. If the proxy itself is elsewhere, adding its directory with
 The child starts with its working directory set to the runtime directory and an
 isolated `PATH` containing that directory plus Windows system directories. The
 child also drops host GPU-runtime instrumentation variables (`XPTI_*`, `UR_*`,
-`ZES_*`, `ZET_*`, `ZE_ENABLE_*`, `OCL_ICD_*`): hosts that have initialized
-torch.xpu — ComfyUI in particular — set these for their own process, and
-inheriting them would activate tracing layers and load the host's profiling
-DLLs inside the isolated worker. Set `AILA_WORKER_ENV_PASSTHROUGH` (see
+`ZES_*`, `ZET_*`, `ZE_ENABLE_*`, `OCL_ICD_*`, `SYCL_CACHE_*`): hosts that have
+initialized torch.xpu — ComfyUI in particular — set these for their own process,
+and inheriting them would activate tracing layers and load the host's profiling
+DLLs inside the isolated worker; an inherited `SYCL_CACHE_PERSISTENT=1`
+additionally crashes the bundled DPC++ runtime at the first JIT build (issue
+#4). Set `AILA_WORKER_ENV_PASSTHROUGH` (see
 `docs/Environment_Variables.md`) to forward specific scrubbed variables on
 purpose. At
 startup the proxy verifies the protocol, public ABI, build identity, executable

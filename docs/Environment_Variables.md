@@ -10,6 +10,7 @@ Aila supports the following environment variables for runtime configuration. Boo
 |----------|------|---------|-------------|
 | `AILA_RUNTIME_DLL_DIR` | directory path | directory containing `AilaShared.dll` | Directory containing `AilaWorker.exe` and the private oneAPI runtime. Relative values resolve relative to AilaShared.dll; absolute values are accepted. The selected path is normalized to an absolute path internally. An unset or empty value enables the legacy flat layout. |
 | `AILA_WORKER_ENV_PASSTHROUGH` | `;`-separated variable names | `""` | Names of scrubbed GPU-runtime variables (see below) that the host explicitly wants forwarded to the worker anyway. Matched case-insensitively; surrounding spaces are ignored. Example: `AILA_WORKER_ENV_PASSTHROUGH=ZES_ENABLE_SYSMAN;UR_L0_USE_COPY_ENGINE`. |
+| `AILA_KEEP_SYCL_CACHE_PERSISTENT` | flag | `0` | `Aila.exe` and `AilaWorker.exe` force `SYCL_CACHE_PERSISTENT=0` at startup because an enabled persistent cache crashes the bundled DPC++ runtime (null dereference while hashing oneDNN interop programs at the first JIT build). Set `1` to keep the inherited value, e.g. to test a runtime that fixes the bug. For the worker, the variable must also be forwarded via `AILA_WORKER_ENV_PASSTHROUGH=SYCL_CACHE_PERSISTENT`. |
 
 The unset/empty fallback exists only for compatibility with legacy deployments.
 When the proxy and runtime DLLs share one directory, exposing the proxy directory
@@ -42,13 +43,15 @@ their own process (`UR_ENABLE_LAYERS`, `XPTI_TRACE_ENABLE`,
 `XPTI_FRAMEWORK_DISPATCHER`, `XPTI_SUBSCRIBERS`, `ZES_ENABLE_SYSMAN`, ...).
 Inherited by the worker, these reconfigure the private oneAPI runtime and can
 load the host's profiling DLLs into the isolated process, which has crashed the
-worker under ComfyUI and other torch-based hosts. The proxy therefore removes
+worker under ComfyUI and other torch-based hosts. `SYCL_CACHE_PERSISTENT=1`
+(commonly exported for llama.cpp-SYCL or torch XPU startup speedups) crashes
+the bundled DPC++ runtime outright (issue #4). The proxy therefore removes
 variables matching these prefixes from the worker environment: `XPTI_`, `UR_`,
-`ZES_`, `ZET_`, `ZE_ENABLE_`, `OCL_ICD_`, and `__KMP_REGISTERED_LIB_`. All other
-variables — including `AILA_*`, `SYCL_*`, `ONEAPI_DEVICE_SELECTOR`,
-`ZE_AFFINITY_MASK`, and `ZE_FLAT_DEVICE_HIERARCHY` — are inherited unchanged.
-To forward a scrubbed variable deliberately, list its name in
-`AILA_WORKER_ENV_PASSTHROUGH`.
+`ZES_`, `ZET_`, `ZE_ENABLE_`, `OCL_ICD_`, `SYCL_CACHE_`, and
+`__KMP_REGISTERED_LIB_`. All other variables — including `AILA_*`,
+`ONEAPI_DEVICE_SELECTOR`, `ZE_AFFINITY_MASK`, and `ZE_FLAT_DEVICE_HIERARCHY` —
+are inherited unchanged. To forward a scrubbed variable deliberately, list its
+name in `AILA_WORKER_ENV_PASSTHROUGH`.
 
 ASR and TTS stream handles keep shared ownership of their proxy engine. Destroy
 ASR streams, and wait for or cancel then destroy TTS streams, before destroying

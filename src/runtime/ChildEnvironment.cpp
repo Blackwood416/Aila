@@ -32,6 +32,9 @@ constexpr std::wstring_view kScrubbedRuntimePrefixes[] = {
     L"ZET_",                   // Level Zero tools/metrics instrumentation
     L"ZE_ENABLE_",             // Level Zero loader layer toggles (tracing/validation/alt drivers)
     L"OCL_ICD_",               // OpenCL ICD loader overrides
+    L"SYCL_CACHE_",            // DPC++ persistent/in-memory cache config; SYCL_CACHE_PERSISTENT=1
+                               // crashes the bundled runtime (issue #4, sycl9 null deref while
+                               // hashing oneDNN interop programs at first JIT build)
     L"__KMP_REGISTERED_LIB_",  // host-process OpenMP registration bookkeeping
 };
 

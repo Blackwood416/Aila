@@ -123,5 +123,28 @@ inline int read_int_raw(const char* name, int default_value) {
 #endif
 }
 
+// SYCL_CACHE_PERSISTENT=1 (recommended by llama.cpp-SYCL / torch XPU guides and
+// set by some launchers) crashes the bundled DPC++ runtime: sycl9 dereferences
+// a null device-image pointer while hashing oneDNN interop programs at the
+// first JIT build (issue #4). Aila-owned processes force it off before the
+// first SYCL call. AILA_KEEP_SYCL_CACHE_PERSISTENT=1 keeps the inherited value
+// (for testing runtimes that fix the bug). Returns true when the value was
+// overridden. On Windows _putenv_s also updates the Win32 block via the shared
+// UCRT, which is where sycl9.dll reads the variable.
+inline bool disable_persistent_sycl_cache() {
+    if (read_flag("AILA_KEEP_SYCL_CACHE_PERSISTENT", false)) {
+        return false;
+    }
+    const std::string value = read_string("SYCL_CACHE_PERSISTENT");
+    if (value.empty() || value == "0") {
+        return false;
+    }
+#ifdef _WIN32
+    return _putenv_s("SYCL_CACHE_PERSISTENT", "0") == 0;
+#else
+    return setenv("SYCL_CACHE_PERSISTENT", "0", 1) == 0;
+#endif
+}
+
 } // namespace env
 } // namespace aila

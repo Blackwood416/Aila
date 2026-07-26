@@ -510,13 +510,17 @@ void test_isolated_environment_scrubs_runtime_instrumentation() {
         {L"ZE_ENABLE_TRACING_LAYER", L"1"},
         {L"OCL_ICD_FILENAMES", L"C:\\HostPython\\injected_icd.dll"},
         {L"__KMP_REGISTERED_LIB_16532", L"00007FF95F503298-cafe4431-libiomp5md.dll"},
+        // DPC++ cache config: SYCL_CACHE_PERSISTENT=1 crashes the bundled
+        // runtime (issue #4), so the whole SYCL_CACHE_ family is scrubbed.
+        {L"SYCL_CACHE_PERSISTENT", L"1"},
+        {L"SYCL_CACHE_DIR", L"C:\\HostPython\\libsycl_cache"},
         // Tuning and engine variables that must keep flowing to the worker.
         {L"AILA_LOG_LEVEL", L"debug"},
-        {L"SYCL_CACHE_PERSISTENT", L"1"},
         {L"ONEAPI_DEVICE_SELECTOR", L"level_zero:0"},
         {L"ZE_AFFINITY_MASK", L"0"},
         {L"ZE_FLAT_DEVICE_HIERARCHY", L"COMPOSITE"},
         {L"URSULA", L"not a UR_ variable prefix match victim"},
+        {L"SYCLONE", L"not a SYCL_CACHE_ variable prefix match victim"},
     };
     const fs::path runtime = L"C:\\Aila Runtime";
     const fs::path system_root = L"C:\\Windows";
@@ -535,6 +539,8 @@ void test_isolated_environment_scrubs_runtime_instrumentation() {
              L"ZET_ENABLE_PROGRAM_INSTRUMENTATION",
              L"ZE_ENABLE_TRACING_LAYER",
              L"OCL_ICD_FILENAMES",
+             L"SYCL_CACHE_PERSISTENT",
+             L"SYCL_CACHE_DIR",
              L"__KMP_REGISTERED_LIB_16532",
          }) {
         expect(
@@ -543,10 +549,6 @@ void test_isolated_environment_scrubs_runtime_instrumentation() {
             "host instrumentation variable leaked into worker: " + utf8(scrubbed));
     }
     expect(parsed.values.at(L"AILA_LOG_LEVEL") == L"debug", name, "AILA variable was dropped");
-    expect(
-        parsed.values.at(L"SYCL_CACHE_PERSISTENT") == L"1",
-        name,
-        "SYCL tuning variable was dropped");
     expect(
         parsed.values.at(L"ONEAPI_DEVICE_SELECTOR") == L"level_zero:0",
         name,
@@ -561,10 +563,15 @@ void test_isolated_environment_scrubs_runtime_instrumentation() {
         name,
         "non-prefix variable was scrubbed");
     expect(
+        parsed.values.at(L"SYCLONE") == L"not a SYCL_CACHE_ variable prefix match victim",
+        name,
+        "non-prefix SYCL variable was scrubbed");
+    expect(
         aila::runtime::is_scrubbed_runtime_variable(L"xpti_subscribers") &&
             aila::runtime::is_scrubbed_runtime_variable(L"Ur_Enable_Layers") &&
+            aila::runtime::is_scrubbed_runtime_variable(L"sycl_cache_persistent") &&
             !aila::runtime::is_scrubbed_runtime_variable(L"ZE_AFFINITY_MASK") &&
-            !aila::runtime::is_scrubbed_runtime_variable(L"SYCL_CACHE_PERSISTENT"),
+            !aila::runtime::is_scrubbed_runtime_variable(L"SYCL_DEVICE_ALLOWLIST"),
         name,
         "scrub predicate did not match case-insensitively");
 }

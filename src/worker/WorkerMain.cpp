@@ -3,12 +3,14 @@
 #include "aila_api.h"
 #include "ipc/IpcProtocol.hpp"
 #include "ipc/Win32Pipe.hpp"
+#include "utils/EnvUtils.hpp"
 #include "worker/WorkerDispatcher.hpp"
 #include "simdjson.h"
 
 #include <cerrno>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -845,6 +847,12 @@ int run(const Handles& handles) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (aila::env::disable_persistent_sycl_cache()) {
+        std::fprintf(
+            stderr,
+            "[Aila] SYCL_CACHE_PERSISTENT was inherited enabled; forcing 0 "
+            "(known runtime crash; set AILA_KEEP_SYCL_CACHE_PERSISTENT=1 to keep)\n");
+    }
     try {
         const Handles handles = parse_arguments(argc, argv);
         return run(handles);
