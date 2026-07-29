@@ -137,6 +137,11 @@ ALIA_API int alia_context_init_ex(AliaContext** out_ctx, const AliaContextConfig
 ALIA_API void alia_context_destroy(AliaContext* ctx);
 ALIA_API int alia_abort_inference(AliaContext* ctx, int pipeline_mask);
 ALIA_API int alia_get_last_error(AliaContext* ctx, int pipeline_mask, char** out_error);
+/*
+ * Returns a malloc-owned JSON snapshot of the latest ASR/foreground/TTS,
+ * speculative endpoint, and background metrics. Release with alia_free_string().
+ */
+ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json);
 ALIA_API int alia_vlm_rollback_kv_cache(AliaContext* ctx, int rollback_tokens);
 ALIA_API int alia_vlm_prefill_asr_text(
     AliaContext* ctx,

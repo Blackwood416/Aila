@@ -270,6 +270,166 @@ ALIA_API int alia_get_last_error(AliaContext* ctx, int pipeline_mask, char** out
     });
 }
 
+ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) {
+    return guarded_alia_call([&]() -> int {
+        if (out_json) {
+            *out_json = nullptr;
+        }
+        if (!ctx || !out_json || !ctx->asr_pipeline ||
+            !ctx->foreground_pipeline || !ctx->tts_pipeline) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+
+        const aila::alia::AliaAsrMetrics asr = ctx->asr_pipeline->last_metrics();
+        const aila::alia::AliaForegroundMetrics foreground =
+            ctx->foreground_pipeline->last_metrics();
+        const aila::alia::AliaTtsMetrics tts = ctx->tts_pipeline->last_metrics();
+        const AliaSpeculativeEndpointMetrics endpoint = ctx->speculative_endpoint
+            ? ctx->speculative_endpoint->metrics()
+            : AliaSpeculativeEndpointMetrics{};
+
+        std::ostringstream out;
+        out << "{";
+        out << "\"asr\":{";
+        out << "\"transcribe_calls\":" << asr.transcribe_calls << ",";
+        out << "\"generated_tokens\":" << asr.generated_tokens << ",";
+        out << "\"prefix_reuse_hits\":" << asr.prefix_reuse_hits << ",";
+        out << "\"prefix_reused_tokens\":" << asr.prefix_reused_tokens << ",";
+        out << "\"prefix_appended_tokens\":" << asr.prefix_appended_tokens << ",";
+        out << "\"mel_ms\":" << asr.mel_ms << ",";
+        out << "\"upload_ms\":" << asr.upload_ms << ",";
+        out << "\"encoder_ms\":" << asr.encoder_ms << ",";
+        out << "\"readback_ms\":" << asr.readback_ms << ",";
+        out << "\"prompt_ms\":" << asr.prompt_ms << ",";
+        out << "\"prefill_ms\":" << asr.prefill_ms << ",";
+        out << "\"decode_ms\":" << asr.decode_ms << ",";
+        out << "\"total_ms\":" << asr.total_ms;
+        out << "},";
+
+        out << "\"foreground\":{";
+        out << "\"prompt_tokens\":" << foreground.prompt_tokens << ",";
+        out << "\"prefilled_prompt_tokens\":"
+            << foreground.prefilled_prompt_tokens << ",";
+        out << "\"prompt_suffix_tokens\":" << foreground.prompt_suffix_tokens << ",";
+        out << "\"generated_tokens\":" << foreground.generated_tokens << ",";
+        out << "\"prompt_build_ms\":" << foreground.prompt_build_ms << ",";
+        out << "\"prompt_prefill_ms\":" << foreground.prompt_prefill_ms << ",";
+        out << "\"first_token_delta_ms\":" << foreground.first_token_delta_ms << ",";
+        out << "\"first_content_delta_ms\":"
+            << foreground.first_content_delta_ms << ",";
+        out << "\"first_tts_enqueue_ms\":"
+            << foreground.first_tts_enqueue_ms << ",";
+        out << "\"first_tts_chunk_wait_ms\":"
+            << foreground.first_tts_chunk_wait_ms << ",";
+        out << "\"tts_first_audio_priority_wait_ms\":"
+            << foreground.tts_first_audio_priority_wait_ms << ",";
+        out << "\"decode_ms\":" << foreground.decode_ms << ",";
+        out << "\"model_ms\":" << foreground.model_ms << ",";
+        out << "\"final_cached_prefix_rejected\":"
+            << foreground.final_cached_prefix_rejected << ",";
+        out << "\"final_cached_prefix_reject_reason\":\""
+            << json_escape(foreground.final_cached_prefix_reject_reason) << "\",";
+        out << "\"final_prefix_path\":\""
+            << json_escape(foreground.final_prefix_path) << "\",";
+        out << "\"first_tts_chunk_reason\":\""
+            << json_escape(foreground.first_tts_chunk_reason) << "\",";
+        out << "\"asr_prefill_tokens\":"
+            << ctx->foreground_pipeline->last_asr_prefill_token_count() << ",";
+        out << "\"asr_prefill_reused_tokens\":"
+            << ctx->foreground_pipeline->last_asr_prefill_reused_token_count() << ",";
+        out << "\"asr_prefill_suffix_tokens\":"
+            << ctx->foreground_pipeline->last_asr_prefill_suffix_token_count() << ",";
+        out << "\"asr_prefill_candidate_tokens\":"
+            << ctx->foreground_pipeline->last_asr_prefill_candidate_token_count() << ",";
+        out << "\"asr_prefill_candidate_suffix_tokens\":"
+            << ctx->foreground_pipeline->last_asr_prefill_candidate_suffix_token_count() << ",";
+        out << "\"asr_prefill_ms\":"
+            << ctx->foreground_pipeline->last_asr_prefill_ms() << ",";
+        out << "\"asr_prefill_skip_reason\":\""
+            << json_escape(ctx->foreground_pipeline->last_asr_prefill_skip_reason())
+            << "\"";
+        out << "},";
+
+        out << "\"tts\":{";
+        out << "\"chunks_synthesized\":" << tts.chunks_synthesized << ",";
+        out << "\"first_text_chars\":" << tts.first_text_chars << ",";
+        out << "\"first_text_tokens\":" << tts.first_text_tokens << ",";
+        out << "\"first_backend_frames\":" << tts.first_backend_frames << ",";
+        out << "\"first_backend_callbacks\":" << tts.first_backend_callbacks << ",";
+        out << "\"first_backend_audio_samples\":"
+            << tts.first_backend_audio_samples << ",";
+        out << "\"first_backend_codes_ms\":" << tts.first_backend_codes_ms << ",";
+        out << "\"first_backend_mimi_init_ms\":"
+            << tts.first_backend_mimi_init_ms << ",";
+        out << "\"first_backend_audio_ms\":" << tts.first_backend_audio_ms << ",";
+        out << "\"first_backend_total_ms\":" << tts.first_backend_total_ms << ",";
+        out << "\"backend_total_ms\":" << tts.backend_total_ms << ",";
+        out << "\"pause_silence_segments\":" << tts.pause_silence_segments << ",";
+        out << "\"pause_silence_ms\":" << tts.pause_silence_ms << ",";
+        out << "\"lookahead_prefetch_attempts\":"
+            << tts.silence_lookahead_prefetch_attempts << ",";
+        out << "\"lookahead_prefetch_hits\":"
+            << tts.silence_lookahead_prefetch_hits;
+        out << "},";
+
+        out << "\"endpoint\":{";
+        out << "\"state\":" << endpoint.state << ",";
+        out << "\"enabled\":" << endpoint.enabled << ",";
+        out << "\"trigger_count\":" << endpoint.trigger_count << ",";
+        out << "\"resume_count\":" << endpoint.resume_count << ",";
+        out << "\"stale_completion_count\":"
+            << endpoint.stale_completion_count << ",";
+        out << "\"candidate_silence_ms\":" << endpoint.candidate_silence_ms << ",";
+        out << "\"candidate_asr_ms\":" << endpoint.candidate_asr_ms << ",";
+        out << "\"candidate_prefill_ms\":" << endpoint.candidate_prefill_ms << ",";
+        out << "\"candidate_prefill_rc\":" << endpoint.candidate_prefill_rc << ",";
+        out << "\"candidate_prefill_tokens\":"
+            << endpoint.candidate_prefill_tokens << ",";
+        out << "\"commit_wait_ms\":" << endpoint.commit_wait_ms << ",";
+        out << "\"final_asr_ms\":" << endpoint.final_asr_ms << ",";
+        out << "\"final_prefill_ms\":" << endpoint.final_prefill_ms << ",";
+        out << "\"final_reused_tokens\":" << endpoint.final_reused_tokens << ",";
+        out << "\"final_suffix_tokens\":" << endpoint.final_suffix_tokens << ",";
+        out << "\"commit_prefill_hit\":" << endpoint.commit_prefill_hit << ",";
+        out << "\"final_asr_reused_candidate\":"
+            << endpoint.final_asr_reused_candidate;
+        out << "},";
+
+        out << "\"background\":{";
+        if (ctx->background_pipeline) {
+            const std::string background_json =
+                ctx->background_pipeline->last_result_json();
+            out << "\"state\":"
+                << map_background_state(ctx->background_pipeline->state()) << ",";
+            out << "\"decode_mode\":"
+                << static_cast<int>(ctx->background_pipeline->last_decode_mode()) << ",";
+            out << "\"schema_valid\":"
+                << (aila::alia::AliaBackgroundPipeline::has_required_schema_keys(
+                        background_json)
+                        ? "true"
+                        : "false")
+                << ",";
+            out << "\"retry_count\":"
+                << ctx->background_pipeline->last_schema_retry_count() << ",";
+            out << "\"schema_repair_applied\":"
+                << (ctx->background_pipeline->last_schema_repair_applied()
+                        ? "true"
+                        : "false") << ",";
+            out << "\"schema_diagnostic\":\""
+                << json_escape(ctx->background_pipeline->last_schema_diagnostic())
+                << "\"";
+        } else {
+            out << "\"state\":" << ALIA_ASYNC_FAILED << ",";
+            out << "\"schema_valid\":false";
+        }
+        out << "}";
+        out << "}";
+
+        *out_json = duplicate_c_string(out.str());
+        return *out_json ? ALIA_OK : ALIA_ERR_RUNTIME;
+    });
+}
+
 ALIA_API int alia_vlm_rollback_kv_cache(AliaContext* ctx, int rollback_tokens) {
     return guarded_alia_call([&]() -> int {
         if (!ctx || rollback_tokens < 0) {
