@@ -21,6 +21,12 @@ void sigmoid_gate(const float* input,
                   int n,
                   float* output);
 
+void split_q_gate_packed(const float* packed,
+                         int num_heads,
+                         int head_dim,
+                         float* q,
+                         float* gate);
+
 float silu(float x);
 
 }  // namespace cpu_q35

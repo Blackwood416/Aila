@@ -97,10 +97,7 @@ uint8_t tensor_u8_at(const CpuTensorView& tensor, int64_t index) {
     return tensor.u8_data()[static_cast<size_t>(index)];
 }
 
-float effective_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) {
-    if (!weight.decoded_absmax.empty()) {
-        return weight.decoded_absmax[static_cast<size_t>(block)];
-    }
+float decode_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) {
     if (!weight.quant_state.nested) {
         return tensor_f32_at(*weight.absmax, block);
     }
@@ -110,6 +107,13 @@ float effective_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) 
     return tensor_f32_at(*weight.nested_quant_map, qv) *
                tensor_f32_at(*weight.nested_absmax, nested_block) +
            weight.quant_state.nested_offset;
+}
+
+float effective_absmax_for_block(const CpuBnb4WeightRef& weight, int64_t block) {
+    if (!weight.decoded_absmax.empty()) {
+        return weight.decoded_absmax[static_cast<size_t>(block)];
+    }
+    return decode_absmax_for_block(weight, block);
 }
 
 bool has_f16c() {
@@ -848,7 +852,7 @@ bool load_cpu_bnb4_weight_ref(const CpuSafetensorsStore& store,
     out.decoded_absmax.assign(static_cast<size_t>(block_count), 0.0f);
     for (int64_t block = 0; block < block_count; ++block) {
         out.decoded_absmax[static_cast<size_t>(block)] =
-            effective_absmax_for_block(out, block);
+            decode_absmax_for_block(out, block);
     }
     build_dense_weight_cache(out);
 

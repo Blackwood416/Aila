@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -298,6 +299,67 @@ void repeated_parallel_dense_matvec_matches_reference(TestResults& results) {
     }
 }
 
+void real_model_projection_is_nonzero_when_requested(TestResults& results) {
+    std::string model_dir;
+#ifdef _WIN32
+    char* model_dir_raw = nullptr;
+    size_t model_dir_size = 0;
+    if (_dupenv_s(&model_dir_raw,
+                  &model_dir_size,
+                  "AILA_CPU_BNB4_REAL_MODEL_DIR") == 0 &&
+        model_dir_raw) {
+        model_dir.assign(model_dir_raw);
+    }
+    std::free(model_dir_raw);
+#else
+    if (const char* model_dir_raw = std::getenv("AILA_CPU_BNB4_REAL_MODEL_DIR")) {
+        model_dir.assign(model_dir_raw);
+    }
+#endif
+    if (model_dir.empty()) {
+        return;
+    }
+
+    CpuSafetensorsStore store;
+    std::string error;
+    AILA_EXPECT_TRUE(results, store.load_from_dir(model_dir, &error));
+    if (!error.empty()) {
+        std::cerr << error << '\n';
+        return;
+    }
+
+    CpuBnb4WeightRef weight;
+    AILA_EXPECT_TRUE(
+        results,
+        load_cpu_bnb4_weight_ref(
+            store,
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            weight,
+            &error,
+            CpuBnb4CacheMode::Fp16));
+    if (!error.empty() || weight.dense_weight_f16.empty()) {
+        std::cerr << error << '\n';
+        return;
+    }
+
+    float max_weight = 0.0f;
+    for (uint16_t value : weight.dense_weight_f16) {
+        max_weight = std::max(max_weight, std::abs(cpu_f16_to_float(value)));
+    }
+    AILA_EXPECT_TRUE(results, max_weight > 0.001f);
+
+    std::vector<float> input(static_cast<size_t>(weight.in_features()), 1.0f);
+    std::vector<float> output(static_cast<size_t>(weight.out_features()), 0.0f);
+    cpu_bnb4_matvec(weight, input.data(), output.data());
+    float max_output = 0.0f;
+    for (float value : output) {
+        max_output = std::max(max_output, std::abs(value));
+    }
+    AILA_EXPECT_TRUE(results, max_output > 0.001f);
+    std::cout << "real_model_projection_max_weight=" << max_weight
+              << " max_output=" << max_output << '\n';
+}
+
 
 
 }  // namespace
@@ -310,6 +372,7 @@ int main() {
     packed_nf4_cache_matches_hand_computed_fixture(results);
     fp16_conversion_and_dot_match_reference(results);
     repeated_parallel_dense_matvec_matches_reference(results);
+    real_model_projection_is_nonzero_when_requested(results);
 
     std::cout << "AilaCpuBnb4Tests: " << results.passed
               << " passed, " << results.failed << " failed\n";

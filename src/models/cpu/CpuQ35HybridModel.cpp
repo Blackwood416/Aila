@@ -262,6 +262,23 @@ void sigmoid_gate(const float* input,
     }
 }
 
+void split_q_gate_packed(const float* packed,
+                         int num_heads,
+                         int head_dim,
+                         float* q,
+                         float* gate) {
+    const int packed_head_dim = 2 * head_dim;
+    for (int head = 0; head < num_heads; ++head) {
+        const float* packed_head = packed + static_cast<size_t>(head) * packed_head_dim;
+        float* q_head = q + static_cast<size_t>(head) * head_dim;
+        float* gate_head = gate + static_cast<size_t>(head) * head_dim;
+        std::memcpy(q_head, packed_head, static_cast<size_t>(head_dim) * sizeof(float));
+        std::memcpy(gate_head,
+                    packed_head + head_dim,
+                    static_cast<size_t>(head_dim) * sizeof(float));
+    }
+}
+
 }  // namespace cpu_q35
 
 bool CpuQ35HybridModel::load(const std::string& model_dir,
@@ -1162,9 +1179,11 @@ bool CpuQ35HybridModel::run_full_attention(CpuQ35Layer& layer,
     }
 
     if (cfg_.attn_output_gate) {
-        std::memcpy(q.data(), q_proj.data(), static_cast<size_t>(full_q_dim_) * sizeof(float));
-        std::memcpy(gate.data(), q_proj.data() + full_q_dim_,
-                    static_cast<size_t>(full_q_dim_) * sizeof(float));
+        cpu_q35::split_q_gate_packed(q_proj.data(),
+                                     full_q_heads_,
+                                     full_head_dim_,
+                                     q.data(),
+                                     gate.data());
     } else {
         std::memcpy(q.data(), q_proj.data(), static_cast<size_t>(full_q_dim_) * sizeof(float));
     }

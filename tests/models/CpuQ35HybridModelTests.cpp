@@ -102,6 +102,22 @@ void sigmoid_gate_matches_reference(TestResults& results) {
     AILA_EXPECT_TRUE(results, std::abs(output[0] - 1.5f) < 0.0001f);
 }
 
+void q_gate_split_preserves_per_head_packing(TestResults& results) {
+    const float packed[12] = {
+        1.0f, 2.0f, 3.0f, 10.0f, 20.0f, 30.0f,
+        4.0f, 5.0f, 6.0f, 40.0f, 50.0f, 60.0f,
+    };
+    float q[6] = {};
+    float gate[6] = {};
+
+    cpu_q35::split_q_gate_packed(packed, 2, 3, q, gate);
+
+    for (int i = 0; i < 6; ++i) {
+        AILA_EXPECT_TRUE(results, q[i] == static_cast<float>(i + 1));
+        AILA_EXPECT_TRUE(results, gate[i] == static_cast<float>((i + 1) * 10));
+    }
+}
+
 void prefill_before_load_reports_error(TestResults& results) {
     CpuQ35HybridModel model;
     const std::vector<int> tokens = {1, 2};
@@ -131,6 +147,7 @@ int main() {
     load_missing_required_weight_reports_name(results);
     rms_norm_q35_adds_one_to_weight(results);
     sigmoid_gate_matches_reference(results);
+    q_gate_split_preserves_per_head_packing(results);
     prefill_before_load_reports_error(results);
     prefill_batch_parser_accepts_supported_values(results);
 
