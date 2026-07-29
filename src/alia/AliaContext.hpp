@@ -4,6 +4,7 @@
 #include "AliaAsrPipeline.hpp"
 #include "AliaBackgroundPipeline.hpp"
 #include "AliaForegroundPipeline.hpp"
+#include "AliaSpeculativeEndpoint.hpp"
 #include "AliaTtsPipeline.hpp"
 #include "ModelSlot.hpp"
 #include "RuntimeContext.hpp"
@@ -39,4 +40,5 @@ struct AliaContext {
     std::unique_ptr<aila::alia::AliaTtsPipeline> tts_pipeline;
     std::unique_ptr<aila::alia::AliaForegroundPipeline> foreground_pipeline;
     std::unique_ptr<aila::alia::AliaBackgroundPipeline> background_pipeline;
+    std::unique_ptr<aila::alia::AliaSpeculativeEndpointController> speculative_endpoint;
 };

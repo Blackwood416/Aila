@@ -16,6 +16,8 @@ param(
     [switch]$NoGenerateAudio,
     [switch]$StreamAsrPrefill,
     [switch]$SpeculativeForeground,
+    [switch]$SpeculativeEndpointWindow,
+    [switch]$SpeculativeEndpointResumeProbe,
     [switch]$SkipToolProbe
 )
 
@@ -119,6 +121,12 @@ try {
     }
     if ($SpeculativeForeground) {
         $smokeArgs += "--speculative-foreground"
+    }
+    if ($SpeculativeEndpointWindow) {
+        $smokeArgs += "--speculative-endpoint-window"
+    }
+    if ($SpeculativeEndpointResumeProbe) {
+        $smokeArgs += "--speculative-endpoint-resume-probe"
     }
     if ($SkipToolProbe) {
         $smokeArgs += "--skip-tool-probe"

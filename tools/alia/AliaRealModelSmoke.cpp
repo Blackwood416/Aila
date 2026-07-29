@@ -25,6 +25,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -92,6 +93,8 @@ struct Options {
     bool run_tool_probe = true;
     bool stream_asr_prefill = false;
     bool speculative_foreground = false;
+    bool speculative_endpoint_window = false;
+    bool speculative_endpoint_resume_probe = false;
 };
 
 struct AudioCapture {
@@ -380,6 +383,10 @@ void print_usage() {
         << "  --stream-asr-prefill   feed ASR in chunks and prefill foreground VLM from stable/partial text\n"
         << "  --speculative-foreground\n"
         << "                         start a text-only foreground response from ASR partial text and commit/fallback at final ASR\n"
+        << "  --speculative-endpoint-window\n"
+        << "                         replay the 15-frame VAD authority window through the prefill-only endpoint\n"
+        << "  --speculative-endpoint-resume-probe\n"
+        << "                         insert a 160ms pause midway through endpoint audio, then resume speech\n"
         << "  --skip-tool-probe      skip the dedicated LoRA tool-call probe\n";
 }
 
@@ -456,6 +463,11 @@ bool parse_args(int argc, char** argv, Options& opts) {
             opts.stream_asr_prefill = true;
         } else if (arg == "--speculative-foreground") {
             opts.speculative_foreground = true;
+        } else if (arg == "--speculative-endpoint-window") {
+            opts.speculative_endpoint_window = true;
+        } else if (arg == "--speculative-endpoint-resume-probe") {
+            opts.speculative_endpoint_window = true;
+            opts.speculative_endpoint_resume_probe = true;
         } else if (arg == "--skip-tool-probe") {
             opts.run_tool_probe = false;
         } else {
@@ -472,6 +484,12 @@ bool parse_args(int argc, char** argv, Options& opts) {
     }
     if (opts.stream_prefill_interval_ms == 0) {
         opts.stream_prefill_interval_ms = opts.stream_chunk_ms;
+    }
+    if (opts.speculative_endpoint_window &&
+        (opts.stream_asr_prefill || opts.speculative_foreground)) {
+        std::cerr << "speculative-endpoint-window cannot be combined with the legacy "
+                  << "stream/speculative foreground paths.\n";
+        return false;
     }
     if (opts.request_text.empty()) {
         std::cerr << "request-text must not be empty.\n";
@@ -912,6 +930,14 @@ int main(int argc, char** argv) {
 
     std::string stable_text;
     std::string partial_text;
+    Clock::time_point speech_end = Clock::now();
+    if (opts.speculative_endpoint_window) {
+        rc = alia_speculative_endpoint_begin(ctx.get());
+        if (rc != ALIA_OK) {
+            std::cerr << "alia_speculative_endpoint_begin_rc=" << rc << "\n";
+            return 1;
+        }
+    }
     if (opts.stream_asr_prefill) {
         const int stream_chunk_samples =
             std::max(1, static_cast<int>(std::llround(
@@ -1133,33 +1159,101 @@ int main(int argc, char** argv) {
         asr_stream_simulated_tail_ms =
             std::max(0.0, asr_stream_simulated_clock_ms - asr_audio_duration_ms);
     } else {
-        rc = alia_asr_feed_audio(ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));
-        if (rc != ALIA_OK) {
-            std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
-            return 1;
-        }
-        const aila::alia::AliaAsrMetrics metrics_before =
-            ctx->asr_pipeline->last_metrics();
-        const auto get_text_start = Clock::now();
-        if (!get_asr_text(stable_text, partial_text, true)) {
-            return 1;
-        }
-        const double get_text_ms = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now() - get_text_start).count());
-        if (asr_profile_calls) {
-            const aila::alia::AliaAsrMetrics metrics_after =
+        if (opts.speculative_endpoint_window) {
+            constexpr int kVadFrameSamples = 512;
+            constexpr int kResumePauseFrames = 5;
+            constexpr int kAuthoritySilenceFrames = 15;
+            constexpr auto kVadFrameDuration = std::chrono::milliseconds(32);
+            const auto feed_audio_range = [&](size_t begin, size_t end) -> bool {
+                for (size_t offset = begin; offset < end;
+                     offset += static_cast<size_t>(kVadFrameSamples)) {
+                    const size_t count = std::min<size_t>(
+                        static_cast<size_t>(kVadFrameSamples), end - offset);
+                    rc = alia_asr_feed_audio(
+                        ctx.get(), mono_16k.data() + offset, static_cast<int>(count));
+                    if (rc != ALIA_OK) {
+                        std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
+                        return false;
+                    }
+                    rc = alia_speculative_endpoint_observe_vad(ctx.get(), 1.0f);
+                    if (rc != ALIA_OK) {
+                        std::cerr << "alia_speculative_endpoint_observe_vad_rc=" << rc << "\n";
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const auto feed_silence_frame = [&]() -> bool {
+                const float silence[kVadFrameSamples] = {};
+                rc = alia_asr_feed_audio(ctx.get(), silence, kVadFrameSamples);
+                if (rc != ALIA_OK) {
+                    std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
+                    return false;
+                }
+                std::this_thread::sleep_for(kVadFrameDuration);
+                rc = alia_speculative_endpoint_observe_vad(ctx.get(), 0.0f);
+                if (rc != ALIA_OK) {
+                    std::cerr << "alia_speculative_endpoint_observe_vad_rc=" << rc << "\n";
+                    return false;
+                }
+                return true;
+            };
+
+            if (opts.speculative_endpoint_resume_probe) {
+                const size_t midpoint = std::max<size_t>(
+                    1, (mono_16k.size() / 2 / kVadFrameSamples) * kVadFrameSamples);
+                if (!feed_audio_range(0, midpoint)) {
+                    return 1;
+                }
+                for (int frame = 0; frame < kResumePauseFrames; ++frame) {
+                    if (!feed_silence_frame()) {
+                        return 1;
+                    }
+                }
+                std::this_thread::sleep_for(kVadFrameDuration);
+                if (!feed_audio_range(midpoint, mono_16k.size())) {
+                    return 1;
+                }
+            } else if (!feed_audio_range(0, mono_16k.size())) {
+                return 1;
+            }
+            speech_end = Clock::now();
+            for (int frame = 0; frame < kAuthoritySilenceFrames; ++frame) {
+                if (!feed_silence_frame()) {
+                    return 1;
+                }
+            }
+        } else {
+            rc = alia_asr_feed_audio(
+                ctx.get(), mono_16k.data(), static_cast<int>(mono_16k.size()));
+            if (rc != ALIA_OK) {
+                std::cerr << "alia_asr_feed_audio_rc=" << rc << "\n";
+                return 1;
+            }
+            speech_end = Clock::now();
+            const aila::alia::AliaAsrMetrics metrics_before =
                 ctx->asr_pipeline->last_metrics();
-            print_asr_profile_call("asr_profile_call",
-                                   asr_profile_call_index++,
-                                   true,
-                                   asr_audio_duration_ms,
-                                   get_text_ms,
-                                   subtract_asr_metrics(metrics_after, metrics_before),
-                                   stable_text,
-                                   partial_text);
+            const auto get_text_start = Clock::now();
+            if (!get_asr_text(stable_text, partial_text, true)) {
+                return 1;
+            }
+            const double get_text_ms = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - get_text_start).count());
+            if (asr_profile_calls) {
+                const aila::alia::AliaAsrMetrics metrics_after =
+                    ctx->asr_pipeline->last_metrics();
+                print_asr_profile_call("asr_profile_call",
+                                       asr_profile_call_index++,
+                                       true,
+                                       asr_audio_duration_ms,
+                                       get_text_ms,
+                                       subtract_asr_metrics(metrics_after, metrics_before),
+                                       stable_text,
+                                       partial_text);
+            }
+            ++asr_text_calls;
         }
-        ++asr_text_calls;
     }
     const auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - asr_start).count();
@@ -1275,34 +1369,73 @@ int main(int argc, char** argv) {
               << quote(speculative_last_candidate_text) << "\n"
               << "foreground_speculative_skip_reason="
               << quote(speculative_skip_reason) << "\n"
+              << "speculative_endpoint_window="
+              << (opts.speculative_endpoint_window ? "true" : "false") << "\n"
+              << "speculative_endpoint_resume_probe="
+              << (opts.speculative_endpoint_resume_probe ? "true" : "false") << "\n"
               << "asr_stable_text=" << quote(stable_text) << "\n"
               << "asr_partial_text=" << quote(partial_text) << "\n";
-    if (user_text.empty()) {
+    if (!opts.speculative_endpoint_window && user_text.empty()) {
         std::cerr << "asr_empty_text=true\n";
         return 1;
     }
 
     AudioCapture audio_capture;
-    audio_capture.turn_start = Clock::now();
+    audio_capture.turn_start = opts.speculative_endpoint_window
+        ? speech_end
+        : Clock::now();
     ctx->runtime->foreground().reset_execution_stats();
     const auto fg_start = Clock::now();
-    rc = speculative_foreground_started
-        ? alia_commit_speculative_conversation_turn(
-            ctx.get(),
-            stable_text.c_str(),
-            partial_text.c_str(),
-            &gen,
-            tool_callback,
-            audio_callback,
-            &audio_capture)
-        : alia_start_conversation_turn(
+    if (opts.speculative_endpoint_window) {
+        rc = alia_speculative_endpoint_commit(
             ctx.get(), &gen, tool_callback, audio_callback, &audio_capture);
+    } else if (speculative_foreground_started) {
+        rc = alia_commit_speculative_conversation_turn(
+            ctx.get(), stable_text.c_str(), partial_text.c_str(), &gen,
+            tool_callback, audio_callback, &audio_capture);
+    } else {
+        rc = alia_start_conversation_turn(
+            ctx.get(), &gen, tool_callback, audio_callback, &audio_capture);
+    }
     if (rc != ALIA_OK) {
-        std::cerr << (speculative_foreground_started
-            ? "alia_commit_speculative_conversation_turn_rc="
-            : "alia_start_conversation_turn_rc=")
-                  << rc << "\n";
+        const char* operation = opts.speculative_endpoint_window
+            ? "alia_speculative_endpoint_commit_rc="
+            : (speculative_foreground_started
+                ? "alia_commit_speculative_conversation_turn_rc="
+                : "alia_start_conversation_turn_rc=");
+        std::cerr << operation << rc << "\n";
         return 1;
+    }
+
+    AliaSpeculativeEndpointMetrics endpoint_metrics{};
+    if (opts.speculative_endpoint_window) {
+        rc = alia_speculative_endpoint_get_metrics(ctx.get(), &endpoint_metrics);
+        if (rc != ALIA_OK) {
+            std::cerr << "alia_speculative_endpoint_get_metrics_rc=" << rc << "\n";
+            return 1;
+        }
+        std::cout << "speculative_endpoint_enabled=" << endpoint_metrics.enabled << "\n"
+                  << "speculative_endpoint_state=" << endpoint_metrics.state << "\n"
+                  << "speculative_endpoint_trigger_count=" << endpoint_metrics.trigger_count << "\n"
+                  << "speculative_endpoint_cold_trigger_count=" << endpoint_metrics.cold_trigger_count << "\n"
+                  << "speculative_endpoint_resume_count=" << endpoint_metrics.resume_count << "\n"
+                  << "speculative_endpoint_stale_completion_count=" << endpoint_metrics.stale_completion_count << "\n"
+                  << "speculative_endpoint_candidate_silence_ms=" << endpoint_metrics.candidate_silence_ms << "\n"
+                  << "speculative_endpoint_candidate_asr_ms=" << endpoint_metrics.candidate_asr_ms << "\n"
+                  << "speculative_endpoint_candidate_prefill_ms=" << endpoint_metrics.candidate_prefill_ms << "\n"
+                  << "speculative_endpoint_candidate_prefill_rc=" << endpoint_metrics.candidate_prefill_rc << "\n"
+                  << "speculative_endpoint_candidate_prefill_tokens=" << endpoint_metrics.candidate_prefill_tokens << "\n"
+                  << "speculative_endpoint_commit_wait_ms=" << endpoint_metrics.commit_wait_ms << "\n"
+                  << "speculative_endpoint_final_asr_ms=" << endpoint_metrics.final_asr_ms << "\n"
+                  << "speculative_endpoint_final_prefill_ms=" << endpoint_metrics.final_prefill_ms << "\n"
+                  << "speculative_endpoint_final_prefill_rc=" << endpoint_metrics.final_prefill_rc << "\n"
+                  << "speculative_endpoint_final_prefill_tokens=" << endpoint_metrics.final_prefill_tokens << "\n"
+                  << "speculative_endpoint_final_reused_tokens=" << endpoint_metrics.final_reused_tokens << "\n"
+                  << "speculative_endpoint_final_suffix_tokens=" << endpoint_metrics.final_suffix_tokens << "\n"
+                  << "speculative_endpoint_commit_prefill_hit=" << endpoint_metrics.commit_prefill_hit << "\n"
+                  << "speculative_endpoint_commit_accepted=" << endpoint_metrics.commit_accepted << "\n";
+        std::cout << "speculative_endpoint_final_asr_reused_candidate="
+                  << endpoint_metrics.final_asr_reused_candidate << "\n";
     }
 
     if (!ctx->foreground_pipeline->wait_until_idle_for(std::chrono::seconds(opts.timeout_sec))) {
@@ -1312,6 +1445,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     ctx->foreground_pipeline->join();
+    user_text = ctx->foreground_pipeline->last_user_text();
     const auto fg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - fg_start).count();
     const Context::ExecutionStats foreground_lock_turn_stats =
@@ -1322,9 +1456,14 @@ int main(int argc, char** argv) {
     const std::string assistant_text = ctx->foreground_pipeline->last_assistant_text();
     const std::vector<std::string> action_tags =
         ctx->foreground_pipeline->last_action_tags();
-    const double simulated_vad_asr_tail_ms = opts.stream_asr_prefill
-        ? asr_stream_simulated_tail_ms
-        : static_cast<double>(asr_ms);
+    const double foreground_start_from_turn_ms = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            fg_start - audio_capture.turn_start).count());
+    const double simulated_vad_asr_tail_ms = opts.speculative_endpoint_window
+        ? 0.0
+        : (opts.stream_asr_prefill
+            ? asr_stream_simulated_tail_ms
+            : static_cast<double>(asr_ms));
     const long long foreground_first_content_delta_ms =
         ctx->foreground_pipeline->last_first_content_delta_ms();
     const long long foreground_first_tts_enqueue_ms =
@@ -1339,11 +1478,13 @@ int main(int argc, char** argv) {
             : -1;
     const double simulated_vad_to_first_content_ms =
         foreground_first_content_delta_ms >= 0
-            ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_content_delta_ms)
+            ? simulated_vad_asr_tail_ms + foreground_start_from_turn_ms +
+                  static_cast<double>(foreground_first_content_delta_ms)
             : -1.0;
     const double simulated_vad_to_first_tts_enqueue_ms =
         foreground_first_tts_enqueue_ms >= 0
-            ? simulated_vad_asr_tail_ms + static_cast<double>(foreground_first_tts_enqueue_ms)
+            ? simulated_vad_asr_tail_ms + foreground_start_from_turn_ms +
+                  static_cast<double>(foreground_first_tts_enqueue_ms)
             : -1.0;
     std::cout << "foreground_ms=" << fg_ms << "\n"
               << "foreground_state=" << foreground_state_name(fg_state) << "\n"
@@ -1433,6 +1574,8 @@ int main(int argc, char** argv) {
               << "foreground_lock_turn_hold_ms_max="
               << foreground_lock_turn_stats.hold_ms_max << "\n"
               << "simulated_vad_asr_tail_ms=" << simulated_vad_asr_tail_ms << "\n"
+              << "speech_end_to_foreground_start_ms="
+              << (opts.speculative_endpoint_window ? foreground_start_from_turn_ms : -1.0) << "\n"
               << "simulated_vad_to_first_content_ms="
               << simulated_vad_to_first_content_ms << "\n"
               << "simulated_vad_to_first_tts_enqueue_ms="
@@ -1455,7 +1598,8 @@ int main(int argc, char** argv) {
             : -1.0;
         const double first_tts_enqueue_to_first_audio_ms =
             first_audio_ms >= 0.0 && foreground_first_tts_enqueue_ms >= 0
-                ? first_audio_ms - static_cast<double>(foreground_first_tts_enqueue_ms)
+                ? first_audio_ms - foreground_start_from_turn_ms -
+                      static_cast<double>(foreground_first_tts_enqueue_ms)
                 : -1.0;
         const double simulated_vad_to_first_audio_ms = first_audio_ms >= 0.0
             ? simulated_vad_asr_tail_ms + first_audio_ms
@@ -1470,6 +1614,8 @@ int main(int argc, char** argv) {
                   << first_tts_enqueue_to_first_audio_ms << "\n"
                   << "simulated_vad_to_first_audio_ms="
                   << simulated_vad_to_first_audio_ms << "\n"
+                  << "speech_end_to_first_audio_ms="
+                  << (opts.speculative_endpoint_window ? first_audio_ms : -1.0) << "\n"
                   << "tts_chunks_synthesized=" << tts_metrics.chunks_synthesized << "\n"
                   << "tts_reference_audio_enabled="
                   << tts_metrics.reference_audio_enabled << "\n"

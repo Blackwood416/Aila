@@ -8,6 +8,7 @@ param(
     [int]$StreamPrefillIntervalMs = 0,
     [switch]$SkipBuild,
     [switch]$StreamAsrPrefill,
+    [switch]$SpeculativeEndpointWindow,
     [switch]$IncludeToolProbe,
     [switch]$VerifyOutputAsr,
     [string]$OutputAsrScriptPath = "E:\RiderProjects\Mimo-ASR\mimo-asr.ps1"
@@ -154,6 +155,9 @@ try {
             if ($StreamAsrPrefill) {
                 $targetArgs.StreamAsrPrefill = $true
             }
+            if ($SpeculativeEndpointWindow) {
+                $targetArgs.SpeculativeEndpointWindow = $true
+            }
             if (-not $IncludeToolProbe) {
                 $targetArgs.SkipToolProbe = $true
             }
@@ -287,6 +291,17 @@ try {
             tts_first_audio_ms = Get-ValueOrEmpty $values "tts_first_audio_ms"
             first_tts_enqueue_to_first_audio_ms = Get-ValueOrEmpty $values "first_tts_enqueue_to_first_audio_ms"
             simulated_vad_to_first_audio_ms = Get-ValueOrEmpty $values "simulated_vad_to_first_audio_ms"
+            speech_end_to_first_audio_ms = Get-ValueOrEmpty $values "speech_end_to_first_audio_ms"
+            speculative_endpoint_enabled = Get-ValueOrEmpty $values "speculative_endpoint_enabled"
+            speculative_endpoint_trigger_count = Get-ValueOrEmpty $values "speculative_endpoint_trigger_count"
+            speculative_endpoint_candidate_asr_ms = Get-ValueOrEmpty $values "speculative_endpoint_candidate_asr_ms"
+            speculative_endpoint_candidate_prefill_ms = Get-ValueOrEmpty $values "speculative_endpoint_candidate_prefill_ms"
+            speculative_endpoint_candidate_prefill_tokens = Get-ValueOrEmpty $values "speculative_endpoint_candidate_prefill_tokens"
+            speculative_endpoint_commit_wait_ms = Get-ValueOrEmpty $values "speculative_endpoint_commit_wait_ms"
+            speculative_endpoint_final_asr_reused_candidate = Get-ValueOrEmpty $values "speculative_endpoint_final_asr_reused_candidate"
+            speculative_endpoint_final_reused_tokens = Get-ValueOrEmpty $values "speculative_endpoint_final_reused_tokens"
+            speculative_endpoint_final_suffix_tokens = Get-ValueOrEmpty $values "speculative_endpoint_final_suffix_tokens"
+            speculative_endpoint_commit_prefill_hit = Get-ValueOrEmpty $values "speculative_endpoint_commit_prefill_hit"
             tts_callback_count = Get-ValueOrEmpty $values "tts_callback_count"
             tts_chunks_synthesized = Get-ValueOrEmpty $values "tts_chunks_synthesized"
             tts_reference_audio_enabled = Get-ValueOrEmpty $values "tts_reference_audio_enabled"
@@ -340,6 +355,7 @@ try {
             foreground_lora_applied = Get-ValueOrEmpty $values "foreground_lora_applied"
             foreground_lora_pair_count = Get-ValueOrEmpty $values "foreground_lora_pair_count"
             asr_partial_text = Get-ValueOrEmpty $values "asr_partial_text"
+            foreground_user_text = Get-ValueOrEmpty $values "foreground_user_text"
             foreground_assistant_text = Get-ValueOrEmpty $values "foreground_assistant_text"
             foreground_action_tag_count = Get-ValueOrEmpty $values "foreground_action_tag_count"
             foreground_action_tags = Get-ValueOrEmpty $values "foreground_action_tags"
@@ -353,7 +369,7 @@ try {
 
     $summaryPath = Join-Path $outputRoot "summary.csv"
     $rows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Encoding UTF8
-    $rows | Format-Table scenario, pass, asr_ms, asr_stream_text_calls, asr_partial_tail_decode_count, simulated_vad_asr_tail_ms, simulated_vad_to_first_content_ms, simulated_vad_to_first_audio_ms, foreground_first_content_delta_ms, tts_first_audio_ms, foreground_ms, background_ms -AutoSize
+    $rows | Format-Table scenario, pass, asr_ms, speculative_endpoint_trigger_count, speculative_endpoint_candidate_asr_ms, speculative_endpoint_candidate_prefill_tokens, speech_end_to_first_audio_ms, tts_playback_gap_count, tts_playback_buffer_gap_count, foreground_ms, background_ms -AutoSize
 
     $failed = @($rows | Where-Object { -not $_.pass })
     if ($failed.Count -gt 0) {

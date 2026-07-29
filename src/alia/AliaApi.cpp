@@ -212,6 +212,13 @@ ALIA_API int alia_abort_inference(AliaContext* ctx, int pipeline_mask) {
             return ALIA_ERR_INVALID_ARGUMENT;
         }
         ctx->abort_mask.fetch_or(pipeline_mask, std::memory_order_relaxed);
+        if (ctx->speculative_endpoint &&
+            (pipeline_mask == ALIA_PIPELINE_ALL ||
+             (pipeline_mask & (ALIA_PIPELINE_ASR |
+                               ALIA_PIPELINE_VLM_FOREGROUND |
+                               ALIA_PIPELINE_TTS)) != 0)) {
+            ctx->speculative_endpoint->cancel();
+        }
         if (ctx->foreground_pipeline &&
             (pipeline_mask == ALIA_PIPELINE_ALL ||
              (pipeline_mask & (ALIA_PIPELINE_VLM_FOREGROUND | ALIA_PIPELINE_TTS)) != 0)) {
@@ -292,6 +299,68 @@ ALIA_API int alia_vlm_prefill_asr_text(
         return ctx->foreground_pipeline->prefill_asr_text(
             safe_string(stable_text),
             safe_string(partial_text));
+    });
+}
+
+ALIA_API int alia_speculative_endpoint_begin(AliaContext* ctx) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->speculative_endpoint) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        ctx->abort_mask.store(0, std::memory_order_relaxed);
+        return ctx->speculative_endpoint->begin();
+    });
+}
+
+ALIA_API int alia_speculative_endpoint_observe_vad(
+    AliaContext* ctx,
+    float speech_probability) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->speculative_endpoint) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        return ctx->speculative_endpoint->observe_vad(speech_probability);
+    });
+}
+
+ALIA_API int alia_speculative_endpoint_commit(
+    AliaContext* ctx,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->speculative_endpoint) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (config && !aila::alia::is_valid_generation_config(*config)) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        ctx->abort_mask.store(0, std::memory_order_relaxed);
+        return ctx->speculative_endpoint->commit(
+            config, tool_cb, audio_cb, user_data);
+    });
+}
+
+ALIA_API int alia_speculative_endpoint_cancel(AliaContext* ctx) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->speculative_endpoint) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        ctx->speculative_endpoint->cancel();
+        return ALIA_OK;
+    });
+}
+
+ALIA_API int alia_speculative_endpoint_get_metrics(
+    AliaContext* ctx,
+    AliaSpeculativeEndpointMetrics* out_metrics) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || !ctx->speculative_endpoint || !out_metrics) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        *out_metrics = ctx->speculative_endpoint->metrics();
+        return ALIA_OK;
     });
 }
 

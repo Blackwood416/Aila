@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -72,6 +73,11 @@ public:
                     AliaToolCallCallback tool_cb,
                     AliaAudioCallback audio_cb,
                     void* user_data);
+    bool start_turn_with_text(const std::string& user_text,
+                              const AliaGenConfig* config,
+                              AliaToolCallCallback tool_cb,
+                              AliaAudioCallback audio_cb,
+                              void* user_data);
     bool start_speculative_turn(const std::string& stable_text,
                                 const std::string& partial_text,
                                 const AliaGenConfig* config);
@@ -83,6 +89,7 @@ public:
                                  void* user_data);
     AliaErrorCode prefill_asr_text(const std::string& stable_text,
                                    const std::string& partial_text);
+    void discard_asr_prefill();
     bool warmup_loaded_vlm(std::string* error_message = nullptr);
     void request_abort();
     AliaErrorCode rollback_kv_cache(int rollback_tokens);
@@ -120,7 +127,8 @@ private:
     void run_turn(AliaGenConfig config,
                   AliaToolCallCallback tool_cb,
                   AliaAudioCallback audio_cb,
-                  void* user_data);
+                  void* user_data,
+                  std::optional<std::string> user_text_override = std::nullopt);
     void run_speculative_turn(std::string stable_text,
                               std::string partial_text,
                               AliaGenConfig config);

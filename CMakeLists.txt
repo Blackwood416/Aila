@@ -135,6 +135,7 @@ set(ALIA_ENGINE_SOURCES
     src/alia/AliaTtsPipeline.cpp
     src/alia/AliaTtsTextChunker.cpp
     src/alia/AliaTurnScheduler.cpp
+    src/alia/AliaSpeculativeEndpoint.cpp
     src/alia/AliaForegroundPipeline.cpp
     src/alia/AliaBackgroundPipeline.cpp
     src/alia/BackgroundExtractorFactory.cpp
@@ -160,6 +161,10 @@ set(COMMAND_SUBMISSION_BENCH_SOURCES
 set(ALIA_TURN_SCHEDULER_TEST_SOURCES
     tests/alia/AliaTurnSchedulerTests.cpp
     src/alia/AliaTurnScheduler.cpp
+)
+
+set(ALIA_SPECULATIVE_ENDPOINT_TEST_SOURCES
+    tests/alia/AliaSpeculativeEndpointTests.cpp
 )
 
 set(ALIA_TTS_TEXT_CHUNKER_TEST_SOURCES
@@ -297,6 +302,15 @@ target_compile_definitions(AilaAliaTurnSchedulerTests PRIVATE NOMINMAX WIN32_LEA
 target_include_directories(AilaAliaTurnSchedulerTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+add_executable(AilaAliaSpeculativeEndpointTests ${ALIA_SPECULATIVE_ENDPOINT_TEST_SOURCES})
+target_compile_definitions(AilaAliaSpeculativeEndpointTests PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaSpeculativeEndpointTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaAliaSpeculativeEndpointTests PRIVATE AilaLib)
 
 add_executable(AilaAliaTtsTextChunkerTests ${ALIA_TTS_TEXT_CHUNKER_TEST_SOURCES})
 target_compile_definitions(AilaAliaTtsTextChunkerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

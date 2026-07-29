@@ -76,6 +76,40 @@ typedef enum AliaAsyncState {
     ALIA_ASYNC_FAILED = 5
 } AliaAsyncState;
 
+typedef enum AliaSpeculativeEndpointState {
+    ALIA_SPECULATIVE_ENDPOINT_IDLE = 0,
+    ALIA_SPECULATIVE_ENDPOINT_LISTENING = 1,
+    ALIA_SPECULATIVE_ENDPOINT_PREFILLING = 2,
+    ALIA_SPECULATIVE_ENDPOINT_READY = 3,
+    ALIA_SPECULATIVE_ENDPOINT_INVALIDATED = 4,
+    ALIA_SPECULATIVE_ENDPOINT_COMMITTING = 5
+} AliaSpeculativeEndpointState;
+
+typedef struct AliaSpeculativeEndpointMetrics {
+    int state;
+    int enabled;
+    int trigger_count;
+    int cold_trigger_count;
+    int resume_count;
+    int stale_completion_count;
+    int last_silence_frames;
+    int candidate_prefill_rc;
+    int candidate_prefill_tokens;
+    int final_prefill_rc;
+    int final_prefill_tokens;
+    int final_reused_tokens;
+    int final_suffix_tokens;
+    int commit_prefill_hit;
+    int commit_accepted;
+    int final_asr_reused_candidate;
+    int64_t candidate_silence_ms;
+    int64_t candidate_asr_ms;
+    int64_t candidate_prefill_ms;
+    int64_t commit_wait_ms;
+    int64_t final_asr_ms;
+    int64_t final_prefill_ms;
+} AliaSpeculativeEndpointMetrics;
+
 typedef int (*AliaToolCallCallback)(
     const char* tool_json,
     char* out_result_buf,
@@ -108,6 +142,20 @@ ALIA_API int alia_vlm_prefill_asr_text(
     AliaContext* ctx,
     const char* stable_text,
     const char* partial_text);
+ALIA_API int alia_speculative_endpoint_begin(AliaContext* ctx);
+ALIA_API int alia_speculative_endpoint_observe_vad(
+    AliaContext* ctx,
+    float speech_probability);
+ALIA_API int alia_speculative_endpoint_commit(
+    AliaContext* ctx,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data);
+ALIA_API int alia_speculative_endpoint_cancel(AliaContext* ctx);
+ALIA_API int alia_speculative_endpoint_get_metrics(
+    AliaContext* ctx,
+    AliaSpeculativeEndpointMetrics* out_metrics);
 ALIA_API int alia_start_speculative_conversation_turn(
     AliaContext* ctx,
     const char* stable_text,

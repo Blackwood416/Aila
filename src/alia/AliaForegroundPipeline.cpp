@@ -574,6 +574,47 @@ bool AliaForegroundPipeline::start_turn(
     return true;
 }
 
+bool AliaForegroundPipeline::start_turn_with_text(
+    const std::string& user_text,
+    const AliaGenConfig* config,
+    AliaToolCallCallback tool_cb,
+    AliaAudioCallback audio_cb,
+    void* user_data) {
+    if (user_text.empty() || (config && !is_valid_generation_config(*config))) {
+        return false;
+    }
+
+    const AliaGenConfig captured_config = config
+        ? *config
+        : default_alia_generation_config();
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (is_busy_locked()) {
+        return false;
+    }
+    if (worker_.joinable()) {
+        lock.unlock();
+        worker_.join();
+        lock.lock();
+    }
+
+    abort_requested_ = false;
+    last_error_.clear();
+    state_ = ForegroundTurnState::Running;
+    worker_ = std::thread([this,
+                           text = user_text,
+                           captured_config,
+                           tool_cb,
+                           audio_cb,
+                           user_data]() mutable {
+        run_turn(captured_config,
+                 tool_cb,
+                 audio_cb,
+                 user_data,
+                 std::move(text));
+    });
+    return true;
+}
+
 bool AliaForegroundPipeline::start_speculative_turn(
     const std::string& stable_text,
     const std::string& partial_text,
@@ -919,6 +960,27 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
         last_asr_prefill_ms_ = elapsed_ms;
     }
     return ALIA_OK;
+}
+
+void AliaForegroundPipeline::discard_asr_prefill() {
+    if (!can_generate_with_loaded_vlm()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        asr_prefill_prompt_ids_.clear();
+        asr_prefill_text_.clear();
+        return;
+    }
+
+    Context* context = vlm_slot_->context();
+    IModelBackend* backend = vlm_slot_->backend();
+    auto lane_lock = context->lock_execution();
+    backend->reset();
+    std::lock_guard<std::mutex> lock(mutex_);
+    asr_prefill_prompt_ids_.clear();
+    asr_prefill_text_.clear();
+    last_asr_prefill_token_count_ = 0;
+    last_asr_prefill_reused_token_count_ = 0;
+    last_asr_prefill_suffix_token_count_ = 0;
+    last_asr_prefill_skip_reason_ = "discarded after speculative prefill failure";
 }
 
 bool AliaForegroundPipeline::warmup_loaded_vlm(std::string* error_message) {
@@ -1550,16 +1612,22 @@ void AliaForegroundPipeline::run_turn(
     AliaGenConfig config,
     AliaToolCallCallback tool_cb,
     AliaAudioCallback audio_cb,
-    void* user_data) {
+    void* user_data,
+    std::optional<std::string> user_text_override) {
     try {
         const auto turn_start = std::chrono::steady_clock::now();
         GenerationConfig generation_config = translate_generation_config(&config);
-        std::string stable_text;
-        std::string partial_text;
-        if (asr_pipeline_) {
-            asr_pipeline_->get_text(stable_text, partial_text);
+        std::string user_text;
+        if (user_text_override.has_value()) {
+            user_text = trim_ascii(std::move(*user_text_override));
+        } else {
+            std::string stable_text;
+            std::string partial_text;
+            if (asr_pipeline_) {
+                asr_pipeline_->get_text(stable_text, partial_text);
+            }
+            user_text = combine_asr_text(stable_text, partial_text);
         }
-        const std::string user_text = combine_asr_text(stable_text, partial_text);
         std::vector<int> prefetched_prompt_ids;
         std::vector<int> prompt_override_ids;
         int prefilled_prompt_tokens = 0;

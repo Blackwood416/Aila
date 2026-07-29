@@ -185,8 +185,9 @@ bool AliaAsrPipeline::feed_audio(const float* samples, int sample_count) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    audio_buffer_.insert(audio_buffer_.end(), samples, samples + sample_count);
+    std::lock_guard<std::mutex> lock(audio_ingress_mutex_);
+    pending_audio_buffer_.insert(
+        pending_audio_buffer_.end(), samples, samples + sample_count);
     return true;
 }
 
@@ -228,6 +229,16 @@ bool AliaAsrPipeline::process_pending(bool force_partial_decode) {
             static_cast<size_t>(min_partial_advance_ms * 16);
 
         std::lock_guard<std::mutex> lock(mutex_);
+        {
+            std::lock_guard<std::mutex> ingress_lock(audio_ingress_mutex_);
+            if (!pending_audio_buffer_.empty()) {
+                audio_buffer_.insert(
+                    audio_buffer_.end(),
+                    pending_audio_buffer_.begin(),
+                    pending_audio_buffer_.end());
+                pending_audio_buffer_.clear();
+            }
+        }
         while (true) {
             const size_t available = audio_buffer_.size() - stable_samples_offset_;
             if (available < kMinStableSamples) {
@@ -575,6 +586,8 @@ bool AliaAsrPipeline::warmup_gpu_mel(std::string* error_message) {
 
 void AliaAsrPipeline::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> ingress_lock(audio_ingress_mutex_);
+    pending_audio_buffer_.clear();
     audio_buffer_.clear();
     stable_samples_offset_ = 0;
     partial_processed_audio_size_ = 0;
@@ -620,7 +633,31 @@ bool AliaAsrPipeline::ready() const {
 
 size_t AliaAsrPipeline::buffered_sample_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return audio_buffer_.size();
+    std::lock_guard<std::mutex> ingress_lock(audio_ingress_mutex_);
+    return audio_buffer_.size() + pending_audio_buffer_.size();
+}
+
+void AliaAsrPipeline::get_speculative_candidate_text(
+    std::string& out_stable,
+    std::string& out_partial) {
+    const int authority_frames = std::max(
+        5,
+        aila::env::read_int_raw(
+            "AILA_SPECULATIVE_ENDPOINT_AUTHORITY_SILENCE_FRAMES", 15));
+    const int candidate_frames = std::max(
+        1,
+        aila::env::read_int_raw(
+            "AILA_SPECULATIVE_ENDPOINT_SILENCE_FRAMES", 5));
+    const int padding_samples =
+        std::max(0, authority_frames - candidate_frames) * 512;
+    if (padding_samples > 0) {
+        std::lock_guard<std::mutex> ingress_lock(audio_ingress_mutex_);
+        pending_audio_buffer_.insert(
+            pending_audio_buffer_.end(),
+            static_cast<size_t>(padding_samples),
+            0.0f);
+    }
+    get_text(out_stable, out_partial);
 }
 
 int AliaAsrPipeline::partial_full_decode_count() const {

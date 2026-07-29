@@ -12,7 +12,9 @@ AliaContext::AliaContext(int max_seq_len_in)
       foreground_pipeline(std::make_unique<aila::alia::AliaForegroundPipeline>(
           &foreground_vlm, tts_pipeline.get(), asr_pipeline.get())),
       background_pipeline(std::make_unique<aila::alia::AliaBackgroundPipeline>(
-          &background_vlm)) {}
+          &background_vlm)),
+      speculative_endpoint(std::make_unique<aila::alia::AliaSpeculativeEndpointController>(
+          asr_pipeline.get(), foreground_pipeline.get())) {}
 
 void AliaContext::configure_model_slots() {
     asr.configure(aila::alia::ModelRole::Asr, asr_model_dir, &runtime->foreground());

@@ -49,6 +49,9 @@ public:
     bool warmup_gpu_mel(std::string* error_message = nullptr);
     void reset();
     void get_text(std::string& out_stable, std::string& out_partial);
+    void get_speculative_candidate_text(
+        std::string& out_stable,
+        std::string& out_partial);
     void get_partial_text(std::string& out_stable, std::string& out_partial);
 
     bool ready() const;
@@ -73,6 +76,8 @@ private:
 
     ModelSlot* slot_ = nullptr;
     mutable std::mutex mutex_;
+    mutable std::mutex audio_ingress_mutex_;
+    std::vector<float> pending_audio_buffer_;
     std::vector<float> audio_buffer_;
     size_t stable_samples_offset_ = 0;
     size_t partial_processed_audio_size_ = 0;
