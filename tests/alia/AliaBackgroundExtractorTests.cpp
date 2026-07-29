@@ -2,6 +2,7 @@
 #include "alia/CpuQ35BackgroundExtractor.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -41,6 +42,22 @@ void expect_eq_string(TestResults& results, const std::string& left,
 #define AILA_EXPECT_EQ_STRING(results, left, right) \
     expect_eq_string((results), (left), (right), #left, #right, __FILE__, __LINE__)
 
+void set_env_var(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_env_var(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 void background_extractor_kind_parser_defaults_to_gpu(TestResults& results) {
     using aila::alia::BackgroundExtractorKind;
     AILA_EXPECT_TRUE(results,
@@ -68,6 +85,21 @@ void background_extractor_kind_parser_accepts_cpu_aliases(TestResults& results) 
     AILA_EXPECT_TRUE(results,
                      aila::alia::background_extractor_kind_from_string("Native_CPU_Q35") ==
                          BackgroundExtractorKind::NativeCpuQ35);
+}
+
+void background_extractor_env_defaults_to_cpu_and_allows_gpu_override(
+    TestResults& results) {
+    using aila::alia::BackgroundExtractorKind;
+    unset_env_var("AILA_BACKGROUND_EXTRACTOR");
+    AILA_EXPECT_TRUE(results,
+                     aila::alia::read_background_extractor_kind_from_env() ==
+                         BackgroundExtractorKind::NativeCpuQ35);
+
+    set_env_var("AILA_BACKGROUND_EXTRACTOR", "gpu");
+    AILA_EXPECT_TRUE(results,
+                     aila::alia::read_background_extractor_kind_from_env() ==
+                         BackgroundExtractorKind::GpuLoadedVlm);
+    unset_env_var("AILA_BACKGROUND_EXTRACTOR");
 }
 
 void cpu_background_kind_skips_only_background_gpu_slot(TestResults& results) {
@@ -119,6 +151,7 @@ int main() {
     TestResults results;
     background_extractor_kind_parser_defaults_to_gpu(results);
     background_extractor_kind_parser_accepts_cpu_aliases(results);
+    background_extractor_env_defaults_to_cpu_and_allows_gpu_override(results);
     cpu_background_kind_skips_only_background_gpu_slot(results);
     cpu_extractor_reports_not_loaded_without_model(results);
 

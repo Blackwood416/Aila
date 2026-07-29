@@ -322,7 +322,7 @@ bool CpuQ35HybridModel::load_from_store(const CpuSafetensorsStore& store,
     cfg_ = spec.qwen35_text;
     max_seq_len_ = max_seq_len;
     weight_cache_mode_ = parse_cpu_bnb4_cache_mode(
-        aila::env::read_string("AILA_CPU_Q35_WEIGHT_CACHE", "fp16"));
+        aila::env::read_string("AILA_CPU_Q35_WEIGHT_CACHE", "packed_nf4_i8"));
 
     hidden_size_ = cfg_.hidden_size;
     ff_dim_ = cfg_.intermediate_size;

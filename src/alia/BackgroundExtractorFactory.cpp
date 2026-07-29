@@ -46,7 +46,7 @@ BackgroundExtractorKind background_extractor_kind_from_string(std::string value)
 
 BackgroundExtractorKind read_background_extractor_kind_from_env() {
     return background_extractor_kind_from_string(
-        aila::env::read_string("AILA_BACKGROUND_EXTRACTOR", "gpu"));
+        aila::env::read_string("AILA_BACKGROUND_EXTRACTOR", "cpu"));
 }
 
 const char* background_extractor_kind_name(BackgroundExtractorKind kind) {
