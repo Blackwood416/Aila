@@ -62,6 +62,17 @@ struct AliaForegroundMetrics {
     std::string first_tts_chunk_reason;
 };
 
+struct AliaInterruptionContextEntry {
+    std::string user_text;
+    std::string heard_assistant_text;
+};
+
+struct AliaInterruptionResult {
+    std::string previous_user_text;
+    std::string heard_assistant_text;
+    AliaInterruptionMetrics metrics{};
+};
+
 class AliaForegroundPipeline {
 public:
     AliaForegroundPipeline(ModelSlot* vlm_slot,
@@ -91,6 +102,8 @@ public:
                                    const std::string& partial_text);
     void discard_asr_prefill();
     bool warmup_loaded_vlm(std::string* error_message = nullptr);
+    AliaErrorCode request_turn_interruption(long long played_audio_samples);
+    AliaInterruptionResult last_interruption_result();
     void request_abort();
     AliaErrorCode rollback_kv_cache(int rollback_tokens);
     void join();
@@ -165,6 +178,8 @@ private:
                             std::string& spoken_text);
     bool abort_requested() const;
     bool is_busy_locked() const;
+    void finalize_pending_interruption();
+    std::vector<AliaInterruptionContextEntry> interruption_chain_snapshot() const;
 
     ModelSlot* vlm_slot_ = nullptr;
     AliaTtsPipeline* tts_pipeline_ = nullptr;
@@ -210,6 +225,13 @@ private:
     int last_asr_prefill_skipped_small_suffix_count_ = 0;
     long long last_asr_prefill_ms_ = -1;
     ForegroundDecodeMode last_decode_mode_ = ForegroundDecodeMode::None;
+    bool interruption_pending_ = false;
+    bool interruption_finalizing_ = false;
+    long long interruption_played_audio_samples_ = 0;
+    std::chrono::steady_clock::time_point interruption_requested_at_{};
+    std::string interruption_previous_user_text_;
+    AliaInterruptionResult last_interruption_result_;
+    std::vector<AliaInterruptionContextEntry> interruption_chain_;
 };
 
 }  // namespace aila::alia

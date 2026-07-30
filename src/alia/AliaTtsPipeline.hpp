@@ -1,6 +1,7 @@
 #pragma once
 
 #include "alia_api.h"
+#include "AliaTtsTextChunker.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -92,6 +93,8 @@ public:
     bool first_audio_callback_emitted() const;
     bool first_audio_synthesis_active() const;
     AliaTtsMetrics last_metrics() const;
+    void request_interruption(long long played_audio_samples);
+    AliaTtsPlayedPrefix resolve_played_prefix(long long played_audio_samples) const;
     ModelSlot* slot() const { return slot_; }
 
 private:
@@ -99,6 +102,9 @@ private:
         std::string text;
         int silence_ms = 0;
         std::chrono::steady_clock::time_point enqueued_at{};
+        long long segment_id = 0;
+        TtsPreparedSegmentKind kind = TtsPreparedSegmentKind::Text;
+        std::string semantic_text;
     };
 
     struct TtsBufferedAudio {
@@ -110,7 +116,8 @@ private:
                          const AliaGenConfig& config,
                          AliaAudioCallback audio_cb,
                          void* user_data,
-                         std::function<bool()> should_cancel);
+                         std::function<bool()> should_cancel,
+                         bool track_output_samples = true);
     bool synthesize_text_to_buffered_callbacks(
         const std::string& text,
         const AliaGenConfig& config,
@@ -121,7 +128,7 @@ private:
                             void* user_data,
                             std::function<bool()> should_cancel);
     bool synthesize_silence_with_lookahead(
-        int silence_ms,
+        const TtsQueueItem& silence_item,
         const AliaGenConfig& config,
         AliaAudioCallback audio_cb,
         void* user_data,
@@ -130,12 +137,17 @@ private:
     std::vector<std::vector<float>> prepare_audio_callbacks(const std::vector<float>& samples);
     std::vector<float> flush_first_audio_buffer();
     void async_worker_loop();
+    void begin_playback_segment(const TtsQueueItem& item);
+    void finish_playback_segment(long long segment_id, bool complete);
+    void note_output_samples(int sample_count);
+    void note_audio_callback();
 
     ModelSlot* slot_ = nullptr;
     mutable std::mutex mutex_;
     mutable std::mutex reference_voice_mutex_;
     std::condition_variable cv_;
     std::deque<TtsQueueItem> text_queue_;
+    std::vector<AliaTtsPlaybackSegment> playback_segments_;
     AliaTtsMetrics metrics_;
     std::vector<float> first_audio_buffer_;
     std::vector<float> reference_speaker_embedding_;
@@ -146,6 +158,11 @@ private:
     bool reference_voice_failed_ = false;
     bool first_audio_callback_emitted_ = false;
     bool first_audio_synthesis_active_ = false;
+    long long next_segment_id_ = 1;
+    long long turn_output_samples_ = 0;
+    bool interruption_requested_ = false;
+    long long interruption_played_samples_ = 0;
+    int late_callback_count_ = 0;
     std::thread worker_;
     bool async_active_ = false;
     bool async_finishing_ = false;

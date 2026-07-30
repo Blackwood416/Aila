@@ -408,14 +408,17 @@ void ellipsis_pause_segments_split_text_and_silence(TestResults& results) {
         results,
         segments[0].kind == aila::alia::TtsPreparedSegmentKind::Text);
     AILA_EXPECT_EQ_STRING(results, segments[0].text, "我");
+    AILA_EXPECT_EQ_STRING(results, segments[0].semantic_text, "我");
     AILA_EXPECT_TRUE(
         results,
         segments[1].kind == aila::alia::TtsPreparedSegmentKind::Silence);
     AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 240);
+    AILA_EXPECT_EQ_STRING(results, segments[1].semantic_text, "……");
     AILA_EXPECT_TRUE(
         results,
         segments[2].kind == aila::alia::TtsPreparedSegmentKind::Text);
     AILA_EXPECT_EQ_STRING(results, segments[2].text, "我有点紧张");
+    AILA_EXPECT_EQ_STRING(results, segments[2].semantic_text, "我有点紧张");
 }
 
 void ascii_ellipsis_pause_segment_uses_single_pause(TestResults& results) {
@@ -448,8 +451,44 @@ void ellipsis_pause_segment_can_close_continuing_text(TestResults& results) {
 
     AILA_EXPECT_EQ_SIZE(results, segments.size(), 3);
     AILA_EXPECT_EQ_STRING(results, segments[0].text, "艾莉亚，");
+    AILA_EXPECT_EQ_STRING(results, segments[0].semantic_text, "艾莉亚");
     AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 240);
     AILA_EXPECT_EQ_STRING(results, segments[2].text, "父亲");
+}
+
+void played_prefix_keeps_only_complete_heard_segments(TestResults& results) {
+    using aila::alia::AliaTtsPlaybackSegment;
+    using aila::alia::TtsPreparedSegmentKind;
+    const std::vector<AliaTtsPlaybackSegment> segments{
+        {1, TtsPreparedSegmentKind::Text, "第一句。", "第一句。", 0, 12000, true},
+        {2, TtsPreparedSegmentKind::Silence, "……", "", 12000, 15840, true},
+        {3, TtsPreparedSegmentKind::Text, "第二句。", "第二句。", 15840, 30000, true},
+    };
+
+    const auto before = aila::alia::resolve_played_tts_prefix(segments, 11999, 2);
+    AILA_EXPECT_EQ_STRING(results, before.text, "");
+    AILA_EXPECT_EQ_INT(results, before.completed_segments, 0);
+    AILA_EXPECT_EQ_INT(results, before.discarded_segments, 3);
+    AILA_EXPECT_EQ_INT(results, before.late_callback_count, 2);
+
+    const auto middle = aila::alia::resolve_played_tts_prefix(segments, 20000);
+    AILA_EXPECT_EQ_STRING(results, middle.text, "第一句。……");
+    AILA_EXPECT_EQ_SIZE(results, static_cast<size_t>(middle.retained_samples), 15840);
+    AILA_EXPECT_EQ_INT(results, middle.completed_segments, 2);
+    AILA_EXPECT_EQ_INT(results, middle.discarded_segments, 1);
+}
+
+void played_prefix_discards_incomplete_segment_even_past_cursor(TestResults& results) {
+    using aila::alia::AliaTtsPlaybackSegment;
+    using aila::alia::TtsPreparedSegmentKind;
+    const std::vector<AliaTtsPlaybackSegment> segments{
+        {1, TtsPreparedSegmentKind::Text, "完整。", "完整。", 0, 8000, true},
+        {2, TtsPreparedSegmentKind::Text, "半句", "半句", 8000, 10000, false},
+    };
+    const auto prefix = aila::alia::resolve_played_tts_prefix(segments, 50000);
+    AILA_EXPECT_EQ_STRING(results, prefix.text, "完整。");
+    AILA_EXPECT_EQ_INT(results, prefix.completed_segments, 1);
+    AILA_EXPECT_EQ_INT(results, prefix.discarded_segments, 1);
 }
 
 void ellipsis_pause_segment_auto_suffix_matches_script(TestResults& results) {
@@ -592,6 +631,8 @@ int main() {
     ellipsis_pause_segment_can_close_continuing_text(results);
     ellipsis_pause_segment_auto_suffix_matches_script(results);
     ellipsis_pause_segments_can_be_disabled(results);
+    played_prefix_keeps_only_complete_heard_segments(results);
+    played_prefix_discards_incomplete_segment_even_past_cursor(results);
     silence_lookahead_prefetch_defaults_disabled(results);
     silence_lookahead_prefetch_can_be_enabled(results);
     silence_lookahead_prefetch_requires_ready_following_text(results);

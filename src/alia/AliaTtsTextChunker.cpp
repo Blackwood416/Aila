@@ -327,6 +327,7 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
             TtsPreparedSegmentKind::Text,
             text,
             0,
+            text,
         });
         return segments;
     }
@@ -344,7 +345,8 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
         if (begin >= end) {
             return;
         }
-        std::string segment = text.substr(begin, end - begin);
+        const std::string semantic_text = text.substr(begin, end - begin);
+        std::string segment = semantic_text;
         if (before_pause &&
             !config.continuation_suffix.empty() &&
             !ends_with_tts_chunk_boundary(segment) &&
@@ -363,9 +365,10 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
             TtsPreparedSegmentKind::Text,
             std::move(segment),
             0,
+            semantic_text,
         });
     };
-    auto append_silence = [&](int marker_count) {
+    auto append_silence = [&](int marker_count, std::string semantic_text) {
         if (marker_count <= 0 || segments.empty()) {
             return;
         }
@@ -378,12 +381,14 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
             segments.back().kind == TtsPreparedSegmentKind::Silence) {
             segments.back().silence_ms =
                 std::min(config.max_pause_ms, segments.back().silence_ms + silence_ms);
+            segments.back().semantic_text += semantic_text;
             return;
         }
         segments.push_back(TtsPreparedSegment{
             TtsPreparedSegmentKind::Silence,
             {},
             silence_ms,
+            std::move(semantic_text),
         });
     };
 
@@ -411,13 +416,34 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
         }
 
         append_text(segment_begin, pos, true);
-        append_silence(marker_count);
+        append_silence(marker_count, text.substr(pos, marker_end - pos));
         pos = marker_end;
         segment_begin = pos;
     }
 
     append_text(segment_begin, text.size(), false);
     return segments;
+}
+
+AliaTtsPlayedPrefix resolve_played_tts_prefix(
+    const std::vector<AliaTtsPlaybackSegment>& segments,
+    long long played_audio_samples,
+    int late_callback_count) {
+    AliaTtsPlayedPrefix result;
+    result.requested_played_samples = std::max(0LL, played_audio_samples);
+    result.late_callback_count = std::max(0, late_callback_count);
+    for (const AliaTtsPlaybackSegment& segment : segments) {
+        const bool retained = segment.complete &&
+                              segment.end_sample <= result.requested_played_samples;
+        if (retained) {
+            result.text += segment.semantic_text;
+            result.retained_samples = std::max(result.retained_samples, segment.end_sample);
+            ++result.completed_segments;
+        } else {
+            ++result.discarded_segments;
+        }
+    }
+    return result;
 }
 
 TtsFirstAudioPriorityWaitHint analyze_tts_first_audio_priority_wait_hint(

@@ -110,6 +110,16 @@ typedef struct AliaSpeculativeEndpointMetrics {
     int64_t final_prefill_ms;
 } AliaSpeculativeEndpointMetrics;
 
+typedef struct AliaInterruptionMetrics {
+    int64_t requested_played_audio_samples;
+    int64_t retained_audio_samples;
+    int completed_segments;
+    int discarded_segments;
+    int64_t abort_to_quiescent_ms;
+    int late_callback_count;
+    int interruption_chain_size;
+} AliaInterruptionMetrics;
+
 typedef int (*AliaToolCallCallback)(
     const char* tool_json,
     char* out_result_buf,
@@ -161,6 +171,14 @@ ALIA_API int alia_speculative_endpoint_cancel(AliaContext* ctx);
 ALIA_API int alia_speculative_endpoint_get_metrics(
     AliaContext* ctx,
     AliaSpeculativeEndpointMetrics* out_metrics);
+ALIA_API int alia_request_turn_interruption(
+    AliaContext* ctx,
+    int64_t played_audio_samples);
+ALIA_API int alia_get_last_interruption_result(
+    AliaContext* ctx,
+    char** out_previous_user_text,
+    char** out_heard_assistant_text,
+    AliaInterruptionMetrics* out_metrics);
 ALIA_API int alia_start_speculative_conversation_turn(
     AliaContext* ctx,
     const char* stable_text,

@@ -578,6 +578,64 @@ ALIA_API int alia_speculative_endpoint_get_metrics(
     });
 }
 
+ALIA_API int alia_request_turn_interruption(
+    AliaContext* ctx,
+    int64_t played_audio_samples) {
+    return guarded_alia_call([&]() -> int {
+        if (!ctx || played_audio_samples < 0) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        if (!ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        if (ctx->speculative_endpoint) {
+            ctx->speculative_endpoint->cancel();
+        }
+        return ctx->foreground_pipeline->request_turn_interruption(
+            played_audio_samples);
+    });
+}
+
+ALIA_API int alia_get_last_interruption_result(
+    AliaContext* ctx,
+    char** out_previous_user_text,
+    char** out_heard_assistant_text,
+    AliaInterruptionMetrics* out_metrics) {
+    return guarded_alia_call([&]() -> int {
+        if (out_previous_user_text) {
+            *out_previous_user_text = nullptr;
+        }
+        if (out_heard_assistant_text) {
+            *out_heard_assistant_text = nullptr;
+        }
+        if (!ctx || !ctx->foreground_pipeline) {
+            return ALIA_ERR_INVALID_ARGUMENT;
+        }
+        const aila::alia::AliaInterruptionResult result =
+            ctx->foreground_pipeline->last_interruption_result();
+        if (out_previous_user_text) {
+            *out_previous_user_text = duplicate_c_string(result.previous_user_text);
+            if (!*out_previous_user_text) {
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        if (out_heard_assistant_text) {
+            *out_heard_assistant_text = duplicate_c_string(result.heard_assistant_text);
+            if (!*out_heard_assistant_text) {
+                if (out_previous_user_text && *out_previous_user_text) {
+                    alia_free_string(*out_previous_user_text);
+                    *out_previous_user_text = nullptr;
+                }
+                return ALIA_ERR_RUNTIME;
+            }
+        }
+        if (out_metrics) {
+            *out_metrics = result.metrics;
+        }
+        return ALIA_OK;
+    });
+}
+
 ALIA_API int alia_start_speculative_conversation_turn(
     AliaContext* ctx,
     const char* stable_text,

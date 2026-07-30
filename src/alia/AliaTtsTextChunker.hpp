@@ -99,7 +99,32 @@ struct TtsPreparedSegment {
     TtsPreparedSegmentKind kind = TtsPreparedSegmentKind::Text;
     std::string text;
     int silence_ms = 0;
+    std::string semantic_text;
 };
+
+struct AliaTtsPlaybackSegment {
+    long long id = 0;
+    TtsPreparedSegmentKind kind = TtsPreparedSegmentKind::Text;
+    std::string semantic_text;
+    std::string synthesis_text;
+    long long start_sample = 0;
+    long long end_sample = 0;
+    bool complete = false;
+};
+
+struct AliaTtsPlayedPrefix {
+    std::string text;
+    long long requested_played_samples = 0;
+    long long retained_samples = 0;
+    int completed_segments = 0;
+    int discarded_segments = 0;
+    int late_callback_count = 0;
+};
+
+AliaTtsPlayedPrefix resolve_played_tts_prefix(
+    const std::vector<AliaTtsPlaybackSegment>& segments,
+    long long played_audio_samples,
+    int late_callback_count = 0);
 
 std::vector<std::string> split_spoken_text_for_tts(
     const std::string& text,

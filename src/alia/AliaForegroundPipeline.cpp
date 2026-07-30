@@ -257,16 +257,41 @@ void append_alia_system_turn(std::vector<int>& ids,
     append_encoded(ids, tokenizer, "\n");
 }
 
+void append_alia_message(std::vector<int>& ids,
+                         Tokenizer* tokenizer,
+                         const char* role,
+                         const std::string& text) {
+    ids.push_back(tokenizer->im_start_id());
+    append_encoded(ids, tokenizer, std::string(role) + "\n" + text);
+    ids.push_back(tokenizer->im_end_id());
+    append_encoded(ids, tokenizer, "\n");
+}
+
+void append_interruption_chain(
+    std::vector<int>& ids,
+    Tokenizer* tokenizer,
+    const std::vector<AliaInterruptionContextEntry>& chain) {
+    static const std::string kInterruptionEvent =
+        "The assistant response above was interrupted at exactly the heard prefix. "
+        "Do not assume the user heard any later content.";
+    for (const AliaInterruptionContextEntry& entry : chain) {
+        append_alia_message(ids, tokenizer, "user", entry.user_text);
+        if (!entry.heard_assistant_text.empty()) {
+            append_alia_message(ids, tokenizer, "assistant", entry.heard_assistant_text);
+        }
+        append_alia_message(ids, tokenizer, "system", kInterruptionEvent);
+    }
+}
+
 std::vector<int> build_alia_chat_prompt(
     Tokenizer* tokenizer,
     const std::string& system_prompt,
-    const std::string& user_message) {
+    const std::string& user_message,
+    const std::vector<AliaInterruptionContextEntry>& interruption_chain = {}) {
     std::vector<int> prompt_ids;
     append_alia_system_turn(prompt_ids, tokenizer, system_prompt);
-    prompt_ids.push_back(tokenizer->im_start_id());
-    append_encoded(prompt_ids, tokenizer, "user\n" + user_message);
-    prompt_ids.push_back(tokenizer->im_end_id());
-    append_encoded(prompt_ids, tokenizer, "\n");
+    append_interruption_chain(prompt_ids, tokenizer, interruption_chain);
+    append_alia_message(prompt_ids, tokenizer, "user", user_message);
     prompt_ids.push_back(tokenizer->im_start_id());
     append_encoded(prompt_ids, tokenizer, "assistant\n");
     append_encoded(prompt_ids, tokenizer, "<think>\n\n</think>\n\n");
@@ -276,12 +301,53 @@ std::vector<int> build_alia_chat_prompt(
 std::vector<int> build_alia_user_prefix_prompt(
     Tokenizer* tokenizer,
     const std::string& system_prompt,
-    const std::string& user_prefix) {
+    const std::string& user_prefix,
+    const std::vector<AliaInterruptionContextEntry>& interruption_chain = {}) {
     std::vector<int> prompt_ids;
     append_alia_system_turn(prompt_ids, tokenizer, system_prompt);
+    append_interruption_chain(prompt_ids, tokenizer, interruption_chain);
     prompt_ids.push_back(tokenizer->im_start_id());
     append_encoded(prompt_ids, tokenizer, "user\n" + user_prefix);
     return prompt_ids;
+}
+
+std::vector<int> build_bounded_alia_chat_prompt(
+    Tokenizer* tokenizer,
+    const std::string& user_message,
+    std::vector<AliaInterruptionContextEntry> interruption_chain,
+    int max_prompt_tokens) {
+    std::vector<int> prompt_ids;
+    do {
+        prompt_ids = build_alia_chat_prompt(
+            tokenizer, foreground_system_prompt(), user_message, interruption_chain);
+        if (max_prompt_tokens <= 0 ||
+            static_cast<int>(prompt_ids.size()) <= max_prompt_tokens ||
+            interruption_chain.empty()) {
+            return prompt_ids;
+        }
+        interruption_chain.erase(interruption_chain.begin());
+    } while (true);
+}
+
+std::pair<std::vector<int>, std::vector<int>> build_bounded_alia_prefill_prompts(
+    Tokenizer* tokenizer,
+    const std::string& user_prefix,
+    std::vector<AliaInterruptionContextEntry> interruption_chain,
+    int max_prompt_tokens) {
+    std::vector<int> prefix_ids;
+    std::vector<int> full_ids;
+    do {
+        prefix_ids = build_alia_user_prefix_prompt(
+            tokenizer, foreground_system_prompt(), user_prefix, interruption_chain);
+        full_ids = build_alia_chat_prompt(
+            tokenizer, foreground_system_prompt(), user_prefix, interruption_chain);
+        if (max_prompt_tokens <= 0 ||
+            static_cast<int>(full_ids.size()) <= max_prompt_tokens ||
+            interruption_chain.empty()) {
+            return {std::move(prefix_ids), std::move(full_ids)};
+        }
+        interruption_chain.erase(interruption_chain.begin());
+    } while (true);
 }
 
 std::string combine_asr_text(const std::string& stable_text,
@@ -545,6 +611,7 @@ bool AliaForegroundPipeline::start_turn(
     if (config && !is_valid_generation_config(*config)) {
         return false;
     }
+    finalize_pending_interruption();
 
     AliaGenConfig captured_config{};
     if (config) {
@@ -583,6 +650,7 @@ bool AliaForegroundPipeline::start_turn_with_text(
     if (user_text.empty() || (config && !is_valid_generation_config(*config))) {
         return false;
     }
+    finalize_pending_interruption();
 
     const AliaGenConfig captured_config = config
         ? *config
@@ -728,6 +796,7 @@ bool AliaForegroundPipeline::commit_speculative_turn(
 AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     const std::string& stable_text,
     const std::string& partial_text) {
+    finalize_pending_interruption();
     const std::string user_prefix = combine_asr_text(stable_text, partial_text);
     if (user_prefix.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -770,10 +839,13 @@ AliaErrorCode AliaForegroundPipeline::prefill_asr_text(
     static const int kAsrPrefillChunkTokens = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_ASR_PREFILL_CHUNK_TOKENS", 0));
     const auto started = std::chrono::steady_clock::now();
-    std::vector<int> target_ids =
-        build_alia_user_prefix_prompt(tokenizer, foreground_system_prompt(), user_prefix);
-    const std::vector<int> full_candidate_ids =
-        build_alia_chat_prompt(tokenizer, foreground_system_prompt(), user_prefix);
+    const std::vector<AliaInterruptionContextEntry> interruption_chain =
+        interruption_chain_snapshot();
+    auto [target_ids, full_candidate_ids] = build_bounded_alia_prefill_prompts(
+        tokenizer,
+        user_prefix,
+        interruption_chain,
+        backend->max_seq_len());
     if (static_cast<int>(target_ids.size()) > kRetokenizeGuardTokens) {
         target_ids.resize(target_ids.size() - kRetokenizeGuardTokens);
     } else {
@@ -1068,6 +1140,122 @@ bool AliaForegroundPipeline::warmup_loaded_vlm(std::string* error_message) {
     return true;
 }
 
+AliaErrorCode AliaForegroundPipeline::request_turn_interruption(
+    long long played_audio_samples) {
+    if (played_audio_samples < 0) {
+        return ALIA_ERR_INVALID_ARGUMENT;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (interruption_pending_ || interruption_finalizing_ ||
+            state_ == ForegroundTurnState::Idle ||
+            state_ == ForegroundTurnState::Aborted ||
+            state_ == ForegroundTurnState::Failed) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+    }
+    if (tts_pipeline_) {
+        tts_pipeline_->request_interruption(played_audio_samples);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (interruption_pending_ || interruption_finalizing_) {
+            return ALIA_ERR_INVALID_STATE;
+        }
+        interruption_pending_ = true;
+        interruption_played_audio_samples_ = played_audio_samples;
+        interruption_requested_at_ = std::chrono::steady_clock::now();
+        interruption_previous_user_text_ = last_user_text_;
+        last_interruption_result_ = AliaInterruptionResult{};
+        abort_requested_ = true;
+        if (state_ == ForegroundTurnState::Running) {
+            state_ = ForegroundTurnState::Aborting;
+        } else if (state_ == ForegroundTurnState::Completed) {
+            state_ = ForegroundTurnState::Aborted;
+        }
+    }
+    cv_.notify_all();
+    return ALIA_OK;
+}
+
+void AliaForegroundPipeline::finalize_pending_interruption() {
+    long long played_audio_samples = 0;
+    std::string previous_user_text;
+    std::chrono::steady_clock::time_point requested_at;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!interruption_pending_ || interruption_finalizing_ || is_busy_locked()) {
+            return;
+        }
+        interruption_finalizing_ = true;
+        played_audio_samples = interruption_played_audio_samples_;
+        previous_user_text = interruption_previous_user_text_;
+        requested_at = interruption_requested_at_;
+    }
+
+    const AliaTtsPlayedPrefix played_prefix = tts_pipeline_
+        ? tts_pipeline_->resolve_played_prefix(played_audio_samples)
+        : AliaTtsPlayedPrefix{};
+
+    if (can_generate_with_loaded_vlm()) {
+        Context* context = vlm_slot_->context();
+        IModelBackend* backend = vlm_slot_->backend();
+        if (context && backend) {
+            auto lane_lock = context->lock_execution();
+            backend->reset();
+        }
+    }
+
+    const long long abort_to_quiescent_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - requested_at).count();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_interruption_result_.previous_user_text = previous_user_text;
+        last_interruption_result_.heard_assistant_text = played_prefix.text;
+        last_interruption_result_.metrics.requested_played_audio_samples =
+            played_prefix.requested_played_samples;
+        last_interruption_result_.metrics.retained_audio_samples =
+            played_prefix.retained_samples;
+        last_interruption_result_.metrics.completed_segments =
+            played_prefix.completed_segments;
+        last_interruption_result_.metrics.discarded_segments =
+            played_prefix.discarded_segments;
+        last_interruption_result_.metrics.abort_to_quiescent_ms = abort_to_quiescent_ms;
+        last_interruption_result_.metrics.late_callback_count =
+            played_prefix.late_callback_count;
+        interruption_chain_.push_back(
+            AliaInterruptionContextEntry{previous_user_text, played_prefix.text});
+        constexpr size_t kMaxInterruptionChain = 4;
+        if (interruption_chain_.size() > kMaxInterruptionChain) {
+            interruption_chain_.erase(
+                interruption_chain_.begin(),
+                interruption_chain_.begin() +
+                    static_cast<std::ptrdiff_t>(interruption_chain_.size() -
+                                                kMaxInterruptionChain));
+        }
+        last_interruption_result_.metrics.interruption_chain_size =
+            static_cast<int>(interruption_chain_.size());
+        asr_prefill_prompt_ids_.clear();
+        asr_prefill_text_.clear();
+        interruption_pending_ = false;
+        interruption_finalizing_ = false;
+    }
+    cv_.notify_all();
+}
+
+AliaInterruptionResult AliaForegroundPipeline::last_interruption_result() {
+    finalize_pending_interruption();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_interruption_result_;
+}
+
+std::vector<AliaInterruptionContextEntry>
+AliaForegroundPipeline::interruption_chain_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return interruption_chain_;
+}
+
 void AliaForegroundPipeline::request_abort() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1190,7 +1378,12 @@ ForegroundTurnState AliaForegroundPipeline::state() const {
 
 bool AliaForegroundPipeline::wait_until_idle_for(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return cv_.wait_for(lock, timeout, [this]() { return !is_busy_locked(); });
+    const bool idle = cv_.wait_for(lock, timeout, [this]() { return !is_busy_locked(); });
+    lock.unlock();
+    if (idle) {
+        finalize_pending_interruption();
+    }
+    return idle;
 }
 
 GenerationConfig AliaForegroundPipeline::last_generation_config() const {
@@ -1375,8 +1568,11 @@ void AliaForegroundPipeline::run_speculative_turn(
         if (!prefetched_prompt_ids.empty()) {
             Tokenizer* tokenizer = vlm_slot_->tokenizer();
             IModelBackend* backend = vlm_slot_->backend();
-            std::vector<int> full_prompt =
-                build_alia_chat_prompt(tokenizer, foreground_system_prompt(), user_text);
+            std::vector<int> full_prompt = build_bounded_alia_chat_prompt(
+                tokenizer,
+                user_text,
+                interruption_chain_snapshot(),
+                std::max(1, backend->max_seq_len() - generation_config.max_new_tokens));
             if (backend &&
                 backend->get_current_context_len() == static_cast<int>(prefetched_prompt_ids.size()) &&
                 is_token_prefix(prefetched_prompt_ids, full_prompt)) {
@@ -1712,8 +1908,11 @@ void AliaForegroundPipeline::run_turn(
         if (!user_text.empty() && !prefetched_prompt_ids.empty()) {
             Tokenizer* tokenizer = vlm_slot_->tokenizer();
             IModelBackend* backend = vlm_slot_->backend();
-            std::vector<int> full_prompt =
-                build_alia_chat_prompt(tokenizer, foreground_system_prompt(), user_text);
+            std::vector<int> full_prompt = build_bounded_alia_chat_prompt(
+                tokenizer,
+                user_text,
+                interruption_chain_snapshot(),
+                std::max(1, backend->max_seq_len() - generation_config.max_new_tokens));
             if (backend &&
                 backend->get_current_context_len() == static_cast<int>(prefetched_prompt_ids.size()) &&
                 is_token_prefix(prefetched_prompt_ids, full_prompt)) {
@@ -1808,6 +2007,9 @@ void AliaForegroundPipeline::run_turn(
             std::lock_guard<std::mutex> lock(mutex_);
             state_ = abort_requested_ ? ForegroundTurnState::Aborted
                                       : ForegroundTurnState::Completed;
+            if (state_ == ForegroundTurnState::Completed) {
+                interruption_chain_.clear();
+            }
         }
     } catch (const ModelBackendCancelled&) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1880,7 +2082,11 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     std::vector<int> prompt_ids = prompt_override_ids
         ? *prompt_override_ids
         : (use_chat_template
-            ? build_alia_chat_prompt(tokenizer, foreground_system_prompt(), prompt_text)
+            ? build_bounded_alia_chat_prompt(
+                  tokenizer,
+                  prompt_text,
+                  interruption_chain_snapshot(),
+                  std::max(1, backend->max_seq_len() - config.max_new_tokens))
             : tokenizer->encode(prompt_text));
     const long long prompt_build_ms = elapsed_ms(model_started);
     if (prompt_ids.empty()) {
