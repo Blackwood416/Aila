@@ -287,6 +287,10 @@ ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) 
         const AliaSpeculativeEndpointMetrics endpoint = ctx->speculative_endpoint
             ? ctx->speculative_endpoint->metrics()
             : AliaSpeculativeEndpointMetrics{};
+        const Context::ExecutionStats foreground_execution =
+            ctx->runtime->foreground().execution_stats();
+        const Context::ExecutionStats background_execution =
+            ctx->runtime->background().execution_stats();
 
         std::ostringstream out;
         out << "{";
@@ -323,6 +327,10 @@ ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) 
             << foreground.first_tts_chunk_wait_ms << ",";
         out << "\"tts_first_audio_priority_wait_ms\":"
             << foreground.tts_first_audio_priority_wait_ms << ",";
+        out << "\"tts_first_audio_priority_wait_deferred_count\":"
+            << foreground.tts_first_audio_priority_wait_deferred_count << ",";
+        out << "\"tts_first_audio_priority_following_text_bytes\":"
+            << foreground.tts_first_audio_priority_following_text_bytes << ",";
         out << "\"decode_ms\":" << foreground.decode_ms << ",";
         out << "\"model_ms\":" << foreground.model_ms << ",";
         out << "\"final_cached_prefix_rejected\":"
@@ -358,6 +366,10 @@ ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) 
         out << "\"first_backend_callbacks\":" << tts.first_backend_callbacks << ",";
         out << "\"first_backend_audio_samples\":"
             << tts.first_backend_audio_samples << ",";
+        out << "\"first_backend_total_audio_samples\":"
+            << tts.first_backend_total_audio_samples << ",";
+        out << "\"backend_audio_samples_total\":"
+            << tts.backend_audio_samples_total << ",";
         out << "\"first_backend_codes_ms\":" << tts.first_backend_codes_ms << ",";
         out << "\"first_backend_mimi_init_ms\":"
             << tts.first_backend_mimi_init_ms << ",";
@@ -369,7 +381,49 @@ ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) 
         out << "\"lookahead_prefetch_attempts\":"
             << tts.silence_lookahead_prefetch_attempts << ",";
         out << "\"lookahead_prefetch_hits\":"
-            << tts.silence_lookahead_prefetch_hits;
+            << tts.silence_lookahead_prefetch_hits << ",";
+        out << "\"text_items_enqueued\":" << tts.text_items_enqueued << ",";
+        out << "\"text_items_dequeued\":" << tts.text_items_dequeued << ",";
+        out << "\"text_queue_depth_max\":" << tts.text_queue_depth_max << ",";
+        out << "\"first_text_queue_wait_ms\":"
+            << tts.first_text_queue_wait_ms << ",";
+        out << "\"text_queue_wait_ms_total\":"
+            << tts.text_queue_wait_ms_total << ",";
+        out << "\"text_queue_wait_ms_max\":"
+            << tts.text_queue_wait_ms_max << ",";
+        out << "\"worker_queue_empty_wait_count\":"
+            << tts.worker_queue_empty_wait_count << ",";
+        out << "\"worker_queue_empty_wait_ms_total\":"
+            << tts.worker_queue_empty_wait_ms_total << ",";
+        out << "\"worker_queue_empty_wait_ms_max\":"
+            << tts.worker_queue_empty_wait_ms_max << ",";
+        out << "\"lane_lock_wait_ms_total\":"
+            << tts.lane_lock_wait_ms_total << ",";
+        out << "\"lane_lock_wait_ms_max\":"
+            << tts.lane_lock_wait_ms_max << ",";
+        out << "\"lane_relock_wait_ms_total\":"
+            << tts.lane_relock_wait_ms_total << ",";
+        out << "\"lane_relock_wait_ms_max\":"
+            << tts.lane_relock_wait_ms_max << ",";
+        out << "\"audio_callback_ms_total\":"
+            << tts.audio_callback_ms_total;
+        out << "},";
+
+        auto append_execution_stats = [&out](
+            const char* name,
+            const Context::ExecutionStats& stats) {
+            out << "\"" << name << "\":{";
+            out << "\"lock_count\":" << stats.lock_count << ",";
+            out << "\"wait_ms_total\":" << stats.wait_ms_total << ",";
+            out << "\"wait_ms_max\":" << stats.wait_ms_max << ",";
+            out << "\"hold_ms_total\":" << stats.hold_ms_total << ",";
+            out << "\"hold_ms_max\":" << stats.hold_ms_max;
+            out << "}";
+        };
+        out << "\"execution\":{";
+        append_execution_stats("foreground", foreground_execution);
+        out << ",";
+        append_execution_stats("background", background_execution);
         out << "},";
 
         out << "\"endpoint\":{";

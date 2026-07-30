@@ -169,15 +169,24 @@ bool AliaTtsPipeline::enqueue_text(std::string text) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (TtsPreparedSegment& segment : segments) {
+            const auto enqueued_at = std::chrono::steady_clock::now();
             if (segment.kind == TtsPreparedSegmentKind::Text) {
                 if (segment.text.empty()) {
                     continue;
                 }
-                text_queue_.push_back(TtsQueueItem{std::move(segment.text), 0});
+                text_queue_.push_back(
+                    TtsQueueItem{std::move(segment.text), 0, enqueued_at});
                 queued = true;
             } else if (segment.silence_ms > 0) {
-                text_queue_.push_back(TtsQueueItem{{}, segment.silence_ms});
+                text_queue_.push_back(
+                    TtsQueueItem{{}, segment.silence_ms, enqueued_at});
                 queued = true;
+            }
+            if (queued) {
+                ++metrics_.text_items_enqueued;
+                metrics_.text_queue_depth_max = std::max(
+                    metrics_.text_queue_depth_max,
+                    static_cast<int>(text_queue_.size()));
             }
         }
     }
@@ -533,6 +542,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
     }
 
     bool emitted_backend_audio = false;
+    int emitted_backend_audio_samples = 0;
     bool backend_ok = false;
     IModelBackend::TtsBackendTiming backend_timing;
     bool first_audio_synthesis = false;
@@ -545,7 +555,16 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
         }
     }
     {
+        const auto lane_wait_started = std::chrono::steady_clock::now();
         auto lane_lock = context->lock_execution();
+        const double lane_wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - lane_wait_started).count();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            metrics_.lane_lock_wait_ms_total += lane_wait_ms;
+            metrics_.lane_lock_wait_ms_max = std::max(
+                metrics_.lane_lock_wait_ms_max, lane_wait_ms);
+        }
         backend_ok = tts_backend->synthesize_codes_stream(
             *context,
             text_tokens,
@@ -563,20 +582,36 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
                     return;
                 }
                 emitted_backend_audio = true;
+                emitted_backend_audio_samples += static_cast<int>(samples.size());
                 std::vector<std::vector<float>> callbacks =
                     prepare_audio_callbacks(samples);
                 if (callbacks.empty()) {
                     return;
                 }
-                auto callback_unlock = lane_lock.scoped_unlock();
-                for (const auto& callback_samples : callbacks) {
-                    if (callback_samples.empty() || cancelled()) {
-                        break;
+                const auto unlocked_started = std::chrono::steady_clock::now();
+                double callback_ms = 0.0;
+                {
+                    auto callback_unlock = lane_lock.scoped_unlock();
+                    for (const auto& callback_samples : callbacks) {
+                        if (callback_samples.empty() || cancelled()) {
+                            break;
+                        }
+                        const auto callback_started = std::chrono::steady_clock::now();
+                        audio_cb(callback_samples.data(),
+                                 static_cast<int>(callback_samples.size()),
+                                 user_data);
+                        callback_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - callback_started).count();
                     }
-                    audio_cb(callback_samples.data(),
-                             static_cast<int>(callback_samples.size()),
-                             user_data);
                 }
+                const double unlocked_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - unlocked_started).count();
+                const double relock_wait_ms = std::max(0.0, unlocked_ms - callback_ms);
+                std::lock_guard<std::mutex> lock(mutex_);
+                metrics_.audio_callback_ms_total += callback_ms;
+                metrics_.lane_relock_wait_ms_total += relock_wait_ms;
+                metrics_.lane_relock_wait_ms_max = std::max(
+                    metrics_.lane_relock_wait_ms_max, relock_wait_ms);
             },
             should_cancel);
         backend_timing = tts_backend->last_tts_backend_timing();
@@ -596,6 +631,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
             metrics_.first_text_tokens = static_cast<int>(text_tokens.size());
             metrics_.first_backend_frames = backend_timing.total_frames;
             metrics_.first_backend_callbacks = backend_timing.callback_count;
+            metrics_.first_backend_total_audio_samples = emitted_backend_audio_samples;
             if (metrics_.first_backend_audio_samples == 0 &&
                 backend_timing.first_audio_samples >= tts_first_audio_samples()) {
                 metrics_.first_backend_audio_samples = backend_timing.first_audio_samples;
@@ -615,6 +651,7 @@ bool AliaTtsPipeline::synthesize_text(const std::string& text,
         }
         metrics_.backend_steady_batch_callback_count +=
             backend_timing.steady_batch_callback_count;
+        metrics_.backend_audio_samples_total += emitted_backend_audio_samples;
         ++metrics_.chunks_synthesized;
         if (backend_timing.total_ms > 0.0) {
             metrics_.backend_total_ms += backend_timing.total_ms;
@@ -745,6 +782,16 @@ bool AliaTtsPipeline::synthesize_silence_with_lookahead(
         if (prefetch) {
             lookahead_text = std::move(text_queue_.front());
             text_queue_.pop_front();
+            const double text_queue_wait_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - lookahead_text.enqueued_at).count();
+            if (metrics_.text_items_dequeued == 0) {
+                metrics_.first_text_queue_wait_ms = text_queue_wait_ms;
+            }
+            ++metrics_.text_items_dequeued;
+            metrics_.text_queue_wait_ms_total += text_queue_wait_ms;
+            metrics_.text_queue_wait_ms_max = std::max(
+                metrics_.text_queue_wait_ms_max, text_queue_wait_ms);
             ++metrics_.silence_lookahead_prefetch_hits;
             metrics_.silence_lookahead_prefetch_text_bytes +=
                 static_cast<int>(lookahead_text.text.size());
@@ -791,6 +838,7 @@ bool AliaTtsPipeline::synthesize_silence_with_lookahead(
 }
 
 void AliaTtsPipeline::async_worker_loop() {
+    bool processed_item = false;
     while (true) {
         TtsQueueItem item;
         AliaGenConfig config{};
@@ -799,9 +847,21 @@ void AliaTtsPipeline::async_worker_loop() {
         std::function<bool()> should_cancel;
         {
             std::unique_lock<std::mutex> lock(mutex_);
+            const bool waiting_for_text = text_queue_.empty();
+            const auto queue_empty_wait_started = std::chrono::steady_clock::now();
             cv_.wait(lock, [this]() {
                 return async_finishing_ || !text_queue_.empty();
             });
+            if (waiting_for_text && processed_item && !text_queue_.empty()) {
+                const double queue_empty_wait_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - queue_empty_wait_started).count();
+                ++metrics_.worker_queue_empty_wait_count;
+                metrics_.worker_queue_empty_wait_ms_total += queue_empty_wait_ms;
+                metrics_.worker_queue_empty_wait_ms_max = std::max(
+                    metrics_.worker_queue_empty_wait_ms_max,
+                    queue_empty_wait_ms);
+            }
             if (text_queue_.empty()) {
                 if (async_finishing_) {
                     AliaAudioCallback finish_audio_cb = async_audio_cb_;
@@ -825,6 +885,16 @@ void AliaTtsPipeline::async_worker_loop() {
             }
             item = std::move(text_queue_.front());
             text_queue_.pop_front();
+            const double text_queue_wait_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - item.enqueued_at).count();
+            if (metrics_.text_items_dequeued == 0) {
+                metrics_.first_text_queue_wait_ms = text_queue_wait_ms;
+            }
+            ++metrics_.text_items_dequeued;
+            metrics_.text_queue_wait_ms_total += text_queue_wait_ms;
+            metrics_.text_queue_wait_ms_max = std::max(
+                metrics_.text_queue_wait_ms_max, text_queue_wait_ms);
             config = async_config_;
             audio_cb = async_audio_cb_;
             user_data = async_user_data_;
@@ -848,6 +918,7 @@ void AliaTtsPipeline::async_worker_loop() {
             std::lock_guard<std::mutex> lock(mutex_);
             async_failed_ = true;
         }
+        processed_item = true;
     }
 }
 

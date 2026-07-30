@@ -35,6 +35,16 @@ bool ends_with_tts_chunk_boundary(const std::string& text) {
     return false;
 }
 
+bool ends_with_tts_soft_chunk_boundary(const std::string& text) {
+    for (const std::string& marker : tts_soft_chunk_boundary_markers()) {
+        if (marker != " " && text.size() >= marker.size() &&
+            text.compare(text.size() - marker.size(), marker.size(), marker) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t last_tts_chunk_boundary(const std::string& text) {
     size_t cutoff = std::string::npos;
     for (const std::string& marker : tts_chunk_boundary_markers()) {
@@ -252,7 +262,7 @@ TtsFirstAudioPriorityConfig read_tts_first_audio_priority_config() {
         0,
         aila::env::read_int_raw(
             "AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_MAX_DEFERRED_STEPS",
-            2));
+            6));
     config.base_timeout_ms = std::max(
         0, aila::env::read_int_raw("AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS", 250));
     config.active_extra_ms = std::max(
@@ -277,6 +287,8 @@ TtsPauseSegmentConfig read_tts_pause_segment_config() {
         0, aila::env::read_int_raw("AILA_TTS_ELLIPSIS_PAUSE_MS", 160));
     config.max_pause_ms = std::max(
         0, aila::env::read_int_raw("AILA_TTS_ELLIPSIS_PAUSE_MAX_MS", 240));
+    config.continuation_suffix =
+        aila::env::read_string("AILA_TTS_ELLIPSIS_TEXT_SUFFIX", "auto");
     return config;
 }
 
@@ -328,13 +340,28 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
         return pos + marker_len <= text.size() &&
                text.compare(pos, marker_len, marker) == 0;
     };
-    auto append_text = [&](size_t begin, size_t end) {
+    auto append_text = [&](size_t begin, size_t end, bool before_pause) {
         if (begin >= end) {
             return;
         }
+        std::string segment = text.substr(begin, end - begin);
+        if (before_pause &&
+            !config.continuation_suffix.empty() &&
+            !ends_with_tts_chunk_boundary(segment) &&
+            !ends_with_tts_soft_chunk_boundary(segment)) {
+            if (config.continuation_suffix == "auto") {
+                const bool has_non_ascii = std::any_of(
+                    segment.begin(), segment.end(), [](unsigned char ch) {
+                        return ch >= 0x80;
+                    });
+                segment += has_non_ascii ? "，" : ",";
+            } else {
+                segment += config.continuation_suffix;
+            }
+        }
         segments.push_back(TtsPreparedSegment{
             TtsPreparedSegmentKind::Text,
-            text.substr(begin, end - begin),
+            std::move(segment),
             0,
         });
     };
@@ -383,13 +410,13 @@ std::vector<TtsPreparedSegment> split_tts_text_pause_segments(
             continue;
         }
 
-        append_text(segment_begin, pos);
+        append_text(segment_begin, pos, true);
         append_silence(marker_count);
         pos = marker_end;
         segment_begin = pos;
     }
 
-    append_text(segment_begin, text.size());
+    append_text(segment_begin, text.size(), false);
     return segments;
 }
 

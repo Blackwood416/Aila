@@ -75,6 +75,7 @@ struct TtsPauseSegmentConfig {
     bool enabled = true;
     int pause_ms = 160;
     int max_pause_ms = 240;
+    std::string continuation_suffix;
 };
 
 struct TtsSilenceLookaheadPrefetchConfig {

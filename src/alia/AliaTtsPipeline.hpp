@@ -2,6 +2,7 @@
 
 #include "alia_api.h"
 
+#include <chrono>
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
@@ -24,6 +25,8 @@ struct AliaTtsMetrics {
     int first_backend_frames = 0;
     int first_backend_callbacks = 0;
     int first_backend_audio_samples = 0;
+    int first_backend_total_audio_samples = 0;
+    int backend_audio_samples_total = 0;
     int backend_stream_batch_frames = 0;
     int backend_initial_stream_batch_frames = 0;
     int backend_steady_stream_batch_frames = 0;
@@ -40,6 +43,10 @@ struct AliaTtsMetrics {
     int silence_lookahead_prefetch_text_bytes = 0;
     int silence_lookahead_prefetch_audio_callbacks = 0;
     int silence_lookahead_prefetch_audio_samples = 0;
+    int text_items_enqueued = 0;
+    int text_items_dequeued = 0;
+    int text_queue_depth_max = 0;
+    int worker_queue_empty_wait_count = 0;
     double reference_embedding_ms = -1.0;
     double first_backend_codes_ms = -1.0;
     double first_backend_mimi_init_ms = -1.0;
@@ -47,6 +54,16 @@ struct AliaTtsMetrics {
     double first_backend_total_ms = -1.0;
     double backend_total_ms = 0.0;
     double silence_lookahead_prefetch_backend_ms = 0.0;
+    double first_text_queue_wait_ms = -1.0;
+    double text_queue_wait_ms_total = 0.0;
+    double text_queue_wait_ms_max = 0.0;
+    double worker_queue_empty_wait_ms_total = 0.0;
+    double worker_queue_empty_wait_ms_max = 0.0;
+    double lane_lock_wait_ms_total = 0.0;
+    double lane_lock_wait_ms_max = 0.0;
+    double lane_relock_wait_ms_total = 0.0;
+    double lane_relock_wait_ms_max = 0.0;
+    double audio_callback_ms_total = 0.0;
     std::string reference_audio_path;
     std::string reference_audio_error;
 };
@@ -81,6 +98,7 @@ private:
     struct TtsQueueItem {
         std::string text;
         int silence_ms = 0;
+        std::chrono::steady_clock::time_point enqueued_at{};
     };
 
     struct TtsBufferedAudio {

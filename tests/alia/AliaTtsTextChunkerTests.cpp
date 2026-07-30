@@ -270,6 +270,22 @@ void first_audio_wait_hint_ignores_normal_first_text(TestResults& results) {
     AILA_EXPECT_EQ_INT(results, hint.total_text_bytes, 21);
 }
 
+void first_audio_wait_hint_uses_queue_aware_tiny_threshold(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+
+    const aila::alia::TtsFirstAudioPriorityWaitHint hint =
+        aila::alia::analyze_tts_first_audio_priority_wait_hint(
+            "啊，这个",
+            config,
+            16);
+
+    AILA_EXPECT_TRUE(results, hint.tiny_first_text);
+    AILA_EXPECT_EQ_INT(results, hint.first_text_bytes, 12);
+}
+
 void steady_chunk_ignores_first_chunk_early_flush(TestResults& results) {
     std::string buffer = "abcdefgh";
     const aila::alia::TtsTextChunkRequest request{
@@ -338,7 +354,7 @@ void first_audio_priority_defaults_to_adaptive_window(TestResults& results) {
     AILA_EXPECT_EQ_INT(results, config.active_extra_ms, 120);
     AILA_EXPECT_TRUE(results, config.queue_aware_tiny_first_text);
     AILA_EXPECT_EQ_INT(results, config.tiny_following_min_bytes, 16);
-    AILA_EXPECT_EQ_INT(results, config.tiny_max_deferred_steps, 2);
+    AILA_EXPECT_EQ_INT(results, config.tiny_max_deferred_steps, 6);
 }
 
 void first_audio_priority_env_clamps_negative_windows(TestResults& results) {
@@ -418,6 +434,38 @@ void ascii_ellipsis_pause_segment_uses_single_pause(TestResults& results) {
         segments[1].kind == aila::alia::TtsPreparedSegmentKind::Silence);
     AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 160);
     AILA_EXPECT_EQ_STRING(results, segments[2].text, "think");
+}
+
+void ellipsis_pause_segment_can_close_continuing_text(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+    config.continuation_suffix = "，";
+
+    const std::vector<aila::alia::TtsPreparedSegment> segments =
+        aila::alia::split_tts_text_pause_segments("艾莉亚……父亲", config);
+
+    AILA_EXPECT_EQ_SIZE(results, segments.size(), 3);
+    AILA_EXPECT_EQ_STRING(results, segments[0].text, "艾莉亚，");
+    AILA_EXPECT_EQ_INT(results, segments[1].silence_ms, 240);
+    AILA_EXPECT_EQ_STRING(results, segments[2].text, "父亲");
+}
+
+void ellipsis_pause_segment_auto_suffix_matches_script(TestResults& results) {
+    aila::alia::TtsPauseSegmentConfig config;
+    config.enabled = true;
+    config.pause_ms = 160;
+    config.max_pause_ms = 240;
+    config.continuation_suffix = "auto";
+
+    const auto chinese =
+        aila::alia::split_tts_text_pause_segments("艾莉亚……父亲", config);
+    const auto ascii =
+        aila::alia::split_tts_text_pause_segments("I...think", config);
+
+    AILA_EXPECT_EQ_STRING(results, chinese[0].text, "艾莉亚，");
+    AILA_EXPECT_EQ_STRING(results, ascii[0].text, "I,");
 }
 
 void ellipsis_pause_segments_can_be_disabled(TestResults& results) {
@@ -531,6 +579,7 @@ int main() {
     first_audio_wait_hint_detects_tiny_pause_without_following_text(results);
     first_audio_wait_hint_detects_tiny_pause_with_following_text(results);
     first_audio_wait_hint_ignores_normal_first_text(results);
+    first_audio_wait_hint_uses_queue_aware_tiny_threshold(results);
     steady_chunk_ignores_first_chunk_early_flush(results);
     force_flushes_all_text(results);
     first_chunk_early_flush_defaults_enabled(results);
@@ -540,6 +589,8 @@ int main() {
     stream_action_tag_guard_can_be_enabled(results);
     ellipsis_pause_segments_split_text_and_silence(results);
     ascii_ellipsis_pause_segment_uses_single_pause(results);
+    ellipsis_pause_segment_can_close_continuing_text(results);
+    ellipsis_pause_segment_auto_suffix_matches_script(results);
     ellipsis_pause_segments_can_be_disabled(results);
     silence_lookahead_prefetch_defaults_disabled(results);
     silence_lookahead_prefetch_can_be_enabled(results);

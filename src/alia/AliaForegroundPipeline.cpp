@@ -2099,7 +2099,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
                         chunk,
                         read_tts_pause_segment_config(),
                         static_cast<size_t>(
-                            std::max(0, tts_chunk_policy.first_hard_min_chars)));
+                            std::max(
+                                tts_chunk_policy.first_hard_min_chars,
+                                first_audio_priority_config.tiny_following_min_bytes)));
                 if (was_first_enqueue) {
                     first_tts_enqueue_seen = true;
                     first_tts_enqueue_tiny_first_text =

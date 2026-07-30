@@ -145,9 +145,11 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | `AILA_TTS_ELLIPSIS_PAUSE_SEGMENTS` | bool | `true` | Split VLM ellipsis text (`…`, `……`, `...`) into fixed PCM silence segments before TTS backend synthesis |
 | `AILA_TTS_ELLIPSIS_PAUSE_MS` | int | `160` | Milliseconds of synthetic silence for one ellipsis marker |
 | `AILA_TTS_ELLIPSIS_PAUSE_MAX_MS` | int | `240` | Maximum synthetic silence for a consecutive ellipsis run |
+| `AILA_TTS_ELLIPSIS_TEXT_SUFFIX` | string | `auto` | Suffix for text immediately before a synthetic ellipsis pause; `auto` uses `，` for non-ASCII text and `,` for ASCII text, while an empty value disables the suffix |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY` | bool | `true` | Let foreground decoding yield briefly after first TTS enqueue so TTS can produce first audio |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS` | int | `250` | Base first-audio priority wait budget |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS` | int | `120` | Extra bounded wait when the first TTS backend job is active but has not emitted audio yet |
+| `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TINY_MAX_DEFERRED_STEPS` | int | `6` | Token steps a tiny first phrase may keep foreground decoding before first-audio priority wait can pause it, allowing following text to reach TTS |
 
 ## TTS Reference Embedding Cache (AILA_REF_*)
 
