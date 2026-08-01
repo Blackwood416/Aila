@@ -472,14 +472,15 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
         return has_suppression && ops::is_token_suppressed(token_id, suppress_tokens);
     };
 
+    if (!gen_config.do_sample && !has_suppression) {
+        return argmax(ctx, logits, vocab_size);
+    }
+
     static thread_local HostSamplingWorkspace host_ws;
     bf16* host_logits_bf16 = host_ws.ensure_bf16(ctx, static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16, logits.data(), vocab_size * sizeof(bf16));
 
     if (!gen_config.do_sample) {
-        if (!has_suppression) {
-            return argmax(ctx, logits, vocab_size);
-        }
         float best_val = -1.0e30f;
         int best_id = 0;
         for (int i = 0; i < vocab_size; ++i) {

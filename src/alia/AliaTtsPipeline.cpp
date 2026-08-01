@@ -51,7 +51,7 @@ int tts_audio_callback_max_frames() {
 
 bool tts_stream_session_enabled() {
     static const bool enabled =
-        aila::env::read_flag("AILA_TTS_STREAM_SESSION", true);
+        aila::env::read_flag("AILA_TTS_STREAM_SESSION", false);
     return enabled;
 }
 
@@ -64,7 +64,7 @@ int tts_stream_session_idle_ms() {
 int tts_session_keepalive_silence_ms() {
     static const int keepalive_ms = std::max(
         0, aila::env::read_int_raw(
-               "AILA_TTS_SESSION_KEEPALIVE_SILENCE_MS", 80));
+               "AILA_TTS_SESSION_KEEPALIVE_SILENCE_MS", 0));
     return keepalive_ms;
 }
 
@@ -1303,6 +1303,14 @@ void AliaTtsPipeline::async_worker_loop() {
     bool finish_called = false;
     bool session_finished = false;
     const int idle_ms = tts_stream_session_idle_ms();
+    long long active_segment_id = -1;
+    bool keepalive_emitted_this_stall = false;
+    auto finish_active_segment = [&](bool complete) {
+        if (active_segment_id >= 0) {
+            finish_playback_segment(active_segment_id, complete);
+            active_segment_id = -1;
+        }
+    };
     while (true) {
         TtsQueueItem item;
         bool have_item = false;
@@ -1362,7 +1370,9 @@ void AliaTtsPipeline::async_worker_loop() {
         }
 
         if (!session_started && have_item) {
+            keepalive_emitted_this_stall = false;
             if (item.silence_ms > 0) {
+                begin_playback_segment(item);
                 if (audio_cb && item.silence_ms > 0) {
                     const int sample_count = std::max(
                         1, static_cast<int>((static_cast<long long>(item.silence_ms) * 24000) / 1000));
@@ -1380,31 +1390,51 @@ void AliaTtsPipeline::async_worker_loop() {
                                  user_data);
                     }
                 }
+                finish_playback_segment(item.segment_id, true);
                 continue;
             }
+            finish_active_segment(true);
             begin_playback_segment(item);
             if (!synthesize_text_session_begin(item.text, config, should_cancel)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 async_failed_ = true;
                 break;
             }
+            active_segment_id = item.segment_id;
             session_started = true;
         } else if (session_started && have_item) {
+            keepalive_emitted_this_stall = false;
             if (item.silence_ms > 0) {
-                const auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(item.silence_ms);
-                while (std::chrono::steady_clock::now() < deadline &&
-                       !(should_cancel && should_cancel())) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                finish_active_segment(true);
+                begin_playback_segment(item);
+                if (audio_cb && item.silence_ms > 0) {
+                    const int sample_count = std::max(
+                        1, static_cast<int>((static_cast<long long>(item.silence_ms) * 24000) / 1000));
+                    std::vector<float> silence(static_cast<size_t>(sample_count), 0.0f);
+                    note_output_samples(sample_count);
+                    std::vector<std::vector<float>> callbacks =
+                        prepare_audio_callbacks(silence);
+                    for (const auto& callback_samples : callbacks) {
+                        if (callback_samples.empty()) {
+                            break;
+                        }
+                        note_audio_callback();
+                        audio_cb(callback_samples.data(),
+                                 static_cast<int>(callback_samples.size()),
+                                 user_data);
+                    }
                 }
+                finish_playback_segment(item.segment_id, true);
                 continue;
             }
+            finish_active_segment(true);
             begin_playback_segment(item);
             if (!synthesize_text_session_append(item.text, should_cancel)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 async_failed_ = true;
                 break;
             }
+            active_segment_id = item.segment_id;
         }
 
         if (finishing_requested && session_started && !finish_called &&
@@ -1433,12 +1463,16 @@ void AliaTtsPipeline::async_worker_loop() {
                 session_finished = true;
                 break;
             }
+            if (!audio_out.empty()) {
+                keepalive_emitted_this_stall = false;
+            }
         }
 
         if (session_started && !finishing_requested && !have_item &&
             first_audio_callback_emitted() &&
             !synthesize_text_session_has_unconsumed_text() &&
-            tts_session_keepalive_silence_ms() > 0) {
+            tts_session_keepalive_silence_ms() > 0 &&
+            !keepalive_emitted_this_stall) {
             const int keepalive_ms = tts_session_keepalive_silence_ms();
             const int sample_count = std::max(
                 1, static_cast<int>((static_cast<long long>(keepalive_ms) * 24000) / 1000));
@@ -1455,6 +1489,7 @@ void AliaTtsPipeline::async_worker_loop() {
                          static_cast<int>(callback_samples.size()),
                          user_data);
             }
+            keepalive_emitted_this_stall = true;
             continue;
         }
 
@@ -1462,6 +1497,8 @@ void AliaTtsPipeline::async_worker_loop() {
             break;
         }
     }
+
+    finish_active_segment(!async_failed_);
 
     {
         std::unique_lock<std::mutex> lock(mutex_);

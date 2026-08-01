@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -33,7 +34,7 @@ struct Options {
     int max_seq_len = 2048;
     int max_tokens = 512;
     int stream_batch = 4;
-    int chunk_delay_ms = 120;
+    int chunk_delay_ms = 1000;
 };
 
 struct AudioCapture {
@@ -184,6 +185,20 @@ bool save_wav(const std::string& path, const std::vector<float>& samples,
     return true;
 }
 
+size_t max_consecutive_low_energy_samples(const std::vector<float>& samples) {
+    size_t best = 0;
+    size_t current = 0;
+    for (float sample : samples) {
+        if (std::fabs(sample) < 0.001f) {
+            ++current;
+            best = std::max(best, current);
+        } else {
+            current = 0;
+        }
+    }
+    return best;
+}
+
 bool load_tts_slot(AliaContext& ctx, const Options& opts) {
     ctx.tts_model_dir = opts.tts_model;
     ctx.configure_model_slots();
@@ -235,8 +250,10 @@ int main(int argc, char** argv) {
     }
 #ifdef _WIN32
     _putenv_s("AILA_TTS_REF_AUDIO", ref_path.string().c_str());
+    _putenv_s("AILA_TTS_STREAM_SESSION", "1");
 #else
     setenv("AILA_TTS_REF_AUDIO", ref_path.string().c_str(), 1);
+    setenv("AILA_TTS_STREAM_SESSION", "1", 1);
 #endif
 
     AliaContext ctx(opts.max_seq_len);
@@ -309,18 +326,59 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "ALIA_TTS_STREAM_PROBE_PASS\n"
+    bool pass = true;
+    std::vector<std::string> failures;
+    const size_t min_session_samples = static_cast<size_t>(
+        static_cast<double>(baseline_capture.samples.size()) * 0.9);
+    if (session_capture.samples.size() < min_session_samples) {
+        pass = false;
+        failures.push_back("session_truncated");
+    }
+    const int min_session_callbacks = static_cast<int>(
+        static_cast<double>(baseline_capture.callback_count) * 0.8);
+    if (session_capture.callback_count < min_session_callbacks) {
+        pass = false;
+        failures.push_back("session_callbacks_low");
+    }
+    constexpr size_t kMaxSilenceSamples = 24000 * 2;  // 2s at 24 kHz
+    const size_t max_silence =
+        max_consecutive_low_energy_samples(session_capture.samples);
+    if (max_silence > kMaxSilenceSamples) {
+        pass = false;
+        failures.push_back("session_long_silence");
+    }
+    if (metrics.session_text_appends !=
+        static_cast<int>(chunks.size()) - 1) {
+        pass = false;
+        failures.push_back("session_appends_missing");
+    }
+    if (metrics.chunks_synthesized != 1) {
+        pass = false;
+        failures.push_back("session_not_single_synthesis");
+    }
+
+    std::cout << (pass ? "ALIA_TTS_STREAM_PROBE_PASS\n"
+                       : "ALIA_TTS_STREAM_PROBE_FAIL\n")
               << "text_chunks=" << chunks.size() << "\n"
               << "baseline_samples=" << baseline_capture.samples.size() << "\n"
               << "baseline_callbacks=" << baseline_capture.callback_count << "\n"
               << "session_samples=" << session_capture.samples.size() << "\n"
               << "session_callbacks=" << session_capture.callback_count << "\n"
+              << "session_max_silence_samples=" << max_silence << "\n"
               << "stream_session_enabled=" << metrics.stream_session_enabled << "\n"
               << "tts_chunks_synthesized=" << metrics.chunks_synthesized << "\n"
               << "session_text_appends=" << metrics.session_text_appends << "\n"
               << "session_eos_suppressed=" << metrics.session_eos_suppressed << "\n"
               << "session_resets=" << metrics.session_resets << "\n"
+              << "probe_failures=";
+    for (size_t i = 0; i < failures.size(); ++i) {
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << failures[i];
+    }
+    std::cout << "\n"
               << "baseline_wav=" << baseline_wav << "\n"
               << "session_wav=" << session_wav << "\n";
-    return 0;
+    return pass ? 0 : 1;
 }

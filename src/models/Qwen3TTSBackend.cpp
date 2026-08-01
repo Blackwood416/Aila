@@ -562,11 +562,9 @@ bool Qwen3TTSBackend::tts_stream_session_has_unconsumed_text() const {
     if (stream_session_ == nullptr || !stream_session_->active) {
         return false;
     }
-    static const int ahead_frames = std::max(
-        0, aila::env::read_int_raw("AILA_TTS_SESSION_AHEAD_FRAMES", 8));
     return stream_session_->finishing ||
            stream_session_->gen_step <
-               stream_session_->trailing_len + ahead_frames;
+               stream_session_->trailing_len;
 }
 
 bool Qwen3TTSBackend::tts_stream_append_text(

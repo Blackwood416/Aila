@@ -146,13 +146,12 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 | `AILA_TTS_ELLIPSIS_PAUSE_MS` | int | `160` | Milliseconds of synthetic silence for one ellipsis marker |
 | `AILA_TTS_ELLIPSIS_PAUSE_MAX_MS` | int | `240` | Maximum synthetic silence for a consecutive ellipsis run |
 | `AILA_TTS_ELLIPSIS_TEXT_SUFFIX` | string | `auto` | Suffix for text immediately before a synthetic ellipsis pause; `auto` uses `，` for non-ASCII text and `,` for ASCII text, while an empty value disables the suffix |
-| `AILA_TTS_STREAM_SESSION` | bool | `true` | Keep queued TTS text chunks in one stateful generation session instead of restarting a complete utterance per chunk. Set to `0` to restore the old per-chunk reset behavior |
+| `AILA_TTS_STREAM_SESSION` | bool | `false` | Keep queued TTS text chunks in one stateful generation session instead of restarting a complete utterance per chunk. Defaults off while late-append text alignment is being re-validated |
 | `AILA_TTS_STREAM_SESSION_IDLE_MS` | int | `50` | Maximum wait between session steps while no new text chunk has arrived. Lower values reduce latency pressure but may generate more filler frames between chunks |
-| `AILA_TTS_SESSION_AHEAD_FRAMES` | int | `8` | Frames the session may keep generating past the current trailing text before waiting for the next chunk. Large values can drift text alignment, so keep-alive silence is preferred for bridging producer stalls |
 | `AILA_TTS_SESSION_FEED_LOW_LATENCY_CALLBACKS` | int | `0` | While fewer than this many TTS audio callbacks have been emitted, keep feeding the session with small low-latency text chunks instead of switching to steady chunk sizes. Tiny chunks can drift text alignment, so this is opt-in |
 | `AILA_TTS_SESSION_POST_FINISH_FRAMES` | int | `128` | Maximum pad frames the session may generate after finish before forcing EOS, bounding pathological runaway without truncating normal utterance tails |
 | `AILA_TTS_SESSION_MAX_FRAMES` | int | `512` | Lower bound for the session codec-frame budget, so the VLM token limit does not truncate TTS output |
-| `AILA_TTS_SESSION_KEEPALIVE_SILENCE_MS` | int | `80` | Short silence callback emitted while the session waits for the next text chunk after first audio, keeping the playback buffer from underrunning. Set to `0` to disable |
+| `AILA_TTS_SESSION_KEEPALIVE_SILENCE_MS` | int | `0` | Short silence callback emitted at most once per wait while the session waits for the next text chunk after first audio. Off by default; unbounded keep-alive can accumulate silence faster than playback drains it |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY` | bool | `true` | Let foreground decoding yield briefly after first TTS enqueue so TTS can produce first audio |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_TIMEOUT_MS` | int | `250` | Base first-audio priority wait budget |
 | `AILA_FOREGROUND_TTS_FIRST_AUDIO_PRIORITY_ACTIVE_EXTRA_MS` | int | `120` | Extra bounded wait when the first TTS backend job is active but has not emitted audio yet |
