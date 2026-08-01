@@ -107,6 +107,7 @@ set(COMMON_ENGINE_SOURCES
     src/models/Qwen3ForceAlignerBackend.cpp
     src/models/Qwen3ForceAlignerBnb4Backend.cpp
     src/models/Qwen3TTSBackend.cpp
+    src/models/Qwen3TtsTextLayout.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp
@@ -152,6 +153,10 @@ set(LIB_SOURCES
 
 set(ALIA_REAL_SMOKE_SOURCES
     tools/alia/AliaRealModelSmoke.cpp
+)
+
+set(ALIA_TTS_STREAM_PROBE_SOURCES
+    tools/alia/AliaTtsStreamProbe.cpp
 )
 
 set(COMMAND_SUBMISSION_BENCH_SOURCES
@@ -220,6 +225,15 @@ set(CPU_Q35_HYBRID_MODEL_TEST_SOURCES
 
 set(QWEN3_TTS_WARMUP_TEST_SOURCES
     tests/models/Qwen3TTSWarmupTests.cpp
+)
+
+set(QWEN3_TTS_TEXT_LAYOUT_TEST_SOURCES
+    tests/models/Qwen3TtsTextLayoutTests.cpp
+    src/models/Qwen3TtsTextLayout.cpp
+)
+
+set(SAMPLING_SUPPRESS_TEST_SOURCES
+    tests/ops/SamplingSuppressTests.cpp
 )
 
 set(QWEN35_VISION_WEIGHTS_TEST_SOURCES
@@ -293,6 +307,14 @@ target_include_directories(AilaAliaRealSmoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(AilaAliaRealSmoke PRIVATE AilaLib)
+
+add_executable(AilaAliaTtsStreamProbe ${ALIA_TTS_STREAM_PROBE_SOURCES})
+target_compile_definitions(AilaAliaTtsStreamProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaAliaTtsStreamProbe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaAliaTtsStreamProbe PRIVATE AilaLib)
 
 add_custom_target(AliaEngine DEPENDS AilaShared)
 add_dependencies(AliaEngine AilaAliaRealSmoke)
@@ -388,6 +410,20 @@ target_link_libraries(AilaCpuQ35HybridModelTests PRIVATE simdjson)
 add_executable(AilaQwen3TTSWarmupTests ${QWEN3_TTS_WARMUP_TEST_SOURCES})
 target_compile_definitions(AilaQwen3TTSWarmupTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQwen3TTSWarmupTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_executable(AilaQwen3TtsTextLayoutTests ${QWEN3_TTS_TEXT_LAYOUT_TEST_SOURCES})
+target_compile_definitions(AilaQwen3TtsTextLayoutTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQwen3TtsTextLayoutTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_executable(AilaSamplingSuppressTests ${SAMPLING_SUPPRESS_TEST_SOURCES})
+target_compile_definitions(AilaSamplingSuppressTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaSamplingSuppressTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )

@@ -2228,6 +2228,9 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
     const TtsTextChunkPolicy tts_chunk_policy = tts_text_chunk_policy_from_env();
     static const bool s_tts_coalesce_steady_text_chunks =
         aila::env::read_flag("AILA_TTS_COALESCE_STEADY_TEXT_CHUNKS", false);
+    static const int s_session_feed_low_latency_callbacks = std::max(
+        0, aila::env::read_int_raw(
+               "AILA_TTS_SESSION_FEED_LOW_LATENCY_CALLBACKS", 0));
     const TtsFirstChunkEarlyFlushConfig first_chunk_early_flush_config =
         read_tts_first_chunk_early_flush_config();
     const TtsFirstAudioPriorityConfig first_audio_priority_config =
@@ -2279,8 +2282,14 @@ bool AliaForegroundPipeline::generate_with_loaded_vlm(
             s_tts_coalesce_steady_text_chunks &&
             first_tts_enqueue_seen &&
             !tts_pipeline_->first_audio_callback_emitted();
+        const bool session_feed_low_latency =
+            tts_pipeline_->stream_session_enabled() &&
+            first_tts_enqueue_seen &&
+            tts_pipeline_->emitted_audio_callback_count() <
+                s_session_feed_low_latency_callbacks;
         const bool low_latency_chunking =
-            !first_tts_enqueue_seen || first_audio_pending;
+            !first_tts_enqueue_seen || first_audio_pending ||
+            session_feed_low_latency;
         const TtsTextChunkResult chunk_result =
             take_ready_tts_text_chunks(
                 pending_tts_text,

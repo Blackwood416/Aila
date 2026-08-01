@@ -360,6 +360,10 @@ ALIA_API int alia_get_last_turn_metrics_json(AliaContext* ctx, char** out_json) 
 
         out << "\"tts\":{";
         out << "\"chunks_synthesized\":" << tts.chunks_synthesized << ",";
+        out << "\"stream_session_enabled\":" << tts.stream_session_enabled << ",";
+        out << "\"session_text_appends\":" << tts.session_text_appends << ",";
+        out << "\"session_eos_suppressed\":" << tts.session_eos_suppressed << ",";
+        out << "\"session_resets\":" << tts.session_resets << ",";
         out << "\"first_text_chars\":" << tts.first_text_chars << ",";
         out << "\"first_text_tokens\":" << tts.first_text_tokens << ",";
         out << "\"first_backend_frames\":" << tts.first_backend_frames << ",";

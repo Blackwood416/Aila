@@ -1,5 +1,6 @@
 #include "Ops.hpp"
 #include "utils/EnvUtils.hpp"
+#include "ops/SamplingSuppress.hpp"
 #include <sycl/sycl.hpp>
 #include <vector>
 #include <numeric>
@@ -463,27 +464,58 @@ void apply_penalties(float* logits_f, int vocab_size,
 
 int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                        const GenerationConfig& gen_config,
-                       const std::vector<int>& generated_ids) {
-    if (!gen_config.do_sample) {
-        return argmax(ctx, logits, vocab_size);
-    }
-
-    float inv_temperature = 1.0f / std::max(gen_config.temperature, 1e-6f);
-    int top_k = std::min(gen_config.top_k, vocab_size);
+                       const std::vector<int>& generated_ids,
+                       const std::vector<int>* suppress_tokens) {
+    const bool has_suppression =
+        suppress_tokens != nullptr && !suppress_tokens->empty();
+    auto is_suppressed = [&](int token_id) {
+        return has_suppression && ops::is_token_suppressed(token_id, suppress_tokens);
+    };
 
     static thread_local HostSamplingWorkspace host_ws;
     bf16* host_logits_bf16 = host_ws.ensure_bf16(ctx, static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16, logits.data(), vocab_size * sizeof(bf16));
 
+    if (!gen_config.do_sample) {
+        if (!has_suppression) {
+            return argmax(ctx, logits, vocab_size);
+        }
+        float best_val = -1.0e30f;
+        int best_id = 0;
+        for (int i = 0; i < vocab_size; ++i) {
+            if (is_suppressed(i)) {
+                continue;
+            }
+            const float value = static_cast<float>(host_logits_bf16[i]);
+            if (value > best_val) {
+                best_val = value;
+                best_id = i;
+            }
+        }
+        return best_id;
+    }
+
+    float inv_temperature = 1.0f / std::max(gen_config.temperature, 1e-6f);
+    int top_k = std::min(gen_config.top_k, vocab_size);
+
     if (!gen_config.has_penalties()) {
         return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
+            [&](int i) {
+                if (is_suppressed(i)) {
+                    return -1.0e30f;
+                }
+                return static_cast<float>(host_logits_bf16[i]) * inv_temperature;
+            });
     }
 
     // Generic path: penalties on CPU float logits
     static thread_local std::vector<float> logits_f;
     logits_f.resize(static_cast<size_t>(vocab_size));
     for (int i = 0; i < vocab_size; i++) {
+        if (is_suppressed(i)) {
+            logits_f[i] = -1.0e30f;
+            continue;
+        }
         logits_f[i] = static_cast<float>(host_logits_bf16[i]);
     }
     apply_penalties(logits_f.data(), vocab_size, generated_ids,
@@ -494,7 +526,12 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
         logits_f[i] *= inv_temperature;
     }
     return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-        [&](int i) { return logits_f[i]; });
+        [&](int i) {
+            if (is_suppressed(i)) {
+                return -1.0e30f;
+            }
+            return logits_f[i];
+        });
 }
 
 bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config) {

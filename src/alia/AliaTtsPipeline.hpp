@@ -33,6 +33,10 @@ struct AliaTtsMetrics {
     int backend_steady_stream_batch_frames = 0;
     int backend_steady_batch_callback_count = 0;
     int backend_playback_aware_steady_batch = 0;
+    int stream_session_enabled = 0;
+    int session_text_appends = 0;
+    int session_eos_suppressed = 0;
+    int session_resets = 0;
     int audio_callback_max_frames = 0;
     int pause_silence_segments = 0;
     int pause_silence_ms = 0;
@@ -92,6 +96,8 @@ public:
     size_t pending_text_count() const;
     bool first_audio_callback_emitted() const;
     bool first_audio_synthesis_active() const;
+    bool stream_session_enabled() const;
+    int emitted_audio_callback_count() const;
     AliaTtsMetrics last_metrics() const;
     void request_interruption(long long played_audio_samples);
     AliaTtsPlayedPrefix resolve_played_prefix(long long played_audio_samples) const;
@@ -123,6 +129,23 @@ private:
         const AliaGenConfig& config,
         TtsBufferedAudio& buffered_audio,
         std::function<bool()> should_cancel);
+    bool synthesize_text_session_begin(
+        const std::string& text,
+        const AliaGenConfig& config,
+        std::function<bool()> should_cancel);
+    bool synthesize_text_session_append(
+        const std::string& text,
+        std::function<bool()> should_cancel);
+    bool synthesize_text_session_step(
+        const AliaGenConfig& config,
+        AliaAudioCallback audio_cb,
+        void* user_data,
+        std::function<bool()> should_cancel,
+        std::vector<float>& audio_out,
+        bool& eos);
+    bool synthesize_text_session_finish(
+        std::function<bool()> should_cancel);
+    bool synthesize_text_session_has_unconsumed_text() const;
     bool synthesize_silence(int silence_ms,
                             AliaAudioCallback audio_cb,
                             void* user_data,
@@ -158,6 +181,7 @@ private:
     bool reference_voice_failed_ = false;
     bool first_audio_callback_emitted_ = false;
     bool first_audio_synthesis_active_ = false;
+    int emitted_audio_callback_count_ = 0;
     long long next_segment_id_ = 1;
     long long turn_output_samples_ = 0;
     bool interruption_requested_ = false;

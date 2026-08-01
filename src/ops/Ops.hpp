@@ -496,7 +496,8 @@ namespace ops {
     // Returns sampled token ID.
     int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                            const GenerationConfig& gen_config,
-                           const std::vector<int>& generated_ids);
+                           const std::vector<int>& generated_ids,
+                           const std::vector<int>* suppress_tokens = nullptr);
 
     // Check whether the current generation config can use the device-side
     // no-penalty sampling fast path.

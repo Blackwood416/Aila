@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IModelBackend.hpp"
+#include "Qwen3TtsTextLayout.hpp"
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
 #include "../ops/Ops.hpp"
@@ -8,6 +9,7 @@
 #include "../utils/SafeTensors.hpp"
 #include "engine/Types.hpp"
 #include <array>
+#include <memory>
 #include <vector>
 #include <string>
 #include <functional>
@@ -50,6 +52,12 @@ public:
 
     // Streaming synthesis: calls audio_callback for each batch of generated audio
     using AudioChunkCallback = std::function<void(const std::vector<float>& samples)>;
+
+    enum class TtsStreamStepResult {
+        Continue,
+        Eos,
+        Error,
+    };
 
     bool synthesize_codes_stream(Context& ctx,
                                   const std::vector<int>& text_tokens,
@@ -116,7 +124,75 @@ public:
     bool decode_mimi_flush(Context& ctx, MimiStreamState& state,
                            std::vector<float>& out_samples);
 
+    // Stateful text-chunk streaming session. The session owns Talker KV,
+    // trailing text hidden, codec history, and Mimi state so that text chunks
+    // appended after begin() continue the same utterance instead of resetting.
+    bool tts_stream_begin(Context& ctx,
+                          const std::vector<int>& text_tokens,
+                          const std::vector<float>& speaker_embedding,
+                          int speaker_id,
+                          const std::vector<int>& instruct_tokens,
+                          int language_id,
+                          const GenerationConfig& gen_config,
+                          int stream_batch_frames);
+    bool tts_stream_append_text(Context& ctx,
+                                const std::vector<int>& body_tokens);
+    TtsStreamStepResult tts_stream_step(Context& ctx,
+                                        std::vector<float>& audio_out);
+    bool tts_stream_finish(Context& ctx);
+    void tts_stream_reset();
+    bool tts_stream_session_active() const {
+        return stream_session_ != nullptr && stream_session_->active;
+    }
+    int tts_stream_session_eos_suppressed() const {
+        return stream_session_ ? stream_session_->eos_suppressed_count : 0;
+    }
+    bool tts_stream_session_has_unconsumed_text() const;
+
 private:
+    struct TtsStreamSession {
+        bool active = false;
+        bool finishing = false;
+        bool eos_reached = false;
+        int gen_step = 0;
+        int trailing_len = 0;
+        int max_tokens = 0;
+        int token = -1;
+        int eos_id = 0;
+        int stream_batch_frames = 4;
+        int initial_callback_batch_frames = 4;
+        int steady_callback_batch_frames = 4;
+        int pending_callback_frames = 0;
+        int pending_callback_real_frames = 0;
+        int callback_batches_emitted = 0;
+        int eos_suppressed_count = 0;
+        bool playback_aware_steady_batch = false;
+        bool use_steady_callback_batch = false;
+        GenerationConfig gen_config{};
+        aila::Qwen3TtsStreamTextState text_state;
+        std::vector<int> generated_cb0_tokens;
+        std::vector<int32_t> pending_callback_codes;
+        std::vector<int> token_upload_storage;
+        size_t token_upload_index = 0;
+        Tensor past_hidden_talker;
+        Tensor trailing_text_hidden;
+        Tensor pred_input;
+        Tensor token_dev;
+        Tensor frame_codes_dev;
+        Tensor last_id_hidden;
+        Tensor predictor_final_hidden;
+        Tensor predictor_final_normed;
+        Tensor predictor_emb_h;
+        Tensor predictor_emb_pred;
+        Tensor predictor_step_normed;
+        Tensor sum_emb;
+        Tensor single_emb;
+        Tensor step_normed_talker;
+        Tensor final_normed_talker;
+        MimiStreamState mimi_state;
+    };
+    std::unique_ptr<TtsStreamSession> stream_session_;
+
     // Conv stages of Mimi decoder (shared by full and incremental paths).
     // Takes pre-transformer output [n_frames, 1024], produces float PCM audio.
     bool mimi_conv_stages(Context& ctx, Tensor& pre_tfm_out, int n_frames,
@@ -126,6 +202,9 @@ private:
     void ensure_talker_runtime_buffers(Context& ctx, int seq_len);
     void ensure_talker_prefill_scores(Context& ctx, int seq_len);
     void ensure_talker_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
+    bool project_text_tokens(Context& ctx,
+                             const std::vector<int>& tokens,
+                             Tensor& out);
 
     void ensure_predictor_runtime_buffers(Context& ctx, int seq_len);
     void ensure_predictor_prefill_scores(Context& ctx, int seq_len);

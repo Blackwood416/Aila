@@ -1,5 +1,6 @@
 #include "Qwen3TTSBackend.hpp"
 #include "Qwen3TTSWarmup.hpp"
+#include "Qwen3TtsTextLayout.hpp"
 #include "../ops/ConvOps.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
@@ -509,6 +510,7 @@ bool Qwen3TTSBackend::load(Context& ctx, ModelWeights& weights, const ModelSpec&
 }
 
 void Qwen3TTSBackend::reset() {
+    stream_session_.reset();
     talker_kv_cache_.reset();
     predictor_kv_cache_.reset();
     current_talker_len_ = 0;
@@ -521,6 +523,910 @@ bool Qwen3TTSBackend::truncate_kv_cache(int new_len) {
         return true;
     }
     return false;
+}
+
+bool Qwen3TTSBackend::project_text_tokens(Context& ctx,
+                                          const std::vector<int>& tokens,
+                                          Tensor& out) {
+    if (tokens.empty()) {
+        return false;
+    }
+    const int length = static_cast<int>(tokens.size());
+    const int hidden = talker_cfg_.hidden_size;
+    Tensor ids = Tensor::allocate(ctx, {length}, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(ids.data(), tokens.data(), length * sizeof(int));
+
+    Tensor text_emb = Tensor::allocate(ctx, {length, 2048});
+    ops::embedding_lookup(ctx, *talker_text_embed_weight_,
+                          ids.data_as<int>(), length, text_emb, 2048);
+
+    Tensor fc1_out = Tensor::allocate(ctx, {length, 2048});
+    talker_text_proj_fc1_.forward_bias(ctx, text_emb,
+                                       *talker_text_proj_fc1_bias_,
+                                       fc1_out, length);
+    Tensor silu_out = Tensor::allocate(ctx, {length, 2048});
+    ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, length * 2048);
+
+    out = Tensor::allocate(ctx, {length, hidden});
+    talker_text_proj_fc2_.forward_bias(ctx, silu_out,
+                                       *talker_text_proj_fc2_bias_,
+                                       out, length);
+    return true;
+}
+
+void Qwen3TTSBackend::tts_stream_reset() {
+    stream_session_.reset();
+}
+
+bool Qwen3TTSBackend::tts_stream_session_has_unconsumed_text() const {
+    if (stream_session_ == nullptr || !stream_session_->active) {
+        return false;
+    }
+    static const int ahead_frames = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_SESSION_AHEAD_FRAMES", 8));
+    return stream_session_->finishing ||
+           stream_session_->gen_step <
+               stream_session_->trailing_len + ahead_frames;
+}
+
+bool Qwen3TTSBackend::tts_stream_append_text(
+    Context& ctx,
+    const std::vector<int>& body_tokens) {
+    if (!stream_session_ || !stream_session_->active ||
+        stream_session_->finishing || body_tokens.empty()) {
+        AILA_LOG_ERROR("[TTS-Session] append rejected active=%d finishing=%d tokens=%zu",
+                       stream_session_ && stream_session_->active ? 1 : 0,
+                       stream_session_ && stream_session_->finishing ? 1 : 0,
+                       body_tokens.size());
+        return false;
+    }
+
+    Tensor projected;
+    if (!project_text_tokens(ctx, body_tokens, projected)) {
+        AILA_LOG_ERROR("[TTS-Session] append text projection failed tokens=%zu",
+                       body_tokens.size());
+        return false;
+    }
+    if (!stream_session_->text_state.Append(body_tokens)) {
+        AILA_LOG_ERROR("[TTS-Session] append text state rejected tokens=%zu",
+                       body_tokens.size());
+        return false;
+    }
+
+    const int hidden = talker_cfg_.hidden_size;
+    const int old_len = stream_session_->trailing_len;
+    const int new_len = old_len + static_cast<int>(body_tokens.size());
+    ctx.queue().wait();
+
+    Tensor new_trailing = Tensor::allocate(
+        ctx, {std::max(1, new_len), hidden});
+    if (old_len > 0 && stream_session_->trailing_text_hidden.data() != nullptr) {
+        ctx.queue().memcpy(new_trailing.data_as<bf16>(),
+                           stream_session_->trailing_text_hidden.data_as<bf16>(),
+                           static_cast<size_t>(old_len) * hidden * sizeof(bf16)).wait();
+    }
+    if (static_cast<int>(projected.shape(0)) > 0) {
+        ctx.queue().memcpy(new_trailing.data_as<bf16>() +
+                               static_cast<size_t>(old_len) * hidden,
+                           projected.data_as<bf16>(),
+                           static_cast<size_t>(body_tokens.size()) *
+                               hidden * sizeof(bf16)).wait();
+    }
+    stream_session_->trailing_text_hidden = std::move(new_trailing);
+    stream_session_->trailing_len = new_len;
+    AILA_LOG_INFO("[TTS-Session] append trailing %d -> %d tokens=%zu",
+                  old_len, new_len, body_tokens.size());
+    return true;
+}
+
+bool Qwen3TTSBackend::tts_stream_finish(Context& ctx) {
+    if (!stream_session_ || !stream_session_->active) {
+        return false;
+    }
+    if (stream_session_->finishing) {
+        return true;
+    }
+
+    stream_session_->finishing = true;
+    stream_session_->text_state.Finish();
+
+    const int hidden = talker_cfg_.hidden_size;
+    const int old_len = stream_session_->trailing_len;
+    const int new_len = old_len + 1;
+    ctx.queue().wait();
+
+    Tensor new_trailing = Tensor::allocate(
+        ctx, {std::max(1, new_len), hidden});
+    if (old_len > 0 && stream_session_->trailing_text_hidden.data() != nullptr) {
+        ctx.queue().memcpy(new_trailing.data_as<bf16>(),
+                           stream_session_->trailing_text_hidden.data_as<bf16>(),
+                           static_cast<size_t>(old_len) * hidden * sizeof(bf16)).wait();
+    }
+    ctx.queue().memcpy(new_trailing.data_as<bf16>() +
+                           static_cast<size_t>(old_len) * hidden,
+                       precomputed_tts_eos_.data(),
+                       hidden * sizeof(bf16)).wait();
+    stream_session_->trailing_text_hidden = std::move(new_trailing);
+    stream_session_->trailing_len = new_len;
+    AILA_LOG_INFO("[TTS-Session] finish trailing %d -> %d",
+                  old_len, new_len);
+    return true;
+}
+
+bool Qwen3TTSBackend::tts_stream_begin(
+    Context& ctx,
+    const std::vector<int>& text_tokens,
+    const std::vector<float>& speaker_embedding,
+    int speaker_id,
+    const std::vector<int>& instruct_tokens,
+    int language_id,
+    const GenerationConfig& gen_config,
+    int stream_batch_frames) {
+    if (text_tokens.empty()) {
+        return false;
+    }
+
+    reset();
+    stream_session_ = std::make_unique<TtsStreamSession>();
+    TtsStreamSession& s = *stream_session_;
+    s.active = true;
+    s.gen_config = gen_config;
+    s.eos_id = talker_cfg_.codec_eos_token_id;
+    static const int session_min_frames = std::max(
+        1, aila::env::read_int_raw("AILA_TTS_SESSION_MAX_FRAMES", 512));
+    s.max_tokens = std::max(gen_config.max_new_tokens, session_min_frames);
+    s.stream_batch_frames = std::clamp(stream_batch_frames, 1, 24);
+    last_tts_timing_ = TtsBackendTiming{};
+    const auto timing_start = std::chrono::high_resolution_clock::now();
+
+    const aila::Qwen3TtsTextLayout layout =
+        aila::parse_qwen3_tts_text_layout(text_tokens);
+    if (layout.body_tokens.empty()) {
+        stream_session_.reset();
+        return false;
+    }
+    s.text_state.Begin(layout.body_tokens);
+    const int trailing_token_count =
+        std::max(0, static_cast<int>(layout.body_tokens.size()) - 1);
+    s.trailing_len = trailing_token_count;
+
+    const int length = static_cast<int>(text_tokens.size());
+    const int hidden = talker_cfg_.hidden_size;
+    const int qd = talker_cfg_.num_attention_heads * talker_cfg_.head_dim;
+    const int kvd = talker_cfg_.num_key_value_heads * talker_cfg_.head_dim;
+    const int ff = talker_cfg_.intermediate_size;
+    const int pred_hidden = predictor_cfg_.hidden_size;
+    const int pred_qd = predictor_cfg_.num_attention_heads * predictor_cfg_.head_dim;
+    const int pred_kvd = predictor_cfg_.num_key_value_heads * predictor_cfg_.head_dim;
+    const int pred_ff = predictor_cfg_.intermediate_size;
+
+    const int text_body_start = layout.text_body_start;
+    const int text_body_end = layout.text_body_end;
+
+    // Text projection over the full formatted token sequence.
+    Tensor text_ids_dev = Tensor::allocate(
+        ctx, {length}, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(text_ids_dev.data(), text_tokens.data(),
+                   length * sizeof(int));
+    Tensor text_emb = Tensor::allocate(ctx, {length, 2048});
+    ops::embedding_lookup(ctx, *talker_text_embed_weight_,
+                          text_ids_dev.data_as<int>(), length,
+                          text_emb, 2048);
+    Tensor fc1_out = Tensor::allocate(ctx, {length, 2048});
+    talker_text_proj_fc1_.forward_bias(ctx, text_emb,
+                                       *talker_text_proj_fc1_bias_,
+                                       fc1_out, length);
+    Tensor silu_out = Tensor::allocate(ctx, {length, 2048});
+    ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, length * 2048);
+    Tensor projected_text = Tensor::allocate(ctx, {length, hidden});
+    talker_text_proj_fc2_.forward_bias(ctx, silu_out,
+                                       *talker_text_proj_fc2_bias_,
+                                       projected_text, length);
+
+    Tensor& tts_bos_embed = precomputed_tts_bos_;
+    Tensor& tts_pad_embed = precomputed_tts_pad_;
+    Tensor& embed_codec_pad = precomputed_codec_pad_;
+    Tensor& embed_codec_bos = precomputed_codec_bos_;
+    auto get_talker_codec_embed = [&](int codec_id) {
+        Tensor c_id = Tensor::allocate(
+            ctx, {1}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(c_id.data(), &codec_id, sizeof(int));
+        Tensor out = Tensor::allocate(ctx, {1, hidden});
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_,
+                              c_id.data_as<int>(), 1, out, hidden);
+        return out;
+    };
+
+    bool has_instruct = !instruct_tokens.empty();
+    int instruct_offset = 0;
+    Tensor instruct_embeds;
+    if (has_instruct) {
+        const int ilen = static_cast<int>(instruct_tokens.size());
+        Tensor instruct_ids_dev = Tensor::allocate(
+            ctx, {ilen}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(instruct_ids_dev.data(), instruct_tokens.data(),
+                       ilen * sizeof(int));
+        Tensor instruct_text_emb = Tensor::allocate(ctx, {ilen, 2048});
+        ops::embedding_lookup(ctx, *talker_text_embed_weight_,
+                              instruct_ids_dev.data_as<int>(), ilen,
+                              instruct_text_emb, 2048);
+        Tensor inst_fc1 = Tensor::allocate(ctx, {ilen, 2048});
+        talker_text_proj_fc1_.forward_bias(ctx, instruct_text_emb,
+                                           *talker_text_proj_fc1_bias_,
+                                           inst_fc1, ilen);
+        Tensor inst_silu = Tensor::allocate(ctx, {ilen, 2048});
+        ops::sigmoid_mul(ctx, inst_fc1, inst_fc1, inst_silu, ilen * 2048);
+        instruct_embeds = Tensor::allocate(ctx, {ilen, hidden});
+        talker_text_proj_fc2_.forward_bias(ctx, inst_silu,
+                                           *talker_text_proj_fc2_bias_,
+                                           instruct_embeds, ilen);
+        instruct_offset = ilen;
+    }
+
+    std::vector<int> codec_prefill_ids;
+    if (language_id == 0) {
+        codec_prefill_ids = {
+            talker_cfg_.codec_nothink_id,
+            talker_cfg_.codec_think_bos_id,
+            talker_cfg_.codec_think_eos_id
+        };
+    } else {
+        codec_prefill_ids = {
+            talker_cfg_.codec_think_id,
+            talker_cfg_.codec_think_bos_id,
+            language_id,
+            talker_cfg_.codec_think_eos_id
+        };
+    }
+    const int codec_prefill_count = static_cast<int>(codec_prefill_ids.size());
+    const int prefill_base_len = 3 + codec_prefill_count + 2;
+    int has_spk = 0;
+    int spk_idx = 0;
+    if (tts_model_type_ == Qwen3TTSModelType::Base) {
+        has_spk = (speaker_embedding.size() == static_cast<size_t>(hidden)) ? 1 : 0;
+    } else if (tts_model_type_ == Qwen3TTSModelType::CustomVoice &&
+               speaker_id > 0) {
+        has_spk = 1;
+    }
+    if (has_spk) {
+        spk_idx = 3 + codec_prefill_count;
+    }
+    const int prefill_len = prefill_base_len + has_spk;
+    const int first_text_idx = prefill_len - 1;
+    const int pad_bos_idx = 3 + codec_prefill_count + has_spk;
+    const int total_prefill_len = instruct_offset + prefill_len;
+
+    Tensor prefill_embeds = Tensor::allocate(
+        ctx, {total_prefill_len, hidden});
+    {
+        bf16* dst = prefill_embeds.data_as<bf16>();
+        if (has_instruct) {
+            bf16* src_inst = instruct_embeds.data_as<bf16>();
+            ctx.queue().memcpy(dst, src_inst,
+                               instruct_offset * hidden * sizeof(bf16)).wait();
+            dst += instruct_offset * hidden;
+        }
+
+        bf16* src_role = projected_text.data_as<bf16>();
+        ctx.queue().memcpy(dst, src_role, 3 * hidden * sizeof(bf16)).wait();
+
+        Tensor codec_ids_dev = Tensor::allocate(
+            ctx, {codec_prefill_count}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(codec_ids_dev.data(), codec_prefill_ids.data(),
+                       codec_prefill_count * sizeof(int));
+        Tensor codec_embs = Tensor::allocate(
+            ctx, {codec_prefill_count, hidden});
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_,
+                              codec_ids_dev.data_as<int>(),
+                              codec_prefill_count, codec_embs, hidden);
+        bf16* c_embs = codec_embs.data_as<bf16>();
+        bf16* p_pad = tts_pad_embed.data_as<bf16>();
+        bf16* p_bos = tts_bos_embed.data_as<bf16>();
+        for (int i = 0; i < codec_prefill_count; ++i) {
+            ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+                dst[(3 + i) * hidden + h[0]] = c_embs[i * hidden + h[0]] + p_pad[h[0]];
+            });
+        }
+        ctx.queue().wait();
+
+        if (has_spk) {
+            if (tts_model_type_ == Qwen3TTSModelType::Base) {
+                Tensor spk_emb_dev = Tensor::allocate(ctx, {1, hidden});
+                std::vector<bf16> spk_bf16(hidden);
+                for (int h = 0; h < hidden; ++h) {
+                    spk_bf16[static_cast<size_t>(h)] = bf16(speaker_embedding[static_cast<size_t>(h)]);
+                }
+                ctx.memcpy_h2d(spk_emb_dev.data(), spk_bf16.data(),
+                               hidden * sizeof(bf16));
+                bf16* s_emb = spk_emb_dev.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+                    dst[spk_idx * hidden + h[0]] = s_emb[h[0]] + p_pad[h[0]];
+                });
+            } else {
+                Tensor spk_codec = get_talker_codec_embed(speaker_id);
+                bf16* s_emb = spk_codec.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+                    dst[spk_idx * hidden + h[0]] = s_emb[h[0]] + p_pad[h[0]];
+                });
+            }
+            ctx.queue().wait();
+        }
+
+        bf16* c_pad = embed_codec_pad.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+            dst[pad_bos_idx * hidden + h[0]] = c_pad[h[0]] + p_bos[h[0]];
+        });
+        ctx.queue().wait();
+
+        if (text_body_end > text_body_start) {
+            bf16* first_text =
+                projected_text.data_as<bf16>() + text_body_start * hidden;
+            bf16* c_bos = embed_codec_bos.data_as<bf16>();
+            ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+                dst[first_text_idx * hidden + h[0]] = first_text[h[0]] + c_bos[h[0]];
+            });
+        } else {
+            bf16* p_eos = precomputed_tts_eos_.data_as<bf16>();
+            bf16* c_bos = embed_codec_bos.data_as<bf16>();
+            ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> h) {
+                dst[first_text_idx * hidden + h[0]] = p_eos[h[0]] + c_bos[h[0]];
+            });
+        }
+        ctx.queue().wait();
+    }
+
+    // Trailing text hidden: body tokens after the first, without eos yet.
+    if (trailing_token_count > 0) {
+        s.trailing_text_hidden = Tensor::allocate(
+            ctx, {trailing_token_count, hidden});
+        bf16* all_proj = projected_text.data_as<bf16>();
+        bf16* trailing_ptr = s.trailing_text_hidden.data_as<bf16>();
+        ctx.queue().memcpy(trailing_ptr,
+                           all_proj + (text_body_start + 1) * hidden,
+                           static_cast<size_t>(trailing_token_count) *
+                               hidden * sizeof(bf16)).wait();
+    } else {
+        s.trailing_text_hidden = Tensor::allocate(ctx, {1, hidden});
+    }
+
+    ensure_talker_runtime_buffers(ctx, total_prefill_len);
+    ensure_talker_prefill_scores(ctx, total_prefill_len);
+    ctx.queue().memcpy(t_buf_.hidden.data(), prefill_embeds.data(),
+                       total_prefill_len * hidden * sizeof(bf16)).wait();
+    ops::rms_norm(ctx, t_buf_.hidden, *talker_layers_[0].input_ln_weight,
+                  talker_cfg_.rms_norm_eps, t_buf_.normed,
+                  total_prefill_len, hidden);
+
+    int rotary_dim_talker = talker_cfg_.head_dim;
+    if (rotary_dim_talker & 1) {
+        --rotary_dim_talker;
+    }
+    for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
+        auto& layer = talker_layers_[static_cast<size_t>(i)];
+        layer.qkv_proj.forward(ctx, t_buf_.normed, t_buf_.qkv,
+                               total_prefill_len);
+        ops::split_qkv(ctx, t_buf_.qkv, t_buf_.q, t_buf_.k, t_buf_.v,
+                       total_prefill_len, qd, kvd);
+        ops::head_rms_norm(ctx, t_buf_.q, *layer.q_norm_weight,
+                           talker_cfg_.rms_norm_eps, total_prefill_len,
+                           talker_cfg_.num_attention_heads,
+                           talker_cfg_.head_dim);
+        ops::head_rms_norm(ctx, t_buf_.k, *layer.k_norm_weight,
+                           talker_cfg_.rms_norm_eps, total_prefill_len,
+                           talker_cfg_.num_key_value_heads,
+                           talker_cfg_.head_dim);
+        ops::apply_rope_partial(ctx, t_buf_.q, t_buf_.k, total_prefill_len, 0,
+                                talker_cfg_.num_attention_heads,
+                                talker_cfg_.num_key_value_heads,
+                                talker_cfg_.head_dim, rotary_dim_talker,
+                                talker_cfg_.rope_theta);
+        ops::copy_to_cache(ctx, t_buf_.k, talker_kv_cache_.k_cache(i),
+                           total_prefill_len, 0,
+                           talker_cfg_.num_key_value_heads,
+                           talker_cfg_.head_dim,
+                           talker_kv_cache_.max_length());
+        ops::copy_to_cache(ctx, t_buf_.v, talker_kv_cache_.v_cache(i),
+                           total_prefill_len, 0,
+                           talker_cfg_.num_key_value_heads,
+                           talker_cfg_.head_dim,
+                           talker_kv_cache_.max_length());
+        ops::attention_prefill(ctx, t_buf_.q, t_buf_.k, t_buf_.v,
+                               t_buf_.attn_out, t_buf_.scores,
+                               total_prefill_len,
+                               talker_cfg_.num_attention_heads,
+                               talker_cfg_.num_key_value_heads,
+                               talker_cfg_.head_dim);
+        layer.o_proj.forward(ctx, t_buf_.attn_out, t_buf_.gate,
+                             total_prefill_len);
+        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.gate,
+                                *layer.post_attn_ln_weight,
+                                talker_cfg_.rms_norm_eps, t_buf_.normed,
+                                total_prefill_len, hidden);
+        layer.gate_up_proj.forward(ctx, t_buf_.normed, t_buf_.gate_up,
+                                   total_prefill_len);
+        ops::split_gate_up(ctx, t_buf_.gate_up, t_buf_.gate, t_buf_.up,
+                           total_prefill_len, ff);
+        ops::swiglu(ctx, t_buf_.gate, t_buf_.up, t_buf_.gate,
+                    total_prefill_len * ff);
+        layer.down_proj.forward(ctx, t_buf_.gate, t_buf_.attn_out,
+                                total_prefill_len);
+        Tensor* next_input_ln =
+            (i < talker_cfg_.num_hidden_layers - 1)
+                ? talker_layers_[static_cast<size_t>(i + 1)].input_ln_weight
+                : talker_final_norm_weight_;
+        ops::fused_add_rms_norm(ctx, t_buf_.hidden, t_buf_.attn_out,
+                                *next_input_ln, talker_cfg_.rms_norm_eps,
+                                t_buf_.normed, total_prefill_len, hidden);
+    }
+
+    Tensor final_hidden = Tensor::allocate(ctx, {1, hidden});
+    {
+        bf16* src = t_buf_.hidden.data_as<bf16>();
+        bf16* dst = final_hidden.data_as<bf16>();
+        ctx.queue().memcpy(dst,
+                           src + (total_prefill_len - 1) * hidden,
+                           hidden * sizeof(bf16)).wait();
+    }
+    Tensor final_normed = Tensor::allocate(ctx, {1, hidden});
+    ops::rms_norm(ctx, final_hidden, *talker_final_norm_weight_,
+                  talker_cfg_.rms_norm_eps, final_normed, 1, hidden);
+    talker_codec_head_.forward(ctx, final_normed, t_buf_.logits, 1);
+
+    std::vector<int> suppress_eos = {s.eos_id};
+    const int first_token = ops::sample_with_config(
+        ctx, t_buf_.logits, talker_cfg_.vocab_size, gen_config, {},
+        &suppress_eos);
+    talker_kv_cache_.advance(total_prefill_len);
+    current_talker_len_ = total_prefill_len;
+
+    GenerationConfig tts_gen = gen_config;
+    if (tts_gen.repetition_penalty == 1.0f) {
+        tts_gen.repetition_penalty = 1.1f;
+    }
+    s.gen_config = tts_gen;
+    s.token = first_token;
+    if (first_token != s.eos_id) {
+        s.generated_cb0_tokens.push_back(first_token);
+    }
+
+    s.past_hidden_talker = Tensor::allocate(ctx, {1, hidden});
+    ctx.queue().memcpy(s.past_hidden_talker.data(), final_normed.data(),
+                       hidden * sizeof(bf16)).wait();
+    s.pred_input = Tensor::allocate(ctx, {2, hidden});
+    s.token_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+    s.frame_codes_dev = Tensor::allocate(
+        ctx, {16}, dnnl::memory::data_type::s32);
+    s.last_id_hidden = Tensor::allocate(ctx, {1, hidden});
+    s.predictor_final_hidden = Tensor::allocate(ctx, {1, pred_hidden});
+    s.predictor_final_normed = Tensor::allocate(ctx, {1, pred_hidden});
+    s.predictor_emb_h = Tensor::allocate(ctx, {1, hidden});
+    s.predictor_emb_pred = Tensor::allocate(ctx, {1, pred_hidden});
+    s.predictor_step_normed = Tensor::allocate(ctx, {1, pred_hidden});
+    s.sum_emb = Tensor::allocate(ctx, {1, hidden});
+    s.single_emb = Tensor::allocate(ctx, {1, hidden});
+    s.step_normed_talker = Tensor::allocate(ctx, {1, hidden});
+    s.final_normed_talker = Tensor::allocate(ctx, {1, hidden});
+    s.token_upload_storage.resize(
+        static_cast<size_t>(std::max(1, s.max_tokens)) * 16 + 16);
+    s.token_upload_index = 0;
+    s.pending_callback_codes.reserve(
+        static_cast<size_t>(std::min(24, std::max(stream_batch_frames, 8))) * 16);
+
+    s.playback_aware_steady_batch =
+        aila::env::read_flag("AILA_TTS_PLAYBACK_AWARE_STEADY_BATCH", false);
+    const int default_steady = std::min(
+        24, std::max(stream_batch_frames, 8));
+    s.steady_callback_batch_frames = s.playback_aware_steady_batch
+        ? std::clamp(aila::env::read_int_raw(
+                         "AILA_TTS_STEADY_STREAM_BATCH_FRAMES", default_steady),
+                     stream_batch_frames, 24)
+        : stream_batch_frames;
+    const int default_initial = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_STREAM_BATCH_FRAMES", stream_batch_frames),
+        1, stream_batch_frames);
+    s.initial_callback_batch_frames = std::clamp(
+        aila::env::read_int_raw("AILA_TTS_INITIAL_STREAM_BATCH_FRAMES", default_initial),
+        1, stream_batch_frames);
+    last_tts_timing_.stream_batch_frames = stream_batch_frames;
+    last_tts_timing_.initial_stream_batch_frames = s.initial_callback_batch_frames;
+    last_tts_timing_.steady_stream_batch_frames = s.steady_callback_batch_frames;
+    last_tts_timing_.playback_aware_steady_batch =
+        s.playback_aware_steady_batch ? 1 : 0;
+
+    const int max_stream_frames = std::max(
+        1024, std::min(4096, std::max(128, s.max_tokens + 256)));
+    if (!init_mimi_stream(ctx, s.mimi_state, max_stream_frames)) {
+        stream_session_.reset();
+        return false;
+    }
+    last_tts_timing_.mimi_init_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - timing_start).count();
+
+    AILA_LOG_INFO("[TTS-Session] begin body_tokens=%zu trailing=%d max_frames=%d",
+                  layout.body_tokens.size(), s.trailing_len, max_stream_frames);
+    return true;
+}
+
+Qwen3TTSBackend::TtsStreamStepResult Qwen3TTSBackend::tts_stream_step(
+    Context& ctx,
+    std::vector<float>& audio_out) {
+    if (!stream_session_ || !stream_session_->active) {
+        AILA_LOG_ERROR("[TTS-Session] step called without active session");
+        return TtsStreamStepResult::Error;
+    }
+    TtsStreamSession& s = *stream_session_;
+    audio_out.clear();
+
+    if (s.eos_reached || s.gen_step >= s.max_tokens) {
+        s.eos_reached = true;
+        return TtsStreamStepResult::Eos;
+    }
+    if (s.token == s.eos_id) {
+        s.eos_reached = true;
+        return TtsStreamStepResult::Eos;
+    }
+
+    const int hidden = talker_cfg_.hidden_size;
+    const int qd = talker_cfg_.num_attention_heads * talker_cfg_.head_dim;
+    const int kvd = talker_cfg_.num_key_value_heads * talker_cfg_.head_dim;
+    const int ff = talker_cfg_.intermediate_size;
+    const int pred_hidden = predictor_cfg_.hidden_size;
+    const int pred_qd = predictor_cfg_.num_attention_heads * predictor_cfg_.head_dim;
+    const int pred_kvd = predictor_cfg_.num_key_value_heads * predictor_cfg_.head_dim;
+    const int pred_ff = predictor_cfg_.intermediate_size;
+    const int rotary_dim_talker =
+        (talker_cfg_.head_dim & 1) ? talker_cfg_.head_dim - 1 : talker_cfg_.head_dim;
+    const int rotary_dim_pred =
+        (predictor_cfg_.head_dim & 1) ? predictor_cfg_.head_dim - 1 : predictor_cfg_.head_dim;
+
+    auto upload_token_async = [&](int value) {
+        if (s.token_upload_index < s.token_upload_storage.size()) {
+            s.token_upload_storage[s.token_upload_index] = value;
+            ctx.queue().memcpy(s.token_dev.data(),
+                               &s.token_upload_storage[s.token_upload_index],
+                               sizeof(int));
+            ++s.token_upload_index;
+        } else {
+            ctx.memcpy_h2d(s.token_dev.data(), &value, sizeof(int));
+        }
+    };
+
+    std::array<int, 16> frame_codes{};
+    frame_codes[0] = s.token;
+
+    upload_token_async(s.token);
+    ops::embedding_lookup(ctx, *talker_codec_embed_weight_,
+                          s.token_dev.data_as<int>(), 1,
+                          s.last_id_hidden, hidden);
+
+    {
+        bf16* dst = s.pred_input.data_as<bf16>();
+        bf16* src_past = s.past_hidden_talker.data_as<bf16>();
+        bf16* src_last = s.last_id_hidden.data_as<bf16>();
+        ctx.queue().memcpy(dst, src_past, hidden * sizeof(bf16));
+        ctx.queue().memcpy(dst + hidden, src_last, hidden * sizeof(bf16));
+    }
+
+    if (has_predictor_projection_) {
+        predictor_projection_linear_.forward_bias(
+            ctx, s.pred_input, *predictor_projection_bias_,
+            p_buf_.pred_input_proj, 2);
+    } else {
+        ctx.queue().memcpy(p_buf_.pred_input_proj.data(), s.pred_input.data(),
+                           2 * pred_hidden * sizeof(bf16));
+    }
+
+    predictor_kv_cache_.reset();
+    ctx.queue().memcpy(p_buf_.hidden.data(), p_buf_.pred_input_proj.data(),
+                       2 * pred_hidden * sizeof(bf16));
+    ops::rms_norm(ctx, p_buf_.hidden, *predictor_layers_[0].input_ln_weight,
+                  predictor_cfg_.rms_norm_eps, p_buf_.normed, 2, pred_hidden);
+
+    for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
+        auto& layer = predictor_layers_[static_cast<size_t>(i)];
+        layer.qkv_proj.forward(ctx, p_buf_.normed, p_buf_.qkv, 2);
+        ops::split_qkv(ctx, p_buf_.qkv, p_buf_.q, p_buf_.k, p_buf_.v,
+                       2, pred_qd, pred_kvd);
+        ops::head_rms_norm(ctx, p_buf_.q, *layer.q_norm_weight,
+                           predictor_cfg_.rms_norm_eps, 2,
+                           predictor_cfg_.num_attention_heads,
+                           predictor_cfg_.head_dim);
+        ops::head_rms_norm(ctx, p_buf_.k, *layer.k_norm_weight,
+                           predictor_cfg_.rms_norm_eps, 2,
+                           predictor_cfg_.num_key_value_heads,
+                           predictor_cfg_.head_dim);
+        ops::apply_rope_partial(ctx, p_buf_.q, p_buf_.k, 2, 0,
+                                predictor_cfg_.num_attention_heads,
+                                predictor_cfg_.num_key_value_heads,
+                                predictor_cfg_.head_dim, rotary_dim_pred,
+                                predictor_cfg_.rope_theta);
+        ops::copy_to_cache(ctx, p_buf_.k, predictor_kv_cache_.k_cache(i), 2, 0,
+                           predictor_cfg_.num_key_value_heads,
+                           predictor_cfg_.head_dim,
+                           predictor_kv_cache_.max_length());
+        ops::copy_to_cache(ctx, p_buf_.v, predictor_kv_cache_.v_cache(i), 2, 0,
+                           predictor_cfg_.num_key_value_heads,
+                           predictor_cfg_.head_dim,
+                           predictor_kv_cache_.max_length());
+        ops::attention_prefill(ctx, p_buf_.q, p_buf_.k, p_buf_.v,
+                               p_buf_.attn_out, p_buf_.scores, 2,
+                               predictor_cfg_.num_attention_heads,
+                               predictor_cfg_.num_key_value_heads,
+                               predictor_cfg_.head_dim);
+        layer.o_proj.forward(ctx, p_buf_.attn_out, p_buf_.gate, 2);
+        ops::fused_add_rms_norm(ctx, p_buf_.hidden, p_buf_.gate,
+                                *layer.post_attn_ln_weight,
+                                predictor_cfg_.rms_norm_eps, p_buf_.normed,
+                                2, pred_hidden);
+        layer.gate_up_proj.forward(ctx, p_buf_.normed, p_buf_.gate_up, 2);
+        ops::split_gate_up(ctx, p_buf_.gate_up, p_buf_.gate, p_buf_.up,
+                           2, pred_ff);
+        ops::swiglu(ctx, p_buf_.gate, p_buf_.up, p_buf_.gate, 2 * pred_ff);
+        layer.down_proj.forward(ctx, p_buf_.gate, p_buf_.attn_out, 2);
+        Tensor* next_input_ln =
+            (i < predictor_cfg_.num_hidden_layers - 1)
+                ? predictor_layers_[static_cast<size_t>(i + 1)].input_ln_weight
+                : predictor_final_norm_weight_;
+        ops::fused_add_rms_norm(ctx, p_buf_.hidden, p_buf_.attn_out,
+                                *next_input_ln, predictor_cfg_.rms_norm_eps,
+                                p_buf_.normed, 2, pred_hidden);
+    }
+
+    ctx.queue().memcpy(s.predictor_final_hidden.data(),
+                       p_buf_.hidden.data_as<bf16>() + pred_hidden,
+                       pred_hidden * sizeof(bf16));
+    ops::rms_norm(ctx, s.predictor_final_hidden, *predictor_final_norm_weight_,
+                  predictor_cfg_.rms_norm_eps, s.predictor_final_normed,
+                  1, pred_hidden);
+    predictor_lm_heads_[0].forward(ctx, s.predictor_final_normed,
+                                   p_buf_.logits, 1);
+    int tok = ops::sample_with_config(ctx, p_buf_.logits,
+                                      predictor_cfg_.vocab_size,
+                                      s.gen_config, {});
+    frame_codes[1] = tok;
+    predictor_kv_cache_.advance(2);
+
+    for (int cb_idx = 1; cb_idx < 15; cb_idx++) {
+        upload_token_async(tok);
+        ops::embedding_lookup(
+            ctx, *predictor_embed_weights_[static_cast<size_t>(cb_idx - 1)],
+            s.token_dev.data_as<int>(), 1, s.predictor_emb_h, hidden);
+
+        if (has_predictor_projection_) {
+            predictor_projection_linear_.forward_bias(
+                ctx, s.predictor_emb_h, *predictor_projection_bias_,
+                s.predictor_emb_pred, 1);
+        } else {
+            ctx.queue().memcpy(s.predictor_emb_pred.data(),
+                               s.predictor_emb_h.data(),
+                               pred_hidden * sizeof(bf16));
+        }
+
+        ctx.queue().memcpy(
+            p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * pred_hidden,
+            s.predictor_emb_pred.data(), pred_hidden * sizeof(bf16));
+        ops::rms_norm(ctx, s.predictor_emb_pred,
+                      *predictor_layers_[0].input_ln_weight,
+                      predictor_cfg_.rms_norm_eps, s.predictor_step_normed,
+                      1, pred_hidden);
+
+        for (int i = 0; i < predictor_cfg_.num_hidden_layers; i++) {
+            auto& layer = predictor_layers_[static_cast<size_t>(i)];
+            layer.qkv_proj.forward(ctx, s.predictor_step_normed,
+                                   p_buf_.qkv, 1);
+            bf16* qkv_ptr = p_buf_.qkv.data_as<bf16>();
+            Tensor q_dec = Tensor::view(ctx, qkv_ptr, {1, pred_qd});
+            Tensor k_dec = Tensor::view(ctx, qkv_ptr + pred_qd, {1, pred_kvd});
+            Tensor v_dec = Tensor::view(
+                ctx, qkv_ptr + pred_qd + pred_kvd, {1, pred_kvd});
+            ops::decode_prepare_qkv_partial(
+                ctx, q_dec, k_dec, v_dec,
+                *layer.q_norm_weight, *layer.k_norm_weight,
+                predictor_kv_cache_.k_cache(i), predictor_kv_cache_.v_cache(i),
+                predictor_kv_cache_.current_length(),
+                predictor_cfg_.num_attention_heads,
+                predictor_cfg_.num_key_value_heads,
+                predictor_cfg_.head_dim, predictor_cfg_.rms_norm_eps,
+                rotary_dim_pred, predictor_cfg_.rope_theta);
+            ops::attention_decode(
+                ctx, q_dec, predictor_kv_cache_.k_cache(i),
+                predictor_kv_cache_.v_cache(i), p_buf_.attn_out,
+                p_buf_.decode_scores, predictor_cfg_.num_attention_heads,
+                predictor_cfg_.num_key_value_heads, predictor_cfg_.head_dim,
+                predictor_kv_cache_.current_length() + 1,
+                &p_buf_.decode_attn_partials);
+            layer.o_proj.forward(ctx, p_buf_.attn_out, p_buf_.gate, 1);
+            ops::fused_add_rms_norm(ctx, s.predictor_emb_pred, p_buf_.gate,
+                                    *layer.post_attn_ln_weight,
+                                    predictor_cfg_.rms_norm_eps,
+                                    s.predictor_step_normed, 1, pred_hidden);
+            layer.gate_up_proj.forward(ctx, s.predictor_step_normed,
+                                       p_buf_.gate_up, 1);
+            ops::fused_gate_up_swiglu(ctx, p_buf_.gate_up, p_buf_.gate,
+                                      pred_ff);
+            layer.down_proj.forward(ctx, p_buf_.gate, p_buf_.attn_out, 1);
+            Tensor* next_input_ln =
+                (i < predictor_cfg_.num_hidden_layers - 1)
+                    ? predictor_layers_[static_cast<size_t>(i + 1)].input_ln_weight
+                    : predictor_final_norm_weight_;
+            ops::fused_add_rms_norm(ctx, s.predictor_emb_pred, p_buf_.attn_out,
+                                    *next_input_ln, predictor_cfg_.rms_norm_eps,
+                                    s.predictor_step_normed, 1, pred_hidden);
+        }
+        ctx.queue().memcpy(
+            p_buf_.hidden.data_as<bf16>() + (cb_idx + 1) * pred_hidden,
+            s.predictor_emb_pred.data(), pred_hidden * sizeof(bf16));
+
+        ops::rms_norm(ctx, s.predictor_emb_pred, *predictor_final_norm_weight_,
+                      predictor_cfg_.rms_norm_eps, s.predictor_final_normed,
+                      1, pred_hidden);
+        predictor_lm_heads_[static_cast<size_t>(cb_idx)].forward(
+            ctx, s.predictor_final_normed, p_buf_.logits, 1);
+        tok = ops::sample_with_config(ctx, p_buf_.logits,
+                                      predictor_cfg_.vocab_size,
+                                      s.gen_config, {});
+        frame_codes[static_cast<size_t>(cb_idx + 1)] = tok;
+        predictor_kv_cache_.advance(1);
+    }
+
+    for (int code : frame_codes) {
+        s.pending_callback_codes.push_back(static_cast<int32_t>(code));
+    }
+    ++s.pending_callback_frames;
+    const bool frame_uses_real_text = s.gen_step < s.trailing_len;
+    if (frame_uses_real_text) {
+        ++s.pending_callback_real_frames;
+    }
+
+    ctx.queue().memcpy(s.frame_codes_dev.data(), frame_codes.data(),
+                       frame_codes.size() * sizeof(int));
+    int* frame_codes_ptr = s.frame_codes_dev.data_as<int>();
+    ops::embedding_lookup(ctx, *talker_codec_embed_weight_, frame_codes_ptr,
+                          1, s.sum_emb, hidden);
+    for (int i = 0; i < 15; i++) {
+        ops::embedding_lookup(ctx, *predictor_embed_weights_[static_cast<size_t>(i)],
+                              frame_codes_ptr + i + 1, 1, s.single_emb, hidden);
+        bf16* sum_ptr = s.sum_emb.data_as<bf16>();
+        bf16* sgl_ptr = s.single_emb.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> idx) {
+            sum_ptr[idx[0]] = sum_ptr[idx[0]] + sgl_ptr[idx[0]];
+        });
+    }
+
+    bf16* sum_ptr = s.sum_emb.data_as<bf16>();
+    bf16* add_ptr = s.gen_step < s.trailing_len
+        ? s.trailing_text_hidden.data_as<bf16>() + s.gen_step * hidden
+        : precomputed_tts_pad_.data_as<bf16>();
+    ctx.queue().parallel_for(sycl::range<1>(hidden), [=](sycl::id<1> idx) {
+        sum_ptr[idx[0]] = sum_ptr[idx[0]] + add_ptr[idx[0]];
+    });
+
+    ops::rms_norm(ctx, s.sum_emb, *talker_layers_[0].input_ln_weight,
+                  talker_cfg_.rms_norm_eps, s.step_normed_talker, 1, hidden);
+    const int current_pos = current_talker_len_;
+    for (int i = 0; i < talker_cfg_.num_hidden_layers; i++) {
+        auto& layer = talker_layers_[static_cast<size_t>(i)];
+        layer.qkv_proj.forward(ctx, s.step_normed_talker, t_buf_.qkv, 1);
+        bf16* qkv_ptr = t_buf_.qkv.data_as<bf16>();
+        Tensor q_dec = Tensor::view(ctx, qkv_ptr, {1, qd});
+        Tensor k_dec = Tensor::view(ctx, qkv_ptr + qd, {1, kvd});
+        Tensor v_dec = Tensor::view(ctx, qkv_ptr + qd + kvd, {1, kvd});
+        ops::decode_prepare_qkv_partial(
+            ctx, q_dec, k_dec, v_dec,
+            *layer.q_norm_weight, *layer.k_norm_weight,
+            talker_kv_cache_.k_cache(i), talker_kv_cache_.v_cache(i),
+            current_pos, talker_cfg_.num_attention_heads,
+            talker_cfg_.num_key_value_heads, talker_cfg_.head_dim,
+            talker_cfg_.rms_norm_eps, rotary_dim_talker,
+            talker_cfg_.rope_theta);
+        ops::attention_decode(
+            ctx, q_dec, talker_kv_cache_.k_cache(i), talker_kv_cache_.v_cache(i),
+            t_buf_.attn_out, t_buf_.decode_scores,
+            talker_cfg_.num_attention_heads, talker_cfg_.num_key_value_heads,
+            talker_cfg_.head_dim, current_pos + 1,
+            &t_buf_.decode_attn_partials);
+        layer.o_proj.forward(ctx, t_buf_.attn_out, t_buf_.gate, 1);
+        ops::fused_add_rms_norm(ctx, s.sum_emb, t_buf_.gate,
+                                *layer.post_attn_ln_weight,
+                                talker_cfg_.rms_norm_eps,
+                                s.step_normed_talker, 1, hidden);
+        layer.gate_up_proj.forward(ctx, s.step_normed_talker,
+                                   t_buf_.gate_up, 1);
+        ops::fused_gate_up_swiglu(ctx, t_buf_.gate_up, t_buf_.gate, ff);
+        layer.down_proj.forward(ctx, t_buf_.gate, t_buf_.attn_out, 1);
+        Tensor* next_input_ln =
+            (i < talker_cfg_.num_hidden_layers - 1)
+                ? talker_layers_[static_cast<size_t>(i + 1)].input_ln_weight
+                : talker_final_norm_weight_;
+        ops::fused_add_rms_norm(ctx, s.sum_emb, t_buf_.attn_out,
+                                *next_input_ln, talker_cfg_.rms_norm_eps,
+                                s.step_normed_talker, 1, hidden);
+    }
+
+    ops::rms_norm(ctx, s.sum_emb, *talker_final_norm_weight_,
+                  talker_cfg_.rms_norm_eps, s.final_normed_talker, 1, hidden);
+    ctx.queue().memcpy(s.past_hidden_talker.data(),
+                       s.final_normed_talker.data(), hidden * sizeof(bf16));
+    talker_codec_head_.forward(ctx, s.final_normed_talker, t_buf_.logits, 1);
+
+    std::vector<int> suppress_eos;
+    const std::vector<int>* suppress_ptr = nullptr;
+    if (!s.finishing) {
+        suppress_eos.push_back(s.eos_id);
+        suppress_ptr = &suppress_eos;
+        ++s.eos_suppressed_count;
+    }
+    s.token = ops::sample_with_config(
+        ctx, t_buf_.logits, talker_cfg_.vocab_size, s.gen_config,
+        s.generated_cb0_tokens, suppress_ptr);
+    if (s.token != s.eos_id) {
+        s.generated_cb0_tokens.push_back(s.token);
+    }
+    talker_kv_cache_.advance(1);
+    ++current_talker_len_;
+    ++s.gen_step;
+    ++last_tts_timing_.total_frames;
+
+    if (s.finishing && !s.eos_reached) {
+        const int pad_after_finish =
+            std::max(0, s.gen_step - s.trailing_len);
+        static const int max_post_finish_frames = std::max(
+            1, aila::env::read_int_raw(
+                   "AILA_TTS_SESSION_POST_FINISH_FRAMES", 128));
+        if (pad_after_finish >= max_post_finish_frames) {
+            s.eos_reached = true;
+            if (s.pending_callback_real_frames > 0) {
+                const size_t keep_codes =
+                    static_cast<size_t>(s.pending_callback_real_frames) * 16;
+                s.pending_callback_codes.resize(keep_codes);
+                if (!decode_mimi_incremental(
+                        ctx, s.pending_callback_codes,
+                        s.pending_callback_real_frames, s.mimi_state,
+                        audio_out)) {
+                    AILA_LOG_ERROR(
+                        "[TTS-Session] post-finish mimi decode failed");
+                    return TtsStreamStepResult::Error;
+                }
+            }
+            s.pending_callback_codes.clear();
+            s.pending_callback_frames = 0;
+            s.pending_callback_real_frames = 0;
+            return TtsStreamStepResult::Eos;
+        }
+    }
+
+    const int threshold =
+        s.callback_batches_emitted == 0
+            ? s.initial_callback_batch_frames
+            : (s.playback_aware_steady_batch && s.use_steady_callback_batch
+                   ? s.steady_callback_batch_frames
+                   : s.stream_batch_frames);
+    const bool reached_threshold = s.pending_callback_frames >= threshold;
+    const bool stop_after_frame =
+        s.finishing && (s.token == s.eos_id || s.gen_step >= s.max_tokens);
+
+    if (reached_threshold || stop_after_frame) {
+        if (s.pending_callback_frames > 0) {
+            if (!decode_mimi_incremental(ctx, s.pending_callback_codes,
+                                         s.pending_callback_frames,
+                                         s.mimi_state, audio_out)) {
+                AILA_LOG_ERROR("[TTS-Session] mimi incremental decode failed frames=%d",
+                               s.pending_callback_frames);
+                return TtsStreamStepResult::Error;
+            }
+            ++s.callback_batches_emitted;
+            s.pending_callback_codes.clear();
+            s.pending_callback_frames = 0;
+            s.pending_callback_real_frames = 0;
+        }
+    }
+
+    if (stop_after_frame) {
+        s.eos_reached = true;
+        return TtsStreamStepResult::Eos;
+    }
+    return TtsStreamStepResult::Continue;
 }
 
 // 我们继承 IModelBackend 必须实现的 forward

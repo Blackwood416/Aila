@@ -49,6 +49,25 @@ int tts_audio_callback_max_frames() {
     return frames;
 }
 
+bool tts_stream_session_enabled() {
+    static const bool enabled =
+        aila::env::read_flag("AILA_TTS_STREAM_SESSION", true);
+    return enabled;
+}
+
+int tts_stream_session_idle_ms() {
+    static const int idle_ms = std::max(
+        0, aila::env::read_int_raw("AILA_TTS_STREAM_SESSION_IDLE_MS", 50));
+    return idle_ms;
+}
+
+int tts_session_keepalive_silence_ms() {
+    static const int keepalive_ms = std::max(
+        0, aila::env::read_int_raw(
+               "AILA_TTS_SESSION_KEEPALIVE_SILENCE_MS", 80));
+    return keepalive_ms;
+}
+
 int tts_audio_callback_max_samples() {
     return tts_audio_callback_max_frames() * kTtsSamplesPerFrame;
 }
@@ -214,6 +233,7 @@ void AliaTtsPipeline::begin_turn_metrics() {
     metrics_ = AliaTtsMetrics{};
     const TtsSilenceLookaheadPrefetchConfig prefetch_config =
         read_tts_silence_lookahead_prefetch_config();
+    metrics_.stream_session_enabled = tts_stream_session_enabled() ? 1 : 0;
     metrics_.silence_lookahead_prefetch_enabled =
         prefetch_config.enabled ? 1 : 0;
     metrics_.silence_lookahead_prefetch_min_text_bytes =
@@ -221,6 +241,7 @@ void AliaTtsPipeline::begin_turn_metrics() {
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = false;
     first_audio_synthesis_active_ = false;
+    emitted_audio_callback_count_ = 0;
     playback_segments_.clear();
     next_segment_id_ = 1;
     turn_output_samples_ = 0;
@@ -260,6 +281,7 @@ bool AliaTtsPipeline::start_async_turn(const AliaGenConfig& config,
         first_audio_buffer_.clear();
         first_audio_callback_emitted_ = false;
         first_audio_synthesis_active_ = false;
+        emitted_audio_callback_count_ = 0;
         async_config_ = config;
         async_audio_cb_ = audio_cb;
         async_user_data_ = user_data;
@@ -353,6 +375,7 @@ void AliaTtsPipeline::reset() {
     first_audio_buffer_.clear();
     first_audio_callback_emitted_ = false;
     first_audio_synthesis_active_ = false;
+    emitted_audio_callback_count_ = 0;
 }
 
 bool AliaTtsPipeline::ready() const {
@@ -376,6 +399,15 @@ bool AliaTtsPipeline::first_audio_callback_emitted() const {
 bool AliaTtsPipeline::first_audio_synthesis_active() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return first_audio_synthesis_active_;
+}
+
+bool AliaTtsPipeline::stream_session_enabled() const {
+    return tts_stream_session_enabled();
+}
+
+int AliaTtsPipeline::emitted_audio_callback_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return emitted_audio_callback_count_;
 }
 
 AliaTtsMetrics AliaTtsPipeline::last_metrics() const {
@@ -463,6 +495,7 @@ void AliaTtsPipeline::note_output_samples(int sample_count) {
 
 void AliaTtsPipeline::note_audio_callback() {
     std::lock_guard<std::mutex> lock(mutex_);
+    ++emitted_audio_callback_count_;
     if (interruption_requested_) {
         ++late_callback_count_;
     }
@@ -608,6 +641,211 @@ bool AliaTtsPipeline::ensure_reference_voice_loaded() {
                   reference_speaker_embedding_.size(),
                   reference_embedding_ms_);
     return true;
+}
+
+bool AliaTtsPipeline::synthesize_text_session_begin(
+    const std::string& text,
+    const AliaGenConfig& config,
+    std::function<bool()> should_cancel) {
+    if (text.empty() || !ready()) {
+        return false;
+    }
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return false;
+    }
+
+    Context* context = slot_->context();
+    Tokenizer* tokenizer = slot_->tokenizer();
+    IModelBackend* backend = slot_->backend();
+    const std::vector<int> text_tokens =
+        tokenizer->encode(format_tts_text_for_backend(text));
+    if (text_tokens.empty()) {
+        return false;
+    }
+    if (!ensure_reference_voice_loaded()) {
+        return cancelled();
+    }
+    std::vector<float> speaker_embedding;
+    {
+        std::lock_guard<std::mutex> voice_lock(reference_voice_mutex_);
+        speaker_embedding = reference_speaker_embedding_;
+    }
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend);
+    if (!tts_backend) {
+        return false;
+    }
+
+    bool ok = false;
+    {
+        auto lane_lock = context->lock_execution();
+        ok = tts_backend->tts_stream_begin(
+            *context,
+            text_tokens,
+            speaker_embedding,
+            0,
+            {},
+            0,
+            translate_tts_generation_config(config),
+            tts_stream_batch_frames());
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        metrics_.session_resets = 1;
+        metrics_.chunks_synthesized = 1;
+        first_audio_synthesis_active_ = true;
+    }
+    AILA_LOG_INFO("[AliaTTS-Session] begin text_bytes=%zu body_tokens=%zu ok=%d",
+                  text.size(), text_tokens.size(), ok ? 1 : 0);
+    return ok;
+}
+
+bool AliaTtsPipeline::synthesize_text_session_append(
+    const std::string& text,
+    std::function<bool()> should_cancel) {
+    if (text.empty() || !ready()) {
+        return false;
+    }
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return false;
+    }
+
+    Context* context = slot_->context();
+    Tokenizer* tokenizer = slot_->tokenizer();
+    IModelBackend* backend = slot_->backend();
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend);
+    if (!tts_backend || !tts_backend->tts_stream_session_active()) {
+        return false;
+    }
+    const std::vector<int> body_tokens = tokenizer->encode(text);
+    if (body_tokens.empty()) {
+        return false;
+    }
+
+    bool ok = false;
+    int appends = metrics_.session_text_appends;
+    {
+        auto lane_lock = context->lock_execution();
+        ok = tts_backend->tts_stream_append_text(*context, body_tokens);
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++metrics_.session_text_appends;
+        appends = metrics_.session_text_appends;
+    }
+    AILA_LOG_INFO("[AliaTTS-Session] append text_bytes=%zu body_tokens=%zu ok=%d appends=%d",
+                  text.size(), body_tokens.size(), ok ? 1 : 0,
+                  appends);
+    return ok;
+}
+
+bool AliaTtsPipeline::synthesize_text_session_step(
+    const AliaGenConfig& config,
+    AliaAudioCallback audio_cb,
+    void* user_data,
+    std::function<bool()> should_cancel,
+    std::vector<float>& audio_out,
+    bool& eos) {
+    audio_out.clear();
+    eos = false;
+    (void)config;
+    if (!audio_cb || !ready()) {
+        return false;
+    }
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return true;
+    }
+
+    Context* context = slot_->context();
+    IModelBackend* backend = slot_->backend();
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend);
+    if (!tts_backend || !tts_backend->tts_stream_session_active()) {
+        return false;
+    }
+
+    Qwen3TTSBackend::TtsStreamStepResult result =
+        Qwen3TTSBackend::TtsStreamStepResult::Continue;
+    {
+        auto lane_lock = context->lock_execution();
+        result = tts_backend->tts_stream_step(*context, audio_out);
+    }
+    if (result == Qwen3TTSBackend::TtsStreamStepResult::Error) {
+        AILA_LOG_ERROR("[AliaTTS-Session] step failed");
+        return false;
+    }
+    eos = result == Qwen3TTSBackend::TtsStreamStepResult::Eos;
+    if (eos) {
+        AILA_LOG_INFO("[AliaTTS-Session] step eos audio_samples=%zu",
+                      audio_out.size());
+    }
+    if (audio_out.empty()) {
+        return true;
+    }
+
+    note_output_samples(static_cast<int>(audio_out.size()));
+    std::vector<std::vector<float>> callbacks = prepare_audio_callbacks(audio_out);
+    for (const auto& callback_samples : callbacks) {
+        if (callback_samples.empty() || cancelled()) {
+            break;
+        }
+        note_audio_callback();
+        audio_cb(callback_samples.data(),
+                 static_cast<int>(callback_samples.size()),
+                 user_data);
+    }
+    return true;
+}
+
+bool AliaTtsPipeline::synthesize_text_session_finish(
+    std::function<bool()> should_cancel) {
+    if (!ready()) {
+        return false;
+    }
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+    if (cancelled()) {
+        return true;
+    }
+
+    Context* context = slot_->context();
+    IModelBackend* backend = slot_->backend();
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend);
+    if (!tts_backend || !tts_backend->tts_stream_session_active()) {
+        return false;
+    }
+
+    bool ok = false;
+    {
+        auto lane_lock = context->lock_execution();
+        ok = tts_backend->tts_stream_finish(*context);
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        metrics_.session_eos_suppressed =
+            tts_backend->tts_stream_session_eos_suppressed();
+    }
+    AILA_LOG_INFO("[AliaTTS-Session] finish ok=%d eos_suppressed=%d",
+                  ok ? 1 : 0,
+                  tts_backend->tts_stream_session_eos_suppressed());
+    return ok;
+}
+
+bool AliaTtsPipeline::synthesize_text_session_has_unconsumed_text() const {
+    if (!slot_ || !slot_->backend()) {
+        return false;
+    }
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(slot_->backend());
+    return tts_backend != nullptr &&
+           tts_backend->tts_stream_session_has_unconsumed_text();
 }
 
 bool AliaTtsPipeline::synthesize_text(const std::string& text,
@@ -971,64 +1209,146 @@ bool AliaTtsPipeline::synthesize_silence_with_lookahead(
 }
 
 void AliaTtsPipeline::async_worker_loop() {
-    bool processed_item = false;
+    if (!tts_stream_session_enabled()) {
+        bool processed_item = false;
+        while (true) {
+            TtsQueueItem item;
+            AliaGenConfig config{};
+            AliaAudioCallback audio_cb = nullptr;
+            void* user_data = nullptr;
+            std::function<bool()> should_cancel;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                const bool waiting_for_text = text_queue_.empty();
+                const auto queue_empty_wait_started = std::chrono::steady_clock::now();
+                cv_.wait(lock, [this]() {
+                    return async_finishing_ || !text_queue_.empty();
+                });
+                if (waiting_for_text && processed_item && !text_queue_.empty()) {
+                    const double queue_empty_wait_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - queue_empty_wait_started).count();
+                    ++metrics_.worker_queue_empty_wait_count;
+                    metrics_.worker_queue_empty_wait_ms_total += queue_empty_wait_ms;
+                    metrics_.worker_queue_empty_wait_ms_max = std::max(
+                        metrics_.worker_queue_empty_wait_ms_max,
+                        queue_empty_wait_ms);
+                }
+                if (text_queue_.empty()) {
+                    if (async_finishing_) {
+                        AliaAudioCallback finish_audio_cb = async_audio_cb_;
+                        void* finish_user_data = async_user_data_;
+                        auto finish_should_cancel = async_should_cancel_;
+                        lock.unlock();
+                        std::vector<float> final_first_audio;
+                        if (!(finish_should_cancel && finish_should_cancel())) {
+                            final_first_audio = flush_first_audio_buffer();
+                        }
+                        if (!final_first_audio.empty() && finish_audio_cb) {
+                            note_audio_callback();
+                            finish_audio_cb(final_first_audio.data(),
+                                            static_cast<int>(final_first_audio.size()),
+                                            finish_user_data);
+                        }
+                        lock.lock();
+                        async_active_ = false;
+                        return;
+                    }
+                    continue;
+                }
+                item = std::move(text_queue_.front());
+                text_queue_.pop_front();
+                const double text_queue_wait_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - item.enqueued_at).count();
+                if (metrics_.text_items_dequeued == 0) {
+                    metrics_.first_text_queue_wait_ms = text_queue_wait_ms;
+                }
+                ++metrics_.text_items_dequeued;
+                metrics_.text_queue_wait_ms_total += text_queue_wait_ms;
+                metrics_.text_queue_wait_ms_max = std::max(
+                    metrics_.text_queue_wait_ms_max, text_queue_wait_ms);
+                config = async_config_;
+                audio_cb = async_audio_cb_;
+                user_data = async_user_data_;
+                should_cancel = async_should_cancel_;
+            }
+
+            if (should_cancel && should_cancel()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                continue;
+            }
+            bool ok = false;
+            begin_playback_segment(item);
+            if (item.silence_ms > 0) {
+                ok = synthesize_silence_with_lookahead(
+                    item, config, audio_cb, user_data, should_cancel);
+            } else {
+                ok = synthesize_text(item.text, config, audio_cb, user_data, should_cancel);
+                finish_playback_segment(
+                    item.segment_id,
+                    ok && !(should_cancel && should_cancel()));
+            }
+            if (!ok) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+            }
+            processed_item = true;
+        }
+        return;
+    }
+
+    bool session_started = false;
+    bool finish_called = false;
+    bool session_finished = false;
+    const int idle_ms = tts_stream_session_idle_ms();
     while (true) {
         TtsQueueItem item;
+        bool have_item = false;
         AliaGenConfig config{};
         AliaAudioCallback audio_cb = nullptr;
         void* user_data = nullptr;
         std::function<bool()> should_cancel;
+        bool finishing_requested = false;
+        bool queue_empty = true;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            const bool waiting_for_text = text_queue_.empty();
-            const auto queue_empty_wait_started = std::chrono::steady_clock::now();
-            cv_.wait(lock, [this]() {
-                return async_finishing_ || !text_queue_.empty();
-            });
-            if (waiting_for_text && processed_item && !text_queue_.empty()) {
-                const double queue_empty_wait_ms =
+            const bool has_unconsumed_text =
+                session_started &&
+                synthesize_text_session_has_unconsumed_text();
+            const bool can_generate_ahead =
+                session_started && !async_finishing_ && has_unconsumed_text;
+            if (can_generate_ahead) {
+                // Keep generating ahead frames without waiting for new text.
+            } else if (session_started && text_queue_.empty()) {
+                cv_.wait_for(lock,
+                             std::chrono::milliseconds(idle_ms),
+                             [this]() {
+                                 return async_finishing_ || !text_queue_.empty();
+                             });
+            } else {
+                cv_.wait(lock, [this]() {
+                    return async_finishing_ || !text_queue_.empty();
+                });
+            }
+            finishing_requested = async_finishing_;
+            if (!text_queue_.empty()) {
+                item = std::move(text_queue_.front());
+                text_queue_.pop_front();
+                have_item = true;
+                const double text_queue_wait_ms =
                     std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - queue_empty_wait_started).count();
-                ++metrics_.worker_queue_empty_wait_count;
-                metrics_.worker_queue_empty_wait_ms_total += queue_empty_wait_ms;
-                metrics_.worker_queue_empty_wait_ms_max = std::max(
-                    metrics_.worker_queue_empty_wait_ms_max,
-                    queue_empty_wait_ms);
-            }
-            if (text_queue_.empty()) {
-                if (async_finishing_) {
-                    AliaAudioCallback finish_audio_cb = async_audio_cb_;
-                    void* finish_user_data = async_user_data_;
-                    auto finish_should_cancel = async_should_cancel_;
-                    lock.unlock();
-                    std::vector<float> final_first_audio;
-                    if (!(finish_should_cancel && finish_should_cancel())) {
-                        final_first_audio = flush_first_audio_buffer();
-                    }
-                    if (!final_first_audio.empty() && finish_audio_cb) {
-                        note_audio_callback();
-                        finish_audio_cb(final_first_audio.data(),
-                                        static_cast<int>(final_first_audio.size()),
-                                        finish_user_data);
-                    }
-                    lock.lock();
-                    async_active_ = false;
-                    return;
+                        std::chrono::steady_clock::now() - item.enqueued_at).count();
+                if (metrics_.text_items_dequeued == 0) {
+                    metrics_.first_text_queue_wait_ms = text_queue_wait_ms;
                 }
-                continue;
+                ++metrics_.text_items_dequeued;
+                metrics_.text_queue_wait_ms_total += text_queue_wait_ms;
+                metrics_.text_queue_wait_ms_max = std::max(
+                    metrics_.text_queue_wait_ms_max, text_queue_wait_ms);
             }
-            item = std::move(text_queue_.front());
-            text_queue_.pop_front();
-            const double text_queue_wait_ms =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - item.enqueued_at).count();
-            if (metrics_.text_items_dequeued == 0) {
-                metrics_.first_text_queue_wait_ms = text_queue_wait_ms;
-            }
-            ++metrics_.text_items_dequeued;
-            metrics_.text_queue_wait_ms_total += text_queue_wait_ms;
-            metrics_.text_queue_wait_ms_max = std::max(
-                metrics_.text_queue_wait_ms_max, text_queue_wait_ms);
+            queue_empty = text_queue_.empty();
             config = async_config_;
             audio_cb = async_audio_cb_;
             user_data = async_user_data_;
@@ -1038,24 +1358,132 @@ void AliaTtsPipeline::async_worker_loop() {
         if (should_cancel && should_cancel()) {
             std::lock_guard<std::mutex> lock(mutex_);
             async_failed_ = true;
+            break;
+        }
+
+        if (!session_started && have_item) {
+            if (item.silence_ms > 0) {
+                if (audio_cb && item.silence_ms > 0) {
+                    const int sample_count = std::max(
+                        1, static_cast<int>((static_cast<long long>(item.silence_ms) * 24000) / 1000));
+                    std::vector<float> silence(static_cast<size_t>(sample_count), 0.0f);
+                    note_output_samples(sample_count);
+                    std::vector<std::vector<float>> callbacks =
+                        prepare_audio_callbacks(silence);
+                    for (const auto& callback_samples : callbacks) {
+                        if (callback_samples.empty()) {
+                            break;
+                        }
+                        note_audio_callback();
+                        audio_cb(callback_samples.data(),
+                                 static_cast<int>(callback_samples.size()),
+                                 user_data);
+                    }
+                }
+                continue;
+            }
+            begin_playback_segment(item);
+            if (!synthesize_text_session_begin(item.text, config, should_cancel)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                break;
+            }
+            session_started = true;
+        } else if (session_started && have_item) {
+            if (item.silence_ms > 0) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(item.silence_ms);
+                while (std::chrono::steady_clock::now() < deadline &&
+                       !(should_cancel && should_cancel())) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                continue;
+            }
+            begin_playback_segment(item);
+            if (!synthesize_text_session_append(item.text, should_cancel)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                break;
+            }
+        }
+
+        if (finishing_requested && session_started && !finish_called &&
+            queue_empty) {
+            if (!synthesize_text_session_finish(should_cancel)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                break;
+            }
+            finish_called = true;
+        }
+
+        if (session_started &&
+            (have_item || finishing_requested ||
+             synthesize_text_session_has_unconsumed_text())) {
+            bool eos = false;
+            std::vector<float> audio_out;
+            if (!synthesize_text_session_step(
+                    config, audio_cb, user_data, should_cancel,
+                    audio_out, eos)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                break;
+            }
+            if (eos) {
+                session_finished = true;
+                break;
+            }
+        }
+
+        if (session_started && !finishing_requested && !have_item &&
+            first_audio_callback_emitted() &&
+            !synthesize_text_session_has_unconsumed_text() &&
+            tts_session_keepalive_silence_ms() > 0) {
+            const int keepalive_ms = tts_session_keepalive_silence_ms();
+            const int sample_count = std::max(
+                1, static_cast<int>((static_cast<long long>(keepalive_ms) * 24000) / 1000));
+            std::vector<float> silence(static_cast<size_t>(sample_count), 0.0f);
+            note_output_samples(sample_count);
+            std::vector<std::vector<float>> callbacks =
+                prepare_audio_callbacks(silence);
+            for (const auto& callback_samples : callbacks) {
+                if (callback_samples.empty()) {
+                    break;
+                }
+                note_audio_callback();
+                audio_cb(callback_samples.data(),
+                         static_cast<int>(callback_samples.size()),
+                         user_data);
+            }
             continue;
         }
-        bool ok = false;
-        begin_playback_segment(item);
-        if (item.silence_ms > 0) {
-            ok = synthesize_silence_with_lookahead(
-                item, config, audio_cb, user_data, should_cancel);
-        } else {
-            ok = synthesize_text(item.text, config, audio_cb, user_data, should_cancel);
-            finish_playback_segment(
-                item.segment_id,
-                ok && !(should_cancel && should_cancel()));
+
+        if (finishing_requested && !session_started && queue_empty) {
+            break;
         }
-        if (!ok) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            async_failed_ = true;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        AliaAudioCallback finish_audio_cb = async_audio_cb_;
+        void* finish_user_data = async_user_data_;
+        auto finish_should_cancel = async_should_cancel_;
+        lock.unlock();
+        std::vector<float> final_first_audio;
+        if (!(finish_should_cancel && finish_should_cancel())) {
+            final_first_audio = flush_first_audio_buffer();
         }
-        processed_item = true;
+        if (!final_first_audio.empty() && finish_audio_cb) {
+            note_audio_callback();
+            finish_audio_cb(final_first_audio.data(),
+                            static_cast<int>(final_first_audio.size()),
+                            finish_user_data);
+        }
+        lock.lock();
+        if (!session_finished && !async_failed_) {
+            metrics_.session_resets = 1;
+        }
+        async_active_ = false;
     }
 }
 
