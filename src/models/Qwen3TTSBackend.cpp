@@ -1403,8 +1403,11 @@ Qwen3TTSBackend::TtsStreamStepResult Qwen3TTSBackend::tts_stream_step(
     const bool reached_threshold = s.pending_callback_frames >= threshold;
     const bool stop_after_frame =
         s.finishing && (s.token == s.eos_id || s.gen_step >= s.max_tokens);
+    const bool flush_exhausted_text =
+        !s.finishing && s.pending_callback_frames > 0 &&
+        s.gen_step >= s.trailing_len && !reached_threshold;
 
-    if (reached_threshold || stop_after_frame) {
+    if (reached_threshold || stop_after_frame || flush_exhausted_text) {
         if (s.pending_callback_frames > 0) {
             if (!decode_mimi_incremental(ctx, s.pending_callback_codes,
                                          s.pending_callback_frames,

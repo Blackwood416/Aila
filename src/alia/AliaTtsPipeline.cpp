@@ -447,6 +447,12 @@ AliaTtsPlayedPrefix AliaTtsPipeline::resolve_played_prefix(
         playback_segments_, played_audio_samples, late_callback_count_);
 }
 
+std::vector<AliaTtsPlaybackSegment>
+AliaTtsPipeline::playback_segments_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return playback_segments_;
+}
+
 void AliaTtsPipeline::begin_playback_segment(const TtsQueueItem& item) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto existing = std::find_if(
@@ -552,6 +558,47 @@ std::vector<float> AliaTtsPipeline::flush_first_audio_buffer() {
     metrics_.first_backend_audio_samples = first_audio_samples;
     metrics_.audio_callback_max_frames = tts_audio_callback_max_frames();
     return padded;
+}
+
+bool AliaTtsPipeline::flush_first_audio_early(
+    AliaAudioCallback audio_cb,
+    void* user_data,
+    std::function<bool()> should_cancel) {
+    if (!audio_cb) {
+        return false;
+    }
+    auto cancelled = [&]() {
+        return should_cancel && should_cancel();
+    };
+
+    std::vector<float> buffered;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (first_audio_callback_emitted_ || first_audio_buffer_.empty()) {
+            return true;
+        }
+        buffered = std::move(first_audio_buffer_);
+        first_audio_buffer_.clear();
+        first_audio_callback_emitted_ = true;
+        first_audio_synthesis_active_ = false;
+        metrics_.first_backend_audio_samples = static_cast<int>(buffered.size());
+        metrics_.audio_callback_max_frames = tts_audio_callback_max_frames();
+    }
+    if (cancelled()) {
+        return true;
+    }
+    std::vector<std::vector<float>> callbacks;
+    append_audio_callbacks(callbacks, buffered, 0, buffered.size());
+    for (const auto& callback_samples : callbacks) {
+        if (callback_samples.empty() || cancelled()) {
+            break;
+        }
+        note_audio_callback();
+        audio_cb(callback_samples.data(),
+                 static_cast<int>(callback_samples.size()),
+                 user_data);
+    }
+    return true;
 }
 
 bool AliaTtsPipeline::ensure_reference_voice_loaded() {
@@ -800,6 +847,10 @@ bool AliaTtsPipeline::synthesize_text_session_step(
         audio_cb(callback_samples.data(),
                  static_cast<int>(callback_samples.size()),
                  user_data);
+    }
+    if (!eos && !first_audio_callback_emitted() &&
+        !synthesize_text_session_has_unconsumed_text()) {
+        flush_first_audio_early(audio_cb, user_data, should_cancel);
     }
     return true;
 }
@@ -1311,6 +1362,32 @@ void AliaTtsPipeline::async_worker_loop() {
             active_segment_id = -1;
         }
     };
+    auto drain_active_text = [&](const AliaGenConfig& config,
+                                 AliaAudioCallback audio_cb,
+                                 void* user_data,
+                                 const std::function<bool()>& should_cancel) -> bool {
+        while (session_started &&
+               synthesize_text_session_has_unconsumed_text()) {
+            if (should_cancel && should_cancel()) {
+                return false;
+            }
+            bool eos = false;
+            std::vector<float> audio_out;
+            if (!synthesize_text_session_step(
+                    config, audio_cb, user_data, should_cancel,
+                    audio_out, eos)) {
+                return false;
+            }
+            if (eos) {
+                session_finished = true;
+                return true;
+            }
+            if (!audio_out.empty()) {
+                keepalive_emitted_this_stall = false;
+            }
+        }
+        return true;
+    };
     while (true) {
         TtsQueueItem item;
         bool have_item = false;
@@ -1404,6 +1481,15 @@ void AliaTtsPipeline::async_worker_loop() {
             session_started = true;
         } else if (session_started && have_item) {
             keepalive_emitted_this_stall = false;
+            if (!drain_active_text(
+                    config, audio_cb, user_data, should_cancel)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                async_failed_ = true;
+                break;
+            }
+            if (session_finished) {
+                break;
+            }
             if (item.silence_ms > 0) {
                 finish_active_segment(true);
                 begin_playback_segment(item);

@@ -40,6 +40,7 @@ struct Options {
 struct AudioCapture {
     std::mutex mutex;
     std::vector<float> samples;
+    std::vector<std::chrono::steady_clock::time_point> callback_times;
     int callback_count = 0;
 };
 
@@ -136,7 +137,24 @@ void audio_callback(const float* samples, int count, void* user_data) {
     auto* capture = static_cast<AudioCapture*>(user_data);
     std::lock_guard<std::mutex> lock(capture->mutex);
     capture->samples.insert(capture->samples.end(), samples, samples + count);
+    capture->callback_times.push_back(std::chrono::steady_clock::now());
     ++capture->callback_count;
+}
+
+long long max_callback_gap_ms(AudioCapture& capture) {
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    if (capture.callback_times.size() < 2) {
+        return 0;
+    }
+    long long best = 0;
+    for (size_t i = 1; i < capture.callback_times.size(); ++i) {
+        const long long gap = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            capture.callback_times[i] - capture.callback_times[i - 1])
+            .count();
+        best = std::max(best, gap);
+    }
+    return best;
 }
 
 bool save_wav(const std::string& path, const std::vector<float>& samples,
@@ -197,6 +215,43 @@ size_t max_consecutive_low_energy_samples(const std::vector<float>& samples) {
         }
     }
     return best;
+}
+
+int expected_text_appends(const std::vector<std::string>& chunks) {
+    const aila::alia::TtsPauseSegmentConfig pause_config =
+        aila::alia::read_tts_pause_segment_config();
+    int text_items = 0;
+    for (const std::string& chunk : chunks) {
+        const std::vector<aila::alia::TtsPreparedSegment> segments =
+            aila::alia::split_tts_text_pause_segments(chunk, pause_config);
+        for (const auto& segment : segments) {
+            if (segment.kind == aila::alia::TtsPreparedSegmentKind::Text &&
+                !segment.text.empty()) {
+                ++text_items;
+            }
+        }
+    }
+    return std::max(0, text_items - 1);
+}
+
+int expected_queue_items(const std::vector<std::string>& chunks) {
+    const aila::alia::TtsPauseSegmentConfig pause_config =
+        aila::alia::read_tts_pause_segment_config();
+    int items = 0;
+    for (const std::string& chunk : chunks) {
+        const std::vector<aila::alia::TtsPreparedSegment> segments =
+            aila::alia::split_tts_text_pause_segments(chunk, pause_config);
+        for (const auto& segment : segments) {
+            if (segment.kind == aila::alia::TtsPreparedSegmentKind::Text) {
+                if (!segment.text.empty()) {
+                    ++items;
+                }
+            } else if (segment.silence_ms > 0) {
+                ++items;
+            }
+        }
+    }
+    return items;
 }
 
 bool load_tts_slot(AliaContext& ctx, const Options& opts) {
@@ -279,6 +334,7 @@ int main(int argc, char** argv) {
 
     // Baseline: single complete utterance through the legacy synchronous path.
     AudioCapture baseline_capture;
+    const auto baseline_started_at = std::chrono::steady_clock::now();
     ctx.tts_pipeline->reset();
     if (!ctx.tts_pipeline->enqueue_text(opts.text) ||
         !ctx.tts_pipeline->synthesize_pending(
@@ -293,9 +349,20 @@ int main(int argc, char** argv) {
         std::cerr << "baseline_wav_save_failed=true\n";
         return 1;
     }
+    long long baseline_first_audio_ms = -1;
+    {
+        std::lock_guard<std::mutex> lock(baseline_capture.mutex);
+        if (!baseline_capture.callback_times.empty()) {
+            baseline_first_audio_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    baseline_capture.callback_times.front() - baseline_started_at)
+                    .count();
+        }
+    }
 
     // Session: async producer feeds sentence chunks with a small delay.
     AudioCapture session_capture;
+    const auto session_started_at = std::chrono::steady_clock::now();
     ctx.tts_pipeline->begin_turn_metrics();
     if (!ctx.tts_pipeline->start_async_turn(
             config, audio_callback, &session_capture,
@@ -325,6 +392,16 @@ int main(int argc, char** argv) {
         std::cerr << "session_wav_save_failed=true\n";
         return 1;
     }
+    long long session_first_audio_ms = -1;
+    {
+        std::lock_guard<std::mutex> lock(session_capture.mutex);
+        if (!session_capture.callback_times.empty()) {
+            session_first_audio_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    session_capture.callback_times.front() - session_started_at)
+                    .count();
+        }
+    }
 
     bool pass = true;
     std::vector<std::string> failures;
@@ -347,10 +424,39 @@ int main(int argc, char** argv) {
         pass = false;
         failures.push_back("session_long_silence");
     }
-    if (metrics.session_text_appends !=
-        static_cast<int>(chunks.size()) - 1) {
+    const long long baseline_callback_gap_ms =
+        max_callback_gap_ms(baseline_capture);
+    const long long session_callback_gap_ms =
+        max_callback_gap_ms(session_capture);
+    constexpr long long kBaselineMaxCallbackGapMs = 500;
+    const long long kSessionMaxCallbackGapMs =
+        static_cast<long long>(opts.chunk_delay_ms) + 1500;
+    if (baseline_callback_gap_ms > kBaselineMaxCallbackGapMs) {
+        pass = false;
+        failures.push_back("baseline_callback_gap");
+    }
+    if (session_callback_gap_ms > kSessionMaxCallbackGapMs) {
+        pass = false;
+        failures.push_back("session_callback_gap");
+    }
+    const int expected_appends = expected_text_appends(chunks);
+    if (metrics.session_text_appends != expected_appends) {
         pass = false;
         failures.push_back("session_appends_missing");
+    }
+    const std::vector<aila::alia::AliaTtsPlaybackSegment> segments =
+        ctx.tts_pipeline->playback_segments_snapshot();
+    const int expected_segments = expected_queue_items(chunks);
+    if (static_cast<int>(segments.size()) != expected_segments) {
+        pass = false;
+        failures.push_back("session_segment_count");
+    }
+    for (const auto& segment : segments) {
+        if (!segment.complete || segment.end_sample <= segment.start_sample) {
+            pass = false;
+            failures.push_back("session_segment_incomplete");
+            break;
+        }
     }
     if (metrics.chunks_synthesized != 1) {
         pass = false;
@@ -362,9 +468,22 @@ int main(int argc, char** argv) {
               << "text_chunks=" << chunks.size() << "\n"
               << "baseline_samples=" << baseline_capture.samples.size() << "\n"
               << "baseline_callbacks=" << baseline_capture.callback_count << "\n"
+              << "baseline_first_audio_ms=" << baseline_first_audio_ms << "\n"
               << "session_samples=" << session_capture.samples.size() << "\n"
               << "session_callbacks=" << session_capture.callback_count << "\n"
+              << "session_first_audio_ms=" << session_first_audio_ms << "\n"
               << "session_max_silence_samples=" << max_silence << "\n"
+              << "baseline_max_callback_gap_ms=" << baseline_callback_gap_ms << "\n"
+              << "session_max_callback_gap_ms=" << session_callback_gap_ms << "\n"
+              << "expected_text_appends=" << expected_appends << "\n"
+              << "session_segments=" << segments.size() << "\n"
+              << "expected_segments=" << expected_segments << "\n"
+              << "session_segments_complete="
+              << std::count_if(segments.begin(), segments.end(),
+                               [](const aila::alia::AliaTtsPlaybackSegment& segment) {
+                                   return segment.complete;
+                               })
+              << "\n"
               << "stream_session_enabled=" << metrics.stream_session_enabled << "\n"
               << "tts_chunks_synthesized=" << metrics.chunks_synthesized << "\n"
               << "session_text_appends=" << metrics.session_text_appends << "\n"

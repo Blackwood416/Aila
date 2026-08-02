@@ -101,6 +101,7 @@ public:
     AliaTtsMetrics last_metrics() const;
     void request_interruption(long long played_audio_samples);
     AliaTtsPlayedPrefix resolve_played_prefix(long long played_audio_samples) const;
+    std::vector<AliaTtsPlaybackSegment> playback_segments_snapshot() const;
     ModelSlot* slot() const { return slot_; }
 
 private:
@@ -146,6 +147,10 @@ private:
     bool synthesize_text_session_finish(
         std::function<bool()> should_cancel);
     bool synthesize_text_session_has_unconsumed_text() const;
+    bool flush_first_audio_early(
+        AliaAudioCallback audio_cb,
+        void* user_data,
+        std::function<bool()> should_cancel);
     bool synthesize_silence(int silence_ms,
                             AliaAudioCallback audio_cb,
                             void* user_data,
