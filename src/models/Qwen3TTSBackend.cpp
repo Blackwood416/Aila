@@ -567,6 +567,14 @@ bool Qwen3TTSBackend::tts_stream_session_has_unconsumed_text() const {
                stream_session_->trailing_len;
 }
 
+bool Qwen3TTSBackend::tts_stream_session_has_pending_text() const {
+    if (stream_session_ == nullptr || !stream_session_->active) {
+        return false;
+    }
+    return stream_session_->finishing ||
+           stream_session_->gen_step < stream_session_->trailing_len;
+}
+
 bool Qwen3TTSBackend::tts_stream_append_text(
     Context& ctx,
     const std::vector<int>& body_tokens) {
@@ -593,7 +601,10 @@ bool Qwen3TTSBackend::tts_stream_append_text(
 
     const int hidden = talker_cfg_.hidden_size;
     const int old_len = stream_session_->trailing_len;
-    const int new_len = old_len + static_cast<int>(body_tokens.size());
+    const int append_pos = std::max(
+        stream_session_->gen_step, stream_session_->trailing_len);
+    const int gap = append_pos - old_len;
+    const int new_len = append_pos + static_cast<int>(body_tokens.size());
     ctx.queue().wait();
 
     Tensor new_trailing = Tensor::allocate(
@@ -603,17 +614,23 @@ bool Qwen3TTSBackend::tts_stream_append_text(
                            stream_session_->trailing_text_hidden.data_as<bf16>(),
                            static_cast<size_t>(old_len) * hidden * sizeof(bf16)).wait();
     }
+    for (int i = 0; i < gap; ++i) {
+        ctx.queue().memcpy(new_trailing.data_as<bf16>() +
+                               static_cast<size_t>(old_len + i) * hidden,
+                           precomputed_tts_pad_.data_as<bf16>(),
+                           static_cast<size_t>(hidden) * sizeof(bf16)).wait();
+    }
     if (static_cast<int>(projected.shape(0)) > 0) {
         ctx.queue().memcpy(new_trailing.data_as<bf16>() +
-                               static_cast<size_t>(old_len) * hidden,
+                               static_cast<size_t>(append_pos) * hidden,
                            projected.data_as<bf16>(),
                            static_cast<size_t>(body_tokens.size()) *
                                hidden * sizeof(bf16)).wait();
     }
     stream_session_->trailing_text_hidden = std::move(new_trailing);
     stream_session_->trailing_len = new_len;
-    AILA_LOG_INFO("[TTS-Session] append trailing %d -> %d tokens=%zu",
-                  old_len, new_len, body_tokens.size());
+    AILA_LOG_INFO("[TTS-Session] append trailing %d -> %d pos=%d tokens=%zu",
+                  old_len, new_len, append_pos, body_tokens.size());
     return true;
 }
 
@@ -630,7 +647,10 @@ bool Qwen3TTSBackend::tts_stream_finish(Context& ctx) {
 
     const int hidden = talker_cfg_.hidden_size;
     const int old_len = stream_session_->trailing_len;
-    const int new_len = old_len + 1;
+    const int append_pos = std::max(
+        stream_session_->gen_step, stream_session_->trailing_len);
+    const int gap = append_pos - old_len;
+    const int new_len = append_pos + 1;
     ctx.queue().wait();
 
     Tensor new_trailing = Tensor::allocate(
@@ -640,14 +660,20 @@ bool Qwen3TTSBackend::tts_stream_finish(Context& ctx) {
                            stream_session_->trailing_text_hidden.data_as<bf16>(),
                            static_cast<size_t>(old_len) * hidden * sizeof(bf16)).wait();
     }
+    for (int i = 0; i < gap; ++i) {
+        ctx.queue().memcpy(new_trailing.data_as<bf16>() +
+                               static_cast<size_t>(old_len + i) * hidden,
+                           precomputed_tts_pad_.data_as<bf16>(),
+                           static_cast<size_t>(hidden) * sizeof(bf16)).wait();
+    }
     ctx.queue().memcpy(new_trailing.data_as<bf16>() +
-                           static_cast<size_t>(old_len) * hidden,
+                           static_cast<size_t>(append_pos) * hidden,
                        precomputed_tts_eos_.data(),
                        hidden * sizeof(bf16)).wait();
     stream_session_->trailing_text_hidden = std::move(new_trailing);
     stream_session_->trailing_len = new_len;
-    AILA_LOG_INFO("[TTS-Session] finish trailing %d -> %d",
-                  old_len, new_len);
+    AILA_LOG_INFO("[TTS-Session] finish trailing %d -> %d pos=%d",
+                  old_len, new_len, append_pos);
     return true;
 }
 
@@ -1405,7 +1431,7 @@ Qwen3TTSBackend::TtsStreamStepResult Qwen3TTSBackend::tts_stream_step(
         s.finishing && (s.token == s.eos_id || s.gen_step >= s.max_tokens);
     const bool flush_exhausted_text =
         !s.finishing && s.pending_callback_frames > 0 &&
-        s.gen_step >= s.trailing_len && !reached_threshold;
+        s.gen_step == s.trailing_len && !reached_threshold;
 
     if (reached_threshold || stop_after_frame || flush_exhausted_text) {
         if (s.pending_callback_frames > 0) {

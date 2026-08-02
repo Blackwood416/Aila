@@ -148,6 +148,7 @@ public:
         return stream_session_ ? stream_session_->eos_suppressed_count : 0;
     }
     bool tts_stream_session_has_unconsumed_text() const;
+    bool tts_stream_session_has_pending_text() const;
 
 private:
     struct TtsStreamSession {

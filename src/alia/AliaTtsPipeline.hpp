@@ -147,6 +147,7 @@ private:
     bool synthesize_text_session_finish(
         std::function<bool()> should_cancel);
     bool synthesize_text_session_has_unconsumed_text() const;
+    bool synthesize_text_session_has_pending_text() const;
     bool flush_first_audio_early(
         AliaAudioCallback audio_cb,
         void* user_data,

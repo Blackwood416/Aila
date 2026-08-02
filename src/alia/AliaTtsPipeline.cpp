@@ -488,7 +488,11 @@ void AliaTtsPipeline::finish_playback_segment(long long segment_id, bool complet
         return;
     }
     it->end_sample = turn_output_samples_;
-    it->complete = complete && it->end_sample > it->start_sample;
+    const bool has_extent =
+        it->kind == TtsPreparedSegmentKind::Silence
+            ? it->end_sample >= it->start_sample
+            : it->end_sample > it->start_sample;
+    it->complete = complete && has_extent;
 }
 
 void AliaTtsPipeline::note_output_samples(int sample_count) {
@@ -849,7 +853,7 @@ bool AliaTtsPipeline::synthesize_text_session_step(
                  user_data);
     }
     if (!eos && !first_audio_callback_emitted() &&
-        !synthesize_text_session_has_unconsumed_text()) {
+        !synthesize_text_session_has_pending_text()) {
         flush_first_audio_early(audio_cb, user_data, should_cancel);
     }
     return true;
@@ -897,6 +901,15 @@ bool AliaTtsPipeline::synthesize_text_session_has_unconsumed_text() const {
     auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(slot_->backend());
     return tts_backend != nullptr &&
            tts_backend->tts_stream_session_has_unconsumed_text();
+}
+
+bool AliaTtsPipeline::synthesize_text_session_has_pending_text() const {
+    if (!slot_ || !slot_->backend()) {
+        return false;
+    }
+    auto* tts_backend = dynamic_cast<Qwen3TTSBackend*>(slot_->backend());
+    return tts_backend != nullptr &&
+           tts_backend->tts_stream_session_has_pending_text();
 }
 
 bool AliaTtsPipeline::synthesize_text(const std::string& text,
@@ -1356,6 +1369,7 @@ void AliaTtsPipeline::async_worker_loop() {
     const int idle_ms = tts_stream_session_idle_ms();
     long long active_segment_id = -1;
     bool keepalive_emitted_this_stall = false;
+    std::string pending_pause_text;
     auto finish_active_segment = [&](bool complete) {
         if (active_segment_id >= 0) {
             finish_playback_segment(active_segment_id, complete);
@@ -1367,7 +1381,7 @@ void AliaTtsPipeline::async_worker_loop() {
                                  void* user_data,
                                  const std::function<bool()>& should_cancel) -> bool {
         while (session_started &&
-               synthesize_text_session_has_unconsumed_text()) {
+               synthesize_text_session_has_pending_text()) {
             if (should_cancel && should_cancel()) {
                 return false;
             }
@@ -1450,29 +1464,17 @@ void AliaTtsPipeline::async_worker_loop() {
             keepalive_emitted_this_stall = false;
             if (item.silence_ms > 0) {
                 begin_playback_segment(item);
-                if (audio_cb && item.silence_ms > 0) {
-                    const int sample_count = std::max(
-                        1, static_cast<int>((static_cast<long long>(item.silence_ms) * 24000) / 1000));
-                    std::vector<float> silence(static_cast<size_t>(sample_count), 0.0f);
-                    note_output_samples(sample_count);
-                    std::vector<std::vector<float>> callbacks =
-                        prepare_audio_callbacks(silence);
-                    for (const auto& callback_samples : callbacks) {
-                        if (callback_samples.empty()) {
-                            break;
-                        }
-                        note_audio_callback();
-                        audio_cb(callback_samples.data(),
-                                 static_cast<int>(callback_samples.size()),
-                                 user_data);
-                    }
-                }
+                pending_pause_text += item.semantic_text;
                 finish_playback_segment(item.segment_id, true);
                 continue;
             }
             finish_active_segment(true);
             begin_playback_segment(item);
-            if (!synthesize_text_session_begin(item.text, config, should_cancel)) {
+            const std::string combined_text =
+                pending_pause_text + item.text;
+            pending_pause_text.clear();
+            if (!synthesize_text_session_begin(
+                    combined_text, config, should_cancel)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 async_failed_ = true;
                 break;
@@ -1493,29 +1495,17 @@ void AliaTtsPipeline::async_worker_loop() {
             if (item.silence_ms > 0) {
                 finish_active_segment(true);
                 begin_playback_segment(item);
-                if (audio_cb && item.silence_ms > 0) {
-                    const int sample_count = std::max(
-                        1, static_cast<int>((static_cast<long long>(item.silence_ms) * 24000) / 1000));
-                    std::vector<float> silence(static_cast<size_t>(sample_count), 0.0f);
-                    note_output_samples(sample_count);
-                    std::vector<std::vector<float>> callbacks =
-                        prepare_audio_callbacks(silence);
-                    for (const auto& callback_samples : callbacks) {
-                        if (callback_samples.empty()) {
-                            break;
-                        }
-                        note_audio_callback();
-                        audio_cb(callback_samples.data(),
-                                 static_cast<int>(callback_samples.size()),
-                                 user_data);
-                    }
-                }
+                pending_pause_text += item.semantic_text;
                 finish_playback_segment(item.segment_id, true);
                 continue;
             }
             finish_active_segment(true);
             begin_playback_segment(item);
-            if (!synthesize_text_session_append(item.text, should_cancel)) {
+            const std::string combined_text =
+                pending_pause_text + item.text;
+            pending_pause_text.clear();
+            if (!synthesize_text_session_append(
+                    combined_text, should_cancel)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 async_failed_ = true;
                 break;

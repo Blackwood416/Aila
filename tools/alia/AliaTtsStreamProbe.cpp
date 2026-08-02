@@ -41,6 +41,7 @@ struct AudioCapture {
     std::mutex mutex;
     std::vector<float> samples;
     std::vector<std::chrono::steady_clock::time_point> callback_times;
+    std::vector<int> callback_sample_counts;
     int callback_count = 0;
 };
 
@@ -138,6 +139,7 @@ void audio_callback(const float* samples, int count, void* user_data) {
     std::lock_guard<std::mutex> lock(capture->mutex);
     capture->samples.insert(capture->samples.end(), samples, samples + count);
     capture->callback_times.push_back(std::chrono::steady_clock::now());
+    capture->callback_sample_counts.push_back(count);
     ++capture->callback_count;
 }
 
@@ -153,6 +155,38 @@ long long max_callback_gap_ms(AudioCapture& capture) {
             capture.callback_times[i] - capture.callback_times[i - 1])
             .count();
         best = std::max(best, gap);
+    }
+    return best;
+}
+
+long long max_virtual_underrun_ms(AudioCapture& capture) {
+    std::lock_guard<std::mutex> lock(capture.mutex);
+    if (capture.callback_times.size() < 2 ||
+        capture.callback_times.size() != capture.callback_sample_counts.size()) {
+        return 0;
+    }
+    long long best = 0;
+    long long buffer_end_ms = 0;
+    bool has_buffer = false;
+    const auto first_at = capture.callback_times.front();
+    for (size_t i = 0; i < capture.callback_times.size(); ++i) {
+        const long long at_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            capture.callback_times[i] - first_at)
+            .count();
+        const long long duration_ms =
+            (static_cast<long long>(capture.callback_sample_counts[i]) * 1000) /
+            24000;
+        if (!has_buffer) {
+            buffer_end_ms = at_ms + duration_ms;
+            has_buffer = true;
+            continue;
+        }
+        if (at_ms > buffer_end_ms) {
+            best = std::max(best, at_ms - buffer_end_ms);
+            buffer_end_ms = at_ms;
+        }
+        buffer_end_ms += duration_ms;
     }
     return best;
 }
@@ -428,16 +462,18 @@ int main(int argc, char** argv) {
         max_callback_gap_ms(baseline_capture);
     const long long session_callback_gap_ms =
         max_callback_gap_ms(session_capture);
-    constexpr long long kBaselineMaxCallbackGapMs = 500;
-    const long long kSessionMaxCallbackGapMs =
-        static_cast<long long>(opts.chunk_delay_ms) + 1500;
-    if (baseline_callback_gap_ms > kBaselineMaxCallbackGapMs) {
+    constexpr long long kMaxVirtualUnderrunMs = 500;
+    const long long baseline_underrun_ms =
+        max_virtual_underrun_ms(baseline_capture);
+    const long long session_underrun_ms =
+        max_virtual_underrun_ms(session_capture);
+    if (baseline_underrun_ms > kMaxVirtualUnderrunMs) {
         pass = false;
-        failures.push_back("baseline_callback_gap");
+        failures.push_back("baseline_underrun");
     }
-    if (session_callback_gap_ms > kSessionMaxCallbackGapMs) {
+    if (session_underrun_ms > kMaxVirtualUnderrunMs) {
         pass = false;
-        failures.push_back("session_callback_gap");
+        failures.push_back("session_underrun");
     }
     const int expected_appends = expected_text_appends(chunks);
     if (metrics.session_text_appends != expected_appends) {
@@ -452,7 +488,7 @@ int main(int argc, char** argv) {
         failures.push_back("session_segment_count");
     }
     for (const auto& segment : segments) {
-        if (!segment.complete || segment.end_sample <= segment.start_sample) {
+        if (!segment.complete || segment.end_sample < segment.start_sample) {
             pass = false;
             failures.push_back("session_segment_incomplete");
             break;
@@ -475,6 +511,8 @@ int main(int argc, char** argv) {
               << "session_max_silence_samples=" << max_silence << "\n"
               << "baseline_max_callback_gap_ms=" << baseline_callback_gap_ms << "\n"
               << "session_max_callback_gap_ms=" << session_callback_gap_ms << "\n"
+              << "baseline_max_underrun_ms=" << baseline_underrun_ms << "\n"
+              << "session_max_underrun_ms=" << session_underrun_ms << "\n"
               << "expected_text_appends=" << expected_appends << "\n"
               << "session_segments=" << segments.size() << "\n"
               << "expected_segments=" << expected_segments << "\n"
