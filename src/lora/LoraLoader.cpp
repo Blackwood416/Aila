@@ -22,14 +22,26 @@ namespace lora {
 // ============================================================
 
 std::string LoraLoader::peft_key_to_base_name(const std::string& lora_key) {
-    const std::string peft_prefix = "base_model.model.";
     const std::string lora_a_suffix = ".lora_A.weight";
     const std::string lora_b_suffix = ".lora_B.weight";
 
-    if (lora_key.size() <= peft_prefix.size()) return "";
-    if (lora_key.compare(0, peft_prefix.size(), peft_prefix) != 0) return "";
-
-    std::string result = lora_key.substr(peft_prefix.size());
+    std::string result;
+    const std::vector<std::string> prefixes = {
+        "base_model.model.model.language_model.",
+        "base_model.model.model.",
+        "base_model.model.",
+    };
+    for (const std::string& prefix : prefixes) {
+        if (lora_key.size() > prefix.size() &&
+            lora_key.compare(0, prefix.size(), prefix) == 0) {
+            result = lora_key.substr(prefix.size());
+            break;
+        }
+    }
+    if (result.empty()) return "";
+    if (result.rfind("layers.", 0) == 0) {
+        result = "model." + result;
+    }
 
     if (result.size() > lora_a_suffix.size() &&
         result.compare(result.size() - lora_a_suffix.size(),

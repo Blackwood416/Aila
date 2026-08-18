@@ -31,7 +31,6 @@ public:
     static int merge_into_weights(Context& ctx, const LoraAdapter& adapter,
                                   ModelWeights& weights, std::string* error_message = nullptr);
 
-private:
     static std::string peft_key_to_base_name(const std::string& lora_key);
 };
 

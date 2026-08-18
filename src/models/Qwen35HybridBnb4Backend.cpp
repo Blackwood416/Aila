@@ -226,6 +226,142 @@ Qwen35HybridBnb4Backend::~Qwen35HybridBnb4Backend() {
     clear_mrope_positions();
 }
 
+bool Qwen35HybridBnb4Backend::apply_lora(
+    Context& ctx,
+    const aila::lora::LoraAdapter& adapter,
+    std::string* error_message) {
+    if (layers_.empty()) {
+        if (error_message) {
+            *error_message = "Qwen3.5 Hybrid backend is not loaded";
+        }
+        return false;
+    }
+
+    auto upload_f32_to_bf16 = [&](const std::vector<float>& f32_data,
+                                  int rows,
+                                  int cols) -> Tensor {
+        const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        std::vector<bf16> bf16_data(n);
+        for (size_t i = 0; i < n; ++i) {
+            bf16_data[i] = bf16(f32_data[i]);
+        }
+        Tensor tensor = Tensor::allocate(
+            ctx,
+            {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+            dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(tensor.data(), bf16_data.data(), n * sizeof(bf16));
+        return tensor;
+    };
+
+    const int num_layers = static_cast<int>(layers_.size());
+    std::vector<std::vector<LoraAttachment>> qkv_attachments(num_layers);
+    int applied = 0;
+    int skipped = 0;
+
+    for (const auto& pair : adapter.pairs) {
+        const std::string prefix = "model.layers.";
+        if (pair.weight_name.rfind(prefix, 0) != 0) {
+            ++skipped;
+            continue;
+        }
+
+        const size_t num_start = prefix.size();
+        const size_t num_end = pair.weight_name.find('.', num_start);
+        if (num_end == std::string::npos) {
+            ++skipped;
+            continue;
+        }
+
+        int layer_idx = -1;
+        try {
+            layer_idx = std::stoi(pair.weight_name.substr(num_start, num_end - num_start));
+        } catch (...) {
+            ++skipped;
+            continue;
+        }
+        if (layer_idx < 0 || layer_idx >= num_layers || layers_[layer_idx].is_linear) {
+            ++skipped;
+            continue;
+        }
+
+        const size_t last_dot = pair.weight_name.rfind('.');
+        const size_t prev_dot = pair.weight_name.rfind('.', last_dot - 1);
+        if (last_dot == std::string::npos || prev_dot == std::string::npos) {
+            ++skipped;
+            continue;
+        }
+        const std::string target =
+            pair.weight_name.substr(prev_dot + 1, last_dot - prev_dot - 1);
+
+        int output_offset = 0;
+        int output_rows = 0;
+        int input_features = hidden_size_;
+        Bnb4BitLinear* direct_linear = nullptr;
+        if (target == "q_proj") {
+            output_offset = 0;
+            output_rows = full_q_proj_dim_;
+        } else if (target == "k_proj") {
+            output_offset = full_q_proj_dim_;
+            output_rows = full_kv_dim_;
+        } else if (target == "v_proj") {
+            output_offset = full_q_proj_dim_ + full_kv_dim_;
+            output_rows = full_kv_dim_;
+        } else if (target == "o_proj") {
+            output_rows = hidden_size_;
+            input_features = full_q_dim_;
+            direct_linear = &layers_[layer_idx].o_proj;
+        } else {
+            ++skipped;
+            continue;
+        }
+
+        if (pair.out_features != output_rows || pair.in_features != input_features) {
+            if (error_message) {
+                *error_message = "LoRA shape mismatch for " + pair.weight_name;
+            }
+            return false;
+        }
+
+        LoraAttachment attachment;
+        attachment.lora_a = upload_f32_to_bf16(pair.lora_a, pair.r, pair.in_features);
+        attachment.lora_b = upload_f32_to_bf16(pair.lora_b, pair.out_features, pair.r);
+        attachment.scaling = adapter.config.scaling;
+        attachment.output_offset = output_offset;
+        attachment.output_rows = output_rows;
+
+        if (direct_linear) {
+            std::vector<LoraAttachment> attachments;
+            attachments.push_back(std::move(attachment));
+            direct_linear->set_lora(std::move(attachments));
+        } else {
+            qkv_attachments[layer_idx].push_back(std::move(attachment));
+        }
+        ++applied;
+    }
+
+    for (int i = 0; i < num_layers; ++i) {
+        if (!qkv_attachments[i].empty()) {
+            layers_[i].qkv_proj.set_lora(std::move(qkv_attachments[i]));
+        }
+    }
+
+    if (applied <= 0) {
+        if (error_message) {
+            *error_message = "Qwen3.5 Hybrid LoRA had no applicable full-attention adapters";
+        }
+        return false;
+    }
+
+    ctx.synchronize();
+    AILA_LOG_INFO("[Qwen3.5 BnB4] LoRA adapter applied: r=%d alpha=%d scaling=%.2f applied=%d skipped=%d",
+                  adapter.config.r, adapter.config.lora_alpha,
+                  adapter.config.scaling, applied, skipped);
+    if (error_message) {
+        error_message->clear();
+    }
+    return true;
+}
+
 bool Qwen35HybridBnb4Backend::load(Context& ctx,
                                    ModelWeights& weights,
                                    const ModelSpec& spec,

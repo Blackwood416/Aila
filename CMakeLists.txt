@@ -365,6 +365,15 @@ target_include_directories(AilaSafeTensorsTests PRIVATE
 target_link_libraries(AilaSafeTensorsTests PRIVATE AilaLib)
 add_test(NAME AilaSafeTensorsTests COMMAND AilaSafeTensorsTests)
 
+add_executable(AilaLoraLoaderTests tests/lora/LoraLoaderTests.cpp)
+target_compile_definitions(AilaLoraLoaderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaLoraLoaderTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaLoraLoaderTests PRIVATE AilaLib)
+add_test(NAME AilaLoraLoaderTests COMMAND AilaLoraLoaderTests)
+
 add_executable(AilaQwen35VisionWeightsTests tests/vision/Qwen35VisionWeightsTests.cpp)
 target_compile_definitions(AilaQwen35VisionWeightsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQwen35VisionWeightsTests PRIVATE

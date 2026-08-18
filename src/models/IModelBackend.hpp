@@ -19,8 +19,13 @@ public:
                       int max_seq_len,
                       std::string* error_message) = 0;
 
-    virtual bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
-                            std::string* error_message = nullptr) { return true; }
+    virtual bool apply_lora(Context&, const aila::lora::LoraAdapter&,
+                            std::string* error_message = nullptr) {
+        if (error_message) {
+            *error_message = "LoRA is not supported by this model backend";
+        }
+        return false;
+    }
 
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) = 0;
     virtual void reset() = 0;

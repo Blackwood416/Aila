@@ -82,6 +82,8 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
+    bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
+                    std::string* error_message = nullptr) override;
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,
