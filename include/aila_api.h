@@ -44,8 +44,35 @@ typedef enum AilaErrorCode {
     AILA_ERR_JSON_PARSE = 3,
     AILA_ERR_VISION_NOT_ENABLED = 4,
     AILA_ERR_CONTEXT_OVERFLOW = 5,
-    AILA_ERR_RUNTIME = 6
+    AILA_ERR_RUNTIME = 6,
+    AILA_ERR_MODEL_CAPABILITY = 7
 } AilaErrorCode;
+
+typedef enum AilaPixelFormat {
+    AILA_PIXEL_RGB8 = 0,
+    AILA_PIXEL_BGR8 = 1,
+    AILA_PIXEL_RGBA8 = 2,
+    AILA_PIXEL_BGRA8 = 3
+} AilaPixelFormat;
+
+typedef struct AilaDetectionConfig {
+    uint32_t struct_size;
+    float confidence_threshold;
+    int max_detections;
+    int reserved[8];
+} AilaDetectionConfig;
+
+typedef struct AilaDetection {
+    uint32_t struct_size;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float confidence;
+    int class_id;
+    const char* class_name;
+    int reserved[4];
+} AilaDetection;
 
 /* -------------- Generation configuration -------------- */
 typedef struct AilaGenConfig {
@@ -128,7 +155,7 @@ typedef void (*AilaLogCallback)(int level, const char* message, void* user_data)
 
 /* -------------- API functions -------------- */
 
-/** Get library version string (e.g. "0.1.0"). The returned pointer is static. */
+/** Get library version string (e.g. "0.2.0"). The returned pointer is static. */
 AILA_API const char* aila_version(void);
 
 /**
@@ -254,6 +281,27 @@ AILA_API int aila_generate_stream(AilaEngine* engine, const char* prompt,
  * @param str  String to free. NULL is safe.
  */
 AILA_API void aila_free_string(char* str);
+
+/* -------------- YOLO26 object detection -------------- */
+AILA_API AilaDetectionConfig aila_default_detection_config(void);
+
+AILA_API int aila_detect_file(
+    AilaEngine* engine, const char* image_path,
+    const AilaDetectionConfig* config,
+    AilaDetection** out_detections, int* out_count);
+
+AILA_API int aila_detect_encoded(
+    AilaEngine* engine, const void* encoded_bytes, size_t encoded_size,
+    const AilaDetectionConfig* config,
+    AilaDetection** out_detections, int* out_count);
+
+AILA_API int aila_detect_pixels(
+    AilaEngine* engine, const void* pixels, size_t size_bytes,
+    int width, int height, int row_stride, AilaPixelFormat format,
+    const AilaDetectionConfig* config,
+    AilaDetection** out_detections, int* out_count);
+
+AILA_API void aila_free_detections(AilaDetection* detections, int count);
 
 /**
  * Set global log callback.

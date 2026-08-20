@@ -1,0 +1,23 @@
+{
+  "format": "inferref-engine-adapter",
+  "format_version": "0.2",
+  "name": "aila-yolo26-regions",
+  "target_device": "xpu",
+  "capabilities": {
+    "device_types": ["xpu"],
+    "dtypes": ["float16", "float32"],
+    "max_rank": 5,
+    "features": ["multiple_outputs", "alias_effects", "mutation_effects"]
+  },
+  "command": [
+    "pwsh",
+    "-NoProfile",
+    "-File",
+    "{adapter_dir}/run_yolo26_adapter.ps1",
+    "{testcase}",
+    "{output}"
+  ],
+  "cwd": ".",
+  "timeout_seconds": 120,
+  "max_output_chars": 65536
+}

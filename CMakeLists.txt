@@ -24,7 +24,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
 
-set(AILA_PUBLIC_API_VERSION "0.1.7")
+set(AILA_PUBLIC_API_VERSION "0.2.0")
 set(AILA_PUBLIC_ABI_VERSION "1")
 find_package(Git QUIET)
 
@@ -181,6 +181,8 @@ set(LIB_SOURCES
     src/utils/JsonParser.cpp
     ${JINJA_SOURCES}
     src/vision/Qwen35VisionEncoder.cpp
+    src/vision/Yolo26Detector.cpp
+    src/vision/DetectionRenderer.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
     src/audio/AudioPreprocessor.cpp
     src/audio/SpeakerEncoder.cpp
@@ -346,6 +348,26 @@ target_include_directories(AilaConvOpsKernelTests PRIVATE
 target_link_libraries(AilaConvOpsKernelTests PRIVATE
     DNNL::dnnl simdjson AilaSyclOptions)
 add_test(NAME AilaConvOpsKernelTests COMMAND AilaConvOpsKernelTests)
+
+add_executable(AilaYolo26InferRefAdapter tests/inferref/Yolo26InferRefAdapter.cpp)
+target_compile_definitions(AilaYolo26InferRefAdapter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaYolo26InferRefAdapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
+
+add_executable(AilaYolo26ModelSpecTests
+    tests/vision/Yolo26ModelSpecTests.cpp
+    src/utils/ModelSpec.cpp
+)
+target_compile_definitions(AilaYolo26ModelSpecTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaYolo26ModelSpecTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaYolo26ModelSpecTests PRIVATE simdjson)
+add_test(NAME AilaYolo26ModelSpecTests COMMAND AilaYolo26ModelSpecTests)
 
 add_executable(AilaEnvUtilsTests tests/utils/EnvUtilsTests.cpp)
 target_compile_definitions(AilaEnvUtilsTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)

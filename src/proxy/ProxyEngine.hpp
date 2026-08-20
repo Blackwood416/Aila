@@ -20,6 +20,16 @@ struct AlignmentWord {
     int end_ms = 0;
 };
 
+struct DetectionResult {
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+    float confidence = 0.0f;
+    int class_id = 0;
+    std::string class_name;
+};
+
 class ProxyEngine {
 public:
     ProxyEngine();
@@ -104,6 +114,16 @@ public:
         const float* samples, int sample_count, int sample_rate,
         const std::vector<std::string>& input_words,
         std::vector<AlignmentWord>& words);
+    int detect_file(
+        std::string_view path, const AilaDetectionConfig* config,
+        std::vector<DetectionResult>& detections);
+    int detect_encoded(
+        const void* bytes, size_t size, const AilaDetectionConfig* config,
+        std::vector<DetectionResult>& detections);
+    int detect_pixels(
+        const void* pixels, size_t size, int width, int height, int row_stride,
+        AilaPixelFormat format, const AilaDetectionConfig* config,
+        std::vector<DetectionResult>& detections);
 
     int last_error_code() const;
     const char* last_error_message() const;

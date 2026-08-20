@@ -701,7 +701,7 @@ void expect_error_contains(const Api& api, AilaEngine* engine, std::string_view 
 }
 
 void verify_defaults(const Api& api) {
-    expect(std::string(api.version()) == "0.1.7", "proxy version changed");
+    expect(std::string(api.version()) == "0.2.0", "proxy version changed");
     const AilaGenConfig config = api.default_config();
     expect(config.max_new_tokens == 512, "default max_new_tokens changed");
     expect(config.temperature == 0.6f, "default temperature changed");

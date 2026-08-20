@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <cstdlib>
 #include <fstream>
@@ -214,6 +215,10 @@ Options:
   --rep-penalty <F>        Repetition penalty (default: 1.0, >1.0 to penalize)
   --pres-penalty <F>       Presence penalty (default: 0.0)
   --freq-penalty <F>       Frequency penalty (default: 0.0)
+  --detect <image>         Run YOLO26 object detection on one image
+  --conf <F>               Detection confidence threshold in [0,1] (default: 0.25)
+  --max-det <N>            Maximum detections in [1,300] (default: 300)
+  --save-detect <png>      Save an annotated PNG at the original image size
   --bench                  Run benchmark mode
   --bench-pp <N>           Benchmark prompt length (default: 512)
   --bench-tg <N>           Benchmark generation length (default: 128)
@@ -280,7 +285,7 @@ Interactive Commands:
 }
 
 void print_version() {
-    std::cout << "Aila v0.1.8" << std::endl;
+    std::cout << "Aila v0.2.0" << std::endl;
 }
 
 bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
@@ -411,6 +416,32 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--freq-penalty" && i + 1 < argc) {
             opts.frequency_penalty = static_cast<float>(std::atof(argv[++i]));
+            continue;
+        }
+        if (arg == "--detect" && i + 1 < argc) {
+            opts.detect_path = argv[++i];
+            continue;
+        }
+        if (arg == "--conf" && i + 1 < argc) {
+            char* end = nullptr;
+            opts.detection_confidence = std::strtof(argv[++i], &end);
+            if (!end || *end != '\0' || !std::isfinite(opts.detection_confidence) ||
+                opts.detection_confidence < 0.0f || opts.detection_confidence > 1.0f) {
+                std::cerr << "Error: --conf must be a finite number in [0,1]" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--max-det" && i + 1 < argc) {
+            opts.detection_max = std::atoi(argv[++i]);
+            if (opts.detection_max < 1 || opts.detection_max > 300) {
+                std::cerr << "Error: --max-det must be in [1,300]" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--save-detect" && i + 1 < argc) {
+            opts.detection_output = argv[++i];
             continue;
         }
         if (arg == "--bench") {

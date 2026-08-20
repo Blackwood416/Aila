@@ -51,7 +51,7 @@ struct AilaTTSStream {
 
 namespace {
 
-constexpr const char* kVersion = "0.1.8";
+constexpr const char* kVersion = "0.2.0";
 constexpr const char* kEmpty = "";
 
 std::mutex engine_registry_mutex;
@@ -161,6 +161,34 @@ int allocate_alignment_result(
         allocated[index].end_ms = values[index].end_ms;
     }
     *out_words = allocated;
+    *out_count = static_cast<int>(values.size());
+    return AILA_OK;
+}
+
+int allocate_detection_result(
+    const std::vector<aila::proxy::DetectionResult>& values,
+    AilaDetection** out_detections, int* out_count) {
+    if (values.empty()) return AILA_OK;
+    auto* allocated = static_cast<AilaDetection*>(
+        std::calloc(values.size(), sizeof(AilaDetection)));
+    if (!allocated) return AILA_ERR_RUNTIME;
+    for (size_t index = 0; index < values.size(); ++index) {
+        char* name = allocate_result(values[index].class_name);
+        if (!name) {
+            for (size_t prior = 0; prior < index; ++prior) {
+                std::free(const_cast<char*>(allocated[prior].class_name));
+            }
+            std::free(allocated);
+            return AILA_ERR_RUNTIME;
+        }
+        allocated[index].struct_size = sizeof(AilaDetection);
+        allocated[index].x1 = values[index].x1; allocated[index].y1 = values[index].y1;
+        allocated[index].x2 = values[index].x2; allocated[index].y2 = values[index].y2;
+        allocated[index].confidence = values[index].confidence;
+        allocated[index].class_id = values[index].class_id;
+        allocated[index].class_name = name;
+    }
+    *out_detections = allocated;
     *out_count = static_cast<int>(values.size());
     return AILA_OK;
 }
@@ -304,6 +332,63 @@ AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void) {
     config.sampling_seed = 42;
     config.use_fixed_seed = 0;
     return config;
+}
+
+AILA_API AilaDetectionConfig aila_default_detection_config(void) {
+    AilaDetectionConfig config{};
+    config.struct_size = sizeof(AilaDetectionConfig);
+    config.confidence_threshold = 0.25f;
+    config.max_detections = 300;
+    return config;
+}
+
+AILA_API int aila_detect_file(AilaEngine* engine, const char* image_path,
+                              const AilaDetectionConfig* config,
+                              AilaDetection** out_detections, int* out_count) {
+    if (out_detections) *out_detections = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !image_path || !out_detections || !out_count) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<aila::proxy::DetectionResult> values;
+        const int status = engine->proxy->detect_file(image_path, config, values);
+        return status == AILA_OK ? allocate_detection_result(values, out_detections, out_count) : status;
+    } catch (...) { record_boundary_failure(engine, "aila_detect_file"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_detect_encoded(AilaEngine* engine, const void* bytes, size_t size,
+                                 const AilaDetectionConfig* config,
+                                 AilaDetection** out_detections, int* out_count) {
+    if (out_detections) *out_detections = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !bytes || !size || !out_detections || !out_count) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<aila::proxy::DetectionResult> values;
+        const int status = engine->proxy->detect_encoded(bytes, size, config, values);
+        return status == AILA_OK ? allocate_detection_result(values, out_detections, out_count) : status;
+    } catch (...) { record_boundary_failure(engine, "aila_detect_encoded"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API int aila_detect_pixels(AilaEngine* engine, const void* pixels, size_t size,
+                                int width, int height, int row_stride, AilaPixelFormat format,
+                                const AilaDetectionConfig* config,
+                                AilaDetection** out_detections, int* out_count) {
+    if (out_detections) *out_detections = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !pixels || !size || !out_detections || !out_count) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<aila::proxy::DetectionResult> values;
+        const int status = engine->proxy->detect_pixels(
+            pixels, size, width, height, row_stride, format, config, values);
+        return status == AILA_OK ? allocate_detection_result(values, out_detections, out_count) : status;
+    } catch (...) { record_boundary_failure(engine, "aila_detect_pixels"); return AILA_ERR_RUNTIME; }
+}
+
+AILA_API void aila_free_detections(AilaDetection* detections, int count) {
+    if (!detections) return;
+    for (int index = 0; index < count; ++index) {
+        std::free(const_cast<char*>(detections[index].class_name));
+    }
+    std::free(detections);
 }
 
 AILA_API char* aila_generate(

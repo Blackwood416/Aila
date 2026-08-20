@@ -7,11 +7,49 @@
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
+#include "vision/DetectionRenderer.hpp"
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <mutex>
 #include <cstdio>
+
+namespace {
+
+std::string json_string(std::string_view value) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string output = "\"";
+    for (const unsigned char character : value) {
+        switch (character) {
+            case '"': output += "\\\""; break;
+            case '\\': output += "\\\\"; break;
+            case '\n': output += "\\n"; break;
+            case '\r': output += "\\r"; break;
+            case '\t': output += "\\t"; break;
+            default:
+                if (character < 0x20) {
+                    output += "\\u00";
+                    output += hex[character >> 4]; output += hex[character & 15];
+                } else output += static_cast<char>(character);
+        }
+    }
+    output += '"';
+    return output;
+}
+
+double percentile(std::vector<double> values, double fraction) {
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const double position = fraction * static_cast<double>(values.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = (std::min)(lower + 1, values.size() - 1);
+    return values[lower] + (values[upper] - values[lower]) * (position - lower);
+}
+
+} // namespace
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -128,6 +166,74 @@ int main(int argc, char** argv) {
         if (!cache_dir.empty()) {
             engine.setRefCacheDir(cache_dir);
         }
+    }
+
+    // YOLO26 single-image detection. With --bench, the same image is used for
+    // warmup and measured full-pipeline iterations.
+    if (!opts.detect_path.empty()) {
+        DetectionConfig detection_config;
+        detection_config.confidence_threshold = opts.detection_confidence;
+        detection_config.max_detections = opts.detection_max;
+        std::vector<Detection> detections;
+        std::vector<double> full_times, preprocess_times, device_times, postprocess_times;
+        const int warmups = opts.bench_mode ? (std::max)(0, opts.bench_warmup) : 0;
+        const int iterations = opts.bench_mode ? (std::max)(1, opts.bench_iters) : 1;
+        for (int iteration = -warmups; iteration < iterations; ++iteration) {
+            const auto start = std::chrono::steady_clock::now();
+            detections = engine.detect_file(opts.detect_path, detection_config);
+            const auto end = std::chrono::steady_clock::now();
+            if (engine.last_error_code() != EngineErrorCode::Ok) {
+                AILA_LOG_ERROR("Object detection failed: %s", engine.last_error_message().c_str());
+                return 2;
+            }
+            if (iteration >= 0) {
+                full_times.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+                preprocess_times.push_back(engine.last_detect_preprocess_ms());
+                device_times.push_back(engine.last_detect_device_wall_ms());
+                postprocess_times.push_back(engine.last_detect_postprocess_ms());
+            }
+        }
+        if (!opts.detection_output.empty()) {
+            std::string render_error;
+            if (!aila::vision::save_detection_png(
+                    opts.detect_path, opts.detection_output, detections, &render_error)) {
+                AILA_LOG_ERROR("Failed to save detection image: %s", render_error.c_str());
+                return 2;
+            }
+        }
+        const Yolo26Config& model = engine.model_spec().yolo26;
+        std::ostringstream json;
+        json << std::setprecision(9)
+             << "{\"width\":" << engine.last_detect_image_width()
+             << ",\"height\":" << engine.last_detect_image_height()
+             << ",\"model_scale\":" << json_string(model.scale)
+             << ",\"num_classes\":" << model.num_classes
+             << ",\"detections\":[";
+        for (size_t index = 0; index < detections.size(); ++index) {
+            const Detection& value = detections[index];
+            if (index) json << ',';
+            json << "{\"x1\":" << value.x1 << ",\"y1\":" << value.y1
+                 << ",\"x2\":" << value.x2 << ",\"y2\":" << value.y2
+                 << ",\"confidence\":" << value.confidence
+                 << ",\"class_id\":" << value.class_id
+                 << ",\"class_name\":" << json_string(value.class_name) << '}';
+        }
+        json << ']';
+        if (opts.bench_mode) {
+            json << ",\"benchmark\":{\"iterations\":" << iterations
+                 << ",\"warmup_iterations\":" << warmups
+                 << ",\"full_pipeline_ms\":{\"median\":" << percentile(full_times, 0.5)
+                 << ",\"p10\":" << percentile(full_times, 0.1)
+                 << ",\"p90\":" << percentile(full_times, 0.9) << "}"
+                 << ",\"preprocess_ms_median\":" << percentile(preprocess_times, 0.5)
+                 << ",\"device_wall_ms_median\":" << percentile(device_times, 0.5)
+                 << ",\"postprocess_ms_median\":" << percentile(postprocess_times, 0.5)
+                 << ",\"peak_device_bytes\":" << engine.last_detect_peak_device_bytes()
+                 << '}';
+        }
+        json << '}';
+        std::cout << json.str() << '\n';
+        return 0;
     }
 
     // Benchmark mode

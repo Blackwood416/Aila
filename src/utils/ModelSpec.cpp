@@ -1,5 +1,7 @@
 #include "ModelSpec.hpp"
 #include "simdjson.h"
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iterator>
 
@@ -448,6 +450,67 @@ void parse_qwen3_tts(simdjson::dom::element root, ModelSpec& spec) {
     read_int64(root, "tts_eos_token_id", spec.qwen3.tts_eos_token_id);
 }
 
+bool parse_yolo26(simdjson::dom::element root, ModelSpec& spec,
+                  std::string* error_message) {
+    spec.family = ModelFamily::Yolo26;
+    auto& cfg = spec.yolo26;
+    read_int64(root, "format_version", cfg.format_version);
+    cfg.task = read_string(root, "task");
+    cfg.scale = read_string(root, "scale");
+    read_int64(root, "input_width", cfg.input_width);
+    read_int64(root, "input_height", cfg.input_height);
+    read_int64(root, "num_classes", cfg.num_classes);
+    read_int64(root, "reg_max", cfg.reg_max);
+    read_bool(root, "end2end", cfg.end2end);
+    cfg.dtype = read_string(root, "dtype", "float16");
+    cfg.topology_sha256 = read_string(root, "topology_sha256");
+
+    simdjson::dom::element strides_elem;
+    if (root.at_key("strides").get(strides_elem) == simdjson::SUCCESS) {
+        size_t index = 0;
+        for (auto value : strides_elem.get_array()) {
+            int64_t stride = 0;
+            if (index >= cfg.strides.size() || value.get_int64().get(stride) != simdjson::SUCCESS) {
+                set_error(error_message, "YOLO26 strides must contain exactly three integers");
+                return false;
+            }
+            cfg.strides[index++] = static_cast<int>(stride);
+        }
+        if (index != cfg.strides.size()) {
+            set_error(error_message, "YOLO26 strides must contain exactly three integers");
+            return false;
+        }
+    }
+
+    cfg.class_names.clear();
+    simdjson::dom::element names_elem;
+    if (root.at_key("class_names").get(names_elem) == simdjson::SUCCESS) {
+        for (auto value : names_elem.get_array()) {
+            std::string_view name;
+            if (value.get_string().get(name) != simdjson::SUCCESS) {
+                set_error(error_message, "YOLO26 class_names must be a string array");
+                return false;
+            }
+            cfg.class_names.emplace_back(name);
+        }
+    }
+
+    const bool scale_ok = cfg.scale == "n" || cfg.scale == "s" || cfg.scale == "m" ||
+                          cfg.scale == "l" || cfg.scale == "x";
+    const bool topology_hash_ok = cfg.topology_sha256.size() == 64 &&
+        std::all_of(cfg.topology_sha256.begin(), cfg.topology_sha256.end(),
+                    [](unsigned char value) { return std::isxdigit(value) != 0; });
+    if (cfg.format_version != 1 || cfg.task != "detect" || !scale_ok || cfg.input_width != 640 ||
+        cfg.input_height != 640 || cfg.num_classes <= 0 || cfg.reg_max != 1 ||
+        !cfg.end2end || cfg.dtype != "float16" ||
+        cfg.strides != std::array<int, 3>{8, 16, 32} ||
+        static_cast<int>(cfg.class_names.size()) != cfg.num_classes || !topology_hash_ok) {
+        set_error(error_message, "unsupported or malformed Aila YOLO26 config");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool load_from_dir(const std::string& model_dir,
@@ -466,7 +529,30 @@ bool load_from_dir(const std::string& model_dir,
 
         spec.model_type = read_string(root, "model_type", "qwen3");
         parse_quantization(root, spec);
-        if (spec.model_type == "qwen3_asr") {
+        if (spec.model_type == "yolo26") {
+            if (!parse_yolo26(root, spec, error_message)) return false;
+            const std::string manifest_text = read_text_file(model_dir + "/manifest.json");
+            if (manifest_text.empty()) {
+                set_error(error_message, "YOLO26 manifest.json not found or empty");
+                return false;
+            }
+            simdjson::dom::parser manifest_parser;
+            simdjson::dom::element manifest = manifest_parser.parse(manifest_text);
+            int manifest_version = 0;
+            int manifest_classes = 0;
+            const std::string manifest_format = read_string(manifest, "format");
+            const std::string manifest_scale = read_string(manifest, "scale");
+            const std::string manifest_topology = read_string(manifest, "topology_sha256");
+            read_int64(manifest, "format_version", manifest_version);
+            read_int64(manifest, "num_classes", manifest_classes);
+            if (manifest_format != "aila-yolo26-conversion" || manifest_version != 1 ||
+                manifest_scale != spec.yolo26.scale || manifest_classes != spec.yolo26.num_classes ||
+                manifest_topology != spec.yolo26.topology_sha256) {
+                set_error(error_message, "YOLO26 manifest does not match config.json");
+                return false;
+            }
+            return true;
+        } else if (spec.model_type == "qwen3_asr") {
             parse_qwen3_asr(root, spec);
         } else if (spec.model_type == "qwen3_tts") {
             parse_qwen3_tts(root, spec);

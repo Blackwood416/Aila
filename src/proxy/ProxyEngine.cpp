@@ -125,6 +125,22 @@ bool valid_asr_legacy_config(const AilaGenConfig* config) {
          finite_float_bits(config->frequency_penalty));
 }
 
+bool valid_detection_config(const AilaDetectionConfig* config) {
+    return config == nullptr ||
+        (config->struct_size >= offsetof(AilaDetectionConfig, max_detections) +
+                                sizeof(config->max_detections) &&
+         finite_float_bits(config->confidence_threshold) &&
+         config->confidence_threshold >= 0.0f && config->confidence_threshold <= 1.0f &&
+         config->max_detections >= 1 && config->max_detections <= 300);
+}
+
+std::string detection_config_json_fields(const AilaDetectionConfig* config) {
+    const float confidence = config ? config->confidence_threshold : 0.25f;
+    const int maximum = config ? config->max_detections : 300;
+    return std::string("\"confidenceThreshold\":") + json_float(confidence) +
+           ",\"maxDetections\":" + std::to_string(maximum);
+}
+
 bool encoded_request_header_fits(
     std::string_view method,
     std::string_view payload,
@@ -974,6 +990,56 @@ void parse_alignment_result(
     }
 }
 
+void parse_detection_result(const ipc::Frame& response, std::string_view method,
+                            std::vector<DetectionResult>& output) {
+    if (response.header.kind != "result" || response.header.method != method ||
+        !response.attachment.empty() || !simdjson::validate_utf8(response.header.payload_json)) {
+        throw malformed_response("detection result identity or encoding was invalid");
+    }
+    simdjson::dom::parser parser;
+    simdjson::dom::element root;
+    simdjson::dom::object object;
+    simdjson::dom::array entries;
+    if (parser.parse(response.header.payload_json).get(root) != simdjson::SUCCESS ||
+        root.get_object().get(object) != simdjson::SUCCESS ||
+        object["detections"].get_array().get(entries) != simdjson::SUCCESS) {
+        throw malformed_response("detection result shape was invalid");
+    }
+    size_t root_fields = 0;
+    for (auto field : object) { (void)field; ++root_fields; }
+    if (root_fields != 1) throw malformed_response("detection result contained extra fields");
+    output.clear();
+    for (simdjson::dom::element element : entries) {
+        if (output.size() >= 300) throw malformed_response("detection result exceeded limit");
+        simdjson::dom::object entry;
+        double x1 = 0, y1 = 0, x2 = 0, y2 = 0, confidence = 0;
+        int64_t class_id = 0;
+        std::string_view class_name;
+        if (element.get_object().get(entry) != simdjson::SUCCESS ||
+            entry["x1"].get_double().get(x1) != simdjson::SUCCESS ||
+            entry["y1"].get_double().get(y1) != simdjson::SUCCESS ||
+            entry["x2"].get_double().get(x2) != simdjson::SUCCESS ||
+            entry["y2"].get_double().get(y2) != simdjson::SUCCESS ||
+            entry["confidence"].get_double().get(confidence) != simdjson::SUCCESS ||
+            entry["classId"].get_int64().get(class_id) != simdjson::SUCCESS ||
+            entry["className"].get_string().get(class_name) != simdjson::SUCCESS ||
+            !std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(x2) ||
+            !std::isfinite(y2) || !std::isfinite(confidence) ||
+            confidence < 0.0 || confidence > 1.0 || class_id < 0 ||
+            class_id > (std::numeric_limits<int>::max)() ||
+            class_name.find('\0') != std::string_view::npos) {
+            throw malformed_response("detection entry was invalid");
+        }
+        size_t fields = 0;
+        for (auto field : entry) { (void)field; ++fields; }
+        if (fields != 7) throw malformed_response("detection entry contained extra fields");
+        output.push_back({static_cast<float>(x1), static_cast<float>(y1),
+                          static_cast<float>(x2), static_cast<float>(y2),
+                          static_cast<float>(confidence), static_cast<int>(class_id),
+                          std::string(class_name)});
+    }
+}
+
 std::vector<std::byte> bytes_from(const void* data, size_t size) {
     std::vector<std::byte> result(size);
     if (size != 0) std::memcpy(result.data(), data, size);
@@ -1262,6 +1328,100 @@ int ProxyEngine::align_words(
         words.clear();
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, "unknown pre-tokenized alignment failure");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::detect_file(std::string_view path, const AilaDetectionConfig* config,
+                             std::vector<DetectionResult>& detections) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    detections.clear();
+    if (stream_active_ || !initialized_ || path.empty() ||
+        path.find('\0') != std::string_view::npos || !simdjson::validate_utf8(path) ||
+        !valid_detection_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "detection file arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const std::string payload = "{" + detection_config_json_fields(config) +
+            ",\"path\":" + json_string(path) + "}";
+        const ipc::Frame response = request_locked("vision.detect_file", payload);
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "vision.detect_file", "object detection failed");
+            return error_code_;
+        }
+        parse_detection_result(response, "vision.detect_file", detections);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& error) {
+        detections.clear(); shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, error.what());
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::detect_encoded(const void* bytes, size_t size,
+                                const AilaDetectionConfig* config,
+                                std::vector<DetectionResult>& detections) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    detections.clear();
+    if (stream_active_ || !initialized_ || !bytes || size == 0 ||
+        size > ipc::kMaxAttachmentBytes || !valid_detection_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "encoded detection arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const std::string payload = "{" + detection_config_json_fields(config) +
+            ",\"byteCount\":" + std::to_string(size) + "}";
+        const ipc::Frame response = request_locked(
+            "vision.detect_encoded", payload, bytes_from(bytes, size));
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "vision.detect_encoded", "object detection failed");
+            return error_code_;
+        }
+        parse_detection_result(response, "vision.detect_encoded", detections);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& error) {
+        detections.clear(); shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, error.what());
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+int ProxyEngine::detect_pixels(const void* pixels, size_t size, int width, int height,
+                               int row_stride, AilaPixelFormat format,
+                               const AilaDetectionConfig* config,
+                               std::vector<DetectionResult>& detections) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    detections.clear();
+    const int channels = format == AILA_PIXEL_RGB8 || format == AILA_PIXEL_BGR8 ? 3 : 4;
+    const size_t minimum_row = width > 0 ? static_cast<size_t>(width) * channels : 0;
+    const bool valid_shape = pixels && size > 0 && size <= ipc::kMaxAttachmentBytes &&
+        width > 0 && height > 0 && row_stride > 0 &&
+        static_cast<size_t>(row_stride) >= minimum_row &&
+        static_cast<size_t>(height - 1) <=
+            ((std::numeric_limits<size_t>::max)() - minimum_row) /
+                static_cast<size_t>(row_stride) &&
+        size >= static_cast<size_t>(height - 1) * row_stride + minimum_row;
+    if (stream_active_ || !initialized_ || format < AILA_PIXEL_RGB8 ||
+        format > AILA_PIXEL_BGRA8 || !valid_shape || !valid_detection_config(config)) {
+        set_error_locked(AILA_ERR_INVALID_ARGUMENT, "raw-pixel detection arguments are invalid");
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        const std::string payload = "{" + detection_config_json_fields(config) +
+            ",\"byteCount\":" + std::to_string(size) +
+            ",\"width\":" + std::to_string(width) +
+            ",\"height\":" + std::to_string(height) +
+            ",\"rowStride\":" + std::to_string(row_stride) +
+            ",\"pixelFormat\":" + std::to_string(static_cast<int>(format)) + "}";
+        const ipc::Frame response = request_locked(
+            "vision.detect_pixels", payload, bytes_from(pixels, size));
+        if (response.header.kind == "error") {
+            accept_error_response_locked(response, "vision.detect_pixels", "object detection failed");
+            return error_code_;
+        }
+        parse_detection_result(response, "vision.detect_pixels", detections);
+        clear_error_locked(); return AILA_OK;
+    } catch (const std::exception& error) {
+        detections.clear(); shutdown_locked(); set_error_locked(AILA_ERR_RUNTIME, error.what());
         return AILA_ERR_RUNTIME;
     }
 }

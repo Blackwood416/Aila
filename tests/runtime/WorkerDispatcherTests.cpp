@@ -44,6 +44,9 @@ using aila::worker::TextGenerationRequest;
 using aila::worker::AlignmentMethod;
 using aila::worker::AlignmentRequest;
 using aila::worker::AlignedWordResult;
+using aila::worker::DetectionMethod;
+using aila::worker::DetectionRequest;
+using aila::worker::DetectionResult;
 
 [[noreturn]] void fail(const char* test_name, const std::string& message) {
     throw std::runtime_error(std::string("FAILED: ") + test_name + ": " + message);
@@ -147,6 +150,10 @@ struct EngineState {
     AlignmentRequest alignment_request;
     std::vector<AlignedWordResult> alignment_result{
         {u8"你", 10, 20}, {u8"好", 21, 42}};
+    int detection_calls = 0;
+    DetectionRequest detection_request;
+    std::vector<DetectionResult> detection_result{
+        {1.25f, 2.5f, 30.0f, 40.0f, 0.875f, 7, u8"交通灯"}};
 };
 
 class FakeEngine final : public WorkerEngineApi {
@@ -270,6 +277,15 @@ public:
         ++state_.alignment_calls;
         state_.alignment_request = request;
         output = state_.alignment_result;
+        return true;
+    }
+
+    bool detect(
+        const DetectionRequest& request,
+        std::vector<DetectionResult>& output) override {
+        ++state_.detection_calls;
+        state_.detection_request = request;
+        output = state_.detection_result;
         return true;
     }
 
@@ -1133,6 +1149,52 @@ void test_log_level_command_validates_and_applies_level() {
     }
 }
 
+void test_detection_wire_methods_use_attachments_and_bounded_json() {
+    constexpr const char* name = "detection wire methods preserve image inputs";
+    EngineState state;
+    int destructions = 0;
+    WorkerDispatcher dispatcher(fake_engine(state, destructions));
+    initialize(dispatcher, name);
+    bool should_shutdown = false;
+
+    Frame file = request(500, "vision.detect_file",
+        R"({"path":"图像.jpg","confidenceThreshold":0.25,"maxDetections":17})");
+    Frame response = dispatcher.dispatch(file, should_shutdown);
+    expect(response.header.kind == "result", name, "file detection failed");
+    expect(state.detection_request.method == DetectionMethod::File &&
+               state.detection_request.path == u8"图像.jpg" &&
+               state.detection_request.config.max_detections == 17,
+           name, "file request was not preserved");
+    expect(response.header.payload_json.find(u8"交通灯") != std::string::npos,
+           name, "UTF-8 detection result was not serialized");
+
+    Frame encoded = request(501, "vision.detect_encoded",
+        R"({"byteCount":4,"confidenceThreshold":0.5,"maxDetections":1})");
+    encoded.attachment = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    response = dispatcher.dispatch(encoded, should_shutdown);
+    expect(response.header.kind == "result" &&
+               state.detection_request.method == DetectionMethod::Encoded &&
+               state.detection_request.bytes == encoded.attachment,
+           name, "encoded image attachment was not preserved");
+
+    Frame pixels = request(502, "vision.detect_pixels",
+        R"({"byteCount":8,"width":1,"height":2,"rowStride":4,"pixelFormat":2,"confidenceThreshold":0,"maxDetections":300})");
+    pixels.attachment.resize(8);
+    response = dispatcher.dispatch(pixels, should_shutdown);
+    expect(response.header.kind == "result" &&
+               state.detection_request.method == DetectionMethod::Pixels &&
+               state.detection_request.width == 1 && state.detection_request.height == 2 &&
+               state.detection_request.row_stride == 4 &&
+               state.detection_request.pixel_format == AILA_PIXEL_RGBA8,
+           name, "raw pixel metadata was not preserved");
+
+    encoded.header.request_id++;
+    encoded.header.payload_json =
+        R"({"byteCount":5,"confidenceThreshold":0.5,"maxDetections":1})";
+    expect(dispatcher.dispatch(encoded, should_shutdown).header.kind == "error",
+           name, "mismatched attachment length was accepted");
+}
+
 } // namespace
 
 int main() {
@@ -1156,6 +1218,7 @@ int main() {
         test_audio_wire_methods_validate_and_preserve_binary_arguments();
         test_tts_stream_emits_typed_audio_chunks();
         test_alignment_wire_methods_validate_and_preserve_inputs();
+        test_detection_wire_methods_use_attachments_and_bounded_json();
         test_log_level_command_validates_and_applies_level();
         std::cout << "AilaWorkerDispatcherTests passed\n";
         return 0;

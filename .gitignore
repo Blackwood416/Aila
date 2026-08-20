@@ -17,6 +17,8 @@ tmp/
 *.wav
 *.bin
 *.mp3
+__pycache__/
+*.py[cod]
 
 # Third-party repos
 Qwen3-TTS/

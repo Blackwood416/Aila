@@ -33,6 +33,12 @@ struct CLIOptions {
     bool show_version = false;     // -v, --version
     bool explicit_stream = false;  // user explicitly set stream mode
 
+    // YOLO26 object detection
+    std::string detect_path;        // --detect
+    float detection_confidence = 0.25f; // --conf
+    int detection_max = 300;        // --max-det
+    std::string detection_output;   // --save-detect
+
     // Penalty parameters
     float repetition_penalty = 1.0f;  // --rep-penalty
     float presence_penalty   = 0.0f;  // --pres-penalty

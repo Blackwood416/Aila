@@ -23,6 +23,37 @@ allocator. The TTS streaming ABI changed in 0.1.7: `aila_synthesize_stream`
 returns an `AilaTTSStream*`, and `aila_stream_wait` / `aila_stream_destroy` take
 that stream handle instead of an `AilaEngine*`.
 
+## YOLO26 object detection (0.2.0)
+
+ABI v1 adds `AilaDetectionConfig`, `AilaPixelFormat`, and `AilaDetection`, plus
+`aila_detect_file`, `aila_detect_encoded`, and `aila_detect_pixels`. Initialize
+the config with `aila_default_detection_config()` so its `struct_size` and
+reserved fields are correct. Returned arrays and their copied UTF-8 class names
+belong to Aila and must be released with `aila_free_detections`.
+
+```c
+AilaDetectionConfig cfg = aila_default_detection_config();
+cfg.confidence_threshold = 0.25f;
+cfg.max_detections = 300;
+AilaDetection* detections = NULL;
+int count = 0;
+int rc = aila_detect_file(engine, "image.jpg", &cfg, &detections, &count);
+if (rc == AILA_OK) {
+    /* A zero count is a successful empty result. */
+    aila_free_detections(detections, count);
+}
+```
+
+Raw pixels may be RGB8, BGR8, RGBA8, or BGRA8 and may have padded rows.
+Encoded input accepts JPEG or PNG bytes. On every detection failure, output is
+reset to `NULL` and `0`. The threshold must be finite and in `[0,1]`; the limit
+must be in `[1,300]`. Calling detection on another model, or generation/ASR/TTS
+on a YOLO26 model, reports `AILA_ERR_MODEL_CAPABILITY` (numeric value 7).
+
+On Windows the proxy sends encoded and raw images as bounded IPC attachments via
+`vision.detect_encoded` and `vision.detect_pixels`; file requests use
+`vision.detect_file`. Protocol and ABI remain version 1.
+
 A recommended integration layout is:
 
 ```text
@@ -1055,7 +1086,7 @@ typedef void (*AilaLogCallback)(int level, const char* message, void* user_data)
 const char* aila_version(void);
 ```
 
-Returns the library version string (currently `"0.1.7"`). The pointer is static and must not be freed.
+Returns the library version string (currently `"0.2.0"`). The pointer is static and must not be freed.
 
 ## Language Bindings
 

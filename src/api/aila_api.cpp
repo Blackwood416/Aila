@@ -4,11 +4,13 @@
 #include "profile/Profiling.hpp"
 #include "AudioPreprocessor.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,7 +18,7 @@
 // ============================================================
 // Version
 // ============================================================
-static const char* AILA_VERSION_STRING = "0.1.8";
+static const char* AILA_VERSION_STRING = "0.2.0";
 
 // ============================================================
 // Opaque handle wraps InferenceEngine
@@ -116,6 +118,7 @@ static int to_c_error_code(EngineErrorCode code) {
         case EngineErrorCode::JsonParseError: return AILA_ERR_JSON_PARSE;
         case EngineErrorCode::VisionNotEnabled: return AILA_ERR_VISION_NOT_ENABLED;
         case EngineErrorCode::ContextOverflow: return AILA_ERR_CONTEXT_OVERFLOW;
+        case EngineErrorCode::ModelCapability: return AILA_ERR_MODEL_CAPABILITY;
         default: return AILA_ERR_RUNTIME;
     }
 }
@@ -224,6 +227,136 @@ AILA_API AilaGenConfigV2 aila_default_gen_config_v2(void) {
     cfg.sampling_seed = 42;
     cfg.use_fixed_seed = 0;
     return cfg;
+}
+
+AILA_API AilaDetectionConfig aila_default_detection_config(void) {
+    AilaDetectionConfig config{};
+    config.struct_size = sizeof(AilaDetectionConfig);
+    config.confidence_threshold = 0.25f;
+    config.max_detections = 300;
+    return config;
+}
+
+static bool to_cpp_detection_config(const AilaDetectionConfig* source,
+                                    DetectionConfig& destination) {
+    if (!source) return true;
+    if (source->struct_size < offsetof(AilaDetectionConfig, max_detections) +
+                                  sizeof(source->max_detections)) return false;
+    destination.confidence_threshold = source->confidence_threshold;
+    destination.max_detections = source->max_detections;
+    return std::isfinite(destination.confidence_threshold) &&
+           destination.confidence_threshold >= 0.0f &&
+           destination.confidence_threshold <= 1.0f &&
+           destination.max_detections >= 1 && destination.max_detections <= 300;
+}
+
+static int copy_detection_result(const std::vector<Detection>& source,
+                                 AilaDetection** out_detections, int* out_count) {
+    if (source.empty()) return AILA_OK;
+    if (source.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        return AILA_ERR_RUNTIME;
+    }
+    auto* output = static_cast<AilaDetection*>(
+        std::calloc(source.size(), sizeof(AilaDetection)));
+    if (!output) return AILA_ERR_RUNTIME;
+    for (size_t index = 0; index < source.size(); ++index) {
+        output[index].struct_size = sizeof(AilaDetection);
+        output[index].x1 = source[index].x1;
+        output[index].y1 = source[index].y1;
+        output[index].x2 = source[index].x2;
+        output[index].y2 = source[index].y2;
+        output[index].confidence = source[index].confidence;
+        output[index].class_id = source[index].class_id;
+        output[index].class_name = copy_string_result(source[index].class_name);
+        if (!output[index].class_name) {
+            for (size_t prior = 0; prior < index; ++prior) {
+                std::free(const_cast<char*>(output[prior].class_name));
+            }
+            std::free(output);
+            return AILA_ERR_RUNTIME;
+        }
+    }
+    *out_detections = output;
+    *out_count = static_cast<int>(source.size());
+    return AILA_OK;
+}
+
+template <typename Invoke>
+static int run_detection(AilaEngine* engine, const AilaDetectionConfig* config,
+                         AilaDetection** out_detections, int* out_count, Invoke&& invoke) {
+    if (out_detections) *out_detections = nullptr;
+    if (out_count) *out_count = 0;
+    if (!engine || !out_detections || !out_count) return AILA_ERR_INVALID_ARGUMENT;
+    DetectionConfig cpp_config;
+    if (!to_cpp_detection_config(config, cpp_config)) return AILA_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<Detection> detections = invoke(cpp_config);
+        if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+            return to_c_error_code(engine->engine.last_error_code());
+        }
+        return copy_detection_result(detections, out_detections, out_count);
+    } catch (const std::exception& error) {
+        AILA_LOG_ERROR("[C-API] Detection failed: %s", error.what());
+        return AILA_ERR_RUNTIME;
+    } catch (...) {
+        AILA_LOG_ERROR("[C-API] Detection failed: unknown exception");
+        return AILA_ERR_RUNTIME;
+    }
+}
+
+AILA_API int aila_detect_file(AilaEngine* engine, const char* image_path,
+                              const AilaDetectionConfig* config,
+                              AilaDetection** out_detections, int* out_count) {
+    if (!image_path) {
+        if (out_detections) *out_detections = nullptr;
+        if (out_count) *out_count = 0;
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    return run_detection(engine, config, out_detections, out_count,
+        [&](const DetectionConfig& value) { return engine->engine.detect_file(image_path, value); });
+}
+
+AILA_API int aila_detect_encoded(AilaEngine* engine, const void* encoded_bytes,
+                                 size_t encoded_size, const AilaDetectionConfig* config,
+                                 AilaDetection** out_detections, int* out_count) {
+    if (!encoded_bytes || encoded_size == 0) {
+        if (out_detections) *out_detections = nullptr;
+        if (out_count) *out_count = 0;
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    return run_detection(engine, config, out_detections, out_count,
+        [&](const DetectionConfig& value) {
+            return engine->engine.detect_encoded(
+                static_cast<const uint8_t*>(encoded_bytes), encoded_size, value);
+        });
+}
+
+AILA_API int aila_detect_pixels(AilaEngine* engine, const void* pixels, size_t size_bytes,
+                                int width, int height, int row_stride, AilaPixelFormat format,
+                                const AilaDetectionConfig* config,
+                                AilaDetection** out_detections, int* out_count) {
+    if (!pixels || width <= 0 || height <= 0 || row_stride <= 0 ||
+        format < AILA_PIXEL_RGB8 || format > AILA_PIXEL_BGRA8) {
+        if (out_detections) *out_detections = nullptr;
+        if (out_count) *out_count = 0;
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    return run_detection(engine, config, out_detections, out_count,
+        [&](const DetectionConfig& value) {
+            ImageView image;
+            image.data = static_cast<const uint8_t*>(pixels); image.size_bytes = size_bytes;
+            image.width = width; image.height = height; image.row_stride = row_stride;
+            image.format = static_cast<PixelFormat>(format);
+            return engine->engine.detect_pixels(image, value);
+        });
+}
+
+AILA_API void aila_free_detections(AilaDetection* detections, int count) {
+    if (!detections) return;
+    for (int index = 0; index < count; ++index) {
+        std::free(const_cast<char*>(detections[index].class_name));
+    }
+    std::free(detections);
 }
 
 AILA_API char* aila_generate(AilaEngine* engine, const char* prompt, const AilaGenConfig* config) {
@@ -544,7 +677,10 @@ AILA_API AilaTranscribeStream* aila_transcribe_stream_create(
         engine->engine.clear_error();
 
         if (engine->engine.model_spec().family != ModelFamily::Qwen3ASR) {
-            engine->engine.set_error(EngineErrorCode::RuntimeError, "Model does not support ASR");
+            engine->engine.set_error(
+                engine->engine.model_spec().family == ModelFamily::Yolo26
+                    ? EngineErrorCode::ModelCapability : EngineErrorCode::RuntimeError,
+                "Model does not support ASR");
             return nullptr;
         }
 
@@ -665,7 +801,7 @@ AILA_API int aila_synthesize_wav(
         std::vector<float> samples;
         bool ok = engine->engine.synthesize_wav(tokens, spk_emb, cpp_cfg, samples);
         if (!ok) {
-            return AILA_ERR_RUNTIME;
+            return to_c_error_code(engine->engine.last_error_code());
         }
 
         float* c_arr = (float*)malloc(samples.size() * sizeof(float));
@@ -711,7 +847,7 @@ AILA_API int aila_synthesize_text_to_wav(
         std::vector<float> samples;
         bool ok = engine->engine.synthesize_text_to_wav(text, spk_emb, cpp_cfg, samples);
         if (!ok) {
-            return AILA_ERR_RUNTIME;
+            return to_c_error_code(engine->engine.last_error_code());
         }
 
         float* c_arr = (float*)malloc(samples.size() * sizeof(float));
@@ -756,7 +892,7 @@ AILA_API int aila_decode_mimi_vocoder(
         
         bool ok = engine->engine.decode_mimi_vocoder(codes_vec, n_frames, samples);
         if (!ok) {
-            return AILA_ERR_RUNTIME;
+            return to_c_error_code(engine->engine.last_error_code());
         }
 
         float* c_arr = (float*)malloc(samples.size() * sizeof(float));
@@ -806,7 +942,7 @@ AILA_API int aila_synthesize(
         );
 
         if (!ok) {
-            return AILA_ERR_RUNTIME;
+            return to_c_error_code(engine->engine.last_error_code());
         }
 
         if (!save_wav(std::string(output_wav_path), samples, 24000)) {
@@ -859,6 +995,11 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
             callback(samples, count, user_data);
         }, 4);
 
+    if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
+        delete stream;
+        return nullptr;
+    }
+
     return stream;
 }
 
@@ -891,7 +1032,7 @@ AILA_API int aila_extract_speaker_embedding(
         std::vector<float> embedding;
         bool ok = engine->engine.extractSpeakerEmbedding(audio_path, embedding);
         if (!ok) {
-            return AILA_ERR_RUNTIME;
+            return to_c_error_code(engine->engine.last_error_code());
         }
 
         float* c_arr = (float*)malloc(embedding.size() * sizeof(float));

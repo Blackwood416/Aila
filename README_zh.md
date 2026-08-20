@@ -19,6 +19,7 @@
 - **🏗️ Qwen3.5 Hybrid 架构** — 完整支持双重注意力（GQA + DeltaNet 线性注意力），GPU 加速 delta 循环计算
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
+- 🎯 **YOLO26 目标检测** — 支持 n/s/m/l/x、固定 640×640、NMS-free one-to-one head、FP16 oneDNN/SYCL 推理，以及 UTF-8 类名
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
 - 🎯 **强制对齐** — 音频 + 文本 → 词级时间戳对齐，支持 CJK 逐字分词和 LIS 时间戳修正
 - 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS），支持原生零样本语音克隆。支持直接生成原始音频 WAV、通过参考音频进行音色克隆，以及离线 Mimi 译码
@@ -47,8 +48,12 @@
 | [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（预置音色） |
 | [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（预置音色） |
 | [Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS（指令设计） |
+| [YOLO26 n/s/m/l/x](https://docs.ultralytics.com/models/yolo26/) | 目标检测、one-to-one 端到端 head | FP16 | ✅（检测） | ❌ |
 
 其他符合支持架构模式的 Qwen3 / Qwen3.5 模型大小理论上也可运行。
+
+YOLO26 权重需要先转换为 Aila 稳定格式，发布包不会附带这些资产。请参阅
+[YOLO26 准备与验证指南](docs/YOLO26.md)。
 
 ## 🔧 系统要求
 
@@ -154,6 +159,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 # 离线语音转录 (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# YOLO26 检测（稳定单行 JSON，可选原尺寸标注 PNG）
+Aila.exe -m ./models/yolo26/aila/n --detect image.jpg --conf 0.25 --max-det 300 --save-detect result.png
+
 # 强制对齐（词级时间戳）
 Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界" --align-audio input.wav --align-lang Chinese
 
@@ -195,6 +203,10 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--rep-penalty <F>` | 重复惩罚 | 1.0 |
 | `--pres-penalty <F>` | 存在惩罚 | 0.0 |
 | `--freq-penalty <F>` | 频率惩罚 | 0.0 |
+| `--detect <image>` | 对单张 JPEG/PNG 执行 YOLO26 检测 | 关闭 |
+| `--conf <F>` | `[0,1]` 内的检测置信度 | 0.25 |
+| `--max-det <N>` | `[1,300]` 内的最大检测数 | 300 |
+| `--save-detect <png>` | 保存原尺寸标注 PNG | 关闭 |
 | `--bench` | 基准测试模式 | 关闭 |
 | `--bench-pp <N>` | 基准测试 prompt 长度 | 512 |
 | `--bench-tg <N>` | 基准测试生成长度 | 128 |

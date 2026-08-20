@@ -9,6 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -43,6 +46,30 @@ std::string json_string(std::string_view value) {
     }
     result += '"';
     return result;
+}
+
+std::string json_float(float value) {
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << std::setprecision((std::numeric_limits<float>::max_digits10)) << value;
+    return stream.str();
+}
+
+std::string detection_result_json(const std::vector<DetectionResult>& detections) {
+    std::string output = "{\"detections\":[";
+    for (size_t index = 0; index < detections.size(); ++index) {
+        const auto& value = detections[index];
+        if (index) output += ',';
+        output += "{\"x1\":" + json_float(value.x1) +
+                  ",\"y1\":" + json_float(value.y1) +
+                  ",\"x2\":" + json_float(value.x2) +
+                  ",\"y2\":" + json_float(value.y2) +
+                  ",\"confidence\":" + json_float(value.confidence) +
+                  ",\"classId\":" + std::to_string(value.class_id) +
+                  ",\"className\":" + json_string(value.class_name) + "}";
+    }
+    output += "]}";
+    return output;
 }
 
 bool require_c_string_safe(std::string_view value) {
@@ -792,6 +819,78 @@ ipc::Frame WorkerDispatcher::dispatch(const ipc::Frame& request, bool& should_sh
         if (request.header.method == "engine.reset") {
             engine_->reset_context();
             return result(request, "{\"ok\":true}");
+        }
+
+        if (request.header.method == "vision.detect_file" ||
+            request.header.method == "vision.detect_encoded" ||
+            request.header.method == "vision.detect_pixels") {
+            if (!initialized_) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "engine is not initialized");
+            }
+            simdjson::dom::object object;
+            DetectionRequest detection;
+            float confidence = 0.0f;
+            int max_detections = 0;
+            if (payload.get_object().get(object) != simdjson::SUCCESS ||
+                !object_float(object, "confidenceThreshold", confidence) ||
+                !object_integer(object, "maxDetections", max_detections) ||
+                confidence < 0.0f || confidence > 1.0f ||
+                max_detections < 1 || max_detections > 300) {
+                return error(request, AILA_ERR_INVALID_ARGUMENT, "detection config is malformed");
+            }
+            detection.config = {};
+            detection.config.struct_size = sizeof(AilaDetectionConfig);
+            detection.config.confidence_threshold = confidence;
+            detection.config.max_detections = max_detections;
+            if (request.header.method == "vision.detect_file") {
+                std::string_view path;
+                if (!request.attachment.empty() ||
+                    object["path"].get_string().get(path) != simdjson::SUCCESS || path.empty() ||
+                    !require_c_string_safe(path)) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "detection file path is malformed");
+                }
+                detection.method = DetectionMethod::File;
+                detection.path.assign(path.data(), path.size());
+            } else {
+                uint64_t byte_count = 0;
+                if (object["byteCount"].get_uint64().get(byte_count) != simdjson::SUCCESS ||
+                    byte_count == 0 || byte_count != request.attachment.size()) {
+                    return error(request, AILA_ERR_INVALID_ARGUMENT, "detection attachment size is malformed");
+                }
+                detection.bytes = request.attachment;
+                if (request.header.method == "vision.detect_encoded") {
+                    detection.method = DetectionMethod::Encoded;
+                } else {
+                    int format = 0;
+                    if (!object_integer(object, "width", detection.width) ||
+                        !object_integer(object, "height", detection.height) ||
+                        !object_integer(object, "rowStride", detection.row_stride) ||
+                        !object_integer(object, "pixelFormat", format) ||
+                        detection.width <= 0 || detection.height <= 0 || detection.row_stride <= 0 ||
+                        format < AILA_PIXEL_RGB8 || format > AILA_PIXEL_BGRA8) {
+                        return error(request, AILA_ERR_INVALID_ARGUMENT, "raw detection image shape is malformed");
+                    }
+                    detection.method = DetectionMethod::Pixels;
+                    detection.pixel_format = static_cast<AilaPixelFormat>(format);
+                }
+            }
+            std::vector<DetectionResult> detections;
+            if (!engine_->detect(detection, detections)) {
+                int code = engine_->last_error_code();
+                if (code == AILA_OK) code = AILA_ERR_RUNTIME;
+                std::string message = engine_->last_error_message();
+                if (message.empty()) message = "object detection failed";
+                return error(request, code, message);
+            }
+            if (detections.size() > 300) {
+                return error(request, AILA_ERR_RUNTIME, "detection result exceeded limit");
+            }
+            for (const auto& value : detections) {
+                if (!simdjson::validate_utf8(value.class_name)) {
+                    return error(request, AILA_ERR_RUNTIME, "detection class name is not UTF-8");
+                }
+            }
+            return result(request, detection_result_json(detections));
         }
 
         if (request.header.method == "align" || request.header.method == "align.words") {

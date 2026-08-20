@@ -107,6 +107,29 @@ struct AlignedWordResult {
     int end_ms = 0;
 };
 
+enum class DetectionMethod { File, Encoded, Pixels };
+
+struct DetectionRequest {
+    DetectionMethod method = DetectionMethod::File;
+    std::string path;
+    std::vector<std::byte> bytes;
+    int width = 0;
+    int height = 0;
+    int row_stride = 0;
+    AilaPixelFormat pixel_format = AILA_PIXEL_RGB8;
+    AilaDetectionConfig config{};
+};
+
+struct DetectionResult {
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+    float confidence = 0.0f;
+    int class_id = 0;
+    std::string class_name;
+};
+
 struct TextGenerationRequest {
     TextGenerationMethod method = TextGenerationMethod::Generate;
     std::string input;
@@ -149,6 +172,13 @@ public:
     virtual bool align(
         const AlignmentRequest& request,
         std::vector<AlignedWordResult>& output) = 0;
+    virtual bool detect(
+        const DetectionRequest& request,
+        std::vector<DetectionResult>& output) {
+        (void)request;
+        output.clear();
+        return false;
+    }
 };
 
 class WorkerDispatcher {

@@ -19,6 +19,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **🏗️ Qwen3.5 Hybrid architecture** — full GPU acceleration for the dual attention (GQA + DeltaNet linear attention) architecture
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
+- 🎯 **YOLO26 detection** — NMS-free n/s/m/l/x inference at 640×640 with FP16 oneDNN/SYCL execution, file/encoded/raw-pixel APIs, and UTF-8 class names
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
 - 🎯 **Forced Alignment** — word-level timestamp alignment from audio + text, with CJK character-level tokenization and LIS-based timestamp correction
 - 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder and native zero-shot voice cloning. Supports direct raw audio WAV generation, voice cloning via reference audio, and offline Mimi decoding
@@ -47,8 +48,12 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 | [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Pre-trained Voices) |
 | [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Pre-trained Voices) |
 | [Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | Talker + Mimi Vocoder | BF16 | ❌ | ✅ TTS (Instruct-based) |
+| [YOLO26 n/s/m/l/x](https://docs.ultralytics.com/models/yolo26/) | Detection, one-to-one end-to-end head | FP16 | ✅ (detection) | ❌ |
 
 Other Qwen3 / Qwen3.5 model sizes may work if they match the supported architecture pattern.
+
+YOLO26 assets must first be converted to Aila's stable format and are not included
+in release packages. See [YOLO26 preparation and validation](docs/YOLO26.md).
 
 ## 🔧 Requirements
 
@@ -158,6 +163,9 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision
 # Offline audio transcription (ASR)
 Aila.exe -m ./models/Qwen3-ASR-1.7B --transcribe input.wav
 
+# YOLO26 detection (stable one-line JSON; optional annotated PNG)
+Aila.exe -m ./models/yolo26/aila/n --detect image.jpg --conf 0.25 --max-det 300 --save-detect result.png
+
 # Forced alignment (word-level timestamps)
 Aila.exe -m ./models/Qwen3-ForcedAligner-0.6B-BNB-NF4 --align-text "你好世界" --align-audio input.wav --align-lang Chinese
 
@@ -199,6 +207,10 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--rep-penalty <F>` | Repetition penalty | 1.0 |
 | `--pres-penalty <F>` | Presence penalty | 0.0 |
 | `--freq-penalty <F>` | Frequency penalty | 0.0 |
+| `--detect <image>` | Run one YOLO26 JPEG/PNG detection | off |
+| `--conf <F>` | Detection confidence in `[0,1]` | 0.25 |
+| `--max-det <N>` | Maximum detections in `[1,300]` | 300 |
+| `--save-detect <png>` | Save original-size annotated PNG | off |
 | `--bench` | Benchmark mode | off |
 | `--bench-pp <N>` | Benchmark prompt length | 512 |
 | `--bench-tg <N>` | Benchmark generation length | 128 |

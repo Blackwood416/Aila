@@ -108,7 +108,54 @@ enum class ModelFamily {
     Qwen3ASR,
     Qwen3TTS,
     Qwen3ForceAligner,  // NEW
+    Yolo26,
     Unknown
+};
+
+enum class PixelFormat {
+    RGB8 = 0,
+    BGR8 = 1,
+    RGBA8 = 2,
+    BGRA8 = 3,
+};
+
+struct ImageView {
+    const uint8_t* data = nullptr;
+    size_t size_bytes = 0;
+    int width = 0;
+    int height = 0;
+    int row_stride = 0;
+    PixelFormat format = PixelFormat::RGB8;
+};
+
+struct DetectionConfig {
+    float confidence_threshold = 0.25f;
+    int max_detections = 300;
+};
+
+struct Detection {
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+    float confidence = 0.0f;
+    int class_id = -1;
+    std::string class_name;
+};
+
+struct Yolo26Config {
+    int format_version = 1;
+    std::string task;
+    std::string scale;
+    int input_width = 640;
+    int input_height = 640;
+    int num_classes = 80;
+    int reg_max = 1;
+    bool end2end = true;
+    std::string dtype = "float16";
+    std::array<int, 3> strides = {8, 16, 32};
+    std::vector<std::string> class_names;
+    std::string topology_sha256;
 };
 
 struct Qwen35TextConfig {
@@ -263,6 +310,9 @@ struct ModelSpec {
     // Model-level quantization metadata
     QuantizationConfig quantization{};
 
+    // YOLO26 detection path
+    Yolo26Config yolo26{};
+
     bool has_vision() const { return vision.enabled; }
     bool has_audio() const { return audio.d_model > 0; }
     bool is_quantized() const { return quantization.enabled(); }
@@ -277,6 +327,7 @@ enum class EngineErrorCode {
     VisionNotEnabled = 4,
     ContextOverflow = 5,
     RuntimeError = 6,
+    ModelCapability = 7,
 };
 
 // ============================================================

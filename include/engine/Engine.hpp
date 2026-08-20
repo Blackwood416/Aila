@@ -12,6 +12,7 @@
 #include "../src/models/Qwen3ForceAlignerBackend.hpp"
 #include "../src/models/Qwen3ForceAlignerBnb4Backend.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
+#include "../src/vision/Yolo26Detector.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
 #include "../src/audio/SpeakerEncoder.hpp"
@@ -335,6 +336,52 @@ public:
         // 1. Create context
         AILA_LOG_INFO("[1/3] Initializing GPU context...");
         ctx_ = std::make_unique<Context>();
+
+        // Detection models are self-contained and intentionally do not initialize
+        // tokenizer, generation backend, KV cache, or token warmup state.
+        {
+            ModelSpec detected_spec;
+            std::string detected_error;
+            const bool detected = aila::modelspec::load_from_dir(
+                model_dir, detected_spec, &detected_error);
+            if (!detected && detected_spec.model_type == "yolo26") {
+                set_error(EngineErrorCode::InvalidArgument, detected_error);
+                AILA_LOG_ERROR("[YOLO26] Invalid model package: %s", detected_error.c_str());
+                return false;
+            }
+            if (detected && detected_spec.family == ModelFamily::Yolo26) {
+                if (!lora_dir.empty()) {
+                    set_error(EngineErrorCode::ModelCapability,
+                              "YOLO26 detection models do not support LoRA adapters");
+                    return false;
+                }
+                model_spec_ = std::move(detected_spec);
+                try {
+                    AILA_LOG_INFO("[2/3] Loading YOLO26 %s FP16 weights...",
+                                  model_spec_.yolo26.scale.c_str());
+                    weights_ = std::make_unique<ModelWeights>(
+                        LoadModelWeightsFromDir(model_dir, *ctx_));
+                    detector_ = std::make_unique<aila::vision::Yolo26Detector>();
+                    std::string detector_error;
+                    if (!detector_->init(*ctx_, *weights_, model_spec_.yolo26, &detector_error)) {
+                        set_error(EngineErrorCode::RuntimeError, detector_error);
+                        AILA_LOG_ERROR("[YOLO26] Detector initialization failed: %s", detector_error.c_str());
+                        detector_.reset();
+                        return false;
+                    }
+                } catch (const std::exception& error) {
+                    set_error(EngineErrorCode::RuntimeError, error.what());
+                    AILA_LOG_ERROR("[YOLO26] Detector initialization failed: %s", error.what());
+                    detector_.reset();
+                    return false;
+                }
+                AILA_LOG_INFO("[3/3] YOLO26 detector ready (input=%dx%d classes=%d)",
+                              model_spec_.yolo26.input_width,
+                              model_spec_.yolo26.input_height,
+                              model_spec_.yolo26.num_classes);
+                return true;
+            }
+        }
 
         // 2. Load tokenizer
         AILA_LOG_INFO("[2/4] Loading tokenizer...");
@@ -966,6 +1013,7 @@ public:
 
     std::string current_model_family_name() const {
         switch (model_spec_.family) {
+        case ModelFamily::Yolo26: return "yolo26";
         case ModelFamily::Qwen35Hybrid: return "qwen3_5_hybrid";
         case ModelFamily::Qwen3Dense: return "qwen3";
         default: return "unknown";
@@ -1012,6 +1060,11 @@ public:
                          const GenerationConfig& gen_config = GenerationConfig(),
                          std::function<void(const std::string&)> token_callback = nullptr) {
         clear_error();
+        if (model_spec_.family == ModelFamily::Yolo26) {
+            set_error(EngineErrorCode::ModelCapability,
+                      "Text generation is not supported by a YOLO26 detection model");
+            return "";
+        }
         if (!backend_) {
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
@@ -1058,6 +1111,7 @@ public:
         last_generation_forced_think_close_ = false;
         last_generation_think_close_truncated_ = false;
         last_generation_template_name_.clear();
+        if (reject_yolo_capability("Text generation")) return "";
         if (!backend_) {
             set_error(EngineErrorCode::RuntimeError, "Backend is not initialized");
             return "";
@@ -2212,6 +2266,7 @@ public:
                           std::vector<int32_t>& out_codes,
                           int& out_n_frames) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
             set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
             return false;
@@ -2232,6 +2287,7 @@ public:
                         const GenerationConfig& gen_config,
                         std::vector<float>& out_samples) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
             set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
             return false;
@@ -2260,6 +2316,7 @@ public:
                                const GenerationConfig& gen_config,
                                std::vector<float>& out_samples) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
             set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
             return false;
@@ -2301,6 +2358,7 @@ public:
                           const GenerationConfig& gen_config,
                           std::vector<float>& out_samples) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
             set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
             return false;
@@ -2396,6 +2454,8 @@ public:
         std::function<void(const float*, int)> callback,
         int stream_batch_frames = 6
     ) {
+        clear_error();
+        if (reject_yolo_capability("TTS")) return {};
         return std::thread([this, text, reference_audio_path, speaker_name,
                             instruct_text, language, gen_config, callback,
                             stream_batch_frames]() {
@@ -2438,6 +2498,7 @@ public:
                              int n_frames,
                              std::vector<float>& out_samples) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
             set_error(EngineErrorCode::RuntimeError, "TTS backend not initialized");
             return false;
@@ -2467,6 +2528,7 @@ public:
     bool extractSpeakerEmbedding(const std::string& audio_path,
                                  std::vector<float>& embedding) {
         clear_error();
+        if (reject_yolo_capability("TTS")) return false;
 
         // 1. Load CPU encoder first to determine the correct embedding dimension
         //    (1024 for 0.6B, 2048 for 1.7B) — this is fast (~100ms, weights are mmap'd).
@@ -2549,6 +2611,7 @@ public:
 
         using bf16 = sycl::ext::oneapi::bfloat16;
         clear_error();
+        if (reject_yolo_capability("ASR/forced alignment")) return {};
 
         if (model_spec_.family != ModelFamily::Qwen3ForceAligner || !audio_encoder_) {
             set_error(EngineErrorCode::RuntimeError, "ForceAligner backend not initialized");
@@ -2724,6 +2787,7 @@ public:
 
         using bf16 = sycl::ext::oneapi::bfloat16;
         clear_error();
+        if (reject_yolo_capability("ASR/forced alignment")) return {};
 
         if (model_spec_.family != ModelFamily::Qwen3ForceAligner || !audio_encoder_) {
             set_error(EngineErrorCode::RuntimeError, "ForceAligner backend not initialized");
@@ -2888,6 +2952,7 @@ public:
         last_transcribe_duration_s_ = 0.0;
         last_transcribe_latency_ms_ = 0.0;
         last_transcribe_tokens_ = 0;
+        if (reject_yolo_capability("ASR")) return "";
         auto t_start = std::chrono::high_resolution_clock::now();
 
         if (model_spec_.family != ModelFamily::Qwen3ASR || !audio_encoder_) {
@@ -3239,6 +3304,91 @@ public:
         return std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
+    std::vector<Detection> detect_file(
+            const std::string& path,
+            const DetectionConfig& detection_config = DetectionConfig()) {
+        clear_error();
+        std::vector<Detection> detections;
+        if (!detector_) {
+            set_error(EngineErrorCode::ModelCapability,
+                      "Object detection requires a YOLO26 model");
+            return detections;
+        }
+        std::string error;
+        try {
+            if (detector_->detect_file(path, detection_config, detections, &error)) return detections;
+            set_error(EngineErrorCode::InvalidArgument, error);
+            detections.clear();
+        } catch (const std::exception& exception) {
+            set_error(EngineErrorCode::RuntimeError, exception.what());
+            detections.clear();
+        }
+        return detections;
+    }
+
+    std::vector<Detection> detect_encoded(
+            const uint8_t* data, size_t size,
+            const DetectionConfig& detection_config = DetectionConfig()) {
+        clear_error();
+        std::vector<Detection> detections;
+        if (!detector_) {
+            set_error(EngineErrorCode::ModelCapability,
+                      "Object detection requires a YOLO26 model");
+            return detections;
+        }
+        std::string error;
+        try {
+            if (detector_->detect_encoded(data, size, detection_config, detections, &error)) return detections;
+            set_error(EngineErrorCode::InvalidArgument, error);
+            detections.clear();
+        } catch (const std::exception& exception) {
+            set_error(EngineErrorCode::RuntimeError, exception.what());
+            detections.clear();
+        }
+        return detections;
+    }
+
+    std::vector<Detection> detect_pixels(
+            const ImageView& image,
+            const DetectionConfig& detection_config = DetectionConfig()) {
+        clear_error();
+        std::vector<Detection> detections;
+        if (!detector_) {
+            set_error(EngineErrorCode::ModelCapability,
+                      "Object detection requires a YOLO26 model");
+            return detections;
+        }
+        std::string error;
+        try {
+            if (detector_->detect_pixels(image, detection_config, detections, &error)) return detections;
+            set_error(EngineErrorCode::InvalidArgument, error);
+            detections.clear();
+        } catch (const std::exception& exception) {
+            set_error(EngineErrorCode::RuntimeError, exception.what());
+            detections.clear();
+        }
+        return detections;
+    }
+
+    int last_detect_image_width() const {
+        return detector_ ? detector_->last_image_width() : 0;
+    }
+    int last_detect_image_height() const {
+        return detector_ ? detector_->last_image_height() : 0;
+    }
+    double last_detect_preprocess_ms() const {
+        return detector_ ? detector_->last_preprocess_ms() : 0.0;
+    }
+    double last_detect_device_wall_ms() const {
+        return detector_ ? detector_->last_device_wall_ms() : 0.0;
+    }
+    double last_detect_postprocess_ms() const {
+        return detector_ ? detector_->last_postprocess_ms() : 0.0;
+    }
+    size_t last_detect_peak_device_bytes() const {
+        return detector_ && ctx_ ? ctx_->peak_allocated_bytes() : 0;
+    }
+
     Qwen3Config& config() { return config_; }
     const Qwen3Config& config() const { return config_; }
     const ModelSpec& model_spec() const { return model_spec_; }
@@ -3248,6 +3398,13 @@ public:
     void clear_error() {
         last_error_code_ = EngineErrorCode::Ok;
         last_error_message_.clear();
+    }
+
+    bool reject_yolo_capability(const char* operation) {
+        if (model_spec_.family != ModelFamily::Yolo26) return false;
+        set_error(EngineErrorCode::ModelCapability,
+                  std::string(operation) + " is not supported by a YOLO26 detection model");
+        return true;
     }
 
     void set_error(EngineErrorCode code, const std::string& message) {
@@ -3394,6 +3551,7 @@ private:
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
+    std::unique_ptr<aila::vision::Yolo26Detector> detector_;
     std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
     std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
     aila::chat::ChatFormatter chat_formatter_;

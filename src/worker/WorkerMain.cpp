@@ -681,6 +681,47 @@ public:
         return true;
     }
 
+    bool detect(const aila::worker::DetectionRequest& request,
+                std::vector<aila::worker::DetectionResult>& output) override {
+        AilaDetection* detections = nullptr;
+        int count = 0;
+        int status = AILA_ERR_INVALID_ARGUMENT;
+        if (request.method == aila::worker::DetectionMethod::File) {
+            status = aila_detect_file(engine_, request.path.c_str(), &request.config,
+                                      &detections, &count);
+        } else if (request.method == aila::worker::DetectionMethod::Encoded) {
+            status = aila_detect_encoded(engine_, request.bytes.data(), request.bytes.size(),
+                                         &request.config, &detections, &count);
+        } else {
+            status = aila_detect_pixels(engine_, request.bytes.data(), request.bytes.size(),
+                                        request.width, request.height, request.row_stride,
+                                        request.pixel_format, &request.config,
+                                        &detections, &count);
+        }
+        if (status != AILA_OK) {
+            if (detections) aila_free_detections(detections, count);
+            return false;
+        }
+        try {
+            output.clear();
+            output.reserve(static_cast<size_t>(count));
+            for (int index = 0; index < count; ++index) {
+                aila::worker::DetectionResult value;
+                value.x1 = detections[index].x1; value.y1 = detections[index].y1;
+                value.x2 = detections[index].x2; value.y2 = detections[index].y2;
+                value.confidence = detections[index].confidence;
+                value.class_id = detections[index].class_id;
+                value.class_name = detections[index].class_name ? detections[index].class_name : "";
+                output.push_back(std::move(value));
+            }
+        } catch (...) {
+            aila_free_detections(detections, count);
+            throw;
+        }
+        aila_free_detections(detections, count);
+        return true;
+    }
+
 private:
     AilaEngine* engine_ = nullptr;
     std::unordered_map<uint64_t, AilaTranscribeStream*> asr_streams_;
