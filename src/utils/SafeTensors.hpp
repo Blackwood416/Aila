@@ -65,7 +65,7 @@ struct Bnb4BitWeightRef {
 
     bool valid() const {
         return packed_weight != nullptr && absmax != nullptr && quant_map != nullptr &&
-               packed_quant_state != nullptr && quant_state.shape.size() == 2;
+               quant_state.shape.size() == 2;
     }
 
     int64_t logical_out_features() const {
@@ -143,7 +143,8 @@ bool LoadBnb4BitWeightRef(Context& ctx,
                           ModelWeights& weights,
                           const std::string& name,
                           Bnb4BitWeightRef& out,
-                          std::string* error_message = nullptr);
+                          std::string* error_message = nullptr,
+                          int64_t in_features_hint = 0);
 
 // 内部工具函数
 std::vector<std::string> ParseHeader(const std::string& header,

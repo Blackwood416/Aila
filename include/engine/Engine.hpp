@@ -5,6 +5,7 @@
 #include "../src/models/Qwen3DenseBackend.hpp"
 #include "../src/models/Qwen3Bnb4Backend.hpp"
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
+#include "../src/models/DiffusionGemmaBnb4Backend.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
@@ -407,13 +408,18 @@ public:
                 }
                 return false;
             }
-            if (quant.bnb_4bit_quant_storage != "uint8") {
+            if (!quant.bnb_4bit_quant_storage.empty() &&
+                quant.bnb_4bit_quant_storage != "uint8") {
                 if (error_message) {
                     *error_message = "Only bitsandbytes uint8 packed storage is supported";
                 }
                 return false;
             }
-            if (quant.bnb_4bit_compute_dtype != "float16") {
+            const bool diffusion_gemma_bf16 =
+                spec.family == ModelFamily::DiffusionGemma &&
+                quant.bnb_4bit_compute_dtype == "bfloat16";
+            if (quant.bnb_4bit_compute_dtype != "float16" &&
+                !diffusion_gemma_bf16) {
                 if (error_message) {
                     *error_message = "On XPU, quantized bitsandbytes checkpoints must use bnb_4bit_compute_dtype=float16";
                 }
@@ -495,6 +501,25 @@ public:
                               model_spec_.classify_num,
                               config_.hidden_size, config_.num_hidden_layers,
                               model_spec_.audio.encoder_layers, model_spec_.audio.d_model);
+            } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                const auto& dg_cfg = model_spec_.diffusion_gemma.text;
+                config_.hidden_size = dg_cfg.hidden_size;
+                config_.num_hidden_layers = dg_cfg.num_hidden_layers;
+                config_.num_attention_heads = dg_cfg.num_attention_heads;
+                config_.num_key_value_heads = dg_cfg.num_key_value_heads;
+                config_.head_dim = dg_cfg.head_dim;
+                config_.intermediate_size = dg_cfg.intermediate_size;
+                config_.vocab_size = dg_cfg.vocab_size;
+                config_.max_position_embeddings = dg_cfg.max_position_embeddings;
+                config_.rms_norm_eps = dg_cfg.rms_norm_eps;
+                config_.tie_word_embeddings = dg_cfg.tie_word_embeddings;
+                config_.bos_token_id = dg_cfg.bos_token_id;
+                config_.eos_token_id = dg_cfg.eos_token_id;
+                AILA_LOG_INFO("[ModelSpec] model_type=%s family=diffusion_gemma text_hidden=%d layers=%d vocab=%d canvas=%d",
+                              model_spec_.model_type.c_str(),
+                              config_.hidden_size, config_.num_hidden_layers,
+                              config_.vocab_size,
+                              model_spec_.diffusion_gemma.canvas_length);
             } else {
                 config_ = model_spec_.qwen3;
                 AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_dense hidden=%d layers=%d vocab=%d",
@@ -572,6 +597,8 @@ public:
             } else {
                 backend_ = std::make_unique<Qwen3ForceAlignerBackend>();
             }
+        } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            backend_ = std::make_unique<DiffusionGemmaBnb4Backend>();
         } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
@@ -662,6 +689,8 @@ public:
         } else if (model_spec_.family == ModelFamily::Qwen35Hybrid && !is_supported_qwen35_hybrid_text_spec(model_spec_.qwen35_text)) {
             run_init_warmup = false;
         } else if (model_spec_.family == ModelFamily::Qwen3TTS) {
+            run_init_warmup = false;
+        } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
             run_init_warmup = false;
         }
 
