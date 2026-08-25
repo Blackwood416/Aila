@@ -111,6 +111,14 @@ private:
         Linear soft_embed;
     };
 
+    struct ProfileTotals {
+        double attention_ms = 0.0;
+        double dense_mlp_ms = 0.0;
+        double router_ms = 0.0;
+        double moe_ms = 0.0;
+        double post_ms = 0.0;
+    };
+
     ModelSpec spec_;
     DiffusionGemmaConfig cfg_{};
     int max_seq_len_ = 0;
@@ -122,6 +130,7 @@ private:
     std::vector<LayerRuntime> runtimes_;
     std::vector<std::unique_ptr<Bnb4GroupedMoE>> moes_;
     Buffers buf_;
+    ProfileTotals profile_totals_;
 
     Tensor* embed_weight_ = nullptr;
     Tensor* final_norm_weight_ = nullptr;

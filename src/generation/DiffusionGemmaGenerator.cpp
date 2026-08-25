@@ -5,6 +5,7 @@
 #include "profile/Profiling.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <random>
 #include <thread>
@@ -96,9 +97,19 @@ bool DiffusionGemmaGenerator::generate(
         if (error_message) *error_message = "invalid DiffusionGemma config";
         return false;
     }
+    AILA_LOG_INFO(
+        "[DiffusionGemma] Generating up to %d tokens (canvas=%d steps=%d)",
+        max_new_tokens, canvas_len, cfg.max_denoising_steps);
+    const bool profile = aila::env::read_flag("AILA_PROFILE_DG", false);
+    double profile_encode_ms = 0.0;
+    double profile_decode_ms = 0.0;
+    double profile_host_ms = 0.0;
+    double profile_soft_ms = 0.0;
 
     if (!prompt_ids.empty()) {
-        AILA_LOG_INFO("[DiffusionGemma] Encoding prompt (%zu tokens)", prompt_ids.size());
+        const auto encode_start = std::chrono::steady_clock::now();
+        AILA_LOG_DEBUG("[DiffusionGemma] Encoding prompt (%zu tokens)",
+                       prompt_ids.size());
         int* prompt_device = static_cast<int*>(
             ctx.alloc_device(prompt_ids.size() * sizeof(int)));
         ctx.memcpy_h2d(prompt_device, prompt_ids.data(),
@@ -113,7 +124,13 @@ bool DiffusionGemmaGenerator::generate(
             return false;
         }
         ctx.synchronize();
-        AILA_LOG_INFO("[DiffusionGemma] Prompt encoded");
+        if (profile) {
+            profile_encode_ms += std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() -
+                                     encode_start)
+                                     .count();
+        }
+        AILA_LOG_DEBUG("[DiffusionGemma] Prompt encoded");
     }
 
     output_ids.clear();
@@ -155,8 +172,9 @@ bool DiffusionGemmaGenerator::generate(
 
         for (int cur_step = cfg.max_denoising_steps; cur_step >= 1;
              --cur_step) {
-            AILA_LOG_INFO("[DiffusionGemma] Canvas %d/%d step %d", c + 1,
-                          max_canvases, cur_step);
+            const auto decode_start = std::chrono::steady_clock::now();
+            AILA_LOG_DEBUG("[DiffusionGemma] Canvas %d/%d step %d", c + 1,
+                           max_canvases, cur_step);
             ctx.memcpy_h2d(canvas_device, canvas.data(),
                            static_cast<size_t>(canvas_len) * sizeof(int));
             ctx.memcpy_h2d(sc_device, sc_embeds.data(),
@@ -166,6 +184,12 @@ bool DiffusionGemmaGenerator::generate(
             ctx.memcpy_d2h(logits_host.data(), logits.data(),
                            logits_host.size() * sizeof(float));
             ctx.synchronize();
+            if (profile) {
+                profile_decode_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - decode_start)
+                        .count();
+            }
 
             const float temperature =
                 cfg.t_min + (cfg.t_max - cfg.t_min) *
@@ -175,12 +199,19 @@ bool DiffusionGemmaGenerator::generate(
                 processed_host[i] = logits_host[i] / temperature;
             }
 
+            // The committed canvas is always the denoiser argmax. On the
+            // final step no later iteration can consume entropy sampling,
+            // renoising, or self-conditioning, so avoid one complete
+            // full-vocabulary host pass and one probs@embedding GEMM.
+            ops::diffusion_argmax(processed_host.data(), new_argmax.data(),
+                                  canvas_len, vocab);
+            if (cur_step == 1) break;
+
+            const auto host_start = std::chrono::steady_clock::now();
             softmax_entropy_host(processed_host.data(), entropy.data(),
                                  canvas_len, vocab);
             gumbel_sample_host(processed_host.data(), rng, denoiser.data(),
                                canvas_len, vocab);
-            ops::diffusion_argmax(processed_host.data(), new_argmax.data(),
-                                  canvas_len, vocab);
             if (debug_probes && cur_step == cfg.max_denoising_steps) {
                 float min_l = 1e30f, max_l = -1e30f;
                 double sum_l = 0.0;
@@ -227,8 +258,8 @@ bool DiffusionGemmaGenerator::generate(
                 mean_entropy += entropy[static_cast<size_t>(i)];
             }
             mean_entropy /= static_cast<float>(canvas_len);
-            AILA_LOG_INFO("[DG] step=%d mean_entropy=%.4f", cur_step,
-                          mean_entropy);
+            AILA_LOG_DEBUG("[DG] step=%d mean_entropy=%.4f", cur_step,
+                           mean_entropy);
             const bool stable = equal_count >= cfg.stability_threshold;
             const bool confident =
                 mean_entropy < cfg.confidence_threshold;
@@ -236,6 +267,15 @@ bool DiffusionGemmaGenerator::generate(
                 finished_denoising = true;
             }
 
+            if (profile) {
+                profile_host_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - host_start)
+                        .count();
+            }
+            if (finished_denoising) break;
+
+            const auto soft_start = std::chrono::steady_clock::now();
             ctx.memcpy_h2d(logits.data(), processed_host.data(),
                            processed_host.size() * sizeof(float));
             Tensor& soft = backend.diffusion_compute_soft_embeds(
@@ -243,8 +283,13 @@ bool DiffusionGemmaGenerator::generate(
             ctx.memcpy_d2h(sc_embeds.data(), soft.data(),
                            sc_embeds.size() * sizeof(bf16));
             ctx.synchronize();
+            if (profile) {
+                profile_soft_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - soft_start)
+                        .count();
+            }
 
-            if (finished_denoising) break;
         }
 
         // Commit the argmax canvas.
@@ -308,5 +353,12 @@ bool DiffusionGemmaGenerator::generate(
     AILA_LOG_INFO(
         "[DiffusionGemma] Generated %zu tokens in %d canvas(es)",
         output_ids.size(), max_canvases);
+    if (profile) {
+        AILA_LOG_INFO(
+            "[DG Profile] encode=%.2f ms decode+logits=%.2f ms "
+            "host_sampling=%.2f ms soft_embedding=%.2f ms",
+            profile_encode_ms, profile_decode_ms, profile_host_ms,
+            profile_soft_ms);
+    }
     return true;
 }

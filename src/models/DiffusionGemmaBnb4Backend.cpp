@@ -6,6 +6,7 @@
 #include "profile/Profiling.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -369,6 +370,8 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
     const int total_len = start_pos + canvas_len;
     ensure_buffers(ctx, canvas_len, total_len);
     ensure_logits_buffers(ctx);
+    const bool profile = aila::env::read_flag("AILA_PROFILE_DG", false);
+    profile_totals_ = {};
     const bool debug_probes =
         aila::env::read_flag("AILA_DG_DEBUG_PROBES", false);
     const std::string dump_dir =
@@ -744,6 +747,15 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
     ops::logit_softcap_inplace(
         ctx, buf_.logits_f32, tc.final_logit_softcapping,
         canvas_len * tc.vocab_size);
+    if (profile) {
+        ctx.synchronize();
+        AILA_LOG_INFO(
+            "[DG Profile] attention=%.2f ms dense_mlp=%.2f ms "
+            "router=%.2f ms moe=%.2f ms post=%.2f ms",
+            profile_totals_.attention_ms, profile_totals_.dense_mlp_ms,
+            profile_totals_.router_ms, profile_totals_.moe_ms,
+            profile_totals_.post_ms);
+    }
     return buf_.logits_f32;
 }
 
@@ -871,7 +883,7 @@ void DiffusionGemmaBnb4Backend::ensure_buffers(Context& ctx, int q_len,
     ctx.memcpy_h2d(buf_.ones.data(), ones.data(),
                    ones.size() * sizeof(sycl::ext::oneapi::bfloat16));
 
-    AILA_LOG_INFO(
+    AILA_LOG_DEBUG(
         "[DiffusionGemma] Buffers allocated: current=%.1f MB peak=%.1f MB",
         ctx.current_allocated_bytes() / (1024.0 * 1024.0),
         ctx.peak_allocated_bytes() / (1024.0 * 1024.0));
@@ -896,7 +908,7 @@ void DiffusionGemmaBnb4Backend::ensure_logits_buffers(Context& ctx) {
     // this path is canvas-only (M=256).
     buf_.soft_embed.init(ctx, *embed_weight_, tc.vocab_size, tc.hidden_size,
                          true, false);
-    AILA_LOG_INFO(
+    AILA_LOG_DEBUG(
         "[DiffusionGemma] Logits buffers allocated: current=%.1f MB",
         ctx.current_allocated_bytes() / (1024.0 * 1024.0));
 }
@@ -963,6 +975,19 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     const int hidden_size = tc.hidden_size;
     const int layer_idx =
         static_cast<int>(&layer - layers_.data());
+    const bool profile = bidirectional &&
+                         aila::env::read_flag("AILA_PROFILE_DG", false);
+    const auto profile_start = std::chrono::steady_clock::now();
+    auto profile_mark = profile_start;
+    const auto record_phase = [&](double& target_ms) {
+        if (!profile) return;
+        ctx.synchronize();
+        const auto now = std::chrono::steady_clock::now();
+        target_ms +=
+            std::chrono::duration<double, std::milli>(now - profile_mark)
+                .count();
+        profile_mark = now;
+    };
     AILA_LOG_DEBUG(
         "[DiffusionGemma] Layer %d forward (seq=%d start=%d bidi=%d) "
         "mem=%.1f MB",
@@ -1104,6 +1129,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     if (dump_layer0) dump_tensor("post_attn_norm", buf_.attn_o);
     ops::residual_add(ctx, hidden, buf_.attn_o, seq_len * hidden_size);
     if (dump_layer0) dump_tensor("hidden_after_attn", hidden);
+    record_phase(profile_totals_.attention_ms);
 
     // Dense MLP path.
     ops::rms_norm(ctx, hidden, *layer.pre_ff_ln, tc.rms_norm_eps, buf_.normed,
@@ -1124,6 +1150,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     ops::rms_norm(ctx, buf_.mlp_out, *layer.post_ff_ln_1, tc.rms_norm_eps,
                   buf_.ff1, seq_len, hidden_size);
     if (dump_layer0) dump_tensor("ff1", buf_.ff1);
+    record_phase(profile_totals_.dense_mlp_ms);
 
     // MoE path (parallel to MLP, routed from the pre-MLP residual).
     // Keep the router projection on the trusted bf16 oneDNN path.  A scalar
@@ -1160,6 +1187,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     router_topk_from_bf16_scores(
         router_score_bf16, per_expert_scale_bf16, seq_len, tc.num_experts,
         tc.top_k_experts, expert_ids, expert_weights);
+    record_phase(profile_totals_.router_ms);
     if (dump_layer0) {
         std::ofstream ids_out(dump_dir + "/router_ids.bin", std::ios::binary);
         ids_out.write(reinterpret_cast<const char*>(expert_ids.data()),
@@ -1179,6 +1207,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     moes_[static_cast<size_t>(layer_idx)]->forward(
         ctx, moe_input, expert_ids, expert_weights, moe_output, seq_len,
         tc.top_k_experts);
+    record_phase(profile_totals_.moe_ms);
     ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                    moe_output.size() * sizeof(bf16));
     if (dump_layer0) dump_tensor("moe_raw", buf_.moe_device_out);
@@ -1198,6 +1227,12 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     // Local scratch tensors are about to go out of scope; make sure every
     // asynchronous kernel touching them has completed before they are freed.
     ctx.synchronize();
+    if (profile) {
+        const auto now = std::chrono::steady_clock::now();
+        profile_totals_.post_ms +=
+            std::chrono::duration<double, std::milli>(now - profile_mark)
+                .count();
+    }
 }
 
 DiffusionGemmaBnb4Backend::~DiffusionGemmaBnb4Backend() = default;

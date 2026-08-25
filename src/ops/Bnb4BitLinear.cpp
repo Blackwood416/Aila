@@ -188,6 +188,23 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           bf16* output_ptr,
                           int M, int N, int K,
                           int blocksize) {
+    static const bool use_a770_bm64 = [&ctx]() {
+        const std::string device_name =
+            ctx.queue().get_device().get_info<sycl::info::device::name>();
+        return device_name.find("Arc(TM) A770") != std::string::npos ||
+               device_name.find("Arc A770") != std::string::npos;
+    }();
+    if (use_a770_bm64) {
+        // [DISPATCH] A770/DG2, oneAPI 2026.1, driver 32.0.101.8860:
+        // BM=64 lowers per-WG SLM from ~36.5 KB to ~20.5 KB. Verified for
+        // M={3,24,37,96,256}, block={32,64,128}, and all aligned
+        // DiffusionGemma N/K shapes. Three one-step pipeline samples improved
+        // median wall time by 35.8% while preserving the generated output.
+        packed_nf4_gemm_bf16_tiled<64, 64, 128, 4, 4, 16, 16>(
+            ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
+            M, N, K, blocksize);
+        return;
+    }
     // The small-M template is incorrect for M=24 with real DiffusionGemma
     // weights on A770. Use the validated large tile for every M > 1.
     packed_nf4_gemm_bf16_tiled<128, 64, 128, 8, 4, 16, 16>(
