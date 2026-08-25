@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -145,9 +146,14 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
                         for (int ni = n_local; ni < n_local_end; ++ni) {
                             const uint8_t b = B_nf4_slm[b_byte_base + ni];
                             const uint8_t nf4 = hi ? (b >> 4) : (b & 0x0F);
-                            b_dequant[ni - n_local] =
-                                qmap[nf4] * B_absmax_slm[ni * blocks_per_tile +
-                                                         k / blocksize];
+                            // bitsandbytes dequantize_4bit materializes the
+                            // requested compute dtype before matmul.  The
+                            // checkpoint requests bf16, so round each NF4
+                            // weight before accumulation instead of retaining
+                            // extra fp32 precision in the fused path.
+                            b_dequant[ni - n_local] = static_cast<float>(bf16(
+                                qmap[nf4] * B_absmax_slm[
+                                    ni * blocks_per_tile + k / blocksize]));
                         }
 
                         for (int mi = m_local; mi < m_local_end; ++mi) {
@@ -182,9 +188,8 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           bf16* output_ptr,
                           int M, int N, int K,
                           int blocksize) {
-    // NOTE: the small-M template (<80,64,128,8,4,10,16>) produced incorrect
-    // results for M=24 with the real DiffusionGemma weights on Intel Arc A770.
-    // Use the large template for all M>1 until the small template is fixed.
+    // The small-M template is incorrect for M=24 with real DiffusionGemma
+    // weights on A770. Use the validated large tile for every M > 1.
     packed_nf4_gemm_bf16_tiled<128, 64, 128, 8, 4, 16, 16>(
         ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
         M, N, K, blocksize);
@@ -363,12 +368,14 @@ void packed_nf4_gemv_bf16(Context& ctx,
                     const uint8_t packed = packed_ptr[row_byte_base + byte_offset];
                     const float absmax = absmax_ptr[row_block_base + (byte_offset / packed_bytes_per_block)];
                     const int input_index = byte_offset * 2;
+                    const float weight_hi = static_cast<float>(bf16(
+                        quant_map_cache[(packed >> 4) & 0x0F] * absmax));
+                    const float weight_lo = static_cast<float>(bf16(
+                        quant_map_cache[packed & 0x0F] * absmax));
                     partial += static_cast<float>(input_ptr[input_index]) *
-                               quant_map_cache[(packed >> 4) & 0x0F] *
-                               absmax;
+                               weight_hi;
                     partial += static_cast<float>(input_ptr[input_index + 1]) *
-                               quant_map_cache[packed & 0x0F] *
-                               absmax;
+                               weight_lo;
                 }
 
                 const float sum = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
@@ -426,21 +433,21 @@ void packed_nf4_gemv_bf16(Context& ctx,
                     // Inline dequant into FMA: eliminates 8 float temporaries,
                     // giving the compiler freedom to schedule and reuse registers.
                     partial = sycl::fma(static_cast<float>(in_v[0]),
-                        quant_map_cache[b0 >> 4] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b0 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[1]),
-                        quant_map_cache[b0 & 0xF] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b0 & 0xF] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[2]),
-                        quant_map_cache[b1 >> 4] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b1 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[3]),
-                        quant_map_cache[b1 & 0xF] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b1 & 0xF] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[4]),
-                        quant_map_cache[b2 >> 4] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b2 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[5]),
-                        quant_map_cache[b2 & 0xF] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b2 & 0xF] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[6]),
-                        quant_map_cache[b3 >> 4] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b3 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[7]),
-                        quant_map_cache[b3 & 0xF] * am, partial);
+                        static_cast<float>(bf16(quant_map_cache[b3 & 0xF] * am)), partial);
                 }
                 for (; byte_offset < packed_bytes_per_row;
                      byte_offset += static_cast<int>(sub_group_size)) {
@@ -449,9 +456,11 @@ void packed_nf4_gemv_bf16(Context& ctx,
                         (byte_offset / packed_bytes_per_block)];
                     const int ii = byte_offset * 2;
                     partial = sycl::fma(static_cast<float>(input_ptr[ii]),
-                        quant_map_cache[(pb >> 4) & 0xF] * am, partial);
+                        static_cast<float>(bf16(
+                            quant_map_cache[(pb >> 4) & 0xF] * am)), partial);
                     partial = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
-                        quant_map_cache[pb & 0xF] * am, partial);
+                        static_cast<float>(bf16(
+                            quant_map_cache[pb & 0xF] * am)), partial);
                 }
             }
 
@@ -476,6 +485,15 @@ void Bnb4BitLinearScratch::ensure(Context& ctx, int seq_len, int in_features, in
     const int new_output_dim_cap = std::max(output_dim_capacity, out_features);
     const int new_weight_in_cap = std::max(weight_in_capacity, in_features);
     const int new_weight_out_cap = std::max(weight_out_capacity, out_features);
+
+    // Tensor move-assignment frees the old USM allocation immediately.  Make
+    // sure an earlier in-order kernel is no longer using a buffer before a
+    // growth operation replaces it.
+    if ((grow_seq || grow_input) && input_bf16.valid() ||
+        (grow_seq || grow_output) && output_bf16.valid() ||
+        (need_weight && grow_weight && weight_bf16.valid())) {
+        ctx.synchronize();
+    }
 
     if (grow_seq || grow_input) {
         input_bf16 = Tensor::allocate(ctx,
@@ -755,7 +773,11 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
                                      dnnl::memory::format_tag::ab);
 
     dnnl::primitive_attr attr;
-    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    // Prefill creates one primitive per weight and sequence length.  Keeping a
+    // user scratchpad in every cached primitive grows by hundreds of MB across
+    // DiffusionGemma's 30 layers and exhausts a 16 GB A770.  Library mode keeps
+    // the scratch lifetime at execution scope.
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
     auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md, attr);
 
     CachedPrimitive cp;
@@ -763,13 +785,6 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     cp.src_md = src_md;
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        cp.scratchpad = Tensor::allocate(ctx,
-                                         {static_cast<int64_t>(scratchpad_size)},
-                                         dnnl::memory::data_type::u8);
-        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
-    }
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 
@@ -974,14 +989,32 @@ void Bnb4BitLinear::forward(Context& ctx,
         in_features_ > 0 && (in_features_ % blocksize) == 0 &&
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
+        // Under high VRAM residency on DG2/Level-Zero, kernels reading a
+        // long-lived backend activation allocation can observe stale data even
+        // after a queue wait, while an explicit device-to-device copy is
+        // stable.  Isolate the packed kernel behind dedicated, exact-layout
+        // linear scratch buffers.  The copies stay on the same in-order queue.
+        scratch.ensure(ctx, seq_len, in_features_, out_features_, false);
+        Tensor fused_input = Tensor::view(
+            ctx, scratch.input_bf16.data(), {seq_len, (int64_t)in_features_},
+            dnnl::memory::data_type::bf16);
+        Tensor fused_output = Tensor::view(
+            ctx, scratch.output_bf16.data(), {seq_len, (int64_t)out_features_},
+            dnnl::memory::data_type::bf16);
+        const size_t input_bytes = static_cast<size_t>(seq_len) *
+                                   static_cast<size_t>(in_features_) * sizeof(bf16);
+        const size_t output_bytes = static_cast<size_t>(seq_len) *
+                                    static_cast<size_t>(out_features_) * sizeof(bf16);
+        ctx.queue().memcpy(fused_input.data(), input.data(), input_bytes);
         packed_nf4_gemm_bf16(ctx,
                              static_cast<const uint8_t*>(weight_.packed_weight->data()),
                              static_cast<const float*>(weight_.quant_map->data()),
                              static_cast<const float*>(absmax_f32_.data()),
-                             static_cast<const bf16*>(input.data()),
-                             static_cast<bf16*>(output.data()),
+                             static_cast<const bf16*>(fused_input.data()),
+                             static_cast<bf16*>(fused_output.data()),
                              seq_len, out_features_, in_features_,
                              blocksize);
+        ctx.queue().memcpy(output.data(), fused_output.data(), output_bytes);
         if (!lora_attachments_.empty()) {
             apply_lora_prefill(ctx, input, output, seq_len);
         }
@@ -1347,8 +1380,10 @@ void Bnb4GroupedMoE::forward(Context& ctx,
         throw std::runtime_error("Bnb4GroupedMoE::forward: shape mismatch");
     }
 
-    std::unordered_map<int, std::vector<std::pair<int, float>>> groups;
-    groups.reserve(static_cast<size_t>(std::min(tokens * top_k, num_experts_)));
+    // HF eager walks expert_hit in ascending expert-id order.  Keep the same
+    // deterministic order because its bf16 index_add accumulation is not
+    // associative.
+    std::map<int, std::vector<std::pair<int, float>>> groups;
     int max_rows = 0;
     for (int t = 0; t < tokens; ++t) {
         for (int k = 0; k < top_k; ++k) {
@@ -1361,9 +1396,9 @@ void Bnb4GroupedMoE::forward(Context& ctx,
     }
     ensure_scratch(ctx, max_rows);
 
-    std::vector<float> acc(static_cast<size_t>(tokens) * hidden_, 0.0f);
+    std::vector<bf16> acc(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
     std::vector<bf16> gather(static_cast<size_t>(max_rows) * hidden_);
-    std::vector<float> row_out(static_cast<size_t>(max_rows) * hidden_);
+    std::vector<bf16> row_out(static_cast<size_t>(max_rows) * hidden_);
 
     for (const auto& [expert, rows] : groups) {
         const int count = static_cast<int>(rows.size());
@@ -1396,18 +1431,18 @@ void Bnb4GroupedMoE::forward(Context& ctx,
         for (int r = 0; r < count; ++r) {
             const int token = rows[static_cast<size_t>(r)].first;
             const float weight = rows[static_cast<size_t>(r)].second;
-            float* dst = acc.data() + static_cast<size_t>(token) * hidden_;
-            const float* src_row =
+            bf16* dst = acc.data() + static_cast<size_t>(token) * hidden_;
+            const bf16* src_row =
                 row_out.data() + static_cast<size_t>(r) * hidden_;
             for (int h = 0; h < hidden_; ++h) {
-                dst[h] += src_row[h] * weight;
+                const bf16 contribution =
+                    bf16(static_cast<float>(src_row[h]) * weight);
+                dst[h] = bf16(static_cast<float>(dst[h]) +
+                              static_cast<float>(contribution));
             }
         }
     }
 
-    output.assign(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
-    for (size_t i = 0; i < acc.size(); ++i) {
-        output[i] = bf16(acc[i]);
-    }
+    output = std::move(acc);
 }
 

@@ -1599,7 +1599,11 @@ public:
             const auto& dgc = model_spec_.diffusion_gemma;
             DiffusionGemmaGeneratorConfig dg_cfg;
             dg_cfg.canvas_length = dgc.canvas_length;
-            dg_cfg.max_denoising_steps = dgc.max_denoising_steps;
+            // The 26B checkpoint converges reliably at 25 steps in the
+            // trusted Transformers path. Keep that validated latency default
+            // while still honoring checkpoints that request fewer steps.
+            dg_cfg.max_denoising_steps =
+                std::min(dgc.max_denoising_steps, 25);
             const int steps_override =
                 aila::env::read_int_raw("AILA_DIFFUSION_STEPS", -1);
             if (steps_override > 0) {

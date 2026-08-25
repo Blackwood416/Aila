@@ -49,6 +49,8 @@ struct DiffusionGemmaLayerWeights {
     Tensor* router_proj = nullptr;      // (num_experts, hidden)
     Tensor* router_scale = nullptr;     // (hidden)
     Tensor* per_expert_scale = nullptr; // (num_experts)
+    float layer_scalar = 1.0f;
+    Linear router_linear;
 };
 
 class DiffusionGemmaBnb4Backend : public IModelBackend {
@@ -94,6 +96,7 @@ private:
         Tensor mlp_gate, mlp_up, mlp_proj, mlp_out;
         Tensor ff1, ff2;
         Tensor moe_device_out;
+        Tensor router_scores;
         Tensor sc_normed, sc_gate, sc_up, sc_proj, sc_down;
         Tensor logits_bf16;
         Tensor logits_f32;
@@ -105,6 +108,7 @@ private:
         Bnb4BitLinearScratch mlp_scratch;
         Bnb4BitLinearScratch sc_scratch;
         Linear lm_head;
+        Linear soft_embed;
     };
 
     ModelSpec spec_;

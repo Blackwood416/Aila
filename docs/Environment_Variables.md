@@ -189,6 +189,29 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 
 ---
 
+## DiffusionGemma
+
+DiffusionGemma-26B on Level Zero may require relaxed allocation limits because
+the runtime can otherwise reject large individual allocations even when total
+VRAM is sufficient:
+
+```powershell
+$env:UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS = "1"
+```
+
+`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS` is a Unified Runtime/Level Zero
+setting, not an Aila-specific variable.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_DIFFUSION_STEPS` | int | `min(model config, 25)` | Override the number of canvas denoising steps. The 26B checkpoint has been validated to converge at 25 steps; larger values remain available for quality experiments |
+| `AILA_DG_DEBUG_PROBES` | bool | `false` | Enable expensive host-side finite-value probes in the DiffusionGemma decoder |
+| `AILA_DG_DUMP_DIR` | path | empty | Dump DiffusionGemma intermediate tensors for numerical comparison |
+| `AILA_DG_DUMP_LAYER` | int | `0` | Layer selected by `AILA_DG_DUMP_DIR` |
+| `AILA_DG_DUMP_DECODER` | bool | `false` | Dump decoder/self-conditioning tensors instead of the causal encoder layer |
+
+---
+
 ## TTS (AILA_TTS_*)
 
 | Variable | Type | Default | Description |

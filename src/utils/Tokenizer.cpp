@@ -206,6 +206,7 @@ bool Tokenizer::load(const std::string& model_dir) {
     chat_template_.clear();
     bos_token_.clear();
     eos_token_.clear();
+    sentencepiece_bpe_ = false;
 
     auto load_special_tokens_from_tokenizer_json = [&]() {
         try {
@@ -217,6 +218,28 @@ bool Tokenizer::load(const std::string& model_dir) {
             std::string tj_str((std::istreambuf_iterator<char>(tf)),
                                 std::istreambuf_iterator<char>());
             tf.close();
+
+            // Gemma's tokenizer.json declares a Replace(" " -> "▁")
+            // normalizer and ByteFallback decoder. It is a Unicode BPE, not
+            // GPT-2's byte-to-unicode BPE used by Qwen.
+            {
+                simdjson::dom::parser metadata_parser;
+                simdjson::dom::element metadata = metadata_parser.parse(tj_str);
+                simdjson::dom::element normalizer;
+                if (metadata.at_key("normalizer").get(normalizer) == simdjson::SUCCESS) {
+                    std::string_view type;
+                    std::string_view content;
+                    simdjson::dom::element pattern;
+                    std::string_view pattern_string;
+                    if (normalizer.at_key("type").get_string().get(type) == simdjson::SUCCESS &&
+                        normalizer.at_key("content").get_string().get(content) == simdjson::SUCCESS &&
+                        normalizer.at_key("pattern").get(pattern) == simdjson::SUCCESS &&
+                        pattern.at_key("String").get_string().get(pattern_string) == simdjson::SUCCESS &&
+                        type == "Replace" && pattern_string == " " && content == "▁") {
+                        sentencepiece_bpe_ = true;
+                    }
+                }
+            }
 
             simdjson::padded_string tj_padded(tj_str);
             simdjson::ondemand::parser tj_parser;
@@ -254,6 +277,32 @@ bool Tokenizer::load(const std::string& model_dir) {
             std::string tc_str((std::istreambuf_iterator<char>(tf)),
                                 std::istreambuf_iterator<char>());
             tf.close();
+
+            // Hugging Face uses an intentionally huge sentinel for
+            // model_max_length in some tokenizers (for Gemma 4 it is larger
+            // than uint64).  simdjson DOM rejects that number before we can
+            // read unrelated string fields such as bos/eos.  The tokenizer
+            // runtime does not consume this field, so replace only an
+            // oversized decimal value with zero before parsing.
+            const std::string max_length_key = "\"model_max_length\"";
+            const size_t key_pos = tc_str.find(max_length_key);
+            if (key_pos != std::string::npos) {
+                const size_t colon = tc_str.find(':', key_pos + max_length_key.size());
+                if (colon != std::string::npos) {
+                    const size_t number_begin = tc_str.find_first_of("-0123456789", colon + 1);
+                    if (number_begin != std::string::npos) {
+                        size_t number_end = number_begin;
+                        if (tc_str[number_end] == '-') ++number_end;
+                        while (number_end < tc_str.size() &&
+                               tc_str[number_end] >= '0' && tc_str[number_end] <= '9') {
+                            ++number_end;
+                        }
+                        if (number_end - number_begin > 19) {
+                            tc_str.replace(number_begin, number_end - number_begin, "0");
+                        }
+                    }
+                }
+            }
 
             simdjson::dom::parser tc_parser;
             simdjson::dom::element tc_root = tc_parser.parse(tc_str);
@@ -532,6 +581,10 @@ bool Tokenizer::load(const std::string& model_dir) {
 // ============================================================
 
 std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+    if (sentencepiece_bpe_) {
+        return pretokenize_sentencepiece(text);
+    }
+
     std::vector<std::string> result;
     if (text.empty()) return result;
 
@@ -724,11 +777,64 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
     return result;
 }
 
+std::vector<std::string> Tokenizer::pretokenize_sentencepiece(
+    const std::string& text) const {
+    std::vector<std::string> result;
+    size_t i = 0;
+    size_t plain_begin = 0;
+
+    auto flush_plain = [&](size_t end) {
+        if (end <= plain_begin) return;
+        std::string normalized;
+        normalized.reserve(end - plain_begin);
+        for (size_t p = plain_begin; p < end; ++p) {
+            if (text[p] == ' ') {
+                normalized += "▁";
+            } else {
+                normalized.push_back(text[p]);
+            }
+        }
+        if (!normalized.empty()) result.push_back(std::move(normalized));
+    };
+
+    while (i < text.size()) {
+        const std::string* match = nullptr;
+        for (const auto& token : special_token_order_) {
+            if (i + token.size() <= text.size() &&
+                text.compare(i, token.size(), token) == 0) {
+                match = &token;
+                break;
+            }
+        }
+        if (match) {
+            flush_plain(i);
+            result.push_back(*match);
+            i += match->size();
+            plain_begin = i;
+        } else {
+            ++i;
+        }
+    }
+    flush_plain(text.size());
+    return result;
+}
+
 // ============================================================
 // Split word to byte-level chars
 // ============================================================
 
 std::vector<std::string> Tokenizer::split_to_chars(const std::string& word) const {
+    if (sentencepiece_bpe_) {
+        std::vector<std::string> chars;
+        size_t i = 0;
+        while (i < word.size()) {
+            const Utf8Char cp = decode_utf8_char(word, i);
+            chars.push_back(word.substr(i, cp.bytes));
+            i += cp.bytes;
+        }
+        return chars;
+    }
+
     static auto b2u = byte_to_unicode();
     std::vector<std::string> chars;
     for (unsigned char c : word) {
@@ -803,6 +909,19 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
             auto it = token_to_id_.find(tok);
             if (it != token_to_id_.end()) {
                 ids.push_back(it->second);
+            } else if (sentencepiece_bpe_) {
+                // tokenizer.json model.byte_fallback: unknown Unicode pieces
+                // are represented by one <0xXX> token per UTF-8 byte.
+                static constexpr char hex[] = "0123456789ABCDEF";
+                for (const unsigned char byte : tok) {
+                    std::string fallback = "<0x00>";
+                    fallback[3] = hex[(byte >> 4) & 0xF];
+                    fallback[4] = hex[byte & 0xF];
+                    auto byte_it = token_to_id_.find(fallback);
+                    if (byte_it != token_to_id_.end()) {
+                        ids.push_back(byte_it->second);
+                    }
+                }
             }
         }
     }
@@ -827,6 +946,31 @@ std::string Tokenizer::decode(int token_id) const {
             return token;
         }
         return "";
+    }
+
+    if (sentencepiece_bpe_) {
+        if (token.size() == 6 && token[0] == '<' && token[1] == '0' &&
+            token[2] == 'x' && token[5] == '>') {
+            auto hex_value = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                return -1;
+            };
+            const int hi = hex_value(token[3]);
+            const int lo = hex_value(token[4]);
+            if (hi >= 0 && lo >= 0) {
+                return std::string(1, static_cast<char>((hi << 4) | lo));
+            }
+        }
+        std::string result = token;
+        const std::string marker = "▁";
+        size_t pos = 0;
+        while ((pos = result.find(marker, pos)) != std::string::npos) {
+            result.replace(pos, marker.size(), " ");
+            ++pos;
+        }
+        return result;
     }
 
     static auto u2b = unicode_to_byte();

@@ -32,6 +32,21 @@ void run_chat_formatter_tests() {
     AILA_CHAT_EXPECT_TRUE(formatter.render_text(input, false, stable, &error));
     AILA_CHAT_EXPECT_TRUE(rendered.text.rfind(stable.text, 0) == 0);
 
+    ChatFormatInput diffusion_input;
+    diffusion_input.request = &req;
+    diffusion_input.family = ModelFamily::DiffusionGemma;
+    diffusion_input.tokenizer_chat_template = "incorrect checkpoint template";
+    diffusion_input.bos_token = "<bos>";
+    diffusion_input.eos_token = "<eos>";
+    ChatFormatTextResult diffusion_rendered;
+    AILA_CHAT_EXPECT_TRUE(
+        formatter.render_text(diffusion_input, true, diffusion_rendered, &error));
+    AILA_CHAT_EXPECT_EQ(
+        diffusion_rendered.text,
+        std::string("<bos><|turn>user\nhello<turn|>\n<|turn>model\n"));
+    AILA_CHAT_EXPECT_EQ(diffusion_rendered.template_name,
+                        std::string("diffusion-gemma-text"));
+
     ChatSessionState session;
     session.set_system_prompt("Be brief.");
     session.add_user_text("What is 1+1?");

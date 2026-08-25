@@ -3087,8 +3087,8 @@ void attention_prefill_masked(Context& ctx,
         ctx, {num_heads, q_len, kv_len}, dnnl::memory::data_type::bf16);
     Tensor attn_tmp = Tensor::allocate(
         ctx, {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16);
-    AILA_LOG_INFO("[Attn] buffers q=%d t=%d h=%d kv=%d d=%d", q_len, kv_len,
-                  num_heads, num_kv_heads, head_dim);
+    AILA_LOG_DEBUG("[Attn] buffers q=%d t=%d h=%d kv=%d d=%d", q_len, kv_len,
+                   num_heads, num_kv_heads, head_dim);
 
     bf16* k_ptr = static_cast<bf16*>(k.data());
     bf16* v_ptr = static_cast<bf16*>(v.data());
@@ -3122,7 +3122,7 @@ void attention_prefill_masked(Context& ctx,
                 k_ptr[src_idx];
             ev_ptr[idx[0]] = v_ptr[src_idx];
         });
-    AILA_LOG_INFO("[Attn] expand submitted");
+    AILA_LOG_DEBUG("[Attn] expand submitted");
 
     const MaskedAttnKey key{q_len, kv_len, num_heads, num_kv_heads, head_dim};
     auto& prims = masked_attn_prims()[key];
@@ -3154,7 +3154,7 @@ void attention_prefill_masked(Context& ctx,
             ctx.engine(), prims.pv_src_md, prims.pv_w_md, prims.pv_dst_md);
         prims.pv_prim = dnnl::matmul(pv_pd);
     }
-    AILA_LOG_INFO("[Attn] prims ready");
+    AILA_LOG_DEBUG("[Attn] prims ready");
 
     dnnl::memory q_mem = expanded_q.make_dnnl_memory(prims.qk_src_md);
     dnnl::memory k_mem = expanded_k.make_dnnl_memory(prims.qk_w_md);
@@ -3163,7 +3163,7 @@ void attention_prefill_masked(Context& ctx,
                           {{DNNL_ARG_SRC, q_mem},
                            {DNNL_ARG_WEIGHTS, k_mem},
                            {DNNL_ARG_DST, scores_mem}});
-    AILA_LOG_INFO("[Attn] qk executed");
+    AILA_LOG_DEBUG("[Attn] qk executed");
 
     float* scores_ptr = static_cast<float*>(scores_buf.data());
     const float* mask_ptr = static_cast<const float*>(mask.data());
@@ -3181,7 +3181,11 @@ void attention_prefill_masked(Context& ctx,
 
             float max_score = -1.0e30f;
             for (int t = 0; t < kv_len; ++t) {
-                const float s = row[t] + mrow[t];
+                // torch.matmul(bf16, bf16) returns bf16 in the trusted
+                // DiffusionGemma implementation. oneDNN accumulates into our
+                // f32 destination, so explicitly apply the observable bf16
+                // output rounding before the fp32 softmax.
+                const float s = static_cast<float>(bf16(row[t])) + mrow[t];
                 row[t] = s;
                 max_score = std::max(max_score, s);
             }
@@ -3196,7 +3200,7 @@ void attention_prefill_masked(Context& ctx,
                 prow[t] = bf16(std::exp(row[t] - max_score) * inv_sum);
             }
         });
-    AILA_LOG_INFO("[Attn] softmax submitted");
+    AILA_LOG_DEBUG("[Attn] softmax submitted");
 
     dnnl::memory probs_mem = probs_bf16.make_dnnl_memory(prims.pv_src_md);
     dnnl::memory v_mem = expanded_v.make_dnnl_memory(prims.pv_w_md);
@@ -3205,7 +3209,7 @@ void attention_prefill_masked(Context& ctx,
                           {{DNNL_ARG_SRC, probs_mem},
                            {DNNL_ARG_WEIGHTS, v_mem},
                            {DNNL_ARG_DST, attn_mem}});
-    AILA_LOG_INFO("[Attn] pv executed");
+    AILA_LOG_DEBUG("[Attn] pv executed");
 
     bf16* attn_ptr = static_cast<bf16*>(attn_tmp.data());
     bf16* out_ptr = static_cast<bf16*>(output.data());

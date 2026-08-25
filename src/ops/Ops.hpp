@@ -93,7 +93,8 @@ public:
 
     // weight: [out_features, in_features] (如果 preprocessed=false)
     // weight: [in_features, out_features]  (如果 preprocessed=true)
-    void init(Context& ctx, Tensor& weight, int in_features, int out_features, bool preprocessed = false);
+    void init(Context& ctx, Tensor& weight, int in_features, int out_features,
+              bool preprocessed = false, bool prepare_gemv = true);
 
     // forward: output = input @ weight^T
     // 如果权重已预转置，则计算 input @ weight_ptr
@@ -280,7 +281,8 @@ namespace ops {
                             int text_pos_delta = 0,
                             int mrope_section_t = 0,
                             int mrope_section_h = 0,
-                            int mrope_section_w = 0);
+                            int mrope_section_w = 0,
+                            bool proportional = false);
 
     // 将新 K/V 写到 cache 的指定位置
     // new_kv: [seq_len, num_kv_heads * head_dim]

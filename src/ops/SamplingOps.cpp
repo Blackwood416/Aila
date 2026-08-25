@@ -847,14 +847,26 @@ void gemma4_router_host(const float* hidden, const float* scale,
         }
         const float inv_rms = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
 
+        // Match the observable dtype boundaries in DiffusionGemmaTextRouter:
+        // RMSNorm returns bf16, both elementwise scales return bf16, and the
+        // bf16 linear projection produces bf16 logits before fp32 softmax.
+        std::vector<float> routed(static_cast<size_t>(hidden_size));
+        for (int i = 0; i < hidden_size; ++i) {
+            float value = static_cast<float>(bf16(h[i] * inv_rms));
+            value = static_cast<float>(bf16(value * scale[i]));
+            routed[static_cast<size_t>(i)] =
+                static_cast<float>(bf16(value * root_size));
+        }
+
         std::vector<float> scores(static_cast<size_t>(num_experts));
         float max_score = -1.0e30f;
         for (int e = 0; e < num_experts; ++e) {
             const float* prow = proj + static_cast<size_t>(e) * hidden_size;
             float acc = 0.0f;
             for (int i = 0; i < hidden_size; ++i) {
-                acc += h[i] * inv_rms * scale[i] * root_size * prow[i];
+                acc += routed[static_cast<size_t>(i)] * prow[i];
             }
+            acc = static_cast<float>(bf16(acc));
             scores[static_cast<size_t>(e)] = acc;
             max_score = std::max(max_score, acc);
         }

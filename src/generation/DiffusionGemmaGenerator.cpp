@@ -1,6 +1,7 @@
 #include "DiffusionGemmaGenerator.hpp"
 
 #include "../ops/Ops.hpp"
+#include "../utils/EnvUtils.hpp"
 #include "profile/Profiling.hpp"
 
 #include <algorithm>
@@ -54,13 +55,18 @@ void softmax_entropy_host(const float* logits, float* entropy, int rows,
 
 void gumbel_sample_host(const float* logits, std::mt19937& rng, int* tokens,
                         int rows, int cols) {
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    // std::mt19937 is not thread-safe. Derive one deterministic stream per
+    // row before entering the worker pool instead of racing a shared engine.
+    std::vector<uint32_t> row_seeds(static_cast<size_t>(rows));
+    for (uint32_t& seed : row_seeds) seed = rng();
     parallel_rows(rows, [&](int r) {
+        std::mt19937 row_rng(row_seeds[static_cast<size_t>(r)]);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
         const float* row = logits + static_cast<size_t>(r) * cols;
         int best = 0;
         float best_value = -1.0e30f;
         for (int c = 0; c < cols; ++c) {
-            const float u = std::max(uniform(rng), 1.0e-30f);
+            const float u = std::max(uniform(row_rng), 1.0e-30f);
             const float gumbel = -std::log(-std::log(u));
             const float value = row[c] + gumbel;
             if (value > best_value) {
@@ -140,6 +146,8 @@ bool DiffusionGemmaGenerator::generate(
 
     bool all_finished = false;
     int generated = 0;
+    const bool debug_probes =
+        aila::env::read_flag("AILA_DG_DEBUG_PROBES", false);
     for (int c = 0; c < max_canvases && !all_finished; ++c) {
         std::vector<int> prev_argmax(canvas);
         int equal_count = 0;
@@ -155,11 +163,9 @@ bool DiffusionGemmaGenerator::generate(
                            sc_embeds.size() * sizeof(bf16));
             Tensor& logits = backend.diffusion_decode_canvas(
                 ctx, canvas_device, sc_device, canvas_len);
-            AILA_LOG_INFO("[DiffusionGemma] Decode done");
             ctx.memcpy_d2h(logits_host.data(), logits.data(),
                            logits_host.size() * sizeof(float));
             ctx.synchronize();
-            AILA_LOG_INFO("[DiffusionGemma] Logits copied to host");
 
             const float temperature =
                 cfg.t_min + (cfg.t_max - cfg.t_min) *
@@ -175,7 +181,7 @@ bool DiffusionGemmaGenerator::generate(
                                canvas_len, vocab);
             ops::diffusion_argmax(processed_host.data(), new_argmax.data(),
                                   canvas_len, vocab);
-            if (cur_step == cfg.max_denoising_steps) {
+            if (debug_probes && cur_step == cfg.max_denoising_steps) {
                 float min_l = 1e30f, max_l = -1e30f;
                 double sum_l = 0.0;
                 for (size_t i = 0; i < processed_host.size(); ++i) {
@@ -183,14 +189,14 @@ bool DiffusionGemmaGenerator::generate(
                     max_l = std::max(max_l, processed_host[i]);
                     sum_l += processed_host[i];
                 }
-                std::fprintf(stderr,
-                             "[DG-DEBUG] step=%d logits min=%.4f max=%.4f "
-                             "mean=%.4f entropy0=%.4f argmax0=%d argmax1=%d "
-                             "argmax2=%d argmax3=%d argmax4=%d\n",
-                             cur_step, min_l, max_l,
-                             static_cast<float>(sum_l / processed_host.size()),
-                             entropy[0], new_argmax[0], new_argmax[1],
-                             new_argmax[2], new_argmax[3], new_argmax[4]);
+                AILA_LOG_INFO(
+                    "[DG-DEBUG] step=%d logits min=%.4f max=%.4f mean=%.4f "
+                    "entropy0=%.4f argmax0=%d argmax1=%d argmax2=%d "
+                    "argmax3=%d argmax4=%d",
+                    cur_step, min_l, max_l,
+                    static_cast<float>(sum_l / processed_host.size()),
+                    entropy[0], new_argmax[0], new_argmax[1],
+                    new_argmax[2], new_argmax[3], new_argmax[4]);
             }
             ops::diffusion_accept_mask(entropy.data(), 1, canvas_len,
                                        cfg.entropy_bound, accept.data());
@@ -237,14 +243,13 @@ bool DiffusionGemmaGenerator::generate(
             ctx.memcpy_d2h(sc_embeds.data(), soft.data(),
                            sc_embeds.size() * sizeof(bf16));
             ctx.synchronize();
-            AILA_LOG_INFO("[DiffusionGemma] Soft embeddings computed");
 
             if (finished_denoising) break;
         }
 
         // Commit the argmax canvas.
         const std::vector<int> commit = new_argmax;
-        {
+        if (debug_probes) {
             std::string tok_list;
             for (int i = 0; i < std::min(16, canvas_len); ++i) {
                 tok_list += std::to_string(commit[static_cast<size_t>(i)]) + " ";

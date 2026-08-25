@@ -417,6 +417,43 @@ int run_attention_masked_test() {
     return 0;
 }
 
+int run_proportional_rope_test() {
+    constexpr int D = 512;
+    Context ctx;
+    std::vector<bf16> q(D, bf16(0.0f));
+    std::vector<bf16> k(D, bf16(0.0f));
+    q[0] = bf16(1.0f);
+    q[256] = bf16(2.0f);
+    q[64] = bf16(3.0f);
+    k[0] = bf16(-2.0f);
+    k[256] = bf16(0.5f);
+    Tensor q_dev = Tensor::allocate(ctx, {1, D}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {1, D}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(q_dev.data(), q.data(), q.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k.data(), k.size() * sizeof(bf16));
+    ops::apply_rope_partial(ctx, q_dev, k_dev, 1, 1, 1, 1, D, 128,
+                            1'000'000.0f, false, nullptr, nullptr, nullptr,
+                            0, 0, 0, 0, 0, true);
+    ctx.synchronize();
+    ctx.memcpy_d2h(q.data(), q_dev.data(), q.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k.data(), k_dev.data(), k.size() * sizeof(bf16));
+
+    const float c = std::cos(1.0f);
+    const float s = std::sin(1.0f);
+    expect(std::abs(static_cast<float>(q[0]) - (c - 2.0f * s)) < 0.02f &&
+               std::abs(static_cast<float>(q[256]) - (2.0f * c + s)) < 0.02f,
+           "proportional RoPE did not pair dimensions 0 and 256");
+    expect(static_cast<float>(q[64]) == 3.0f,
+           "proportional RoPE modified an inactive dimension");
+    expect(std::abs(static_cast<float>(k[0]) - (-2.0f * c - 0.5f * s)) <
+                   0.02f &&
+               std::abs(static_cast<float>(k[256]) - (0.5f * c - 2.0f * s)) <
+                   0.02f,
+           "proportional RoPE K rotation mismatch");
+    std::cout << "DiffusionGemmaModelSpecTests: proportional RoPE passed\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -424,6 +461,7 @@ int main() {
     try {
         failed |= run_model_spec_tests();
         failed |= run_empty_quant_state_loader_test();
+        failed |= run_proportional_rope_test();
         failed |= run_attention_masked_test();
     } catch (const std::exception& e) {
         std::cerr << "DiffusionGemmaModelSpecTests: failed: " << e.what() << "\n";

@@ -97,8 +97,10 @@ int run_packed_nf4_gemm_layout_test(int M, int Block) {
                 const uint8_t code = nf4_at(packed, n, k, K);
                 expected +=
                     static_cast<float>(input[static_cast<size_t>(m * K + k)]) *
-                    qmap[static_cast<size_t>(code)] *
-                    absmax[static_cast<size_t>(n * blocks_per_row + k / Block)];
+                    static_cast<float>(bf16(
+                        qmap[static_cast<size_t>(code)] *
+                        absmax[static_cast<size_t>(
+                            n * blocks_per_row + k / Block)]));
             }
             const double actual = static_cast<float>(output[static_cast<size_t>(m * N + n)]);
             const double diff = std::abs(actual - expected);
@@ -334,8 +336,9 @@ int run_packed_nf4_gemm_shape_test(int M, int N, int K, bool zero_input = false)
                                  : static_cast<uint8_t>(byte & 0x0F);
                 expected +=
                     static_cast<float>(input[static_cast<size_t>(r * K + k)]) *
-                    qmap[code] *
-                    absmax[static_cast<size_t>(c * blocks_per_row + block)];
+                    static_cast<float>(bf16(
+                        qmap[code] *
+                        absmax[static_cast<size_t>(c * blocks_per_row + block)]));
             }
             const double actual =
                 static_cast<float>(output[static_cast<size_t>(r * N + c)]);
@@ -515,10 +518,15 @@ int run_real_qproj_kernel_test() {
     ctx.synchronize();
     std::vector<bf16> output(static_cast<size_t>(M) * N);
     ctx.memcpy_d2h(output.data(), output_dev.data(), output.size() * sizeof(bf16));
-    // Reference dots for rows 0..2, cols 0..3 in fp64.
+    // Reference dots across every output tile.  The former cols 0..3-only
+    // check missed a DG2 miscompile where exactly that first tile fragment was
+    // correct and most later q_proj columns were corrupted.
     bool failed = false;
+    const std::vector<int> sampled_cols = {
+        0, 1, 2, 3, 4, 5, 15, 16, 63, 64, 127, 128, 255, 256,
+        511, 512, 1023, 1024, 2047, 2048, 3071, 3072, 4095};
     for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 4; ++c) {
+        for (const int c : sampled_cols) {
             double expected = 0.0;
             for (int k = 0; k < K; ++k) {
                 const int block = k / Block;
@@ -527,8 +535,9 @@ int run_real_qproj_kernel_test() {
                     (k % 2 == 0) ? static_cast<uint8_t>(byte >> 4)
                                  : static_cast<uint8_t>(byte & 0x0F);
                 expected += static_cast<float>(input[static_cast<size_t>(r * K + k)]) *
-                            qmap[code] *
-                            absmax_host[static_cast<size_t>(c * blocks_per_row + block)];
+                            static_cast<float>(bf16(
+                                qmap[code] * absmax_host[static_cast<size_t>(
+                                    c * blocks_per_row + block)]));
             }
             const double actual =
                 static_cast<float>(output[static_cast<size_t>(r * N + c)]);

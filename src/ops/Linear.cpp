@@ -30,7 +30,8 @@ uint64_t fused_linear_key(int seq_len, dnnl::memory::data_type bias_dtype) {
 // Linear 层实现 (oneDNN MatMul)
 // ============================================================
 
-void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_features, bool preprocessed) {
+void Linear::init(Context& ctx, Tensor& weight, int in_features,
+                  int out_features, bool preprocessed, bool prepare_gemv) {
     weight_ = &weight;
     in_features_ = in_features;
     out_features_ = out_features;
@@ -39,7 +40,7 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     // Pre-transpose weight to [M, K] for native GEMV kernel (contiguous access).
     // The standard "preprocessed" weight is [K, M] row-major for oneDNN.
     // We store a [M, K] copy so the GEMV kernel can read weight rows contiguously.
-    if (preprocessed && in_features > 0 && out_features > 0) {
+    if (preprocessed && prepare_gemv && in_features > 0 && out_features > 0) {
         gemv_weight_ = Tensor::allocate(ctx, {out_features, in_features});
         ops::transpose(ctx, weight, gemv_weight_);
         ctx.synchronize();
