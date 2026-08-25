@@ -1,7 +1,9 @@
 #include "Bnb4BitLinear.hpp"
+#include "Ops.hpp"
 #include "../utils/EnvUtils.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -11,6 +13,39 @@ namespace {
 
 int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
+}
+
+void moe_split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate,
+                       Tensor& up, int rows, int ff_dim) {
+    bf16* src_ptr = static_cast<bf16*>(gate_up.data());
+    bf16* gate_ptr = static_cast<bf16*>(gate.data());
+    bf16* up_ptr = static_cast<bf16*>(up.data());
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(rows) * ff_dim),
+        [=](sycl::id<1> idx) {
+            const int row = static_cast<int>(idx[0]) / ff_dim;
+            const int col = static_cast<int>(idx[0]) % ff_dim;
+            gate_ptr[idx[0]] =
+                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + col];
+            up_ptr[idx[0]] =
+                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + ff_dim + col];
+        });
+}
+
+void moe_gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
+                            Tensor& output, int n) {
+    bf16* gate_ptr = static_cast<bf16*>(gate.data());
+    bf16* up_ptr = static_cast<bf16*>(up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            const float g = static_cast<float>(gate_ptr[i]);
+            const float u = static_cast<float>(up_ptr[i]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
 }
 
 // Fused NF4 dequant + matmul for prefill (M > 1).
@@ -26,6 +61,7 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
                                 int blocksize) {
     const int packed_bytes_per_row = K / 2;
     const int blocks_per_row = K / blocksize;
+    const int blocks_per_tile = BK / blocksize;
 
     constexpr int WG_SIZE = TILE_M * TILE_N;
 
@@ -35,7 +71,8 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
-        sycl::local_accessor<float, 1> B_absmax_slm(sycl::range<1>(BN), cgh);
+        sycl::local_accessor<float, 1> B_absmax_slm(
+            sycl::range<1>(BN * blocks_per_tile), cgh);
         sycl::local_accessor<uint8_t, 1> B_nf4_slm(sycl::range<1>(BK * BN / 2), cgh);
 
         cgh.parallel_for(
@@ -81,11 +118,15 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
                         }
                     }
 
-                    // Load absmax for each N column in this tile
-                    if (lid < BN) {
-                        const int src_n = n0 + lid;
-                        B_absmax_slm[lid] = (src_n < N)
-                            ? absmax_ptr[src_n * blocks_per_row + kb / blocksize] : 0.0f;
+                    // Load absmax for each (N column, K block) in this tile.
+                    const int absmax_elems = BN * blocks_per_tile;
+                    for (int i = lid; i < absmax_elems; i += WG_SIZE) {
+                        const int ni = i / blocks_per_tile;
+                        const int b = i % blocks_per_tile;
+                        const int src_n = n0 + ni;
+                        B_absmax_slm[i] = (src_n < N)
+                            ? absmax_ptr[src_n * blocks_per_row + kb / blocksize + b]
+                            : 0.0f;
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
@@ -104,7 +145,9 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
                         for (int ni = n_local; ni < n_local_end; ++ni) {
                             const uint8_t b = B_nf4_slm[b_byte_base + ni];
                             const uint8_t nf4 = hi ? (b >> 4) : (b & 0x0F);
-                            b_dequant[ni - n_local] = qmap[nf4] * B_absmax_slm[ni];
+                            b_dequant[ni - n_local] =
+                                qmap[nf4] * B_absmax_slm[ni * blocks_per_tile +
+                                                         k / blocksize];
                         }
 
                         for (int mi = m_local; mi < m_local_end; ++mi) {
@@ -139,12 +182,9 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           bf16* output_ptr,
                           int M, int N, int K,
                           int blocksize) {
-    if (M <= 80 && (N <= 4096 || K >= 4096)) {
-        packed_nf4_gemm_bf16_tiled<80, 64, 128, 8, 4, 10, 16>(
-            ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
-            M, N, K, blocksize);
-        return;
-    }
+    // NOTE: the small-M template (<80,64,128,8,4,10,16>) produced incorrect
+    // results for M=24 with the real DiffusionGemma weights on Intel Arc A770.
+    // Use the large template for all M>1 until the small template is fixed.
     packed_nf4_gemm_bf16_tiled<128, 64, 128, 8, 4, 16, 16>(
         ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
         M, N, K, blocksize);
@@ -503,7 +543,6 @@ bool Bnb4BitLinear::init(Context& ctx, const Bnb4BitWeightRef& weight, std::stri
     } else {
         ctx.memcpy_d2h(host_absmax.data(), weight.absmax->data(), host_absmax.size() * sizeof(float));
     }
-
     absmax_f32_ = Tensor::allocate(ctx, {(int64_t)block_count}, dnnl::memory::data_type::f32);
     ctx.memcpy_h2d(absmax_f32_.data(), host_absmax.data(), host_absmax.size() * sizeof(float));
     finish_init(ctx);
@@ -930,7 +969,8 @@ void Bnb4BitLinear::forward(Context& ctx,
     static bool use_fused_prefill =
         aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", 1) != 0;
     if (use_fused_prefill && seq_len > 1 &&
-        blocksize == 128 && (blocksize % 2) == 0 &&
+        (blocksize % 2) == 0 &&
+        (128 % blocksize) == 0 &&
         in_features_ > 0 && (in_features_ % blocksize) == 0 &&
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
@@ -1131,4 +1171,243 @@ void bf16_gemv_bf16(Context& ctx,
 }
 
 } // namespace ops
+
+bool Bnb4GroupedMoE::ExpertWeightSet::init(Context& ctx,
+                                           const Bnb4BitWeightRef& weight_ref,
+                                           std::string* error_message) {
+    (void)ctx;
+    ref = weight_ref;
+    if (!ref.valid() || !ref.absmax) {
+        if (error_message) *error_message = "invalid MoE weight reference";
+        return false;
+    }
+    ready = true;
+    return true;
+}
+
+bool Bnb4GroupedMoE::init(Context& ctx, const Bnb4BitWeightRef& gate_up,
+                          const Bnb4BitWeightRef& down, int hidden_size,
+                          int moe_intermediate_size, int num_experts,
+                          std::string* error_message) {
+    hidden_ = hidden_size;
+    moe_intermediate_ = moe_intermediate_size;
+    num_experts_ = num_experts;
+    if (hidden_ <= 0 || moe_intermediate_ <= 0 || num_experts_ <= 0) {
+        if (error_message) *error_message = "invalid MoE dimensions";
+        return false;
+    }
+    if (!gate_up_.init(ctx, gate_up, error_message) ||
+        !down_.init(ctx, down, error_message)) {
+        return false;
+    }
+    gate_up_in_features_ = static_cast<int>(gate_up.logical_in_features());
+    gate_up_rows_per_expert_ =
+        static_cast<int>(gate_up.logical_out_features() / num_experts_);
+    down_in_features_ = static_cast<int>(down.logical_in_features());
+    down_rows_per_expert_ =
+        static_cast<int>(down.logical_out_features() / num_experts_);
+    if (gate_up_in_features_ != hidden_ ||
+        gate_up_rows_per_expert_ != 2 * moe_intermediate_ ||
+        down_in_features_ != moe_intermediate_ ||
+        down_rows_per_expert_ != hidden_) {
+        if (error_message) {
+            *error_message = "MoE weight shapes do not match config";
+        }
+        return false;
+    }
+    prims_.clear();
+    scratch_rows_ = 0;
+    return true;
+}
+
+void Bnb4GroupedMoE::ensure_scratch(Context& ctx, int rows) {
+    if (rows <= scratch_rows_) return;
+    scratch_rows_ = rows;
+    src_ = Tensor::allocate(ctx, {scratch_rows_, hidden_},
+                            dnnl::memory::data_type::bf16);
+    gate_up_out_ = Tensor::allocate(
+        ctx, {scratch_rows_, 2 * moe_intermediate_},
+        dnnl::memory::data_type::bf16);
+    gate_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
+                             dnnl::memory::data_type::bf16);
+    up_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
+                           dnnl::memory::data_type::bf16);
+    proj_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
+                             dnnl::memory::data_type::bf16);
+    down_out_ = Tensor::allocate(ctx, {scratch_rows_, hidden_},
+                                 dnnl::memory::data_type::bf16);
+    gate_up_w_ = Tensor::allocate(
+        ctx, {gate_up_in_features_, 2 * moe_intermediate_},
+                                  dnnl::memory::data_type::bf16);
+    down_w_ = Tensor::allocate(ctx, {down_in_features_, hidden_},
+                               dnnl::memory::data_type::bf16);
+}
+
+void Bnb4GroupedMoE::run_matmul(Context& ctx, int rows, int in_n, int out_n,
+                                uint64_t prim_key, Tensor& src, Tensor& w,
+                                Tensor& dst) {
+    auto& mp = prims_[prim_key];
+    if (!mp.inited) {
+        mp.inited = true;
+        mp.src_md = dnnl::memory::desc({rows, in_n},
+                                       dnnl::memory::data_type::bf16,
+                                       dnnl::memory::format_tag::ab);
+        mp.w_md = dnnl::memory::desc({in_n, out_n},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+        mp.dst_md = dnnl::memory::desc({rows, out_n},
+                                       dnnl::memory::data_type::bf16,
+                                       dnnl::memory::format_tag::ab);
+        auto pd = dnnl::matmul::primitive_desc(ctx.engine(), mp.src_md,
+                                               mp.w_md, mp.dst_md);
+        mp.prim = dnnl::matmul(pd);
+    }
+    dnnl::memory src_mem = src.make_dnnl_memory(mp.src_md);
+    dnnl::memory w_mem = w.make_dnnl_memory(mp.w_md);
+    dnnl::memory dst_mem = dst.make_dnnl_memory(mp.dst_md);
+    mp.prim.execute(ctx.stream(),
+                    {{DNNL_ARG_SRC, src_mem},
+                     {DNNL_ARG_WEIGHTS, w_mem},
+                     {DNNL_ARG_DST, dst_mem}});
+}
+
+void Bnb4GroupedMoE::dequant_subset(Context& ctx, const ExpertWeightSet& set,
+                                    int expert, int rows_per_expert,
+                                    Tensor& out) {
+    const Bnb4BitWeightRef& ref = set.ref;
+    const int64_t in_features = ref.logical_in_features();
+    const int64_t packed_per_row = in_features / 2;
+    const int blocksize = ref.quant_state.blocksize;
+    const int64_t blocks_per_row = in_features / blocksize;
+    const int64_t row_start = static_cast<int64_t>(expert) * rows_per_expert;
+    const uint8_t* packed =
+        static_cast<const uint8_t*>(ref.packed_weight->data()) +
+        row_start * packed_per_row;
+    const float* qmap = static_cast<const float*>(ref.quant_map->data());
+    const uint8_t* absmax_codes = nullptr;
+    const float* absmax_f32 = nullptr;
+    const float* nested_absmax = nullptr;
+    const float* nested_qmap = nullptr;
+    int nested_blocksize = 1;
+    float nested_offset = 0.0f;
+    if (ref.quant_state.nested) {
+        absmax_codes = static_cast<const uint8_t*>(ref.absmax->data());
+        nested_absmax =
+            static_cast<const float*>(ref.nested_absmax->data());
+        nested_qmap =
+            static_cast<const float*>(ref.nested_quant_map->data());
+        nested_blocksize = ref.quant_state.nested_blocksize;
+        nested_offset = ref.quant_state.nested_offset;
+    } else {
+        absmax_f32 = static_cast<const float*>(ref.absmax->data());
+    }
+    bf16* out_ptr = static_cast<bf16*>(out.data());
+    const int64_t packed_bytes =
+        static_cast<int64_t>(rows_per_expert) * packed_per_row;
+
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(packed_bytes)),
+        [=](sycl::id<1> idx) {
+            const int64_t byte_index = static_cast<int64_t>(idx[0]);
+            const int64_t row = byte_index / packed_per_row;
+            const int64_t byte_in_row = byte_index % packed_per_row;
+            const uint8_t packed_byte = packed[byte_index];
+            const int64_t block = (row_start + row) * blocks_per_row +
+                                  byte_in_row / (blocksize / 2);
+            float am = 0.0f;
+            if (absmax_f32 != nullptr) {
+                am = absmax_f32[block];
+            } else {
+                const uint8_t code = absmax_codes[block];
+                am = nested_qmap[code] *
+                         nested_absmax[block / nested_blocksize] +
+                     nested_offset;
+            }
+            const int64_t flat = byte_index * 2;
+            const int64_t col = flat % in_features;
+            out_ptr[col * rows_per_expert + row] =
+                bf16(qmap[(packed_byte >> 4) & 0x0F] * am);
+            const int64_t flat1 = flat + 1;
+            if (flat1 < static_cast<int64_t>(rows_per_expert) * in_features) {
+                const int64_t col1 = flat1 % in_features;
+                out_ptr[col1 * rows_per_expert + row] =
+                    bf16(qmap[packed_byte & 0x0F] * am);
+            }
+        });
+}
+
+void Bnb4GroupedMoE::forward(Context& ctx,
+                             const std::vector<bf16>& input,
+                             const std::vector<int>& expert_ids,
+                             const std::vector<float>& expert_weights,
+                             std::vector<bf16>& output,
+                             int tokens, int top_k) {
+    if (tokens <= 0 || top_k <= 0 ||
+        static_cast<size_t>(tokens) * hidden_ != input.size() ||
+        static_cast<size_t>(tokens) * top_k != expert_ids.size()) {
+        throw std::runtime_error("Bnb4GroupedMoE::forward: shape mismatch");
+    }
+
+    std::unordered_map<int, std::vector<std::pair<int, float>>> groups;
+    groups.reserve(static_cast<size_t>(std::min(tokens * top_k, num_experts_)));
+    int max_rows = 0;
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            const int idx = t * top_k + k;
+            const int expert = expert_ids[static_cast<size_t>(idx)];
+            auto& list = groups[expert];
+            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
+            max_rows = std::max(max_rows, static_cast<int>(list.size()));
+        }
+    }
+    ensure_scratch(ctx, max_rows);
+
+    std::vector<float> acc(static_cast<size_t>(tokens) * hidden_, 0.0f);
+    std::vector<bf16> gather(static_cast<size_t>(max_rows) * hidden_);
+    std::vector<float> row_out(static_cast<size_t>(max_rows) * hidden_);
+
+    for (const auto& [expert, rows] : groups) {
+        const int count = static_cast<int>(rows.size());
+        for (int r = 0; r < count; ++r) {
+            const int token = rows[static_cast<size_t>(r)].first;
+            std::memcpy(gather.data() + static_cast<size_t>(r) * hidden_,
+                        input.data() + static_cast<size_t>(token) * hidden_,
+                        static_cast<size_t>(hidden_) * sizeof(bf16));
+        }
+        ctx.memcpy_h2d(src_.data(), gather.data(),
+                       static_cast<size_t>(count) * hidden_ * sizeof(bf16));
+
+        dequant_subset(ctx, gate_up_, expert, gate_up_rows_per_expert_,
+                       gate_up_w_);
+        run_matmul(ctx, count, gate_up_in_features_, 2 * moe_intermediate_,
+                   static_cast<uint64_t>(count) * 2 + 0, src_, gate_up_w_,
+                   gate_up_out_);
+        moe_split_gate_up(ctx, gate_up_out_, gate_, up_, count,
+                          moe_intermediate_);
+        moe_gelu_tanh_gate_mul(ctx, gate_, up_, proj_,
+                               count * moe_intermediate_);
+
+        dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
+        run_matmul(ctx, count, down_in_features_, hidden_,
+                   static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
+                   down_out_);
+        ctx.memcpy_d2h(row_out.data(), down_out_.data(),
+                       static_cast<size_t>(count) * hidden_ * sizeof(bf16));
+
+        for (int r = 0; r < count; ++r) {
+            const int token = rows[static_cast<size_t>(r)].first;
+            const float weight = rows[static_cast<size_t>(r)].second;
+            float* dst = acc.data() + static_cast<size_t>(token) * hidden_;
+            const float* src_row =
+                row_out.data() + static_cast<size_t>(r) * hidden_;
+            for (int h = 0; h < hidden_; ++h) {
+                dst[h] += src_row[h] * weight;
+            }
+        }
+    }
+
+    output.assign(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
+    for (size_t i = 0; i < acc.size(); ++i) {
+        output[i] = bf16(acc[i]);
+    }
+}
 

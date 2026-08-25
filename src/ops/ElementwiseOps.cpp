@@ -491,6 +491,40 @@ void gelu_tanh_inplace(Context& ctx, Tensor& input, int n) {
         });
 }
 
+void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
+                        Tensor& output, int n) {
+    bf16* gate_ptr = static_cast<bf16*>(gate.data());
+    bf16* up_ptr = static_cast<bf16*>(up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            const float g = static_cast<float>(gate_ptr[i]);
+            const float u = static_cast<float>(up_ptr[i]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
+}
+
+void scale_inplace(Context& ctx, Tensor& input, float scale, int n) {
+    bf16* ptr = static_cast<bf16*>(input.data());
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            ptr[i] = bf16(static_cast<float>(ptr[i]) * scale);
+        });
+}
+
+void logit_softcap_inplace(Context& ctx, Tensor& input, float cap, int n) {
+    float* ptr = static_cast<float*>(input.data());
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            ptr[i] = sycl::tanh(ptr[i] / cap) * cap;
+        });
+}
+
 void bias_add_inplace(Context& ctx, Tensor& input, Tensor& bias, int rows, int cols) {
     bf16* in_ptr = static_cast<bf16*>(input.data());
     bf16* bias_bf16_ptr = nullptr;

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <unordered_map>
 #include <functional>
+#include <thread>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -691,6 +692,204 @@ void sample_with_config_device(Context& ctx, Tensor& logits, int vocab_size,
 
             *d_result = result;
         });
+    });
+}
+
+namespace {
+
+template <typename Fn>
+void parallel_rows(int rows, Fn&& fn) {
+    if (rows <= 0) return;
+    unsigned hardware = std::thread::hardware_concurrency();
+    if (hardware == 0) hardware = 1;
+    unsigned threads = std::min<unsigned>(hardware, 16u);
+    threads = std::min<unsigned>(threads, static_cast<unsigned>(rows));
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) {
+        const int start = static_cast<int>(static_cast<int64_t>(rows) * t / threads);
+        const int end = static_cast<int>(static_cast<int64_t>(rows) * (t + 1) / threads);
+        pool.emplace_back([&fn, start, end]() {
+            for (int r = start; r < end; ++r) fn(r);
+        });
+    }
+    for (auto& th : pool) th.join();
+}
+
+} // namespace
+
+void diffusion_softmax_entropy(const bf16* logits, bf16* probs,
+                               float* entropy, int rows, int cols) {
+    if (cols <= 0) return;
+    parallel_rows(rows, [&](int r) {
+        const bf16* row = logits + static_cast<size_t>(r) * cols;
+        bf16* prows = probs + static_cast<size_t>(r) * cols;
+        float max_logit = -1.0e30f;
+        for (int c = 0; c < cols; ++c) {
+            max_logit = std::max(max_logit, static_cast<float>(row[c]));
+        }
+        float sum = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            sum += std::exp(static_cast<float>(row[c]) - max_logit);
+        }
+        const float inv_sum = 1.0f / sum;
+        float ent = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            const float p =
+                std::exp(static_cast<float>(row[c]) - max_logit) * inv_sum;
+            prows[c] = bf16(p);
+            if (p > 0.0f) ent -= p * std::log(p);
+        }
+        entropy[r] = ent;
+    });
+}
+
+void diffusion_temperature_scale(const float* logits, float* out, int rows,
+                                 int cols, float temperature) {
+    const int64_t n = static_cast<int64_t>(rows) * cols;
+    const float inv = 1.0f / temperature;
+    parallel_rows(static_cast<int>(rows), [&](int r) {
+        const float* src = logits + static_cast<size_t>(r) * cols;
+        float* dst = out + static_cast<size_t>(r) * cols;
+        for (int c = 0; c < cols; ++c) dst[c] = src[c] * inv;
+    });
+    (void)n;
+}
+
+void diffusion_accept_mask(const float* entropy, int rows, int cols,
+                           float entropy_bound, uint8_t* accept) {
+    parallel_rows(rows, [&](int r) {
+        std::vector<std::pair<float, int>> order(static_cast<size_t>(cols));
+        const float* erow = entropy + static_cast<size_t>(r) * cols;
+        for (int c = 0; c < cols; ++c) {
+            order[static_cast<size_t>(c)] = {erow[c], c};
+        }
+        std::sort(order.begin(), order.end(),
+                  [](const std::pair<float, int>& a,
+                     const std::pair<float, int>& b) { return a.first < b.first; });
+        float cumulative = 0.0f;
+        for (int k = 0; k < cols; ++k) {
+            cumulative += order[static_cast<size_t>(k)].first;
+            const bool selected =
+                cumulative - order[static_cast<size_t>(k)].first <= entropy_bound;
+            accept[static_cast<size_t>(r) * cols +
+                   static_cast<size_t>(order[static_cast<size_t>(k)].second)] =
+                selected ? 1 : 0;
+        }
+    });
+}
+
+void diffusion_argmax(const float* logits, int* tokens, int rows, int cols) {
+    parallel_rows(rows, [&](int r) {
+        const float* row = logits + static_cast<size_t>(r) * cols;
+        int best = 0;
+        float best_value = row[0];
+        for (int c = 1; c < cols; ++c) {
+            if (row[c] > best_value) {
+                best_value = row[c];
+                best = c;
+            }
+        }
+        tokens[r] = best;
+    });
+}
+
+void diffusion_gumbel_sample(const float* logits, const float* uniforms,
+                             int* tokens, int rows, int cols) {
+    parallel_rows(rows, [&](int r) {
+        const float* row = logits + static_cast<size_t>(r) * cols;
+        const float* us = uniforms + static_cast<size_t>(r) * cols;
+        int best = 0;
+        float best_value = -1.0e30f;
+        for (int c = 0; c < cols; ++c) {
+            const float u = std::max(us[c], 1.0e-30f);
+            const float gumbel = -std::log(-std::log(u));
+            const float value = row[c] + gumbel;
+            if (value > best_value) {
+                best_value = value;
+                best = c;
+            }
+        }
+        tokens[r] = best;
+    });
+}
+
+void diffusion_renoise(int* canvas, const uint8_t* accept, int rows, int cols,
+                       int vocab_size, uint64_t seed, int* new_canvas) {
+    if (rows <= 0 || cols <= 0) return;
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> dist(0, vocab_size - 1);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const int idx = r * cols + c;
+            const int random_token = dist(rng);
+            new_canvas[idx] =
+                accept[idx] ? canvas[idx] : random_token;
+        }
+    }
+}
+
+void gemma4_router_host(const float* hidden, const float* scale,
+                        const float* proj, const float* per_expert_scale,
+                        int tokens, int hidden_size, int num_experts,
+                        int top_k, std::vector<int>& expert_ids,
+                        std::vector<float>& expert_weights) {
+    expert_ids.assign(static_cast<size_t>(tokens) * top_k, 0);
+    expert_weights.assign(static_cast<size_t>(tokens) * top_k, 0.0f);
+    const float root_size = 1.0f / std::sqrt(static_cast<float>(hidden_size));
+    const float eps = 1e-6f;
+
+    parallel_rows(tokens, [&](int t) {
+        const float* h = hidden + static_cast<size_t>(t) * hidden_size;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < hidden_size; ++i) {
+            sum_sq += h[i] * h[i];
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_sq / hidden_size + eps);
+
+        std::vector<float> scores(static_cast<size_t>(num_experts));
+        float max_score = -1.0e30f;
+        for (int e = 0; e < num_experts; ++e) {
+            const float* prow = proj + static_cast<size_t>(e) * hidden_size;
+            float acc = 0.0f;
+            for (int i = 0; i < hidden_size; ++i) {
+                acc += h[i] * inv_rms * scale[i] * root_size * prow[i];
+            }
+            scores[static_cast<size_t>(e)] = acc;
+            max_score = std::max(max_score, acc);
+        }
+
+        float sum = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            scores[static_cast<size_t>(e)] = std::exp(scores[static_cast<size_t>(e)] - max_score);
+            sum += scores[static_cast<size_t>(e)];
+        }
+        const float inv_sum = 1.0f / sum;
+        for (int e = 0; e < num_experts; ++e) {
+            scores[static_cast<size_t>(e)] *= inv_sum;
+        }
+
+        std::vector<std::pair<float, int>> ranked(static_cast<size_t>(num_experts));
+        for (int e = 0; e < num_experts; ++e) {
+            ranked[static_cast<size_t>(e)] = {scores[static_cast<size_t>(e)], e};
+        }
+        std::partial_sort(
+            ranked.begin(), ranked.begin() + top_k, ranked.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                return a.first > b.first;
+            });
+
+        float top_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            top_sum += ranked[static_cast<size_t>(k)].first;
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const int idx = t * top_k + k;
+            expert_ids[static_cast<size_t>(idx)] = ranked[static_cast<size_t>(k)].second;
+            expert_weights[static_cast<size_t>(idx)] =
+                ranked[static_cast<size_t>(k)].first / top_sum *
+                per_expert_scale[static_cast<size_t>(ranked[static_cast<size_t>(k)].second)];
+        }
     });
 }
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <unordered_map>
 #include <sycl/sycl.hpp>
 
 
@@ -3012,6 +3013,215 @@ void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
   } else {
     copy_to_cache_impl<false>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
   }
+}
+
+namespace {
+
+struct MaskedAttnKey {
+    int q_len;
+    int kv_len;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+
+    bool operator==(const MaskedAttnKey& other) const {
+        return q_len == other.q_len && kv_len == other.kv_len &&
+               num_heads == other.num_heads &&
+               num_kv_heads == other.num_kv_heads &&
+               head_dim == other.head_dim;
+    }
+};
+
+struct MaskedAttnKeyHash {
+    size_t operator()(const MaskedAttnKey& key) const {
+        size_t h = std::hash<int>()(key.q_len);
+        h = h * 31 + std::hash<int>()(key.kv_len);
+        h = h * 31 + std::hash<int>()(key.num_heads);
+        h = h * 31 + std::hash<int>()(key.num_kv_heads);
+        h = h * 31 + std::hash<int>()(key.head_dim);
+        return h;
+    }
+};
+
+struct MaskedAttnPrims {
+    bool inited = false;
+    dnnl::matmul qk_prim{};
+    dnnl::matmul pv_prim{};
+    dnnl::memory::desc qk_src_md{};
+    dnnl::memory::desc qk_w_md{};
+    dnnl::memory::desc qk_dst_md{};
+    dnnl::memory::desc pv_src_md{};
+    dnnl::memory::desc pv_w_md{};
+    dnnl::memory::desc pv_dst_md{};
+};
+
+std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>&
+masked_attn_prims() {
+    static std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>
+        cache;
+    return cache;
+}
+
+} // namespace
+
+void attention_prefill_masked(Context& ctx,
+                              Tensor& q, Tensor& k, Tensor& v,
+                              Tensor& mask, Tensor& output,
+                              Tensor& scores_buf,
+                              int q_len, int kv_len,
+                              int num_heads, int num_kv_heads,
+                              int head_dim) {
+    if (num_heads <= 0 || num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
+        throw std::runtime_error(
+            "attention_prefill_masked: invalid head configuration");
+    }
+    const int groups = num_heads / num_kv_heads;
+
+    Tensor expanded_q = Tensor::allocate(
+        ctx, {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor expanded_k = Tensor::allocate(
+        ctx, {num_heads, head_dim, kv_len}, dnnl::memory::data_type::bf16);
+    Tensor expanded_v = Tensor::allocate(
+        ctx, {num_heads, kv_len, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor probs_bf16 = Tensor::allocate(
+        ctx, {num_heads, q_len, kv_len}, dnnl::memory::data_type::bf16);
+    Tensor attn_tmp = Tensor::allocate(
+        ctx, {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16);
+    AILA_LOG_INFO("[Attn] buffers q=%d t=%d h=%d kv=%d d=%d", q_len, kv_len,
+                  num_heads, num_kv_heads, head_dim);
+
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* eq_ptr = static_cast<bf16*>(expanded_q.data());
+    bf16* ek_ptr = static_cast<bf16*>(expanded_k.data());
+    bf16* ev_ptr = static_cast<bf16*>(expanded_v.data());
+    const int kv_dim = num_kv_heads * head_dim;
+
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int total = num_heads * q_len * head_dim;
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int qq = (static_cast<int>(idx[0]) / head_dim) % q_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * q_len);
+            (void)total;
+            const int src_q = qq * (num_heads * head_dim) + h * head_dim + d;
+            eq_ptr[(static_cast<size_t>(h) * q_len + qq) * head_dim + d] =
+                q_ptr[src_q];
+        });
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * kv_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int t = (static_cast<int>(idx[0]) / head_dim) % kv_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * kv_len);
+            const int kv_h = h / groups;
+            const int src_idx = t * kv_dim + kv_h * head_dim + d;
+            ek_ptr[(static_cast<size_t>(h) * head_dim + d) * kv_len + t] =
+                k_ptr[src_idx];
+            ev_ptr[idx[0]] = v_ptr[src_idx];
+        });
+    AILA_LOG_INFO("[Attn] expand submitted");
+
+    const MaskedAttnKey key{q_len, kv_len, num_heads, num_kv_heads, head_dim};
+    auto& prims = masked_attn_prims()[key];
+    if (!prims.inited) {
+        prims.inited = true;
+        prims.qk_src_md = dnnl::memory::desc(
+            {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.qk_w_md = dnnl::memory::desc(
+            {num_heads, head_dim, kv_len}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.qk_dst_md = dnnl::memory::desc(
+            {num_heads, q_len, kv_len}, dnnl::memory::data_type::f32,
+            dnnl::memory::format_tag::abc);
+        prims.pv_src_md = dnnl::memory::desc(
+            {num_heads, q_len, kv_len}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.pv_w_md = dnnl::memory::desc(
+            {num_heads, kv_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.pv_dst_md = dnnl::memory::desc(
+            {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+
+        auto qk_pd = dnnl::matmul::primitive_desc(
+            ctx.engine(), prims.qk_src_md, prims.qk_w_md, prims.qk_dst_md);
+        prims.qk_prim = dnnl::matmul(qk_pd);
+        auto pv_pd = dnnl::matmul::primitive_desc(
+            ctx.engine(), prims.pv_src_md, prims.pv_w_md, prims.pv_dst_md);
+        prims.pv_prim = dnnl::matmul(pv_pd);
+    }
+    AILA_LOG_INFO("[Attn] prims ready");
+
+    dnnl::memory q_mem = expanded_q.make_dnnl_memory(prims.qk_src_md);
+    dnnl::memory k_mem = expanded_k.make_dnnl_memory(prims.qk_w_md);
+    dnnl::memory scores_mem = scores_buf.make_dnnl_memory(prims.qk_dst_md);
+    prims.qk_prim.execute(ctx.stream(),
+                          {{DNNL_ARG_SRC, q_mem},
+                           {DNNL_ARG_WEIGHTS, k_mem},
+                           {DNNL_ARG_DST, scores_mem}});
+    AILA_LOG_INFO("[Attn] qk executed");
+
+    float* scores_ptr = static_cast<float*>(scores_buf.data());
+    const float* mask_ptr = static_cast<const float*>(mask.data());
+    bf16* probs_ptr = static_cast<bf16*>(probs_bf16.data());
+
+    // Apply mask, softmax over kv_len in fp32, write bf16 probabilities.
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len),
+        [=](sycl::id<1> idx) {
+            const int h = static_cast<int>(idx[0]) / q_len;
+            const int q = static_cast<int>(idx[0]) % q_len;
+            float* row = scores_ptr +
+                         (static_cast<size_t>(h) * q_len + q) * kv_len;
+            const float* mrow = mask_ptr + static_cast<size_t>(q) * kv_len;
+
+            float max_score = -1.0e30f;
+            for (int t = 0; t < kv_len; ++t) {
+                const float s = row[t] + mrow[t];
+                row[t] = s;
+                max_score = std::max(max_score, s);
+            }
+            float sum = 0.0f;
+            for (int t = 0; t < kv_len; ++t) {
+                sum += std::exp(row[t] - max_score);
+            }
+            const float inv_sum = 1.0f / sum;
+            bf16* prow = probs_ptr +
+                         (static_cast<size_t>(h) * q_len + q) * kv_len;
+            for (int t = 0; t < kv_len; ++t) {
+                prow[t] = bf16(std::exp(row[t] - max_score) * inv_sum);
+            }
+        });
+    AILA_LOG_INFO("[Attn] softmax submitted");
+
+    dnnl::memory probs_mem = probs_bf16.make_dnnl_memory(prims.pv_src_md);
+    dnnl::memory v_mem = expanded_v.make_dnnl_memory(prims.pv_w_md);
+    dnnl::memory attn_mem = attn_tmp.make_dnnl_memory(prims.pv_dst_md);
+    prims.pv_prim.execute(ctx.stream(),
+                          {{DNNL_ARG_SRC, probs_mem},
+                           {DNNL_ARG_WEIGHTS, v_mem},
+                           {DNNL_ARG_DST, attn_mem}});
+    AILA_LOG_INFO("[Attn] pv executed");
+
+    bf16* attn_ptr = static_cast<bf16*>(attn_tmp.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    const int q_dim = num_heads * head_dim;
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int total = num_heads * q_len * head_dim;
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int q = (static_cast<int>(idx[0]) / head_dim) % q_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * q_len);
+            out_ptr[static_cast<size_t>(q) * q_dim +
+                    static_cast<size_t>(h) * head_dim + d] =
+                attn_ptr[(static_cast<size_t>(h) * q_len + q) * head_dim + d];
+            (void)total;
+        });
 }
 
 } // namespace ops

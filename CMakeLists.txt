@@ -172,6 +172,7 @@ set(LIB_SOURCES
     src/models/Qwen3ForceAlignerBnb4Backend.cpp
     src/models/Qwen3TTSBackend.cpp
     src/models/DiffusionGemmaBnb4Backend.cpp
+    src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp

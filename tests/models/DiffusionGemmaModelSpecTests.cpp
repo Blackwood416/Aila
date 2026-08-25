@@ -4,6 +4,7 @@
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
 #include "ops/Bnb4BitLinear.hpp"
+#include "ops/Ops.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -319,6 +320,103 @@ int run_empty_quant_state_loader_test() {
     return 0;
 }
 
+int run_attention_masked_test() {
+    constexpr int H = 16;
+    constexpr int KV = 2;
+    constexpr int Q = 256;
+    constexpr int T = 280;
+    constexpr int D = 512;
+    Context ctx;
+
+    std::vector<bf16> q(static_cast<size_t>(Q) * H * D);
+    std::vector<bf16> k(static_cast<size_t>(T) * KV * D);
+    std::vector<bf16> v(static_cast<size_t>(T) * KV * D);
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = bf16(static_cast<float>((static_cast<int>(i) % 37) - 18) * 0.01f);
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = bf16(static_cast<float>((static_cast<int>(i) % 29) - 14) * 0.01f);
+        v[i] = bf16(static_cast<float>((static_cast<int>(i) % 23) - 11) * 0.01f);
+    }
+    std::vector<float> mask(static_cast<size_t>(Q) * T, 0.0f);
+    for (int qq = 0; qq < Q; ++qq) {
+        for (int t = 0; t < T; ++t) {
+            if (t > qq) {
+                mask[static_cast<size_t>(qq) * T + t] = -1.0e30f;
+            }
+        }
+    }
+
+    Tensor q_dev = Tensor::allocate(ctx, {Q, H * D}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {T, KV * D}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(ctx, {T, KV * D}, dnnl::memory::data_type::bf16);
+    Tensor mask_dev = Tensor::allocate(ctx, {Q, T}, dnnl::memory::data_type::f32);
+    Tensor out_dev = Tensor::allocate(ctx, {Q, H * D}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev =
+        Tensor::allocate(ctx, {H, Q, T}, dnnl::memory::data_type::f32);
+    ctx.memcpy_h2d(q_dev.data(), q.data(), q.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k.data(), k.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), v.data(), v.size() * sizeof(bf16));
+    ctx.memcpy_h2d(mask_dev.data(), mask.data(), mask.size() * sizeof(float));
+
+    ops::attention_prefill_masked(ctx, q_dev, k_dev, v_dev, mask_dev, out_dev,
+                                  scores_dev, Q, T, H, KV, D);
+    ctx.synchronize();
+
+    std::vector<bf16> out(static_cast<size_t>(Q) * H * D);
+    ctx.memcpy_d2h(out.data(), out_dev.data(), out.size() * sizeof(bf16));
+
+    // Spot-check against an eager fp32 reference on a few rows.
+    double max_diff = 0.0;
+    for (int h : {0, 7, 15}) {
+        for (int qq : {0, 3, 255}) {
+            std::vector<float> scores(static_cast<size_t>(T));
+            float max_score = -1.0e30f;
+            for (int t = 0; t < T; ++t) {
+                float s = 0.0f;
+                const int kv_h = h / (H / KV);
+                for (int d = 0; d < D; ++d) {
+                    s += static_cast<float>(q[static_cast<size_t>(qq) * H * D +
+                                              static_cast<size_t>(h) * D + d]) *
+                         static_cast<float>(k[static_cast<size_t>(t) * KV * D +
+                                              static_cast<size_t>(kv_h) * D + d]);
+                }
+                if (t > qq) s = -1.0e30f;
+                scores[static_cast<size_t>(t)] = s;
+                max_score = std::max(max_score, s);
+            }
+            float sum = 0.0f;
+            for (int t = 0; t < T; ++t) {
+                scores[static_cast<size_t>(t)] =
+                    std::exp(scores[static_cast<size_t>(t)] - max_score);
+                sum += scores[static_cast<size_t>(t)];
+            }
+            for (int d = 0; d < D; ++d) {
+                float expected = 0.0f;
+                const int kv_h = h / (H / KV);
+                for (int t = 0; t < T; ++t) {
+                    expected +=
+                        scores[static_cast<size_t>(t)] / sum *
+                        static_cast<float>(v[static_cast<size_t>(t) * KV * D +
+                                             static_cast<size_t>(kv_h) * D + d]);
+                }
+                const float actual =
+                    static_cast<float>(out[static_cast<size_t>(qq) * H * D +
+                                           static_cast<size_t>(h) * D + d]);
+                const float expected_f = static_cast<float>(expected);
+                const float rel = std::abs(actual - expected_f) /
+                                  std::max(1.0f, std::abs(expected_f));
+                max_diff = std::max(max_diff, static_cast<double>(rel));
+            }
+        }
+    }
+    expect(max_diff < 0.1, "attention_prefill_masked head_dim=512 mismatch");
+    std::cout << "DiffusionGemmaModelSpecTests: masked attention passed "
+                 "(max_rel_diff="
+              << max_diff << ")\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -326,6 +424,7 @@ int main() {
     try {
         failed |= run_model_spec_tests();
         failed |= run_empty_quant_state_loader_test();
+        failed |= run_attention_masked_test();
     } catch (const std::exception& e) {
         std::cerr << "DiffusionGemmaModelSpecTests: failed: " << e.what() << "\n";
         return 1;

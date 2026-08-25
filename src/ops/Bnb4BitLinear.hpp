@@ -128,3 +128,77 @@ private:
     void apply_lora_decode(Context& ctx, Tensor& input, Tensor& output);
     void apply_lora_prefill(Context& ctx, Tensor& input, Tensor& output, int seq_len);
 };
+
+// Grouped Mixture-of-Experts over one packed NF4 tensor per layer.
+// Expert weights are stored concatenated along the row axis:
+//   gate_up rows: num_experts * 2 * moe_intermediate_size
+//   down    rows: num_experts * moe_intermediate_size
+// forward() is host-driven for v1 correctness: tokens are grouped by expert on
+// the host, per-expert rows are dequantized on the GPU, and per-group GEMMs
+// run through oneDNN.
+class Bnb4GroupedMoE {
+public:
+    bool init(Context& ctx, const Bnb4BitWeightRef& gate_up,
+              const Bnb4BitWeightRef& down, int hidden_size,
+              int moe_intermediate_size, int num_experts,
+              std::string* error_message = nullptr);
+
+    // input: [tokens * hidden_size] bf16 host
+    // expert_ids: [tokens * top_k] int (selected expert indices)
+    // expert_weights: [tokens * top_k] float (renormalized, per-expert scaled)
+    // output: [tokens * hidden_size] bf16 host
+    void forward(Context& ctx,
+                 const std::vector<sycl::ext::oneapi::bfloat16>& input,
+                 const std::vector<int>& expert_ids,
+                 const std::vector<float>& expert_weights,
+                 std::vector<sycl::ext::oneapi::bfloat16>& output,
+                 int tokens, int top_k);
+
+    int hidden_size() const { return hidden_; }
+    int moe_intermediate_size() const { return moe_intermediate_; }
+    int num_experts() const { return num_experts_; }
+
+private:
+    struct ExpertWeightSet {
+        Bnb4BitWeightRef ref{};
+        bool ready = false;
+
+        bool init(Context& ctx, const Bnb4BitWeightRef& weight_ref,
+                  std::string* error_message);
+    };
+
+    struct MatmulPrim {
+        bool inited = false;
+        dnnl::matmul prim{};
+        dnnl::memory::desc src_md{};
+        dnnl::memory::desc w_md{};
+        dnnl::memory::desc dst_md{};
+    };
+
+    ExpertWeightSet gate_up_;
+    ExpertWeightSet down_;
+    int hidden_ = 0;
+    int moe_intermediate_ = 0;
+    int num_experts_ = 0;
+    int gate_up_in_features_ = 0;
+    int gate_up_rows_per_expert_ = 0;
+    int down_in_features_ = 0;
+    int down_rows_per_expert_ = 0;
+
+    std::unordered_map<uint64_t, MatmulPrim> prims_;
+    Tensor src_;
+    Tensor gate_up_out_;
+    Tensor gate_;
+    Tensor up_;
+    Tensor proj_;
+    Tensor down_out_;
+    Tensor gate_up_w_;
+    Tensor down_w_;
+    int scratch_rows_ = 0;
+
+    void ensure_scratch(Context& ctx, int rows);
+    void run_matmul(Context& ctx, int rows, int in_n, int out_n,
+                    uint64_t prim_key, Tensor& src, Tensor& w, Tensor& dst);
+    static void dequant_subset(Context& ctx, const ExpertWeightSet& set,
+                               int expert, int rows_per_expert, Tensor& out);
+};

@@ -73,6 +73,62 @@ void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
     });
 }
 
+void rms_norm_unweighted(Context& ctx, Tensor& input, float eps,
+                         Tensor& output, int seq_len, int hidden_size) {
+    bf16* in_ptr = static_cast<bf16*>(input.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+
+    constexpr int wg_size = 256;
+    if (seq_len == 1) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(wg_size, wg_size),
+                [=](sycl::nd_item<1> item) {
+                    const int lid = item.get_local_id(0);
+                    float local_sum_sq = 0.0f;
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        const float val = static_cast<float>(in_ptr[h]);
+                        local_sum_sq += val * val;
+                    }
+                    const float group_sum = sycl::reduce_over_group(
+                        item.get_group(), local_sum_sq, sycl::plus<float>());
+                    const float inv_rms =
+                        sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
+                    for (int h = lid; h < hidden_size; h += wg_size) {
+                        out_ptr[h] = bf16(static_cast<float>(in_ptr[h]) * inv_rms);
+                    }
+                });
+        });
+        return;
+    }
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> row_cache(sycl::range<1>(hidden_size), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(seq_len * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                const int row = item.get_group(0);
+                const int lid = item.get_local_id(0);
+                const int wg = item.get_local_range(0);
+
+                float local_sum_sq = 0.0f;
+                for (int h = lid; h < hidden_size; h += wg) {
+                    const float val = static_cast<float>(in_ptr[row * hidden_size + h]);
+                    row_cache[h] = val;
+                    local_sum_sq += val * val;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const float group_sum = sycl::reduce_over_group(
+                    item.get_group(), local_sum_sq, sycl::plus<float>());
+                const float inv_rms =
+                    sycl::rsqrt(group_sum / static_cast<float>(hidden_size) + eps);
+
+                for (int h = lid; h < hidden_size; h += wg) {
+                    out_ptr[row * hidden_size + h] = bf16(row_cache[h] * inv_rms);
+                }
+            });
+    });
+}
+
 void layer_norm(Context& ctx, Tensor& input, Tensor& weight, Tensor& bias,
                 float eps, Tensor& output, int rows, int cols) {
     bf16* in_ptr = static_cast<bf16*>(input.data());

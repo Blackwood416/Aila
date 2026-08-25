@@ -6,6 +6,7 @@
 #include "../src/models/Qwen3Bnb4Backend.hpp"
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/DiffusionGemmaBnb4Backend.hpp"
+#include "../src/generation/DiffusionGemmaGenerator.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
@@ -42,6 +43,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <random>
 #include <vector>
 #include <cctype>
 #include <fstream>
@@ -444,6 +446,9 @@ public:
                 }
                 return true;
             }
+            if (spec.family == ModelFamily::DiffusionGemma) {
+                return true;
+            }
             if (error_message) {
                 *error_message = "bitsandbytes quantized inference is currently supported only for Qwen3 dense and Qwen3.5 hybrid text models";
             }
@@ -552,6 +557,16 @@ public:
         // 4. Load model weights
         AILA_LOG_INFO("[4/4] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
+
+        // DiffusionGemma v1 is text-only: release the vision tower and vision
+        // embedder weights (~2 GB) to keep the 16 GB A770 budget.
+        if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            auto vision_stats = weights_->erase_with_prefix("model.encoder.vision_tower");
+            auto embed_stats = weights_->erase_with_prefix("model.encoder.embed_vision");
+            AILA_LOG_INFO("[DiffusionGemma] Released vision weights (%zu tensors, %.1f MB)",
+                          vision_stats.count + embed_stats.count,
+                          (vision_stats.bytes + embed_stats.bytes) / (1024.0 * 1024.0));
+        }
 
         // 4.5. Load LoRA adapter (if provided)
         aila::lora::LoraAdapter lora_adapter;
@@ -1567,6 +1582,75 @@ public:
             return "";
         }
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
+
+        if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            if (total_vision_tokens > 0 || total_audio_tokens > 0) {
+                set_error(EngineErrorCode::VisionNotEnabled,
+                          "DiffusionGemma v1 supports text-only prompts");
+                return "";
+            }
+            auto* dg_backend =
+                dynamic_cast<DiffusionGemmaBnb4Backend*>(backend_.get());
+            if (!dg_backend) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "DiffusionGemma backend is unavailable");
+                return "";
+            }
+            const auto& dgc = model_spec_.diffusion_gemma;
+            DiffusionGemmaGeneratorConfig dg_cfg;
+            dg_cfg.canvas_length = dgc.canvas_length;
+            dg_cfg.max_denoising_steps = dgc.max_denoising_steps;
+            const int steps_override =
+                aila::env::read_int_raw("AILA_DIFFUSION_STEPS", -1);
+            if (steps_override > 0) {
+                dg_cfg.max_denoising_steps = steps_override;
+            }
+            dg_cfg.t_min = dgc.t_min;
+            dg_cfg.t_max = dgc.t_max;
+            dg_cfg.entropy_bound = dgc.entropy_bound;
+            dg_cfg.confidence_threshold = dgc.confidence_threshold;
+            dg_cfg.stability_threshold = dgc.stability_threshold;
+            dg_cfg.pad_token_id = dgc.pad_token_id;
+            dg_cfg.eos_token_ids = dgc.eos_token_ids;
+            dg_cfg.seed = gen_config.use_fixed_seed
+                              ? gen_config.sampling_seed
+                              : static_cast<uint64_t>(std::random_device{}());
+
+            std::vector<int> generated_ids;
+            std::string dg_error;
+            DiffusionGemmaGenerator generator;
+            DiffusionGemmaGenerator::CanvasCallback canvas_callback;
+            if (token_callback) {
+                canvas_callback = [&](const std::vector<int>& canvas_tokens) {
+                    for (int token : canvas_tokens) {
+                        token_callback(tokenizer_.decode(token));
+                    }
+                };
+            }
+            try {
+                if (!generator.generate(*ctx_, *dg_backend, full_ids, dg_cfg,
+                                        max_new_tokens, generated_ids, &dg_error,
+                                        canvas_callback)) {
+                    set_error(EngineErrorCode::RuntimeError, dg_error);
+                    return "";
+                }
+            } catch (const std::exception& e) {
+                set_error(EngineErrorCode::RuntimeError,
+                          std::string("DiffusionGemma generation failed: ") +
+                              e.what());
+                return "";
+            }
+            std::string output_text;
+            output_text.reserve(generated_ids.size() * 4);
+            for (int token : generated_ids) {
+                output_text += tokenizer_.decode(token);
+            }
+            last_generation_finish_reason_ =
+                (generated_ids.size() >= static_cast<size_t>(max_new_tokens))
+                    ? "length"
+                    : "stop";
+            return output_text;
+        }
 
         int reusable_prefix = 0;
         bool allow_incremental_prefill = (total_vision_tokens == 0 && total_audio_tokens == 0);

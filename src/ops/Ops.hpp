@@ -98,6 +98,9 @@ public:
     // forward: output = input @ weight^T
     // 如果权重已预转置，则计算 input @ weight_ptr
     void forward(Context& ctx, Tensor& input, Tensor& output, int seq_len);
+    // forward with fp32 output (used by large-vocab lm heads to avoid an
+    // intermediate bf16 logits buffer).
+    void forward_f32(Context& ctx, Tensor& input, Tensor& output, int seq_len);
     void forward_bias(Context& ctx, Tensor& input, Tensor& bias,
                       Tensor& output, int seq_len);
     void forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
@@ -136,6 +139,7 @@ private:
     std::unordered_map<int, dnnl::memory> decode_args_;
 
     void ensure_primitive(Context& ctx, int seq_len);
+    void ensure_primitive_f32(Context& ctx, int seq_len);
     void ensure_bias_primitive(Context& ctx, int seq_len,
                                dnnl::memory::data_type bias_dtype);
     void ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
@@ -208,6 +212,7 @@ private:
     };
 
     std::unordered_map<int, CachedPrimitive> prim_cache_;
+    std::unordered_map<int, CachedPrimitive> prim_cache_f32_;
     std::unordered_map<uint64_t, CachedBiasPrimitive> bias_cache_;
     std::unordered_map<uint64_t, CachedBiasGeluTanhPrimitive> bias_gelu_tanh_cache_;
 };
@@ -227,6 +232,11 @@ namespace ops {
     // input/output: [seq_len, hidden_size], weight: [hidden_size]
     void rms_norm(Context& ctx, Tensor& input, Tensor& weight,
                   float eps, Tensor& output, int seq_len, int hidden_size);
+
+    // RMSNorm without learned weight (with_scale=false).
+    // input/output: [seq_len, hidden_size]
+    void rms_norm_unweighted(Context& ctx, Tensor& input, float eps,
+                             Tensor& output, int seq_len, int hidden_size);
 
     // LayerNorm: output = ((x - mean) / sqrt(var + eps)) * weight + bias
     // input/output: [rows, cols], weight/bias: [cols]
@@ -376,6 +386,20 @@ namespace ops {
                                   int num_heads, int num_kv_heads,
                                   int head_dim, int max_seq_len);
 
+    // Masked prefill attention (DiffusionGemma encoder/decoder).
+    // q: [q_len, num_heads * head_dim] bf16
+    // k/v: [kv_len, num_kv_heads * head_dim] bf16 (already normed + RoPE)
+    // mask: [q_len, kv_len] float (0.0 = attend, -inf = block)
+    // output: [q_len, num_heads * head_dim] bf16
+    // scores_buf: [num_heads, q_len, kv_len] float scratch
+    void attention_prefill_masked(Context& ctx,
+                                  Tensor& q, Tensor& k, Tensor& v,
+                                  Tensor& mask, Tensor& output,
+                                  Tensor& scores_buf,
+                                  int q_len, int kv_len,
+                                  int num_heads, int num_kv_heads,
+                                  int head_dim);
+
     // SwiGLU: output = silu(gate) * up
     // gate, up, output: [n] (element-wise)
     void swiglu(Context& ctx, Tensor& gate, Tensor& up,
@@ -420,6 +444,16 @@ namespace ops {
 
     // GELU-Tanh activation: x = gelu(x) (in-place)
     void gelu_tanh_inplace(Context& ctx, Tensor& input, int n);
+
+    // output = gelu_tanh(gate) * up (element-wise, n elements)
+    void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
+                            Tensor& output, int n);
+
+    // In-place scalar multiply: input[i] *= scale
+    void scale_inplace(Context& ctx, Tensor& input, float scale, int n);
+
+    // In-place final logit softcap (fp32): x = tanh(x / cap) * cap
+    void logit_softcap_inplace(Context& ctx, Tensor& input, float cap, int n);
 
     // Bias add: input[row, col] += bias[col] (in-place)
     void bias_add_inplace(Context& ctx, Tensor& input, Tensor& bias, int rows, int cols);
@@ -502,6 +536,38 @@ namespace ops {
     void sample_with_config_device(Context& ctx, Tensor& logits, int vocab_size,
                                    const GenerationConfig& gen_config,
                                    float random_u, int* d_result);
+
+    // Gemma4 MoE router (host). Applies unweighted RMSNorm, scale and
+    // root_size, projects to expert logits, softmax over all experts, top-k,
+    // renormalize, then multiplies by per_expert_scale.
+    void gemma4_router_host(const float* hidden, const float* scale,
+                            const float* proj, const float* per_expert_scale,
+                            int tokens, int hidden_size, int num_experts,
+                            int top_k, std::vector<int>& expert_ids,
+                            std::vector<float>& expert_weights);
+
+    // DiffusionGemma block-diffusion host sampling helpers.
+    // logits: [rows, cols] bf16; probs: [rows, cols] bf16; entropy: [rows].
+    void diffusion_softmax_entropy(const bf16* logits, bf16* probs,
+                                   float* entropy, int rows, int cols);
+    // out[i] = logits[i] / temperature
+    void diffusion_temperature_scale(const float* logits, float* out,
+                                     int rows, int cols, float temperature);
+    // Entropy-bound acceptance: sum_i^k entropy_i - max(...k) <= bound.
+    // entropy: [rows, cols] (rows = batch, cols = canvas positions).
+    // accept: [rows, cols] uint8, 1 = accept denoiser token, 0 = keep current.
+    void diffusion_accept_mask(const float* entropy, int rows, int cols,
+                               float entropy_bound, uint8_t* accept);
+    // argmax over cols for each row (host).
+    void diffusion_argmax(const float* logits, int* tokens, int rows, int cols);
+    // Gumbel-max sampling: tokens[r] = argmax_c logits[r,c] + gumbel(uniform).
+    void diffusion_gumbel_sample(const float* logits, const float* uniforms,
+                                 int* tokens, int rows, int cols);
+    // Renoising: draws a fresh random canvas (mt19937 seeded with `seed`,
+    // row-major over every position), keeps accepted positions.
+    void diffusion_renoise(int* canvas, const uint8_t* accept, int rows,
+                           int cols, int vocab_size, uint64_t seed,
+                           int* new_canvas);
 
     // Vision patchify + normalize: RGB u8 -> patch rows bf16
     // patches: [num_patches, 3 * patch_size * patch_size]
