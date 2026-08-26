@@ -333,6 +333,21 @@ shared transfer buffers were added (bitwise mismatches in the harness even in
 isolation, plus the earlier `AILA_PROFILE_DG` access violation). It remains
 disabled and should be re-validated from scratch before any further work.
 
+Driver-hang root cause (2026-08-27): the `AILA_PROFILE_DG` crash was a
+Level-Zero driver deadlock, not a host bug. With the batched MoE path, all
+threads park in ntdll waits inside `ze_intel_gpu64.dll` when a large burst of
+oneDNN matmul submissions is followed by the profile mode's per-phase syncs
+(first manifests at layer 5's linear-attention sync in a cold run). Draining
+the queue after every expert group avoids it entirely. Production (no
+profile) is stable with the default drain every 8 groups; the batched path
+auto-drains every group under `AILA_PROFILE_DG`, and `AILA_DG_MOE_PACE`
+overrides the interval. The oneDNN memory handles from `run_matmul` are also
+retained until the queue drains (`pending_memories_`) as defensive hygiene.
+
+Final three-run 25-step medians with warmup + batched MoE (seed 42):
+warmup 16.70 s, generate 94.98 s (94.23/94.98/95.05 s), runtime peak
+14733.99 MiB, SHA256 `A4F674A0...` on all runs. Profile mode now completes.
+
 ## Important files
 
 - `src/ops/Bnb4BitLinear.cpp`: A770 NF4 GEMM dispatch and kernels

@@ -190,6 +190,15 @@ Batched MoE cuts the median `generate()` time from 129.23 s to 94.07 s
 memory after decoder buffers is 14733.99 MiB (+28.6 MiB vs the BK64 record,
 inside the 256 MiB gate); all runs preserved SHA256 `A4F674A0...`.
 
+The final build's three-run median with warmup + batched MoE is 94.98 s
+(94.23/94.98/95.05 s). `AILA_DG_MOE_PACE` drains the queued oneDNN matmuls
+every N expert groups (default 8). On this A770/Level-Zero stack, draining
+less often than every group while `AILA_PROFILE_DG` adds per-phase syncs
+deadlocks the GPU driver (all threads park in ntdll waits inside
+`ze_intel_gpu64.dll`; the process exits `0xC0000005`), so the batched path
+automatically drains every group under `AILA_PROFILE_DG`. Production is
+unaffected and stable.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

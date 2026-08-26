@@ -998,6 +998,8 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         static_cast<int>(&layer - layers_.data());
     const bool profile = bidirectional &&
                          aila::env::read_flag("AILA_PROFILE_DG", false);
+    const bool trace_moe =
+        aila::env::read_flag("AILA_DG_MOE_TRACE", false);
     const auto profile_start = std::chrono::steady_clock::now();
     auto profile_mark = profile_start;
     const auto record_phase = [&](double& target_ms) {
@@ -1009,6 +1011,13 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                 .count();
         profile_mark = now;
     };
+    const auto trace_point = [&](const char* label) {
+        if (trace_moe) {
+            std::fprintf(stderr, "[MoE trace] layer=%d %s\n", layer_idx,
+                         label);
+        }
+    };
+    trace_point("begin");
     AILA_LOG_DEBUG(
         "[DiffusionGemma] Layer %d forward (seq=%d start=%d bidi=%d) "
         "mem=%.1f MB",
@@ -1100,6 +1109,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                                sizeof(bf16));
     }
     record_phase(profile_totals_.qkv_proj_ms);
+    trace_point("qkv done");
 
     ops::head_rms_norm(ctx, q, *layer.q_norm, tc.rms_norm_eps, seq_len,
                        num_heads, head_dim);
@@ -1143,6 +1153,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                                   scores, seq_len, kv_len, num_heads,
                                   num_kv_heads, head_dim);
     record_phase(profile_totals_.attention_core_ms);
+    trace_point("attn core done");
     if (dump_layer0) dump_tensor("attention_scores", scores);
     if (dump_layer0) dump_tensor("attn_out", attn_out);
     layer.o_proj.forward(ctx, buf_.o_scratch, attn_out, buf_.attn_o, seq_len);
@@ -1153,6 +1164,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     ops::residual_add(ctx, hidden, buf_.attn_o, seq_len * hidden_size);
     if (dump_layer0) dump_tensor("hidden_after_attn", hidden);
     record_phase(profile_totals_.o_proj_ms);
+    trace_point("o done");
     if (profile) {
         profile_totals_.attention_ms = profile_totals_.qkv_proj_ms +
                                        profile_totals_.attention_core_ms +
@@ -1170,10 +1182,12 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                          seq_len);
     if (dump_layer0) dump_tensor("mlp_up", buf_.mlp_up);
     record_phase(profile_totals_.dense_gate_up_ms);
+    trace_point("dense gu done");
     ops::gelu_tanh_gate_mul(ctx, buf_.mlp_gate, buf_.mlp_up, buf_.mlp_proj,
                             seq_len * tc.intermediate_size);
     if (dump_layer0) dump_tensor("mlp_proj", buf_.mlp_proj);
     record_phase(profile_totals_.dense_activation_ms);
+    trace_point("dense act done");
     layer.mlp_down.forward(ctx, buf_.mlp_scratch, buf_.mlp_proj, buf_.mlp_out,
                            seq_len);
     if (dump_layer0) dump_tensor("mlp_out", buf_.mlp_out);
@@ -1181,6 +1195,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                   buf_.ff1, seq_len, hidden_size);
     if (dump_layer0) dump_tensor("ff1", buf_.ff1);
     record_phase(profile_totals_.dense_down_ms);
+    trace_point("dense down done");
     if (profile) {
         profile_totals_.dense_mlp_ms = profile_totals_.dense_gate_up_ms +
                                        profile_totals_.dense_activation_ms +
@@ -1223,6 +1238,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         router_score_bf16, per_expert_scale_bf16, seq_len, tc.num_experts,
         tc.top_k_experts, expert_ids, expert_weights);
     record_phase(profile_totals_.router_ms);
+    trace_point("router done");
     if (dump_layer0) {
         std::ofstream ids_out(dump_dir + "/router_ids.bin", std::ios::binary);
         ids_out.write(reinterpret_cast<const char*>(expert_ids.data()),
@@ -1283,6 +1299,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
             }
         };
     if (moe_harness) {
+        trace_point("harness begin");
         // Reference: committed host-driven path.
         std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
         ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
@@ -1311,6 +1328,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
             compare_moe_outputs("gpu", buf_.moe_gpu_ref);
         }
     } else if (moe_batched) {
+        trace_point("batched begin");
         std::vector<bf16> moe_output;
         moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
                              buf_.moe_token_ids, expert_ids, expert_weights,
@@ -1318,6 +1336,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         record_phase(profile_totals_.moe_ms);
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
+        trace_point("batched done");
     } else if (moe_gpu) {
         moe->forward_gpu(ctx, buf_.normed, buf_.moe_device_out, expert_ids,
                          expert_weights, seq_len, tc.top_k_experts);
@@ -1333,6 +1352,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
     }
+    trace_point("post moe");
     if (dump_layer0) dump_tensor("moe_raw", buf_.moe_device_out);
     ops::rms_norm(ctx, buf_.moe_device_out, *layer.post_ff_ln_2, tc.rms_norm_eps,
                   buf_.ff2, seq_len, hidden_size);

@@ -168,6 +168,12 @@ public:
                          const std::vector<float>& expert_weights,
                          std::vector<sycl::ext::oneapi::bfloat16>& output,
                          int tokens, int top_k);
+    void forward_batched_impl(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights,
+        std::vector<sycl::ext::oneapi::bfloat16>& output, int tokens,
+        int top_k);
 
     // GPU-resident MoE forward.  input is [tokens * hidden] bf16 on the
     // device; output is [tokens * hidden] bf16 on the device and is zeroed at
@@ -221,6 +227,11 @@ private:
     Tensor down_w_;
     Tensor tokens_dev_;
     Tensor weights_dev_;
+    // oneDNN memory handles from run_matmul must outlive their asynchronous
+    // executions on this A770/Level-Zero stack; destroying them while a batch
+    // of matmuls is still queued can deadlock the driver.  They are released
+    // only after the queue is drained.
+    std::vector<dnnl::memory> pending_memories_;
     int scratch_rows_ = 0;
 
     void ensure_scratch(Context& ctx, int rows);

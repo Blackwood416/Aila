@@ -1610,6 +1610,9 @@ void Bnb4GroupedMoE::run_matmul(Context& ctx, int rows, int in_n, int out_n,
     dnnl::memory src_mem = src.make_dnnl_memory(mp.src_md);
     dnnl::memory w_mem = w.make_dnnl_memory(mp.w_md);
     dnnl::memory dst_mem = dst.make_dnnl_memory(mp.dst_md);
+    pending_memories_.push_back(src_mem);
+    pending_memories_.push_back(w_mem);
+    pending_memories_.push_back(dst_mem);
     mp.prim.execute(ctx.stream(),
                     {{DNNL_ARG_SRC, src_mem},
                      {DNNL_ARG_WEIGHTS, w_mem},
@@ -1686,6 +1689,9 @@ void Bnb4GroupedMoE::forward(Context& ctx,
                              const std::vector<float>& expert_weights,
                              std::vector<bf16>& output,
                              int tokens, int top_k) {
+    // Previous invocation's queue work was drained by its blocking d2h;
+    // release the oneDNN memory handles from that run.
+    pending_memories_.clear();
     static const bool diag = aila::env::read_flag("AILA_DG_MOE_DIAG", false);
     double diag_dequant_ms = 0.0;
     double diag_matmul_ms = 0.0;
@@ -1800,6 +1806,7 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
                                  const std::vector<int>& expert_ids,
                                  const std::vector<float>& expert_weights,
                                  int tokens, int top_k) {
+    pending_memories_.clear();
     if (tokens <= 0 || top_k <= 0 ||
         input.shape(0) < tokens || input.shape(1) != hidden_ ||
         output.shape(0) < tokens || output.shape(1) != hidden_ ||
@@ -1888,6 +1895,22 @@ void Bnb4GroupedMoE::forward_batched(Context& ctx, Tensor& input,
                                      const std::vector<float>& expert_weights,
                                      std::vector<bf16>& output,
                                      int tokens, int top_k) {
+    pending_memories_.clear();
+    try {
+        forward_batched_impl(ctx, input, transfer, token_ids_dev, expert_ids,
+                             expert_weights, output, tokens, top_k);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr,
+            "[MoE batched] EXCEPTION tokens=%d: %s\n", tokens, error.what());
+        throw;
+    }
+}
+
+void Bnb4GroupedMoE::forward_batched_impl(
+    Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+    const std::vector<int>& expert_ids,
+    const std::vector<float>& expert_weights, std::vector<bf16>& output,
+    int tokens, int top_k) {
     if (tokens <= 0 || top_k <= 0 ||
         static_cast<size_t>(tokens) * top_k != expert_ids.size()) {
         throw std::runtime_error("Bnb4GroupedMoE::forward_batched: shape mismatch");
@@ -1966,6 +1989,22 @@ void Bnb4GroupedMoE::forward_batched(Context& ctx, Tensor& input,
                    static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
                    dst_view);
         ++group_index;
+        // Bound the number of asynchronously queued oneDNN matmuls.  On this
+        // A770/Level-Zero stack, a full layer burst (~360 submissions)
+        // followed by an immediate queue sync can fault with 0xC0000005;
+        // draining every N groups keeps the pending window small while
+        // retaining most of the batched-transfer win.
+        // Production default drains every 8 groups (~94 s/25-step median).
+        // Under AILA_PROFILE_DG the extra per-phase syncs plus a larger burst
+        // hang the Level-Zero driver (all threads in ntdll waits, process
+        // exits 0xC0000005); drain every group in that diagnostic mode.
+        int pace = aila::env::read_int_raw("AILA_DG_MOE_PACE", 0);
+        if (pace == 0) {
+            pace = aila::env::read_flag("AILA_PROFILE_DG", false) ? 1 : 8;
+        }
+        if (pace > 0 && (group_index % pace) == 0) {
+            ctx.synchronize();
+        }
     }
 
     ctx.memcpy_d2h(host_out.data(), transfer.data(),
