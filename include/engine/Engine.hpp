@@ -797,15 +797,22 @@ public:
                                              sizeof(sycl::ext::oneapi::bfloat16));
 
                     Tensor* warmup_logits = nullptr;
-                    for (int pass = 0; pass < warmup_passes; ++pass) {
-                        warmup_logits = &dg_backend->diffusion_decode_canvas(
-                            *ctx_, canvas_dev, sc_dev, warmup_canvas);
+                    try {
+                        for (int pass = 0; pass < warmup_passes; ++pass) {
+                            warmup_logits = &dg_backend->diffusion_decode_canvas(
+                                *ctx_, canvas_dev, sc_dev, warmup_canvas);
+                        }
+                        if (warmup_logits != nullptr) {
+                            dg_backend->diffusion_compute_soft_embeds(
+                                *ctx_, *warmup_logits, warmup_canvas);
+                        }
+                        ctx_->synchronize();
+                    } catch (const std::exception& error) {
+                        AILA_LOG_ERROR(
+                            "[Warmup] DiffusionGemma warmup failed: %s",
+                            error.what());
+                        throw;
                     }
-                    if (warmup_logits != nullptr) {
-                        dg_backend->diffusion_compute_soft_embeds(
-                            *ctx_, *warmup_logits, warmup_canvas);
-                    }
-                    ctx_->synchronize();
 
                     ctx_->free_device(canvas_dev);
                     ctx_->free_device(sc_dev);
