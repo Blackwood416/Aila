@@ -93,9 +93,10 @@ about 20.5 KiB to 10.5 KiB. Other GPUs and larger NF4 block sizes retain their
 existing dispatch.
 
 Validated on driver `32.0.101.8860`, oneAPI `2026.1`, and oneDNN `3.11.2`, with
-`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`, seed 42, a 256-token canvas, and 25
-denoising steps. Each sample was a separate process and tensor dumping plus
-synchronizing profiling were disabled.
+seed 42, a 256-token canvas, and 25 denoising steps. Each sample was a separate
+process and tensor dumping plus synchronizing profiling were disabled. Aila
+does not require `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS`; that variable is only
+for the separate Python/Transformers reconstruction and reference workflow.
 
 | A770 K tile | 25-step wall samples (ms) | Median (ms) |
 |-------------|---------------------------|-------------|

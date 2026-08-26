@@ -191,16 +191,13 @@ Window mode is a quality/speed trade-off. Keep `WINDOW=0` for strict quality par
 
 ## DiffusionGemma
 
-DiffusionGemma-26B on Level Zero may require relaxed allocation limits because
-the runtime can otherwise reject large individual allocations even when total
-VRAM is sufficient:
+The Aila DiffusionGemma backend does **not** require
+`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS`. It partitions runtime storage so that
+no individual Aila allocation exceeds the Level Zero limit.
 
-```powershell
-$env:UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS = "1"
-```
-
-`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS` is a Unified Runtime/Level Zero
-setting, not an Aila-specific variable.
+That Unified Runtime variable is only needed by the separate Python/Transformers
+checkpoint reconstruction or reference workflow when it creates allocations
+larger than 4 GiB. Do not treat it as an Aila runtime requirement.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
