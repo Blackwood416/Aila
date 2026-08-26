@@ -97,6 +97,8 @@ private:
         Tensor ff1, ff2;
         Tensor moe_device_out;
         Tensor moe_gpu_ref;
+        Tensor moe_transfer;
+        Tensor moe_token_ids;
         Tensor router_scores;
         Tensor sc_normed, sc_gate, sc_up, sc_proj, sc_down;
         Tensor logits_bf16;

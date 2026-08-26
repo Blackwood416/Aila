@@ -63,6 +63,19 @@ void moe_gather_rows(Context& ctx, const bf16* input_ptr, bf16* src_ptr,
         });
 }
 
+void moe_gather_rows_flat(Context& ctx, const bf16* input_ptr,
+                          bf16* dst_ptr, const int* token_ids,
+                          int total_rows, int hidden) {
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(total_rows) * hidden),
+        [=](sycl::id<1> idx) {
+            const int r = static_cast<int>(idx[0] / hidden);
+            const int h = static_cast<int>(idx[0] % hidden);
+            dst_ptr[idx[0]] =
+                input_ptr[static_cast<size_t>(token_ids[r]) * hidden + h];
+        });
+}
+
 // Round-to-nearest-even float -> bf16 as a float with the low 16 mantissa
 // bits cleared.  Keeps the intermediate bf16 rounding of the product explicit
 // so the device compiler cannot fold the round-trip under -ffast-math.
@@ -1866,4 +1879,119 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
         moe_accumulate_rows(ctx, down_out_ptr, output_ptr, tokens_ptr,
                             weights_ptr, count, hidden_);
     }
+}
+
+void Bnb4GroupedMoE::forward_batched(Context& ctx, Tensor& input,
+                                     Tensor& transfer,
+                                     Tensor& token_ids_dev,
+                                     const std::vector<int>& expert_ids,
+                                     const std::vector<float>& expert_weights,
+                                     std::vector<bf16>& output,
+                                     int tokens, int top_k) {
+    if (tokens <= 0 || top_k <= 0 ||
+        static_cast<size_t>(tokens) * top_k != expert_ids.size()) {
+        throw std::runtime_error("Bnb4GroupedMoE::forward_batched: shape mismatch");
+    }
+    const int total_rows = tokens * top_k;
+    if (transfer.shape(0) < total_rows || transfer.shape(1) != hidden_ ||
+        token_ids_dev.shape(0) < total_rows) {
+        throw std::runtime_error(
+            "Bnb4GroupedMoE::forward_batched: transfer buffer too small");
+    }
+
+    // Same sorted-expert grouping as forward().
+    std::map<int, std::vector<std::pair<int, float>>> groups;
+    int max_rows = 0;
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            const int idx = t * top_k + k;
+            const int expert = expert_ids[static_cast<size_t>(idx)];
+            auto& list = groups[expert];
+            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
+            max_rows = std::max(max_rows, static_cast<int>(list.size()));
+        }
+    }
+    ensure_scratch(ctx, max_rows);
+
+    // Flat token-id array in group order (groups ascending by expert id,
+    // rows in insertion order), matching the per-group gather layout of
+    // forward() exactly.
+    std::vector<int> flat_token_ids;
+    flat_token_ids.reserve(static_cast<size_t>(total_rows));
+    std::vector<int> group_offsets;
+    group_offsets.reserve(groups.size());
+    for (const auto& [expert, rows] : groups) {
+        (void)expert;
+        group_offsets.push_back(static_cast<int>(flat_token_ids.size()));
+        for (const auto& [token, weight] : rows) {
+            (void)weight;
+            flat_token_ids.push_back(token);
+        }
+    }
+    ctx.memcpy_h2d(token_ids_dev.data(), flat_token_ids.data(),
+                   static_cast<size_t>(total_rows) * sizeof(int));
+
+    const bf16* input_ptr = input.data_as<bf16>();
+    bf16* transfer_ptr = transfer.data_as<bf16>();
+    moe_gather_rows_flat(ctx, input_ptr, transfer_ptr,
+                         static_cast<int*>(token_ids_dev.data()),
+                         total_rows, hidden_);
+
+    std::vector<bf16> acc(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
+    std::vector<bf16> host_out(static_cast<size_t>(total_rows) * hidden_);
+
+    int group_index = 0;
+    for (const auto& [expert, rows] : groups) {
+        const int count = static_cast<int>(rows.size());
+        const int offset = group_offsets[static_cast<size_t>(group_index)];
+        Tensor src_view = Tensor::view(
+            ctx, transfer_ptr + static_cast<size_t>(offset) * hidden_,
+            {count, hidden_}, dnnl::memory::data_type::bf16);
+        Tensor dst_view = Tensor::view(
+            ctx, transfer_ptr + static_cast<size_t>(offset) * hidden_,
+            {count, hidden_}, dnnl::memory::data_type::bf16);
+
+        dequant_subset(ctx, gate_up_, expert, gate_up_rows_per_expert_,
+                       gate_up_w_);
+        run_matmul(ctx, count, gate_up_in_features_, 2 * moe_intermediate_,
+                   static_cast<uint64_t>(count) * 2 + 0, src_view,
+                   gate_up_w_, gate_up_out_);
+        moe_split_gate_up(ctx, gate_up_out_, gate_, up_, count,
+                          moe_intermediate_);
+        moe_gelu_tanh_gate_mul(ctx, gate_, up_, proj_,
+                               count * moe_intermediate_);
+
+        dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
+        run_matmul(ctx, count, down_in_features_, hidden_,
+                   static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
+                   dst_view);
+        ++group_index;
+    }
+
+    ctx.memcpy_d2h(host_out.data(), transfer.data(),
+                   host_out.size() * sizeof(bf16));
+
+    group_index = 0;
+    for (const auto& [expert, rows] : groups) {
+        (void)expert;
+        const int count = static_cast<int>(rows.size());
+        const int offset = group_offsets[static_cast<size_t>(group_index)];
+        const bf16* src_row =
+            host_out.data() + static_cast<size_t>(offset) * hidden_;
+        for (int r = 0; r < count; ++r) {
+            const int token = rows[static_cast<size_t>(r)].first;
+            const float weight = rows[static_cast<size_t>(r)].second;
+            bf16* dst = acc.data() + static_cast<size_t>(token) * hidden_;
+            for (int h = 0; h < hidden_; ++h) {
+                const bf16 contribution =
+                    bf16(static_cast<float>(src_row[static_cast<size_t>(r) * hidden_ + h]) *
+                         weight);
+                dst[h] = bf16(static_cast<float>(dst[h]) +
+                              static_cast<float>(contribution));
+            }
+        }
+        ++group_index;
+    }
+
+    output = std::move(acc);
 }

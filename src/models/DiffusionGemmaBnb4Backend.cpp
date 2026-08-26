@@ -875,6 +875,14 @@ void DiffusionGemmaBnb4Backend::ensure_buffers(Context& ctx, int q_len,
                                            dnnl::memory::data_type::bf16);
     buf_.moe_gpu_ref = Tensor::allocate(ctx, {max_q, hidden},
                                         dnnl::memory::data_type::bf16);
+    // Shared batched MoE transfer buffer: capacity for every routed row
+    // (tokens x top_k) of one decoder pass, reused across layers.
+    buf_.moe_transfer = Tensor::allocate(
+        ctx, {static_cast<int64_t>(max_q) * tc.top_k_experts, hidden},
+        dnnl::memory::data_type::bf16);
+    buf_.moe_token_ids = Tensor::allocate(
+        ctx, {static_cast<int64_t>(max_q) * tc.top_k_experts},
+        dnnl::memory::data_type::s32);
     buf_.router_scores = Tensor::allocate(
         ctx, {max_q, tc.num_experts}, dnnl::memory::data_type::bf16);
 
@@ -1229,9 +1237,51 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     if (dump_layer0) dump_tensor("pre_ff2_norm", buf_.normed);
     static const bool moe_gpu =
         aila::env::read_flag("AILA_DG_MOE_GPU", false);
+    static const bool moe_batched =
+        aila::env::read_flag("AILA_DG_MOE_BATCHED", true);
     static const bool moe_harness =
         aila::env::read_flag("AILA_DG_MOE_HARNESS", false);
     auto* moe = moes_[static_cast<size_t>(layer_idx)].get();
+    const auto compare_moe_outputs =
+        [&](const char* label, Tensor& candidate) {
+            std::vector<uint8_t> host_bytes(
+                static_cast<size_t>(seq_len) * hidden_size * sizeof(bf16));
+            std::vector<uint8_t> candidate_bytes(host_bytes.size());
+            ctx.memcpy_d2h(host_bytes.data(), buf_.moe_device_out.data(),
+                           host_bytes.size());
+            ctx.memcpy_d2h(candidate_bytes.data(), candidate.data(),
+                           candidate_bytes.size());
+            ctx.synchronize();
+            size_t mismatches = 0;
+            size_t first = host_bytes.size();
+            for (size_t i = 0; i < host_bytes.size(); i += 2) {
+                if (host_bytes[i] != candidate_bytes[i] ||
+                    host_bytes[i + 1] != candidate_bytes[i + 1]) {
+                    ++mismatches;
+                    first = std::min(first, i);
+                }
+            }
+            static long long harness_total_mismatches = 0;
+            static long long harness_total_elements = 0;
+            harness_total_mismatches += static_cast<long long>(mismatches);
+            harness_total_elements +=
+                static_cast<long long>(host_bytes.size() / 2);
+            if (mismatches != 0) {
+                const size_t element = first / 2;
+                uint16_t host_raw = 0;
+                uint16_t candidate_raw = 0;
+                std::memcpy(&host_raw, &host_bytes[first], 2);
+                std::memcpy(&candidate_raw, &candidate_bytes[first], 2);
+                std::fprintf(stderr,
+                    "[MoE harness] %s layer=%d seq=%d MISMATCH=%zu first=%zu "
+                    "(m=%d h=%d) host=%u cand=%u total=%lld/%lld\n",
+                    label, layer_idx, seq_len, mismatches, element,
+                    static_cast<int>(element / hidden_size),
+                    static_cast<int>(element % hidden_size), host_raw,
+                    candidate_raw, harness_total_mismatches,
+                    harness_total_elements);
+            }
+        };
     if (moe_harness) {
         // Reference: committed host-driven path.
         std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
@@ -1243,45 +1293,31 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         record_phase(profile_totals_.moe_ms);
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
-        // Candidate: GPU-resident path.  In-order queue keeps both runs on
-        // the same scratch buffers sequentially.
-        moe->forward_gpu(ctx, buf_.normed, buf_.moe_gpu_ref, expert_ids,
-                         expert_weights, seq_len, tc.top_k_experts);
-        ctx.synchronize();
-        std::vector<uint8_t> host_bytes(static_cast<size_t>(seq_len) * hidden_size * sizeof(bf16));
-        std::vector<uint8_t> gpu_bytes(host_bytes.size());
-        ctx.memcpy_d2h(host_bytes.data(), buf_.moe_device_out.data(),
-                       host_bytes.size());
-        ctx.memcpy_d2h(gpu_bytes.data(), buf_.moe_gpu_ref.data(),
-                       gpu_bytes.size());
-        ctx.synchronize();
-        size_t mismatches = 0;
-        size_t first = host_bytes.size();
-        for (size_t i = 0; i < host_bytes.size(); i += 2) {
-            if (host_bytes[i] != gpu_bytes[i] ||
-                host_bytes[i + 1] != gpu_bytes[i + 1]) {
-                ++mismatches;
-                first = std::min(first, i);
-            }
+        // Candidates run after the host reference on the same in-order queue.
+        if (moe_batched) {
+            std::vector<bf16> batched_output;
+            moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+                                 buf_.moe_token_ids, expert_ids,
+                                 expert_weights, batched_output, seq_len,
+                                 tc.top_k_experts);
+            ctx.memcpy_h2d(buf_.moe_gpu_ref.data(), batched_output.data(),
+                           batched_output.size() * sizeof(bf16));
+            compare_moe_outputs("batched", buf_.moe_gpu_ref);
         }
-        static long long harness_total_mismatches = 0;
-        static long long harness_total_elements = 0;
-        harness_total_mismatches += static_cast<long long>(mismatches);
-        harness_total_elements += static_cast<long long>(host_bytes.size() / 2);
-        if (mismatches != 0) {
-            const size_t element = first / 2;
-            uint16_t host_raw = 0;
-            uint16_t gpu_raw = 0;
-            std::memcpy(&host_raw, &host_bytes[first], 2);
-            std::memcpy(&gpu_raw, &gpu_bytes[first], 2);
-            std::fprintf(stderr,
-                "[MoE harness] layer=%d seq=%d MISMATCH=%zu first=%zu "
-                "(m=%d h=%d) host=%u gpu=%u total=%lld/%lld\n",
-                layer_idx, seq_len, mismatches, element,
-                static_cast<int>(element / hidden_size),
-                static_cast<int>(element % hidden_size), host_raw, gpu_raw,
-                harness_total_mismatches, harness_total_elements);
+        if (moe_gpu) {
+            // Candidate: GPU-resident path (WIP).
+            moe->forward_gpu(ctx, buf_.normed, buf_.moe_gpu_ref, expert_ids,
+                             expert_weights, seq_len, tc.top_k_experts);
+            compare_moe_outputs("gpu", buf_.moe_gpu_ref);
         }
+    } else if (moe_batched) {
+        std::vector<bf16> moe_output;
+        moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+                             buf_.moe_token_ids, expert_ids, expert_weights,
+                             moe_output, seq_len, tc.top_k_experts);
+        record_phase(profile_totals_.moe_ms);
+        ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
+                       moe_output.size() * sizeof(bf16));
     } else if (moe_gpu) {
         moe->forward_gpu(ctx, buf_.normed, buf_.moe_device_out, expert_ids,
                          expert_weights, seq_len, tc.top_k_experts);

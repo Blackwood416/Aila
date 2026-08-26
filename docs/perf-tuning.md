@@ -164,6 +164,32 @@ controls the number of dummy decoder passes and `AILA_DG_WARMUP_CANVAS`
 overrides the dummy canvas length; a smaller canvas only saves compute
 because the JIT cost is shape-independent.
 
+### Batched MoE transfers
+
+The host-driven MoE path used one blocking h2d/d2h pair per expert group
+(about 60 groups per layer), which measured ~51 ms/layer of transfer/sync
+overhead on top of ~17 ms of dequant+matmul. The batched path
+(`Bnb4GroupedMoE::forward_batched`, default on via `AILA_DG_MOE_BATCHED=1`)
+keeps every per-expert oneDNN matmul byte-identical but gathers all groups
+into one shared device buffer with a single flat gather kernel and copies
+the combined per-expert outputs back with one d2h. Per-expert matmuls run on
+offset views of the same buffer, so the committed arithmetic order and the
+oneDNN kernels are unchanged; the MoE harness (`AILA_DG_MOE_HARNESS=1`)
+confirmed zero bitwise mismatches versus the host path on every layer.
+
+Fresh-process 25-step runs with warmup + batched MoE (seed 42):
+
+| Mode | Warmup median (ms) | Generate median (ms) |
+|------|--------------------|----------------------|
+| Cold, host MoE | 0 | 149913 (4 runs) |
+| Warmup, host MoE | 17903 (3 runs) | 129230 (3 runs) |
+| Warmup + batched MoE | 16675 (3 runs) | 94071 (3 runs) |
+
+Batched MoE cuts the median `generate()` time from 129.23 s to 94.07 s
+(-27.2%) with a tighter spread (93.2-94.5 s vs 143-152 s cold). Runtime peak
+memory after decoder buffers is 14733.99 MiB (+28.6 MiB vs the BK64 record,
+inside the 256 MiB gate); all runs preserved SHA256 `A4F674A0...`.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

@@ -154,6 +154,21 @@ public:
                  std::vector<sycl::ext::oneapi::bfloat16>& output,
                  int tokens, int top_k);
 
+    // Batched-transfer MoE forward, numerically identical to forward().
+    // input is [tokens * hidden] bf16 on the device.  transfer is one
+    // device buffer with capacity [tokens * top_k, hidden] that aliases the
+    // gathered per-expert source rows and the per-expert down outputs (each
+    // expert uses a disjoint row range, and the in-order queue separates the
+    // read of a range from its later overwrite).  All expert groups share a
+    // single gather kernel and a single d2h instead of one blocking h2d/d2h
+    // pair per group.  token_ids_dev is [tokens * top_k] int32 scratch.
+    void forward_batched(Context& ctx, Tensor& input, Tensor& transfer,
+                         Tensor& token_ids_dev,
+                         const std::vector<int>& expert_ids,
+                         const std::vector<float>& expert_weights,
+                         std::vector<sycl::ext::oneapi::bfloat16>& output,
+                         int tokens, int top_k);
+
     // GPU-resident MoE forward.  input is [tokens * hidden] bf16 on the
     // device; output is [tokens * hidden] bf16 on the device and is zeroed at
     // the start.  The per-expert dequant and oneDNN matmul steps are the same

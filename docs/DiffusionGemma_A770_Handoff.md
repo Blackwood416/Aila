@@ -306,6 +306,33 @@ SHA256 `A4F674A0...`. `AILA_DG_WARMUP_PASSES` and `AILA_DG_WARMUP_CANVAS`
 override the dummy pass count/canvas length (a smaller canvas only saves
 compute; JIT cost is shape-independent).
 
+### Merged: batched MoE transfers
+
+The host MoE path's ~60 blocking h2d/d2h pairs per layer measured ~51 ms/layer
+of transfer/sync overhead. `Bnb4GroupedMoE::forward_batched` (default on,
+`AILA_DG_MOE_BATCHED=0` restores the per-group path) gathers every group into
+one shared device buffer with a single flat gather kernel and copies all
+per-expert outputs back with one d2h. Each expert's oneDNN matmul runs on an
+offset view of the same buffer, so kernels, values, and accumulation order are
+unchanged; the harness verified zero bitwise mismatches on every layer.
+
+Fresh-process 25-step medians (seed 42, canvas 256, 25 steps):
+
+| Mode | Warmup median (ms) | Generate median (ms) |
+|------|--------------------|----------------------|
+| Cold, host MoE | 0 | 149913 (4 runs) |
+| Warmup, host MoE | 17903 (3 runs) | 129230 (3 runs) |
+| Warmup + batched MoE | 16675 (3 runs) | 94071 (3 runs) |
+
+Batched MoE cuts median `generate()` to 94.07 s (-27.2% vs warmup-only) with
+a 93.2-94.5 s spread; runtime peak 14733.99 MiB (+28.6 MiB vs the BK64
+record); all runs preserved SHA256 `A4F674A0...`.
+
+Note: the GPU-resident MoE WIP (`AILA_DG_MOE_GPU=1`) became flaky after the
+shared transfer buffers were added (bitwise mismatches in the harness even in
+isolation, plus the earlier `AILA_PROFILE_DG` access violation). It remains
+disabled and should be re-validated from scratch before any further work.
+
 ## Important files
 
 - `src/ops/Bnb4BitLinear.cpp`: A770 NF4 GEMM dispatch and kernels
