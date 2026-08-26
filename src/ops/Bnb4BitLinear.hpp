@@ -154,6 +154,16 @@ public:
                  std::vector<sycl::ext::oneapi::bfloat16>& output,
                  int tokens, int top_k);
 
+    // GPU-resident MoE forward.  input is [tokens * hidden] bf16 on the
+    // device; output is [tokens * hidden] bf16 on the device and is zeroed at
+    // the start.  The per-expert dequant and oneDNN matmul steps are the same
+    // as forward(); only the gather and the final bf16 accumulation move on
+    // device, preserving the sorted-expert accumulation order bitwise.
+    void forward_gpu(Context& ctx, Tensor& input, Tensor& output,
+                     const std::vector<int>& expert_ids,
+                     const std::vector<float>& expert_weights,
+                     int tokens, int top_k);
+
     int hidden_size() const { return hidden_; }
     int moe_intermediate_size() const { return moe_intermediate_; }
     int num_experts() const { return num_experts_; }
@@ -194,6 +204,8 @@ private:
     Tensor down_out_;
     Tensor gate_up_w_;
     Tensor down_w_;
+    Tensor tokens_dev_;
+    Tensor weights_dev_;
     int scratch_rows_ = 0;
 
     void ensure_scratch(Context& ctx, int rows);

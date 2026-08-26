@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -872,6 +873,8 @@ void DiffusionGemmaBnb4Backend::ensure_buffers(Context& ctx, int q_len,
                                 dnnl::memory::data_type::bf16);
     buf_.moe_device_out = Tensor::allocate(ctx, {max_q, hidden},
                                            dnnl::memory::data_type::bf16);
+    buf_.moe_gpu_ref = Tensor::allocate(ctx, {max_q, hidden},
+                                        dnnl::memory::data_type::bf16);
     buf_.router_scores = Tensor::allocate(
         ctx, {max_q, tc.num_experts}, dnnl::memory::data_type::bf16);
 
@@ -1224,16 +1227,76 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     ops::rms_norm(ctx, hidden, *layer.pre_ff_ln_2, tc.rms_norm_eps, buf_.normed,
                   seq_len, hidden_size);
     if (dump_layer0) dump_tensor("pre_ff2_norm", buf_.normed);
-    std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
-    ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
-                   moe_input.size() * sizeof(bf16));
-    std::vector<bf16> moe_output;
-    moes_[static_cast<size_t>(layer_idx)]->forward(
-        ctx, moe_input, expert_ids, expert_weights, moe_output, seq_len,
-        tc.top_k_experts);
-    record_phase(profile_totals_.moe_ms);
-    ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
-                   moe_output.size() * sizeof(bf16));
+    static const bool moe_gpu =
+        aila::env::read_flag("AILA_DG_MOE_GPU", false);
+    static const bool moe_harness =
+        aila::env::read_flag("AILA_DG_MOE_HARNESS", false);
+    auto* moe = moes_[static_cast<size_t>(layer_idx)].get();
+    if (moe_harness) {
+        // Reference: committed host-driven path.
+        std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
+        ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
+                       moe_input.size() * sizeof(bf16));
+        std::vector<bf16> moe_output;
+        moe->forward(ctx, moe_input, expert_ids, expert_weights, moe_output,
+                     seq_len, tc.top_k_experts);
+        record_phase(profile_totals_.moe_ms);
+        ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
+                       moe_output.size() * sizeof(bf16));
+        // Candidate: GPU-resident path.  In-order queue keeps both runs on
+        // the same scratch buffers sequentially.
+        moe->forward_gpu(ctx, buf_.normed, buf_.moe_gpu_ref, expert_ids,
+                         expert_weights, seq_len, tc.top_k_experts);
+        ctx.synchronize();
+        std::vector<uint8_t> host_bytes(static_cast<size_t>(seq_len) * hidden_size * sizeof(bf16));
+        std::vector<uint8_t> gpu_bytes(host_bytes.size());
+        ctx.memcpy_d2h(host_bytes.data(), buf_.moe_device_out.data(),
+                       host_bytes.size());
+        ctx.memcpy_d2h(gpu_bytes.data(), buf_.moe_gpu_ref.data(),
+                       gpu_bytes.size());
+        ctx.synchronize();
+        size_t mismatches = 0;
+        size_t first = host_bytes.size();
+        for (size_t i = 0; i < host_bytes.size(); i += 2) {
+            if (host_bytes[i] != gpu_bytes[i] ||
+                host_bytes[i + 1] != gpu_bytes[i + 1]) {
+                ++mismatches;
+                first = std::min(first, i);
+            }
+        }
+        static long long harness_total_mismatches = 0;
+        static long long harness_total_elements = 0;
+        harness_total_mismatches += static_cast<long long>(mismatches);
+        harness_total_elements += static_cast<long long>(host_bytes.size() / 2);
+        if (mismatches != 0) {
+            const size_t element = first / 2;
+            uint16_t host_raw = 0;
+            uint16_t gpu_raw = 0;
+            std::memcpy(&host_raw, &host_bytes[first], 2);
+            std::memcpy(&gpu_raw, &gpu_bytes[first], 2);
+            std::fprintf(stderr,
+                "[MoE harness] layer=%d seq=%d MISMATCH=%zu first=%zu "
+                "(m=%d h=%d) host=%u gpu=%u total=%lld/%lld\n",
+                layer_idx, seq_len, mismatches, element,
+                static_cast<int>(element / hidden_size),
+                static_cast<int>(element % hidden_size), host_raw, gpu_raw,
+                harness_total_mismatches, harness_total_elements);
+        }
+    } else if (moe_gpu) {
+        moe->forward_gpu(ctx, buf_.normed, buf_.moe_device_out, expert_ids,
+                         expert_weights, seq_len, tc.top_k_experts);
+        record_phase(profile_totals_.moe_ms);
+    } else {
+        std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
+        ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
+                       moe_input.size() * sizeof(bf16));
+        std::vector<bf16> moe_output;
+        moe->forward(ctx, moe_input, expert_ids, expert_weights, moe_output,
+                     seq_len, tc.top_k_experts);
+        record_phase(profile_totals_.moe_ms);
+        ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
+                       moe_output.size() * sizeof(bf16));
+    }
     if (dump_layer0) dump_tensor("moe_raw", buf_.moe_device_out);
     ops::rms_norm(ctx, buf_.moe_device_out, *layer.post_ff_ln_2, tc.rms_norm_eps,
                   buf_.ff2, seq_len, hidden_size);

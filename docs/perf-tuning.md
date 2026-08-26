@@ -92,6 +92,15 @@ prefill-shaped NF4 GEMM. The smaller K tile reduces per-work-group SLM from
 about 20.5 KiB to 10.5 KiB. Other GPUs and larger NF4 block sizes retain their
 existing dispatch.
 
+The vectorized NF4 GEMM (`packed_nf4_gemm_bf16_tiled_v2`) stages the
+dequantized bf16 B tile in SLM and uses `vec8` inner-loop loads. On A770 the
+blocksize-64 dispatch uses `BM=32`, `BN=128`, `BK=64`, `TM=2`, `TN=8`, and a
+16x16 work-group. The old `BM=64`/`BN=64` scalar geometry remains available as
+the fallback (`AILA_BNB4_GEMM_V2=0`) and is bitwise identical on real
+DiffusionGemma weights for every `BN>=32` geometry swept; `BN=16`/`TN=1`
+geometries were rejected because the device compiler reassociates their k
+accumulation under `-ffast-math`.
+
 Validated on driver `32.0.101.8860`, oneAPI `2026.1`, and oneDNN `3.11.2`, with
 seed 42, a 256-token canvas, and 25 denoising steps. Each sample was a separate
 process and tensor dumping plus synchronizing profiling were disabled. Aila
@@ -102,13 +111,31 @@ for the separate Python/Transformers reconstruction and reference workflow.
 |-------------|---------------------------|-------------|
 | BK128 baseline | 328312.37, 329871.85, 330980.95 | 329871.85 |
 | BK64 | 260323.84, 257500.51, 258545.84 | 258545.84 |
+| BK64 + v2 GEMM | 139772.34, 141609.89, 140662.14 | 140662.14 |
 
-BK64 reduces median generation wall time by 21.6% (1.276x speedup). Both paths
-produced the same 256 committed token IDs; the 1024-byte int32 token stream had
-SHA256 `A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`.
+BK64 reduces median generation wall time by 21.6% (1.276x speedup); the v2
+GEMM reduces it by a further 45.6% over BK64 (1.84x total vs the BK128
+baseline). Both paths produced the same 256 committed token IDs; the
+1024-byte int32 token stream had SHA256
+`A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`.
 Model-load memory remained 13665.85 MiB current and 13799.81 MiB peak. After
 allocating the decoder's runtime buffers, memory was 14673.44 MiB current and
-14705.43 MiB peak; BK64 adds no global or persistent allocation over BK128.
+14705.43 MiB peak; the v2 GEMM adds no global or persistent allocation.
+
+20-sample operator medians for the v2 GEMM on the real decode shapes
+(blocksize 64):
+
+| Shape `M x N x K` | BK64 median (ms) | v2 median (ms) |
+|-------------------|------------------|----------------|
+| `256 x 2816 x 2112` | 20.60 | 5.95 |
+| `256 x 2112 x 2816` | 27.50 | 7.74 |
+| `256 x 1024 x 2816` | 27.68 | 7.74 |
+| `256 x 4224 x 2816` | 45.22 | 11.71 |
+
+The `AILA_BNB4_GEMM_V2=0` environment variable selects the original scalar
+geometry for A/B comparison. `AILA_BNB4_GEOM_BENCH=1` in
+`AilaBnb4BitLinearKernelTests` runs the geometry sweep, and
+`AILA_BNB4_ROUND_PROBE=1` exercises device bf16 rounding/multiply edge cases.
 
 ## Benchmark Methodology
 

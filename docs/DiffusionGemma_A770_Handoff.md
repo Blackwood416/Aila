@@ -215,6 +215,71 @@ token gate. Suggested order:
    5% faster, runtime peak no more than 256 MiB above baseline, and no
    OOM/TDR/device-lost.
 
+## 2026-08-26 session: vectorized NF4 GEMM (merged) and MoE GPU path (WIP)
+
+### Merged: v2 NF4 GEMM (`packed_nf4_gemm_bf16_tiled_v2`)
+
+The blocksize-64 A770 dispatch is now `BM=32, BN=128, BK=64, TM=2, TN=8`,
+16x16 work-group. The B tile is dequantized to bf16 SLM once per K block and
+the inner loop uses `vec8` A/B loads. 20-sample operator medians on the real
+decode shapes improved 3.5-3.9x over the BK64 scalar kernel.
+
+Three-run 25-step medians (fresh process, seed 42, 256-token canvas, 25
+denoising steps, dumping/profiling disabled):
+
+| Dispatch | 25-step samples (ms) | Median (ms) |
+|----------|----------------------|-------------|
+| BK64 baseline | 328312/329872/330981 (BK128), 260324/257501/258546 (BK64) | 258545.84 |
+| BK64 + v2 | 139772.34, 141609.89, 140662.14 | 140662.14 |
+
+Median latency improved 45.6% over the BK64 baseline (1.84x total vs BK128).
+All 256 committed token IDs were exact in every run
+(SHA256 `A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`).
+Runtime peak after decoder buffers: 14714.51 MiB (+9 MiB vs the BK64 record),
+no OOM/TDR/device-lost. ctest regression set and InferRef fresh-run pass
+(InferRef exact match, zero NaNs/Infs).
+
+Numerical gate that made this safe: the test suite now runs a bitwise A/B on
+the real scgate/qproj weight fixtures for every supported GEMM geometry
+(`run_real_v1_v2_bitwise_test`). On this stack, only geometries with
+`BN >= 32` are bitwise identical to the committed scalar kernel; `BN=16`/
+`TN=1` geometries are 2-5x faster in the microbenchmark but the device
+compiler reassociates their k accumulation under `-ffast-math` and changes
+last-ulp results (visible only on real weights, not synthetic fixtures).
+`-ffp-model=strict`, `/fp:strict`, and `#pragma clang fp` do not affect the
+DPC++ device codegen for these kernels; the geometry gate is the only
+reliable protection.
+
+`AILA_BNB4_GEMM_V2=0` selects the original scalar geometry for A/B.
+`AILA_BNB4_GEOM_BENCH=1` sweeps geometries with bitwise validation, and
+`AILA_BNB4_ROUND_PROBE=1` probes device bf16 conversion/multiply edge cases
+(the probe documents that a fused bf16-load `*` float multiply on this device
+rounds one float ulp below the IEEE host multiply; widen bf16 through
+`bf16_to_f32_raw` before multiplying when bitwise host parity is required).
+
+### Not merged: GPU-resident MoE path (validated but slower)
+
+`Bnb4GroupedMoE::forward_gpu` moves the per-expert gather and the final bf16
+accumulation to the GPU while keeping the dequant and oneDNN matmul steps
+unchanged. `AILA_DG_MOE_HARNESS=1` runs the committed host path and the GPU
+path for every layer and compares bitwise: with the `bf16_to_f32_raw` widen
+fix, all layers/passes matched with zero mismatches. This satisfies the
+handoff's "isolated MoE region harness" prerequisite.
+
+It is NOT the production default (`AILA_DG_MOE_GPU` defaults to 0) because:
+
+1. Per-group wall time dropped from ~50-90 ms to ~42 ms per layer, but the
+   extra gather/accumulate submissions cost more than the removed
+   h2d/d2h transfers; the 25-step median was ~151 s vs ~141 s for the host
+   path with the v2 GEMM.
+2. `AILA_PROFILE_DG=1` together with the GPU path crashes with
+   `0xC0000005` (RIP=0) after the first MoE layer, while production mode
+   completes with the exact token hash. Treat the GPU path as WIP; a batched
+   (single-kernel) gather/accumulate or fused dequant+matmul is required
+   before it can win.
+
+The host MoE path is unchanged and remains the committed behavior.
+
 ## Important files
 
 - `src/ops/Bnb4BitLinear.cpp`: A770 NF4 GEMM dispatch and kernels
