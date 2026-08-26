@@ -137,6 +137,33 @@ geometry for A/B comparison. `AILA_BNB4_GEOM_BENCH=1` in
 `AilaBnb4BitLinearKernelTests` runs the geometry sweep, and
 `AILA_BNB4_ROUND_PROBE=1` exercises device bf16 rounding/multiply edge cases.
 
+### vLLM-style init warmup for DiffusionGemma
+
+The engine now auto-runs a vLLM-style dummy pass at init for DiffusionGemma
+(`AILA_INIT_WARMUP` defaults to auto). Like vLLM's `_dummy_run`, it runs the
+full model once with the real canvas shape so SYCL kernel JIT, oneDNN
+primitive creation, buffer allocation, and GPU clock ramp happen before the
+first real request instead of inside `generate()`. The warmup consists of a
+dummy 8-token prompt encode, one dummy 256-token `diffusion_decode_canvas`
+pass with zero soft self-conditioning, and one soft-embedding call. Its
+output is discarded and the backend is reset, so the committed token stream
+is unchanged.
+
+Three fresh-process 25-step runs on driver `32.0.101.8860`:
+
+| Mode | Warmup (ms) | Generate (ms) |
+|------|-------------|---------------|
+| No warmup (`AILA_INIT_WARMUP=0`) | 0 | 143284, 149916, 149910, 151797 (median 149913) |
+| Default warmup (1 pass) | 17903, 17788, 18009 (median 17903) | 129230, 124560, 132580 (median 129230) |
+
+Warmup moves the one-time JIT/primitive cost out of `generate()`, cutting the
+median generation wall time by 13.8% (149.91 s to 129.23 s) while the total
+init+warmup+generate time stays neutral-to-better. Every run preserved the
+committed 256-token stream (SHA256 `A4F674A0...`). `AILA_DG_WARMUP_PASSES`
+controls the number of dummy decoder passes and `AILA_DG_WARMUP_CANVAS`
+overrides the dummy canvas length; a smaller canvas only saves compute
+because the JIT cost is shape-independent.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

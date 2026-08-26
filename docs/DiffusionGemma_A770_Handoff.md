@@ -64,7 +64,11 @@ have been configured with a different compiler stack.
 pwsh build.ps1 -BuildDir build-diffusiongemma -Jobs 36
 ```
 
-Minimal 25-step Aila run, without the Python-only relaxed-allocation variable:
+Minimal 25-step Aila run, without the Python-only relaxed-allocation variable.
+The engine runs a vLLM-style warmup at init by default (one dummy 256-token
+canvas pass) so a fresh process pays the one-time SYCL JIT/oneDNN primitive
+cost before `generate()` starts; `AILA_INIT_WARMUP=0` below selects the
+cold-start measurement used for the benchmark records in this document.
 
 ```powershell
 $env:AILA_INIT_WARMUP = "0"
@@ -279,6 +283,28 @@ It is NOT the production default (`AILA_DG_MOE_GPU` defaults to 0) because:
    before it can win.
 
 The host MoE path is unchanged and remains the committed behavior.
+
+### Merged: vLLM-style init warmup
+
+Following vLLM's `_dummy_run` methodology (run the full model once with the
+real max shape before serving so JIT/primitive costs never hit a request),
+the engine now auto-warms DiffusionGemma at init: a dummy 8-token prompt
+encode, one dummy 256-token `diffusion_decode_canvas` pass with zero soft
+self-conditioning, and one soft-embedding call. The output is discarded and
+the backend is reset; the committed token stream is unchanged.
+
+Fresh-process 25-step medians (seed 42, canvas 256, 25 steps):
+
+| Mode | Warmup median (ms) | Generate median (ms) |
+|------|--------------------|----------------------|
+| Cold (`AILA_INIT_WARMUP=0`) | 0 | 149913 (4 runs) |
+| Default warmup (1 pass) | 17903 (3 runs) | 129230 (3 runs) |
+
+Warmup cuts median `generate()` wall time by 13.8% (149.91 s -> 129.23 s) and
+keeps total init+warmup+generate neutral-to-better; all runs preserved
+SHA256 `A4F674A0...`. `AILA_DG_WARMUP_PASSES` and `AILA_DG_WARMUP_CANVAS`
+override the dummy pass count/canvas length (a smaller canvas only saves
+compute; JIT cost is shape-independent).
 
 ## Important files
 

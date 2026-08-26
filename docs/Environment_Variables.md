@@ -85,7 +85,9 @@ continue to run inference in-process.
 | `AILA_THINKING_BUDGET` | int | `-1` | Thinking budget: `-1` = disabled, `0` = no-think prompt mode, `>0` = max generated tokens inside `<think>` |
 | `AILA_STREAM_OUTPUT` | int | auto | Force streaming (`1`) or non-streaming (`0`). Auto-detected from terminal type when not set |
 | `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `verbose` (-1), `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
-| `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (skip for unsupported specs) |
+| `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (enabled for DiffusionGemma, skipped for unsupported specs) |
+| `AILA_DG_WARMUP_PASSES` | int | `1` | DiffusionGemma warmup: number of dummy full-canvas decoder passes run at init (vLLM-style JIT/primitive amortization) |
+| `AILA_DG_WARMUP_CANVAS` | int | `0` | DiffusionGemma warmup canvas override: `0` = real canvas length, `>0` = smaller dummy canvas (JIT cost is shape-independent; only compute scales) |
 
 ---
 
