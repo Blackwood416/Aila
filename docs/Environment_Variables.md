@@ -206,10 +206,10 @@ setting, not an Aila-specific variable.
 |----------|------|---------|-------------|
 | `AILA_DIFFUSION_STEPS` | int | `min(model config, 25)` | Override the number of canvas denoising steps. The 26B checkpoint has been validated to converge at 25 steps; larger values remain available for quality experiments |
 | `AILA_DG_DEBUG_PROBES` | bool | `false` | Enable expensive host-side finite-value probes in the DiffusionGemma decoder |
-| `AILA_DG_DUMP_DIR` | path | empty | Dump DiffusionGemma intermediate tensors for numerical comparison |
+| `AILA_DG_DUMP_DIR` | path | empty | Dump DiffusionGemma intermediate tensors and `committed_tokens.bin` for numerical comparison |
 | `AILA_DG_DUMP_LAYER` | int | `0` | Layer selected by `AILA_DG_DUMP_DIR` |
 | `AILA_DG_DUMP_DECODER` | bool | `false` | Dump decoder/self-conditioning tensors instead of the causal encoder layer |
-| `AILA_PROFILE_DG` | bool | `false` | Synchronize DiffusionGemma decoder phase boundaries and report attention, dense MLP, router, MoE, and post-processing wall time |
+| `AILA_PROFILE_DG` | bool | `false` | Synchronize DiffusionGemma decoder sub-phase boundaries and report projection, attention, dense MLP, router, MoE, and post-processing wall time |
 
 ---
 

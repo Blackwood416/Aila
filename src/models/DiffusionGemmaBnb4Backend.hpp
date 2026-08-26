@@ -113,7 +113,13 @@ private:
 
     struct ProfileTotals {
         double attention_ms = 0.0;
+        double qkv_proj_ms = 0.0;
+        double attention_core_ms = 0.0;
+        double o_proj_ms = 0.0;
         double dense_mlp_ms = 0.0;
+        double dense_gate_up_ms = 0.0;
+        double dense_activation_ms = 0.0;
+        double dense_down_ms = 0.0;
         double router_ms = 0.0;
         double moe_ms = 0.0;
         double post_ms = 0.0;

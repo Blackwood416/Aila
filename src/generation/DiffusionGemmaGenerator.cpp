@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <random>
 #include <thread>
 
@@ -97,6 +98,7 @@ bool DiffusionGemmaGenerator::generate(
         if (error_message) *error_message = "invalid DiffusionGemma config";
         return false;
     }
+    const auto generation_start = std::chrono::steady_clock::now();
     AILA_LOG_INFO(
         "[DiffusionGemma] Generating up to %d tokens (canvas=%d steps=%d)",
         max_new_tokens, canvas_len, cfg.max_denoising_steps);
@@ -165,6 +167,13 @@ bool DiffusionGemmaGenerator::generate(
     int generated = 0;
     const bool debug_probes =
         aila::env::read_flag("AILA_DG_DEBUG_PROBES", false);
+    const std::string dump_dir =
+        aila::env::read_string("AILA_DG_DUMP_DIR", "");
+    std::ofstream committed_token_dump;
+    if (!dump_dir.empty()) {
+        committed_token_dump.open(dump_dir + "/committed_tokens.bin",
+                                  std::ios::binary | std::ios::trunc);
+    }
     for (int c = 0; c < max_canvases && !all_finished; ++c) {
         std::vector<int> prev_argmax(canvas);
         int equal_count = 0;
@@ -294,6 +303,11 @@ bool DiffusionGemmaGenerator::generate(
 
         // Commit the argmax canvas.
         const std::vector<int> commit = new_argmax;
+        if (committed_token_dump) {
+            committed_token_dump.write(
+                reinterpret_cast<const char*>(commit.data()),
+                static_cast<std::streamsize>(commit.size() * sizeof(int)));
+        }
         if (debug_probes) {
             std::string tok_list;
             for (int i = 0; i < std::min(16, canvas_len); ++i) {
@@ -350,9 +364,16 @@ bool DiffusionGemmaGenerator::generate(
     if (generated > max_new_tokens) {
         output_ids.resize(static_cast<size_t>(max_new_tokens));
     }
+    const double generation_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() -
+                                     generation_start)
+                                     .count();
     AILA_LOG_INFO(
-        "[DiffusionGemma] Generated %zu tokens in %d canvas(es)",
-        output_ids.size(), max_canvases);
+        "[DiffusionGemma] Generated %zu tokens in %d canvas(es), %.2f ms "
+        "(memory current=%.2f MB peak=%.2f MB)",
+        output_ids.size(), max_canvases, generation_ms,
+        ctx.current_allocated_bytes() / (1024.0 * 1024.0),
+        ctx.peak_allocated_bytes() / (1024.0 * 1024.0));
     if (profile) {
         AILA_LOG_INFO(
             "[DG Profile] encode=%.2f ms decode+logits=%.2f ms "

@@ -755,6 +755,16 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
             profile_totals_.attention_ms, profile_totals_.dense_mlp_ms,
             profile_totals_.router_ms, profile_totals_.moe_ms,
             profile_totals_.post_ms);
+        AILA_LOG_INFO(
+            "[DG Profile Detail] qkv_proj=%.2f ms attention_core=%.2f ms "
+            "o_proj=%.2f ms dense_gate_up=%.2f ms "
+            "dense_activation=%.2f ms dense_down=%.2f ms",
+            profile_totals_.qkv_proj_ms,
+            profile_totals_.attention_core_ms,
+            profile_totals_.o_proj_ms,
+            profile_totals_.dense_gate_up_ms,
+            profile_totals_.dense_activation_ms,
+            profile_totals_.dense_down_ms);
     }
     return buf_.logits_f32;
 }
@@ -1078,6 +1088,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                            static_cast<size_t>(seq_len) * kv_dim *
                                sizeof(bf16));
     }
+    record_phase(profile_totals_.qkv_proj_ms);
 
     ops::head_rms_norm(ctx, q, *layer.q_norm, tc.rms_norm_eps, seq_len,
                        num_heads, head_dim);
@@ -1120,6 +1131,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     ops::attention_prefill_masked(ctx, q, k_full, v_full, mask, attn_out,
                                   scores, seq_len, kv_len, num_heads,
                                   num_kv_heads, head_dim);
+    record_phase(profile_totals_.attention_core_ms);
     if (dump_layer0) dump_tensor("attention_scores", scores);
     if (dump_layer0) dump_tensor("attn_out", attn_out);
     layer.o_proj.forward(ctx, buf_.o_scratch, attn_out, buf_.attn_o, seq_len);
@@ -1129,7 +1141,12 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     if (dump_layer0) dump_tensor("post_attn_norm", buf_.attn_o);
     ops::residual_add(ctx, hidden, buf_.attn_o, seq_len * hidden_size);
     if (dump_layer0) dump_tensor("hidden_after_attn", hidden);
-    record_phase(profile_totals_.attention_ms);
+    record_phase(profile_totals_.o_proj_ms);
+    if (profile) {
+        profile_totals_.attention_ms = profile_totals_.qkv_proj_ms +
+                                       profile_totals_.attention_core_ms +
+                                       profile_totals_.o_proj_ms;
+    }
 
     // Dense MLP path.
     ops::rms_norm(ctx, hidden, *layer.pre_ff_ln, tc.rms_norm_eps, buf_.normed,
@@ -1141,16 +1158,23 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     layer.mlp_up.forward(ctx, buf_.mlp_scratch, buf_.normed, buf_.mlp_up,
                          seq_len);
     if (dump_layer0) dump_tensor("mlp_up", buf_.mlp_up);
+    record_phase(profile_totals_.dense_gate_up_ms);
     ops::gelu_tanh_gate_mul(ctx, buf_.mlp_gate, buf_.mlp_up, buf_.mlp_proj,
                             seq_len * tc.intermediate_size);
     if (dump_layer0) dump_tensor("mlp_proj", buf_.mlp_proj);
+    record_phase(profile_totals_.dense_activation_ms);
     layer.mlp_down.forward(ctx, buf_.mlp_scratch, buf_.mlp_proj, buf_.mlp_out,
                            seq_len);
     if (dump_layer0) dump_tensor("mlp_out", buf_.mlp_out);
     ops::rms_norm(ctx, buf_.mlp_out, *layer.post_ff_ln_1, tc.rms_norm_eps,
                   buf_.ff1, seq_len, hidden_size);
     if (dump_layer0) dump_tensor("ff1", buf_.ff1);
-    record_phase(profile_totals_.dense_mlp_ms);
+    record_phase(profile_totals_.dense_down_ms);
+    if (profile) {
+        profile_totals_.dense_mlp_ms = profile_totals_.dense_gate_up_ms +
+                                       profile_totals_.dense_activation_ms +
+                                       profile_totals_.dense_down_ms;
+    }
 
     // MoE path (parallel to MLP, routed from the pre-MLP residual).
     // Keep the router projection on the trusted bf16 oneDNN path.  A scalar

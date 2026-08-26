@@ -85,6 +85,30 @@ AILA_BNB4_FUSED_PREFILL=1
 ```
 - Higher throughput due to smaller model size.
 
+### Intel Arc A770 + DiffusionGemma-26B-A4B-it BNB NF4
+
+The A770 dispatch uses `BM=64`, `BN=64`, and `BK=64` for blocksize-64
+prefill-shaped NF4 GEMM. The smaller K tile reduces per-work-group SLM from
+about 20.5 KiB to 10.5 KiB. Other GPUs and larger NF4 block sizes retain their
+existing dispatch.
+
+Validated on driver `32.0.101.8860`, oneAPI `2026.1`, and oneDNN `3.11.2`, with
+`UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`, seed 42, a 256-token canvas, and 25
+denoising steps. Each sample was a separate process and tensor dumping plus
+synchronizing profiling were disabled.
+
+| A770 K tile | 25-step wall samples (ms) | Median (ms) |
+|-------------|---------------------------|-------------|
+| BK128 baseline | 328312.37, 329871.85, 330980.95 | 329871.85 |
+| BK64 | 260323.84, 257500.51, 258545.84 | 258545.84 |
+
+BK64 reduces median generation wall time by 21.6% (1.276x speedup). Both paths
+produced the same 256 committed token IDs; the 1024-byte int32 token stream had
+SHA256 `A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`.
+Model-load memory remained 13665.85 MiB current and 13799.81 MiB peak. After
+allocating the decoder's runtime buffers, memory was 14673.44 MiB current and
+14705.43 MiB peak; BK64 adds no global or persistent allocation over BK128.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

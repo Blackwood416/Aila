@@ -196,10 +196,17 @@ void packed_nf4_gemm_bf16(Context& ctx,
     }();
     if (use_a770_bm64) {
         // [DISPATCH] A770/DG2, oneAPI 2026.1, driver 32.0.101.8860:
-        // BM=64 lowers per-WG SLM from ~36.5 KB to ~20.5 KB. Verified for
+        // BK=64 lowers per-WG SLM from ~20.5 KB to ~10.5 KB. Verified for
         // M={3,24,37,96,256}, block={32,64,128}, and all aligned
-        // DiffusionGemma N/K shapes. Three one-step pipeline samples improved
-        // median wall time by 35.8% while preserving the generated output.
+        // DiffusionGemma N/K shapes. For blocksize 64, 20-sample decoder-shape
+        // medians improved 24.6%-36.3% over BK=128; the 25-step pipeline
+        // median improved 21.6% and preserved all 256 token IDs exactly.
+        if (blocksize <= 64) {
+            packed_nf4_gemm_bf16_tiled<64, 64, 64, 4, 4, 16, 16>(
+                ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                output_ptr, M, N, K, blocksize);
+            return;
+        }
         packed_nf4_gemm_bf16_tiled<64, 64, 128, 4, 4, 16, 16>(
             ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
             M, N, K, blocksize);

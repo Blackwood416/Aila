@@ -359,6 +359,18 @@ target_include_directories(AilaYolo26InferRefAdapter PRIVATE
 )
 target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
 
+add_executable(AilaDiffusionGemmaNf4InferRefAdapter
+    tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp)
+target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
+
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp
 )

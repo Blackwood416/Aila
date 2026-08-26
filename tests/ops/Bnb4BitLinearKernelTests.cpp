@@ -1,5 +1,6 @@
 #include "src/ops/Bnb4BitLinear.cpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -64,7 +65,9 @@ int run_packed_nf4_gemm_layout_test(int M, int Block) {
     Tensor packed_dev = Tensor::allocate(ctx, {static_cast<int64_t>(packed.size())},
                                          dnnl::memory::data_type::u8);
     Tensor qmap_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
-    Tensor absmax_dev = Tensor::allocate(ctx, {N}, dnnl::memory::data_type::f32);
+    Tensor absmax_dev = Tensor::allocate(
+        ctx, {static_cast<int64_t>(absmax.size())},
+        dnnl::memory::data_type::f32);
     Tensor input_dev = Tensor::allocate(ctx, {M, K}, dnnl::memory::data_type::bf16);
     Tensor output_dev = Tensor::allocate(ctx, {M, N}, dnnl::memory::data_type::bf16);
 
@@ -352,6 +355,41 @@ int run_packed_nf4_gemm_shape_test(int M, int N, int K, bool zero_input = false)
                 return 1;
             }
         }
+    }
+    if (!zero_input && M == 256 &&
+        aila::env::read_flag("AILA_BNB4_BENCH", false)) {
+        constexpr int kWarmup = 3;
+        constexpr int kSamples = 20;
+        for (int i = 0; i < kWarmup; ++i) {
+            packed_nf4_gemm_bf16(
+                ctx, static_cast<const uint8_t*>(packed_dev.data()),
+                static_cast<const float*>(qmap_dev.data()),
+                static_cast<const float*>(absmax_dev.data()),
+                static_cast<const bf16*>(input_dev.data()),
+                static_cast<bf16*>(output_dev.data()), M, N, K, Block);
+            ctx.synchronize();
+        }
+        std::vector<double> samples;
+        samples.reserve(kSamples);
+        for (int i = 0; i < kSamples; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            packed_nf4_gemm_bf16(
+                ctx, static_cast<const uint8_t*>(packed_dev.data()),
+                static_cast<const float*>(qmap_dev.data()),
+                static_cast<const float*>(absmax_dev.data()),
+                static_cast<const bf16*>(input_dev.data()),
+                static_cast<bf16*>(output_dev.data()), M, N, K, Block);
+            ctx.synchronize();
+            samples.push_back(std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count());
+        }
+        std::sort(samples.begin(), samples.end());
+        std::cout << "[BNB4 bench] M=" << M << " N=" << N << " K=" << K
+                  << " block=" << Block
+                  << " wall_median_ms=" << samples[kSamples / 2]
+                  << " p10_ms=" << samples[kSamples / 10]
+                  << " p90_ms=" << samples[(kSamples * 9) / 10] << "\n";
     }
     std::cout << "packed_nf4_gemm_bf16 M=" << M << " N=" << N << " K=" << K
               << (zero_input ? " zero-input" : "") << " passed\n";

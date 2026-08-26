@@ -1,0 +1,23 @@
+{
+  "format": "inferref-engine-adapter",
+  "format_version": "0.2",
+  "name": "aila-diffusion-gemma-nf4-gemm",
+  "target_device": "xpu",
+  "capabilities": {
+    "device_types": ["xpu"],
+    "dtypes": ["uint8", "bfloat16", "float32"],
+    "max_rank": 2,
+    "features": []
+  },
+  "command": [
+    "pwsh",
+    "-NoProfile",
+    "-File",
+    "{adapter_dir}/run_diffusion_gemma_nf4_adapter.ps1",
+    "{testcase}",
+    "{output}"
+  ],
+  "cwd": ".",
+  "timeout_seconds": 60,
+  "max_output_chars": 65536
+}
