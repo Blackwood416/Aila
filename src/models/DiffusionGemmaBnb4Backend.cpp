@@ -925,8 +925,11 @@ void DiffusionGemmaBnb4Backend::ensure_logits_buffers(Context& ctx) {
         ctx, {canvas_len, tc.vocab_size}, dnnl::memory::data_type::bf16);
     buf_.lm_head.init(ctx, *embed_weight_, tc.hidden_size, tc.vocab_size);
     // Embedding is already [vocab, hidden], exactly the [in, out] layout for
-    // probs @ embedding. Do not build the 1.5 GB decode-GEMV transpose because
-    // this path is canvas-only (M=256).
+    // probs @ embedding. Do not build the 1.5 GB decode-GEMV transpose
+    // because this path is canvas-only (M=256).  The K=262144 contraction is
+    // inherently slow in oneDNN jit:gemm on A770 (~300 ms); neither the ab
+    // nor the transposed ba orientation selects the systolic path used by the
+    // K=2816 logits projection, so keep the committed ab layout.
     buf_.soft_embed.init(ctx, *embed_weight_, tc.vocab_size, tc.hidden_size,
                          true, false);
     AILA_LOG_DEBUG(

@@ -723,6 +723,16 @@ int bench_gemm_geometries() {
          &packed_nf4_gemm_bf16_tiled_v2<64, 32, 64, 4, 2, 16, 16>},
         {"v2_32x32x64_tm2tn2_wg256",
          &packed_nf4_gemm_bf16_tiled_v2<32, 32, 64, 2, 2, 16, 16>},
+        {"v3_32x128x64_tm2tn8_wg256",
+         &packed_nf4_gemm_bf16_tiled_v3<32, 128, 64, 2, 8, 16, 16>},
+        {"v3_32x128x32_tm2tn8_wg256",
+         &packed_nf4_gemm_bf16_tiled_v3<32, 128, 32, 2, 8, 16, 16>},
+        {"v3_64x64x64_tm4tn4_wg256",
+         &packed_nf4_gemm_bf16_tiled_v3<64, 64, 64, 4, 4, 16, 16>},
+        {"v3_64x64x32_tm4tn4_wg256",
+         &packed_nf4_gemm_bf16_tiled_v3<64, 64, 32, 4, 4, 16, 16>},
+        {"v3_64x128x64_tm4tn8_wg256",
+         &packed_nf4_gemm_bf16_tiled_v3<64, 128, 64, 4, 8, 16, 16>},
     };
     const std::vector<std::tuple<int, int, int>> shapes = {
         {256, 2816, 2112},

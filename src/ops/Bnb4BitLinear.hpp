@@ -219,8 +219,6 @@ private:
     std::unordered_map<uint64_t, MatmulPrim> prims_;
     Tensor src_;
     Tensor gate_up_out_;
-    Tensor gate_;
-    Tensor up_;
     Tensor proj_;
     Tensor down_out_;
     Tensor gate_up_w_;

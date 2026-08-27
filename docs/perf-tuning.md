@@ -199,6 +199,35 @@ deadlocks the GPU driver (all threads park in ntdll waits inside
 automatically drains every group under `AILA_PROFILE_DG`. Production is
 unaffected and stable.
 
+### 2026-08-27 incremental wins
+
+- MoE dequant coalescing: consecutive work-items now map to consecutive
+  expert rows so the bf16 stores are fully coalesced (the packed reads become
+  strided, which is cheaper than striding 4x the bytes of stores).
+- MoE split+SiLU fusion: the gate/up split and gelu kernels are one kernel
+  reading the fused gate_up output directly (one launch and two intermediate
+  buffers saved per expert group).
+- GPU logits divide: `logits / temperature` now happens in place on the GPU
+  (IEEE division, bitwise identical to the host loop), removing a 256 MB
+  host->device round trip and a 67M-element host divide loop per step.
+
+Three-run 25-step medians with warmup (seed 42): generate 88.45 s
+(87.96/88.45/88.63 s), warmup 16.75 s, runtime peak 14733.99 MiB; all runs
+preserve SHA256 `A4F674A0...`. `AILA_DG_STEP_TIMING=1` prints the unprofiled
+per-step decode/transfer/host/soft breakdown.
+
+Measured negative results (kept for reference):
+
+- `packed_nf4_gemm_bf16_tiled_v3` (double-buffered A/B SLM, one barrier per K
+  tile) is bitwise identical but slower than v2 on every geometry
+  (32x128x64: 7.72 ms vs 5.99 ms; 32x128x32: 6.15 ms). The kernel is
+  load/latency-bound, so the extra 40 KB SLM occupancy loss outweighs the
+  prefetch overlap.
+- The soft-embedding GEMM `256x262144x2816` runs ~300 ms in oneDNN
+  `jit:gemm:any` on A770 regardless of weight tag (ab) or transposed ba
+  orientation; only the K=2816 logits projection selects the fast systolic
+  path. The K=262144 contraction has no oneDNN fast path on this stack.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

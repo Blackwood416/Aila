@@ -90,6 +90,7 @@ continue to run inference in-process.
 | `AILA_DG_WARMUP_CANVAS` | int | `0` | DiffusionGemma warmup canvas override: `0` = real canvas length, `>0` = smaller dummy canvas (JIT cost is shape-independent; only compute scales) |
 | `AILA_DG_MOE_BATCHED` | int | `1` | DiffusionGemma MoE batched-transfer path: single flat gather + one d2h for all expert groups instead of one blocking h2d/d2h per group. Bitwise identical to the per-group host path (`0` restores it) |
 | `AILA_DG_MOE_PACE` | int | auto | DiffusionGemma batched MoE drain interval in expert groups: `0`/unset = 8 in production, 1 under `AILA_PROFILE_DG` (larger bursts plus per-phase syncs hang the Level-Zero driver on A770) |
+| `AILA_DG_STEP_TIMING` | int | `0` | Print the unprofiled per-step decode/transfer/host/soft wall breakdown for DiffusionGemma generation |
 
 ---
 

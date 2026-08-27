@@ -156,7 +156,6 @@ bool DiffusionGemmaGenerator::generate(
         static_cast<size_t>(canvas_len) * hidden * sizeof(bf16)));
 
     std::vector<float> logits_host(static_cast<size_t>(canvas_len) * vocab);
-    std::vector<float> processed_host(static_cast<size_t>(canvas_len) * vocab);
     std::vector<float> entropy(static_cast<size_t>(canvas_len));
     std::vector<int> denoiser(static_cast<size_t>(canvas_len));
     std::vector<int> new_argmax(static_cast<size_t>(canvas_len));
@@ -167,6 +166,8 @@ bool DiffusionGemmaGenerator::generate(
     int generated = 0;
     const bool debug_probes =
         aila::env::read_flag("AILA_DG_DEBUG_PROBES", false);
+    const bool step_timing =
+        aila::env::read_flag("AILA_DG_STEP_TIMING", false);
     const std::string dump_dir =
         aila::env::read_string("AILA_DG_DUMP_DIR", "");
     std::ofstream committed_token_dump;
@@ -190,9 +191,24 @@ bool DiffusionGemmaGenerator::generate(
                            sc_embeds.size() * sizeof(bf16));
             Tensor& logits = backend.diffusion_decode_canvas(
                 ctx, canvas_device, sc_device, canvas_len);
+            const float temperature =
+                cfg.t_min + (cfg.t_max - cfg.t_min) *
+                                (static_cast<float>(cur_step) /
+                                 static_cast<float>(cfg.max_denoising_steps));
+            // Divide the logits in place on the GPU with the same IEEE
+            // division the host performed before, so the soft self-
+            // conditioning path reads bitwise-identical processed logits
+            // without a 256 MB host->device round trip per step.
+            float* logits_ptr = static_cast<float*>(logits.data());
+            ctx.queue().parallel_for(
+                sycl::range<1>(static_cast<size_t>(canvas_len) * vocab),
+                [=](sycl::id<1> idx) {
+                    logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
+                });
             ctx.memcpy_d2h(logits_host.data(), logits.data(),
                            logits_host.size() * sizeof(float));
             ctx.synchronize();
+            const auto transfer_done = std::chrono::steady_clock::now();
             if (profile) {
                 profile_decode_ms +=
                     std::chrono::duration<double, std::milli>(
@@ -200,41 +216,33 @@ bool DiffusionGemmaGenerator::generate(
                         .count();
             }
 
-            const float temperature =
-                cfg.t_min + (cfg.t_max - cfg.t_min) *
-                                (static_cast<float>(cur_step) /
-                                 static_cast<float>(cfg.max_denoising_steps));
-            for (size_t i = 0; i < logits_host.size(); ++i) {
-                processed_host[i] = logits_host[i] / temperature;
-            }
-
             // The committed canvas is always the denoiser argmax. On the
             // final step no later iteration can consume entropy sampling,
             // renoising, or self-conditioning, so avoid one complete
             // full-vocabulary host pass and one probs@embedding GEMM.
-            ops::diffusion_argmax(processed_host.data(), new_argmax.data(),
+            ops::diffusion_argmax(logits_host.data(), new_argmax.data(),
                                   canvas_len, vocab);
             if (cur_step == 1) break;
 
             const auto host_start = std::chrono::steady_clock::now();
-            softmax_entropy_host(processed_host.data(), entropy.data(),
+            softmax_entropy_host(logits_host.data(), entropy.data(),
                                  canvas_len, vocab);
-            gumbel_sample_host(processed_host.data(), rng, denoiser.data(),
+            gumbel_sample_host(logits_host.data(), rng, denoiser.data(),
                                canvas_len, vocab);
             if (debug_probes && cur_step == cfg.max_denoising_steps) {
                 float min_l = 1e30f, max_l = -1e30f;
                 double sum_l = 0.0;
-                for (size_t i = 0; i < processed_host.size(); ++i) {
-                    min_l = std::min(min_l, processed_host[i]);
-                    max_l = std::max(max_l, processed_host[i]);
-                    sum_l += processed_host[i];
+                for (size_t i = 0; i < logits_host.size(); ++i) {
+                    min_l = std::min(min_l, logits_host[i]);
+                    max_l = std::max(max_l, logits_host[i]);
+                    sum_l += logits_host[i];
                 }
                 AILA_LOG_INFO(
                     "[DG-DEBUG] step=%d logits min=%.4f max=%.4f mean=%.4f "
                     "entropy0=%.4f argmax0=%d argmax1=%d argmax2=%d "
                     "argmax3=%d argmax4=%d",
                     cur_step, min_l, max_l,
-                    static_cast<float>(sum_l / processed_host.size()),
+                    static_cast<float>(sum_l / logits_host.size()),
                     entropy[0], new_argmax[0], new_argmax[1],
                     new_argmax[2], new_argmax[3], new_argmax[4]);
             }
@@ -285,13 +293,30 @@ bool DiffusionGemmaGenerator::generate(
             if (finished_denoising) break;
 
             const auto soft_start = std::chrono::steady_clock::now();
-            ctx.memcpy_h2d(logits.data(), processed_host.data(),
-                           processed_host.size() * sizeof(float));
             Tensor& soft = backend.diffusion_compute_soft_embeds(
                 ctx, logits, canvas_len);
             ctx.memcpy_d2h(sc_embeds.data(), soft.data(),
                            sc_embeds.size() * sizeof(bf16));
             ctx.synchronize();
+            const auto soft_done = std::chrono::steady_clock::now();
+            if (step_timing) {
+                std::fprintf(stderr,
+                    "[DG step] step=%d decode=%.1f ms transfer=%.1f ms "
+                    "host=%.1f ms soft=%.1f ms\n",
+                    cur_step,
+                    std::chrono::duration<double, std::milli>(
+                        transfer_done - decode_start)
+                        .count(),
+                    std::chrono::duration<double, std::milli>(
+                        soft_start - transfer_done)
+                        .count(),
+                    std::chrono::duration<double, std::milli>(
+                        soft_start - host_start)
+                        .count(),
+                    std::chrono::duration<double, std::milli>(
+                        soft_done - soft_start)
+                        .count());
+            }
             if (profile) {
                 profile_soft_ms +=
                     std::chrono::duration<double, std::milli>(

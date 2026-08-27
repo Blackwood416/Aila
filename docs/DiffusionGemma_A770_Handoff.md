@@ -348,6 +348,30 @@ Final three-run 25-step medians with warmup + batched MoE (seed 42):
 warmup 16.70 s, generate 94.98 s (94.23/94.98/95.05 s), runtime peak
 14733.99 MiB, SHA256 `A4F674A0...` on all runs. Profile mode now completes.
 
+### 2026-08-27 incremental wins (merged)
+
+- MoE dequant write coalescing (consecutive work-items -> consecutive expert
+  rows) and split+SiLU fusion (one kernel, one launch per group).
+- GPU in-place `logits / temperature` (IEEE division, bitwise identical to the
+  host loop), removing the 256 MB host->device processed-logits round trip
+  and the host divide loop per step.
+
+Updated three-run 25-step medians with warmup (seed 42): generate 88.45 s
+(87.96/88.45/88.63 s), warmup 16.75 s, runtime peak 14733.99 MiB; all runs
+preserve SHA256 `A4F674A0...`. `AILA_DG_STEP_TIMING=1` gives the unprofiled
+per-step breakdown (decode ~2.47 s, logits transfer ~0.18 s, host ~0.16 s,
+soft ~0.51 s per step at the 94.98 s state).
+
+Measured negative results this session:
+
+- Double-buffered v3 GEMM (one barrier per K tile, 40 KB SLM at 32x128x64)
+  is bitwise identical but slower than v2 on every swept geometry; the kernel
+  is load/latency-bound and the occupancy loss dominates.
+- The soft-embedding GEMM `256x262144:262144x2816` is ~300 ms in oneDNN
+  `jit:gemm:any`; neither the ab declaration nor a transposed ba
+  `2816x262144:262144x256` form selects the systolic path used by the K=2816
+  logits projection. No safe speedup found; the ab layout is retained.
+
 ## Important files
 
 - `src/ops/Bnb4BitLinear.cpp`: A770 NF4 GEMM dispatch and kernels

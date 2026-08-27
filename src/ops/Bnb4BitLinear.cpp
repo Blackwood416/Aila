@@ -18,36 +18,26 @@ int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
 }
 
-void moe_split_gate_up(Context& ctx, Tensor& gate_up, Tensor& gate,
-                       Tensor& up, int rows, int ff_dim) {
+// Fused split + SiLU(gate)*up for a [rows, 2*ff_dim] gate_up output.  Reads
+// gate/up halves directly from the fused matmul output and writes the
+// activated projection, producing exactly the same values as the two-kernel
+// split + gelu path while saving one launch and two intermediate buffers.
+void moe_gelu_tanh_gate_up_mul(Context& ctx, Tensor& gate_up,
+                               Tensor& output, int rows, int ff_dim) {
     bf16* src_ptr = static_cast<bf16*>(gate_up.data());
-    bf16* gate_ptr = static_cast<bf16*>(gate.data());
-    bf16* up_ptr = static_cast<bf16*>(up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
     ctx.queue().parallel_for(
         sycl::range<1>(static_cast<size_t>(rows) * ff_dim),
         [=](sycl::id<1> idx) {
-            const int row = static_cast<int>(idx[0]) / ff_dim;
-            const int col = static_cast<int>(idx[0]) % ff_dim;
-            gate_ptr[idx[0]] =
-                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + col];
-            up_ptr[idx[0]] =
-                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + ff_dim + col];
-        });
-}
-
-void moe_gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
-                            Tensor& output, int n) {
-    bf16* gate_ptr = static_cast<bf16*>(gate.data());
-    bf16* up_ptr = static_cast<bf16*>(up.data());
-    bf16* out_ptr = static_cast<bf16*>(output.data());
-    constexpr float kAlpha = 0.7978845608028654f;
-    ctx.queue().parallel_for(sycl::range<1>(n),
-        [=](sycl::id<1> idx) {
-            const int i = idx[0];
-            const float g = static_cast<float>(gate_ptr[i]);
-            const float u = static_cast<float>(up_ptr[i]);
+            const int row = static_cast<int>(idx[0] / ff_dim);
+            const int col = static_cast<int>(idx[0] % ff_dim);
+            const float g = static_cast<float>(
+                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + col]);
+            const float u = static_cast<float>(
+                src_ptr[static_cast<size_t>(row) * 2 * ff_dim + ff_dim + col]);
             const float v = kAlpha * (g + 0.044715f * g * g * g);
-            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+            out_ptr[idx[0]] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
         });
 }
 
@@ -430,6 +420,203 @@ void packed_nf4_gemm_bf16_tiled_v2(Context& ctx,
                         }
                     }
                     item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Write output
+                for (int mi = 0; mi < TM; ++mi) {
+                    const int m = m0 + ty * TM + mi;
+                    if (m >= M || m - m0 >= BM) continue;
+                    for (int ni = 0; ni < TN; ++ni) {
+                        const int n = n0 + tx * TN + ni;
+                        if (n >= N || n - n0 >= BN) continue;
+                        output_ptr[m * N + n] = bf16(C[mi][ni]);
+                    }
+                }
+            });
+    });
+}
+
+// Double-buffered variant of the v2 NF4 GEMM.  A and B tiles are staged in
+// two SLM buffers each; while a tile is computed, the next K tile's global
+// loads/dequant are already in flight.  Per-element accumulation order and
+// bf16 rounding are identical to v1/v2, so outputs stay bitwise equal; the
+// barrier count drops from 2 per K tile to 1.
+template <int BM, int BN, int BK, int TM, int TN, int TILE_M, int TILE_N>
+void packed_nf4_gemm_bf16_tiled_v3(Context& ctx,
+                                   const uint8_t* packed_ptr,
+                                   const float* quant_map_ptr,
+                                   const float* absmax_ptr,
+                                   const bf16* input_ptr,
+                                   bf16* output_ptr,
+                                   int M, int N, int K,
+                                   int blocksize) {
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+
+    constexpr int WG_SIZE = TILE_M * TILE_N;
+
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(2 * BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(2 * BN * BK), cgh);
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(grid_n) * TILE_N,
+                                             static_cast<size_t>(grid_m) * TILE_M),
+                              sycl::range<2>(TILE_N, TILE_M)),
+            [=](sycl::nd_item<2> item) {
+                using bvec8 = sycl::vec<bf16, 8>;
+                const int tx = static_cast<int>(item.get_local_id(0));  // N dimension
+                const int ty = static_cast<int>(item.get_local_id(1));  // M dimension
+                const int lid = ty * TILE_N + tx;
+
+                const int block_n = static_cast<int>(item.get_group(0));
+                const int block_m = static_cast<int>(item.get_group(1));
+                const int n0 = block_n * BN;
+                const int m0 = block_m * BM;
+
+                if (lid < 16) qmap[lid] = quant_map_ptr[lid];
+
+                bf16* As_base = As.get_multi_ptr<sycl::access::decorated::no>().get();
+                bf16* Bs_base = Bs.get_multi_ptr<sycl::access::decorated::no>().get();
+
+                const int a_rows = sycl::min(BM, M - m0);
+
+                auto load_tile = [&](int kb, int buf) {
+                    bf16* As_ptr = As_base + buf * (BM * BK);
+                    bf16* Bs_ptr = Bs_base + buf * (BN * BK);
+                    const int a_cols = sycl::min(BK, K - kb);
+                    if (a_cols % 8 == 0) {
+                        const int a_vecs = a_rows * (a_cols / 8);
+                        for (int i = lid; i < a_vecs; i += WG_SIZE) {
+                            const int r = i / (a_cols / 8);
+                            const int c8 = i % (a_cols / 8);
+                            const bvec8 v = *reinterpret_cast<const bvec8*>(
+                                input_ptr + static_cast<size_t>(m0 + r) * K + kb + c8 * 8);
+                            *reinterpret_cast<bvec8*>(As_ptr + r * a_cols + c8 * 8) = v;
+                        }
+                    } else {
+                        const int a_elems = a_rows * a_cols;
+                        for (int i = lid; i < a_elems; i += WG_SIZE) {
+                            const int r = i / a_cols;
+                            const int c = i % a_cols;
+                            As_ptr[i] = input_ptr[static_cast<size_t>(m0 + r) * K + kb + c];
+                        }
+                    }
+                    if (a_cols % 8 == 0) {
+                        const int b_words = BN * (a_cols / 8);
+                        for (int i = lid; i < b_words; i += WG_SIZE) {
+                            const int ni = i / (a_cols / 8);
+                            const int kv = i % (a_cols / 8);
+                            const int src_n = n0 + ni;
+                            if (src_n < N) {
+                                const uint32_t w = *reinterpret_cast<const uint32_t*>(
+                                    packed_ptr + static_cast<size_t>(src_n) * packed_bytes_per_row +
+                                    kb / 2 + kv * 4);
+                                const float am = absmax_ptr[
+                                    static_cast<size_t>(src_n) * blocks_per_row +
+                                    (kb + kv * 8) / blocksize];
+                                const uint8_t b0 = static_cast<uint8_t>(w);
+                                const uint8_t b1 = static_cast<uint8_t>(w >> 8);
+                                const uint8_t b2 = static_cast<uint8_t>(w >> 16);
+                                const uint8_t b3 = static_cast<uint8_t>(w >> 24);
+                                bvec8 vals;
+                                vals[0] = bf16(qmap[b0 >> 4] * am);
+                                vals[1] = bf16(qmap[b0 & 0x0F] * am);
+                                vals[2] = bf16(qmap[b1 >> 4] * am);
+                                vals[3] = bf16(qmap[b1 & 0x0F] * am);
+                                vals[4] = bf16(qmap[b2 >> 4] * am);
+                                vals[5] = bf16(qmap[b2 & 0x0F] * am);
+                                vals[6] = bf16(qmap[b3 >> 4] * am);
+                                vals[7] = bf16(qmap[b3 & 0x0F] * am);
+                                *reinterpret_cast<bvec8*>(Bs_ptr + ni * a_cols + kv * 8) = vals;
+                            } else {
+                                bvec8 zero{};
+                                *reinterpret_cast<bvec8*>(Bs_ptr + ni * a_cols + kv * 8) = zero;
+                            }
+                        }
+                    } else {
+                        const int b_bytes = BN * (a_cols / 2);
+                        for (int i = lid; i < b_bytes; i += WG_SIZE) {
+                            const int ni = i / (a_cols / 2);
+                            const int kh = i % (a_cols / 2);
+                            const int src_n = n0 + ni;
+                            const int kk = kh * 2;
+                            const uint8_t packed_byte = (src_n < N)
+                                ? packed_ptr[static_cast<size_t>(src_n) * packed_bytes_per_row + kb / 2 + kh]
+                                : 0;
+                            const float am = (src_n < N)
+                                ? absmax_ptr[static_cast<size_t>(src_n) * blocks_per_row +
+                                             (kb + kk) / blocksize]
+                                : 0.0f;
+                            Bs_ptr[ni * a_cols + kk] =
+                                bf16(qmap[packed_byte >> 4] * am);
+                            if (kk + 1 < a_cols) {
+                                Bs_ptr[ni * a_cols + kk + 1] =
+                                    bf16(qmap[packed_byte & 0x0F] * am);
+                            }
+                        }
+                    }
+                };
+
+                // Thread-local accumulators for output tile elements
+                float C[TM][TN] = {};
+
+                const int ntiles = (K + BK - 1) / BK;
+                load_tile(0, 0);
+                item.barrier(sycl::access::fence_space::local_space);
+                int cur = 0;
+                for (int t = 0; t < ntiles; ++t) {
+                    const int kb = t * BK;
+                    if (t + 1 < ntiles) {
+                        load_tile(kb + BK, cur ^ 1);
+                    }
+
+                    // Compute partial products for this K tile from buffer cur.
+                    const int a_cols = sycl::min(BK, K - kb);
+                    bf16* As_ptr = As_base + cur * (BM * BK);
+                    bf16* Bs_ptr = Bs_base + cur * (BN * BK);
+                    const int m_local = ty * TM;
+                    const int n_local = tx * TN;
+                    const int m_local_end = sycl::min(m_local + TM, a_rows);
+                    const int n_local_end = sycl::min(n_local + TN, BN);
+
+                    int k = 0;
+                    for (; k + 8 <= a_cols; k += 8) {
+                        bvec8 bv[TN];
+                        for (int ni = n_local; ni < n_local_end; ++ni) {
+                            bv[ni - n_local] = *reinterpret_cast<const bvec8*>(
+                                Bs_ptr + ni * a_cols + k);
+                        }
+                        for (int mi = m_local; mi < m_local_end; ++mi) {
+                            const bvec8 av = *reinterpret_cast<const bvec8*>(
+                                As_ptr + mi * a_cols + k);
+                            for (int ni = n_local; ni < n_local_end; ++ni) {
+                                float* acc = &C[mi - m_local][ni - n_local];
+                                const bvec8& b = bv[ni - n_local];
+                                #pragma unroll
+                                for (int v = 0; v < 8; ++v) {
+                                    *acc += static_cast<float>(av[v]) *
+                                            static_cast<float>(b[v]);
+                                }
+                            }
+                        }
+                    }
+                    for (; k < a_cols; ++k) {
+                        for (int ni = n_local; ni < n_local_end; ++ni) {
+                            const float bd = static_cast<float>(
+                                Bs_ptr[ni * a_cols + k]);
+                            for (int mi = m_local; mi < m_local_end; ++mi) {
+                                C[mi - m_local][ni - n_local] +=
+                                    static_cast<float>(As_ptr[mi * a_cols + k]) * bd;
+                            }
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    cur ^= 1;
                 }
 
                 // Write output
@@ -1569,10 +1756,6 @@ void Bnb4GroupedMoE::ensure_scratch(Context& ctx, int rows) {
     gate_up_out_ = Tensor::allocate(
         ctx, {scratch_rows_, 2 * moe_intermediate_},
         dnnl::memory::data_type::bf16);
-    gate_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
-                             dnnl::memory::data_type::bf16);
-    up_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
-                           dnnl::memory::data_type::bf16);
     proj_ = Tensor::allocate(ctx, {scratch_rows_, moe_intermediate_},
                              dnnl::memory::data_type::bf16);
     down_out_ = Tensor::allocate(ctx, {scratch_rows_, hidden_},
@@ -1656,9 +1839,14 @@ void Bnb4GroupedMoE::dequant_subset(Context& ctx, const ExpertWeightSet& set,
     ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(packed_bytes)),
         [=](sycl::id<1> idx) {
             const int64_t byte_index = static_cast<int64_t>(idx[0]);
-            const int64_t row = byte_index / packed_per_row;
-            const int64_t byte_in_row = byte_index % packed_per_row;
-            const uint8_t packed_byte = packed[byte_index];
+            // Map consecutive work-items to consecutive expert rows so the
+            // two bf16 stores per byte (out[k*rows + n]) are fully coalesced.
+            // The packed reads become strided (row stride K/2 bytes), which is
+            // cheaper than striding 4x the bytes of bf16 stores.
+            const int64_t row = byte_index % rows_per_expert;
+            const int64_t byte_in_row = byte_index / rows_per_expert;
+            const uint8_t packed_byte =
+                packed[row * packed_per_row + byte_in_row];
             const int64_t block = (row_start + row) * blocks_per_row +
                                   byte_in_row / (blocksize / 2);
             float am = 0.0f;
@@ -1670,14 +1858,11 @@ void Bnb4GroupedMoE::dequant_subset(Context& ctx, const ExpertWeightSet& set,
                          nested_absmax[block / nested_blocksize] +
                      nested_offset;
             }
-            const int64_t flat = byte_index * 2;
-            const int64_t col = flat % in_features;
+            const int64_t col = byte_in_row * 2;
             out_ptr[col * rows_per_expert + row] =
                 bf16(qmap[(packed_byte >> 4) & 0x0F] * am);
-            const int64_t flat1 = flat + 1;
-            if (flat1 < static_cast<int64_t>(rows_per_expert) * in_features) {
-                const int64_t col1 = flat1 % in_features;
-                out_ptr[col1 * rows_per_expert + row] =
+            if (col + 1 < in_features) {
+                out_ptr[(col + 1) * rows_per_expert + row] =
                     bf16(qmap[packed_byte & 0x0F] * am);
             }
         });
@@ -1759,10 +1944,8 @@ void Bnb4GroupedMoE::forward(Context& ctx,
                    static_cast<uint64_t>(count) * 2 + 0, src_, gate_up_w_,
                    gate_up_out_);
         diag_section(diag_matmul_ms);
-        moe_split_gate_up(ctx, gate_up_out_, gate_, up_, count,
-                          moe_intermediate_);
-        moe_gelu_tanh_gate_mul(ctx, gate_, up_, proj_,
-                               count * moe_intermediate_);
+        moe_gelu_tanh_gate_up_mul(ctx, gate_up_out_, proj_, count,
+                                  moe_intermediate_);
         diag_section(diag_matmul_ms);
 
         dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
@@ -1874,10 +2057,8 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
         run_matmul(ctx, count, gate_up_in_features_, 2 * moe_intermediate_,
                    static_cast<uint64_t>(count) * 2 + 0, src_, gate_up_w_,
                    gate_up_out_);
-        moe_split_gate_up(ctx, gate_up_out_, gate_, up_, count,
-                          moe_intermediate_);
-        moe_gelu_tanh_gate_mul(ctx, gate_, up_, proj_,
-                               count * moe_intermediate_);
+        moe_gelu_tanh_gate_up_mul(ctx, gate_up_out_, proj_, count,
+                                  moe_intermediate_);
 
         dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
         run_matmul(ctx, count, down_in_features_, hidden_,
@@ -1979,10 +2160,8 @@ void Bnb4GroupedMoE::forward_batched_impl(
         run_matmul(ctx, count, gate_up_in_features_, 2 * moe_intermediate_,
                    static_cast<uint64_t>(count) * 2 + 0, src_view,
                    gate_up_w_, gate_up_out_);
-        moe_split_gate_up(ctx, gate_up_out_, gate_, up_, count,
-                          moe_intermediate_);
-        moe_gelu_tanh_gate_mul(ctx, gate_, up_, proj_,
-                               count * moe_intermediate_);
+        moe_gelu_tanh_gate_up_mul(ctx, gate_up_out_, proj_, count,
+                                  moe_intermediate_);
 
         dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
         run_matmul(ctx, count, down_in_features_, hidden_,
