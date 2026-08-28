@@ -505,25 +505,6 @@ void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
     bf16* up_ptr = static_cast<bf16*>(up.data());
     bf16* out_ptr = static_cast<bf16*>(output.data());
     constexpr float kAlpha = 0.7978845608028654f;
-    if (n % 8 == 0) {
-        const int n8 = n / 8;
-        ctx.queue().parallel_for(sycl::range<1>(n8),
-            [=](sycl::id<1> idx) {
-                const int i = static_cast<int>(idx[0]);
-                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_ptr + i * 8);
-                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(up_ptr + i * 8);
-                sycl::vec<bf16, 8> out_v;
-                #pragma unroll
-                for (int v_idx = 0; v_idx < 8; ++v_idx) {
-                    const float g = static_cast<float>(g_v[v_idx]);
-                    const float u = static_cast<float>(u_v[v_idx]);
-                    const float v = kAlpha * (g + 0.044715f * g * g * g);
-                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
-                }
-                *reinterpret_cast<sycl::vec<bf16, 8>*>(out_ptr + i * 8) = out_v;
-            });
-        return;
-    }
     ctx.queue().parallel_for(sycl::range<1>(n),
         [=](sycl::id<1> idx) {
             const int i = idx[0];

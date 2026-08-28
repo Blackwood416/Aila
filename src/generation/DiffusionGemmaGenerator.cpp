@@ -150,6 +150,7 @@ bool DiffusionGemmaGenerator::generate(
         static_cast<size_t>(canvas_len) * hidden * sizeof(bf16)));
 
     std::vector<float> logits_host(static_cast<size_t>(canvas_len) * vocab);
+    std::vector<float> processed_host(static_cast<size_t>(canvas_len) * vocab);
     std::vector<float> entropy(static_cast<size_t>(canvas_len));
     std::vector<int> denoiser(static_cast<size_t>(canvas_len));
     std::vector<int> new_argmax(static_cast<size_t>(canvas_len));
@@ -179,7 +180,7 @@ bool DiffusionGemmaGenerator::generate(
                                   std::ios::binary | std::ios::trunc);
     }
     const bool use_gpu_sampling =
-        aila::env::read_flag("AILA_DG_GPU_SAMPLING", true);
+        aila::env::read_flag("AILA_DG_GPU_SAMPLING", false);
 
     int* d_argmax = nullptr;
     float* d_entropy = nullptr;
@@ -229,19 +230,16 @@ bool DiffusionGemmaGenerator::generate(
                 cfg.t_min + (cfg.t_max - cfg.t_min) *
                                 (static_cast<float>(cur_step) /
                                  static_cast<float>(cfg.max_denoising_steps));
-            // Divide the logits in place on the GPU with the same IEEE
-            // division the host performed before, so the soft self-
-            // conditioning path reads bitwise-identical processed logits
-            // without a 256 MB host->device round trip per step.
-            float* logits_ptr = static_cast<float*>(logits.data());
-            ctx.queue().parallel_for(
-                sycl::range<1>(static_cast<size_t>(canvas_len) * vocab),
-                [=](sycl::id<1> idx) {
-                    logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
-                });
             const auto decoder_submit_done = std::chrono::steady_clock::now();
 
             if (use_gpu_sampling && !debug_probes && !profile) {
+                float* logits_ptr = static_cast<float*>(logits.data());
+                ctx.queue().parallel_for(
+                    sycl::range<1>(static_cast<size_t>(canvas_len) * vocab),
+                    [=](sycl::id<1> idx) {
+                        logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
+                    });
+
                 // Step 1: Argmax on GPU
                 const auto argmax_start = std::chrono::steady_clock::now();
                 ops::diffusion_argmax_device(
@@ -402,8 +400,12 @@ bool DiffusionGemmaGenerator::generate(
                             .count();
                 }
 
+                for (size_t i = 0; i < logits_host.size(); ++i) {
+                    processed_host[i] = logits_host[i] / temperature;
+                }
+
                 const auto argmax_start = std::chrono::steady_clock::now();
-                ops::diffusion_argmax(logits_host.data(), new_argmax.data(),
+                ops::diffusion_argmax(processed_host.data(), new_argmax.data(),
                                       canvas_len, vocab);
                 const auto argmax_done = std::chrono::steady_clock::now();
                 if (cur_step == 1) {
@@ -433,26 +435,26 @@ bool DiffusionGemmaGenerator::generate(
                 }
 
                 const auto host_start = std::chrono::steady_clock::now();
-                softmax_entropy_host(logits_host.data(), entropy.data(),
+                softmax_entropy_host(processed_host.data(), entropy.data(),
                                      canvas_len, vocab);
                 const auto entropy_done = std::chrono::steady_clock::now();
-                gumbel_sample_host(logits_host.data(), rng, denoiser.data(),
+                gumbel_sample_host(processed_host.data(), rng, denoiser.data(),
                                    canvas_len, vocab);
                 const auto gumbel_done = std::chrono::steady_clock::now();
                 if (debug_probes && cur_step == cfg.max_denoising_steps) {
                     float min_l = 1e30f, max_l = -1e30f;
                     double sum_l = 0.0;
-                    for (size_t i = 0; i < logits_host.size(); ++i) {
-                        min_l = std::min(min_l, logits_host[i]);
-                        max_l = std::max(max_l, logits_host[i]);
-                        sum_l += logits_host[i];
+                    for (size_t i = 0; i < processed_host.size(); ++i) {
+                        min_l = std::min(min_l, processed_host[i]);
+                        max_l = std::max(max_l, processed_host[i]);
+                        sum_l += processed_host[i];
                     }
                     AILA_LOG_INFO(
                         "[DG-DEBUG] step=%d logits min=%.4f max=%.4f mean=%.4f "
                         "entropy0=%.4f argmax0=%d argmax1=%d argmax2=%d "
                         "argmax3=%d argmax4=%d",
                         cur_step, min_l, max_l,
-                        static_cast<float>(sum_l / logits_host.size()),
+                        static_cast<float>(sum_l / processed_host.size()),
                         entropy[0], new_argmax[0], new_argmax[1],
                         new_argmax[2], new_argmax[3], new_argmax[4]);
                 }
@@ -503,6 +505,8 @@ bool DiffusionGemmaGenerator::generate(
                 if (finished_denoising) break;
 
                 const auto soft_start = std::chrono::steady_clock::now();
+                ctx.memcpy_h2d(logits.data(), processed_host.data(),
+                               processed_host.size() * sizeof(float));
                 Tensor& soft = backend.diffusion_compute_soft_embeds(
                     ctx, logits, canvas_len);
                 const auto soft_submit_done = std::chrono::steady_clock::now();

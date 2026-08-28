@@ -3272,7 +3272,7 @@ void attention_prefill_masked(Context& ctx,
     }
 
     static const bool fused_xmx =
-        aila::env::read_flag("AILA_DG_FUSED_ATTN", true);
+        aila::env::read_flag("AILA_DG_FUSED_ATTN", false);
     if (fused_xmx && kv_len <= 384 && head_dim == 256 &&
         num_heads == 16 && num_kv_heads == 8) {
         run_fused_masked_attention_xmx(

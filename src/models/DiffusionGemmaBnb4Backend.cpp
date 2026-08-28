@@ -46,48 +46,48 @@ void router_topk_from_bf16_scores(
     std::vector<float>& expert_weights) {
     expert_ids.assign(static_cast<size_t>(tokens) * top_k, 0);
     expert_weights.assign(static_cast<size_t>(tokens) * top_k, 0.0f);
-    tbb::parallel_for(tbb::blocked_range<int>(0, tokens), [&](const tbb::blocked_range<int>& range) {
-        std::array<std::pair<float, int>, 256> ranked;
-        for (int token = range.begin(); token < range.end(); ++token) {
-            const auto* row = score_values.data() +
-                              static_cast<size_t>(token) * num_experts;
-            float max_score = -1.0e30f;
-            for (int expert = 0; expert < num_experts; ++expert) {
-                max_score = std::max(max_score, static_cast<float>(row[expert]));
-            }
-            float probability_sum = 0.0f;
-            for (int expert = 0; expert < num_experts; ++expert) {
-                const float value =
-                    std::exp(static_cast<float>(row[expert]) - max_score);
-                ranked[static_cast<size_t>(expert)] = {value, expert};
-                probability_sum += value;
-            }
-            const float inv_probability_sum = 1.0f / probability_sum;
-            for (int expert = 0; expert < num_experts; ++expert) {
-                ranked[static_cast<size_t>(expert)].first *= inv_probability_sum;
-            }
-            std::partial_sort(
-                ranked.begin(), ranked.begin() + top_k, ranked.begin() + num_experts,
-                [](const auto& lhs, const auto& rhs) {
-                    return lhs.first > rhs.first;
-                });
-            float selected_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k) {
-                selected_sum += ranked[static_cast<size_t>(k)].first;
-            }
-            for (int k = 0; k < top_k; ++k) {
-                const auto [probability, expert] =
-                    ranked[static_cast<size_t>(k)];
-                const size_t output_index =
-                    static_cast<size_t>(token) * top_k + k;
-                expert_ids[output_index] = expert;
-                expert_weights[output_index] =
-                    probability / selected_sum *
-                    static_cast<float>(
-                        per_expert_scale[static_cast<size_t>(expert)]);
-            }
+    for (int token = 0; token < tokens; ++token) {
+        const auto* row = score_values.data() +
+                          static_cast<size_t>(token) * num_experts;
+        float max_score = -1.0e30f;
+        for (int expert = 0; expert < num_experts; ++expert) {
+            max_score = std::max(max_score, static_cast<float>(row[expert]));
         }
-    });
+        std::vector<std::pair<float, int>> ranked(
+            static_cast<size_t>(num_experts));
+        float probability_sum = 0.0f;
+        for (int expert = 0; expert < num_experts; ++expert) {
+            const float value =
+                std::exp(static_cast<float>(row[expert]) - max_score);
+            ranked[static_cast<size_t>(expert)] = {value, expert};
+            probability_sum += value;
+        }
+        const float inv_probability_sum = 1.0f / probability_sum;
+        for (auto& [value, expert] : ranked) {
+            (void)expert;
+            value *= inv_probability_sum;
+        }
+        std::partial_sort(
+            ranked.begin(), ranked.begin() + top_k, ranked.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.first > rhs.first;
+            });
+        float selected_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            selected_sum += ranked[static_cast<size_t>(k)].first;
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const auto [probability, expert] =
+                ranked[static_cast<size_t>(k)];
+            const size_t output_index =
+                static_cast<size_t>(token) * top_k + k;
+            expert_ids[output_index] = expert;
+            expert_weights[output_index] =
+                probability / selected_sum *
+                static_cast<float>(
+                    per_expert_scale[static_cast<size_t>(expert)]);
+        }
+    }
 }
 
 } // namespace
@@ -791,6 +791,49 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_compute_soft_embeds(
 
     const float* logits_ptr = static_cast<const float*>(logits_f32.data());
     bf16* probs_ptr = static_cast<bf16*>(buf_.probs_bf16.data());
+
+    static const bool use_soft_xmx =
+        aila::env::read_flag("AILA_DG_SOFT_EMBED_XMX", false);
+    if (!use_soft_xmx) {
+        const auto t_sm_start = std::chrono::steady_clock::now();
+        ctx.queue().parallel_for(
+            sycl::range<1>(static_cast<size_t>(canvas_len)),
+            [=](sycl::id<1> idx) {
+                const int row = static_cast<int>(idx[0]);
+                const float* src = logits_ptr + static_cast<size_t>(row) * vocab;
+                bf16* dst = probs_ptr + static_cast<size_t>(row) * vocab;
+                float max_logit = -1.0e30f;
+                for (int c = 0; c < vocab; ++c) {
+                    const float value = static_cast<float>(bf16(src[c]));
+                    max_logit = std::max(max_logit, value);
+                }
+                float sum = 0.0f;
+                for (int c = 0; c < vocab; ++c) {
+                    const float value = static_cast<float>(bf16(src[c]));
+                    sum += std::exp(value - max_logit);
+                }
+                const float inv = 1.0f / sum;
+                for (int c = 0; c < vocab; ++c) {
+                    const float value = static_cast<float>(bf16(src[c]));
+                    dst[c] = bf16(std::exp(value - max_logit) * inv);
+                }
+            });
+        const auto t_sm_end = std::chrono::steady_clock::now();
+
+        const auto t_gemm_start = std::chrono::steady_clock::now();
+        buf_.soft_embed.forward(ctx, buf_.probs_bf16, buf_.soft_embeds,
+                                canvas_len);
+        const auto t_gemm_end = std::chrono::steady_clock::now();
+
+        ops::scale_inplace(ctx, buf_.soft_embeds, embed_scale_,
+                           canvas_len * hidden);
+
+        last_soft_embed_timing_.softmax_submit_ms =
+            std::chrono::duration<double, std::milli>(t_sm_end - t_sm_start).count();
+        last_soft_embed_timing_.gemm_submit_ms =
+            std::chrono::duration<double, std::milli>(t_gemm_end - t_gemm_start).count();
+        return buf_.soft_embeds;
+    }
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shared_max(sycl::range<1>(256), cgh);
         sycl::local_accessor<float, 1> shared_sum(sycl::range<1>(256), cgh);
@@ -1184,6 +1227,8 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                          aila::env::read_flag("AILA_PROFILE_DG", false);
     const bool trace_moe =
         aila::env::read_flag("AILA_DG_MOE_TRACE", false);
+    const bool debug_probes =
+        aila::env::read_flag("AILA_DG_DEBUG_PROBES", false);
     const auto profile_start = std::chrono::steady_clock::now();
     auto profile_mark = profile_start;
     const auto record_phase = [&](double& target_ms) {
@@ -1501,24 +1546,32 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
         if (moe_batched) {
-            moe->forward_batched_gpu(ctx, buf_.normed, buf_.moe_transfer,
-                                     buf_.moe_token_ids, buf_.moe_gpu_ref,
-                                     expert_ids, expert_weights, seq_len,
-                                     tc.top_k_experts);
-            compare_moe_outputs("batched_gpu", buf_.moe_gpu_ref);
+            std::vector<bf16> batched_out;
+            moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+                                 buf_.moe_token_ids, expert_ids, expert_weights,
+                                 batched_out, seq_len, tc.top_k_experts);
+            ctx.memcpy_h2d(buf_.moe_gpu_ref.data(), batched_out.data(),
+                           batched_out.size() * sizeof(bf16));
+            compare_moe_outputs("batched", buf_.moe_gpu_ref);
         }
-    } else if (moe_batched) {
-        trace_point("batched begin");
+    } else if (moe_gpu) {
+        trace_point("gpu moe begin");
         moe->forward_batched_gpu(ctx, buf_.normed, buf_.moe_transfer,
                                  buf_.moe_token_ids, buf_.moe_device_out,
                                  expert_ids, expert_weights, seq_len,
                                  tc.top_k_experts);
         record_phase(profile_totals_.moe_ms);
-        trace_point("batched done");
-    } else if (moe_gpu) {
-        moe->forward_gpu(ctx, buf_.normed, buf_.moe_device_out, expert_ids,
-                         expert_weights, seq_len, tc.top_k_experts);
+        trace_point("gpu moe done");
+    } else if (moe_batched) {
+        trace_point("batched begin");
+        std::vector<bf16> moe_output;
+        moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+                             buf_.moe_token_ids, expert_ids, expert_weights,
+                             moe_output, seq_len, tc.top_k_experts);
         record_phase(profile_totals_.moe_ms);
+        ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
+                       moe_output.size() * sizeof(bf16));
+        trace_point("batched done");
     } else {
         std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
         ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
@@ -1545,9 +1598,12 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     ops::scale_inplace(ctx, hidden, layer.layer_scalar,
                        seq_len * hidden_size);
     if (dump_layer0) dump_tensor("hidden_out", hidden);
-    // Local scratch tensors are about to go out of scope; make sure every
-    // asynchronous kernel touching them has completed before they are freed.
-    ctx.synchronize();
+
+    static const bool reuse_sync =
+        aila::env::read_flag("AILA_DG_REUSE_LAYER_SYNC", false);
+    if (reuse_sync || profile || debug_probes) {
+        ctx.synchronize();
+    }
     if (profile) {
         const auto now = std::chrono::steady_clock::now();
         profile_totals_.post_ms +=

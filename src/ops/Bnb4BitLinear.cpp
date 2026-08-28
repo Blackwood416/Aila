@@ -699,6 +699,7 @@ void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
                 if (lid < 16) {
                     qmap_slm[lid] = quant_map_ptr[lid];
                 }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
                 joint_matrix_fill(sg, sub_c, 0.0f);
@@ -900,7 +901,7 @@ void packed_nf4_gemm_bf16(Context& ctx,
     }();
     if (use_a770_bm64) {
         // [DISPATCH] A770 XMX Joint Matrix: hardware DPAS Matrix Engine acceleration (23x faster than ALU)
-        static const bool use_xmx = aila::env::read_flag("AILA_BNB4_GEMM_XMX", true);
+        static const bool use_xmx = aila::env::read_flag("AILA_BNB4_GEMM_XMX", false);
         if (use_xmx && (K % 16 == 0) && (N <= 32768) && (K <= 16384) && (blocksize <= 64)) {
             if (M >= 64 && N >= 64) {
                 packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
@@ -2128,6 +2129,48 @@ void Bnb4GroupedMoE::dequant_subset(Context& ctx, const ExpertWeightSet& set,
         });
 }
 
+void Bnb4GroupedMoE::build_route_layout(
+    const std::vector<int>& expert_ids,
+    const std::vector<float>& expert_weights,
+    int tokens, int top_k) {
+    const int total_rows = tokens * top_k;
+    route_counts_.assign(static_cast<size_t>(num_experts_), 0);
+    route_offsets_.assign(static_cast<size_t>(num_experts_) + 1, 0);
+    route_cursors_.resize(static_cast<size_t>(num_experts_));
+    route_token_ids_.resize(static_cast<size_t>(total_rows));
+    route_weights_.resize(static_cast<size_t>(total_rows));
+    active_experts_.clear();
+    route_max_rows_ = 0;
+
+    for (int i = 0; i < total_rows; ++i) {
+        const int expert = expert_ids[static_cast<size_t>(i)];
+        route_counts_[static_cast<size_t>(expert)]++;
+    }
+
+    int running_offset = 0;
+    for (int e = 0; e < num_experts_; ++e) {
+        const int count = route_counts_[static_cast<size_t>(e)];
+        route_offsets_[static_cast<size_t>(e)] = running_offset;
+        route_cursors_[static_cast<size_t>(e)] = running_offset;
+        running_offset += count;
+        route_max_rows_ = std::max(route_max_rows_, count);
+        if (count > 0) {
+            active_experts_.push_back(e);
+        }
+    }
+    route_offsets_[static_cast<size_t>(num_experts_)] = running_offset;
+
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            const int idx = t * top_k + k;
+            const int expert = expert_ids[static_cast<size_t>(idx)];
+            const int pos = route_cursors_[static_cast<size_t>(expert)]++;
+            route_token_ids_[static_cast<size_t>(pos)] = t;
+            route_weights_[static_cast<size_t>(pos)] = expert_weights[static_cast<size_t>(idx)];
+        }
+    }
+}
+
 void Bnb4GroupedMoE::forward(Context& ctx,
                              const std::vector<bf16>& input,
                              const std::vector<int>& expert_ids,
@@ -2163,32 +2206,22 @@ void Bnb4GroupedMoE::forward(Context& ctx,
     }
     diag_mark();
 
-    // HF eager walks expert_hit in ascending expert-id order.  Keep the same
-    // deterministic order because its bf16 index_add accumulation is not
-    // associative.
-    std::map<int, std::vector<std::pair<int, float>>> groups;
-    int max_rows = 0;
-    for (int t = 0; t < tokens; ++t) {
-        for (int k = 0; k < top_k; ++k) {
-            const int idx = t * top_k + k;
-            const int expert = expert_ids[static_cast<size_t>(idx)];
-            auto& list = groups[expert];
-            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
-            max_rows = std::max(max_rows, static_cast<int>(list.size()));
-        }
-    }
+    build_route_layout(expert_ids, expert_weights, tokens, top_k);
     diag_mark();
-    ensure_scratch(ctx, max_rows);
+    ensure_scratch(ctx, route_max_rows_);
     diag_mark();
 
     std::vector<bf16> acc(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
-    std::vector<bf16> gather(static_cast<size_t>(max_rows) * hidden_);
-    std::vector<bf16> row_out(static_cast<size_t>(max_rows) * hidden_);
+    std::vector<bf16> gather(static_cast<size_t>(route_max_rows_) * hidden_);
+    std::vector<bf16> row_out(static_cast<size_t>(route_max_rows_) * hidden_);
 
-    for (const auto& [expert, rows] : groups) {
-        const int count = static_cast<int>(rows.size());
+    for (int expert : active_experts_) {
+        const int count = route_counts_[static_cast<size_t>(expert)];
+        const int offset = route_offsets_[static_cast<size_t>(expert)];
+        const int* group_tokens = route_token_ids_.data() + offset;
+        const float* group_weights = route_weights_.data() + offset;
         for (int r = 0; r < count; ++r) {
-            const int token = rows[static_cast<size_t>(r)].first;
+            const int token = group_tokens[r];
             std::memcpy(gather.data() + static_cast<size_t>(r) * hidden_,
                         input.data() + static_cast<size_t>(token) * hidden_,
                         static_cast<size_t>(hidden_) * sizeof(bf16));
@@ -2219,8 +2252,8 @@ void Bnb4GroupedMoE::forward(Context& ctx,
         diag_section(diag_memcpy_ms);
 
         for (int r = 0; r < count; ++r) {
-            const int token = rows[static_cast<size_t>(r)].first;
-            const float weight = rows[static_cast<size_t>(r)].second;
+            const int token = group_tokens[r];
+            const float weight = group_weights[r];
             bf16* dst = acc.data() + static_cast<size_t>(token) * hidden_;
             const bf16* src_row =
                 row_out.data() + static_cast<size_t>(r) * hidden_;
@@ -2240,7 +2273,7 @@ void Bnb4GroupedMoE::forward(Context& ctx,
         std::fprintf(stderr,
             "[MoE diag] tokens=%d top_k=%d groups=%zu dequant=%.2f ms "
             "matmul=%.2f ms memcpy=%.2f ms host=%.2f ms other=%.2f ms\n",
-            tokens, top_k, groups.size(), diag_dequant_ms, diag_matmul_ms,
+            tokens, top_k, active_experts_.size(), diag_dequant_ms, diag_matmul_ms,
             diag_memcpy_ms, diag_host_ms, diag_other_ms);
     }
 }
@@ -2257,19 +2290,8 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
         throw std::runtime_error("Bnb4GroupedMoE::forward_gpu: shape mismatch");
     }
 
-    // Same sorted-expert grouping as forward().
-    std::map<int, std::vector<std::pair<int, float>>> groups;
-    int max_rows = 0;
-    for (int t = 0; t < tokens; ++t) {
-        for (int k = 0; k < top_k; ++k) {
-            const int idx = t * top_k + k;
-            const int expert = expert_ids[static_cast<size_t>(idx)];
-            auto& list = groups[expert];
-            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
-            max_rows = std::max(max_rows, static_cast<int>(list.size()));
-        }
-    }
-    ensure_scratch(ctx, max_rows);
+    build_route_layout(expert_ids, expert_weights, tokens, top_k);
+    ensure_scratch(ctx, route_max_rows_);
 
     bf16* input_ptr = input.data_as<bf16>();
     bf16* output_ptr = output.data_as<bf16>();
@@ -2281,21 +2303,15 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
     // acc[token][h] starts at bf16 zero (all-zero bytes).
     ctx.queue().memset(output_ptr, 0,
                        static_cast<size_t>(tokens) * hidden_ * sizeof(bf16));
-    std::vector<int> token_ids;
-    std::vector<float> group_weights;
-    token_ids.reserve(max_rows);
-    group_weights.reserve(max_rows);
     sycl::event last_token_copy;
     sycl::event last_weight_copy;
     bool have_pending_copy = false;
-    for (const auto& [expert, rows] : groups) {
-        const int count = static_cast<int>(rows.size());
-        token_ids.clear();
-        group_weights.clear();
-        for (int r = 0; r < count; ++r) {
-            token_ids.push_back(rows[static_cast<size_t>(r)].first);
-            group_weights.push_back(rows[static_cast<size_t>(r)].second);
-        }
+    for (int expert : active_experts_) {
+        const int count = route_counts_[static_cast<size_t>(expert)];
+        const int offset = route_offsets_[static_cast<size_t>(expert)];
+        const int* group_tokens = route_token_ids_.data() + offset;
+        const float* group_weights = route_weights_.data() + offset;
+
         // Wait only for the previous group's copies so the host can reuse the
         // source vectors; the in-order queue keeps the current copies ahead
         // of the kernels that consume them.
@@ -2304,10 +2320,10 @@ void Bnb4GroupedMoE::forward_gpu(Context& ctx, Tensor& input, Tensor& output,
             last_weight_copy.wait();
         }
         last_token_copy = ctx.memcpy_h2d_async(
-            tokens_ptr, token_ids.data(),
+            tokens_ptr, group_tokens,
             static_cast<size_t>(count) * sizeof(int));
         last_weight_copy = ctx.memcpy_h2d_async(
-            weights_ptr, group_weights.data(),
+            weights_ptr, group_weights,
             static_cast<size_t>(count) * sizeof(float));
         have_pending_copy = true;
 
@@ -2408,6 +2424,7 @@ void run_grouped_moe_gemm_single_launch(
                 if (lid < 16) {
                     qmap_slm[lid] = quant_map[lid];
                 }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
                 joint_matrix_fill(sg, sub_c, 0.0f);
@@ -2760,7 +2777,7 @@ void Bnb4GroupedMoE::forward_batched_impl(
     const std::vector<float>& expert_weights, std::vector<bf16>& output,
     int tokens, int top_k) {
     static const bool moe_gpu =
-        aila::env::read_flag("AILA_DG_MOE_GPU", true);
+        aila::env::read_flag("AILA_DG_MOE_GPU", false);
     if (moe_gpu) {
         Tensor dev_out = Tensor::allocate(ctx, {tokens, hidden_},
                                           dnnl::memory::data_type::bf16);
@@ -2783,33 +2800,10 @@ void Bnb4GroupedMoE::forward_batched_impl(
             "Bnb4GroupedMoE::forward_batched: transfer buffer too small");
     }
 
-    // Same sorted-expert grouping as forward().
-    std::map<int, std::vector<std::pair<int, float>>> groups;
-    int max_rows = 0;
-    for (int t = 0; t < tokens; ++t) {
-        for (int k = 0; k < top_k; ++k) {
-            const int idx = t * top_k + k;
-            const int expert = expert_ids[static_cast<size_t>(idx)];
-            auto& list = groups[expert];
-            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
-            max_rows = std::max(max_rows, static_cast<int>(list.size()));
-        }
-    }
-    ensure_scratch(ctx, max_rows);
+    build_route_layout(expert_ids, expert_weights, tokens, top_k);
+    ensure_scratch(ctx, route_max_rows_);
 
-    std::vector<int> flat_token_ids;
-    flat_token_ids.reserve(static_cast<size_t>(total_rows));
-    std::vector<int> group_offsets;
-    group_offsets.reserve(groups.size());
-    for (const auto& [expert, rows] : groups) {
-        (void)expert;
-        group_offsets.push_back(static_cast<int>(flat_token_ids.size()));
-        for (const auto& [token, weight] : rows) {
-            (void)weight;
-            flat_token_ids.push_back(token);
-        }
-    }
-    ctx.memcpy_h2d(token_ids_dev.data(), flat_token_ids.data(),
+    ctx.memcpy_h2d(token_ids_dev.data(), route_token_ids_.data(),
                    static_cast<size_t>(total_rows) * sizeof(int));
 
     const bf16* input_ptr = input.data_as<bf16>();
@@ -2820,10 +2814,9 @@ void Bnb4GroupedMoE::forward_batched_impl(
 
     std::vector<bf16> acc(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
     std::vector<bf16> host_out(static_cast<size_t>(total_rows) * hidden_);
-    int group_index = 0;
-    for (const auto& [expert, rows] : groups) {
-        const int count = static_cast<int>(rows.size());
-        const int offset = group_offsets[static_cast<size_t>(group_index)];
+    for (int expert : active_experts_) {
+        const int count = route_counts_[static_cast<size_t>(expert)];
+        const int offset = route_offsets_[static_cast<size_t>(expert)];
         Tensor src_view = Tensor::view(
             ctx, transfer_ptr + static_cast<size_t>(offset) * hidden_,
             {count, hidden_}, dnnl::memory::data_type::bf16);
@@ -2843,22 +2836,21 @@ void Bnb4GroupedMoE::forward_batched_impl(
         run_matmul(ctx, count, down_in_features_, hidden_,
                    static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
                    dst_view);
-        ++group_index;
     }
 
     ctx.memcpy_d2h(host_out.data(), transfer.data(),
                    host_out.size() * sizeof(bf16));
 
-    group_index = 0;
-    for (const auto& [expert, rows] : groups) {
-        (void)expert;
-        const int count = static_cast<int>(rows.size());
-        const int offset = group_offsets[static_cast<size_t>(group_index)];
+    for (int expert : active_experts_) {
+        const int count = route_counts_[static_cast<size_t>(expert)];
+        const int offset = route_offsets_[static_cast<size_t>(expert)];
         const bf16* src_row =
             host_out.data() + static_cast<size_t>(offset) * hidden_;
+        const int* group_tokens = route_token_ids_.data() + offset;
+        const float* group_weights = route_weights_.data() + offset;
         for (int r = 0; r < count; ++r) {
-            const int token = rows[static_cast<size_t>(r)].first;
-            const float weight = rows[static_cast<size_t>(r)].second;
+            const int token = group_tokens[r];
+            const float weight = group_weights[r];
             bf16* dst = acc.data() + static_cast<size_t>(token) * hidden_;
             for (int h = 0; h < hidden_; ++h) {
                 const bf16 contribution =
@@ -2868,7 +2860,6 @@ void Bnb4GroupedMoE::forward_batched_impl(
                               static_cast<float>(contribution));
             }
         }
-        ++group_index;
     }
 
     output = std::move(acc);
