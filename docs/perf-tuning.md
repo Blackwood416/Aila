@@ -228,6 +228,86 @@ Measured negative results (kept for reference):
   orientation; only the K=2816 logits projection selects the fast systolic
   path. The K=262144 contraction has no oneDNN fast path on this stack.
 
+### 2026-08-27 next-round A770 candidates
+
+The DiffusionGemma decoder now has one persistent raw attention-scratch arena
+(`q/k/v`, attention output, full K/V, mask, and scores). Each layer creates a
+compact row-major view with its exact current geometry, so the full-attention
+and sliding-attention layouts remain unchanged. `AILA_DG_REUSE_LAYER_SCRATCH`
+defaults to `1`; setting it to `0` restores the per-layer allocation path.
+After the reuse-only gate passed, `AILA_DG_REUSE_LAYER_SYNC=0` became the
+production default and removes the layer-tail queue drain. Setting it to `1`
+keeps the staged synchronization while diagnosing stale USM data. Both A/B
+paths produced the same committed stream and no NaN/Inf values.
+
+Fresh-process 25-step runs (seed 42, canvas 256, warmup enabled, no profile or
+tensor dump) were interleaved as follows:
+
+| Path | Samples (s) | Median (s) | Peak MiB |
+|------|-------------|------------|----------|
+| fallback: scratch alloc + old softmax | 77.27, 77.54, 77.50 | 77.50 | 14713.79 |
+| default: persistent scratch + no layer sync + in-place softmax | 73.66, 73.67, 73.92 | 73.67 | 14715.93 |
+
+The default candidate is 4.9% faster than this fresh fallback and 16.7% below
+the handoff's 88.45 s baseline, staying well below the 84.03 s candidate line.
+Every full run preserved the target committed-token SHA256
+`A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`.
+The resident-memory delta was about 17 MiB in these runs (inside the
+256 MiB gate); the exact amount depends on the allocator's prior per-layer
+high-water mark.
+
+The in-place softmax rounds logits to bf16 first, computes max and exp in a
+parallel kernel, accumulates the denominator in the historical ascending
+column order, and writes bf16 probabilities. It reuses the dead f32 logits
+buffer, then leaves the oneDNN soft-embedding `ab` contraction unchanged.
+`AILA_DG_SOFTMAX_INPLACE=0` restores the old row-serial implementation.
+`AILA_DG_TOKEN_DUMP=<file>` records only the committed int32 stream, avoiding
+the synchronization and tensor writes associated with `AILA_DG_DUMP_DIR`.
+For direct row-0 probability/embedding A/B inspection, the debug-only
+`AILA_DG_SOFTMAX_DUMP_DIR=<dir>` switch writes the original logits, bf16
+probabilities, and soft embedding; it intentionally adds one synchronization
+and does not enable decoder tensor dumps.
+
+The B-only v2 SLM K-chunk-major swizzle is retained as an opt-in experiment
+(`AILA_BNB4_GEMM_V2_SWIZZLE=1`) but is not enabled by default. The four-shape
+20-sample sweep (three warmups, milliseconds shown as p10/median/p90) was:
+
+| MxNxK | old v2 | B-swizzle v2 |
+|-------|--------|--------------|
+| 256x2816x2112 | 5.84/5.99/6.45 | 5.88/5.97/6.49 |
+| 256x2112x2816 | 7.68/7.73/8.23 | 7.65/7.71/8.36 |
+| 256x1024x2816 | 7.63/7.68/8.23 | 7.58/7.63/8.15 |
+| 256x4224x2816 | 11.08/11.24/11.72 | 11.03/11.21/11.74 |
+
+The fresh run shows only sub-percent changes, far below the required weighted
+8% improvement; earlier isolated runs also showed shape-sensitive variance,
+so the candidate remains opt-in. The real-weight bitwise test passes for both
+layouts.
+
+MoE routing now uses a fixed 128-expert stable counting layout shared by the
+host, batched, and GPU variants; it preserves ascending expert order and the
+original token/top-k insertion order without `std::map` allocations.
+`AILA_DG_MOE_ROUTE_HIST=1` prints the observed M histogram. The real harness
+showed many M=1--5 experts plus a small number of heavily loaded experts
+(roughly M=120--255 for a 256-token canvas), and the batched path remained
+bitwise identical to the host reference. A grouped NF4 small-M kernel was not
+merged: no candidate yet meets the real-weight exactness gate.
+
+`AILA_DG_STEP_TIMING=1` now reports input H2D, decoder submission and logits
+D2H wait, argmax, entropy, gumbel, accept/renoise, host total, softmax and
+soft-embedding submission windows, soft-embed D2H wait, and total. The
+submission windows intentionally add no queue synchronization; the blocking
+D2H buckets include the corresponding asynchronous device execution.
+
+The synchronized profile path still reproduced the known A770 Level-Zero
+`UR_RESULT_ERROR_DEVICE_LOST` during warmup, and decoder tensor dumping can
+terminate with the existing `0xC0000005` diagnostic-path fault. Neither path is
+used as a production performance gate; unprofiled production runs and the
+InferRef NF4 GEMM test remain stable.
+The new softmax-only dump uses the same explicit-sync diagnostic route; after
+the driver entered that faulted state it produced no files, so rerun the direct
+probability/embedding gate after an adapter reset.
+
 ## Benchmark Methodology
 
 1. **Always warm up**: First iteration is up to 10% slower due to GPU cold state and oneDNN JIT compilation.

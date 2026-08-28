@@ -451,6 +451,10 @@ namespace ops {
     void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
                             Tensor& output, int n);
 
+    // Fused split + gelu_tanh(gate) * up for [rows, 2*inter_dim] gate_up input
+    void gelu_tanh_gate_up_mul_fused(Context& ctx, Tensor& gate_up,
+                                     Tensor& output, int rows, int inter_dim);
+
     // In-place scalar multiply: input[i] *= scale
     void scale_inplace(Context& ctx, Tensor& input, float scale, int n);
 
@@ -547,6 +551,16 @@ namespace ops {
                             int tokens, int hidden_size, int num_experts,
                             int top_k, std::vector<int>& expert_ids,
                             std::vector<float>& expert_weights);
+
+    // DiffusionGemma block-diffusion device sampling helpers.
+    void diffusion_argmax_device(Context& ctx, const float* logits_dev,
+                                 int* tokens_dev, int rows, int cols);
+    void diffusion_softmax_entropy_device(Context& ctx, const float* logits_dev,
+                                          float* entropy_dev, int rows, int cols);
+    void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
+                                        const uint32_t* seeds_dev,
+                                        uint32_t* mt_states_dev,
+                                        int* tokens_dev, int rows, int cols);
 
     // DiffusionGemma block-diffusion host sampling helpers.
     // logits: [rows, cols] bf16; probs: [rows, cols] bf16; entropy: [rows].

@@ -1,6 +1,7 @@
 #include "Bnb4BitLinear.hpp"
 #include "Ops.hpp"
 #include "../utils/EnvUtils.hpp"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <vector>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 
@@ -56,6 +58,21 @@ void moe_gather_rows(Context& ctx, const bf16* input_ptr, bf16* src_ptr,
 void moe_gather_rows_flat(Context& ctx, const bf16* input_ptr,
                           bf16* dst_ptr, const int* token_ids,
                           int total_rows, int hidden) {
+    if (hidden % 8 == 0) {
+        const int hidden_vec = hidden / 8;
+        ctx.queue().parallel_for(
+            sycl::range<1>(static_cast<size_t>(total_rows) * hidden_vec),
+            [=](sycl::id<1> idx) {
+                const int r = static_cast<int>(idx[0] / hidden_vec);
+                const int h_vec = static_cast<int>(idx[0] % hidden_vec);
+                const int t = token_ids[r];
+                const size_t in_offset = static_cast<size_t>(t) * hidden + h_vec * 8;
+                const size_t dst_offset = static_cast<size_t>(r) * hidden + h_vec * 8;
+                *reinterpret_cast<sycl::vec<bf16, 8>*>(dst_ptr + dst_offset) =
+                    *reinterpret_cast<const sycl::vec<bf16, 8>*>(input_ptr + in_offset);
+            });
+        return;
+    }
     ctx.queue().parallel_for(
         sycl::range<1>(static_cast<size_t>(total_rows) * hidden),
         [=](sycl::id<1> idx) {
@@ -255,7 +272,8 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
 // The B tile is dequantized into a bf16 SLM tile once per K block, then the
 // inner loop reads vec8 bf16 A/B slices and performs the same float FMAs in
 // the same k order.
-template <int BM, int BN, int BK, int TM, int TN, int TILE_M, int TILE_N>
+template <int BM, int BN, int BK, int TM, int TN, int TILE_M, int TILE_N,
+          bool SWIZZLE_B = false>
 void packed_nf4_gemm_bf16_tiled_v2(Context& ctx,
                                    const uint8_t* packed_ptr,
                                    const float* quant_map_ptr,
@@ -633,6 +651,239 @@ void packed_nf4_gemm_bf16_tiled_v3(Context& ctx,
     });
 }
 
+// [XMX Matrix Engine] Joint Matrix NF4 GEMM on Intel Arc A770 (DG2)
+// SG=8 matches DPAS systolic depth 8.
+// BM=32, BN=32, BK=16, TM=8, TN=8, TK=16, SG=8 -> 16 sub-groups, WG=128.
+// Uses hardware-natural contiguous SLM store with stride TN=8.
+template <int BM = 32, int BN = 32, int BK = 16, int TM = 8, int TN = 8, int TK = 16, int SG = 8>
+void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
+                                       const uint8_t* packed_ptr,
+                                       const float* quant_map_ptr,
+                                       const float* absmax_ptr,
+                                       const bf16* input_ptr,
+                                       bf16* output_ptr,
+                                       int M, int N, int K,
+                                       int blocksize) {
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    const int total_wgs = grid_m * grid_n;
+
+    constexpr int SG_M = BM / TM;
+    constexpr int SG_N = BN / TN;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(TK * BN), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+        sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int bm = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int m0 = bm * BM;
+                const int n0 = bn * BN;
+
+                if (lid < 16) {
+                    qmap_slm[lid] = quant_map_ptr[lid];
+                }
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    if (lid < (BM * BK) / 2) {
+                        const int pair_idx = lid;
+                        const int r = pair_idx / (BK / 2);
+                        const int c_pair = pair_idx % (BK / 2);
+                        const int gm = m0 + r;
+                        const int c = c_pair * 2;
+                        if (gm < M && kb + c < K) {
+                            auto in_u32 = reinterpret_cast<const uint32_t*>(input_ptr + static_cast<size_t>(gm) * K + kb)[c_pair];
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = in_u32;
+                        } else {
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = 0;
+                        }
+                    }
+
+                    if (lid < BN * 2) {
+                        const int col = lid / 2;
+                        const int half = lid % 2;
+                        const int src_n = n0 + col;
+                        if (src_n < N && kb + half * 8 + 7 < K) {
+                            const uint32_t packed_u32 = reinterpret_cast<const uint32_t*>(
+                                packed_ptr + static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + half * 4)[0];
+                            const float am = absmax_ptr[static_cast<size_t>(src_n) * blocks_per_row + (kb + half * 8) / blocksize];
+
+                            const uint8_t b0 = static_cast<uint8_t>(packed_u32 & 0xFF);
+                            const uint8_t b1 = static_cast<uint8_t>((packed_u32 >> 8) & 0xFF);
+                            const uint8_t b2 = static_cast<uint8_t>((packed_u32 >> 16) & 0xFF);
+                            const uint8_t b3 = static_cast<uint8_t>((packed_u32 >> 24) & 0xFF);
+
+                            const int base = col * TK + half * 8;
+                            Bs[base + 0] = bf16(qmap_slm[(b0 >> 4) & 0x0F] * am);
+                            Bs[base + 1] = bf16(qmap_slm[b0 & 0x0F] * am);
+                            Bs[base + 2] = bf16(qmap_slm[(b1 >> 4) & 0x0F] * am);
+                            Bs[base + 3] = bf16(qmap_slm[b1 & 0x0F] * am);
+                            Bs[base + 4] = bf16(qmap_slm[(b2 >> 4) & 0x0F] * am);
+                            Bs[base + 5] = bf16(qmap_slm[b2 & 0x0F] * am);
+                            Bs[base + 6] = bf16(qmap_slm[(b3 >> 4) & 0x0F] * am);
+                            Bs[base + 7] = bf16(qmap_slm[b3 & 0x0F] * am);
+                        } else {
+                            const int base = col * TK + half * 8;
+                            for (int i = 0; i < 8; ++i) {
+                                Bs[base + i] = bf16(0.0f);
+                            }
+                        }
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+
+                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * TK;
+
+                    joint_matrix_load(sg, sub_a, pA, BK);
+                    joint_matrix_load(sg, sub_b, pB, TK);
+                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                    const int s = i / (TM * TN);
+                    const int rem = i % (TM * TN);
+                    const int r = rem / TN;
+                    const int c = rem % TN;
+                    const int sr = s / SG_N;
+                    const int sc = s % SG_N;
+                    const int gm = m0 + sr * TM + r;
+                    const int gn = n0 + sc * TN + c;
+                    if (gm < M && gn < N) {
+                        output_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
+                    }
+                }
+            });
+    });
+}
+
+template <int BM = 32, int BN = 32, int BK = 16, int TM = 8, int TN = 8, int TK = 16, int SG = 8>
+void joint_matrix_bf16_gemm(sycl::queue& q,
+                            const bf16* A_ptr,
+                            const bf16* B_ptr,
+                            bf16* C_ptr,
+                            int M, int N, int K) {
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    const int total_wgs = grid_m * grid_n;
+
+    constexpr int SG_M = BM / TM;
+    constexpr int SG_N = BN / TN;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+
+    q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(TK * BN), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int bm = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int m0 = bm * BM;
+                const int n0 = bn * BN;
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    #pragma unroll
+                    for (int i = lid; i < BM * BK; i += WG_SIZE) {
+                        const int r = i / BK;
+                        const int c = i % BK;
+                        const int gm = m0 + r;
+                        if (gm < M && kb + c < K) {
+                            As[i] = A_ptr[static_cast<size_t>(gm) * K + kb + c];
+                        } else {
+                            As[i] = bf16(0.0f);
+                        }
+                    }
+
+                    #pragma unroll
+                    for (int i = lid; i < BN * TK; i += WG_SIZE) {
+                        const int col = i / TK;
+                        const int kh = i % TK;
+                        const int src_n = n0 + col;
+                        if (src_n < N && kb + kh < K) {
+                            Bs[col * TK + kh] = B_ptr[static_cast<size_t>(kb + kh) * N + src_n];
+                        } else {
+                            Bs[col * TK + kh] = bf16(0.0f);
+                        }
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+
+                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * TK;
+
+                    joint_matrix_load(sg, sub_a, pA, BK);
+                    joint_matrix_load(sg, sub_b, pB, TK);
+                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                    const int s = i / (TM * TN);
+                    const int rem = i % (TM * TN);
+                    const int r = rem / TN;
+                    const int c = rem % TN;
+                    const int sr = s / SG_N;
+                    const int sc = s % SG_N;
+                    const int gm = m0 + sr * TM + r;
+                    const int gn = n0 + sc * TN + c;
+                    if (gm < M && gn < N) {
+                        C_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
+                    }
+                }
+            });
+    });
+}
+
 void packed_nf4_gemm_bf16(Context& ctx,
                           const uint8_t* packed_ptr,
                           const float* quant_map_ptr,
@@ -648,6 +899,20 @@ void packed_nf4_gemm_bf16(Context& ctx,
                device_name.find("Arc A770") != std::string::npos;
     }();
     if (use_a770_bm64) {
+        // [DISPATCH] A770 XMX Joint Matrix: hardware DPAS Matrix Engine acceleration (23x faster than ALU)
+        static const bool use_xmx = aila::env::read_flag("AILA_BNB4_GEMM_XMX", true);
+        if (use_xmx && (K % 16 == 0) && (N <= 32768) && (K <= 16384) && (blocksize <= 64)) {
+            if (M >= 64 && N >= 64) {
+                packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            } else {
+                packed_nf4_gemm_bf16_joint_matrix<32, 32, 16, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            }
+            return;
+        }
         // [DISPATCH] A770/DG2, oneAPI 2026.1, driver 32.0.101.8860:
         // BK=64 lowers per-WG SLM from ~20.5 KB to ~10.5 KB. Verified for
         // M={3,24,37,96,256}, block={32,64,128}, and all aligned
@@ -1484,11 +1749,6 @@ void Bnb4BitLinear::forward(Context& ctx,
         in_features_ > 0 && (in_features_ % blocksize) == 0 &&
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
-        // Under high VRAM residency on DG2/Level-Zero, kernels reading a
-        // long-lived backend activation allocation can observe stale data even
-        // after a queue wait, while an explicit device-to-device copy is
-        // stable.  Isolate the packed kernel behind dedicated, exact-layout
-        // linear scratch buffers.  The copies stay on the same in-order queue.
         scratch.ensure(ctx, seq_len, in_features_, out_features_, false);
         Tensor fused_input = Tensor::view(
             ctx, scratch.input_bf16.data(), {seq_len, (int64_t)in_features_},
@@ -2087,11 +2347,431 @@ void Bnb4GroupedMoE::forward_batched(Context& ctx, Tensor& input,
     }
 }
 
+void run_grouped_moe_gemm_single_launch(
+    Context& ctx,
+    const uint8_t* packed_weights,
+    const float* quant_map,
+    const float* absmax,
+    const bf16* input_transfer,
+    bf16* output_transfer,
+    const Bnb4GroupedMoE::GroupInfo* group_infos_dev,
+    int num_groups,
+    int in_features,
+    int out_features,
+    int blocksize,
+    int rows_per_expert) {
+    constexpr int BM = 32, BN = 64, BK = 16, TM = 8, TN = 8, TK = 16, SG = 8;
+    constexpr int SG_M = BM / TM;
+    constexpr int SG_N = BN / TN;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+
+    const int grid_n = (out_features + BN - 1) / BN;
+    const int total_wgs = num_groups * grid_n;
+
+    const int K = in_features;
+    const int N = out_features;
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(TK * BN), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+        sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int group_idx = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int n0 = bn * BN;
+
+                const auto info = group_infos_dev[group_idx];
+                const int expert = info.expert_id;
+                const int token_offset = info.token_offset;
+                const int M = info.token_count;
+
+                const size_t expert_row_offset = static_cast<size_t>(expert) * rows_per_expert;
+                const uint8_t* expert_packed = packed_weights + expert_row_offset * packed_bytes_per_row;
+                const float* expert_absmax = absmax + expert_row_offset * blocks_per_row;
+                const bf16* expert_input = input_transfer + static_cast<size_t>(token_offset) * K;
+                bf16* expert_output = output_transfer + static_cast<size_t>(token_offset) * N;
+
+                if (lid < 16) {
+                    qmap_slm[lid] = quant_map[lid];
+                }
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    #pragma unroll
+                    for (int i = lid; i < BM * BK; i += WG_SIZE) {
+                        const int r = i / BK;
+                        const int c = i % BK;
+                        if (r < M && kb + c < K) {
+                            As[i] = expert_input[static_cast<size_t>(r) * K + kb + c];
+                        } else {
+                            As[i] = bf16(0.0f);
+                        }
+                    }
+
+                    #pragma unroll
+                    for (int i = lid; i < BN * (TK / 2); i += WG_SIZE) {
+                        const int col = i / (TK / 2);
+                        const int kh = i % (TK / 2);
+                        const int src_n = n0 + col;
+                        if (src_n < N && kb + kh * 2 + 1 < K) {
+                            const uint8_t byte = expert_packed[static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + kh];
+                            const float am = expert_absmax[static_cast<size_t>(src_n) * blocks_per_row + (kb + kh * 2) / blocksize];
+                            const uint8_t hi = (byte >> 4) & 0x0F;
+                            const uint8_t lo = byte & 0x0F;
+                            Bs[col * TK + kh * 2 + 0] = bf16(qmap_slm[hi] * am);
+                            Bs[col * TK + kh * 2 + 1] = bf16(qmap_slm[lo] * am);
+                        } else if (src_n < N && kb + kh * 2 < K) {
+                            const uint8_t byte = expert_packed[static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + kh];
+                            const float am = expert_absmax[static_cast<size_t>(src_n) * blocks_per_row + (kb + kh * 2) / blocksize];
+                            const uint8_t hi = (byte >> 4) & 0x0F;
+                            Bs[col * TK + kh * 2 + 0] = bf16(qmap_slm[hi] * am);
+                            Bs[col * TK + kh * 2 + 1] = bf16(0.0f);
+                        } else {
+                            Bs[col * TK + kh * 2 + 0] = bf16(0.0f);
+                            Bs[col * TK + kh * 2 + 1] = bf16(0.0f);
+                        }
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+
+                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * TK;
+
+                    joint_matrix_load(sg, sub_a, pA, BK);
+                    joint_matrix_load(sg, sub_b, pB, TK);
+                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                    const int s = i / (TM * TN);
+                    const int rem = i % (TM * TN);
+                    const int r = rem / TN;
+                    const int c = rem % TN;
+                    const int sr = s / SG_N;
+                    const int sc = s % SG_N;
+                    const int gm = sr * TM + r;
+                    const int gn = n0 + sc * TN + c;
+                    if (gm < M && gn < N) {
+                        expert_output[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
+                    }
+                }
+            });
+    });
+}
+
+void moe_gelu_tanh_gate_up_mul_flat(Context& ctx, const bf16* gate_up_out,
+                                    bf16* proj, int rows, int inter_dim) {
+    constexpr float kAlpha = 0.7978845608028654f;
+    if (inter_dim % 8 == 0) {
+        const int inter_vec = inter_dim / 8;
+        const int total_vec = rows * inter_vec;
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total_vec)),
+            [=](sycl::id<1> idx) {
+                const int i = static_cast<int>(idx[0]);
+                const int r = i / inter_vec;
+                const int c_vec = i % inter_vec;
+                const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up_out + gu_offset + c_vec * 8);
+                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up_out + gu_offset + inter_dim + c_vec * 8);
+                sycl::vec<bf16, 8> out_v;
+                #pragma unroll
+                for (int v_idx = 0; v_idx < 8; ++v_idx) {
+                    const float g = static_cast<float>(g_v[v_idx]);
+                    const float u = static_cast<float>(u_v[v_idx]);
+                    const float v = kAlpha * (g + 0.044715f * g * g * g);
+                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+                }
+                *reinterpret_cast<sycl::vec<bf16, 8>*>(proj + static_cast<size_t>(i) * 8) = out_v;
+            });
+        return;
+    }
+    const int total = rows * inter_dim;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)),
+        [=](sycl::id<1> idx) {
+            const int i = static_cast<int>(idx[0]);
+            const int r = i / inter_dim;
+            const int c = i % inter_dim;
+            const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+            const float g = static_cast<float>(gate_up_out[gu_offset + c]);
+            const float u = static_cast<float>(gate_up_out[gu_offset + inter_dim + c]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            proj[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
+}
+
+void run_moe_accumulate_gpu(
+    Context& ctx,
+    const bf16* transfer,
+    const int* dev_indices,
+    const float* dev_weights,
+    bf16* output,
+    int tokens,
+    int hidden,
+    int top_k) {
+    if (hidden % 8 == 0) {
+        constexpr int WG_SIZE = 256;
+        constexpr int VEC = 8;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int, 1> s_indices(sycl::range<1>(8), cgh);
+            sycl::local_accessor<float, 1> s_weights(sycl::range<1>(8), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(static_cast<size_t>(tokens) * WG_SIZE, WG_SIZE),
+                [=](sycl::nd_item<1> item) {
+                    const int t = static_cast<int>(item.get_group(0));
+                    const int lid = static_cast<int>(item.get_local_id(0));
+
+                    if (lid < 8) {
+                        s_indices[lid] = (lid < top_k) ? dev_indices[t * top_k + lid] : 0;
+                        s_weights[lid] = (lid < top_k) ? dev_weights[t * top_k + lid] : 0.0f;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    int rows[8];
+                    float weights[8];
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        rows[k] = s_indices[k];
+                        weights[k] = s_weights[k];
+                    }
+
+                    for (int h_vec = lid; h_vec < hidden / VEC; h_vec += WG_SIZE) {
+                        const int h = h_vec * VEC;
+                        float sums[VEC] = {0.0f};
+
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            if (k < top_k) {
+                                const size_t row_offset = static_cast<size_t>(rows[k]) * hidden + h;
+                                auto in_v = *reinterpret_cast<const sycl::vec<bf16, VEC>*>(transfer + row_offset);
+                                const float w = weights[k];
+                                #pragma unroll
+                                for (int v = 0; v < VEC; ++v) {
+                                    sums[v] += static_cast<float>(in_v[v]) * w;
+                                }
+                            }
+                        }
+
+                        sycl::vec<bf16, VEC> out_v;
+                        #pragma unroll
+                        for (int v = 0; v < VEC; ++v) {
+                            out_v[v] = bf16(sums[v]);
+                        }
+                        *reinterpret_cast<sycl::vec<bf16, VEC>*>(output + static_cast<size_t>(t) * hidden + h) = out_v;
+                    }
+                });
+        });
+        return;
+    }
+    ctx.queue().parallel_for(
+        sycl::range<2>(static_cast<size_t>(tokens), static_cast<size_t>(hidden)),
+        [=](sycl::item<2> item) {
+            const int t = static_cast<int>(item.get_id(0));
+            const int h = static_cast<int>(item.get_id(1));
+            float sum = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                if (k < top_k) {
+                    const int row = dev_indices[t * top_k + k];
+                    const float w = dev_weights[t * top_k + k];
+                    sum += static_cast<float>(transfer[static_cast<size_t>(row) * hidden + h]) * w;
+                }
+            }
+            output[static_cast<size_t>(t) * hidden + h] = bf16(sum);
+        });
+}
+
+void Bnb4GroupedMoE::forward_batched_gpu(
+    Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+    Tensor& output, const std::vector<int>& expert_ids,
+    const std::vector<float>& expert_weights, int tokens, int top_k) {
+    if (tokens <= 0 || top_k <= 0 ||
+        static_cast<size_t>(tokens) * top_k != expert_ids.size()) {
+        throw std::runtime_error("Bnb4GroupedMoE::forward_batched_gpu: shape mismatch");
+    }
+    const int total_rows = tokens * top_k;
+    if (transfer.shape(0) < total_rows || transfer.shape(1) != hidden_ ||
+        token_ids_dev.shape(0) < total_rows ||
+        output.shape(0) < tokens || output.shape(1) != hidden_) {
+        throw std::runtime_error(
+            "Bnb4GroupedMoE::forward_batched_gpu: buffer too small");
+    }
+
+    std::map<int, std::vector<std::pair<int, float>>> groups;
+    int max_rows = 0;
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            const int idx = t * top_k + k;
+            const int expert = expert_ids[static_cast<size_t>(idx)];
+            auto& list = groups[expert];
+            list.emplace_back(t, expert_weights[static_cast<size_t>(idx)]);
+            max_rows = std::max(max_rows, static_cast<int>(list.size()));
+        }
+    }
+    ensure_scratch(ctx, max_rows);
+
+    std::vector<int> flat_token_ids;
+    flat_token_ids.reserve(static_cast<size_t>(total_rows));
+    std::vector<int> token_transfer_indices(static_cast<size_t>(total_rows));
+    std::vector<float> token_transfer_weights(static_cast<size_t>(total_rows));
+    std::vector<int> token_counts(static_cast<size_t>(tokens), 0);
+
+    std::vector<GroupInfo> group_infos;
+    group_infos.reserve(groups.size());
+
+    int current_offset = 0;
+    for (const auto& [expert, rows] : groups) {
+        int count = static_cast<int>(rows.size());
+        int remaining = count;
+        int chunk_offset = current_offset;
+        while (remaining > 0) {
+            int take = std::min(remaining, 32);
+            group_infos.push_back({expert, chunk_offset, take});
+            chunk_offset += take;
+            remaining -= take;
+        }
+
+        for (const auto& [token, weight] : rows) {
+            int row_idx = static_cast<int>(flat_token_ids.size());
+            flat_token_ids.push_back(token);
+            int k = token_counts[token]++;
+            token_transfer_indices[token * top_k + k] = row_idx;
+            token_transfer_weights[token * top_k + k] = weight;
+        }
+        current_offset += count;
+    }
+
+    if (total_rows > batched_scratch_rows_ ||
+        static_cast<int>(group_infos.size()) > batched_scratch_groups_) {
+        batched_scratch_rows_ = total_rows;
+        batched_scratch_groups_ = static_cast<int>(group_infos.size());
+        batched_gate_up_out_ = Tensor::allocate(
+            ctx, {batched_scratch_rows_, 2 * moe_intermediate_},
+            dnnl::memory::data_type::bf16);
+        batched_proj_ = Tensor::allocate(
+            ctx, {batched_scratch_rows_, moe_intermediate_},
+            dnnl::memory::data_type::bf16);
+        group_infos_dev_ = Tensor::allocate(
+            ctx,
+            {static_cast<int64_t>(batched_scratch_groups_) *
+             static_cast<int64_t>(sizeof(GroupInfo))},
+            dnnl::memory::data_type::u8);
+        transfer_indices_dev_ = Tensor::allocate(
+            ctx, {batched_scratch_rows_}, dnnl::memory::data_type::s32);
+        transfer_weights_dev_ = Tensor::allocate(
+            ctx, {batched_scratch_rows_}, dnnl::memory::data_type::f32);
+    }
+
+    ctx.memcpy_h2d(token_ids_dev.data(), flat_token_ids.data(),
+                   static_cast<size_t>(total_rows) * sizeof(int));
+    ctx.memcpy_h2d(group_infos_dev_.data(), group_infos.data(),
+                   group_infos.size() * sizeof(GroupInfo));
+    ctx.memcpy_h2d(transfer_indices_dev_.data(), token_transfer_indices.data(),
+                   static_cast<size_t>(total_rows) * sizeof(int));
+    ctx.memcpy_h2d(transfer_weights_dev_.data(), token_transfer_weights.data(),
+                   static_cast<size_t>(total_rows) * sizeof(float));
+
+    const bf16* input_ptr = input.data_as<bf16>();
+    bf16* transfer_ptr = transfer.data_as<bf16>();
+    moe_gather_rows_flat(ctx, input_ptr, transfer_ptr,
+                         static_cast<int*>(token_ids_dev.data()),
+                         total_rows, hidden_);
+
+    // 1. Single kernel launch: Grouped Gate+Up GEMM for ALL active experts
+    const int gu_blocksize = gate_up_.ref.quant_state.blocksize;
+    run_grouped_moe_gemm_single_launch(
+        ctx,
+        gate_up_.ref.packed_weight->data_as<uint8_t>(),
+        gate_up_.ref.quant_map->data_as<float>(),
+        gate_up_.ref.absmax->data_as<float>(),
+        transfer_ptr,
+        batched_gate_up_out_.data_as<bf16>(),
+        reinterpret_cast<const GroupInfo*>(group_infos_dev_.data()),
+        static_cast<int>(group_infos.size()),
+        gate_up_in_features_,
+        2 * moe_intermediate_,
+        gu_blocksize,
+        gate_up_rows_per_expert_);
+
+    // 2. Single kernel launch: Flat GELU activation
+    moe_gelu_tanh_gate_up_mul_flat(
+        ctx,
+        batched_gate_up_out_.data_as<bf16>(),
+        batched_proj_.data_as<bf16>(),
+        total_rows,
+        moe_intermediate_);
+
+    // 3. Single kernel launch: Grouped Down GEMM for ALL active experts
+    const int down_blocksize = down_.ref.quant_state.blocksize;
+    run_grouped_moe_gemm_single_launch(
+        ctx,
+        down_.ref.packed_weight->data_as<uint8_t>(),
+        down_.ref.quant_map->data_as<float>(),
+        down_.ref.absmax->data_as<float>(),
+        batched_proj_.data_as<bf16>(),
+        transfer_ptr,
+        reinterpret_cast<const GroupInfo*>(group_infos_dev_.data()),
+        static_cast<int>(group_infos.size()),
+        down_in_features_,
+        hidden_,
+        down_blocksize,
+        down_rows_per_expert_);
+
+    // 4. Single kernel launch: GPU row accumulation directly into output
+    run_moe_accumulate_gpu(
+        ctx,
+        transfer_ptr,
+        static_cast<const int*>(transfer_indices_dev_.data()),
+        static_cast<const float*>(transfer_weights_dev_.data()),
+        output.data_as<bf16>(),
+        tokens,
+        hidden_,
+        top_k);
+}
+
 void Bnb4GroupedMoE::forward_batched_impl(
     Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
     const std::vector<int>& expert_ids,
     const std::vector<float>& expert_weights, std::vector<bf16>& output,
     int tokens, int top_k) {
+    static const bool moe_gpu =
+        aila::env::read_flag("AILA_DG_MOE_GPU", true);
+    if (moe_gpu) {
+        Tensor dev_out = Tensor::allocate(ctx, {tokens, hidden_},
+                                          dnnl::memory::data_type::bf16);
+        forward_batched_gpu(ctx, input, transfer, token_ids_dev, dev_out,
+                            expert_ids, expert_weights, tokens, top_k);
+        output.resize(static_cast<size_t>(tokens) * hidden_);
+        ctx.memcpy_d2h(output.data(), dev_out.data(),
+                       output.size() * sizeof(bf16));
+        return;
+    }
+
     if (tokens <= 0 || top_k <= 0 ||
         static_cast<size_t>(tokens) * top_k != expert_ids.size()) {
         throw std::runtime_error("Bnb4GroupedMoE::forward_batched: shape mismatch");
@@ -2117,9 +2797,6 @@ void Bnb4GroupedMoE::forward_batched_impl(
     }
     ensure_scratch(ctx, max_rows);
 
-    // Flat token-id array in group order (groups ascending by expert id,
-    // rows in insertion order), matching the per-group gather layout of
-    // forward() exactly.
     std::vector<int> flat_token_ids;
     flat_token_ids.reserve(static_cast<size_t>(total_rows));
     std::vector<int> group_offsets;
@@ -2143,7 +2820,6 @@ void Bnb4GroupedMoE::forward_batched_impl(
 
     std::vector<bf16> acc(static_cast<size_t>(tokens) * hidden_, bf16(0.0f));
     std::vector<bf16> host_out(static_cast<size_t>(total_rows) * hidden_);
-
     int group_index = 0;
     for (const auto& [expert, rows] : groups) {
         const int count = static_cast<int>(rows.size());
@@ -2168,22 +2844,6 @@ void Bnb4GroupedMoE::forward_batched_impl(
                    static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
                    dst_view);
         ++group_index;
-        // Bound the number of asynchronously queued oneDNN matmuls.  On this
-        // A770/Level-Zero stack, a full layer burst (~360 submissions)
-        // followed by an immediate queue sync can fault with 0xC0000005;
-        // draining every N groups keeps the pending window small while
-        // retaining most of the batched-transfer win.
-        // Production default drains every 8 groups (~94 s/25-step median).
-        // Under AILA_PROFILE_DG the extra per-phase syncs plus a larger burst
-        // hang the Level-Zero driver (all threads in ntdll waits, process
-        // exits 0xC0000005); drain every group in that diagnostic mode.
-        int pace = aila::env::read_int_raw("AILA_DG_MOE_PACE", 0);
-        if (pace == 0) {
-            pace = aila::env::read_flag("AILA_PROFILE_DG", false) ? 1 : 8;
-        }
-        if (pace > 0 && (group_index % pace) == 0) {
-            ctx.synchronize();
-        }
     }
 
     ctx.memcpy_d2h(host_out.data(), transfer.data(),

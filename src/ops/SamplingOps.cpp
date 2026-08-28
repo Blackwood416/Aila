@@ -779,6 +779,234 @@ void diffusion_accept_mask(const float* entropy, int rows, int cols,
     });
 }
 
+void diffusion_argmax_device(Context& ctx, const float* logits_dev,
+                             int* tokens_dev, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return;
+    constexpr int WG = 256;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_val(sycl::range<1>(WG), cgh);
+        sycl::local_accessor<int, 1> local_idx(sycl::range<1>(WG), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(rows) * WG),
+                              sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                const int row = static_cast<int>(item.get_group(0));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const float* rlogits =
+                    logits_dev + static_cast<size_t>(row) * cols;
+
+                float max_val = -1.0e30f;
+                int min_idx = 0;
+                for (int c = lane; c < cols; c += WG) {
+                    const float v = rlogits[c];
+                    if (v > max_val) {
+                        max_val = v;
+                        min_idx = c;
+                    }
+                }
+                local_val[lane] = max_val;
+                local_idx[lane] = min_idx;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int offset = WG / 2; offset > 0; offset >>= 1) {
+                    if (lane < offset) {
+                        const float other_val = local_val[lane + offset];
+                        const int other_idx = local_idx[lane + offset];
+                        if (other_val > local_val[lane] ||
+                            (other_val == local_val[lane] &&
+                             other_idx < local_idx[lane])) {
+                            local_val[lane] = other_val;
+                            local_idx[lane] = other_idx;
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (lane == 0) {
+                    tokens_dev[row] = local_idx[0];
+                }
+            });
+    });
+}
+
+void diffusion_softmax_entropy_device(Context& ctx, const float* logits_dev,
+                                      float* entropy_dev, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return;
+    constexpr int WG = 256;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_max(sycl::range<1>(WG), cgh);
+        sycl::local_accessor<float, 1> local_sum(sycl::range<1>(WG), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(rows) * WG),
+                              sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                const int row = static_cast<int>(item.get_group(0));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const float* rlogits =
+                    logits_dev + static_cast<size_t>(row) * cols;
+
+                float max_val = -1.0e30f;
+                for (int c = lane; c < cols; c += WG) {
+                    max_val = sycl::max(max_val, rlogits[c]);
+                }
+                local_max[lane] = max_val;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int offset = WG / 2; offset > 0; offset >>= 1) {
+                    if (lane < offset) {
+                        local_max[lane] = sycl::max(
+                            local_max[lane], local_max[lane + offset]);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float max_logit = local_max[0];
+                float sum_exp = 0.0f;
+                for (int c = lane; c < cols; c += WG) {
+                    sum_exp += sycl::exp(rlogits[c] - max_logit);
+                }
+                local_sum[lane] = sum_exp;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int offset = WG / 2; offset > 0; offset >>= 1) {
+                    if (lane < offset) {
+                        local_sum[lane] += local_sum[lane + offset];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float inv_sum = 1.0f / local_sum[0];
+                float ent = 0.0f;
+                for (int c = lane; c < cols; c += WG) {
+                    const float p = sycl::exp(rlogits[c] - max_logit) * inv_sum;
+                    if (p > 0.0f) {
+                        ent -= p * sycl::log(p);
+                    }
+                }
+                local_sum[lane] = ent;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int offset = WG / 2; offset > 0; offset >>= 1) {
+                    if (lane < offset) {
+                        local_sum[lane] += local_sum[lane + offset];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (lane == 0) {
+                    entropy_dev[row] = local_sum[0];
+                }
+            });
+    });
+}
+
+struct Philox4x32 {
+    static constexpr uint32_t PHILOX_M4x32_0 = 0xD2511F53;
+    static constexpr uint32_t PHILOX_M4x32_1 = 0xCD9E8D57;
+    static constexpr uint32_t PHILOX_W32_0   = 0x9E3779B9;
+    static constexpr uint32_t PHILOX_W32_1   = 0xBB67AE85;
+
+    static inline void round(uint32_t& x0, uint32_t& x1, uint32_t& x2, uint32_t& x3, uint32_t k0, uint32_t k1) {
+        uint64_t prod0 = static_cast<uint64_t>(PHILOX_M4x32_0) * x0;
+        uint64_t prod1 = static_cast<uint64_t>(PHILOX_M4x32_1) * x2;
+        uint32_t hi0 = static_cast<uint32_t>(prod0 >> 32);
+        uint32_t lo0 = static_cast<uint32_t>(prod0);
+        uint32_t hi1 = static_cast<uint32_t>(prod1 >> 32);
+        uint32_t lo1 = static_cast<uint32_t>(prod1);
+        x0 = hi1 ^ x1 ^ k0;
+        x1 = lo1;
+        x2 = hi0 ^ x3 ^ k1;
+        x3 = lo0;
+    }
+
+    static inline void generate4(uint32_t ctr0, uint32_t ctr1, uint32_t key0, uint32_t key1,
+                                 float& u0, float& u1, float& u2, float& u3) {
+        uint32_t x0 = ctr0, x1 = 0, x2 = ctr1, x3 = 0;
+        uint32_t k0 = key0, k1 = key1;
+
+        #pragma unroll
+        for (int r = 0; r < 7; ++r) {
+            round(x0, x1, x2, x3, k0, k1);
+            k0 += PHILOX_W32_0;
+            k1 += PHILOX_W32_1;
+        }
+
+        constexpr float scale = 1.0f / 4294967296.0f;
+        u0 = sycl::fmax((x0 + 0.5f) * scale, 1.0e-30f);
+        u1 = sycl::fmax((x1 + 0.5f) * scale, 1.0e-30f);
+        u2 = sycl::fmax((x2 + 0.5f) * scale, 1.0e-30f);
+        u3 = sycl::fmax((x3 + 0.5f) * scale, 1.0e-30f);
+    }
+};
+
+void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
+                                    const uint32_t* seeds_dev,
+                                    uint32_t* /* mt_states_dev */,
+                                    int* tokens_dev, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return;
+    constexpr int WG_SIZE = 256;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> s_max_val(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<int, 1> s_max_idx(sycl::range<1>(WG_SIZE), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(rows) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) {
+                const int row = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const float* rlogits = logits_dev + static_cast<size_t>(row) * cols;
+
+                float best_val = -1.0e30f;
+                int best_idx = 0;
+
+                const uint32_t row_seed = seeds_dev ? seeds_dev[row] : static_cast<uint32_t>(row * 1337 + 42);
+                const uint32_t key0 = row_seed;
+                const uint32_t key1 = static_cast<uint32_t>(row) * 0x9E3779B9u;
+
+                for (int c = lid * 4; c < cols; c += WG_SIZE * 4) {
+                    float u0, u1, u2, u3;
+                    Philox4x32::generate4(static_cast<uint32_t>(c / 4), static_cast<uint32_t>(row), key0, key1, u0, u1, u2, u3);
+
+                    float g0 = -sycl::log(-sycl::log(u0));
+                    float v0 = (c + 0 < cols) ? (rlogits[c + 0] + g0) : -1.0e30f;
+                    if (v0 > best_val) { best_val = v0; best_idx = c + 0; }
+
+                    float g1 = -sycl::log(-sycl::log(u1));
+                    float v1 = (c + 1 < cols) ? (rlogits[c + 1] + g1) : -1.0e30f;
+                    if (v1 > best_val) { best_val = v1; best_idx = c + 1; }
+
+                    float g2 = -sycl::log(-sycl::log(u2));
+                    float v2 = (c + 2 < cols) ? (rlogits[c + 2] + g2) : -1.0e30f;
+                    if (v2 > best_val) { best_val = v2; best_idx = c + 2; }
+
+                    float g3 = -sycl::log(-sycl::log(u3));
+                    float v3 = (c + 3 < cols) ? (rlogits[c + 3] + g3) : -1.0e30f;
+                    if (v3 > best_val) { best_val = v3; best_idx = c + 3; }
+                }
+
+                s_max_val[lid] = best_val;
+                s_max_idx[lid] = best_idx;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                #pragma unroll
+                for (int offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+                    if (lid < offset) {
+                        if (s_max_val[lid + offset] > s_max_val[lid] ||
+                            (s_max_val[lid + offset] == s_max_val[lid] && s_max_idx[lid + offset] < s_max_idx[lid])) {
+                            s_max_val[lid] = s_max_val[lid + offset];
+                            s_max_idx[lid] = s_max_idx[lid + offset];
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (lid == 0) {
+                    tokens_dev[row] = s_max_idx[0];
+                }
+            });
+    });
+}
+
 void diffusion_argmax(const float* logits, int* tokens, int rows, int cols) {
     parallel_rows(rows, [&](int r) {
         const float* row = logits + static_cast<size_t>(r) * cols;

@@ -505,11 +505,72 @@ void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
     bf16* up_ptr = static_cast<bf16*>(up.data());
     bf16* out_ptr = static_cast<bf16*>(output.data());
     constexpr float kAlpha = 0.7978845608028654f;
+    if (n % 8 == 0) {
+        const int n8 = n / 8;
+        ctx.queue().parallel_for(sycl::range<1>(n8),
+            [=](sycl::id<1> idx) {
+                const int i = static_cast<int>(idx[0]);
+                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_ptr + i * 8);
+                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(up_ptr + i * 8);
+                sycl::vec<bf16, 8> out_v;
+                #pragma unroll
+                for (int v_idx = 0; v_idx < 8; ++v_idx) {
+                    const float g = static_cast<float>(g_v[v_idx]);
+                    const float u = static_cast<float>(u_v[v_idx]);
+                    const float v = kAlpha * (g + 0.044715f * g * g * g);
+                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+                }
+                *reinterpret_cast<sycl::vec<bf16, 8>*>(out_ptr + i * 8) = out_v;
+            });
+        return;
+    }
     ctx.queue().parallel_for(sycl::range<1>(n),
         [=](sycl::id<1> idx) {
             const int i = idx[0];
             const float g = static_cast<float>(gate_ptr[i]);
             const float u = static_cast<float>(up_ptr[i]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
+}
+
+void gelu_tanh_gate_up_mul_fused(Context& ctx, Tensor& gate_up,
+                                 Tensor& output, int rows, int inter_dim) {
+    const bf16* gu_ptr = static_cast<const bf16*>(gate_up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    if (inter_dim % 8 == 0) {
+        const int inter_vec = inter_dim / 8;
+        const int total_vec = rows * inter_vec;
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total_vec)),
+            [=](sycl::id<1> idx) {
+                const int i = static_cast<int>(idx[0]);
+                const int r = i / inter_vec;
+                const int c_vec = i % inter_vec;
+                const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gu_ptr + gu_offset + c_vec * 8);
+                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gu_ptr + gu_offset + inter_dim + c_vec * 8);
+                sycl::vec<bf16, 8> out_v;
+                #pragma unroll
+                for (int v_idx = 0; v_idx < 8; ++v_idx) {
+                    const float g = static_cast<float>(g_v[v_idx]);
+                    const float u = static_cast<float>(u_v[v_idx]);
+                    const float v = kAlpha * (g + 0.044715f * g * g * g);
+                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+                }
+                *reinterpret_cast<sycl::vec<bf16, 8>*>(out_ptr + static_cast<size_t>(i) * 8) = out_v;
+            });
+        return;
+    }
+    const int total = rows * inter_dim;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)),
+        [=](sycl::id<1> idx) {
+            const int i = static_cast<int>(idx[0]);
+            const int r = i / inter_dim;
+            const int c = i % inter_dim;
+            const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+            const float g = static_cast<float>(gu_ptr[gu_offset + c]);
+            const float u = static_cast<float>(gu_ptr[gu_offset + inter_dim + c]);
             const float v = kAlpha * (g + 0.044715f * g * g * g);
             out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
         });

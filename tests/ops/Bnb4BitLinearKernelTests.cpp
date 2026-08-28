@@ -709,6 +709,8 @@ int bench_gemm_geometries() {
          &packed_nf4_gemm_bf16_tiled_v2<64, 64, 64, 4, 4, 16, 16>},
         {"v2_32x128x64_tm2tn8_wg256",
          &packed_nf4_gemm_bf16_tiled_v2<32, 128, 64, 2, 8, 16, 16>},
+        {"v2_32x128x64_tm2tn8_wg256_swzB",
+         &packed_nf4_gemm_bf16_tiled_v2<32, 128, 64, 2, 8, 16, 16, true>},
         {"v2_32x256x64_tm2tn16_wg256",
          &packed_nf4_gemm_bf16_tiled_v2<32, 256, 64, 2, 16, 16, 16>},
         {"v2_16x128x64_tm1tn8_wg256",
@@ -736,6 +738,8 @@ int bench_gemm_geometries() {
     };
     const std::vector<std::tuple<int, int, int>> shapes = {
         {256, 2816, 2112},
+        {256, 2112, 2816},
+        {256, 1024, 2816},
         {256, 4224, 2816},
     };
     constexpr int Block = 64;
@@ -1224,6 +1228,34 @@ int run_real_v1_v2_bitwise_test() {
                 std::cerr << " production v2 geometry is not bitwise identical "
                              "to v1 on " << fx.label << "\n";
                 ++failed;
+            }
+            if (std::string(name) == "32x128_bk64_tm2tn8") {
+                // The B-tile K-chunk-major layout is kept as an explicit A/B
+                // candidate.  It must satisfy the same real-weight bitwise
+                // gate as the shipped v2 geometry before it can be enabled.
+                packed_nf4_gemm_bf16_tiled_v2<
+                    32, 128, 64, 2, 8, 16, 16, true>(
+                    ctx, packed_ptr, qmap_ptr, absmax_ptr, input_ptr,
+                    out2_ptr, fx.M, fx.N, fx.K, fx.Block);
+                ctx.synchronize();
+                std::vector<uint8_t> swizzled_out(
+                    static_cast<size_t>(fx.M) * fx.N * sizeof(bf16));
+                ctx.memcpy_d2h(swizzled_out.data(), out2_dev.data(),
+                               swizzled_out.size());
+                ctx.synchronize();
+                size_t swizzled_mismatches = 0;
+                for (size_t i = 0; i < out1.size(); i += 2) {
+                    if (out1[i] != swizzled_out[i] ||
+                        out1[i + 1] != swizzled_out[i + 1]) {
+                        ++swizzled_mismatches;
+                    }
+                }
+                std::cout << "/swz" << swizzled_mismatches;
+                if (swizzled_mismatches != 0) {
+                    std::cerr << " swizzled v2 is not bitwise identical to v1 "
+                                 "on " << fx.label << "\n";
+                    ++failed;
+                }
             }
         }
         std::cout << "\n";

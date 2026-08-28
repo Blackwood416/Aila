@@ -34,6 +34,10 @@ struct Bnb4BitLinearScratch {
 class Bnb4BitLinear {
 public:
     Bnb4BitLinear() = default;
+    Bnb4BitLinear(Bnb4BitLinear&& other) noexcept = default;
+    Bnb4BitLinear& operator=(Bnb4BitLinear&& other) noexcept = default;
+    Bnb4BitLinear(const Bnb4BitLinear&) = delete;
+    Bnb4BitLinear& operator=(const Bnb4BitLinear&) = delete;
 
     bool init(Context& ctx, const Bnb4BitWeightRef& weight, std::string* error_message = nullptr);
     bool init_fused_rows(Context& ctx,
@@ -175,6 +179,17 @@ public:
         std::vector<sycl::ext::oneapi::bfloat16>& output, int tokens,
         int top_k);
 
+    void forward_batched(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& weights_dev, Tensor& output,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+    void forward_batched_impl(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& weights_dev, Tensor& output,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+
     // GPU-resident MoE forward.  input is [tokens * hidden] bf16 on the
     // device; output is [tokens * hidden] bf16 on the device and is zeroed at
     // the start.  The per-expert dequant and oneDNN matmul steps are the same
@@ -184,6 +199,17 @@ public:
                      const std::vector<int>& expert_ids,
                      const std::vector<float>& expert_weights,
                      int tokens, int top_k);
+
+    void forward_batched_gpu(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& output, const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+
+    struct GroupInfo {
+        int expert_id;
+        int token_offset;
+        int token_count;
+    };
 
     int hidden_size() const { return hidden_; }
     int moe_intermediate_size() const { return moe_intermediate_; }
@@ -225,13 +251,34 @@ private:
     Tensor down_w_;
     Tensor tokens_dev_;
     Tensor weights_dev_;
+
+
+
+    Tensor batched_gate_up_out_;
+    Tensor batched_proj_;
+    Tensor group_infos_dev_;
+    Tensor transfer_indices_dev_;
+    Tensor transfer_weights_dev_;
+    int batched_scratch_rows_ = 0;
+    int batched_scratch_groups_ = 0;
+
     // oneDNN memory handles from run_matmul must outlive their asynchronous
     // executions on this A770/Level-Zero stack; destroying them while a batch
     // of matmuls is still queued can deadlock the driver.  They are released
     // only after the queue is drained.
     std::vector<dnnl::memory> pending_memories_;
     int scratch_rows_ = 0;
+    std::vector<int> route_counts_;
+    std::vector<int> route_offsets_;
+    std::vector<int> route_cursors_;
+    std::vector<int> route_token_ids_;
+    std::vector<float> route_weights_;
+    std::vector<int> active_experts_;
+    int route_max_rows_ = 0;
 
+    void build_route_layout(const std::vector<int>& expert_ids,
+                            const std::vector<float>& expert_weights,
+                            int tokens, int top_k);
     void ensure_scratch(Context& ctx, int rows);
     void run_matmul(Context& ctx, int rows, int in_n, int out_n,
                     uint64_t prim_key, Tensor& src, Tensor& w, Tensor& dst);

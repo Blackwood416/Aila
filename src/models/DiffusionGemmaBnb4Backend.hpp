@@ -27,7 +27,9 @@ struct DiffusionGemmaLayerWeights {
     Bnb4BitLinear o_proj;
     Bnb4BitLinear mlp_gate;
     Bnb4BitLinear mlp_up;
+    Bnb4BitLinear mlp_gate_up;
     Bnb4BitLinear mlp_down;
+    bool has_fused_gate_up = false;
 
     // MoE experts are stored as one packed tensor per layer with all experts
     // concatenated along the row axis:
@@ -49,12 +51,21 @@ struct DiffusionGemmaLayerWeights {
     Tensor* router_proj = nullptr;      // (num_experts, hidden)
     Tensor* router_scale = nullptr;     // (hidden)
     Tensor* per_expert_scale = nullptr; // (num_experts)
+    std::vector<sycl::ext::oneapi::bfloat16> per_expert_scale_host;
     float layer_scalar = 1.0f;
     Linear router_linear;
 };
 
 class DiffusionGemmaBnb4Backend : public IModelBackend {
 public:
+    struct SoftEmbedTiming {
+        // Host-side submission windows.  The GPU work remains asynchronous;
+        // the following soft-embed D2H wait in the generator accounts for the
+        // actual device execution without adding a profiling synchronization.
+        double softmax_submit_ms = 0.0;
+        double gemm_submit_ms = 0.0;
+    };
+
     ~DiffusionGemmaBnb4Backend() override;
 
     bool load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
@@ -81,6 +92,10 @@ public:
     Tensor& diffusion_compute_soft_embeds(Context& ctx, Tensor& logits_f32,
                                           int canvas_len) override;
 
+    const SoftEmbedTiming& last_soft_embed_timing() const {
+        return last_soft_embed_timing_;
+    }
+
     const DiffusionGemmaConfig& config() const { return cfg_; }
 
 private:
@@ -90,15 +105,28 @@ private:
     };
 
     struct Buffers {
+        // Per-layer attention scratch.  These are raw capacity buffers rather
+        // than fixed-stride matrices so run_layer_forward() can create a
+        // compact view for either the full-attention or sliding-attention
+        // geometry without allocating on every layer.
+        Tensor attn_q;
+        Tensor attn_k;
+        Tensor attn_v;
+        Tensor attn_out;
+        Tensor attn_k_full;
+        Tensor attn_v_full;
+        Tensor attn_mask;
+        Tensor attn_scores;
         Tensor hidden;
         Tensor normed;
         Tensor attn_o;
-        Tensor mlp_gate, mlp_up, mlp_proj, mlp_out;
+        Tensor mlp_gate, mlp_up, mlp_gate_up_out, mlp_proj, mlp_out;
         Tensor ff1, ff2;
         Tensor moe_device_out;
         Tensor moe_gpu_ref;
         Tensor moe_transfer;
         Tensor moe_token_ids;
+        Tensor moe_weights;
         Tensor router_scores;
         Tensor sc_normed, sc_gate, sc_up, sc_proj, sc_down;
         Tensor logits_bf16;
@@ -109,6 +137,7 @@ private:
         Bnb4BitLinearScratch qkv_scratch;
         Bnb4BitLinearScratch o_scratch;
         Bnb4BitLinearScratch mlp_scratch;
+        Bnb4BitLinearScratch mlp_down_scratch;
         Bnb4BitLinearScratch sc_scratch;
         Linear lm_head;
         Linear soft_embed;
@@ -134,12 +163,15 @@ private:
     int current_len_ = 0;
     int buf_q_cap_ = 0;
     int buf_kv_cap_ = 0;
+    int attn_q_dim_cap_ = 0;
+    int attn_kv_dim_cap_ = 0;
 
     std::vector<DiffusionGemmaLayerWeights> layers_;
     std::vector<LayerRuntime> runtimes_;
     std::vector<std::unique_ptr<Bnb4GroupedMoE>> moes_;
     Buffers buf_;
     ProfileTotals profile_totals_;
+    SoftEmbedTiming last_soft_embed_timing_;
 
     Tensor* embed_weight_ = nullptr;
     Tensor* final_norm_weight_ = nullptr;

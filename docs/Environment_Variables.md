@@ -90,7 +90,7 @@ continue to run inference in-process.
 | `AILA_DG_WARMUP_CANVAS` | int | `0` | DiffusionGemma warmup canvas override: `0` = real canvas length, `>0` = smaller dummy canvas (JIT cost is shape-independent; only compute scales) |
 | `AILA_DG_MOE_BATCHED` | int | `1` | DiffusionGemma MoE batched-transfer path: single flat gather + one d2h for all expert groups instead of one blocking h2d/d2h per group. Bitwise identical to the per-group host path (`0` restores it) |
 | `AILA_DG_MOE_PACE` | int | auto | DiffusionGemma batched MoE drain interval in expert groups: `0`/unset = 8 in production, 1 under `AILA_PROFILE_DG` (larger bursts plus per-phase syncs hang the Level-Zero driver on A770) |
-| `AILA_DG_STEP_TIMING` | int | `0` | Print the unprofiled per-step decode/transfer/host/soft wall breakdown for DiffusionGemma generation |
+| `AILA_DG_STEP_TIMING` | int | `0` | Print unprofiled per-step buckets: input H2D, decoder/logits total, decoder submission, logits D2H wait, argmax, entropy, gumbel, accept/renoise, host total, softmax submission, soft-embedding GEMM submission, soft-embed D2H wait, and total; no extra profiling synchronization is added |
 
 ---
 
@@ -124,6 +124,7 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 | `AILA_BNB4_GEMV_WG` | int | `256` | Override GEMV SG16 work-group size (min 32). Controls rows-per-WG: rows = WG / 16 |
 | `AILA_FUSE_RESIDUAL_ADD` | bool | `false` | Fuse residual +=hidden into O-proj and down GEMV outputs (experimental, -1.5% decode regression on tested config) |
 | `AILA_BNB4_FUSED_PREFILL` | bool | `true` | Enable fused NF4 dequant + matmul kernel for prefill. Disable only for debugging |
+| `AILA_BNB4_GEMM_V2_SWIZZLE` | bool | `false` | DiffusionGemma/A770 v2 NF4 GEMM B-tile K-chunk-major SLM layout candidate; `0` keeps the validated legacy v2 layout |
 
 ---
 
@@ -209,8 +210,14 @@ larger than 4 GiB. Do not treat it as an Aila runtime requirement.
 | `AILA_DIFFUSION_STEPS` | int | `min(model config, 25)` | Override the number of canvas denoising steps. The 26B checkpoint has been validated to converge at 25 steps; larger values remain available for quality experiments |
 | `AILA_DG_DEBUG_PROBES` | bool | `false` | Enable expensive host-side finite-value probes in the DiffusionGemma decoder |
 | `AILA_DG_DUMP_DIR` | path | empty | Dump DiffusionGemma intermediate tensors and `committed_tokens.bin` for numerical comparison |
+| `AILA_DG_TOKEN_DUMP` | path | empty | Dump only the committed int32 token stream; unlike `AILA_DG_DUMP_DIR`, this does not enable intermediate tensor dumps or their synchronization overhead |
 | `AILA_DG_DUMP_LAYER` | int | `0` | Layer selected by `AILA_DG_DUMP_DIR` |
 | `AILA_DG_DUMP_DECODER` | bool | `false` | Dump decoder/self-conditioning tensors instead of the causal encoder layer |
+| `AILA_DG_REUSE_LAYER_SCRATCH` | bool | `true` | Reuse compact raw attention scratch buffers across DiffusionGemma layers; `0` restores per-layer allocations for A/B or stale-data diagnosis |
+| `AILA_DG_REUSE_LAYER_SYNC` | bool | `false` | When layer scratch reuse is enabled, omit the production layer-tail queue drain; set `1` for the staged synchronization A/B or stale-data diagnosis |
+| `AILA_DG_SOFTMAX_INPLACE` | bool | `true` | Reuse dead f32 logits as the exact-sum softmax workspace before soft-embedding; `0` restores the original row-serial kernel; decoder dump mode preserves row 0 before the overwrite for bitwise A/B comparison |
+| `AILA_DG_SOFTMAX_DUMP_DIR` | path | empty | Debug-only row-0 dump of soft logits, bf16 probabilities, and soft embedding; does not enable layer/decoder dumps, but adds an explicit synchronization |
+| `AILA_DG_MOE_ROUTE_HIST` | bool | `false` | Print the stable expert-major MoE route histogram (`M` rows per expert, active experts, and maximum M) used by the host/GPU paths |
 | `AILA_PROFILE_DG` | bool | `false` | Synchronize DiffusionGemma decoder sub-phase boundaries and report projection, attention, dense MLP, router, MoE, and post-processing wall time |
 
 ---

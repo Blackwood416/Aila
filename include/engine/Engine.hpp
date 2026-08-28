@@ -767,6 +767,7 @@ public:
                     dg_backend->diffusion_encode(*ctx_, prompt_dev,
                                                  kWarmupPromptTokens,
                                                  &encode_error);
+                    ctx_->synchronize();
                     ctx_->free_device(prompt_dev);
 
                     // Dummy full-canvas decoder passes with zero soft
@@ -805,6 +806,29 @@ public:
                         if (warmup_logits != nullptr) {
                             dg_backend->diffusion_compute_soft_embeds(
                                 *ctx_, *warmup_logits, warmup_canvas);
+                            const int vocab =
+                                model_spec_.diffusion_gemma.text.vocab_size;
+                            int* dummy_argmax_dev = static_cast<int*>(
+                                ctx_->alloc_device(
+                                    static_cast<size_t>(warmup_canvas) *
+                                    sizeof(int)));
+                            float* dummy_entropy_dev = static_cast<float*>(
+                                ctx_->alloc_device(
+                                    static_cast<size_t>(warmup_canvas) *
+                                    sizeof(float)));
+                            ops::diffusion_argmax_device(
+                                *ctx_,
+                                static_cast<const float*>(
+                                    warmup_logits->data()),
+                                dummy_argmax_dev, warmup_canvas, vocab);
+                            ops::diffusion_softmax_entropy_device(
+                                *ctx_,
+                                static_cast<const float*>(
+                                    warmup_logits->data()),
+                                dummy_entropy_dev, warmup_canvas, vocab);
+                            ctx_->synchronize();
+                            ctx_->free_device(dummy_argmax_dev);
+                            ctx_->free_device(dummy_entropy_dev);
                         }
                         ctx_->synchronize();
                     } catch (const std::exception& error) {
