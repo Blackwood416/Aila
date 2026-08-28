@@ -3120,6 +3120,7 @@ void run_fused_masked_attention_xmx(
     constexpr int TM = 8, TN = 8, TK = 16, SG = 8;
     constexpr int NUM_SGS = (BM / TM) * (BK / TN); // 16 SGs
     constexpr int WG_SIZE = NUM_SGS * SG; // 128 threads
+    constexpr int stride_s = 384;
 
     const int grid_m = (q_len + BM - 1) / BM;
     const int total_wgs = grid_m * H;
@@ -3127,7 +3128,7 @@ void run_fused_masked_attention_xmx(
     q.submit([&](sycl::handler& cgh) {
         // SLM buffers (Total: 16 KB + 24 KB + 1 KB + 1 KB + 4 KB = 46 KB < 64 KB limit)
         sycl::local_accessor<bf16, 1> Qs(sycl::range<1>(BM * D), cgh);         // 16 KB
-        sycl::local_accessor<bf16, 1> S_scores(sycl::range<1>(BM * 384), cgh); // 24 KB
+        sycl::local_accessor<bf16, 1> S_scores(sycl::range<1>(BM * stride_s), cgh); // 24 KB
         sycl::local_accessor<bf16, 1> Ks(sycl::range<1>(TK * BK), cgh);        // 1 KB
         sycl::local_accessor<bf16, 1> Vs(sycl::range<1>(TK * BD), cgh);        // 1 KB
         sycl::local_accessor<float, 1> Slm_out(sycl::range<1>(BM * BD), cgh);  // 4 KB
@@ -3185,7 +3186,7 @@ void run_fused_masked_attention_xmx(
                         const int r = i / BK;
                         const int c = i % BK;
                         if (k_tile + c < kv_len) {
-                            S_scores[r * kv_len + (k_tile + c)] = bf16(Slm_out[i]);
+                            S_scores[r * stride_s + (k_tile + c)] = bf16(Slm_out[i]);
                         }
                     }
                     item.barrier(sycl::access::fence_space::local_space);
@@ -3198,18 +3199,29 @@ void run_fused_masked_attention_xmx(
                         const float* mrow = Mask_ptr + static_cast<size_t>(q_pos) * kv_len;
                         float max_val = -1.0e30f;
                         for (int k = 0; k < kv_len; ++k) {
-                            float s = static_cast<float>(S_scores[r * kv_len + k]) + mrow[k];
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
                             max_val = sycl::max(max_val, s);
                         }
                         float sum = 0.0f;
                         for (int k = 0; k < kv_len; ++k) {
-                            float s = static_cast<float>(S_scores[r * kv_len + k]) + mrow[k];
-                            sum += sycl::exp(s - max_val);
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
+                            const float diff = s - max_val;
+                            const float e = (diff > -80.0f) ? sycl::exp(diff) : 0.0f;
+                            sum += e;
                         }
-                        const float inv_sum = 1.0f / sum;
+                        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
                         for (int k = 0; k < kv_len; ++k) {
-                            float s = static_cast<float>(S_scores[r * kv_len + k]) + mrow[k];
-                            S_scores[r * kv_len + k] = bf16(sycl::exp(s - max_val) * inv_sum);
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
+                            const float diff = s - max_val;
+                            const float e = (diff > -80.0f) ? sycl::exp(diff) : 0.0f;
+                            S_scores[r * stride_s + k] = bf16(e * inv_sum);
+                        }
+                        for (int k = kv_len; k < stride_s; ++k) {
+                            S_scores[r * stride_s + k] = bf16(0.0f);
+                        }
+                    } else {
+                        for (int k = 0; k < stride_s; ++k) {
+                            S_scores[r * stride_s + k] = bf16(0.0f);
                         }
                     }
                 }
@@ -3232,7 +3244,7 @@ void run_fused_masked_attention_xmx(
 
                         joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> a_mat;
                         joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::row_major> b_mat;
-                        joint_matrix_load(sg, a_mat, local_ptr(S_scores.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * kv_len + m_step), kv_len);
+                        joint_matrix_load(sg, a_mat, local_ptr(S_scores.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * stride_s + m_step), stride_s);
                         joint_matrix_load(sg, b_mat, local_ptr(Vs.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_col * TN)), BD);
                         joint_matrix_mad(sg, out_mat, a_mat, b_mat, out_mat);
                         item.barrier(sycl::access::fence_space::local_space);

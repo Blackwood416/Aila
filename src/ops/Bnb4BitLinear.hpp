@@ -259,6 +259,7 @@ private:
     Tensor group_infos_dev_;
     Tensor transfer_indices_dev_;
     Tensor transfer_weights_dev_;
+    int accumulate_scratch_rows_ = 0;
     int batched_scratch_rows_ = 0;
     int batched_scratch_groups_ = 0;
 

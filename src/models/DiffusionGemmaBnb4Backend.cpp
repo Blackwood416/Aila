@@ -1545,6 +1545,13 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         record_phase(profile_totals_.moe_ms);
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
+        if (moe_gpu) {
+            moe->forward_batched_gpu(ctx, buf_.normed, buf_.moe_transfer,
+                                     buf_.moe_token_ids, buf_.moe_gpu_ref,
+                                     expert_ids, expert_weights, seq_len,
+                                     tc.top_k_experts);
+            compare_moe_outputs("gpu", buf_.moe_gpu_ref);
+        }
         if (moe_batched) {
             std::vector<bf16> batched_out;
             moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,

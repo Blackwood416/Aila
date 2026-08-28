@@ -705,8 +705,7 @@ void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
                 joint_matrix_fill(sg, sub_c, 0.0f);
 
                 for (int kb = 0; kb < K; kb += BK) {
-                    if (lid < (BM * BK) / 2) {
-                        const int pair_idx = lid;
+                    for (int pair_idx = lid; pair_idx < (BM * BK) / 2; pair_idx += WG_SIZE) {
                         const int r = pair_idx / (BK / 2);
                         const int c_pair = pair_idx % (BK / 2);
                         const int gm = m0 + r;
@@ -719,9 +718,9 @@ void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
                         }
                     }
 
-                    if (lid < BN * 2) {
-                        const int col = lid / 2;
-                        const int half = lid % 2;
+                    for (int i = lid; i < BN * 2; i += WG_SIZE) {
+                        const int col = i / 2;
+                        const int half = i % 2;
                         const int src_n = n0 + col;
                         if (src_n < N && kb + half * 8 + 7 < K) {
                             const uint32_t packed_u32 = reinterpret_cast<const uint32_t*>(
@@ -744,8 +743,8 @@ void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
                             Bs[base + 7] = bf16(qmap_slm[b3 & 0x0F] * am);
                         } else {
                             const int base = col * TK + half * 8;
-                            for (int i = 0; i < 8; ++i) {
-                                Bs[base + i] = bf16(0.0f);
+                            for (int v = 0; v < 8; ++v) {
+                                Bs[base + v] = bf16(0.0f);
                             }
                         }
                     }
@@ -2367,7 +2366,12 @@ void run_grouped_moe_gemm_single_launch(
     Context& ctx,
     const uint8_t* packed_weights,
     const float* quant_map,
-    const float* absmax,
+    const uint8_t* absmax_codes,
+    const float* absmax_f32,
+    const float* nested_absmax,
+    const float* nested_qmap,
+    int nested_blocksize,
+    float nested_offset,
     const bf16* input_transfer,
     bf16* output_transfer,
     const Bnb4GroupedMoE::GroupInfo* group_infos_dev,
@@ -2417,7 +2421,6 @@ void run_grouped_moe_gemm_single_launch(
 
                 const size_t expert_row_offset = static_cast<size_t>(expert) * rows_per_expert;
                 const uint8_t* expert_packed = packed_weights + expert_row_offset * packed_bytes_per_row;
-                const float* expert_absmax = absmax + expert_row_offset * blocks_per_row;
                 const bf16* expert_input = input_transfer + static_cast<size_t>(token_offset) * K;
                 bf16* expert_output = output_transfer + static_cast<size_t>(token_offset) * N;
 
@@ -2448,14 +2451,28 @@ void run_grouped_moe_gemm_single_launch(
                         const int src_n = n0 + col;
                         if (src_n < N && kb + kh * 2 + 1 < K) {
                             const uint8_t byte = expert_packed[static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + kh];
-                            const float am = expert_absmax[static_cast<size_t>(src_n) * blocks_per_row + (kb + kh * 2) / blocksize];
+                            const size_t block =
+                                (expert_row_offset + src_n) * blocks_per_row +
+                                (kb + kh * 2) / blocksize;
+                            const float am = (absmax_f32 != nullptr)
+                                ? absmax_f32[block]
+                                : (nested_qmap[absmax_codes[block]] *
+                                       nested_absmax[block / nested_blocksize] +
+                                   nested_offset);
                             const uint8_t hi = (byte >> 4) & 0x0F;
                             const uint8_t lo = byte & 0x0F;
                             Bs[col * TK + kh * 2 + 0] = bf16(qmap_slm[hi] * am);
                             Bs[col * TK + kh * 2 + 1] = bf16(qmap_slm[lo] * am);
                         } else if (src_n < N && kb + kh * 2 < K) {
                             const uint8_t byte = expert_packed[static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + kh];
-                            const float am = expert_absmax[static_cast<size_t>(src_n) * blocks_per_row + (kb + kh * 2) / blocksize];
+                            const size_t block =
+                                (expert_row_offset + src_n) * blocks_per_row +
+                                (kb + kh * 2) / blocksize;
+                            const float am = (absmax_f32 != nullptr)
+                                ? absmax_f32[block]
+                                : (nested_qmap[absmax_codes[block]] *
+                                       nested_absmax[block / nested_blocksize] +
+                                   nested_offset);
                             const uint8_t hi = (byte >> 4) & 0x0F;
                             Bs[col * TK + kh * 2 + 0] = bf16(qmap_slm[hi] * am);
                             Bs[col * TK + kh * 2 + 1] = bf16(0.0f);
@@ -2504,29 +2521,6 @@ void run_grouped_moe_gemm_single_launch(
 void moe_gelu_tanh_gate_up_mul_flat(Context& ctx, const bf16* gate_up_out,
                                     bf16* proj, int rows, int inter_dim) {
     constexpr float kAlpha = 0.7978845608028654f;
-    if (inter_dim % 8 == 0) {
-        const int inter_vec = inter_dim / 8;
-        const int total_vec = rows * inter_vec;
-        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total_vec)),
-            [=](sycl::id<1> idx) {
-                const int i = static_cast<int>(idx[0]);
-                const int r = i / inter_vec;
-                const int c_vec = i % inter_vec;
-                const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
-                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up_out + gu_offset + c_vec * 8);
-                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up_out + gu_offset + inter_dim + c_vec * 8);
-                sycl::vec<bf16, 8> out_v;
-                #pragma unroll
-                for (int v_idx = 0; v_idx < 8; ++v_idx) {
-                    const float g = static_cast<float>(g_v[v_idx]);
-                    const float u = static_cast<float>(u_v[v_idx]);
-                    const float v = kAlpha * (g + 0.044715f * g * g * g);
-                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
-                }
-                *reinterpret_cast<sycl::vec<bf16, 8>*>(proj + static_cast<size_t>(i) * 8) = out_v;
-            });
-        return;
-    }
     const int total = rows * inter_dim;
     ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)),
         [=](sycl::id<1> idx) {
@@ -2579,7 +2573,11 @@ void run_moe_accumulate_gpu(
 
                     for (int h_vec = lid; h_vec < hidden / VEC; h_vec += WG_SIZE) {
                         const int h = h_vec * VEC;
-                        float sums[VEC] = {0.0f};
+                        sycl::vec<bf16, VEC> out_v;
+                        #pragma unroll
+                        for (int v = 0; v < VEC; ++v) {
+                            out_v[v] = bf16(0.0f);
+                        }
 
                         #pragma unroll
                         for (int k = 0; k < 8; ++k) {
@@ -2589,16 +2587,12 @@ void run_moe_accumulate_gpu(
                                 const float w = weights[k];
                                 #pragma unroll
                                 for (int v = 0; v < VEC; ++v) {
-                                    sums[v] += static_cast<float>(in_v[v]) * w;
+                                    const bf16 contribution = bf16(static_cast<float>(in_v[v]) * w);
+                                    out_v[v] = bf16(static_cast<float>(out_v[v]) + static_cast<float>(contribution));
                                 }
                             }
                         }
 
-                        sycl::vec<bf16, VEC> out_v;
-                        #pragma unroll
-                        for (int v = 0; v < VEC; ++v) {
-                            out_v[v] = bf16(sums[v]);
-                        }
                         *reinterpret_cast<sycl::vec<bf16, VEC>*>(output + static_cast<size_t>(t) * hidden + h) = out_v;
                     }
                 });
@@ -2610,16 +2604,17 @@ void run_moe_accumulate_gpu(
         [=](sycl::item<2> item) {
             const int t = static_cast<int>(item.get_id(0));
             const int h = static_cast<int>(item.get_id(1));
-            float sum = 0.0f;
+            bf16 acc = bf16(0.0f);
             #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 if (k < top_k) {
                     const int row = dev_indices[t * top_k + k];
                     const float w = dev_weights[t * top_k + k];
-                    sum += static_cast<float>(transfer[static_cast<size_t>(row) * hidden + h]) * w;
+                    const bf16 contribution = bf16(static_cast<float>(transfer[static_cast<size_t>(row) * hidden + h]) * w);
+                    acc = bf16(static_cast<float>(acc) + static_cast<float>(contribution));
                 }
             }
-            output[static_cast<size_t>(t) * hidden + h] = bf16(sum);
+            output[static_cast<size_t>(t) * hidden + h] = acc;
         });
 }
 
@@ -2637,6 +2632,81 @@ void Bnb4GroupedMoE::forward_batched_gpu(
         output.shape(0) < tokens || output.shape(1) != hidden_) {
         throw std::runtime_error(
             "Bnb4GroupedMoE::forward_batched_gpu: buffer too small");
+    }
+
+    static const bool grouped_xmx =
+        aila::env::read_flag("AILA_DG_MOE_GROUPED_XMX", false);
+    if (!grouped_xmx) {
+        pending_memories_.clear();
+        build_route_layout(expert_ids, expert_weights, tokens, top_k);
+        ensure_scratch(ctx, route_max_rows_);
+
+        ctx.memcpy_h2d(token_ids_dev.data(), route_token_ids_.data(),
+                       static_cast<size_t>(total_rows) * sizeof(int));
+
+        const bf16* input_ptr = input.data_as<bf16>();
+        bf16* transfer_ptr = transfer.data_as<bf16>();
+        moe_gather_rows_flat(ctx, input_ptr, transfer_ptr,
+                             static_cast<int*>(token_ids_dev.data()),
+                             total_rows, hidden_);
+
+        for (int expert : active_experts_) {
+            const int count = route_counts_[static_cast<size_t>(expert)];
+            const int offset = route_offsets_[static_cast<size_t>(expert)];
+            Tensor src_view = Tensor::view(
+                ctx, transfer_ptr + static_cast<size_t>(offset) * hidden_,
+                {count, hidden_}, dnnl::memory::data_type::bf16);
+            Tensor dst_view = Tensor::view(
+                ctx, transfer_ptr + static_cast<size_t>(offset) * hidden_,
+                {count, hidden_}, dnnl::memory::data_type::bf16);
+
+            dequant_subset(ctx, gate_up_, expert, gate_up_rows_per_expert_,
+                           gate_up_w_);
+            run_matmul(ctx, count, gate_up_in_features_, 2 * moe_intermediate_,
+                       static_cast<uint64_t>(count) * 2 + 0, src_view,
+                       gate_up_w_, gate_up_out_);
+            moe_gelu_tanh_gate_up_mul(ctx, gate_up_out_, proj_, count,
+                                      moe_intermediate_);
+
+            dequant_subset(ctx, down_, expert, down_rows_per_expert_, down_w_);
+            run_matmul(ctx, count, down_in_features_, hidden_,
+                       static_cast<uint64_t>(count) * 2 + 1, proj_, down_w_,
+                       dst_view);
+        }
+
+        std::vector<int> token_transfer_indices(static_cast<size_t>(total_rows));
+        std::vector<float> token_transfer_weights(static_cast<size_t>(total_rows));
+        std::vector<int> token_counts(static_cast<size_t>(tokens), 0);
+        for (int expert : active_experts_) {
+            const int count = route_counts_[static_cast<size_t>(expert)];
+            const int offset = route_offsets_[static_cast<size_t>(expert)];
+            const int* group_tokens = route_token_ids_.data() + offset;
+            const float* group_weights = route_weights_.data() + offset;
+            for (int r = 0; r < count; ++r) {
+                const int token = group_tokens[r];
+                const int k = token_counts[static_cast<size_t>(token)]++;
+                token_transfer_indices[static_cast<size_t>(token * top_k + k)] = offset + r;
+                token_transfer_weights[static_cast<size_t>(token * top_k + k)] = group_weights[r];
+            }
+        }
+        if (total_rows > accumulate_scratch_rows_) {
+            accumulate_scratch_rows_ = total_rows;
+            transfer_weights_dev_ = Tensor::allocate(
+                ctx, {accumulate_scratch_rows_},
+                dnnl::memory::data_type::f32);
+        }
+        ctx.memcpy_h2d(token_ids_dev.data(), token_transfer_indices.data(),
+                       static_cast<size_t>(total_rows) * sizeof(int));
+        ctx.memcpy_h2d(transfer_weights_dev_.data(),
+                       token_transfer_weights.data(),
+                       static_cast<size_t>(total_rows) * sizeof(float));
+
+        run_moe_accumulate_gpu(
+            ctx, transfer_ptr,
+            static_cast<const int*>(token_ids_dev.data()),
+            static_cast<const float*>(transfer_weights_dev_.data()),
+            output.data_as<bf16>(), tokens, hidden_, top_k);
+        return;
     }
 
     std::map<int, std::vector<std::pair<int, float>>> groups;
@@ -2721,11 +2791,21 @@ void Bnb4GroupedMoE::forward_batched_gpu(
 
     // 1. Single kernel launch: Grouped Gate+Up GEMM for ALL active experts
     const int gu_blocksize = gate_up_.ref.quant_state.blocksize;
+    const uint8_t* gu_absmax_codes = gate_up_.ref.quant_state.nested ? gate_up_.ref.absmax->data_as<uint8_t>() : nullptr;
+    const float* gu_absmax_f32 = gate_up_.ref.quant_state.nested ? nullptr : gate_up_.ref.absmax->data_as<float>();
+    const float* gu_nested_absmax = gate_up_.ref.quant_state.nested ? gate_up_.ref.nested_absmax->data_as<float>() : nullptr;
+    const float* gu_nested_qmap = gate_up_.ref.quant_state.nested ? gate_up_.ref.nested_quant_map->data_as<float>() : nullptr;
+
     run_grouped_moe_gemm_single_launch(
         ctx,
         gate_up_.ref.packed_weight->data_as<uint8_t>(),
         gate_up_.ref.quant_map->data_as<float>(),
-        gate_up_.ref.absmax->data_as<float>(),
+        gu_absmax_codes,
+        gu_absmax_f32,
+        gu_nested_absmax,
+        gu_nested_qmap,
+        gate_up_.ref.quant_state.nested_blocksize,
+        gate_up_.ref.quant_state.nested_offset,
         transfer_ptr,
         batched_gate_up_out_.data_as<bf16>(),
         reinterpret_cast<const GroupInfo*>(group_infos_dev_.data()),
@@ -2745,11 +2825,21 @@ void Bnb4GroupedMoE::forward_batched_gpu(
 
     // 3. Single kernel launch: Grouped Down GEMM for ALL active experts
     const int down_blocksize = down_.ref.quant_state.blocksize;
+    const uint8_t* down_absmax_codes = down_.ref.quant_state.nested ? down_.ref.absmax->data_as<uint8_t>() : nullptr;
+    const float* down_absmax_f32 = down_.ref.quant_state.nested ? nullptr : down_.ref.absmax->data_as<float>();
+    const float* down_nested_absmax = down_.ref.quant_state.nested ? down_.ref.nested_absmax->data_as<float>() : nullptr;
+    const float* down_nested_qmap = down_.ref.quant_state.nested ? down_.ref.nested_quant_map->data_as<float>() : nullptr;
+
     run_grouped_moe_gemm_single_launch(
         ctx,
         down_.ref.packed_weight->data_as<uint8_t>(),
         down_.ref.quant_map->data_as<float>(),
-        down_.ref.absmax->data_as<float>(),
+        down_absmax_codes,
+        down_absmax_f32,
+        down_nested_absmax,
+        down_nested_qmap,
+        down_.ref.quant_state.nested_blocksize,
+        down_.ref.quant_state.nested_offset,
         batched_proj_.data_as<bf16>(),
         transfer_ptr,
         reinterpret_cast<const GroupInfo*>(group_infos_dev_.data()),

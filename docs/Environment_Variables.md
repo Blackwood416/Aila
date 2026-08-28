@@ -89,6 +89,9 @@ continue to run inference in-process.
 | `AILA_DG_WARMUP_PASSES` | int | `1` | DiffusionGemma warmup: number of dummy full-canvas decoder passes run at init (vLLM-style JIT/primitive amortization) |
 | `AILA_DG_WARMUP_CANVAS` | int | `0` | DiffusionGemma warmup canvas override: `0` = real canvas length, `>0` = smaller dummy canvas (JIT cost is shape-independent; only compute scales) |
 | `AILA_DG_MOE_BATCHED` | int | `1` | DiffusionGemma MoE batched-transfer path: single flat gather + one d2h for all expert groups instead of one blocking h2d/d2h per group. Bitwise identical to the per-group host path (`0` restores it) |
+| `AILA_DG_MOE_GPU` | bool | `false` | Opt-in exact GPU-resident MoE output path. Keeps the same per-expert dequantization and oneDNN matmuls as the batched path, then performs the stable expert-order bf16 accumulation on GPU to avoid the output D2H, host accumulation, and result H2D |
+| `AILA_DG_MOE_GROUPED_XMX` | bool | `false` | Experimental grouped NF4/XMX MoE GEMM used only with `AILA_DG_MOE_GPU=1`. Double-quant absmax decoding is supported, but the XMX accumulation order is not bitwise identical to oneDNN; do not enable for exact-token production runs |
+| `AILA_DG_MOE_HARNESS` | bool | `false` | Run the host MoE reference and compare enabled batched/GPU candidates byte-for-byte for every layer. Adds blocking copies and duplicate computation; validation only |
 | `AILA_DG_MOE_PACE` | int | auto | DiffusionGemma batched MoE drain interval in expert groups: `0`/unset = 8 in production, 1 under `AILA_PROFILE_DG` (larger bursts plus per-phase syncs hang the Level-Zero driver on A770) |
 | `AILA_DG_STEP_TIMING` | int | `0` | Print unprofiled per-step buckets: input H2D, decoder/logits total, decoder submission, logits D2H wait, argmax, entropy, gumbel, accept/renoise, host total, softmax submission, soft-embedding GEMM submission, soft-embed D2H wait, and total; no extra profiling synchronization is added |
 

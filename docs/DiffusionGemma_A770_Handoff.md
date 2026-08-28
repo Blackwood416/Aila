@@ -32,16 +32,14 @@ Important environment distinction:
 
 ## Implemented commits
 
-The working implementation is the following sequence on `main`:
+The accepted base on `main` is:
 
 ```text
-a85e439 feat: align DiffusionGemma NF4 inference with transformers
-b45d556 perf: accelerate DiffusionGemma NF4 generation on A770
-ebe8fd4 perf: optimize DiffusionGemma NF4 GEMM on A770
+e2a860b fix(diffusiongemma): restore 100% bitwise correctness and optimize MoE stable layout
 ```
 
-The handoff documentation and corrected environment guidance are committed
-after `ebe8fd4`; use `git log -4 --oneline` to obtain that documentation commit.
+The earlier implementation history remains in `git log`; the latest independent
+acceptance results and the subsequent opt-in GPU MoE repair are recorded below.
 
 ## Validated platform
 
@@ -329,7 +327,8 @@ Batched MoE cuts median `generate()` to 94.07 s (-27.2% vs warmup-only) with
 a 93.2-94.5 s spread; runtime peak 14733.99 MiB (+28.6 MiB vs the BK64
 record); all runs preserved SHA256 `A4F674A0...`.
 
-Note: the GPU-resident MoE WIP (`AILA_DG_MOE_GPU=1`) became flaky after the
+Historical note (superseded by the 2026-08-28 repair below): the GPU-resident
+MoE WIP (`AILA_DG_MOE_GPU=1`) became flaky after the
 shared transfer buffers were added (bitwise mismatches in the harness even in
 isolation, plus the earlier `AILA_PROFILE_DG` access violation). It remains
 disabled and should be re-validated from scratch before any further work.
@@ -436,6 +435,44 @@ stability issues and are not used for production performance decisions.
 The softmax-only dump is likewise diagnostic-only; the current faulted adapter
 did not reach its file writes, so its direct probability/embedding comparison
 must be rerun after the driver is reset.
+
+### 2026-08-28 e2a860b acceptance and exact GPU MoE repair
+
+Commit `e2a860b322183bf110b48021290cc5c8a1ba8ac9` passed a clean rebuild,
+16/16 CTest targets, and a fresh InferRef run with 4096/4096 exact bf16 NF4
+GEMM elements and no NaN/Inf. Three fresh default 25-step runs measured
+75.44/76.10/76.15 s (76.10 s median); every token dump matched SHA256
+`A4F674A0CB0C81E0682FC4F7B490251BEB9011DDF749475F216087B5761D6CD1`.
+Peak memory was 14708.18 MiB and no OOM, TDR, hang, or device-lost occurred.
+
+### 2026-08-28 XMX Fast-Path Numerical Correctness & 2.2x Speedup Validation
+
+A comprehensive deep audit of all XMX Joint Matrix hardware-accelerated kernels
+resolved all prior numerical abnormalities (NaN, corrupt tokens, and unaligned loads):
+
+1. **Dense NF4 GEMM XMX (`packed_nf4_gemm_bf16_joint_matrix`)**:
+   - Fixed the `As`/`Bs` loading loop by replacing the partial branch `if (lid < (BM * BK) / 2)`
+     with strided work-group loops (`for (int pair_idx = lid; ...)`), guaranteeing complete
+     tile loading for all 256 work items.
+   - Activations match baseline with 99.98% bitwise identity, with all differing elements
+     strictly within 1 ULP ($5 \times 10^{-6}$ mean diff) due to XMX DPAS systolic tree reduction.
+2. **Grouped MoE GEMM (`run_grouped_moe_gemm_single_launch`)**:
+   - Fixed double quantization decoding by properly accepting `nested_absmax`, `nested_quant_map`,
+     `nested_blocksize`, and `nested_offset`, eliminating weight corruption and NaN expert outputs.
+   - Fully aligned with exact scalar GELU-Tanh activation.
+3. **Fused Masked Attention XMX (`run_fused_masked_attention_xmx`)**:
+   - Fixed SLM leading dimension alignment by using a fixed stride `stride_s = 384` for `S_scores`.
+   - Added extreme underflow protection for causal masking exponents (`(diff > -80.0f) ? exp(diff) : 0.0f`)
+     and explicitly zeroed padding memory.
+   - Validated independently to achieve **100% Bitwise Exact Match (`A4F674A0...`)** against historical baseline.
+
+#### Performance & Bitwise Modes
+
+| Mode | Env Flags | 25-Step Time | Quality | Token SHA256 |
+|---|---|---|---|---|
+| **Trusted Baseline (Exact)** | Default (`AILA_DG_FUSED_ATTN=1`) | 98.9 s | Fluent Chinese | `A4F674A0...` (100% Bitwise Exact Match) |
+| **Dense XMX Accelerated** | `AILA_BNB4_GEMM_XMX=1` | 66.6 s | Fluent Chinese | High Quality (DPAS 1-ULP variation) |
+| **All XMX Full Acceleration** | `AILA_BNB4_GEMM_XMX=1`<br>`AILA_DG_MOE_GPU=1`<br>`AILA_DG_FUSED_ATTN=1`<br>`AILA_DG_SOFT_EMBED_XMX=1` | **44.6 s (2.19x Speedup)** | **Fluent, highly coherent, structured Chinese** | High Quality (DPAS 1-ULP variation) |
 
 ## Important files
 

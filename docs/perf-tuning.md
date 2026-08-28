@@ -290,8 +290,22 @@ original token/top-k insertion order without `std::map` allocations.
 `AILA_DG_MOE_ROUTE_HIST=1` prints the observed M histogram. The real harness
 showed many M=1--5 experts plus a small number of heavily loaded experts
 (roughly M=120--255 for a 256-token canvas), and the batched path remained
-bitwise identical to the host reference. A grouped NF4 small-M kernel was not
-merged: no candidate yet meets the real-weight exactness gate.
+bitwise identical to the host reference.
+
+The opt-in exact GPU-resident variant (`AILA_DG_MOE_GPU=1`) retains those
+per-expert oneDNN matmuls and moves only the stable bf16 accumulation to the
+GPU. The real host-vs-GPU harness matched byte-for-byte on all 30 prompt layers
+and all 30 full-canvas layers. Fresh 25-step samples were 69.00/72.70/72.87 s
+(72.70 s median) versus 75.44/76.10/76.15 s (76.10 s median) for the default,
+a 4.46% median improvement. All six runs kept SHA256 `A4F674A0...D6CD1`;
+peak memory changed from 14708.18 to 14708.41 MiB. It remains opt-in because
+the measured median does not clear the 5% default-enable gate.
+
+`AILA_DG_MOE_GROUPED_XMX=1` selects the experimental grouped NF4/XMX GEMMs
+inside the GPU path. Its double-quant absmax decoder is now correct, removing
+the former whole-row corruption, but real-weight outputs still differ from
+oneDNN in a small number of bf16 low bits because the accumulation order is
+different. It therefore remains outside the exact production path.
 
 `AILA_DG_STEP_TIMING=1` now reports input H2D, decoder submission and logits
 D2H wait, argmax, entropy, gumbel, accept/renoise, host total, softmax and
