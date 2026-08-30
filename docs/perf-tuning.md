@@ -101,6 +101,14 @@ AILA_BNB4_FUSED_PREFILL=1
 - Vision encode: ~320 ms for a 400x473 image (195 tokens), including image
   decode/resize; ~305 ms is the 27-block ViT encoder.
 
+Measured negative results (kept as env-gated candidates):
+
+- `AILA_BNB4_GEMM_XMX_BK=32/64` widens the XMX GEMM K block to amortize the
+  two SLM barriers per tile. On the Qwen3.5-9B prefill shapes it is
+  bitwise-equivalent to BK=16 (identical seed-42 token stream) but slower:
+  BK=16 331 tok/s, BK=32 240 tok/s, BK=64 200 tok/s on `pp=256`. The larger
+  B/A tiles reduce work-group occupancy; BK=16 remains the production tile.
+
 ### Intel Arc A770 + Qwen3.5-0.8B BNB NF4
 
 ```
