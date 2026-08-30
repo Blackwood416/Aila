@@ -1074,9 +1074,45 @@ void packed_nf4_gemm_bf16(Context& ctx,
                         ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
                         output_ptr, M, N, K, blocksize);
                 } else {
-                    packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
-                        ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
-                        output_ptr, M, N, K, blocksize);
+                    static const int xmx_tile =
+                        aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_TILE", 0);
+                    switch (xmx_tile) {
+                        case 1:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 32, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 2:
+                            packed_nf4_gemm_bf16_joint_matrix<32, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 3:
+                            packed_nf4_gemm_bf16_joint_matrix<32, 128, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 4:
+                            packed_nf4_gemm_bf16_joint_matrix<128, 32, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 5:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 128, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 6:
+                            packed_nf4_gemm_bf16_joint_matrix<128, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        default:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                    }
                 }
             } else {
                 packed_nf4_gemm_bf16_joint_matrix<32, 32, 16, 8, 8, 16, 8>(

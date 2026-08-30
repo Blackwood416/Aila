@@ -130,6 +130,7 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 | `AILA_Q35_PREFILL_XMX` | bool | `true` | Qwen3.5 prefill dense-NF4 XMX Joint Matrix GEMM on A770. The XMX route is ~7x faster than the ALU tiled GEMM for the 9B vision shape. Set `0` to restore the ALU v2 path for A/B |
 | `AILA_BNB4_GEMM_XMX` | bool | unset | Process-wide override for the A770 dense-NF4 XMX GEMM: `1` forces it on, `0` forces it off. Unset follows the per-backend default (on for Qwen3.5 prefill, off elsewhere) |
 | `AILA_BNB4_GEMM_XMX_BK` | int | `16` | A770 XMX GEMM K-block width (`16`/`32`/`64`). Measured negative: BK=32/64 stage larger SLM tiles and lose occupancy; keep `16` for production |
+| `AILA_BNB4_GEMM_XMX_TILE` | int | `0` | A770 XMX GEMM BM/BN tile for the M>=64/N>=64 prefill path: `0`=64x64, `1`=64x32, `2`=32x64, `3`=32x128, `4`=128x32, `5`=64x128, `6`=128x64. Swept on Qwen3.5-9B: 64x64 wins at M=128 and M=512; keep `0` for production |
 | `AILA_BNB4_GEMM_V2_SWIZZLE` | bool | `false` | DiffusionGemma/A770 v2 NF4 GEMM B-tile K-chunk-major SLM layout candidate; `0` keeps the validated legacy v2 layout |
 
 ---

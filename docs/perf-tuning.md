@@ -108,6 +108,13 @@ Measured negative results (kept as env-gated candidates):
   bitwise-equivalent to BK=16 (identical seed-42 token stream) but slower:
   BK=16 331 tok/s, BK=32 240 tok/s, BK=64 200 tok/s on `pp=256`. The larger
   B/A tiles reduce work-group occupancy; BK=16 remains the production tile.
+- `AILA_BNB4_GEMM_XMX_TILE` BM/BN sweep on the same model, `pp=512` (the
+  production prefill chunk shape), 2 iterations per tile: 64x64 343.6 tok/s,
+  128x64 320.5, 32x64 315.4, 64x32 310.9, 128x32 310.3, 32x128 308.7,
+  64x128 308.2. At `pp=128` 64x64 (307.8) also leads 128x64 (290.2), 32x64
+  (288.9), and 64x128 (279.6). 128x64 is uniformly slower across every
+  prefill projection in the stage profile, so there is no mixed per-N
+  dispatch opportunity. The 64x64 tile stays the production dispatch.
 
 ### Intel Arc A770 + Qwen3.5-0.8B BNB NF4
 
