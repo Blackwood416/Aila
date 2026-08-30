@@ -127,6 +127,8 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 | `AILA_BNB4_GEMV_WG` | int | `256` | Override GEMV SG16 work-group size (min 32). Controls rows-per-WG: rows = WG / 16 |
 | `AILA_FUSE_RESIDUAL_ADD` | bool | `false` | Fuse residual +=hidden into O-proj and down GEMV outputs (experimental, -1.5% decode regression on tested config) |
 | `AILA_BNB4_FUSED_PREFILL` | bool | `true` | Enable fused NF4 dequant + matmul kernel for prefill. Disable only for debugging |
+| `AILA_Q35_PREFILL_XMX` | bool | `true` | Qwen3.5 prefill dense-NF4 XMX Joint Matrix GEMM on A770. The XMX route is ~7x faster than the ALU tiled GEMM for the 9B vision shape. Set `0` to restore the ALU v2 path for A/B |
+| `AILA_BNB4_GEMM_XMX` | bool | unset | Process-wide override for the A770 dense-NF4 XMX GEMM: `1` forces it on, `0` forces it off. Unset follows the per-backend default (on for Qwen3.5 prefill, off elsewhere) |
 | `AILA_BNB4_GEMM_V2_SWIZZLE` | bool | `false` | DiffusionGemma/A770 v2 NF4 GEMM B-tile K-chunk-major SLM layout candidate; `0` keeps the validated legacy v2 layout |
 
 ---

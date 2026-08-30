@@ -621,6 +621,9 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         return out;
     };
 
+    static const bool q35_prefill_xmx =
+        aila::env::read_flag("AILA_Q35_PREFILL_XMX", true);
+
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         auto& layer = layers_[i];
         auto& cache = layer_caches_[i];
@@ -816,6 +819,16 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         if (!layer.gate_up_proj.init_fused_rows(ctx, gate_proj, up_proj, &fused_gate_up_error)) {
             if (error_message) *error_message = fused_gate_up_error;
             return false;
+        }
+        if (q35_prefill_xmx) {
+            layer.linear_o_proj.set_allow_dense_xmx(true);
+            layer.linear_all_proj.set_allow_dense_xmx(true);
+            layer.linear_qkv_proj.set_allow_dense_xmx(true);
+            layer.linear_z_proj.set_allow_dense_xmx(true);
+            layer.o_proj.set_allow_dense_xmx(true);
+            layer.qkv_proj.set_allow_dense_xmx(true);
+            layer.gate_up_proj.set_allow_dense_xmx(true);
+            layer.down_proj.set_allow_dense_xmx(true);
         }
         weights_to_erase.push_back(prefix + "mlp.gate_proj.weight");
         weights_to_erase.push_back(prefix + "mlp.up_proj.weight");

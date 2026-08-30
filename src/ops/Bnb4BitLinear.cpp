@@ -891,7 +891,8 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           const bf16* input_ptr,
                           bf16* output_ptr,
                           int M, int N, int K,
-                          int blocksize) {
+                          int blocksize,
+                          bool allow_dense_xmx = false) {
     static const bool use_a770_bm64 = [&ctx]() {
         const std::string device_name =
             ctx.queue().get_device().get_info<sycl::info::device::name>();
@@ -900,7 +901,14 @@ void packed_nf4_gemm_bf16(Context& ctx,
     }();
     if (use_a770_bm64) {
         // [DISPATCH] A770 XMX Joint Matrix: hardware DPAS Matrix Engine acceleration (23x faster than ALU)
-        static const bool use_xmx = aila::env::read_flag("AILA_BNB4_GEMM_XMX", false);
+        // AILA_BNB4_GEMM_XMX is a process-wide override: 1 forces the XMX
+        // route on, 0 forces it off. When unset, the caller's
+        // allow_dense_xmx default decides. Existing backends keep the
+        // historical off-by-default behavior; Qwen3.5 prefill opts in.
+        static bool xmx_override = false;
+        static const bool xmx_explicit = aila::env::read_flag_if_present(
+            "AILA_BNB4_GEMM_XMX", &xmx_override);
+        const bool use_xmx = xmx_explicit ? xmx_override : allow_dense_xmx;
         if (use_xmx && (K % 16 == 0) && (N <= 32768) && (K <= 16384) && (blocksize <= 64)) {
             if (M >= 64 && N >= 64) {
                 packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
@@ -1768,7 +1776,7 @@ void Bnb4BitLinear::forward(Context& ctx,
                              static_cast<const bf16*>(fused_input.data()),
                              static_cast<bf16*>(fused_output.data()),
                              seq_len, out_features_, in_features_,
-                             blocksize);
+                             blocksize, allow_dense_xmx_);
         ctx.queue().memcpy(output.data(), fused_output.data(), output_bytes);
         if (!lora_attachments_.empty()) {
             apply_lora_prefill(ctx, input, output, seq_len);
