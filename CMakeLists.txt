@@ -187,6 +187,7 @@ set(LIB_SOURCES
     src/audio/AudioPreprocessor.cpp
     src/audio/SpeakerEncoder.cpp
     src/audio/GpuSpeakerEncoder.cpp
+    src/audio/MimiEncoder.cpp
     src/profile/Device.cpp
     src/profile/Profiling.cpp
     src/api/aila_api.cpp
@@ -386,6 +387,15 @@ target_include_directories(AilaSafeTensorsTests PRIVATE
 )
 target_link_libraries(AilaSafeTensorsTests PRIVATE AilaLib)
 add_test(NAME AilaSafeTensorsTests COMMAND AilaSafeTensorsTests)
+
+add_executable(AilaMimiEncoderTests tests/audio/MimiEncoderTests.cpp)
+target_compile_definitions(AilaMimiEncoderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaMimiEncoderTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaMimiEncoderTests PRIVATE AilaLib)
+add_test(NAME AilaMimiEncoderTests COMMAND AilaMimiEncoderTests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_executable(AilaLoraLoaderTests tests/lora/LoraLoaderTests.cpp)
 target_compile_definitions(AilaLoraLoaderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)

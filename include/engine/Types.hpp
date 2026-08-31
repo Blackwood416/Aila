@@ -80,6 +80,36 @@ struct Qwen3Config {
 };
 
 // ============================================================
+// TTS Voice Cloning types (Issue #5)
+// ============================================================
+enum class VoiceCloneMode {
+    Auto = 0,
+    Icl = 1,
+    XVectorOnly = 2,
+};
+
+struct TTSReferenceCodes {
+    std::vector<int32_t> codes; // frame-major [frames, 16]
+    int frames = 0;
+    int codebooks = 16;
+};
+
+struct VoiceClonePrompt {
+    VoiceCloneMode mode = VoiceCloneMode::Auto;
+    std::vector<float> speaker_embedding;
+    TTSReferenceCodes reference_codes;
+    std::vector<int> reference_text_tokens;
+    std::string reference_text;
+
+    bool is_icl() const {
+        if (mode == VoiceCloneMode::Icl) return true;
+        if (mode == VoiceCloneMode::XVectorOnly) return false;
+        // Auto: enabled when both reference codes and reference text tokens are provided
+        return reference_codes.frames > 0 && !reference_text_tokens.empty();
+    }
+};
+
+// ============================================================
 // Generic chat/message types (OpenAI-style content parts)
 // ============================================================
 enum class ContentType {
