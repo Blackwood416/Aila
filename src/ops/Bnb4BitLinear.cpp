@@ -1294,8 +1294,10 @@ void Bnb4BitLinear::forward(Context& ctx,
     }
 
     const int blocksize = weight_.quant_state.blocksize;
-    static bool use_fused_prefill =
-        aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", 1) != 0;
+    static const int fused_prefill_mode =
+        aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", -1);
+    const bool use_fused_prefill = (fused_prefill_mode == 1) ||
+                                   (fused_prefill_mode == -1 && allow_dense_xmx_);
     if (use_fused_prefill && seq_len > 1 &&
         (blocksize % 2) == 0 &&
         (128 % blocksize) == 0 &&

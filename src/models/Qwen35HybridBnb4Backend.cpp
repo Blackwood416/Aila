@@ -621,8 +621,8 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         return out;
     };
 
-    static const bool q35_prefill_xmx =
-        aila::env::read_flag("AILA_Q35_PREFILL_XMX", true);
+    const bool q35_prefill_xmx =
+        aila::env::read_flag("AILA_Q35_PREFILL_XMX", cfg_.hidden_size >= 4096);
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         auto& layer = layers_[i];
