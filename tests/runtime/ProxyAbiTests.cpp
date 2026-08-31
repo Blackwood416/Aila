@@ -297,6 +297,14 @@ struct Api {
     using SynthesizeStream = AilaTTSStream* (*)(AilaEngine*, const char*, const char*,
                                                 const char*, const char*, const char*,
                                                 const AilaGenConfig*, AilaAudioCallback, void*);
+    using DefaultTTSOptions = AilaTTSOptions (*)();
+    using SynthesizeFileEx = int (*)(AilaEngine*, const char*, const char*, const char*,
+                                     const char*, const char*, const AilaGenConfig*,
+                                     const AilaTTSOptions*, const char*);
+    using SynthesizeStreamEx = AilaTTSStream* (*)(AilaEngine*, const char*, const char*,
+                                                  const char*, const char*, const char*,
+                                                  const AilaGenConfig*, const AilaTTSOptions*,
+                                                  AilaAudioCallback, void*);
     using StreamWait = int (*)(AilaTTSStream*);
     using StreamDestroy = void (*)(AilaTTSStream*);
     using Reset = void (*)(AilaEngine*);
@@ -316,6 +324,7 @@ struct Api {
           destroy(library.symbol<Destroy>("aila_engine_destroy")),
           default_config(library.symbol<DefaultConfig>("aila_default_gen_config")),
           default_config_v2(library.symbol<DefaultConfigV2>("aila_default_gen_config_v2")),
+          default_tts_options(library.symbol<DefaultTTSOptions>("aila_tts_options_default")),
           generate(library.symbol<Generate>("aila_generate")),
           generate_messages(library.symbol<Generate>("aila_generate_messages")),
           generate_chat_json(library.symbol<Generate>("aila_generate_chat_json")),
@@ -334,11 +343,13 @@ struct Api {
           synthesize_wav(library.symbol<SynthesizeWav>("aila_synthesize_wav")),
           synthesize_text(library.symbol<SynthesizeText>("aila_synthesize_text_to_wav")),
           synthesize_file(library.symbol<SynthesizeFile>("aila_synthesize")),
+          synthesize_file_ex(library.symbol<SynthesizeFileEx>("aila_synthesize_ex")),
           decode_mimi(library.symbol<DecodeMimi>("aila_decode_mimi_vocoder")),
           extract_embedding(library.symbol<ExtractEmbedding>("aila_extract_speaker_embedding")),
           align(library.symbol<Align>("aila_align")),
           align_words(library.symbol<AlignWords>("aila_align_words")),
           synthesize_stream(library.symbol<SynthesizeStream>("aila_synthesize_stream")),
+          synthesize_stream_ex(library.symbol<SynthesizeStreamEx>("aila_synthesize_stream_ex")),
           stream_wait(library.symbol<StreamWait>("aila_stream_wait")),
           stream_destroy(library.symbol<StreamDestroy>("aila_stream_destroy")),
           reset(library.symbol<Reset>("aila_engine_reset_context")),
@@ -358,6 +369,7 @@ struct Api {
     Destroy destroy;
     DefaultConfig default_config;
     DefaultConfigV2 default_config_v2;
+    DefaultTTSOptions default_tts_options;
     Generate generate;
     Generate generate_messages;
     Generate generate_chat_json;
@@ -373,11 +385,13 @@ struct Api {
     SynthesizeWav synthesize_wav;
     SynthesizeText synthesize_text;
     SynthesizeFile synthesize_file;
+    SynthesizeFileEx synthesize_file_ex;
     DecodeMimi decode_mimi;
     ExtractEmbedding extract_embedding;
     Align align;
     AlignWords align_words;
     SynthesizeStream synthesize_stream;
+    SynthesizeStreamEx synthesize_stream_ex;
     StreamWait stream_wait;
     StreamDestroy stream_destroy;
     Reset reset;
@@ -1403,6 +1417,17 @@ void verify_audio_proxy(const Api& api, AilaEngine* engine) {
     expect(api.extract_embedding(engine, "", &samples, &count) == AILA_OK && count == 3,
            "non-NULL empty embedding path was rejected locally");
     api.free_samples(samples);
+
+    AilaTTSOptions def_opts = api.default_tts_options();
+    expect(def_opts.struct_size == sizeof(AilaTTSOptions), "default_tts_options returned wrong struct_size");
+    expect(def_opts.voice_clone_mode == AILA_VOICE_CLONE_AUTO, "default_tts_options returned wrong default mode");
+
+    AilaTTSOptions invalid_opts = def_opts;
+    invalid_opts.struct_size = 1;
+    expect(api.synthesize_file_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &invalid_opts, u8R"(C:\输出\结果.wav)") == AILA_ERR_INVALID_ARGUMENT,
+           "synthesize_file_ex accepted invalid struct_size");
+    expect(api.synthesize_stream_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &invalid_opts, [](const float*, int, void*) {}, nullptr) == nullptr,
+           "synthesize_stream_ex accepted invalid struct_size");
 
     samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
     count = 19;

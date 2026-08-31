@@ -30,8 +30,10 @@ bool load_audio_from_memory(const uint8_t* data, size_t size, const std::string&
 // Keep for legacy compatibility, calls load_audio internally.
 bool load_wav(const std::string& path, WavFile& wav, std::string* error = nullptr);
 
-// Cubic spline resampler from src_rate to 16kHz.
+// Band-limited sinc resampler with Kaiser window.
+void resample_audio(const std::vector<float>& input, int src_rate, int dst_rate, std::vector<float>& output);
 void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<float>& output);
+void resample_to_24k(const std::vector<float>& input, int src_rate, std::vector<float>& output);
 
 // Compute Whisper-compatible mel spectrogram (128 bins, 16kHz, n_fft=400, hop=160).
 // Input: mono 16kHz float samples.

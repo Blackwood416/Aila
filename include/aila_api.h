@@ -510,9 +510,13 @@ typedef enum AilaVoiceCloneMode {
 } AilaVoiceCloneMode;
 
 typedef struct AilaTTSOptions {
-    const char* reference_text;          // UTF-8 reference transcript for ICL
-    AilaVoiceCloneMode voice_clone_mode; // Auto, Icl, or XVectorOnly
+    uint32_t struct_size;                /* set to sizeof(AilaTTSOptions) */
+    const char* reference_text;          /* UTF-8 reference transcript for ICL */
+    AilaVoiceCloneMode voice_clone_mode; /* Auto, Icl, or XVectorOnly */
+    int reserved[6];                     /* must be zero */
 } AilaTTSOptions;
+
+AILA_API AilaTTSOptions aila_tts_options_default(void);
 
 AILA_API int aila_synthesize_ex(
     AilaEngine* engine,

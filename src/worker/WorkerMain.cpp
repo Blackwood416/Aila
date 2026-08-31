@@ -568,7 +568,7 @@ public:
                 break;
             case aila::worker::AudioMethod::SynthesizeFile: {
                 output.clear();
-                AilaTTSOptions options{};
+                AilaTTSOptions options = aila_tts_options_default();
                 options.reference_text = request.has_reference_text ? request.reference_text.c_str() : nullptr;
                 options.voice_clone_mode = static_cast<AilaVoiceCloneMode>(request.voice_clone_mode);
                 return aila_synthesize_ex(
@@ -627,7 +627,7 @@ public:
             }
             context->accepted.store(accepted, std::memory_order_release);
         };
-        AilaTTSOptions options{};
+        AilaTTSOptions options = aila_tts_options_default();
         options.reference_text = request.has_reference_text ? request.reference_text.c_str() : nullptr;
         options.voice_clone_mode = static_cast<AilaVoiceCloneMode>(request.voice_clone_mode);
         AilaTTSStream* stream = aila_synthesize_stream_ex(

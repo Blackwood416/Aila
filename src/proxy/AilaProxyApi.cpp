@@ -713,6 +713,14 @@ AILA_API int aila_synthesize_text_to_wav(
     } catch (...) { record_boundary_failure(engine, "aila_synthesize_text_to_wav"); return AILA_ERR_RUNTIME; }
 }
 
+AILA_API AilaTTSOptions aila_tts_options_default(void) {
+    AilaTTSOptions opts;
+    std::memset(&opts, 0, sizeof(opts));
+    opts.struct_size = static_cast<uint32_t>(sizeof(AilaTTSOptions));
+    opts.voice_clone_mode = AILA_VOICE_CLONE_AUTO;
+    return opts;
+}
+
 AILA_API int aila_synthesize(
     AilaEngine* engine, const char* text, const char* reference_audio_path,
     const char* speaker_name, const char* instruct_text, const char* language,
@@ -729,6 +737,10 @@ AILA_API int aila_synthesize_ex(
     const AilaGenConfig* config, const AilaTTSOptions* options, const char* output_wav_path) {
     if (!engine || !text || !output_wav_path) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS file arguments are invalid"); } catch (...) {}
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
+        if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
@@ -793,6 +805,10 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
     AilaAudioCallback callback, void* user_data) {
     if (!engine || !text || !callback) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS stream arguments are invalid"); } catch (...) {}
+        return nullptr;
+    }
+    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
+        if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
         return nullptr;
     }
     try {

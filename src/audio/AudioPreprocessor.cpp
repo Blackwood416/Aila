@@ -301,45 +301,88 @@ bool load_wav(const std::string& path, WavFile& wav, std::string* error) {
 }
 
 // ============================================================
-// resample_to_16k (Cubic spline interpolation)
+// High-quality band-limited Sinc Resampler with Kaiser Window
 // ============================================================
 
-void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<float>& output) {
-    if (src_rate == 16000) {
+static inline double bessel_i0(double x) {
+    double ax = std::abs(x);
+    if (ax < 3.75) {
+        double y = x / 3.75;
+        y = y * y;
+        return 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))));
+    } else {
+        double y = 3.75 / ax;
+        return (std::exp(ax) / std::sqrt(ax)) * (0.39894228 + y * (0.01328592 + y * (0.00225319 + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))));
+    }
+}
+
+static inline int64_t calc_gcd(int64_t a, int64_t b) {
+    while (b) {
+        int64_t t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+void resample_audio(const std::vector<float>& input, int src_rate, int dst_rate, std::vector<float>& output) {
+    if (input.empty()) {
+        output.clear();
+        return;
+    }
+    if (src_rate <= 0 || dst_rate <= 0 || src_rate == dst_rate) {
         output = input;
         return;
     }
 
-    double ratio = static_cast<double>(src_rate) / 16000.0;
-    size_t input_size = input.size();
-    size_t output_size = static_cast<size_t>(std::round(input_size / ratio));
-    output.resize(output_size);
+    int64_t gcd_val = calc_gcd(src_rate, dst_rate);
+    int64_t orig_freq = src_rate / gcd_val;
+    int64_t new_freq = dst_rate / gcd_val;
 
-    auto get_sample = [&](int idx) -> float {
-        if (idx < 0) return input[0];
-        if (idx >= static_cast<int>(input_size)) return input[input_size - 1];
-        return input[idx];
-    };
+    int lowpass_filter_width = 64;
+    double rolloff = 0.99;
+    double beta = 14.769656459379492;
 
-    for (size_t i = 0; i < output_size; ++i) {
-        double t = i * ratio;
-        int idx = static_cast<int>(std::floor(t));
-        double f = t - idx;
+    double base_freq = std::min(static_cast<double>(orig_freq), static_cast<double>(new_freq)) * rolloff;
+    double i0_beta = bessel_i0(beta);
+    double scale = base_freq / orig_freq;
 
-        // Cubic spline Hermite interpolation (Catmull-Rom)
-        float y0 = get_sample(idx - 1);
-        float y1 = get_sample(idx);
-        float y2 = get_sample(idx + 1);
-        float y3 = get_sample(idx + 2);
+    size_t target_len = static_cast<size_t>(std::ceil(static_cast<double>(input.size()) * dst_rate / src_rate));
+    output.resize(target_len);
 
-        float a0 = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
-        float a1 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
-        float a2 = -0.5f * y0 + 0.5f * y2;
-        float a3 = y1;
+    double win_radius = lowpass_filter_width * orig_freq / base_freq;
+    const double pi = 3.14159265358979323846;
 
-        float val = static_cast<float>(((a0 * f + a1) * f + a2) * f + a3);
-        output[i] = val;
+    for (size_t j = 0; j < target_len; ++j) {
+        double input_pos = static_cast<double>(j) * orig_freq / static_cast<double>(new_freq);
+        int64_t k_min = static_cast<int64_t>(std::floor(input_pos - win_radius));
+        int64_t k_max = static_cast<int64_t>(std::ceil(input_pos + win_radius));
+
+        double sum_val = 0.0;
+        for (int64_t k = k_min; k <= k_max; ++k) {
+            double t = (static_cast<double>(k) - input_pos) * (base_freq / orig_freq);
+            if (std::abs(t) >= lowpass_filter_width) continue;
+
+            double sinc_val = (std::abs(t) < 1e-9) ? 1.0 : (std::sin(pi * t) / (pi * t));
+            double t_rel = t / lowpass_filter_width;
+            double kaiser_arg = beta * std::sqrt(std::max(0.0, 1.0 - t_rel * t_rel));
+            double win_val = bessel_i0(kaiser_arg) / i0_beta;
+
+            double weight = sinc_val * win_val * scale;
+            if (k >= 0 && k < static_cast<int64_t>(input.size())) {
+                sum_val += input[k] * weight;
+            }
+        }
+        output[j] = static_cast<float>(sum_val);
     }
+}
+
+void resample_to_16k(const std::vector<float>& input, int src_rate, std::vector<float>& output) {
+    resample_audio(input, src_rate, 16000, output);
+}
+
+void resample_to_24k(const std::vector<float>& input, int src_rate, std::vector<float>& output) {
+    resample_audio(input, src_rate, 24000, output);
 }
 
 // ============================================================

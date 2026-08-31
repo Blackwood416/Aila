@@ -394,7 +394,7 @@ target_include_directories(AilaMimiEncoderTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(AilaMimiEncoderTests PRIVATE AilaLib)
+target_link_libraries(AilaMimiEncoderTests PRIVATE AilaLib simdjson)
 add_test(NAME AilaMimiEncoderTests COMMAND AilaMimiEncoderTests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_executable(AilaLoraLoaderTests tests/lora/LoraLoaderTests.cpp)

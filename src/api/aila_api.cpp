@@ -930,6 +930,14 @@ AILA_API int aila_synthesize(
     );
 }
 
+AILA_API AilaTTSOptions aila_tts_options_default(void) {
+    AilaTTSOptions opts;
+    std::memset(&opts, 0, sizeof(opts));
+    opts.struct_size = static_cast<uint32_t>(sizeof(AilaTTSOptions));
+    opts.voice_clone_mode = AILA_VOICE_CLONE_AUTO;
+    return opts;
+}
+
 AILA_API int aila_synthesize_ex(
     AilaEngine* engine,
     const char* text,
@@ -942,6 +950,9 @@ AILA_API int aila_synthesize_ex(
     const char* output_wav_path
 ) {
     if (!engine || !text || !output_wav_path) {
+        return AILA_ERR_INVALID_ARGUMENT;
+    }
+    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
@@ -992,6 +1003,8 @@ AILA_API int aila_synthesize_ex(
 // Streaming TTS API
 struct AilaTTSStream {
     std::thread worker;
+    std::shared_ptr<std::atomic<int>> status_code{std::make_shared<std::atomic<int>>(AILA_OK)};
+    std::shared_ptr<std::string> error_message{std::make_shared<std::string>()};
     std::mutex mutex;
     bool done = false;
 };
@@ -1026,6 +1039,9 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
     void* user_data
 ) {
     if (!engine || !text || !callback) return nullptr;
+    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
+        return nullptr;
+    }
     auto* stream = new AilaTTSStream();
 
     GenerationConfig cpp_cfg = to_cpp_config(config);
@@ -1048,7 +1064,8 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
         cpp_cfg,
         [callback, user_data](const float* samples, int count) {
             callback(samples, count, user_data);
-        }, 4, ref_text, mode);
+        }, 4, ref_text, mode,
+        stream->status_code, stream->error_message);
 
     if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
         delete stream;
@@ -1064,7 +1081,8 @@ AILA_API int aila_stream_wait(AilaTTSStream* stream) {
         stream->worker.join();
         stream->done = true;
     }
-    return AILA_OK;
+    int code = stream->status_code ? stream->status_code->load() : AILA_OK;
+    return code;
 }
 
 AILA_API void aila_stream_destroy(AilaTTSStream* stream) {

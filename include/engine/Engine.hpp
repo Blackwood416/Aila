@@ -2391,6 +2391,17 @@ public:
         VoiceClonePrompt clone_prompt;
         const VoiceClonePrompt* p_clone_prompt = nullptr;
 
+        if (clone_mode == VoiceCloneMode::Icl) {
+            if (reference_audio_path.empty()) {
+                set_error(EngineErrorCode::InvalidArgument, "ICL voice clone requires reference_audio_path");
+                return false;
+            }
+            if (reference_text.empty()) {
+                set_error(EngineErrorCode::InvalidArgument, "ICL voice clone requires reference_text");
+                return false;
+            }
+        }
+
         if (!reference_audio_path.empty()) {
             // Base mode: ECAPA-TDNN voice cloning from reference audio
             // extractSpeakerEmbedding sets its own detailed error on failure
@@ -2401,12 +2412,8 @@ public:
             clone_prompt.mode = clone_mode;
             clone_prompt.speaker_embedding = spk_emb;
 
-            bool enable_icl = false;
-            if (clone_mode == VoiceCloneMode::Icl) {
-                enable_icl = true;
-            } else if (clone_mode == VoiceCloneMode::Auto && !reference_text.empty()) {
-                enable_icl = true;
-            }
+            bool enable_icl = (clone_mode == VoiceCloneMode::Icl) ||
+                              (clone_mode == VoiceCloneMode::Auto && !reference_text.empty());
 
             if (enable_icl) {
                 TTSReferenceCodes ref_codes;
@@ -2534,13 +2541,33 @@ public:
         std::function<void(const float*, int)> callback,
         int stream_batch_frames = 6,
         const std::string& reference_text = "",
-        VoiceCloneMode clone_mode = VoiceCloneMode::Auto
+        VoiceCloneMode clone_mode = VoiceCloneMode::Auto,
+        std::shared_ptr<std::atomic<int>> status_out = nullptr,
+        std::shared_ptr<std::string> err_msg_out = nullptr
     ) {
         clear_error();
-        if (reject_yolo_capability("TTS")) return {};
+        if (reject_yolo_capability("TTS")) {
+            if (status_out) status_out->store(static_cast<int>(EngineErrorCode::ModelCapability));
+            return {};
+        }
+
+        if (clone_mode == VoiceCloneMode::Icl) {
+            if (reference_audio_path.empty()) {
+                set_error(EngineErrorCode::InvalidArgument, "ICL voice clone requires reference_audio_path");
+                if (status_out) status_out->store(static_cast<int>(EngineErrorCode::InvalidArgument));
+                return {};
+            }
+            if (reference_text.empty()) {
+                set_error(EngineErrorCode::InvalidArgument, "ICL voice clone requires reference_text");
+                if (status_out) status_out->store(static_cast<int>(EngineErrorCode::InvalidArgument));
+                return {};
+            }
+        }
+
         return std::thread([this, text, reference_audio_path, speaker_name,
                             instruct_text, language, gen_config, callback,
-                            stream_batch_frames, reference_text, clone_mode]() {
+                            stream_batch_frames, reference_text, clone_mode,
+                            status_out, err_msg_out]() {
             // Determine mode
             std::vector<float> spk_emb;
             int spk_id = 0;
@@ -2548,7 +2575,11 @@ public:
             const VoiceClonePrompt* p_clone_prompt = nullptr;
 
             if (!reference_audio_path.empty()) {
-                extractSpeakerEmbedding(reference_audio_path, spk_emb);
+                if (!extractSpeakerEmbedding(reference_audio_path, spk_emb)) {
+                    if (status_out) status_out->store(static_cast<int>(EngineErrorCode::RuntimeError));
+                    if (err_msg_out) *err_msg_out = "Failed to extract speaker embedding";
+                    return;
+                }
                 clone_prompt.mode = clone_mode;
                 clone_prompt.speaker_embedding = spk_emb;
 
@@ -2567,7 +2598,15 @@ public:
                             std::string enc_err;
                             if (mimi_encoder_->encodeFromFile(reference_audio_path, ref_codes, &enc_err)) {
                                 cacheRefCodes(reference_audio_path, ref_codes);
+                            } else {
+                                if (status_out) status_out->store(static_cast<int>(EngineErrorCode::RuntimeError));
+                                if (err_msg_out) *err_msg_out = "Failed to encode reference audio: " + enc_err;
+                                return;
                             }
+                        } else {
+                            if (status_out) status_out->store(static_cast<int>(EngineErrorCode::RuntimeError));
+                            if (err_msg_out) *err_msg_out = "Failed to load Mimi Audio Encoder";
+                            return;
                         }
                     }
                     clone_prompt.reference_codes = std::move(ref_codes);
@@ -2593,9 +2632,13 @@ public:
 
             // Run streaming synthesis
             auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
-            if (!tts_backend) return;
+            if (!tts_backend) {
+                if (status_out) status_out->store(static_cast<int>(EngineErrorCode::RuntimeError));
+                if (err_msg_out) *err_msg_out = "TTS backend not initialized";
+                return;
+            }
 
-            tts_backend->synthesize_codes_stream(
+            bool ok = tts_backend->synthesize_codes_stream(
                 *ctx_, tokens, spk_emb, spk_id, instruct_tokens, lang_id,
                 gen_config, stream_batch_frames,
                 [&](const std::vector<float>& chunk) {
@@ -2604,6 +2647,10 @@ public:
                     }
                 },
                 p_clone_prompt);
+            if (!ok) {
+                if (status_out) status_out->store(static_cast<int>(EngineErrorCode::RuntimeError));
+                if (err_msg_out) *err_msg_out = "Streaming TTS synthesis failed";
+            }
         });
     }
 
@@ -3651,13 +3698,36 @@ public:
         }
     }
 
+    std::string canonicalAudioHash(const std::string& audio_path) const {
+        std::error_code ec;
+        auto p = std::filesystem::canonical(audio_path, ec);
+        std::string path_str = ec ? audio_path : p.string();
+        std::hash<std::string> hasher;
+        size_t h = hasher(path_str);
+        std::stringstream ss;
+        ss << std::hex << h;
+        return ss.str();
+    }
+
+    bool getAudioFileMeta(const std::string& path, uint64_t& out_size, int64_t& out_mtime) const {
+        std::error_code ec;
+        auto fs = std::filesystem::file_size(path, ec);
+        if (ec) return false;
+        out_size = fs;
+        auto lwt = std::filesystem::last_write_time(path, ec);
+        if (ec) return false;
+        out_mtime = lwt.time_since_epoch().count();
+        return true;
+    }
+
     // Build disk cache path for 12Hz reference audio codes
     std::string refCodesDiskCachePath(const std::string& audio_path) const {
         std::string suffix = ".qwen3tts12hz.codes.bin";
         if (!ref_cache_dir_.empty()) {
+            std::string hash_str = canonicalAudioHash(audio_path);
             size_t sep = audio_path.find_last_of("/\\");
             std::string base = (sep != std::string::npos) ? audio_path.substr(sep + 1) : audio_path;
-            return ref_cache_dir_ + "/" + base + suffix;
+            return ref_cache_dir_ + "/" + base + "_" + hash_str + suffix;
         }
         return audio_path + suffix;
     }
@@ -3668,6 +3738,11 @@ public:
             outCodes = mem_it->second;
             return true;
         }
+
+        uint64_t curr_size = 0;
+        int64_t curr_mtime = 0;
+        bool has_meta = getAudioFileMeta(audio_path, curr_size, curr_mtime);
+
         std::string disk_path = refCodesDiskCachePath(audio_path);
         std::ifstream in(disk_path, std::ios::binary);
         if (in.is_open()) {
@@ -3675,19 +3750,32 @@ public:
             in.read(magic, 4);
             if (std::memcmp(magic, "MIMI", 4) == 0) {
                 int32_t version = 0;
-                int32_t frames = 0;
-                int32_t codebooks = 0;
                 in.read(reinterpret_cast<char*>(&version), 4);
-                in.read(reinterpret_cast<char*>(&frames), 4);
-                in.read(reinterpret_cast<char*>(&codebooks), 4);
-                if (version == 1 && frames > 0 && codebooks == 16) {
-                    outCodes.frames = frames;
-                    outCodes.codebooks = codebooks;
-                    outCodes.codes.resize(static_cast<size_t>(frames) * 16);
-                    in.read(reinterpret_cast<char*>(outCodes.codes.data()),
-                            outCodes.codes.size() * sizeof(int32_t));
-                    ref_codes_cache_[audio_path] = outCodes;
-                    return true;
+                if (version == 2) {
+                    uint64_t cached_size = 0;
+                    int64_t cached_mtime = 0;
+                    int32_t frames = 0;
+                    int32_t codebooks = 0;
+                    in.read(reinterpret_cast<char*>(&cached_size), 8);
+                    in.read(reinterpret_cast<char*>(&cached_mtime), 8);
+                    in.read(reinterpret_cast<char*>(&frames), 4);
+                    in.read(reinterpret_cast<char*>(&codebooks), 4);
+
+                    if (has_meta && (cached_size != curr_size || cached_mtime != curr_mtime)) {
+                        return false; // Source audio changed on disk
+                    }
+
+                    if (frames > 0 && codebooks == 16) {
+                        outCodes.frames = frames;
+                        outCodes.codebooks = codebooks;
+                        outCodes.codes.resize(static_cast<size_t>(frames) * 16);
+                        in.read(reinterpret_cast<char*>(outCodes.codes.data()),
+                                outCodes.codes.size() * sizeof(int32_t));
+                        if (in.gcount() == static_cast<std::streamsize>(outCodes.codes.size() * sizeof(int32_t))) {
+                            ref_codes_cache_[audio_path] = outCodes;
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -3697,23 +3785,38 @@ public:
     void cacheRefCodes(const std::string& audio_path, const TTSReferenceCodes& codes) {
         if (codes.frames <= 0 || codes.codebooks != 16) return;
         ref_codes_cache_[audio_path] = codes;
+
+        uint64_t curr_size = 0;
+        int64_t curr_mtime = 0;
+        getAudioFileMeta(audio_path, curr_size, curr_mtime);
+
         std::string disk_path = refCodesDiskCachePath(audio_path);
         std::error_code ec;
         std::filesystem::create_directories(
             std::filesystem::path(disk_path).parent_path(), ec);
-        std::ofstream out(disk_path, std::ios::binary);
-        if (out.is_open()) {
-            const char magic[4] = {'M', 'I', 'M', 'I'};
-            int32_t version = 1;
-            int32_t frames = codes.frames;
-            int32_t codebooks = 16;
-            out.write(magic, 4);
-            out.write(reinterpret_cast<const char*>(&version), 4);
-            out.write(reinterpret_cast<const char*>(&frames), 4);
-            out.write(reinterpret_cast<const char*>(&codebooks), 4);
-            out.write(reinterpret_cast<const char*>(codes.codes.data()),
-                      codes.codes.size() * sizeof(int32_t));
+
+        std::string tmp_path = disk_path + ".tmp." + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        {
+            std::ofstream out(tmp_path, std::ios::binary);
+            if (out.is_open()) {
+                const char magic[4] = {'M', 'I', 'M', 'I'};
+                int32_t version = 2;
+                int32_t frames = codes.frames;
+                int32_t codebooks = 16;
+                out.write(magic, 4);
+                out.write(reinterpret_cast<const char*>(&version), 4);
+                out.write(reinterpret_cast<const char*>(&curr_size), 8);
+                out.write(reinterpret_cast<const char*>(&curr_mtime), 8);
+                out.write(reinterpret_cast<const char*>(&frames), 4);
+                out.write(reinterpret_cast<const char*>(&codebooks), 4);
+                out.write(reinterpret_cast<const char*>(codes.codes.data()),
+                          codes.codes.size() * sizeof(int32_t));
+                out.flush();
+            } else {
+                return;
+            }
         }
+        std::filesystem::rename(tmp_path, disk_path, ec);
     }
 
 private:

@@ -677,36 +677,10 @@ bool MimiEncoder::encodeFromFile(const std::string& audioPath,
         mono = std::move(audio.samples);
     }
 
-    // Resample to 24kHz if needed (cubic spline)
+    // Resample to 24kHz if needed (band-limited Kaiser sinc)
     std::vector<float> resampled;
     if (audio.sample_rate != 24000) {
-        double ratio = static_cast<double>(audio.sample_rate) / 24000.0;
-        size_t outSize = static_cast<size_t>(std::round(mono.size() / ratio));
-        resampled.resize(outSize);
-
-        auto get_sample = [&](int idx) -> float {
-            if (idx < 0) return mono[0];
-            if (idx >= static_cast<int>(mono.size())) return mono[mono.size() - 1];
-            return mono[idx];
-        };
-
-        for (size_t i = 0; i < outSize; ++i) {
-            double t = i * ratio;
-            int idx = static_cast<int>(std::floor(t));
-            double f = t - idx;
-
-            float y0 = get_sample(idx - 1);
-            float y1 = get_sample(idx);
-            float y2 = get_sample(idx + 1);
-            float y3 = get_sample(idx + 2);
-
-            float a0 = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
-            float a1 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
-            float a2 = -0.5f * y0 + 0.5f * y2;
-            float a3 = y1;
-
-            resampled[i] = static_cast<float>(((a0 * f + a1) * f + a2) * f + a3);
-        }
+        resample_to_24k(mono, audio.sample_rate, resampled);
     } else {
         resampled = std::move(mono);
     }
