@@ -16,6 +16,7 @@
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
 #include "../src/audio/SpeakerEncoder.hpp"
+#include "../src/audio/MimiEncoder.hpp"
 #include "../src/utils/ForceAlignerPostProcess.hpp"
 #include "../src/audio/GpuSpeakerEncoder.hpp"
 #include "../src/lora/LoraLoader.hpp"
@@ -597,6 +598,17 @@ public:
                 if (!tts_backend->load_mimi_vocoder(*ctx_, model_dir_, &mimi_error)) {
                     AILA_LOG_ERROR("Failed to load Mimi Vocoder for Qwen3TTS: %s", mimi_error.c_str());
                     return false;
+                }
+            }
+            std::string tokenizer_path = model_dir_ + "/speech_tokenizer/model.safetensors";
+            if (std::filesystem::exists(tokenizer_path)) {
+                mimi_encoder_ = std::make_unique<aila::audio::MimiEncoder>();
+                std::string enc_error;
+                if (mimi_encoder_->loadWeights(tokenizer_path, &enc_error)) {
+                    AILA_LOG_INFO("[TTS] Mimi 12Hz Audio Encoder loaded successfully");
+                } else {
+                    AILA_LOG_WARN("[TTS] Failed to load Mimi Audio Encoder: %s", enc_error.c_str());
+                    mimi_encoder_.reset();
                 }
             }
         }
@@ -2356,7 +2368,9 @@ public:
                           const std::string& instruct_text,
                           const std::string& language,
                           const GenerationConfig& gen_config,
-                          std::vector<float>& out_samples) {
+                          std::vector<float>& out_samples,
+                          const std::string& reference_text = "",
+                          VoiceCloneMode clone_mode = VoiceCloneMode::Auto) {
         clear_error();
         if (reject_yolo_capability("TTS")) return false;
         if (model_spec_.family != ModelFamily::Qwen3TTS || !backend_) {
@@ -2374,12 +2388,55 @@ public:
         //    VoiceDesign / default (instruct-only or no identity)
         std::vector<float> spk_emb;
         int spk_id = 0;
+        VoiceClonePrompt clone_prompt;
+        const VoiceClonePrompt* p_clone_prompt = nullptr;
 
         if (!reference_audio_path.empty()) {
             // Base mode: ECAPA-TDNN voice cloning from reference audio
             // extractSpeakerEmbedding sets its own detailed error on failure
             if (!extractSpeakerEmbedding(reference_audio_path, spk_emb)) {
                 return false;
+            }
+
+            clone_prompt.mode = clone_mode;
+            clone_prompt.speaker_embedding = spk_emb;
+
+            bool enable_icl = false;
+            if (clone_mode == VoiceCloneMode::Icl) {
+                enable_icl = true;
+            } else if (clone_mode == VoiceCloneMode::Auto && !reference_text.empty()) {
+                enable_icl = true;
+            }
+
+            if (enable_icl) {
+                TTSReferenceCodes ref_codes;
+                if (!lookupRefCodesCache(reference_audio_path, ref_codes)) {
+                    if (!mimi_encoder_ || !mimi_encoder_->isLoaded()) {
+                        std::string tokenizer_path = model_dir_ + "/speech_tokenizer/model.safetensors";
+                        mimi_encoder_ = std::make_unique<aila::audio::MimiEncoder>();
+                        std::string enc_err;
+                        if (!mimi_encoder_->loadWeights(tokenizer_path, &enc_err)) {
+                            set_error(EngineErrorCode::RuntimeError, "Failed to load Mimi Audio Encoder: " + enc_err);
+                            return false;
+                        }
+                    }
+                    std::string enc_err;
+                    if (!mimi_encoder_->encodeFromFile(reference_audio_path, ref_codes, &enc_err)) {
+                        set_error(EngineErrorCode::RuntimeError, "Failed to encode reference audio codes: " + enc_err);
+                        return false;
+                    }
+                    cacheRefCodes(reference_audio_path, ref_codes);
+                }
+
+                clone_prompt.reference_codes = std::move(ref_codes);
+                clone_prompt.reference_text = reference_text;
+                if (!reference_text.empty()) {
+                    clone_prompt.reference_text_tokens = tokenizer_.encode(reference_text);
+                }
+                p_clone_prompt = &clone_prompt;
+                AILA_LOG_INFO("[TTS] ICL mode active: %d ref codes frames, %zu ref text tokens",
+                              clone_prompt.reference_codes.frames,
+                              clone_prompt.reference_text_tokens.size());
             }
         } else if (!speaker_name.empty()) {
             // CustomVoice mode: use spk_id token from model's pre-trained voice map
@@ -2422,14 +2479,37 @@ public:
         int n_frames = 0;
         bool ok = tts_backend->synthesize_codes(*ctx_, tokens, spk_emb, spk_id,
                                                  instruct_tokens, lang_id,
-                                                 gen_config, codes, n_frames);
+                                                 gen_config, codes, n_frames,
+                                                 p_clone_prompt);
         if (!ok) {
             set_error(EngineErrorCode::RuntimeError, "TTS synthesize_codes failed");
             return false;
         }
 
         // 6. Decode codes to audio via Mimi vocoder
-        ok = tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
+        if (p_clone_prompt && p_clone_prompt->is_icl() && p_clone_prompt->reference_codes.frames > 0) {
+            int ref_len = p_clone_prompt->reference_codes.frames;
+            int total_len = ref_len + n_frames;
+            std::vector<int32_t> codes_for_decode;
+            codes_for_decode.reserve(static_cast<size_t>(total_len) * 16);
+            codes_for_decode.insert(codes_for_decode.end(),
+                                    p_clone_prompt->reference_codes.codes.begin(),
+                                    p_clone_prompt->reference_codes.codes.end());
+            codes_for_decode.insert(codes_for_decode.end(), codes.begin(), codes.end());
+
+            std::vector<float> full_decoded;
+            ok = tts_backend->decode_mimi_vocoder(*ctx_, codes_for_decode, total_len, full_decoded);
+            if (ok && !full_decoded.empty()) {
+                size_t cut = static_cast<size_t>(static_cast<double>(ref_len) / std::max(total_len, 1) * full_decoded.size());
+                if (cut < full_decoded.size()) {
+                    out_samples.assign(full_decoded.begin() + cut, full_decoded.end());
+                } else {
+                    out_samples.clear();
+                }
+            }
+        } else {
+            ok = tts_backend->decode_mimi_vocoder(*ctx_, codes, n_frames, out_samples);
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
 
         if (ok && !out_samples.empty()) {
@@ -2452,18 +2532,51 @@ public:
         const std::string& language,
         const GenerationConfig& gen_config,
         std::function<void(const float*, int)> callback,
-        int stream_batch_frames = 6
+        int stream_batch_frames = 6,
+        const std::string& reference_text = "",
+        VoiceCloneMode clone_mode = VoiceCloneMode::Auto
     ) {
         clear_error();
         if (reject_yolo_capability("TTS")) return {};
         return std::thread([this, text, reference_audio_path, speaker_name,
                             instruct_text, language, gen_config, callback,
-                            stream_batch_frames]() {
+                            stream_batch_frames, reference_text, clone_mode]() {
             // Determine mode
             std::vector<float> spk_emb;
             int spk_id = 0;
+            VoiceClonePrompt clone_prompt;
+            const VoiceClonePrompt* p_clone_prompt = nullptr;
+
             if (!reference_audio_path.empty()) {
                 extractSpeakerEmbedding(reference_audio_path, spk_emb);
+                clone_prompt.mode = clone_mode;
+                clone_prompt.speaker_embedding = spk_emb;
+
+                bool enable_icl = (clone_mode == VoiceCloneMode::Icl) ||
+                                  (clone_mode == VoiceCloneMode::Auto && !reference_text.empty());
+                if (enable_icl) {
+                    TTSReferenceCodes ref_codes;
+                    if (!lookupRefCodesCache(reference_audio_path, ref_codes)) {
+                        if (!mimi_encoder_ || !mimi_encoder_->isLoaded()) {
+                            std::string tokenizer_path = model_dir_ + "/speech_tokenizer/model.safetensors";
+                            mimi_encoder_ = std::make_unique<aila::audio::MimiEncoder>();
+                            std::string enc_err;
+                            mimi_encoder_->loadWeights(tokenizer_path, &enc_err);
+                        }
+                        if (mimi_encoder_ && mimi_encoder_->isLoaded()) {
+                            std::string enc_err;
+                            if (mimi_encoder_->encodeFromFile(reference_audio_path, ref_codes, &enc_err)) {
+                                cacheRefCodes(reference_audio_path, ref_codes);
+                            }
+                        }
+                    }
+                    clone_prompt.reference_codes = std::move(ref_codes);
+                    clone_prompt.reference_text = reference_text;
+                    if (!reference_text.empty()) {
+                        clone_prompt.reference_text_tokens = tokenizer_.encode(reference_text);
+                    }
+                    p_clone_prompt = &clone_prompt;
+                }
             } else if (!speaker_name.empty()) {
                 spk_id = getSpeakerId(speaker_name);
             }
@@ -2489,7 +2602,8 @@ public:
                     if (!chunk.empty()) {
                         callback(chunk.data(), static_cast<int>(chunk.size()));
                     }
-                });
+                },
+                p_clone_prompt);
         });
     }
 
@@ -3537,9 +3651,76 @@ public:
         }
     }
 
+    // Build disk cache path for 12Hz reference audio codes
+    std::string refCodesDiskCachePath(const std::string& audio_path) const {
+        std::string suffix = ".qwen3tts12hz.codes.bin";
+        if (!ref_cache_dir_.empty()) {
+            size_t sep = audio_path.find_last_of("/\\");
+            std::string base = (sep != std::string::npos) ? audio_path.substr(sep + 1) : audio_path;
+            return ref_cache_dir_ + "/" + base + suffix;
+        }
+        return audio_path + suffix;
+    }
+
+    bool lookupRefCodesCache(const std::string& audio_path, TTSReferenceCodes& outCodes) {
+        auto mem_it = ref_codes_cache_.find(audio_path);
+        if (mem_it != ref_codes_cache_.end()) {
+            outCodes = mem_it->second;
+            return true;
+        }
+        std::string disk_path = refCodesDiskCachePath(audio_path);
+        std::ifstream in(disk_path, std::ios::binary);
+        if (in.is_open()) {
+            char magic[4];
+            in.read(magic, 4);
+            if (std::memcmp(magic, "MIMI", 4) == 0) {
+                int32_t version = 0;
+                int32_t frames = 0;
+                int32_t codebooks = 0;
+                in.read(reinterpret_cast<char*>(&version), 4);
+                in.read(reinterpret_cast<char*>(&frames), 4);
+                in.read(reinterpret_cast<char*>(&codebooks), 4);
+                if (version == 1 && frames > 0 && codebooks == 16) {
+                    outCodes.frames = frames;
+                    outCodes.codebooks = codebooks;
+                    outCodes.codes.resize(static_cast<size_t>(frames) * 16);
+                    in.read(reinterpret_cast<char*>(outCodes.codes.data()),
+                            outCodes.codes.size() * sizeof(int32_t));
+                    ref_codes_cache_[audio_path] = outCodes;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void cacheRefCodes(const std::string& audio_path, const TTSReferenceCodes& codes) {
+        if (codes.frames <= 0 || codes.codebooks != 16) return;
+        ref_codes_cache_[audio_path] = codes;
+        std::string disk_path = refCodesDiskCachePath(audio_path);
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(disk_path).parent_path(), ec);
+        std::ofstream out(disk_path, std::ios::binary);
+        if (out.is_open()) {
+            const char magic[4] = {'M', 'I', 'M', 'I'};
+            int32_t version = 1;
+            int32_t frames = codes.frames;
+            int32_t codebooks = 16;
+            out.write(magic, 4);
+            out.write(reinterpret_cast<const char*>(&version), 4);
+            out.write(reinterpret_cast<const char*>(&frames), 4);
+            out.write(reinterpret_cast<const char*>(&codebooks), 4);
+            out.write(reinterpret_cast<const char*>(codes.codes.data()),
+                      codes.codes.size() * sizeof(int32_t));
+        }
+    }
+
 private:
     // In-memory speaker embedding cache (keyed by audio file path).
     std::unordered_map<std::string, std::vector<float>> ref_cache_;
+    // In-memory reference codes cache (keyed by audio file path).
+    std::unordered_map<std::string, TTSReferenceCodes> ref_codes_cache_;
     // Optional persistent cache directory for speaker embeddings.
     std::string ref_cache_dir_;
 
@@ -3554,6 +3735,7 @@ private:
     std::unique_ptr<aila::vision::Yolo26Detector> detector_;
     std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
     std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
+    std::unique_ptr<aila::audio::MimiEncoder> mimi_encoder_;
     aila::chat::ChatFormatter chat_formatter_;
     Tokenizer tokenizer_;
     bool vision_backend_enabled_ = false;

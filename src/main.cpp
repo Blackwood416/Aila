@@ -455,6 +455,10 @@ int main(int argc, char** argv) {
             // Accumulate samples for optional WAV output
             std::mutex sample_mutex;
             std::vector<float> all_samples;
+            VoiceCloneMode clone_mode = VoiceCloneMode::Auto;
+            if (opts.tts_voice_clone_mode == "icl") clone_mode = VoiceCloneMode::Icl;
+            else if (opts.tts_voice_clone_mode == "xvector-only" || opts.tts_voice_clone_mode == "xvector") clone_mode = VoiceCloneMode::XVectorOnly;
+
             auto worker = engine.synthesizeSpeechStream(
                 input_text, opts.tts_reference_path, opts.tts_speaker_name,
                 opts.tts_instruct_text, opts.tts_language, tts_gen,
@@ -465,7 +469,7 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lock(sample_mutex);
                         all_samples.insert(all_samples.end(), samples, samples + count);
                     }
-                }, batch);
+                }, batch, opts.tts_ref_text, clone_mode);
             worker.join();
 
             // Save WAV if requested
@@ -488,9 +492,14 @@ int main(int argc, char** argv) {
         AILA_LOG_INFO("Synthesizing text: \"%s\"", input_text.c_str());
 
         std::vector<float> samples;
+        VoiceCloneMode clone_mode = VoiceCloneMode::Auto;
+        if (opts.tts_voice_clone_mode == "icl") clone_mode = VoiceCloneMode::Icl;
+        else if (opts.tts_voice_clone_mode == "xvector-only" || opts.tts_voice_clone_mode == "xvector") clone_mode = VoiceCloneMode::XVectorOnly;
+
         bool ok = engine.synthesizeSpeech(
             input_text, opts.tts_reference_path, opts.tts_speaker_name,
-            opts.tts_instruct_text, opts.tts_language, tts_gen, samples);
+            opts.tts_instruct_text, opts.tts_language, tts_gen, samples,
+            opts.tts_ref_text, clone_mode);
 
         if (!ok) {
             AILA_LOG_ERROR("TTS synthesis failed: %s", engine.last_error_message().c_str());

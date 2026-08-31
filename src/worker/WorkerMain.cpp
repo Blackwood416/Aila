@@ -566,16 +566,21 @@ public:
                     static_cast<int>(request.embedding.size()),
                     request.has_config ? &request.config : nullptr, &values, &count);
                 break;
-            case aila::worker::AudioMethod::SynthesizeFile:
+            case aila::worker::AudioMethod::SynthesizeFile: {
                 output.clear();
-                return aila_synthesize(
+                AilaTTSOptions options{};
+                options.reference_text = request.has_reference_text ? request.reference_text.c_str() : nullptr;
+                options.voice_clone_mode = static_cast<AilaVoiceCloneMode>(request.voice_clone_mode);
+                return aila_synthesize_ex(
                     engine_, request.text.c_str(),
                     request.has_reference_audio_path ? request.reference_audio_path.c_str() : nullptr,
                     request.has_speaker_name ? request.speaker_name.c_str() : nullptr,
                     request.has_instruct_text ? request.instruct_text.c_str() : nullptr,
                     request.has_language ? request.language.c_str() : nullptr,
                     request.has_config ? &request.config : nullptr,
+                    &options,
                     request.output_wav_path.c_str()) == AILA_OK;
+            }
             case aila::worker::AudioMethod::DecodeMimi:
                 status = aila_decode_mimi_vocoder(
                     engine_, request.codes.data(), request.frame_count, &values, &count);
@@ -622,13 +627,17 @@ public:
             }
             context->accepted.store(accepted, std::memory_order_release);
         };
-        AilaTTSStream* stream = aila_synthesize_stream(
+        AilaTTSOptions options{};
+        options.reference_text = request.has_reference_text ? request.reference_text.c_str() : nullptr;
+        options.voice_clone_mode = static_cast<AilaVoiceCloneMode>(request.voice_clone_mode);
+        AilaTTSStream* stream = aila_synthesize_stream_ex(
             engine_, request.text.c_str(),
             request.has_reference_audio_path ? request.reference_audio_path.c_str() : nullptr,
             request.has_speaker_name ? request.speaker_name.c_str() : nullptr,
             request.has_instruct_text ? request.instruct_text.c_str() : nullptr,
             request.has_language ? request.language.c_str() : nullptr,
             request.has_config ? &request.config : nullptr,
+            &options,
             adapter, &context);
         if (!stream) return -1;
         const int status = aila_stream_wait(stream);

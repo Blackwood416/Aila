@@ -452,7 +452,8 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        int language_id,
                                        const GenerationConfig& gen_config,
                                        std::vector<int32_t>& out_codes,
-                                       int& out_n_frames) {
+                                       int& out_n_frames,
+                                       const VoiceClonePrompt* clone_prompt) {
     out_codes.clear();
     out_n_frames = 0;
 
@@ -478,46 +479,6 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     auto t_prefill_start = t_total_start;
     reset();
 
-    // 临时分配用于文本投影的 GPU 张量
-    Tensor text_ids_dev = Tensor::allocate(ctx, {L}, dnnl::memory::data_type::s32);
-    ctx.memcpy_h2d(text_ids_dev.data(), text_tokens.data(), L * sizeof(int));
-
-    Tensor text_emb = Tensor::allocate(ctx, {L, 2048});
-    ops::embedding_lookup(ctx, *talker_text_embed_weight_, text_ids_dev.data_as<int>(), L, text_emb, 2048);
-    print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
-
-    // 对 text_emb 过 ResizeMLP (text_projection)
-    Tensor fc1_out = Tensor::allocate(ctx, {L, 2048});
-    talker_text_proj_fc1_.forward_bias(ctx, text_emb, *talker_text_proj_fc1_bias_, fc1_out, L);
-    print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
-
-    // SiLU(x) = x * sigmoid(x)
-    Tensor silu_out = Tensor::allocate(ctx, {L, 2048});
-    ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, L * 2048);
-    print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
-
-    Tensor projected_text = Tensor::allocate(ctx, {L, H_talker});
-    talker_text_proj_fc2_.forward_bias(ctx, silu_out, *talker_text_proj_fc2_bias_, projected_text, L);
-    print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
-
-    // Use pre-computed embeddings (computed once during load)
-    Tensor& tts_bos_embed = precomputed_tts_bos_;
-    Tensor& tts_eos_embed = precomputed_tts_eos_;
-    Tensor& tts_pad_embed = precomputed_tts_pad_;
-    print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
-
-    // Codec embedding lookup helper (still needed for dynamic spk_id in CustomVoice)
-    auto get_talker_codec_embed = [&](int codec_id) {
-        Tensor c_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
-        ctx.memcpy_h2d(c_id.data(), &codec_id, sizeof(int));
-        Tensor out = Tensor::allocate(ctx, {1, H_talker});
-        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, c_id.data_as<int>(), 1, out, H_talker);
-        return out;
-    };
-
-    Tensor& embed_codec_pad = precomputed_codec_pad_;
-    Tensor& embed_codec_bos = precomputed_codec_bos_;
-
     // 正文提取：找到 <|im_end|> (151645) 的位置作为正文结束边界
     // BPE tokenizer 可能将 <|im_end|> 与相邻字符合并，不能用固定 L-5 计算
     // 前 3 个 tokens 是 role 前缀：`<|im_start|>assistant\n`
@@ -540,6 +501,72 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
             }
         }
     }
+
+    bool is_icl = (clone_prompt != nullptr && clone_prompt->is_icl());
+
+    // 构造送入 text_projection 的 token 序列：
+    // 非 ICL: text_tokens 原样投影
+    // ICL: 角色前缀(3) + 参考文本tokens + 正文tokens(text_body_start..text_body_end)
+    std::vector<int> tokens_to_project;
+    int target_body_len = std::max(0, text_body_end - text_body_start);
+    int icl_ref_tokens_count = 0;
+    if (is_icl) {
+        tokens_to_project.reserve(3 + clone_prompt->reference_text_tokens.size() + target_body_len);
+        for (int i = 0; i < 3; ++i) {
+            tokens_to_project.push_back(text_tokens[i]);
+        }
+        for (int id : clone_prompt->reference_text_tokens) {
+            tokens_to_project.push_back(id);
+        }
+        icl_ref_tokens_count = static_cast<int>(clone_prompt->reference_text_tokens.size());
+        for (int i = 0; i < target_body_len; ++i) {
+            tokens_to_project.push_back(text_tokens[text_body_start + i]);
+        }
+    } else {
+        tokens_to_project = text_tokens;
+    }
+
+    int proj_L = static_cast<int>(tokens_to_project.size());
+
+    // 临时分配用于文本投影的 GPU 张量
+    Tensor text_ids_dev = Tensor::allocate(ctx, {proj_L}, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(text_ids_dev.data(), tokens_to_project.data(), proj_L * sizeof(int));
+
+    Tensor text_emb = Tensor::allocate(ctx, {proj_L, 2048});
+    ops::embedding_lookup(ctx, *talker_text_embed_weight_, text_ids_dev.data_as<int>(), proj_L, text_emb, 2048);
+    print_gpu_tensor(ctx, "text_emb[0, 0, :5]", text_emb, 0);
+
+    // 对 text_emb 过 ResizeMLP (text_projection)
+    Tensor fc1_out = Tensor::allocate(ctx, {proj_L, 2048});
+    talker_text_proj_fc1_.forward_bias(ctx, text_emb, *talker_text_proj_fc1_bias_, fc1_out, proj_L);
+    print_gpu_tensor(ctx, "fc1_out[0, 0, :5]", fc1_out, 0);
+
+    // SiLU(x) = x * sigmoid(x)
+    Tensor silu_out = Tensor::allocate(ctx, {proj_L, 2048});
+    ops::sigmoid_mul(ctx, fc1_out, fc1_out, silu_out, proj_L * 2048);
+    print_gpu_tensor(ctx, "silu_out[0, 0, :5]", silu_out, 0);
+
+    Tensor projected_text = Tensor::allocate(ctx, {proj_L, H_talker});
+    talker_text_proj_fc2_.forward_bias(ctx, silu_out, *talker_text_proj_fc2_bias_, projected_text, proj_L);
+    print_gpu_tensor(ctx, "projected_text[0, 0, :5]", projected_text, 0);
+
+    // Use pre-computed embeddings (computed once during load)
+    Tensor& tts_bos_embed = precomputed_tts_bos_;
+    Tensor& tts_eos_embed = precomputed_tts_eos_;
+    Tensor& tts_pad_embed = precomputed_tts_pad_;
+    print_gpu_tensor(ctx, "tts_pad_embed[0, 0, :5]", tts_pad_embed, 0);
+
+    // Codec embedding lookup helper (still needed for dynamic spk_id in CustomVoice)
+    auto get_talker_codec_embed = [&](int codec_id) {
+        Tensor c_id = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(c_id.data(), &codec_id, sizeof(int));
+        Tensor out = Tensor::allocate(ctx, {1, H_talker});
+        ops::embedding_lookup(ctx, *talker_codec_embed_weight_, c_id.data_as<int>(), 1, out, H_talker);
+        return out;
+    };
+
+    Tensor& embed_codec_pad = precomputed_codec_pad_;
+    Tensor& embed_codec_bos = precomputed_codec_bos_;
 
     // ==========================================
     // Instruct text prefix (for VoiceDesign and CustomVoice with style override)
@@ -592,12 +619,12 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     int codec_prefill_count = static_cast<int>(codec_prefill_ids.size());
 
     // ==========================================
-    // Determine prefill layout based on model type
-    // Base layout:   [role(3)] [codec_prefill] [spk_embed(1)] [pad+bos(1)] [text+bos(1)]
-    // CustomVoice:   [role(3)] [codec_prefill] [spk_codec(1)] [pad+bos(1)] [text+bos(1)]
-    // VoiceDesign:   [role(3)] [codec_prefill] [pad+bos(1)] [text+bos(1)]  (no spk slot)
+    // Determine prefill layout based on model type & ICL
+    // Base layout (non-ICL): [role(3)] [codec_prefill] [spk_embed(1)] [pad+bos(1)] [text+bos(1)]
+    // Base layout (ICL):     [role(3)] [codec_prefill] [spk_embed(1)] [pad+bos(1)] [icl_input_embed(T2)]
+    // CustomVoice:           [role(3)] [codec_prefill] [spk_codec(1)] [pad+bos(1)] [text+bos(1)]
+    // VoiceDesign:           [role(3)] [codec_prefill] [pad+bos(1)] [text+bos(1)]  (no spk slot)
     // ==========================================
-    int prefill_base_len = 3 + codec_prefill_count + 2; // role + codec_prefill + pad_bos + text_bos
     int has_spk = 0;
     int spk_idx = 0;
 
@@ -609,9 +636,21 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
     // VoiceDesign: always has_spk = 0
 
     if (has_spk) spk_idx = 3 + codec_prefill_count;
-    int prefill_len = prefill_base_len + has_spk;
-    int first_text_idx = prefill_len - 1;
     int pad_bos_idx = 3 + codec_prefill_count + has_spk;
+
+    // Prefill 长度与布局变量
+    int prefill_len = 0;
+    int first_text_idx = 0;
+    int R_frames = is_icl ? clone_prompt->reference_codes.frames : 0;
+    int T2_frames = is_icl ? (1 + R_frames) : 0;
+    int icl_start_idx = pad_bos_idx + 1;
+
+    if (is_icl) {
+        prefill_len = icl_start_idx + T2_frames;
+    } else {
+        prefill_len = pad_bos_idx + 1 + 1; // +1 for text_bos
+        first_text_idx = prefill_len - 1;
+    }
 
     int total_prefill_len = instruct_offset + prefill_len;
     Tensor prefill_embeds = Tensor::allocate(ctx, {total_prefill_len, H_talker});
@@ -679,48 +718,152 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
         });
         ctx.queue().wait();
 
-        // 5. 最后一帧：首个正文 token + codec_bos
-        if (text_body_end > text_body_start) {
-            bf16* first_text = projected_text.data_as<bf16>() + text_body_start * H_talker;
-            bf16* c_bos = embed_codec_bos.data_as<bf16>();
-            ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
-                dst[first_text_idx * H_talker + h] = first_text[h] + c_bos[h];
-            });
-        } else {
-            // 无正文 token 的退化情况：用 tts_eos_embed + codec_bos
-            bf16* p_eos = tts_eos_embed.data_as<bf16>();
-            bf16* c_bos = embed_codec_bos.data_as<bf16>();
-            ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
-                dst[first_text_idx * H_talker + h] = p_eos[h] + c_bos[h];
-            });
+        if (!is_icl) {
+            // 5. 非 ICL 最后一帧：首个正文 token + codec_bos
+            if (text_body_end > text_body_start) {
+                bf16* first_text = projected_text.data_as<bf16>() + text_body_start * H_talker;
+                bf16* c_bos = embed_codec_bos.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                    dst[first_text_idx * H_talker + h] = first_text[h] + c_bos[h];
+                });
+            } else {
+                // 无正文 token 的退化情况：用 tts_eos_embed + codec_bos
+                bf16* p_eos = tts_eos_embed.data_as<bf16>();
+                bf16* c_bos = embed_codec_bos.data_as<bf16>();
+                ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                    dst[first_text_idx * H_talker + h] = p_eos[h] + c_bos[h];
+                });
+            }
+            ctx.queue().wait();
         }
-        ctx.queue().wait();
     }
 
-    // 构建 trailing_text_hidden：从第 2 个正文 token 开始到 <|im_end|> 之前的所有正文 token
-    // 加上 tts_eos_embed 作为结尾，用于 decode 逐步注入时提供文本时序指导
-    int trailing_token_count = std::max(0, text_body_end - text_body_start - 1);
-    int trailing_len = trailing_token_count + 1; // +1 for tts_eos_embed at end
-    AILA_LOG_INFO("[TTS] text_body_end=%d (detected), trailing_tokens=%d, trailing_len=%d",
-                  text_body_end, trailing_token_count, trailing_len);
-    std::vector<bf16> trailing_text_hidden(trailing_len * H_talker);
-    if (trailing_token_count > 0) {
-        // 拷贝第 5 个 token (index=4) 起的正文投影
-        bf16* all_proj = projected_text.data_as<bf16>();
-        std::vector<bf16> proj_cpu(L * H_talker);
-        ctx.queue().memcpy(proj_cpu.data(), all_proj, L * H_talker * sizeof(bf16)).wait();
-        for (int t = 0; t < trailing_token_count; ++t) {
-            std::memcpy(trailing_text_hidden.data() + t * H_talker,
-                       proj_cpu.data() + (text_body_start + 1 + t) * H_talker,
-                       H_talker * sizeof(bf16));
+    // trailing_text_hidden 初始化
+    int trailing_len = 0;
+    std::vector<bf16> trailing_text_hidden;
+
+    if (!is_icl) {
+        // 非 ICL 模式：构建 trailing_text_hidden
+        int trailing_token_count = std::max(0, text_body_end - text_body_start - 1);
+        trailing_len = trailing_token_count + 1; // +1 for tts_eos_embed at end
+        AILA_LOG_INFO("[TTS] text_body_end=%d (detected), trailing_tokens=%d, trailing_len=%d",
+                      text_body_end, trailing_token_count, trailing_len);
+        trailing_text_hidden.resize(trailing_len * H_talker);
+        if (trailing_token_count > 0) {
+            bf16* all_proj = projected_text.data_as<bf16>();
+            std::vector<bf16> proj_cpu(L * H_talker);
+            ctx.queue().memcpy(proj_cpu.data(), all_proj, L * H_talker * sizeof(bf16)).wait();
+            for (int t = 0; t < trailing_token_count; ++t) {
+                std::memcpy(trailing_text_hidden.data() + t * H_talker,
+                           proj_cpu.data() + (text_body_start + 1 + t) * H_talker,
+                           H_talker * sizeof(bf16));
+            }
         }
-    }
-    // 末尾追加 tts_eos_embed
-    {
-        std::vector<bf16> eos_cpu(H_talker);
-        ctx.queue().memcpy(eos_cpu.data(), tts_eos_embed.data(), H_talker * sizeof(bf16)).wait();
-        std::memcpy(trailing_text_hidden.data() + (trailing_len - 1) * H_talker,
-                   eos_cpu.data(), H_talker * sizeof(bf16));
+        // 末尾追加 tts_eos_embed
+        {
+            std::vector<bf16> eos_cpu(H_talker);
+            ctx.queue().memcpy(eos_cpu.data(), tts_eos_embed.data(), H_talker * sizeof(bf16)).wait();
+            std::memcpy(trailing_text_hidden.data() + (trailing_len - 1) * H_talker,
+                       eos_cpu.data(), H_talker * sizeof(bf16));
+        }
+    } else {
+        // ==========================================
+        // ICL 模式组装：
+        // 1) text_embed: tokens_to_project[3..] 对应 ref+target，再加上 tts_eos_embed
+        //    总长度 T1 = (proj_L - 3) + 1
+        // 2) codec_embed: 长度 T2 = 1 + R_frames
+        //    t = 0: embed_codec_bos
+        //    t = 1..R: talker_codec_embed(cb0) + sum_{c=1..15} predictor_embed_weights_[c-1](cb_c)
+        // 3) icl_input_embed (长度 T2):
+        //    前 min(T1, T2) 帧: text_embed[t] + codec_embed[t]
+        //    若 T1 < T2，多余帧: tts_pad_embed + codec_embed[t]
+        // 4) trailing_text_hidden:
+        //    若 T1 > T2，长度 T1 - T2: text_embed[T2 .. T1 - 1]
+        // ==========================================
+        int N_text = proj_L - 3;
+        int T1 = N_text + 1; // +1 for tts_eos_embed
+        AILA_LOG_INFO("[TTS-ICL] ref_tokens=%d, target_tokens=%d, T1=%d, R_frames=%d, T2=%d",
+                      icl_ref_tokens_count, target_body_len, T1, R_frames, T2_frames);
+
+        // 获取 text_embed 的 CPU 视图
+        std::vector<bf16> text_embed_cpu(T1 * H_talker);
+        {
+            bf16* all_proj = projected_text.data_as<bf16>();
+            ctx.queue().memcpy(text_embed_cpu.data(), all_proj + 3 * H_talker, N_text * H_talker * sizeof(bf16)).wait();
+            std::vector<bf16> eos_cpu(H_talker);
+            ctx.queue().memcpy(eos_cpu.data(), tts_eos_embed.data(), H_talker * sizeof(bf16)).wait();
+            std::memcpy(text_embed_cpu.data() + N_text * H_talker, eos_cpu.data(), H_talker * sizeof(bf16));
+        }
+
+        // 构建 codec_embed (T2 x H_talker)
+        Tensor codec_embed_full = Tensor::allocate(ctx, {T2_frames, H_talker});
+        {
+            // t = 0: embed_codec_bos
+            ctx.queue().memcpy(codec_embed_full.data_as<bf16>(), embed_codec_bos.data(), H_talker * sizeof(bf16)).wait();
+
+            // t = 1..R: 逐帧提取 codebooks
+            const auto& ref_codes_vec = clone_prompt->reference_codes.codes;
+            Tensor frame_tokens_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+            Tensor single_emb = Tensor::allocate(ctx, {1, H_talker});
+
+            for (int r = 0; r < R_frames; ++r) {
+                bf16* dst_r = codec_embed_full.data_as<bf16>() + (1 + r) * H_talker;
+                // cb 0
+                int c0 = ref_codes_vec[r * 16 + 0];
+                ctx.memcpy_h2d(frame_tokens_dev.data(), &c0, sizeof(int));
+                ops::embedding_lookup(ctx, *talker_codec_embed_weight_, frame_tokens_dev.data_as<int>(), 1, single_emb, H_talker);
+                ctx.queue().memcpy(dst_r, single_emb.data(), H_talker * sizeof(bf16)).wait();
+
+                // cb 1..15
+                for (int c = 1; c < 16; ++c) {
+                    int cc = ref_codes_vec[r * 16 + c];
+                    ctx.memcpy_h2d(frame_tokens_dev.data(), &cc, sizeof(int));
+                    ops::embedding_lookup(ctx, *predictor_embed_weights_[c - 1], frame_tokens_dev.data_as<int>(), 1, single_emb, H_talker);
+                    bf16* s_ptr = single_emb.data_as<bf16>();
+                    ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                        dst_r[h] = dst_r[h] + s_ptr[h];
+                    });
+                    ctx.queue().wait();
+                }
+            }
+        }
+
+        // 组装 icl_input_embed 写入 prefill_embeds 的 [icl_start_idx .. icl_start_idx + T2_frames - 1]
+        {
+            bf16* dst_prefill = prefill_embeds.data_as<bf16>() + (instruct_offset + icl_start_idx) * H_talker;
+            bf16* c_embed = codec_embed_full.data_as<bf16>();
+            bf16* p_pad = tts_pad_embed.data_as<bf16>();
+
+            Tensor text_embed_dev = Tensor::allocate(ctx, {T1, H_talker});
+            ctx.memcpy_h2d(text_embed_dev.data(), text_embed_cpu.data(), T1 * H_talker * sizeof(bf16));
+            bf16* t_embed = text_embed_dev.data_as<bf16>();
+
+            for (int t = 0; t < T2_frames; ++t) {
+                if (t < T1) {
+                    ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                        dst_prefill[t * H_talker + h] = t_embed[t * H_talker + h] + c_embed[t * H_talker + h];
+                    });
+                } else {
+                    ctx.queue().parallel_for(sycl::range<1>(H_talker), [=](sycl::id<1> h) {
+                        dst_prefill[t * H_talker + h] = p_pad[h] + c_embed[t * H_talker + h];
+                    });
+                }
+            }
+            ctx.queue().wait();
+        }
+
+        // 组装 trailing_text_hidden
+        if (T1 > T2_frames) {
+            trailing_len = T1 - T2_frames;
+            trailing_text_hidden.resize(trailing_len * H_talker);
+            std::memcpy(trailing_text_hidden.data(),
+                        text_embed_cpu.data() + T2_frames * H_talker,
+                        trailing_len * H_talker * sizeof(bf16));
+        } else {
+            trailing_len = 0;
+            trailing_text_hidden.clear();
+        }
+        AILA_LOG_INFO("[TTS-ICL] total_prefill_len=%d, trailing_len=%d", total_prefill_len, trailing_len);
     }
 
     print_gpu_tensor(ctx, "prefill_embeds[0, 0, :5]", prefill_embeds, 0);
@@ -1145,21 +1288,31 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     int language_id,
     const GenerationConfig& gen_config,
     int stream_batch_frames,
-    AudioChunkCallback audio_callback) {
+    AudioChunkCallback audio_callback,
+    const VoiceClonePrompt* clone_prompt) {
 
     // 1. Generate all codec tokens (existing blocking call)
     std::vector<int32_t> all_codes;
     int total_frames = 0;
     if (!synthesize_codes(ctx, text_tokens, speaker_embedding, speaker_id,
                            instruct_tokens, language_id, gen_config,
-                           all_codes, total_frames)) {
+                           all_codes, total_frames, clone_prompt)) {
         return false;
     }
 
     // 2. Initialize Mimi stream
     MimiStreamState mimi_state;
-    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
+    bool is_icl = (clone_prompt != nullptr && clone_prompt->is_icl());
+    int ref_frames = is_icl ? clone_prompt->reference_codes.frames : 0;
+    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + ref_frames + 16))) {
         return false;
+    }
+
+    if (is_icl && ref_frames > 0) {
+        std::vector<float> dummy_ref_audio;
+        if (!decode_mimi_incremental(ctx, clone_prompt->reference_codes.codes, ref_frames, mimi_state, dummy_ref_audio)) {
+            return false;
+        }
     }
 
     // 3. Feed codes in batches to incremental decoder

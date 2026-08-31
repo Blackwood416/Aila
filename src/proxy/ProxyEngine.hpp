@@ -96,13 +96,15 @@ public:
     int synthesize_file(
         std::string_view text, const char* reference_audio_path, const char* speaker_name,
         const char* instruct_text, const char* language, const AilaGenConfig* config,
-        std::string_view output_wav_path);
+        std::string_view output_wav_path,
+        const AilaTTSOptions* options = nullptr);
     int decode_mimi(
         const int32_t* codes, int n_frames, std::vector<float>& samples);
     int extract_speaker_embedding(std::string_view audio_path, std::vector<float>& embedding);
     int synthesize_stream(
         std::string_view text, const char* reference_audio_path, const char* speaker_name,
         const char* instruct_text, const char* language, const AilaGenConfig* config,
+        const AilaTTSOptions* options,
         AilaAudioCallback callback, void* user_data,
         const std::atomic_bool& cancellation_requested,
         const std::function<void()>& request_started);

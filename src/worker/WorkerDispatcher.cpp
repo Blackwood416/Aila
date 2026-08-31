@@ -410,7 +410,12 @@ bool parse_tts_text_request(simdjson::dom::object object, AudioRequest& audio) {
         !optional_string_field(object, "instructText", audio.has_instruct_text,
                                audio.instruct_text) ||
         !optional_string_field(object, "language", audio.has_language, audio.language) ||
+        (object.at_key("referenceText").error() == simdjson::SUCCESS && !optional_string_field(object, "referenceText", audio.has_reference_text, audio.reference_text)) ||
         !parse_optional_legacy_config(object, audio.has_config, audio.config)) return false;
+    int64_t mode_val = 0;
+    if (object["voiceCloneMode"].get_int64().get(mode_val) == simdjson::SUCCESS) {
+        audio.voice_clone_mode = static_cast<int>(mode_val);
+    }
     audio.text.assign(text.data(), text.size());
     return true;
 }

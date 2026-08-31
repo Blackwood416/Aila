@@ -240,6 +240,8 @@ Options:
   --synthesize <prompt>    TTS voice synthesis from text prompt (Qwen3-TTS only)
   --output-wav <path>      Output path for synthesized WAV file (default: output.wav)
   --ref <path>             Reference audio for TTS voice cloning (Base model)
+  --ref-text <text>        Reference transcript for ICL voice clone (Base model)
+  --voice-clone-mode <m>   Voice clone mode: auto, icl, xvector-only (default: auto)
   --instruct <text>        Voice design / style description text (VoiceDesign model)
   --speaker <name>         CustomVoice speaker name (vivian, ryan, serena, ...)
   --language <lang>        Language code: chinese, english, japanese, korean (default: auto)
@@ -520,6 +522,14 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
             opts.tts_reference_path = argv[++i];
             continue;
         }
+        if (arg == "--ref-text" && i + 1 < argc) {
+            opts.tts_ref_text = argv[++i];
+            continue;
+        }
+        if (arg == "--voice-clone-mode" && i + 1 < argc) {
+            opts.tts_voice_clone_mode = argv[++i];
+            continue;
+        }
         if (arg == "--speaker" && i + 1 < argc) {
             opts.tts_speaker_name = argv[++i];
             continue;
@@ -793,7 +803,7 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
         std::string trimmed_args = trim(args);
         if (trimmed_args.empty()) {
             if (default_reference_path.empty()) {
-                std::cout << "[TTS] Usage: /tts <text_prompt> [--ref <reference_audio_or_bin>]" << std::endl;
+                std::cout << "[TTS] Usage: /tts <text_prompt> [--ref <path>] [--ref-text <text>]" << std::endl;
             } else {
                 std::cout << "[TTS] Usage: /tts <text_prompt> [--ref <path>]  (session reference: "
                           << default_reference_path << ")" << std::endl;
@@ -809,9 +819,15 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             return true;
         }
 
-        // Parse --ref argument if any (overrides session default)
+        // Parse --ref and --ref-text arguments if any
         std::string text_prompt = trimmed_args;
         std::string ref_path = "";
+        std::string ref_text = "";
+        size_t ref_text_pos = trimmed_args.find("--ref-text ");
+        if (ref_text_pos != std::string::npos) {
+            ref_text = trim(trimmed_args.substr(ref_text_pos + 11));
+            trimmed_args = trim(trimmed_args.substr(0, ref_text_pos));
+        }
         size_t ref_pos = trimmed_args.find("--ref ");
         if (ref_pos != std::string::npos) {
             text_prompt = trim(trimmed_args.substr(0, ref_pos));
@@ -821,6 +837,8 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             if (ref_pos != std::string::npos) {
                 text_prompt = trim(trimmed_args.substr(0, ref_pos));
                 ref_path = trim(trimmed_args.substr(ref_pos + 6));
+            } else {
+                text_prompt = trimmed_args;
             }
         }
 
@@ -842,7 +860,8 @@ CommandRegistry build_default_commands(GenerationConfig& gen_config, bool& strea
             speaker_embedding = load_or_extract_speaker_embedding(engine, ref_path);
         }
 
-        bool ok = engine->synthesize_text_to_wav(norm_args, speaker_embedding, gen_config, samples);
+        bool ok = engine->synthesizeSpeech(
+            norm_args, ref_path, "", "", "", gen_config, samples, ref_text, VoiceCloneMode::Auto);
         if (!ok) {
             std::cout << "[TTS] Synthesis failed: " << engine->last_error_message() << std::endl;
             return true;

@@ -1078,7 +1078,8 @@ int ProxyEngine::synthesize_wav(
             ",\"embeddingCount\":" + std::to_string(normalized_embedding_len) +
             ",\"tokenOffset\":0,\"embeddingOffset\":" + std::to_string(token_bytes) +
             ",\"elementSize\":4,\"byteCount\":" + std::to_string(attachment.size()) +
-            ",\"config\":" + legacy_config_json(config) + "}";
+            ",\"config\":" + legacy_config_json(config) +
+            "}";
         const ipc::Frame response = request_locked("tts.synthesize_wav", payload, std::move(attachment));
         if (response.header.kind == "error") {
             accept_error_response_locked(response, "tts.synthesize_wav", "TTS synthesis failed");
@@ -1129,7 +1130,8 @@ int ProxyEngine::synthesize_text_to_wav(
 int ProxyEngine::synthesize_file(
     std::string_view text, const char* reference_audio_path, const char* speaker_name,
     const char* instruct_text, const char* language, const AilaGenConfig* config,
-    std::string_view output_wav_path) {
+    std::string_view output_wav_path,
+    const AilaTTSOptions* options) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stream_active_ || !initialized_ || text.find('\0') != std::string_view::npos ||
         output_wav_path.find('\0') != std::string_view::npos ||
@@ -1147,7 +1149,9 @@ int ProxyEngine::synthesize_file(
             ",\"instructText\":" + nullable_c_string_json(instruct_text) +
             ",\"language\":" + nullable_c_string_json(language) +
             ",\"config\":" + legacy_config_json(config) +
-            ",\"outputWavPath\":" + json_string(output_wav_path) + "}";
+            ",\"outputWavPath\":" + json_string(output_wav_path) +
+            ",\"referenceText\":" + nullable_c_string_json(options ? options->reference_text : nullptr) +
+            ",\"voiceCloneMode\":" + std::to_string(options ? static_cast<int>(options->voice_clone_mode) : 0) + "}";
         const ipc::Frame response = request_locked("tts.synthesize", payload);
         if (!accept_lifecycle_response_locked(response, "tts.synthesize")) return error_code_;
         clear_error_locked(); return AILA_OK;
@@ -1429,6 +1433,7 @@ int ProxyEngine::detect_pixels(const void* pixels, size_t size, int width, int h
 int ProxyEngine::synthesize_stream(
     std::string_view text, const char* reference_audio_path, const char* speaker_name,
     const char* instruct_text, const char* language, const AilaGenConfig* config,
+    const AilaTTSOptions* options,
     AilaAudioCallback callback, void* user_data,
     const std::atomic_bool& cancellation_requested,
     const std::function<void()>& request_started) {
@@ -1454,7 +1459,9 @@ int ProxyEngine::synthesize_stream(
             ",\"speakerName\":" + nullable_c_string_json(speaker_name) +
             ",\"instructText\":" + nullable_c_string_json(instruct_text) +
             ",\"language\":" + nullable_c_string_json(language) +
-            ",\"config\":" + legacy_config_json(config) + "}";
+            ",\"config\":" + legacy_config_json(config) +
+            ",\"referenceText\":" + nullable_c_string_json(options ? options->reference_text : nullptr) +
+            ",\"voiceCloneMode\":" + std::to_string(options ? static_cast<int>(options->voice_clone_mode) : 0) + "}";
         bool terminal_seen = false;
         const ipc::Frame response = worker_.request_stream(
             request,

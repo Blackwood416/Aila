@@ -924,11 +924,38 @@ AILA_API int aila_synthesize(
     const AilaGenConfig* config,
     const char* output_wav_path
 ) {
+    return aila_synthesize_ex(
+        engine, text, reference_audio_path, speaker_name, instruct_text,
+        language, config, nullptr, output_wav_path
+    );
+}
+
+AILA_API int aila_synthesize_ex(
+    AilaEngine* engine,
+    const char* text,
+    const char* reference_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    const AilaTTSOptions* options,
+    const char* output_wav_path
+) {
     if (!engine || !text || !output_wav_path) {
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
         GenerationConfig cpp_cfg = to_cpp_config(config);
+
+        std::string ref_text = (options && options->reference_text) ? options->reference_text : "";
+        VoiceCloneMode mode = VoiceCloneMode::Auto;
+        if (options) {
+            switch (options->voice_clone_mode) {
+                case AILA_VOICE_CLONE_ICL: mode = VoiceCloneMode::Icl; break;
+                case AILA_VOICE_CLONE_XVECTOR_ONLY: mode = VoiceCloneMode::XVectorOnly; break;
+                case AILA_VOICE_CLONE_AUTO: default: mode = VoiceCloneMode::Auto; break;
+            }
+        }
 
         std::vector<float> samples;
         bool ok = engine->engine.synthesizeSpeech(
@@ -938,7 +965,9 @@ AILA_API int aila_synthesize(
             instruct_text ? std::string(instruct_text) : std::string(),
             language ? std::string(language) : std::string(),
             cpp_cfg,
-            samples
+            samples,
+            ref_text,
+            mode
         );
 
         if (!ok) {
@@ -961,8 +990,6 @@ AILA_API int aila_synthesize(
 
 // ============================================================
 // Streaming TTS API
-// ============================================================
-
 struct AilaTTSStream {
     std::thread worker;
     std::mutex mutex;
@@ -980,10 +1007,38 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
     AilaAudioCallback callback,
     void* user_data
 ) {
+    return aila_synthesize_stream_ex(
+        engine, text, reference_audio_path, speaker_name, instruct_text,
+        language, config, nullptr, callback, user_data
+    );
+}
+
+AILA_API AilaTTSStream* aila_synthesize_stream_ex(
+    AilaEngine* engine,
+    const char* text,
+    const char* reference_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    const AilaTTSOptions* options,
+    AilaAudioCallback callback,
+    void* user_data
+) {
     if (!engine || !text || !callback) return nullptr;
     auto* stream = new AilaTTSStream();
 
     GenerationConfig cpp_cfg = to_cpp_config(config);
+    std::string ref_text = (options && options->reference_text) ? options->reference_text : "";
+    VoiceCloneMode mode = VoiceCloneMode::Auto;
+    if (options) {
+        switch (options->voice_clone_mode) {
+            case AILA_VOICE_CLONE_ICL: mode = VoiceCloneMode::Icl; break;
+            case AILA_VOICE_CLONE_XVECTOR_ONLY: mode = VoiceCloneMode::XVectorOnly; break;
+            case AILA_VOICE_CLONE_AUTO: default: mode = VoiceCloneMode::Auto; break;
+        }
+    }
+
     stream->worker = engine->engine.synthesizeSpeechStream(
         std::string(text),
         reference_audio_path ? std::string(reference_audio_path) : std::string(),
@@ -993,7 +1048,7 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
         cpp_cfg,
         [callback, user_data](const float* samples, int count) {
             callback(samples, count, user_data);
-        }, 4);
+        }, 4, ref_text, mode);
 
     if (engine->engine.last_error_code() != EngineErrorCode::Ok) {
         delete stream;

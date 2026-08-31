@@ -717,6 +717,16 @@ AILA_API int aila_synthesize(
     AilaEngine* engine, const char* text, const char* reference_audio_path,
     const char* speaker_name, const char* instruct_text, const char* language,
     const AilaGenConfig* config, const char* output_wav_path) {
+    return aila_synthesize_ex(
+        engine, text, reference_audio_path, speaker_name, instruct_text,
+        language, config, nullptr, output_wav_path
+    );
+}
+
+AILA_API int aila_synthesize_ex(
+    AilaEngine* engine, const char* text, const char* reference_audio_path,
+    const char* speaker_name, const char* instruct_text, const char* language,
+    const AilaGenConfig* config, const AilaTTSOptions* options, const char* output_wav_path) {
     if (!engine || !text || !output_wav_path) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS file arguments are invalid"); } catch (...) {}
         return AILA_ERR_INVALID_ARGUMENT;
@@ -724,8 +734,8 @@ AILA_API int aila_synthesize(
     try {
         return engine->proxy->synthesize_file(
             text, reference_audio_path, speaker_name, instruct_text, language, config,
-            output_wav_path);
-    } catch (...) { record_boundary_failure(engine, "aila_synthesize"); return AILA_ERR_RUNTIME; }
+            output_wav_path, options);
+    } catch (...) { record_boundary_failure(engine, "aila_synthesize_ex"); return AILA_ERR_RUNTIME; }
 }
 
 AILA_API int aila_decode_mimi_vocoder(
@@ -770,6 +780,17 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
     AilaEngine* engine, const char* text, const char* reference_audio_path,
     const char* speaker_name, const char* instruct_text, const char* language,
     const AilaGenConfig* config, AilaAudioCallback callback, void* user_data) {
+    return aila_synthesize_stream_ex(
+        engine, text, reference_audio_path, speaker_name, instruct_text,
+        language, config, nullptr, callback, user_data
+    );
+}
+
+AILA_API AilaTTSStream* aila_synthesize_stream_ex(
+    AilaEngine* engine, const char* text, const char* reference_audio_path,
+    const char* speaker_name, const char* instruct_text, const char* language,
+    const AilaGenConfig* config, const AilaTTSOptions* options,
+    AilaAudioCallback callback, void* user_data) {
     if (!engine || !text || !callback) {
         if (engine) try { engine->proxy->record_invalid_argument("TTS stream arguments are invalid"); } catch (...) {}
         return nullptr;
@@ -790,19 +811,33 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
         const std::string language_copy = has_language ? language : "";
         const bool has_config = config != nullptr;
         const AilaGenConfig config_copy = has_config ? *config : AilaGenConfig{};
+        const bool has_options = options != nullptr;
+        AilaTTSOptions options_copy{};
+        std::string ref_text_copy;
+        if (has_options) {
+            options_copy = *options;
+            if (options->reference_text) {
+                ref_text_copy = options->reference_text;
+                options_copy.reference_text = ref_text_copy.c_str();
+            }
+        }
         AilaTTSStream* raw = stream.get();
         raw->worker = std::thread([
             raw, text_copy, has_reference, reference_copy, has_speaker, speaker_copy,
-            has_instruct, instruct_copy, has_language, language_copy, has_config, config_copy] {
+            has_instruct, instruct_copy, has_language, language_copy, has_config, config_copy,
+            has_options, options_copy, ref_text_copy] {
             int status = AILA_ERR_RUNTIME;
             try {
-                status = raw->owner->synthesize_stream(
+                AilaTTSOptions options_val{};
+            if (has_options) options_val = options_copy;
+            status = raw->owner->synthesize_stream(
                     text_copy,
                     has_reference ? reference_copy.c_str() : nullptr,
                     has_speaker ? speaker_copy.c_str() : nullptr,
                     has_instruct ? instruct_copy.c_str() : nullptr,
                     has_language ? language_copy.c_str() : nullptr,
                     has_config ? &config_copy : nullptr,
+                    has_options ? &options_val : nullptr,
                     raw->callback, raw->user_data, raw->cancel_requested,
                     [raw] {
                         {

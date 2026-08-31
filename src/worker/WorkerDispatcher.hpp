@@ -61,6 +61,9 @@ struct AudioRequest {
     std::string instruct_text;
     bool has_language = false;
     std::string language;
+    bool has_reference_text = false;
+    std::string reference_text;
+    int voice_clone_mode = 0;
     std::string output_wav_path;
     bool has_config = false;
     AilaGenConfig config{};

@@ -503,6 +503,29 @@ AILA_API int aila_synthesize(
     const char* output_wav_path
 );
 
+typedef enum AilaVoiceCloneMode {
+    AILA_VOICE_CLONE_AUTO = 0,
+    AILA_VOICE_CLONE_ICL = 1,
+    AILA_VOICE_CLONE_XVECTOR_ONLY = 2,
+} AilaVoiceCloneMode;
+
+typedef struct AilaTTSOptions {
+    const char* reference_text;          // UTF-8 reference transcript for ICL
+    AilaVoiceCloneMode voice_clone_mode; // Auto, Icl, or XVectorOnly
+} AilaTTSOptions;
+
+AILA_API int aila_synthesize_ex(
+    AilaEngine* engine,
+    const char* text,
+    const char* reference_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    const AilaTTSOptions* options,
+    const char* output_wav_path
+);
+
 /**
  * Audio streaming callback for TTS.
  * @param samples   PCM float audio samples (24kHz mono)
@@ -521,6 +544,19 @@ AILA_API AilaTTSStream* aila_synthesize_stream(
     const char* instruct_text,
     const char* language,
     const AilaGenConfig* config,
+    AilaAudioCallback callback,
+    void* user_data
+);
+
+AILA_API AilaTTSStream* aila_synthesize_stream_ex(
+    AilaEngine* engine,
+    const char* text,
+    const char* reference_audio_path,
+    const char* speaker_name,
+    const char* instruct_text,
+    const char* language,
+    const AilaGenConfig* config,
+    const AilaTTSOptions* options,
     AilaAudioCallback callback,
     void* user_data
 );

@@ -71,6 +71,8 @@ struct CLIOptions {
     std::string tts_text;           // --synthesize
     std::string tts_output_path;    // --output-wav
     std::string tts_reference_path;  // --ref, --speaker (reference audio path)
+    std::string tts_ref_text;        // --ref-text (reference audio text for ICL)
+    std::string tts_voice_clone_mode;// --voice-clone-mode (auto, icl, xvector-only)
     std::string tts_speaker_name;   // --speaker (CustomVoice: "vivian", etc.)
     std::string tts_instruct_text;  // --instruct (voice style description)
     std::string tts_language;       // --language ("chinese", "english", etc.)
