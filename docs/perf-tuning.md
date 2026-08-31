@@ -77,6 +77,30 @@ AILA_BNB4_FUSED_PREFILL=1  # NF4 fused GEMM prefill
 - Prefill: ~1637 tok/s
 - Decode: ~57.9 tok/s
 
+### Intel Arc A770 + Qwen3.5-9B BNB NF4 with-vision
+
+Text side (hidden=4096, 32 layers, ff_intermediate=12288, full attention
+head_dim=256 + DeltaNet linear attention). Measured with oneAPI 2026.1,
+driver 32.0.101.8974, `pp=2048 tg=256`, 3 bench iterations, seed 42.
+
+```
+AILA_Q35_PREFILL_XMX=1   # default: dense NF4 prefill uses A770 XMX DPAS
+AILA_ATTN_JM=1
+AILA_BNB4_FUSED_PREFILL=1
+```
+- Prefill: 341.5 tok/s (2048 tokens in ~6.0 s), up from 47.0 tok/s (43.5 s)
+  with the ALU tiled GEMM (`AILA_Q35_PREFILL_XMX=0`). The win is the
+  XMX Joint Matrix GEMM dispatch for the dense NF4 prefill projections; the
+  same seed-42 greedy prompt produces an identical committed token stream
+  with XMX on and off.
+- Decode: ~37.2 tok/s, unchanged by the prefill change. Decode is
+  bandwidth-bound on the NF4 GEMVs and the dense bf16 lm_head
+  (248320 x 4096), which reads ~2 GB per token. Quantizing lm_head to NF4
+  would cut that read to ~0.5 GB/token but changes logit numerics and is not
+  enabled by default.
+- Vision encode: ~320 ms for a 400x473 image (195 tokens), including image
+  decode/resize; ~305 ms is the 27-block ViT encoder.
+
 ### Intel Arc A770 + Qwen3.5-0.8B BNB NF4
 
 ```

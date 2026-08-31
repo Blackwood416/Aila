@@ -66,6 +66,12 @@ public:
     int in_features() const { return in_features_; }
     int out_features() const { return out_features_; }
 
+    // Allow the dense prefill path to select the A770 XMX Joint Matrix GEMM.
+    // Off by default; backends opt in after validating numerics for their
+    // weight format. The process-wide AILA_BNB4_GEMM_XMX override still wins.
+    void set_allow_dense_xmx(bool value) { allow_dense_xmx_ = value; }
+    bool allow_dense_xmx() const { return allow_dense_xmx_; }
+
     void set_lora(std::vector<LoraAttachment>&& attachments) {
         lora_attachments_ = std::move(attachments);
     }
@@ -89,6 +95,7 @@ private:
     bool release_quant_after_cache_ = false;
     bool cache_dequantized_weight_ = false;
     bool cached_weight_ready_ = false;
+    bool allow_dense_xmx_ = false;
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;
     dnnl::memory::desc decode_weight_md_;

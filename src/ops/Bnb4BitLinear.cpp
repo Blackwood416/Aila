@@ -1,11 +1,13 @@
 #include "Bnb4BitLinear.hpp"
 #include "../utils/EnvUtils.hpp"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 
@@ -131,6 +133,292 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
     });
 }
 
+// [XMX Matrix Engine] Joint Matrix NF4 GEMM on Intel Arc A770 (DG2)
+// SG=8 matches DPAS systolic depth 8.
+// BM=32, BN=32, BK=16, TM=8, TN=8, TK=16, SG=8 -> 16 sub-groups, WG=128.
+// Uses hardware-natural contiguous SLM store with stride TN=8.
+template <int BM = 32, int BN = 32, int BK = 16, int TM = 8, int TN = 8, int TK = 16, int SG = 8>
+void packed_nf4_gemm_bf16_joint_matrix(Context& ctx,
+                                       const uint8_t* packed_ptr,
+                                       const float* quant_map_ptr,
+                                       const float* absmax_ptr,
+                                       const bf16* input_ptr,
+                                       bf16* output_ptr,
+                                       int M, int N, int K,
+                                       int blocksize) {
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    const int total_wgs = grid_m * grid_n;
+
+    constexpr int SG_M = BM / TM;
+    constexpr int SG_N = BN / TN;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(TK * BN), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+        sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int bm = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int m0 = bm * BM;
+                const int n0 = bn * BN;
+
+                if (lid < 16) {
+                    qmap_slm[lid] = quant_map_ptr[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    for (int pair_idx = lid; pair_idx < (BM * BK) / 2; pair_idx += WG_SIZE) {
+                        const int r = pair_idx / (BK / 2);
+                        const int c_pair = pair_idx % (BK / 2);
+                        const int gm = m0 + r;
+                        const int c = c_pair * 2;
+                        if (gm < M && kb + c < K) {
+                            auto in_u32 = reinterpret_cast<const uint32_t*>(input_ptr + static_cast<size_t>(gm) * K + kb)[c_pair];
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = in_u32;
+                        } else {
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = 0;
+                        }
+                    }
+
+                    for (int i = lid; i < BN * 2; i += WG_SIZE) {
+                        const int col = i / 2;
+                        const int half = i % 2;
+                        const int src_n = n0 + col;
+                        if (src_n < N && kb + half * 8 + 7 < K) {
+                            const uint32_t packed_u32 = reinterpret_cast<const uint32_t*>(
+                                packed_ptr + static_cast<size_t>(src_n) * packed_bytes_per_row + (kb / 2) + half * 4)[0];
+                            const float am = absmax_ptr[static_cast<size_t>(src_n) * blocks_per_row + (kb + half * 8) / blocksize];
+
+                            const uint8_t b0 = static_cast<uint8_t>(packed_u32 & 0xFF);
+                            const uint8_t b1 = static_cast<uint8_t>((packed_u32 >> 8) & 0xFF);
+                            const uint8_t b2 = static_cast<uint8_t>((packed_u32 >> 16) & 0xFF);
+                            const uint8_t b3 = static_cast<uint8_t>((packed_u32 >> 24) & 0xFF);
+
+                            const int base = col * TK + half * 8;
+                            Bs[base + 0] = bf16(qmap_slm[(b0 >> 4) & 0x0F] * am);
+                            Bs[base + 1] = bf16(qmap_slm[b0 & 0x0F] * am);
+                            Bs[base + 2] = bf16(qmap_slm[(b1 >> 4) & 0x0F] * am);
+                            Bs[base + 3] = bf16(qmap_slm[b1 & 0x0F] * am);
+                            Bs[base + 4] = bf16(qmap_slm[(b2 >> 4) & 0x0F] * am);
+                            Bs[base + 5] = bf16(qmap_slm[b2 & 0x0F] * am);
+                            Bs[base + 6] = bf16(qmap_slm[(b3 >> 4) & 0x0F] * am);
+                            Bs[base + 7] = bf16(qmap_slm[b3 & 0x0F] * am);
+                        } else {
+                            const int base = col * TK + half * 8;
+                            for (int v = 0; v < 8; ++v) {
+                                Bs[base + v] = bf16(0.0f);
+                            }
+                        }
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+
+                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * TK;
+
+                    joint_matrix_load(sg, sub_a, pA, BK);
+                    joint_matrix_load(sg, sub_b, pB, TK);
+                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                    const int s = i / (TM * TN);
+                    const int rem = i % (TM * TN);
+                    const int r = rem / TN;
+                    const int c = rem % TN;
+                    const int sr = s / SG_N;
+                    const int sc = s % SG_N;
+                    const int gm = m0 + sr * TM + r;
+                    const int gn = n0 + sc * TN + c;
+                    if (gm < M && gn < N) {
+                        output_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
+                    }
+                }
+            });
+    });
+}
+
+// Generalized-k-block XMX NF4 GEMM. Identical per-element arithmetic and
+// k-accumulation order to packed_nf4_gemm_bf16_joint_matrix (TK=16 chunks
+// are consumed sequentially), but BK can be 32/64 so the two SLM barriers
+// per K tile are amortized over 2x/4x the DPAS work. The packed B tile is
+// dequantized to bf16 SLM as [BN][BK] with the same bf16(qmap*am) rounding.
+template <int BM = 64, int BN = 64, int BK = 32, int TM = 8, int TN = 8,
+          int TK = 16, int SG = 8>
+void packed_nf4_gemm_bf16_joint_matrix_wide(Context& ctx,
+                                            const uint8_t* packed_ptr,
+                                            const float* quant_map_ptr,
+                                            const float* absmax_ptr,
+                                            const bf16* input_ptr,
+                                            bf16* output_ptr,
+                                            int M, int N, int K,
+                                            int blocksize) {
+    static_assert(BK % TK == 0, "BK must be a multiple of the JM K tile");
+
+    const int packed_bytes_per_row = K / 2;
+    const int blocks_per_row = K / blocksize;
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    const int total_wgs = grid_m * grid_n;
+
+    constexpr int SG_M = BM / TM;
+    constexpr int SG_N = BN / TN;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+    constexpr int TK_CHUNKS = BK / TK;
+    constexpr int B8_CHUNKS = BK / 8;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(BN * BK), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+        sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int bm = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int m0 = bm * BM;
+                const int n0 = bn * BN;
+
+                if (lid < 16) {
+                    qmap_slm[lid] = quant_map_ptr[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+                joint_matrix_fill(sg, sub_c, 0.0f);
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    // Stage A[BM, BK] as uint32 bf16 pairs.
+                    for (int pair_idx = lid; pair_idx < (BM * BK) / 2; pair_idx += WG_SIZE) {
+                        const int r = pair_idx / (BK / 2);
+                        const int c_pair = pair_idx % (BK / 2);
+                        const int gm = m0 + r;
+                        const int c = c_pair * 2;
+                        if (gm < M && kb + c < K) {
+                            auto in_u32 = reinterpret_cast<const uint32_t*>(
+                                input_ptr + static_cast<size_t>(gm) * K + kb)[c_pair];
+                            reinterpret_cast<uint32_t*>(
+                                As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = in_u32;
+                        } else {
+                            reinterpret_cast<uint32_t*>(
+                                As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = 0;
+                        }
+                    }
+
+                    // Dequant B[BN, BK] into SLM, 8 NF4 values per item.
+                    for (int i = lid; i < BN * B8_CHUNKS; i += WG_SIZE) {
+                        const int col = i / B8_CHUNKS;
+                        const int chunk = i % B8_CHUNKS;
+                        const int src_n = n0 + col;
+                        const int k0 = kb + chunk * 8;
+                        const int base = col * BK + chunk * 8;
+                        if (src_n < N && k0 + 7 < K) {
+                            const uint32_t packed_u32 = reinterpret_cast<const uint32_t*>(
+                                packed_ptr + static_cast<size_t>(src_n) * packed_bytes_per_row +
+                                (kb / 2) + chunk * 4)[0];
+                            const float am = absmax_ptr[
+                                static_cast<size_t>(src_n) * blocks_per_row +
+                                k0 / blocksize];
+
+                            const uint8_t b0 = static_cast<uint8_t>(packed_u32 & 0xFF);
+                            const uint8_t b1 = static_cast<uint8_t>((packed_u32 >> 8) & 0xFF);
+                            const uint8_t b2 = static_cast<uint8_t>((packed_u32 >> 16) & 0xFF);
+                            const uint8_t b3 = static_cast<uint8_t>((packed_u32 >> 24) & 0xFF);
+
+                            auto bs = Bs.get_multi_ptr<sycl::access::decorated::no>().get();
+                            bs[base + 0] = bf16(qmap_slm[(b0 >> 4) & 0x0F] * am);
+                            bs[base + 1] = bf16(qmap_slm[b0 & 0x0F] * am);
+                            bs[base + 2] = bf16(qmap_slm[(b1 >> 4) & 0x0F] * am);
+                            bs[base + 3] = bf16(qmap_slm[b1 & 0x0F] * am);
+                            bs[base + 4] = bf16(qmap_slm[(b2 >> 4) & 0x0F] * am);
+                            bs[base + 5] = bf16(qmap_slm[b2 & 0x0F] * am);
+                            bs[base + 6] = bf16(qmap_slm[(b3 >> 4) & 0x0F] * am);
+                            bs[base + 7] = bf16(qmap_slm[b3 & 0x0F] * am);
+                        } else {
+                            auto bs = Bs.get_multi_ptr<sycl::access::decorated::no>().get();
+                            for (int v = 0; v < 8; ++v) {
+                                bs[base + v] = bf16(0.0f);
+                            }
+                        }
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+
+                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * BK;
+
+                    for (int chunk = 0; chunk < TK_CHUNKS; ++chunk) {
+                        joint_matrix_load(sg, sub_a, pA + chunk * TK, BK);
+                        joint_matrix_load(sg, sub_b, pB + chunk * TK, BK);
+                        joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                    const int s = i / (TM * TN);
+                    const int rem = i % (TM * TN);
+                    const int r = rem / TN;
+                    const int c = rem % TN;
+                    const int sr = s / SG_N;
+                    const int sc = s % SG_N;
+                    const int gm = m0 + sr * TM + r;
+                    const int gn = n0 + sc * TN + c;
+                    if (gm < M && gn < N) {
+                        output_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
+                    }
+                }
+            });
+    });
+}
+
 void packed_nf4_gemm_bf16(Context& ctx,
                           const uint8_t* packed_ptr,
                           const float* quant_map_ptr,
@@ -138,7 +426,86 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           const bf16* input_ptr,
                           bf16* output_ptr,
                           int M, int N, int K,
-                          int blocksize) {
+                          int blocksize,
+                          bool allow_dense_xmx = false) {
+    static const bool use_a770_bm64 = [&ctx]() {
+        const std::string device_name =
+            ctx.queue().get_device().get_info<sycl::info::device::name>();
+        return device_name.find("Arc(TM) A770") != std::string::npos ||
+               device_name.find("Arc A770") != std::string::npos;
+    }();
+    if (use_a770_bm64) {
+        // [DISPATCH] A770 XMX Joint Matrix: hardware DPAS Matrix Engine acceleration
+        // AILA_BNB4_GEMM_XMX is a process-wide override: 1 forces the XMX
+        // route on, 0 forces it off. When unset, the caller's
+        // allow_dense_xmx default decides. Existing backends keep the
+        // historical off-by-default behavior; Qwen3.5 prefill opts in.
+        static bool xmx_override = false;
+        static const bool xmx_explicit = aila::env::read_flag_if_present(
+            "AILA_BNB4_GEMM_XMX", &xmx_override);
+        const bool use_xmx = xmx_explicit ? xmx_override : allow_dense_xmx;
+        if (use_xmx && (K % 16 == 0) && (N <= 32768) && (K <= 16384) && (blocksize <= 64 || blocksize == 128)) {
+            if (M >= 64 && N >= 64) {
+                static const int xmx_bk =
+                    aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_BK", 0);
+                if (xmx_bk >= 64 && (K % 64) == 0) {
+                    packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 64, 8, 8, 16, 8>(
+                        ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                        output_ptr, M, N, K, blocksize);
+                } else if (xmx_bk >= 32 && (K % 32) == 0) {
+                    packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 32, 8, 8, 16, 8>(
+                        ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                        output_ptr, M, N, K, blocksize);
+                } else {
+                    static const int xmx_tile =
+                        aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_TILE", 0);
+                    switch (xmx_tile) {
+                        case 1:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 32, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 2:
+                            packed_nf4_gemm_bf16_joint_matrix<32, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 3:
+                            packed_nf4_gemm_bf16_joint_matrix<32, 128, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 4:
+                            packed_nf4_gemm_bf16_joint_matrix<128, 32, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 5:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 128, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        case 6:
+                            packed_nf4_gemm_bf16_joint_matrix<128, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                        default:
+                            packed_nf4_gemm_bf16_joint_matrix<64, 64, 16, 8, 8, 16, 8>(
+                                ctx, packed_ptr, quant_map_ptr, absmax_ptr,
+                                input_ptr, output_ptr, M, N, K, blocksize);
+                            break;
+                    }
+                }
+            } else {
+                packed_nf4_gemm_bf16_joint_matrix<32, 32, 16, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            }
+            return;
+        }
+    }
+
     if (M <= 80 && (N <= 4096 || K >= 4096)) {
         packed_nf4_gemm_bf16_tiled<80, 64, 128, 8, 4, 10, 16>(
             ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr, output_ptr,
@@ -930,7 +1297,8 @@ void Bnb4BitLinear::forward(Context& ctx,
     static bool use_fused_prefill =
         aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", 1) != 0;
     if (use_fused_prefill && seq_len > 1 &&
-        blocksize == 128 && (blocksize % 2) == 0 &&
+        (blocksize % 2) == 0 &&
+        (128 % blocksize) == 0 &&
         in_features_ > 0 && (in_features_ % blocksize) == 0 &&
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
@@ -941,7 +1309,7 @@ void Bnb4BitLinear::forward(Context& ctx,
                              static_cast<const bf16*>(input.data()),
                              static_cast<bf16*>(output.data()),
                              seq_len, out_features_, in_features_,
-                             blocksize);
+                             blocksize, allow_dense_xmx_);
         if (!lora_attachments_.empty()) {
             apply_lora_prefill(ctx, input, output, seq_len);
         }
