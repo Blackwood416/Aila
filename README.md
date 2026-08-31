@@ -22,7 +22,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - 🎯 **YOLO26 detection** — NMS-free n/s/m/l/x inference at 640×640 with FP16 oneDNN/SYCL execution, file/encoded/raw-pixel APIs, and UTF-8 class names
 - 🎙️ Audio (Qwen3-ASR) — speech-to-text transcription with audio preprocessing and GPU-accelerated audio encoder. Supports both offline wav transcription and real-time streaming input ASR
 - 🎯 **Forced Alignment** — word-level timestamp alignment from audio + text, with CJK character-level tokenization and LIS-based timestamp correction
-- 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder and native zero-shot voice cloning. Supports direct raw audio WAV generation, voice cloning via reference audio, and offline Mimi decoding
+- 🔊 Audio (Qwen3-TTS) — text-to-speech synthesis with Mimi Vocoder, high-quality libsoxr Kaiser resampling, and native zero-shot voice cloning. Supports In-Context Learning (ICL) voice cloning, x-vector cloning, CustomVoice presets, and VoiceDesign prompt styling
 - 🎤 **CustomVoice / VoiceDesign** — named speaker presets (vivian, ryan, etc.) for instant voice selection and text-described voice styles via VoiceDesign for creative TTS control
 - 🔉 **Streaming TTS** — real-time raw 24kHz mono f32 PCM audio output to stdout for low-latency streaming speech synthesis
 - ⚡ **Native bf16 GEMV kernel** — hand-optimized SG=16 vec8+FMA bf16 GEMV for TTS decode, delivering 9x faster TTS (RTF 8.08 to 0.89 on 0.6B)
@@ -226,6 +226,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--synthesize <text>` | TTS text-to-speech synthesis | (none) |
 | `--output-wav <path>` | TTS output WAV file path | `output.wav` |
 | `--ref <path>` | Reference audio for TTS voice cloning | (none) |
+| `--ref-text <text>` | Reference transcript for ICL voice cloning | (none) |
+| `--clone-mode <mode>` | Voice clone mode: `auto` (default), `icl`, `xvector` | `auto` |
 | `--speaker <name>` | TTS named voice (e.g., vivian, ryan) | (none) |
 | `--instruct <text>` | VoiceDesign style description for TTS (e.g., "deep warm voice") | (none) |
 | `--language <lang>` | TTS language: chinese, english, japanese, korean, auto | auto |
@@ -293,39 +295,55 @@ starting the next request.
 
 ### 🎤 TTS Voice Cloning
 
-Aila supports **zero-shot voice cloning** for Qwen3-TTS models. The speaker embedding is extracted via a native C++ ECAPA-TDNN encoder (no Python dependency).
+Aila supports **zero-shot voice cloning** for Qwen3-TTS models in two modes:
+- **In-Context Learning (ICL) mode** (`--ref` + `--ref-text`): Combines reference audio with its transcript for high-fidelity speech and prosody cloning. Audio is resampled via high-quality `libsoxr` Kaiser sinc resampler and encoded into discrete acoustic codes via Mimi Audio Encoder.
+- **x-vector mode** (`--ref` only): Extracts global speaker embeddings via a native C++ ECAPA-TDNN encoder (no Python dependency).
 
 **Reference audio requirements:**
 
 | Requirement | Value |
 |-------------|-------|
 | **Format** | WAV, MP3, or FLAC |
-| **Sample rate** | Any (auto-resampled to 24kHz) |
+| **Sample rate** | Any (auto-resampled to 24kHz using libsoxr Kaiser resampler) |
 | **Channels** | Mono recommended (multi-channel is averaged to mono) |
 | **Duration** | ≥ 3 seconds of clear speech recommended |
 | **Content** | Clean speech from the target speaker with minimal background noise |
 | **Encoding** | 16-bit PCM or 32-bit float |
 
 ```powershell
-# Clone a voice from reference audio
+# 1. Native ICL Voice Cloning (recommended for highest quality)
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
-    --synthesize "你好世界" `
+    --synthesize "你好，世界。" `
     --ref ./reference_speaker.wav `
-    --output-wav cloned_output.wav
+    --ref-text "这是一个参考音频的文本。" `
+    --output-wav cloned_icl.wav
 
-# CustomVoice — use a named speaker preset
+# 2. x-vector Voice Cloning (audio-only)
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "今天天气真好。" `
+    --ref ./reference_speaker.wav `
+    --output-wav cloned_xvector.wav
+
+# 3. Streaming ICL Voice Cloning (real-time generation)
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "你好，世界。" `
+    --ref ./reference_speaker.wav `
+    --ref-text "这是一个参考音频的文本。" `
+    --stream --output-wav cloned_stream.wav
+
+# 4. CustomVoice — use a named speaker preset
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker vivian `
     --synthesize "Hello world!" `
     --output-wav vivian_output.wav
 
-# VoiceDesign — describe the voice style in natural language
+# 5. VoiceDesign — describe the voice style in natural language
 Aila.exe -m ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign `
     --instruct "A deep, warm voice with a slow pace" `
     --synthesize "Hello world!" `
     --output-wav styled_output.wav
 
-# CustomVoice + language + instruct override
+# 6. CustomVoice + language + instruct override
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker ryan `
     --language english `
@@ -333,13 +351,9 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --synthesize "Hello" `
     --output-wav ryan_english.wav
 
-# Streaming TTS — real-time PCM audio output
+# 7. Streaming TTS — real-time raw PCM output to stdout
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --stream-tts --synthesize "Hello!" 2>/dev/null | pcm_play
-
-# Streaming TTS with custom batch size
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
-    --stream-tts --stream-batch 8 --synthesize "Hello!" 2>/dev/null | pcm_play
 ```
 
 The `--rep-penalty` flag controls repetition penalty (auto-set to 1.1 for TTS). Increase it (e.g. `--rep-penalty 1.3`) if the output has repetitive artifacts, or decrease it (e.g. `--rep-penalty 1.0`) for more variation.
@@ -471,9 +485,11 @@ Aila/
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel's deep neural network library providing the matmul primitives used for bf16 inference
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 quantization format and dequantization reference
 - **[simdjson](https://github.com/simdjson/simdjson)** — Fast JSON parser used for model config and tokenizer metadata
+- **[libsoxr](https://sourceforge.net/projects/soxr/)** — High-performance 1D sample-rate conversion library for audio preprocessing and 24kHz reference resampling (LGPL v2.1)
 - **[dr_libs](https://github.com/mackron/dr_libs)** — Single-header audio decoding libraries (`dr_wav`, `dr_mp3`, `dr_flac`) used for ASR audio preprocessing
 - **[llama.cpp jinja module](https://github.com/ggml-org/llama.cpp/tree/master/common/jinja)** — jinja chat template parser module, used for parsing and building chat template
 
 ## 📄 License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE) for details. Third-party components retain their respective licenses:
+- `third_party/soxr` is licensed under the [GNU LGPL v2.1](third_party/soxr/COPYING.LGPL).

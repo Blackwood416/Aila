@@ -22,7 +22,7 @@
 - 🎯 **YOLO26 目标检测** — 支持 n/s/m/l/x、固定 640×640、NMS-free one-to-one head、FP16 oneDNN/SYCL 推理，以及 UTF-8 类名
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
 - 🎯 **强制对齐** — 音频 + 文本 → 词级时间戳对齐，支持 CJK 逐字分词和 LIS 时间戳修正
-- 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 的文本转语音（TTS），支持原生零样本语音克隆。支持直接生成原始音频 WAV、通过参考音频进行音色克隆，以及离线 Mimi 译码
+- 🔊 语音合成 (Qwen3-TTS) — 基于 Mimi Vocoder 与高质量 libsoxr Kaiser 重采样的文本转语音（TTS），支持原生零样本语音克隆。支持 In-Context Learning (ICL) 语音克隆、x-vector 音色克隆、CustomVoice 预置音色及 VoiceDesign 风格提示词
 - 🎤 **CustomVoice / VoiceDesign** — 命名说话人预设（vivian、ryan 等）快速选择音色，以及通过 VoiceDesign 文本描述音色风格进行创意 TTS 控制
 - 🔉 **流式 TTS** — 实时原始 24kHz 单声道 f32 PCM 音频输出到 stdout，实现低延迟流式语音合成
 - ⚡ **原生 bf16 GEMV kernel** — 手写优化的 SG=16 vec8+FMA bf16 GEMV 用于 TTS 解码，TTS 速度提升 9 倍（0.6B 模型 RTF 从 8.08 降至 0.89）
@@ -222,6 +222,8 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--synthesize <text>` | TTS 文本转语音合成 | 无 |
 | `--output-wav <path>` | TTS 输出 WAV 文件路径 | `output.wav` |
 | `--ref <path>` | TTS 语音克隆参考音频 | 无 |
+| `--ref-text <text>` | ICL 语音克隆参考音频对应文本 | 无 |
+| `--clone-mode <mode>` | 语音克隆模式：`auto` (默认), `icl`, `xvector` | `auto` |
 | `--speaker <name>` | TTS 命名音色（如 vivian、ryan） | 无 |
 | `--instruct <text>` | VoiceDesign 音色风格描述（如 "深沉温暖的声音"） | 无 |
 | `--language <lang>` | TTS 语言：chinese、english、japanese、korean、auto | auto |
@@ -287,39 +289,55 @@ Aila 只负责格式化 prompt 并解析模型输出的工具调用，不在推�
 
 ### 🎤 TTS 语音克隆
 
-Aila 为 Qwen3-TTS 模型提供**零样本语音克隆**支持。说话人嵌入通过原生 C++ ECAPA-TDNN 编码器提取（不依赖 Python）。
+Aila 为 Qwen3-TTS 模型提供**零样本语音克隆**支持，包含两种模式：
+- **In-Context Learning (ICL) 模式** (`--ref` + `--ref-text`)：结合参考音频及其转录文本，高保真还原说话人的音色、语调与发音细节。音频通过高质量 `libsoxr` Kaiser sinc 重采样器对齐至 24kHz，并由 Mimi Audio Encoder 编码为离散声学特征码。
+- **x-vector 模式**（仅 `--ref`）：通过原生 C++ ECAPA-TDNN 编码器提取全局说话人特征嵌入（不依赖 Python）。
 
 **参考音频要求：**
 
 | 要求 | 说明 |
 |------|------|
 | **格式** | WAV、MP3 或 FLAC |
-| **采样率** | 任意（自动重采样到 24kHz） |
+| **采样率** | 任意（采用 libsoxr Kaiser 重采样器自动高保真重采样到 24kHz） |
 | **声道** | 推荐单声道（多声道自动平均为单声道） |
 | **时长** | 建议 ≥ 3 秒清晰语音 |
 | **内容** | 目标说话人的清晰语音，背景噪音尽量小 |
 | **编码** | 16-bit PCM 或 32-bit float |
 
 ```powershell
-# 从参考音频克隆音色
+# 1. 原生 ICL 语音克隆（推荐，音色与韵律品质最佳）
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
-    --synthesize "你好世界" `
+    --synthesize "你好，世界。" `
     --ref ./reference_speaker.wav `
-    --output-wav cloned_output.wav
+    --ref-text "这是一个参考音频的文本。" `
+    --output-wav cloned_icl.wav
 
-# CustomVoice — 使用命名说话人预设
+# 2. x-vector 语音克隆（仅需音频）
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "今天天气真好。" `
+    --ref ./reference_speaker.wav `
+    --output-wav cloned_xvector.wav
+
+# 3. 流式 ICL 语音克隆（实时生成）
+Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
+    --synthesize "你好，世界。" `
+    --ref ./reference_speaker.wav `
+    --ref-text "这是一个参考音频的文本。" `
+    --stream --output-wav cloned_stream.wav
+
+# 4. CustomVoice — 使用命名说话人预设
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker vivian `
     --synthesize "你好世界" `
     --output-wav vivian_output.wav
 
-# VoiceDesign — 用自然语言描述音色风格
+# 5. VoiceDesign — 用自然语言描述音色风格
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --instruct "深沉温暖的声音，语速较慢" `
     --synthesize "你好世界" `
     --output-wav styled_output.wav
 
-# VoiceDesign 配合语言指定
+# 6. CustomVoice 配合语言指定
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --speaker ryan `
     --language english `
@@ -327,13 +345,9 @@ Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice `
     --synthesize "Hello" `
     --output-wav ryan_english.wav
 
-# 流式 TTS — 实时 PCM 音频输出
+# 7. 流式 TTS — 实时 raw PCM 音频输出到 stdout
 Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
     --stream-tts --synthesize "你好！" 2>/dev/null | pcm_play
-
-# 流式 TTS 自定义批大小
-Aila.exe -m ./models/Qwen3-TTS-12Hz-0.6B-Base `
-    --stream-tts --stream-batch 8 --synthesize "你好！" 2>/dev/null | pcm_play
 ```
 
 `--rep-penalty` 参数控制重复惩罚（TTS 模式下自动设为 1.1）。如果输出出现重复伪影可调高（如 `--rep-penalty 1.3`），需要更多变化时可调低（如 `--rep-penalty 1.0`）。
@@ -464,9 +478,11 @@ Aila/
 - **[oneDNN](https://github.com/oneapi-src/oneDNN)** — Intel 深度神经网络库，提供 bf16 推理所用的矩阵乘法原语
 - **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — NF4 量化格式和反量化参考实现
 - **[simdjson](https://github.com/simdjson/simdjson)** — 高性能 JSON 解析器，用于模型配置和分词器元数据
+- **[libsoxr](https://sourceforge.net/projects/soxr/)** — 高性能一维音频重采样库，用于音频预处理与 24kHz 参考音频对齐（LGPL v2.1）
 - **[dr_libs](https://github.com/mackron/dr_libs)** — 单文件头音频解码库（`dr_wav`、`dr_mp3`、`dr_flac`），用于 ASR 音频预处理
 - **[llama.cpp jinja module](https://github.com/ggml-org/llama.cpp/tree/master/common/jinja)** — jinja对话模板解析模块，用于对话模板解析和构建
 
 ## 📄 许可证
 
-详见 [LICENSE](LICENSE)。
+详见 [LICENSE](LICENSE)。第三方组件保留其原有许可证：
+- `third_party/soxr` 基于 [GNU LGPL v2.1](third_party/soxr/COPYING.LGPL) 开源。

@@ -321,7 +321,7 @@ if(WIN32)
     target_link_libraries(AilaShared PRIVATE simdjson_proxy AilaBuildIdentity)
 else()
     add_library(AilaShared SHARED ${LIB_SOURCES})
-    target_link_libraries(AilaShared PUBLIC DNNL::dnnl simdjson AilaSyclOptions)
+    target_link_libraries(AilaShared PUBLIC DNNL::dnnl simdjson soxr AilaSyclOptions)
 endif()
 target_compile_definitions(AilaShared PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_BUILDING_DLL)
 target_include_directories(AilaShared PUBLIC
@@ -870,9 +870,12 @@ endif()
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_RUNTIME_DIR}/licenses/soxr"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaWorker>" "${AILA_RELEASE_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/third_party/soxr/LICENCE" "${AILA_RELEASE_RUNTIME_DIR}/licenses/soxr/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/third_party/soxr/COPYING.LGPL" "${AILA_RELEASE_RUNTIME_DIR}/licenses/soxr/"
         COMMAND ${CMAKE_COMMAND}
             "-DTARGET_PATH=$<TARGET_FILE:Aila>"
             "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
@@ -883,8 +886,8 @@ endif()
             "-DTARGET_DIR=${AILA_RELEASE_RUNTIME_DIR}"
             "-DTARGET_KIND=EXECUTABLE"
             -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
-        COMMENT "Staging release binaries in ${AILA_RELEASE_BIN_DIR}"
+        COMMENT "Staging release binaries and third-party licenses in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )
-    add_dependencies(release Aila AilaShared AilaWorker)
+    add_dependencies(release Aila AilaShared AilaWorker soxr)
 endif()
