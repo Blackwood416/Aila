@@ -1318,9 +1318,17 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     }
 
     // 2. Initialize Mimi stream
+    int ref_frames = (clone_prompt && clone_prompt->reference_codes.frames > 0)
+                     ? clone_prompt->reference_codes.frames : 0;
     MimiStreamState mimi_state;
-    if (!init_mimi_stream(ctx, mimi_state, std::max(128, total_frames + 16))) {
+    if (!init_mimi_stream(ctx, mimi_state, std::max(128, ref_frames + total_frames + 16))) {
         return false;
+    }
+
+    // Warmup vocoder state with reference codes (discard reference audio output)
+    if (ref_frames > 0) {
+        std::vector<float> ref_warmup_samples;
+        decode_mimi_incremental(ctx, clone_prompt->reference_codes.codes, ref_frames, mimi_state, ref_warmup_samples);
     }
 
     // 3. Feed codes in batches to incremental decoder

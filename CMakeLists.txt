@@ -424,6 +424,15 @@ target_include_directories(AilaMimiEncoderTests PRIVATE
 target_link_libraries(AilaMimiEncoderTests PRIVATE AilaLib simdjson)
 add_test(NAME AilaMimiEncoderTests COMMAND AilaMimiEncoderTests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(AilaTTSVoiceCloneAlignmentTests tests/audio/TTSVoiceCloneAlignmentTests.cpp)
+target_compile_definitions(AilaTTSVoiceCloneAlignmentTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaTTSVoiceCloneAlignmentTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaTTSVoiceCloneAlignmentTests PRIVATE AilaLib simdjson)
+add_test(NAME AilaTTSVoiceCloneAlignmentTests COMMAND AilaTTSVoiceCloneAlignmentTests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
 add_executable(AilaLoraLoaderTests tests/lora/LoraLoaderTests.cpp)
 target_compile_definitions(AilaLoraLoaderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_include_directories(AilaLoraLoaderTests PRIVATE

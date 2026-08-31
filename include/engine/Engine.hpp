@@ -2500,7 +2500,8 @@ public:
             std::vector<float> full_samples;
             ok = tts_backend->decode_mimi_vocoder(*ctx_, full_codes, ref_frames + n_frames, full_samples);
             if (ok) {
-                size_t cut_samples = static_cast<size_t>(ref_frames) * 2000;
+                // Official Mimi 12Hz upsample rate is exactly 1920 samples/frame (24000 / 12.5)
+                size_t cut_samples = static_cast<size_t>(ref_frames) * 1920;
                 if (full_samples.size() > cut_samples) {
                     out_samples.assign(full_samples.begin() + cut_samples, full_samples.end());
                 } else {
@@ -2619,9 +2620,8 @@ public:
                 instruct_tokens = tokenizer_.encode(instruct_text);
             }
             int lang_id = getLanguageId(language);
-            std::string formatted_text = "<|im_start|>assistant\n" + text
-                + "<|im_end|>\n<|im_start|>assistant\n";
-            std::vector<int> tokens = tokenizer_.encode(formatted_text);
+            // 4. Tokenize the main text (pure text tokens without ChatML tags, identical to blocking mode)
+            std::vector<int> tokens = tokenizer_.encode(text);
 
             // Run streaming synthesis
             auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());
