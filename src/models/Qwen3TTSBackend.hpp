@@ -231,6 +231,7 @@ private:
     Qwen3TTSModelType tts_model_type_ = Qwen3TTSModelType::Base;
 
     // Pre-computed embeddings (bos/eos/pad, computed once during load)
+    Tensor precomputed_role_embed_; // [3, H_talker]
     Tensor precomputed_tts_bos_; // [1, H_talker]
     Tensor precomputed_tts_eos_; // [1, H_talker]
     Tensor precomputed_tts_pad_; // [1, H_talker]

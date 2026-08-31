@@ -1429,6 +1429,42 @@ void verify_audio_proxy(const Api& api, AilaEngine* engine) {
     expect(api.synthesize_stream_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &invalid_opts, [](const float*, int, void*) {}, nullptr) == nullptr,
            "synthesize_stream_ex accepted invalid struct_size");
 
+    // Test non-zero reserved fields rejection
+    AilaTTSOptions bad_reserved = def_opts;
+    bad_reserved.reserved[0] = 1;
+    expect(api.synthesize_file_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &bad_reserved, u8R"(C:\输出\结果.wav)") == AILA_ERR_INVALID_ARGUMENT,
+           "synthesize_file_ex accepted non-zero reserved[0]");
+    expect(api.synthesize_stream_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &bad_reserved, [](const float*, int, void*) {}, nullptr) == nullptr,
+           "synthesize_stream_ex accepted non-zero reserved[0]");
+
+    bad_reserved = def_opts;
+    bad_reserved.reserved[5] = 42;
+    expect(api.synthesize_file_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr, &bad_reserved, u8R"(C:\输出\结果.wav)") == AILA_ERR_INVALID_ARGUMENT,
+           "synthesize_file_ex accepted non-zero reserved[5]");
+
+    // Test truncated prefix safety with guard pages
+    {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        const size_t page_size = info.dwPageSize;
+        auto* pages = static_cast<unsigned char*>(VirtualAlloc(
+            nullptr, page_size * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        expect(pages != nullptr, "VirtualAlloc for TTS options guard pages failed");
+        DWORD old_protection = 0;
+        expect(VirtualProtect(pages + page_size, page_size, PAGE_NOACCESS, &old_protection) != FALSE,
+               "VirtualProtect for TTS options guard page failed");
+
+        // Small prefix: struct_size = 4
+        constexpr uint32_t small_prefix = sizeof(uint32_t);
+        unsigned char* prefix4 = pages + page_size - small_prefix;
+        std::memcpy(prefix4, &small_prefix, sizeof(small_prefix));
+        expect(api.synthesize_file_ex(engine, u8"文字", nullptr, "", nullptr, "chinese", nullptr,
+                                      reinterpret_cast<const AilaTTSOptions*>(prefix4), u8R"(C:\输出\结果.wav)") == AILA_OK,
+               "synthesize_file_ex failed or crashed with 4-byte prefix");
+
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+
     samples = reinterpret_cast<float*>(static_cast<uintptr_t>(1));
     count = 19;
     expect(api.synthesize_wav(engine, nullptr, 2, nullptr, 0, nullptr, &samples, &count) ==

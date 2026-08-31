@@ -739,14 +739,34 @@ AILA_API int aila_synthesize_ex(
         if (engine) try { engine->proxy->record_invalid_argument("TTS file arguments are invalid"); } catch (...) {}
         return AILA_ERR_INVALID_ARGUMENT;
     }
-    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
-        if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
-        return AILA_ERR_INVALID_ARGUMENT;
+    AilaTTSOptions safe_options = aila_tts_options_default();
+    const AilaTTSOptions* p_options = nullptr;
+    if (options) {
+        uint32_t sz = options->struct_size == 0 ? static_cast<uint32_t>(sizeof(AilaTTSOptions)) : options->struct_size;
+        if (sz < sizeof(uint32_t)) {
+            if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
+            return AILA_ERR_INVALID_ARGUMENT;
+        }
+        if (sz >= offsetof(AilaTTSOptions, reference_text) + sizeof(options->reference_text)) {
+            safe_options.reference_text = options->reference_text;
+        }
+        if (sz >= offsetof(AilaTTSOptions, voice_clone_mode) + sizeof(options->voice_clone_mode)) {
+            safe_options.voice_clone_mode = options->voice_clone_mode;
+        }
+        if (sz >= sizeof(AilaTTSOptions)) {
+            for (int i = 0; i < 6; ++i) {
+                if (options->reserved[i] != 0) {
+                    if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions reserved fields must be 0"); } catch (...) {}
+                    return AILA_ERR_INVALID_ARGUMENT;
+                }
+            }
+        }
+        p_options = &safe_options;
     }
     try {
         return engine->proxy->synthesize_file(
             text, reference_audio_path, speaker_name, instruct_text, language, config,
-            output_wav_path, options);
+            output_wav_path, p_options);
     } catch (...) { record_boundary_failure(engine, "aila_synthesize_ex"); return AILA_ERR_RUNTIME; }
 }
 
@@ -807,9 +827,32 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
         if (engine) try { engine->proxy->record_invalid_argument("TTS stream arguments are invalid"); } catch (...) {}
         return nullptr;
     }
-    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
-        if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
-        return nullptr;
+    const bool has_options = options != nullptr;
+    AilaTTSOptions options_copy = aila_tts_options_default();
+    std::string ref_text_copy;
+    if (has_options) {
+        uint32_t sz = options->struct_size == 0 ? static_cast<uint32_t>(sizeof(AilaTTSOptions)) : options->struct_size;
+        if (sz < sizeof(uint32_t)) {
+            if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions struct_size is invalid"); } catch (...) {}
+            return nullptr;
+        }
+        if (sz >= offsetof(AilaTTSOptions, reference_text) + sizeof(options->reference_text)) {
+            if (options->reference_text) {
+                ref_text_copy = options->reference_text;
+                options_copy.reference_text = ref_text_copy.c_str();
+            }
+        }
+        if (sz >= offsetof(AilaTTSOptions, voice_clone_mode) + sizeof(options->voice_clone_mode)) {
+            options_copy.voice_clone_mode = options->voice_clone_mode;
+        }
+        if (sz >= sizeof(AilaTTSOptions)) {
+            for (int i = 0; i < 6; ++i) {
+                if (options->reserved[i] != 0) {
+                    if (engine) try { engine->proxy->record_invalid_argument("AilaTTSOptions reserved fields must be 0"); } catch (...) {}
+                    return nullptr;
+                }
+            }
+        }
     }
     try {
         auto stream = std::make_unique<AilaTTSStream>();
@@ -827,16 +870,6 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
         const std::string language_copy = has_language ? language : "";
         const bool has_config = config != nullptr;
         const AilaGenConfig config_copy = has_config ? *config : AilaGenConfig{};
-        const bool has_options = options != nullptr;
-        AilaTTSOptions options_copy{};
-        std::string ref_text_copy;
-        if (has_options) {
-            options_copy = *options;
-            if (options->reference_text) {
-                ref_text_copy = options->reference_text;
-                options_copy.reference_text = ref_text_copy.c_str();
-            }
-        }
         AilaTTSStream* raw = stream.get();
         raw->worker = std::thread([
             raw, text_copy, has_reference, reference_copy, has_speaker, speaker_copy,

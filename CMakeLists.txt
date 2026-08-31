@@ -4,8 +4,10 @@ set(CMAKE_CXX_STANDARD 17)
 
 if(WIN32)
         set(CMAKE_CXX_COMPILER "icx-cl")
+        set(CMAKE_C_COMPILER "icx-cl")
 else()
         set(CMAKE_CXX_COMPILER "icpx")
+        set(CMAKE_C_COMPILER "icx")
 endif()
 
 # Set default build type to Release before project() initializes the toolchain.
@@ -17,7 +19,7 @@ if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-project (Aila CXX)
+project (Aila C CXX)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
 
@@ -220,10 +222,24 @@ set(SIMDJSON_SOURCES
     third_party/simdjson/simdjson.cpp
 )
 
+set(SOXR_SOURCES
+    third_party/soxr/soxr.c
+    third_party/soxr/data-io.c
+    third_party/soxr/dbesi0.c
+    third_party/soxr/filter.c
+    third_party/soxr/cr.c
+    third_party/soxr/cr32.c
+    third_party/soxr/cr64.c
+    third_party/soxr/fft4g32.c
+    third_party/soxr/fft4g64.c
+    third_party/soxr/vr32.c
+)
+
 # ============================================================
 # Include directories
 # ============================================================
 include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${PROJECT_SOURCE_DIR}/third_party/soxr)
 include_directories(${PROJECT_SOURCE_DIR}/src/utils)
 include_directories(${PROJECT_SOURCE_DIR}/src/core)
 include_directories(${PROJECT_SOURCE_DIR}/src/ops)
@@ -242,6 +258,17 @@ include_directories(${PROJECT_SOURCE_DIR}/src/templates/jinja)
 find_package(dnnl REQUIRED)
 add_library(simdjson STATIC ${SIMDJSON_SOURCES})
 target_include_directories(simdjson PUBLIC ${PROJECT_SOURCE_DIR}/third_party/simdjson)
+
+add_library(soxr STATIC ${SOXR_SOURCES})
+target_include_directories(soxr PUBLIC ${PROJECT_SOURCE_DIR}/third_party/soxr)
+target_compile_definitions(soxr PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX SOXR_LIB=1)
+set_target_properties(soxr PROPERTIES LINKER_LANGUAGE CXX)
+if(WIN32)
+    target_compile_options(soxr PRIVATE
+        -fno-sycl
+        -Wno-unused-command-line-argument)
+endif()
+
 if(WIN32)
     get_filename_component(AILA_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     get_filename_component(AILA_COMPILER_ROOT
@@ -261,7 +288,7 @@ endif()
 # ============================================================
 add_library(AilaLib STATIC ${LIB_SOURCES})
 target_compile_definitions(AilaLib PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson AilaSyclOptions)
+target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson soxr AilaSyclOptions)
 if(WIN32)
     target_link_libraries(AilaLib PUBLIC windowscodecs ole32)
 endif()

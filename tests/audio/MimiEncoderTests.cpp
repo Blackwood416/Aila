@@ -158,6 +158,7 @@ void test_golden_alignment() {
         }
     }
     std::cout << "[Test] ref_test.wav (32k -> 24k) mismatch vs golden: " << file_mismatch_count << " / 368" << std::endl;
+    EXPECT_EQ(file_mismatch_count, 0);
 }
 
 int main() {

@@ -938,6 +938,39 @@ AILA_API AilaTTSOptions aila_tts_options_default(void) {
     return opts;
 }
 
+static bool parse_tts_options(const AilaTTSOptions* in, std::string& out_ref_text, VoiceCloneMode& out_mode) {
+    out_ref_text.clear();
+    out_mode = VoiceCloneMode::Auto;
+    if (!in) {
+        return true;
+    }
+    if (in->struct_size != 0 && in->struct_size < sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t sz = in->struct_size == 0 ? static_cast<uint32_t>(sizeof(AilaTTSOptions)) : in->struct_size;
+
+    if (sz >= offsetof(AilaTTSOptions, reference_text) + sizeof(in->reference_text)) {
+        if (in->reference_text) {
+            out_ref_text = in->reference_text;
+        }
+    }
+    if (sz >= offsetof(AilaTTSOptions, voice_clone_mode) + sizeof(in->voice_clone_mode)) {
+        switch (in->voice_clone_mode) {
+            case AILA_VOICE_CLONE_ICL: out_mode = VoiceCloneMode::Icl; break;
+            case AILA_VOICE_CLONE_XVECTOR_ONLY: out_mode = VoiceCloneMode::XVectorOnly; break;
+            case AILA_VOICE_CLONE_AUTO: default: out_mode = VoiceCloneMode::Auto; break;
+        }
+    }
+    if (sz >= sizeof(AilaTTSOptions)) {
+        for (int i = 0; i < 6; ++i) {
+            if (in->reserved[i] != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 AILA_API int aila_synthesize_ex(
     AilaEngine* engine,
     const char* text,
@@ -952,21 +985,13 @@ AILA_API int aila_synthesize_ex(
     if (!engine || !text || !output_wav_path) {
         return AILA_ERR_INVALID_ARGUMENT;
     }
-    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
+    std::string ref_text;
+    VoiceCloneMode mode = VoiceCloneMode::Auto;
+    if (!parse_tts_options(options, ref_text, mode)) {
         return AILA_ERR_INVALID_ARGUMENT;
     }
     try {
         GenerationConfig cpp_cfg = to_cpp_config(config);
-
-        std::string ref_text = (options && options->reference_text) ? options->reference_text : "";
-        VoiceCloneMode mode = VoiceCloneMode::Auto;
-        if (options) {
-            switch (options->voice_clone_mode) {
-                case AILA_VOICE_CLONE_ICL: mode = VoiceCloneMode::Icl; break;
-                case AILA_VOICE_CLONE_XVECTOR_ONLY: mode = VoiceCloneMode::XVectorOnly; break;
-                case AILA_VOICE_CLONE_AUTO: default: mode = VoiceCloneMode::Auto; break;
-            }
-        }
 
         std::vector<float> samples;
         bool ok = engine->engine.synthesizeSpeech(
@@ -1039,21 +1064,15 @@ AILA_API AilaTTSStream* aila_synthesize_stream_ex(
     void* user_data
 ) {
     if (!engine || !text || !callback) return nullptr;
-    if (options && options->struct_size != 0 && options->struct_size < sizeof(uint32_t)) {
+    std::string ref_text;
+    VoiceCloneMode mode = VoiceCloneMode::Auto;
+    if (!parse_tts_options(options, ref_text, mode)) {
+        engine->engine.set_error(EngineErrorCode::InvalidArgument, "Invalid AilaTTSOptions");
         return nullptr;
     }
     auto* stream = new AilaTTSStream();
 
     GenerationConfig cpp_cfg = to_cpp_config(config);
-    std::string ref_text = (options && options->reference_text) ? options->reference_text : "";
-    VoiceCloneMode mode = VoiceCloneMode::Auto;
-    if (options) {
-        switch (options->voice_clone_mode) {
-            case AILA_VOICE_CLONE_ICL: mode = VoiceCloneMode::Icl; break;
-            case AILA_VOICE_CLONE_XVECTOR_ONLY: mode = VoiceCloneMode::XVectorOnly; break;
-            case AILA_VOICE_CLONE_AUTO: default: mode = VoiceCloneMode::Auto; break;
-        }
-    }
 
     stream->worker = engine->engine.synthesizeSpeechStream(
         std::string(text),

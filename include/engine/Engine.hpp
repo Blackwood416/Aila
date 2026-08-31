@@ -2474,10 +2474,8 @@ public:
             AILA_LOG_INFO("[TTS] Language: %s (id=%d)", language.c_str(), lang_id);
         }
 
-        // 4. Format and tokenize the main text
-        std::string formatted_text = "<|im_start|>assistant\n" + text
-            + "<|im_end|>\n<|im_start|>assistant\n";
-        std::vector<int> tokens = tokenizer_.encode(formatted_text);
+        // 4. Tokenize the main text (pure text tokens without ChatML tags)
+        std::vector<int> tokens = tokenizer_.encode(text);
         AILA_LOG_INFO("[TTS] Input: \"%s\", %zu tokens", text.c_str(), tokens.size());
 
         // 5. Synthesize codes
@@ -2493,25 +2491,20 @@ public:
             return false;
         }
 
-        // 6. Decode codes to audio via Mimi vocoder
-        if (p_clone_prompt && p_clone_prompt->is_icl() && p_clone_prompt->reference_codes.frames > 0) {
-            int ref_len = p_clone_prompt->reference_codes.frames;
-            int total_len = ref_len + n_frames;
-            std::vector<int32_t> codes_for_decode;
-            codes_for_decode.reserve(static_cast<size_t>(total_len) * 16);
-            codes_for_decode.insert(codes_for_decode.end(),
-                                    p_clone_prompt->reference_codes.codes.begin(),
-                                    p_clone_prompt->reference_codes.codes.end());
-            codes_for_decode.insert(codes_for_decode.end(), codes.begin(), codes.end());
-
-            std::vector<float> full_decoded;
-            ok = tts_backend->decode_mimi_vocoder(*ctx_, codes_for_decode, total_len, full_decoded);
-            if (ok && !full_decoded.empty()) {
-                size_t cut = static_cast<size_t>(static_cast<double>(ref_len) / std::max(total_len, 1) * full_decoded.size());
-                if (cut < full_decoded.size()) {
-                    out_samples.assign(full_decoded.begin() + cut, full_decoded.end());
+        // 6. Decode codes to audio via Mimi vocoder (official: prepend ref_codes for smooth vocoder context, then slice)
+        int ref_frames = (p_clone_prompt && p_clone_prompt->reference_codes.frames > 0)
+                         ? p_clone_prompt->reference_codes.frames : 0;
+        if (ref_frames > 0) {
+            std::vector<int32_t> full_codes = p_clone_prompt->reference_codes.codes;
+            full_codes.insert(full_codes.end(), codes.begin(), codes.end());
+            std::vector<float> full_samples;
+            ok = tts_backend->decode_mimi_vocoder(*ctx_, full_codes, ref_frames + n_frames, full_samples);
+            if (ok) {
+                size_t cut_samples = static_cast<size_t>(ref_frames) * 2000;
+                if (full_samples.size() > cut_samples) {
+                    out_samples.assign(full_samples.begin() + cut_samples, full_samples.end());
                 } else {
-                    out_samples.clear();
+                    out_samples = std::move(full_samples);
                 }
             }
         } else {
@@ -3709,7 +3702,15 @@ public:
         return ss.str();
     }
 
-    bool getAudioFileMeta(const std::string& path, uint64_t& out_size, int64_t& out_mtime) const {
+    struct CachedRefCodes {
+        TTSReferenceCodes codes;
+        uint64_t source_size = 0;
+        int64_t source_mtime = 0;
+        uint64_t tokenizer_size = 0;
+        int64_t tokenizer_mtime = 0;
+    };
+
+    bool getFileMeta(const std::string& path, uint64_t& out_size, int64_t& out_mtime) const {
         std::error_code ec;
         auto fs = std::filesystem::file_size(path, ec);
         if (ec) return false;
@@ -3718,6 +3719,10 @@ public:
         if (ec) return false;
         out_mtime = lwt.time_since_epoch().count();
         return true;
+    }
+
+    bool getAudioFileMeta(const std::string& path, uint64_t& out_size, int64_t& out_mtime) const {
+        return getFileMeta(path, out_size, out_mtime);
     }
 
     // Build disk cache path for 12Hz reference audio codes
@@ -3733,16 +3738,35 @@ public:
     }
 
     bool lookupRefCodesCache(const std::string& audio_path, TTSReferenceCodes& outCodes) {
+        uint64_t curr_audio_size = 0;
+        int64_t curr_audio_mtime = 0;
+        bool has_audio_meta = getFileMeta(audio_path, curr_audio_size, curr_audio_mtime);
+
+        uint64_t curr_tok_size = 0;
+        int64_t curr_tok_mtime = 0;
+        std::string tok_path = model_dir_ + "/speech_tokenizer/model.safetensors";
+        bool has_tok_meta = getFileMeta(tok_path, curr_tok_size, curr_tok_mtime);
+
+        // 1. Check in-memory cache with full metadata validation
         auto mem_it = ref_codes_cache_.find(audio_path);
         if (mem_it != ref_codes_cache_.end()) {
-            outCodes = mem_it->second;
-            return true;
+            const auto& item = mem_it->second;
+            bool valid = true;
+            if (has_audio_meta && (item.source_size != curr_audio_size || item.source_mtime != curr_audio_mtime)) {
+                valid = false;
+            }
+            if (has_tok_meta && (item.tokenizer_size != curr_tok_size || item.tokenizer_mtime != curr_tok_mtime)) {
+                valid = false;
+            }
+            if (valid) {
+                outCodes = item.codes;
+                return true;
+            } else {
+                ref_codes_cache_.erase(mem_it);
+            }
         }
 
-        uint64_t curr_size = 0;
-        int64_t curr_mtime = 0;
-        bool has_meta = getAudioFileMeta(audio_path, curr_size, curr_mtime);
-
+        // 2. Check disk cache
         std::string disk_path = refCodesDiskCachePath(audio_path);
         std::ifstream in(disk_path, std::ios::binary);
         if (in.is_open()) {
@@ -3752,17 +3776,24 @@ public:
                 int32_t version = 0;
                 in.read(reinterpret_cast<char*>(&version), 4);
                 if (version == 2) {
-                    uint64_t cached_size = 0;
-                    int64_t cached_mtime = 0;
+                    uint64_t cached_audio_size = 0;
+                    int64_t cached_audio_mtime = 0;
+                    uint64_t cached_tok_size = 0;
+                    int64_t cached_tok_mtime = 0;
                     int32_t frames = 0;
                     int32_t codebooks = 0;
-                    in.read(reinterpret_cast<char*>(&cached_size), 8);
-                    in.read(reinterpret_cast<char*>(&cached_mtime), 8);
+                    in.read(reinterpret_cast<char*>(&cached_audio_size), 8);
+                    in.read(reinterpret_cast<char*>(&cached_audio_mtime), 8);
+                    in.read(reinterpret_cast<char*>(&cached_tok_size), 8);
+                    in.read(reinterpret_cast<char*>(&cached_tok_mtime), 8);
                     in.read(reinterpret_cast<char*>(&frames), 4);
                     in.read(reinterpret_cast<char*>(&codebooks), 4);
 
-                    if (has_meta && (cached_size != curr_size || cached_mtime != curr_mtime)) {
+                    if (has_audio_meta && (cached_audio_size != curr_audio_size || cached_audio_mtime != curr_audio_mtime)) {
                         return false; // Source audio changed on disk
+                    }
+                    if (has_tok_meta && (cached_tok_size != curr_tok_size || cached_tok_mtime != curr_tok_mtime)) {
+                        return false; // Speech tokenizer changed/mismatched
                     }
 
                     if (frames > 0 && codebooks == 16) {
@@ -3772,7 +3803,13 @@ public:
                         in.read(reinterpret_cast<char*>(outCodes.codes.data()),
                                 outCodes.codes.size() * sizeof(int32_t));
                         if (in.gcount() == static_cast<std::streamsize>(outCodes.codes.size() * sizeof(int32_t))) {
-                            ref_codes_cache_[audio_path] = outCodes;
+                            CachedRefCodes item;
+                            item.codes = outCodes;
+                            item.source_size = curr_audio_size;
+                            item.source_mtime = curr_audio_mtime;
+                            item.tokenizer_size = curr_tok_size;
+                            item.tokenizer_mtime = curr_tok_mtime;
+                            ref_codes_cache_[audio_path] = std::move(item);
                             return true;
                         }
                     }
@@ -3784,11 +3821,23 @@ public:
 
     void cacheRefCodes(const std::string& audio_path, const TTSReferenceCodes& codes) {
         if (codes.frames <= 0 || codes.codebooks != 16) return;
-        ref_codes_cache_[audio_path] = codes;
 
-        uint64_t curr_size = 0;
-        int64_t curr_mtime = 0;
-        getAudioFileMeta(audio_path, curr_size, curr_mtime);
+        uint64_t curr_audio_size = 0;
+        int64_t curr_audio_mtime = 0;
+        getFileMeta(audio_path, curr_audio_size, curr_audio_mtime);
+
+        uint64_t curr_tok_size = 0;
+        int64_t curr_tok_mtime = 0;
+        std::string tok_path = model_dir_ + "/speech_tokenizer/model.safetensors";
+        getFileMeta(tok_path, curr_tok_size, curr_tok_mtime);
+
+        CachedRefCodes item;
+        item.codes = codes;
+        item.source_size = curr_audio_size;
+        item.source_mtime = curr_audio_mtime;
+        item.tokenizer_size = curr_tok_size;
+        item.tokenizer_mtime = curr_tok_mtime;
+        ref_codes_cache_[audio_path] = item;
 
         std::string disk_path = refCodesDiskCachePath(audio_path);
         std::error_code ec;
@@ -3805,8 +3854,10 @@ public:
                 int32_t codebooks = 16;
                 out.write(magic, 4);
                 out.write(reinterpret_cast<const char*>(&version), 4);
-                out.write(reinterpret_cast<const char*>(&curr_size), 8);
-                out.write(reinterpret_cast<const char*>(&curr_mtime), 8);
+                out.write(reinterpret_cast<const char*>(&curr_audio_size), 8);
+                out.write(reinterpret_cast<const char*>(&curr_audio_mtime), 8);
+                out.write(reinterpret_cast<const char*>(&curr_tok_size), 8);
+                out.write(reinterpret_cast<const char*>(&curr_tok_mtime), 8);
                 out.write(reinterpret_cast<const char*>(&frames), 4);
                 out.write(reinterpret_cast<const char*>(&codebooks), 4);
                 out.write(reinterpret_cast<const char*>(codes.codes.data()),
@@ -3823,7 +3874,7 @@ private:
     // In-memory speaker embedding cache (keyed by audio file path).
     std::unordered_map<std::string, std::vector<float>> ref_cache_;
     // In-memory reference codes cache (keyed by audio file path).
-    std::unordered_map<std::string, TTSReferenceCodes> ref_codes_cache_;
+    std::unordered_map<std::string, CachedRefCodes> ref_codes_cache_;
     // Optional persistent cache directory for speaker embeddings.
     std::string ref_cache_dir_;
 
