@@ -471,6 +471,10 @@ bool Qwen3TTSBackend::synthesize_codes(Context& ctx,
                                        const VoiceClonePrompt* clone_prompt) {
     out_codes.clear();
     out_n_frames = 0;
+    reset();
+    if (gen_config.use_fixed_seed) {
+        ops::set_sampling_seed(gen_config.sampling_seed);
+    }
 
     static const bool tts_profile = aila::env::read_flag("AILA_TTS_PROFILE", false);
 
@@ -1328,7 +1332,9 @@ bool Qwen3TTSBackend::synthesize_codes_stream(Context& ctx,
     // Warmup vocoder state with reference codes (discard reference audio output)
     if (ref_frames > 0) {
         std::vector<float> ref_warmup_samples;
-        decode_mimi_incremental(ctx, clone_prompt->reference_codes.codes, ref_frames, mimi_state, ref_warmup_samples);
+        if (!decode_mimi_incremental(ctx, clone_prompt->reference_codes.codes, ref_frames, mimi_state, ref_warmup_samples)) {
+            return false;
+        }
     }
 
     // 3. Feed codes in batches to incremental decoder

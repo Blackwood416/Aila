@@ -2362,6 +2362,11 @@ public:
     // (speaker name), and VoiceDesign (instruct text) models.
     // Exactly one of reference_audio_path / speaker_name / instruct_text should be
     // non-empty to select the mode; all empty = default voice.
+    /// Tokenize text for TTS (pure tokens without ChatML tags)
+    std::vector<int> tokenize_tts_text(const std::string& text) const {
+        return tokenizer_.encode(text);
+    }
+
     bool synthesizeSpeech(const std::string& text,
                           const std::string& reference_audio_path,
                           const std::string& speaker_name,
@@ -2475,7 +2480,7 @@ public:
         }
 
         // 4. Tokenize the main text (pure text tokens without ChatML tags)
-        std::vector<int> tokens = tokenizer_.encode(text);
+        std::vector<int> tokens = tokenize_tts_text(text);
         AILA_LOG_INFO("[TTS] Input: \"%s\", %zu tokens", text.c_str(), tokens.size());
 
         // 5. Synthesize codes
@@ -2621,7 +2626,7 @@ public:
             }
             int lang_id = getLanguageId(language);
             // 4. Tokenize the main text (pure text tokens without ChatML tags, identical to blocking mode)
-            std::vector<int> tokens = tokenizer_.encode(text);
+            std::vector<int> tokens = tokenize_tts_text(text);
 
             // Run streaming synthesis
             auto tts_backend = dynamic_cast<Qwen3TTSBackend*>(backend_.get());

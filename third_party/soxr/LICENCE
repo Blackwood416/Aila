@@ -1,5 +1,4 @@
-SoX Resampler Library
-Copyright (c) 2007-18 robs@users.sourceforge.net
+SoX Resampler Library       Copyright (c) 2007-18 robs@users.sourceforge.net
 
 This library is free software; you can redistribute it and/or modify it
 under the terms of the GNU Lesser General Public License as published by
@@ -12,6 +11,13 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser
 General Public License for more details.
 
 You should have received a copy of the GNU Lesser General Public License
-along with this library (see COPYING.LGPL); if not, write to the Free
-Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
-MA 02110-1301  USA
+along with this library; if not, see <https://www.gnu.org/licenses/>.
+
+
+Notes
+
+1. Re software in the `examples' directory: works that are not resampling
+examples but are based on the given examples -- for example, applications using
+the library -- shall not be considered to be derivative works of the examples.
+
+2. If building with pffft.c, see the licence embedded in that file.
