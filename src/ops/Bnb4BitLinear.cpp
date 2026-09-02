@@ -212,6 +212,16 @@ void packed_nf4_gemm_bf16_tiled(Context& ctx,
                             ? absmax_ptr[src_n * blocks_per_row + kb / blocksize + b]
                             : 0.0f;
                     }
+
+                    // Simulated 2D Block Prefetch: prefetch next 2D tile for A and B
+                    if (kb + BK < K) {
+                        ops::Prefetch2D<bf16, BM, BK>::prefetch(
+                            input_ptr + m0 * K + kb + BK, K, lid, WG_SIZE);
+                        ops::Prefetch2D<uint8_t, BN, BK / 2>::prefetch(
+                            packed_ptr + n0 * packed_bytes_per_row + (kb + BK) / 2,
+                            packed_bytes_per_row, lid, WG_SIZE);
+                    }
+
                     item.barrier(sycl::access::fence_space::local_space);
 
                     // Compute partial products for this K tile
@@ -1207,6 +1217,14 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                 int byte_offset = sg_lane * 4;
                 for (; byte_offset + 3 < packed_bytes_per_row;
                      byte_offset += stride) {
+                    if (byte_offset + stride + 3 < packed_bytes_per_row) {
+                        sycl::ext::oneapi::experimental::prefetch(
+                            gate_packed + row_byte_base + byte_offset + stride);
+                        sycl::ext::oneapi::experimental::prefetch(
+                            up_packed + row_byte_base + byte_offset + stride);
+                        sycl::ext::oneapi::experimental::prefetch(
+                            input_ptr + (byte_offset + stride) * 2);
+                    }
                     const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
                         gate_packed + row_byte_base + byte_offset);
                     const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
@@ -1388,6 +1406,12 @@ void packed_nf4_gemv_bf16(Context& ctx,
                 const int stride = static_cast<int>(sub_group_size) * 4;
                 for (; byte_offset + 3 < packed_bytes_per_row;
                      byte_offset += stride) {
+                    if (byte_offset + stride + 3 < packed_bytes_per_row) {
+                        sycl::ext::oneapi::experimental::prefetch(
+                            packed_ptr + row_byte_base + byte_offset + stride);
+                        sycl::ext::oneapi::experimental::prefetch(
+                            input_ptr + (byte_offset + stride) * 2);
+                    }
                     const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
                         packed_ptr + row_byte_base + byte_offset);
                     const float am = absmax_ptr[row_block_base +
@@ -3164,3 +3188,168 @@ void Bnb4GroupedMoE::forward_batched_impl(
 
     output = std::move(acc);
 }
+
+void run_fused_softmax_soft_embed_xmx(
+    Context& ctx,
+    const float* logits_ptr,
+    const float* row_max_ptr,
+    const float* row_inv_sum_ptr,
+    const bf16* embed_weight,
+    bf16* output,
+    int canvas_len, int hidden, int vocab, float embed_scale) {
+    constexpr int BM = 256, BN = 64, BK = 16, TM = 8, TN = 8, TK = 16, SG = 8;
+    constexpr int TILES_PER_SG_M = 4;
+    constexpr int SG_M = 8;
+    constexpr int SG_N = 8;
+    constexpr int NUM_SGS = SG_M * SG_N;
+    constexpr int WG_SIZE = NUM_SGS * SG;
+
+    const int grid_m = (canvas_len + BM - 1) / BM;
+    const int grid_n = (hidden + BN - 1) / BN;
+    const int total_wgs = grid_m * grid_n;
+
+    const bf16* B_ptr = embed_weight;
+    bf16* C_ptr = output;
+    const int M = canvas_len;
+    const int N = hidden;
+    const int K = vocab;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(BK * BN), cgh);
+        sycl::local_accessor<float, 1> s_row_max(sycl::range<1>(BM), cgh);
+        sycl::local_accessor<float, 1> s_row_inv(sycl::range<1>(BM), cgh);
+        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / SG_N;
+                const int sg_col = sg_id % SG_N;
+
+                const int bm = wg_idx / grid_n;
+                const int bn = wg_idx % grid_n;
+                const int m0 = bm * BM;
+                const int n0 = bn * BN;
+
+                // Preload row stats into SLM once per WG:
+                for (int i = lid; i < BM; i += WG_SIZE) {
+                    const int gm = m0 + i;
+                    if (gm < M) {
+                        s_row_max[i] = row_max_ptr[gm];
+                        s_row_inv[i] = row_inv_sum_ptr[gm];
+                    } else {
+                        s_row_max[i] = 0.0f;
+                        s_row_inv[i] = 0.0f;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c[TILES_PER_SG_M];
+                #pragma unroll
+                for (int t = 0; t < TILES_PER_SG_M; ++t) {
+                    joint_matrix_fill(sg, sub_c[t], 0.0f);
+                }
+
+                for (int kb = 0; kb < K; kb += BK) {
+                    // Inline Softmax load into As SLM directly from logits_ptr using SLM preloaded stats:
+                    for (int pair_idx = lid; pair_idx < (BM * BK) / 2; pair_idx += WG_SIZE) {
+                        const int r = pair_idx / (BK / 2);
+                        const int c_pair = pair_idx % (BK / 2);
+                        const int c0 = c_pair * 2;
+                        const int c1 = c0 + 1;
+                        const int gm_load = m0 + r;
+                        if (gm_load < M) {
+                            const float r_max = s_row_max[r];
+                            const float r_inv = s_row_inv[r];
+                            bf16 val0 = bf16(0.0f);
+                            bf16 val1 = bf16(0.0f);
+                            if (kb + c0 < K) {
+                                const float l0 = static_cast<float>(bf16(logits_ptr[static_cast<size_t>(gm_load) * K + kb + c0]));
+                                val0 = bf16(sycl::native::exp(l0 - r_max) * r_inv);
+                            }
+                            if (kb + c1 < K) {
+                                const float l1 = static_cast<float>(bf16(logits_ptr[static_cast<size_t>(gm_load) * K + kb + c1]));
+                                val1 = bf16(sycl::native::exp(l1 - r_max) * r_inv);
+                            }
+                            const uint32_t packed_pair = (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&val1)) << 16) |
+                                                         (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&val0)));
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = packed_pair;
+                        } else {
+                            reinterpret_cast<uint32_t*>(As.get_multi_ptr<sycl::access::decorated::no>().get())[pair_idx] = 0;
+                        }
+                    }
+
+                    if (lid < (BN * BK) / 8) {
+                        const int kh = lid / (BN / 8);
+                        const int col8 = lid % (BN / 8);
+                        const int src_n = n0 + col8 * 8;
+                        if (src_n < N && kb + kh < K) {
+                            auto v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(
+                                B_ptr + static_cast<size_t>(kb + kh) * N + src_n);
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                Bs[(col8 * 8 + j) * BK + kh] = v[j];
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                Bs[(col8 * 8 + j) * BK + kh] = bf16(0.0f);
+                            }
+                        }
+                    }
+
+                    // Simulated 2D Block Prefetch: prefetch next [BK, BN] 2D tile of B and [BM, BK] 2D tile of logits
+                    if (kb + BK < K) {
+                        ops::Prefetch2D<bf16, BK, BN>::prefetch(
+                            B_ptr + static_cast<size_t>(kb + BK) * N + n0, N, lid, WG_SIZE);
+                        ops::Prefetch2D<float, BM, BK>::prefetch(
+                            logits_ptr + static_cast<size_t>(m0) * K + kb + BK, K, lid, WG_SIZE);
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * BK;
+                    joint_matrix_load(sg, sub_b, pB, BK);
+
+                    #pragma unroll
+                    for (int t = 0; t < TILES_PER_SG_M; ++t) {
+                        joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+                        const int r_offset = (sg_row * TILES_PER_SG_M + t) * TM;
+                        auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + r_offset * BK;
+                        joint_matrix_load(sg, sub_a, pA, BK);
+                        joint_matrix_mad(sg, sub_c[t], sub_a, sub_b, sub_c[t]);
+                    }
+
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                for (int t = 0; t < TILES_PER_SG_M; ++t) {
+                    auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
+                    joint_matrix_store(sg, sub_c[t], pC_slm, TN, layout::row_major);
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
+                        const int s = i / (TM * TN);
+                        const int rem = i % (TM * TN);
+                        const int r = rem / TN;
+                        const int c = rem % TN;
+                        const int sr = s / SG_N;
+                        const int sc = s % SG_N;
+                        const int gm = m0 + (sr * TILES_PER_SG_M + t) * TM + r;
+                        const int gn = n0 + sc * TN + c;
+                        if (gm < M && gn < N) {
+                            C_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i] * embed_scale);
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+            });
+    });
+}
+

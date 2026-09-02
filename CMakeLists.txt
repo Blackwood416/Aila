@@ -185,6 +185,7 @@ set(LIB_SOURCES
     src/utils/JsonParser.cpp
     ${JINJA_SOURCES}
     src/vision/Qwen35VisionEncoder.cpp
+    src/vision/Gemma4VisionEncoder.cpp
     src/vision/Yolo26Detector.cpp
     src/vision/DetectionRenderer.cpp
     src/audio/Qwen3ASRAudioEncoder.cpp
@@ -409,6 +410,28 @@ target_include_directories(AilaDiffusionGemmaModelSpecTests PRIVATE
 )
 target_link_libraries(AilaDiffusionGemmaModelSpecTests PRIVATE AilaLib)
 add_test(NAME AilaDiffusionGemmaModelSpecTests COMMAND AilaDiffusionGemmaModelSpecTests)
+
+add_executable(AilaDiffusionGemmaFusionTests
+    tests/ops/DiffusionGemmaFusionTests.cpp
+)
+target_compile_definitions(AilaDiffusionGemmaFusionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaDiffusionGemmaFusionTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaDiffusionGemmaFusionTests PRIVATE AilaLib)
+add_test(NAME AilaDiffusionGemmaFusionTests COMMAND AilaDiffusionGemmaFusionTests)
+
+add_executable(AilaDiffusionGemmaVisionTests
+    tests/vision/DiffusionGemmaVisionTests.cpp
+)
+target_compile_definitions(AilaDiffusionGemmaVisionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaDiffusionGemmaVisionTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaDiffusionGemmaVisionTests PRIVATE AilaLib)
+add_test(NAME AilaDiffusionGemmaVisionTests COMMAND AilaDiffusionGemmaVisionTests)
 
 add_executable(AilaYolo26ModelSpecTests
     tests/vision/Yolo26ModelSpecTests.cpp

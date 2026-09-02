@@ -182,6 +182,21 @@ bool DiffusionGemmaGenerator::generate(
     const bool use_gpu_sampling =
         aila::env::read_flag("AILA_DG_GPU_SAMPLING", false);
 
+    static const float env_conf_thresh =
+        aila::env::read_float("AILA_DG_CONFIDENCE_THRESHOLD", -1.0f);
+    const float effective_conf_thresh =
+        (env_conf_thresh >= 0.0f) ? env_conf_thresh : cfg.confidence_threshold;
+
+    static const int env_stab_thresh =
+        aila::env::read_int("AILA_DG_STABILITY_THRESHOLD", -1);
+    const int effective_stab_thresh =
+        (env_stab_thresh > 0) ? env_stab_thresh : cfg.stability_threshold;
+
+    static const int env_parallel_canvases =
+        aila::env::read_int("AILA_DG_PARALLEL_CANVASES", -1);
+    const int effective_parallel_canvases =
+        (env_parallel_canvases > 0) ? env_parallel_canvases : cfg.num_parallel_canvases;
+
     int* d_argmax = nullptr;
     float* d_entropy = nullptr;
     int* d_denoiser = nullptr;
@@ -202,8 +217,10 @@ bool DiffusionGemmaGenerator::generate(
     }
 
     for (int c = 0; c < max_canvases && !all_finished; ++c) {
-        std::vector<int> prev_argmax(canvas);
-        int equal_count = 0;
+        const int ST = std::max(1, effective_stab_thresh);
+        std::vector<std::vector<int>> accepted_canvas_history(
+            static_cast<size_t>(ST), std::vector<int>(static_cast<size_t>(canvas_len), -1));
+        int history_len = 0;
         bool finished_denoising = false;
         if (use_gpu_sampling) {
             ctx.queue().memset(
@@ -216,36 +233,46 @@ bool DiffusionGemmaGenerator::generate(
             const auto step_start = std::chrono::steady_clock::now();
             AILA_LOG_DEBUG("[DiffusionGemma] Canvas %d/%d step %d", c + 1,
                            max_canvases, cur_step);
-            ctx.memcpy_h2d(canvas_device, canvas.data(),
-                           static_cast<size_t>(canvas_len) * sizeof(int));
+            if (cur_step == cfg.max_denoising_steps || !use_gpu_sampling) {
+                ctx.memcpy_h2d(canvas_device, canvas.data(),
+                               static_cast<size_t>(canvas_len) * sizeof(int));
+            }
             if (!use_gpu_sampling) {
                 ctx.memcpy_h2d(sc_device, sc_embeds.data(),
                                sc_embeds.size() * sizeof(bf16));
             }
             const auto h2d_done = std::chrono::steady_clock::now();
             const auto decode_start = h2d_done;
-            Tensor& logits = backend.diffusion_decode_canvas(
-                ctx, canvas_device, sc_device, canvas_len);
             const float temperature =
                 cfg.t_min + (cfg.t_max - cfg.t_min) *
                                 (static_cast<float>(cur_step) /
                                  static_cast<float>(cfg.max_denoising_steps));
+            Tensor& logits = backend.diffusion_decode_canvas(
+                ctx, canvas_device, sc_device, canvas_len, temperature);
             const auto decoder_submit_done = std::chrono::steady_clock::now();
 
             if (use_gpu_sampling && !debug_probes && !profile) {
                 float* logits_ptr = static_cast<float*>(logits.data());
-                ctx.queue().parallel_for(
-                    sycl::range<1>(static_cast<size_t>(canvas_len) * vocab),
-                    [=](sycl::id<1> idx) {
-                        logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
-                    });
+                int* d_argmax_ptr = backend.diffusion_argmax_device();
+                float* d_entropy_ptr = backend.diffusion_entropy_device();
 
-                // Step 1: Argmax on GPU
-                const auto argmax_start = std::chrono::steady_clock::now();
-                ops::diffusion_argmax_device(
-                    ctx, logits_ptr, d_argmax, canvas_len, vocab);
+                // If fused post logits is disabled, compute argmax/entropy on demand
+                static const bool fused_post_logits =
+                    aila::env::read_flag("AILA_DG_FUSED_POST_LOGITS", true);
+
+                if (!fused_post_logits) {
+                    ctx.queue().parallel_for(
+                        sycl::range<1>(static_cast<size_t>(canvas_len) * vocab),
+                        [=](sycl::id<1> idx) {
+                            logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
+                        });
+                    ops::diffusion_argmax_device(
+                        ctx, logits_ptr, d_argmax, canvas_len, vocab);
+                    d_argmax_ptr = d_argmax;
+                }
+
                 ctx.memcpy_d2h_async(
-                    new_argmax.data(), d_argmax,
+                    new_argmax.data(), d_argmax_ptr ? d_argmax_ptr : d_argmax,
                     static_cast<size_t>(canvas_len) * sizeof(int));
 
                 if (cur_step == 1) {
@@ -254,7 +281,7 @@ bool DiffusionGemmaGenerator::generate(
                     if (step_timing) {
                         std::fprintf(stderr,
                             "[DG step] step=%d h2d=%.1f decode_logits=%.1f "
-                            "decoder_submit=%.1f logits_d2h=0.0 argmax=%.1f "
+                            "decoder_submit=%.1f logits_d2h=0.0 argmax=0.0 "
                             "entropy=0.0 gumbel=0.0 "
                             "accept_renoise=0.0 host_total=0.0 "
                             "softmax_submit=0.0 soft_gemm_submit=0.0 "
@@ -267,22 +294,22 @@ bool DiffusionGemmaGenerator::generate(
                             std::chrono::duration<double, std::milli>(
                                 decoder_submit_done - decode_start).count(),
                             std::chrono::duration<double, std::milli>(
-                                argmax_done - argmax_start).count(),
-                            std::chrono::duration<double, std::milli>(
                                 argmax_done - step_start).count());
                     }
                     break;
                 }
 
-                // Step 2: Compute entropy on GPU
-                const auto entropy_start = std::chrono::steady_clock::now();
-                ops::diffusion_softmax_entropy_device(
-                    ctx, logits_ptr, d_entropy, canvas_len, vocab);
+                if (!fused_post_logits) {
+                    ops::diffusion_softmax_entropy_device(
+                        ctx, logits_ptr, d_entropy, canvas_len, vocab);
+                    d_entropy_ptr = d_entropy;
+                }
+
                 ctx.memcpy_d2h_async(
-                    entropy.data(), d_entropy,
+                    entropy.data(), d_entropy_ptr ? d_entropy_ptr : d_entropy,
                     static_cast<size_t>(canvas_len) * sizeof(float));
 
-                // Step 3: Fast GPU Gumbel sampling
+                // Fast GPU Gumbel sampling
                 std::vector<uint32_t> row_seeds(static_cast<size_t>(canvas_len));
                 for (uint32_t& s : row_seeds) s = rng();
                 ctx.memcpy_h2d_async(
@@ -293,54 +320,52 @@ bool DiffusionGemmaGenerator::generate(
                 ops::diffusion_gumbel_sample_device(
                     ctx, logits_ptr, d_seeds, d_mt_states, d_denoiser,
                     canvas_len, vocab);
-                ctx.memcpy_d2h_async(
-                    denoiser.data(), d_denoiser,
-                    static_cast<size_t>(canvas_len) * sizeof(int));
+
+                // GPU device-side Accept Mask & Renoising directly on canvas_device
+                ops::diffusion_accept_renoise_device(
+                    ctx, d_entropy_ptr ? d_entropy_ptr : d_entropy, d_denoiser,
+                    canvas_device, canvas_device, d_seeds, cfg.entropy_bound,
+                    vocab, 1, canvas_len);
+
                 ctx.synchronize();
                 const auto gumbel_done = std::chrono::steady_clock::now();
 
-                const auto host_start = gumbel_done;
-                ops::diffusion_accept_mask(entropy.data(), 1, canvas_len,
-                                           cfg.entropy_bound, accept.data());
-                for (int i = 0; i < canvas_len; ++i) {
-                    new_canvas[static_cast<size_t>(i)] =
-                        accept[static_cast<size_t>(i)]
-                            ? denoiser[static_cast<size_t>(i)]
-                            : canvas[static_cast<size_t>(i)];
-                }
-                for (int i = 0; i < canvas_len; ++i) {
-                    const int random_token = token_dist(rng);
-                    canvas[static_cast<size_t>(i)] =
-                        accept[static_cast<size_t>(i)]
-                            ? new_canvas[static_cast<size_t>(i)]
-                            : random_token;
-                }
+                // vLLM-aligned sliding stability history check
+                accepted_canvas_history[static_cast<size_t>(history_len % ST)] = new_argmax;
+                ++history_len;
 
-                if (new_argmax == prev_argmax) {
-                    ++equal_count;
-                } else {
-                    equal_count = 0;
+                bool stable = false;
+                if (history_len >= ST) {
+                    stable = true;
+                    for (int h = 1; h < ST; ++h) {
+                        if (accepted_canvas_history[static_cast<size_t>(h)] !=
+                            accepted_canvas_history[0]) {
+                            stable = false;
+                            break;
+                        }
+                    }
                 }
-                prev_argmax = new_argmax;
 
                 float mean_entropy = 0.0f;
                 for (int i = 0; i < canvas_len; ++i) {
                     mean_entropy += entropy[static_cast<size_t>(i)];
                 }
                 mean_entropy /= static_cast<float>(canvas_len);
-                AILA_LOG_DEBUG("[DG] step=%d mean_entropy=%.4f", cur_step,
-                               mean_entropy);
-                const bool stable = equal_count >= cfg.stability_threshold;
-                const bool confident =
-                    mean_entropy < cfg.confidence_threshold;
+                AILA_LOG_DEBUG("[DG] step=%d mean_entropy=%.4f stable=%d (history_len=%d)",
+                               cur_step, mean_entropy, stable ? 1 : 0, history_len);
+
+                const bool confident = (mean_entropy < effective_conf_thresh);
                 if (stable && confident) {
                     finished_denoising = true;
+                    AILA_LOG_INFO(
+                        "[DiffusionGemma] Canvas %d early stopped at step %d/%d (mean_entropy=%.4f, stable_steps=%d)",
+                        c + 1, cur_step, cfg.max_denoising_steps, mean_entropy, ST);
                 }
 
                 const auto host_done = std::chrono::steady_clock::now();
                 const auto host_ms =
                     std::chrono::duration<double, std::milli>(
-                        host_done - host_start).count();
+                        host_done - gumbel_done).count();
 
                 if (finished_denoising) break;
 
@@ -358,11 +383,11 @@ bool DiffusionGemmaGenerator::generate(
                 if (step_timing) {
                     std::fprintf(stderr,
                         "[DG step] step=%d h2d=%.1f decode_logits=%.1f "
-                        "decoder_submit=%.1f logits_d2h=0.0 argmax=%.1f "
-                        "entropy_gpu=%.1f gumbel_gpu=%.1f "
+                        "decoder_submit=%.1f logits_d2h=0.0 argmax=0.0 "
+                        "entropy_gpu=0.0 gumbel_gpu=%.1f "
                         "accept_renoise=%.2f host_total=%.2f "
                         "softmax_submit=%.1f soft_gemm_submit=%.1f "
-                        "soft_embed_d2h=%.1f total=%.1f ms\n",
+                        "soft_embed_d2h=0.0 total=%.1f ms\n",
                         cur_step,
                         std::chrono::duration<double, std::milli>(
                             h2d_done - step_start).count(),
@@ -371,17 +396,11 @@ bool DiffusionGemmaGenerator::generate(
                         std::chrono::duration<double, std::milli>(
                             decoder_submit_done - decode_start).count(),
                         std::chrono::duration<double, std::milli>(
-                            entropy_start - argmax_start).count(),
-                        std::chrono::duration<double, std::milli>(
-                            gumbel_start - entropy_start).count(),
-                        std::chrono::duration<double, std::milli>(
                             gumbel_done - gumbel_start).count(),
                         host_ms,
                         host_ms,
                         soft_timing.softmax_submit_ms,
                         soft_timing.gemm_submit_ms,
-                        std::chrono::duration<double, std::milli>(
-                            soft_done - soft_submit_done).count(),
                         std::chrono::duration<double, std::milli>(
                             soft_done - step_start).count());
                 }
@@ -475,12 +494,21 @@ bool DiffusionGemmaGenerator::generate(
                             : random_token;
                 }
 
-                if (new_argmax == prev_argmax) {
-                    ++equal_count;
-                } else {
-                    equal_count = 0;
+                // vLLM-aligned sliding stability history check
+                accepted_canvas_history[static_cast<size_t>(history_len % ST)] = new_argmax;
+                ++history_len;
+
+                bool stable = false;
+                if (history_len >= ST) {
+                    stable = true;
+                    for (int h = 1; h < ST; ++h) {
+                        if (accepted_canvas_history[static_cast<size_t>(h)] !=
+                            accepted_canvas_history[0]) {
+                            stable = false;
+                            break;
+                        }
+                    }
                 }
-                prev_argmax = new_argmax;
 
                 float mean_entropy = 0.0f;
                 for (int i = 0; i < canvas_len; ++i) {
@@ -489,9 +517,8 @@ bool DiffusionGemmaGenerator::generate(
                 mean_entropy /= static_cast<float>(canvas_len);
                 AILA_LOG_DEBUG("[DG] step=%d mean_entropy=%.4f", cur_step,
                                mean_entropy);
-                const bool stable = equal_count >= cfg.stability_threshold;
                 const bool confident =
-                    mean_entropy < cfg.confidence_threshold;
+                    mean_entropy < effective_conf_thresh;
                 if (stable && confident) {
                     finished_denoising = true;
                 }
@@ -586,13 +613,10 @@ bool DiffusionGemmaGenerator::generate(
             }
             AILA_LOG_INFO("[DG-DEBUG] committed tokens: %s", tok_list.c_str());
         }
-        output_ids.insert(output_ids.end(), commit.begin(), commit.end());
-        generated += canvas_len;
-        if (callback) callback(commit);
-
-        // EOS handling: pad everything after the first EOS in this canvas.
+        // EOS handling: truncate output after the first EOS in this canvas.
         bool eos_found = false;
         std::vector<int> padded = commit;
+        size_t valid_count = commit.size();
         for (int i = 0; i < canvas_len; ++i) {
             const int token = padded[static_cast<size_t>(i)];
             const bool is_eos =
@@ -600,11 +624,18 @@ bool DiffusionGemmaGenerator::generate(
                           token) != cfg.eos_token_ids.end();
             if (is_eos) {
                 eos_found = true;
+                valid_count = static_cast<size_t>(i);
                 for (int j = i + 1; j < canvas_len; ++j) {
                     padded[static_cast<size_t>(j)] = cfg.pad_token_id;
                 }
                 break;
             }
+        }
+        output_ids.insert(output_ids.end(), commit.begin(), commit.begin() + valid_count);
+        generated += static_cast<int>(valid_count);
+        if (callback) {
+            std::vector<int> valid_tokens(commit.begin(), commit.begin() + valid_count);
+            callback(valid_tokens);
         }
         if (eos_found) {
             all_finished = true;

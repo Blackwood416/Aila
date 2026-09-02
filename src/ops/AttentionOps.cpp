@@ -2429,7 +2429,8 @@ void attention_bidi_exact_head64_tile256(Context &ctx, Tensor &q, Tensor &k,
 
 void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
                     Tensor& output, Tensor& scores_buf,
-                    int seq_len, int num_heads, int head_dim) {
+                    int seq_len, int num_heads, int head_dim,
+                    float scale) {
   (void)scores_buf;
   if (seq_len <= 0 || num_heads <= 0 || head_dim <= 0) {
     return;
@@ -2538,7 +2539,8 @@ void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
   bf16 *v_ptr = static_cast<bf16 *>(v.data());
   bf16 *o_ptr = static_cast<bf16 *>(output.data());
 
-  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const float effective_scale =
+      (scale > 0.0f) ? scale : (1.0f / sycl::sqrt(static_cast<float>(head_dim)));
   const int total_dim = num_heads * head_dim;
   const int wg_size = (head_dim <= 64 && seq_len <= 64) ? 64 : 128;
   const int tile_t = wg_size;
@@ -2581,7 +2583,7 @@ void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
               for (int d = 0; d < head_dim; ++d) {
                 score += q_cache[d] * static_cast<float>(k_row[d]);
               }
-              score *= scale;
+              score *= effective_scale;
               scores[lid] = score;
             } else {
               scores[lid] = -1e30f;

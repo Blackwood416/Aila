@@ -88,9 +88,22 @@ public:
     Tensor& diffusion_decode_canvas(
         Context& ctx, const int* canvas_ids_device,
         const sycl::ext::oneapi::bfloat16* sc_embeds_device,
-        int canvas_len) override;
+        int canvas_len, float temperature = 1.0f) override;
     Tensor& diffusion_compute_soft_embeds(Context& ctx, Tensor& logits_f32,
                                           int canvas_len) override;
+
+    int* diffusion_argmax_device() override {
+        return buf_.d_argmax.valid() ? static_cast<int*>(buf_.d_argmax.data()) : nullptr;
+    }
+    float* diffusion_entropy_device() override {
+        return buf_.d_entropy.valid() ? static_cast<float*>(buf_.d_entropy.data()) : nullptr;
+    }
+    bool supports_vision_embedding_override() const override { return true; }
+    void set_embedding_overrides(
+        const std::vector<int>& positions,
+        const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
+        int hidden_size) override;
+    void clear_embedding_overrides() override;
 
     const SoftEmbedTiming& last_soft_embed_timing() const {
         return last_soft_embed_timing_;
@@ -99,6 +112,9 @@ public:
     const DiffusionGemmaConfig& config() const { return cfg_; }
 
 private:
+    std::vector<int> embed_override_positions_;
+    std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;
+    int embed_override_hidden_size_ = 0;
     struct LayerRuntime {
         Tensor k_cache;  // [kv_heads, max_seq_len, head_dim]
         Tensor v_cache;  // [kv_heads, max_seq_len, head_dim]
@@ -133,6 +149,12 @@ private:
         Tensor logits_f32;
         Tensor soft_embeds;
         Tensor probs_bf16;
+        Tensor row_max;
+        Tensor row_inv_sum;
+        Tensor d_argmax;
+        Tensor d_entropy;
+        Tensor expert_ids_dev;
+        Tensor expert_weights_dev;
         Tensor ones;
         Bnb4BitLinearScratch qkv_scratch;
         Bnb4BitLinearScratch o_scratch;

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
@@ -371,7 +371,8 @@ namespace ops {
     void attention_bidi(Context& ctx,
                         Tensor& q, Tensor& k, Tensor& v,
                         Tensor& output, Tensor& scores_buf,
-                        int seq_len, int num_heads, int head_dim);
+                        int seq_len, int num_heads, int head_dim,
+                        float scale = -1.0f);
 
     // Incremental Prefill Attention (seq_len > 1, start_pos > 0)
     // Q attends to full KV cache [0, start_pos + seq_len) with causal masking.
@@ -632,4 +633,57 @@ namespace ops {
                         bf16* output,      // [M] bf16
                         int M, int K);
 
+
+    // 2D Prefetch helper for A770
+    template <typename T, int Rows, int Cols>
+    struct Prefetch2D {
+        static inline void prefetch(const T* ptr, int stride, int lid, int wg_size) {
+            constexpr int total_items = Rows * Cols;
+            for (int idx = lid * 16; idx < total_items; idx += wg_size * 16) {
+                int r = idx / Cols;
+                int c = idx % Cols;
+                if (r < Rows && c < Cols) {
+                    sycl::ext::oneapi::experimental::prefetch(ptr + r * stride + c);
+                }
+            }
+        }
+    };
+
+    void fused_head_rms_norm_rope_qkv(
+        Context& ctx, Tensor& q, Tensor& k, Tensor& v,
+        Tensor& q_norm, Tensor& k_norm, Tensor& v_norm,
+        int seq_len, int start_pos, int num_heads, int num_kv_heads, int head_dim,
+        int rotary_dim, float theta, float eps, bool proportional);
+
+    void fused_post_attn_residual_norms(
+        Context& ctx, Tensor& hidden, Tensor& attn_o, Tensor& post_attn_ln,
+        Tensor& pre_ff_ln, Tensor& pre_ff_ln_2, Tensor& router_scale,
+        Tensor& mlp_normed, Tensor& moe_normed, Tensor& router_scaled,
+        int seq_len, int hidden_size, float eps);
+
+    void fused_post_ff_norm_residual_scale(
+        Context& ctx, Tensor& hidden, Tensor& ff1, Tensor& ff2, Tensor& post_ff_ln,
+        float layer_scalar, int seq_len, int hidden_size, float eps);
+
+    void logits_row_max_inv_sum(
+        Context& ctx, const float* logits_ptr, float* row_max_ptr,
+        float* row_inv_sum_ptr, int rows, int vocab);
+
+    void router_topk_device(
+        Context& ctx, const bf16* router_scores_ptr, const bf16* per_expert_scale_ptr,
+        int* expert_ids_dev, float* expert_weights_dev,
+        int tokens, int num_experts, int top_k);
+
+
+    void fused_post_logits_transform_stats_argmax(
+        Context& ctx, const bf16* logits_bf16, float* logits_f32,
+        int* argmax_dev, float* entropy_dev,
+        float* row_max_dev, float* row_inv_sum_dev,
+        float cap, float temperature, int rows, int cols);
+
+    void diffusion_accept_renoise_device(
+        Context& ctx, const float* entropy_dev, const int* denoiser_dev,
+        const int* prev_canvas_dev, int* new_canvas_dev,
+        const uint32_t* seeds_dev, float entropy_bound, int vocab_size,
+        int num_canvases, int canvas_len);
 } // namespace ops

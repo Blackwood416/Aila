@@ -80,14 +80,20 @@ public:
     // cache without writing; returns softcapped fp32 logits [canvas_len, vocab].
     virtual Tensor& diffusion_decode_canvas(
         Context& ctx, const int* canvas_ids_device,
-        const sycl::ext::oneapi::bfloat16* sc_embeds_device, int canvas_len) {
+        const sycl::ext::oneapi::bfloat16* sc_embeds_device, int canvas_len,
+        float temperature = 1.0f) {
         (void)ctx;
         (void)canvas_ids_device;
         (void)sc_embeds_device;
         (void)canvas_len;
+        (void)temperature;
         throw std::runtime_error(
             "block diffusion is not supported by this backend");
     }
+    // Optional device buffers computed during fused post-logits decode
+    virtual int* diffusion_argmax_device() { return nullptr; }
+    virtual float* diffusion_entropy_device() { return nullptr; }
+
     // Computes soft embeddings = softmax(logits) @ embed^T * embed_scale
     // (bf16). logits: [canvas_len, vocab] fp32; out: [canvas_len, hidden] bf16.
     virtual Tensor& diffusion_compute_soft_embeds(

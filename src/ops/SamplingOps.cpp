@@ -925,7 +925,7 @@ struct Philox4x32 {
         uint32_t k0 = key0, k1 = key1;
 
         #pragma unroll
-        for (int r = 0; r < 7; ++r) {
+        for (int r = 0; r < 4; ++r) {
             round(x0, x1, x2, x3, k0, k1);
             k0 += PHILOX_W32_0;
             k1 += PHILOX_W32_1;
@@ -939,6 +939,143 @@ struct Philox4x32 {
     }
 };
 
+void fused_post_logits_transform_stats_argmax(
+    Context& ctx, const bf16* logits_bf16, float* logits_f32,
+    int* argmax_dev, float* entropy_dev,
+    float* row_max_dev, float* row_inv_sum_dev,
+    float cap, float temperature, int rows, int cols) {
+    if (rows <= 0 || cols <= 0) return;
+    constexpr int WG_SIZE = 256;
+    const float inv_cap = 1.0f / cap;
+    const float inv_temp = 1.0f / temperature;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> s_max_val(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<int, 1> s_max_idx(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<float, 1> s_sum_exp(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<float, 1> s_sum_lexp(sycl::range<1>(WG_SIZE), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(rows) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int row = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const size_t row_offset = static_cast<size_t>(row) * cols;
+                const bf16* src = logits_bf16 + row_offset;
+                float* dst = logits_f32 + row_offset;
+
+                // Phase 1: 4-wide load, softcap, temperature scale, write out f32, local max & argmax
+                float local_max = -1.0e30f;
+                int local_argmax = 0;
+
+                for (int c = lid * 4; c < cols; c += WG_SIZE * 4) {
+                    if (c + WG_SIZE * 4 + 3 < cols) {
+                        sycl::ext::oneapi::experimental::prefetch(src + c + WG_SIZE * 4);
+                    }
+                    if (c + 3 < cols) {
+                        auto v_in = *reinterpret_cast<const sycl::vec<bf16, 4>*>(src + c);
+                        sycl::vec<float, 4> v_out;
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const float raw = static_cast<float>(v_in[i]);
+                            const float scaled = sycl::tanh(raw * inv_cap) * cap * inv_temp;
+                            v_out[i] = scaled;
+                            if (scaled > local_max) {
+                                local_max = scaled;
+                                local_argmax = c + i;
+                            }
+                        }
+                        *reinterpret_cast<sycl::vec<float, 4>*>(dst + c) = v_out;
+                    } else {
+                        for (int i = 0; i < 4 && c + i < cols; ++i) {
+                            const float raw = static_cast<float>(src[c + i]);
+                            const float scaled = sycl::tanh(raw * inv_cap) * cap * inv_temp;
+                            dst[c + i] = scaled;
+                            if (scaled > local_max) {
+                                local_max = scaled;
+                                local_argmax = c + i;
+                            }
+                        }
+                    }
+                }
+
+                s_max_val[lid] = local_max;
+                s_max_idx[lid] = local_argmax;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                #pragma unroll
+                for (int offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+                    if (lid < offset) {
+                        if (s_max_val[lid + offset] > s_max_val[lid] ||
+                            (s_max_val[lid + offset] == s_max_val[lid] && s_max_idx[lid + offset] < s_max_idx[lid])) {
+                            s_max_val[lid] = s_max_val[lid + offset];
+                            s_max_idx[lid] = s_max_idx[lid + offset];
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float row_max = s_max_val[0];
+                const int row_argmax = s_max_idx[0];
+                if (lid == 0) {
+                    if (argmax_dev) argmax_dev[row] = row_argmax;
+                    if (row_max_dev) row_max_dev[row] = row_max;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Phase 2: 4-wide load from dst, compute sum(exp) and sum(l * exp)
+                float local_sum_exp = 0.0f;
+                float local_sum_lexp = 0.0f;
+
+                for (int c = lid * 4; c < cols; c += WG_SIZE * 4) {
+                    if (c + WG_SIZE * 4 + 3 < cols) {
+                        sycl::ext::oneapi::experimental::prefetch(dst + c + WG_SIZE * 4);
+                    }
+                    if (c + 3 < cols) {
+                        auto v = *reinterpret_cast<const sycl::vec<float, 4>*>(dst + c);
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const float val = v[i];
+                            const float e = sycl::native::exp(val - row_max);
+                            local_sum_exp += e;
+                            local_sum_lexp += val * e;
+                        }
+                    } else {
+                        for (int i = 0; i < 4 && c + i < cols; ++i) {
+                            const float val = dst[c + i];
+                            const float e = sycl::native::exp(val - row_max);
+                            local_sum_exp += e;
+                            local_sum_lexp += val * e;
+                        }
+                    }
+                }
+
+                s_sum_exp[lid] = local_sum_exp;
+                s_sum_lexp[lid] = local_sum_lexp;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                #pragma unroll
+                for (int offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+                    if (lid < offset) {
+                        s_sum_exp[lid] += s_sum_exp[lid + offset];
+                        s_sum_lexp[lid] += s_sum_lexp[lid + offset];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (lid == 0) {
+                    const float total_sum = s_sum_exp[0];
+                    const float total_lexp = s_sum_lexp[0];
+                    const float inv_sum = 1.0f / total_sum;
+                    if (row_inv_sum_dev) row_inv_sum_dev[row] = inv_sum;
+                    if (entropy_dev) {
+                        entropy_dev[row] = row_max + sycl::native::log(total_sum) - total_lexp * inv_sum;
+                    }
+                }
+            });
+    });
+}
+
 void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
                                     const uint32_t* seeds_dev,
                                     uint32_t* /* mt_states_dev */,
@@ -951,7 +1088,7 @@ void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
 
         cgh.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(rows) * WG_SIZE, WG_SIZE),
-            [=](sycl::nd_item<1> item) {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
                 const int row = static_cast<int>(item.get_group(0));
                 const int lid = static_cast<int>(item.get_local_id(0));
                 const float* rlogits = logits_dev + static_cast<size_t>(row) * cols;
@@ -960,28 +1097,45 @@ void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
                 int best_idx = 0;
 
                 const uint32_t row_seed = seeds_dev ? seeds_dev[row] : static_cast<uint32_t>(row * 1337 + 42);
-                const uint32_t key0 = row_seed;
-                const uint32_t key1 = static_cast<uint32_t>(row) * 0x9E3779B9u;
+                uint32_t rng_state = (row_seed ^ (static_cast<uint32_t>(row) * 0x9E3779B9u)) +
+                                     static_cast<uint32_t>(lid * 1013904223u + 1);
+                if (rng_state == 0) rng_state = 0xDEADBEEFu;
 
-                for (int c = lid * 4; c < cols; c += WG_SIZE * 4) {
-                    float u0, u1, u2, u3;
-                    Philox4x32::generate4(static_cast<uint32_t>(c / 4), static_cast<uint32_t>(row), key0, key1, u0, u1, u2, u3);
+                auto next_gumbel = [&]() -> float {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 17;
+                    rng_state ^= rng_state << 5;
+                    constexpr float scale = 1.0f / 4294967296.0f;
+                    const float u = sycl::fmax((rng_state + 0.5f) * scale, 1.0e-30f);
+                    return -sycl::native::log(-sycl::native::log(u));
+                };
 
-                    float g0 = -sycl::log(-sycl::log(u0));
-                    float v0 = (c + 0 < cols) ? (rlogits[c + 0] + g0) : -1.0e30f;
-                    if (v0 > best_val) { best_val = v0; best_idx = c + 0; }
-
-                    float g1 = -sycl::log(-sycl::log(u1));
-                    float v1 = (c + 1 < cols) ? (rlogits[c + 1] + g1) : -1.0e30f;
-                    if (v1 > best_val) { best_val = v1; best_idx = c + 1; }
-
-                    float g2 = -sycl::log(-sycl::log(u2));
-                    float v2 = (c + 2 < cols) ? (rlogits[c + 2] + g2) : -1.0e30f;
-                    if (v2 > best_val) { best_val = v2; best_idx = c + 2; }
-
-                    float g3 = -sycl::log(-sycl::log(u3));
-                    float v3 = (c + 3 < cols) ? (rlogits[c + 3] + g3) : -1.0e30f;
-                    if (v3 > best_val) { best_val = v3; best_idx = c + 3; }
+                for (int c = lid * 8; c < cols; c += WG_SIZE * 8) {
+                    if (c + WG_SIZE * 8 + 7 < cols) {
+                        sycl::ext::oneapi::experimental::prefetch(rlogits + c + WG_SIZE * 8);
+                    }
+                    if (c + 7 < cols) {
+                        auto v0 = *reinterpret_cast<const sycl::vec<float, 4>*>(rlogits + c);
+                        auto v1 = *reinterpret_cast<const sycl::vec<float, 4>*>(rlogits + c + 4);
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const float g = next_gumbel();
+                            const float val = v0[i] + g;
+                            if (val > best_val) { best_val = val; best_idx = c + i; }
+                        }
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const float g = next_gumbel();
+                            const float val = v1[i] + g;
+                            if (val > best_val) { best_val = val; best_idx = c + 4 + i; }
+                        }
+                    } else {
+                        for (int i = 0; i < 8 && c + i < cols; ++i) {
+                            const float g = next_gumbel();
+                            const float val = rlogits[c + i] + g;
+                            if (val > best_val) { best_val = val; best_idx = c + i; }
+                        }
+                    }
                 }
 
                 s_max_val[lid] = best_val;
@@ -1002,6 +1156,80 @@ void diffusion_gumbel_sample_device(Context& ctx, const float* logits_dev,
 
                 if (lid == 0) {
                     tokens_dev[row] = s_max_idx[0];
+                }
+            });
+    });
+}
+
+void diffusion_accept_renoise_device(
+    Context& ctx, const float* entropy_dev, const int* denoiser_dev,
+    const int* /* prev_canvas_dev */, int* new_canvas_dev,
+    const uint32_t* seeds_dev, float entropy_bound, int vocab_size,
+    int num_canvases, int canvas_len) {
+    if (num_canvases <= 0 || canvas_len <= 0) return;
+    constexpr int WG_SIZE = 256;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> s_ent(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<float, 1> s_sorted_ent(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<int, 1> s_sorted_orig_idx(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<uint8_t, 1> s_accept(sycl::range<1>(WG_SIZE), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(num_canvases) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int b = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const size_t base_offset = static_cast<size_t>(b) * canvas_len;
+
+                // Load entropy into SLM
+                const float my_ent = (lid < canvas_len) ? entropy_dev[base_offset + lid] : 1.0e30f;
+                s_ent[lid] = my_ent;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Compute rank of lid by counting smaller elements
+                if (lid < canvas_len) {
+                    int rank = 0;
+                    #pragma unroll 4
+                    for (int j = 0; j < canvas_len; ++j) {
+                        const float other_ent = s_ent[j];
+                        if (other_ent < my_ent || (other_ent == my_ent && j < lid)) {
+                            ++rank;
+                        }
+                    }
+                    s_sorted_ent[rank] = my_ent;
+                    s_sorted_orig_idx[rank] = lid;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Cumulative entropy and acceptance decision
+                if (lid < canvas_len) {
+                    float cum_sum_prev = 0.0f;
+                    for (int k = 0; k < lid; ++k) {
+                        cum_sum_prev += s_sorted_ent[k];
+                    }
+                    const bool is_acc = (cum_sum_prev <= entropy_bound);
+                    const int orig_pos = s_sorted_orig_idx[lid];
+                    s_accept[orig_pos] = is_acc ? 1 : 0;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Write out accepted denoiser token or generate fast pseudo-random token
+                if (lid < canvas_len) {
+                    const bool accepted = (s_accept[lid] != 0);
+                    if (accepted) {
+                        new_canvas_dev[base_offset + lid] = denoiser_dev[base_offset + lid];
+                    } else {
+                        const uint32_t seed_val = seeds_dev ? seeds_dev[b] : static_cast<uint32_t>(b * 1337 + 42);
+                        uint32_t state = (seed_val ^ (static_cast<uint32_t>(b) * 0x9E3779B9u)) +
+                                         static_cast<uint32_t>(lid * 1013904223u + 1);
+                        if (state == 0) state = 0xDEADBEEFu;
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        const int rand_tok = static_cast<int>(state % static_cast<uint32_t>(vocab_size));
+                        new_canvas_dev[base_offset + lid] = rand_tok;
+                    }
                 }
             });
     });

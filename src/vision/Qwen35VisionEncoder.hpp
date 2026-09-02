@@ -7,43 +7,33 @@
 #include <vector>
 #include <deque>
 #include <cstdint>
-#include <sycl/sycl.hpp>
+#include "IVisionEncoder.hpp"
 
 class Context;
 
 namespace aila {
 namespace vision {
 
-using bf16 = sycl::ext::oneapi::bfloat16;
-
-struct VisionEncodeResult {
-    int token_count = 0;
-    int llm_grid_t = 1;
-    int llm_grid_h = 0;
-    int llm_grid_w = 0;
-    std::vector<bf16> embeddings; // [token_count, out_hidden_size]
-};
-
-class Qwen35VisionEncoder {
+class Qwen35VisionEncoder : public IVisionEncoder {
 public:
-    ~Qwen35VisionEncoder();
+    ~Qwen35VisionEncoder() override;
 
     bool load(Context& ctx,
               ModelWeights& weights,
               const ModelSpec& spec,
               const std::string& model_dir,
-              std::string* error_message);
+              std::string* error_message) override;
 
-    bool ready() const { return loaded_; }
-    int out_hidden_size() const { return out_hidden_size_; }
+    bool ready() const override { return loaded_; }
+    int out_hidden_size() const override { return out_hidden_size_; }
 
     bool encode_image(const std::string& uri,
                       VisionEncodeResult& out,
-                      std::string* error_message);
+                      std::string* error_message) override;
     bool encode_image(const ContentPart& part,
                       VisionEncodeResult& out,
-                      std::string* error_message);
-    bool warmup(std::string* error_message);
+                      std::string* error_message) override;
+    bool warmup(std::string* error_message) override;
 
 private:
     struct BlockWeights {

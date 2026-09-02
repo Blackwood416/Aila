@@ -11,6 +11,7 @@
 struct DiffusionGemmaGeneratorConfig {
     int canvas_length = 256;
     int max_denoising_steps = 25;
+    int num_parallel_canvases = 1;
     float t_min = 0.4f;
     float t_max = 0.8f;
     float entropy_bound = 0.1f;

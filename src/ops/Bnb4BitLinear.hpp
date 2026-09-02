@@ -293,3 +293,13 @@ private:
     static void dequant_subset(Context& ctx, const ExpertWeightSet& set,
                                int expert, int rows_per_expert, Tensor& out);
 };
+
+void run_fused_softmax_soft_embed_xmx(
+    Context& ctx,
+    const float* logits_ptr,
+    const float* row_max_ptr,
+    const float* row_inv_sum_ptr,
+    const sycl::ext::oneapi::bfloat16* embed_weight,
+    sycl::ext::oneapi::bfloat16* output,
+    int canvas_len, int hidden, int vocab, float embed_scale = 1.0f);
+

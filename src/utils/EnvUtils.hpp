@@ -105,6 +105,23 @@ inline std::string read_string(const char* name, const std::string& default_valu
 #endif
 }
 
+inline float read_float(const char* name, float default_value = 0.0f) {
+#ifdef _WIN32
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) == 0 && value) {
+        float parsed = std::strtof(value, nullptr);
+        free(value);
+        return parsed;
+    }
+    if (value) free(value);
+    return default_value;
+#else
+    const char* value = std::getenv(name);
+    return value ? std::strtof(value, nullptr) : default_value;
+#endif
+}
+
 // Variant returning raw int (allows 0 or negative values)
 inline int read_int_raw(const char* name, int default_value) {
 #ifdef _WIN32

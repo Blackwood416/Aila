@@ -120,13 +120,12 @@ bool DiffusionGemmaBnb4Backend::load(Context& ctx, ModelWeights& weights,
         return false;
     }
 
-    // A770 16GB budget: cap the KV cache to 384 by default; users may raise
-    // it via --max-seq at their own risk.
-    max_seq_len_ = max_seq_len > 0 ? max_seq_len : 384;
-    max_seq_len_ = std::min(max_seq_len_, 384);
-    if (max_seq_len > 384) {
+    // A770 16GB budget: cap the KV cache to 1024 by default (supports vision + canvas).
+    max_seq_len_ = max_seq_len > 0 ? max_seq_len : 1024;
+    max_seq_len_ = std::min(max_seq_len_, 2048);
+    if (max_seq_len > 2048) {
         AILA_LOG_WARN(
-            "[DiffusionGemma] Clamping max_seq_len %d -> 384 to fit A770 VRAM",
+            "[DiffusionGemma] Clamping max_seq_len %d -> 2048 to fit A770 VRAM",
             max_seq_len);
     }
 
@@ -368,6 +367,29 @@ bool DiffusionGemmaBnb4Backend::truncate_kv_cache(int new_len) {
     return false;  // full reset required
 }
 
+void DiffusionGemmaBnb4Backend::set_embedding_overrides(
+    const std::vector<int>& positions,
+    const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
+    int hidden_size) {
+    if (positions.empty() || embeddings.empty() || hidden_size <= 0) {
+        clear_embedding_overrides();
+        return;
+    }
+    if (embeddings.size() != static_cast<size_t>(positions.size()) * static_cast<size_t>(hidden_size)) {
+        clear_embedding_overrides();
+        return;
+    }
+    embed_override_positions_ = positions;
+    embed_override_values_ = embeddings;
+    embed_override_hidden_size_ = hidden_size;
+}
+
+void DiffusionGemmaBnb4Backend::clear_embedding_overrides() {
+    embed_override_positions_.clear();
+    embed_override_values_.clear();
+    embed_override_hidden_size_ = 0;
+}
+
 bool DiffusionGemmaBnb4Backend::diffusion_encode(Context& ctx,
                                                  const int* token_ids_device,
                                                  int seq_len,
@@ -386,6 +408,32 @@ bool DiffusionGemmaBnb4Backend::diffusion_encode(Context& ctx,
                           buf_.hidden, tc.hidden_size);
     ops::scale_inplace(ctx, buf_.hidden, embed_scale_,
                        seq_len * tc.hidden_size);
+    if (!embed_override_positions_.empty() && embed_override_hidden_size_ == tc.hidden_size) {
+        bf16* hidden_ptr = static_cast<bf16*>(buf_.hidden.data());
+        bool contiguous = true;
+        for (size_t i = 1; i < embed_override_positions_.size(); ++i) {
+            if (embed_override_positions_[i] != embed_override_positions_[i - 1] + 1) {
+                contiguous = false;
+                break;
+            }
+        }
+        int pos0 = embed_override_positions_[0];
+        if (contiguous && pos0 >= start_pos && pos0 + static_cast<int>(embed_override_positions_.size()) <= start_pos + seq_len) {
+            int local_row = pos0 - start_pos;
+            bf16* dst = hidden_ptr + static_cast<size_t>(local_row) * static_cast<size_t>(tc.hidden_size);
+            ctx.memcpy_h2d(dst, embed_override_values_.data(),
+                           embed_override_values_.size() * sizeof(bf16));
+        } else {
+            for (size_t i = 0; i < embed_override_positions_.size(); ++i) {
+                int pos = embed_override_positions_[i];
+                if (pos < start_pos || pos >= start_pos + seq_len) continue;
+                int local_row = pos - start_pos;
+                const bf16* src = embed_override_values_.data() + i * static_cast<size_t>(tc.hidden_size);
+                bf16* dst = hidden_ptr + static_cast<size_t>(local_row) * static_cast<size_t>(tc.hidden_size);
+                ctx.memcpy_h2d(dst, src, static_cast<size_t>(tc.hidden_size) * sizeof(bf16));
+            }
+        }
+    }
 
     for (int layer_idx = 0; layer_idx < tc.num_hidden_layers; ++layer_idx) {
         run_layer_forward(ctx, layers_[static_cast<size_t>(layer_idx)],
@@ -402,7 +450,8 @@ bool DiffusionGemmaBnb4Backend::diffusion_encode(Context& ctx,
 
 Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
     Context& ctx, const int* canvas_ids_device,
-    const sycl::ext::oneapi::bfloat16* sc_embeds_device, int canvas_len) {
+    const sycl::ext::oneapi::bfloat16* sc_embeds_device, int canvas_len,
+    float temperature) {
     const auto& tc = cfg_.text;
     const int start_pos = current_len_;
     const int total_len = start_pos + canvas_len;
@@ -746,7 +795,20 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
     }
 
     buf_.lm_head.forward(ctx, buf_.normed, buf_.logits_bf16, canvas_len);
-    {
+
+    static const bool fused_post_logits =
+        aila::env::read_flag("AILA_DG_FUSED_POST_LOGITS", true);
+    if (fused_post_logits) {
+        ops::fused_post_logits_transform_stats_argmax(
+            ctx, static_cast<const bf16*>(buf_.logits_bf16.data()),
+            static_cast<float*>(buf_.logits_f32.data()),
+            static_cast<int*>(buf_.d_argmax.data()),
+            static_cast<float*>(buf_.d_entropy.data()),
+            static_cast<float*>(buf_.row_max.data()),
+            static_cast<float*>(buf_.row_inv_sum.data()),
+            tc.final_logit_softcapping, temperature,
+            canvas_len, tc.vocab_size);
+    } else {
         const int64_t n =
             static_cast<int64_t>(canvas_len) * tc.vocab_size;
         bf16* src = static_cast<bf16*>(buf_.logits_bf16.data());
@@ -755,10 +817,17 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_decode_canvas(
             [=](sycl::id<1> idx) {
                 dst[idx[0]] = static_cast<float>(src[idx[0]]);
             });
+        ops::logit_softcap_inplace(
+            ctx, buf_.logits_f32, tc.final_logit_softcapping,
+            canvas_len * tc.vocab_size);
+        if (temperature != 1.0f) {
+            float* logits_ptr = static_cast<float*>(buf_.logits_f32.data());
+            ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(n)),
+                [=](sycl::id<1> idx) {
+                    logits_ptr[idx[0]] = logits_ptr[idx[0]] / temperature;
+                });
+        }
     }
-    ops::logit_softcap_inplace(
-        ctx, buf_.logits_f32, tc.final_logit_softcapping,
-        canvas_len * tc.vocab_size);
     if (profile) {
         ctx.synchronize();
         AILA_LOG_INFO(
@@ -792,48 +861,37 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_compute_soft_embeds(
     const float* logits_ptr = static_cast<const float*>(logits_f32.data());
     bf16* probs_ptr = static_cast<bf16*>(buf_.probs_bf16.data());
 
+    const auto t_sm_start = std::chrono::steady_clock::now();
     static const bool use_soft_xmx =
-        aila::env::read_flag("AILA_DG_SOFT_EMBED_XMX", false);
-    if (!use_soft_xmx) {
-        const auto t_sm_start = std::chrono::steady_clock::now();
-        ctx.queue().parallel_for(
-            sycl::range<1>(static_cast<size_t>(canvas_len)),
-            [=](sycl::id<1> idx) {
-                const int row = static_cast<int>(idx[0]);
-                const float* src = logits_ptr + static_cast<size_t>(row) * vocab;
-                bf16* dst = probs_ptr + static_cast<size_t>(row) * vocab;
-                float max_logit = -1.0e30f;
-                for (int c = 0; c < vocab; ++c) {
-                    const float value = static_cast<float>(bf16(src[c]));
-                    max_logit = std::max(max_logit, value);
-                }
-                float sum = 0.0f;
-                for (int c = 0; c < vocab; ++c) {
-                    const float value = static_cast<float>(bf16(src[c]));
-                    sum += std::exp(value - max_logit);
-                }
-                const float inv = 1.0f / sum;
-                for (int c = 0; c < vocab; ++c) {
-                    const float value = static_cast<float>(bf16(src[c]));
-                    dst[c] = bf16(std::exp(value - max_logit) * inv);
-                }
-            });
-        const auto t_sm_end = std::chrono::steady_clock::now();
-
+        aila::env::read_flag("AILA_DG_SOFT_EMBED_XMX", true);
+    static const bool fused_post_logits =
+        aila::env::read_flag("AILA_DG_FUSED_POST_LOGITS", true);
+    if (use_soft_xmx) {
+        if (!fused_post_logits) {
+            ops::logits_row_max_inv_sum(ctx, logits_ptr,
+                                        static_cast<float*>(buf_.row_max.data()),
+                                        static_cast<float*>(buf_.row_inv_sum.data()),
+                                        canvas_len, vocab);
+        }
         const auto t_gemm_start = std::chrono::steady_clock::now();
-        buf_.soft_embed.forward(ctx, buf_.probs_bf16, buf_.soft_embeds,
-                                canvas_len);
+        run_fused_softmax_soft_embed_xmx(
+            ctx, logits_ptr,
+            static_cast<const float*>(buf_.row_max.data()),
+            static_cast<const float*>(buf_.row_inv_sum.data()),
+            static_cast<const bf16*>(embed_weight_->data()),
+            static_cast<bf16*>(buf_.soft_embeds.data()),
+            canvas_len, hidden, vocab, embed_scale_);
         const auto t_gemm_end = std::chrono::steady_clock::now();
 
-        ops::scale_inplace(ctx, buf_.soft_embeds, embed_scale_,
-                           canvas_len * hidden);
-
         last_soft_embed_timing_.softmax_submit_ms =
-            std::chrono::duration<double, std::milli>(t_sm_end - t_sm_start).count();
+            std::chrono::duration<double, std::milli>(t_gemm_start - t_sm_start)
+                .count();
         last_soft_embed_timing_.gemm_submit_ms =
-            std::chrono::duration<double, std::milli>(t_gemm_end - t_gemm_start).count();
+            std::chrono::duration<double, std::milli>(t_gemm_end - t_gemm_start)
+                .count();
         return buf_.soft_embeds;
     }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shared_max(sycl::range<1>(256), cgh);
         sycl::local_accessor<float, 1> shared_sum(sycl::range<1>(256), cgh);
@@ -888,136 +946,21 @@ Tensor& DiffusionGemmaBnb4Backend::diffusion_compute_soft_embeds(
             });
     });
 
-    // Hardware XMX GEMM: C[canvas_len, hidden] = probs[canvas_len, vocab] @ embed_weight[vocab, hidden]
-    // Uses BM=64, BN=64, BK=16 with 512 threads (64 SGs) to halve global memory bandwidth from B.
-    constexpr int BM = 64, BN = 64, BK = 16, TM = 8, TN = 8, TK = 16, SG = 8;
-    const int grid_m = (canvas_len + BM - 1) / BM;
-    const int grid_n = (hidden + BN - 1) / BN;
-    const int total_wgs = grid_m * grid_n;
-    constexpr int SG_M = BM / TM;
-    constexpr int SG_N = BN / TN;
-    constexpr int NUM_SGS = SG_M * SG_N;
-    constexpr int WG_SIZE = NUM_SGS * SG;
-
-    const bf16* A_ptr = static_cast<const bf16*>(buf_.probs_bf16.data());
-    const bf16* B_ptr = static_cast<const bf16*>(embed_weight_->data());
-    bf16* C_ptr = static_cast<bf16*>(buf_.soft_embeds.data());
-    const int M = canvas_len;
-    const int N = hidden;
-    const int K = vocab;
-
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<bf16, 1> As(sycl::range<1>(BM * BK), cgh);
-        sycl::local_accessor<bf16, 1> Bs(sycl::range<1>(TK * BN), cgh);
-        sycl::local_accessor<float, 1> c_slm(sycl::range<1>(NUM_SGS * TM * TN), cgh);
-
-        cgh.parallel_for(
-            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
-            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
-                auto sg = item.get_sub_group();
-                const int wg_idx = static_cast<int>(item.get_group(0));
-                const int lid = static_cast<int>(item.get_local_id(0));
-                const int sg_id = lid / SG;
-                const int sg_row = sg_id / SG_N;
-                const int sg_col = sg_id % SG_N;
-
-                const int bm = wg_idx / grid_n;
-                const int bn = wg_idx % grid_n;
-                const int m0 = bm * BM;
-                const int n0 = bn * BN;
-
-                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
-                joint_matrix_fill(sg, sub_c, 0.0f);
-
-                for (int kb = 0; kb < K; kb += BK) {
-                    #pragma unroll
-                    for (int i = lid; i < BM * BK; i += WG_SIZE) {
-                        const int r = i / BK;
-                        const int c = i % BK;
-                        const int gm = m0 + r;
-                        if (gm < M && kb + c < K) {
-                            As[i] = A_ptr[static_cast<size_t>(gm) * K + kb + c];
-                        } else {
-                            As[i] = bf16(0.0f);
-                        }
-                    }
-
-                    #pragma unroll
-                    for (int i = lid; i < BN * TK; i += WG_SIZE) {
-                        const int col = i / TK;
-                        const int kh = i % TK;
-                        const int src_n = n0 + col;
-                        if (src_n < N && kb + kh < K) {
-                            Bs[col * TK + kh] = B_ptr[static_cast<size_t>(kb + kh) * N + src_n];
-                        } else {
-                            Bs[col * TK + kh] = bf16(0.0f);
-                        }
-                    }
-
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
-                    joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
-
-                    auto pA = As.get_multi_ptr<sycl::access::decorated::no>() + (sg_row * TM) * BK;
-                    auto pB = Bs.get_multi_ptr<sycl::access::decorated::no>() + (sg_col * TN) * TK;
-
-                    joint_matrix_load(sg, sub_a, pA, BK);
-                    joint_matrix_load(sg, sub_b, pB, TK);
-                    joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
-
-                    item.barrier(sycl::access::fence_space::local_space);
-                }
-
-                auto pC_slm = c_slm.get_multi_ptr<sycl::access::decorated::no>() + sg_id * (TM * TN);
-                joint_matrix_store(sg, sub_c, pC_slm, TN, layout::row_major);
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int i = lid; i < NUM_SGS * TM * TN; i += WG_SIZE) {
-                    const int s = i / (TM * TN);
-                    const int rem = i % (TM * TN);
-                    const int r = rem / TN;
-                    const int c = rem % TN;
-                    const int sr = s / SG_N;
-                    const int sc = s % SG_N;
-                    const int gm = m0 + sr * TM + r;
-                    const int gn = n0 + sc * TN + c;
-                    if (gm < M && gn < N) {
-                        C_ptr[static_cast<size_t>(gm) * N + gn] = bf16(c_slm[i]);
-                    }
-                }
-            });
-    });
+    const auto t_sm_end = std::chrono::steady_clock::now();
+    const auto t_gemm_start = std::chrono::steady_clock::now();
+    buf_.soft_embed.forward(ctx, buf_.probs_bf16, buf_.soft_embeds,
+                            canvas_len);
+    const auto t_gemm_end = std::chrono::steady_clock::now();
 
     ops::scale_inplace(ctx, buf_.soft_embeds, embed_scale_,
                        canvas_len * hidden);
-    const std::string dump_dir =
-        aila::env::read_string("AILA_DG_DUMP_DIR", "");
-    if (aila::env::read_flag("AILA_DG_DUMP_DECODER", false) &&
-        !dump_dir.empty()) {
-        ctx.synchronize();
-        std::vector<float> logits_row(static_cast<size_t>(vocab));
-        std::vector<bf16> probs_row(static_cast<size_t>(vocab));
-        std::vector<bf16> soft_row(static_cast<size_t>(hidden));
-        ctx.memcpy_d2h(logits_row.data(), logits_f32.data(),
-                       logits_row.size() * sizeof(float));
-        ctx.memcpy_d2h(probs_row.data(), buf_.probs_bf16.data(),
-                       probs_row.size() * sizeof(bf16));
-        ctx.memcpy_d2h(soft_row.data(), buf_.soft_embeds.data(),
-                       soft_row.size() * sizeof(bf16));
-        const auto write_bytes = [&](const char* name, const void* data,
-                                     size_t bytes) {
-            std::ofstream out(dump_dir + "/" + name, std::ios::binary);
-            out.write(static_cast<const char*>(data),
-                      static_cast<std::streamsize>(bytes));
-        };
-        write_bytes("soft_logits_row0.bin", logits_row.data(),
-                    logits_row.size() * sizeof(float));
-        write_bytes("soft_probs_row0.bin", probs_row.data(),
-                    probs_row.size() * sizeof(bf16));
-        write_bytes("soft_embed_row0.bin", soft_row.data(),
-                    soft_row.size() * sizeof(bf16));
-    }
+
+    last_soft_embed_timing_.softmax_submit_ms =
+        std::chrono::duration<double, std::milli>(t_sm_end - t_sm_start)
+            .count();
+    last_soft_embed_timing_.gemm_submit_ms =
+        std::chrono::duration<double, std::milli>(t_gemm_end - t_gemm_start)
+            .count();
     return buf_.soft_embeds;
 }
 
@@ -1107,6 +1050,12 @@ void DiffusionGemmaBnb4Backend::ensure_buffers(Context& ctx, int q_len,
     buf_.moe_weights = Tensor::allocate(
         ctx, {static_cast<int64_t>(max_q) * tc.top_k_experts},
         dnnl::memory::data_type::f32);
+    buf_.expert_ids_dev = Tensor::allocate(
+        ctx, {static_cast<int64_t>(max_q) * tc.top_k_experts},
+        dnnl::memory::data_type::s32);
+    buf_.expert_weights_dev = Tensor::allocate(
+        ctx, {static_cast<int64_t>(max_q) * tc.top_k_experts},
+        dnnl::memory::data_type::f32);
     buf_.router_scores = Tensor::allocate(
         ctx, {max_q, tc.num_experts}, dnnl::memory::data_type::bf16);
 
@@ -1147,6 +1096,14 @@ void DiffusionGemmaBnb4Backend::ensure_logits_buffers(Context& ctx) {
                                         dnnl::memory::data_type::bf16);
     buf_.probs_bf16 = Tensor::allocate(
         ctx, {canvas_len, tc.vocab_size}, dnnl::memory::data_type::bf16);
+    buf_.row_max = Tensor::allocate(
+        ctx, {canvas_len}, dnnl::memory::data_type::f32);
+    buf_.row_inv_sum = Tensor::allocate(
+        ctx, {canvas_len}, dnnl::memory::data_type::f32);
+    buf_.d_argmax = Tensor::allocate(
+        ctx, {canvas_len}, dnnl::memory::data_type::s32);
+    buf_.d_entropy = Tensor::allocate(
+        ctx, {canvas_len}, dnnl::memory::data_type::f32);
     buf_.lm_head.init(ctx, *embed_weight_, tc.hidden_size, tc.vocab_size);
     // Embedding is already [vocab, hidden], exactly the [in, out] layout for
     // probs @ embedding. Do not build the 1.5 GB decode-GEMV transpose
@@ -1165,6 +1122,9 @@ void DiffusionGemmaBnb4Backend::fill_attention_mask(
     Context& ctx, Tensor& mask, int q_len, int kv_len, int cached_len,
     bool bidirectional, bool sliding, int window) {
     float* mask_ptr = static_cast<float*>(mask.data());
+    const int img_start = !embed_override_positions_.empty() ? embed_override_positions_.front() : -1;
+    const int img_end = !embed_override_positions_.empty() ? embed_override_positions_.back() : -1;
+
     ctx.queue().parallel_for(
         sycl::range<2>(q_len, kv_len),
         [=](sycl::id<2> idx) {
@@ -1174,6 +1134,13 @@ void DiffusionGemmaBnb4Backend::fill_attention_mask(
             bool allowed = true;
             if (!bidirectional && t > absolute_q) {
                 allowed = false;
+            }
+            // Gemma 4 / DiffusionGemma vision block bidirectional attention:
+            // Applies ONLY on sliding attention layers (full attention layers are strictly causal).
+            if (!bidirectional && sliding && img_start >= 0 &&
+                absolute_q >= img_start && absolute_q <= img_end &&
+                t >= img_start && t <= img_end) {
+                allowed = true;
             }
             // The diffusion decoder is a DiT block: HF deliberately gives
             // both layer patterns a fully bidirectional mask over the encoder
@@ -1339,24 +1306,34 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     record_phase(profile_totals_.qkv_proj_ms);
     trace_point("qkv done");
 
-    ops::head_rms_norm(ctx, q, *layer.q_norm, tc.rms_norm_eps, seq_len,
-                       num_heads, head_dim);
-    ops::head_rms_norm(ctx, k, *layer.k_norm, tc.rms_norm_eps, seq_len,
-                       num_kv_heads, head_dim);
-    ops::head_rms_norm(ctx, v, buf_.ones, tc.rms_norm_eps, seq_len,
-                       num_kv_heads, head_dim);
-    if (dump_layer0) {
-        dump_tensor("q_norm", q);
-        dump_tensor("k_norm", k);
-    }
-    ops::apply_rope_partial(ctx, q, k, seq_len, start_pos, num_heads,
-                            num_kv_heads, head_dim, rotary_dim, theta,
-                            false, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
-                            !sliding);
-    if (dump_layer0) {
-        dump_tensor("q_rope", q);
-        dump_tensor("k_rope", k);
-        dump_tensor("v_norm", v);
+    static const bool fused_decoder =
+        aila::env::read_flag("AILA_DG_FUSED_DECODER", true);
+
+    if (fused_decoder && !dump_layer0) {
+        ops::fused_head_rms_norm_rope_qkv(
+            ctx, q, k, v, *layer.q_norm, *layer.k_norm, buf_.ones,
+            seq_len, start_pos, num_heads, num_kv_heads, head_dim,
+            rotary_dim, theta, tc.rms_norm_eps, !sliding);
+    } else {
+        ops::head_rms_norm(ctx, q, *layer.q_norm, tc.rms_norm_eps, seq_len,
+                           num_heads, head_dim);
+        ops::head_rms_norm(ctx, k, *layer.k_norm, tc.rms_norm_eps, seq_len,
+                           num_kv_heads, head_dim);
+        ops::head_rms_norm(ctx, v, buf_.ones, tc.rms_norm_eps, seq_len,
+                           num_kv_heads, head_dim);
+        if (dump_layer0) {
+            dump_tensor("q_norm", q);
+            dump_tensor("k_norm", k);
+        }
+        ops::apply_rope_partial(ctx, q, k, seq_len, start_pos, num_heads,
+                                num_kv_heads, head_dim, rotary_dim, theta,
+                                false, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+                                !sliding);
+        if (dump_layer0) {
+            dump_tensor("q_rope", q);
+            dump_tensor("k_rope", k);
+            dump_tensor("v_norm", v);
+        }
     }
 
     if (!bidirectional) {
@@ -1386,11 +1363,21 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     if (dump_layer0) dump_tensor("attn_out", attn_out);
     layer.o_proj.forward(ctx, buf_.o_scratch, attn_out, buf_.attn_o, seq_len);
     if (dump_layer0) dump_tensor("attn_o", buf_.attn_o);
-    ops::rms_norm(ctx, buf_.attn_o, *layer.post_attn_ln, tc.rms_norm_eps,
-                  buf_.attn_o, seq_len, hidden_size);
-    if (dump_layer0) dump_tensor("post_attn_norm", buf_.attn_o);
-    ops::residual_add(ctx, hidden, buf_.attn_o, seq_len * hidden_size);
-    if (dump_layer0) dump_tensor("hidden_after_attn", hidden);
+    if (fused_decoder && !dump_layer0) {
+        ops::fused_post_attn_residual_norms(
+            ctx, hidden, buf_.attn_o, *layer.post_attn_ln,
+            *layer.pre_ff_ln, *layer.pre_ff_ln_2, *layer.router_scale,
+            buf_.normed, buf_.sc_normed, buf_.sc_gate,
+            seq_len, hidden_size, tc.rms_norm_eps);
+    } else {
+        ops::rms_norm(ctx, buf_.attn_o, *layer.post_attn_ln, tc.rms_norm_eps,
+                      buf_.attn_o, seq_len, hidden_size);
+        if (dump_layer0) dump_tensor("post_attn_norm", buf_.attn_o);
+        ops::residual_add(ctx, hidden, buf_.attn_o, seq_len * hidden_size);
+        if (dump_layer0) dump_tensor("hidden_after_attn", hidden);
+        ops::rms_norm(ctx, hidden, *layer.pre_ff_ln, tc.rms_norm_eps, buf_.normed,
+                      seq_len, hidden_size);
+    }
     record_phase(profile_totals_.o_proj_ms);
     trace_point("o done");
     if (profile) {
@@ -1400,8 +1387,6 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     }
 
     // Dense MLP path.
-    ops::rms_norm(ctx, hidden, *layer.pre_ff_ln, tc.rms_norm_eps, buf_.normed,
-                  seq_len, hidden_size);
     if (layer.has_fused_gate_up) {
         layer.mlp_gate_up.forward(ctx, buf_.mlp_scratch, buf_.normed,
                                   buf_.mlp_gate_up_out, seq_len);
@@ -1443,37 +1428,55 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     }
 
     // MoE path (parallel to MLP, routed from the pre-MLP residual).
-    // Keep the router projection on the trusted bf16 oneDNN path.  A scalar
-    // host dot product uses a different accumulation order and changed about
-    // 10-15% of near-tied top-k expert assignments in real layer traces.
-    ops::rms_norm_unweighted(ctx, hidden, tc.rms_norm_eps, buf_.normed,
-                             seq_len, hidden_size);
-    bf16* routed_ptr = static_cast<bf16*>(buf_.normed.data());
-    const bf16* router_scale_ptr =
-        static_cast<const bf16*>(layer.router_scale->data());
-    const bf16 root_size =
-        bf16(1.0f / std::sqrt(static_cast<float>(hidden_size)));
-    ctx.queue().parallel_for(
-        sycl::range<1>(static_cast<size_t>(seq_len) * hidden_size),
-        [=](sycl::id<1> idx) {
-            const size_t flat = idx[0];
-            const int column = static_cast<int>(flat % hidden_size);
-            const bf16 scaled = bf16(static_cast<float>(routed_ptr[flat]) *
-                                     static_cast<float>(
-                                         router_scale_ptr[column]));
-            routed_ptr[flat] =
-                bf16(static_cast<float>(scaled) * static_cast<float>(root_size));
-        });
-    layer.router_linear.forward(ctx, buf_.normed, buf_.router_scores, seq_len);
-    std::vector<bf16> router_score_bf16(
-        static_cast<size_t>(seq_len) * tc.num_experts);
-    ctx.memcpy_d2h(router_score_bf16.data(), buf_.router_scores.data(),
-                   router_score_bf16.size() * sizeof(bf16));
+    if (fused_decoder && !dump_layer0) {
+        layer.router_linear.forward(ctx, buf_.sc_gate, buf_.router_scores, seq_len);
+    } else {
+        ops::rms_norm_unweighted(ctx, hidden, tc.rms_norm_eps, buf_.normed,
+                                 seq_len, hidden_size);
+        bf16* routed_ptr = static_cast<bf16*>(buf_.normed.data());
+        const bf16* router_scale_ptr =
+            static_cast<const bf16*>(layer.router_scale->data());
+        const bf16 root_size =
+            bf16(1.0f / std::sqrt(static_cast<float>(hidden_size)));
+        ctx.queue().parallel_for(
+            sycl::range<1>(static_cast<size_t>(seq_len) * hidden_size),
+            [=](sycl::id<1> idx) {
+                const size_t flat = idx[0];
+                const int column = static_cast<int>(flat % hidden_size);
+                const bf16 scaled = bf16(static_cast<float>(routed_ptr[flat]) *
+                                         static_cast<float>(
+                                             router_scale_ptr[column]));
+                routed_ptr[flat] =
+                    bf16(static_cast<float>(scaled) * static_cast<float>(root_size));
+            });
+        layer.router_linear.forward(ctx, buf_.normed, buf_.router_scores, seq_len);
+    }
     std::vector<int> expert_ids;
     std::vector<float> expert_weights;
-    router_topk_from_bf16_scores(
-        router_score_bf16, layer.per_expert_scale_host, seq_len, tc.num_experts,
-        tc.top_k_experts, expert_ids, expert_weights);
+    static const bool gpu_router =
+        aila::env::read_flag("AILA_DG_GPU_ROUTER", true);
+    if (gpu_router && !dump_layer0) {
+        ops::router_topk_device(
+            ctx, buf_.router_scores.data_as<bf16>(),
+            layer.per_expert_scale ? layer.per_expert_scale->data_as<bf16>() : nullptr,
+            buf_.expert_ids_dev.data_as<int>(),
+            buf_.expert_weights_dev.data_as<float>(),
+            seq_len, tc.num_experts, tc.top_k_experts);
+        expert_ids.resize(static_cast<size_t>(seq_len) * tc.top_k_experts);
+        expert_weights.resize(static_cast<size_t>(seq_len) * tc.top_k_experts);
+        ctx.memcpy_d2h(expert_ids.data(), buf_.expert_ids_dev.data(),
+                       expert_ids.size() * sizeof(int));
+        ctx.memcpy_d2h(expert_weights.data(), buf_.expert_weights_dev.data(),
+                       expert_weights.size() * sizeof(float));
+    } else {
+        std::vector<bf16> router_score_bf16(
+            static_cast<size_t>(seq_len) * tc.num_experts);
+        ctx.memcpy_d2h(router_score_bf16.data(), buf_.router_scores.data(),
+                       router_score_bf16.size() * sizeof(bf16));
+        router_topk_from_bf16_scores(
+            router_score_bf16, layer.per_expert_scale_host, seq_len, tc.num_experts,
+            tc.top_k_experts, expert_ids, expert_weights);
+    }
     record_phase(profile_totals_.router_ms);
     trace_point("router done");
     if (dump_layer0) {
@@ -1485,9 +1488,12 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                           static_cast<std::streamsize>(expert_weights.size() * sizeof(float)));
     }
 
-    ops::rms_norm(ctx, hidden, *layer.pre_ff_ln_2, tc.rms_norm_eps, buf_.normed,
-                  seq_len, hidden_size);
-    if (dump_layer0) dump_tensor("pre_ff2_norm", buf_.normed);
+    if (!fused_decoder || dump_layer0) {
+        ops::rms_norm(ctx, hidden, *layer.pre_ff_ln_2, tc.rms_norm_eps, buf_.normed,
+                      seq_len, hidden_size);
+        if (dump_layer0) dump_tensor("pre_ff2_norm", buf_.normed);
+    }
+    Tensor& moe_in_tensor = (fused_decoder && !dump_layer0) ? buf_.sc_normed : buf_.normed;
     static const bool moe_gpu =
         aila::env::read_flag("AILA_DG_MOE_GPU", false);
     static const bool moe_batched =
@@ -1537,7 +1543,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         };
     if (moe_harness) {
         std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
-        ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
+        ctx.memcpy_d2h(moe_input.data(), moe_in_tensor.data(),
                        moe_input.size() * sizeof(bf16));
         std::vector<bf16> moe_output;
         moe->forward(ctx, moe_input, expert_ids, expert_weights, moe_output,
@@ -1546,7 +1552,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         ctx.memcpy_h2d(buf_.moe_device_out.data(), moe_output.data(),
                        moe_output.size() * sizeof(bf16));
         if (moe_gpu) {
-            moe->forward_batched_gpu(ctx, buf_.normed, buf_.moe_transfer,
+            moe->forward_batched_gpu(ctx, moe_in_tensor, buf_.moe_transfer,
                                      buf_.moe_token_ids, buf_.moe_gpu_ref,
                                      expert_ids, expert_weights, seq_len,
                                      tc.top_k_experts);
@@ -1554,7 +1560,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         }
         if (moe_batched) {
             std::vector<bf16> batched_out;
-            moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+            moe->forward_batched(ctx, moe_in_tensor, buf_.moe_transfer,
                                  buf_.moe_token_ids, expert_ids, expert_weights,
                                  batched_out, seq_len, tc.top_k_experts);
             ctx.memcpy_h2d(buf_.moe_gpu_ref.data(), batched_out.data(),
@@ -1563,7 +1569,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         }
     } else if (moe_gpu) {
         trace_point("gpu moe begin");
-        moe->forward_batched_gpu(ctx, buf_.normed, buf_.moe_transfer,
+        moe->forward_batched_gpu(ctx, moe_in_tensor, buf_.moe_transfer,
                                  buf_.moe_token_ids, buf_.moe_device_out,
                                  expert_ids, expert_weights, seq_len,
                                  tc.top_k_experts);
@@ -1572,7 +1578,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
     } else if (moe_batched) {
         trace_point("batched begin");
         std::vector<bf16> moe_output;
-        moe->forward_batched(ctx, buf_.normed, buf_.moe_transfer,
+        moe->forward_batched(ctx, moe_in_tensor, buf_.moe_transfer,
                              buf_.moe_token_ids, expert_ids, expert_weights,
                              moe_output, seq_len, tc.top_k_experts);
         record_phase(profile_totals_.moe_ms);
@@ -1581,7 +1587,7 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
         trace_point("batched done");
     } else {
         std::vector<bf16> moe_input(static_cast<size_t>(seq_len) * hidden_size);
-        ctx.memcpy_d2h(moe_input.data(), buf_.normed.data(),
+        ctx.memcpy_d2h(moe_input.data(), moe_in_tensor.data(),
                        moe_input.size() * sizeof(bf16));
         std::vector<bf16> moe_output;
         moe->forward(ctx, moe_input, expert_ids, expert_weights, moe_output,
@@ -1596,14 +1602,20 @@ void DiffusionGemmaBnb4Backend::run_layer_forward(
                   buf_.ff2, seq_len, hidden_size);
     if (dump_layer0) dump_tensor("ff2", buf_.ff2);
 
-    ops::residual_add(ctx, buf_.ff1, buf_.ff2, seq_len * hidden_size);
-    if (dump_layer0) dump_tensor("ff_sum", buf_.ff1);
-    ops::rms_norm(ctx, buf_.ff1, *layer.post_ff_ln, tc.rms_norm_eps, buf_.normed,
-                  seq_len, hidden_size);
-    if (dump_layer0) dump_tensor("post_ff_norm", buf_.normed);
-    ops::residual_add(ctx, hidden, buf_.normed, seq_len * hidden_size);
-    ops::scale_inplace(ctx, hidden, layer.layer_scalar,
-                       seq_len * hidden_size);
+    if (fused_decoder && !dump_layer0) {
+        ops::fused_post_ff_norm_residual_scale(
+            ctx, hidden, buf_.ff1, buf_.ff2, *layer.post_ff_ln,
+            layer.layer_scalar, seq_len, hidden_size, tc.rms_norm_eps);
+    } else {
+        ops::residual_add(ctx, buf_.ff1, buf_.ff2, seq_len * hidden_size);
+        if (dump_layer0) dump_tensor("ff_sum", buf_.ff1);
+        ops::rms_norm(ctx, buf_.ff1, *layer.post_ff_ln, tc.rms_norm_eps, buf_.normed,
+                      seq_len, hidden_size);
+        if (dump_layer0) dump_tensor("post_ff_norm", buf_.normed);
+        ops::residual_add(ctx, hidden, buf_.normed, seq_len * hidden_size);
+        ops::scale_inplace(ctx, hidden, layer.layer_scalar,
+                           seq_len * hidden_size);
+    }
     if (dump_layer0) dump_tensor("hidden_out", hidden);
 
     static const bool reuse_sync =

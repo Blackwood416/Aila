@@ -3,13 +3,23 @@
 namespace aila::chat {
 
 const std::string& diffusion_gemma_text_chat_template() {
-    // Text-only subset of the Google Gemma 4 canonical template.  Tools and
-    // multimodal turns are intentionally outside DiffusionGemma v1 scope.
     static const std::string tmpl = R"JINJA(
 {{- bos_token -}}
 {%- for message in messages -%}
     {%- set role = 'model' if message.role == 'assistant' else message.role -%}
-    {{- '<|turn>' + role + '\n' + message.content + '<turn|>\n' -}}
+    {{- '<|turn>' + role + '\n' -}}
+    {%- if message.content is string -%}
+        {{- message.content -}}
+    {%- elif message.content is sequence -%}
+        {%- for item in message.content -%}
+            {%- if item.text -%}
+                {{- item.text -}}
+            {%- elif item is string -%}
+                {{- item -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '<turn|>\n' -}}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
     {{- '<|turn>model\n' -}}

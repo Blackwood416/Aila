@@ -1,4 +1,4 @@
-llama.cpp/
+﻿llama.cpp/
 oneDNN/
 vllm/
 vllm-omni/
@@ -7,9 +7,11 @@ peft/
 Qwen3-ASR/
 qwen-asr/
 build/
+build*/
 bitsandbytes/
 /models/
 *.txt
+*.png
 tmp/
 .claude/HANDOVER.md
 

@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <utility>
+#include <algorithm>
 #include "engine/Types.hpp"
 
 // ============================================================
@@ -44,6 +45,16 @@ public:
     int special_token_id(const std::string& name) const {
         auto it = special_tokens_.find(name);
         return (it != special_tokens_.end()) ? it->second : -1;
+    }
+
+    void register_special_token(const std::string& name, int id) {
+        if (name.empty() || id < 0) return;
+        special_tokens_[name] = id;
+        special_token_order_.push_back(name);
+        std::sort(special_token_order_.begin(), special_token_order_.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return a.size() > b.size();
+                  });
     }
 
     int vocab_size() const { return static_cast<int>(id_to_token_.size()); }

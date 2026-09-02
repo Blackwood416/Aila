@@ -627,6 +627,9 @@ void parse_diffusion_gemma(simdjson::dom::element root, ModelSpec& spec) {
         read_int64(vis_elem, "position_embedding_size",
                    vc.position_embedding_size);
         read_float(vis_elem, "rms_norm_eps", vc.rms_norm_eps);
+
+        spec.vision.enabled = true;
+        spec.vision.image_token_id = static_cast<int>(cfg.image_token_id);
     }
 }
 

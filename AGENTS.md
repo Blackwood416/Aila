@@ -43,6 +43,8 @@ The NF4 format is ~0.5 bytes/weight vs bf16's 2 bytes/weight — a 4× bandwidth
 - `Qwen35HybridBnb4Backend`: Qwen3.5 Hybrid with BNB NF4 quantization. Alternating full attention (head_dim=256, GQA) and linear attention (DeltaNet, head_dim=128) layers.
 - `Qwen3Bnb4Backend`: Qwen3 dense with BNB NF4. Standard GQA attention.
 - `Qwen35HybridTextBackend`: Qwen3.5 Hybrid with bf16 weights (no quantization). Used for vision encoder.
+- `DiffusionGemmaBnb4Backend`: DiffusionGemma 26B A4B MoE Block Diffusion Model with bitsandbytes NF4 quantization and soft self-conditioning.
+- `Gemma4VisionEncoder`: Gemma 4 Vision Tower (27 layers, 2D RoPE, 3x3 spatial pooling, unweighted RMSNorm, XMX embedding projection) supporting multimodal image-text generation.
 
 ### Dependency: oneDNN
 

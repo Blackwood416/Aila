@@ -13,7 +13,9 @@
 #include "../src/models/Qwen3TTSBackend.hpp"
 #include "../src/models/Qwen3ForceAlignerBackend.hpp"
 #include "../src/models/Qwen3ForceAlignerBnb4Backend.hpp"
+#include "../src/vision/IVisionEncoder.hpp"
 #include "../src/vision/Qwen35VisionEncoder.hpp"
+#include "../src/vision/Gemma4VisionEncoder.hpp"
 #include "../src/vision/Yolo26Detector.hpp"
 #include "../src/audio/Qwen3ASRAudioEncoder.hpp"
 #include "../src/audio/AudioPreprocessor.hpp"
@@ -521,6 +523,17 @@ public:
                 config_.tie_word_embeddings = dg_cfg.tie_word_embeddings;
                 config_.bos_token_id = dg_cfg.bos_token_id;
                 config_.eos_token_id = dg_cfg.eos_token_id;
+
+                if (model_spec_.diffusion_gemma.boi_token_id > 0) {
+                    tokenizer_.register_special_token("<|image>", static_cast<int>(model_spec_.diffusion_gemma.boi_token_id));
+                }
+                if (model_spec_.diffusion_gemma.image_token_id > 0) {
+                    tokenizer_.register_special_token("<|image|>", static_cast<int>(model_spec_.diffusion_gemma.image_token_id));
+                }
+                if (model_spec_.diffusion_gemma.eoi_token_id > 0) {
+                    tokenizer_.register_special_token("<image|>", static_cast<int>(model_spec_.diffusion_gemma.eoi_token_id));
+                }
+
                 AILA_LOG_INFO("[ModelSpec] model_type=%s family=diffusion_gemma text_hidden=%d layers=%d vocab=%d canvas=%d",
                               model_spec_.model_type.c_str(),
                               config_.hidden_size, config_.num_hidden_layers,
@@ -559,9 +572,9 @@ public:
         AILA_LOG_INFO("[4/4] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
 
-        // DiffusionGemma v1 is text-only: release the vision tower and vision
-        // embedder weights (~2 GB) to keep the 16 GB A770 budget.
-        if (model_spec_.family == ModelFamily::DiffusionGemma) {
+        // Retain DiffusionGemma vision weights unless explicitly released by env
+        const bool release_dg_vision = aila::env::read_flag("AILA_DG_RELEASE_VISION", false);
+        if (model_spec_.family == ModelFamily::DiffusionGemma && release_dg_vision) {
             auto vision_stats = weights_->erase_with_prefix("model.encoder.vision_tower");
             auto embed_stats = weights_->erase_with_prefix("model.encoder.embed_vision");
             AILA_LOG_INFO("[DiffusionGemma] Released vision weights (%zu tensors, %.1f MB)",
@@ -690,6 +703,19 @@ public:
                               vision_encoder_->out_hidden_size());
             } else {
                 AILA_LOG_WARN("[Vision] Vision encoder init failed, falling back to text-only: %s",
+                              vision_error.c_str());
+                vision_encoder_.reset();
+                vision_backend_enabled_ = false;
+            }
+        } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            vision_encoder_ = std::make_unique<aila::vision::Gemma4VisionEncoder>();
+            std::string vision_error;
+            if (vision_encoder_->load(*ctx_, *weights_, model_spec_, model_dir_, &vision_error)) {
+                vision_backend_enabled_ = true;
+                AILA_LOG_INFO("[Vision] Gemma4/DiffusionGemma vision encoder loaded (out_hidden=%d)",
+                              vision_encoder_->out_hidden_size());
+            } else {
+                AILA_LOG_WARN("[Vision] Gemma4 vision encoder init failed, falling back to text-only: %s",
                               vision_error.c_str());
                 vision_encoder_.reset();
                 vision_backend_enabled_ = false;
@@ -1393,11 +1419,19 @@ public:
                     ContentPart ph;
                     ph.type = ContentType::Text;
                     ph.text.reserve(static_cast<size_t>(encoded.token_count) * 12u + 32u);
-                    ph.text += "<|vision_start|>";
-                    for (int i = 0; i < encoded.token_count; ++i) {
-                        ph.text += "<|image_pad|>";
+                    if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                        ph.text += "<|image>";
+                        for (int i = 0; i < encoded.token_count; ++i) {
+                            ph.text += "<|image|>";
+                        }
+                        ph.text += "<image|>";
+                    } else {
+                        ph.text += "<|vision_start|>";
+                        for (int i = 0; i < encoded.token_count; ++i) {
+                            ph.text += "<|image_pad|>";
+                        }
+                        ph.text += "<|vision_end|>";
                     }
-                    ph.text += "<|vision_end|>";
                     out_msg.content.push_back(std::move(ph));
 
                     total_vision_tokens += static_cast<size_t>(encoded.token_count);
@@ -1575,6 +1609,12 @@ public:
             }
 
             int image_pad_id = model_spec_.vision.image_token_id;
+            if (image_pad_id < 0 && model_spec_.family == ModelFamily::DiffusionGemma) {
+                image_pad_id = static_cast<int>(model_spec_.diffusion_gemma.image_token_id);
+            }
+            if (image_pad_id < 0) {
+                image_pad_id = tokenizer_.special_token_id("<|image|>");
+            }
             if (image_pad_id < 0) {
                 image_pad_id = tokenizer_.special_token_id("<|image_pad|>");
             }
@@ -1602,53 +1642,62 @@ public:
             std::vector<int> pos_t(full_ids.size(), 0);
             std::vector<int> pos_h(full_ids.size(), 0);
             std::vector<int> pos_w(full_ids.size(), 0);
-            size_t next_segment = 0;
-            int current_pos = 0;
-            for (size_t i = 0; i < full_ids.size();) {
-                if (full_ids[i] != image_pad_id) {
-                    size_t j = i + 1;
-                    while (j < full_ids.size() && full_ids[j] != image_pad_id) ++j;
-                    for (size_t k = i; k < j; ++k) {
-                        int text_pos = current_pos + static_cast<int>(k - i);
-                        pos_t[k] = text_pos;
-                        pos_h[k] = text_pos;
-                        pos_w[k] = text_pos;
-                    }
-                    current_pos += static_cast<int>(j - i);
-                    i = j;
-                    continue;
-                }
 
-                size_t j = i + 1;
-                while (j < full_ids.size() && full_ids[j] == image_pad_id) ++j;
-                if (next_segment >= vision_segments.size()) {
-                    set_error(EngineErrorCode::RuntimeError,
-                              "Missing multimodal segment metadata for image tokens");
-                    return "";
+            if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                for (size_t k = 0; k < full_ids.size(); ++k) {
+                    pos_t[k] = static_cast<int>(k);
+                    pos_h[k] = static_cast<int>(k);
+                    pos_w[k] = static_cast<int>(k);
                 }
-                const auto& seg = vision_segments[next_segment++];
-                const int seq_len = static_cast<int>(j - i);
-                const int grid_t = std::max(1, seg.llm_grid_t);
-                const int grid_h = std::max(1, seg.llm_grid_h);
-                const int grid_w = std::max(1, seg.llm_grid_w);
-                if (seq_len != seg.token_count || grid_t * grid_h * grid_w != seq_len) {
-                    set_error(EngineErrorCode::RuntimeError,
-                              "Vision grid metadata does not match rendered image token count");
-                    return "";
-                }
-                size_t out_idx = i;
-                for (int t = 0; t < grid_t; ++t) {
-                    for (int h = 0; h < grid_h; ++h) {
-                        for (int w = 0; w < grid_w; ++w) {
-                            pos_t[out_idx] = current_pos + t;
-                            pos_h[out_idx] = current_pos + h;
-                            pos_w[out_idx] = current_pos + w;
-                            ++out_idx;
+            } else {
+                size_t next_segment = 0;
+                int current_pos = 0;
+                for (size_t i = 0; i < full_ids.size();) {
+                    if (full_ids[i] != image_pad_id) {
+                        size_t j = i + 1;
+                        while (j < full_ids.size() && full_ids[j] != image_pad_id) ++j;
+                        for (size_t k = i; k < j; ++k) {
+                            int text_pos = current_pos + static_cast<int>(k - i);
+                            pos_t[k] = text_pos;
+                            pos_h[k] = text_pos;
+                            pos_w[k] = text_pos;
+                        }
+                        current_pos += static_cast<int>(j - i);
+                        i = j;
+                        continue;
+                    }
+
+                    size_t j = i + 1;
+                    while (j < full_ids.size() && full_ids[j] == image_pad_id) ++j;
+                    if (next_segment >= vision_segments.size()) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Missing multimodal segment metadata for image tokens");
+                        return "";
+                    }
+                    const auto& seg = vision_segments[next_segment++];
+                    const int seq_len = static_cast<int>(j - i);
+                    const int grid_t = std::max(1, seg.llm_grid_t);
+                    const int grid_h = std::max(1, seg.llm_grid_h);
+                    const int grid_w = std::max(1, seg.llm_grid_w);
+                    if (seq_len != seg.token_count || grid_t * grid_h * grid_w != seq_len) {
+                        set_error(EngineErrorCode::RuntimeError,
+                                  "Vision grid metadata does not match rendered image token count");
+                        return "";
+                    }
+                    size_t out_idx = i;
+                    for (int t = 0; t < grid_t; ++t) {
+                        for (int h = 0; h < grid_h; ++h) {
+                            for (int w = 0; w < grid_w; ++w) {
+                                pos_t[out_idx] = current_pos + t;
+                                pos_h[out_idx] = current_pos + h;
+                                pos_w[out_idx] = current_pos + w;
+                                ++out_idx;
+                            }
                         }
                     }
+                    current_pos += std::max({grid_t, grid_h, grid_w});
+                    i = j;
                 }
-                current_pos += std::max({grid_t, grid_h, grid_w});
-                i = j;
             }
             int max_pos = 0;
             for (size_t i = 0; i < full_ids.size(); ++i) {
@@ -1720,9 +1769,9 @@ public:
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
 
         if (model_spec_.family == ModelFamily::DiffusionGemma) {
-            if (total_vision_tokens > 0 || total_audio_tokens > 0) {
-                set_error(EngineErrorCode::VisionNotEnabled,
-                          "DiffusionGemma v1 supports text-only prompts");
+            if (total_audio_tokens > 0) {
+                set_error(EngineErrorCode::ModelCapability,
+                          "DiffusionGemma does not support audio prompts");
                 return "";
             }
             auto* dg_backend =
@@ -4133,7 +4182,7 @@ private:
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
     std::unique_ptr<aila::vision::Yolo26Detector> detector_;
-    std::unique_ptr<aila::vision::Qwen35VisionEncoder> vision_encoder_;
+    std::unique_ptr<aila::vision::IVisionEncoder> vision_encoder_;
     std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
     std::unique_ptr<aila::audio::MimiEncoder> mimi_encoder_;
     aila::chat::ChatFormatter chat_formatter_;
