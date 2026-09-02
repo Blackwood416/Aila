@@ -215,6 +215,23 @@ larger than 4 GiB. Do not treat it as an Aila runtime requirement.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_DIFFUSION_STEPS` | int | `min(model config, 25)` | Override the number of canvas denoising steps. The 26B checkpoint has been validated to converge at 25 steps; larger values remain available for quality experiments |
+| `AILA_DG_CONFIDENCE_THRESHOLD` | float | `0.02` | Entropy threshold for canvas early stopping (`0.0` disables early stopping) |
+| `AILA_DG_STABILITY_THRESHOLD` | int | `1` | Consecutive stable steps required to trigger canvas early stopping |
+| `AILA_DG_PARALLEL_CANVASES` | bool | `true` | Process multiple diffusion canvases in parallel |
+| `AILA_DG_GPU_SAMPLING` | bool | `true` | GPU-resident Gumbel noise generation and canvas token sampling |
+| `AILA_DG_GPU_ROUTER` | bool | `true` | GPU-resident MoE router Top-K expert selection and softmax weights calculation |
+| `AILA_DG_FUSED_ATTN` | bool | `true` | Enable XMX/SLM fused masked attention kernel for DiffusionGemma |
+| `AILA_DG_FUSED_DECODER` | bool | `true` | Enable fused decoder post-attention and post-FFN norm & residual accumulation |
+| `AILA_DG_FUSED_GATE_UP` | bool | `true` | Enable fused gate+up projection with activation |
+| `AILA_DG_FUSED_POST_LOGITS` | bool | `true` | Enable fused post-logits soft-capping, temperature scaling, stats, and argmax |
+| `AILA_DG_SOFT_EMBED_XMX` | bool | `true` | Enable XMX Joint Matrix accelerated Soft-Embedding matmul |
+| `AILA_DG_RELEASE_VISION` | bool | `false` | Free vision tower weights from GPU memory after image encoding to save VRAM for diffusion generation |
+| `AILA_DG_MOE_BATCHED` | int | `1` | DiffusionGemma MoE batched-transfer path: single flat gather + one d2h for all expert groups instead of one blocking h2d/d2h per group. Bitwise identical to the per-group host path (`0` restores it) |
+| `AILA_DG_MOE_GPU` | bool | `false` | Opt-in exact GPU-resident MoE output path. Keeps the same per-expert dequantization and oneDNN matmuls as the batched path, then performs the stable expert-order bf16 accumulation on GPU to avoid the output D2H, host accumulation, and result H2D |
+| `AILA_DG_MOE_GROUPED_XMX` | bool | `false` | Experimental grouped NF4/XMX MoE GEMM used only with `AILA_DG_MOE_GPU=1`. Double-quant absmax decoding is supported, but the XMX accumulation order is not bitwise identical to oneDNN; do not enable for exact-token production runs |
+| `AILA_DG_MOE_HARNESS` | bool | `false` | Run the host MoE reference and compare enabled batched/GPU candidates byte-for-byte for every layer. Adds blocking copies and duplicate computation; validation only |
+| `AILA_DG_MOE_DIAG` | bool | `false` | Enable diagnostic logging for MoE weights and routing |
+| `AILA_DG_MOE_TRACE` | bool | `false` | Detailed trace logging for MoE layer execution |
 | `AILA_DG_DEBUG_PROBES` | bool | `false` | Enable expensive host-side finite-value probes in the DiffusionGemma decoder |
 | `AILA_DG_DUMP_DIR` | path | empty | Dump DiffusionGemma intermediate tensors and `committed_tokens.bin` for numerical comparison |
 | `AILA_DG_TOKEN_DUMP` | path | empty | Dump only the committed int32 token stream; unlike `AILA_DG_DUMP_DIR`, this does not enable intermediate tensor dumps or their synchronization overhead |
@@ -296,6 +313,7 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 | `AILA_DEVICE_SAMPLING` | bool | `true` | Device-side sampling: `0` = force host fallback, `1` = allow GPU sampling |
 | `AILA_PRINT_MATRIX_COMBOS` | bool | `false` | Print all supported joint-matrix (XMX) tile combinations at startup |
 | `AILA_NO_MROPE` | bool | `false` | Disable multimodal rotary position IDs for embedded media inputs. Debug/compatibility use only |
+| `AILA_YOLO_DUMP_DIR` | directory path | empty | Directory to dump YOLO detector debug visualizations and intermediate predictions |
 
 ---
 
