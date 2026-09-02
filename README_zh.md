@@ -18,6 +18,7 @@
 - **🔢 Bfloat16 推理** — 通过 oneDNN 矩阵乘法原语支持密集（非量化）模型
 - **🏗️ Qwen3.5 Hybrid 架构** — 完整支持双重注意力（GQA + DeltaNet 线性注意力），GPU 加速 delta 循环计算
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
+- **🧩 DiffusionGemma 块扩散** — 支持文本模式的 256-token 画布去噪、循环自条件和 BNB NF4 MoE 权重
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎯 **YOLO26 目标检测** — 支持 n/s/m/l/x、固定 640×640、NMS-free one-to-one head、FP16 oneDNN/SYCL 推理，以及 UTF-8 类名
 - 🎙️ 语音转录 (Qwen3-ASR) — 基于音频预处理与 GPU 加速音频编码器的语音转文本（ASR）。支持离线 wav 转录和实时流式输入转录
@@ -40,6 +41,7 @@
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
+| DiffusionGemma-26B-A4B-it | Block diffusion (Gemma 4 + MoE) | BNB NF4 | ❌（v1 仅文本） | ❌ |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Blackwood416/Qwen3-ASR-1.7B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅ (ASR) |
 | [Qwen3-ForcedAligner-0.6B](https://huggingface.co/Blackwood416/Qwen3-ForceAligner-0.6B-BNB-NF4) | Dense + Audio Encoder | BNB NF4, dense | ❌ | ✅（对齐） |

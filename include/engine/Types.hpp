@@ -139,6 +139,7 @@ enum class ModelFamily {
     Qwen3TTS,
     Qwen3ForceAligner,  // NEW
     Yolo26,
+    DiffusionGemma,
     Unknown
 };
 
@@ -264,6 +265,89 @@ inline bool is_supported_qwen35_hybrid_0p8b_spec(const Qwen35TextConfig& cfg) {
     return is_exact_qwen35_hybrid_0p8b_spec(cfg);
 }
 
+// ============================================================
+// DiffusionGemma (Gemma4 backbone + block diffusion)
+// ============================================================
+struct DiffusionGemmaRopeParams {
+    std::string rope_type = "default";
+    float rope_theta = 10000.0f;
+    float partial_rotary_factor = 1.0f;
+};
+
+struct DiffusionGemmaTextConfig {
+    int hidden_size = 2816;
+    int num_attention_heads = 16;
+    int num_key_value_heads = 8;
+    int head_dim = 256;
+    int global_head_dim = 512;
+    int num_global_key_value_heads = 2;
+    int num_hidden_layers = 30;
+    int intermediate_size = 2112;
+    int moe_intermediate_size = 704;
+    int num_experts = 128;
+    int top_k_experts = 8;
+    int vocab_size = 262144;
+    int max_position_embeddings = 262144;
+    int sliding_window = 1024;
+    float rms_norm_eps = 1e-6f;
+    float final_logit_softcapping = 30.0f;
+    bool tie_word_embeddings = true;
+    bool attention_k_eq_v = true;
+    int bos_token_id = 2;
+    int eos_token_id = 1;
+    std::vector<std::string> layer_types;
+    DiffusionGemmaRopeParams rope_full;     // full_attention layers
+    DiffusionGemmaRopeParams rope_sliding;  // sliding_attention layers
+
+    bool is_sliding_layer(int layer_idx) const {
+        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_types.size()) {
+            return true;
+        }
+        return layer_types[static_cast<size_t>(layer_idx)] == "sliding_attention";
+    }
+    int head_dim_for_layer(int layer_idx) const {
+        return is_sliding_layer(layer_idx) ? head_dim : global_head_dim;
+    }
+    int kv_heads_for_layer(int layer_idx) const {
+        return is_sliding_layer(layer_idx) ? num_key_value_heads : num_global_key_value_heads;
+    }
+};
+
+struct DiffusionGemmaVisionConfig {
+    bool enabled = false;
+    int hidden_size = 1152;
+    int intermediate_size = 4304;
+    int num_attention_heads = 16;
+    int num_key_value_heads = 16;
+    int head_dim = 72;
+    int num_hidden_layers = 27;
+    int patch_size = 16;
+    int pooling_kernel_size = 3;
+    int position_embedding_size = 10240;
+    float rms_norm_eps = 1e-6f;
+};
+
+struct DiffusionGemmaConfig {
+    DiffusionGemmaTextConfig text{};
+    DiffusionGemmaVisionConfig vision{};
+
+    int canvas_length = 256;
+    int image_token_id = -1;
+    int boi_token_id = -1;
+    int eoi_token_id = -1;
+
+    // Diffusion generation defaults (generation_config.json)
+    int max_denoising_steps = 48;
+    float t_min = 0.4f;
+    float t_max = 0.8f;
+    float entropy_bound = 0.1f;
+    float confidence_threshold = 0.005f;
+    int stability_threshold = 1;
+    int pad_token_id = 0;
+    int default_max_new_tokens = 256;
+    std::vector<int> eos_token_ids{1, 106, 50};
+};
+
 struct VisionConfig {
     bool enabled = false;
     int image_token_id = -1;
@@ -325,6 +409,9 @@ struct ModelSpec {
     // Qwen3.5 path
     Qwen35TextConfig qwen35_text{};
     VisionConfig vision{};
+
+    // DiffusionGemma path
+    DiffusionGemmaConfig diffusion_gemma{};
 
     // Qwen3-ASR path
     AudioEncoderConfig audio{};

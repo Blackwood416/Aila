@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <unordered_map>
 #include <sycl/sycl.hpp>
 
 
@@ -3012,6 +3013,461 @@ void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
   } else {
     copy_to_cache_impl<false>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
   }
+}
+
+namespace {
+
+struct MaskedAttnKey {
+    int q_len;
+    int kv_len;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+
+    bool operator==(const MaskedAttnKey& other) const {
+        return q_len == other.q_len && kv_len == other.kv_len &&
+               num_heads == other.num_heads &&
+               num_kv_heads == other.num_kv_heads &&
+               head_dim == other.head_dim;
+    }
+};
+
+struct MaskedAttnKeyHash {
+    size_t operator()(const MaskedAttnKey& key) const {
+        size_t h = std::hash<int>()(key.q_len);
+        h = h * 31 + std::hash<int>()(key.kv_len);
+        h = h * 31 + std::hash<int>()(key.num_heads);
+        h = h * 31 + std::hash<int>()(key.num_kv_heads);
+        h = h * 31 + std::hash<int>()(key.head_dim);
+        return h;
+    }
+};
+
+struct MaskedAttnPrims {
+    bool inited = false;
+    dnnl::matmul qk_prim{};
+    dnnl::matmul pv_prim{};
+    dnnl::memory::desc qk_src_md{};
+    dnnl::memory::desc qk_w_md{};
+    dnnl::memory::desc qk_dst_md{};
+    dnnl::memory::desc pv_src_md{};
+    dnnl::memory::desc pv_w_md{};
+    dnnl::memory::desc pv_dst_md{};
+
+    bf16* expanded_q = nullptr;
+    bf16* expanded_k = nullptr;
+    bf16* expanded_v = nullptr;
+    bf16* probs_bf16 = nullptr;
+    bf16* attn_tmp = nullptr;
+    sycl::queue q;
+
+    MaskedAttnPrims() = default;
+    ~MaskedAttnPrims() {
+        if (expanded_q) sycl::free(expanded_q, q);
+        if (expanded_k) sycl::free(expanded_k, q);
+        if (expanded_v) sycl::free(expanded_v, q);
+        if (probs_bf16) sycl::free(probs_bf16, q);
+        if (attn_tmp) sycl::free(attn_tmp, q);
+    }
+    MaskedAttnPrims(MaskedAttnPrims&& other) noexcept
+        : inited(other.inited),
+          qk_prim(std::move(other.qk_prim)),
+          pv_prim(std::move(other.pv_prim)),
+          qk_src_md(other.qk_src_md),
+          qk_w_md(other.qk_w_md),
+          qk_dst_md(other.qk_dst_md),
+          pv_src_md(other.pv_src_md),
+          pv_w_md(other.pv_w_md),
+          pv_dst_md(other.pv_dst_md),
+          expanded_q(other.expanded_q),
+          expanded_k(other.expanded_k),
+          expanded_v(other.expanded_v),
+          probs_bf16(other.probs_bf16),
+          attn_tmp(other.attn_tmp),
+          q(std::move(other.q)) {
+        other.expanded_q = nullptr;
+        other.expanded_k = nullptr;
+        other.expanded_v = nullptr;
+        other.probs_bf16 = nullptr;
+        other.attn_tmp = nullptr;
+    }
+};
+
+std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>&
+masked_attn_prims() {
+    static std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>
+        cache;
+    return cache;
+}
+
+template <typename T>
+auto local_ptr(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space,
+                                    sycl::access::decorated::no>(p);
+}
+
+void run_fused_masked_attention_xmx(
+    sycl::queue& q,
+    const bf16* Q_ptr,
+    const bf16* K_ptr,
+    const bf16* V_ptr,
+    const float* Mask_ptr,
+    bf16* Out_ptr,
+    int q_len, int kv_len, int H, int KV, int D) {
+    constexpr int BM = 32;
+    constexpr int BK = 32;
+    constexpr int BD = 32;
+    constexpr int TM = 8, TN = 8, TK = 16, SG = 8;
+    constexpr int NUM_SGS = (BM / TM) * (BK / TN); // 16 SGs
+    constexpr int WG_SIZE = NUM_SGS * SG; // 128 threads
+    constexpr int stride_s = 384;
+
+    const int grid_m = (q_len + BM - 1) / BM;
+    const int total_wgs = grid_m * H;
+
+    q.submit([&](sycl::handler& cgh) {
+        // SLM buffers (Total: 16 KB + 24 KB + 1 KB + 1 KB + 4 KB = 46 KB < 64 KB limit)
+        sycl::local_accessor<bf16, 1> Qs(sycl::range<1>(BM * D), cgh);         // 16 KB
+        sycl::local_accessor<bf16, 1> S_scores(sycl::range<1>(BM * stride_s), cgh); // 24 KB
+        sycl::local_accessor<bf16, 1> Ks(sycl::range<1>(TK * BK), cgh);        // 1 KB
+        sycl::local_accessor<bf16, 1> Vs(sycl::range<1>(TK * BD), cgh);        // 1 KB
+        sycl::local_accessor<float, 1> Slm_out(sycl::range<1>(BM * BD), cgh);  // 4 KB
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(total_wgs) * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int wg_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / SG;
+                const int sg_row = sg_id / 4; // 0..3
+                const int sg_col = sg_id % 4; // 0..3
+
+                const int q_tile_idx = wg_idx % grid_m;
+                const int h = wg_idx / grid_m;
+                const int kv_h = h / (H / KV);
+                const int q_start = q_tile_idx * BM;
+
+                for (int i = lid; i < BM * D; i += WG_SIZE) {
+                    const int r = i / D;
+                    const int c = i % D;
+                    const int q_pos = q_start + r;
+                    Qs[i] = (q_pos < q_len) ? Q_ptr[static_cast<size_t>(q_pos) * (H * D) + h * D + c] : bf16(0.0f);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int k_tile = 0; k_tile < kv_len; k_tile += BK) {
+                    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> s_mat;
+                    joint_matrix_fill(sg, s_mat, 0.0f);
+
+                    for (int d_step = 0; d_step < D; d_step += TK) {
+                        for (int i = lid; i < TK * BK; i += WG_SIZE) {
+                            const int r = i / BK;
+                            const int c = i % BK;
+                            const int k_pos = k_tile + c;
+                            const int d_pos = d_step + r;
+                            Ks[i] = (k_pos < kv_len && d_pos < D) ? K_ptr[static_cast<size_t>(k_pos) * (KV * D) + kv_h * D + d_pos] : bf16(0.0f);
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> a_mat;
+                        joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::row_major> b_mat;
+                        joint_matrix_load(sg, a_mat, local_ptr(Qs.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * D + d_step), D);
+                        joint_matrix_load(sg, b_mat, local_ptr(Ks.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_col * TN)), BK);
+                        joint_matrix_mad(sg, s_mat, a_mat, b_mat, s_mat);
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    float* s_out = Slm_out.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * BK + (sg_col * TN);
+                    joint_matrix_store(sg, s_mat, local_ptr(s_out), BK, layout::row_major);
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int i = lid; i < BM * BK; i += WG_SIZE) {
+                        const int r = i / BK;
+                        const int c = i % BK;
+                        if (k_tile + c < kv_len) {
+                            S_scores[r * stride_s + (k_tile + c)] = bf16(Slm_out[i]);
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Phase 2: Mask + Softmax per row in S_scores -> in-place P_probs
+                for (int r = lid; r < BM; r += WG_SIZE) {
+                    const int q_pos = q_start + r;
+                    if (q_pos < q_len) {
+                        const float* mrow = Mask_ptr + static_cast<size_t>(q_pos) * kv_len;
+                        float max_val = -1.0e30f;
+                        for (int k = 0; k < kv_len; ++k) {
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
+                            max_val = sycl::max(max_val, s);
+                        }
+                        float sum = 0.0f;
+                        for (int k = 0; k < kv_len; ++k) {
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
+                            const float diff = s - max_val;
+                            const float e = (diff > -80.0f) ? sycl::exp(diff) : 0.0f;
+                            sum += e;
+                        }
+                        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+                        for (int k = 0; k < kv_len; ++k) {
+                            float s = static_cast<float>(S_scores[r * stride_s + k]) + mrow[k];
+                            const float diff = s - max_val;
+                            const float e = (diff > -80.0f) ? sycl::exp(diff) : 0.0f;
+                            S_scores[r * stride_s + k] = bf16(e * inv_sum);
+                        }
+                        for (int k = kv_len; k < stride_s; ++k) {
+                            S_scores[r * stride_s + k] = bf16(0.0f);
+                        }
+                    } else {
+                        for (int k = 0; k < stride_s; ++k) {
+                            S_scores[r * stride_s + k] = bf16(0.0f);
+                        }
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Phase 3: Out[BM, D] = S_scores[BM, kv_len] @ V[kv_len, D]
+                for (int d_tile = 0; d_tile < D; d_tile += BD) {
+                    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> out_mat;
+                    joint_matrix_fill(sg, out_mat, 0.0f);
+
+                    for (int m_step = 0; m_step < kv_len; m_step += TK) {
+                        for (int i = lid; i < TK * BD; i += WG_SIZE) {
+                            const int r = i / BD;
+                            const int c = i % BD;
+                            const int v_pos = m_step + r;
+                            const int d_pos = d_tile + c;
+                            Vs[i] = (v_pos < kv_len && d_pos < D) ? V_ptr[static_cast<size_t>(v_pos) * (KV * D) + kv_h * D + d_pos] : bf16(0.0f);
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> a_mat;
+                        joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::row_major> b_mat;
+                        joint_matrix_load(sg, a_mat, local_ptr(S_scores.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * stride_s + m_step), stride_s);
+                        joint_matrix_load(sg, b_mat, local_ptr(Vs.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_col * TN)), BD);
+                        joint_matrix_mad(sg, out_mat, a_mat, b_mat, out_mat);
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    float* o_out = Slm_out.get_multi_ptr<sycl::access::decorated::no>().get() + (sg_row * TM) * BD + (sg_col * TN);
+                    joint_matrix_store(sg, out_mat, local_ptr(o_out), BD, layout::row_major);
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int i = lid; i < BM * BD; i += WG_SIZE) {
+                        const int r = i / BD;
+                        const int c = i % BD;
+                        const int q_pos = q_start + r;
+                        const int d_pos = d_tile + c;
+                        if (q_pos < q_len && d_pos < D) {
+                            Out_ptr[static_cast<size_t>(q_pos) * (H * D) + h * D + d_pos] = bf16(Slm_out[i]);
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+            });
+    });
+}
+
+} // namespace
+
+void attention_prefill_masked(Context& ctx,
+                              Tensor& q, Tensor& k, Tensor& v,
+                              Tensor& mask, Tensor& output,
+                              Tensor& scores_buf,
+                              int q_len, int kv_len,
+                              int num_heads, int num_kv_heads,
+                              int head_dim) {
+    if (num_heads <= 0 || num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
+        throw std::runtime_error(
+            "attention_prefill_masked: invalid head configuration");
+    }
+
+    static const bool fused_xmx =
+        aila::env::read_flag("AILA_DG_FUSED_ATTN", false);
+    if (fused_xmx && kv_len <= 384 && head_dim == 256 &&
+        num_heads == 16 && num_kv_heads == 8) {
+        run_fused_masked_attention_xmx(
+            ctx.queue(),
+            q.data_as<bf16>(),
+            k.data_as<bf16>(),
+            v.data_as<bf16>(),
+            mask.data_as<float>(),
+            output.data_as<bf16>(),
+            q_len, kv_len, num_heads, num_kv_heads, head_dim);
+        return;
+    }
+
+    const int groups = num_heads / num_kv_heads;
+
+    auto& cache = masked_attn_prims();
+    MaskedAttnKey key{q_len, kv_len, num_heads, num_kv_heads, head_dim};
+    auto& prims = cache[key];
+    if (!prims.inited) {
+        prims.inited = true;
+        prims.q = ctx.queue();
+        prims.expanded_q = sycl::malloc_device<bf16>(
+            static_cast<size_t>(num_heads) * q_len * head_dim, ctx.queue());
+        prims.expanded_k = sycl::malloc_device<bf16>(
+            static_cast<size_t>(num_heads) * head_dim * kv_len, ctx.queue());
+        prims.expanded_v = sycl::malloc_device<bf16>(
+            static_cast<size_t>(num_heads) * kv_len * head_dim, ctx.queue());
+        prims.probs_bf16 = sycl::malloc_device<bf16>(
+            static_cast<size_t>(num_heads) * q_len * kv_len, ctx.queue());
+        prims.attn_tmp = sycl::malloc_device<bf16>(
+            static_cast<size_t>(num_heads) * q_len * head_dim, ctx.queue());
+
+        prims.qk_src_md = dnnl::memory::desc(
+            {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.qk_w_md = dnnl::memory::desc(
+            {num_heads, head_dim, kv_len}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.qk_dst_md = dnnl::memory::desc(
+            {num_heads, q_len, kv_len}, dnnl::memory::data_type::f32,
+            dnnl::memory::format_tag::abc);
+        prims.pv_src_md = dnnl::memory::desc(
+            {num_heads, q_len, kv_len}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.pv_w_md = dnnl::memory::desc(
+            {num_heads, kv_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+        prims.pv_dst_md = dnnl::memory::desc(
+            {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
+            dnnl::memory::format_tag::abc);
+
+        auto qk_pd = dnnl::matmul::primitive_desc(
+            ctx.engine(), prims.qk_src_md, prims.qk_w_md, prims.qk_dst_md);
+        prims.qk_prim = dnnl::matmul(qk_pd);
+        auto pv_pd = dnnl::matmul::primitive_desc(
+            ctx.engine(), prims.pv_src_md, prims.pv_w_md, prims.pv_dst_md);
+        prims.pv_prim = dnnl::matmul(pv_pd);
+    }
+
+    Tensor expanded_q = Tensor::view(
+        ctx, prims.expanded_q, {num_heads, q_len, head_dim},
+        dnnl::memory::data_type::bf16);
+    Tensor expanded_k = Tensor::view(
+        ctx, prims.expanded_k, {num_heads, head_dim, kv_len},
+        dnnl::memory::data_type::bf16);
+    Tensor expanded_v = Tensor::view(
+        ctx, prims.expanded_v, {num_heads, kv_len, head_dim},
+        dnnl::memory::data_type::bf16);
+    Tensor probs_bf16 = Tensor::view(
+        ctx, prims.probs_bf16, {num_heads, q_len, kv_len},
+        dnnl::memory::data_type::bf16);
+    Tensor attn_tmp = Tensor::view(
+        ctx, prims.attn_tmp, {num_heads, q_len, head_dim},
+        dnnl::memory::data_type::bf16);
+    AILA_LOG_DEBUG("[Attn] buffers q=%d t=%d h=%d kv=%d d=%d", q_len, kv_len,
+                   num_heads, num_kv_heads, head_dim);
+
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* eq_ptr = static_cast<bf16*>(expanded_q.data());
+    bf16* ek_ptr = static_cast<bf16*>(expanded_k.data());
+    bf16* ev_ptr = static_cast<bf16*>(expanded_v.data());
+    const int kv_dim = num_kv_heads * head_dim;
+
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int total = num_heads * q_len * head_dim;
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int qq = (static_cast<int>(idx[0]) / head_dim) % q_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * q_len);
+            (void)total;
+            const int src_q = qq * (num_heads * head_dim) + h * head_dim + d;
+            eq_ptr[(static_cast<size_t>(h) * q_len + qq) * head_dim + d] =
+                q_ptr[src_q];
+        });
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * kv_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int t = (static_cast<int>(idx[0]) / head_dim) % kv_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * kv_len);
+            const int kv_h = h / groups;
+            const int src_idx = t * kv_dim + kv_h * head_dim + d;
+            ek_ptr[(static_cast<size_t>(h) * head_dim + d) * kv_len + t] =
+                k_ptr[src_idx];
+            ev_ptr[idx[0]] = v_ptr[src_idx];
+        });
+    AILA_LOG_DEBUG("[Attn] expand submitted");
+
+    AILA_LOG_DEBUG("[Attn] prims ready");
+
+    dnnl::memory q_mem = expanded_q.make_dnnl_memory(prims.qk_src_md);
+    dnnl::memory k_mem = expanded_k.make_dnnl_memory(prims.qk_w_md);
+    dnnl::memory scores_mem = scores_buf.make_dnnl_memory(prims.qk_dst_md);
+    prims.qk_prim.execute(ctx.stream(),
+                          {{DNNL_ARG_SRC, q_mem},
+                           {DNNL_ARG_WEIGHTS, k_mem},
+                           {DNNL_ARG_DST, scores_mem}});
+    AILA_LOG_DEBUG("[Attn] qk executed");
+
+    float* scores_ptr = static_cast<float*>(scores_buf.data());
+    const float* mask_ptr = static_cast<const float*>(mask.data());
+    bf16* probs_ptr = static_cast<bf16*>(probs_bf16.data());
+
+    // Apply mask, softmax over kv_len in fp32, write bf16 probabilities.
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len),
+        [=](sycl::id<1> idx) {
+            const int h = static_cast<int>(idx[0]) / q_len;
+            const int q = static_cast<int>(idx[0]) % q_len;
+            float* row = scores_ptr +
+                         (static_cast<size_t>(h) * q_len + q) * kv_len;
+            const float* mrow = mask_ptr + static_cast<size_t>(q) * kv_len;
+
+            float max_score = -1.0e30f;
+            for (int t = 0; t < kv_len; ++t) {
+                // torch.matmul(bf16, bf16) returns bf16 in the trusted
+                // DiffusionGemma implementation. oneDNN accumulates into our
+                // f32 destination, so explicitly apply the observable bf16
+                // output rounding before the fp32 softmax.
+                const float s = static_cast<float>(bf16(row[t])) + mrow[t];
+                row[t] = s;
+                max_score = std::max(max_score, s);
+            }
+            float sum = 0.0f;
+            for (int t = 0; t < kv_len; ++t) {
+                sum += std::exp(row[t] - max_score);
+            }
+            const float inv_sum = 1.0f / sum;
+            bf16* prow = probs_ptr +
+                         (static_cast<size_t>(h) * q_len + q) * kv_len;
+            for (int t = 0; t < kv_len; ++t) {
+                prow[t] = bf16(std::exp(row[t] - max_score) * inv_sum);
+            }
+        });
+    AILA_LOG_DEBUG("[Attn] softmax submitted");
+
+    dnnl::memory probs_mem = probs_bf16.make_dnnl_memory(prims.pv_src_md);
+    dnnl::memory v_mem = expanded_v.make_dnnl_memory(prims.pv_w_md);
+    dnnl::memory attn_mem = attn_tmp.make_dnnl_memory(prims.pv_dst_md);
+    prims.pv_prim.execute(ctx.stream(),
+                          {{DNNL_ARG_SRC, probs_mem},
+                           {DNNL_ARG_WEIGHTS, v_mem},
+                           {DNNL_ARG_DST, attn_mem}});
+    AILA_LOG_DEBUG("[Attn] pv executed");
+
+    bf16* attn_ptr = static_cast<bf16*>(attn_tmp.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    const int q_dim = num_heads * head_dim;
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(num_heads) * q_len * head_dim),
+        [=](sycl::id<1> idx) {
+            const int total = num_heads * q_len * head_dim;
+            const int d = static_cast<int>(idx[0]) % head_dim;
+            const int q = (static_cast<int>(idx[0]) / head_dim) % q_len;
+            const int h = static_cast<int>(idx[0]) / (head_dim * q_len);
+            out_ptr[static_cast<size_t>(q) * q_dim +
+                    static_cast<size_t>(h) * head_dim + d] =
+                attn_ptr[(static_cast<size_t>(h) * q_len + q) * head_dim + d];
+            (void)total;
+        });
 }
 
 } // namespace ops

@@ -1,5 +1,6 @@
 #include "Ops.hpp"
 #include "../utils/EnvUtils.hpp"
+#include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -29,7 +30,8 @@ uint64_t fused_linear_key(int seq_len, dnnl::memory::data_type bias_dtype) {
 // Linear 层实现 (oneDNN MatMul)
 // ============================================================
 
-void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_features, bool preprocessed) {
+void Linear::init(Context& ctx, Tensor& weight, int in_features,
+                  int out_features, bool preprocessed, bool prepare_gemv) {
     weight_ = &weight;
     in_features_ = in_features;
     out_features_ = out_features;
@@ -38,7 +40,7 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     // Pre-transpose weight to [M, K] for native GEMV kernel (contiguous access).
     // The standard "preprocessed" weight is [K, M] row-major for oneDNN.
     // We store a [M, K] copy so the GEMV kernel can read weight rows contiguously.
-    if (preprocessed && in_features > 0 && out_features > 0) {
+    if (preprocessed && prepare_gemv && in_features > 0 && out_features > 0) {
         gemv_weight_ = Tensor::allocate(ctx, {out_features, in_features});
         ops::transpose(ctx, weight, gemv_weight_);
         ctx.synchronize();
@@ -61,6 +63,11 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features, int out_feature
     decode_prim_ = dnnl::matmul(pd);
     size_t scratchpad_size = pd.scratchpad_desc().get_size();
     if (scratchpad_size > 0) {
+        if (scratchpad_size > 8 * 1024 * 1024) {
+            AILA_LOG_INFO("[Linear] decode scratchpad in=%d out=%d size=%.1f MB",
+                          in_features, out_features,
+                          scratchpad_size / (1024.0 * 1024.0));
+        }
         decode_scratchpad_ = Tensor::allocate(ctx,
                                               {static_cast<int64_t>(scratchpad_size)},
                                               dnnl::memory::data_type::u8);
@@ -99,6 +106,63 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
         cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
     }
     prim_cache_.emplace(seq_len, std::move(cp));
+}
+
+void Linear::ensure_primitive_f32(Context& ctx, int seq_len) {
+    if (prim_cache_f32_.count(seq_len)) {
+        return;
+    }
+    auto src_md = dnnl::memory::desc({seq_len, in_features_},
+                                     dnnl::memory::data_type::bf16,
+                                     dnnl::memory::format_tag::ab);
+    dnnl::memory::desc weight_md =
+        linear_weight_md(preprocessed_, in_features_, out_features_);
+    auto dst_md = dnnl::memory::desc({seq_len, out_features_},
+                                     dnnl::memory::data_type::f32,
+                                     dnnl::memory::format_tag::ab);
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md,
+                                           dst_md, attr);
+    CachedPrimitive cp;
+    cp.prim = dnnl::matmul(pd);
+    cp.src_md = src_md;
+    cp.weight_md = weight_md;
+    cp.dst_md = dst_md;
+    size_t scratchpad_size = pd.scratchpad_desc().get_size();
+    if (scratchpad_size > 0) {
+        cp.scratchpad = Tensor::allocate(
+            ctx, {static_cast<int64_t>(scratchpad_size)},
+            dnnl::memory::data_type::u8);
+        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(
+            pd.scratchpad_desc());
+    }
+    prim_cache_f32_.emplace(seq_len, std::move(cp));
+}
+
+void Linear::forward_f32(Context& ctx, Tensor& input, Tensor& output,
+                         int seq_len) {
+    ensure_primitive_f32(ctx, seq_len);
+    auto& cp = prim_cache_f32_[seq_len];
+    if (!cp.mem_inited) {
+        cp.src_mem = input.make_dnnl_memory(cp.src_md);
+        cp.weight_mem = weight_->make_dnnl_memory(cp.weight_md);
+        cp.dst_mem = output.make_dnnl_memory(cp.dst_md);
+        cp.mem_inited = true;
+        cp.src_ptr = input.data();
+        cp.weight_ptr = weight_->data();
+        cp.dst_ptr = output.data();
+        cp.args = {{DNNL_ARG_SRC, cp.src_mem},
+                   {DNNL_ARG_WEIGHTS, cp.weight_mem},
+                   {DNNL_ARG_DST, cp.dst_mem}};
+        if (cp.scratchpad.valid()) {
+            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
+        }
+    }
+    cp.src_mem.set_data_handle(input.data());
+    cp.weight_mem.set_data_handle(weight_->data());
+    cp.dst_mem.set_data_handle(output.data());
+    cp.prim.execute(ctx.stream(), cp.args);
 }
 
 void Linear::ensure_bias_primitive(Context& ctx, int seq_len,

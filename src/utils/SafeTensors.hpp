@@ -65,19 +65,26 @@ struct Bnb4BitWeightRef {
 
     bool valid() const {
         return packed_weight != nullptr && absmax != nullptr && quant_map != nullptr &&
-               packed_quant_state != nullptr && quant_state.shape.size() == 2;
+               (quant_state.shape.size() == 2 || quant_state.shape.size() == 3);
     }
 
     int64_t logical_out_features() const {
+        if (quant_state.shape.size() == 3) {
+            return quant_state.shape[0] * quant_state.shape[1];
+        }
         return quant_state.shape.size() > 0 ? quant_state.shape[0] : 0;
     }
 
     int64_t logical_in_features() const {
-        return quant_state.shape.size() > 1 ? quant_state.shape[1] : 0;
+        return quant_state.shape.size() > 0 ? quant_state.shape.back() : 0;
     }
 
     int64_t logical_numel() const {
-        return logical_out_features() * logical_in_features();
+        int64_t numel = 1;
+        for (int64_t dim : quant_state.shape) {
+            numel *= dim;
+        }
+        return numel;
     }
 
     int64_t packed_num_bytes() const {
@@ -143,7 +150,8 @@ bool LoadBnb4BitWeightRef(Context& ctx,
                           ModelWeights& weights,
                           const std::string& name,
                           Bnb4BitWeightRef& out,
-                          std::string* error_message = nullptr);
+                          std::string* error_message = nullptr,
+                          int64_t in_features_hint = 0);
 
 // 内部工具函数
 std::vector<std::string> ParseHeader(const std::string& header,

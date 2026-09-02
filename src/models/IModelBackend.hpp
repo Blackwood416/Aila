@@ -61,5 +61,42 @@ public:
         (void)text_pos_delta;
     }
     virtual void clear_mrope_positions() {}
+
+    // Block-diffusion generation support (DiffusionGemma).
+    virtual bool supports_block_diffusion() const { return false; }
+    // Causal encoder prefill/decode: embeds tokens, runs all layers, appends
+    // K/V to the internal cache. No logits are produced.
+    virtual bool diffusion_encode(Context& ctx, const int* token_ids_device,
+                                  int seq_len, std::string* error_message) {
+        (void)ctx;
+        (void)token_ids_device;
+        (void)seq_len;
+        if (error_message) {
+            *error_message = "block diffusion is not supported by this backend";
+        }
+        return false;
+    }
+    // Bidirectional canvas decode over [cached KV + canvas KV]. Reads the KV
+    // cache without writing; returns softcapped fp32 logits [canvas_len, vocab].
+    virtual Tensor& diffusion_decode_canvas(
+        Context& ctx, const int* canvas_ids_device,
+        const sycl::ext::oneapi::bfloat16* sc_embeds_device, int canvas_len) {
+        (void)ctx;
+        (void)canvas_ids_device;
+        (void)sc_embeds_device;
+        (void)canvas_len;
+        throw std::runtime_error(
+            "block diffusion is not supported by this backend");
+    }
+    // Computes soft embeddings = softmax(logits) @ embed^T * embed_scale
+    // (bf16). logits: [canvas_len, vocab] fp32; out: [canvas_len, hidden] bf16.
+    virtual Tensor& diffusion_compute_soft_embeds(
+        Context& ctx, Tensor& logits_f32, int canvas_len) {
+        (void)ctx;
+        (void)logits_f32;
+        (void)canvas_len;
+        throw std::runtime_error(
+            "block diffusion is not supported by this backend");
+    }
 };
 

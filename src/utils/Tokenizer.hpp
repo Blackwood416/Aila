@@ -59,6 +59,10 @@ public:
     }
 
 private:
+    // tokenizer.json BPE dialect. Qwen uses GPT-2 byte-to-unicode, while
+    // Gemma uses a SentencePiece-style space marker plus byte fallback.
+    bool sentencepiece_bpe_ = false;
+
     // 词表
     std::unordered_map<std::string, int> token_to_id_;
     std::vector<std::string> id_to_token_;
@@ -94,6 +98,8 @@ private:
 
     // 将单个 word 拆分为字符级别 token
     std::vector<std::string> split_to_chars(const std::string& word) const;
+
+    std::vector<std::string> pretokenize_sentencepiece(const std::string& text) const;
 
     // Byte-to-unicode 映射 (GPT-2 / Qwen 风格)
     static std::unordered_map<uint8_t, std::string> byte_to_unicode();

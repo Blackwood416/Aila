@@ -215,12 +215,19 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
         size_t total_bytes = 0;
         int success = 0;
         int fail = 0;
+        int skipped = 0;
 
         for (const auto& name : layer_names) {
             const auto& meta = metadata[name];
             try {
+                const size_t bytes = meta.byte_offset_end - meta.byte_offset_start;
+                if (bytes == 0) {
+                    // Zero-byte tensors are metadata placeholders (e.g. bnb
+                    // quant_state markers); they carry no payload.
+                    skipped++;
+                    continue;
+                }
                 Tensor t = LoadTensorToGPU(tensor_data_start, meta, ctx);
-                size_t bytes = meta.byte_offset_end - meta.byte_offset_start;
                 total_bytes += bytes;
                 weights.put(name, std::move(t));
                 success++;
@@ -233,6 +240,7 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
         AILA_LOG_INFO("[SafeTensors] Loaded %d tensors (%.2f MB) to GPU%s",
                       success, total_bytes / (1024.0 * 1024.0),
                       (fail > 0 ? (" , " + std::to_string(fail) + " failed").c_str() : ""));
+        AILA_LOG_INFO("[SafeTensors] Skipped %d zero-byte metadata tensors", skipped);
 
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[SafeTensors] Load failed: %s", e.what());
@@ -354,6 +362,62 @@ bool parse_bnb_4bit_quant_state_json(const std::string& json_text,
     }
 }
 
+// Bitsandbytes checkpoints exported by recent transformers/bnb store an empty
+// `quant_state.bitsandbytes__nf4` tensor and rely on the side tensors
+// (absmax / nested_absmax / nested_quant_map / quant_map) to reconstruct the
+// quant state. Blocksize and nested blocksize are derived from tensor shapes.
+bool infer_bnb_4bit_quant_state(Bnb4BitWeightRef& out,
+                                int64_t in_features_hint,
+                                std::string* error_message) {
+    const int64_t packed_numel = out.packed_num_bytes();
+    const int64_t absmax_count = out.absmax ? out.absmax->numel() : 0;
+    const int64_t logical_numel = packed_numel * 2;
+    if (packed_numel <= 0 || absmax_count <= 0 || logical_numel <= 0) {
+        set_error(error_message,
+                  "bitsandbytes packed weight or absmax is empty: " + out.name);
+        return false;
+    }
+    if (logical_numel % absmax_count != 0) {
+        set_error(error_message,
+                  "cannot infer bitsandbytes blocksize from tensor shapes: " +
+                      out.name);
+        return false;
+    }
+    const int64_t blocksize = logical_numel / absmax_count;
+    if (blocksize <= 0 || blocksize > 4096 || (blocksize & (blocksize - 1)) != 0) {
+        set_error(error_message,
+                  "invalid inferred bitsandbytes blocksize for weight: " + out.name);
+        return false;
+    }
+    if (in_features_hint <= 0 || logical_numel % in_features_hint != 0) {
+        set_error(error_message,
+                  "cannot infer bitsandbytes weight shape without a valid "
+                  "in_features hint: " + out.name);
+        return false;
+    }
+
+    out.quant_state = {};
+    out.quant_state.quant_type = "nf4";
+    out.quant_state.dtype = "uint8";
+    out.quant_state.blocksize = static_cast<int>(blocksize);
+    out.quant_state.shape = {logical_numel / in_features_hint, in_features_hint};
+
+    if (out.nested_absmax != nullptr && out.nested_quant_map != nullptr) {
+        const int64_t nested_count = out.nested_absmax->numel();
+        if (nested_count <= 0 || absmax_count % nested_count != 0) {
+            set_error(error_message,
+                      "cannot infer bitsandbytes nested blocksize for weight: " +
+                          out.name);
+            return false;
+        }
+        out.quant_state.nested = true;
+        out.quant_state.nested_blocksize = static_cast<int>(absmax_count / nested_count);
+        out.quant_state.nested_dtype = "uint8";
+        out.quant_state.nested_offset = 0.0f;
+    }
+    return true;
+}
+
 std::vector<std::string> parse_sharded_safetensors_index(const std::string& index_path) {
     std::string text = read_text_file(index_path);
     if (text.empty()) {
@@ -392,7 +456,8 @@ bool LoadBnb4BitWeightRef(Context& ctx,
                           ModelWeights& weights,
                           const std::string& name,
                           Bnb4BitWeightRef& out,
-                          std::string* error_message) {
+                          std::string* error_message,
+                          int64_t in_features_hint) {
     out = {};
     out.name = name;
 
@@ -407,7 +472,7 @@ bool LoadBnb4BitWeightRef(Context& ctx,
     const std::string nested_quant_map_name = name + ".nested_quant_map";
     const std::string packed_quant_state_name = name + ".quant_state.bitsandbytes__nf4";
 
-    if (!weights.has(absmax_name) || !weights.has(quant_map_name) || !weights.has(packed_quant_state_name)) {
+    if (!weights.has(absmax_name) || !weights.has(quant_map_name)) {
         set_error(error_message,
                   "Missing required bitsandbytes side tensors for weight: " + name);
         return false;
@@ -416,7 +481,9 @@ bool LoadBnb4BitWeightRef(Context& ctx,
     out.packed_weight = &weights.get(name);
     out.absmax = &weights.get(absmax_name);
     out.quant_map = &weights.get(quant_map_name);
-    out.packed_quant_state = &weights.get(packed_quant_state_name);
+    out.packed_quant_state = weights.has(packed_quant_state_name)
+                                 ? &weights.get(packed_quant_state_name)
+                                 : nullptr;
     if (weights.has(nested_absmax_name)) {
         out.nested_absmax = &weights.get(nested_absmax_name);
     }
@@ -432,7 +499,8 @@ bool LoadBnb4BitWeightRef(Context& ctx,
         set_error(error_message, "bitsandbytes quant_map must be float32: " + quant_map_name);
         return false;
     }
-    if (out.packed_quant_state->dtype() != dnnl::memory::data_type::u8) {
+    if (out.packed_quant_state &&
+        out.packed_quant_state->dtype() != dnnl::memory::data_type::u8) {
         set_error(error_message, "bitsandbytes packed quant_state must be uint8: " + packed_quant_state_name);
         return false;
     }
@@ -442,10 +510,22 @@ bool LoadBnb4BitWeightRef(Context& ctx,
         return false;
     }
 
-    std::string packed_state_json(static_cast<size_t>(out.packed_quant_state->numel()), '\0');
-    ctx.memcpy_d2h(packed_state_json.data(), out.packed_quant_state->data(), packed_state_json.size());
-    if (!parse_bnb_4bit_quant_state_json(packed_state_json, out.quant_state, error_message)) {
-        return false;
+    if (out.packed_quant_state == nullptr ||
+        out.packed_quant_state->numel() == 0) {
+        // Modern bnb export: quant_state tensor is empty; derive metadata from
+        // the side tensors.
+        if (!infer_bnb_4bit_quant_state(out, in_features_hint, error_message)) {
+            return false;
+        }
+    } else {
+        std::string packed_state_json(
+            static_cast<size_t>(out.packed_quant_state->numel()), '\0');
+        ctx.memcpy_d2h(packed_state_json.data(), out.packed_quant_state->data(),
+                       packed_state_json.size());
+        if (!parse_bnb_4bit_quant_state_json(packed_state_json, out.quant_state,
+                                             error_message)) {
+            return false;
+        }
     }
 
     if (!out.valid()) {

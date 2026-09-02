@@ -36,21 +36,28 @@ void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
                         int rotary_dim, float theta, bool interleaved,
                         const int* pos_t, const int* pos_h, const int* pos_w,
                         int prompt_pos_len, int text_pos_delta,
-                        int mrope_section_t, int mrope_section_h, int mrope_section_w) {
+                        int mrope_section_t, int mrope_section_h, int mrope_section_w,
+                        bool proportional) {
     bf16* q_ptr = static_cast<bf16*>(q.data());
     bf16* k_ptr = static_cast<bf16*>(k.data());
     int q_dim = num_heads_q * head_dim;
     int k_dim = num_kv_heads * head_dim;
     int rot = std::max(2, std::min(head_dim, rotary_dim));
     if (rot & 1) --rot;
-    int half_dim = rot / 2;
+    const int active_half_dim = rot / 2;
+    // Proportional RoPE (Gemma 4 full attention) keeps a full-head cos/sin
+    // vector with zero frequencies in the non-rotary portion. rotate_half()
+    // therefore pairs the active prefix with the second half of the complete
+    // head, not with the second half of the rotary prefix.
+    const int pair_offset = proportional ? head_dim / 2 : active_half_dim;
+    const int frequency_dim = proportional ? head_dim : rot;
 
-    ctx.queue().parallel_for(sycl::range<2>(seq_len, num_heads_q * half_dim),
+    ctx.queue().parallel_for(sycl::range<2>(seq_len, num_heads_q * active_half_dim),
         [=](sycl::id<2> idx) {
             int s = idx[0];
             int flat = idx[1];
-            int h = flat / half_dim;   
-            int d = flat % half_dim;   
+            int h = flat / active_half_dim;
+            int d = flat % active_half_dim;
             int global_pos = start_pos + s;
             int pos_scalar = global_pos;
             if (global_pos >= prompt_pos_len) {
@@ -77,14 +84,15 @@ void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
                 else position_value = static_cast<float>(t_val);
             }
 
-            float freq = 1.0f / sycl::pow(theta, (2.0f * d) / static_cast<float>(rot));
+            float freq = 1.0f / sycl::pow(
+                theta, (2.0f * d) / static_cast<float>(frequency_dim));
             float angle = position_value * freq;
             float cos_val = sycl::cos(angle);
             float sin_val = sycl::sin(angle);
 
             int q_base = s * q_dim + h * head_dim;
             int q_i0 = d;
-            int q_i1 = d + half_dim;
+            int q_i1 = d + pair_offset;
             float q0 = static_cast<float>(q_ptr[q_base + q_i0]);
             float q1 = static_cast<float>(q_ptr[q_base + q_i1]);
             q_ptr[q_base + q_i0] = bf16(q0 * cos_val - q1 * sin_val);
@@ -93,7 +101,7 @@ void apply_rope_partial(Context& ctx, Tensor& q, Tensor& k,
             if (h < num_kv_heads) {
                 int k_base = s * k_dim + h * head_dim;
                 int k_i0 = d;
-                int k_i1 = d + half_dim;
+                int k_i1 = d + pair_offset;
                 float k0 = static_cast<float>(k_ptr[k_base + k_i0]);
                 float k1 = static_cast<float>(k_ptr[k_base + k_i1]);
                 k_ptr[k_base + k_i0] = bf16(k0 * cos_val - k1 * sin_val);
@@ -488,6 +496,82 @@ void gelu_tanh_inplace(Context& ctx, Tensor& input, int n) {
             float x = static_cast<float>(ptr[i]);
             float u = kAlpha * (x + 0.044715f * x * x * x);
             ptr[i] = bf16(0.5f * x * (1.0f + sycl::tanh(u)));
+        });
+}
+
+void gelu_tanh_gate_mul(Context& ctx, Tensor& gate, Tensor& up,
+                        Tensor& output, int n) {
+    bf16* gate_ptr = static_cast<bf16*>(gate.data());
+    bf16* up_ptr = static_cast<bf16*>(up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            const float g = static_cast<float>(gate_ptr[i]);
+            const float u = static_cast<float>(up_ptr[i]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
+}
+
+void gelu_tanh_gate_up_mul_fused(Context& ctx, Tensor& gate_up,
+                                 Tensor& output, int rows, int inter_dim) {
+    const bf16* gu_ptr = static_cast<const bf16*>(gate_up.data());
+    bf16* out_ptr = static_cast<bf16*>(output.data());
+    constexpr float kAlpha = 0.7978845608028654f;
+    if (inter_dim % 8 == 0) {
+        const int inter_vec = inter_dim / 8;
+        const int total_vec = rows * inter_vec;
+        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total_vec)),
+            [=](sycl::id<1> idx) {
+                const int i = static_cast<int>(idx[0]);
+                const int r = i / inter_vec;
+                const int c_vec = i % inter_vec;
+                const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+                auto g_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gu_ptr + gu_offset + c_vec * 8);
+                auto u_v = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gu_ptr + gu_offset + inter_dim + c_vec * 8);
+                sycl::vec<bf16, 8> out_v;
+                #pragma unroll
+                for (int v_idx = 0; v_idx < 8; ++v_idx) {
+                    const float g = static_cast<float>(g_v[v_idx]);
+                    const float u = static_cast<float>(u_v[v_idx]);
+                    const float v = kAlpha * (g + 0.044715f * g * g * g);
+                    out_v[v_idx] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+                }
+                *reinterpret_cast<sycl::vec<bf16, 8>*>(out_ptr + static_cast<size_t>(i) * 8) = out_v;
+            });
+        return;
+    }
+    const int total = rows * inter_dim;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(total)),
+        [=](sycl::id<1> idx) {
+            const int i = static_cast<int>(idx[0]);
+            const int r = i / inter_dim;
+            const int c = i % inter_dim;
+            const size_t gu_offset = static_cast<size_t>(r) * (2 * inter_dim);
+            const float g = static_cast<float>(gu_ptr[gu_offset + c]);
+            const float u = static_cast<float>(gu_ptr[gu_offset + inter_dim + c]);
+            const float v = kAlpha * (g + 0.044715f * g * g * g);
+            out_ptr[i] = bf16(0.5f * g * (1.0f + sycl::tanh(v)) * u);
+        });
+}
+
+void scale_inplace(Context& ctx, Tensor& input, float scale, int n) {
+    bf16* ptr = static_cast<bf16*>(input.data());
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            ptr[i] = bf16(static_cast<float>(ptr[i]) * scale);
+        });
+}
+
+void logit_softcap_inplace(Context& ctx, Tensor& input, float cap, int n) {
+    float* ptr = static_cast<float*>(input.data());
+    ctx.queue().parallel_for(sycl::range<1>(n),
+        [=](sycl::id<1> idx) {
+            const int i = idx[0];
+            ptr[i] = sycl::tanh(ptr[i] / cap) * cap;
         });
 }
 

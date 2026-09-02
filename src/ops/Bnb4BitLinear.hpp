@@ -34,6 +34,10 @@ struct Bnb4BitLinearScratch {
 class Bnb4BitLinear {
 public:
     Bnb4BitLinear() = default;
+    Bnb4BitLinear(Bnb4BitLinear&& other) noexcept = default;
+    Bnb4BitLinear& operator=(Bnb4BitLinear&& other) noexcept = default;
+    Bnb4BitLinear(const Bnb4BitLinear&) = delete;
+    Bnb4BitLinear& operator=(const Bnb4BitLinear&) = delete;
 
     bool init(Context& ctx, const Bnb4BitWeightRef& weight, std::string* error_message = nullptr);
     bool init_fused_rows(Context& ctx,
@@ -134,4 +138,158 @@ private:
     std::vector<LoraAttachment> lora_attachments_;
     void apply_lora_decode(Context& ctx, Tensor& input, Tensor& output);
     void apply_lora_prefill(Context& ctx, Tensor& input, Tensor& output, int seq_len);
+};
+
+// Grouped Mixture-of-Experts over one packed NF4 tensor per layer.
+// Expert weights are stored concatenated along the row axis:
+//   gate_up rows: num_experts * 2 * moe_intermediate_size
+//   down    rows: num_experts * moe_intermediate_size
+// forward() is host-driven for v1 correctness: tokens are grouped by expert on
+// the host, per-expert rows are dequantized on the GPU, and per-group GEMMs
+// run through oneDNN.
+class Bnb4GroupedMoE {
+public:
+    bool init(Context& ctx, const Bnb4BitWeightRef& gate_up,
+              const Bnb4BitWeightRef& down, int hidden_size,
+              int moe_intermediate_size, int num_experts,
+              std::string* error_message = nullptr);
+
+    // input: [tokens * hidden_size] bf16 host
+    // expert_ids: [tokens * top_k] int (selected expert indices)
+    // expert_weights: [tokens * top_k] float (renormalized, per-expert scaled)
+    // output: [tokens * hidden_size] bf16 host
+    void forward(Context& ctx,
+                 const std::vector<sycl::ext::oneapi::bfloat16>& input,
+                 const std::vector<int>& expert_ids,
+                 const std::vector<float>& expert_weights,
+                 std::vector<sycl::ext::oneapi::bfloat16>& output,
+                 int tokens, int top_k);
+
+    // Batched-transfer MoE forward, numerically identical to forward().
+    // input is [tokens * hidden] bf16 on the device.  transfer is one
+    // device buffer with capacity [tokens * top_k, hidden] that aliases the
+    // gathered per-expert source rows and the per-expert down outputs (each
+    // expert uses a disjoint row range, and the in-order queue separates the
+    // read of a range from its later overwrite).  All expert groups share a
+    // single gather kernel and a single d2h instead of one blocking h2d/d2h
+    // pair per group.  token_ids_dev is [tokens * top_k] int32 scratch.
+    void forward_batched(Context& ctx, Tensor& input, Tensor& transfer,
+                         Tensor& token_ids_dev,
+                         const std::vector<int>& expert_ids,
+                         const std::vector<float>& expert_weights,
+                         std::vector<sycl::ext::oneapi::bfloat16>& output,
+                         int tokens, int top_k);
+    void forward_batched_impl(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights,
+        std::vector<sycl::ext::oneapi::bfloat16>& output, int tokens,
+        int top_k);
+
+    void forward_batched(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& weights_dev, Tensor& output,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+    void forward_batched_impl(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& weights_dev, Tensor& output,
+        const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+
+    // GPU-resident MoE forward.  input is [tokens * hidden] bf16 on the
+    // device; output is [tokens * hidden] bf16 on the device and is zeroed at
+    // the start.  The per-expert dequant and oneDNN matmul steps are the same
+    // as forward(); only the gather and the final bf16 accumulation move on
+    // device, preserving the sorted-expert accumulation order bitwise.
+    void forward_gpu(Context& ctx, Tensor& input, Tensor& output,
+                     const std::vector<int>& expert_ids,
+                     const std::vector<float>& expert_weights,
+                     int tokens, int top_k);
+
+    void forward_batched_gpu(
+        Context& ctx, Tensor& input, Tensor& transfer, Tensor& token_ids_dev,
+        Tensor& output, const std::vector<int>& expert_ids,
+        const std::vector<float>& expert_weights, int tokens, int top_k);
+
+    struct GroupInfo {
+        int expert_id;
+        int token_offset;
+        int token_count;
+    };
+
+    int hidden_size() const { return hidden_; }
+    int moe_intermediate_size() const { return moe_intermediate_; }
+    int num_experts() const { return num_experts_; }
+
+private:
+    struct ExpertWeightSet {
+        Bnb4BitWeightRef ref{};
+        bool ready = false;
+
+        bool init(Context& ctx, const Bnb4BitWeightRef& weight_ref,
+                  std::string* error_message);
+    };
+
+    struct MatmulPrim {
+        bool inited = false;
+        dnnl::matmul prim{};
+        dnnl::memory::desc src_md{};
+        dnnl::memory::desc w_md{};
+        dnnl::memory::desc dst_md{};
+    };
+
+    ExpertWeightSet gate_up_;
+    ExpertWeightSet down_;
+    int hidden_ = 0;
+    int moe_intermediate_ = 0;
+    int num_experts_ = 0;
+    int gate_up_in_features_ = 0;
+    int gate_up_rows_per_expert_ = 0;
+    int down_in_features_ = 0;
+    int down_rows_per_expert_ = 0;
+
+    std::unordered_map<uint64_t, MatmulPrim> prims_;
+    Tensor src_;
+    Tensor gate_up_out_;
+    Tensor proj_;
+    Tensor down_out_;
+    Tensor gate_up_w_;
+    Tensor down_w_;
+    Tensor tokens_dev_;
+    Tensor weights_dev_;
+
+
+
+    Tensor batched_gate_up_out_;
+    Tensor batched_proj_;
+    Tensor group_infos_dev_;
+    Tensor transfer_indices_dev_;
+    Tensor transfer_weights_dev_;
+    int accumulate_scratch_rows_ = 0;
+    int batched_scratch_rows_ = 0;
+    int batched_scratch_groups_ = 0;
+
+    // oneDNN memory handles from run_matmul must outlive their asynchronous
+    // executions on this A770/Level-Zero stack; destroying them while a batch
+    // of matmuls is still queued can deadlock the driver.  They are released
+    // only after the queue is drained.
+    std::vector<dnnl::memory> pending_memories_;
+    int scratch_rows_ = 0;
+    std::vector<int> route_counts_;
+    std::vector<int> route_offsets_;
+    std::vector<int> route_cursors_;
+    std::vector<int> route_token_ids_;
+    std::vector<float> route_weights_;
+    std::vector<int> active_experts_;
+    int route_max_rows_ = 0;
+
+    void build_route_layout(const std::vector<int>& expert_ids,
+                            const std::vector<float>& expert_weights,
+                            int tokens, int top_k);
+    void ensure_scratch(Context& ctx, int rows);
+    void run_matmul(Context& ctx, int rows, int in_n, int out_n,
+                    uint64_t prim_key, Tensor& src, Tensor& w, Tensor& dst);
+    static void dequant_subset(Context& ctx, const ExpertWeightSet& set,
+                               int expert, int rows_per_expert, Tensor& out);
 };

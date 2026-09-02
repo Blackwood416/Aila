@@ -173,6 +173,8 @@ set(LIB_SOURCES
     src/models/Qwen3ForceAlignerBackend.cpp
     src/models/Qwen3ForceAlignerBnb4Backend.cpp
     src/models/Qwen3TTSBackend.cpp
+    src/models/DiffusionGemmaBnb4Backend.cpp
+    src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
     src/utils/ModelSpec.cpp
@@ -384,6 +386,29 @@ target_include_directories(AilaYolo26InferRefAdapter PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
+
+add_executable(AilaDiffusionGemmaNf4InferRefAdapter
+    tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp)
+target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
+
+add_executable(AilaDiffusionGemmaModelSpecTests
+    tests/models/DiffusionGemmaModelSpecTests.cpp
+)
+target_compile_definitions(AilaDiffusionGemmaModelSpecTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaDiffusionGemmaModelSpecTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaDiffusionGemmaModelSpecTests PRIVATE AilaLib)
+add_test(NAME AilaDiffusionGemmaModelSpecTests COMMAND AilaDiffusionGemmaModelSpecTests)
 
 add_executable(AilaYolo26ModelSpecTests
     tests/vision/Yolo26ModelSpecTests.cpp

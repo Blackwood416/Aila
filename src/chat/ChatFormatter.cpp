@@ -88,6 +88,9 @@ bool ChatFormatter::render_text(const ChatFormatInput& input,
         } else if (input.family == ModelFamily::Qwen35Hybrid) {
             source = qwen35_fixed_chat_template();
             name = "qwen35-fixed-v20";
+        } else if (input.family == ModelFamily::DiffusionGemma) {
+            source = diffusion_gemma_text_chat_template();
+            name = "diffusion-gemma-text";
         } else if (!input.tokenizer_chat_template.empty()) {
             source = input.tokenizer_chat_template;
             name = "tokenizer_config";

@@ -5,6 +5,8 @@
 #include "../src/models/Qwen3DenseBackend.hpp"
 #include "../src/models/Qwen3Bnb4Backend.hpp"
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
+#include "../src/models/DiffusionGemmaBnb4Backend.hpp"
+#include "../src/generation/DiffusionGemmaGenerator.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
 #include "../src/models/Qwen3ASRBnb4Backend.hpp"
@@ -42,6 +44,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <random>
 #include <vector>
 #include <cctype>
 #include <fstream>
@@ -408,13 +411,18 @@ public:
                 }
                 return false;
             }
-            if (quant.bnb_4bit_quant_storage != "uint8") {
+            if (!quant.bnb_4bit_quant_storage.empty() &&
+                quant.bnb_4bit_quant_storage != "uint8") {
                 if (error_message) {
                     *error_message = "Only bitsandbytes uint8 packed storage is supported";
                 }
                 return false;
             }
-            if (quant.bnb_4bit_compute_dtype != "float16") {
+            const bool diffusion_gemma_bf16 =
+                spec.family == ModelFamily::DiffusionGemma &&
+                quant.bnb_4bit_compute_dtype == "bfloat16";
+            if (quant.bnb_4bit_compute_dtype != "float16" &&
+                !diffusion_gemma_bf16) {
                 if (error_message) {
                     *error_message = "On XPU, quantized bitsandbytes checkpoints must use bnb_4bit_compute_dtype=float16";
                 }
@@ -437,6 +445,9 @@ public:
                     }
                     return false;
                 }
+                return true;
+            }
+            if (spec.family == ModelFamily::DiffusionGemma) {
                 return true;
             }
             if (error_message) {
@@ -496,6 +507,25 @@ public:
                               model_spec_.classify_num,
                               config_.hidden_size, config_.num_hidden_layers,
                               model_spec_.audio.encoder_layers, model_spec_.audio.d_model);
+            } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                const auto& dg_cfg = model_spec_.diffusion_gemma.text;
+                config_.hidden_size = dg_cfg.hidden_size;
+                config_.num_hidden_layers = dg_cfg.num_hidden_layers;
+                config_.num_attention_heads = dg_cfg.num_attention_heads;
+                config_.num_key_value_heads = dg_cfg.num_key_value_heads;
+                config_.head_dim = dg_cfg.head_dim;
+                config_.intermediate_size = dg_cfg.intermediate_size;
+                config_.vocab_size = dg_cfg.vocab_size;
+                config_.max_position_embeddings = dg_cfg.max_position_embeddings;
+                config_.rms_norm_eps = dg_cfg.rms_norm_eps;
+                config_.tie_word_embeddings = dg_cfg.tie_word_embeddings;
+                config_.bos_token_id = dg_cfg.bos_token_id;
+                config_.eos_token_id = dg_cfg.eos_token_id;
+                AILA_LOG_INFO("[ModelSpec] model_type=%s family=diffusion_gemma text_hidden=%d layers=%d vocab=%d canvas=%d",
+                              model_spec_.model_type.c_str(),
+                              config_.hidden_size, config_.num_hidden_layers,
+                              config_.vocab_size,
+                              model_spec_.diffusion_gemma.canvas_length);
             } else {
                 config_ = model_spec_.qwen3;
                 AILA_LOG_INFO("[ModelSpec] model_type=%s family=qwen3_dense hidden=%d layers=%d vocab=%d",
@@ -528,6 +558,16 @@ public:
         // 4. Load model weights
         AILA_LOG_INFO("[4/4] Loading model weights...");
         weights_ = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(model_dir, *ctx_));
+
+        // DiffusionGemma v1 is text-only: release the vision tower and vision
+        // embedder weights (~2 GB) to keep the 16 GB A770 budget.
+        if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            auto vision_stats = weights_->erase_with_prefix("model.encoder.vision_tower");
+            auto embed_stats = weights_->erase_with_prefix("model.encoder.embed_vision");
+            AILA_LOG_INFO("[DiffusionGemma] Released vision weights (%zu tensors, %.1f MB)",
+                          vision_stats.count + embed_stats.count,
+                          (vision_stats.bytes + embed_stats.bytes) / (1024.0 * 1024.0));
+        }
 
         // 4.5. Load LoRA adapter (if provided)
         aila::lora::LoraAdapter lora_adapter;
@@ -573,6 +613,8 @@ public:
             } else {
                 backend_ = std::make_unique<Qwen3ForceAlignerBackend>();
             }
+        } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            backend_ = std::make_unique<DiffusionGemmaBnb4Backend>();
         } else if (model_spec_.is_bitsandbytes_4bit()) {
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 backend_ = std::make_unique<Qwen35HybridBnb4Backend>();
@@ -675,11 +717,20 @@ public:
             run_init_warmup = false;
         } else if (model_spec_.family == ModelFamily::Qwen3TTS) {
             run_init_warmup = false;
+        } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            // vLLM-style warmup: one or more dummy full-canvas decoder passes
+            // at init amortize SYCL kernel JIT, oneDNN primitive creation,
+            // buffer allocation, and GPU clock ramp before the first real
+            // request.  Auto-enable for DiffusionGemma; AILA_INIT_WARMUP=0
+            // still disables it for cold-start measurement.
+            run_init_warmup = true;
         }
 
         if (run_init_warmup) {
             if (init_warmup_mode == 1) {
                 AILA_LOG_INFO("[Warmup] Running init warmup (forced via AILA_INIT_WARMUP=1)");
+            } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                AILA_LOG_INFO("[Warmup] Running DiffusionGemma canvas warmup");
             } else if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 AILA_LOG_INFO("[Warmup] Running init warmup for Qwen3.5 hybrid spec (hidden=%d layers=%d)",
                               model_spec_.qwen35_text.hidden_size,
@@ -690,6 +741,123 @@ public:
 
             backend_->reset();
 
+            auto t_warmup_start = std::chrono::high_resolution_clock::now();
+            auto t_warmup_end = t_warmup_start;
+            if (model_spec_.family == ModelFamily::DiffusionGemma) {
+                auto* dg_backend =
+                    dynamic_cast<DiffusionGemmaBnb4Backend*>(backend_.get());
+                if (!dg_backend) {
+                    AILA_LOG_WARN(
+                        "[Warmup] DiffusionGemma backend unavailable; skipping warmup");
+                    backend_->reset();
+                } else {
+                    const int canvas_len =
+                        model_spec_.diffusion_gemma.canvas_length;
+                    const int hidden =
+                        model_spec_.diffusion_gemma.text.hidden_size;
+                    const int warmup_passes = aila::env::read_int_raw(
+                        "AILA_DG_WARMUP_PASSES", 1);
+                    int warmup_canvas = aila::env::read_int_raw(
+                        "AILA_DG_WARMUP_CANVAS", 0);
+                    if (warmup_canvas <= 0) {
+                        warmup_canvas = canvas_len;
+                    }
+                    warmup_canvas = std::min(warmup_canvas, canvas_len);
+                    AILA_LOG_INFO(
+                        "[Warmup] DiffusionGemma canvas=%d passes=%d",
+                        warmup_canvas, warmup_passes);
+
+                    // Dummy prompt encode warms the encode path (same decoder
+                    // layers, small-M GEMM and masked attention).
+                    constexpr int kWarmupPromptTokens = 8;
+                    std::vector<int> dummy_prompt(kWarmupPromptTokens, 0);
+                    int* prompt_dev = static_cast<int*>(
+                        ctx_->alloc_device(kWarmupPromptTokens * sizeof(int)));
+                    ctx_->memcpy_h2d_async(prompt_dev, dummy_prompt.data(),
+                                           dummy_prompt.size() * sizeof(int));
+                    std::string encode_error;
+                    dg_backend->diffusion_encode(*ctx_, prompt_dev,
+                                                 kWarmupPromptTokens,
+                                                 &encode_error);
+                    ctx_->synchronize();
+                    ctx_->free_device(prompt_dev);
+
+                    // Dummy full-canvas decoder passes with zero soft
+                    // self-conditioning exercise every layer: full/linear
+                    // attention, dense MLP, router, MoE, and logits.  The
+                    // canvas tokens are discarded after warmup; KV cache
+                    // positions written here are fully overwritten by the
+                    // real encode + first canvas pass (reset clears
+                    // current_len_).
+                    std::vector<int> dummy_canvas(
+                        static_cast<size_t>(warmup_canvas));
+                    for (int i = 0; i < warmup_canvas; ++i) {
+                        dummy_canvas[static_cast<size_t>(i)] =
+                            i % model_spec_.diffusion_gemma.text.vocab_size;
+                    }
+                    int* canvas_dev = static_cast<int*>(
+                        ctx_->alloc_device(
+                            static_cast<size_t>(warmup_canvas) * sizeof(int)));
+                    ctx_->memcpy_h2d_async(canvas_dev, dummy_canvas.data(),
+                                           dummy_canvas.size() * sizeof(int));
+                    auto* sc_dev = static_cast<sycl::ext::oneapi::bfloat16*>(
+                        ctx_->alloc_device(
+                            static_cast<size_t>(warmup_canvas) * hidden *
+                            sizeof(sycl::ext::oneapi::bfloat16)));
+                    ctx_->queue().memset(sc_dev, 0,
+                                         static_cast<size_t>(warmup_canvas) *
+                                             hidden *
+                                             sizeof(sycl::ext::oneapi::bfloat16));
+
+                    Tensor* warmup_logits = nullptr;
+                    try {
+                        for (int pass = 0; pass < warmup_passes; ++pass) {
+                            warmup_logits = &dg_backend->diffusion_decode_canvas(
+                                *ctx_, canvas_dev, sc_dev, warmup_canvas);
+                        }
+                        if (warmup_logits != nullptr) {
+                            dg_backend->diffusion_compute_soft_embeds(
+                                *ctx_, *warmup_logits, warmup_canvas);
+                            const int vocab =
+                                model_spec_.diffusion_gemma.text.vocab_size;
+                            int* dummy_argmax_dev = static_cast<int*>(
+                                ctx_->alloc_device(
+                                    static_cast<size_t>(warmup_canvas) *
+                                    sizeof(int)));
+                            float* dummy_entropy_dev = static_cast<float*>(
+                                ctx_->alloc_device(
+                                    static_cast<size_t>(warmup_canvas) *
+                                    sizeof(float)));
+                            ops::diffusion_argmax_device(
+                                *ctx_,
+                                static_cast<const float*>(
+                                    warmup_logits->data()),
+                                dummy_argmax_dev, warmup_canvas, vocab);
+                            ops::diffusion_softmax_entropy_device(
+                                *ctx_,
+                                static_cast<const float*>(
+                                    warmup_logits->data()),
+                                dummy_entropy_dev, warmup_canvas, vocab);
+                            ctx_->synchronize();
+                            ctx_->free_device(dummy_argmax_dev);
+                            ctx_->free_device(dummy_entropy_dev);
+                        }
+                        ctx_->synchronize();
+                    } catch (const std::exception& error) {
+                        AILA_LOG_ERROR(
+                            "[Warmup] DiffusionGemma warmup failed: %s",
+                            error.what());
+                        throw;
+                    }
+
+                    ctx_->free_device(canvas_dev);
+                    ctx_->free_device(sc_dev);
+                    backend_->reset();
+
+                    t_warmup_end =
+                        std::chrono::high_resolution_clock::now();
+                }
+            } else {
             // Lightweight warmup: 2-token prefill (like llama.cpp's approach).
             // A pure decode (seq_len=1) would skip prefill-score buffer allocation;
             // the first real prefill would then allocate a large buffer directly
@@ -701,16 +869,16 @@ public:
             int* warmup_token_ids = static_cast<int*>(ctx_->alloc_device(2 * sizeof(int)));
             ctx_->memcpy_h2d_async(warmup_token_ids, warmup_arr, 2 * sizeof(int));
 
-            auto t_warmup_start = std::chrono::high_resolution_clock::now();
             Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, 2);
             int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
             ctx_->synchronize();
-            auto t_warmup_end = std::chrono::high_resolution_clock::now();
+            t_warmup_end = std::chrono::high_resolution_clock::now();
 
             ctx_->free_device(warmup_argmax);
             ctx_->free_device(warmup_token_ids);
             backend_->reset();
+            }
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
             AILA_LOG_INFO("[Warmup] Completed in %.2f ms", warmup_ms);
@@ -1550,6 +1718,79 @@ public:
             return "";
         }
         int max_new_tokens = std::min(gen_config.max_new_tokens, available_decode_tokens);
+
+        if (model_spec_.family == ModelFamily::DiffusionGemma) {
+            if (total_vision_tokens > 0 || total_audio_tokens > 0) {
+                set_error(EngineErrorCode::VisionNotEnabled,
+                          "DiffusionGemma v1 supports text-only prompts");
+                return "";
+            }
+            auto* dg_backend =
+                dynamic_cast<DiffusionGemmaBnb4Backend*>(backend_.get());
+            if (!dg_backend) {
+                set_error(EngineErrorCode::RuntimeError,
+                          "DiffusionGemma backend is unavailable");
+                return "";
+            }
+            const auto& dgc = model_spec_.diffusion_gemma;
+            DiffusionGemmaGeneratorConfig dg_cfg;
+            dg_cfg.canvas_length = dgc.canvas_length;
+            // The 26B checkpoint converges reliably at 25 steps in the
+            // trusted Transformers path. Keep that validated latency default
+            // while still honoring checkpoints that request fewer steps.
+            dg_cfg.max_denoising_steps =
+                std::min(dgc.max_denoising_steps, 25);
+            const int steps_override =
+                aila::env::read_int_raw("AILA_DIFFUSION_STEPS", -1);
+            if (steps_override > 0) {
+                dg_cfg.max_denoising_steps = steps_override;
+            }
+            dg_cfg.t_min = dgc.t_min;
+            dg_cfg.t_max = dgc.t_max;
+            dg_cfg.entropy_bound = dgc.entropy_bound;
+            dg_cfg.confidence_threshold = dgc.confidence_threshold;
+            dg_cfg.stability_threshold = dgc.stability_threshold;
+            dg_cfg.pad_token_id = dgc.pad_token_id;
+            dg_cfg.eos_token_ids = dgc.eos_token_ids;
+            dg_cfg.seed = gen_config.use_fixed_seed
+                              ? gen_config.sampling_seed
+                              : static_cast<uint64_t>(std::random_device{}());
+
+            std::vector<int> generated_ids;
+            std::string dg_error;
+            DiffusionGemmaGenerator generator;
+            DiffusionGemmaGenerator::CanvasCallback canvas_callback;
+            if (token_callback) {
+                canvas_callback = [&](const std::vector<int>& canvas_tokens) {
+                    for (int token : canvas_tokens) {
+                        token_callback(tokenizer_.decode(token));
+                    }
+                };
+            }
+            try {
+                if (!generator.generate(*ctx_, *dg_backend, full_ids, dg_cfg,
+                                        max_new_tokens, generated_ids, &dg_error,
+                                        canvas_callback)) {
+                    set_error(EngineErrorCode::RuntimeError, dg_error);
+                    return "";
+                }
+            } catch (const std::exception& e) {
+                set_error(EngineErrorCode::RuntimeError,
+                          std::string("DiffusionGemma generation failed: ") +
+                              e.what());
+                return "";
+            }
+            std::string output_text;
+            output_text.reserve(generated_ids.size() * 4);
+            for (int token : generated_ids) {
+                output_text += tokenizer_.decode(token);
+            }
+            last_generation_finish_reason_ =
+                (generated_ids.size() >= static_cast<size_t>(max_new_tokens))
+                    ? "length"
+                    : "stop";
+            return output_text;
+        }
 
         int reusable_prefix = 0;
         bool allow_incremental_prefill = (total_vision_tokens == 0 && total_audio_tokens == 0);

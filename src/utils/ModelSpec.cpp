@@ -56,6 +56,25 @@ bool read_bool(simdjson::dom::element root, const char* key, bool& out) {
     return true;
 }
 
+bool read_int64_array(simdjson::dom::element root, const char* key,
+                      std::vector<int>& out) {
+    out.clear();
+    simdjson::dom::element v;
+    if (root.at_key(key).get(v) != simdjson::SUCCESS) return false;
+    if (v.get_array().error() == simdjson::SUCCESS) {
+        for (auto x : v.get_array()) {
+            int64_t val = 0;
+            if (x.get_int64().get(val) != simdjson::SUCCESS) return false;
+            out.push_back(static_cast<int>(val));
+        }
+        return true;
+    }
+    int64_t single = 0;
+    if (v.get_int64().get(single) != simdjson::SUCCESS) return false;
+    out.push_back(static_cast<int>(single));
+    return true;
+}
+
 std::string read_string(simdjson::dom::element root, const char* key,
                         const std::string& fallback = "") {
     simdjson::dom::element v;
@@ -511,6 +530,133 @@ bool parse_yolo26(simdjson::dom::element root, ModelSpec& spec,
     return true;
 }
 
+void parse_diffusion_gemma(simdjson::dom::element root, ModelSpec& spec) {
+    spec.family = ModelFamily::DiffusionGemma;
+    auto& cfg = spec.diffusion_gemma;
+    auto& tc = cfg.text;
+
+    read_int64(root, "canvas_length", cfg.canvas_length);
+    read_int64(root, "image_token_id", cfg.image_token_id);
+    read_int64(root, "boi_token_id", cfg.boi_token_id);
+    read_int64(root, "eoi_token_id", cfg.eoi_token_id);
+    read_int64_array(root, "eos_token_id", cfg.eos_token_ids);
+
+    simdjson::dom::element text_elem;
+    if (root.at_key("text_config").get(text_elem) == simdjson::SUCCESS) {
+        read_int64(text_elem, "hidden_size", tc.hidden_size);
+        read_int64(text_elem, "num_attention_heads", tc.num_attention_heads);
+        read_int64(text_elem, "num_key_value_heads", tc.num_key_value_heads);
+        read_int64(text_elem, "head_dim", tc.head_dim);
+        read_int64(text_elem, "global_head_dim", tc.global_head_dim);
+        read_int64(text_elem, "num_global_key_value_heads",
+                   tc.num_global_key_value_heads);
+        read_int64(text_elem, "num_hidden_layers", tc.num_hidden_layers);
+        read_int64(text_elem, "intermediate_size", tc.intermediate_size);
+        read_int64(text_elem, "moe_intermediate_size", tc.moe_intermediate_size);
+        read_int64(text_elem, "num_experts", tc.num_experts);
+        read_int64(text_elem, "top_k_experts", tc.top_k_experts);
+        read_int64(text_elem, "vocab_size", tc.vocab_size);
+        read_int64(text_elem, "max_position_embeddings",
+                   tc.max_position_embeddings);
+        read_int64(text_elem, "sliding_window", tc.sliding_window);
+        read_float(text_elem, "rms_norm_eps", tc.rms_norm_eps);
+        read_float(text_elem, "final_logit_softcapping",
+                   tc.final_logit_softcapping);
+        read_bool(text_elem, "tie_word_embeddings", tc.tie_word_embeddings);
+        read_bool(text_elem, "attention_k_eq_v", tc.attention_k_eq_v);
+        read_int64(text_elem, "bos_token_id", tc.bos_token_id);
+        read_int64(text_elem, "eos_token_id", tc.eos_token_id);
+
+        simdjson::dom::element rope_elem;
+        if (text_elem.at_key("rope_parameters").get(rope_elem) == simdjson::SUCCESS) {
+            simdjson::dom::element sub;
+            if (rope_elem.at_key("full_attention").get(sub) == simdjson::SUCCESS) {
+                tc.rope_full.rope_type = read_string(sub, "rope_type", "proportional");
+                read_float(sub, "rope_theta", tc.rope_full.rope_theta);
+                read_float(sub, "partial_rotary_factor",
+                           tc.rope_full.partial_rotary_factor);
+            }
+            if (rope_elem.at_key("sliding_attention").get(sub) == simdjson::SUCCESS) {
+                tc.rope_sliding.rope_type = read_string(sub, "rope_type", "default");
+                read_float(sub, "rope_theta", tc.rope_sliding.rope_theta);
+                read_float(sub, "partial_rotary_factor",
+                           tc.rope_sliding.partial_rotary_factor);
+            }
+        }
+
+        tc.layer_types.clear();
+        simdjson::dom::element layer_types_elem;
+        if (text_elem.at_key("layer_types").get(layer_types_elem) == simdjson::SUCCESS) {
+            for (auto x : layer_types_elem.get_array()) {
+                std::string_view sv;
+                if (x.get_string().get(sv) == simdjson::SUCCESS) {
+                    tc.layer_types.emplace_back(sv);
+                }
+            }
+        }
+    }
+
+    if (tc.layer_types.empty()) {
+        // HF default: 5 sliding + 1 full pattern, last layer forced full.
+        tc.layer_types.reserve(static_cast<size_t>(tc.num_hidden_layers));
+        for (int i = 0; i < tc.num_hidden_layers; ++i) {
+            tc.layer_types.push_back(((i + 1) % 6 == 0) ? "full_attention"
+                                                         : "sliding_attention");
+        }
+        if (!tc.layer_types.empty()) {
+            tc.layer_types.back() = "full_attention";
+        }
+    }
+
+    if (tc.rope_full.rope_theta <= 0.0f) tc.rope_full.rope_theta = 1000000.0f;
+    if (tc.rope_full.partial_rotary_factor <= 0.0f) tc.rope_full.partial_rotary_factor = 0.25f;
+    if (tc.rope_sliding.rope_theta <= 0.0f) tc.rope_sliding.rope_theta = 10000.0f;
+
+    simdjson::dom::element vis_elem;
+    if (root.at_key("vision_config").get(vis_elem) == simdjson::SUCCESS) {
+        auto& vc = cfg.vision;
+        vc.enabled = true;
+        read_int64(vis_elem, "hidden_size", vc.hidden_size);
+        read_int64(vis_elem, "intermediate_size", vc.intermediate_size);
+        read_int64(vis_elem, "num_attention_heads", vc.num_attention_heads);
+        read_int64(vis_elem, "num_key_value_heads", vc.num_key_value_heads);
+        read_int64(vis_elem, "head_dim", vc.head_dim);
+        read_int64(vis_elem, "num_hidden_layers", vc.num_hidden_layers);
+        read_int64(vis_elem, "patch_size", vc.patch_size);
+        read_int64(vis_elem, "pooling_kernel_size", vc.pooling_kernel_size);
+        read_int64(vis_elem, "position_embedding_size",
+                   vc.position_embedding_size);
+        read_float(vis_elem, "rms_norm_eps", vc.rms_norm_eps);
+    }
+}
+
+void parse_diffusion_gemma_generation_config(const std::string& model_dir,
+                                             ModelSpec& spec) {
+    auto& cfg = spec.diffusion_gemma;
+    const std::string text = read_text_file(model_dir + "/generation_config.json");
+    if (text.empty()) return;
+
+    try {
+        simdjson::dom::parser parser;
+        simdjson::dom::element root = parser.parse(text);
+
+        read_int64(root, "max_denoising_steps", cfg.max_denoising_steps);
+        read_float(root, "t_min", cfg.t_min);
+        read_float(root, "t_max", cfg.t_max);
+        read_float(root, "confidence_threshold", cfg.confidence_threshold);
+        read_int64(root, "stability_threshold", cfg.stability_threshold);
+        read_int64(root, "max_new_tokens", cfg.default_max_new_tokens);
+        read_int64_array(root, "eos_token_id", cfg.eos_token_ids);
+
+        simdjson::dom::element sampler_elem;
+        if (root.at_key("sampler_config").get(sampler_elem) == simdjson::SUCCESS) {
+            read_float(sampler_elem, "entropy_bound", cfg.entropy_bound);
+        }
+    } catch (const std::exception&) {
+        // Non-fatal: generation config defaults remain.
+    }
+}
+
 } // namespace
 
 bool load_from_dir(const std::string& model_dir,
@@ -558,6 +704,9 @@ bool load_from_dir(const std::string& model_dir,
             parse_qwen3_tts(root, spec);
         } else if (spec.model_type == "qwen3_5" || spec.model_type == "qwen3_5_text") {
             parse_qwen35(root, spec);
+        } else if (spec.model_type == "diffusion_gemma") {
+            parse_diffusion_gemma(root, spec);
+            parse_diffusion_gemma_generation_config(model_dir, spec);
         } else {
             parse_qwen3_dense(root, spec);
         }
