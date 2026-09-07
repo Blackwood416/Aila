@@ -1,14 +1,20 @@
 # Windows HTTP/SSE dependency probe
 
-Date: 2026-09-07. Scope: local dependency inspection for a future C++ server. No model was loaded, no HTTP service was started, and no dependencies were downloaded.
+Date: 2026-09-07. Scope: an ordinary Windows C++17 build and actual loopback HTTP/SSE acceptance probe for a future C++ server. All dependency sources, binaries, package caches, and run artifacts are isolated in `build-refactor-http-probe`. No model, Aila inference API, or GPU was used.
 
 ## Result
 
-The machine has a usable C++ toolchain and the Visual Studio distribution of vcpkg, but no discoverable Drogon/Trantor installation or existing HTTP server library in this repository. A Drogon loopback SSE probe was therefore **not built or run**. This inspection establishes the missing dependency prerequisite; it does not establish whether a selected Drogon release will compile or meet the streaming requirements on this machine.
+**The six socket acceptance scenarios passed with Drogon 1.9.11 plus the local Windows listener-callback patch, Trantor 1.5.24, JsonCpp 1.9.6, and zlib 1.3.1.** This is a synthetic dependency/protocol probe, not an integrated inference server or a claim of general production backpressure.
+
+Unmodified Drogon 1.9.11 built successfully but did **not** meet the complete Windows acceptance criteria. Its non-Linux listener branch did not forward the after-accept socket-option callback or the connection callback. The original run reported 5/6 scenarios; the socket buffer readback remained zero because the callback never ran. That failed report is preserved alongside the passing run.
+
+The local patch only forwards the same three callbacks already forwarded in the Linux branch: before-listen socket options, after-accept socket options, and connection state. It changes 14 lines in `lib/src/ListenerManager.cc`. It has not been sent upstream.
 
 The existing Windows proxy provides a suitable boundary for an ordinary C++ host: the inspected `build/AilaShared.dll` imports only `KERNEL32.dll` and `USER32.dll`. GPU runtime dependencies remain in the worker process.
 
-## Observed environment
+## Initial environment inspection
+
+These observations preceded the isolated dependency installation below.
 
 | Item | Local evidence |
 | --- | --- |
@@ -38,32 +44,82 @@ Useful read-only reproduction commands:
 & 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx86\x64\dumpbin.exe' /dependents build/AilaShared.dll
 ```
 
-## Dependency cost and next build step
+## Fixed dependencies and reproducible build
 
-The available vcpkg is a manifest distribution. A probe needs its own manifest and pinned registry baseline/version selection; the installed vcpkg executable is not itself an installed Drogon package. Keep that manifest, installed tree, and standalone CMake project under `build-refactor-http-probe` until the framework passes the probe.
+The actual vcpkg resolve plan was inspected with baseline `544a4c5c297e60e4ac4a5a1810df66748d908869`, triplet `x64-windows-static-md`, and all Drogon features disabled. That port still requires Brotli 1.2.0, c-ares 1.34.6, OpenSSL 3.6.0#3, JsonCpp 1.9.6, and zlib 1.3.1. TLS, DNS, and compression are unconditional port dependencies, so disabling default features is insufficient. Database, ORM, YAML, and `drogon_ctl` features were not selected.
 
-Plan for the Drogon/Trantor networking framework and its JSON dependency, including the possible duplication of JSON libraries alongside Aila's simdjson. The exact selected port must be inspected before installation: TLS, compression, DNS, command-line tools, and database features can add dependencies such as OpenSSL, zlib, Brotli, c-ares, or database clients. For the first loopback HTTP probe, use the smallest feature set supported by that port and omit database, ORM, tool, and TLS features where optional. Do not assume that disabling default features removes a port's unconditional dependencies.
+To build the minimal plaintext probe, vcpkg installs only JsonCpp and zlib at that same baseline. Drogon and Trantor are built from their exact upstream release archives. The SHA512 values are copied from the pinned vcpkg ports and checked before extraction. The build uses MSVC, C++17, static framework libraries, and the dynamic MSVC CRT.
 
-No package build, download size, installed size, or build time was measured. A numerical estimate would currently be speculative. First inspect the resolved installation plan, then build only the selected framework and probe. If dependency resolution or its Windows build fails, preserve that concrete failure before evaluating another established HTTP library.
+| Dependency | Fixed source | Selected configuration |
+| --- | --- | --- |
+| Drogon | `an-tao/drogon`, `v1.9.11`, archive SHA512 in `build.ps1` | No ORM/databases, tools, examples, YAML, Brotli, coroutines, or TLS; local Windows callback patch |
+| Trantor | `an-tao/trantor`, `v1.5.24`, archive SHA512 in `build.ps1` | No TLS provider, c-ares, tests, examples, or shared library |
+| JsonCpp | vcpkg baseline above, 1.9.6 | Static library, dynamic CRT |
+| zlib | vcpkg baseline above, 1.3.1 | Static library, dynamic CRT |
 
-Use a standalone ordinary C++17 CMake project with `find_package(Drogon CONFIG REQUIRED)` and `Drogon::Drogon`, subject to confirmation against the chosen release. The repository's top-level CMake currently requires IntelLLVM, so it cannot directly be configured with MSVC merely to build a server. The production build must either keep the ordinary C++ server as a separate subproject/imported-proxy consumer or adjust that compiler requirement as a deliberate build-system change. No such change is made by this probe.
+Trantor configuration reports `Trantor using SSL library: None`. Both OpenSSL and Botan discovery are explicitly disabled. `BUILD_C-ARES`, `BUILD_ORM`, `BUILD_CTL`, and `BUILD_BROTLI` are off in the recorded CMake caches. The executable's PE imports contain Windows system and MSVC/UCRT libraries, with no OpenSSL or GPU runtime DLLs.
 
-## Minimal loopback SSE acceptance probe
+Reproduce from the repository root:
 
-Once Drogon is installed, the probe should use an entirely synthetic producer and bind only `127.0.0.1` on a test port. It should exercise the chosen release's asynchronous streaming API rather than accumulating the whole response before sending it.
+```powershell
+pwsh -NoProfile -File tools/http-probe/build.ps1 -Parallelism 4
+pwsh -NoProfile -File tools/http-probe/run.ps1
+```
 
-| Scenario | Acceptance condition |
+`build.ps1` locates ordinary MSVC with `vswhere`, records the full and minimal vcpkg plans, verifies source archives and the patch, installs to the isolated prefix, and builds the standalone probe. `-DependenciesOnly` stops after the framework install. After a successful full build, `-ProbeOnly` rebuilds just the probe. Dependency source trees and caches stay under the chosen `-BuildRoot`; no top-level CMake changes are required.
+
+The normalized-LF SHA256 of `tools/http-probe/drogon-windows-listener-callbacks.patch` is:
+
+```text
+f267e88c29eaa99bb8b138fae3f8224d4843a0ef9dc393406dbd7c43498cb179
+```
+
+The script verifies that exact patch, uses a separate Git root inside the extracted dependency to prevent a parent-repository path prefix from silently skipping it, and checks that the applied patch can be reversed. `logs/source-lock.json`, `logs/applied-patch.json`, and `logs/verify-windows-listener-patch.txt` preserve the source and patch evidence. `logs/probe-dependents.txt` and `logs/artifact-inventory.json` record PE imports and artifact hashes for the measured run. Its executable was 1,301,504 bytes; the static library sizes are recorded separately. A clean full-build wall-clock time was not measured separately from investigation and incremental rebuilds.
+
+The standalone `tools/http-probe/CMakeLists.txt` successfully uses `find_package(Drogon CONFIG REQUIRED)` and `Drogon::Drogon`. The repository's top-level CMake requires IntelLLVM, so it cannot directly be configured with MSVC merely to build a server. The production build must either keep the ordinary C++ server as a separate subproject/imported-proxy consumer or adjust that compiler requirement deliberately. This probe does neither. The repository's broad `*.txt` ignore rule also covers the new standalone `CMakeLists.txt`; include it explicitly when committing the probe.
+
+## Actual loopback acceptance results
+
+The server uses `HttpResponse::newAsyncStreamResponse` with synthetic timers, binds only `127.0.0.1`, and runs two I/O loops. Python's standard `http.client` handles HTTP/chunk framing; the harness reads the decoded body one byte at a time and assembles SSE events with strict UTF-8 decoding. It does not substitute an in-memory fake, a fully buffered HTTP client, or a custom HTTP parser.
+
+| Scenario | Observed passing result |
 | --- | --- |
-| Incremental delivery | UTF-8 `text/event-stream` records arrive before the producer finishes, each with a terminating blank line; response headers are sent before the first record |
-| Two concurrent clients | Two synthetic request IDs produce independently ordered streams; one stream's completion does not terminate the other |
-| Disconnect | A client closes after its first event; disconnect reaches that request's cancellation state and its timer/producer is released |
-| Slow reader | Pausing one client's reads keeps its queued byte count bounded while a second client and a health route remain responsive |
-| Completion race | Disconnect and normal completion racing produce one terminal state; no write uses a destroyed connection or stream object |
-| Shutdown | Stop accepting requests, cancel active synthetic producers, close streams, and join all server threads within a bounded timeout |
+| Incremental delivery | Headers at 0.76 ms, first UTF-8 event at 103 ms, final event at 488 ms; all eight ordered token events contain `汉字🙂` and terminating blank lines |
+| Two concurrent clients | Seven-token and eleven-token streams overlap, retain their own IDs/order, and each deliver exactly one `done` event |
+| Disconnect | Closing the victim's socket after one event reaches its actual connection callback and releases its timer/producer; cancellation observed within 23.5 ms. A second, simultaneously active stream completes all six tokens |
+| Slow reader | Client receive buffer 4,096 B, server send buffer readback 16,384 B; accounted transport pending-byte upper bound peaks at 52,220 B under the 65,536 B gate. Producer pauses 41 timer ticks, resumes after reading, and cancels on disconnect. Eight health requests finish within 20.1 ms; an independent five-token stream completes |
+| Completion race | Eight disconnect/completion races exercise both outcomes; each has one state transition to a terminal status and no more than one `done` event |
+| Shutdown | Two active streams, including a slow reader, are cancelled. All 17 request records have released timers and destroyed producers; active count is zero. Final server report appears 138 ms after shutdown request, and the process exits with code 0 within the runner's bounded wait, without forced cleanup |
 
-The client harness should read actual socket bytes with a deadline, explicitly close the first client socket for the disconnect case, and record producer cancellation as well as client observations. A buffering command-line client alone is insufficient to demonstrate incremental flushing or cleanup.
+These timings describe one local acceptance run, not load-test latency or inference throughput. The passing run recorded 53 after-accept callbacks and 53 connection-close callbacks. Per-request `disconnect_callback_seen` proves that the victim cancellation reached its own producer, and the survivor test proves it did not terminate the other request.
 
-Keep a process handle and PID for any launched probe. Run it with a hidden window, terminate it through the framework's shutdown path, and use a bounded cleanup in a `finally` block for failures. Record the selected port, test results, and process exit status. The present inspection launched no persistent processes and allocated no listening port.
+| Evidence | Isolated path / process |
+| --- | --- |
+| Unmodified framework failure | `runs/20260907-171304-712bea34/{client,server,process}.json`; PID 22936, port 60960, exit 0, no forced cleanup |
+| Patched framework passing run | `runs/20260907-172618-47843b20/{client,server,process}.json`; PID 18416, port 55218, exit 0, no forced cleanup |
+| Latest run pointer | `build-refactor-http-probe/latest-run.json` |
+
+Run paths in the table are relative to `build-refactor-http-probe`. Each run also retains `launch.json`, stdout, and stderr. `run.ps1` starts the known server PID with `-WindowStyle Hidden`, waits for its framework shutdown, and in `finally` retries graceful shutdown before a bounded, PID-specific forced cleanup if necessary. Neither recorded process remains running.
+
+## Backpressure boundary and remaining limitations
+
+`ResponseStream::send()` only reports whether the stream is open. Trantor 1.5.24's `sendAsyncDataInLoop()` does not invoke the ordinary-send high-water callback. Merely limiting a producer queue and then unconditionally calling `send()` would still permit the framework's stream buffer to grow.
+
+The probe therefore admits each chunk on its connection's I/O loop only when this upper bound, plus the next chunk and closing marker, fits 64 KiB:
+
+```text
+4096 bytes reserved for headers
++ cumulative HTTP chunk bytes submitted by this stream
+- connection bytesSent() since the request began
+```
+
+The subtraction is clamped at zero. Chunk framing and the five-byte final marker are included. `bytesSent()` counts bytes accepted by the socket, so this bounds pending bytes in Trantor's async stream node for the tested connection; it is not merely the number of tokens waiting in a producer queue. The kernel send buffer is separately configured and read back as 16 KiB. One prepared event is capped at roughly 16 KiB. These are payload/accounting bounds, not a measurement of total process heap, allocator overhead, kernel memory, TCP acknowledgements, or remote application consumption.
+
+**The proof and acceptance are limited to fresh, single-request, plaintext HTTP/1.1 SSE connections with no other writer.** The Python harness opens a new connection for every request. The probe router's `active.count(connection)` check is not a complete prohibition of connection reuse or HTTP pipelining; preceding or additional responses on the same connection can invalidate the byte-accounting assumptions. The strategy must not be promoted directly to generic production backpressure. Production integration needs enforced exclusive connection ownership with reuse/pipelining rejected, or a framework interface reporting its actual pending bytes. TLS, HTTP/2, proxies, and cross-thread output queues need separate verification. A scheduler-to-I/O handoff queue must itself be bounded; this probe submits on the I/O thread and does not test an unbounded `queueInLoop` producer.
+
+During deliberate abrupt-disconnect races, Trantor emitted three `FATAL`-labelled socket diagnostics (`0` / Windows error `10053`) in the passing run's stdout. They did not abort the process, strand a producer, or prevent shutdown; the logs are retained. This remains Windows error-reporting/handling behavior to review before production use, not something the local callback patch fixes.
+
+No authentication, TLS termination, admission policy for arbitrary HTTP traffic, inference scheduler binding, proxy integration, or production load test is included. The existing C API and worker integration still need the separate work below.
 
 ## Ordinary C++ server to proxy contract
 

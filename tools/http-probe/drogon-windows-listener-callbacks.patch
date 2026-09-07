@@ -1,0 +1,24 @@
+diff --git a/lib/src/ListenerManager.cc b/lib/src/ListenerManager.cc
+--- a/lib/src/ListenerManager.cc
++++ b/lib/src/ListenerManager.cc
+@@ -168,6 +168,20 @@ void ListenerManager::createListeners(
+                 listeningThread_->getLoop(),
+                 InetAddress(ip, listener.port_, isIpv6),
+                 "drogon");
++            if (beforeListenSetSockOptCallback_)
++            {
++                serverPtr->setBeforeListenSockOptCallback(
++                    beforeListenSetSockOptCallback_);
++            }
++            if (afterAcceptSetSockOptCallback_)
++            {
++                serverPtr->setAfterAcceptSockOptCallback(
++                    afterAcceptSetSockOptCallback_);
++            }
++            if (connectionCallback_)
++            {
++                serverPtr->setConnectionCallback(connectionCallback_);
++            }
+             if (listener.useSSL_ && utils::supportsTls())
+             {
+                 auto cert = listener.certFile_;
