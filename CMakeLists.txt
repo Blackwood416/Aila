@@ -164,6 +164,9 @@ set(LIB_SOURCES
     src/ops/Transpose.cpp
     src/ops/ConvOps.cpp
     src/memory/KVCache.cpp
+    src/inference/Model.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
     src/models/Qwen3DenseBackend.cpp
     src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp
@@ -353,6 +356,68 @@ target_include_directories(AilaChatTests PRIVATE
 target_link_libraries(AilaChatTests PRIVATE simdjson)
 enable_testing()
 add_test(NAME AilaChatTests COMMAND AilaChatTests)
+
+# Request validation must retain NaN/Inf checks despite the kernel-oriented
+# global fast-math flags. Keep this override local to the host state machine.
+if(MSVC)
+    set_property(SOURCE src/inference/Request.cpp APPEND PROPERTY COMPILE_OPTIONS /fp:precise)
+else()
+    set_property(SOURCE src/inference/Request.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math)
+endif()
+
+find_package(Threads REQUIRED)
+add_executable(AilaRequestStateTests
+    tests/inference/RequestStateTests.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
+    src/profile/Profiling.cpp
+)
+target_include_directories(AilaRequestStateTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(AilaRequestStateTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaRequestStateTests PRIVATE -fno-sycl)
+target_link_options(AilaRequestStateTests PRIVATE -fno-sycl)
+if(MSVC)
+    target_compile_options(AilaRequestStateTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaRequestStateTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaRequestStateTests PRIVATE Threads::Threads)
+add_test(NAME AilaRequestStateTests COMMAND AilaRequestStateTests)
+set_tests_properties(AilaRequestStateTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
+
+add_executable(AilaQwen3SessionTests tests/inference/Qwen3SessionTests.cpp)
+target_compile_definitions(AilaQwen3SessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaQwen3SessionTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaQwen3SessionTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaQwen3SessionTests PRIVATE AilaLib)
+add_test(NAME AilaQwen3SessionTests COMMAND AilaQwen3SessionTests)
+set_tests_properties(AilaQwen3SessionTests PROPERTIES
+    LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
+    SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_executable(AilaDeferredLoggingTests
+    tests/inference/DeferredLoggingTests.cpp
+    src/profile/Profiling.cpp)
+target_include_directories(AilaDeferredLoggingTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(AilaDeferredLoggingTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaDeferredLoggingTests PRIVATE -fno-sycl)
+target_link_options(AilaDeferredLoggingTests PRIVATE -fno-sycl)
+target_link_libraries(AilaDeferredLoggingTests PRIVATE Threads::Threads)
+add_test(NAME AilaDeferredLoggingTests COMMAND AilaDeferredLoggingTests)
+set_tests_properties(AilaDeferredLoggingTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
+
+find_program(AILA_PWSH_EXECUTABLE NAMES pwsh)
+if(AILA_PWSH_EXECUTABLE)
+    add_test(NAME AilaTokenTraceComparisonTests
+        COMMAND "${AILA_PWSH_EXECUTABLE}" -NoProfile -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/inference/TokenTraceComparisonTests.ps1")
+    set_tests_properties(AilaTokenTraceComparisonTests PROPERTIES LABELS "cpu;inference" TIMEOUT 120)
+endif()
 add_test(
     NAME AilaRuntimeDllSelectionCMakeTests
     COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/RuntimeDllSelectionTests.cmake"

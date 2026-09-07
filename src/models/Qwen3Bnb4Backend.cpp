@@ -44,10 +44,69 @@ struct StageProfileTotals {
 };
 }
 
+Qwen3Bnb4Backend::Session::Session(Context& ctx, const Qwen3Config& config,
+                                  int capacity,
+                                  std::shared_ptr<const SessionOwner> owner)
+    : context_(&ctx), owner_(std::move(owner)) {
+    cache_.init(ctx, config, capacity);
+    for (int i = 0; i < config.num_hidden_layers; ++i) {
+        cacheBytes_ += cache_.k_cache(i).size_bytes();
+        cacheBytes_ += cache_.v_cache(i).size_bytes();
+    }
+}
+
 Qwen3Bnb4Backend::~Qwen3Bnb4Backend() = default;
+
+std::unique_ptr<Qwen3Bnb4Backend::Session>
+Qwen3Bnb4Backend::CreateSessionImpl(Context& ctx) {
+    if (!sessionOwner_) {
+        throw std::logic_error("Qwen3Bnb4Backend::CreateSession: model is not loaded");
+    }
+    if (&ctx != context_) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::CreateSession: context does not match the loaded model");
+    }
+    return std::unique_ptr<Session>(new Session(ctx, cfg_, max_seq_len_, sessionOwner_));
+}
+
+std::unique_ptr<Qwen3Bnb4Backend::Session>
+Qwen3Bnb4Backend::CreateSession(Context& ctx) {
+    // Existing FP8 decode kernels are not valid for this shared-session path:
+    // the JM reader assumes BF16 and the fused writer omits half of head128.
+    if (aila::env::read_flag("AILA_KV_QUANT", false)) {
+        throw std::invalid_argument(
+            "Qwen3 shared sessions require BF16 KV; set AILA_KV_QUANT=0");
+    }
+    auto session = CreateSessionImpl(ctx);
+    // Once published, existing cache state must not be mixed with replacement
+    // weights or another adapter, even if every explicit Session is released.
+    explicitSessionsCreated_ = true;
+    return session;
+}
+
+void Qwen3Bnb4Backend::ValidateSession(const Session& session) const {
+    if (!sessionOwner_) {
+        throw std::logic_error("Qwen3Bnb4Backend: model is not loaded");
+    }
+    if (session.owner_ != sessionOwner_ || session.context_ != context_) {
+        throw std::invalid_argument("Qwen3Bnb4Backend: session does not belong to this loaded model");
+    }
+}
 
 bool Qwen3Bnb4Backend::apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
                                   std::string* error_message) {
+    if (explicitSessionsCreated_) {
+        if (error_message) {
+            *error_message = "Qwen3Bnb4Backend: cannot change LoRA after explicit sessions have been created";
+        }
+        return false;
+    }
+    if (!sessionOwner_ || &ctx != context_) {
+        if (error_message) {
+            *error_message = "Qwen3Bnb4Backend: LoRA requires a loaded model and its original context";
+        }
+        return false;
+    }
+
     int H = hidden_size_;
     int QD = q_dim_;
     int KVD = kv_dim_;
@@ -147,6 +206,10 @@ bool Qwen3Bnb4Backend::apply_lora(Context& ctx, const aila::lora::LoraAdapter& a
 void Qwen3Bnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     if (seq_len <= runtime_seq_capacity_) return;
 
+    // Another Session may have just submitted work using these allocations.
+    // Tensor replacement frees USM immediately, so growth must drain first.
+    if (buf_.hidden.valid()) ctx.synchronize();
+
     int H = hidden_size_;
     int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
 
@@ -168,6 +231,8 @@ void Qwen3Bnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 void Qwen3Bnb4Backend::ensure_prefill_scores(Context& ctx, int seq_len) {
     if (seq_len <= prefill_scores_capacity_) return;
 
+    if (buf_.scores.valid()) ctx.synchronize();
+
     int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
     buf_.scores = Tensor::allocate(ctx,
         {(int64_t)cfg_.num_attention_heads, (int64_t)new_cap, (int64_t)new_cap},
@@ -179,6 +244,8 @@ void Qwen3Bnb4Backend::ensure_prefill_scores(Context& ctx, int seq_len) {
 
 void Qwen3Bnb4Backend::ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len) {
     if (seq_len <= incr_prefill_seq_cap_ && total_len <= incr_prefill_total_cap_) return;
+
+    if (buf_.incr_scores.valid()) ctx.synchronize();
 
     int new_seq_cap = std::max(seq_len, incr_prefill_seq_cap_);
     int new_total_cap = std::max(total_len, incr_prefill_total_cap_);
@@ -197,6 +264,12 @@ void Qwen3Bnb4Backend::ensure_incr_prefill_scores(Context& ctx, int seq_len, int
 
 bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
                              int max_seq_len, std::string* error_message) {
+    if (explicitSessionsCreated_) {
+        if (error_message) {
+            *error_message = "Qwen3Bnb4Backend: cannot reload a model after explicit sessions have been created";
+        }
+        return false;
+    }
     if (spec.family != ModelFamily::Qwen3Dense) {
         if (error_message) *error_message = "Qwen3Bnb4Backend: invalid model family";
         return false;
@@ -205,6 +278,29 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
         if (error_message) *error_message = "Qwen3Bnb4Backend: model is not a bitsandbytes 4-bit checkpoint";
         return false;
     }
+    if (max_seq_len <= 0) {
+        if (error_message) *error_message = "Qwen3Bnb4Backend: max_seq_len must be positive";
+        return false;
+    }
+
+    // Reload is still supported for the legacy facade before any explicit
+    // Session is published. Discard every binding and allocation from the old
+    // execution slot only after its queue has finished.
+    if (context_) context_->synchronize();
+    defaultSession_.reset();
+    sessionOwner_.reset();
+    layers_.clear();
+    fused_weights_.clear();
+    linear_scratch_ = Bnb4BitLinearScratch();
+    lm_head_ = Linear();
+    buf_ = Buffers();
+    runtime_seq_capacity_ = 0;
+    prefill_scores_capacity_ = 0;
+    incr_prefill_seq_cap_ = 0;
+    incr_prefill_total_cap_ = 0;
+    embed_weight_ = nullptr;
+    final_norm_weight_ = nullptr;
+    context_ = &ctx;
 
     cfg_ = spec.qwen3;
     max_seq_len_ = max_seq_len;
@@ -314,8 +410,6 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
     AILA_LOG_INFO("[Qwen3Bnb4] embed_tokens loaded");
 
     // --- Layers ---
-    layers_.clear();
-    fused_weights_.clear();
     layers_.resize(cfg_.num_hidden_layers);
     fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 2 + 1);
 
@@ -377,9 +471,6 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
     // --- Final norm ---
     final_norm_weight_ = &weights.get("model.norm.weight");
 
-    // --- KV Cache ---
-    kv_cache_.init(ctx, cfg_, max_seq_len);
-
     // --- LM Head (always dense, even in quantized mode) ---
     if (weights.has("lm_head.weight") &&
         !weights.has("lm_head.weight.quant_state.bitsandbytes__nf4") &&
@@ -431,14 +522,42 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
             dnnl::memory::data_type::f32);
     }
 
+    sessionOwner_ = std::make_shared<const SessionOwner>();
     AILA_LOG_INFO("[Qwen3Bnb4] Model fully loaded and initialized");
     return true;
 }
 
 Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
-    if (seq_len <= 0) {
-        throw std::runtime_error("Qwen3Bnb4Backend::forward: seq_len must be positive");
+    if (seq_len <= 0 || !token_ids_device) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::forward: token IDs must be non-null and seq_len positive");
     }
+    if (!defaultSession_) defaultSession_ = CreateSessionImpl(ctx);
+    return Forward(ctx, *defaultSession_, token_ids_device, seq_len);
+}
+
+Tensor& Qwen3Bnb4Backend::Forward(Context& ctx, Session& session,
+                                const int* token_ids_device, int seq_len) {
+    ValidateSession(session);
+    if (&ctx != context_) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::Forward: context does not match the loaded model");
+    }
+    if (seq_len <= 0) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::Forward: seq_len must be positive");
+    }
+    if (!token_ids_device) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::Forward: token IDs must be non-null");
+    }
+
+    auto& kvCache = session.cache_;
+    const int start_pos = kvCache.current_length();
+    // Subtract before adding to reject oversized counts without signed overflow.
+    if (seq_len > session.Capacity() - start_pos) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::Forward: context window exceeded (start_pos=" +
+                                    std::to_string(start_pos) + ", seq_len=" +
+                                    std::to_string(seq_len) + ", capacity=" +
+                                    std::to_string(session.Capacity()) + ")");
+    }
+    const int cached_len = start_pos + seq_len;
 
     static const bool s_profile_decode = aila::env::read_flag("AILA_PROFILE_Q3_DECODE", false);
     static const bool s_profile_prefill = aila::env::read_flag("AILA_PROFILE_Q3_PREFILL", false);
@@ -468,14 +587,6 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
     int QD = q_dim_;
     int KVD = kv_dim_;
     int FF = ff_dim_;
-    int start_pos = kv_cache_.current_length();
-    int cached_len = start_pos + seq_len;
-    if (cached_len > max_seq_len_) {
-        throw std::runtime_error("Qwen3Bnb4Backend::forward: context window exceeded (cached_len=" +
-                                 std::to_string(cached_len) + ", max_seq_len=" +
-                                 std::to_string(max_seq_len_) + ")");
-    }
-
     ensure_runtime_buffers(ctx, seq_len);
     if (seq_len > 1) {
         if (start_pos == 0) {
@@ -520,7 +631,7 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
             time_stage(ProfileStage::QkNormRope, [&] {
                 ops::decode_prepare_qkv(ctx, q_decode_view, k_view, v_view, buf_.rope_freq,
                                         *layer.q_norm_weight, *layer.k_norm_weight,
-                                        kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                                        kvCache.k_cache(i), kvCache.v_cache(i),
                                         start_pos,
                                         cfg_.num_attention_heads, cfg_.num_key_value_heads,
                                         cfg_.head_dim, cfg_.rms_norm_eps, cfg_.rope_theta);
@@ -548,21 +659,21 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
             });
 
             time_stage(ProfileStage::KvCache, [&] {
-                ops::copy_to_cache(ctx, buf_.k, kv_cache_.k_cache(i),
+                ops::copy_to_cache(ctx, buf_.k, kvCache.k_cache(i),
                                    seq_len, start_pos,
                                    cfg_.num_key_value_heads, cfg_.head_dim,
-                                   kv_cache_.max_length());
-                ops::copy_to_cache(ctx, buf_.v, kv_cache_.v_cache(i),
+                                   kvCache.max_length());
+                ops::copy_to_cache(ctx, buf_.v, kvCache.v_cache(i),
                                    seq_len, start_pos,
                                    cfg_.num_key_value_heads, cfg_.head_dim,
-                                   kv_cache_.max_length());
+                                   kvCache.max_length());
             });
         }
 
         // Attention
         time_stage(ProfileStage::Attention, [&] {
             if (seq_len == 1) {
-                ops::attention_decode(ctx, *q_for_attn, kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                ops::attention_decode(ctx, *q_for_attn, kvCache.k_cache(i), kvCache.v_cache(i),
                                       buf_.attn_out, buf_.decode_scores,
                                       cfg_.num_attention_heads, cfg_.num_key_value_heads,
                                       cfg_.head_dim, cached_len,
@@ -575,11 +686,11 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
                                        cfg_.head_dim);
             } else {
                 ops::attention_prefill_cached(ctx, buf_.q,
-                                              kv_cache_.k_cache(i), kv_cache_.v_cache(i),
+                                              kvCache.k_cache(i), kvCache.v_cache(i),
                                               buf_.attn_out, buf_.incr_scores,
                                               seq_len, start_pos,
                                               cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                              cfg_.head_dim, kv_cache_.max_length());
+                                              cfg_.head_dim, kvCache.max_length());
             }
         });
 
@@ -665,7 +776,7 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
         }
     });
 
-    kv_cache_.advance(seq_len);
+    kvCache.advance(seq_len);
 
     if (profile_enabled) {
         static StageProfileTotals decode_totals;
@@ -713,10 +824,28 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
 }
 
 void Qwen3Bnb4Backend::reset() {
-    kv_cache_.reset();
+    if (defaultSession_) Reset(*defaultSession_);
 }
 
 bool Qwen3Bnb4Backend::truncate_kv_cache(int new_len) {
-    kv_cache_.truncate(new_len);
+    if (new_len < 0) return false;
+    // Keep the legacy no-op behavior when asked to truncate beyond the end.
+    if (defaultSession_ && new_len < defaultSession_->CurrentLength()) {
+        Truncate(*defaultSession_, new_len);
+    }
     return true;
+}
+
+void Qwen3Bnb4Backend::Reset(Session& session) {
+    ValidateSession(session);
+    session.cache_.reset();
+}
+
+int Qwen3Bnb4Backend::Truncate(Session& session, int newLength) {
+    ValidateSession(session);
+    if (newLength < 0 || newLength > session.CurrentLength()) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::Truncate: length must be between zero and the current length");
+    }
+    session.cache_.truncate(newLength);
+    return session.CurrentLength();
 }

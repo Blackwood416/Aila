@@ -1,0 +1,205 @@
+# 重构验证入口与 P0 基线
+
+核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
+
+## 1. 固定输入与构建
+
+| 项目 | 值 |
+|---|---|
+| 基线源码 | `1956de9ed445accc33604b6e98ae3e3d7fddc813` |
+| 不可变源码目录 | `E:\RiderProjects\Aila\.worktrees\refactor-baseline-1956de9` |
+| 基线构建目录 | `E:\RiderProjects\Aila\.worktrees\refactor-baseline-1956de9\build` |
+| 实现目录 | `E:\RiderProjects\Aila`，分支 `codex/shared-model-sessions` |
+| 候选构建目录 | `E:\RiderProjects\Aila\build-refactor` |
+| 编译配置 | Release，Ninja，`build.ps1` 的 `oneapi-2026.1` |
+| 已记录工具链版本 | compiler 2026.1.0，oneDNN 3.11.2，TBB 2023.1，UMF 1.1，`sycl9.dll`；来自基线 `build/build_info.json` |
+| GPU / 驱动 | Intel Arc A770，`32.0.101.8974`（驱动日期 2026-08-11） |
+| 模型最大上下文 | 以下最小 smoke/bench 固定 4096，BF16 KV（`AILA_KV_QUANT=0`） |
+
+模型来自主工作区，worktree 不需要另拷权重：
+
+| 模型 | 绝对目录 | 形状 | `model.safetensors` 字节数 |
+|---|---|---|---:|
+| Qwen3-0.6B NF4 | `E:\RiderProjects\Aila\models\qwen3-0.6B-bnb-nf4-offline` | 28 层，hidden 1024，16 Q / 8 KV heads，head_dim 128 | 538883408 |
+| Qwen3.5-0.8B NF4 | `E:\RiderProjects\Aila\models\qwen3.5-0.8B-bnb-nf4-offline` | 24 层，hidden 1024，18 DeltaNet / 6 Full Attention | 766662032 |
+
+两份 `config.json` 当前 SHA256：
+
+- Qwen3：`107E29CC28C78CEFF2259BCD318C3694B5EF31EACC95B67E459CAE2AA4EC0B4E`
+- Qwen3.5：`FDAA22884228DBDD50582A1223EB08417BE72DDFA4A14A3396D7B4FEE9D46CEB`
+
+这两个配置哈希不替代完整权重身份。本次 `perf/refactor-legacy-check.ps1` 记录了 Qwen3 的模型文件、输入、二进制 SHA256 和实际调用参数，见 `tmp/refactor/legacy-parity/report.json`。现有 `regress.ps1` 也支持递归权重 manifest，但其 metadataNames 不包含独立 `chat_template.jinja`，使用该入口时需要额外记录。
+
+固定文本输入：
+
+- `E:\RiderProjects\Aila\perf\fixtures\smoke_text_qa.json`：system + “请简短回答：1+1等于几？ /no_think”。SHA256 `20288E77651FA139DD033949CCD8BFD72BF433E495867456FD28D1907504F8A7`。
+- `E:\RiderProjects\Aila\perf\fixtures\smoke_multi_turn.json`：预置 Alice 历史，再询问姓名。SHA256 `7E7FBAA0D3DEBFA68DB5AFC6F71656B5247FEE7B8231015B9FF9AF197F986681`。这是一次带历史的完整输入，不是同一存活 Session 的增量缓存复用测试。
+
+测量时同时保留构建日志、可执行文件哈希、源码 diff、设备/驱动、全部影响执行的 AILA/SYCL/UR/ZE 环境设置。现有脚本的 Git 信息只有 commit/branch，不记录 dirty diff；未提交候选改动不能仅凭同一 commit 字段声称源码相同。
+
+## 2. CPU CTest 白名单
+
+在上述 HEAD 的 Windows/Ninja 配置中共注册 20 个 CTest。以下 12 项不会创建 SYCL Context 或提交 GPU 工作：
+
+| CTest 名称 | 覆盖范围 |
+|---|---|
+| AilaChatTests | 模板、JSON、工具策略、输出/流解析、thinking budget |
+| AilaRuntimeDllSelectionCMakeTests | DLL 选择规则，CMake 文件测试 |
+| AilaYolo26ModelSpecTests | JSON 配置/manifest 校验 |
+| AilaSafeTensorsTests | 空 Tensor 下的 ModelWeights 键删除规则 |
+| AilaLoraLoaderTests | PEFT 权重名称映射 |
+| AilaQwen35VisionWeightsTests | 视觉 patch 权重形状与释放判定 |
+| AilaIpcProtocolTests | 协议帧与 Windows pipe |
+| AilaBuildIdentityCMakeTests | 只读 Git、Ninja 依赖和 Worker 二进制 build ID，不重建、不改 HEAD |
+| AilaWorkerDispatcherTests | fake engine 的参数转发和结果校验 |
+| AilaRuntimeIsolationTests | fake worker 的进程/环境/管道生命周期 |
+| AilaProxyAbiTests | fake worker 下的旧 C ABI、回调线程、重入、派生句柄生命周期 |
+| AilaProxyLoggingTests | Proxy 日志/回调生命周期 |
+
+基线命令（PowerShell）：
+
+```powershell
+$refactorBaseline = 'E:\RiderProjects\Aila\.worktrees\refactor-baseline-1956de9'
+$refactorBuild = Join-Path $refactorBaseline 'build'
+$refactorCpuTests = '^Aila(ChatTests|RuntimeDllSelectionCMakeTests|Yolo26ModelSpecTests|SafeTensorsTests|LoraLoaderTests|Qwen35VisionWeightsTests|IpcProtocolTests|BuildIdentityCMakeTests|WorkerDispatcherTests|RuntimeIsolationTests|ProxyAbiTests|ProxyLoggingTests)$'
+ctest --test-dir $refactorBuild -C Release --output-on-failure --parallel 4 -R $refactorCpuTests --output-log (Join-Path $refactorBaseline 'baseline-cpu-ctest.log')
+```
+
+候选新增三个 CPU CTest：`AilaRequestStateTests`（会话租约、请求状态/取消/独立 RNG、输入校验和生命周期）、`AilaDeferredLoggingTests`（延迟日志、重入及有界缓存）和 `AilaTokenTraceComparisonTests`（完整 trace 与失败判定）。它们可与上面 12 项在同一个 CTest 命令中并行运行；不要同时启动两个 CTest 进程写入同一构建目录的 `Testing/Temporary/LastTest.log`。
+
+另有 `AilaMimiEncoderTests` 为 CPU 卷积/Transformer/RVQ 实现，但加载真实 TTS 权重并依赖 `tests/audio/data/ref_codes_golden.json`、`tmp/icl_oracle/ref_test_wav24k.bin` 和 `ref_test.wav`。它较重且不能在缺数据的 worktree 直接复跑，因此不列入快速白名单。
+
+其余 7 项需要纳入 GPU 串行队列：`AilaBnb4BitLinearKernelTests`、`AilaConvOpsKernelTests`、`AilaDiffusionGemmaModelSpecTests`、`AilaDiffusionGemmaFusionTests`、`AilaDiffusionGemmaVisionTests`、`AilaEnvUtilsTests`、`AilaTTSVoiceCloneAlignmentTests`。尤其 EnvUtils 会构造 Context，DiffusionGemmaModelSpec 会执行 NF4 projection / masked attention / RoPE，不能按名字归类为 CPU。
+
+未注册为 CTest 的补充入口包括 `tests/perf/PerfCommonTests.ps1`（脚本/fake executable 自测）和 `compare_accuracy.ps1 -SelfTest`。`tests/runtime/ProxyDependencyTests.ps1 -BuildDir <dir>` 只检查发布依赖，但要求已存在 `Release/bin` staging；这三项不是本次 12 项结果的一部分。
+
+## 3. 最快文本 smoke 与 token 采集
+
+以下命令使用基线目录中的脚本，使结果里的源码身份来自基线。两个命令顺序运行。`smoke.ps1` 的真实入口是 `-BuildDir`，没有 `-AilaExe`。
+
+```powershell
+$refactorRepo = 'E:\RiderProjects\Aila'
+$refactorBaseline = Join-Path $refactorRepo '.worktrees\refactor-baseline-1956de9'
+$refactorBuild = Join-Path $refactorBaseline 'build'
+$refactorTraceEnv = @{ AILA_DEBUG_TOKEN_IDS = '1'; AILA_LOG_LEVEL = 'info'; AILA_KV_QUANT = '0' }
+
+& (Join-Path $refactorBaseline 'smoke.ps1') -BuildDir $refactorBuild -Preset phase_gate_q3_bnb4 -CaseNames q3_06_bnb_nf4_smoke -ModelDir (Join-Path $refactorRepo 'models\qwen3-0.6B-bnb-nf4-offline') -MaxSeqLen 4096 -OneApiStack oneapi-2026.1 -EnvOverrides $refactorTraceEnv -OutputDir (Join-Path $refactorBaseline 'tmp\refactor\q3-smoke')
+& (Join-Path $refactorBaseline 'smoke.ps1') -BuildDir $refactorBuild -Preset phase_gate_q35_text -CaseNames q35_08_bnb_nf4_smoke -ModelDir (Join-Path $refactorRepo 'models\qwen3.5-0.8B-bnb-nf4-offline') -MaxSeqLen 4096 -OneApiStack oneapi-2026.1 -EnvOverrides $refactorTraceEnv -OutputDir (Join-Path $refactorBaseline 'tmp\refactor\q35-smoke')
+```
+
+两例都是 greedy、最多 16 generated tokens；Qwen3 expectation 是非空，Qwen3.5 还检查包含 `2` / `二` / `两`。结果在各自 `smokes.json` 和 `smoke_logs/<case>.log`。`AILA_DEBUG_TOKEN_IDS` 仅记录前 64 个生成 step，默认 Info 日志必须开启。比较时要求 step 从 0 连续、每个 id 非负、step 数量等于 `[GenerateMessages] ... Generated=N`，再比较完整 ID 数组。不能只比较解码文本或前 64 token 前缀。
+
+如需现有 runner 自动保存完整 token provenance 和模型 manifest，可以生成只包含这两个 chat case 的临时 cases JSON，再调用基线 `regress.ps1`：
+
+```powershell
+$refactorCasesDir = Join-Path $refactorBaseline 'tmp\refactor'
+New-Item -ItemType Directory -Path $refactorCasesDir -Force | Out-Null
+$refactorCasesPath = Join-Path $refactorCasesDir 'text-cases.json'
+@{
+    schemaVersion = 1
+    cases = @(
+        @{ name = 'q3_06_nf4_text'; kind = 'chat'; model = (Join-Path $refactorRepo 'models\qwen3-0.6B-bnb-nf4-offline'); input = (Join-Path $refactorRepo 'perf\fixtures\smoke_text_qa.json'); maxTokens = 16; mode = 'greedy' },
+        @{ name = 'q35_08_nf4_text'; kind = 'chat'; model = (Join-Path $refactorRepo 'models\qwen3.5-0.8B-bnb-nf4-offline'); input = (Join-Path $refactorRepo 'perf\fixtures\smoke_text_qa.json'); maxTokens = 16; mode = 'greedy' }
+    )
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $refactorCasesPath -Encoding utf8
+$refactorAccuracyEnv = @{ AILA_MAX_SEQ_LEN = '4096'; AILA_KV_QUANT = '0'; AILA_LOG_LEVEL = 'info' }
+$refactorPreviousEnv = @{}
+foreach ($refactorKey in $refactorAccuracyEnv.Keys) {
+    $refactorPreviousEnv[$refactorKey] = [Environment]::GetEnvironmentVariable($refactorKey, 'Process')
+    [Environment]::SetEnvironmentVariable($refactorKey, $refactorAccuracyEnv[$refactorKey], 'Process')
+}
+try {
+    & (Join-Path $refactorBaseline 'regress.ps1') -BuildDir $refactorBuild -OneApiStack oneapi-2026.1 -CasesFile $refactorCasesPath -OutputDir (Join-Path $refactorBaseline 'tmp\refactor\text-accuracy') -CaseTimeoutSeconds 600
+} finally {
+    foreach ($refactorKey in $refactorPreviousEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($refactorKey, $refactorPreviousEnv[$refactorKey], 'Process')
+    }
+}
+```
+
+`regress.ps1` 只支持 greedy chat，不接受采样参数或 MaxSeqLen 参数。运行该入口前必须固定 `AILA_MAX_SEQ_LEN=4096`、`AILA_KV_QUANT=0` 和 Info 日志，并在外层记录/恢复原环境。它自动在子进程开启 `AILA_DEBUG_TOKEN_IDS`，生成 `accuracy.json`、`case_results`、原始 stdout/stderr 和输出文本；默认 cases 文件未包含 Qwen3 文本例，所以此处使用单独文件。候选运行应使用同一个 cases 文件，改用候选脚本/构建和候选 `tmp` 输出目录。
+
+## 4. 最小性能记录
+
+使用 manual 模式可直接给绝对模型目录。`bench.ps1 -Preset ...` 会从 presets 的模型别名解析路径，并忽略 `-ModelDir`、`-PromptTokens` 等手动 case 参数；worktree 没有模型目录时尤其需要避免混用。
+
+```powershell
+$refactorBenchEnv = @{ AILA_KV_QUANT = '0' }
+& (Join-Path $refactorBaseline 'bench.ps1') -BuildDir $refactorBuild -ModelDir (Join-Path $refactorRepo 'models\qwen3-0.6B-bnb-nf4-offline') -PromptTokens 256 -GenTokens 128 -BenchIters 3 -WarmupIters 1 -Seed 42 -OneApiStack oneapi-2026.1 -EnvOverrides $refactorBenchEnv -OutputDir (Join-Path $refactorBaseline 'tmp\refactor\q3-bench')
+& (Join-Path $refactorBaseline 'bench.ps1') -BuildDir $refactorBuild -ModelDir (Join-Path $refactorRepo 'models\qwen3.5-0.8B-bnb-nf4-offline') -PromptTokens 256 -GenTokens 128 -BenchIters 3 -WarmupIters 1 -Seed 42 -OneApiStack oneapi-2026.1 -EnvOverrides $refactorBenchEnv -OutputDir (Join-Path $refactorBaseline 'tmp\refactor\q35-bench')
+```
+
+不传 `-Sample` 时为 greedy。输入是 `src/bench/Benchmark.cpp` 固定英文段落编码后重复至指定长度。每次 decode 测量前重新 prefill，warmup 仅解码 `min(GenTokens,16)`。保存 `bench.json` 和每轮原始日志；3 轮足以建立最小样本，但不足以预先承诺某个回归百分比。
+
+现有 `ttft_ms_avg = prefill_ms_avg + decode_ms_avg / gen_length` 是推算值，不包含模型加载、HTTP/IPC、排队、tokenization 或实际首字节观测。它不能充当服务 TTFT，也没有 p95 token latency。当前 Context 内存计数只覆盖经 Context 分配的内存，不代表进程或设备总峰值。
+
+`bench.ps1` 有全局 benchmark mutex，但 smoke/CTest 不参与此锁，因此仍由集成负责人统一串行所有 GPU 工作。数值 trace 与性能运行分开，profile 环境不得残留。
+
+## 5. 首批数值验证实现
+
+基线仓库没有 Qwen3/Qwen3.5 的逐步 backend 测试，也没有固定文本模型完整 logits golden 文件。本次新增 `tests/inference/Qwen3SessionTests.cpp`，在真实 Qwen3 NF4 模型上比较独立与交错执行。现有两个 smoke JSON 仍是输入 fixture；Mimi/audio 与 DiffusionGemma/YOLO 的 golden/InferRef 工具不能替代文本 Session 验证。
+
+`compare_accuracy.ps1` 的现有比较模式限定 baseline `oneapi-2025.3`、candidate `oneapi-2026.1`，要求两边同 commit、tracked tree/index 干净，并拒绝模型源码变化后的旧产物。因此它不能直接比较本次同 oneAPI、不同源码的重构结果；不得修改产物 metadata 来绕过检查。
+
+本次组合两层门禁：
+
+1. P0/兼容入口：新增 `perf/compare-token-traces.ps1`，要求完整连续 token 记录和唯一终态，再比较完整 token 数组；不完整日志和差异都返回非零。`perf/refactor-legacy-check.ps1` 在同一 oneAPI 下顺序运行基线与候选，固定 seed 并覆盖采样、惩罚、流式、thinking budget、带历史输入，同时保存输入/模型/二进制身份。不改变现有 oneAPI 升级比较器的含义。
+2. P2/资源隔离：真实 GPU fixture 使用同一份权重，A 输入 24 token（8 + 16 分块），B 输入 144 token（96 + 48 分块），随后执行 decode。每步在复用 workspace 前保存 host logits，与各自相同形状的独立执行逐元素精确比较，并检查实际 cache length。另验证 greedy、固定 seed、采样惩罚、取消、截断/重算、会话释放与重新创建、默认设备域共享和日志回调重入。
+
+复跑完整兼容对照：
+
+```powershell
+pwsh -NoProfile -File perf/refactor-legacy-check.ps1 -BaselineBuild .worktrees/refactor-baseline-1956de9/build -CandidateBuild build-refactor -ModelDir models/qwen3-0.6B-bnb-nf4-offline
+```
+
+真实会话测试的模型环境设置与命令见 [shared-sessions.md](shared-sessions.md)。Qwen3.5 后续加入递归状态/快照回滚，按照实际恢复长度补算。本次旧 Qwen3.5 smoke 不代表它已支持新 Session API。
+
+## 6. 已执行结果与剩余门禁
+
+| 检查 | 当前结果 | 证据 |
+|---|---|---|
+| 基线完整 Release 构建 | 通过（集成负责人执行） | 基线 worktree `baseline-build.log`、`build/build_info.json` |
+| 候选完整 Release 构建 | 通过，包含新会话接口、测试和 Worker 适配器 | `build-refactor/kv-capability-build.log`、`build_info.json` |
+| 基线 12 项 CPU 白名单 | 全部通过，0 失败，11.18 秒（并行 4） | 基线 worktree `baseline-cpu-ctest.log` |
+| 候选 15 项 CPU CTest | 全部通过，0 失败，24.58 秒（并行 4） | `build-refactor/final-cpu-ctest.log`、`final-cpu-details.log` |
+| Qwen3 greedy smoke/token trace | prompt 34、generated 16，全部 token 相同 | `tmp/refactor/q3-smoke-comparison.json` |
+| Qwen3.5 greedy smoke/token trace | prompt 37、generated 9，全部 token 相同 | `tmp/refactor/q35-smoke-comparison.json` |
+| Qwen3 旧 CLI 扩展对照 | 五组全部相同：固定 seed 32、惩罚 32、流式 32、thinking budget 13、带历史 8 token | `tmp/refactor/legacy-parity/report.json`，`passed: true` |
+| 同栈精确 token comparator | 27 组离线案例通过；拒绝不完整 trace 和错误终态 | `AilaTokenTraceComparisonTests`，`tests/inference/TokenTraceComparisonTests.ps1` |
+| Request / 日志 CPU 回归 | 请求 15 组、日志 9 组通过，包括日志回调释放最后一个外部请求句柄 | `AilaRequestStateTests`、`AilaDeferredLoggingTests` |
+| 两 Session 逐步 logits/生命周期 | BF16 KV 通过，独立/交错每个 logit 精确一致；含 FP8 准入拒绝的最后复测 23.54 秒 | `build-refactor/kv-capability-details.log` |
+| 旧 CLI 单请求性能 | 两模型完成；Qwen3 额外完成紧邻复测，数据见下表 | 各自 `tmp/refactor/q3-bench/bench.json`、`q35-bench/bench.json`、`q3-bench-repeat/bench.json` |
+
+所有性能运行使用 256 prompt / 128 generated、greedy、warmup 1、测量 3 轮、BF16 KV、同一 oneAPI，并串行使用 GPU。吞吐单位为 token/s，变化为候选相对基线：
+
+| 运行 | 阶段 | 基线 | 候选 | 变化 |
+|---|---|---:|---:|---:|
+| Qwen3 首组 | prefill | 3375.60 | 3282.55 | -2.76% |
+| Qwen3 首组 | decode | 139.96 | 135.38 | -3.27% |
+| Qwen3 紧邻复测 | prefill | 3286.05 | 3303.54 | +0.53% |
+| Qwen3 紧邻复测 | decode | 135.53 | 135.65 | +0.09% |
+| Qwen3.5 | prefill | 2183.10 | 2215.89 | +1.50% |
+| Qwen3.5 | decode | 138.28 | 137.76 | -0.38% |
+
+Qwen3 首组有约 3% 差异，因此保留原记录并紧邻重跑基线/候选。复测 decode 平均为 944.42 / 943.57 ms，每组标准差 4.87 / 3.09 ms；prefill 为 77.91 / 77.49 ms，标准差 0.90 / 0.59 ms。复测没有重现稳定下降，基线自身也有跨运行漂移。这些短测量不足以设定覆盖所有负载的固定回归阈值，更不代表新 Session API 的并发吞吐或 HTTP TTFT 已测。
+
+基准和兼容 trace 在候选提交前生成，部分 metadata 的 commit 字段仍为 `1956de9`；实际源码差异与二进制 SHA256 另保存在 `tmp/refactor/candidate-source.patch`、`candidate-provenance.json`。判断产物身份时应同时使用这些记录，不能仅凭 Git 字段把基线与候选视为同一源码。
+
+Qwen3 fixture 的容量固定 512；每个 BF16 KV 会话新增 **58,720,256 字节（56 MiB）**，释放后归还，第二会话不复制权重或执行工作区。较大测试形状后 Context 记账的模型/工作区常驻量为 **1,278,658,202 字节**。这些数字不是设备总显存；当前只验证会话数准入与实际 KV 增减，非零字节预算尚未单列集成用例。
+
+主项目启用 kernel 用的 fast-math；`Request.cpp` 和相关 host 验证目标单独使用 `/fp:precise`（非 MSVC 模式为 `-fno-fast-math`），保留 NaN/Inf 输入校验。没有更改设备算子优化选项。
+
+这批结果验证了进程内 Qwen3 手动多会话切片与所列旧入口；统一 LayerPlan、Hybrid 共享状态、自动调度、IPC 多请求、HTTP/SSE、4B/长上下文、长期压力与服务延迟分布仍待后续阶段验收。
+
+## 7. FP8 KV 探索结果与当前限制
+
+额外使用 `AILA_KV_QUANT=1` 运行同一真实会话 fixture，17.16 秒失败于 `interleaved A 2: non-finite logit at 0`。原始失败保存在 `build-refactor/qwen3-fp8-session-details.log`；这不是 FP8 正确性通过记录。
+
+源码对照发现两处既有问题：
+
+- `src/ops/AttentionOps.cpp` 的 `attention_decode` 在默认 JM 路径不检查 KV dtype，`attention_decode_joint_matrix_tiled` 把 K/V 当作 `bf16*`，而缓存可能实际为 FP8。A 的首次 decode（cached length 25）符合该分支条件。
+- `src/ops/ElementwiseOps.cpp` 的 head_dim 128 量化融合写入只写 `k0/v0` 的低 64 维，漏掉 `k1/v1` 的高 64 维；部分旋转变体也有相同问题。仅关闭 JM 不能证明整个 FP8 路径正确。
+
+上述两个 ops 文件及 `src/memory/KVCache.cpp` 与基线 `1956de9` 无差异。这里保留了失败与源码证据，没有额外运行基线 FP8 logits 诊断，也没有在本次资源拆分中修改这些算子。
+
+新共享会话 API 限定 BF16 KV：加载前检查有效 `AILA_KV_QUANT` 设置，显式 `CreateSession` 再次检查以覆盖加载后设置变化，均以 `InvalidArgument` 拒绝 FP8。旧默认会话入口保持原有行为。GPU fixture 已通过加载前/加载后开启量化的拒绝回归：错误提示明确、会话计数和 Context current/peak 分配不变，恢复设置后可继续 BF16 推理。FP8 重新开放必须先修复读取/写入问题并单独通过数值验证。

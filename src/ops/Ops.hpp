@@ -8,6 +8,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 #include "oneapi/dnnl/dnnl.hpp"
 #include <sycl/sycl.hpp>
 #include <vector>
+#include <random>
 #include <unordered_map>
 #include <string>
 #include <cstdint>
@@ -533,6 +534,13 @@ namespace ops {
     int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                            const GenerationConfig& gen_config,
                            const std::vector<int>& generated_ids);
+
+    // Explicit request-owned RNG for interleaved sessions. The legacy overload
+    // retains its thread-local seed behavior.
+    int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
+                           const GenerationConfig& gen_config,
+                           const std::vector<int>& generated_ids,
+                           std::mt19937& rng);
 
     // Check whether the current generation config can use the device-side
     // no-penalty sampling fast path.

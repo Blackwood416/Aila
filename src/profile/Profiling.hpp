@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cctype>
 #include <chrono>
@@ -17,6 +18,23 @@ enum class LogLevel { Verbose = -1, Debug = 0, Info = 1, Warning = 2, Error = 3 
 
 // C-compatible callback signature (also used by C API)
 using LogCallback = void(*)(int level, const char* message, void* user_data);
+
+// Defers this thread's logs until the outermost scope exits. Construct before
+// lock guards so callbacks run after those guards release their locks. Scopes
+// are thread-affine; callback/user_data are resolved at delivery time.
+// Filtering still uses the log level in effect when the message is emitted.
+class ScopedLogDeferral final {
+public:
+    static constexpr std::size_t MaxBufferedBytes = 256 * 1024;
+    static constexpr std::size_t MaxBufferedMessages = 1024;
+
+    ScopedLogDeferral() noexcept;
+    ~ScopedLogDeferral() noexcept;
+    ScopedLogDeferral(const ScopedLogDeferral&) = delete;
+    ScopedLogDeferral& operator=(const ScopedLogDeferral&) = delete;
+    ScopedLogDeferral(ScopedLogDeferral&&) = delete;
+    ScopedLogDeferral& operator=(ScopedLogDeferral&&) = delete;
+};
 
 // Set custom log callback. Pass nullptr to restore default (stdout/stderr).
 void set_log_callback(LogCallback cb, void* user_data = nullptr);

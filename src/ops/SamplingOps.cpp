@@ -110,7 +110,8 @@ struct DeviceSamplingWorkspace {
 };
 
 template <typename LogitGetter>
-int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_logit) {
+int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_logit,
+                    std::mt19937& rng = sampling_rng()) {
     if (vocab_size <= 0) return 0;
 
     int k = top_k;
@@ -184,7 +185,7 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
         }
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(sampling_rng());
+        float r = dist(rng);
 
         float cumsum = 0.0f;
         for (int i = 0; i < keep; ++i) {
@@ -273,7 +274,7 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
     }
 
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(sampling_rng());
+    float r = dist(rng);
 
     float cumsum = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
@@ -465,6 +466,13 @@ void apply_penalties(float* logits_f, int vocab_size,
 int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                        const GenerationConfig& gen_config,
                        const std::vector<int>& generated_ids) {
+    return sample_with_config(ctx, logits, vocab_size, gen_config, generated_ids,
+                              sampling_rng());
+}
+
+int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
+                       const GenerationConfig& gen_config,
+                       const std::vector<int>& generated_ids, std::mt19937& rng) {
     if (!gen_config.do_sample) {
         return argmax(ctx, logits, vocab_size);
     }
@@ -478,7 +486,7 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
 
     if (!gen_config.has_penalties()) {
         return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
+            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; }, rng);
     }
 
     // Generic path: penalties on CPU float logits
@@ -495,7 +503,7 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
         logits_f[i] *= inv_temperature;
     }
     return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-        [&](int i) { return logits_f[i]; });
+        [&](int i) { return logits_f[i]; }, rng);
 }
 
 bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config) {
@@ -503,10 +511,8 @@ bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config)
         return false;
     }
 
-    static int device_sampling_mode = -1;
-    if (device_sampling_mode < 0) {
-        device_sampling_mode = aila::env::read_int_raw("AILA_DEVICE_SAMPLING", 1);
-    }
+    static const int device_sampling_mode =
+        aila::env::read_int_raw("AILA_DEVICE_SAMPLING", 1);
     if (device_sampling_mode == 0) {
         return false;
     }
