@@ -1,0 +1,73 @@
+diff --git a/trantor/net/TcpConnection.h b/trantor/net/TcpConnection.h
+--- a/trantor/net/TcpConnection.h
++++ b/trantor/net/TcpConnection.h
+@@ -248,5 +248,20 @@
+     virtual size_t bytesSent() const = 0;
+ 
++    /**
++     * @brief Return queued plaintext memory and asynchronous stream bytes.
++     *
++     * Aila's pinned dependency extension. Call only from getLoop()'s thread;
++     * a call from another thread aborts, including in release builds.
++     * Ordinary memory nodes and every asynchronous stream node are included.
++     * SIZE_MAX is returned for TLS, file or synchronous stream nodes, invalid
++     * lengths, or overflow; callers must treat that value as no write credit.
++     *
++     * This excludes kernel socket buffers, buffers in queued cross-thread
++     * callbacks, HTTP parser/response queues, and unused allocator capacity.
++     * It is a snapshot, not a reservation or a peer-consumption signal.
++     */
++    virtual size_t pendingWriteBytes() const = 0;
++
+     /**
+      * @brief Return the number of bytes received.
+      *
+diff --git a/trantor/net/inner/TcpConnectionImpl.h b/trantor/net/inner/TcpConnectionImpl.h
+--- a/trantor/net/inner/TcpConnectionImpl.h
++++ b/trantor/net/inner/TcpConnectionImpl.h
+@@ -143,6 +143,7 @@
+     {
+         return bytesSent_;
+     }
++    size_t pendingWriteBytes() const override;
+     size_t bytesReceived() const override
+     {
+         return bytesReceived_;
+diff --git a/trantor/net/inner/TcpConnectionImpl.cc b/trantor/net/inner/TcpConnectionImpl.cc
+--- a/trantor/net/inner/TcpConnectionImpl.cc
++++ b/trantor/net/inner/TcpConnectionImpl.cc
+@@ -18,3 +18,4 @@
+ #include <trantor/utils/Utilities.h>
++#include <limits>
+ #ifdef __linux__
+ #include <sys/sendfile.h>
+@@ -364,5 +365,29 @@
+ }
+ 
++size_t TcpConnectionImpl::pendingWriteBytes() const
++{
++    loop_->assertInLoopThread();
++    const auto unavailable = (std::numeric_limits<size_t>::max)();
++    if (tlsProviderPtr_)
++        return unavailable;
++
++    size_t pending = 0;
++    for (const auto &node : writeBufferList_)
++    {
++        // Synchronous stream remainingBytes() is a 0/1 availability marker,
++        // and file nodes may count bytes that have not been read into memory.
++        if (node->isFile() || (node->isStream() && !node->isAsync()))
++            return unavailable;
++        const auto remaining = node->remainingBytes();
++        if (remaining < 0 ||
++            static_cast<unsigned long long>(remaining) >
++                static_cast<unsigned long long>(unavailable - pending))
++            return unavailable;
++        pending += static_cast<size_t>(remaining);
++    }
++    return pending;
++}
++
+ void TcpConnectionImpl::forceClose()
+ {
+     auto thisPtr = shared_from_this();

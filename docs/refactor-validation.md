@@ -383,3 +383,63 @@ fixture 中 `caller_first_token_ms` 是主测试线程轮询读到首 token 的�
 v2 当前只发布 Qwen3 NF4/BF16 KV token 请求能力。Qwen3.5 远端、公共异步 C ABI、聊天/thinking budget 和 HTTP/SSE 不属于这个 token 切片。所有 payload 额度仍不代表整个进程 RSS 或设备总显存；连续合批、长期服务压力和更大上下文另行验收。
 
 源码快照、当时的 diff、模型与二进制哈希、build metadata 和日志身份保存在 `tmp/refactor/ipc-v2-precommit-provenance.json`；提交后的匹配构建身份与补充检查保存在 `tmp/refactor/ipc-v2-final-provenance.json`。提交前 metadata 的 Git 字段仍为 `78bcdd1`，需要结合源码快照与 SHA256 判断实际产物。
+
+## 11. C++ HTTP/SSE 真实推理服务
+
+本批在 `cd57b46` 的 IPC v2 基础上实现普通 MSVC C++17 `AilaServer`，通过独立 Worker 服务 Qwen3 NF4 文本请求。提供 `/health`、`/v1/models` 和 `/v1/chat/completions`，支持 JSON 与 SSE。字段、构建/运行命令、传输语义和限制见 [inference-server.md](inference-server.md)。历史依赖探针目录、IPC 证据和旧基线均保留；本批使用独立 `build-refactor-server` 与 `build-refactor-server-deps`。
+
+### 构建、CPU 与依赖检查
+
+| 检查 | 实际结果 | 证据 |
+| --- | --- | --- |
+| 普通 MSVC Release 服务构建 | 通过；Drogon 1.9.11、Trantor 1.5.24、JsonCpp 1.9.6、zlib 1.3.1，静态框架与 `/MD` | `build-refactor-server/server-build-deps-fixed.log`、`logs/build-server.txt` |
+| ChatCodec | 19 组通过，0.08 秒；严格字段/Unicode、reasoning、usage、输出预算、结束与故障语义 | `server-cpu-deps-fixed-details.log` |
+| 普通 MSVC InferenceClient | 16 组通过，0.28 秒 | 同上 |
+| 普通 MSVC 真实 CPU pipe | 7 组通过，7.83 秒；三个 CTest 总计 8.20 秒 | `server-cpu-deps-fixed.log` 与明细 |
+| Server PE 导入 | 仅 Windows、MSVC/UCRT，无 SYCL/oneDNN/OpenSSL | `server-dependents-fixed.log` |
+| Ninja header dependencies | 31 个 C++ 对象全部非空且 VALID；HttpServer.cpp 记录 221 项依赖 | `logs/server-header-dependencies.txt`、`server-build-info.json` |
+
+真实构建复核发现本机 CMake 4.1.2-msvc8 的 MSVC `/showIncludes` 自动探测将 UTF-8 中文前缀按 ANSI 936 解码，Ninja 因原始字节不匹配记录了 0 项依赖。设置 `VSLANG=1033` 未改变该编译器的输出。修复采用独立小编译探针、`ENCODING NONE` 保留原字节，从已知 header 行提取前缀；前缀哈希进入编译命令，使旧 0-deps 对象自动重编译。构建脚本额外校验所有对象的依赖有效。
+
+隔离复现先证明旧配置修改 header 后漏编译；同一探针目录重配后依赖从 0 变为 4，包含直接/间接自有 header 和 UCRT header，修改间接 header 正常重编译，再次无改动构建为 no-op。证据保存在 `tmp/refactor/server-compiler-probe/raw-prefix-1/result.json`，未改写历史 HTTP 探针。
+
+### 实际 socket 验收
+
+`tests/server/socket_tests.py` 使用 Python 标准库，实际启动 Server 与 Worker，并通过 loopback socket 读取 HTTP/SSE。每个 runner 持有自己的 Popen 句柄，先创建唯一 shutdown 文件、等待有界退出，失败时只终止其拥有的进程。两个 suite 串行运行，未与其他 GPU 进程并跑。
+
+| Suite | 结果 | 用例合计耗时 | 结果文件 |
+| --- | --- | ---: | --- |
+| CPU fake Worker + 实际 HTTP/SSE | 11/11 通过 | 21.07 秒 | `tmp/refactor/server-sockets-fake/result.json` |
+| Qwen3-0.6B NF4 + 实际 HTTP/SSE | 7/7 通过 | 24.44 秒 | `tmp/refactor/server-sockets-gpu/result.json` |
+
+GPU 模型为 `models/qwen3-0.6B-bnb-nf4-offline`，BF16 KV，context 512；服务配置 4 个请求槽、生成上限 256 token、1 MiB 输出预算、64 KiB Trantor 门限与 5 秒慢读期限。单条 GPU 内容验收生成至多 24 token，并发固定 seed 案例各至多 16 token。每条 JSON/SSE 比较包括完整 content、reasoning_content、finish_reason 和 usage；HTTP 接口不输出原始 token ID，逐 token 的独立参考比较由第 10 节的 IPC GPU 门禁提供。
+
+两组共同验证：
+
+- 健康与模型端点、未知字段、非法 JSON/seed、超生成上限、n>1、错误 stream_options 和媒体输入拒绝。
+- JSON 与实际增量 SSE 完全一致；分段 socket 读取保持 UTF-8/帧边界，usage 可选，finish 与 `[DONE]` 各一次。
+- 1/2/4 并发的活动请求峰值实际为 1/2/4，各输出与其独立固定 seed 参考一致。
+- 客户端 `Connection: close`、实际 `100 Continue`、同包 pipeline、延迟第二请求和连接复用关闭。
+- 确认 A/B 同时 active 后断开 A，B 仍与参考一致；GPU 用例观察到 A 约 15.95 ms 后进入断连终态，但这是单次验收观测，不是取消最坏延迟保证。
+- 带活动请求关闭服务，无需 runner 强制 kill；请求、IPC outstanding/pending 与连接集合均归零，accepted 与 closed 计数一致。
+
+Fake 模式额外生成约 4056 字节/token 的合法 UTF-8 文本，以 160-token 响应与 4096 字节接收缓冲区稳定制造网络压力。观察到持续不读时 pause_ticks 增长，独立 B 正常完成；恢复读取后 A 完成，持续停读则只取消 A，随后槽位可复用。四个占用请求得到明确 429，断开一个后可立即再次接入。
+
+| Fake 传输观测 | 实际值 | 配置上限 |
+| --- | ---: | ---: |
+| Trantor 最大实际 pending bytes | 63,855 B | 65,536 B |
+| 单请求最大 handoff frame | 4,249 B | 16,384 B |
+| 恢复读取的 A | 160 个内容帧，680,445 B SSE payload | 1 MiB 输出预算 |
+| SO_SNDBUF 回调读回 | 16,384 B；388 次回调、0 次失败 | 请求值 16,384 B |
+
+Fake 主进程最终关闭 388/388 个连接；GPU 关闭 141/141 个连接。GPU 短文本仅达到 1,620 B pending、未触发网络暂停，因此不拿它证明慢读门限。Fake health 344 个样本中位 15.81 ms、最大 549.28 ms；GPU health 108 个样本中位 14.50 ms、最大 27.08 ms。这些仅是本次 runner 的观测，受客户端轮询、Windows 调度和首次 JIT 影响；GPU 增量用例本身耗时 16.41 秒，不能当作预热 TTFT 或服务吞吐基准。
+
+独立故障用例用专用 token 使 fake Worker 退出，SSE 收到单个 error payload 与 `[DONE]`，没有成功 finish_reason，随后推理返回 503。故障服务关闭的退出码为 2、`shutdown.graceful=false`，明确保留 Worker 故障；`shutdown.idle=true`、5/5 socket 关闭且所有请求/命令归零，无强制 kill。原始响应、stderr 和故障 report 在 `server-sockets-fake/worker-fault`。
+
+### 当前边界与产物身份
+
+本批复用现有 NF4 内核、in-order queue、Scheduler 和 IPC 所有权，没有改变 GEMV/GEMM 计算。真实服务当前只发布 Qwen3 NF4、BF16 KV、纯文本、本机 HTTP/1.1、一连接一个应用请求。Hybrid 远端、鉴权/TLS、持久连接、工具/媒体/thinking budget、连续合批、长上下文、长期压力和性能分布仍需后续验收。
+
+Trantor 扩展读取实际 memory/async write 节点，包含普通 HTTP 输出；不是用累计 bytesSent 推算消费确认。该快照加上单请求 handoff 仅约束被计入的数据载荷，不涵盖内核 socket buffer、所有 Drogon header/parser 内存、allocator、权重或驱动分配，不能作为总 RSS/显存上限结论。
+
+提交前源码快照（含当时未跟踪的服务文件）、模型/产物/依赖/日志 SHA256 与 socket 证据清单保存在 `tmp/refactor/server-precommit-provenance.json`；此时 Worker metadata 的提交身份为 `cd57b46`，实际源码须结合快照判读。提交后匹配重建及补充验收的身份记录保存在 `tmp/refactor/server-final-provenance.json`；每个快照目录另复制当时的构建日志，避免后续重建覆盖历史内容。

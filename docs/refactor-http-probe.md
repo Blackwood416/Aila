@@ -2,6 +2,8 @@
 
 Date: 2026-09-07. Scope: an ordinary Windows C++17 build and actual loopback HTTP/SSE acceptance probe for a future C++ server. All dependency sources, binaries, package caches, and run artifacts are isolated in `build-refactor-http-probe`. No model, Aila inference API, or GPU was used.
 
+The integrated Qwen3 inference server is now documented in [inference-server.md](inference-server.md), with its own dependency directory and socket acceptance evidence in section 11 of [refactor-validation.md](refactor-validation.md). This page and the original probe artifacts remain the historical dependency experiment.
+
 ## Result
 
 **The six socket acceptance scenarios passed with Drogon 1.9.11 plus the local Windows listener-callback patch, Trantor 1.5.24, JsonCpp 1.9.6, and zlib 1.3.1.** This is a synthetic dependency/protocol probe, not an integrated inference server or a claim of general production backpressure.

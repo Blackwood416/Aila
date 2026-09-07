@@ -1,8 +1,8 @@
 # Aila 重构实施路线
 
-日期：2026-09-07。状态：P1/P2 共享会话切片之后，P3 已接入 Qwen3 与 Qwen3.5 Hybrid NF4 的具体 LayerPlan 和共享 Session，P4 token 调度器可复用两类会话。P5 的 Qwen3 token IPC v2 已实现，本轮 CPU、真实子进程 pipe、真实 Qwen3 GPU IPC 和最终集成门禁均已通过。此前已完成 Qwen3 的 1/2/4 会话性能测量与独立 HTTP/SSE 依赖探针；BF16 权重策略复用、Hybrid 远端和真实 HTTP 推理仍待接入。
+日期：2026-09-07。状态：P1/P2 共享会话切片之后，P3 已接入 Qwen3 与 Qwen3.5 Hybrid NF4 的具体 LayerPlan 和共享 Session，P4 token 调度器可复用两类会话。P5 的 Qwen3 token IPC v2 与普通 MSVC C++ HTTP/SSE 服务均已接通；真实 socket 的 11 项 fake Worker 和 7 项 Qwen3 GPU 验收通过。此前的 CPU、真实子进程 pipe、GPU IPC 与兼容集成门禁保留。BF16 权重策略复用、Hybrid 远端、长期压力和完整资源预算仍待后续推进。
 
-本路线基于当前源码、已有性能脚本和对 Worker/IPC/C API 的专项复核。目标是统一层执行、共享模型多会话，以及 C++ HTTP/SSE 服务。本文描述完整目标；当前交付边界见下文，进程内 API 见 [shared-sessions.md](shared-sessions.md)，跨进程实现见 [inference-ipc-v2-implementation.md](inference-ipc-v2-implementation.md)，实际验证记录见 [refactor-validation.md](refactor-validation.md)。
+本路线基于当前源码、已有性能脚本和对 Worker/IPC/C API 的专项复核。目标是统一层执行、共享模型多会话，以及 C++ HTTP/SSE 服务。本文描述完整目标；当前交付边界见下文，进程内 API 见 [shared-sessions.md](shared-sessions.md)，跨进程实现见 [inference-ipc-v2-implementation.md](inference-ipc-v2-implementation.md)，服务构建与请求示例见 [inference-server.md](inference-server.md)，实际验证记录见 [refactor-validation.md](refactor-validation.md)。
 
 当前交付包括：
 
@@ -16,8 +16,9 @@
 - [IPC v2 协议](inference-ipc-v2.md) 已落到独立 codec、Worker controller/管道外壳、真实 Model/Session/Scheduler 适配，以及普通 C++ `InferenceClient`/Win32 transport。内部宿主 API 支持 epoch 绑定的 Model/Session/Request 句柄、多个在途请求、独立响应/事件路由、累计 ACK、release 私有排空和关闭屏障；首片只发布 Qwen3 NF4/BF16 KV token 能力。
 - 本轮 CPU protocol 11 组、Worker 6 个测试函数、RuntimeFault 7 组、Scheduler 22 组、受控 InferenceClient 16 组均通过；真实 Windows 子进程 CPU pipe 7 组通过（6.96 秒），6 个 v1 兼容门禁通过（14.00 秒）。客户端单测耗时 0.30 秒。真实 Qwen3 GPU IPC 首跑通过（61.41 秒）：1/2/4 会话及续写逐 token 精确相同，seed/penalties、取消/背压、父释放、优雅关闭与新 epoch reload 均通过。这些门禁耗时不是服务性能结果。
 - 最终全 Release 构建通过；既有 Q3 Session（23.21 秒）、Q3 Scheduler（26.33 秒）、Q35 0.8B（36.93 秒）GPU 回归全部通过，总计 86.48 秒；23 项基础/兼容/IPC 回归全部通过，60.67 秒。普通宿主导入检查无 SYCL。日志分别为 `build-refactor/ipc-v2-full-build.log`、`ipc-v2-model-gpu-regressions.log`、`ipc-v2-final-regressions.log`、`ipc-v2-host-dependents.log`，最终证据见 [refactor-validation.md](refactor-validation.md)。
+- 普通 C++ `AilaServer` 已通过独立 Worker 提供健康检查、模型列表和 JSON/SSE Chat Completions，首片为本机 Qwen3 NF4 文本、最多 4 个并发请求。复用 tokenizer/聊天模板/reasoning 解析，支持独立 seed、usage、严格参数校验、断连与慢读取消、Worker 故障和优雅关闭。普通 MSVC 的 ChatCodec 19 组、Client 16 组、真实 pipe 7 组通过；11 项 fake socket 与 7 项真实 Qwen3 GPU socket 全部通过，完整记录见验证文档第 11 节。
 
-此阶段尚未实现 BF16 权重共享策略、Hybrid 远端能力、新公共 C ABI 或模型推理 HTTP/SSE 端点。当前 device/host payload 额度不包含权重、执行 scratch、oneDNN/driver 分配和 allocator 元数据，不代表总内存或总显存准入。聊天格式化/reasoning 仍在旧驱动；Hybrid 媒体 setter 只操作旧默认 Session。独立 HTTP 探针尚未连接调度器和 Worker。
+此阶段尚未实现 BF16 权重共享策略、Hybrid 远端能力、新公共异步 C ABI、连续合批和完整媒体服务。当前 device/host/HTTP payload 额度不包含完整进程与驱动分配，不代表总内存或总显存准入。聊天格式化/reasoning 已复用于 Qwen3 HTTP 路径；thinking budget 仍由旧驱动支持，Hybrid 媒体 setter 只操作旧默认 Session。历史独立 HTTP 探针保留，真实服务使用单独的依赖与构建目录。
 
 执行步骤、Reset/Truncate、模型加载和 Session 初始化已接入设备域故障处理。加载/初始化先保留同步 SYCL/oneDNN 首因，再 drain；成功发布资源前还要通过最终 drain。普通 host/file/config 和准入失败保持局部语义，清理 drain 失败才进一步使域故障。生命周期执行器通过 `Scheduler::ReportRuntimeFault()` 广播，通过 `DeviceRuntime::FaultMessage()` 获取析构 drain 留下的首因；已发布终态保持原状态。分类与广播的 CPU 注入门禁已经通过，详细约定见 [共享会话](shared-sessions.md#设备域故障与生命周期) 和 [调度器](scheduler.md#生命周期故障的外部报告)。
 
@@ -132,14 +133,14 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 - 普通输入错误、慢消费者和请求取消只影响对应 Request。设备域故障保留首因并停止新执行；损坏协议、Worker 退出和连接读写失败失效整个连接。单请求等待超时不直接杀掉共享 Worker。
 - 加载/Session 初始化同步设备异常分类、最终 drain、析构故障查询及 Scheduler 广播已完成，CPU RuntimeFault 7 组与 Scheduler 22 组通过。局部 host/file/config 或准入失败不一律升级为设备域故障。
 
-后续服务接入与验收：
+服务接入与后续验收：
 
-- 在本轮 IPC 与最终集成门禁通过的基础上接入服务层；长时间创建/释放、完整资源预算与 IPC 服务性能仍需独立测量。
+- 服务层已接入并完成首轮真实 socket 验收；长时间创建/释放、完整资源预算与 HTTP/IPC 服务性能仍需独立测量。
 - 旧同步 C API 保持原调用线程上的文本回调。以后适配 v2 时只等待自己的请求；新服务接口使用独立、明确的异步事件约定。
-- AilaServer 计划作为普通 C++ 目标，通过新的宿主 API 访问 Worker，保留 oneAPI 运行时隔离。CMake 公共目标改动由集成负责人统一处理。
-- Drogon 的 Windows 构建、SSE 和断线检测已通过独立探针；真实服务仍需处理记录中的 Windows listener 补丁、连接复用和端到端背压边界，保持 HTTP 适配与 Scheduler 接口解耦。
-- 第一版端点建议为 GET /health、GET /v1/models、POST /v1/chat/completions（普通 JSON 与 SSE）。明确支持的参数、结束原因映射和 usage 口径。
-- 复用现有聊天模板、工具调用和 reasoning 解析；传输层负责将内部事件映射成 HTTP 响应，不重写模型的模板规则。
+- AilaServer 是独立 MSVC C++17 子项目，通过 InferenceClient 访问 Worker，PE 导入检查无 SYCL/oneDNN。构建从 Worker metadata 绑定 hello 身份，锁定依赖与补丁，并检查 Ninja 的头文件依赖有效。
+- Windows listener 回调补丁已沿用；另为 Trantor 加入实际 pending-byte 查询，以单请求 16 KiB handoff 和 64 KiB 默认网络队列门限回传压力。已验证停读后恢复、持续停读取消及其他请求隔离。固定 loopback HTTP/1.1，一连接一个应用请求；连接复用和 pipeline 关闭该连接。
+- GET /health、GET /v1/models、POST /v1/chat/completions（普通 JSON 与 SSE）已实现。字段、finish_reason、usage 与错误映射见 [服务文档](inference-server.md)。
+- 复用现有 tokenizer、可信模型模板和 reasoning parser，默认关闭 thinking。工具调用、媒体、thinking budget、请求侧自定义模板尚未接入；非法/未支持参数显式拒绝。
 
 ### P7 及其他模型
 
@@ -189,7 +190,7 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 
 人周是工程量估计，不是本次助手运行时长。子代理能并行独立模块和审查，但接口决策、集成与单 GPU 验证处于关键路径，不能把工期直接除以代理数量。
 
-Qwen3 与 Qwen3.5 NF4 的 Session/LayerPlan 已接入 token Scheduler；Qwen3 IPC v2 已实现多请求路由、模型/会话/请求 ID、Worker epoch、有界消费确认和加载/初始化故障门禁，并通过本轮 CPU、真实 GPU IPC 与最终集成回归。下一步把已构建的 HTTP 探针接为真实 v2 宿主客户端，同时处理 Drogon Windows 补丁、连接复用和端到端背压限制。BF16 权重策略复用、Hybrid 远端、更大模型与长上下文、完整内存预算、聊天/reasoning 驱动迁移、长期压力和服务延迟分布仍是后续工作。验证覆盖范围与数值由 [refactor-validation.md](refactor-validation.md) 持续记录。
+Qwen3 与 Qwen3.5 NF4 的 Session/LayerPlan 已接入 token Scheduler；Qwen3 IPC v2 与 C++ HTTP/SSE 已形成真实推理纵向切片，并通过 CPU、真实 GPU IPC/HTTP、兼容回归和受控网络压力验收。下一步优先扩展 Hybrid 远端能力，并补齐更大模型/长上下文、长期创建释放、完整内存预算和服务延迟分布；BF16 权重策略复用、thinking budget/工具/媒体驱动与连续合批继续分阶段迁移。验证覆盖范围与数值由 [refactor-validation.md](refactor-validation.md) 持续记录。
 
 ## 8. 源码依据
 
