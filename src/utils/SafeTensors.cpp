@@ -1,5 +1,6 @@
 #include "SafeTensors.hpp"
 #include "profile/Profiling.hpp"
+#include "utils/DeviceException.hpp"
 #include <stdexcept>
 #include <algorithm>
 #include <filesystem>
@@ -219,22 +220,25 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
 
         for (const auto& name : layer_names) {
             const auto& meta = metadata[name];
-            try {
+            // Tensor allocation/upload uses SYCL here; it does not execute
+            // oneDNN primitives. Keep device failures visible to the model
+            // lifecycle boundary instead of returning a partial weight set.
+            aila::device_failure::RecoverNonDeviceExceptions<sycl::exception>([&] {
                 const size_t bytes = meta.byte_offset_end - meta.byte_offset_start;
                 if (bytes == 0) {
                     // Zero-byte tensors are metadata placeholders (e.g. bnb
                     // quant_state markers); they carry no payload.
                     skipped++;
-                    continue;
+                    return;
                 }
                 Tensor t = LoadTensorToGPU(tensor_data_start, meta, ctx);
                 total_bytes += bytes;
                 weights.put(name, std::move(t));
                 success++;
-            } catch (const std::exception& e) {
+            }, [&](const std::exception& e) {
                 AILA_LOG_ERROR("  [FAIL] %s: %s", name.c_str(), e.what());
                 fail++;
-            }
+            });
         }
 
         AILA_LOG_INFO("[SafeTensors] Loaded %d tensors (%.2f MB) to GPU%s",

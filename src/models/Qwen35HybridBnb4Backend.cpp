@@ -1045,6 +1045,10 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
                 tied_lm_head_ready = true;
                 lm_head_loaded = true;
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
+            } catch (const sycl::exception&) {
+                throw;
+            } catch (const dnnl::error&) {
+                throw;
             } catch (const std::exception& e) {
                 AILA_LOG_WARN("[Qwen3.5] Failed to preprocess tied lm_head, falling back to direct embed weight: %s",
                               e.what());

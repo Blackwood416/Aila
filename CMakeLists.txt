@@ -638,6 +638,69 @@ target_include_directories(AilaIpcProtocolTests PRIVATE
 target_link_libraries(AilaIpcProtocolTests PRIVATE simdjson)
 add_test(NAME AilaIpcProtocolTests COMMAND AilaIpcProtocolTests)
 
+# IPC v2 is an internal ordinary-C++ API, independent of the legacy ABI and
+# its whole-request WorkerProcess. None of these libraries loads a SYCL runtime.
+add_library(AilaInferenceProtocol STATIC
+    src/ipc/IpcProtocol.cpp
+    src/ipc/InferenceProtocol.cpp)
+target_compile_definitions(AilaInferenceProtocol PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaInferenceProtocol PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_include_directories(AilaInferenceProtocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaInferenceProtocol PUBLIC simdjson)
+if(WIN32)
+    target_link_directories(AilaInferenceProtocol PUBLIC "${AILA_COMPILER_ROOT}/lib")
+endif()
+if(MSVC)
+    target_compile_options(AilaInferenceProtocol PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaInferenceProtocol PRIVATE -fno-fast-math)
+endif()
+
+add_library(AilaInferenceWorkerCore STATIC src/worker/InferenceWorker.cpp)
+target_compile_definitions(AilaInferenceWorkerCore PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaInferenceWorkerCore PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_include_directories(AilaInferenceWorkerCore PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaInferenceWorkerCore PUBLIC AilaInferenceProtocol Threads::Threads)
+
+add_executable(AilaInferenceProtocolTests tests/runtime/InferenceProtocolTests.cpp)
+target_compile_definitions(AilaInferenceProtocolTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaInferenceProtocolTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_link_options(AilaInferenceProtocolTests PRIVATE -fno-sycl)
+target_link_libraries(AilaInferenceProtocolTests PRIVATE AilaInferenceProtocol)
+if(MSVC)
+    target_compile_options(AilaInferenceProtocolTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaInferenceProtocolTests PRIVATE -fno-fast-math)
+endif()
+add_test(NAME AilaInferenceProtocolTests COMMAND AilaInferenceProtocolTests)
+set_tests_properties(AilaInferenceProtocolTests PROPERTIES LABELS "cpu;ipc" TIMEOUT 30)
+
+add_executable(AilaInferenceWorkerTests
+    tests/runtime/InferenceWorkerTests.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
+    src/inference/Scheduler.cpp
+    src/profile/Profiling.cpp)
+target_compile_definitions(AilaInferenceWorkerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaInferenceWorkerTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_link_options(AilaInferenceWorkerTests PRIVATE -fno-sycl)
+target_link_libraries(AilaInferenceWorkerTests PRIVATE AilaInferenceWorkerCore)
+add_test(NAME AilaInferenceWorkerTests COMMAND AilaInferenceWorkerTests)
+set_tests_properties(AilaInferenceWorkerTests PROPERTIES LABELS "cpu;inference;ipc" TIMEOUT 90)
+
+add_executable(AilaRuntimeFaultTests tests/inference/RuntimeFaultTests.cpp)
+target_compile_definitions(AilaRuntimeFaultTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaRuntimeFaultTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_link_options(AilaRuntimeFaultTests PRIVATE -fno-sycl)
+target_include_directories(AilaRuntimeFaultTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(WIN32)
+    target_link_directories(AilaRuntimeFaultTests PRIVATE "${AILA_COMPILER_ROOT}/lib")
+endif()
+add_test(NAME AilaRuntimeFaultTests COMMAND AilaRuntimeFaultTests)
+set_tests_properties(AilaRuntimeFaultTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
+
 if(WIN32)
     get_filename_component(AILA_WORKER_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     get_filename_component(AILA_WORKER_COMPILER_ROOT
@@ -647,7 +710,8 @@ if(WIN32)
         src/worker/WorkerMain.cpp
         src/worker/CApiWorkerEngine.cpp
         src/worker/WorkerDispatcher.cpp
-        src/ipc/IpcProtocol.cpp
+        src/worker/InferenceWorkerMain.cpp
+        src/worker/SharedInferenceEngine.cpp
         src/ipc/Win32Pipe.cpp
     )
     target_compile_definitions(AilaWorker PRIVATE
@@ -661,7 +725,72 @@ if(WIN32)
     )
     target_link_directories(AilaWorker PRIVATE
         "${AILA_WORKER_COMPILER_ROOT}/lib")
-    target_link_libraries(AilaWorker PRIVATE AilaLib simdjson AilaBuildIdentity)
+    target_link_libraries(AilaWorker PRIVATE AilaLib simdjson AilaBuildIdentity AilaInferenceWorkerCore bcrypt)
+
+    add_library(AilaInferenceClient STATIC
+        src/runtime/InferenceClient.cpp
+        src/runtime/InferencePipeTransport.cpp
+        src/runtime/RuntimeDirectory.cpp
+        src/runtime/ChildEnvironment.cpp
+        src/ipc/Win32Pipe.cpp)
+    target_compile_definitions(AilaInferenceClient PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaInferenceClient PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_libraries(AilaInferenceClient PUBLIC AilaInferenceProtocol Threads::Threads)
+    if(MSVC)
+        target_compile_options(AilaInferenceClient PRIVATE /fp:precise)
+    else()
+        target_compile_options(AilaInferenceClient PRIVATE -fno-fast-math)
+    endif()
+
+    add_executable(AilaInferenceClientTests tests/runtime/InferenceClientTests.cpp)
+    target_compile_definitions(AilaInferenceClientTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaInferenceClientTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaInferenceClientTests PRIVATE -fno-sycl)
+    target_link_libraries(AilaInferenceClientTests PRIVATE AilaInferenceClient)
+    if(MSVC)
+        target_compile_options(AilaInferenceClientTests PRIVATE /fp:precise)
+    else()
+        target_compile_options(AilaInferenceClientTests PRIVATE -fno-fast-math)
+    endif()
+    add_test(NAME AilaInferenceClientTests COMMAND AilaInferenceClientTests)
+    set_tests_properties(AilaInferenceClientTests PROPERTIES LABELS "cpu;inference;ipc" TIMEOUT 90)
+
+    add_executable(AilaQwen3IpcSessionTests tests/inference/Qwen3IpcSessionTests.cpp)
+    target_compile_definitions(AilaQwen3IpcSessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB
+        AILA_IPC_WORKER_PATH="$<TARGET_FILE:AilaWorker>")
+    target_link_libraries(AilaQwen3IpcSessionTests PRIVATE AilaLib AilaInferenceClient AilaBuildIdentity)
+    if(MSVC)
+        target_compile_options(AilaQwen3IpcSessionTests PRIVATE /fp:precise)
+    else()
+        target_compile_options(AilaQwen3IpcSessionTests PRIVATE -fno-fast-math)
+    endif()
+    add_dependencies(AilaQwen3IpcSessionTests AilaWorker)
+    add_test(NAME AilaQwen3IpcSessionTests COMMAND AilaQwen3IpcSessionTests)
+    set_tests_properties(AilaQwen3IpcSessionTests PROPERTIES
+        LABELS "gpu;inference;ipc" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    add_executable(AilaFakeInferenceWorker
+        tests/runtime/FakeInferenceWorkerMain.cpp
+        src/worker/InferenceWorkerMain.cpp
+        src/ipc/Win32Pipe.cpp
+        src/inference/Session.cpp
+        src/inference/Request.cpp
+        src/inference/Scheduler.cpp
+        src/profile/Profiling.cpp)
+    target_compile_definitions(AilaFakeInferenceWorker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaFakeInferenceWorker PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaFakeInferenceWorker PRIVATE -fno-sycl)
+    target_link_libraries(AilaFakeInferenceWorker PRIVATE AilaInferenceWorkerCore AilaBuildIdentity bcrypt)
+
+    add_executable(AilaInferencePipeTests tests/runtime/InferencePipeTests.cpp)
+    target_compile_definitions(AilaInferencePipeTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+        AILA_FAKE_INFERENCE_WORKER_PATH="$<TARGET_FILE:AilaFakeInferenceWorker>")
+    target_compile_options(AilaInferencePipeTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaInferencePipeTests PRIVATE -fno-sycl)
+    target_link_libraries(AilaInferencePipeTests PRIVATE AilaInferenceClient AilaBuildIdentity)
+    add_dependencies(AilaInferencePipeTests AilaFakeInferenceWorker)
+    add_test(NAME AilaInferencePipeTests COMMAND AilaInferencePipeTests)
+    set_tests_properties(AilaInferencePipeTests PROPERTIES LABELS "cpu;inference;ipc" TIMEOUT 90)
     if(CMAKE_GENERATOR MATCHES "Ninja" AND Git_FOUND)
         add_test(
             NAME AilaBuildIdentityCMakeTests

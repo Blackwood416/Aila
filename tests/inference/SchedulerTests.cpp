@@ -895,6 +895,167 @@ void TestDroppedRunningHandleRetainsSessionUntilSafe() {
     ExpectNoReservations(scheduler);
 }
 
+void TestLifecycleFaultPreservesCompletedStreamsAndFirstCause() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 1;
+    Scheduler scheduler(limits);
+    ForwardGate decoding;
+    auto completedSession = MakeFixture(1);
+    auto active = MakeFixture(2);
+    auto pending = MakeFixture(3);
+    completedSession.state->samples = {11};
+    active.state->samples = {21, 22};
+    active.state->duringForward = [hold = decoding.Action()](size_t call, bool) {
+        if (call == 2) hold();
+    };
+    // With one active slot this terminal is already published, but unread,
+    // when the following session reaches its second forward.
+    auto completed = scheduler.Submit(completedSession.session, {1}, Options(1));
+    auto running = scheduler.Submit(active.session, {2}, Options(6));
+    decoding.AwaitEntry();
+    auto queued = scheduler.Submit(pending.session, {3}, Options(1));
+    Expect(completed->Snapshot().status == RequestStatus::Completed &&
+               !completed->Snapshot().terminalConsumed && running->Snapshot().bufferedTokens == 1,
+           "Lifecycle fault fixture did not retain a completed stream and an active token");
+    const auto before = scheduler.Snapshot();
+    const std::string firstCause = "model.load: synchronous SYCL upload failure";
+    std::string borrowedCause = firstCause;
+    scheduler.ReportRuntimeFault(borrowedCause);
+    borrowedCause.assign("caller reused its error buffer");
+    scheduler.ReportRuntimeFault("later device drain failure");
+    const auto faulted = scheduler.Snapshot();
+    Expect(faulted.faulted && !faulted.accepting && faulted.faultMessage == firstCause &&
+               faulted.outstandingRequests == before.outstandingRequests &&
+               faulted.reservedTokens == before.reservedTokens &&
+               faulted.reservedSessionCacheBytes == before.reservedSessionCacheBytes &&
+               active.session->Busy() && pending.session->Busy(),
+           "Lifecycle fault lost its first diagnosis, blocked on Forward, or released active ownership early");
+    auto rejected = MakeFixture(4);
+    ExpectError(ErrorCode::RuntimeFault, [&] { scheduler.Submit(rejected.session, {4}, Options(1)); });
+    Expect(!rejected.session->Busy() && rejected.state->Inputs().empty(),
+           "Lifecycle fault admitted a new request");
+
+    decoding.Release();
+    const auto completedResult = Drain(completed);
+    const auto activeResult = Drain(running);
+    const auto pendingResult = Drain(queued);
+    ExpectEnd(completedResult, RequestStatus::Completed, RequestEndReason::Length);
+    Expect(completedResult.tokens == std::vector<int>({11}) &&
+               !completedResult.terminal.errorCode && completedResult.terminal.error.empty(),
+           "Lifecycle fault rewrote a previously completed unread stream");
+    for (const auto* result : {&activeResult, &pendingResult}) {
+        ExpectEnd(*result, RequestStatus::Failed, RequestEndReason::RuntimeFault);
+        Expect(result->terminal.errorCode == ErrorCode::RuntimeFault &&
+                   result->terminal.error == firstCause,
+               "Lifecycle broadcast did not preserve the original error on every unfinished request");
+    }
+    Expect(activeResult.tokens == std::vector<int>({21}) && pendingResult.tokens.empty() &&
+               active.state->Inputs().size() == 2 && pending.state->Inputs().empty() &&
+               !active.session->Busy() && !pending.session->Busy(),
+           "Lifecycle fault lost earlier output, published an in-flight token, or executed pending work");
+    scheduler.Shutdown();
+    scheduler.ReportRuntimeFault("report after shutdown");
+    Expect(scheduler.Snapshot().faultMessage == firstCause, "Repeated report replaced the first diagnosis");
+    ExpectNoReservations(scheduler);
+}
+
+void TestLifecycleFaultWhileSubmitIsInitializing() {
+    Scheduler scheduler(Limits());
+    auto fixture = MakeFixture();
+    // Release the gate before waiting for this future during exception unwind.
+    std::future<std::shared_ptr<ScheduledRequest>> submitting;
+    ForwardGate contextQuery;
+    fixture.state->duringContextLength = contextQuery.Action();
+    submitting = std::async(std::launch::async, [&] {
+        return scheduler.Submit(fixture.session, {1}, Options(1));
+    });
+    contextQuery.AwaitEntry();
+    const auto reserved = scheduler.Snapshot();
+    Expect(reserved.outstandingRequests == 1 && reserved.queuedRequests == 0 &&
+               reserved.activeRequests == 0 && fixture.session->Busy(),
+           "Submit did not reach its reserved, unpublished state");
+    const std::string diagnosis = "session.create: device initialization failed";
+    scheduler.ReportRuntimeFault(diagnosis);
+    const auto faulted = scheduler.Snapshot();
+    Expect(faulted.faulted && !faulted.accepting && faulted.faultMessage == diagnosis &&
+               faulted.outstandingRequests == 1 && fixture.session->Busy() &&
+               fixture.state->Inputs().empty(),
+           "Lifecycle report waited for initializing Submit or reclaimed its ownership before rollback");
+    contextQuery.Release();
+    Expect(submitting.wait_for(5s) == std::future_status::ready,
+           "Initializing Submit did not finish after a lifecycle fault");
+    ExpectError(ErrorCode::RuntimeFault, [&] { submitting.get(); });
+    Expect(!fixture.session->Busy() && fixture.state->Inputs().empty(),
+           "Submit raced past the lifecycle fault or retained its unpublished session lease");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestReentrantLifecycleFaultBeforeTerminalPublication() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 1;
+    Scheduler scheduler(limits);
+    ForwardGate finalizing;
+    auto active = MakeFixture(1);
+    auto pending = MakeFixture(2);
+    active.state->samples = {31};
+    std::shared_ptr<ScheduledRequest> running;
+    struct Probe {
+        Scheduler* scheduler;
+        std::shared_ptr<ScheduledRequest>* stream;
+        SessionState* session;
+        std::atomic<int> calls{0};
+        std::atomic<bool> terminalNotPublished{false};
+        std::atomic<bool> finalStepAlreadyEnded{false};
+        std::atomic<bool> reportReturned{false};
+    } probe{&scheduler, &running, active.session.get()};
+    struct RestoreLogging {
+        aila::LogLevel level = aila::get_log_level();
+        ~RestoreLogging() {
+            aila::set_log_callback(nullptr);
+            aila::set_log_level(level);
+        }
+    } restore;
+    aila::set_log_level(aila::LogLevel::Info);
+    aila::set_log_callback([](int, const char* text, void* userData) {
+        if (std::strcmp(text, "SchedulerTests lifecycle fault before terminal") != 0) return;
+        auto& probe = *static_cast<Probe*>(userData);
+        ++probe.calls;
+        // Step has already constructed Completed and released its lease.
+        // Its deferred logs run before Scheduler publishes the terminal.
+        probe.finalStepAlreadyEnded.store(!probe.session->Busy());
+        probe.terminalNotPublished.store((*probe.stream)->Snapshot().status == RequestStatus::Finalizing);
+        probe.scheduler->ReportRuntimeFault("session.create: oneDNN initialization failed");
+        probe.reportReturned.store(true);
+    }, &probe);
+    active.state->duringForward = [hold = finalizing.Action()](size_t call, bool) {
+        if (call == 2) {
+            hold();
+            AILA_LOG_INFO("SchedulerTests lifecycle fault before terminal");
+        }
+    };
+    running = scheduler.Submit(active.session, {1}, Options(1));
+    finalizing.AwaitEntry();
+    auto queued = scheduler.Submit(pending.session, {2}, Options(1));
+    finalizing.Release();
+    const auto activeResult = Drain(running);
+    const auto pendingResult = Drain(queued);
+    Expect(probe.calls.load() == 1 && probe.finalStepAlreadyEnded.load() &&
+               probe.terminalNotPublished.load() && probe.reportReturned.load(),
+           "Lifecycle fault did not occur after Step completion and before terminal publication");
+    for (const auto* result : {&activeResult, &pendingResult}) {
+        ExpectEnd(*result, RequestStatus::Failed, RequestEndReason::RuntimeFault);
+        Expect(result->terminal.errorCode == ErrorCode::RuntimeFault &&
+                   result->terminal.error == "session.create: oneDNN initialization failed",
+               "Reentrant lifecycle fault failed to retire a still-unpublished terminal");
+    }
+    Expect(activeResult.tokens == std::vector<int>({31}) && pendingResult.tokens.empty() &&
+               pending.state->Inputs().empty() && !active.session->Busy() && !pending.session->Busy(),
+           "Reentrant fault discarded buffered output, ran queued work, or retained a session");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
 void TestHandlesSurviveSchedulerDestruction() {
     std::shared_ptr<ScheduledRequest> survivor;
     auto a = MakeFixture(1);
@@ -1194,6 +1355,9 @@ int main() {
         {"UTF-8 error bound preserves Progress and terminal types", TestUtf8ErrorsPreserveTypedProgress},
         {"RuntimeFault stops active and pending requests", TestRuntimeFaultStopsAllRequests},
         {"Submit setup faults roll back admission and stop peers", TestSubmitSetupFaultStopsScheduler},
+        {"lifecycle fault preserves completed streams and broadcasts first cause", TestLifecycleFaultPreservesCompletedStreamsAndFirstCause},
+        {"lifecycle fault races unpublished Submit and rolls back admission", TestLifecycleFaultWhileSubmitIsInitializing},
+        {"reentrant lifecycle fault precedes terminal publication", TestReentrantLifecycleFaultBeforeTerminalPublication},
         {"dropping a running handle preserves lifetime until safe", TestDroppedRunningHandleRetainsSessionUntilSafe},
         {"readable handles outlive Scheduler", TestHandlesSurviveSchedulerDestruction},
         {"reentrant/concurrent Shutdown wakes readers", TestReentrantAndConcurrentShutdownWakesReaders},

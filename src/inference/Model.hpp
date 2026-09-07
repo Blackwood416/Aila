@@ -2,6 +2,7 @@
 
 #include "inference/Session.hpp"
 
+#include <optional>
 #include <string>
 
 namespace aila::inference {
@@ -24,6 +25,10 @@ public:
     static std::shared_ptr<DeviceRuntime> Create();
     std::string DeviceName() const;
     MemorySnapshot Memory() const;
+    // First device failure, including one observed by a no-throw destructor
+    // drain. Lifecycle/reaper callers forward it to Scheduler::ReportRuntimeFault.
+    // Takes the execution mutex; do not call it on a transport reader thread.
+    std::optional<std::string> FaultMessage() const;
 
 private:
     friend class LoadedModel;

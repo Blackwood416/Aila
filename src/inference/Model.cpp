@@ -1,4 +1,5 @@
 #include "inference/Model.hpp"
+#include "inference/RuntimeFault.hpp"
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
@@ -22,34 +23,18 @@ namespace detail {
 struct DeviceState {
     Context context;
     mutable std::mutex mutex;
-    bool faulted = false;
-    std::string fault;
+    RuntimeFaultRecord fault;
 
-    void CheckUsable() const {
-        if (faulted) throw Error(ErrorCode::RuntimeFault, FaultMessage());
-    }
+    void CheckUsable() const { fault.CheckUsable(); }
 
-    const char* FaultMessage() const noexcept {
-        return fault.empty() ? "Device execution domain is unusable" : fault.c_str();
-    }
+    const char* FaultMessage() const noexcept { return fault.Message(); }
 
     void RecordFaultNoThrow(const char* message) noexcept {
-        // Keep the domain invalid even if recording the message runs out of
-        // host memory while handling a device failure.
-        faulted = true;
-        try { if (fault.empty()) fault = message; } catch (...) {}
+        fault.Record(message);
     }
 
     void DrainNoThrow() noexcept {
-        try {
-            context.synchronize();
-        } catch (const std::exception& e) {
-            // wait_and_throw drains submitted work. Destructors must not throw,
-            // but other sessions in this execution domain must subsequently fail.
-            RecordFaultNoThrow(e.what());
-        } catch (...) {
-            RecordFaultNoThrow("Unknown device failure");
-        }
+        fault.DrainNoThrow([&] { context.synchronize(); });
     }
 
     ~DeviceState() { DrainNoThrow(); }
@@ -127,20 +112,19 @@ public:
              model->activeSessions >= options.maxSessionHostBytes / model->sessionHostReservationBytes)) {
             throw Error(ErrorCode::ResourceLimit, "Shared model session memory limit reached");
         }
-        try {
+        std::unique_ptr<typename Backend::Session> initializedCache;
+        RunDeviceLifecycle<sycl::exception, dnnl::error>(model->device->fault, [&] {
             if constexpr (std::is_same_v<Backend, Qwen35HybridBnb4Backend>) {
-                cache = ModelBackend().CreateSession(model->device->context, options.maxRecurrentSnapshots);
+                initializedCache = ModelBackend().CreateSession(
+                    model->device->context, options.maxRecurrentSnapshots);
             } else {
-                cache = ModelBackend().CreateSession(model->device->context);
+                initializedCache = ModelBackend().CreateSession(model->device->context);
             }
-            ++model->activeSessions;
-        } catch (const std::invalid_argument& error) {
-            model->device->DrainNoThrow();
-            throw Error(ErrorCode::InvalidArgument, error.what());
-        } catch (...) {
-            model->device->DrainNoThrow();
-            throw;
-        }
+        }, [&] { model->device->context.synchronize(); });
+        // Count only a fully initialized, drained session. A failed final drain
+        // must not leave a cache whose destructor decrements an unheld credit.
+        cache = std::move(initializedCache);
+        ++model->activeSessions;
     }
 
     int ContextLength() const override {
@@ -213,15 +197,14 @@ public:
             context.synchronize();
             return result;
         } catch (const std::exception& e) {
-            device.faulted = true;
-            // Drain borrowed host input before any error-message allocation.
-            device.DrainNoThrow();
+            // The record has fixed storage: preserve the first failure before
+            // draining borrowed host input and allocating an Error message.
             device.RecordFaultNoThrow(e.what());
+            device.DrainNoThrow();
             throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
         } catch (...) {
-            device.faulted = true;
-            device.DrainNoThrow();
             device.RecordFaultNoThrow("Unknown device execution failure");
+            device.DrainNoThrow();
             throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
         }
     }
@@ -239,14 +222,12 @@ private:
             mutate();
             device.context.synchronize();
         } catch (const std::exception& error) {
-            device.faulted = true;
-            device.DrainNoThrow();
             device.RecordFaultNoThrow(error.what());
+            device.DrainNoThrow();
             throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
         } catch (...) {
-            device.faulted = true;
-            device.DrainNoThrow();
             device.RecordFaultNoThrow("Unknown session state mutation failure");
+            device.DrainNoThrow();
             throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
         }
     }
@@ -268,7 +249,12 @@ std::shared_ptr<DeviceRuntime> DeviceRuntime::Create() {
     std::lock_guard<std::mutex> lock(creationMutex);
     auto device = activeDevice.lock();
     if (!device) {
-        device = std::make_shared<detail::DeviceState>();
+        // There is no published domain to drain when Context construction
+        // fails, but its device exception must still reach the Worker typed.
+        detail::RuntimeFaultRecord creationFault;
+        detail::RunDeviceLifecycle<sycl::exception, dnnl::error>(creationFault, [&] {
+            device = std::make_shared<detail::DeviceState>();
+        }, [] {});
         activeDevice = device;
     }
     return std::shared_ptr<DeviceRuntime>(new DeviceRuntime(std::move(device)));
@@ -282,6 +268,12 @@ std::string DeviceRuntime::DeviceName() const {
 MemorySnapshot DeviceRuntime::Memory() const {
     std::lock_guard<std::mutex> lock(state->mutex);
     return {state->context.current_allocated_bytes(), state->context.peak_allocated_bytes()};
+}
+
+std::optional<std::string> DeviceRuntime::FaultMessage() const {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->fault.Faulted()) return std::nullopt;
+    return std::string(state->FaultMessage());
 }
 
 LoadedModel::LoadedModel(std::shared_ptr<detail::LoadedModelState> value)
@@ -368,7 +360,7 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadNf4(
     std::unique_lock<std::mutex> lock(loaded->device->mutex);
     loaded->device->CheckUsable();
     auto& context = loaded->device->context;
-    try {
+    detail::RunDeviceLifecycle<sycl::exception, dnnl::error>(loaded->device->fault, [&] {
         loaded->weights = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(modelDirectory, context));
         if (hybrid) loaded->backend = std::make_unique<Qwen35HybridBnb4Backend>();
         else loaded->backend = std::make_unique<Qwen3Bnb4Backend>();
@@ -376,11 +368,7 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadNf4(
             throw Error(ErrorCode::UnsupportedModel, error);
         }
         loaded->workspace = std::make_unique<detail::ExecutionWorkspace>();
-        context.synchronize();
-    } catch (...) {
-        loaded->device->DrainNoThrow();
-        throw;
-    }
+    }, [&] { context.synchronize(); });
     lock.unlock();
     return std::shared_ptr<LoadedModel>(new LoadedModel(std::move(loaded)));
 }

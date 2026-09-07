@@ -1,6 +1,6 @@
 # Token 请求调度器
 
-`src/inference/Scheduler.hpp` 提供进程内的自动多会话调度。每个 Scheduler 有一个提交线程，使用已有 `SessionState / RequestState` 执行 Qwen3 或 Qwen3.5 Hybrid NF4，共享会话使用 BF16 KV。该接口链接 `AilaLib`，尚未接入 Worker/Proxy 多请求协议或 HTTP 服务。资源接口见 [shared-sessions.md](shared-sessions.md)，Hybrid 状态约定见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)。
+`src/inference/Scheduler.hpp` 提供进程内的自动多会话调度。每个 Scheduler 有一个提交线程，使用已有 `SessionState / RequestState` 执行 Qwen3 或 Qwen3.5 Hybrid NF4，共享会话使用 BF16 KV。该接口链接 `AilaLib`；跨进程接口约定见 [IPC v2](inference-ipc-v2.md)，服务层进度见 [重构路线图](refactor-roadmap.md)。资源接口见 [shared-sessions.md](shared-sessions.md)，Hybrid 状态约定见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)。
 
 ## 执行与公平性
 
@@ -106,7 +106,23 @@ ring 满时，在下一次会产生 token 的步骤之前取消该请求，终�
 
 Hybrid 的 `SessionState::Truncate(requestedLength)` 可能恢复到更早的保留 checkpoint，没有可用 checkpoint 时重置为 0；相同长度截断是 no-op。必须根据返回的实际长度补算历史。恢复同时处理递归矩阵、卷积历史、环形位置和 host/device 一致性，其他 Session 不受影响；活动请求持有会话租约时，Reset/Truncate 仍返回 Busy。
 
-当前执行及 Reset/Truncate 的设备变更异常会归一为 `RuntimeFault`；模型加载和 Session 初始化的同步设备异常分类仍沿用旧实现，不能假定所有初始化失败都已转为域故障。后续 [IPC v2 设计](inference-ipc-v2.md) 的故障门禁还需补异常分类及故障注入验证；该文档不代表多在途 Worker/Proxy 已经实现。
+## 生命周期故障的外部报告
+
+执行步骤产生的 `RuntimeFault` 会由 Scheduler 广播。模型加载、Session 初始化及资源析构发生在提交线程之外时，生命周期管理者还需把设备域故障传给同域的 `Scheduler::ReportRuntimeFault(std::string_view) noexcept`。Scheduler 不自动订阅 `DeviceRuntime`，也不能将所有加载失败都作为域故障报告。
+
+`ReportRuntimeFault()` 线程安全且可重复调用：先将首个诊断复制到固定存储，立即停止准入并请求当前步骤取消，不 join 提交线程，也不等待设备 drain。`SchedulerSnapshot::faulted` 为 true、`accepting` 为 false，`faultMessage` 返回首因；后续报告不会覆盖它。诊断最多 1024 字节，截断保留 UTF-8 边界，空诊断使用默认设备故障消息。
+
+故障报告与 token/terminal 发布使用同一调度锁确定先后顺序。报告返回后不再发布新的 token；报告之前已发布的 token 仍可读取。尚未发布 terminal 的活动和排队请求在安全边界以 `Failed / RuntimeFault` 终结，正在初始化但尚未发布的 Submit 回滚准入和会话租约。此前已经发布的 terminal 保持原状态，即使用户还未读取；不会把已完成请求改为失败。报告本身不提前销毁正在执行的 Request，也不提前归还其额度。
+
+`DeviceRuntime::FaultMessage()` 返回 `std::optional<std::string>`，健康时为 `nullopt`，故障时返回设备域的首因，包括不抛异常的析构 drain 所记录的故障。它需要取得设备执行锁，可能等待当前步骤；应由生命周期/清理线程调用，不能放在要求持续排空管道的 transport reader 上。例如，在资源操作或销毁结束后检查并转发：
+
+```cpp
+if (auto message = runtime->FaultMessage()) {
+    scheduler.ReportRuntimeFault(*message);
+}
+```
+
+共享模型加载和 Session 初始化现已将 `sycl::exception`、`dnnl::error` 及已有的 `RuntimeFault` 归一为设备域故障，并在成功发布资源前完成最终 drain。普通 host/file/config 错误及 Busy/额度拒绝保持局部影响；若随后 drain 本身失败，仍按设备域故障处理。首因、清理及权重加载回退的详细分类见 [共享会话的设备域故障](shared-sessions.md#设备域故障与生命周期)。
 
 ## 关闭与回调
 
@@ -118,10 +134,12 @@ Hybrid 的 `SessionState::Truncate(requestedLength)` 可能恢复到更早的保
 
 ## 验证入口
 
-CPU 的 `AilaSchedulerTests` 使用可控执行 gate，验证轮转、固定 seed、准入、排队/运行取消、背压、故障广播、输出寿命与回调关闭。它不创建 SYCL Context。
+CPU 的 `AilaSchedulerTests` 使用可控执行 gate，验证轮转、固定 seed、准入、排队/运行取消、背压、故障广播、输出寿命与回调关闭。它不创建 SYCL Context。本轮主任务已统一运行通过全部 22 组，其中新增的 3 组覆盖：生命周期故障保留已完成未读流并广播首因、故障与尚未发布的 Submit 竞争时回滚准入、日志回调重入报告故障先于 terminal 发布。
+
+同轮 `AilaRuntimeFaultTests` 的 7 组 CPU 故障注入也已由主任务运行通过，覆盖同步设备异常、最终 drain、局部 host/file/config 失败、析构首因及加载恢复边界。它们验证可注入的分类策略和状态机，不代表真实 GPU/driver 故障注入结果。
 
 ```powershell
-ctest --test-dir build-refactor -R '^AilaSchedulerTests$' --output-on-failure
+ctest --test-dir build-refactor -R '^Aila(Scheduler|RuntimeFault)Tests$' --output-on-failure
 ```
 
 真实模型集成和性能结果统一记录在 [refactor-validation.md](refactor-validation.md)。GPU 测试与 benchmark 必须串行运行。

@@ -1,8 +1,8 @@
 # 共享推理 IPC v2 实施协议
 
-日期：2026-09-07。**状态：设计，尚未实现。** 本文规定后续 Worker/Proxy 的首个 Qwen3 token 纵向切片；不表示现有 Worker、公共 C ABI 或 HTTP 服务已经支持多请求。现有实现边界见 [shared-sessions.md](shared-sessions.md) 和 [scheduler.md](scheduler.md)，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
+日期：2026-09-07。**状态：首个 Qwen3 token 切片已实现，本轮 IPC 与最终集成门禁均已通过。** v2 codec、Worker controller/管道外壳、普通 C++ `InferenceClient`/Win32 transport 及设备故障前提已接通，旧 Worker/Proxy 和公共 C ABI 保持 v1。全 Release 构建、既有 Qwen3/Qwen3.5 模型/调度 GPU 回归、23 项基础/兼容/IPC 回归及普通宿主无 SYCL 导入检查通过；HTTP 和 Hybrid 远端能力仍属后续范围。实现入口见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)，当前验证快照见第 10 节，最终证据见 [refactor-validation.md](refactor-validation.md)，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
 
-本设计依据 `src/inference/{Model,Session,Request,Scheduler}.hpp`、`src/ipc/IpcProtocol.*`、`src/runtime/WorkerProcess.*`、`src/worker/{WorkerMain,WorkerDispatcher,CApiWorkerEngine}.*` 和 `src/proxy/{ProxyEngine,AilaProxyApi}.*`。协议枚举使用稳定字符串，不直接发送 C++ 枚举的整数值或结构体内存。
+本文保留 v2 的协议契约。实现位于 `src/ipc/InferenceProtocol.*`、`src/runtime/InferenceClient.*`、`src/runtime/InferencePipeTransport.cpp` 和 `src/worker/{InferenceWorker,InferenceWorkerMain}.*`，通过 `SharedInferenceEngine.cpp` 接入已有 Model/Session/Scheduler。进程内资源与调度语义见 [shared-sessions.md](shared-sessions.md) 和 [scheduler.md](scheduler.md)。协议枚举使用稳定字符串，不直接发送 C++ 枚举的整数值或结构体内存。
 
 ## 1. 首片边界及兼容模式
 
@@ -183,7 +183,7 @@ AND terminal 摘要与 final 摘要相同
 
 ## 7. 有界额度、累计 ACK 和公平发送
 
-以下是首片建议的固定默认值，不是性能保证；握手宣告实际值。计数与字节限制同时生效。
+以下是首片实现的固定默认值，不是性能保证；握手宣告实际值。计数与字节限制同时生效。
 
 | 限制 | 首片默认 | 归还或适用边界 |
 | --- | ---: | --- |
@@ -218,7 +218,7 @@ Worker 以 `sentTokenCount - acknowledgedTokenCount + stagedTokenCount < tokenWi
 
 当用户/HTTP 客户端主动断开时，`handle.release(request)` 将宿主路由转为 abandoning，立即停止向用户回调；私有 reader 丢弃该请求已收和后续 token，并以相同顺序 ACK。Worker 调用 Cancel，仍以有界窗口发送剩余已发布数据、terminal 和 final，直到正常排空判据成立；随后释放传输额度、请求 registry 和私有 owner。closing Request 仍接受清理用 ACK，新的用户操作返回 InvalidHandle；重复 release 在收尾期间无副作用，宿主对已经结束的本地 release 不再重复发命令。这样 release 不需要制造 sequence 缺口，也不会因两条 pipe 的在途帧而误报未知请求。局部 release 不等待用户读流，其他 Session 不受影响。
 
-上述私有排空是尚待实现的 bridge 行为。bridge 必须保留 `ScheduledRequest` 的强引用，Cancel 后继续读取并完成有界传输及终态确认，不能直接销毁该对象：当前 `ScheduledRequest` 析构会调用 `Detach()`、丢弃 ring 并请求取消，不能再据此发送完整的原 sequence/eventCount 流。
+上述私有排空由 v2 宿主路由与 Worker bridge 协作完成。bridge 保留 `ScheduledRequest` 的强引用，Cancel 后继续读取并完成有界传输及终态确认，不能直接销毁该对象：`ScheduledRequest` 析构会调用 `Detach()`、丢弃 ring 并请求取消，不能再据此发送完整的原 sequence/eventCount 流。Worker 归还流额度时还需确认相关 terminal/final 写入槽已经完成。
 
 显式 request.cancel 只请求停止生成，保留用户的可读流；cancel 响应不是 terminal。重复 cancel 与完成 racing 时，保留最先到达的原执行终态。丢弃请求句柄用 release/自动排空，不能等价为仅 cancel 后把路由删除。
 
@@ -236,13 +236,13 @@ Worker 以 `sentTokenCount - acknowledgedTokenCount + stagedTokenCount < tokenWi
 | Scheduler thread | 当前已有的完整步骤调度 | 写 pipe、socket、调用用户输出回调 |
 | Worker bridge + event sender | 每请求 Read(0)、冻结终态、轮转小帧、维护信用 | 绕过窗口、阻塞 GPU 线程、每次读到一条流就整条读完 |
 | Worker response sender | accepted、控制响应及最终摘要的有界独立发送 | 让慢 event 流持有 response writer 锁 |
-| Proxy command sender | 分配 RPC ID、登记 pending、序列化写入、合并 ACK | 持有等待最终结果的整请求互斥锁 |
-| Proxy response/event readers | 按 epoch + RPC/inference ID 路由、验证排空、唤醒本地等待者 | 调用用户/HTTP 回调，或等待某条请求腾出无预留空间 |
+| v2 InferenceClient command sender | 分配 RPC ID、登记 pending、序列化写入、合并 ACK | 持有等待最终结果的整请求互斥锁 |
+| v2 InferenceClient response/event readers | 按 epoch + RPC/inference ID 路由、验证排空、唤醒本地等待者 | 调用用户/HTTP 回调，或等待某条请求腾出无预留空间 |
 | API caller / HTTP adapter | 等待并消费自己的 token/terminal、把下游断开映射为 release | 直接使用 Worker 的裸 Model/Session 指针 |
 
 registry 查找后取强引用，释放 registry 锁再调用 Submit/Cancel/Snapshot 或安排析构。拿到短引用后若 release 并发发生，已登记的命令按其登记次序执行；新命令检查句柄 closing，不能恢复它。Session 的提交/变更门和 core 的租约共同保证 Busy；读到 Busy 时无需再等待 ContextLength。
 
-首片可以用一个 bridge 线程按最多 64 个请求做有界 sweep，加可唤醒短等待；现有 Scheduler 不提供多流 wait API，无需先为此改写它。response sender、event sender 的队列和保留槽必须在接受请求前预留，避免已经接受的请求在终态时因没有分配空间而丢失完成信息。日志也走有界异步队列，不能复用目前 `EventWriter::log` 内的同步 pipe 写入。
+首片的 Worker 控制/bridge 循环按最多 64 个请求做有界 sweep，加可唤醒短等待；Scheduler 不提供多流 wait API。response sender、event sender 的队列和保留槽在接受请求前预留，避免已经接受的请求在终态时因没有分配空间而丢失完成信息。日志也走有界异步队列，不复用 v1 `EventWriter::log` 内的同步 pipe 写入。
 
 ## 9. 请求错误、域故障、epoch 与关闭
 
@@ -251,14 +251,16 @@ registry 查找后取强引用，释放 registry 锁再调用 Submit/Cancel/Snap
 | InvalidArgument、Busy、ContextOverflow、UnsupportedModel、ResourceLimit | 对应命令或请求；Submit 拒绝 eventCount=0，accepted 之后以该请求的 Failed/Cancelled terminal 收尾 |
 | 正常 cancel、core 输出背压 | 仅对应 Request；保留已发布事件、一次 terminal 和 final |
 | release 后访问、跨 Model/Session 类型使用、StaleEpoch | 返回 InvalidHandle/StaleEpoch；不重启健康 Worker |
-| 执行或 Submit 观察到 typed RuntimeFault | v2 目标为标记整个设备域 faulted，停止 load/create/submit，Scheduler 使未终结请求 Failed，并发 domain.fault 通知 |
-| 模型加载或 Session 初始化发生设备异常 | 先补齐原异常分类、记录和域广播，再按域故障处理；这是 v2 接入前置项，当前 Initialize/LoadNf4 尚不保证完整分类 |
+| 执行或 Submit 观察到 typed RuntimeFault | 标记整个设备域 faulted，停止 load/create/submit，Scheduler 使未终结请求 Failed，并发 domain.fault 通知 |
+| 模型加载或 Session 初始化发生设备异常 | 保存同步 SYCL/oneDNN 首因，完成异常清理并以 RuntimeFault 上报；成功初始化还需通过最终 drain，生命周期执行器负责域广播 |
 | framing 损坏、事件计数失配、Worker 退出、连接级读写失败 | 关闭连接，宿主一次性终结所有尚未终结的本地请求并失效远端句柄 |
 | 单个请求的等待超时 | 上层请求 Cancel 或 release；不得直接沿用 v1 的“该请求超时便杀 Worker” |
 
-当前 core 的 `Forward/Reset/Truncate` 执行失败会标记 `DeviceState` 并抛出 typed `ErrorCode::RuntimeFault`；Scheduler 在 Step 或 Submit 的 `RequestState::Create` 中观察到这类错误后，才停止自身准入并终结其余请求。`DeviceState` 标记与 Scheduler 故障状态是不同层的状态，不能把生命周期操作返回异常等同于已经完成 Scheduler 广播。
+core 的 `Forward/Reset/Truncate` 执行失败会标记 `DeviceState` 并抛出 typed `ErrorCode::RuntimeFault`；Scheduler 在 Step 或 Submit 的 `RequestState::Create` 中观察到这类错误后停止准入并终结其余未结束请求。`DeviceState` 标记与 Scheduler 故障状态仍是不同层的状态：生命周期执行器通过 `Scheduler::ReportRuntimeFault()` 显式转发加载、初始化和清理故障，不能把一次普通加载异常直接等同于域广播。
 
-`ModelSessionBackend::Initialize` 和 `LoadedModel::LoadNf4` 的异常路径目前只调用 `DrainNoThrow()` 后转换部分参数异常或重抛。若原始同步 SYCL/oneDNN 异常已经抛出、后续 synchronize 成功，DrainNoThrow 不能可靠地再次捕获原异常，设备域可能尚未被标记，调用者也未必收到 typed RuntimeFault；因此成功 drain 不是域健康的证明。初始化/加载异常的分类与原始故障记录、lifecycle executor 向设备域/Scheduler 的故障传播接口，以及对应故障注入测试，均须作为 v2 接入前置工作完成。纯参数或准入错误仍应保留局部拒绝语义，不能把全部加载失败一律提升为设备故障。
+`ModelSessionBackend::Initialize` 和 `LoadedModel::LoadNf4` 现通过 `RunDeviceLifecycle` 先记录同步 SYCL/oneDNN 异常，再尝试 drain；即使后续 synchronize 成功，也以首因抛出 `RuntimeFault`。首因使用有界固定存储，后续 drain/析构故障不覆盖它。加载在最终 drain 通过后才返回 `LoadedModel`；Session 也只有最终 drain 通过后才发布 cache/state 并增加活动会话计数。普通参数、配置、文件、主机分配和准入失败保持局部语义；若清理的 drain 也失败，则按域故障收敛。
+
+SafeTensors 的逐 tensor 恢复会原样传播 SYCL 上传异常，Qwen3.5 tied projection 回退会原样传播 SYCL/oneDNN 异常，避免把设备错误吞掉后继续加载。析构 drain 不抛异常，其故障由生命周期/清理线程通过 `DeviceRuntime::FaultMessage()` 查询并转发给 Scheduler；该查询取得设备执行锁，不在 transport reader 上执行。`ReportRuntimeFault()` 不等待 GPU 步骤或 join，首因可由 `SchedulerSnapshot::faultMessage` 读取；已发布 terminal 保持原状态，尚未发布的 token/terminal 与故障报告按同一调度锁确定先后顺序。分类与广播的 CPU 注入门禁已经通过，详情见 [共享会话故障语义](shared-sessions.md#设备域故障与生命周期) 和第 10 节。
 
 域 fault 通知为 requestId=0 的事件，带 epoch、`errorCode: "RuntimeFault"` 和有界 message；不占请求 sequence。它通知句柄禁止再次执行，不是“可以立即删除全部输出路由”的指令。已完成请求的终态不因之后域 fault 被改写；尚未完成的流尽量收到原 Scheduler 的 RuntimeFault terminal。旧 epoch 的只读 drain/ack/release 在这个已故障连接内仍可用于清理，但任何新执行都失败。
 
@@ -275,13 +277,13 @@ registry 查找后取强引用，释放 registry 锁再调用 Submit/Cancel/Snap
 5. Worker 发送 shutdown result，包含 `lastEventOrdinal`；宿主等待 event reader 读到此 ordinal，再完成健康关闭。response 和 event 的到达乱序不能让 shutdown result 提前截断最后事件。
 6. 关闭句柄并回收资源。grace 到期且当前 GPU 步骤/连接仍无法收尾时，宿主按**整个域**故障终止 Worker；所有受影响请求明确失败，不能报告正常优雅关闭。
 
-关闭模式丢弃 token 是拟新增的 v2 传输层 Shutdown 输出放弃语义，不适用于普通 Cancel；正常运行的读者不能用这种方式越过未消费输出。当前 `Scheduler::Shutdown()` 本身保留可读输出，句柄在 Scheduler 销毁后仍可读取；ACK、私有排空和 deliveryAbandoned 都需要未来 bridge 实现，不能声称是当前 core 的行为。关闭期间终态的 wire 校验仍完整进行，然后在本地保留小型最终状态及交付计数供用户查询。需要全部输出的调用方应先消费请求终态，再执行 v2 Shutdown。grace 只是请求的收尾期限，不承诺 SYCL kernel 可以在该期限内被安全抢占。
+关闭模式丢弃 token 是 v2 传输层已实现的 Shutdown 输出放弃语义，不适用于普通 Cancel；正常运行的读者不能用这种方式越过未消费输出。`Scheduler::Shutdown()` 本身保留可读输出，句柄在 Scheduler 销毁后仍可读取；ACK、私有排空和 deliveryAbandoned 由 v2 宿主与 Worker bridge 负责，不属于 core 的输出丢弃行为。关闭期间终态的 wire 校验仍完整进行，然后在本地保留小型最终状态及交付计数供用户查询。需要全部输出的调用方应先消费请求终态，再执行 v2 Shutdown。grace 只是请求的收尾期限，不承诺 SYCL kernel 可以在该期限内被安全抢占。
 
 ## 10. 首个可交付纵向切片
 
-最小命令集为第 5 节的 11 项，覆盖能力协商、加载/释放父对象、创建独立 Session、提交/取消/查询、消费确认和关闭。首片输入输出均为 token，普通 C++ 宿主不加载 oneAPI DLL。
+最小命令集为第 5 节的 11 项，覆盖能力协商、加载/释放父对象、创建独立 Session、提交/取消/查询、消费确认和关闭。首片输入输出均为 token，普通 C++ 宿主不加载 oneAPI DLL。代码已接通；以下保留首片验收要求，运行状态单独列在后文，不能将已编译等同于 GPU 验收通过。
 
-1. 先实现 v2 codec/schema、private host connection 和 CPU fake Worker：两个 submit 可同时处于 accepted，在 A 仍生成时 B 能 accepted；cancel/query/release 有独立结果路由。用 gate 控制步骤，不依赖 sleep 猜测交错。
+1. v2 codec/schema、private host connection 和 CPU fake Worker 已实现；验证两个 submit 可同时处于 accepted，在 A 仍生成时 B 能 accepted，cancel/query/release 有独立结果路由。客户端受控 transport 单测已通过；用 gate 控制步骤，不依赖 sleep 猜测交错。
 2. 接入现有 Model/Session/Scheduler，运行同模型 A/B 和 1/2/4 Session token 测试；对照直接进程内请求，保持各请求分块形状、seed 和 penalties 一致。
 3. 使用 `maxNewTokens > tokenWindow + coreRing` 且不会提前命中 stop 的长请求 A，例如默认窗口/ring 下生成 256 token，并确保 Session 容量足够。停住 A 的 token 消费，确认 A 用完窗口和 core ring 后被局部取消；B 持续完成。再 release A，确认 bridge 强持有请求完成私有排空并归还所有对象/传输额度。另测短请求和 Finalizing 保持正常完成，不能用前文 128-token 示例要求必然触发背压。
 4. 完成 v1 ABI、日志线程、owner、运行时隔离的兼容门禁，才形成独立可回归提交。真实 HTTP/SSE 在这之后接 v2 host API，不在首片加入文本生成兼容宣称。
@@ -295,32 +297,52 @@ registry 查找后取强引用，释放 registry 锁再调用 Submit/Cancel/Snap
 - 当前全局 1024 帧事件队列、`EventWriter` 同步写 pipe 和“慢 callback 阻塞事件消费”不能承担多客户端的背压语义。
 - `ProxyEngine::stream_active_` 仍是旧引擎外观的兼容门；新路径用每 Session Busy 和每 Request 生命周期，不能将它推广成整个共享模型的全局 Busy。
 
-### 测试矩阵
+### 当前验证快照
 
-| 建议测试目标 | 具体通过条件 |
+以下为本轮主任务已确认的状态；完整日志、构建身份及后续状态转换由 [refactor-validation.md](refactor-validation.md) 统一记录。实现说明与使用入口见 [inference-ipc-v2-implementation.md](inference-ipc-v2-implementation.md)。
+
+| 门禁 | 当前状态 |
 | --- | --- |
-| `IpcProtocolV2Tests` | 两种版本独立编解码；长度 prefix 在分配前拒绝；整数/乘法溢出、UTF-8 和转义后字节上限；重复字段和错误附件；未知能力失败 |
-| `InferenceWorkerDispatcherTests` | 两个 Session submit；同 Session Busy；父先释放仍完成；模型/KV 实际存活数限制；submit 准入失败完整回滚；完成未 ACK 继续占额度 |
-| `WorkerProcessV2Tests` | accepted 前先到事件；final/terminal 任意跨 pipe 顺序；A/B 交错；cancel/query 各自响应；重复/跳号/多 terminal/摘要不符必须失败 |
-| `InferenceTransportBackpressureTests` | A 停 ACK，B 在有界时间完成；整个进程停读引发连接故障；send 部分写/断管；response/event 都不占 GPU 锁；所有队列峰值在限额内 |
-| `InferenceHandleLifetimeTests` | Model/Session/Request 乱序 release；正在 callback 的旧 owner 生命周期；release 后在途事件私有排空；旧 epoch ID 即便数值相同也不可执行 |
-| `InferenceShutdownTests` | 活动/排队/完成未读流同时关闭；已阻塞 lifecycle 操作；双 Shutdown；用户停止读仍收尾；终态后关闭结果乱序；超时必须全域失败 |
-| `InferenceRuntimeFaultTests` | 执行和 Submit 观察到 typed RuntimeFault 时停止域准入并终结 peers；补测 Initialize/LoadNf4 原同步设备异常且后续 drain 成功的故障分类与广播，此项是尚未实现的 v2 前置门禁；普通参数/准入错误不影响 B；故障后旧输出可排空、新执行失败；Worker crash 不自动重试 |
-| `Qwen3IpcSessionTests` | 真实 A/B、1/2/4 会话 token/logits 对照；取消 A 不污染 B；重复创建销毁与 KV 准入；与进程内基准的 shape/seed 一致 |
+| `AilaInferenceProtocolTests` | 已通过，CPU 11 组 |
+| `AilaInferenceWorkerTests` | 已通过，CPU 6 个测试函数 |
+| `AilaRuntimeFaultTests` / `AilaSchedulerTests` | 已通过，CPU 7 组 / 22 组 |
+| `AilaInferencePipeTests` | 已通过，真实 Windows 子进程 CPU pipe 7 组，6.96 秒 |
+| v1 的 IpcProtocol、WorkerDispatcher、RuntimeIsolation、ProxyAbi、ProxyLogging、BuildIdentity | 6 个门禁已通过，14.00 秒 |
+| `AilaInferenceClientTests` | 已通过，受控 transport 16 组，0.30 秒 |
+| `AilaQwen3IpcSessionTests` | 真实 Qwen3 GPU IPC 首跑通过，61.41 秒；1/2/4 会话及续写逐 token 精确相同，seed/penalties、取消/背压、父释放、优雅关闭及新 epoch reload 通过 |
+| 全 Release 构建 | 已通过，`build-refactor/ipc-v2-full-build.log` |
+| 既有 Qwen3/Qwen3.5 模型/调度 GPU 回归 | Q3 Session 23.21 秒、Q3 Scheduler 26.33 秒、Q35 0.8B 36.93 秒，全部通过，总计 86.48 秒；`build-refactor/ipc-v2-model-gpu-regressions.log` |
+| 最终基础/兼容/IPC 回归 | 23 项全部通过，60.67 秒；`build-refactor/ipc-v2-final-regressions.log` |
+| 普通宿主运行时导入 | 无 SYCL 导入，`build-refactor/ipc-v2-host-dependents.log` |
+
+CPU pipe 测试使用同一 Worker 控制器和管道外壳，以 CPU 工厂替换真实模型。GPU IPC 首跑详情记录于 `build-refactor/ipc-v2-qwen3-gpu-details.log`；这些测试耗时不作为推理吞吐或 HTTP 服务性能结果。Hybrid 远端、HTTP/SSE 及新增公共 C ABI 未在此切片发布。
+
+### 验收矩阵
+
+| 测试入口 | 具体通过条件；运行结论以上述快照为准 |
+| --- | --- |
+| `AilaInferenceProtocolTests` | 两种版本独立编解码；长度 prefix 在分配前拒绝；整数/乘法溢出、UTF-8 和转义后字节上限；重复字段和错误附件；未知能力失败 |
+| `AilaInferenceWorkerTests` | 两个 Session submit；同 Session Busy；父先释放仍完成；模型/KV 实际存活数限制；submit 准入失败完整回滚；完成未 ACK 继续占额度 |
+| `AilaInferenceClientTests` | accepted 前先到事件；final/terminal 任意跨 pipe 顺序；A/B 交错；cancel/query 各自响应；重复/跳号/多 terminal/摘要不符必须失败 |
+| `AilaInferenceWorkerTests` / `AilaInferencePipeTests` | A 停 ACK，B 在有界时间完成；整个进程停读引发连接故障；send 部分写/断管；response/event 都不占 GPU 锁；所有队列峰值在限额内 |
+| Worker/Client/Pipe 与 v1 owner 门禁 | Model/Session/Request 乱序 release；正在 callback 的旧 owner 生命周期；release 后在途事件私有排空；旧 epoch ID 即便数值相同也不可执行 |
+| Worker/Client/Pipe 关闭用例 | 活动/排队/完成未读流同时关闭；已阻塞 lifecycle 操作；双 Shutdown；用户停止读仍收尾；终态后关闭结果乱序；超时必须全域失败 |
+| `AilaRuntimeFaultTests` / `AilaSchedulerTests` 及 Worker/Pipe 故障用例 | 执行和 Submit 的 typed RuntimeFault 停止域准入并终结 peers；Initialize/LoadNf4 原同步设备异常在后续 drain 成功时仍保留首因并广播；普通参数/准入错误不影响 B；故障后旧输出可排空、新执行失败；Worker crash 不自动重试 |
+| `AilaQwen3IpcSessionTests` | 真实 A/B、1/2/4 会话 token 对照；固定 seed/penalties、续写、取消与长请求停读；重复创建销毁与 KV 准入；与进程内基准的 shape/seed 一致 |
 | 既有回归目标 | IpcProtocol、WorkerDispatcher、RuntimeIsolation、ProxyAbi、ProxyLogging、BuildIdentity；旧 caller-thread 回调、ASR/TTS owner 和 generation 校验全部保留 |
 
-CPU fake transport 使用受控管道与 step gate 验证事件顺序；增加长轮次创建/释放检查 handles、host bytes、remote records 的稳定性。GPU 测试和性能测量由主代理串行运行，不能与现有 benchmark 同时占用 Arc。测量至少分开记录 submit ACK 延迟、TTFT、token 到达间隔、总吞吐、取消/排空时间及缓冲峰值；这份协议设计不提供已通过的运行结果。
+CPU fake transport 使用受控管道与 step gate 验证事件顺序；长期创建/释放仍需检查 handles、host bytes、remote records 的稳定性。GPU 测试和性能测量由主代理串行运行，不能与现有 benchmark 同时占用 Arc。后续测量至少分开记录 submit ACK 延迟、TTFT、token 到达间隔、总吞吐、取消/排空时间及缓冲峰值，不能以 CPU 控制器或 pipe 门禁代替真实 GPU/HTTP 结果。
 
-### 建议文件归属与依赖
+### 实现文件归属与后续依赖
 
-| 负责人 | 建议新增/修改文件 | 依赖及边界 |
+| 负责人 | 当前文件或后续组件 | 依赖及边界 |
 | --- | --- | --- |
-| 集成负责人 | v2 共享 schema/limits/错误类型、WorkerMain 模式选择、CMake、build identity | 先冻结消息 schema 和状态机；维护旧公共头兼容 |
-| IPC/宿主实现 | `src/ipc/InferenceProtocol.*`、`src/runtime/InferenceWorkerConnection.*`、`src/proxy/InferenceClient.*` | 新路径独立 pending/reader/额度；不要同时重写旧 ProxyEngine |
-| Worker 实现 | `src/worker/InferenceWorkerDispatcher.*`、`InferenceTransport.*`、`InferenceWorkerMain.*` | 对接现有 Scheduler；CApiWorkerEngine 保持 v1 所属 |
-| 验收实现 | `tests/runtime/FakeInferenceWorkerMain.cpp`、上述 CPU 测试与 GPU fixture | fake 可先行；真实 GPU 验证等待集成，CMake 由单一负责人修改 |
+| 集成负责人 | v2 schema/limits/错误类型、WorkerMain 模式选择、CMake、build identity | 维护消息契约、旧公共头兼容和最终集成证据 |
+| IPC/宿主实现 | `src/ipc/InferenceProtocol.*`、`src/runtime/InferenceClient.*`、`src/runtime/InferencePipeTransport.cpp` | 独立 pending/reader/额度；旧 ProxyEngine 保持 v1 |
+| Worker 实现 | `src/worker/InferenceWorker.*`、`src/worker/InferenceWorkerMain.*`、`src/worker/SharedInferenceEngine.cpp` | 控制器/外壳与真实 Model/Session/Scheduler 适配；CApiWorkerEngine 保持 v1 |
+| 验收实现 | `tests/runtime/FakeInferenceWorkerMain.cpp`、上述 CPU 测试与 `tests/inference/Qwen3IpcSessionTests.cpp` | CPU 工厂复用 Worker 外壳；本轮 CPU/GPU IPC 门禁及最终全量集成回归均已通过 |
 | 后续服务适配 | `AilaServer`、tokenization/chat driver、HTTP/SSE bridge | 依赖 v2 drain/backpressure 门禁；不把 HTTP 探针当作端到端推理验收 |
 
-这些文件名是实施建议，尚不存在的文件不构成已完成组件。本设计产物只新增本文，没有修改 codec、runtime、Worker、Proxy、公共头或 CMake，也没有运行网络/GPU测试。
+表中的 v2 codec、宿主、Worker 与测试入口已存在；HTTP 服务适配仍为后续工作。各目标的链接边界和宿主 API 示例见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)。实现完成、编译完成与验收通过分别记录；本轮 IPC 和集成回归通过不替代后续服务层验收。
 
-集成时需落定两点，均有明确建议：**采用独立 v2 启动模式**以保持 v1 兼容路径可回归；**先发布仓库内部 C++ host API**，待 token/句柄语义通过后再设计带 size/version 的新增公共 C ABI，现有 `aila_api.h` 不改布局。上文准入值作为首片默认直接实施，性能测量后再通过协商配置调整，不阻塞协议落地。
+本切片已采用**独立 v2 启动模式**与**仓库内部 C++ host API**。新增公共 C ABI 留待 token/句柄语义验收后另行设计 size/version 约定，现有 `aila_api.h` 布局保持。上文准入值作为首片默认实施，后续性能测量再通过协商配置调整。

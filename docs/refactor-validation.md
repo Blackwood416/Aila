@@ -341,3 +341,45 @@ CPU 内存预算测试独立于 SYCL，校验已知模型字节数、上下文�
 本批证明 Qwen3 与 Qwen3.5 NF4 文本会话可复用进程内执行/调度框架，未实现连续合批。Hybrid 新接口仍是 token API；媒体 setter、聊天模板、reasoning 和 thinking budget 继续属于旧驱动。4B 的上述检查固定 context 512，不代表长上下文或长期服务压力门禁已经完成。
 
 [IPC v2 文档](inference-ipc-v2.md) 是可实施的协议设计，尚未改动 Worker/Proxy 多在途通信或增加真实 HTTP 推理。初始化/加载中的同步设备异常尚未可靠统一为 `RuntimeFault`；v2 接入前需补齐分类、原始故障记录、生命周期故障广播和注入测试。新 host/device 额度是 payload 准入，完整内存预算和 Qwen3.5 的 1/2/4 会话性能分布仍待后续阶段验证。
+
+## 10. IPC v2：Qwen3 独立 Worker 纵向切片
+
+本批从 `78bcdd1` 的协议设计继续实现。新增严格 v2 codec、Worker 控制器/生命周期执行器、独立管道 reader/writer、普通 C++ `InferenceClient` 和真实 Qwen3 模型工厂。v1 Worker、Proxy 与公共 C ABI 保留。具体接口和所有权见 [inference-ipc-v2-implementation.md](inference-ipc-v2-implementation.md)。本节的验证对象是 token API；HTTP/SSE 的实现和验证单独记录。
+
+### 构建与回归
+
+| 检查 | 实际结果 | 证据 |
+| --- | --- | --- |
+| 完整 Release 构建 | 通过，oneAPI 2026.1 / oneDNN 3.11.2 | `build-refactor/ipc-v2-full-build.log` |
+| 23 项基础、兼容与 IPC 回归 | 全部通过，60.67 秒，串行执行 | `build-refactor/ipc-v2-final-regressions.log`、`ipc-v2-final-regressions-details.log` |
+| v2 codec | 11 组通过；严格类型/重复字段/UTF-8/附件/限额/完成摘要 | `AilaInferenceProtocolTests` |
+| 设备故障分类 / Scheduler | 7 / 22 组通过；同步故障、首因保留、最终 drain、生命周期广播 | `AilaRuntimeFaultTests`、`AilaSchedulerTests` |
+| Worker 控制器 | 6 个测试函数通过，覆盖资源准入、父子所有权、释放/背压、fault、日志和关闭 | `AilaInferenceWorkerTests` |
+| 客户端受控双通道 | 16 组通过，首次完整通过 0.30 秒，最终回归 0.28 秒 | `ipc-v2-client-tests-fixed.log`、最终回归明细 |
+| 真实 Windows 子进程 / CPU pipe | 7 组通过，首次 6.96 秒，最终回归 7.76 秒 | `ipc-v2-pipe-tests.log`、最终回归明细 |
+| 真实 Qwen3 IPC GPU | 全部通过，61.41 秒 | `ipc-v2-qwen3-gpu.log`、`ipc-v2-qwen3-gpu-details.log` |
+| Qwen3 Session / Scheduler GPU 回归 | 23.21 / 26.33 秒，全部通过 | `ipc-v2-model-gpu-regressions.log`、`ipc-v2-model-gpu-regressions-details.log` |
+| Qwen3.5-0.8B Session GPU 回归 | 36.93 秒，通过；三项模型回归总计 86.48 秒 | 同上 |
+
+客户端单测首次在第 9 组失败：CPU 假响应的 SchedulerStopped 摘要遗漏协议要求的 errorCode，codec 正确拒绝；修复 fixture 后 16 组通过，未放宽 codec 或修改宿主行为。原失败保存在 `ipc-v2-client-tests.log`。RuntimeFault 单测此前还修正了 MSVC 上不可依赖的 exception_ptr 身份断言，改为检查异常动态类型、消息和错误 payload；生产故障策略未放宽。
+
+`AilaInferencePipeTests` 实际运行同一个 Worker 外壳和 Scheduler，只替换 CPU 模型工厂；包括双 Session、取消/释放后的私有排空、未读输出关闭、异常子进程退出、新 epoch，以及五次启动中每次三轮创建/释放与模型槽复用。检查宿主句柄回到起始数，PATH/当前目录不变且未载入 oneAPI 模块。`dumpbin /dependents` 的普通宿主产物只包含 Windows、MSVC/UCRT 依赖，没有 SYCL/oneDNN DLL；原始清单是 `ipc-v2-host-dependents.log`。此处是有限轮次的句柄稳定性验证，不是长期 RSS/显存泄漏结论。
+
+### 真实 Qwen3 的覆盖范围
+
+模型为 `models/qwen3-0.6B-bnb-nf4-offline`，BF16 KV，context 容量 512；设备与工具链沿用前文。直接推理先产生参考结果并销毁全部设备 owner，再启动独立 Worker，避免同时运行两个 GPU 测试进程。
+
+- 四条不同 prompt 长度为 40/43/52/50，生成 20/23/26/29 token，prefill chunk 为 16/32。前两条 greedy，后两条固定独立 seed，含 repetition/presence/frequency penalties。
+- 1/2/4 个 IPC Session 的完整生成 ID 与直接参考精确相同；各追加 5 token 的续写也精确相同。空闲 Session 的 contextLength 包含最后生成 token，并观察到多个已接受请求重叠执行/排队。
+- 长 A 首 token 后取消，B 仍与参考相同；另一次完全停读 A 的 256-token 请求触发 A 的 OutputBackpressure，B 完成。A 的 wire 窗口不超过 32，core ring 不超过 128，生成数不超过 160；未消费 terminal 继续占额度，Release 私有排空后归还。
+- 请求执行中先释放 Session/Model，请求仍正确结束。Shutdown 完成 eventOrdinal 屏障与子进程退出；新 Worker 采用新 epoch，重新加载后的输出仍相同。
+
+fixture 中 `caller_first_token_ms` 是主测试线程轮询读到首 token 的时刻，包含冷启动/JIT、各请求提交和读取顺序；首次单会话记录为 15365.6 ms。它不是预热后的 TTFT 基准，不据此报告 IPC 吞吐或服务性能。本批未重复前阶段的 NF4 内核性能测量，未改动 NF4 GEMV/GEMM 算子。
+
+### 故障与当前边界
+
+加载/Session 初始化的同步 SYCL 和 oneDNN 异常现在会记录首次原因并归一为 RuntimeFault，即使后续 drain 成功也不漏报。普通文件、配置和 host allocation 失败仍可局部返回；最终 drain 失败会升级为设备域故障。生命周期执行器向 Scheduler 报告 fault，停止准入、保留已经发布的终态并使未完成请求在安全边界失败。CPU 注入验证了这些策略；本批没有故意触发真实 GPU 设备挂起。
+
+v2 当前只发布 Qwen3 NF4/BF16 KV token 请求能力。Qwen3.5 远端、公共异步 C ABI、聊天/thinking budget 和 HTTP/SSE 不属于这个 token 切片。所有 payload 额度仍不代表整个进程 RSS 或设备总显存；连续合批、长期服务压力和更大上下文另行验收。
+
+源码快照、当时的 diff、模型与二进制哈希、build metadata 和日志身份保存在 `tmp/refactor/ipc-v2-precommit-provenance.json`；提交后的匹配构建身份与补充检查保存在 `tmp/refactor/ipc-v2-final-provenance.json`。提交前 metadata 的 Git 字段仍为 `78bcdd1`，需要结合源码快照与 SHA256 判断实际产物。

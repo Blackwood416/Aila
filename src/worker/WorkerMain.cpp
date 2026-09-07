@@ -6,6 +6,7 @@
 #include "utils/EnvUtils.hpp"
 #include "worker/CApiWorkerEngine.hpp"
 #include "worker/WorkerDispatcher.hpp"
+#include "worker/InferenceWorkerMain.hpp"
 #include "simdjson.h"
 
 #include <cerrno>
@@ -76,6 +77,7 @@ struct Handles {
     UniqueHandle command_read;
     UniqueHandle response_write;
     UniqueHandle event_write;
+    bool inference_v2 = false;
 };
 
 std::string utf8(const std::wstring& value) {
@@ -216,11 +218,13 @@ HANDLE parse_handle(const wchar_t* value) {
 
 Handles parse_arguments(int argc, wchar_t** argv) {
     if (argc != 8 || argv == nullptr || argv[1] == nullptr ||
-        std::wstring_view(argv[1]) != L"--ffi-worker") {
+        (std::wstring_view(argv[1]) != L"--ffi-worker" &&
+         std::wstring_view(argv[1]) != L"--ffi-worker-v2")) {
         throw std::runtime_error("invalid worker command line");
     }
 
     Handles handles;
+    handles.inference_v2 = std::wstring_view(argv[1]) == L"--ffi-worker-v2";
     for (int index = 2; index < argc; index += 2) {
         if (argv[index] == nullptr || argv[index + 1] == nullptr) {
             throw std::runtime_error("worker command line contains a missing option value");
@@ -495,6 +499,18 @@ int wmain(int argc, wchar_t** argv) {
     }
     try {
         const Handles handles = parse_arguments(argc, argv);
+        if (handles.inference_v2) {
+            const fs::path executable = fs::absolute(module_path()).lexically_normal();
+            aila::ipc::v2::Hello hello;
+            hello.buildId = AILA_BUILD_ID;
+            hello.executable = utf8(executable.wstring());
+            hello.runtimeDirectory = utf8(executable.parent_path().wstring());
+            hello.currentDirectory = utf8(fs::absolute(current_directory()).lexically_normal().wstring());
+            hello.path = utf8(environment_value(L"PATH"));
+            return aila::worker::RunInferenceWorker(handles.command_read.get(), handles.response_write.get(),
+                                                     handles.event_write.get(), std::move(hello),
+                                                     aila::worker::MakeSharedInferenceModelFactory());
+        }
         return run(handles);
     } catch (...) {
         return 2;

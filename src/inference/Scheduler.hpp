@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string_view>
 
 namespace aila::inference {
 
@@ -83,6 +84,7 @@ struct SchedulerSnapshot {
     size_t activeRequests = 0;
     size_t reservedTokens = 0;
     size_t reservedSessionCacheBytes = 0;
+    std::string faultMessage; // First runtime failure, at most 1024 UTF-8 bytes.
 };
 
 // A thread-safe, single-consumer stream. Cancel is nonblocking and takes
@@ -126,6 +128,12 @@ public:
         std::vector<int> promptIds,
         RequestOptions options = {});
     SchedulerSnapshot Snapshot() const;
+
+    // Thread-safe and idempotent. A lifecycle/reaper executor uses this after
+    // observing a DeviceRuntime fault outside Submit/Step. Stops admission
+    // immediately, without joining or waiting for a device step. Unfinished
+    // requests fail at a safe boundary; existing terminal events stay intact.
+    void ReportRuntimeFault(std::string_view message) noexcept;
 
     // Idempotent. Cancels queued/running requests and joins the submission
     // thread without waiting for readers. Called reentrantly from that thread

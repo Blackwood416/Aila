@@ -1,4 +1,5 @@
 #include "inference/Scheduler.hpp"
+#include "inference/RuntimeFault.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -11,7 +12,7 @@
 namespace aila::inference {
 namespace {
 
-constexpr size_t MaxErrorBytes = 1024;
+constexpr size_t MaxErrorBytes = detail::RuntimeFaultRecord::MaxMessageBytes;
 
 std::string_view BoundedError(std::string_view error) noexcept {
     size_t count = std::min(error.size(), MaxErrorBytes);
@@ -92,7 +93,7 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
     }
 
     void CheckAccepting() const {
-        if (faulted) throw Error(ErrorCode::RuntimeFault, "Scheduler execution domain has failed");
+        fault.CheckUsable();
         if (stopping) throw Error(ErrorCode::SchedulerStopped, "Scheduler has been shut down");
     }
 
@@ -112,11 +113,11 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
         if (worker.joinable()) worker.join();
     }
 
-    void Fault() noexcept {
+    void Fault(std::string_view message) noexcept {
         std::shared_ptr<ScheduledRequestState> runningRequest;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            faulted = true;
+            fault.Record(message);
             runningRequest = running;
         }
         if (runningRequest) runningRequest->Cancel(RequestEndReason::RuntimeFault);
@@ -141,8 +142,18 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
         std::unique_ptr<AdmissionCredit> releasedCredit;
         std::vector<BufferedToken> releasedBuffer;
         {
+            // Linearize completion with lifecycle faults. A terminal published
+            // before Fault remains final; a still-unpublished terminal fails
+            // with the domain's first diagnosis, including a concurrent fault.
+            std::lock_guard<std::mutex> queueLock(mutex);
             std::lock_guard<std::mutex> lock(entry->mutex);
             if (entry->terminalReady) return;
+            if (fault.Faulted()) {
+                status = RequestStatus::Failed;
+                reason = RequestEndReason::RuntimeFault;
+                errorCode = ErrorCode::RuntimeFault;
+                error = fault.Message();
+            }
             auto& snapshot = entry->snapshot;
             snapshot.status = status;
             snapshot.endReason = reason;
@@ -172,7 +183,7 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
             bool shutdown = false;
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                domainFaulted = faulted;
+                domainFaulted = fault.Faulted();
                 shutdown = stopping;
             }
             if (domainFaulted) entry->Cancel(RequestEndReason::RuntimeFault);
@@ -199,32 +210,16 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
             const auto step = request->Step();
             const auto progress = request->Progress();
             processed = progress.promptTokensProcessed;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                domainFaulted = faulted;
-            }
-            if (domainFaulted && !IsTerminal(step.status)) {
-                // A deferred log callback or concurrent Submit can discover
-                // a domain failure after Step prepared its return value.
-                // Retire it without publishing that now-invalid sample.
-                request->Cancel();
-                request->Step();
-                request.reset();
-                Complete(entry, RequestStatus::Failed, RequestEndReason::RuntimeFault,
-                         ErrorCode::RuntimeFault, "Scheduler execution domain has failed", processed);
-                return true;
-            }
             if (IsTerminal(step.status)) {
                 RequestStatus status = step.status;
                 RequestEndReason reason = RequestEndReason::Failed;
                 auto errorCode = progress.errorCode;
                 std::string_view error = progress.ErrorMessage();
-                if (domainFaulted || errorCode == ErrorCode::RuntimeFault) {
-                    Fault();
+                if (errorCode == ErrorCode::RuntimeFault) {
+                    Fault(error);
                     status = RequestStatus::Failed;
                     reason = RequestEndReason::RuntimeFault;
                     errorCode = ErrorCode::RuntimeFault;
-                    if (error.empty()) error = "Scheduler execution domain has failed";
                 } else if (status == RequestStatus::Completed) {
                     reason = progress.generatedTokens == entry->maxNewTokens
                                  ? RequestEndReason::Length : RequestEndReason::StopToken;
@@ -245,17 +240,34 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
             }
 
             {
-                std::lock_guard<std::mutex> lock(entry->mutex);
-                auto& snapshot = entry->snapshot;
-                snapshot.status = step.status;
-                snapshot.promptTokensProcessed = processed;
-                if (step.tokenId && !entry->detached) {
-                    const size_t tail = (entry->bufferHead + entry->buffered) % entry->buffer.size();
-                    entry->buffer[tail] = {*step.tokenId, step.status, processed};
-                    ++entry->buffered;
-                    ++snapshot.generatedTokens;
-                    snapshot.bufferedTokens = entry->buffered;
+                // No sample may be published after ReportRuntimeFault returns.
+                // Both locks protect host-only, preallocated state; device
+                // work, destruction and callbacks stay outside these locks.
+                std::lock_guard<std::mutex> queueLock(mutex);
+                domainFaulted = fault.Faulted();
+                if (!domainFaulted) {
+                    std::lock_guard<std::mutex> lock(entry->mutex);
+                    auto& snapshot = entry->snapshot;
+                    snapshot.status = step.status;
+                    snapshot.promptTokensProcessed = processed;
+                    if (step.tokenId && !entry->detached) {
+                        const size_t tail = (entry->bufferHead + entry->buffered) % entry->buffer.size();
+                        entry->buffer[tail] = {*step.tokenId, step.status, processed};
+                        ++entry->buffered;
+                        ++snapshot.generatedTokens;
+                        snapshot.bufferedTokens = entry->buffered;
+                    }
                 }
+            }
+            if (domainFaulted) {
+                // The report may arrive after Step prepared its result (even
+                // in a deferred log callback). Retire it without a new sample.
+                request->Cancel();
+                request->Step();
+                request.reset();
+                Complete(entry, RequestStatus::Failed, RequestEndReason::RuntimeFault,
+                         ErrorCode::RuntimeFault, {}, processed);
+                return true;
             }
             entry->changed.notify_all();
             return false;
@@ -291,8 +303,8 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
             bool wasActive = false;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                changed.wait(lock, [&] { return stopping || faulted || !waiting.empty() || !runnable.empty(); });
-                if (waiting.empty() && runnable.empty() && (stopping || faulted)) break;
+                changed.wait(lock, [&] { return stopping || fault.Faulted() || !waiting.empty() || !runnable.empty(); });
+                if (waiting.empty() && runnable.empty() && (stopping || fault.Faulted())) break;
 
                 while (activeRequests < options.maxActiveRequests && !waiting.empty()) {
                     runnable.splice(runnable.end(), waiting, waiting.begin());
@@ -305,7 +317,7 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
                 auto cancelled = waiting.end();
                 if (!lastWasQueuedCancellation || runnable.empty()) {
                     cancelled = std::find_if(waiting.begin(), waiting.end(), [&](const auto& entry) {
-                        return stopping || faulted ||
+                        return stopping || fault.Faulted() ||
                                entry->cancellation.load(std::memory_order_acquire) != RequestEndReason::None;
                     });
                 }
@@ -360,7 +372,7 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
     size_t reservedCacheBytes = 0;
     uint64_t nextRequestId = 1;
     bool stopping = false;
-    bool faulted = false;
+    RuntimeFaultRecord fault;
     std::mutex joinMutex;
     std::thread worker;
     std::thread::id workerId;
@@ -483,12 +495,18 @@ void Scheduler::Shutdown() noexcept {
     if (retained) retained->Shutdown();
 }
 
+void Scheduler::ReportRuntimeFault(std::string_view message) noexcept {
+    const auto retained = state;
+    if (retained) retained->Fault(message);
+}
+
 SchedulerSnapshot Scheduler::Snapshot() const {
     const auto retained = state;
     std::lock_guard<std::mutex> lock(retained->mutex);
-    return {!retained->stopping && !retained->faulted, retained->stopping, retained->faulted,
+    return {!retained->stopping && !retained->fault.Faulted(), retained->stopping, retained->fault.Faulted(),
             retained->outstandingRequests, retained->waiting.size(), retained->activeRequests,
-            retained->reservedTokens, retained->reservedCacheBytes};
+            retained->reservedTokens, retained->reservedCacheBytes,
+            retained->fault.Faulted() ? retained->fault.Message() : ""};
 }
 
 std::shared_ptr<ScheduledRequest> Scheduler::Submit(
@@ -547,7 +565,7 @@ std::shared_ptr<ScheduledRequest> Scheduler::Submit(
     try {
         entry->request = RequestState::Create(std::move(session), std::move(promptIds), std::move(options));
     } catch (const Error& error) {
-        if (error.Code() == ErrorCode::RuntimeFault) retained->Fault();
+        if (error.Code() == ErrorCode::RuntimeFault) retained->Fault(error.what());
         throw;
     }
     auto handle = std::shared_ptr<ScheduledRequest>(new ScheduledRequest(entry));
