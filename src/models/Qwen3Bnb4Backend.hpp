@@ -82,6 +82,25 @@ public:
     int Truncate(Session& session, int newLength);
 
 private:
+    enum class ExecutionPhase { Prefill, Decode };
+
+    // A concrete full-GQA + dense-SwiGLU NF4 layer. Bindings are fixed at
+    // load time; mutable projection state stays in the single execution slot.
+    struct LayerPlan {
+        Qwen3Bnb4Layer* layer = nullptr;
+        Tensor* postMlpNormWeight = nullptr;
+        int cacheIndex = 0;
+    };
+
+    struct DecoderPlan {
+        Tensor* initialNormWeight = nullptr;
+        std::vector<LayerPlan> layers;
+    };
+
+    struct LayerExecution;
+
+    void BuildDecoderPlan();
+    void ExecuteLayer(const LayerPlan& plan, const LayerExecution& execution);
     std::unique_ptr<Session> CreateSessionImpl(Context& ctx);
     void ValidateSession(const Session& session) const;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
@@ -103,6 +122,7 @@ private:
     bool explicitSessionsCreated_ = false;
 
     std::vector<Qwen3Bnb4Layer> layers_;
+    std::unique_ptr<const DecoderPlan> decoderPlan_;
     std::vector<Tensor> fused_weights_;
     Bnb4BitLinearScratch linear_scratch_;
 

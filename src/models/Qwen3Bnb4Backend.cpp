@@ -42,7 +42,43 @@ struct StageProfileTotals {
         tokens = 0;
     }
 };
+
+struct StageProfiler {
+    Context& context;
+    std::array<double, static_cast<size_t>(ProfileStage::Count)>& stageMs;
+    bool enabled;
+    bool hostOnly;
+
+    template <typename Fn>
+    void operator()(ProfileStage stage, Fn&& fn) const {
+        if (!enabled) {
+            fn();
+            return;
+        }
+        auto t0 = std::chrono::high_resolution_clock::now();
+        fn();
+        if (!hostOnly) context.synchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        stageMs[static_cast<size_t>(stage)] +=
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+};
 }
+
+struct Qwen3Bnb4Backend::LayerExecution {
+    Context& context;
+    Buffers& buffers;
+    Bnb4BitLinearScratch& linearScratch;
+    ExecutionPhase phase;
+    int startPosition;
+    int tokenCount;
+    int cachedLength;
+    Tensor& keyCache;
+    Tensor& valueCache;
+    int cacheCapacity;
+    bf16* residualHidden;
+    const StageProfiler& profiler;
+};
 
 Qwen3Bnb4Backend::Session::Session(Context& ctx, const Qwen3Config& config,
                                   int capacity,
@@ -282,6 +318,10 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
         if (error_message) *error_message = "Qwen3Bnb4Backend: max_seq_len must be positive";
         return false;
     }
+    if (spec.qwen3.num_hidden_layers <= 0) {
+        if (error_message) *error_message = "Qwen3Bnb4Backend: model must contain at least one decoder layer";
+        return false;
+    }
 
     // Reload is still supported for the legacy facade before any explicit
     // Session is published. Discard every binding and allocation from the old
@@ -289,6 +329,7 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
     if (context_) context_->synchronize();
     defaultSession_.reset();
     sessionOwner_.reset();
+    decoderPlan_.reset();
     layers_.clear();
     fused_weights_.clear();
     linear_scratch_ = Bnb4BitLinearScratch();
@@ -522,9 +563,174 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
             dnnl::memory::data_type::f32);
     }
 
+    BuildDecoderPlan();
     sessionOwner_ = std::make_shared<const SessionOwner>();
     AILA_LOG_INFO("[Qwen3Bnb4] Model fully loaded and initialized");
     return true;
+}
+
+void Qwen3Bnb4Backend::BuildDecoderPlan() {
+    auto plan = std::make_unique<DecoderPlan>();
+    plan->initialNormWeight = layers_.front().input_ln_weight;
+    plan->layers.reserve(layers_.size());
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        // Preserve the existing cross-layer residual + input-norm fusion.
+        // layers_ is never resized after binding its fused linear weights.
+        Tensor* postMlpNorm = i + 1 < layers_.size()
+            ? layers_[i + 1].input_ln_weight : final_norm_weight_;
+        plan->layers.push_back({&layers_[i], postMlpNorm, static_cast<int>(i)});
+    }
+    decoderPlan_ = std::move(plan);
+}
+
+void Qwen3Bnb4Backend::ExecuteLayer(const LayerPlan& plan,
+                                    const LayerExecution& execution) {
+    auto& ctx = execution.context;
+    auto& buf = execution.buffers;
+    auto& linearScratch = execution.linearScratch;
+    auto& layer = *plan.layer;
+    const auto& time_stage = execution.profiler;
+    const int seq_len = execution.tokenCount;
+    const int start_pos = execution.startPosition;
+    const bool decode = execution.phase == ExecutionPhase::Decode;
+    bf16* hidden_ptr_for_residual = execution.residualHidden;
+    const int H = hidden_size_;
+    const int QD = q_dim_;
+    const int KVD = kv_dim_;
+    const int FF = ff_dim_;
+    Tensor q_decode_view;
+    Tensor* q_for_attn = &buf.q;
+
+    // Entry: hidden carries the residual stream; normed is this layer's
+    // normalized input. Exit: normed is prepared for the next layer / LM head.
+    if (decode) {
+        // Decode path: fused QKV projection via Bnb4BitLinear.
+        time_stage(ProfileStage::FullQkvProj, [&] {
+            layer.qkv_proj.forward(ctx, linearScratch, buf.normed, buf.qkv, 1);
+        });
+        bf16* qkv_ptr = static_cast<bf16*>(buf.qkv.data());
+        q_decode_view = Tensor::view(ctx, qkv_ptr, {1, (int64_t)QD});
+        Tensor k_view = Tensor::view(ctx, qkv_ptr + QD, {1, (int64_t)KVD});
+        Tensor v_view = Tensor::view(ctx, qkv_ptr + QD + KVD, {1, (int64_t)KVD});
+        q_for_attn = &q_decode_view;
+
+        time_stage(ProfileStage::QkNormRope, [&] {
+            ops::decode_prepare_qkv(ctx, q_decode_view, k_view, v_view, buf.rope_freq,
+                                    *layer.q_norm_weight, *layer.k_norm_weight,
+                                    execution.keyCache, execution.valueCache,
+                                    start_pos,
+                                    cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                    cfg_.head_dim, cfg_.rms_norm_eps, cfg_.rope_theta);
+        });
+    } else {
+        time_stage(ProfileStage::FullQkvProj, [&] {
+            layer.qkv_proj.forward(ctx, linearScratch, buf.normed, buf.qkv, seq_len);
+        });
+        time_stage(ProfileStage::FullSplit, [&] {
+            ops::split_qkv(ctx, buf.qkv, buf.q, buf.k, buf.v, seq_len, QD, KVD);
+        });
+
+        time_stage(ProfileStage::QkNormRope, [&] {
+            ops::head_rms_norm(ctx, buf.q, *layer.q_norm_weight,
+                               cfg_.rms_norm_eps, seq_len,
+                               cfg_.num_attention_heads, cfg_.head_dim);
+            ops::head_rms_norm(ctx, buf.k, *layer.k_norm_weight,
+                               cfg_.rms_norm_eps, seq_len,
+                               cfg_.num_key_value_heads, cfg_.head_dim);
+
+            ops::apply_rope(ctx, buf.q, buf.k, seq_len, start_pos,
+                            cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                            cfg_.head_dim, cfg_.rope_theta);
+        });
+
+        time_stage(ProfileStage::KvCache, [&] {
+            ops::copy_to_cache(ctx, buf.k, execution.keyCache,
+                               seq_len, start_pos,
+                               cfg_.num_key_value_heads, cfg_.head_dim,
+                               execution.cacheCapacity);
+            ops::copy_to_cache(ctx, buf.v, execution.valueCache,
+                               seq_len, start_pos,
+                               cfg_.num_key_value_heads, cfg_.head_dim,
+                               execution.cacheCapacity);
+        });
+    }
+
+    time_stage(ProfileStage::Attention, [&] {
+        if (decode) {
+            ops::attention_decode(ctx, *q_for_attn, execution.keyCache, execution.valueCache,
+                                  buf.attn_out, buf.decode_scores,
+                                  cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                  cfg_.head_dim, execution.cachedLength,
+                                  &buf.decode_attn_partials);
+        } else if (start_pos == 0) {
+            ops::attention_prefill(ctx, buf.q, buf.k, buf.v,
+                                   buf.attn_out, buf.scores,
+                                   seq_len,
+                                   cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                   cfg_.head_dim);
+        } else {
+            ops::attention_prefill_cached(ctx, buf.q,
+                                          execution.keyCache, execution.valueCache,
+                                          buf.attn_out, buf.incr_scores,
+                                          seq_len, start_pos,
+                                          cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                          cfg_.head_dim, execution.cacheCapacity);
+        }
+    });
+
+    time_stage(ProfileStage::OProj, [&] {
+        layer.o_proj.forward(ctx, linearScratch, buf.attn_out, buf.gate, seq_len, hidden_ptr_for_residual);
+    });
+
+    time_stage(ProfileStage::PostAttnNorm, [&] {
+        if (hidden_ptr_for_residual) {
+            ops::rms_norm(ctx, buf.gate, *layer.post_attn_ln_weight,
+                          cfg_.rms_norm_eps, buf.normed, seq_len, H);
+        } else {
+            ops::fused_add_rms_norm(ctx, buf.hidden, buf.gate,
+                                    *layer.post_attn_ln_weight, cfg_.rms_norm_eps,
+                                    buf.normed, seq_len, H);
+        }
+    });
+
+    if (decode) {
+        bool fused_ok = false;
+        time_stage(ProfileStage::FfnProj, [&] {
+            fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                ctx, layer.gate_up_proj, buf.normed, buf.gate, FF);
+        });
+        if (!fused_ok) {
+            time_stage(ProfileStage::FfnProj, [&] {
+                layer.gate_up_proj.forward(ctx, linearScratch, buf.normed, buf.gate_up, 1);
+            });
+            time_stage(ProfileStage::FfnAct, [&] {
+                ops::fused_gate_up_swiglu(ctx, buf.gate_up, buf.gate, FF);
+            });
+        }
+    } else {
+        time_stage(ProfileStage::FfnProj, [&] {
+            layer.gate_up_proj.forward(ctx, linearScratch, buf.normed, buf.gate_up, seq_len);
+        });
+        time_stage(ProfileStage::FfnAct, [&] {
+            ops::split_gate_up(ctx, buf.gate_up, buf.gate, buf.up, seq_len, FF);
+            ops::swiglu(ctx, buf.gate, buf.up, buf.gate, seq_len * FF);
+        });
+    }
+
+    time_stage(ProfileStage::DownProj, [&] {
+        layer.down_proj.forward(ctx, linearScratch, buf.gate, buf.up, seq_len, hidden_ptr_for_residual);
+    });
+
+    time_stage(ProfileStage::PostMlpNorm, [&] {
+        if (hidden_ptr_for_residual) {
+            ops::rms_norm(ctx, buf.up, *plan.postMlpNormWeight,
+                          cfg_.rms_norm_eps, buf.normed, seq_len, H);
+        } else {
+            ops::fused_add_rms_norm(ctx, buf.hidden, buf.up,
+                                    *plan.postMlpNormWeight, cfg_.rms_norm_eps,
+                                    buf.normed, seq_len, H);
+        }
+    });
 }
 
 Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
@@ -570,23 +776,9 @@ Tensor& Qwen3Bnb4Backend::Forward(Context& ctx, Session& session,
     bool profile_enabled = profile_decode || profile_prefill;
     std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
     bool profile_host_only = profile_enabled && s_profile_host_only;
-    auto time_stage = [&](ProfileStage stage, auto&& fn) {
-        if (!profile_enabled) {
-            fn();
-            return;
-        }
-        auto t0 = std::chrono::high_resolution_clock::now();
-        fn();
-        if (!profile_host_only) ctx.synchronize();
-        auto t1 = std::chrono::high_resolution_clock::now();
-        stage_ms[static_cast<size_t>(stage)] +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-    };
+    const StageProfiler time_stage{ctx, stage_ms, profile_enabled, profile_host_only};
 
     int H = hidden_size_;
-    int QD = q_dim_;
-    int KVD = kv_dim_;
-    int FF = ff_dim_;
     ensure_runtime_buffers(ctx, seq_len);
     if (seq_len > 1) {
         if (start_pos == 0) {
@@ -607,162 +799,19 @@ Tensor& Qwen3Bnb4Backend::Forward(Context& ctx, Session& session,
         ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, H);
 
         // 2. Initial norm for the first layer
-        ops::rms_norm(ctx, buf_.hidden, *layers_[0].input_ln_weight,
+        ops::rms_norm(ctx, buf_.hidden, *decoderPlan_->initialNormWeight,
                       cfg_.rms_norm_eps, buf_.normed, seq_len, H);
     });
 
-    // 3. Iterate through transformer layers
-    for (int i = 0; i < cfg_.num_hidden_layers; i++) {
-        auto& layer = layers_[i];
-        Tensor q_decode_view;
-        Tensor* q_for_attn = &buf_.q;
-
-        if (seq_len == 1) {
-            // Decode path: fused QKV projection via Bnb4BitLinear
-            time_stage(ProfileStage::FullQkvProj, [&] {
-                layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, 1);
-            });
-            bf16* qkv_ptr = static_cast<bf16*>(buf_.qkv.data());
-            q_decode_view = Tensor::view(ctx, qkv_ptr, {1, (int64_t)QD});
-            Tensor k_view = Tensor::view(ctx, qkv_ptr + QD, {1, (int64_t)KVD});
-            Tensor v_view = Tensor::view(ctx, qkv_ptr + QD + KVD, {1, (int64_t)KVD});
-            q_for_attn = &q_decode_view;
-
-            time_stage(ProfileStage::QkNormRope, [&] {
-                ops::decode_prepare_qkv(ctx, q_decode_view, k_view, v_view, buf_.rope_freq,
-                                        *layer.q_norm_weight, *layer.k_norm_weight,
-                                        kvCache.k_cache(i), kvCache.v_cache(i),
-                                        start_pos,
-                                        cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                        cfg_.head_dim, cfg_.rms_norm_eps, cfg_.rope_theta);
-            });
-        } else {
-            // Prefill path
-            time_stage(ProfileStage::FullQkvProj, [&] {
-                layer.qkv_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.qkv, seq_len);
-            });
-            time_stage(ProfileStage::FullSplit, [&] {
-                ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v, seq_len, QD, KVD);
-            });
-
-            time_stage(ProfileStage::QkNormRope, [&] {
-                ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len,
-                                   cfg_.num_attention_heads, cfg_.head_dim);
-                ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len,
-                                   cfg_.num_key_value_heads, cfg_.head_dim);
-
-                ops::apply_rope(ctx, buf_.q, buf_.k, seq_len, start_pos,
-                                cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                cfg_.head_dim, cfg_.rope_theta);
-            });
-
-            time_stage(ProfileStage::KvCache, [&] {
-                ops::copy_to_cache(ctx, buf_.k, kvCache.k_cache(i),
-                                   seq_len, start_pos,
-                                   cfg_.num_key_value_heads, cfg_.head_dim,
-                                   kvCache.max_length());
-                ops::copy_to_cache(ctx, buf_.v, kvCache.v_cache(i),
-                                   seq_len, start_pos,
-                                   cfg_.num_key_value_heads, cfg_.head_dim,
-                                   kvCache.max_length());
-            });
-        }
-
-        // Attention
-        time_stage(ProfileStage::Attention, [&] {
-            if (seq_len == 1) {
-                ops::attention_decode(ctx, *q_for_attn, kvCache.k_cache(i), kvCache.v_cache(i),
-                                      buf_.attn_out, buf_.decode_scores,
-                                      cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                      cfg_.head_dim, cached_len,
-                                      &buf_.decode_attn_partials);
-            } else if (start_pos == 0) {
-                ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v,
-                                       buf_.attn_out, buf_.scores,
-                                       seq_len,
-                                       cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                       cfg_.head_dim);
-            } else {
-                ops::attention_prefill_cached(ctx, buf_.q,
-                                              kvCache.k_cache(i), kvCache.v_cache(i),
-                                              buf_.attn_out, buf_.incr_scores,
-                                              seq_len, start_pos,
-                                              cfg_.num_attention_heads, cfg_.num_key_value_heads,
-                                              cfg_.head_dim, kvCache.max_length());
-            }
-        });
-
-        // O projection
-        time_stage(ProfileStage::OProj, [&] {
-            layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.gate, seq_len, hidden_ptr_for_residual);
-        });
-
-        // Fused: residual + post-attn norm
-        time_stage(ProfileStage::PostAttnNorm, [&] {
-            if (hidden_ptr_for_residual) {
-                ops::rms_norm(ctx, buf_.gate, *layer.post_attn_ln_weight,
-                              cfg_.rms_norm_eps, buf_.normed, seq_len, H);
-            } else {
-                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate,
-                                        *layer.post_attn_ln_weight, cfg_.rms_norm_eps,
-                                        buf_.normed, seq_len, H);
-            }
-        });
-
-        // FFN
-        if (seq_len == 1) {
-            bool fused_ok = false;
-            time_stage(ProfileStage::FfnProj, [&] {
-                fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-                    ctx, layer.gate_up_proj, buf_.normed, buf_.gate, FF);
-            });
-            if (!fused_ok) {
-                time_stage(ProfileStage::FfnProj, [&] {
-                    layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, 1);
-                });
-                time_stage(ProfileStage::FfnAct, [&] {
-                    ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, FF);
-                });
-            }
-        } else {
-            time_stage(ProfileStage::FfnProj, [&] {
-                layer.gate_up_proj.forward(ctx, linear_scratch_, buf_.normed, buf_.gate_up, seq_len);
-            });
-            time_stage(ProfileStage::FfnAct, [&] {
-                ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, FF);
-                ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * FF);
-            });
-        }
-
-        // Down projection
-        time_stage(ProfileStage::DownProj, [&] {
-            layer.down_proj.forward(ctx, linear_scratch_, buf_.gate, buf_.up, seq_len, hidden_ptr_for_residual);
-        });
-
-        // Residual + norm for next layer (or final)
-        time_stage(ProfileStage::PostMlpNorm, [&] {
-            if (hidden_ptr_for_residual) {
-                if (i < cfg_.num_hidden_layers - 1) {
-                    ops::rms_norm(ctx, buf_.up, *layers_[i + 1].input_ln_weight,
-                                  cfg_.rms_norm_eps, buf_.normed, seq_len, H);
-                } else {
-                    ops::rms_norm(ctx, buf_.up, *final_norm_weight_,
-                                  cfg_.rms_norm_eps, buf_.normed, seq_len, H);
-                }
-            } else {
-                if (i < cfg_.num_hidden_layers - 1) {
-                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
-                                            *layers_[i + 1].input_ln_weight, cfg_.rms_norm_eps,
-                                            buf_.normed, seq_len, H);
-                } else {
-                    ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up,
-                                            *final_norm_weight_, cfg_.rms_norm_eps,
-                                            buf_.normed, seq_len, H);
-                }
-            }
-        });
+    // A single-token prompt retains the existing decode kernel fast path.
+    const auto phase = seq_len == 1 ? ExecutionPhase::Decode : ExecutionPhase::Prefill;
+    for (const auto& layerPlan : decoderPlan_->layers) {
+        const LayerExecution execution{
+            ctx, buf_, linear_scratch_, phase, start_pos, seq_len, cached_len,
+            kvCache.k_cache(layerPlan.cacheIndex), kvCache.v_cache(layerPlan.cacheIndex),
+            kvCache.max_length(), hidden_ptr_for_residual, time_stage
+        };
+        ExecuteLayer(layerPlan, execution);
     }
 
     time_stage(ProfileStage::LmHead, [&] {
