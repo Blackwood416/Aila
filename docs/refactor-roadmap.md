@@ -17,6 +17,7 @@
 - 本轮 CPU protocol 11 组、Worker 6 个测试函数、RuntimeFault 7 组、Scheduler 22 组、受控 InferenceClient 16 组均通过；真实 Windows 子进程 CPU pipe 7 组通过（6.96 秒），6 个 v1 兼容门禁通过（14.00 秒）。客户端单测耗时 0.30 秒。真实 Qwen3 GPU IPC 首跑通过（61.41 秒）：1/2/4 会话及续写逐 token 精确相同，seed/penalties、取消/背压、父释放、优雅关闭与新 epoch reload 均通过。这些门禁耗时不是服务性能结果。
 - 最终全 Release 构建通过；既有 Q3 Session（23.21 秒）、Q3 Scheduler（26.33 秒）、Q35 0.8B（36.93 秒）GPU 回归全部通过，总计 86.48 秒；23 项基础/兼容/IPC 回归全部通过，60.67 秒。普通宿主导入检查无 SYCL。日志分别为 `build-refactor/ipc-v2-full-build.log`、`ipc-v2-model-gpu-regressions.log`、`ipc-v2-final-regressions.log`、`ipc-v2-host-dependents.log`，最终证据见 [refactor-validation.md](refactor-validation.md)。
 - 普通 C++ `AilaServer` 已通过独立 Worker 提供健康检查、模型列表和 JSON/SSE Chat Completions，首片为本机 Qwen3 NF4 文本、最多 4 个并发请求。复用 tokenizer/聊天模板/reasoning 解析，支持独立 seed、usage、严格参数校验、断连与慢读取消、Worker 故障和优雅关闭。普通 MSVC 的 ChatCodec 19 组、Client 16 组、真实 pipe 7 组通过；11 项 fake socket 与 7 项真实 Qwen3 GPU socket 全部通过，完整记录见验证文档第 11 节。
+- 提交后日志复核发现 Trantor 在同批读回调禁用写事件后仍分发陈旧 OUT 的问题；独立 Channel 补丁和 4 组真实 loopback 回归已验证修复。加入框架 ERROR/FATAL 日志门禁后的完整 fake/GPU socket 重跑通过，原始失败证据保留。
 
 此阶段尚未实现 BF16 权重共享策略、Hybrid 远端能力、新公共异步 C ABI、连续合批和完整媒体服务。当前 device/host/HTTP payload 额度不包含完整进程与驱动分配，不代表总内存或总显存准入。聊天格式化/reasoning 已复用于 Qwen3 HTTP 路径；thinking budget 仍由旧驱动支持，Hybrid 媒体 setter 只操作旧默认 Session。历史独立 HTTP 探针保留，真实服务使用单独的依赖与构建目录。
 

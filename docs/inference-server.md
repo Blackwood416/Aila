@@ -105,9 +105,9 @@ usage 的 `prompt_tokens` 包括完整模板化输入，`completion_tokens` 来�
 
 ## 依赖与额度边界
 
-固定依赖为 Drogon 1.9.11、Trantor 1.5.24、JsonCpp 1.9.6、zlib 1.3.1；框架静态链接、CRT 使用 `/MD`，关闭 TLS/DNS/ORM。构建锁记录源 archive SHA512、补丁 SHA256 与产物 SHA256。两处本地补丁分别转发 Windows listener 回调和提供 IO-loop-only 待写字节查询；源码和哈希随仓库保存。
+固定依赖为 Drogon 1.9.11、Trantor 1.5.24、JsonCpp 1.9.6、zlib 1.3.1；框架静态链接、CRT 使用 `/MD`，关闭 TLS/DNS/ORM。构建锁记录源 archive SHA512、补丁 SHA256 与产物 SHA256。三处本地补丁分别转发 Windows listener 回调、提供 IO-loop-only 待写字节查询，以及在写回调分发前重新检查写事件是否仍启用；源码和哈希随仓库保存。
 
-`pendingWriteBytes()` 对 memory/async 节点求和；遇到未支持的 TLS、文件、同步流节点返回 SIZE_MAX，由服务关闭连接。它不把 bytesSent 当作客户端消费确认。构建另使用保留原始输出字节的 `/showIncludes` 探针，修正本机 CMake/MSVC 输出编码导致的头文件依赖丢失；脚本检查 Ninja 依赖有效。
+`pendingWriteBytes()` 对 memory/async 节点求和；遇到未支持的 TLS、文件、同步流节点返回 SIZE_MAX，由服务关闭连接。它不把 bytesSent 当作客户端消费确认。Channel 补丁处理同批事件中读回调先禁用写入的情况，避免继续调用陈旧的写就绪回调；有效写事件仍正常分发。构建另使用保留原始输出字节的 `/showIncludes` 探针，修正本机 CMake/MSVC 输出编码导致的头文件依赖丢失；脚本检查 Ninja 依赖有效。
 
 HTTP body 限制为 64 KiB，连接上限 128。正常输出以 `maxOutputBytes−2048` 分别限制原始生成文本和序列化输出，预留 2048 字节用于错误收尾；SSE 累计预算包括 `[DONE]`。输出预算、单帧额度和 Trantor 额度是各自的 payload 限制，**不是总 RSS 或显存上限**。它们不覆盖内核 socket buffer、Drogon 全部 header/parser 内存、allocator、权重、共享 scratch 和 oneDNN/driver 分配。非流式 JSON 有单独的输出预算，不使用 SSE 的 pending 门限。单独限制连接数并不能证明全部 HTTP 内存已精确有界。
 
@@ -115,7 +115,7 @@ HTTP body 限制为 64 KiB，连接上限 128。正常输出以 `maxOutputBytes�
 
 ## Socket 验收
 
-Python runner 仅依赖标准库，持有自己的子进程句柄和唯一 shutdown 文件，保存原始 HTTP/SSE、启动参数、日志、health 样本及最终 report。先运行 CPU fake 组，再独占 GPU 运行真实模型组：
+Python runner 仅依赖标准库，持有自己的子进程句柄和唯一 shutdown 文件，保存原始 HTTP/SSE、启动参数、日志、health 样本及最终 report；框架 ERROR/FATAL 日志也使验收失败。CPU CTest 另包括真实 loopback Channel 的读写事件回归。先运行 CPU fake 组，再独占 GPU 运行真实模型组：
 
 ```powershell
 python tests/server/socket_tests.py --server ./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaFakeInferenceWorker.exe --mode fake --output ./tmp/refactor/server-sockets-fake

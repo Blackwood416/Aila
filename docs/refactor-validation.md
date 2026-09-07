@@ -443,3 +443,17 @@ Fake 主进程最终关闭 388/388 个连接；GPU 关闭 141/141 个连接。GP
 Trantor 扩展读取实际 memory/async write 节点，包含普通 HTTP 输出；不是用累计 bytesSent 推算消费确认。该快照加上单请求 handoff 仅约束被计入的数据载荷，不涵盖内核 socket buffer、所有 Drogon header/parser 内存、allocator、权重或驱动分配，不能作为总 RSS/显存上限结论。
 
 提交前源码快照（含当时未跟踪的服务文件）、模型/产物/依赖/日志 SHA256 与 socket 证据清单保存在 `tmp/refactor/server-precommit-provenance.json`；此时 Worker metadata 的提交身份为 `cd57b46`，实际源码须结合快照判读。提交后匹配重建及补充验收的身份记录保存在 `tmp/refactor/server-final-provenance.json`；每个快照目录另复制当时的构建日志，避免后续重建覆盖历史内容。
+
+### 提交后日志复核：Trantor 陈旧写事件
+
+服务首片提交 `b8a5086` 后，匹配重建、BuildIdentity/pipe/Proxy ABI 三项（19.70 秒）、普通宿主三个 CPU CTest（8.48 秒）及 GPU socket 7 项仍通过。随后复核 stdout，发现初次 fake 与此次 GPU 各有一条 `FATAL no writing but write callback called`，原 socket runner 仅检查响应和资源收尾，未将框架日志纳入失败条件。这两次记录只证明当时的功能断言，不能据此声称框架无错误日志。
+
+源码路径是 `Channel::handleEventSafely()`：同批 IN|OUT 先执行 read callback；该 callback 可因普通 FIN 进入 `handleClose()`，清除写订阅。Channel 随后仍根据旧 revents 分发 write，触发 `TcpConnectionImpl::writeCallback()` 的 LOG_SYSERR。Windows Wepoll 将普通 FIN 映射为 IN/RDHUP，现有 `!HUP` 判断无法排除这条路径；LOG_SYSERR 在该版 Logger 中标成 FATAL 但不会终止进程。
+
+新增真实 loopback `AilaServerChannelTests`，通过公共 API 预置可读字节和写订阅，必须实际观察同一批 `revents=0x5`。未补丁库稳定复现：read 中 disableAll、disableWriting 两组仍错误执行 write（顺序 rwq），另两组 keepWriting、disable→reenableWriting 正常通过，合计 2/4。原库、Server 和日志身份保存在 `tmp/refactor/server-channel-before/provenance.json`，失败详情为 `build-refactor-server/server-channel-before-tests-details.log`。
+
+修复以独立 `trantor-channel-interest.patch` 在分发 write callback 前重新检查 `isWriting()`，不更改真实写事件、读回调、HTTP 取消流程或日志等级。依赖锁新增补丁哈希，构建会拒绝缺少补丁的旧前缀。Socket runner 同时检查框架 ERROR/FATAL 日志；它能够检出上述两份原始日志，旧证据完整保留。
+
+补丁后同一 Channel 测试 4/4 通过：两种禁用场景都是 read=1/write=0/order=rq，两种保留写订阅的对照仍为 read=1/write=1/order=rwq，全部实际观察到 revents=0x5。完整普通宿主四个 CTest 通过，总计 7.59 秒，32 个编译对象的头文件依赖均有效。证据为 `build-refactor-server/server-channel-fixed-tests.log` 及其明细。
+
+加入日志门禁后，完整 fake socket 11/11（用例合计 21.01 秒）与 GPU socket 7/7（22.70 秒）均通过，`framework_errors=[]`，分别在 `tmp/refactor/server-sockets-channel-fake` 与 `server-sockets-channel-gpu`。Fake 仍观察到 63,855 B pending / 4,249 B handoff；主进程 388/388、GPU 143/143 个连接正常收尾，请求/IPC 计数归零。独立故障 Worker 用例保持退出码 2 与 idle=true，未出现框架错误。补丁前后原始输出与失败证据均未覆盖；修复提交前快照为 `tmp/refactor/server-channel-precommit-provenance.json`。

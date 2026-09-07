@@ -82,6 +82,24 @@ def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def framework_errors(directory):
+    # Trantor's LOG_SYSERR is rendered as FATAL on this pinned version even
+    # when the process survives. A successful response cannot hide that error.
+    pattern = re.compile(r"^\d{8} \d{2}:\d{2}:\d{2}\.\d+\s+\S+\s+\S+\s+(?:ERROR|FATAL)\b")
+    errors = []
+    for name in ("stdout.log", "stderr.log"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8", errors="replace") as log:
+            for number, line in enumerate(log, 1):
+                if pattern.match(line):
+                    errors.append({"file": name, "line": number, "message": line.rstrip()[:2048]})
+                    if len(errors) == 32:
+                        return errors
+    return errors
+
+
 def fake_text(token_id):
     return ("é中🙂" * 450) + f":{token_id:03d};\n"
 
@@ -533,6 +551,7 @@ class ServerProcess:
             "interrupted_during_shutdown": interrupted,
             "exit_code": self.process.returncode, "seconds": time.perf_counter() - started,
             "report_path": str(self.report_file),
+            "framework_errors": framework_errors(self.directory),
         }
         if self.report_file.is_file():
             self.cleanup["report"] = strict_json(self.report_file.read_bytes())
@@ -1047,6 +1066,7 @@ class Runner:
         cleanup = self.process.stop()
         check(not cleanup["forced_kill"], "Server needed the runner's forced process kill")
         check(cleanup["exit_code"] == 0, f"Graceful server exit failed: {cleanup}")
+        check(not cleanup["framework_errors"], f"Server transport logged errors: {cleanup['framework_errors']}")
         report = cleanup.get("report")
         check(isinstance(report, dict), "Server did not write its final report")
         self.validate_health(report)
@@ -1103,6 +1123,7 @@ def worker_fault_case(args, directory, model):
                 # unsuccessful Worker shutdown (exit 2), independently of the
                 # HTTP socket and request close barriers.
                 check(cleanup["exit_code"] in (0, 2), f"Unexpected faulted-server exit: {cleanup}")
+                check(not cleanup["framework_errors"], f"Faulted server transport logged errors: {cleanup['framework_errors']}")
                 check(isinstance(cleanup.get("report"), dict), "Faulted server did not write its final report")
                 check(cleanup["report"]["shutdown"]["idle"] is True, "Faulted server stranded requests or sockets")
         except BaseException as error:
@@ -1204,7 +1225,8 @@ def main():
         if process is not None:
             try:
                 result["cleanup"] = process.stop()
-                if result["cleanup"].get("forced_kill") or result["cleanup"].get("exit_code") != 0:
+                if (result["cleanup"].get("forced_kill") or result["cleanup"].get("exit_code") != 0 or
+                        result["cleanup"].get("framework_errors")):
                     failed = True
             except BaseException as error:
                 failed = True

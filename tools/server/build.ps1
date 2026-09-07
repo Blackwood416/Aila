@@ -127,6 +127,11 @@ function Assert-ServerDependencies {
             sha256Lf = 'c1c359ef7cf9dc5ac776c7efa0339805ec90f88af6aa7bd07a585746f06cc5fc'
         },
         @{
+            name = 'trantor-channel-interest'; source = 'trantor'
+            path = Join-Path $PSScriptRoot 'trantor-channel-interest.patch'
+            sha256Lf = 'f55f7014b88e6603d8ec643c4f46c5758c37f537579a98c1a8ef05df44526cb4'
+        },
+        @{
             name = 'drogon-windows-listener-callbacks'; source = 'drogon'
             path = Join-Path $PSScriptRoot '../http-probe/drogon-windows-listener-callbacks.patch'
             sha256Lf = 'f267e88c29eaa99bb8b138fae3f8224d4843a0ef9dc393406dbd7c43498cb179'
@@ -275,7 +280,7 @@ $configureArguments = @('--fresh', '-S', $PSScriptRoot, '-B', $BuildRoot,
 Invoke-ServerBuildCommand $cmake $configureArguments 'configure-server'
 Invoke-ServerBuildCommand $cmake @('--build', $BuildRoot, '--config', 'Release',
     '--parallel', "$Parallelism", '--target', 'AilaServer', 'AilaServerChatTests',
-    'AilaServerClientTests', 'AilaServerPipeTests') 'build-server'
+    'AilaServerClientTests', 'AilaServerPipeTests', 'AilaServerChannelTests') 'build-server'
 $compilerDependencies = Assert-ServerHeaderDependencies
 
 $manifest = [ordered]@{

@@ -177,6 +177,11 @@ target_compile_definitions(AilaServer PRIVATE AILA_WORKER_BUILD_ID="${AILA_WORKE
 target_link_libraries(AilaServer PRIVATE AilaServerChat Drogon::Drogon)
 
 enable_testing()
+add_executable(AilaServerChannelTests "${AILA_REPO_ROOT}/tests/server/ChannelTests.cpp")
+target_link_libraries(AilaServerChannelTests PRIVATE AilaServerBuildOptions Trantor::Trantor)
+add_test(NAME AilaServerChannelTests COMMAND AilaServerChannelTests)
+set_tests_properties(AilaServerChannelTests PROPERTIES LABELS "cpu;server;transport" TIMEOUT 30)
+
 add_executable(AilaServerChatTests "${AILA_REPO_ROOT}/tests/server/ChatCodecTests.cpp")
 target_link_libraries(AilaServerChatTests PRIVATE AilaServerChat)
 add_test(NAME AilaServerChatTests COMMAND AilaServerChatTests)

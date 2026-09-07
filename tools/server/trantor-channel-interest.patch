@@ -1,0 +1,10 @@
+diff --git a/trantor/net/Channel.cc b/trantor/net/Channel.cc
+--- a/trantor/net/Channel.cc
++++ b/trantor/net/Channel.cc
+@@ -107,3 +107,5 @@
+         // LOG_TRACE<<"handle write";
+-        if (writeCallback_)
++        // The read callback can disable writing while handling this batch.
++        // Revalidate interest instead of dispatching a stale ready bit.
++        if (writeCallback_ && isWriting())
+             writeCallback_();

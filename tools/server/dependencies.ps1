@@ -168,9 +168,11 @@ foreach ($source in $sources) {
 $sources | ConvertTo-Json -Depth 4 |
     Set-Content -LiteralPath (Join-Path $DependencyRoot 'logs/source-lock.json') -Encoding utf8
 $trantorPatchPath = Join-Path $PSScriptRoot 'trantor-pending-bytes.patch'
+$channelPatchPath = Join-Path $PSScriptRoot 'trantor-channel-interest.patch'
 $listenerPatchPath = Join-Path $PSScriptRoot '../http-probe/drogon-windows-listener-callbacks.patch'
 $patches = @(
     Install-DependencyPatch 'trantor-pending-bytes' 'trantor' $trantorPatchPath 'c1c359ef7cf9dc5ac776c7efa0339805ec90f88af6aa7bd07a585746f06cc5fc'
+    Install-DependencyPatch 'trantor-channel-interest' 'trantor' $channelPatchPath 'f55f7014b88e6603d8ec643c4f46c5758c37f537579a98c1a8ef05df44526cb4'
     Install-DependencyPatch 'drogon-windows-listener-callbacks' 'drogon' $listenerPatchPath 'f267e88c29eaa99bb8b138fae3f8224d4843a0ef9dc393406dbd7c43498cb179'
 )
 $patches | ConvertTo-Json -Depth 4 |
