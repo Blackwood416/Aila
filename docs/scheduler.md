@@ -1,14 +1,16 @@
-# Qwen3 token 请求调度器
+# Token 请求调度器
 
-`src/inference/Scheduler.hpp` 提供进程内的自动多会话调度。每个 Scheduler 有一个提交线程，使用已有 `SessionState / RequestState` 执行 Qwen3 NF4。该接口链接 `AilaLib`，尚未接入 Worker/Proxy 多请求协议或 HTTP 服务。
+`src/inference/Scheduler.hpp` 提供进程内的自动多会话调度。每个 Scheduler 有一个提交线程，使用已有 `SessionState / RequestState` 执行 Qwen3 或 Qwen3.5 Hybrid NF4，共享会话使用 BF16 KV。该接口链接 `AilaLib`，尚未接入 Worker/Proxy 多请求协议或 HTTP 服务。资源接口见 [shared-sessions.md](shared-sessions.md)，Hybrid 状态约定见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)。
 
 ## 执行与公平性
 
 一个调度 quantum 是完整的 prefill 分块、一个 decode token，或最后一次 `Finalizing`。每步返回前完成设备工作，随后轮转到下一个活动请求。长 prompt 的块大小被 `maxPrefillChunkSize` 限制；请求可以指定更小的块。单 token prompt 继续使用后端原有的 decode 快路径。
 
+Qwen3 与 Hybrid 的具体 LayerPlan 在加载时绑定层投影、缓存索引和下一层/最终 norm；Hybrid 明确区分 Full Attention 与 DeltaNet，切换请求时使用各自的 KV、递归矩阵和卷积状态。NF4 投影内核与融合顺序保持；分组 DeltaNet 的卷积历史写回另修复了既有跨工作组竞争，见 Hybrid 会话文档。两个显式 backend 都返回最后有效位置的一行 logits，Scheduler 不从共享张量容量推断采样行。
+
 最多 `maxActiveRequests` 个请求参与轮转，其余按提交顺序等待。新获得活动名额的请求排在刚完成本轮的请求之前。取消的排队请求可以在步骤边界直接终结，无需等待活动名额；这类维护与正常执行交替，避免取消流量饿死 decode。
 
-同一设备域使用一个 Scheduler。多个调用线程可以 Submit、读取自己的流、Cancel 和查询快照，输出消费不在提交线程上执行。Qwen3 的会话长度是由会话操作锁保护的私有主机元数据；提交空闲 Session 不需要等待另一个 Session 占用的设备执行锁。加载模型及预创建 Session 仍由调用者完成，设备互斥锁保护共享执行槽；此版本没有跨请求 GEMM 合批、分页 KV 或多 GPU 调度。
+同一设备域使用一个 Scheduler。多个调用线程可以 Submit、读取自己的流、Cancel 和查询快照，输出消费不在提交线程上执行。两类模型的会话长度都是由会话操作锁保护的私有主机元数据；提交空闲 Session 不需要等待另一个 Session 占用的设备执行锁。加载模型及预创建 Session 仍由调用者完成，设备互斥锁保护共享执行槽；此版本没有跨请求 GEMM 合批、分页 KV 或多 GPU 调度。
 
 ## 使用示例
 
@@ -54,6 +56,8 @@ for (;;) {
 scheduler.Shutdown();
 ```
 
+调度 Hybrid 时将加载入口换为 `LoadedModel::LoadQwen35Nf4`，Request 与读取循环相同。通过 `ModelOptions::maxRecurrentSnapshots` 配置回滚快照，通过 `maxSessionHostBytes` 限制 mirror/snapshot 预留；它们属于模型准入参数，不是 `SchedulerOptions` 字段。
+
 每个流只需一个消费者。不同 Session 可先分别 Submit，再由各自的线程或上层事件循环读取。`ScheduledRequest` 不暴露底层 `Step()`，因此调用者不能绕过调度器并发推进同一个请求。
 
 ## 准入与资源界限
@@ -68,13 +72,17 @@ scheduler.Shutdown();
 | `maxOutstandingTokens` | 32768 | 尚未归还额度的请求之 `prompt + max_new_tokens` 总和 |
 | `maxPrefillChunkSize` | 512 | 每步最多消费的 prompt token 数 |
 | `maxBufferedTokensPerRequest` | 128 | 每个流固定 token ring 的容量 |
-| `maxSessionCacheBytes` | 0 | 可选的已准入 Session KV 额度；0 表示仅由模型的缓存限制管理 |
+| `maxSessionCacheBytes` | 0 | 可选的已准入 Session device cache/state 额度；0 表示仅由模型的缓存限制管理 |
 
 准入先预留额度，再分配输出 ring、复制紧凑输入并获取 Session 租约。无效输入、Busy、超额或与 Shutdown 的竞争都会回滚额度。请求不会保留调用方 vector 的多余容量。生成历史在开始前按上限预留；错误信息最多 1024 字节，截断保留 UTF-8 边界。
 
 正常消费 terminal 后，或丢弃最后一个句柄且执行安全结束后，额度才归还。完成但无人读取的输出不能无限积累。归还额度前实际销毁 token ring；底层 Request 在发布终态前释放模型/Session 的所有权。终态被消费后的句柄仍可查询其小型快照；这些由调用方保留的句柄不再占用调度额度。
 
-`maxSessionCacheBytes` 按请求所持 Session 的 `CacheBytes()` 保守计数，不合并同一个已完成 Session 的重复引用。Session 在 Submit 前已经创建，分配前的限制仍由 `ModelOptions::maxSessions / maxSessionCacheBytes` 负责。**这些设置不代表总显存准入**：权重、共享 scratch、oneDNN/直接 USM 分配及外部持有的 Session 都需要额外预算。HTTP/IPC 还需对输入原文、编码输出、socket 缓冲和连接数单独设限。
+`SchedulerOptions::maxSessionCacheBytes` 按请求所持 Session 的 `CacheBytes()` 保守计数，不合并同一个已完成 Session 的重复引用。Qwen3 计 BF16 KV；Hybrid 计 Full KV、DeltaNet 递归矩阵和卷积状态。Session 在 Submit 前已经创建，分配前的会话数、device 与 host 限制分别由 `ModelOptions::maxSessions / maxSessionCacheBytes / maxSessionHostBytes` 负责。
+
+Hybrid 的 host 额度为常驻 float mirror × `(1 + maxRecurrentSnapshots)`。每会话默认最多 4 个快照，0 禁用快照但保留 mirror；实际快照按需分配，复制前先淘汰超额的最旧项。模型和 backend 共用 `SessionMemory.hpp` 的溢出检查与 payload 公式；`SessionHostReservationBytes()` 可查询每会话预留。Scheduler 当前没有单独的 host snapshot 额度字段。
+
+**这些设置不代表总内存或总显存准入**：权重、共享 scratch、oneDNN/driver/直接 USM 分配、STL/allocator 元数据及外部持有的 Session 都需要额外预算。HTTP/IPC 还需对输入原文、编码输出、socket 缓冲和连接数单独设限。
 
 ## 输出、取消和终态
 
@@ -91,10 +99,14 @@ ring 满时，在下一次会产生 token 的步骤之前取消该请求，终�
 | `Cancelled` | Cancelled | 显式取消或丢弃句柄 |
 | `OutputBackpressure` | Cancelled | 输出 ring 满，保留已有输出 |
 | `SchedulerStopped` | Cancelled | 调度器关闭 |
-| `RuntimeFault` | Failed | 设备域故障，整个调度器停止准入并终结其余请求 |
+| `RuntimeFault` | Failed | 收到设备域故障，整个调度器停止准入并终结其余请求 |
 | `Failed` | Failed | 其他请求异常，只影响该请求 |
 
 取消/失败后的缓存只保证保留实际消费的前缀，可能尚未包含最后一个已发布 token；复用长期 Session 前，应查询 `ContextLength()`，补算或 Reset。设备域故障后必须销毁相应旧域资源并重新加载，不能复用失效 Session。
+
+Hybrid 的 `SessionState::Truncate(requestedLength)` 可能恢复到更早的保留 checkpoint，没有可用 checkpoint 时重置为 0；相同长度截断是 no-op。必须根据返回的实际长度补算历史。恢复同时处理递归矩阵、卷积历史、环形位置和 host/device 一致性，其他 Session 不受影响；活动请求持有会话租约时，Reset/Truncate 仍返回 Busy。
+
+当前执行及 Reset/Truncate 的设备变更异常会归一为 `RuntimeFault`；模型加载和 Session 初始化的同步设备异常分类仍沿用旧实现，不能假定所有初始化失败都已转为域故障。后续 [IPC v2 设计](inference-ipc-v2.md) 的故障门禁还需补异常分类及故障注入验证；该文档不代表多在途 Worker/Proxy 已经实现。
 
 ## 关闭与回调
 
@@ -119,10 +131,14 @@ $env:AILA_QWEN3_TEST_MODEL = 'E:\RiderProjects\Aila\models\qwen3-0.6B-bnb-nf4-of
 $env:AILA_KV_QUANT = '0'
 ctest --test-dir build-refactor -C Release -R '^AilaQwen3(Session|Scheduler)Tests$' --output-on-failure
 
+$env:AILA_QWEN35_TEST_MODEL = 'E:\RiderProjects\Aila\models\qwen3.5-0.8B-bnb-nf4-offline'
+$env:AILA_VLM_KV_QUANT = '0'
+ctest --test-dir build-refactor -C Release -R '^AilaQwen35SessionTests$' --output-on-failure
+
 pwsh -NoProfile -File perf/shared-session-bench.ps1 `
     -ModelDir models/qwen3-0.6B-bnb-nf4-offline -BuildDir build-refactor
 ```
 
-性能入口调用 `AilaQwen3SchedulerTests --benchmark <json>`，跳过正确性用例，单独测量 1/2/4 会话，各预热 1 轮、测量 3 轮。固定 prompt 256、输出 128、prefill chunk 256、上下文 512、greedy；每请求独立读取线程，报告 Submit 到首 token 的 TTFT、实际 token 到达间隔和包含 prefill/finalization 的总吞吐。这些指标不包含 HTTP、tokenization、模型加载或 Session 创建。
+上述性能入口专用于 Qwen3，调用 `AilaQwen3SchedulerTests --benchmark <json>`，跳过正确性用例，单独测量 1/2/4 会话，各预热 1 轮、测量 3 轮。固定 prompt 256、输出 128、prefill chunk 256、上下文 512、greedy；每请求独立读取线程，报告 Submit 到首 token 的 TTFT、实际 token 到达间隔和包含 prefill/finalization 的总吞吐。这些指标不包含 HTTP、tokenization、模型加载或 Session 创建，不应作为 Hybrid 或真实服务的测量结果。
 
 脚本导入并校验 oneAPI 栈，持有全局 benchmark mutex，默认关闭 profiling，固定 BF16 KV，设置 600 秒超时。每次创建独立输出目录，保存原始日志、逐 token 时间与 ID、模型/二进制/源码哈希、tracked diff、环境和驱动信息；默认入口指针是 `tmp/refactor/q3-scheduler-bench/latest-run.json`。CTest 不使用该 mutex，仍需调用者串行安排 GPU 工作。

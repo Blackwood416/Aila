@@ -35,17 +35,27 @@ struct ModelOptions {
     int maxSequenceLength = 4096;
     size_t maxSessions = 4;
     // Zero uses the session-count bound alone. A nonzero limit reserves the
-    // BF16 KV size before allocation. Shared sessions currently reject FP8 KV.
+    // device cache/state size before allocation. Shared sessions reject FP8 KV.
     size_t maxSessionCacheBytes = 0;
+    // Hybrid host mirrors plus bounded recurrent snapshot payloads. Zero uses
+    // the session-count bound alone; STL/allocator overhead is not included.
+    size_t maxSessionHostBytes = 0;
+    // Qwen3.5 only: keep the latest N recurrent checkpoints; zero disables
+    // snapshots. Truncate may restore an earlier checkpoint or reset to zero.
+    size_t maxRecurrentSnapshots = 4;
 };
 
-// Initial shared-model implementation supports Qwen3 NF4 text only. Other
-// models continue through IModelBackend and the existing Engine facade.
+// Shared-model text execution supports Qwen3 and Qwen3.5 Hybrid NF4. Other
+// model/storage capabilities continue through the existing Engine facade.
 // Weights and fused projections are loaded once. Their mutable oneDNN
 // bindings/activations stay in one execution slot, guarded by DeviceRuntime.
 class LoadedModel final {
 public:
     static std::shared_ptr<LoadedModel> LoadQwen3Nf4(
+        std::shared_ptr<DeviceRuntime> runtime,
+        const std::string& modelDirectory,
+        ModelOptions options = {});
+    static std::shared_ptr<LoadedModel> LoadQwen35Nf4(
         std::shared_ptr<DeviceRuntime> runtime,
         const std::string& modelDirectory,
         ModelOptions options = {});
@@ -55,8 +65,13 @@ public:
     int MaxSequenceLength() const noexcept;
     size_t ActiveSessions() const;
     size_t SessionReservationBytes() const noexcept;
+    size_t SessionHostReservationBytes() const noexcept;
 
 private:
+    static std::shared_ptr<LoadedModel> LoadNf4(
+        std::shared_ptr<DeviceRuntime> runtime,
+        const std::string& modelDirectory,
+        ModelOptions options, ModelFamily family);
     explicit LoadedModel(std::shared_ptr<detail::LoadedModelState> state);
     std::shared_ptr<detail::LoadedModelState> state;
 };

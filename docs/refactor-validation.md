@@ -1,6 +1,6 @@
 # 重构验证入口与 P0 基线
 
-核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。第 6 节保留 P1/P2 首批结果，第 8 节记录本轮 LayerPlan、Scheduler 与 HTTP 探针。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
+核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。第 6 节保留 P1/P2 首批结果，第 8 节保留 Qwen3 LayerPlan、Scheduler 与 HTTP 探针结果，第 9 节记录 Qwen3.5 Hybrid 共享会话及分组状态竞争修复。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
 
 ## 1. 固定输入与构建
 
@@ -266,3 +266,78 @@ Decode 标准差分别为 4.69 / 2.72 ms，候选吞吐约低 0.71%。保留该�
 独立普通 C++17 探针在 Drogon 1.9.11 + Trantor 1.5.24 及本地 Windows listener callback 补丁下，真实 loopback 的六个场景全部通过：增量 UTF-8 SSE、双客户端、断线隔离、慢读、完成竞争及退出清理。未打补丁的失败记录也已保留。此探针没有加载模型或调用 GPU；结果、复现命令、固定依赖及连接复用/背压限制见 [refactor-http-probe.md](refactor-http-probe.md)。
 
 本轮交付 Qwen3 的层计划和进程内自动调度；共享接口仍只接受 NF4 权重与 BF16 KV。Hybrid Full/DeltaNet 状态与回滚、BF16 权重策略、总显存预算、多在途 Worker/Proxy ID/epoch、真实 HTTP 推理、长上下文/4B 和持续服务压力均保留为后续验收项。
+
+## 9. Qwen3.5 Hybrid 共享会话续批验证
+
+本批在 `f85790d` 上继续开发，基线仍为不可变 `1956de9`，沿用第 1 节 A770 / oneAPI / 驱动。`LoadedModel::LoadQwen35Nf4` 接入已有 Session/Request/Scheduler，Full KV、DeltaNet 矩阵、卷积历史、host mirror 和快照均归会话；NF4 投影、共享执行槽及跨层融合保留。具体 API、实际回滚长度与预算说明见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)。
+
+### 构建、数值和资源门禁
+
+下表为包含分组竞争修复后的最终源码验证。此前通过和失败的原始日志均保留，没有覆盖失败记录。
+
+| 检查 | 实际结果 | 证据 |
+| --- | --- | --- |
+| 完整 Release 构建 | 通过，包含最终 backend 和诊断 fixture | `build-refactor/q35-grouped-fix-build.log` |
+| 17 项 CPU CTest | 全部通过，24.38 秒；新增 SessionMemory 预算边界测试 | `build-refactor/q35-final-cpu-ctest.log`、`q35-final-cpu-details.log` |
+| Qwen3 Session / Scheduler GPU 回归 | 通过，23.62 / 26.43 秒，总计 50.06 秒 | `build-refactor/q35-final-q3-gpu-ctest.log`、`q35-final-q3-gpu-details.log` |
+| Qwen3.5-0.8B 完整 GPU fixture | 通过，37.41 秒 | `build-refactor/q35-final-08b-gpu-ctest.log`、`q35-final-08b-gpu-details.log` |
+| Qwen3.5-4B 完整 GPU fixture | 通过，81.37 秒 | `build-refactor/q35-grouped-fixed-4b-gpu-ctest.log`、`q35-grouped-fixed-4b-gpu-details.log` |
+| 4B 混合形状 logits 复现 | 修复后首次通过，另用三个新进程重复，三次均精确通过 | `build-refactor/q35-grouped-after-interleaved.log`、`q35-grouped-repeat-1.log` 至 `q35-grouped-repeat-3.log` |
+
+0.8B 与 4B 使用同一完整 fixture，context 固定 512，快照上限 4，BF16 KV。覆盖内容包括：
+
+- 独立 legacy backend 对 `[11,3,7,16,19,1,3,1]` 步形状读取实际最后有效 logits 行，再与共享 API 逐元素精确比较，覆盖小块增量的多行输出与旧容量残留。
+- 两 Session 不同分块形状交错的每步 logits，以及四 Session 的 initial/continuation token、greedy、固定 seed、penalties 和最终状态探针。独立参考保持各请求的分块形状。
+- 截断到 20 实际恢复 checkpoint 17，截断到 65 恢复 decode checkpoint 64；无 checkpoint 时返回 0；最近四份快照的保留/淘汰以及禁用快照后的重算。
+- 192/256-token prefill 安全边界的取消与丢弃，B 继续正常完成；反复创建/销毁和外部 Model/Runtime 先释放的所有权验证。
+- device 与 host 预算分别设为 `2 * reservation - 1`、`maxSessions=4`，第二个 Session 在分配前拒绝；释放后额度可复用。有效 scoped/global/engine KV 覆盖矩阵在加载和 Session 创建前拒绝量化 KV。
+
+CPU 内存预算测试独立于 SYCL，校验已知模型字节数、上下文增长、分组 heads、显式/部分 layer_types、kernel=1、非法维度、`size_t` 溢出及最大可表示快照额度。模型准入与 backend 分配使用同一个计算模块。
+
+| 模型，context 512 | 每 Session device payload | Host mirror + 4 snapshots 额度 |
+| --- | ---: | ---: |
+| Qwen3.5-0.8B NF4 | 26,492,928 B | 101,007,360 B |
+| Qwen3.5-4B NF4 | 69,468,160 B | 263,454,720 B |
+
+这两个 device 数值与 fixture 中实际新增/释放的 Context 记账一致。host 列是 float payload 最大预留，不是进程 RSS 实测；不包含 STL/allocator 开销。禁用快照仍需要一份 host mirror。两列都不包含权重、共享 workspace 或 oneDNN/driver 分配。
+
+### 4B 验证暴露的分组 DeltaNet 竞争
+
+首次 4B 完整测试在 44.40 秒失败于 session 0 的第二个追加 token。该 Session 使用 greedy、无惩罚，初始和追加分块在独立/调度路径相同。缩小到 `--case interleaved-logits` 后，首次 8-token prefill 就有 **232,280 / 248,320** 个 logits 不同，`max_abs=0.359375`，说明问题并非采样随机数。失败证据是 `build-refactor/q35-shared-4b-gpu-details.log` 和 `q35-grouped-before-interleaved.log`。
+
+源码原因是一个 value head 对应一个工作组，分组时两个或更多工作组共用同一 Q/K 卷积历史。leader 在组内 barrier 后原地写回，其他工作组可能还没读完旧值；prefill 各工作组的 token 循环也不能互相同步。这段 decode/prefill helper 在修复前与基线 `1956de9` 的 31,392 字符区域完全一致，比较证据位于 `tmp/refactor/q35-grouped-before/baseline-kernel-comparison.json`。该目录还保留修复前源码和二进制哈希。
+
+修复仅针对 grouped fast path：计算 kernel 期间历史只读；prefill 的历史 tap `k=t-3+j` 在 k<0 时读初始物理 ring，否则读取本块第 k 行投影输入。计算结束后，用后置 kernel 按原 ring/head 格式写回最后 `min(T,3)` 行；in-order queue 提供跨 kernel 顺序，不添加逐层主机等待。非 grouped / generic fallback 和 NF4 GEMV/GEMM 保持原计算方式。代码复核确认 T=1/2 的混合历史、长块末三行与 input stride；随后通过上表中的精确数值、回滚与重复复现门禁。
+
+这个修复同时作用于 NF4 后端的新旧入口。未把含竞争的 4B 旧输出当作正确性 oracle，也未用它计算性能加速比。BF16 权重后端尚未迁移，其相似 grouped 实现仍需单独验证和处理。
+
+### 旧 CLI 完整 token 与相邻性能对照
+
+使用 `perf/refactor-legacy-check.ps1` 对 Qwen3.5-0.8B 比较不可变基线与候选；五组全部精确一致，`tmp/refactor/q35-shared-legacy-parity/report.json` 的 `passed` 为 true。
+
+| 案例 | Prompt tokens | Generated tokens | 完整 ID 数组 |
+| --- | ---: | ---: | --- |
+| fixed_seed | 37 | 24 | 相同 |
+| penalties | 37 | 9 | 相同 |
+| stream | 37 | 9 | 相同 |
+| thinking_budget | 37 | 9 | 相同 |
+| history | 54 | 5 | 相同 |
+
+性能继续使用此前的短测协议：256 prompt / 128 generated、greedy、最大上下文 4096、warmup 1、测量 3 轮、BF16 KV，关闭 Q3/Q35 profiling 和 oneDNN verbose。首组按基线→候选运行；因为 prefill 有 3.54% 差异，又在源码和二进制不变的情况下按候选→基线复测，保留两组结果。
+
+| 运行顺序 | 阶段 | 基线 token/s | 候选 token/s | 候选相对变化 | 基线 / 候选平均 ms |
+| --- | --- | ---: | ---: | ---: | --- |
+| 基线→候选 | Prefill | 2254.93 | 2175.12 | -3.54% | 113.53 / 117.69 |
+| 基线→候选 | Decode | 143.32 | 143.52 | +0.14% | 893.11 / 891.87 |
+| 候选→基线 | Prefill | 2255.35 | 2234.64 | -0.92% | 113.51 / 114.56 |
+| 候选→基线 | Decode | 142.96 | 145.18 | +1.55% | 895.33 / 881.64 |
+
+首组 prefill/decode 的标准差为基线 0.28 / 3.06 ms、候选 0.05 / 1.01 ms；复测为基线 0.44 / 3.47 ms、候选 0.44 / 6.37 ms。prefill 首轮差异在反序复测中缩小，但两组都略低于基线，不能据此宣称完全无性能下降或设定通用阈值。原始结果分别位于基线 worktree 与主工作区各自的 `tmp/refactor/q35-shared-bench/bench.json` 和 `q35-shared-bench-repeat/bench.json`，未覆盖历史基准。这些是旧 CLI 的阶段吞吐，不是 Hybrid 多会话或 HTTP 性能。
+
+本批源码快照（包含新增且当时未跟踪的文件）、完整模型文件哈希、构建信息、二进制/运行时 DLL 和日志身份保存于 `tmp/refactor/q35-shared-precommit-provenance.json`；提交后的身份、重建和补充检查对应 `q35-shared-final-provenance.json`。候选测量时的 build metadata 仍写 `f85790d`，须结合源码快照与二进制 SHA256，不能把该字段当作已提交的完整源码身份。
+
+### 本批边界
+
+本批证明 Qwen3 与 Qwen3.5 NF4 文本会话可复用进程内执行/调度框架，未实现连续合批。Hybrid 新接口仍是 token API；媒体 setter、聊天模板、reasoning 和 thinking budget 继续属于旧驱动。4B 的上述检查固定 context 512，不代表长上下文或长期服务压力门禁已经完成。
+
+[IPC v2 文档](inference-ipc-v2.md) 是可实施的协议设计，尚未改动 Worker/Proxy 多在途通信或增加真实 HTTP 推理。初始化/加载中的同步设备异常尚未可靠统一为 `RuntimeFault`；v2 接入前需补齐分类、原始故障记录、生命周期故障广播和注入测试。新 host/device 额度是 payload 准入，完整内存预算和 Qwen3.5 的 1/2/4 会话性能分布仍待后续阶段验证。

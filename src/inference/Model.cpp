@@ -2,7 +2,9 @@
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
+#include "memory/SessionMemory.hpp"
 #include "models/Qwen3Bnb4Backend.hpp"
+#include "models/Qwen35HybridBnb4Backend.hpp"
 #include "ops/Ops.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
@@ -10,7 +12,7 @@
 #include "utils/SafeTensors.hpp"
 
 #include <algorithm>
-#include <limits>
+#include <type_traits>
 #include <utility>
 
 namespace aila::inference {
@@ -77,10 +79,12 @@ struct LoadedModelState {
     std::shared_ptr<DeviceState> device;
     ModelOptions options;
     ModelSpec spec;
+    int vocabSize = 0;
     size_t sessionReservationBytes = 0;
+    size_t sessionHostReservationBytes = 0;
     size_t activeSessions = 0; // Protected by device->mutex.
     std::unique_ptr<ModelWeights> weights;
-    std::unique_ptr<Qwen3Bnb4Backend> backend;
+    std::unique_ptr<IModelBackend> backend;
     std::unique_ptr<ExecutionWorkspace> workspace;
 
     ~LoadedModelState() {
@@ -93,12 +97,15 @@ struct LoadedModelState {
     }
 };
 
-class Qwen3SessionBackend final : public SessionBackend {
+// Select the model implementation once when creating the session. Sampling,
+// execution locking and lifetime rules are shared by both text backends.
+template <typename Backend>
+class ModelSessionBackend final : public SessionBackend {
 public:
-    explicit Qwen3SessionBackend(std::shared_ptr<LoadedModelState> loadedModel)
+    explicit ModelSessionBackend(std::shared_ptr<LoadedModelState> loadedModel)
         : model(std::move(loadedModel)) {}
 
-    ~Qwen3SessionBackend() override {
+    ~ModelSessionBackend() override {
         if (!cache) return;
         // Keep the model/runtime alive while every Tensor is freed, including
         // when the caller has already dropped its model and runtime handles.
@@ -115,11 +122,17 @@ public:
         const auto& options = model->options;
         if (model->activeSessions >= options.maxSessions ||
             (options.maxSessionCacheBytes != 0 &&
-             model->activeSessions >= options.maxSessionCacheBytes / model->sessionReservationBytes)) {
-            throw Error(ErrorCode::ResourceLimit, "Shared model session cache limit reached");
+             model->activeSessions >= options.maxSessionCacheBytes / model->sessionReservationBytes) ||
+            (options.maxSessionHostBytes != 0 && model->sessionHostReservationBytes != 0 &&
+             model->activeSessions >= options.maxSessionHostBytes / model->sessionHostReservationBytes)) {
+            throw Error(ErrorCode::ResourceLimit, "Shared model session memory limit reached");
         }
         try {
-            cache = model->backend->CreateSession(model->device->context);
+            if constexpr (std::is_same_v<Backend, Qwen35HybridBnb4Backend>) {
+                cache = ModelBackend().CreateSession(model->device->context, options.maxRecurrentSnapshots);
+            } else {
+                cache = ModelBackend().CreateSession(model->device->context);
+            }
             ++model->activeSessions;
         } catch (const std::invalid_argument& error) {
             model->device->DrainNoThrow();
@@ -138,19 +151,21 @@ public:
         return cache->CurrentLength();
     }
     int Capacity() const override { return model->options.maxSequenceLength; }
-    int VocabSize() const override { return model->spec.qwen3.vocab_size; }
+    int VocabSize() const override { return model->vocabSize; }
     size_t CacheBytes() const override { return cache->CacheBytes(); }
 
     void Reset() override {
         std::lock_guard<std::mutex> lock(model->device->mutex);
         model->device->CheckUsable();
-        model->backend->Reset(*cache);
+        MutateCache([&] { ModelBackend().Reset(*cache); });
     }
 
     int Truncate(int length) override {
         std::lock_guard<std::mutex> lock(model->device->mutex);
         model->device->CheckUsable();
-        return model->backend->Truncate(*cache, length);
+        int restored = 0;
+        MutateCache([&] { restored = ModelBackend().Truncate(*cache, length); });
+        return restored;
     }
 
     ExecutionResult Forward(const std::vector<int>& tokenIds,
@@ -166,7 +181,7 @@ public:
             slot.Ensure(context, tokenIds.size());
             context.memcpy_h2d_async(slot.tokenIds.data(), tokenIds.data(),
                                      tokenIds.size() * sizeof(int));
-            Tensor& logits = model->backend->Forward(
+            Tensor& logits = ModelBackend().Forward(
                 context, *cache, slot.tokenIds.data_as<int>(),
                 static_cast<int>(tokenIds.size()));
 
@@ -212,32 +227,35 @@ public:
     }
 
 private:
+    Backend& ModelBackend() const { return static_cast<Backend&>(*model->backend); }
+
+    // Reset/rollback can submit zeroing and host-to-device state restores.
+    // Drain them before returning so borrowed host storage may be reused, and
+    // preserve the same execution-domain failure semantics as Forward.
+    template <typename Mutation>
+    void MutateCache(Mutation&& mutate) {
+        auto& device = *model->device;
+        try {
+            mutate();
+            device.context.synchronize();
+        } catch (const std::exception& error) {
+            device.faulted = true;
+            device.DrainNoThrow();
+            device.RecordFaultNoThrow(error.what());
+            throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
+        } catch (...) {
+            device.faulted = true;
+            device.DrainNoThrow();
+            device.RecordFaultNoThrow("Unknown session state mutation failure");
+            throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
+        }
+    }
+
     std::shared_ptr<LoadedModelState> model;
-    std::unique_ptr<Qwen3Bnb4Backend::Session> cache;
+    std::unique_ptr<typename Backend::Session> cache;
 };
 
 } // namespace detail
-
-namespace {
-
-size_t checked_product(size_t a, size_t b) {
-    if (b != 0 && a > std::numeric_limits<size_t>::max() / b) {
-        throw Error(ErrorCode::InvalidArgument, "Session cache size overflows size_t");
-    }
-    return a * b;
-}
-
-size_t session_reservation_bytes(const Qwen3Config& config, int capacity) {
-    size_t result = 2 * sizeof(sycl::ext::oneapi::bfloat16); // K and V.
-    for (int dimension : {config.num_hidden_layers, config.num_key_value_heads,
-                          config.head_dim, capacity}) {
-        if (dimension <= 0) throw Error(ErrorCode::InvalidArgument, "Invalid model cache dimensions");
-        result = checked_product(result, static_cast<size_t>(dimension));
-    }
-    return result;
-}
-
-} // namespace
 
 DeviceRuntime::DeviceRuntime(std::shared_ptr<detail::DeviceState> value)
     : state(std::move(value)) {}
@@ -273,13 +291,32 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadQwen3Nf4(
     std::shared_ptr<DeviceRuntime> runtime,
     const std::string& modelDirectory,
     ModelOptions options) {
+    return LoadNf4(std::move(runtime), modelDirectory, options, ModelFamily::Qwen3Dense);
+}
+
+std::shared_ptr<LoadedModel> LoadedModel::LoadQwen35Nf4(
+    std::shared_ptr<DeviceRuntime> runtime,
+    const std::string& modelDirectory,
+    ModelOptions options) {
+    return LoadNf4(std::move(runtime), modelDirectory, options, ModelFamily::Qwen35Hybrid);
+}
+
+std::shared_ptr<LoadedModel> LoadedModel::LoadNf4(
+    std::shared_ptr<DeviceRuntime> runtime,
+    const std::string& modelDirectory,
+    ModelOptions options, ModelFamily family) {
     aila::ScopedLogDeferral deferLogs;
     if (!runtime || modelDirectory.empty() || options.maxSequenceLength <= 0 || options.maxSessions == 0) {
         throw Error(ErrorCode::InvalidArgument, "Runtime, model directory and positive model limits are required");
     }
-    if (aila::env::read_flag("AILA_KV_QUANT", false)) {
+    const bool hybrid = family == ModelFamily::Qwen35Hybrid;
+    const bool quantizedCache = hybrid
+        ? aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")
+        : aila::env::read_flag("AILA_KV_QUANT", false);
+    if (quantizedCache) {
         throw Error(ErrorCode::InvalidArgument,
-                    "Qwen3 shared sessions require BF16 KV; set AILA_KV_QUANT=0");
+                    hybrid ? "Qwen3.5 shared sessions require BF16 KV; set AILA_VLM_KV_QUANT=0"
+                           : "Qwen3 shared sessions require BF16 KV; set AILA_KV_QUANT=0");
     }
     auto loaded = std::make_shared<detail::LoadedModelState>();
     loaded->device = runtime->state;
@@ -288,19 +325,44 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadQwen3Nf4(
         throw Error(ErrorCode::InvalidArgument, error);
     }
     const auto& spec = loaded->spec;
-    if (spec.family != ModelFamily::Qwen3Dense || !spec.is_bitsandbytes_4bit() ||
+    if (spec.family != family || !spec.is_bitsandbytes_4bit() ||
         spec.quantization.bnb_4bit_quant_type != "nf4") {
-        throw Error(ErrorCode::UnsupportedModel, "Shared sessions currently require a Qwen3 NF4 text model");
+        throw Error(ErrorCode::UnsupportedModel,
+                    hybrid ? "This shared-model loader requires Qwen3.5 Hybrid NF4"
+                           : "This shared-model loader requires Qwen3 NF4");
     }
-    if (spec.qwen3.vocab_size <= 0 || spec.qwen3.hidden_size <= 0 ||
-        spec.qwen3.num_attention_heads <= 0 || spec.qwen3.num_key_value_heads <= 0 ||
-        spec.qwen3.num_attention_heads % spec.qwen3.num_key_value_heads != 0 ||
-        spec.qwen3.max_position_embeddings <= 0) {
-        throw Error(ErrorCode::InvalidArgument, "Invalid Qwen3 model dimensions");
+    aila::memory::SessionMemoryReservation reservation;
+    try {
+        if (hybrid) {
+            const auto& config = spec.qwen35_text;
+            if (!is_supported_qwen35_hybrid_text_spec(config)) {
+                throw Error(ErrorCode::UnsupportedModel, "Unsupported Qwen3.5 Hybrid dimensions");
+            }
+            if (config.vocab_size <= 0 || config.max_position_embeddings <= 0) {
+                throw Error(ErrorCode::InvalidArgument, "Invalid Qwen3.5 vocabulary or context capacity");
+            }
+            options.maxSequenceLength = std::min(options.maxSequenceLength, config.max_position_embeddings);
+            reservation = aila::memory::qwen35_session_memory(
+                config, options.maxSequenceLength, options.maxRecurrentSnapshots);
+            loaded->vocabSize = config.vocab_size;
+        } else {
+            const auto& config = spec.qwen3;
+            if (config.vocab_size <= 0 || config.hidden_size <= 0 ||
+                config.num_attention_heads <= 0 || config.num_key_value_heads <= 0 ||
+                config.num_attention_heads % config.num_key_value_heads != 0 ||
+                config.max_position_embeddings <= 0) {
+                throw Error(ErrorCode::InvalidArgument, "Invalid Qwen3 model dimensions");
+            }
+            options.maxSequenceLength = std::min(options.maxSequenceLength, config.max_position_embeddings);
+            reservation = aila::memory::qwen3_session_memory(config, options.maxSequenceLength);
+            loaded->vocabSize = config.vocab_size;
+        }
+    } catch (const std::invalid_argument& error) {
+        throw Error(ErrorCode::InvalidArgument, error.what());
     }
-    options.maxSequenceLength = std::min(options.maxSequenceLength, spec.qwen3.max_position_embeddings);
     loaded->options = options;
-    loaded->sessionReservationBytes = session_reservation_bytes(spec.qwen3, options.maxSequenceLength);
+    loaded->sessionReservationBytes = reservation.deviceBytes;
+    loaded->sessionHostReservationBytes = reservation.hostBytes;
     // Declare the lock after loaded: a failed load frees resources only after
     // releasing this lock (LoadedModelState's destructor acquires it again).
     std::unique_lock<std::mutex> lock(loaded->device->mutex);
@@ -308,7 +370,8 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadQwen3Nf4(
     auto& context = loaded->device->context;
     try {
         loaded->weights = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(modelDirectory, context));
-        loaded->backend = std::make_unique<Qwen3Bnb4Backend>();
+        if (hybrid) loaded->backend = std::make_unique<Qwen35HybridBnb4Backend>();
+        else loaded->backend = std::make_unique<Qwen3Bnb4Backend>();
         if (!loaded->backend->load(context, *loaded->weights, spec, options.maxSequenceLength, &error)) {
             throw Error(ErrorCode::UnsupportedModel, error);
         }
@@ -324,14 +387,21 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadQwen3Nf4(
 
 std::shared_ptr<SessionState> LoadedModel::CreateSession() {
     aila::ScopedLogDeferral deferLogs;
-    auto backend = std::make_unique<detail::Qwen3SessionBackend>(state);
-    backend->Initialize();
-    return std::make_shared<SessionState>(std::move(backend));
+    if (state->spec.family == ModelFamily::Qwen35Hybrid) {
+        auto backend = std::make_unique<detail::ModelSessionBackend<Qwen35HybridBnb4Backend>>(state);
+        backend->Initialize();
+        return std::make_shared<SessionState>(std::move(backend));
+    } else {
+        auto backend = std::make_unique<detail::ModelSessionBackend<Qwen3Bnb4Backend>>(state);
+        backend->Initialize();
+        return std::make_shared<SessionState>(std::move(backend));
+    }
 }
 
-int LoadedModel::VocabSize() const noexcept { return state->spec.qwen3.vocab_size; }
+int LoadedModel::VocabSize() const noexcept { return state->vocabSize; }
 int LoadedModel::MaxSequenceLength() const noexcept { return state->options.maxSequenceLength; }
 size_t LoadedModel::SessionReservationBytes() const noexcept { return state->sessionReservationBytes; }
+size_t LoadedModel::SessionHostReservationBytes() const noexcept { return state->sessionHostReservationBytes; }
 
 size_t LoadedModel::ActiveSessions() const {
     std::lock_guard<std::mutex> lock(state->device->mutex);
