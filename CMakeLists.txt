@@ -519,6 +519,7 @@ if(WIN32)
 
     add_executable(AilaWorker
         src/worker/WorkerMain.cpp
+        src/worker/CApiWorkerEngine.cpp
         src/worker/WorkerDispatcher.cpp
         src/ipc/IpcProtocol.cpp
         src/ipc/Win32Pipe.cpp
