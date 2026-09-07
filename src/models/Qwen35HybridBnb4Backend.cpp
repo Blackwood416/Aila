@@ -95,6 +95,24 @@ bool supports_default_grouped_linear_delta_fastpath(int q_heads, int kv_heads,
                                               true);
 }
 
+// Grouped value heads run in separate work-groups but share Q/K history.
+// Keep that history read-only during their computation, then commit the final
+// input rows on the in-order queue after every reader has finished.
+void commit_linear_conv_history(Context& ctx, const bf16* input, int input_stride,
+                                float* history, int channels, int history_rows,
+                                int initial_head, int token_count) {
+    const int rows_to_copy = std::min(token_count, history_rows);
+    const int first_token = token_count - rows_to_copy;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(rows_to_copy) * channels),
+        [=](sycl::id<1> index) {
+            const size_t channel = index[0] % static_cast<size_t>(channels);
+            const int token = first_token + static_cast<int>(index[0] / channels);
+            const int row = (initial_head + token % history_rows) % history_rows;
+            history[static_cast<size_t>(row) * channels + channel] =
+                static_cast<float>(input[static_cast<size_t>(token) * input_stride + channel]);
+        });
+}
+
 int linear_delta_gqa_group_size(int q_heads, int kv_heads) {
     if (q_heads <= 0 || kv_heads <= 0 || (kv_heads % q_heads) != 0) {
         return 0;
@@ -1099,6 +1117,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                                            allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
+        const bool grouped_heads = num_heads > q_heads;
         const int row0 = conv_head;
         const int row1 = (conv_head + 1) % conv_rows;
         const int row2 = (conv_head + 2) % conv_rows;
@@ -1152,7 +1171,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    if (lid < head_dim) {
+                    if (!grouped_heads && lid < head_dim) {
                         size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
                         if (write_shared_qk) {
                             conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
@@ -1253,6 +1272,10 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                 });
         });
+        if (grouped_heads) {
+            commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
+                                       qkv_dim, conv_rows, conv_head, 1);
+        }
         cache.device_state_dirty = true;
         if (conv_rows > 0) {
             cache.linear_conv_head = (conv_head + 1) % conv_rows;
@@ -1437,6 +1460,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
                                            allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
+        const bool grouped_heads = num_heads > q_heads;
 
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
@@ -1483,6 +1507,29 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
 
                         if (lid < head_dim) {
                             auto conv_channel = [&](int channel) {
+                                if (grouped_heads) {
+                                    // Previous rows in this prefill are already
+                                    // available in the immutable projection input.
+                                    // Only negative positions use the initial ring;
+                                    // no work-group updates it until this kernel ends.
+                                    auto history_value = [&](int offset) {
+                                        const int prior_token = t - conv_rows + offset;
+                                        if (prior_token >= 0) {
+                                            return static_cast<float>(fused_ptr[
+                                                static_cast<size_t>(prior_token) * all_dim + channel]);
+                                        }
+                                        const int history_row =
+                                            (conv_head + prior_token + conv_rows) % conv_rows;
+                                        return conv_state_ptr[
+                                            static_cast<size_t>(history_row) * qkv_dim + channel];
+                                    };
+                                    bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
+                                    const float v = history_value(0) * static_cast<float>(w[0]) +
+                                                    history_value(1) * static_cast<float>(w[1]) +
+                                                    history_value(2) * static_cast<float>(w[2]) +
+                                                    static_cast<float>(row[channel]) * static_cast<float>(w[3]);
+                                    return silu_dev(v);
+                                }
                                 const size_t state0 = static_cast<size_t>(row0) * qkv_dim + channel;
                                 const size_t state1 = static_cast<size_t>(row1) * qkv_dim + channel;
                                 const size_t state2 = static_cast<size_t>(row2) * qkv_dim + channel;
@@ -1501,7 +1548,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
                         }
                         item.barrier(sycl::access::fence_space::local_space);
 
-                        if (lid < head_dim) {
+                        if (!grouped_heads && lid < head_dim) {
                             size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
                             if (write_shared_qk) {
                                 conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
@@ -1597,6 +1644,10 @@ void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
                 });
         });
 
+        if (grouped_heads) {
+            commit_linear_conv_history(ctx, fused_ptr, all_dim, conv_state_ptr,
+                                       qkv_dim, conv_rows, conv_head, seq_len);
+        }
         cache.device_state_dirty = true;
         cache.linear_conv_head = (conv_head + seq_len) % conv_rows;
         return;
