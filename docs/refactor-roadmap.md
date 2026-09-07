@@ -1,16 +1,19 @@
 # Aila 重构实施路线
 
-日期：2026-09-07。状态：首批基线与 P1/P2 共享会话切片已实现并通过集成验证；P3–P7 为后续阶段。
+日期：2026-09-07。状态：P1/P2 共享会话切片之后，已完成 P3 的 Qwen3 LayerPlan、P4 的 token 调度器及独立 HTTP/SSE 依赖探针，并完成 1/2/4 会话性能测量；Hybrid、多请求 IPC 和真实 HTTP 推理仍待接入。
 
 本路线基于当前源码、已有性能脚本和对 Worker/IPC/C API 的专项复核。目标是统一层执行、共享模型多会话，以及 C++ HTTP/SSE 服务。本文描述完整目标；当前交付边界见下文，实现 API 见 [shared-sessions.md](shared-sessions.md)，实际验证记录见 [refactor-validation.md](refactor-validation.md)。
 
-当前首批交付包括：
+当前交付包括：
 
 - 新增进程内 `DeviceRuntime / LoadedModel / SessionState / RequestState`，Qwen3 NF4 权重加载一次，多会话独立持有 BF16 KV 与采样 RNG，按完整步骤手动交错推进；未通过验证的 FP8 KV 配置显式拒绝。
 - 保留旧 Qwen3 默认会话入口，增加 CPU 状态/日志测试、真实 GPU 会话对照、同工具链完整 token 比较器与兼容回归脚本。
 - 将 `CApiWorkerEngine` 从 `WorkerMain` 提取为独立适配器，通信循环仍保持现有协议。
+- Qwen3 加载时构造不可变 DecoderPlan/LayerPlan，显式传递步骤阶段、位置、KV 视图和共享工作区，保留现有算子与跨层融合顺序。
+- [Scheduler](scheduler.md) 用专用线程轮转推进请求，限制活动/未消费请求数、token/KV 额度和输出 ring；支持排队取消、慢消费者隔离、一次终态、域故障传播与关闭。
+- 独立普通 C++ HTTP/SSE 探针已实际构建并验证。Drogon 1.9.11 在 Windows 上需要记录下来的 listener callback 补丁；探针使用受控新连接与合成输出，详见 [refactor-http-probe.md](refactor-http-probe.md)。
 
-此切片没有 LayerPlan、Qwen3.5 共享会话、自动调度器、多在途 IPC、新公共 C ABI 或 HTTP/SSE 端点。Qwen3.5 目前只验证旧入口兼容；HTTP 目前完成本地依赖调查，尚未进行构建与 socket 级验证。
+此阶段尚未实现 Qwen3.5 共享会话、多在途 IPC、新公共 C ABI 或模型推理 HTTP/SSE 端点。当前缓存额度不代表总显存准入，聊天格式化/reasoning 仍在旧驱动。Qwen3.5 目前只验证旧入口兼容；独立 HTTP 探针尚未连接调度器和 Worker。
 
 ## 1. 交付范围
 
@@ -136,7 +139,7 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 
 ## 5. 子代理分工与集成
 
-本会话可用原生 subagent 工具：创建子代理、追加任务、收发消息、查看状态、等待和中断。总并发名额为 4，包含主代理。本批已实际分派 Qwen3 后端拆分与 GPU fixture、CPU 状态/日志/比较器测试，以及 Worker 适配器提取与生命周期复核，并由主代理完成集成和串行 GPU 验证。能力以当前会话的工具状态为准。独立 shell 命令可并行执行，实现任务也可使用 git worktree 隔离。
+本会话可用原生 subagent 工具：创建子代理、追加任务、收发消息、查看状态、等待和中断。总并发名额为 4，包含主代理。已实际分派 Qwen3 后端拆分/层计划与 GPU fixture、CPU 状态/调度测试、Worker 提取/生命周期审查，以及独立 HTTP 探针；主代理负责调度器、公用接口、集成和串行 GPU 验证。能力以当前会话的工具状态为准。独立 shell 命令可并行执行，实现任务也可使用 git worktree 隔离。
 
 | 执行者 | 主要责任 | 可并行工作 | 需要避免的冲突 |
 |---|---|---|---|
@@ -175,7 +178,7 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 
 人周是工程量估计，不是本次助手运行时长。子代理能并行独立模块和审查，但接口决策、集成与单 GPU 验证处于关键路径，不能把工期直接除以代理数量。
 
-首批实现完成后，下一步先将现有 Qwen3 层循环接入具体 LayerPlan，保持 NF4 投影与跨层融合，再以 Qwen3.5 的 Full Attention / DeltaNet 状态迁移验证抽象边界。同时可在已验证的 Request Step 接口之上开发单提交线程与有界公平调度，传输侧用 fake executor 推进多请求路由；真实服务接通依次等待调度、IPC 和 HTTP/SSE 验收。长上下文、4B 形状、完整显存预算和服务延迟分布仍是后续门禁。
+Qwen3 LayerPlan 和 token Scheduler 接入后，下一步以 Qwen3.5 的 Full Attention / DeltaNet 会话状态、快照与实际恢复长度验证复用边界。传输侧可使用现有 Scheduler 合约推进多请求路由、模型/会话/请求 ID 和 Worker epoch，再把已构建的 HTTP 探针替换为真实 Proxy 客户端；同时处理 Drogon Windows 补丁、连接复用和端到端背压限制。长上下文、4B 形状、完整显存预算、聊天/reasoning 驱动迁移、长期压力和服务延迟分布仍是后续门禁。
 
 ## 8. 源码依据
 

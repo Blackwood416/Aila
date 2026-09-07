@@ -2,8 +2,10 @@
 
 #include "inference/Session.hpp"
 
+#include <array>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace aila::inference {
 
@@ -36,6 +38,18 @@ struct RequestSnapshot {
     size_t promptTokensProcessed = 0;
     std::vector<int> generatedIds;
     std::string error;
+    std::optional<ErrorCode> errorCode;
+};
+
+// A bounded-size progress read for schedulers; it does not copy token history.
+struct RequestProgress {
+    RequestStatus status = RequestStatus::Queued;
+    size_t promptTokensProcessed = 0;
+    size_t generatedTokens = 0;
+    std::optional<ErrorCode> errorCode;
+    std::array<char, 1024> errorText{};
+    size_t errorSize = 0;
+    std::string_view ErrorMessage() const noexcept { return {errorText.data(), errorSize}; }
 };
 
 // Low-level token request: appends the supplied prompt to the session cache.
@@ -55,11 +69,13 @@ public:
     StepResult Step();
     void Cancel() noexcept { cancelRequested.store(true); }
     RequestSnapshot Snapshot() const;
+    RequestProgress Progress() const;
 
 private:
     RequestState(std::shared_ptr<SessionState> session,
                  std::vector<int> promptIds, RequestOptions options);
-    StepResult Finish(RequestStatus status, std::string error = {});
+    StepResult Finish(RequestStatus status, std::string_view error = {},
+                      std::optional<ErrorCode> errorCode = std::nullopt);
 
     std::shared_ptr<SessionState> session;
     std::vector<int> promptIds;

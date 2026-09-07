@@ -116,7 +116,12 @@ RequestState::RequestState(std::shared_ptr<SessionState> session,
       options(std::move(options)),
       rng(this->options.generation.use_fixed_seed
               ? static_cast<uint32_t>(this->options.generation.sampling_seed)
-              : std::random_device{}()) {}
+              : std::random_device{}()) {
+    // Error paths can publish a bounded message without allocating after a
+    // backend failure. Request creation rolls the lease back if this fails.
+    snapshot.error.reserve(1024);
+    snapshot.generatedIds.reserve(static_cast<size_t>(this->options.generation.max_new_tokens));
+}
 
 RequestState::~RequestState() {
     if (ownsSession) {
@@ -124,12 +129,19 @@ RequestState::~RequestState() {
     }
 }
 
-StepResult RequestState::Finish(RequestStatus status, std::string error) {
+StepResult RequestState::Finish(RequestStatus status, std::string_view error,
+                                std::optional<ErrorCode> errorCode) {
     if (IsTerminal(snapshot.status)) {
         return {snapshot.status, std::nullopt, false};
     }
     snapshot.status = status;
-    snapshot.error = std::move(error);
+    snapshot.errorCode = errorCode;
+    size_t errorSize = std::min(error.size(), size_t{1024});
+    if (errorSize < error.size()) {
+        while (errorSize && (static_cast<unsigned char>(error[errorSize]) & 0xc0) == 0x80) --errorSize;
+    }
+    snapshot.error.clear();
+    if (errorSize) snapshot.error.assign(error.data(), errorSize);
     pendingToken = -1;
     if (ownsSession) {
         ownsSession = false;
@@ -211,6 +223,8 @@ StepResult RequestState::Step() {
                               ? RequestStatus::Finalizing
                               : RequestStatus::Decode;
         return {snapshot.status, result.tokenId, false};
+    } catch (const Error& error) {
+        return Finish(RequestStatus::Failed, error.what(), error.Code());
     } catch (const std::exception& error) {
         return Finish(RequestStatus::Failed, error.what());
     } catch (...) {
@@ -221,6 +235,18 @@ StepResult RequestState::Step() {
 RequestSnapshot RequestState::Snapshot() const {
     std::lock_guard<std::mutex> lock(stepMutex);
     return snapshot;
+}
+
+RequestProgress RequestState::Progress() const {
+    std::lock_guard<std::mutex> lock(stepMutex);
+    RequestProgress result;
+    result.status = snapshot.status;
+    result.promptTokensProcessed = snapshot.promptTokensProcessed;
+    result.generatedTokens = snapshot.generatedIds.size();
+    result.errorCode = snapshot.errorCode;
+    result.errorSize = std::min(snapshot.error.size(), result.errorText.size());
+    std::copy_n(snapshot.error.data(), result.errorSize, result.errorText.data());
+    return result;
 }
 
 } // namespace aila::inference

@@ -131,7 +131,10 @@ public:
     }
 
     int ContextLength() const override {
-        std::lock_guard<std::mutex> lock(model->device->mutex);
+        // SessionState serializes reads and writes with operationMutex (or
+        // this backend is still unpublished during construction). This is
+        // private host metadata: querying an idle session must not wait on a
+        // different session's GPU step while Scheduler::Submit admits it.
         return cache->CurrentLength();
     }
     int Capacity() const override { return model->options.maxSequenceLength; }

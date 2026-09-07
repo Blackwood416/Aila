@@ -1,6 +1,6 @@
 # 重构验证入口与 P0 基线
 
-核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
+核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。第 6 节保留 P1/P2 首批结果，第 8 节记录本轮 LayerPlan、Scheduler 与 HTTP 探针。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
 
 ## 1. 固定输入与构建
 
@@ -39,7 +39,7 @@
 
 ## 2. CPU CTest 白名单
 
-在上述 HEAD 的 Windows/Ninja 配置中共注册 20 个 CTest。以下 12 项不会创建 SYCL Context 或提交 GPU 工作：
+在基线 `1956de9` 的 Windows/Ninja 配置中共注册 20 个 CTest。以下 12 项不会创建 SYCL Context 或提交 GPU 工作：
 
 | CTest 名称 | 覆盖范围 |
 |---|---|
@@ -65,7 +65,7 @@ $refactorCpuTests = '^Aila(ChatTests|RuntimeDllSelectionCMakeTests|Yolo26ModelSp
 ctest --test-dir $refactorBuild -C Release --output-on-failure --parallel 4 -R $refactorCpuTests --output-log (Join-Path $refactorBaseline 'baseline-cpu-ctest.log')
 ```
 
-候选新增三个 CPU CTest：`AilaRequestStateTests`（会话租约、请求状态/取消/独立 RNG、输入校验和生命周期）、`AilaDeferredLoggingTests`（延迟日志、重入及有界缓存）和 `AilaTokenTraceComparisonTests`（完整 trace 与失败判定）。它们可与上面 12 项在同一个 CTest 命令中并行运行；不要同时启动两个 CTest 进程写入同一构建目录的 `Testing/Temporary/LastTest.log`。
+候选新增四个 CPU CTest：`AilaRequestStateTests`（会话租约、请求状态/取消/独立 RNG、输入校验和生命周期）、`AilaDeferredLoggingTests`（延迟日志、重入及有界缓存）、`AilaTokenTraceComparisonTests`（完整 trace 与失败判定）和 `AilaSchedulerTests`（轮转、准入、取消、背压、故障和输出生命周期，19 组）。它们可与上面 12 项在同一个 CTest 命令中并行运行；不要同时启动两个 CTest 进程写入同一构建目录的 `Testing/Temporary/LastTest.log`。新增的 `AilaQwen3SessionTests` 和 `AilaQwen3SchedulerTests` 属于 GPU 串行队列。
 
 另有 `AilaMimiEncoderTests` 为 CPU 卷积/Transformer/RVQ 实现，但加载真实 TTS 权重并依赖 `tests/audio/data/ref_codes_golden.json`、`tmp/icl_oracle/ref_test_wav24k.bin` 和 `ref_test.wav`。它较重且不能在缺数据的 worktree 直接复跑，因此不列入快速白名单。
 
@@ -154,7 +154,7 @@ pwsh -NoProfile -File perf/refactor-legacy-check.ps1 -BaselineBuild .worktrees/r
 
 真实会话测试的模型环境设置与命令见 [shared-sessions.md](shared-sessions.md)。Qwen3.5 后续加入递归状态/快照回滚，按照实际恢复长度补算。本次旧 Qwen3.5 smoke 不代表它已支持新 Session API。
 
-## 6. 已执行结果与剩余门禁
+## 6. P1/P2 首批结果与当时的剩余门禁
 
 | 检查 | 当前结果 | 证据 |
 |---|---|---|
@@ -185,11 +185,11 @@ Qwen3 首组有约 3% 差异，因此保留原记录并紧邻重跑基线/候选
 
 基准和兼容 trace 在候选提交前生成，部分 metadata 的 commit 字段仍为 `1956de9`；实际源码差异与二进制 SHA256 另保存在 `tmp/refactor/candidate-source.patch`、`candidate-provenance.json`。判断产物身份时应同时使用这些记录，不能仅凭 Git 字段把基线与候选视为同一源码。
 
-Qwen3 fixture 的容量固定 512；每个 BF16 KV 会话新增 **58,720,256 字节（56 MiB）**，释放后归还，第二会话不复制权重或执行工作区。较大测试形状后 Context 记账的模型/工作区常驻量为 **1,278,658,202 字节**。这些数字不是设备总显存；当前只验证会话数准入与实际 KV 增减，非零字节预算尚未单列集成用例。
+Qwen3 fixture 的容量固定 512；每个 BF16 KV 会话新增 **58,720,256 字节（56 MiB）**，释放后归还，第二会话不复制权重或执行工作区。较大测试形状后 Context 记账的模型/工作区常驻量为 **1,278,658,202 字节**。这些数字不是设备总显存；首批只验证了会话数准入与实际 KV 增减，非零字节预算的新增集成用例见第 8 节。
 
 主项目启用 kernel 用的 fast-math；`Request.cpp` 和相关 host 验证目标单独使用 `/fp:precise`（非 MSVC 模式为 `-fno-fast-math`），保留 NaN/Inf 输入校验。没有更改设备算子优化选项。
 
-这批结果验证了进程内 Qwen3 手动多会话切片与所列旧入口；统一 LayerPlan、Hybrid 共享状态、自动调度、IPC 多请求、HTTP/SSE、4B/长上下文、长期压力与服务延迟分布仍待后续阶段验收。
+首批结果验证了进程内 Qwen3 手动多会话切片与所列旧入口。Qwen3 LayerPlan、自动调度及独立 HTTP 探针随后完成的验证见第 8 节；Hybrid 共享状态、IPC 多请求、真实 HTTP 推理、4B/长上下文、长期压力与服务延迟分布仍待后续阶段验收。
 
 ## 7. FP8 KV 探索结果与当前限制
 
@@ -203,3 +203,66 @@ Qwen3 fixture 的容量固定 512；每个 BF16 KV 会话新增 **58,720,256 字
 上述两个 ops 文件及 `src/memory/KVCache.cpp` 与基线 `1956de9` 无差异。这里保留了失败与源码证据，没有额外运行基线 FP8 logits 诊断，也没有在本次资源拆分中修改这些算子。
 
 新共享会话 API 限定 BF16 KV：加载前检查有效 `AILA_KV_QUANT` 设置，显式 `CreateSession` 再次检查以覆盖加载后设置变化，均以 `InvalidArgument` 拒绝 FP8。旧默认会话入口保持原有行为。GPU fixture 已通过加载前/加载后开启量化的拒绝回归：错误提示明确、会话计数和 Context current/peak 分配不变，恢复设置后可继续 BF16 推理。FP8 重新开放必须先修复读取/写入问题并单独通过数值验证。
+
+## 8. LayerPlan / Scheduler 续批验证
+
+本轮基于 `ad25cd3` 的共享会话实现继续开发，基线仍为不可变 `1956de9`。使用第 1 节同一工具链、A770 和驱动。Qwen3 加载时绑定具体 LayerPlan，执行时显式传入阶段、位置、KV 视图和工作区；保留 NF4 内核、跨层 residual/norm 融合与 in-order queue，没有新增逐层同步。Scheduler 在完整 prefill 分块、decode 或 finalization 之间轮转，所有 GPU 验证和测量顺序执行。
+
+### 构建、正确性与资源回收
+
+| 检查 | 已执行结果 | 证据 |
+| --- | --- | --- |
+| 完整 Release 构建 | 通过；最终构建包含去除 `ContextLength()` 设备全局锁后的源码 | `build-refactor/scheduler-final-build.log` |
+| 16 项 CPU CTest | 全部通过，24.36 秒；Scheduler 内部 19 组 | `build-refactor/scheduler-cpu-ctest.log`、`scheduler-cpu-details.log` |
+| Qwen3 Session GPU | 通过，23.17 秒；每步 logits 精确一致 | `build-refactor/scheduler-gpu-ctest.log`、`scheduler-gpu-details.log` |
+| Qwen3 Scheduler GPU | 通过，26.14 秒；四会话 token 及最终探针 logits 与独立运行精确一致 | 同上，两项总计 49.32 秒 |
+| 旧 Qwen3 CLI 完整 token 对照 | 五组全部一致，明细如下 | `tmp/refactor/layer-scheduler-legacy-parity/report.json` |
+| 同会话与跨会话取消/回收 | 192/256-token 首块后取消或丢弃 A，B 继续正确生成；A 的 KV 精确归还 | `AilaQwen3SchedulerTests` |
+| 输出背压 | 4-token ring 满时只取消 A；B 完成；独立终态位置保留 | `AilaSchedulerTests`、`AilaQwen3SchedulerTests` |
+| 非零模型 KV 字节预算 | `maxSessions=4`、预算 `2 * cacheBytes - 1` 时，第二 Session 在分配前被拒绝；销毁后额度可复用 | `AilaQwen3SchedulerTests` |
+| 生命周期与错误 | 排队/运行取消、已完成未读流占用额度、RuntimeFault 广播、回调重入/销毁、并发 Shutdown、Submit/Shutdown 竞争均通过 | `AilaSchedulerTests` |
+
+CPU 16 项执行后，最后仅调整了 `Model.cpp` 的主机长度 getter 和 `Session.hpp` 的同步说明；随后完整重建并通过上述两项 GPU 测试。getter 由 Session 操作锁或尚未发布的构造期保护，不再等待另一个会话的设备执行锁；执行、分配和销毁仍保留设备锁。
+
+| 旧 CLI 对照案例 | Prompt tokens | Generated tokens | 完整 ID 数组 |
+| --- | ---: | ---: | --- |
+| fixed_seed | 34 | 32 | 相同 |
+| penalties | 34 | 32 | 相同 |
+| stream | 34 | 32 | 相同 |
+| thinking_budget | 34 | 13 | 相同 |
+| history | 54 | 8 | 相同 |
+
+此对照测量时的 CLI SHA256 为 `F357FCA6018D798AFC78F195728D144B7C2CC06D8F55E45B743E0455FFA5B0CA`，基线为 `7E082C11C94476D870ACCF3642F1D603B97FF22440199E04A8475810A36FD43B`。最终接口重建后 CLI 发生重新链接，不把较早哈希当作最终产物；提交后构建身份、二进制哈希和补充检查统一保存在 `tmp/refactor/layer-scheduler-final-provenance.json`，最终 CLI 对照另存 `tmp/refactor/layer-scheduler-final-legacy-parity/report.json`，保留上述原始结果。
+
+### 旧 CLI 相邻性能对照
+
+固定 256 prompt / 128 generated、greedy、warmup 1、测量 3 轮、最大上下文 4096、BF16 KV。基线后紧接候选运行；这一组用于检查 LayerPlan 提取对旧路径的影响。
+
+| 阶段 | 基线 token/s | 候选 token/s | 基线平均 ms | 候选平均 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill | 3404.04 | 3405.98 | 75.20 | 75.16 |
+| Decode | 142.54 | 141.53 | 897.98 | 904.42 |
+
+Decode 标准差分别为 4.69 / 2.72 ms，候选吞吐约低 0.71%。保留该短测量差异，不据此设定通用回归门限。原始数据位于基线 worktree 与主工作区各自的 `tmp/refactor/q3-layer-bench/bench.json`，构建目录保留 `layer-baseline-bench.log` 和 `layer-candidate-bench.log`。前一阶段的性能数据未覆盖或删除。
+
+### 进程内 1/2/4 会话性能
+
+入口为 `perf/shared-session-bench.ps1`。本次运行目录：`tmp/refactor/q3-scheduler-bench/20260907-180522-641b5122`。`benchmark.json` 保存每次 Submit 和实际 Read 到达的时间、全部输出 ID 与逐 token 时间；`run.json` 保存模型/二进制/源码哈希、构建/驱动、环境和退出码，`tracked-source.patch` 保存当时 tracked diff。
+
+每个并发数预热 1 轮、测量 3 轮，固定上下文容量 512、prompt 256、生成 128、prefill chunk 256、greedy、BF16 KV，每请求一个读取线程。模型加载、tokenization 和 Session 创建在计时外。TTFT 从各请求 Submit 前计时到其读取线程实际读到首 token；间隔取同一流相邻 token 到达时间。总吞吐是所有测量轮的输出 token 总数除以各轮“最早 Submit 到最后 terminal Read”的时长之和，包含 prefill 与 finalization。分位数用 nearest-rank，跨轮汇集请求/间隔样本。
+
+| 会话数 | 总吞吐 token/s | TTFT p50 / p95 ms | Token 间隔 p50 / p95 ms | 测量轮总时长范围 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 121.28 | 76.60 / 76.92 | 7.61 / 7.93 | 1049.89–1062.62 |
+| 2 | 120.34 | 75.52 / 151.44 | 15.32 / 16.11 | 2110.82–2156.89 |
+| 4 | 116.47 | 159.57 / 317.59 | 30.98 / 34.81 | 4242.12–4694.09 |
+
+四会话三轮吞吐分别为 120.69、120.42、109.07 token/s；最后一轮较慢，原样纳入汇总，没有删掉该样本或推断其原因。每个并发数仅有 3/6/12 个 TTFT 样本，p95 不代表稳定的服务尾延迟。请求交替推进改善多会话可用性；当前没有合批，本次测量未显示并发吞吐提升。这些数字是进程内 token 流观测，不能当作 HTTP/SSE 延迟，也不能直接与旧 CLI 的 decode-only token/s 比较。
+
+在各轮请求结束、Session 仍存活时，Context current 字节数分别为 1,306,903,194 / 1,365,623,450 / 1,483,063,962。同一并发数三轮数值相同，差值符合每会话 58,720,256 字节 KV；这只证明所测形状下的 Context 记账稳定，不是总显存或长期泄漏门禁。JSON 中 peak 是整个测试进程截至该时刻的峰值，不能视为每轮重置后的独立峰值。
+
+### HTTP 探针与剩余范围
+
+独立普通 C++17 探针在 Drogon 1.9.11 + Trantor 1.5.24 及本地 Windows listener callback 补丁下，真实 loopback 的六个场景全部通过：增量 UTF-8 SSE、双客户端、断线隔离、慢读、完成竞争及退出清理。未打补丁的失败记录也已保留。此探针没有加载模型或调用 GPU；结果、复现命令、固定依赖及连接复用/背压限制见 [refactor-http-probe.md](refactor-http-probe.md)。
+
+本轮交付 Qwen3 的层计划和进程内自动调度；共享接口仍只接受 NF4 权重与 BF16 KV。Hybrid Full/DeltaNet 状态与回滚、BF16 权重策略、总显存预算、多在途 Worker/Proxy ID/epoch、真实 HTTP 推理、长上下文/4B 和持续服务压力均保留为后续验收项。

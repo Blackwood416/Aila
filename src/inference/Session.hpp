@@ -19,6 +19,7 @@ enum class ErrorCode {
     UnsupportedModel,
     ResourceLimit,
     RuntimeFault,
+    SchedulerStopped,
 };
 
 class Error : public std::runtime_error {
@@ -47,6 +48,8 @@ struct ExecutionResult {
 // Device-independent seam for a real model session and CPU test executors.
 // Forward consumes its input and finishes all device work before returning.
 // Implementations retain the model/runtime and serialize shared workspaces.
+// SessionState serializes mutable per-session state and ContextLength reads;
+// its constructor reads metadata before publishing the session to callers.
 class SessionBackend {
 public:
     virtual ~SessionBackend() = default;

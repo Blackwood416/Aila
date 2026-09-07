@@ -167,6 +167,7 @@ set(LIB_SOURCES
     src/inference/Model.cpp
     src/inference/Session.cpp
     src/inference/Request.cpp
+    src/inference/Scheduler.cpp
     src/models/Qwen3DenseBackend.cpp
     src/models/Qwen3Bnb4Backend.cpp
     src/models/Qwen35HybridTextBackend.cpp
@@ -366,6 +367,8 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
+target_link_libraries(AilaLib PUBLIC Threads::Threads)
+target_link_libraries(AilaShared PRIVATE Threads::Threads)
 add_executable(AilaRequestStateTests
     tests/inference/RequestStateTests.cpp
     src/inference/Session.cpp
@@ -387,6 +390,28 @@ target_link_libraries(AilaRequestStateTests PRIVATE Threads::Threads)
 add_test(NAME AilaRequestStateTests COMMAND AilaRequestStateTests)
 set_tests_properties(AilaRequestStateTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
 
+add_executable(AilaSchedulerTests
+    tests/inference/SchedulerTests.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
+    src/inference/Scheduler.cpp
+    src/profile/Profiling.cpp
+)
+target_include_directories(AilaSchedulerTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(AilaSchedulerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaSchedulerTests PRIVATE -fno-sycl)
+target_link_options(AilaSchedulerTests PRIVATE -fno-sycl)
+if(MSVC)
+    target_compile_options(AilaSchedulerTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaSchedulerTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaSchedulerTests PRIVATE Threads::Threads)
+add_test(NAME AilaSchedulerTests COMMAND AilaSchedulerTests)
+set_tests_properties(AilaSchedulerTests PROPERTIES LABELS "cpu;inference" TIMEOUT 60)
+
 add_executable(AilaQwen3SessionTests tests/inference/Qwen3SessionTests.cpp)
 target_compile_definitions(AilaQwen3SessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 if(MSVC)
@@ -397,6 +422,19 @@ endif()
 target_link_libraries(AilaQwen3SessionTests PRIVATE AilaLib)
 add_test(NAME AilaQwen3SessionTests COMMAND AilaQwen3SessionTests)
 set_tests_properties(AilaQwen3SessionTests PROPERTIES
+    LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
+    SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_executable(AilaQwen3SchedulerTests tests/inference/Qwen3SchedulerTests.cpp)
+target_compile_definitions(AilaQwen3SchedulerTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaQwen3SchedulerTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaQwen3SchedulerTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaQwen3SchedulerTests PRIVATE AilaLib)
+add_test(NAME AilaQwen3SchedulerTests COMMAND AilaQwen3SchedulerTests)
+set_tests_properties(AilaQwen3SchedulerTests PROPERTIES
     LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
     SKIP_RETURN_CODE 77 TIMEOUT 600)
 
