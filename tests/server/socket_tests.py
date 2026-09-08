@@ -5,6 +5,9 @@ server shutdown, waits a bounded interval, and only then kills that exact child.
 Fake mode writes a byte-BPE tokenizer under the output directory. It exercises
 network backpressure with roughly 4 KiB per generated token; GPU mode uses the
 provided checkpoint and does not claim to exercise that artificial byte limit.
+Both modes accept --backend qwen3_nf4|qwen35_nf4. A --case selection keeps every
+assertion of the selected cases and the final resource/transport cleanup gate;
+the report explicitly lists cases excluded from a partial run.
 """
 
 from __future__ import annotations
@@ -27,7 +30,16 @@ import traceback
 import uuid
 from pathlib import Path
 
-MODEL_ID = "qwen3"
+MODEL_IDS = {"qwen3_nf4": "qwen3", "qwen35_nf4": "qwen3.5"}
+COMMON_CASES = (
+    "health_models_parameters", "incremental_utf8_json_sse", "concurrent_1_2_4_fixed_seed",
+    "multiturn_text_thinking_json_sse", "connection_close_expect_continue", "same_socket_reuse_pipeline",
+    "disconnect_isolates_other_request", "graceful_shutdown_with_active_requests",
+)
+FAKE_CASES = (
+    "slow_reader_resume_and_peer", "slow_reader_stall_cleanup", "admission_429_and_slot_reuse",
+    "worker_fault_error_terminal",
+)
 OUTPUT_LIMIT = 1048576
 STREAM_LIMIT = 65536
 FRAME_LIMIT = 16384
@@ -104,7 +116,7 @@ def fake_text(token_id):
     return ("é中🙂" * 450) + f":{token_id:03d};\n"
 
 
-def write_fake_tokenizer(directory):
+def write_fake_tokenizer(directory, backend):
     directory.mkdir(parents=True, exist_ok=False)
     # Match Tokenizer::byte_to_unicode, including the nonprinting-byte range.
     byte_values = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -139,7 +151,8 @@ def write_fake_tokenizer(directory):
         "{%- for message in messages -%}"
         "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}"
         "{%- endfor -%}"
-        "{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}{%- endif -%}"
+        "{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}"
+        "{%- if enable_thinking -%}{{- '<think>\\n' -}}{%- endif -%}{%- endif -%}"
     )
     (directory / "vocab.json").write_bytes(json_bytes(vocab))
     (directory / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
@@ -153,9 +166,12 @@ def write_fake_tokenizer(directory):
             for text, token_id in special.items()
         },
     })
-    write_json(directory / "config.json", {"model_type": "qwen3", "vocab_size": 2048})
+    write_json(directory / "config.json", {
+        "model_type": "qwen3_5" if backend == "qwen35_nf4" else "qwen3", "vocab_size": 2048,
+    })
     manifest = {
         "kind": "AilaFakeInferenceWorker byte-BPE HTTP fixture",
+        "backend": backend,
         "vocab_size": 2048,
         "output_token_ids": [0, 999],
         "output_token_utf8_bytes": len(fake_text(0).encode("utf-8")),
@@ -249,10 +265,10 @@ def validate_usage(value, maximum):
     return value
 
 
-def validate_completion(value, maximum):
+def validate_completion(value, maximum, model_id):
     check(value.get("object") == "chat.completion", "Wrong completion object")
     check(isinstance(value.get("id"), str) and value["id"], "Missing completion ID")
-    check(value.get("model") == MODEL_ID, "Wrong served model")
+    check(value.get("model") == model_id, "Wrong served model")
     integer(value.get("created"), "completion.created", 1)
     choices = value.get("choices")
     check(isinstance(choices, list) and len(choices) == 1, "Expected one completion choice")
@@ -369,7 +385,8 @@ class SseClient:
                 self.errors.append(event["error"])
                 return True
             check(not self.errors, "Normal SSE data followed an error")
-            check(event.get("object") == "chat.completion.chunk" and event.get("model") == MODEL_ID, "Invalid SSE envelope")
+            check(event.get("object") == "chat.completion.chunk" and event.get("model") == self.runner.model_id,
+                  "Invalid SSE envelope")
             identity = event.get("id")
             check(isinstance(identity, str) and identity, "Missing SSE ID")
             if self.id is None:
@@ -487,7 +504,7 @@ class ServerProcess:
             self.port = reservation.getsockname()[1]
         self.command = [
             str(args.server), "--worker", str(args.worker), "--model", str(model),
-            "--model-id", MODEL_ID, "--port", str(self.port), "--context", "512",
+            "--backend", args.backend, "--model-id", args.model_id, "--port", str(self.port), "--context", "512",
             "--sessions", "4", "--max-new-tokens", "256", "--max-output-bytes", str(OUTPUT_LIMIT),
             "--stream-buffer-bytes", str(STREAM_LIMIT), "--stream-stall-ms", "5000",
             "--request-timeout-ms", "120000", "--shutdown-file", str(self.shutdown_file),
@@ -496,7 +513,8 @@ class ServerProcess:
         self.stdout = (directory / "stdout.log").open("wb")
         self.stderr = (directory / "stderr.log").open("wb")
         launch = {"created_at": utc_now(), "command": self.command, "cwd": str(directory),
-                  "mode": args.mode, "requested_model": None if args.model is None else str(args.model),
+                  "mode": args.mode, "backend": args.backend, "model_id": args.model_id,
+                  "requested_model": None if args.model is None else str(args.model),
                   "effective_model": str(model), "shutdown_file": str(self.shutdown_file),
                   "report_file": str(self.report_file), "creationflags": "CREATE_NO_WINDOW" if os.name == "nt" else 0}
         write_json(directory / "launch.json", launch)
@@ -562,6 +580,8 @@ class Runner:
     def __init__(self, args, process, directory, result):
         self.args = args
         self.mode = args.mode
+        self.backend = args.backend
+        self.model_id = args.model_id
         self.process = process
         self.directory = directory
         self.responses = directory / "responses"
@@ -576,7 +596,7 @@ class Runner:
         self.started = time.perf_counter()
 
     def chat(self, prompt, maximum, stream=False, seed=42, temperature=0.0, include_usage=True):
-        payload = {"model": MODEL_ID, "messages": [{"role": "user", "content": prompt}],
+        payload = {"model": self.model_id, "messages": [{"role": "user", "content": prompt}],
                    "max_tokens": maximum, "seed": seed, "temperature": temperature,
                    "stream": stream, "enable_thinking": False}
         if stream:
@@ -615,6 +635,8 @@ class Runner:
         self.health_samples.append(sample)
         check(timing["seconds"] < 2.0, f"Health endpoint blocked for {timing['seconds']:.3f} seconds")
         self.validate_health(value)
+        check(value.get("model") == self.model_id and value.get("backend") == self.backend,
+              "Health reports a different served model or backend")
         return value
 
     @staticmethod
@@ -685,7 +707,7 @@ class Runner:
 
     def completion(self, label, payload):
         value, timing = self.json_call(label, "/v1/chat/completions", "POST", payload)
-        semantic = validate_completion(value, payload["max_tokens"])
+        semantic = validate_completion(value, payload["max_tokens"], self.model_id)
         self.remember_id(value["id"])
         if self.mode == "fake":
             check(semantic["usage"]["completion_tokens"] == payload["max_tokens"], "Fake JSON response lost tokens")
@@ -742,7 +764,7 @@ class Runner:
         healthy = self.health()
         models, timing = self.json_call("models", "/v1/models")
         check(models.get("object") == "list" and isinstance(models.get("data"), list), "Invalid model list")
-        check([item.get("id") for item in models["data"]] == [MODEL_ID], "Model list does not identify the loaded checkpoint")
+        check([item.get("id") for item in models["data"]] == [self.model_id], "Model list does not identify the loaded checkpoint")
         valid = self.chat("hello", 8)
         malformed = [
             ("invalid_json", b'{"model":'),
@@ -829,6 +851,60 @@ class Runner:
             groups.append({"width": width, "peak_active": peak_active, "requests": stats})
             self.idle()
         return {"groups": groups, "seed_policy": "Each concurrent request matches its own independent fixed-seed reference."}
+
+    def multiturn_thinking(self):
+        maximum = 8 if self.mode == "fake" else 24
+        messages = [
+            {"role": "system", "content": "Answer briefly, using the details in the conversation."},
+            {"role": "user", "content": "Remember the color violet and the number seven. 记住这两个信息。"},
+            {"role": "assistant", "content": "I will remember violet and seven.",
+             "reasoning_content": "The user supplied a color and a number."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Use the remembered color in a sentence. "},
+                {"type": "text", "text": "Then multiply the remembered number by three and add two."},
+            ]},
+        ]
+        references = {}
+        variants = []
+        for thinking in (False, True):
+            label = f"multiturn_thinking_{str(thinking).lower()}"
+            payload = self.chat("", maximum, seed=126)
+            payload["messages"] = messages
+            payload["enable_thinking"] = thinking
+            reference, reference_stats = self.completion(label + "_reference", payload)
+            self.idle()
+            client = self.stream(label, {**payload, "stream": True, "stream_options": {"include_usage": True}})
+            try:
+                summary = client.complete()
+                check(client.semantic() == reference, "Multi-turn text/thinking JSON and SSE differ")
+                check(reference["content"] or reference["reasoning_content"], "Text/thinking request returned no text")
+                for text in (reference["content"], reference["reasoning_content"]):
+                    check("<think>" not in text and "</think>" not in text, "Thinking delimiters leaked into response text")
+            finally:
+                client.close()
+            self.remember_id(summary["id"])
+            retained = self.wait_record(summary["id"])
+            check(retained["status"] == "completed", "Multi-turn stream did not retire as completed")
+            self.idle()
+            references[thinking] = reference
+            variants.append({"enable_thinking": thinking, "reference": reference_stats, "stream": summary,
+                             "content_characters": len(reference["content"]),
+                             "reasoning_characters": len(reference["reasoning_content"]), "retained": retained})
+        check(references[False]["usage"]["prompt_tokens"] != references[True]["usage"]["prompt_tokens"],
+              "enable_thinking did not alter the trusted chat-template prefix")
+
+        # Convert the final two text parts into their equivalent string after a
+        # thinking request. This also catches parser/Session state surviving a
+        # previous request with the opposite thinking mode.
+        repeated = self.chat("", maximum, seed=126)
+        repeated["messages"] = [*messages[:-1], {
+            "role": "user", "content": "".join(part["text"] for part in messages[-1]["content"]),
+        }]
+        repeated_semantic, repeated_stats = self.completion("multiturn_text_string_after_thinking", repeated)
+        check(repeated_semantic == references[False], "Text-part flattening or prior thinking state changed a fresh request")
+        self.idle()
+        return {"variants": variants, "string_after_thinking": repeated_stats,
+                "comparison": "Full content, reasoning_content, finish_reason and token usage; no answer-quality assertion."}
 
     def close_and_expect(self):
         close_client = self.stream("connection_close", self.chat("Describe the sky.", 12, stream=True))
@@ -1064,31 +1140,39 @@ class Runner:
         # Keep both peer sockets open until the process exits. A successful
         # cleanup must originate at the server, including its blocked producer.
         cleanup = self.process.stop()
+        report = self.validate_cleanup(cleanup)
+        check(report["counters"]["cancelled"] > before["counters"]["cancelled"], "Active requests were not cancelled by shutdown")
+        self.last_health = report
+        first.close()
+        second.close()
+        return {"active_at_shutdown": during["active_requests"], "cleanup": cleanup}
+
+    def validate_cleanup(self, cleanup):
+        # Also mandatory for --case runs that omit the active-shutdown case.
         check(not cleanup["forced_kill"], "Server needed the runner's forced process kill")
         check(cleanup["exit_code"] == 0, f"Graceful server exit failed: {cleanup}")
         check(not cleanup["framework_errors"], f"Server transport logged errors: {cleanup['framework_errors']}")
         report = cleanup.get("report")
         check(isinstance(report, dict), "Server did not write its final report")
         self.validate_health(report)
+        check(report.get("model") == self.model_id and report.get("backend") == self.backend,
+              "Final report lost the served model or backend")
         check(report["shutdown"]["graceful"] is True and report["shutdown"]["idle"] is True, "Shutdown did not finish its close barriers")
         check(report["active_requests"] == 0 and report["ipc"]["outstanding_requests"] == 0 and
               report["ipc"]["pending_commands"] == 0, "Shutdown stranded a request or command")
         check(report["connections"]["accepted"] == report["connections"]["closed"], "Shutdown stranded accepted sockets")
-        check(report["counters"]["cancelled"] > before["counters"]["cancelled"], "Active requests were not cancelled by shutdown")
         counts = report["counters"]
         check(counts["admitted"] == counts["completed"] + counts["failed"] + counts["cancelled"],
               "An admitted request has a missing or duplicated final outcome")
-        self.last_health = report
-        first.close()
-        second.close()
-        return {"active_at_shutdown": during["active_requests"], "cleanup": cleanup}
+        return report
 
 
 def worker_fault_case(args, directory, model):
     directory.mkdir(parents=True, exist_ok=True)
     process = None
     runner = None
-    result = {"mode": "fake", "tests": [], "purpose": "isolated Worker crash terminal", "passed": False}
+    result = {"mode": "fake", "backend": args.backend, "model_id": args.model_id,
+              "tests": [], "purpose": "isolated Worker crash terminal", "passed": False}
     try:
         process = ServerProcess(args, directory, model)
         runner = Runner(args, process, directory, result)
@@ -1140,6 +1224,10 @@ def parse_arguments():
     parser.add_argument("--worker", type=Path, required=True, help="AilaWorker or AilaFakeInferenceWorker executable")
     parser.add_argument("--model", type=Path, help="GPU checkpoint directory; fake mode always generates its own fixture")
     parser.add_argument("--mode", choices=("fake", "gpu"), required=True)
+    parser.add_argument("--backend", choices=tuple(MODEL_IDS), default="qwen3_nf4")
+    parser.add_argument("--model-id", help="Explicit HTTP model name; defaults to qwen3 or qwen3.5 for the selected backend")
+    parser.add_argument("--case", action="append", choices=COMMON_CASES + FAKE_CASES,
+                        help="Run only selected cases; repeat to select more. Omit for the complete suite.")
     parser.add_argument("--output", type=Path, required=True, help="Artifact directory; existing runs are preserved in a new child directory")
     parser.add_argument("--startup-timeout", type=float, default=300.0)
     parser.add_argument("--shutdown-timeout", type=float, default=45.0)
@@ -1148,6 +1236,15 @@ def parse_arguments():
         parser.error("--model is required in GPU mode")
     if args.startup_timeout <= 0 or args.shutdown_timeout <= 0:
         parser.error("Timeouts must be positive")
+    if args.model_id is None:
+        args.model_id = MODEL_IDS[args.backend]
+    if not re.fullmatch(r"[A-Za-z0-9._/-]{1,128}", args.model_id):
+        parser.error("--model-id must contain 1..128 ASCII model-name characters")
+    if args.case:
+        if len(args.case) != len(set(args.case)):
+            parser.error("--case names must not repeat")
+        if args.mode == "gpu" and any(name in FAKE_CASES for name in args.case):
+            parser.error("Fake-only cases cannot be selected in GPU mode")
     args.server = args.server.resolve()
     args.worker = args.worker.resolve()
     if args.model is not None:
@@ -1165,11 +1262,13 @@ def main():
         directory = directory / f"run-{stamp}-{uuid.uuid4().hex[:8]}"
         directory.mkdir()
     result = {
-        "schema_version": 1, "started_at": utc_now(), "mode": args.mode, "passed": False,
+        "schema_version": 1, "started_at": utc_now(), "mode": args.mode,
+        "backend": args.backend, "model_id": args.model_id, "passed": False,
+        "requested_cases": args.case, "full_suite": args.case is None,
         "output": str(directory), "tests": [], "scope": {
             "transport": "Plaintext HTTP/1.1; current Trantor memory/async node bytes and one per-request handoff frame.",
             "excluded": "Total RSS, kernel memory, TCP acknowledgements, HTTP/2, TLS, and proxy behavior.",
-            "slow_reader_gate": "Required in fake mode; not claimed by short-token GPU tests.",
+            "slow_reader_gate": "Required in a full fake run; not claimed by short-token GPU or excluded cases.",
         },
     }
     process = None
@@ -1181,7 +1280,7 @@ def main():
         check(args.worker.is_file(), f"Worker executable does not exist: {args.worker}")
         if args.mode == "fake":
             model = directory / "fake-pipe-model"
-            result["fixture"] = write_fake_tokenizer(model)
+            result["fixture"] = write_fake_tokenizer(model, args.backend)
         else:
             model = args.model
             check(model.is_dir(), f"Model directory does not exist: {model}")
@@ -1192,6 +1291,7 @@ def main():
             ("health_models_parameters", runner.basics),
             ("incremental_utf8_json_sse", runner.incremental),
             ("concurrent_1_2_4_fixed_seed", runner.concurrency),
+            ("multiturn_text_thinking_json_sse", runner.multiturn_thinking),
             ("connection_close_expect_continue", runner.close_and_expect),
             ("same_socket_reuse_pipeline", runner.ownership),
             ("disconnect_isolates_other_request", runner.disconnect),
@@ -1210,6 +1310,12 @@ def main():
         planned.append(("graceful_shutdown_with_active_requests", runner.shutdown))
         if args.mode == "fake":
             planned.append(("worker_fault_error_terminal", lambda: worker_fault_case(args, directory / "worker-fault", model)))
+        available = COMMON_CASES + (FAKE_CASES if args.mode == "fake" else ())
+        check({name for name, _ in planned} == set(available), "Case registry and implementations differ")
+        selected = set(args.case) if args.case else set(available)
+        result["excluded_cases"] = [name for name, _ in planned if name not in selected]
+        planned = [(name, function) for name, function in planned if name in selected]
+        result["planned_cases"] = [name for name, _ in planned]
         for name, function in planned:
             runner.case(name, function)
     except BaseException as error:
@@ -1228,6 +1334,9 @@ def main():
                 if (result["cleanup"].get("forced_kill") or result["cleanup"].get("exit_code") != 0 or
                         result["cleanup"].get("framework_errors")):
                     failed = True
+                if runner is not None:
+                    runner.validate_cleanup(result["cleanup"])
+                    result["last_health"] = result["cleanup"]["report"]
             except BaseException as error:
                 failed = True
                 result["cleanup_error"] = f"{type(error).__name__}: {error}"

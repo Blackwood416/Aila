@@ -16,6 +16,7 @@ struct ServerOptions {
     std::filesystem::path reportFile;
     std::string expectedBuildId;
     std::string modelId = "qwen3";
+    std::string backend = "qwen3_nf4";
     uint16_t port = 8080;
     uint32_t maxSessions = 4;
     uint32_t contextTokens = 4096;

@@ -28,13 +28,11 @@ class SharedFactory final : public InferenceModelFactory {
 public:
     std::shared_ptr<InferenceModel> LoadQwen3(
         const std::string& directory, InferenceModelOptions options) override {
-        if (!runtime) runtime = inference::DeviceRuntime::Create();
-        inference::ModelOptions modelOptions;
-        modelOptions.maxSequenceLength = options.maxSequenceLength;
-        modelOptions.maxSessions = options.maxSessions;
-        modelOptions.maxSessionCacheBytes = options.maxSessionCacheBytes;
-        return std::make_shared<SharedModel>(
-            inference::LoadedModel::LoadQwen3Nf4(runtime, directory, modelOptions));
+        return Load(directory, options, false);
+    }
+    std::shared_ptr<InferenceModel> LoadQwen35(
+        const std::string& directory, InferenceModelOptions options) override {
+        return Load(directory, options, true);
     }
 
     std::string RuntimeFaultMessage() const override {
@@ -42,6 +40,23 @@ public:
     }
 
 private:
+    std::shared_ptr<InferenceModel> Load(
+        const std::string& directory, InferenceModelOptions options, bool hybrid) {
+        if (!runtime) runtime = inference::DeviceRuntime::Create();
+        inference::ModelOptions modelOptions;
+        modelOptions.maxSequenceLength = options.maxSequenceLength;
+        modelOptions.maxSessions = options.maxSessions;
+        modelOptions.maxSessionCacheBytes = options.maxSessionCacheBytes;
+        // IPC has no rollback API. Keep the required Hybrid host mirrors but
+        // allocate no recurrent snapshots; host payload remains session-count
+        // bounded (at most four), not covered by the device-cache byte limit.
+        if (hybrid) modelOptions.maxRecurrentSnapshots = 0;
+        auto loaded = hybrid
+            ? inference::LoadedModel::LoadQwen35Nf4(runtime, directory, modelOptions)
+            : inference::LoadedModel::LoadQwen3Nf4(runtime, directory, modelOptions);
+        return std::make_shared<SharedModel>(std::move(loaded));
+    }
+
     std::shared_ptr<inference::DeviceRuntime> runtime;
 };
 

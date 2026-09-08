@@ -441,6 +441,17 @@ std::vector<std::string> default_capabilities() {
     return {"token_requests_v1", "qwen3_nf4_bf16_kv", "session_lifecycle_v1", "multi_inflight_v1",
             "cumulative_ack_v1", "domain_epoch_v1"};
 }
+std::vector<std::string> supported_capabilities() {
+    auto capabilities = default_capabilities();
+    capabilities.emplace_back("qwen35_nf4_bf16_kv");
+    return capabilities;
+}
+std::string_view model_capability(std::string_view backend, std::string_view kvType) noexcept {
+    if (kvType != "bf16") return {};
+    if (backend == "qwen3_nf4") return "qwen3_nf4_bf16_kv";
+    if (backend == "qwen35_nf4") return "qwen35_nf4_bf16_kv";
+    return {};
+}
 
 bool validate_limits(const Limits& requested, ValidationError& error, const Limits& ceiling) {
     return Guard(error, [&] {
@@ -773,8 +784,9 @@ bool parse_command(const Frame& frame, Command& command, ValidationError& error,
                 !Unsigned(object, "maxSequenceLength", parsed.maxSequenceLength, error, code) ||
                 !Unsigned(object, "maxSessions", parsed.maxSessions, error, code) ||
                 !Unsigned(object, "maxSessionCacheBytes", parsed.maxSessionCacheBytes, error, code)) return false;
-            if (parsed.backend != "qwen3_nf4") return Fail(error, ErrorCode::UnsupportedModel, "The v2 token slice supports qwen3_nf4 only");
-            if (parsed.kvType != "bf16" || parsed.modelDirectory.empty() || parsed.maxSequenceLength == 0 ||
+            if (model_capability(parsed.backend).empty())
+                return Fail(error, ErrorCode::UnsupportedModel, "The v2 token API supports qwen3_nf4 and qwen35_nf4");
+            if (model_capability(parsed.backend, parsed.kvType).empty() || parsed.modelDirectory.empty() || parsed.maxSequenceLength == 0 ||
                 parsed.maxSequenceLength > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()) ||
                 parsed.maxSessions == 0 || parsed.maxSessions > limits.maxSessions ||
                 (limits.maxSessionCacheBytes != 0 && (parsed.maxSessionCacheBytes == 0 || parsed.maxSessionCacheBytes > limits.maxSessionCacheBytes))) {

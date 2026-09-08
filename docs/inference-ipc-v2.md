@@ -1,12 +1,12 @@
 # 共享推理 IPC v2 实施协议
 
-日期：2026-09-07。**状态：首个 Qwen3 token 切片已实现，本轮 IPC 与最终集成门禁均已通过。** v2 codec、Worker controller/管道外壳、普通 C++ `InferenceClient`/Win32 transport 及设备故障前提已接通，旧 Worker/Proxy 和公共 C ABI 保持 v1。全 Release 构建、既有 Qwen3/Qwen3.5 模型/调度 GPU 回归、23 项基础/兼容/IPC 回归及普通宿主无 SYCL 导入检查通过；HTTP 和 Hybrid 远端能力仍属后续范围。实现入口见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)，当前验证快照见第 10 节，最终证据见 [refactor-validation.md](refactor-validation.md)，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
+日期：2026-09-08。**状态：Qwen3 与 Qwen3.5 Hybrid NF4 token 入口均已接入 IPC v2。** codec、Worker controller/管道外壳、普通 C++ `InferenceClient`/Win32 transport 及设备故障处理共用一套实现，旧 Worker/Proxy 和公共 C ABI 保持 v1。普通 C++ [HTTP/SSE 服务](inference-server.md) 已使用这两种后端。实现入口见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)，Qwen3 首片验证快照保留在第 10 节，各批实际证据见 [refactor-validation.md](refactor-validation.md) 第 10–12 节，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
 
 本文保留 v2 的协议契约。实现位于 `src/ipc/InferenceProtocol.*`、`src/runtime/InferenceClient.*`、`src/runtime/InferencePipeTransport.cpp` 和 `src/worker/{InferenceWorker,InferenceWorkerMain}.*`，通过 `SharedInferenceEngine.cpp` 接入已有 Model/Session/Scheduler。进程内资源与调度语义见 [shared-sessions.md](shared-sessions.md) 和 [scheduler.md](scheduler.md)。协议枚举使用稳定字符串，不直接发送 C++ 枚举的整数值或结构体内存。
 
 ## 1. 首片边界及兼容模式
 
-- 一个 v2 Worker 拥有一个 `DeviceRuntime` 设备域和一个 `Scheduler`。首片最多加载一个 Qwen3 NF4 模型；共享 BF16 KV Session，按完整 prefill/decode 步骤轮转。已有 NF4 算子、融合和 in-order queue 不变。
+- 一个 v2 Worker 拥有一个 `DeviceRuntime` 设备域和一个 `Scheduler`，最多加载一个 Qwen3 或 Qwen3.5 Hybrid NF4 模型；共享 BF16 KV Session，Hybrid 同时隔离递归/卷积状态和 host mirror，按完整 prefill/decode 步骤轮转。已有 NF4 算子、融合和 in-order queue 不变。
 - v1 `--ffi-worker`、`WorkerDispatcher`、`CApiWorkerEngine` 继续提供旧命令。新增私有启动模式 `--ffi-worker-v2`；同一进程启动后固定模式，不在已建立的管道上切换协议。
 - v2 使用 `protocol=2`；`abi=1` 仍表示现有公共 C ABI 版本。IPC 版本与公共 ABI 版本分别管理。现有 `kProtocolVersion=1` 不应直接全局改为 2，让旧调用方无意中发送新协议。
 - 新的宿主端内部 C++ API 选择 v2；旧公开函数先继续使用 v1。首片不把旧 `generate_chat_json` 翻译成 token 请求，也不声称已迁移聊天模板、reasoning、工具解析、音视频或 thinking budget。
@@ -23,12 +23,12 @@ Worker 在创建 GPU 资源前发送唯一 `kind=handshake, method=worker.hello,
 | --- | --- |
 | `epoch` | OS 生成的 128 位随机值，32 个小写十六进制字符；每次 Worker 启动重新生成 |
 | `supportedProtocols` | 首片为 `[2]`；表示当前启动模式支持的协议 |
-| `capabilities` | 实际可用的字符串集合；首片为 `token_requests_v1`、`qwen3_nf4_bf16_kv`、`session_lifecycle_v1`、`multi_inflight_v1`、`cumulative_ack_v1`、`domain_epoch_v1` |
+| `capabilities` | 实际可用的字符串集合；当前为 `token_requests_v1`、`qwen3_nf4_bf16_kv`、`qwen35_nf4_bf16_kv`、`session_lifecycle_v1`、`multi_inflight_v1`、`cumulative_ack_v1`、`domain_epoch_v1` |
 | `hardLimits` | 本文准入表的上限；包含帧、对象、调度及传输限制 |
 
 宿主先保留原身份校验，再发送 `worker.configure`，携带 `epoch`、`requiredCapabilities` 和不超过 hardLimits 的 `limits`。Worker 返回选定的完整 limits 和 capabilities；宿主确认能力齐全、数值合法后进入 Ready。未知必需能力返回 `UnsupportedCapability`，超上限参数返回 `InvalidArgument`，不能悄悄改变请求中的限制。未配置时只允许 configure、worker.query 和 shutdown；configure 成功后不能再次修改域的限额。
 
-握手读取先使用现有有界 bootstrap 帧限制；configure 后按 v2 的较小限制读取。能力只有实现和测试后才能发布，尤其不能因某个 legacy backend 存在就发布共享会话能力。首片不发布 FP8 KV、Hybrid、运行中 LoRA 替换、文本解码或 HTTP 能力。
+握手读取先使用现有有界 bootstrap 帧限制；configure 后按 v2 的较小限制读取。默认宿主必需能力保留原 Qwen3 集合，新增 Hybrid 是可选扩展；`LoadQwen35` 检查 configure 结果含 `qwen35_nf4_bf16_kv`，缺少时局部拒绝，不发送加载命令。configure 不能返回 hello 未声明的能力，model.load 的成功结果必须含所请求后端能力。能力协商不放宽 build ID 校验。当前不发布 FP8 KV、运行中 LoRA 替换、文本解码或 HTTP wire 能力；聊天与 HTTP 由宿主层完成。
 
 ## 3. 帧、关联与句柄标识
 
@@ -90,7 +90,7 @@ Scheduler 的 `Read(terminal)` 会归还其调度额度。IPC sender 读到 term
 | --- | --- | --- |
 | `worker.configure` | `requiredCapabilities: string[]`, `limits: object` | `capabilities`, `limits`, `domainStatus: "ready"` |
 | `worker.query` | 无 | `domainStatus`, Scheduler 的 accepting/stopping/faulted 和各额度计数，传输计数；不遍历所有请求输出 |
-| `model.load` | `backend: "qwen3_nf4"`, `modelDirectory: string`, `kvType: "bf16"`, `maxSequenceLength: u32`, `maxSessions: u32`, `maxSessionCacheBytes: u64` | `modelId`, `vocabSize`, `maxSequenceLength`, `sessionReservationBytes`, 实际能力 |
+| `model.load` | `backend: "qwen3_nf4" / "qwen35_nf4"`, `modelDirectory: string`, `kvType: "bf16"`, `maxSequenceLength: u32`, `maxSessions: u32`, `maxSessionCacheBytes: u64` | `modelId`, `vocabSize`, `maxSequenceLength`, `sessionReservationBytes`, 所加载后端的实际能力 |
 | `session.create` | `modelId` | `sessionId`, `modelId`, `capacity`, `cacheBytes`, `contextLength: 0` |
 | `session.query` | `sessionId` | `modelId`, `capacity`, `cacheBytes`, `busy`, `contextLength: u32/null`；Busy 时长度为 null，不能假称得到精确缓存前缀 |
 | `request.submit` | 见下文；header requestId 即 inferenceId | 一次 accepted，再一次最终 result/error，见下一节 |
@@ -100,7 +100,7 @@ Scheduler 的 `Read(terminal)` 会归还其调度额度。IPC sender 读到 term
 | `handle.release` | `type: "model"/"session"/"request"`, `id: u64` | `releaseAccepted: true`；Request 可以仍处于内部收尾状态 |
 | `worker.shutdown` | `graceMs: u32`，不得超过配置的关闭上限 | `domainStatus: "closed"`, `lastEventOrdinal`，仅在设备收尾及事件发送屏障后返回 |
 
-`session.reset` 和 `session.truncate {sessionId, length}` 可以在下一提交加入。两者只允许空闲 Session；truncate 响应必须含实际 `restoredLength`，不能将请求的 length 当作返回值。首片可用销毁并新建 Session 完成取消后的重用验证，因此这两项不是首片必需命令。
+`session.reset` 和 `session.truncate {sessionId, length}` 尚未加入。两者只允许空闲 Session；未来 truncate 响应必须含实际 `restoredLength`，不能将请求的 length 当作返回值。当前通过销毁并新建 Session 完成取消后的重用。Hybrid 远端固定关闭 recurrent snapshots，但保留续写所需的 host mirror；device reservation 含 Full KV、递归矩阵和卷积状态，host mirror 受 Session 数量限制，未纳入 v2 device 字节额度。
 
 `session.query` 的 idle 精确读取也要先取得会话操作资格，不能让新 submit 与查询的长度读取交错。Busy 快照不等待 GPU。model.load/session.create/destruction 可能取得设备锁，必须在 lifecycle executor 上执行，禁止在 command reader 内分配 KV、加载权重或析构最后设备引用。
 

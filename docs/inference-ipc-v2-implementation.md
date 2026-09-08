@@ -1,12 +1,12 @@
 # IPC v2：共享推理的独立 Worker
 
-日期：2026-09-07。当前为首个 token 推理切片的实现记录；最终验证结果与构建身份见 [refactor-validation.md](refactor-validation.md)。协议字段和完成判据见 [inference-ipc-v2.md](inference-ipc-v2.md)。
+日期：2026-09-08。当前实现覆盖 Qwen3 与 Qwen3.5 Hybrid NF4 token 推理；实际验证结果与构建身份见 [refactor-validation.md](refactor-validation.md) 第 10–12 节。协议字段和完成判据见 [inference-ipc-v2.md](inference-ipc-v2.md)。
 
 ## 接入范围
 
-新增 `--ffi-worker-v2` 启动模式与 `src/runtime/InferenceClient.hpp` 内部 C++ API。一个 Worker 使用一个设备域、一个 Scheduler 和最多一个 Qwen3 NF4 模型，共享模型权重，最多创建四个独立 BF16 KV Session。输入输出均为 token ID；已经迁移的 Qwen3.5 进程内会话暂不作为远端能力发布。
+`--ffi-worker-v2` 启动模式与 `src/runtime/InferenceClient.hpp` 内部 C++ API 使用一个设备域、一个 Scheduler 和最多一个 Qwen3 或 Qwen3.5 Hybrid NF4 模型，共享模型权重，最多创建四个独立 BF16 KV Session。Hybrid 各自持有 DeltaNet 递归矩阵、卷积历史及 host mirror；输入输出均为 token ID。
 
-旧 `--ffi-worker`、`WorkerProcess`、Proxy 与公共 C ABI 继续使用 protocol 1。v2 的 protocol 为 2，ABI 仍为 1。此切片没有迁移聊天模板、reasoning、工具解析、thinking budget、音视频或运行中 adapter 替换，也没有提供 HTTP 端点。独立 Drogon 探针的结果见 [refactor-http-probe.md](refactor-http-probe.md)。
+旧 `--ffi-worker`、`WorkerProcess`、Proxy 与公共 C ABI 继续使用 protocol 1。v2 的 protocol 为 2，ABI 仍为 1。聊天模板和 reasoning 在普通 C++ [HTTP/SSE 服务](inference-server.md) 中复用；IPC 仍仅传 token。工具、thinking budget、音视频和运行中 adapter 替换尚未迁移。
 
 ## 代码边界
 
@@ -34,6 +34,7 @@ auto client = InferenceClient::Start(runtimeDirectory, workerExecutable,
 InferenceModelOptions modelOptions;
 modelOptions.maxSequenceLength = 512;
 auto model = client->LoadQwen3(modelDirectory, modelOptions);
+// 对 Qwen3.5 Hybrid NF4，改用 client->LoadQwen35(modelDirectory, modelOptions)。
 auto session = model->CreateSession();
 
 InferenceRequestOptions options;
@@ -54,6 +55,10 @@ client->Shutdown();
 ```
 
 对不同 Session 提交请求即可重叠执行。一个 Session 只允许一个执行租约；同 Session 的重叠 submit 返回 Busy。空闲时 `Session::Query()` 提供精确 contextLength，忙时返回 null。正常 Length 结束包含最后 token 的缓存写入，随后可以向原 Session 追加 prompt；取消或失败的会话可能缺少最后一个已发布 token，调用者不能把输出长度当作精确缓存长度。
+
+`LoadQwen35` 使用 `backend="qwen35_nf4"` 和 `qwen35_nf4_bf16_kv` 能力。默认 requiredCapabilities 保留原 Qwen3 集合；hello/configure 可以额外发布 Hybrid，加载前检查已配置的能力，模型返回值再核对所请求后端。缺少可选能力时本次加载局部失败，原 Qwen3 连接仍可使用；configure 返回 hello 未声明的能力或模型返回其他后端能力属于协议故障。实际进程连接仍要求匹配的 build ID，此处兼容描述不取消版本身份校验。
+
+v2 尚无 Reset/Truncate 命令，因此远端 Hybrid 固定 `maxRecurrentSnapshots=0`，不会生成回滚快照；Session 仍能追加 token 续写。host mirror 必须保留，以最多四个 Session 约束其数量；`maxSessionCacheBytes` 只管 device cache/state payload。进程内 Hybrid 的快照和回滚 API 保持原行为。
 
 `Request::Read(timeout)` 仅让本次等待超时。`Cancel()` 产生独立 RPC，保留可读输出；取消响应不等于请求终态。`Release()` 非阻塞，标记取消并由私有路由丢弃、累计确认剩余输出。请求执行器在完整 prefill/decode 步骤边界处理取消。
 
@@ -95,5 +100,6 @@ Scheduler 的执行完成、bridge 读取 terminal、pipe 写完、宿主读取�
 - `AilaInferenceClientTests`：受控双通道传输下的跨管道乱序、消费/释放/关闭状态机。
 - `AilaInferencePipeTests`：实际 Windows 子进程和 pipe 的 CPU 集成，以及普通宿主的运行时隔离。
 - `AilaQwen3IpcSessionTests`：真实 Qwen3 直接调用对照、1/2/4 会话、固定 seed/penalties、续写、取消、长请求停读、重启 epoch。
+- `AilaQwen35IpcSessionTests`：同一可执行文件以 `--backend qwen35_nf4` 验证 Hybrid；使用 `AILA_QWEN35_TEST_MODEL`，另覆盖不同 prefill 块与四槽释放重建。可重复传 `--case concurrency|cancel-backpressure|session-recreate|parent-shutdown|epoch` 筛选，默认运行全部。
 
-GPU 测试与 benchmark 必须串行执行。既有 IpcProtocol、WorkerDispatcher、RuntimeIsolation、ProxyAbi、ProxyLogging 与 BuildIdentity 保留为 v1 兼容门禁。服务层接入应在本切片门禁通过后进行；文本/聊天与 HTTP/SSE 的实现和验收独立记录。
+GPU 测试与 benchmark 必须串行执行。既有 IpcProtocol、WorkerDispatcher、RuntimeIsolation、ProxyAbi、ProxyLogging 与 BuildIdentity 保留为 v1 兼容门禁；文本/聊天与 HTTP/SSE 的实现和验收独立记录。

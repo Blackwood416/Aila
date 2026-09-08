@@ -49,6 +49,7 @@ struct Counters {
     Gate step;
     Gate load;
     std::atomic<int> models{0}, sessions{0};
+    std::atomic<int> qwen3Loads{0}, qwen35Loads{0};
     std::atomic<bool> failSession{false};
     std::atomic<bool> faultSession{false};
 };
@@ -104,27 +105,43 @@ public:
     explicit FakeFactory(std::shared_ptr<Counters> counters) : counters(std::move(counters)) {}
     std::shared_ptr<aila::worker::InferenceModel> LoadQwen3(const std::string& directory,
                                                         aila::worker::InferenceModelOptions options) override {
+        ++counters->qwen3Loads;
+        return Load(directory, options);
+    }
+    std::shared_ptr<aila::worker::InferenceModel> LoadQwen35(const std::string& directory,
+                                                         aila::worker::InferenceModelOptions options) override {
+        ++counters->qwen35Loads;
+        return Load(directory, options);
+    }
+private:
+    std::shared_ptr<aila::worker::InferenceModel> Load(const std::string& directory,
+                                                    aila::worker::InferenceModelOptions options) {
         counters->load.Enter();
         if (directory == "bad-model") throw std::invalid_argument("injected file/configuration failure");
         return std::make_shared<FakeModel>(counters, options.maxSequenceLength);
     }
-private:
     std::shared_ptr<Counters> counters;
 };
 
 class Harness {
 public:
-    Harness() : counters(std::make_shared<Counters>()), worker(Epoch, std::make_unique<FakeFactory>(counters)) {}
+    explicit Harness(std::string backend = "qwen3_nf4")
+        : backend(std::move(backend)), counters(std::make_shared<Counters>()),
+          worker(Epoch, std::make_unique<FakeFactory>(counters)) {}
     ~Harness() { counters->step.Open(); counters->load.Open(); worker.Stop(); }
     uint64_t Send(wire::Command command) {
-        command.rpcId = ++nextId;
+        command.rpcId = nextId + 1;
         if (command.epoch.empty()) command.epoch = Epoch;
         aila::ipc::Frame frame;
         wire::ValidationError error;
         Expect(wire::make_command(command, frame, error, limits), "make_command: " + error.message);
+        return SendFrame(std::move(frame));
+    }
+    uint64_t SendFrame(aila::ipc::Frame frame) {
+        frame.header.request_id = ++nextId;
         std::string transportError;
         Expect(worker.Enqueue(std::move(frame), transportError), "Enqueue: " + transportError);
-        return command.rpcId;
+        return nextId;
     }
     void Pump(bool readEvents = true) {
         aila::worker::InferenceWorkerOutput output;
@@ -167,18 +184,24 @@ public:
         command.method = wire::Method::WorkerConfigure;
         command.limits = selected;
         command.requiredCapabilities = wire::default_capabilities();
+        if (backend == "qwen35_nf4") command.requiredCapabilities.emplace_back("qwen35_nf4_bf16_kv");
         const auto response = Call(command);
         Expect(response.kind == wire::ResponseKind::Result, "configure failed: " + response.message);
+        Expect(response.capabilities == wire::supported_capabilities(), "configure omitted a supported backend");
         limits = selected;
     }
     uint64_t Load(unsigned sessions = 4) {
         wire::Command command;
         command.method = wire::Method::ModelLoad;
+        command.backend = backend;
         command.modelDirectory = "fake-model";
         command.maxSequenceLength = 512;
         command.maxSessions = sessions;
         const auto response = Call(command);
         Expect(response.kind == wire::ResponseKind::Result, "model load failed: " + response.message);
+        const std::vector<std::string> capabilities{
+            std::string(wire::model_capability(backend)), "token_requests_v1", "session_lifecycle_v1"};
+        Expect(response.model.capabilities == capabilities, "loaded model advertised a different backend");
         return response.model.modelId;
     }
     uint64_t Create(uint64_t model) {
@@ -264,6 +287,7 @@ public:
         Expect(counters->models.load() == 0 && counters->sessions.load() == 0, "shutdown retained resources");
     }
 
+    const std::string backend;
     wire::Limits limits;
     std::shared_ptr<Counters> counters;
     aila::worker::InferenceWorker worker;
@@ -273,8 +297,8 @@ public:
     std::map<uint64_t, std::vector<wire::Event>> events;
 };
 
-void TestConcurrentControlAndParentLifetime() {
-    Harness h;
+void TestConcurrentControlAndParentLifetime(const std::string& backend) {
+    Harness h(backend);
     h.Configure();
     const auto model = h.Load();
     const auto a = h.Create(model), b = h.Create(model);
@@ -297,6 +321,7 @@ void TestConcurrentControlAndParentLifetime() {
     Expect(h.counters->models == 1 && h.counters->sessions == 2, "released parents destroyed live requests");
     wire::Command load;
     load.method = wire::Method::ModelLoad; load.modelDirectory = "fake-model";
+    load.backend = backend;
     Expect(h.Call(load).errorCode == wire::ErrorCode::ResourceLimit, "parent release bypassed actual model count");
     wire::Command cancel;
     cancel.method = wire::Method::RequestCancel; cancel.inferenceId = requestA;
@@ -310,8 +335,8 @@ void TestConcurrentControlAndParentLifetime() {
     h.Shutdown();
 }
 
-void TestBackpressureAndRetainedReservations() {
-    Harness h;
+void TestBackpressureAndRetainedReservations(const std::string& backend) {
+    Harness h(backend);
     wire::Limits limits;
     limits.tokenWindow = 4;
     limits.maxBufferedTokensPerRequest = 8;
@@ -342,11 +367,12 @@ void TestBackpressureAndRetainedReservations() {
     h.Shutdown();
 }
 
-void TestAdmissionRollbackAndStaleEpoch() {
-    Harness h;
+void TestAdmissionRollbackAndStaleEpoch(const std::string& backend) {
+    Harness h(backend);
     h.Configure();
     wire::Command invalidLoad;
     invalidLoad.method = wire::Method::ModelLoad;
+    invalidLoad.backend = backend;
     invalidLoad.modelDirectory = "bad-model";
     Expect(h.Call(invalidLoad).errorCode == wire::ErrorCode::InvalidArgument, "local load error was not preserved");
     Expect(h.Query().accepting, "local load error poisoned the domain");
@@ -379,8 +405,8 @@ void TestAdmissionRollbackAndStaleEpoch() {
     h.Shutdown();
 }
 
-void TestLifecycleFaultBroadcast() {
-    Harness h;
+void TestLifecycleFaultBroadcast(const std::string& backend) {
+    Harness h(backend);
     h.Configure();
     const auto model = h.Load();
     const auto session = h.Create(model);
@@ -399,17 +425,95 @@ void TestLifecycleFaultBroadcast() {
     h.Shutdown();
 }
 
-void TestLoadDoesNotBlockControl() {
-    Harness h;
+void TestLoadDoesNotBlockControl(const std::string& backend) {
+    Harness h(backend);
     h.Configure();
     h.counters->load.Block();
     wire::Command load;
     load.method = wire::Method::ModelLoad; load.modelDirectory = "fake-model";
+    load.backend = backend;
     const auto loadId = h.Send(load);
     h.counters->load.Wait();
     Expect(h.Query().accepting, "worker.query waited on model loading");
     h.counters->load.Open();
     Expect(h.Wait(loadId).kind == wire::ResponseKind::Result, "gated model load failed");
+    h.Shutdown();
+}
+
+void TestBackendValidationAndLoadRecovery(const std::string& backend) {
+    Harness h(backend);
+    h.Configure();
+    wire::Command load;
+    load.method = wire::Method::ModelLoad;
+    load.backend = backend;
+    load.modelDirectory = "fake-model";
+    load.maxSequenceLength = 512;
+    load.rpcId = 1;
+    load.epoch = Epoch;
+    aila::ipc::Frame valid;
+    wire::ValidationError validation;
+    Expect(wire::make_command(load, valid, validation, h.limits), "valid load could not be encoded");
+    for (const bool invalidBackend : {true, false}) {
+        auto invalid = valid;
+        const std::string from = invalidBackend ? "\"" + backend + "\"" : "\"bf16\"";
+        const size_t position = invalid.header.payload_json.find(from);
+        Expect(position != std::string::npos, "load fixture is missing a model option");
+        invalid.header.payload_json.replace(position, from.size(), invalidBackend ? "\"future_nf4\"" : "\"fp8\"");
+        const auto rejected = h.Wait(h.SendFrame(std::move(invalid)));
+        Expect(rejected.kind == wire::ResponseKind::Error &&
+               rejected.errorCode == (invalidBackend ? wire::ErrorCode::UnsupportedModel : wire::ErrorCode::InvalidArgument),
+               "unsupported backend or KV type was not rejected locally");
+        Expect(h.Query().accepting && h.counters->qwen3Loads == 0 && h.counters->qwen35Loads == 0,
+               "invalid model options reached the factory or poisoned the Worker");
+    }
+    load.modelDirectory = "bad-model";
+    Expect(h.Call(load).errorCode == wire::ErrorCode::InvalidArgument, "model configuration failure was not local");
+    Expect(h.Query().accepting, "model configuration failure stopped the Worker");
+    const auto model = h.Load();
+    const bool hybrid = backend == "qwen35_nf4";
+    Expect(h.counters->qwen3Loads == (hybrid ? 0 : 2) && h.counters->qwen35Loads == (hybrid ? 2 : 0),
+           "model backend reached the wrong factory dispatch");
+    const auto session = h.Create(model);
+    const auto request = h.Submit(session, 3);
+    Expect(h.Final(request).summary.generatedTokens == 3, "Worker was not usable after failed model loading");
+    h.Release(wire::ObjectType::Request, request);
+    h.Shutdown();
+}
+
+void TestSessionIsolationAndContinuation(const std::string& backend) {
+    Harness h(backend);
+    h.Configure();
+    const auto model = h.Load();
+    const auto reference = h.Create(model), a = h.Create(model), b = h.Create(model);
+    const auto tokens = [&h](uint64_t request) {
+        std::vector<int32_t> result;
+        for (const auto& event : h.events.at(request)) {
+            if (event.kind == wire::EventKind::Token) result.push_back(event.tokenId);
+        }
+        return result;
+    };
+    const auto baseline = h.Submit(reference, 4);
+    Expect(h.Final(baseline).summary.status == wire::RequestStatus::Completed, "isolated reference failed");
+    h.counters->step.Block();
+    const auto requestA = h.Submit(a, 4);
+    h.counters->step.Wait();
+    const auto requestB = h.Submit(b, 4);
+    h.counters->step.Open();
+    Expect(h.Final(requestA).summary.status == wire::RequestStatus::Completed &&
+           h.Final(requestB).summary.status == wire::RequestStatus::Completed, "interleaved Sessions failed");
+    Expect(tokens(requestA) == tokens(baseline) && tokens(requestB) == tokens(baseline),
+           "interleaved Sessions changed independent token results");
+
+    const auto baselineContinuation = h.Submit(reference, 4);
+    h.Final(baselineContinuation);
+    const auto advanceA = h.Submit(a, 1);
+    h.Final(advanceA);
+    const auto continueB = h.Submit(b, 4);
+    h.Final(continueB);
+    Expect(tokens(continueB) == tokens(baselineContinuation), "advancing A changed B's continuation state");
+    for (const auto request : {baseline, requestA, requestB, baselineContinuation, advanceA, continueB})
+        h.Release(wire::ObjectType::Request, request);
+    h.WaitOutstanding(0);
     h.Shutdown();
 }
 
@@ -453,11 +557,16 @@ void TestUnknownCommandAndLogLimitReduction() {
 
 int main() {
     try {
-        TestConcurrentControlAndParentLifetime();
-        TestBackpressureAndRetainedReservations();
-        TestAdmissionRollbackAndStaleEpoch();
-        TestLifecycleFaultBroadcast();
-        TestLoadDoesNotBlockControl();
+        for (const char* backend : {"qwen3_nf4", "qwen35_nf4"}) {
+            TestConcurrentControlAndParentLifetime(backend);
+            TestBackpressureAndRetainedReservations(backend);
+            TestAdmissionRollbackAndStaleEpoch(backend);
+            TestLifecycleFaultBroadcast(backend);
+            TestLoadDoesNotBlockControl(backend);
+            TestBackendValidationAndLoadRecovery(backend);
+            TestSessionIsolationAndContinuation(backend);
+            std::cout << "[PASS] " << backend << " dispatch, lifecycle, control, isolation and load recovery\n";
+        }
         TestUnknownCommandAndLogLimitReduction();
         std::cout << "[PASS] inference Worker lifecycle, routing, backpressure, faults and reservations\n";
         return 0;

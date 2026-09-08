@@ -88,7 +88,12 @@ struct Limits {
 };
 
 Limits hard_limits() noexcept;
+// Keep existing Qwen3 callers compatible with Workers that predate Hybrid.
 std::vector<std::string> default_capabilities();
+// All capabilities published by current real and CPU fixture Workers.
+std::vector<std::string> supported_capabilities();
+// Empty for unsupported backend/storage combinations; values have static lifetime.
+std::string_view model_capability(std::string_view backend, std::string_view kvType = "bf16") noexcept;
 bool validate_limits(const Limits& requested, ValidationError& error,
                      const Limits& ceiling = hard_limits());
 bool negotiate(const Limits& requested, const std::vector<std::string>& requiredCapabilities,

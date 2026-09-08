@@ -1,6 +1,6 @@
 # Aila 重构实施路线
 
-日期：2026-09-07。状态：P1/P2 共享会话切片之后，P3 已接入 Qwen3 与 Qwen3.5 Hybrid NF4 的具体 LayerPlan 和共享 Session，P4 token 调度器可复用两类会话。P5 的 Qwen3 token IPC v2 与普通 MSVC C++ HTTP/SSE 服务均已接通；真实 socket 的 11 项 fake Worker 和 7 项 Qwen3 GPU 验收通过。此前的 CPU、真实子进程 pipe、GPU IPC 与兼容集成门禁保留。BF16 权重策略复用、Hybrid 远端、长期压力和完整资源预算仍待后续推进。
+日期：2026-09-08。状态：P1/P2 共享会话切片之后，P3 已接入 Qwen3 与 Qwen3.5 Hybrid NF4 的具体 LayerPlan 和共享 Session，P4 token 调度器可复用两类会话。P5 的 token IPC v2 与普通 MSVC C++ HTTP/SSE 服务现已接入两种 NF4 后端。此前 Qwen3 的 CPU、真实 pipe、GPU IPC/HTTP、网络压力和兼容门禁保留；Hybrid 扩展的实际验收见验证文档第 12 节。BF16 权重策略复用、长期压力和完整资源预算仍待后续推进。
 
 本路线基于当前源码、已有性能脚本和对 Worker/IPC/C API 的专项复核。目标是统一层执行、共享模型多会话，以及 C++ HTTP/SSE 服务。本文描述完整目标；当前交付边界见下文，进程内 API 见 [shared-sessions.md](shared-sessions.md)，跨进程实现见 [inference-ipc-v2-implementation.md](inference-ipc-v2-implementation.md)，服务构建与请求示例见 [inference-server.md](inference-server.md)，实际验证记录见 [refactor-validation.md](refactor-validation.md)。
 
@@ -18,8 +18,10 @@
 - 最终全 Release 构建通过；既有 Q3 Session（23.21 秒）、Q3 Scheduler（26.33 秒）、Q35 0.8B（36.93 秒）GPU 回归全部通过，总计 86.48 秒；23 项基础/兼容/IPC 回归全部通过，60.67 秒。普通宿主导入检查无 SYCL。日志分别为 `build-refactor/ipc-v2-full-build.log`、`ipc-v2-model-gpu-regressions.log`、`ipc-v2-final-regressions.log`、`ipc-v2-host-dependents.log`，最终证据见 [refactor-validation.md](refactor-validation.md)。
 - 普通 C++ `AilaServer` 已通过独立 Worker 提供健康检查、模型列表和 JSON/SSE Chat Completions，首片为本机 Qwen3 NF4 文本、最多 4 个并发请求。复用 tokenizer/聊天模板/reasoning 解析，支持独立 seed、usage、严格参数校验、断连与慢读取消、Worker 故障和优雅关闭。普通 MSVC 的 ChatCodec 19 组、Client 16 组、真实 pipe 7 组通过；11 项 fake socket 与 7 项真实 Qwen3 GPU socket 全部通过，完整记录见验证文档第 11 节。
 - 提交后日志复核发现 Trantor 在同批读回调禁用写事件后仍分发陈旧 OUT 的问题；独立 Channel 补丁和 4 组真实 loopback 回归已验证修复。加入框架 ERROR/FATAL 日志门禁后的完整 fake/GPU socket 重跑通过，原始失败证据保留。
+- Hybrid 远端增加 `qwen35_nf4` backend 与独立能力，复用原 v2 schema/句柄/Scheduler；客户端在加载前与返回后核对能力，原 Qwen3 默认握手保持。`LoadQwen35` 与 Server `--backend qwen35_nf4` 已接入真实共享模型，远端无回滚命令所以固定关闭快照，保留独立递归/卷积状态和 host mirror。HTTP 使用相应模型族的可信模板，验证与边界记录在第 12 节。
+- 本轮 Hybrid 0.8B/4B 与 Qwen3 的完整 GPU IPC 通过，生成/续写逐 token 对齐直接执行，四槽释放重建没有跨会话状态残留。根 CPU/兼容 12/12、普通宿主 CPU 4/4 通过；Hybrid fake socket 12/12，三模型 GPU HTTP/SSE 各 8/8，均无框架错误且正常请求/连接排空。具体测试范围不包含长期服务或完整内存计量。
 
-此阶段尚未实现 BF16 权重共享策略、Hybrid 远端能力、新公共异步 C ABI、连续合批和完整媒体服务。当前 device/host/HTTP payload 额度不包含完整进程与驱动分配，不代表总内存或总显存准入。聊天格式化/reasoning 已复用于 Qwen3 HTTP 路径；thinking budget 仍由旧驱动支持，Hybrid 媒体 setter 只操作旧默认 Session。历史独立 HTTP 探针保留，真实服务使用单独的依赖与构建目录。
+此阶段尚未实现 BF16 权重共享策略、新公共异步 C ABI、连续合批和完整媒体服务。当前 device/host/HTTP payload 额度不包含完整进程与驱动分配，不代表总内存或总显存准入；远端 Hybrid host mirror 仅受 Session 数量约束。聊天格式化/reasoning 已复用于两类 NF4 HTTP 路径；thinking budget 仍由旧驱动支持，Hybrid 媒体 setter 只操作旧默认 Session。历史独立 HTTP 探针保留，真实服务使用单独的依赖与构建目录。
 
 执行步骤、Reset/Truncate、模型加载和 Session 初始化已接入设备域故障处理。加载/初始化先保留同步 SYCL/oneDNN 首因，再 drain；成功发布资源前还要通过最终 drain。普通 host/file/config 和准入失败保持局部语义，清理 drain 失败才进一步使域故障。生命周期执行器通过 `Scheduler::ReportRuntimeFault()` 广播，通过 `DeviceRuntime::FaultMessage()` 获取析构 drain 留下的首因；已发布终态保持原状态。分类与广播的 CPU 注入门禁已经通过，详细约定见 [共享会话](shared-sessions.md#设备域故障与生命周期) 和 [调度器](scheduler.md#生命周期故障的外部报告)。
 
@@ -47,7 +49,7 @@
 | RequestState | 输入进度、采样 RNG、生成 token、惩罚参数、停止/取消/错误 | 一次生成独立；完成后按句柄和输出消费情况释放；thinking budget 和文本流解析尚未迁入 |
 | ExecutionWorkspace | 激活值、投影 scratch、oneDNN 参数绑定及 scratchpad、采样临时区 | 按执行槽复用；设备工作完成前不得回收或错误重绑 |
 | Scheduler | 等待队列、可运行请求、资源准入、公平性和状态转换 | 首版一个 GPU 提交线程，调度多个 Session |
-| Transport | IPC 编解码、响应路由、有界输出队列；HTTP 适配仍待接入 | v2 已使用独立 sender/readers 和每请求信用；GPU 提交线程不直接等待慢客户端 |
+| Transport | IPC 编解码、响应路由、有界输出队列和 HTTP/SSE 适配 | v2 使用独立 sender/readers 和每请求信用；GPU 提交线程不直接等待慢客户端 |
 
 具体约定：
 
@@ -90,7 +92,7 @@ AR、Diffusion、TTS、ASR 和检测保留各自的驱动/能力接口。共用�
 | P6 首版集成门禁 | 文本模型端到端回归、取消/异常/内存压力测试、单请求与并发性能报告 | P3/P4/P5 | 无跨会话污染、持续资源增长和旧能力回归；有可复现性能记录 |
 | P7 连续合批 | Batched projection、逐序列位置/采样/LM head、批次增删；再评估分页 KV | P6 | 批处理数值正确，吞吐/延迟收益可量化，B=1 快路径保持 |
 
-上表保留完整阶段目标，不能将其中的目标视为全部已交付。当前 P3 的两类 NF4 会话/层计划与 P4 进程内调度已经接通；P5 的 Qwen3 token Worker/宿主链路已接入真实 Model/Session/Scheduler，并通过本轮 GPU IPC 与最终集成回归。P3 的 BF16 权重策略、完整资源预算、Hybrid 远端及 P5 HTTP 服务仍未完成；IPC 通过不能代替 HTTP/SSE 验收。
+上表保留完整阶段目标，不能将其中的目标视为全部已交付。当前 P3 的两类 NF4 会话/层计划与 P4 进程内调度已经接通；P5 的两类 token Worker/宿主链路与 HTTP/SSE 共用真实 Model/Session/Scheduler。P3 的 BF16 权重策略和 P6 的完整资源预算、长期压力及性能分布仍未完成；IPC 与 HTTP/SSE 分别验收。
 
 ### P0：基线准备
 
@@ -124,7 +126,7 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 
 ### P5：IPC 与服务落地
 
-当前 [IPC v2 协议](inference-ipc-v2.md) 的 Qwen3 token 首片已实现，接口示例与文件边界见 [实现记录](inference-ipc-v2-implementation.md)。codec、Worker controller/管道外壳、普通 C++ 宿主与故障前提已接通，受控 CPU 与真实子进程 CPU pipe 门禁通过；真实 Qwen3 GPU IPC 的 1/2/4 会话、续写、取消/背压及生命周期首跑，以及全 Release 构建、既有模型/调度和基础/兼容/IPC 回归均已通过。Hybrid 的进程内能力仍需另经远端接入与验收后才能作为 Worker 能力发布。
+当前 [IPC v2 协议](inference-ipc-v2.md) 已接入 Qwen3 与 Hybrid NF4 token 后端，接口示例与文件边界见 [实现记录](inference-ipc-v2-implementation.md)。codec、Worker controller/管道外壳、普通 C++ 宿主与故障处理共用一套实现；Qwen3 首片和 Hybrid 扩展分别保留验证证据。Hybrid 不增加 wire 字段，仅增加后端能力选择，现有进程内 Session 所有权和状态隔离约定继续适用。
 
 - 旧 WorkerProcess 保留 v1 的整请求互斥/同步等待。新 InferenceClient 使用常驻发送、响应/事件 reader 与独立 pending/request 表，允许多个在途请求。
 - 响应和流事件走不同管道，最终响应可能先于末尾事件到达。宿主已按请求校验 accepted、final、terminal、连续 sequence、eventCount 与摘要，只有排空条件成立才向用户交付终态。
@@ -191,7 +193,7 @@ P2 是首个决定后续方向的验收点：两条不同 prompt、不同长度�
 
 人周是工程量估计，不是本次助手运行时长。子代理能并行独立模块和审查，但接口决策、集成与单 GPU 验证处于关键路径，不能把工期直接除以代理数量。
 
-Qwen3 与 Qwen3.5 NF4 的 Session/LayerPlan 已接入 token Scheduler；Qwen3 IPC v2 与 C++ HTTP/SSE 已形成真实推理纵向切片，并通过 CPU、真实 GPU IPC/HTTP、兼容回归和受控网络压力验收。下一步优先扩展 Hybrid 远端能力，并补齐更大模型/长上下文、长期创建释放、完整内存预算和服务延迟分布；BF16 权重策略复用、thinking budget/工具/媒体驱动与连续合批继续分阶段迁移。验证覆盖范围与数值由 [refactor-validation.md](refactor-validation.md) 持续记录。
+Qwen3 与 Qwen3.5 NF4 的 Session/LayerPlan 已接入 token Scheduler、IPC v2 与 C++ HTTP/SSE。下一步优先补齐长上下文、长期创建释放、完整内存预算和服务延迟分布；BF16 权重策略复用、thinking budget/工具/媒体驱动与连续合批继续分阶段迁移。各模型大小与具体场景的验证覆盖范围由 [refactor-validation.md](refactor-validation.md) 持续记录，不能将短用例通过视为 P6 全部完成。
 
 ## 8. 源码依据
 

@@ -171,7 +171,8 @@ host::InferenceRequestOptions RequestOptions(uint32_t count) {
 
 class Run final {
 public:
-    explicit Run(host::InferenceClientOptions options = ClientOptions()) : limits(options.limits) {
+    explicit Run(host::InferenceClientOptions options = ClientOptions(), bool hybridModel = false)
+        : hybrid(hybridModel), limits(options.limits) {
         const fs::path executable = fs::absolute(fs::path(AILA_FAKE_INFERENCE_WORKER_PATH)).lexically_normal();
         Expect(fs::is_regular_file(executable), "Fake inference Worker executable is missing");
         client = host::InferenceClient::Start(executable.parent_path(), executable, AILA_BUILD_ID, std::move(options));
@@ -180,6 +181,12 @@ public:
                "Fake model metadata changed in transit");
         Expect(model->Epoch() == client->Snapshot().epoch && wire::valid_epoch(model->Epoch()),
                "Model was not bound to the negotiated epoch");
+        const auto& capabilities = model->Info().capabilities;
+        const auto expected = hybrid ? "qwen35_nf4_bf16_kv" : "qwen3_nf4_bf16_kv";
+        const auto other = hybrid ? "qwen3_nf4_bf16_kv" : "qwen35_nf4_bf16_kv";
+        Expect(std::find(capabilities.begin(), capabilities.end(), expected) != capabilities.end() &&
+                   std::find(capabilities.begin(), capabilities.end(), other) == capabilities.end(),
+               "Loaded model capabilities do not match the selected backend");
     }
     ~Run() {
         if (client) {
@@ -191,7 +198,8 @@ public:
         options.maxSequenceLength = SessionCapacity;
         options.maxSessions = limits.maxSessions;
         options.maxSessionCacheBytes = limits.maxSessionCacheBytes;
-        return client->LoadQwen3("fake-pipe-model", options, 3s);
+        return hybrid ? client->LoadQwen35("fake-pipe-hybrid-model", options, 3s)
+                      : client->LoadQwen3("fake-pipe-model", options, 3s);
     }
     void ExpectBounds() const {
         const auto local = client->Snapshot();
@@ -215,6 +223,7 @@ public:
                 local.reservedTokens == 0 && local.transportBytes == 0;
         }, "Released requests did not return host/Worker reservations");
     }
+    const bool hybrid;
     wire::Limits limits;
     std::shared_ptr<host::InferenceClient> client;
     std::shared_ptr<host::InferenceModel> model;
@@ -283,8 +292,8 @@ void ExpectCompleted(const Captured& captured, const std::vector<int32_t>& expec
            "Healthy CPU request did not finish at its requested length");
 }
 
-void TestConcurrentSessions() {
-    Run run;
+void ConcurrentSessions(bool hybrid) {
+    Run run(ClientOptions(), hybrid);
     const auto a = run.model->CreateSession();
     const auto b = run.model->CreateSession();
     const std::vector<int32_t> promptA{11, 12, 13}, promptB{71, 72, 73};
@@ -310,6 +319,9 @@ void TestConcurrentSessions() {
     run.WaitForNoRequests();
     run.client->Shutdown();
 }
+
+void TestConcurrentSessions() { ConcurrentSessions(false); }
+void TestHybridConcurrentSessions() { ConcurrentSessions(true); }
 
 void TestCancelReleaseAndParentLifetime() {
     Run run;
@@ -514,7 +526,7 @@ void TestRepeatedLifecycleAndHandleStability() {
     const DWORD baseline = ProcessHandleCount();
     for (unsigned cycle = 0; cycle < 5; ++cycle) {
         {
-            Run run;
+            Run run(ClientOptions(), cycle % 2 != 0);
             for (unsigned iteration = 0; iteration < 3; ++iteration) {
                 const auto a = ReuseSessionSlot(run.model);
                 const auto b = ReuseSessionSlot(run.model);
@@ -556,6 +568,7 @@ int main() {
     const auto started = Clock::now();
     const std::pair<const char*, void (*)()> tests[]{
         {"concurrent real-pipe sessions and cache continuation", TestConcurrentSessions},
+        {"Hybrid real-pipe sessions and cache continuation", TestHybridConcurrentSessions},
         {"cancel, release and parent lifetime", TestCancelReleaseAndParentLifetime},
         {"stopped consumer and private release drain", TestStoppedConsumerDoesNotBlockPeer},
         {"unread completion and concurrent shutdown", TestUnreadCompletionAndConcurrentShutdown},

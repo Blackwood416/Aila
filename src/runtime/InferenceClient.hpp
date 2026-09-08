@@ -152,6 +152,11 @@ public:
     std::shared_ptr<InferenceModel> LoadQwen3(
         const std::string& modelDirectory, InferenceModelOptions options = {},
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Hybrid token sessions retain independent recurrent state and host
+    // mirrors. The remote API has no rollback operation, so snapshots are off.
+    std::shared_ptr<InferenceModel> LoadQwen35(
+        const std::string& modelDirectory, InferenceModelOptions options = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     wire::WorkerInfo Query(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     InferenceClientSnapshot Snapshot() const;
     // Idempotent and shared by concurrent callers. Stops new user operations,
@@ -160,6 +165,9 @@ public:
 
 private:
     explicit InferenceClient(std::shared_ptr<detail::InferenceConnection> connection);
+    std::shared_ptr<InferenceModel> LoadNf4(
+        const std::string& backend, const std::string& modelDirectory,
+        InferenceModelOptions options, std::chrono::milliseconds timeout);
     std::shared_ptr<detail::InferenceConnection> connection_;
 };
 

@@ -181,6 +181,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
     };
     struct ModelRecord {
         uint64_t id = 0;
+        std::string_view capability;
         bool closed = false;
         size_t sessionLimit = 0;
         size_t cacheLimit = 0;
@@ -467,7 +468,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         wire::Limits selected;
         wire::ValidationError error;
         if (!wire::negotiate(command.limits, command.requiredCapabilities, wire::hard_limits(),
-                             wire::default_capabilities(), selected, error)) {
+                             wire::supported_capabilities(), selected, error)) {
             throw CommandFailure(error.code, error.message);
         }
         const uint64_t reservedBase = uint64_t(selected.maxPendingCommands) * selected.maxFinalFrameBytes +
@@ -491,7 +492,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         configured = true;
         auto response = ResponseFor(*input);
         response.limits = limits;
-        response.capabilities = wire::default_capabilities();
+        response.capabilities = wire::supported_capabilities();
         response.worker.domainStatus = wire::DomainStatus::Ready;
         SendResponse(std::move(response), input);
     }
@@ -499,14 +500,18 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
     void LoadModel(const std::shared_ptr<Input>& input, const wire::Command& command) {
         RequireReady();
         if (liveModels >= limits.maxLoadedModels) throw CommandFailure(wire::ErrorCode::ResourceLimit, "Loaded model limit reached");
-        if (command.backend != "qwen3_nf4" || command.kvType != "bf16")
-            throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Worker supports Qwen3 NF4 with BF16 KV only");
+        if (wire::model_capability(command.backend).empty())
+            throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Worker supports Qwen3 and Qwen3.5 Hybrid NF4");
+        const auto capability = wire::model_capability(command.backend, command.kvType);
+        if (capability.empty())
+            throw CommandFailure(wire::ErrorCode::InvalidArgument, "Shared inference requires BF16 KV");
         if (command.maxSessions > limits.maxSessions)
             throw CommandFailure(wire::ErrorCode::ResourceLimit, "Model session limit exceeds negotiated limit");
         if (nextModelId == (std::numeric_limits<uint64_t>::max)())
             throw CommandFailure(wire::ErrorCode::ResourceLimit, "Model IDs exhausted; restart Worker");
         auto record = std::make_shared<ModelRecord>();
         record->id = nextModelId++;
+        record->capability = capability;
         record->sessionLimit = command.maxSessions;
         record->cacheLimit = static_cast<size_t>(command.maxSessionCacheBytes);
         if (limits.maxSessionCacheBytes && (!record->cacheLimit || record->cacheLimit > limits.maxSessionCacheBytes))
@@ -515,11 +520,13 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         auto self = shared_from_this();
         ++liveModels;
         try {
-            Lifecycle([self, input, record, directory = command.modelDirectory, options] {
+            Lifecycle([self, input, record, directory = command.modelDirectory,
+                       hybrid = command.backend == "qwen35_nf4", options] {
                 std::exception_ptr failure;
                 try {
                     self->RequireReady();
-                    record->model = self->factory->LoadQwen3(directory, options);
+                    record->model = hybrid ? self->factory->LoadQwen35(directory, options)
+                                          : self->factory->LoadQwen3(directory, options);
                     self->CheckLifecycleFault();
                     self->RequireReady();
                     if (!record->model || record->model->VocabSize() <= 0 || record->model->MaxSequenceLength() <= 0)
@@ -541,7 +548,8 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
                     auto response = self->ResponseFor(*input);
                     response.model = {record->id, static_cast<uint32_t>(record->model->VocabSize()),
                         static_cast<uint32_t>(record->model->MaxSequenceLength()),
-                        record->model->SessionReservationBytes(), {"qwen3_nf4_bf16_kv", "token_requests_v1", "session_lifecycle_v1"}};
+                        record->model->SessionReservationBytes(),
+                        {std::string(record->capability), "token_requests_v1", "session_lifecycle_v1"}};
                     self->SendResponse(std::move(response), input);
                 });
             });

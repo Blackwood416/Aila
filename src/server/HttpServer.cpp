@@ -199,6 +199,7 @@ public:
         chat.maxPromptTokens = std::min<uint32_t>(4096, this->options.contextTokens);
         chat.maxNewTokens = this->options.maxNewTokens;
         chat.maxOutputBytes = this->options.maxOutputBytes;
+        chat.family = this->options.backend == "qwen35_nf4" ? ModelFamily::Qwen35Hybrid : ModelFamily::Qwen3Dense;
     }
 
     void Connected(const trantor::TcpConnectionPtr& connection) {
@@ -372,6 +373,7 @@ public:
         value["status"] = snapshot.status == wire::DomainStatus::Ready && !stopping.load() ? "ok" :
             stopping.load() && snapshot.status == wire::DomainStatus::Ready ? "stopping" : std::string(wire::to_string(snapshot.status));
         value["model"] = options.modelId;
+        value["backend"] = options.backend;
         value["active_requests"] = Json::UInt64(active.size());
         auto& counters = value["counters"];
         counters["admitted"] = Json::UInt64(admitted); counters["rejected"] = Json::UInt64(rejected);
@@ -726,6 +728,8 @@ void RequestRun::Execute() noexcept {
 } // namespace
 
 int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested) {
+    const auto capability = wire::model_capability(options.backend);
+    if (capability.empty()) throw std::invalid_argument("Unsupported server backend: " + options.backend);
     aila::set_log_level(aila::LogLevel::Warning);
     auto tokenizer = std::make_shared<Tokenizer>();
     if (!tokenizer->load(options.modelDirectory.u8string())) throw std::runtime_error("Could not load the model tokenizer");
@@ -733,12 +737,16 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     clientOptions.handshakeTimeout = 10s;
     clientOptions.commandTimeout = 120s;
     clientOptions.shutdownTimeout = 30s;
+    if (std::find(clientOptions.requiredCapabilities.begin(), clientOptions.requiredCapabilities.end(), capability) ==
+        clientOptions.requiredCapabilities.end()) clientOptions.requiredCapabilities.emplace_back(capability);
     auto client = host::InferenceClient::Start(options.workerExecutable.parent_path(), options.workerExecutable,
                                               options.expectedBuildId, clientOptions);
     host::InferenceModelOptions modelOptions;
     modelOptions.maxSequenceLength = options.contextTokens;
     modelOptions.maxSessions = options.maxSessions;
-    auto model = client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
+    auto model = options.backend == "qwen35_nf4"
+        ? client->LoadQwen35(options.modelDirectory.u8string(), modelOptions)
+        : client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
     if (tokenizer->vocab_size() <= 0 || static_cast<uint32_t>(tokenizer->vocab_size()) > model->Info().vocabSize)
         throw std::runtime_error("Tokenizer vocabulary does not fit the loaded model");
     auto service = std::make_shared<Service>(options, client, model, tokenizer);
@@ -795,6 +803,7 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
         Json::Value ready;
         ready["event"] = "ready"; ready["address"] = "127.0.0.1";
         ready["port"] = service->options.port; ready["model"] = service->options.modelId;
+        ready["backend"] = service->options.backend;
         ready["worker_build_id"] = service->options.expectedBuildId;
         ready["epoch"] = service->client->Snapshot().epoch;
         std::cout << JsonText(ready) << std::endl;

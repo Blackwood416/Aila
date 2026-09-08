@@ -144,7 +144,8 @@ public:
             break;
         case wire::Method::ModelLoad:
             response.model = {++modelId_, 2048, command.maxSequenceLength, 4096,
-                              {"qwen3_nf4_bf16_kv", "token_requests_v1", "session_lifecycle_v1"}};
+                              {std::string(wire::model_capability(command.backend, command.kvType)),
+                               "token_requests_v1", "session_lifecycle_v1"}};
             models_.emplace(response.model.modelId, response.model);
             break;
         case wire::Method::SessionCreate: {
@@ -1086,6 +1087,101 @@ void BrokenWriterAndProcessExitFailure() {
     }
 }
 
+void HybridModelNegotiationAndLoading() {
+    {
+        // The default handshake must still work with a Qwen3-only v2 peer.
+        auto transport = std::make_shared<ControlledTransport>();
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        ExpectError([&] { client->LoadQwen35("C:\\fake-hybrid"); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::ModelLoad) == 0,
+               "Unsupported Hybrid load consumed a wire command or model slot");
+        auto model = client->LoadQwen3("C:\\fake-qwen3");
+        Expect(client->Query().accepting && !transport->Forced(),
+               "Missing optional model capability poisoned the connection");
+        client->Shutdown(2s);
+    }
+    {
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        InferenceModelOptions options;
+        options.maxSequenceLength = 512;
+        options.maxSessions = 2;
+        options.maxSessionCacheBytes = 8192;
+        auto model = client->LoadQwen35("C:\\fake-hybrid", options);
+        const auto command = transport->Take(wire::Method::ModelLoad);
+        Expect(command.backend == "qwen35_nf4" && command.kvType == "bf16" &&
+                   command.maxSequenceLength == 512 && command.maxSessions == 2 && command.maxSessionCacheBytes == 8192,
+               "Hybrid model load options changed in transit");
+        const auto& capabilities = model->Info().capabilities;
+        Expect(std::find(capabilities.begin(), capabilities.end(), "qwen35_nf4_bf16_kv") != capabilities.end() &&
+                   std::find(capabilities.begin(), capabilities.end(), "qwen3_nf4_bf16_kv") == capabilities.end(),
+               "Model capabilities describe a different backend");
+        auto session = model->CreateSession();
+        Expect(session->Query().contextLength == 0 && session->Info().capacity == 512,
+               "Hybrid model did not create an independent empty session");
+        client->Shutdown(2s);
+        Expect(!transport->Forced(), "Hybrid client did not shut down gracefully");
+    }
+    {
+        // Hello offers Hybrid, but configure may select a smaller feature set.
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        transport->Hold(wire::Method::WorkerConfigure);
+        auto connected = std::async(std::launch::async, [&] { return InferenceClient::Connect(transport, ExpectedIdentity()); });
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        auto response = transport->Base(command);
+        response.limits = command.limits;
+        response.capabilities = wire::default_capabilities();
+        response.worker.domainStatus = wire::DomainStatus::Ready;
+        transport->Reply(std::move(response));
+        auto client = Get(connected);
+        ExpectError([&] { client->LoadQwen35("C:\\fake-hybrid"); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::ModelLoad) == 0,
+               "Client used hello instead of the configured model capabilities");
+        auto model = client->LoadQwen3("C:\\fake-qwen3");
+        client->Shutdown(2s);
+    }
+}
+
+void ModelCapabilityMismatchAndConfigureConsistency() {
+    for (const bool hybrid : {false, true}) {
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        transport->Hold(wire::Method::ModelLoad);
+        auto loaded = std::async(std::launch::async, [&] {
+            return hybrid ? client->LoadQwen35("C:\\fake-hybrid") : client->LoadQwen3("C:\\fake-qwen3");
+        });
+        const auto command = transport->Take(wire::Method::ModelLoad);
+        auto response = transport->Base(command);
+        response.model = {1, 2048, command.maxSequenceLength, 4096,
+            {hybrid ? "qwen3_nf4_bf16_kv" : "qwen35_nf4_bf16_kv", "token_requests_v1", "session_lifecycle_v1"}};
+        transport->Reply(std::move(response));
+        ExpectError([&] { Get(loaded); }, ClientErrorCode::ProtocolError);
+        transport->WaitStopped();
+        Expect(transport->Forced(), "Client accepted a model from the wrong backend");
+    }
+    {
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->Hold(wire::Method::WorkerConfigure);
+        auto connected = std::async(std::launch::async, [&] { return InferenceClient::Connect(transport, ExpectedIdentity()); });
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        auto response = transport->Base(command);
+        response.limits = command.limits;
+        response.capabilities = wire::supported_capabilities();
+        response.worker.domainStatus = wire::DomainStatus::Ready;
+        transport->Reply(std::move(response));
+        ExpectError([&] { Get(connected); }, ClientErrorCode::ProtocolError);
+        Expect(transport->Forced(), "Configure published a capability absent from hello");
+    }
+}
+
 void HandshakeAndReusedObjectIds() {
     {
         auto hello = Hello();
@@ -1141,6 +1237,8 @@ int main() {
         {"shared shutdown and abandoned delivery", ShutdownDiscardsAndHasOneSharedResult},
         {"shutdown event fence and EOF races", ShutdownCrossPipeFenceAndEof},
         {"blocked writer and abnormal process exit", BrokenWriterAndProcessExitFailure},
+        {"Hybrid model negotiation and loading", HybridModelNegotiationAndLoading},
+        {"model capability mismatch and configure consistency", ModelCapabilityMismatchAndConfigureConsistency},
         {"handshake rejection and stale object IDs", HandshakeAndReusedObjectIds},
     };
     for (const auto& test : tests) {

@@ -2,7 +2,7 @@
 
 `LoadedModel::LoadQwen35Nf4` 将 Qwen3.5 Hybrid NF4 接入已有 `SessionState / RequestState / Scheduler`。权重与可变 oneDNN 绑定、激活和投影 scratch 共用一个执行槽，设备域的执行锁串行保护该槽。多个会话在完整 prefill 分块、decode 或 finalization 之间轮转。
 
-该入口面向 token 文本推理，要求 BF16 KV。Qwen3.5 的旧 CLI、媒体入口和多行 logits 约定继续通过默认 Session 外观运行。共享 API 尚未提供图像输入、聊天格式化、thinking budget 或新的公共 C ABI；HTTP 推理和多在途 IPC 依照路线图接入。
+该入口面向 token 文本推理，要求 BF16 KV。Qwen3.5 的旧 CLI、媒体入口和多行 logits 约定继续通过默认 Session 外观运行。共享 API 尚未提供图像输入、thinking budget 或新的公共 C ABI。[IPC v2](inference-ipc-v2-implementation.md) 的 `InferenceClient::LoadQwen35` 与 [HTTP/SSE 服务](inference-server.md) 的 `--backend qwen35_nf4` 已接入同一共享后端；聊天格式化在 HTTP 宿主完成。
 
 ## 独立状态与层执行
 
@@ -64,11 +64,13 @@ auto request = scheduler.Submit(session, promptTokens, options);
 
 这些额度不包含权重、共享 workspace、oneDNN/driver 分配、STL/allocator 元数据或网络缓冲，因此不构成完整的进程内存或显存预算。host 快照按需分配，额度按上限预留；快照复制前先淘汰超额的最旧项，避免同时持有第 N+1 份快照 payload。
 
-Forward 与 Reset/Truncate 的执行异常会失效共享设备域。加载和 Session 初始化仍沿用原有异常处理：如果同步设备异常已经在原调用处抛出，后续 drain 成功不能证明故障已记录，也不保证转换为 `RuntimeFault`。完整分类与生命周期故障广播是 [IPC v2](inference-ipc-v2.md) 接入前需要补齐的门禁。
+Forward 与 Reset/Truncate 的设备执行异常会失效共享设备域。加载和 Session 初始化已保留首次同步 SYCL/oneDNN 异常并归一为 `RuntimeFault`；成功发布前还要完成最终 drain。普通文件/配置/准入失败保持局部语义，清理 drain 失败才进一步升级为域故障。生命周期执行器查询析构 drain 留下的首因并向 Scheduler 广播，详细约定见 [IPC v2 故障语义](inference-ipc-v2.md)。
 
 ## 回滚、续写与取消
 
 快照沿用已有时机：多 token prefill 分块结束，以及 decode 长度达到 `AILA_Q35_PREFILL_STEP` 边界（默认 64）。共享会话只保留最近 N 个 checkpoint；旧默认会话保留原有快照策略。
+
+上述默认 4 个快照用于进程内 API。远端 v2 没有 Reset/Truncate 命令，Worker 适配器固定关闭快照，保留续写和必须的 host mirror；HTTP 每次创建独立 Session。以后开放远端回滚时还需要增加实际恢复长度、host 字节准入及对应验收，不能假设已有远端会话可回滚。
 
 `SessionState::Truncate(requestedLength)` 返回实际恢复长度。它选择不大于 requestedLength 的最近保留 checkpoint；没有合适快照时重置为 0。调用者必须从返回位置补算自己的输入历史，不能把请求的长度当作实际缓存长度。例如已有 checkpoint 11、17，在长度 21 时请求截断到 20，实际返回 17。
 

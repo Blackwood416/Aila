@@ -281,6 +281,54 @@ void TestAllCommands() {
     }
 }
 
+void TestModelCapabilities() {
+    const std::vector<std::string> legacy{
+        "token_requests_v1", "qwen3_nf4_bf16_kv", "session_lifecycle_v1", "multi_inflight_v1",
+        "cumulative_ack_v1", "domain_epoch_v1"};
+    Expect(wire::default_capabilities() == legacy, "Legacy Qwen3 required capabilities changed");
+    auto current = legacy;
+    current.emplace_back("qwen35_nf4_bf16_kv");
+    Expect(wire::supported_capabilities() == current, "Worker capabilities omitted Hybrid or changed Qwen3");
+    Expect(wire::model_capability("qwen3_nf4") == "qwen3_nf4_bf16_kv" &&
+           wire::model_capability("qwen35_nf4", "bf16") == "qwen35_nf4_bf16_kv",
+           "Backend capability mapping was incorrect");
+    Expect(wire::model_capability("qwen35_nf4", "fp8").empty() &&
+           wire::model_capability("qwen3_nf4", "BF16").empty() &&
+           wire::model_capability("future_nf4").empty(), "Unknown backend or KV type was advertised");
+
+    wire::Limits selected;
+    wire::ValidationError error;
+    Expect(!wire::negotiate({}, {"qwen35_nf4_bf16_kv"}, {}, legacy, selected, error) &&
+           error.code == wire::ErrorCode::UnsupportedCapability, "Legacy Worker accepted Hybrid requirements");
+    Success(wire::negotiate({}, legacy, {}, current, selected, error), error);
+    Success(wire::negotiate({}, {"qwen35_nf4_bf16_kv"}, {}, current, selected, error), error);
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4"}) {
+        auto command = Command(wire::Method::ModelLoad);
+        command.backend = backend;
+        Frame sent = Make(command);
+        std::vector<std::byte> bytes;
+        Success(wire::encode_frame(sent, bytes, error), error);
+        Frame received;
+        Success(wire::decode_frame(bytes, received, error), error);
+        wire::Command parsed;
+        Success(wire::parse_command(received, parsed, error), error);
+        Expect(parsed.backend == backend && parsed.kvType == "bf16" &&
+               received.header.protocol == 2 && received.header.abi == 1,
+               "NF4 model command round trip changed backend or wire version");
+
+        auto invalid = sent;
+        Replace(invalid.header.payload_json, "\"bf16\"", "\"fp8\"");
+        parsed.rpcId = 999;
+        Expect(!wire::parse_command(invalid, parsed, error) && error.code == wire::ErrorCode::InvalidArgument &&
+               parsed.rpcId == 999, "Invalid KV type lost local error semantics or changed output");
+    }
+    auto invalid = Make(Command(wire::Method::ModelLoad));
+    Replace(invalid.header.payload_json, "\"qwen3_nf4\"", "\"future_nf4\"");
+    wire::Command parsed;
+    Expect(!wire::parse_command(invalid, parsed, error) && error.code == wire::ErrorCode::UnsupportedModel,
+           "Unknown model backend lost local UnsupportedModel semantics");
+}
+
 void TestStrictCommandPayloads() {
     const Frame submit = Make(Command(wire::Method::RequestSubmit));
     std::vector<Frame> invalid;
@@ -313,7 +361,7 @@ void TestStrictCommandPayloads() {
     bad.attachment = {std::byte{0}};
     RejectCommand(bad);
     bad = Make(Command(wire::Method::ModelLoad));
-    Replace(bad.header.payload_json, "\"qwen3_nf4\"", "\"qwen35_nf4\"");
+    Replace(bad.header.payload_json, "\"qwen3_nf4\"", "\"future_nf4\"");
     RejectCommand(bad);
     bad = Make(Command(wire::Method::ModelLoad));
     Replace(bad.header.payload_json, "\"bf16\"", "\"fp8\"");
@@ -385,6 +433,16 @@ void TestResponsesAndHandshake() {
     busy.session.contextLength = 10;
     Expect(!wire::make_response(busy, frame, error), "Busy session reported an exact length");
 
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4"}) {
+        auto result = Result(wire::Method::ModelLoad);
+        result.model.capabilities = {std::string(wire::model_capability(backend))};
+        Success(wire::make_response(result, frame, error), error);
+        wire::Response parsed;
+        Success(wire::parse_response(frame, parsed, error), error);
+        Expect(parsed.model.capabilities == result.model.capabilities,
+               "Model result changed the selected backend capability");
+    }
+
     wire::Hello hello;
     hello.epoch = Epoch;
     hello.buildId = "test-build";
@@ -392,7 +450,7 @@ void TestResponsesAndHandshake() {
     hello.runtimeDirectory = "C:\\runtime";
     hello.currentDirectory = "C:\\runtime";
     hello.path = "C:\\runtime;C:\\Windows\\System32";
-    hello.capabilities = wire::default_capabilities();
+    hello.capabilities = wire::supported_capabilities();
     Success(wire::make_hello(hello, frame, error), error);
     std::vector<std::byte> bytes;
     Success(wire::encode_frame(frame, bytes, error, wire::bootstrap_bounds()), error);
@@ -567,6 +625,7 @@ int main() {
         {"prefix and strict envelope", TestPrefixAndEnvelope},
         {"little endian token attachment", TestLittleEndianTokens},
         {"all eleven commands", TestAllCommands},
+        {"model backends and capability compatibility", TestModelCapabilities},
         {"strict command payloads", TestStrictCommandPayloads},
         {"result schemas and handshake", TestResponsesAndHandshake},
         {"accepted and rejected submit", TestAcceptedAndRejected},

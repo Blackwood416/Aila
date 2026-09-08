@@ -162,12 +162,53 @@ void WriteTokenizer(const fs::path& path, const std::string& chatTemplate, bool 
     Write(path / "tokenizer_config.json", Serialize(config));
 }
 
+void WriteHybridTokenizer(const fs::path& path, bool withVision) {
+    WriteTokenizer(path, "");
+    // Retain the real Qwen3.5-0.8B/4B marker IDs in an otherwise tiny byte
+    // vocabulary. This catches accidental use of Qwen3's hard-coded IDs
+    // without requiring checkpoints or a GPU in the CPU test suite.
+    Json::Value tokenizer(Json::objectValue);
+    tokenizer["added_tokens"] = Json::arrayValue;
+    const std::vector<std::pair<const char*, int>> markers = {
+        {"<|endoftext|>", 248044}, {"<|im_start|>", 248045}, {"<|im_end|>", 248046},
+        {"<|vision_start|>", 248053}, {"<|vision_end|>", 248054}, {"<|image_pad|>", 248056},
+        {"<think>", 248068}, {"</think>", 248069}
+    };
+    for (const auto& [content, id] : markers) {
+        Json::Value token(Json::objectValue);
+        token["content"] = content;
+        token["id"] = id;
+        token["special"] = id != 248068 && id != 248069;
+        tokenizer["added_tokens"].append(std::move(token));
+    }
+    Write(path / "tokenizer.json", Serialize(tokenizer));
+
+    // Metadata mirrors the text-only and vision-dense export layouts. These
+    // tests cover the tokenizer/HTTP boundary, not Worker weight loading.
+    Json::Value textConfig(Json::objectValue);
+    textConfig["model_type"] = "qwen3_5_text";
+    textConfig["eos_token_id"] = 248044;
+    Json::Value config = textConfig;
+    if (withVision) {
+        config = Json::objectValue;
+        config["model_type"] = "qwen3_5";
+        config["architectures"].append("Qwen3_5ForConditionalGeneration");
+        config["text_config"] = textConfig;
+        config["vision_config"]["model_type"] = "qwen3_5_vision";
+    } else {
+        config["architectures"].append("Qwen3_5ForCausalLM");
+    }
+    Write(path / "config.json", Serialize(config));
+}
+
 struct Fixture {
     TempDirectory directory;
     Tokenizer tokenizer;
     Tokenizer fallback;
     Tokenizer noEos;
     Tokenizer brokenTemplate;
+    Tokenizer hybrid;
+    Tokenizer hybridVision;
     ChatSettings settings;
 
     Fixture() {
@@ -176,10 +217,14 @@ struct Fixture {
         WriteTokenizer(directory.path / "fallback", "");
         WriteTokenizer(directory.path / "no-eos", "safe", false);
         WriteTokenizer(directory.path / "broken", "{{");
+        WriteHybridTokenizer(directory.path / "hybrid-text", false);
+        WriteHybridTokenizer(directory.path / "hybrid-vision", true);
         Expect(tokenizer.load((directory.path / "trusted").string()), "Could not load trusted tokenizer fixture");
         Expect(fallback.load((directory.path / "fallback").string()), "Could not load fallback tokenizer fixture");
         Expect(noEos.load((directory.path / "no-eos").string()), "Could not load tokenizer without EOS");
         Expect(brokenTemplate.load((directory.path / "broken").string()), "Could not load tokenizer with invalid template");
+        Expect(hybrid.load((directory.path / "hybrid-text").string()), "Could not load Hybrid text tokenizer fixture");
+        Expect(hybridVision.load((directory.path / "hybrid-vision").string()), "Could not load Hybrid vision tokenizer fixture");
         Expect(tokenizer.vocab_size() == 261, "Byte tokenizer fixture has the wrong vocabulary size");
     }
 
@@ -321,19 +366,23 @@ struct OutputRun {
     std::vector<std::string> frames;
 };
 
-OutputRun RunOutput(const std::string& text, size_t chunkSize, bool stream = true,
-                    bool usage = true, bool reasoning = false) {
-    const auto prepared = OutputRequest(stream, usage, reasoning);
+OutputRun RunOutput(const PreparedChat& prepared, const std::string& text, size_t chunkSize,
+                    wire::EndReason reason = wire::EndReason::StopToken) {
     ChatOutput output(Identity(), prepared);
     OutputRun run;
     Append(run.frames, output.Begin());
     for (size_t offset = 0; offset < text.size(); offset += chunkSize) {
         Append(run.frames, output.PushText(std::string_view(text).substr(offset, chunkSize)));
     }
-    run.completion = output.Finish(Summary(prepared));
+    run.completion = output.Finish(Summary(prepared, 5, reason));
     Append(run.frames, run.completion.sseFrames);
     Expect(!run.completion.failed && run.completion.httpStatus == 200, "Valid output failed: " + run.completion.json);
     return run;
+}
+
+OutputRun RunOutput(const std::string& text, size_t chunkSize, bool stream = true,
+                    bool usage = true, bool reasoning = false) {
+    return RunOutput(OutputRequest(stream, usage, reasoning), text, chunkSize);
 }
 
 void DefaultsAndTemplate(const Fixture& fixture) {
@@ -572,6 +621,271 @@ void PromptAndServerLimits(const Fixture& fixture) {
     const auto fallback = PrepareChat(Serialize(body), fixture.fallback, fixture.settings);
     const auto expected = fixture.fallback.encode("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n");
     Expect(fallback.promptIds == std::vector<int32_t>(expected.begin(), expected.end()), "Fixed fallback template was not applied");
+}
+
+ChatSettings HybridSettings(const Fixture& fixture) {
+    auto settings = fixture.settings;
+    settings.family = ModelFamily::Qwen35Hybrid;
+    return settings;
+}
+
+std::string HybridGenerationPrompt(bool thinking) {
+    return std::string("<|im_start|>assistant\n") + (thinking ? "<think>\n" : "<think>\n</think>\n");
+}
+
+void ExpectPrompt(const Tokenizer& tokenizer, const PreparedChat& prepared, const std::string& expected,
+                  const std::string& message) {
+    const auto ids = tokenizer.encode(expected);
+    if (prepared.promptIds == std::vector<int32_t>(ids.begin(), ids.end())) return;
+    std::string actual;
+    for (const int32_t id : prepared.promptIds) {
+        const auto raw = tokenizer.raw_token(id);
+        actual += tokenizer.special_token_id(raw) == id ? raw : tokenizer.decode(id);
+    }
+    throw std::runtime_error(message + "\nExpected prompt: " + Serialize(Json::Value(expected)) +
+                             "\nActual prompt: " + Serialize(Json::Value(actual)));
+}
+
+void HybridFallbackAndEos(const Fixture& fixture) {
+    const auto settings = HybridSettings(fixture);
+    Expect(fixture.settings.family == ModelFamily::Qwen3Dense, "Existing service settings no longer default to Qwen3");
+    Expect(fixture.hybrid.chat_template().empty(), "Hybrid fallback fixture unexpectedly has a checkpoint template");
+    Expect(fixture.hybrid.decode(248068) == "<think>" && fixture.hybrid.decode(248069) == "</think>" &&
+           fixture.hybrid.decode(248044).empty() && fixture.hybrid.decode(248046).empty(),
+           "Hybrid tokenizer must expose reasoning markers to ChatOutput and suppress terminal tokens");
+    auto body = Request();
+    body["messages"][0]["content"] = "  Hi  ";
+    const auto omitted = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    Expect(!omitted.startsInReasoning && omitted.chatRequest.template_options.enable_thinking == false,
+           "Hybrid HTTP thinking must default to false independent of model size");
+    for (bool thinking : {false, true}) {
+        body["enable_thinking"] = thinking;
+        const auto prepared = PrepareChat(Serialize(body), fixture.hybrid, settings);
+        ExpectPrompt(fixture.hybrid, prepared, "<|im_start|>user\nHi<|im_end|>\n" + HybridGenerationPrompt(thinking),
+                     "Hybrid fallback did not render the fixed family template exactly");
+        Expect(prepared.startsInReasoning == thinking && prepared.chatRequest.template_options.enable_thinking == thinking,
+               "Hybrid thinking option and generation prefix disagree");
+        if (!thinking) Expect(prepared.promptIds == omitted.promptIds, "Omitted and false Hybrid thinking differ");
+        Expect(prepared.options.stopTokenIds == std::vector<int32_t>({248046, 248044}),
+               "Hybrid must stop on both im_end and endoftext using checkpoint marker IDs");
+        Expect(std::find(prepared.promptIds.begin(), prepared.promptIds.end(), 248068) != prepared.promptIds.end(),
+               "Hybrid opening marker was split despite being an added token");
+        Expect((std::find(prepared.promptIds.begin(), prepared.promptIds.end(), 248069) == prepared.promptIds.end()) == thinking,
+               "Hybrid closing marker did not follow the thinking flag");
+        Expect(prepared.chatRequest.template_options.template_override_text.empty() &&
+               prepared.chatRequest.template_options.template_override_path.empty(), "Trusted Hybrid fallback leaked into public request options");
+    }
+}
+
+void HybridHistoryAndTextParts(const Fixture& fixture) {
+    const auto settings = HybridSettings(fixture);
+    auto body = Request();
+    body["messages"] = Json::arrayValue;
+    const auto addMessage = [&](const char* role, const std::string& content) {
+        Json::Value message(Json::objectValue);
+        message["role"] = role;
+        message["content"] = content;
+        body["messages"].append(std::move(message));
+    };
+    addMessage("developer", "  Be brief.  ");
+    addMessage("user", " First ");
+    addMessage("assistant", "<think>\nprevious reasoning\n</think>\n\nFirst answer");
+    addMessage("user", "Next");
+    addMessage("assistant", "Partial answer");
+    body["messages"][4]["reasoning_content"] = "current reasoning";
+    const auto unicode = Utf8(0x4e16) + Utf8(0x754c);
+    auto& parts = body["messages"][3]["content"];
+    parts = Json::arrayValue;
+    Json::Value part(Json::objectValue);
+    part["type"] = "text";
+    part["text"] = "  Next ";
+    parts.append(part);
+    part["text"] = unicode + "  ";
+    parts.append(part);
+    const std::string expectedHistory =
+        "<|im_start|>system\nBe brief.<|im_end|>\n"
+        "<|im_start|>user\nFirst<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nprevious reasoning\n</think>\n\nFirst answer<|im_end|>\n"
+        "<|im_start|>user\nNext " + unicode + "<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\ncurrent reasoning\n</think>\n\nPartial answer<|im_end|>\n";
+    for (bool thinking : {false, true}) {
+        body["enable_thinking"] = thinking;
+        const auto prepared = PrepareChat(Serialize(body), fixture.hybrid, settings);
+        ExpectPrompt(fixture.hybrid, prepared, expectedHistory + HybridGenerationPrompt(thinking),
+                     "Hybrid history must preserve supplied assistant reasoning and normalize developer/text parts");
+        // ChatTemplateOptions defaults to preserving history, and the engine
+        // always passes that value to Jinja. The template's undefined-variable
+        // fallback does not override the HTTP/CLI request default.
+        Expect(prepared.chatRequest.template_options.preserve_thinking,
+               "Hybrid HTTP history no longer follows the shared preserve_thinking default");
+        Expect(prepared.chatRequest.messages[2].content[0].text.find("previous reasoning") != std::string::npos &&
+               prepared.chatRequest.messages[3].content[0].text == "  Next " + unicode + "  " &&
+               prepared.chatRequest.messages[4].reasoning_content == "current reasoning",
+               "Rendering must not mutate normalized input history");
+        Expect(prepared.startsInReasoning == thinking, "Historical reasoning changed the next generation channel");
+    }
+    body["messages"][2]["content"] = "First answer";
+    body["messages"][2]["reasoning_content"] = "previous reasoning";
+    const auto separate = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    ExpectPrompt(fixture.hybrid, separate, expectedHistory + HybridGenerationPrompt(true),
+                 "Inline and separate assistant reasoning history must produce the same complete prompt");
+
+    auto literal = Request();
+    literal["messages"][0]["content"] = "Quote <think>user text</think> exactly.";
+    const auto quoted = PrepareChat(Serialize(literal), fixture.hybrid, settings);
+    ExpectPrompt(fixture.hybrid, quoted,
+                 "<|im_start|>user\nQuote <think>user text</think> exactly.<|im_end|>\n" + HybridGenerationPrompt(false),
+                 "Hybrid history rendering altered literal tags in a user message");
+    Expect(!quoted.startsInReasoning, "A user-quoted reasoning marker became the output channel");
+}
+
+void HybridTrustedTemplate(const Fixture& fixture) {
+    const auto settings = HybridSettings(fixture);
+    for (bool thinking : {false, true}) {
+        auto body = Request();
+        body["enable_thinking"] = thinking;
+        const auto prepared = PrepareChat(Serialize(body), fixture.tokenizer, settings);
+        ExpectPrompt(fixture.tokenizer, prepared,
+                     "TRUSTED|<|im_start|>user\nHi<|im_end|>\n" + HybridGenerationPrompt(thinking),
+                     "A trusted checkpoint template must take precedence over the Hybrid fallback");
+    }
+
+    const std::string templatePrefix =
+        "{%- for message in messages -%}"
+        "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}"
+        "{%- endfor -%}{{- '<|im_start|>assistant\\n' -}}";
+    struct Suffix {
+        const char* source;
+        const char* rendered;
+        bool thinking;
+        bool startsInReasoning;
+    };
+    const std::vector<Suffix> suffixes = {
+        {"{{- '<think>\\n' -}}", "<think>\n", false, true},
+        {"{{- '<think>\\n</think>\\n' -}}", "<think>\n</think>\n", true, false},
+        {"", "", true, false}
+    };
+    TempDirectory directory;
+    for (size_t index = 0; index < suffixes.size(); ++index) {
+        const auto& suffix = suffixes[index];
+        const auto path = directory.path / std::to_string(index);
+        WriteTokenizer(path, templatePrefix + suffix.source);
+        Tokenizer tokenizer;
+        Expect(tokenizer.load(path.string()), "Could not load checkpoint generation-prefix fixture");
+        auto body = Request();
+        body["messages"][0]["content"] = "literal <think>";
+        body["enable_thinking"] = suffix.thinking;
+        const auto prepared = PrepareChat(Serialize(body), tokenizer, settings);
+        ExpectPrompt(tokenizer, prepared,
+                     std::string("<|im_start|>user\nliteral <think><|im_end|>\n<|im_start|>assistant\n") + suffix.rendered,
+                     "Checkpoint generation suffix changed during Hybrid preparation");
+        Expect(prepared.startsInReasoning == suffix.startsInReasoning,
+               "Output reasoning state must come from the rendered suffix, not the request flag or a history marker");
+    }
+}
+
+void HybridPreparedOutputParity(const Fixture& fixture) {
+    const auto settings = HybridSettings(fixture);
+    const std::string thought = "\n" + Utf8(0x63a8) + Utf8(0x7406) + Utf8(0x1f642) + "  \n";
+    const std::string visible = "\n" + Utf8(0x7b54) + Utf8(0x6848) + " <tag>ok</tag>";
+    struct Scenario {
+        bool thinking;
+        const char* control;
+        bool startsInReasoning;
+        std::string output;
+        std::string reasoning;
+        std::string content;
+        wire::EndReason reason = wire::EndReason::StopToken;
+    };
+    const std::vector<Scenario> scenarios = {
+        {false, "", false, visible, "", visible},
+        {true, "", true, thought + "</think>" + visible, thought, visible},
+        {false, "<|think_on|>", true, thought + "</think>" + visible, thought, visible},
+        {true, "<|think_off|>", false, visible, "", visible},
+        {true, "", true, thought, thought, "", wire::EndReason::Length}
+    };
+    for (const auto& scenario : scenarios) {
+        auto body = Request();
+        body["max_tokens"] = 32;
+        body["enable_thinking"] = scenario.thinking;
+        body["messages"][0]["content"] = std::string("Hi ") + scenario.control;
+        const auto plainRequest = PrepareChat(Serialize(body), fixture.hybrid, settings);
+        body["stream"] = true;
+        body["stream_options"]["include_usage"] = true;
+        const auto streamRequest = PrepareChat(Serialize(body), fixture.hybrid, settings);
+        Expect(plainRequest.startsInReasoning == scenario.startsInReasoning &&
+               streamRequest.startsInReasoning == scenario.startsInReasoning && plainRequest.promptIds == streamRequest.promptIds,
+               "Prepared Hybrid stream/plain requests disagree on the rendered reasoning state");
+        const auto nonstream = RunOutput(plainRequest, scenario.output, scenario.output.size(), scenario.reason);
+        Expect(nonstream.frames.empty(), "Nonstream Hybrid completion emitted SSE");
+        const auto expected = Parse(nonstream.completion.json);
+        const auto& message = expected["choices"][0]["message"];
+        Expect(message["content"].asString() == scenario.content && message["reasoning_content"].asString() == scenario.reasoning,
+               "Hybrid generation prefix leaked reasoning into visible content or discarded text");
+        for (size_t chunk : {size_t(1), size_t(2), size_t(7), scenario.output.size()}) {
+            const auto streamed = RunOutput(streamRequest, scenario.output, chunk, scenario.reason);
+            const auto view = Inspect(streamed.frames, true);
+            Expect(view.content == scenario.content && view.reasoning == scenario.reasoning &&
+                   view.roles == 1 && view.done == 1 && view.finishes == 1 && view.usageChunks == 1 && view.errors == 0,
+                   "Token-fragmented Hybrid output differs from its prepared reasoning contract");
+            Expect(view.finishReason == (scenario.reason == wire::EndReason::Length ? "length" : "stop") &&
+                   view.usage == expected["usage"] && Parse(streamed.completion.json) == expected,
+                   "Hybrid JSON and SSE completion, finish reason, or usage disagree");
+        }
+    }
+}
+
+void HybridVisionTextBoundary(const Fixture& fixture) {
+    const auto settings = HybridSettings(fixture);
+    auto body = Request();
+    body["messages"][0]["content"] = Json::arrayValue;
+    Json::Value text(Json::objectValue);
+    text["type"] = "text";
+    text["text"] = "Describe this text.";
+    body["messages"][0]["content"].append(text);
+    const auto textOnly = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    const auto visionExport = PrepareChat(Serialize(body), fixture.hybridVision, settings);
+    Expect(visionExport.promptIds == textOnly.promptIds && visionExport.options.stopTokenIds == textOnly.options.stopTokenIds,
+           "Vision architecture metadata changed the pure-text HTTP tokenizer path");
+    for (const int marker : {248053, 248054, 248056}) {
+        Expect(std::find(visionExport.promptIds.begin(), visionExport.promptIds.end(), marker) == visionExport.promptIds.end(),
+               "Pure-text Hybrid request received an implicit vision marker");
+    }
+    for (const char* type : {"image", "image_url", "video", "audio", "input_audio"}) {
+        auto media = body;
+        media["messages"][0]["content"][0]["type"] = type;
+        ExpectError([&] { PrepareChat(Serialize(media), fixture.hybridVision, settings); },
+                    400, "unsupported_content_type", "messages[0].content[0].type");
+    }
+    auto image = body;
+    image["messages"][0]["content"][0].removeMember("text");
+    image["messages"][0]["content"][0]["type"] = "image_url";
+    image["messages"][0]["content"][0]["image_url"]["url"] = "file:///not-loaded.png";
+    ExpectError([&] { PrepareChat(Serialize(image), fixture.hybridVision, settings); },
+                400, "unsupported_parameter", "messages[0].content[0].image_url");
+}
+
+void HybridLimitsAndTemplateFailures(const Fixture& fixture) {
+    auto settings = HybridSettings(fixture);
+    auto body = Request();
+    body["max_tokens"] = 1;
+    const auto baseline = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    settings.maxPromptTokens = static_cast<uint32_t>(baseline.promptIds.size());
+    settings.maxContextTokens = settings.maxPromptTokens + 1;
+    Expect(PrepareChat(Serialize(body), fixture.hybrid, settings).promptIds == baseline.promptIds,
+           "Exact Hybrid prompt/context boundary was rejected");
+    --settings.maxContextTokens;
+    ExpectError([&] { PrepareChat(Serialize(body), fixture.hybrid, settings); }, 400, "context_length_exceeded");
+    settings = HybridSettings(fixture);
+    ExpectError([&] { PrepareChat(Serialize(body), fixture.brokenTemplate, settings); }, 500, "chat_template_failed");
+    ExpectError([&] { PrepareChat(Serialize(body), fixture.noEos, settings); }, 500, "tokenizer_failed");
+    body["chat_template_kwargs"]["enable_thinking"] = true;
+    ExpectError([&] { PrepareChat(Serialize(body), fixture.hybrid, settings); },
+                400, "unsupported_parameter", "chat_template_kwargs");
+    body.removeMember("chat_template_kwargs");
+    body["enable_thinking"] = 1;
+    ExpectError([&] { PrepareChat(Serialize(body), fixture.hybrid, settings); },
+                400, "invalid_parameter", "enable_thinking");
 }
 
 void NonstreamAndSseSchema() {
@@ -932,6 +1246,12 @@ int main() {
             {"message shape validation", [&] { InvalidMessages(fixture); }},
             {"sampling and option validation", [&] { InvalidParameters(fixture); }},
             {"prompt and service configuration limits", [&] { PromptAndServerLimits(fixture); }},
+            {"Hybrid fallback, thinking, and checkpoint EOS IDs", [&] { HybridFallbackAndEos(fixture); }},
+            {"Hybrid history and text parts", [&] { HybridHistoryAndTextParts(fixture); }},
+            {"Hybrid trusted templates and rendered reasoning state", [&] { HybridTrustedTemplate(fixture); }},
+            {"Hybrid prepared JSON and SSE parity", [&] { HybridPreparedOutputParity(fixture); }},
+            {"Hybrid vision metadata and text-only boundary", [&] { HybridVisionTextBoundary(fixture); }},
+            {"Hybrid limits and template failures", [&] { HybridLimitsAndTemplateFailures(fixture); }},
             {"nonstream and SSE schema", NonstreamAndSseSchema},
             {"fragmentation and reasoning channels", FragmentationAndReasoning},
             {"unsolicited tools retained as text", ToolBlocksRemainText},

@@ -113,6 +113,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
     mutable std::mutex mutex;
     std::condition_variable changed;
     wire::Hello hello;
+    std::vector<std::string> capabilities;
     bool helloSeen = false;
     bool configured = false;
     bool dead = false;
@@ -341,6 +342,14 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
         wire::ValidationError error;
         if (!wire::make_command(command, frame, error, limits)) {
             throw InferenceClientError(ClientErrorCode::RemoteError, error.message, error.code);
+        }
+        if (command.method == wire::Method::ModelLoad) {
+            const auto capability = wire::model_capability(command.backend, command.kvType);
+            if (std::find(capabilities.begin(), capabilities.end(), capability) == capabilities.end()) {
+                throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate the requested model capability: " + std::string(capability),
+                    wire::ErrorCode::UnsupportedCapability);
+            }
         }
         command.rpcId = 0;
     }
@@ -574,7 +583,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                     require(response.model.maxSequenceLength <= item->command.maxSequenceLength,
                             "Loaded model capacity exceeds the requested capacity");
                     require(std::find(response.model.capabilities.begin(), response.model.capabilities.end(),
-                                      "qwen3_nf4_bf16_kv") != response.model.capabilities.end(),
+                                      wire::model_capability(item->command.backend, item->command.kvType)) != response.model.capabilities.end(),
                             "Loaded model does not support the requested backend/KV type");
                     lastModelId = response.model.modelId;
                 }
@@ -882,7 +891,12 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (dead) throw InferenceClientError(failureCode, failure, failureRemoteCode);
+                for (const auto& capability : response.capabilities) {
+                    require(std::find(hello.capabilities.begin(), hello.capabilities.end(), capability) != hello.capabilities.end(),
+                            "Worker configured a capability absent from its hello");
+                }
                 limits = response.limits;
+                capabilities = std::move(response.capabilities);
                 configured = true;
                 if (status == wire::DomainStatus::Starting) status = wire::DomainStatus::Ready;
             }
@@ -1058,9 +1072,21 @@ std::shared_ptr<InferenceClient> InferenceClient::Connect(
 
 std::shared_ptr<InferenceModel> InferenceClient::LoadQwen3(
     const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
+    return LoadNf4("qwen3_nf4", directory, options, timeout);
+}
+
+std::shared_ptr<InferenceModel> InferenceClient::LoadQwen35(
+    const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
+    return LoadNf4("qwen35_nf4", directory, options, timeout);
+}
+
+std::shared_ptr<InferenceModel> InferenceClient::LoadNf4(
+    const std::string& backend, const std::string& directory, InferenceModelOptions options,
+    std::chrono::milliseconds timeout) {
     OperationOwner operation(connection_);
     wire::Command command;
     command.method = wire::Method::ModelLoad;
+    command.backend = backend;
     command.modelDirectory = directory;
     command.maxSequenceLength = options.maxSequenceLength;
     command.maxSessions = options.maxSessions;

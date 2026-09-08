@@ -84,7 +84,7 @@ void CancelIo(std::thread& thread) noexcept {
 int RunInferenceWorker(HANDLE commandRead, HANDLE responseWrite, HANDLE eventWrite, wire::Hello hello,
                        std::unique_ptr<InferenceModelFactory> factory) {
     hello.epoch = NewEpoch();
-    hello.capabilities = wire::default_capabilities();
+    hello.capabilities = wire::supported_capabilities();
     hello.hardLimits = wire::hard_limits();
     ipc::Frame handshake;
     wire::ValidationError validation;

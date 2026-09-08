@@ -1,6 +1,6 @@
 # 重构验证入口与 P0 基线
 
-核对日期：2026-09-07。本文记录当前源码的实际入口，区分已执行结果与待补门禁。第 6 节保留 P1/P2 首批结果，第 8 节保留 Qwen3 LayerPlan、Scheduler 与 HTTP 探针结果，第 9 节记录 Qwen3.5 Hybrid 共享会话及分组状态竞争修复。GPU 验证由集成负责人串行执行；子代理只执行本页 CPU 白名单。
+核对日期：2026-09-08。本文记录当前源码的实际入口，区分已执行结果与待补门禁。第 6 节保留 P1/P2 首批结果，第 8 节保留 Qwen3 LayerPlan、Scheduler 与 HTTP 探针结果，第 9 节记录 Hybrid 共享会话及分组状态竞争修复，第 10–11 节保留 Qwen3 IPC/HTTP 首片，第 12 节记录 Hybrid 远端与服务接入。GPU 验证由集成负责人串行执行；子代理仅执行明确分配的 CPU 验证。
 
 ## 1. 固定输入与构建
 
@@ -457,3 +457,65 @@ Trantor 扩展读取实际 memory/async write 节点，包含普通 HTTP 输出�
 补丁后同一 Channel 测试 4/4 通过：两种禁用场景都是 read=1/write=0/order=rq，两种保留写订阅的对照仍为 read=1/write=1/order=rwq，全部实际观察到 revents=0x5。完整普通宿主四个 CTest 通过，总计 7.59 秒，32 个编译对象的头文件依赖均有效。证据为 `build-refactor-server/server-channel-fixed-tests.log` 及其明细。
 
 加入日志门禁后，完整 fake socket 11/11（用例合计 21.01 秒）与 GPU socket 7/7（22.70 秒）均通过，`framework_errors=[]`，分别在 `tmp/refactor/server-sockets-channel-fake` 与 `server-sockets-channel-gpu`。Fake 仍观察到 63,855 B pending / 4,249 B handoff；主进程 388/388、GPU 143/143 个连接正常收尾，请求/IPC 计数归零。独立故障 Worker 用例保持退出码 2 与 idle=true，未出现框架错误。补丁前后原始输出与失败证据均未覆盖；修复提交前快照为 `tmp/refactor/server-channel-precommit-provenance.json`。
+
+## 12. Qwen3.5 Hybrid 远端与 HTTP/SSE
+
+本批在 `8ec6a3e` 基础上增加 `qwen35_nf4` / `qwen35_nf4_bf16_kv` 能力，复用已有 IPC v2 schema、Worker 生命周期、Scheduler 和 Hybrid 共享 Session。普通 C++ 客户端新增 `LoadQwen35`，Server 新增 `--backend qwen35_nf4`，默认 HTTP 模型名为 `qwen3.5`。原 Qwen3 参数、默认握手、v1 Worker/Proxy 和公共 C ABI 保留。本批没有修改 NF4/DeltaNet 算子或 in-order queue。
+
+### 构建与 CPU 门禁
+
+| 检查 | 实际结果 | 证据 |
+| --- | --- | --- |
+| 完整 Worker Release 构建 | 通过，oneAPI 2026.1.0 / oneDNN 3.11.2 | `build-refactor/hybrid-remote-worker-build.log` |
+| 根构建目录的协议、调度、故障、Client、真实 pipe 与兼容门禁 | 12/12，通过，27.47 秒 | `build-refactor/hybrid-remote-cpu-tests.log`、`hybrid-remote-cpu-details.log` |
+| 普通 MSVC C++17 Server 构建 | 通过，32 个 C++ 对象的 Ninja 头文件依赖有效 | `build-refactor-server/hybrid-remote-server-build.log`、`hybrid-history-corrected-build.log` |
+| 普通宿主完整 CPU CTest | 4/4，通过，10.61 秒；Channel 4 组、ChatCodec 25 组、Client 18 组、真实 pipe 8 组 | `build-refactor-server/hybrid-remote-cpu-corrected-tests.log`、对应 `details.log` |
+| 宿主 PE 导入 | 仅 Windows/MSVC/UCRT，无 SYCL/oneDNN 导入 | `build-refactor-server/hybrid-remote-dependents.log` |
+
+协议测试共 12 组，确认新增 backend 的严格编解码、默认 Qwen3 能力兼容、未知后端与 KV 的局部拒绝。Worker 的 7 个后端场景分别对 Q3/Q35 执行，连同公共控制场景共 15 个；覆盖正确工厂分发、加载失败恢复、独立 Session/续写、准入、背压和生命周期。Client 验证 Qwen3-only peer、hello/configure 能力子集、缺少可选能力不发送命令、不污染连接，以及错误模型能力触发协议故障。真实 CPU 子进程测试增加 Hybrid 分发/续写，重复创建关闭轮换两种后端。
+
+首次 ChatCodec 结果为 24/25：新增历史测试错误地假设会剥离旧 assistant reasoning。实际 `ChatTemplateOptions::preserve_thinking` 默认 true，且模板引擎显式传入该值；本批没有改变它。测试改为逐 token 精确验证 inline 与独立 reasoning 字段产生相同的保留历史 prompt。原失败和 Actual/Expected 诊断保存在 `hybrid-remote-cpu-details.log`、`hybrid-history-diagnostic-cpu.log`；修正后单独 25/25 和完整四项 CPU 门禁均通过，没有放宽匹配要求。
+
+### 真实 GPU IPC
+
+所有 GPU 运行串行执行，设备仍为 Intel Arc A770、驱动 `32.0.101.8974`，两个 KV 环境设置均为 0，context 固定 512。共用 `AilaQwen3IpcSessionTests` 可执行文件；CTest 的 Hybrid alias 传 `--backend qwen35_nf4`。
+
+| 模型 | 全套结果 | 耗时 | 证据 |
+| --- | --- | ---: | --- |
+| Qwen3.5-0.8B NF4 | 通过 | 76.72 秒 | `build-refactor/hybrid-remote-ipc-08b-tests.log`、`hybrid-remote-ipc-08b-details.log` |
+| Qwen3.5-4B NF4 | 通过 | 116.12 秒 | `build-refactor/hybrid-remote-ipc-q3-4b-tests.log`、`hybrid-remote-ipc-q3-4b-details.log` |
+| Qwen3-0.6B NF4 回归 | 通过 | 75.12 秒 | 同上 Q3/4B 合并日志 |
+
+每个后端先用直接 `RequestState::Step()` 生成四个独立参考，释放全部直接模型/会话资源后才启动 Worker。Hybrid 初始 prefill 块为 1/8/16/32，续写块为 1/3，生成 20/23/26/29 token 后各追加 5 token；混合 greedy、独立 seed 和 penalties。1/2/4 并发的全部生成与续写 token 必须和各自参考精确一致，同时核验容量、device reservation 和实际 contextLength。
+
+另验证取消 A 后 B 保持参考结果、未读的 256-token 请求背压与私有排空、两轮填满四槽后全部释放重建并轮换 prompt/seed、父句柄释放后请求继续完成，以及旧 Worker 退出后新 epoch reload 的生成/续写。该对照证明远端传输、排程与直接执行一致；它不是另一个独立算子实现或 Transformers 的数值参考。
+
+| Hybrid 模型，context 512 | 每 Session device cache/state payload | 每 Session host mirror payload，零快照 |
+| --- | ---: | ---: |
+| 0.8B | 26,492,928 B | 20,201,472 B |
+| 4B | 69,468,160 B | 52,690,944 B |
+
+远端没有 Reset/Truncate 命令，因此固定 `maxRecurrentSnapshots=0`。这些数字来自模型公共预算查询；host mirror 仍必需且仅受最多四个 Session 的数量限制，不在 IPC 的 device 字节额度内。进程内默认四快照的回滚行为保持原状。payload 不含权重、共享 scratch、allocator 和 oneDNN/driver 分配，不代表总 RSS 或显存。
+
+### 真实 HTTP/SSE socket
+
+Server 使用 context 512、四请求槽、最多 256 生成 token、1 MiB 输出预算、64 KiB Trantor 门限。扩展后的 runner 默认执行全套，新增多轮文本与 thinking false/true 的 JSON/SSE 对照；下面各报告均为 `full_suite=true`，没有排除用例。
+
+| 模式/模型 | 结果 | 用例合计耗时 | 证据目录 |
+| --- | --- | ---: | --- |
+| Hybrid fake Worker | 12/12 | 22.32 秒 | `tmp/refactor/hybrid-http-fake` |
+| Hybrid 0.8B GPU | 8/8 | 27.05 秒 | `tmp/refactor/hybrid-http-08b` |
+| Hybrid 4B GPU | 8/8 | 36.29 秒 | `tmp/refactor/hybrid-http-4b` |
+| Qwen3-0.6B GPU 回归 | 8/8 | 23.78 秒 | `tmp/refactor/hybrid-http-q3` |
+
+全部覆盖健康/模型/参数、分片 UTF-8 SSE、JSON/SSE 的完整 content/reasoning/finish/usage 一致、1/2/4 并发独立 seed、multi-turn 历史和 text part 归一化、thinking 模式切换后新请求的隔离、Connection close/100 Continue、复用/pipeline、断连隔离与活动请求关闭。HTTP 不暴露原始 token ID，逐 token 参考来自前述 IPC 门禁；没有把 JSON 与 SSE 相等解读为答案质量评估。
+
+Fake 额外验证慢读暂停后恢复、持续停读取消且不影响 B、429 与槽位复用，以及 Worker 崩溃的单次错误终态。观察到最大 **63,885 B pending / 4,261 B handoff**，分别低于 65,536 / 16,384 B 门限。主进程最后关闭 408/408 个连接；0.8B、4B、Q3 分别关闭 146/146、235/235、146/146 个连接。全部 `framework_errors=[]`，正常运行无强制 kill，活动请求与 IPC outstanding/pending 均归零。独立 fake 故障用例仍以非优雅关闭保留 Worker 崩溃语义。
+
+本地 Hybrid checkpoint 的 `tokenizer_config.json` 没有内嵌模板，服务显式使用项目 `qwen35-fixed-v20`；不读取独立 `.jinja`，也不宣称与其 prompt token 相同。默认 `preserve_thinking=true`、文本开关覆盖、checkpoint 模板优先、双 EOS（248046/248044）和纯文本边界有独立 CPU 测试。vision 元数据用例只验证 Tokenizer/HTTP 的文本边界，不代表媒体或 vision 权重的远端验收。
+
+### 身份、证据与后续边界
+
+提交前 metadata 的 Git 身份仍为 `8ec6a3e`，实际候选源码、diff、三模型文件哈希、二进制、依赖、驱动与日志记录在 `tmp/refactor/hybrid-remote-precommit-provenance.json`。提交后的匹配重建身份与补充验收另存 `tmp/refactor/hybrid-remote-final-provenance.json`；每个快照复制相应构建日志，原第 9–11 节证据和本轮失败诊断均保留。
+
+以上耗时包含启动、冷/JIT 和验证工作，不是吞吐或延迟性能基准。本批仍为本机纯文本、一个共享模型、最多四个交替推进请求；长上下文、长期创建释放、完整内存预算和服务延迟分布属于后续 P6，BF16 权重策略、工具/媒体/thinking budget、远端回滚和连续合批尚未开放。

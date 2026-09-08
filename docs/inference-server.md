@@ -1,8 +1,8 @@
-# C++ Qwen3 HTTP/SSE 服务
+# C++ Qwen3 / Qwen3.5 Hybrid HTTP/SSE 服务
 
-`AilaServer` 是 Windows x64、普通 MSVC C++17 的本地文本服务，通过 [InferenceClient / IPC v2](inference-ipc-v2-implementation.md) 启动独立 `AilaWorker.exe`。Worker 加载一份 Qwen3 NF4 权重，最多服务 4 个独立 BF16 KV Session；每次 HTTP 请求创建新 Session。多轮聊天通过 `messages` 传入完整历史。
+`AilaServer` 是 Windows x64、普通 MSVC C++17 的本地文本服务，通过 [InferenceClient / IPC v2](inference-ipc-v2-implementation.md) 启动独立 `AilaWorker.exe`。Worker 加载一份 Qwen3 或 Qwen3.5 Hybrid NF4 权重，最多服务 4 个独立 BF16 KV Session；Hybrid 的 DeltaNet 递归矩阵、卷积历史和 host mirror 也归各 Session。每次 HTTP 请求创建新 Session，多轮聊天通过 `messages` 传入完整历史。
 
-服务固定监听 `127.0.0.1`，支持 HTTP/1.1。宿主不链接 AilaLib、SYCL 或 oneDNN；设备运行时留在 Worker 进程中。并发请求由已有 Scheduler 交替推进，当前没有连续合批。实际验收范围见 [验证记录](refactor-validation.md) 第 11 节。
+服务固定监听 `127.0.0.1`，支持 HTTP/1.1。宿主不链接 AilaLib、SYCL 或 oneDNN；设备运行时留在 Worker 进程中。并发请求由已有 Scheduler 交替推进，当前没有连续合批。实际验收范围见 [验证记录](refactor-validation.md) 第 11–12 节。
 
 ## 构建与运行
 
@@ -28,13 +28,20 @@ $env:AILA_VLM_KV_QUANT = '0'
 ./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaWorker.exe --model ./models/qwen3-0.6B-bnb-nf4-offline --port 8080
 ```
 
-加载完成后，stdout 输出包含 `event=ready`、端口、模型名和 Worker epoch 的 JSON。Ctrl+C 停止接入新请求、取消活动请求、关闭 socket，并等待 Worker 退出。也可指定 `--shutdown-file PATH`，由受控启动程序创建该文件触发关闭；`--report PATH` 将最终状态写成 JSON。没有 HTTP 关闭端点。
+启动 Hybrid 时显式选择后端；默认 HTTP 模型名相应变为 `qwen3.5`：
+
+```powershell
+./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaWorker.exe --backend qwen35_nf4 --model ./models/qwen3.5-0.8B-bnb-nf4-offline --port 8080
+```
+
+加载完成后，stdout 输出包含 `event=ready`、端口、模型名、backend 和 Worker epoch 的 JSON；`/health` 与最终 report 也提供 backend。后端与模型配置不匹配时启动失败，不自动切换。Ctrl+C 停止接入新请求、取消活动请求、关闭 socket，并等待 Worker 退出。也可指定 `--shutdown-file PATH`，由受控启动程序创建该文件触发关闭；`--report PATH` 将最终状态写成 JSON。没有 HTTP 关闭端点。
 
 主要选项：
 
 | 选项 | 默认值 | 约束 |
 | --- | ---: | --- |
-| `--model-id` | `qwen3` | 1–128 个 ASCII 模型名字符 |
+| `--backend` | `qwen3_nf4` | `qwen3_nf4` 或 `qwen35_nf4`；一个进程加载一个模型 |
+| `--model-id` | `qwen3` / `qwen3.5` | 按后端选择默认值；可覆盖为 1–128 个 ASCII 模型名字符 |
 | `--port` | 8080 | 1–65535，固定 loopback |
 | `--context` | 4096 | 32–4096 token |
 | `--sessions` | 4 | 1–4 个同时占用的请求槽 |
@@ -85,7 +92,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post -C
 | `n` | 仅支持 1 |
 | `enable_thinking` | boolean，默认 false；控制可信模型模板的 thinking 开关 |
 
-未知字段、重复键、错误类型、非法 Unicode、非有限数、额外 JSON 文本均拒绝。`stop` 字符串、工具调用、媒体、logprobs、response_format、thinking budget 和请求侧模板覆盖尚未支持。模板使用模型目录中的可信 tokenizer 模板或固定 Qwen fallback；模板引擎和 reasoning 解析复用现有聊天模块。模型意外输出的 tool 块按普通文本保留，不执行工具。
+未知字段、重复键、错误类型、非法 Unicode、非有限数、额外 JSON 文本均拒绝。`stop` 字符串、工具调用、媒体、logprobs、response_format、thinking budget 和请求侧模板覆盖尚未支持。模板优先使用 `tokenizer_config.json` 中的可信 `chat_template`；缺少时 Qwen3 使用固定 ChatML fallback，Hybrid 使用项目已有 `qwen35-fixed-v20` 模板。HTTP 不读取独立 `chat_template.jinja`，也不接受环境变量或请求参数覆盖模板；因此不承诺与该独立文件渲染的 prompt token 相同。模板引擎和 reasoning 解析复用现有聊天模块，模型意外输出的 tool 块按普通文本保留，不执行工具。
+
+Hybrid 固定模板沿用项目的 `preserve_thinking=true` 默认值，保留并规范化 assistant 历史中的 inline 或独立 reasoning；本轮未实现历史思维块自动剥离。`<|think_on|>` / `<|think_off|>` 文本开关可覆盖 `enable_thinking`，服务根据渲染后的实际后缀判断是否已进入 reasoning。0.8B 与 4B 的 HTTP 默认均显式关闭 thinking，开启后 reasoning token 同样计入生成额度。结束 token 从 tokenizer 获取并去重，不复用 Qwen3 的硬编码 ID；本地 Hybrid 检查点同时使用 `<|im_end|>`（248046）和 `<|endoftext|>`（248044）。具有 vision 元数据的模型仍只开放文本请求。
 
 usage 的 `prompt_tokens` 包括完整模板化输入，`completion_tokens` 来自 Worker 的生成摘要，包含输出控制 token 和 reasoning token；它不等于文本字符数。正常生成因长度结束且最后 token 只构成合法 UTF-8 字符的前缀时，用一个 U+FFFD 收尾；非法 UTF-8、StopToken 时不完整字符及异常断流返回错误。
 
@@ -111,6 +120,8 @@ usage 的 `prompt_tokens` 包括完整模板化输入，`completion_tokens` 来�
 
 HTTP body 限制为 64 KiB，连接上限 128。正常输出以 `maxOutputBytes−2048` 分别限制原始生成文本和序列化输出，预留 2048 字节用于错误收尾；SSE 累计预算包括 `[DONE]`。输出预算、单帧额度和 Trantor 额度是各自的 payload 限制，**不是总 RSS 或显存上限**。它们不覆盖内核 socket buffer、Drogon 全部 header/parser 内存、allocator、权重、共享 scratch 和 oneDNN/driver 分配。非流式 JSON 有单独的输出预算，不使用 SSE 的 pending 门限。单独限制连接数并不能证明全部 HTTP 内存已精确有界。
 
+远端 Hybrid 固定关闭 recurrent snapshots，因为 v2 尚未提供回滚接口；必要 host mirror 仍保留。`sessionReservationBytes` / `cacheBytes` 包含 Full KV、递归矩阵和卷积状态的 device payload，host mirror 由最多 4 Session 限制，未纳入 v2 的 device 字节额度。进程内 Hybrid 默认 4 个快照的 API 不受此设置影响。
+
 本服务当前用于本机 HTTP/1.1 文本推理；鉴权、TLS、HTTP/2、代理环境、持久连接、Qwen3.5 远端、连续合批、完整内存准入和长期压力/性能分布仍需后续实现或验收。
 
 ## Socket 验收
@@ -120,6 +131,7 @@ Python runner 仅依赖标准库，持有自己的子进程句柄和唯一 shutd
 ```powershell
 python tests/server/socket_tests.py --server ./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaFakeInferenceWorker.exe --mode fake --output ./tmp/refactor/server-sockets-fake
 python tests/server/socket_tests.py --server ./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaWorker.exe --model ./models/qwen3-0.6B-bnb-nf4-offline --mode gpu --output ./tmp/refactor/server-sockets-gpu
+python tests/server/socket_tests.py --server ./build-refactor-server/AilaServer.exe --worker ./build-refactor/AilaWorker.exe --model ./models/qwen3.5-0.8B-bnb-nf4-offline --backend qwen35_nf4 --mode gpu --output ./tmp/refactor/server-sockets-hybrid-gpu
 ```
 
 Fake 模式自动创建专用 tokenizer，用每 token 约 4 KiB 的文本稳定触发 socket 背压，并单独启动故障 Worker 验证失败终态。GPU 组验证真实推理的 JSON/SSE 一致性、1/2/4 并发独立 seed、连接行为、断连隔离和活动请求关闭。短文本 GPU 请求不保证填满网络缓冲区，因此慢读门限由 fake socket 组验收。记录的冷启动/JIT 与端到端用例耗时不是服务性能基准。

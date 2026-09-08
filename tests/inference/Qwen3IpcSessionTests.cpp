@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -18,10 +19,10 @@
 #include <vector>
 
 #ifndef AILA_IPC_WORKER_PATH
-#error "Qwen3 IPC tests require the actual Worker target path"
+#error "NF4 IPC tests require the actual Worker target path"
 #endif
 #ifndef AILA_BUILD_ID
-#error "Qwen3 IPC tests require the Worker build identity"
+#error "NF4 IPC tests require the Worker build identity"
 #endif
 
 namespace {
@@ -33,6 +34,17 @@ using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 using Tokens = std::vector<int32_t>;
 constexpr int Capacity = 512;
+enum class Backend { Qwen3, Qwen35 };
+constexpr std::array<const char*, 5> CaseNames{
+    "concurrency", "cancel-backpressure", "session-recreate", "parent-shutdown", "epoch"};
+
+const char* BackendName(Backend backend) {
+    return backend == Backend::Qwen35 ? "qwen35_nf4" : "qwen3_nf4";
+}
+
+const char* ModelEnvironment(Backend backend) {
+    return backend == Backend::Qwen35 ? "AILA_QWEN35_TEST_MODEL" : "AILA_QWEN3_TEST_MODEL";
+}
 
 void Expect(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -45,6 +57,13 @@ struct Case {
     host::InferenceRequestOptions continuationOptions;
     Tokens expected;
     Tokens expectedContinuation;
+};
+
+struct ReferenceSet {
+    std::vector<Case> cases;
+    uint32_t vocabSize = 0;
+    uint64_t sessionCacheBytes = 0;
+    uint64_t sessionHostBytes = 0;
 };
 
 core::RequestOptions DirectOptions(const host::InferenceRequestOptions& input) {
@@ -76,7 +95,7 @@ Tokens Direct(const std::shared_ptr<core::SessionState>& session, const Tokens& 
     return Tokens(result.generatedIds.begin(), result.generatedIds.end());
 }
 
-std::vector<Case> References(const std::string& directory) {
+ReferenceSet References(const std::string& directory, Backend backend) {
     Tokenizer tokenizer;
     Expect(tokenizer.load(directory), "Could not load tokenizer");
     const std::array<std::string, 4> prompts{
@@ -84,19 +103,33 @@ std::vector<Case> References(const std::string& directory) {
         "用中文简短说明共享模型权重与独立会话缓存的关系。 /no_think",
         "A train leaves at noon and travels 60 kilometres in an hour. Explain its speed, then give a short example. /no_think",
         "Write a small C++ function that sums a vector of integers. Explain the time complexity and one possible overflow issue. /no_think"};
-    std::vector<Case> cases;
+    ReferenceSet reference;
     auto runtime = core::DeviceRuntime::Create();
     core::ModelOptions options;
     options.maxSequenceLength = Capacity;
     options.maxSessions = 4;
-    auto model = core::LoadedModel::LoadQwen3Nf4(runtime, directory, options);
+    // IPC has no rollback command. Match its zero-snapshot Hybrid policy while
+    // keeping the host mirrors needed to switch independent recurrent states.
+    if (backend == Backend::Qwen35) options.maxRecurrentSnapshots = 0;
+    auto model = backend == Backend::Qwen35
+        ? core::LoadedModel::LoadQwen35Nf4(runtime, directory, options)
+        : core::LoadedModel::LoadQwen3Nf4(runtime, directory, options);
+    reference.vocabSize = static_cast<uint32_t>(model->VocabSize());
+    reference.sessionCacheBytes = model->SessionReservationBytes();
+    reference.sessionHostBytes = model->SessionHostReservationBytes();
+    Expect(tokenizer.vocab_size() > 0 && static_cast<uint32_t>(tokenizer.vocab_size()) <= reference.vocabSize,
+           "Tokenizer vocabulary exceeds the model's padded vocabulary");
+    std::cout << "[MODEL] backend=" << BackendName(backend) << " vocab=" << reference.vocabSize
+              << " device_session_payload_bytes=" << reference.sessionCacheBytes
+              << " host_session_payload_bytes=" << reference.sessionHostBytes << '\n';
+    constexpr std::array<uint32_t, 4> hybridChunks{1, 8, 16, 32};
     for (size_t index = 0; index < prompts.size(); ++index) {
         Case test;
         const auto prompt = tokenizer.apply_chat_template("You are a helpful assistant.", prompts[index]);
         test.prompt.assign(prompt.begin(), prompt.end());
         const auto continuation = tokenizer.encode(" Continue with one more useful example.");
         test.continuation.assign(continuation.begin(), continuation.end());
-        test.options.prefillChunkSize = index % 2 ? 32 : 16;
+        test.options.prefillChunkSize = backend == Backend::Qwen35 ? hybridChunks[index] : index % 2 ? 32 : 16;
         test.options.generation.maxNewTokens = static_cast<uint32_t>(20 + index * 3);
         test.options.generation.doSample = index >= 2;
         test.options.generation.useFixedSeed = true;
@@ -106,13 +139,22 @@ std::vector<Case> References(const std::string& directory) {
         test.options.generation.frequencyPenalty = index >= 2 ? 0.05 : 0.0;
         test.continuationOptions = test.options;
         test.continuationOptions.generation.maxNewTokens = 5;
+        if (backend == Backend::Qwen35) test.continuationOptions.prefillChunkSize = index % 2 ? 3 : 1;
+        Expect(test.prompt.size() + 256 <= Capacity &&
+                   test.prompt.size() + test.options.generation.maxNewTokens + test.continuation.size() +
+                       test.continuationOptions.generation.maxNewTokens <= Capacity,
+               "Fixture prompt exceeds the fixed Session capacity");
         auto session = model->CreateSession();
         test.expected = Direct(session, test.prompt, test.options);
         test.expectedContinuation = Direct(session, test.continuation, test.continuationOptions);
-        cases.push_back(std::move(test));
+        std::cout << "[REFERENCE] request=" << index << " prompt=" << test.prompt.size()
+                  << " prefill_chunk=" << test.options.prefillChunkSize
+                  << " continuation_chunk=" << test.continuationOptions.prefillChunkSize
+                  << " generated=" << test.expected.size() << " continuation=" << test.expectedContinuation.size() << '\n';
+        reference.cases.push_back(std::move(test));
     }
     std::cout << "[PASS] direct greedy, seeded/penalized and continuation references\n";
-    return cases; // All direct device owners are destroyed before Worker starts.
+    return reference; // All direct device owners are destroyed before Worker starts.
 }
 
 struct Output {
@@ -174,7 +216,15 @@ void WaitReclaimed(const std::shared_ptr<host::InferenceClient>& client) {
 std::shared_ptr<host::InferenceSession> CreateEventually(const std::shared_ptr<host::InferenceModel>& model) {
     const auto deadline = Clock::now() + 10s;
     for (;;) {
-        try { return model->CreateSession(); }
+        try {
+            auto session = model->CreateSession();
+            const auto state = session->Query();
+            Expect(!state.busy && state.contextLength == 0, "New Session retained previous context");
+            Expect(state.modelId == model->Info().modelId && state.capacity == Capacity &&
+                       state.cacheBytes == model->Info().sessionReservationBytes,
+                   "New Session metadata differs from its model reservation");
+            return session;
+        }
         catch (const host::InferenceClientError& error) {
             if (error.RemoteCode() != wire::ErrorCode::ResourceLimit || Clock::now() >= deadline) throw;
             std::this_thread::sleep_for(2ms);
@@ -201,14 +251,20 @@ void TestConcurrency(const std::shared_ptr<host::InferenceClient>& client,
             Expect(!query.busy && query.contextLength == cases[index].prompt.size() + output[index].tokens.size(),
                    "completed Session did not retain final token");
             std::cout << "[MEASURE] sessions=" << count << " request=" << index << " prompt=" << cases[index].prompt.size()
+                      << " prefill_chunk=" << cases[index].options.prefillChunkSize
                       << " generated=" << output[index].tokens.size() << " caller_first_token_ms=" << output[index].firstTokenMs << '\n';
         }
         requests.clear();
         for (size_t index = 0; index < count; ++index)
             requests.push_back(sessions[index]->Submit(cases[index].continuation, cases[index].continuationOptions));
         const auto continued = Drain(requests);
-        for (size_t index = 0; index < count; ++index)
+        for (size_t index = 0; index < count; ++index) {
             Same(continued[index].tokens, cases[index].expectedContinuation, "IPC continuation");
+            const auto state = sessions[index]->Query();
+            Expect(!state.busy && state.contextLength == cases[index].prompt.size() + cases[index].expected.size() +
+                       cases[index].continuation.size() + continued[index].tokens.size(),
+                   "Continuation context did not retain the complete independent history");
+        }
         requests.clear(); sessions.clear();
         WaitReclaimed(client);
         std::cout << "[PASS] " << count << " IPC sessions and continuation\n";
@@ -260,6 +316,41 @@ void TestCancelAndBackpressure(const std::shared_ptr<host::InferenceClient>& cli
     std::cout << "[PASS] explicit cancel, unread 256-token backpressure and private release drain\n";
 }
 
+void TestSessionRecreate(const std::shared_ptr<host::InferenceClient>& client,
+                         const std::shared_ptr<host::InferenceModel>& model, const std::vector<Case>& cases) {
+    std::set<uint64_t> identities;
+    for (size_t round = 0; round < 2; ++round) {
+        std::vector<std::shared_ptr<host::InferenceSession>> sessions;
+        std::vector<std::shared_ptr<host::InferenceRequest>> requests;
+        // Refill all four slots after releasing the preceding wave. Creating
+        // just one replacement could hide leaked Session reservations.
+        for (size_t index = 0; index < 4; ++index) {
+            auto session = CreateEventually(model);
+            Expect(identities.insert(session->Info().sessionId).second, "Released Session ID was reused in one epoch");
+            sessions.push_back(std::move(session));
+        }
+        for (size_t index = 0; index < sessions.size(); ++index) {
+            const auto& test = cases[(index + round + 1) % cases.size()];
+            requests.push_back(sessions[index]->Submit(test.prompt, test.options));
+        }
+        const auto output = Drain(requests);
+        for (size_t index = 0; index < sessions.size(); ++index) {
+            const auto& test = cases[(index + round + 1) % cases.size()];
+            Same(output[index].tokens, test.expected, "recreated Session / round " + std::to_string(round));
+            Expect(output[index].terminal.summary.status == wire::RequestStatus::Completed,
+                   "Recreated Session failed to complete");
+        }
+        requests.clear();
+        const auto& appended = cases[(round + 1) % cases.size()];
+        auto continuation = sessions[0]->Submit(appended.continuation, appended.continuationOptions);
+        Same(Drain({continuation})[0].tokens, appended.expectedContinuation, "recreated Session continuation");
+        continuation.reset();
+        sessions.clear();
+        WaitReclaimed(client);
+    }
+    std::cout << "[PASS] all four Session slots reused with fresh KV/recurrent state and independent continuations\n";
+}
+
 void TestParentReleaseAndShutdown(const std::shared_ptr<host::InferenceClient>& client,
                                   const std::shared_ptr<host::InferenceModel>& model, const std::vector<Case>& cases) {
     auto session = CreateEventually(model);
@@ -274,36 +365,78 @@ void TestParentReleaseAndShutdown(const std::shared_ptr<host::InferenceClient>& 
     std::cout << "[PASS] parent release retained in-flight request; graceful shutdown barrier\n";
 }
 
-std::shared_ptr<host::InferenceClient> StartWorker() {
+std::shared_ptr<host::InferenceClient> StartWorker(Backend backend) {
     const std::filesystem::path executable(AILA_IPC_WORKER_PATH);
     host::InferenceClientOptions options;
     options.handshakeTimeout = 10s;
     options.commandTimeout = 120s;
     options.shutdownTimeout = 20s;
+    if (backend == Backend::Qwen35) {
+        auto& capabilities = options.requiredCapabilities;
+        capabilities.erase(std::remove(capabilities.begin(), capabilities.end(), "qwen3_nf4_bf16_kv"), capabilities.end());
+        capabilities.emplace_back("qwen35_nf4_bf16_kv");
+    }
     return host::InferenceClient::Start(executable.parent_path(), executable, AILA_BUILD_ID, options);
 }
 
-void Run(const std::string& directory) {
+std::shared_ptr<host::InferenceModel> LoadModel(const std::shared_ptr<host::InferenceClient>& client,
+                                               const std::string& directory, Backend backend,
+                                               const ReferenceSet& reference) {
+    host::InferenceModelOptions options;
+    options.maxSequenceLength = Capacity;
+    options.maxSessions = 4;
+    auto model = backend == Backend::Qwen35 ? client->LoadQwen35(directory, options) : client->LoadQwen3(directory, options);
+    const auto& info = model->Info();
+    const std::string capability = backend == Backend::Qwen35 ? "qwen35_nf4_bf16_kv" : "qwen3_nf4_bf16_kv";
+    const std::string other = backend == Backend::Qwen35 ? "qwen3_nf4_bf16_kv" : "qwen35_nf4_bf16_kv";
+    Expect(std::find(info.capabilities.begin(), info.capabilities.end(), capability) != info.capabilities.end() &&
+               std::find(info.capabilities.begin(), info.capabilities.end(), other) == info.capabilities.end(),
+           "Loaded model advertised the wrong backend capability");
+    Expect(info.vocabSize == reference.vocabSize && info.maxSequenceLength == Capacity &&
+               info.sessionReservationBytes == reference.sessionCacheBytes,
+           "IPC model metadata differs from the direct model");
+    return model;
+}
+
+void Run(const std::string& directory, Backend backend, const std::set<std::string>& selected) {
     aila::set_log_level(aila::LogLevel::Warning);
-    const auto cases = References(directory);
-    auto client = StartWorker();
+    std::cout << "[RUN] backend=" << BackendName(backend) << " model=" << directory << " cases=";
+    if (selected.empty()) std::cout << "all";
+    else for (const auto& name : selected) std::cout << name << ' ';
+    std::cout << '\n';
+    const auto reference = References(directory, backend);
+    const auto& cases = reference.cases;
+    std::cout << "[PASS] direct device owners released before isolated Worker startup\n";
+    auto client = StartWorker(backend);
     const auto firstEpoch = client->Snapshot().epoch;
-    host::InferenceModelOptions modelOptions;
-    modelOptions.maxSequenceLength = Capacity;
-    modelOptions.maxSessions = 4;
-    auto model = client->LoadQwen3(directory, modelOptions);
-    TestConcurrency(client, model, cases);
-    TestCancelAndBackpressure(client, model, cases);
-    TestParentReleaseAndShutdown(client, model, cases);
-    auto restarted = StartWorker();
+    auto model = LoadModel(client, directory, backend, reference);
+    const auto run = [&](const char* name) { return selected.empty() || selected.count(name) != 0; };
+    if (run("concurrency")) TestConcurrency(client, model, cases);
+    if (run("cancel-backpressure")) TestCancelAndBackpressure(client, model, cases);
+    if (run("session-recreate")) TestSessionRecreate(client, model, cases);
+    if (run("parent-shutdown")) TestParentReleaseAndShutdown(client, model, cases);
+    else {
+        model->Release();
+        WaitReclaimed(client);
+        client->Shutdown(20s);
+        Expect(client->Snapshot().status == wire::DomainStatus::Closed, "Worker shutdown did not close domain");
+    }
+    model.reset();
+    client.reset();
+    if (!run("epoch")) return;
+    auto restarted = StartWorker(backend);
     Expect(restarted->Snapshot().epoch != firstEpoch, "restarted Worker reused epoch");
-    auto newModel = restarted->LoadQwen3(directory, modelOptions);
-    auto session = newModel->CreateSession();
+    auto newModel = LoadModel(restarted, directory, backend, reference);
+    auto session = CreateEventually(newModel);
     auto request = session->Submit(cases[0].prompt, cases[0].options);
     Same(Drain({request})[0].tokens, cases[0].expected, "new epoch inference");
+    request.reset();
+    request = session->Submit(cases[0].continuation, cases[0].continuationOptions);
+    Same(Drain({request})[0].tokens, cases[0].expectedContinuation, "new epoch continuation");
     request.reset(); session.reset(); newModel.reset();
     WaitReclaimed(restarted);
     restarted->Shutdown(20s);
+    Expect(restarted->Snapshot().status == wire::DomainStatus::Closed, "Restarted Worker shutdown did not close domain");
     std::cout << "[PASS] fresh Worker epoch, reload and token parity\n";
 }
 
@@ -312,24 +445,47 @@ void Run(const std::string& directory) {
 int main(int argc, char** argv) {
     try {
         std::string directory;
+        Backend backend = Backend::Qwen3;
+        bool backendSpecified = false;
+        std::set<std::string> selected;
         for (int index = 1; index < argc; ++index) {
-            if (std::string(argv[index]) != "--model" || index + 1 >= argc || !directory.empty())
-                throw std::invalid_argument("Usage: AilaQwen3IpcSessionTests --model <NF4 model directory>");
-            directory = argv[++index];
+            const std::string argument = argv[index];
+            if (argument == "--help" || argument == "--list-cases") {
+                std::cout << "Usage: " << argv[0] << " [--backend qwen3_nf4|qwen35_nf4] [--model <NF4 directory>]\n"
+                             "       [--case <name> ...] (default: all cases, Qwen3 backend)\n"
+                             "Environment: AILA_QWEN3_TEST_MODEL / AILA_QWEN35_TEST_MODEL by backend.\n"
+                             "Case names:";
+                for (const auto* name : CaseNames) std::cout << ' ' << name;
+                std::cout << "\nDirect references, Worker and restarted Worker run sequentially.\n";
+                return 0;
+            }
+            Expect(index + 1 < argc, "Missing value for " + argument);
+            const std::string value = argv[++index];
+            if (argument == "--backend") {
+                Expect(!backendSpecified && (value == "qwen3_nf4" || value == "qwen35_nf4"), "Expected one supported --backend");
+                backend = value == "qwen35_nf4" ? Backend::Qwen35 : Backend::Qwen3;
+                backendSpecified = true;
+            } else if (argument == "--model") {
+                Expect(directory.empty() && !value.empty(), "Expected one nonempty --model directory");
+                directory = value;
+            } else if (argument == "--case") {
+                Expect(std::find(CaseNames.begin(), CaseNames.end(), value) != CaseNames.end(), "Unknown fixture case: " + value);
+                Expect(selected.insert(value).second, "Duplicate fixture case: " + value);
+            } else throw std::invalid_argument("Unknown argument: " + argument);
         }
         if (directory.empty()) {
             char* value = nullptr;
             size_t length = 0;
-            if (_dupenv_s(&value, &length, "AILA_QWEN3_TEST_MODEL") == 0 && value) directory = value;
+            if (_dupenv_s(&value, &length, ModelEnvironment(backend)) == 0 && value) directory = value;
             std::free(value);
         }
         if (directory.empty()) {
-            std::cout << "[SKIP] Set AILA_QWEN3_TEST_MODEL or pass --model.\n";
+            std::cout << "[SKIP] Set " << ModelEnvironment(backend) << " or pass --model.\n";
             return 77;
         }
         directory = std::filesystem::absolute(directory).lexically_normal().string();
         Expect(std::filesystem::is_directory(directory), "Model directory does not exist");
-        Run(directory);
+        Run(directory, backend, selected);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[FAIL] " << error.what() << '\n';

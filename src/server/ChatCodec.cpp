@@ -1,6 +1,7 @@
 #include "server/ChatCodec.hpp"
 
 #include "chat/AssistantOutputParser.hpp"
+#include "chat/BuiltinTemplates.hpp"
 #include "chat/ChatFormatter.hpp"
 #include "chat/ChatJson.hpp"
 #include "chat/StructuredStreamParser.hpp"
@@ -357,10 +358,11 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     // Select the trusted checkpoint template (or the fixed service fallback)
     // explicitly so environment/request paths cannot override the HTTP route.
     auto renderRequest = prepared.chatRequest;
-    renderRequest.template_options.template_override_text = tokenizer.chat_template().empty() ? FallbackTemplate() : tokenizer.chat_template();
+    renderRequest.template_options.template_override_text = !tokenizer.chat_template().empty() ? tokenizer.chat_template()
+        : settings.family == ModelFamily::Qwen35Hybrid ? chat::qwen35_fixed_chat_template() : FallbackTemplate();
     chat::ChatFormatInput input;
     input.request = &renderRequest;
-    input.family = ModelFamily::Qwen3Dense;
+    input.family = settings.family;
     input.tokenizer_chat_template = tokenizer.chat_template();
     input.bos_token = tokenizer.bos_token();
     input.eos_token = tokenizer.eos_token();
@@ -388,7 +390,7 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
             prepared.options.stopTokenIds.push_back(candidate);
         }
     }
-    if (prepared.options.stopTokenIds.empty()) throw ApiError(500, "tokenizer_failed", "Qwen3 tokenizer has no valid EOS token");
+    if (prepared.options.stopTokenIds.empty()) throw ApiError(500, "tokenizer_failed", "Model tokenizer has no valid EOS token");
     prepared.options.prefillChunkSize = std::min(hard.maxPrefillChunkSize, settings.maxPromptTokens);
     return prepared;
 }

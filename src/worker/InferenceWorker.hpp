@@ -34,6 +34,8 @@ public:
     virtual ~InferenceModelFactory() = default;
     virtual std::shared_ptr<InferenceModel> LoadQwen3(
         const std::string& directory, InferenceModelOptions options) = 0;
+    virtual std::shared_ptr<InferenceModel> LoadQwen35(
+        const std::string& directory, InferenceModelOptions options) = 0;
     // Called on the lifecycle executor after resource destruction. A recorded
     // asynchronous error must propagate even when a destructor could not throw.
     virtual std::string RuntimeFaultMessage() const { return {}; }

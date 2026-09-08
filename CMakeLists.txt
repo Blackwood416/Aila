@@ -766,7 +766,8 @@ if(WIN32)
     endif()
     add_dependencies(AilaQwen3IpcSessionTests AilaWorker)
     add_test(NAME AilaQwen3IpcSessionTests COMMAND AilaQwen3IpcSessionTests)
-    set_tests_properties(AilaQwen3IpcSessionTests PROPERTIES
+    add_test(NAME AilaQwen35IpcSessionTests COMMAND AilaQwen3IpcSessionTests --backend qwen35_nf4)
+    set_tests_properties(AilaQwen3IpcSessionTests AilaQwen35IpcSessionTests PROPERTIES
         LABELS "gpu;inference;ipc" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
 
     add_executable(AilaFakeInferenceWorker

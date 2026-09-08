@@ -31,6 +31,7 @@ struct ChatSettings {
     uint32_t maxPromptTokens = 4096;
     uint32_t maxNewTokens = 1024;
     size_t maxOutputBytes = 262144;
+    ModelFamily family = ModelFamily::Qwen3Dense;
 };
 
 struct PreparedChat {

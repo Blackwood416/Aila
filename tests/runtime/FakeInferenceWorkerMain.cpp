@@ -180,9 +180,20 @@ class FakeFactory final : public worker::InferenceModelFactory {
 public:
     std::shared_ptr<worker::InferenceModel> LoadQwen3(const std::string& directory,
                                                    worker::InferenceModelOptions options) override {
+        return Load(directory, options, false);
+    }
+    std::shared_ptr<worker::InferenceModel> LoadQwen35(const std::string& directory,
+                                                    worker::InferenceModelOptions options) override {
+        return Load(directory, options, true);
+    }
+private:
+    std::shared_ptr<worker::InferenceModel> Load(const std::string& directory,
+                                               worker::InferenceModelOptions options, bool hybrid) {
         // Socket tests place their CPU tokenizer in an isolated absolute
         // directory; the real GPU factory is never involved in this fixture.
-        if (std::filesystem::u8path(directory).filename() != "fake-pipe-model" || options.maxSequenceLength <= 0)
+        const auto basename = fs::u8path(directory).filename();
+        if ((basename != "fake-pipe-model" && !(hybrid && basename == "fake-pipe-hybrid-model")) ||
+            options.maxSequenceLength <= 0)
             throw std::invalid_argument("Unknown CPU fixture model");
         return std::make_shared<FakeModel>(options.maxSequenceLength);
     }
