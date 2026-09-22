@@ -2,6 +2,8 @@
 
 #include "chat/ChatTemplateEngine.hpp"
 
+#include <optional>
+
 namespace aila::chat {
 
 struct ChatFormatInput {
@@ -11,6 +13,10 @@ struct ChatFormatInput {
     std::string tokenizer_chat_template;
     std::string bos_token;
     std::string eos_token;
+    // Hosts with an isolated CRT can provide the current process environment.
+    // An explicit empty string means unset; nullopt uses the local CRT lookup.
+    std::optional<std::string> environment_template_text;
+    std::optional<std::string> environment_template_path;
 };
 
 struct ChatFormatTextResult {

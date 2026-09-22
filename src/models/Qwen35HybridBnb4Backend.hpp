@@ -1,11 +1,14 @@
 #pragma once
 
 #include "IModelBackend.hpp"
+#include "HybridLayerExecution.hpp"
 #include "../ops/Bnb4BitLinear.hpp"
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -70,7 +73,63 @@ struct Qwen35HybridBnB4Buffers {
 };
 
 class Qwen35HybridBnb4Backend : public IModelBackend {
+    struct SessionOwner {};
+
+    struct LayerStateSnapshot {
+        std::vector<float> linear_state_host;
+        std::vector<float> linear_conv_state_host;
+        int linear_conv_head = 0;
+    };
+    struct StateSnapshot {
+        std::vector<LayerStateSnapshot> layers;
+    };
+
 public:
+    // Weights, projection bindings, scratch and logits remain one execution
+    // slot. Callers serialize operations and keep the Context/model alive.
+    // Each Session owns its full-attention KV, recurrent state and history.
+    class Session {
+    public:
+        ~Session();
+        Session(const Session&) = delete;
+        Session& operator=(const Session&) = delete;
+        Session(Session&&) = delete;
+        Session& operator=(Session&&) = delete;
+
+        int CurrentLength() const { return currentLength_; }
+        int Capacity() const { return capacity_; }
+        std::size_t CacheBytes() const { return cacheBytes_; }
+        // Float payload reservation: persistent host mirrors plus the maximum
+        // retained snapshots. Excludes STL metadata, allocator and driver use.
+        std::size_t HostReservationBytes() const { return hostReservationBytes_; }
+
+    private:
+        friend class Qwen35HybridBnb4Backend;
+        friend struct aila::models::HybridDecodeBatchExecutor;
+        Session(Context& ctx, int capacity,
+                std::shared_ptr<const SessionOwner> owner,
+                bool boundedSnapshots, std::size_t maxSnapshots);
+
+        Context* context_ = nullptr;
+        std::shared_ptr<const SessionOwner> owner_;
+        int currentLength_ = 0;
+        int capacity_ = 0;
+        std::size_t cacheBytes_ = 0;
+        std::size_t hostReservationBytes_ = 0;
+        bool boundedSnapshots_ = true;
+        std::size_t maxSnapshots_ = 4;
+        std::vector<Qwen35HybridBnB4LayerCache> layerCaches_;
+        std::unordered_map<int, StateSnapshot> snapshots_;
+
+        Tensor mropePosT_, mropePosH_, mropePosW_;
+        int mropePromptLength_ = 0;
+        int mropeTextPositionDelta_ = 0;
+        std::vector<int> embeddingOverridePositions_;
+        std::vector<sycl::ext::oneapi::bfloat16> embeddingOverrideValues_;
+        int embeddingOverrideHiddenSize_ = 0;
+    };
+
+    Qwen35HybridBnb4Backend();
     ~Qwen35HybridBnb4Backend() override;
 
     bool load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
@@ -78,12 +137,32 @@ public:
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;
-    int get_current_context_len() const override { return current_len_; }
+    int get_current_context_len() const override {
+        return defaultSession_ ? defaultSession_->CurrentLength() : 0;
+    }
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
     bool apply_lora(Context& ctx, const aila::lora::LoraAdapter& adapter,
                     std::string* error_message = nullptr) override;
+
+    // Explicit sessions require effective BF16 KV under AILA_VLM_KV_QUANT
+    // (which falls back to AILA_KV_QUANT). Zero disables recurrent snapshots.
+    std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
+    // Returns one row for the last supplied token. The view belongs to the
+    // execution slot and must be consumed before another forward.
+    Tensor& Forward(Context& ctx, Session& session,
+                    const int* tokenIdsDevice, int count);
+    bool SupportsDecodeBatch() const noexcept;
+    Tensor& ForwardDecodeBatch(Context& ctx, const std::vector<Session*>& sessions,
+                               const int* tokenIdsDevice);
+    // Legacy text ABI compatibility: retain the original multi-row layout.
+    Tensor& ForwardLegacyLogits(Context& ctx, Session& session,
+                                const int* tokenIdsDevice, int count);
+    void Reset(Session& session);
+    // Recurrent state restores the nearest retained checkpoint <= newLength;
+    // otherwise resets to zero. Invalid lengths leave the Session intact.
+    int Truncate(Session& session, int newLength);
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,
@@ -97,9 +176,31 @@ public:
     void clear_mrope_positions() override;
 
 private:
+    friend struct aila::models::HybridLayerExecutor;
+    friend struct aila::models::HybridDecodeBatchExecutor;
+    using ExecutionPhase = aila::models::HybridExecutionPhase;
+    using LayerKind = aila::models::HybridLayerKind;
+    using LayerPlan = aila::models::HybridLayerPlan<Qwen35HybridBnB4Layer>;
+    using DecoderPlan = aila::models::HybridDecoderPlan<Qwen35HybridBnB4Layer>;
+    using LayerExecution = aila::models::HybridLayerExecution<
+        Qwen35HybridBnB4Buffers, LayerCache, aila::models::Nf4ProjectionWorkspace>;
+    struct ProjectionPolicy;
+    struct ProfileState;
+
+    void BuildDecoderPlan();
+    void ExecuteLayer(const LayerPlan& plan, const LayerExecution& execution);
+    Tensor& ForwardImpl(Context& ctx, Session& session,
+                        const int* tokenIdsDevice, int count, bool lastTokenOnly);
+    std::unique_ptr<Session> CreateSessionImpl(Context& ctx, bool quantizedKv,
+                                              bool boundedSnapshots,
+                                              std::size_t maxSnapshots);
+    Session& DefaultSession(Context& ctx);
+    void ValidateSession(const Session& session) const;
+    void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount);
+
     ModelSpec spec_;
     Qwen35TextConfig cfg_;
-    int hidden_size_ = 0, ff_dim_ = 0, max_seq_len_ = 0, current_len_ = 0;
+    int hidden_size_ = 0, ff_dim_ = 0, max_seq_len_ = 0;
     int full_q_heads_ = 0, full_kv_heads_ = 0, full_head_dim_ = 0;
     int full_q_dim_ = 0, full_kv_dim_ = 0, full_q_proj_dim_ = 0, full_fused_qkv_dim_ = 0;
     int linear_q_heads_ = 0, linear_kv_heads_ = 0, linear_head_dim_ = 0;
@@ -108,13 +209,21 @@ private:
     int linear_conv_kernel_dim_ = 0;
     int max_qkv_dim_ = 0, max_attn_dim_ = 0, max_attn_heads_ = 0;
     bool use_delta_linear_ = false;
+    Context* context_ = nullptr;
+    std::shared_ptr<const SessionOwner> sessionOwner_;
+    std::unique_ptr<Session> defaultSession_;
+    bool explicitSessionsCreated_ = false;
+    bool legacyQuantizedKv_ = false;
     std::vector<Qwen35HybridBnB4Layer> layers_;
-    std::vector<Qwen35HybridBnB4LayerCache> layer_caches_;
+    std::unique_ptr<const DecoderPlan> decoderPlan_;
+    std::unique_ptr<ProfileState> profile_;
     std::vector<Tensor> fused_weights_;
     Qwen35HybridBnB4Buffers buf_;
     Bnb4BitLinearScratch linear_scratch_;
     Qwen35HybridDeltaScratch linear_delta_scratch_;
     Linear lm_head_;
+    Tensor lastTokenLogits_;
+    Tensor batchLogits_, batchLogitsView_;
 
     Tensor* embed_weight_ = nullptr;
     Tensor* final_norm_weight_ = nullptr;
@@ -122,17 +231,6 @@ private:
     int runtime_seq_capacity_ = 0;
     int prefill_scores_capacity_ = 0;
     int incr_prefill_seq_cap_ = 0, incr_prefill_total_cap_ = 0;
-
-    Context* mrope_ctx_ = nullptr;
-    int* mrope_pos_t_ = nullptr;
-    int* mrope_pos_h_ = nullptr;
-    int* mrope_pos_w_ = nullptr;
-    int mrope_prompt_len_ = 0;
-    int mrope_text_pos_delta_ = 0;
-
-    std::vector<int> embed_override_positions_;
-    std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;
-    int embed_override_hidden_size_ = 0;
 
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
@@ -152,6 +250,9 @@ private:
                                 LayerCache& cache,
                                 Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                 int seq_len);
+    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                                Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
+                                int seq_len, Tensor& out_dst);
     void run_linear_delta_decode_host(Context& ctx, Layer& layer,
                                        LayerCache& cache,
                                        Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
@@ -169,14 +270,4 @@ private:
                                       const std::vector<float>& z, int seq_len, int num_heads,
                                       int head_dim, float eps);
 
-    struct LayerStateSnapshot {
-        std::vector<float> linear_state_host;
-        std::vector<float> linear_conv_state_host;
-        int linear_conv_head = 0;
-    };
-    struct StateSnapshot {
-        std::vector<LayerStateSnapshot> layers;
-    };
-    std::unordered_map<int, StateSnapshot> snapshots_;
-    void clear_snapshots();
 };

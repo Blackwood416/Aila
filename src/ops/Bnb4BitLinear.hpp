@@ -61,6 +61,15 @@ public:
                  Tensor& output,
                  int seq_len,
                  const sycl::ext::oneapi::bfloat16* add_residual = nullptr);
+    // Independent decode rows, not a prefill GEMM. Buffers may have larger
+    // capacity shapes; logical row strides are in_features()/out_features().
+    // Accepts 1..4 BF16 rows and preserves each row's single-decode arithmetic.
+    // Input and output logical spans must not overlap.
+    void ForwardDecodeRows(Context& ctx,
+                           Bnb4BitLinearScratch& scratch,
+                           Tensor& input,
+                           Tensor& output,
+                           int rows);
     static bool try_forward_decode_gate_up_swiglu(Context& ctx,
                                                   Bnb4BitLinear& fused_gate_up,
                                                   Tensor& input,
@@ -125,8 +134,7 @@ private:
         dnnl::memory src_mem;
         dnnl::memory weight_mem;
         dnnl::memory dst_mem;
-        dnnl::memory scratchpad_mem;
-        Tensor scratchpad;
+        dnnl::memory::desc scratchpad_md;
         bool mem_inited = false;
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
@@ -136,6 +144,8 @@ private:
     std::unordered_map<int, CachedPrimitive> prim_cache_;
 
     std::vector<LoraAttachment> lora_attachments_;
+    Tensor lora_scratch_;
+    float* ensure_lora_scratch(Context& ctx, size_t count);
     void apply_lora_decode(Context& ctx, Tensor& input, Tensor& output);
     void apply_lora_prefill(Context& ctx, Tensor& input, Tensor& output, int seq_len);
 };

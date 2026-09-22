@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.24)
+project(AilaHttpProbe LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(Drogon CONFIG REQUIRED)
+
+add_executable(AilaHttpProbe main.cpp)
+target_compile_features(AilaHttpProbe PRIVATE cxx_std_17)
+target_link_libraries(AilaHttpProbe PRIVATE Drogon::Drogon)
+if(MSVC)
+    target_compile_definitions(AilaHttpProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaHttpProbe PRIVATE /W4 /utf-8 /EHsc)
+    set_property(TARGET AilaHttpProbe PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+endif()

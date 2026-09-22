@@ -37,80 +37,55 @@ constexpr int kDeviceSampleFastMaxTopK = 64;
 constexpr int kDeviceSampleFastWG = 64;
 
 struct HostSamplingWorkspace {
-    sycl::context sycl_ctx;
-    bool has_ctx = false;
+    explicit HostSamplingWorkspace(Context& owner) : owner(owner) {}
+    Context& owner;
     bf16* bf16_logits = nullptr;
     size_t bf16_capacity = 0;
+    std::vector<TopCandidate> heap, sorted;
+    std::vector<float> probabilities, penalized_logits;
 
     ~HostSamplingWorkspace() {
-        if (bf16_logits && has_ctx) {
-            sycl::free(bf16_logits, sycl_ctx);
-        }
+        owner.free_host(bf16_logits);
     }
 
     bf16* ensure_bf16(Context& ctx, size_t count) {
-        if (bf16_logits != nullptr && has_ctx && count <= bf16_capacity &&
-            sycl_ctx == ctx.queue().get_context()) {
+        if (count <= bf16_capacity) {
             return bf16_logits;
         }
-        if (bf16_logits && has_ctx) {
-            sycl::free(bf16_logits, sycl_ctx);
-            bf16_logits = nullptr;
-            bf16_capacity = 0;
-        }
-        sycl_ctx = ctx.queue().get_context();
-        has_ctx = true;
-        bf16_logits = sycl::malloc_host<bf16>(count, ctx.queue());
-        if (!bf16_logits) {
-            throw std::runtime_error("Pinned host allocation failed for sampling logits");
-        }
+        ctx.synchronize();
+        auto* replacement = static_cast<bf16*>(ctx.alloc_host(count * sizeof(bf16)));
+        owner.free_host(bf16_logits);
+        bf16_logits = replacement;
         bf16_capacity = count;
         return bf16_logits;
     }
 };
 
 struct DeviceSamplingWorkspace {
-    sycl::context sycl_ctx;
-    bool has_ctx = false;
+    explicit DeviceSamplingWorkspace(Context&) {}
+    Tensor logits_storage, ids_storage;
     float* partial_logits = nullptr;
     int* partial_ids = nullptr;
     size_t partial_capacity = 0;
 
-    ~DeviceSamplingWorkspace() {
-        if (partial_logits && has_ctx) {
-            sycl::free(partial_logits, sycl_ctx);
-        }
-        if (partial_ids && has_ctx) {
-            sycl::free(partial_ids, sycl_ctx);
-        }
-    }
-
     void ensure(Context& ctx, size_t count) {
-        if (partial_logits != nullptr && partial_ids != nullptr && has_ctx &&
-            count <= partial_capacity && sycl_ctx == ctx.queue().get_context()) {
+        if (count <= partial_capacity) {
             return;
         }
-        if (partial_logits && has_ctx) {
-            sycl::free(partial_logits, sycl_ctx);
-            partial_logits = nullptr;
-        }
-        if (partial_ids && has_ctx) {
-            sycl::free(partial_ids, sycl_ctx);
-            partial_ids = nullptr;
-        }
-        sycl_ctx = ctx.queue().get_context();
-        has_ctx = true;
-        partial_logits = sycl::malloc_device<float>(count, ctx.queue());
-        partial_ids = sycl::malloc_device<int>(count, ctx.queue());
-        if (!partial_logits || !partial_ids) {
-            throw std::runtime_error("Device allocation failed for sampling partial buffers");
-        }
+        ctx.synchronize();
+        auto logits = Tensor::allocate(ctx, {static_cast<int64_t>(count)}, dnnl::memory::data_type::f32);
+        auto ids = Tensor::allocate(ctx, {static_cast<int64_t>(count)}, dnnl::memory::data_type::s32);
+        logits_storage = std::move(logits);
+        ids_storage = std::move(ids);
+        partial_logits = logits_storage.data_as<float>();
+        partial_ids = ids_storage.data_as<int>();
         partial_capacity = count;
     }
 };
 
 template <typename LogitGetter>
-int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_logit) {
+int sample_topk_topp(HostSamplingWorkspace& workspace, int vocab_size, int top_k, float top_p, LogitGetter get_logit,
+                    std::mt19937& rng = sampling_rng()) {
     if (vocab_size <= 0) return 0;
 
     int k = top_k;
@@ -184,7 +159,7 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
         }
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(sampling_rng());
+        float r = dist(rng);
 
         float cumsum = 0.0f;
         for (int i = 0; i < keep; ++i) {
@@ -196,9 +171,9 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
         return sorted_ids[keep - 1];
     }
 
-    static thread_local std::vector<TopCandidate> heap;
-    static thread_local std::vector<TopCandidate> sorted;
-    static thread_local std::vector<float> probs;
+    auto& heap = workspace.heap;
+    auto& sorted = workspace.sorted;
+    auto& probs = workspace.probabilities;
     heap.clear();
     heap.reserve(static_cast<size_t>(k));
 
@@ -273,7 +248,7 @@ int sample_topk_topp(int vocab_size, int top_k, float top_p, LogitGetter get_log
     }
 
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float r = dist(sampling_rng());
+    float r = dist(rng);
 
     float cumsum = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
@@ -411,11 +386,11 @@ int argmax(Context& ctx, Tensor& logits, int vocab_size) {
 
 int topk_sample(Context& ctx, Tensor& logits, int vocab_size,
                  float temperature, int top_k) {
-    static thread_local HostSamplingWorkspace host_ws;
+    auto& host_ws = ctx.workspace<HostSamplingWorkspace>();
     bf16* host_logits_bf16 = host_ws.ensure_bf16(ctx, static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16, logits.data(), vocab_size * sizeof(bf16));
     float inv_temperature = 1.0f / std::max(temperature, 1e-6f);
-    return sample_topk_topp(vocab_size, top_k, 1.0f,
+    return sample_topk_topp(host_ws, vocab_size, top_k, 1.0f,
                             [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
 }
 
@@ -465,6 +440,13 @@ void apply_penalties(float* logits_f, int vocab_size,
 int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                        const GenerationConfig& gen_config,
                        const std::vector<int>& generated_ids) {
+    return sample_with_config(ctx, logits, vocab_size, gen_config, generated_ids,
+                              sampling_rng());
+}
+
+int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
+                       const GenerationConfig& gen_config,
+                       const std::vector<int>& generated_ids, std::mt19937& rng) {
     if (!gen_config.do_sample) {
         return argmax(ctx, logits, vocab_size);
     }
@@ -472,17 +454,17 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
     float inv_temperature = 1.0f / std::max(gen_config.temperature, 1e-6f);
     int top_k = std::min(gen_config.top_k, vocab_size);
 
-    static thread_local HostSamplingWorkspace host_ws;
+    auto& host_ws = ctx.workspace<HostSamplingWorkspace>();
     bf16* host_logits_bf16 = host_ws.ensure_bf16(ctx, static_cast<size_t>(vocab_size));
     ctx.memcpy_d2h(host_logits_bf16, logits.data(), vocab_size * sizeof(bf16));
 
     if (!gen_config.has_penalties()) {
-        return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; });
+        return sample_topk_topp(host_ws, vocab_size, top_k, gen_config.top_p,
+            [&](int i) { return static_cast<float>(host_logits_bf16[i]) * inv_temperature; }, rng);
     }
 
     // Generic path: penalties on CPU float logits
-    static thread_local std::vector<float> logits_f;
+    auto& logits_f = host_ws.penalized_logits;
     logits_f.resize(static_cast<size_t>(vocab_size));
     for (int i = 0; i < vocab_size; i++) {
         logits_f[i] = static_cast<float>(host_logits_bf16[i]);
@@ -494,8 +476,8 @@ int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
     for (int i = 0; i < vocab_size; ++i) {
         logits_f[i] *= inv_temperature;
     }
-    return sample_topk_topp(vocab_size, top_k, gen_config.top_p,
-        [&](int i) { return logits_f[i]; });
+    return sample_topk_topp(host_ws, vocab_size, top_k, gen_config.top_p,
+        [&](int i) { return logits_f[i]; }, rng);
 }
 
 bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config) {
@@ -503,10 +485,8 @@ bool can_use_device_sampling(int vocab_size, const GenerationConfig& gen_config)
         return false;
     }
 
-    static int device_sampling_mode = -1;
-    if (device_sampling_mode < 0) {
-        device_sampling_mode = aila::env::read_int_raw("AILA_DEVICE_SAMPLING", 1);
-    }
+    static const int device_sampling_mode =
+        aila::env::read_int_raw("AILA_DEVICE_SAMPLING", 1);
     if (device_sampling_mode == 0) {
         return false;
     }
@@ -542,7 +522,7 @@ void sample_with_config_device(Context& ctx, Tensor& logits, int vocab_size,
     float top_p = std::clamp(gen_config.top_p, 1e-6f, 1.0f);
     int num_groups = choose_sampling_groups(vocab_size);
 
-    static thread_local DeviceSamplingWorkspace device_ws;
+    auto& device_ws = ctx.workspace<DeviceSamplingWorkspace>();
     device_ws.ensure(ctx, static_cast<size_t>(num_groups) * kDeviceSampleFastMaxTopK);
     float* partial_logits_ptr = device_ws.partial_logits;
     int* partial_ids_ptr = device_ws.partial_ids;

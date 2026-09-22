@@ -9,6 +9,12 @@ Aila supports the following environment variables for runtime configuration. Boo
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_RUNTIME_DLL_DIR` | directory path | directory containing `AilaShared.dll` | Directory containing `AilaWorker.exe` and the private oneAPI runtime. Relative values resolve relative to AilaShared.dll; absolute values are accepted. The selected path is normalized to an absolute path internally. An unset or empty value enables the legacy flat layout. |
+| `AILA_LEGACY_TEXT_V2` | integer flag | `0` | Set `1` to route supported pure-text legacy C ABI calls through shared Model/Session/Request and IPC v2. Requires matching `AilaInference.dll` beside `AilaShared.dll`; Worker remains in `AILA_RUNTIME_DLL_DIR`. At most 4 Sessions share each owner. The generated-token ceiling follows context capacity, up to 32768, while prompt + generation must fit the shared 32768-token reservation budget. Media/quantized-KV/legacy-linear models retain v1. See [legacy text adapter](legacy-text-adapter.md). |
+| `AILA_LEGACY_TEXT_MAX_SESSIONS` | unsigned decimal, 1–4 | `4` | Lower the number of legacy text Sessions sharing a Model/Worker; a full owner rejects another Engine without starting an extra Worker. |
+| `AILA_LEGACY_TEXT_MAX_SESSION_CACHE_BYTES` | uint64 decimal bytes | `0` | Total reserved device cache/state payload for Sessions sharing one legacy text Model; `0` uses the Session-count bound alone. |
+| `AILA_LEGACY_TEXT_MAX_DEVICE_BYTES` | uint64 decimal bytes | `0` | Maximum explicit device USM owned by this shared legacy Worker, including weights, Session state and execution scratch. `0` disables this additional byte ceiling. |
+| `AILA_LEGACY_TEXT_MAX_PINNED_HOST_BYTES` | uint64 decimal bytes | `0` | Maximum explicit pinned host USM in this shared legacy Worker, including sampling scratch. `0` disables this additional byte ceiling. |
+| `AILA_LEGACY_TEXT_MAX_SESSION_HOST_BYTES` | uint64 decimal bytes | `0` | Total reserved pageable host Session payload, including Hybrid mirrors; `0` uses the Session-count bound alone. |
 | `AILA_WORKER_ENV_PASSTHROUGH` | `;`-separated variable names | `""` | Names of scrubbed GPU-runtime variables (see below) that the host explicitly wants forwarded to the worker anyway. Matched case-insensitively; surrounding spaces are ignored. Example: `AILA_WORKER_ENV_PASSTHROUGH=ZES_ENABLE_SYSMAN;UR_L0_USE_COPY_ENGINE`. |
 | `AILA_KEEP_SYCL_CACHE_PERSISTENT` | flag | `0` | `Aila.exe` and `AilaWorker.exe` force `SYCL_CACHE_PERSISTENT=0` at startup because an enabled persistent cache crashes the bundled DPC++ runtime (null dereference while hashing oneDNN interop programs at the first JIT build). Set `1` to keep the inherited value, e.g. to test a runtime that fixes the bug. For the worker, the variable must also be forwarded via `AILA_WORKER_ENV_PASSTHROUGH=SYCL_CACHE_PERSISTENT`. |
 
@@ -18,13 +24,15 @@ to the host DLL loader also exposes the private runtime, so the flat layout does
 not provide host DLL-search isolation. Python, ComfyUI, and other embedding hosts
 must use the split layout and explicitly set `AILA_RUNTIME_DLL_DIR`.
 
-The recommended release/integration layout keeps only `AilaShared.dll` in the
+The recommended release/integration layout keeps the host API DLLs in the
 integration root, with `AilaWorker.exe`, `Aila.exe`, and the oneAPI runtime DLLs
 under `aila_runtime/`:
 
 ```text
 integration_root/
 |-- AilaShared.dll
+|-- AilaInference.dll        (async API / shared legacy text)
+|-- <host C++ runtime DLLs>  (when required by AilaInference.dll)
 `-- aila_runtime/
     |-- AilaWorker.exe
     |-- Aila.exe
@@ -32,10 +40,21 @@ integration_root/
 ```
 
 For this layout, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before the host loads
-`AilaShared.dll`. Each initialized engine uses its own worker process. The worker
+`AilaShared.dll`. The default v1 path uses one Worker per Engine. With
+`AILA_LEGACY_TEXT_V2=1`, compatible text Engines share a Worker when their
+model/runtime/capacity/backend/environment match. The worker
 starts in the selected directory with a child-only `PATH` containing that
 directory and Windows system directories. The host's DLL search path remains
 unchanged.
+
+The five legacy text admission settings are read once for each owner from the
+same Win32 environment snapshot used to select that owner. They apply only to
+the `AILA_LEGACY_TEXT_V2=1` path. Values must contain decimal digits only;
+signs, whitespace, units and uint64 overflow are rejected as invalid arguments
+before a Worker starts. Budgets describe Aila-owned payloads and explicit USM,
+not total process RSS or WDDM residency. Different model/runtime/capacity or
+environment groups have independent owners and budgets. Defaults leave the
+existing optional adapter behavior unchanged.
 
 The worker also does not inherit host GPU-runtime instrumentation variables.
 GPU hosts such as PyTorch XPU set tracing and instrumentation variables in
@@ -141,6 +160,7 @@ Qwen3.5 Hybrid models use Aila's built-in fixed Qwen3.5 template when no explici
 |----------|------|---------|-------------|
 | `AILA_ATTN_JM` | int | `1` | Decode attention joint-matrix (XMX) mode: `0` = off, `1` = auto (use if available), `2` = force |
 | `AILA_ATTN_JM_TILE` | int | `-1` (auto) | Force joint-matrix tile ID: `0` = 16×32×16, `1` = 32×32×16, `2` = 8×8×16. Auto-selects the largest tile when `-1` |
+| `AILA_ATTN_DECODE_ROWS` | int | `1` | Batched decode: `1` merges eligible decode rows into one attention launch (baseline for head_dim 256 below threshold, exact partial merge for head_dim 128/256 at or above threshold, and fused Joint-Matrix for head_dim 128 below 128 tokens), `0` restores per-row decode attention calls. Only window/sink and mixed-threshold rows keep per-row dispatch |
 | `AILA_ATTN_DECODE_WG` | int | `512` | Decode attention work-group size |
 | `AILA_ATTN_DECODE_WINDOW` | int | `0` | Decode attention sliding window size (`0` = full context). Positive values restrict each decode step to recent tokens for significant throughput gains |
 | `AILA_ATTN_DECODE_WINDOW_START` | int | `-1` | Enable decode window only after context length exceeds this threshold. Auto = `max(512, window)` when `-1` |
@@ -290,10 +310,20 @@ Set `AILA_REF_CACHE_DIR` to a shared directory to reuse embeddings across differ
 
 ### Debug Output (AILA_DEBUG_*)
 
+Shared inference also supports `AILA_EXECUTION_TRACE_DIR` (directory, unset by
+default), read once before its DeviceRuntime is created. It writes exclusive,
+per-domain JSONL files with durable host execution/wait/free boundaries; no
+extra GPU synchronization is added. It changes host timing and is diagnostic
+only. Trace failures stop new shared inference work without skipping cleanup.
+This does not instrument legacy Context users or individual kernels. The HTTP
+runner enables it only via `--mode probe --execution-trace`, otherwise removes
+an inherited path. See [execution-tracing.md](execution-tracing.md).
+
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_DEBUG_PROMPT_TEXT` | bool | `false` | Log the fully rendered prompt text before prefill, including chat-template special markers such as `<|im_start|>` and `<|im_end|>` |
 | `AILA_DEBUG_CHAT_TEMPLATE` | bool | `false` | Log the selected chat template source/version without dumping the full prompt |
+| `AILA_SERVER_TOOL_DIAGNOSTICS` | int | `0` | HTTP Server only: a nonzero value logs invalid tool blocks at WARN with the request ID, parse reason and at most 4096 bytes of JSON-escaped block text. Read once on the first tool parse failure; set before starting the Server. May include generated argument content; diagnostic only |
 | `AILA_DEBUG_PROMPT_TEXT_MAX_CHARS` | int | `20000` | Maximum rendered prompt characters to log when `AILA_DEBUG_PROMPT_TEXT=1`. Set to `0` for unlimited output |
 | `AILA_DUMP_LOGITS` | bool | `false` | Dump intermediate Qwen3-ASR audio-encoder tensors as `debug_cpp_*.bin` files in the process/worker working directory. Diagnostic only |
 | `AILA_DEBUG_TOKEN_IDS` | bool | `false` | Log token IDs during generation |

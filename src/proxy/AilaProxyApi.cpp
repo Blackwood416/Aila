@@ -446,11 +446,12 @@ AILA_API int aila_generate_stream(
         catch (...) {}
         return -1;
     }
+    const auto owner = engine->proxy;
     try {
-        return engine->proxy->generate_stream(
+        return owner->generate_stream(
             "generate.stream", prompt, config, callback, user_data);
     } catch (...) {
-        record_boundary_failure(engine, "aila_generate_stream");
+        try { owner->record_runtime_error("aila_generate_stream failed at the C ABI boundary"); } catch (...) {}
         return -1;
     }
 }
@@ -467,11 +468,12 @@ AILA_API int aila_generate_messages_stream(
         catch (...) {}
         return -1;
     }
+    const auto owner = engine->proxy;
     try {
-        return engine->proxy->generate_stream(
+        return owner->generate_stream(
             "generate.messages_stream", messages_json, config, callback, user_data);
     } catch (...) {
-        record_boundary_failure(engine, "aila_generate_messages_stream");
+        try { owner->record_runtime_error("aila_generate_messages_stream failed at the C ABI boundary"); } catch (...) {}
         return -1;
     }
 }
@@ -488,11 +490,12 @@ AILA_API int aila_generate_chat_json_stream_ex(
         catch (...) {}
         return -1;
     }
+    const auto owner = engine->proxy;
     try {
-        return engine->proxy->generate_stream_v2(
+        return owner->generate_stream_v2(
             "generate.chat_json_stream_ex", chat_request_json, config, callback, user_data);
     } catch (...) {
-        record_boundary_failure(engine, "aila_generate_chat_json_stream_ex");
+        try { owner->record_runtime_error("aila_generate_chat_json_stream_ex failed at the C ABI boundary"); } catch (...) {}
         return -1;
     }
 }

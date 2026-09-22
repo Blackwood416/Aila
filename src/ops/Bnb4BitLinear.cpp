@@ -1,5 +1,6 @@
 #include "Bnb4BitLinear.hpp"
 #include "Ops.hpp"
+#include "../utils/DeviceException.hpp"
 #include "../utils/EnvUtils.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <algorithm>
@@ -7,6 +8,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <exception>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <vector>
@@ -1464,6 +1467,120 @@ void packed_nf4_gemv_bf16(Context& ctx,
     });
 }
 
+// Each sequence owns its own padded output-row grid. Keeping one SG16 per
+// output and the original vec8/FMA reduction order makes B2..4 decode match
+// B1, without dequantizing a whole weight matrix for a prefill GEMM.
+void packed_nf4_decode_rows_bf16(Context& ctx,
+                                const Bnb4BitWeightRef& weight,
+                                Tensor& absmax_f32,
+                                Tensor& input,
+                                Tensor& output,
+                                int in_features,
+                                int out_features,
+                                int rows) {
+    const uint8_t* packed_ptr = static_cast<const uint8_t*>(weight.packed_weight->data());
+    const float* quant_map_ptr = static_cast<const float*>(weight.quant_map->data());
+    const float* absmax_ptr = static_cast<const float*>(absmax_f32.data());
+    const bf16* input_base = static_cast<const bf16*>(input.data());
+    bf16* output_base = static_cast<bf16*>(output.data());
+
+    const int blocksize = weight.quant_state.blocksize;
+    const int packed_bytes_per_row = in_features / 2;
+    const int packed_bytes_per_block = blocksize / 2;
+    const int blocks_per_row = in_features / blocksize;
+    const size_t wg_size = 256;
+    const size_t sub_group_size = 16;
+    const size_t rows_per_group = wg_size / sub_group_size;
+    const size_t groups_per_sequence =
+        (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
+    const size_t num_groups = static_cast<size_t>(rows) * groups_per_sequence;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const int lid = static_cast<int>(item.get_local_id(0));
+            const int sg_id = lid / sub_group_size;
+            const int sg_lane = lid % sub_group_size;
+            const size_t sequence = item.get_group(0) / groups_per_sequence;
+            const int group_row_base = static_cast<int>(item.get_group(0) % groups_per_sequence) *
+                                       static_cast<int>(rows_per_group);
+            const int row = group_row_base + sg_id;
+            const bf16* input_ptr = input_base + sequence * in_features;
+            bf16* out_ptr = output_base + sequence * out_features;
+
+            if (lid < 16) {
+                quant_map_cache[lid] = quant_map_ptr[lid];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            float partial = 0.0f;
+            if (row < out_features) {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                int byte_offset = sg_lane * 4;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row;
+                     byte_offset += stride) {
+                    if (byte_offset + stride + 3 < packed_bytes_per_row) {
+                        sycl::ext::oneapi::experimental::prefetch(
+                            packed_ptr + row_byte_base + byte_offset + stride);
+                        sycl::ext::oneapi::experimental::prefetch(
+                            input_ptr + (byte_offset + stride) * 2);
+                    }
+                    const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
+                        packed_ptr + row_byte_base + byte_offset);
+                    const float am = absmax_ptr[row_block_base +
+                        (byte_offset / packed_bytes_per_block)];
+                    const int ib = byte_offset * 2;
+                    const uint8_t b0 = static_cast<uint8_t>(p4);
+                    const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
+                    const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
+                    const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
+                    const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
+                    // Inline dequant into FMA: eliminates 8 float temporaries,
+                    // giving the compiler freedom to schedule and reuse registers.
+                    partial = sycl::fma(static_cast<float>(in_v[0]),
+                        static_cast<float>(bf16(quant_map_cache[b0 >> 4] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[1]),
+                        static_cast<float>(bf16(quant_map_cache[b0 & 0xF] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[2]),
+                        static_cast<float>(bf16(quant_map_cache[b1 >> 4] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[3]),
+                        static_cast<float>(bf16(quant_map_cache[b1 & 0xF] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[4]),
+                        static_cast<float>(bf16(quant_map_cache[b2 >> 4] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[5]),
+                        static_cast<float>(bf16(quant_map_cache[b2 & 0xF] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[6]),
+                        static_cast<float>(bf16(quant_map_cache[b3 >> 4] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(in_v[7]),
+                        static_cast<float>(bf16(quant_map_cache[b3 & 0xF] * am)), partial);
+                }
+                for (; byte_offset < packed_bytes_per_row;
+                     byte_offset += static_cast<int>(sub_group_size)) {
+                    const uint8_t pb = packed_ptr[row_byte_base + byte_offset];
+                    const float am = absmax_ptr[row_block_base +
+                        (byte_offset / packed_bytes_per_block)];
+                    const int ii = byte_offset * 2;
+                    partial = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        static_cast<float>(bf16(
+                            quant_map_cache[(pb >> 4) & 0xF] * am)), partial);
+                    partial = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        static_cast<float>(bf16(
+                            quant_map_cache[pb & 0xF] * am)), partial);
+                }
+            }
+
+            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            if (sg_lane == 0 && row < out_features) {
+                out_ptr[row] = bf16(sum);
+            }
+        });
+    });
+}
+
 } // namespace
 
 void Bnb4BitLinearScratch::ensure(Context& ctx, int seq_len, int in_features, int out_features, bool need_weight) {
@@ -1664,30 +1781,48 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
     size_t absmax_offset = 0;
     auto* fused_packed_ptr = static_cast<uint8_t*>(owned_packed_weight_.data());
     auto* fused_absmax_ptr = static_cast<float*>(absmax_f32_.data());
-    for (const Bnb4BitLinear* src : sources) {
-        const size_t packed_bytes = src->weight_.packed_weight->size_bytes();
-        const size_t absmax_values = static_cast<size_t>(src->absmax_f32_.numel());
-        ctx.queue().memcpy(fused_packed_ptr + packed_offset,
-                           src->weight_.packed_weight->data(),
-                           packed_bytes);
-        ctx.queue().memcpy(fused_absmax_ptr + absmax_offset,
-                           src->absmax_f32_.data(),
-                           absmax_values * sizeof(float));
-        packed_offset += packed_bytes;
-        absmax_offset += absmax_values;
+    try {
+        for (const Bnb4BitLinear* src : sources) {
+            const size_t packed_bytes = src->weight_.packed_weight->size_bytes();
+            const size_t absmax_values = static_cast<size_t>(src->absmax_f32_.numel());
+            ctx.queue().memcpy(fused_packed_ptr + packed_offset,
+                               src->weight_.packed_weight->data(),
+                               packed_bytes);
+            ctx.queue().memcpy(fused_absmax_ptr + absmax_offset,
+                               src->absmax_f32_.data(),
+                               absmax_values * sizeof(float));
+            packed_offset += packed_bytes;
+            absmax_offset += absmax_values;
+        }
+
+        weight_ = {};
+        weight_.name = fused_name;
+        weight_.packed_weight = &owned_packed_weight_;
+        weight_.quant_map = first->weight_.quant_map;
+        weight_.quant_state = ref_quant_state;
+        weight_.quant_state.shape = {total_out_features, (int64_t)in_features};
+        in_features_ = in_features;
+        out_features_ = static_cast<int>(total_out_features);
+
+        finish_init(ctx);
+        ctx.synchronize();
+    } catch (...) {
+        // The caller may own source linears on its stack. Drain before those
+        // sources or this object's fused buffers can be destroyed by unwinding.
+        // This also covers metadata allocation and finish_init after the copies.
+        const auto failure = std::current_exception();
+        try {
+            ctx.synchronize();
+        } catch (...) {
+            const auto drain_failure = std::current_exception();
+            // Keep an original device failure; otherwise a failed drain must
+            // escape as a device error, not a recoverable host/quota rejection.
+            aila::device_failure::RecoverNonDeviceExceptions<sycl::exception, dnnl::error>(
+                [&] { std::rethrow_exception(failure); },
+                [&](const std::exception&) { std::rethrow_exception(drain_failure); });
+        }
+        std::rethrow_exception(failure);
     }
-
-    weight_ = {};
-    weight_.name = fused_name;
-    weight_.packed_weight = &owned_packed_weight_;
-    weight_.quant_map = first->weight_.quant_map;
-    weight_.quant_state = ref_quant_state;
-    weight_.quant_state.shape = {total_out_features, (int64_t)in_features};
-    in_features_ = in_features;
-    out_features_ = static_cast<int>(total_out_features);
-
-    finish_init(ctx);
-    ctx.synchronize();
     return true;
 }
 
@@ -1756,6 +1891,7 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     if (prim_cache_.count(seq_len)) {
         return;
     }
+    ctx.make_primitive_cache_room(prim_cache_);
 
     auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
                                      dnnl::memory::format_tag::ab);
@@ -1765,11 +1901,10 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
                                      dnnl::memory::format_tag::ab);
 
     dnnl::primitive_attr attr;
-    // Prefill creates one primitive per weight and sequence length.  Keeping a
-    // user scratchpad in every cached primitive grows by hundreds of MB across
-    // DiffusionGemma's 30 layers and exhausts a 16 GB A770.  Library mode keeps
-    // the scratch lifetime at execution scope.
-    attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
+    // Share one tracked scratch allocation across sequential primitives. A
+    // scratchpad per weight/shape exhausts memory on large models; library
+    // scratch hides payload from the execution-domain admission counter.
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
     auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md, attr);
 
     CachedPrimitive cp;
@@ -1777,6 +1912,7 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     cp.src_md = src_md;
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
+    cp.scratchpad_md = pd.scratchpad_desc();
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 
@@ -1821,6 +1957,10 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
                                                       Tensor& input,
                                                       Tensor& output,
                                                       int ff_dim) {
+    // Both gate and up adapters live on this fused projection. The fused
+    // kernel only reads the base weights; let the ordinary projection apply
+    // every adapter before the existing SwiGLU fallback instead.
+    if (fused_gate_up.has_lora()) return false;
     if (input.dtype() != dnnl::memory::data_type::bf16 ||
         output.dtype() != dnnl::memory::data_type::bf16) return false;
     if (input.ndim() != 2) return false;
@@ -1856,6 +1996,14 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
     return true;
 }
 
+float* Bnb4BitLinear::ensure_lora_scratch(Context& ctx, size_t count) {
+    if (!lora_scratch_.valid() || static_cast<size_t>(lora_scratch_.numel()) < count) {
+        ctx.synchronize();
+        lora_scratch_ = Tensor::allocate(ctx, {static_cast<int64_t>(count)}, dnnl::memory::data_type::f32);
+    }
+    return lora_scratch_.data_as<float>();
+}
+
 void Bnb4BitLinear::apply_lora_decode(Context& ctx, Tensor& input, Tensor& output) {
     const bf16* in_ptr = static_cast<const bf16*>(input.data());
     bf16* out_ptr = static_cast<bf16*>(output.data());
@@ -1869,8 +2017,9 @@ void Bnb4BitLinear::apply_lora_decode(Context& ctx, Tensor& input, Tensor& outpu
         int offset = att.output_offset;
         float scale = att.scaling;
 
-        // Small USM temp buffer for intermediate: (r,) float
-        float* inter_f32 = sycl::malloc_device<float>(static_cast<size_t>(r), ctx.queue());
+        // Retain the intermediate until the execution slot is drained. SYCL
+        // free and a local Tensor destructor do not wait for submitted kernels.
+        float* inter_f32 = ensure_lora_scratch(ctx, static_cast<size_t>(r));
 
         // Step 1: intermediate[k] = sum_j A[k,j] * x[j]
         ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(r)),
@@ -1896,7 +2045,6 @@ void Bnb4BitLinear::apply_lora_decode(Context& ctx, Tensor& input, Tensor& outpu
                 out_ptr[out_idx] = bf16(static_cast<float>(out_ptr[out_idx]) + acc * scale);
             });
 
-        sycl::free(inter_f32, ctx.queue());
     }
 }
 
@@ -1913,10 +2061,7 @@ void Bnb4BitLinear::apply_lora_prefill(Context& ctx, Tensor& input, Tensor& outp
         int offset = att.output_offset;
         float scale = att.scaling;
 
-        // Allocate temp buffer for intermediate: (seq_len, r)
-        Tensor inter = Tensor::allocate(ctx, {static_cast<int64_t>(seq_len), static_cast<int64_t>(r)},
-                                        dnnl::memory::data_type::f32);
-        float* inter_ptr = static_cast<float*>(inter.data());
+        float* inter_ptr = ensure_lora_scratch(ctx, static_cast<size_t>(seq_len) * r);
 
         // Step 1: intermediate[b,k] = sum_j A[k,j] * input[b,j]
         ctx.queue().parallel_for(sycl::range<2>(static_cast<size_t>(seq_len), static_cast<size_t>(r)),
@@ -1945,6 +2090,73 @@ void Bnb4BitLinear::apply_lora_prefill(Context& ctx, Tensor& input, Tensor& outp
                 int out_idx = static_cast<size_t>(b) * out_f + offset + i;
                 out_ptr[out_idx] = bf16(static_cast<float>(out_ptr[out_idx]) + acc * scale);
             });
+    }
+}
+
+void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
+                                     Bnb4BitLinearScratch& scratch,
+                                     Tensor& input,
+                                     Tensor& output,
+                                     int rows) {
+    if (rows < 1 || rows > 4) {
+        throw std::invalid_argument("Bnb4BitLinear::ForwardDecodeRows: rows must be in [1, 4]");
+    }
+    if (in_features_ <= 0 || out_features_ <= 0) {
+        throw std::invalid_argument("Bnb4BitLinear::ForwardDecodeRows: linear is not initialized");
+    }
+    const auto validate = [&](const Tensor& tensor, int features, const char* name) {
+        if (!tensor.valid() || tensor.context() != &ctx ||
+            tensor.dtype() != dnnl::memory::data_type::bf16 || tensor.ndim() != 2 ||
+            tensor.shape(0) <= 0 || tensor.shape(1) <= 0) {
+            throw std::invalid_argument(std::string("Bnb4BitLinear::ForwardDecodeRows: ") +
+                                        name + " must be a valid BF16 matrix in this context");
+        }
+        // Tensor shapes describe capacity, not the logical projection stride.
+        // Check multiplication before numel(): malformed view metadata must not
+        // overflow or reach a device submission.
+        if (tensor.shape(0) > std::numeric_limits<int64_t>::max() / tensor.shape(1) ||
+            tensor.shape(0) * tensor.shape(1) < static_cast<int64_t>(rows) * features) {
+            throw std::invalid_argument(std::string("Bnb4BitLinear::ForwardDecodeRows: ") +
+                                        name + " capacity is invalid or too small");
+        }
+    };
+    validate(input, in_features_, "input");
+    validate(output, out_features_, "output");
+
+    static const int gemv_wg_override = aila::env::read_int_raw("AILA_BNB4_GEMV_WG", 0);
+    const bool use_decode_rows = rows > 1 && in_features_ >= 512 &&
+        (gemv_wg_override == 0 || gemv_wg_override == 256) &&
+        can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1);
+    if (!use_decode_rows) {
+        // Preserve single-row behavior for B1, small K, custom work-group
+        // overrides, and non-packed/incompatible weights. forward already applies
+        // adapters on these paths, so they must not be added again below.
+        for (int row = 0; row < rows; ++row) {
+            auto row_input = Tensor::view(ctx,
+                input.data_as<bf16>() + static_cast<size_t>(row) * in_features_,
+                {1, in_features_}, dnnl::memory::data_type::bf16);
+            auto row_output = Tensor::view(ctx,
+                output.data_as<bf16>() + static_cast<size_t>(row) * out_features_,
+                {1, out_features_}, dnnl::memory::data_type::bf16);
+            forward(ctx, scratch, row_input, row_output, 1);
+        }
+        return;
+    }
+
+    packed_nf4_decode_rows_bf16(ctx, weight_, absmax_f32_, input, output,
+                               in_features_, out_features_, rows);
+    if (!lora_attachments_.empty()) {
+        // The in-order queue safely reuses the retained single-row adapter
+        // intermediate, including attachments with different ranks/overlaps.
+        for (int row = 0; row < rows; ++row) {
+            auto row_input = Tensor::view(ctx,
+                input.data_as<bf16>() + static_cast<size_t>(row) * in_features_,
+                {1, in_features_}, dnnl::memory::data_type::bf16);
+            auto row_output = Tensor::view(ctx,
+                output.data_as<bf16>() + static_cast<size_t>(row) * out_features_,
+                {1, out_features_}, dnnl::memory::data_type::bf16);
+            apply_lora_decode(ctx, row_input, row_output);
+        }
     }
 }
 
@@ -2094,9 +2306,6 @@ void Bnb4BitLinear::forward(Context& ctx,
                 {DNNL_ARG_WEIGHTS, cp.weight_mem},
                 {DNNL_ARG_DST, cp.dst_mem}
             };
-            if (cp.scratchpad.valid()) {
-                cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
-            }
             cp.mem_inited = true;
         } else {
             if (cp.src_ptr != input_bf16.data()) {
@@ -2114,6 +2323,9 @@ void Bnb4BitLinear::forward(Context& ctx,
                 cp.dst_ptr = output_bf16.data();
                 cp.args[DNNL_ARG_DST] = cp.dst_mem;
             }
+        }
+        if (cp.scratchpad_md.get_size()) {
+            cp.args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(cp.scratchpad_md);
         }
         cp.prim.execute(ctx.stream(), cp.args);
     }

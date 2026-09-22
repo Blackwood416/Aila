@@ -75,6 +75,23 @@ BenchmarkResult run_benchmark(InferenceEngine& engine, const BenchmarkConfig& cf
     auto prompt = generate_synthetic_prompt(engine, cfg.prompt_length);
     int actual_pp = static_cast<int>(prompt.size());
 
+    // The decode loop keeps appending to the same KV cache, so prompt plus
+    // generated tokens must fit the model context. Without this check an
+    // over-large request writes past the cache and the process dies with
+    // STATUS_STACK_BUFFER_OVERRUN instead of reporting an actionable error.
+    const int max_context = engine.max_context_length();
+    if (max_context > 0 && actual_pp + cfg.gen_length > max_context) {
+        AILA_LOG_ERROR(
+            "[Bench] prompt %d + gen %d = %d tokens exceeds the model context of %d; "
+            "reduce --bench-pp or --bench-tg",
+            actual_pp, cfg.gen_length, actual_pp + cfg.gen_length, max_context);
+        // Report the rejected sizes so callers can see what was refused.
+        BenchmarkResult rejected;
+        rejected.prompt_tokens = actual_pp;
+        rejected.gen_tokens = cfg.gen_length;
+        return rejected;
+    }
+
     // --- Warmup ---
     AILA_LOG_INFO("[Bench] Running %d warmup iteration(s)...", cfg.warmup_iters);
     for (int i = 0; i < cfg.warmup_iters; i++) {

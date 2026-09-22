@@ -8,6 +8,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 #include "oneapi/dnnl/dnnl.hpp"
 #include <sycl/sycl.hpp>
 #include <vector>
+#include <random>
 #include <unordered_map>
 #include <string>
 #include <cstdint>
@@ -157,8 +158,7 @@ private:
         dnnl::memory src_mem;
         dnnl::memory weight_mem;
         dnnl::memory dst_mem;
-        dnnl::memory scratchpad_mem;
-        Tensor scratchpad;
+        dnnl::memory::desc scratchpad_md;
         bool mem_inited = false;
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
@@ -179,8 +179,7 @@ private:
         dnnl::memory weight_mem;
         dnnl::memory bias_mem;
         dnnl::memory dst_mem;
-        dnnl::memory scratchpad_mem;
-        Tensor scratchpad;
+        dnnl::memory::desc scratchpad_md;
         bool mem_inited = false;
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
@@ -201,8 +200,7 @@ private:
         dnnl::memory weight_mem;
         dnnl::memory bias_mem;
         dnnl::memory dst_mem;
-        dnnl::memory scratchpad_mem;
-        Tensor scratchpad;
+        dnnl::memory::desc scratchpad_md;
         bool mem_inited = false;
         void* src_ptr = nullptr;
         void* weight_ptr = nullptr;
@@ -352,6 +350,28 @@ namespace ops {
                           int num_heads, int num_kv_heads, int head_dim,
                           int cached_len,
                           Tensor* exact_partials_buf = nullptr);
+
+    // Per-row decode geometry for the multi-row entry point below. Rows are
+    // independent sequences, so each carries its own cache and position.
+    struct DecodeRowGeometry {
+        Tensor* k_cache = nullptr;
+        Tensor* v_cache = nullptr;
+        int cached_len = 0;
+    };
+
+    // GQA Attention for 1..4 independent decode sequences. Each row keeps the
+    // single-row kernel body, reduction order and rounding, so a row's output
+    // is bitwise identical to calling attention_decode for that row alone.
+    // Falls back to per-row attention_decode when any row needs a path that has
+    // no multi-row implementation (joint-matrix or exact partial merge).
+    // q_row_stride is the distance between consecutive sequences inside q,
+    // which is num_heads*head_dim only when q is stored as a dense row stack.
+    void attention_decode_rows(Context& ctx,
+                               Tensor& q, int q_row_stride, Tensor& output,
+                               Tensor& scores_buf, const DecodeRowGeometry* rows,
+                               int row_count, int num_heads, int num_kv_heads,
+                               int head_dim, int max_cached_len,
+                               Tensor* exact_partials_buf = nullptr);
 
     // Prefill Attention (seq_len > 1, initial prefill with start_pos=0)
     // q: [seq_len, num_heads * head_dim]
@@ -533,6 +553,13 @@ namespace ops {
     int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
                            const GenerationConfig& gen_config,
                            const std::vector<int>& generated_ids);
+
+    // Explicit request-owned RNG for interleaved sessions. The legacy overload
+    // retains its thread-local seed behavior.
+    int sample_with_config(Context& ctx, Tensor& logits, int vocab_size,
+                           const GenerationConfig& gen_config,
+                           const std::vector<int>& generated_ids,
+                           std::mt19937& rng);
 
     // Check whether the current generation config can use the device-side
     // no-penalty sampling fast path.

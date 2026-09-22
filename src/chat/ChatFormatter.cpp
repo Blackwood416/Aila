@@ -77,8 +77,10 @@ bool ChatFormatter::render_text(const ChatFormatInput& input,
         source = read_file_text(request_copy.template_options.template_override_path);
         name = request_copy.template_options.template_override_path;
     } else {
-        const std::string env_template = aila::env::read_string("AILA_CHAT_TEMPLATE", "");
-        const std::string env_path = aila::env::read_string("AILA_CHAT_TEMPLATE_PATH", "");
+        const std::string env_template = input.environment_template_text
+            ? *input.environment_template_text : aila::env::read_string("AILA_CHAT_TEMPLATE", "");
+        const std::string env_path = input.environment_template_path
+            ? *input.environment_template_path : aila::env::read_string("AILA_CHAT_TEMPLATE_PATH", "");
         if (!env_template.empty()) {
             source = env_template;
             name = "AILA_CHAT_TEMPLATE";

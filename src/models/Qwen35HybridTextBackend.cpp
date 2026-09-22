@@ -1,6 +1,12 @@
 #include "Qwen35HybridTextBackend.hpp"
+#include "HybridLayerExecutor.hpp"
+#include "HybridDecodeBatchExecutor.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
+#include "memory/SessionMemory.hpp"
+#include "memory/AllocationBudget.hpp"
+#include <chrono>
+#include <limits>
 #include <array>
 #include <algorithm>
 #include <cstdio>
@@ -9,45 +15,15 @@
 #include <stdexcept>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using aila::models::ProfileStage;
+using aila::models::StageProfileTotals;
+using aila::models::StageProfiler;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 int round_up_seq(int v, int granularity) {
     return ((v + granularity - 1) / granularity) * granularity;
 }
-
-enum class ProfileStage : int {
-    EmbedNorm = 0,
-    LinearProj,
-    LinearDelta,
-    LinearOProj,
-    FullQkvProj,
-    FullSplit,
-    QkNormRope,
-    KvCache,
-    Attention,
-    AttnGate,
-    FullOProj,
-    PostAttnNorm,
-    FfnProj,
-    FfnAct,
-    DownProj,
-    PostMlpNorm,
-    LmHead,
-    Count,
-};
-
-struct StageProfileTotals {
-    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
-    int calls = 0;
-    int tokens = 0;
-
-    void reset() {
-        stage_ms.fill(0.0);
-        calls = 0;
-        tokens = 0;
-    }
-};
 
 bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
     if (!dev.has(sycl::aspect::ext_intel_matrix)) {
@@ -101,6 +77,24 @@ bool supports_default_grouped_linear_delta_fastpath(int q_heads, int kv_heads,
                                               true);
 }
 
+// Grouped value heads share Q/K history across work-groups. Keep the history
+// read-only during computation, then commit it on the in-order queue once
+// every reader has finished.
+void commit_linear_conv_history(Context& ctx, const bf16* input, int input_stride,
+                                float* history, int channels, int history_rows,
+                                int initial_head, int token_count) {
+    const int rows_to_copy = std::min(token_count, history_rows);
+    const int first_token = token_count - rows_to_copy;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(rows_to_copy) * channels),
+        [=](sycl::id<1> index) {
+            const size_t channel = index[0] % static_cast<size_t>(channels);
+            const int token = first_token + static_cast<int>(index[0] / channels);
+            const int row = (initial_head + token % history_rows) % history_rows;
+            history[static_cast<size_t>(row) * channels + channel] =
+                static_cast<float>(input[static_cast<size_t>(token) * input_stride + channel]);
+        });
+}
+
 int linear_delta_gqa_group_size(int q_heads, int kv_heads) {
     if (q_heads <= 0 || kv_heads <= 0 || (kv_heads % q_heads) != 0) {
         return 0;
@@ -124,6 +118,11 @@ bool linear_delta_is_group_leader(int value_head, int q_heads, int kv_heads) {
     return (value_head % group_size) == 0;
 }
 }
+
+struct Qwen35HybridTextBackend::ProfileState {
+    StageProfileTotals decode;
+    StageProfileTotals prefill;
+};
 
 float Qwen35HybridTextBackend::softplus(float x) {
     if (x > 20.0f) return x;
@@ -174,8 +173,9 @@ void Qwen35HybridTextBackend::head_rms_norm_and_silu_gate(std::vector<float>& x,
 
 void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     if (seq_len <= runtime_seq_capacity_) return;
+    if (runtime_seq_capacity_ > 0) ctx.synchronize();
 
-    int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
+    int new_cap = std::max(seq_len, std::min(max_seq_len_, round_up_seq(seq_len, 64)));
     buf_.hidden = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.normed = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_qkv_dim_});
@@ -189,8 +189,11 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
     buf_.attn_out = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
     buf_.full_qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)full_fused_qkv_dim_});
     buf_.gate_up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * ff_dim_)});
-    buf_.gate = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
-    buf_.up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
+    // Attention/down output uses hidden width; FFN activation uses ff_dim_.
+    // Keep physical capacity sufficient for either logical row layout.
+    const int projection_capacity = std::max(ff_dim_, hidden_size_);
+    buf_.gate = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
+    buf_.up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
 
     runtime_seq_capacity_ = new_cap;
     AILA_LOG_INFO("[Qwen3.5] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);
@@ -198,6 +201,7 @@ void Qwen35HybridTextBackend::ensure_runtime_buffers(Context& ctx, int seq_len) 
 
 void Qwen35HybridTextBackend::ensure_prefill_scores(Context& ctx, int seq_len) {
     if (seq_len <= prefill_scores_capacity_) return;
+    if (buf_.scores.valid()) ctx.synchronize();
 
     int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
     buf_.scores = Tensor::allocate(
@@ -210,6 +214,7 @@ void Qwen35HybridTextBackend::ensure_prefill_scores(Context& ctx, int seq_len) {
 
 void Qwen35HybridTextBackend::ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len) {
     if (seq_len <= incr_prefill_seq_cap_ && total_len <= incr_prefill_total_cap_) return;
+    if (buf_.incr_scores.valid()) ctx.synchronize();
 
     int new_seq_cap = std::max(seq_len, incr_prefill_seq_cap_);
     int new_total_cap = std::max(total_len, incr_prefill_total_cap_);
@@ -344,9 +349,279 @@ void Qwen35HybridTextBackend::run_decode_jm_matvec_custom(
     });
 }
 
+// Multi-row decode variants: one launch for 2..4 independent sequences. Each
+// (sequence, output row) pair still uses the original subgroup size, vec8/FMA
+// order and reduce_over_group, so a batched row is numerically identical to the
+// single-row kernel. Groups are ordered so all sequences of the same weight row
+// are adjacent, letting L2 serve one weight row to every sequence.
+void Qwen35HybridTextBackend::run_decode_jm_matvec_rows(
+    Context& ctx, Tensor& input, const Tensor& weight_jm,
+    int in_dim, int out_dim, Tensor& output, int rows) {
+    if (rows < 1 || rows > 4) {
+        throw std::invalid_argument("run_decode_jm_matvec_rows: rows must be in [1, 4]");
+    }
+    // A sequence row offset must stay vec8-aligned, so an in_dim that is not a
+    // multiple of the vector width keeps the original per-row kernels.
+    if (rows == 1 || (in_dim % 8) != 0) {
+        for (int r = 0; r < rows; ++r) {
+            auto row_input = Tensor::view(ctx, input.data_as<bf16>() + static_cast<size_t>(r) * in_dim,
+                                          {1, static_cast<int64_t>(in_dim)}, input.dtype());
+            auto row_output = Tensor::view(ctx, output.data_as<bf16>() + static_cast<size_t>(r) * out_dim,
+                                           {1, static_cast<int64_t>(out_dim)}, output.dtype());
+            run_decode_jm_matvec_custom(ctx, row_input, weight_jm, in_dim, out_dim, row_output);
+        }
+        return;
+    }
+    using vec8 = sycl::vec<bf16, 8>;
+    const bf16* input_base = static_cast<const bf16*>(input.data());
+    const bf16* weight_ptr = static_cast<const bf16*>(weight_jm.data());
+    bf16* output_base = static_cast<bf16*>(output.data());
+
+    constexpr int sg_size = kDecodeFfnSubgroup;
+    constexpr int vec_width = 8;
+    const int vec_chunks = in_dim / vec_width;
+    const int tail_start = vec_chunks * vec_width;
+    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(out_dim) * rows * sg_size),
+                              sycl::range<1>(sg_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const size_t group = item.get_group(0);
+                // row varies slowest so every sequence reads the same weights together.
+                const int row = static_cast<int>(group / static_cast<size_t>(rows));
+                const int sequence = static_cast<int>(group % static_cast<size_t>(rows));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const bf16* input_ptr = input_base + static_cast<size_t>(sequence) * in_dim;
+                const bf16* input_row_bytes = input_ptr;
+                const vec8* input_vec = reinterpret_cast<const vec8*>(input_row_bytes);
+                const vec8* weight_row = weight_vec + row * vec_chunks;
+                float acc = 0.0f;
+
+                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
+                    vec8 in_v = input_vec[chunk];
+                    vec8 w_v = weight_row[chunk];
+                    for (int i = 0; i < vec_width; ++i) {
+                        acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(w_v[i]), acc);
+                    }
+                }
+
+                for (int k = tail_start + lane; k < in_dim; k += sg_size) {
+                    acc = sycl::fma(static_cast<float>(input_ptr[k]),
+                                    static_cast<float>(weight_ptr[row * in_dim + k]),
+                                    acc);
+                }
+
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+
+                if (lane == 0) {
+                    (output_base + static_cast<size_t>(sequence) * out_dim)[row] = bf16(acc);
+                }
+            });
+    });
+}
+
+void Qwen35HybridTextBackend::run_decode_ffn_gate_up_swiglu_rows(
+    Context& ctx, const Layer& layer, Tensor& input, Tensor& output, int rows) {
+    if (rows < 1 || rows > 4) {
+        throw std::invalid_argument("run_decode_ffn_gate_up_swiglu_rows: rows must be in [1, 4]");
+    }
+    if (rows == 1) {
+        run_decode_ffn_gate_up_swiglu_custom(ctx, layer, input, output);
+        return;
+    }
+    using vec8 = sycl::vec<bf16, 8>;
+    const bf16* input_base = static_cast<const bf16*>(input.data());
+    const bf16* weight_ptr = static_cast<const bf16*>(layer.gate_up_weight_jm->data());
+    bf16* output_base = static_cast<bf16*>(output.data());
+
+    constexpr int sg_size = kDecodeFfnSubgroup;
+    constexpr int ff_dim = kDecodeFfnIntermediate;
+    constexpr int hidden = kDecodeFfnHidden;
+    constexpr int vec_width = 8;
+    const int vec_chunks = hidden / vec_width;
+    const int tail_start = vec_chunks * vec_width;
+    const vec8* weight_vec = reinterpret_cast<const vec8*>(weight_ptr);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(ff_dim) * rows * sg_size),
+                              sycl::range<1>(sg_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const size_t group = item.get_group(0);
+                const int row = static_cast<int>(group / static_cast<size_t>(rows));
+                const int sequence = static_cast<int>(group % static_cast<size_t>(rows));
+                const int lane = static_cast<int>(item.get_local_id(0));
+                const bf16* input_ptr = input_base + static_cast<size_t>(sequence) * hidden;
+                const vec8* input_vec = reinterpret_cast<const vec8*>(input_ptr);
+                const vec8* gate_row = weight_vec + row * vec_chunks;
+                const vec8* up_row = weight_vec + (ff_dim + row) * vec_chunks;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+
+                for (int chunk = lane; chunk < vec_chunks; chunk += sg_size) {
+                    vec8 in_v = input_vec[chunk];
+                    vec8 gate_v = gate_row[chunk];
+                    vec8 up_v = up_row[chunk];
+                    for (int i = 0; i < vec_width; ++i) {
+                        gate_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(gate_v[i]), gate_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[i]), static_cast<float>(up_v[i]), up_acc);
+                    }
+                }
+
+                for (int k = tail_start + lane; k < hidden; k += sg_size) {
+                    const float in_v = static_cast<float>(input_ptr[k]);
+                    gate_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[row * hidden + k]), gate_acc);
+                    up_acc = sycl::fma(in_v, static_cast<float>(weight_ptr[(ff_dim + row) * hidden + k]), up_acc);
+                }
+
+                gate_acc = sycl::reduce_over_group(sg, gate_acc, sycl::plus<float>());
+                up_acc = sycl::reduce_over_group(sg, up_acc, sycl::plus<float>());
+
+                if (lane == 0) {
+                    const float silu_gate = gate_acc / (1.0f + sycl::native::exp(-gate_acc));
+                    (output_base + static_cast<size_t>(sequence) * ff_dim)[row] = bf16(silu_gate * up_acc);
+                }
+            });
+    });
+}
+
+Qwen35HybridTextBackend::Qwen35HybridTextBackend()
+    : profile_(std::make_unique<ProfileState>()) {}
+
 Qwen35HybridTextBackend::~Qwen35HybridTextBackend() {
-    clear_snapshots();
-    clear_mrope_positions();
+    // The runtime also drains its execution slot. Keep direct legacy users safe
+    // before shared scratch, bindings and the default cache are released.
+    if (context_) {
+        try { context_->synchronize(); } catch (...) {}
+    }
+    defaultSession_.reset();
+}
+
+Qwen35HybridTextBackend::Session::Session(
+    Context& ctx, int capacity, std::shared_ptr<const SessionOwner> owner,
+    bool boundedSnapshots, std::size_t maxSnapshots)
+    : context_(&ctx), owner_(std::move(owner)), capacity_(capacity),
+      boundedSnapshots_(boundedSnapshots), maxSnapshots_(maxSnapshots) {}
+
+Qwen35HybridTextBackend::Session::~Session() {
+    // Covers asynchronous forward/reset as well as partially allocated sessions.
+    // Context must outlive the Session, including when construction fails.
+    if (context_) {
+        try { context_->synchronize(); } catch (...) {}
+    }
+}
+
+std::unique_ptr<Qwen35HybridTextBackend::Session>
+Qwen35HybridTextBackend::CreateSessionImpl(
+    Context& ctx, bool quantizedKv, bool boundedSnapshots, std::size_t maxSnapshots) {
+    if (!sessionOwner_ || !decoderPlan_) {
+        throw std::logic_error("Qwen35HybridTextBackend::CreateSession: model is not loaded");
+    }
+    if (&ctx != context_) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend::CreateSession: context does not match the loaded model");
+    }
+
+    const auto reservation = aila::memory::qwen35_session_memory(
+        cfg_, max_seq_len_, boundedSnapshots ? maxSnapshots : 0);
+    // The shared helper checked these dimensions and products before any
+    // allocation; use the same reservation as model-level admission.
+    const size_t recurrentElements = static_cast<size_t>(linear_kv_heads_) *
+        static_cast<size_t>(linear_head_dim_) * static_cast<size_t>(cfg_.linear_value_head_dim);
+    const size_t convElements = static_cast<size_t>(std::max(0, linear_conv_kernel_dim_ - 1)) *
+        static_cast<size_t>(linear_conv_channels_);
+    size_t actualCacheBytes = 0;
+
+    // Own the Session before allocating any tensors: its destructor drains
+    // queued initialization writes if a later allocation fails.
+    auto session = std::unique_ptr<Session>(
+        new Session(ctx, max_seq_len_, sessionOwner_, boundedSnapshots, maxSnapshots));
+    session->layerCaches_.resize(layers_.size());
+    const auto kvType = quantizedKv
+        ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
+    for (const auto& plan : decoderPlan_->layers) {
+        auto& cache = session->layerCaches_[static_cast<size_t>(plan.cacheIndex)];
+        if (plan.kind == LayerKind::DeltaNet) {
+            cache.linear_state = Tensor::allocate(
+                ctx, {static_cast<int64_t>(linear_kv_heads_),
+                      static_cast<int64_t>(linear_head_dim_),
+                      static_cast<int64_t>(cfg_.linear_value_head_dim)},
+                dnnl::memory::data_type::f32);
+            if (convElements != 0) {
+                cache.linear_conv_state = Tensor::allocate(
+                    ctx, {static_cast<int64_t>(linear_conv_kernel_dim_ - 1),
+                          static_cast<int64_t>(linear_conv_channels_)},
+                    dnnl::memory::data_type::f32);
+            }
+            cache.host_linear_state.assign(recurrentElements, 0.0f);
+            cache.host_linear_conv_state.assign(convElements, 0.0f);
+            ctx.queue().memset(cache.linear_state.data(), 0, cache.linear_state.size_bytes());
+            if (cache.linear_conv_state.valid()) {
+                ctx.queue().memset(cache.linear_conv_state.data(), 0,
+                                   cache.linear_conv_state.size_bytes());
+            }
+        } else {
+            const bool legacyLinear = plan.kind == LayerKind::LegacyLinearAttention;
+            const int keyHeads = legacyLinear ? linear_q_heads_ : full_kv_heads_;
+            const int valueHeads = legacyLinear ? linear_kv_heads_ : full_kv_heads_;
+            const int keyDim = legacyLinear ? linear_head_dim_ : full_head_dim_;
+            const int valueDim = legacyLinear ? cfg_.linear_value_head_dim : full_head_dim_;
+            cache.k = Tensor::allocate(
+                ctx, {static_cast<int64_t>(keyHeads), static_cast<int64_t>(max_seq_len_),
+                      static_cast<int64_t>(keyDim)}, kvType);
+            cache.v = Tensor::allocate(
+                ctx, {static_cast<int64_t>(valueHeads), static_cast<int64_t>(max_seq_len_),
+                      static_cast<int64_t>(valueDim)}, kvType);
+        }
+        for (const auto* tensor : {&cache.k, &cache.v, &cache.linear_state, &cache.linear_conv_state}) {
+            actualCacheBytes = aila::memory::checked_memory_sum(actualCacheBytes, tensor->size_bytes());
+        }
+    }
+    session->cacheBytes_ = actualCacheBytes;
+    session->hostReservationBytes_ = decoderPlan_->hasRecurrentLayers ? reservation.hostBytes : 0;
+    return session;
+}
+
+std::unique_ptr<Qwen35HybridTextBackend::Session>
+Qwen35HybridTextBackend::CreateSession(Context& ctx, std::size_t maxSnapshots) {
+    if (!use_delta_linear_) {
+        throw std::invalid_argument(
+            "Qwen3.5 shared sessions require the DeltaNet path; set AILA_Q35_LINEAR_DELTA=1");
+    }
+    if (aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")) {
+        throw std::invalid_argument(
+            "Qwen3.5 shared sessions require BF16 KV; set AILA_VLM_KV_QUANT=0 "
+            "(or AILA_KV_QUANT=0 when no scoped override is set)");
+    }
+    auto session = CreateSessionImpl(ctx, false, true, maxSnapshots);
+    explicitSessionsCreated_ = true;
+    return session;
+}
+
+Qwen35HybridTextBackend::Session&
+Qwen35HybridTextBackend::DefaultSession(Context& ctx) {
+    if (&ctx != context_ || !sessionOwner_) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend: default session requires the loaded model's context");
+    }
+    if (!defaultSession_) {
+        defaultSession_ = CreateSessionImpl(ctx, legacyQuantizedKv_, false, 0);
+    }
+    return *defaultSession_;
+}
+
+void Qwen35HybridTextBackend::ValidateSession(const Session& session) const {
+    if (!sessionOwner_ || !decoderPlan_) {
+        throw std::logic_error("Qwen35HybridTextBackend: model is not loaded");
+    }
+    if (session.owner_ != sessionOwner_ || session.context_ != context_) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend: session does not belong to this loaded model");
+    }
 }
 
 bool Qwen35HybridTextBackend::load(Context& ctx,
@@ -354,18 +629,50 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                                    const ModelSpec& spec,
                                    int max_seq_len,
                                    std::string* error_message) {
+    if (explicitSessionsCreated_) {
+        if (error_message) {
+            *error_message = "Qwen35HybridTextBackend: cannot reload after explicit sessions have been created";
+        }
+        return false;
+    }
     if (spec.family != ModelFamily::Qwen35Hybrid) {
         if (error_message) *error_message = "Qwen35HybridTextBackend: invalid model family";
         return false;
     }
+    if (spec.is_bitsandbytes_4bit()) {
+        if (error_message) *error_message = "Qwen35HybridTextBackend: BF16 weights are required";
+        return false;
+    }
+    if (max_seq_len <= 0 || spec.qwen35_text.num_hidden_layers <= 0 ||
+        spec.qwen35_text.hidden_size <= 0 || spec.qwen35_text.intermediate_size <= 0) {
+        if (error_message) *error_message = "Qwen35HybridTextBackend: context capacity and layer count must be positive";
+        return false;
+    }
+    try {
+        // Validate dimensions and layer types before replacing a loaded model.
+        (void)aila::memory::qwen35_session_memory(spec.qwen35_text, max_seq_len, 0);
+    } catch (const aila::memory::AllocationLimitExceeded&) {
+        throw;
+    } catch (const std::exception& ex) {
+        if (error_message) *error_message = ex.what();
+        return false;
+    }
+
+    if (context_) context_->synchronize();
+    defaultSession_.reset();
+    decoderPlan_.reset();
+    sessionOwner_.reset();
+    context_ = &ctx;
+    profile_->decode.reset();
+    profile_->prefill.reset();
 
     spec_ = spec;
     cfg_ = spec.qwen35_text;
+    legacyQuantizedKv_ = aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT");
 
     hidden_size_ = cfg_.hidden_size;
     ff_dim_ = cfg_.intermediate_size;
     max_seq_len_ = max_seq_len;
-    current_len_ = 0;
 
     full_q_heads_ = cfg_.num_attention_heads;
     full_kv_heads_ = cfg_.num_key_value_heads;
@@ -462,10 +769,8 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
     embed_weight_ = &weights.get("model.language_model.embed_tokens.weight");
 
     layers_.clear();
-    layer_caches_.clear();
     fused_weights_.clear();
     layers_.resize(cfg_.num_hidden_layers);
-    layer_caches_.resize(cfg_.num_hidden_layers);
     fused_weights_.reserve(static_cast<size_t>(cfg_.num_hidden_layers) * 6 + 1);
 
     auto fuse_three_cols = [&](Tensor& a, Tensor& b, Tensor& c) {
@@ -563,7 +868,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
 
     for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
         auto& layer = layers_[i];
-        auto& cache = layer_caches_[i];
         std::string prefix = "model.language_model.layers." + std::to_string(i) + ".";
         std::vector<std::string> weights_to_erase;
 
@@ -672,48 +976,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                 layer.linear_o_weight_jm = &fused_weights_.back();
             }
 
-            if (use_delta_linear_) {
-                cache.k = Tensor();
-                cache.v = Tensor();
-                cache.linear_state = Tensor::allocate(
-                    ctx,
-                    {(int64_t)linear_kv_heads_, (int64_t)linear_head_dim_, (int64_t)cfg_.linear_value_head_dim},
-                    dnnl::memory::data_type::f32);
-                if (linear_conv_kernel_dim_ > 1) {
-                    cache.linear_conv_state = Tensor::allocate(
-                        ctx,
-                        {(int64_t)(linear_conv_kernel_dim_ - 1), (int64_t)linear_conv_channels_},
-                        dnnl::memory::data_type::f32);
-                } else {
-                    cache.linear_conv_state = Tensor();
-                }
-                if (cache.linear_state.numel() > 0) {
-                    ctx.queue().memset(cache.linear_state.data(), 0, cache.linear_state.size_bytes());
-                }
-                if (cache.linear_conv_state.numel() > 0) {
-                    ctx.queue().memset(cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
-                }
-                cache.host_linear_state.assign(
-                    (size_t)linear_kv_heads_ * (size_t)linear_head_dim_ * (size_t)cfg_.linear_value_head_dim,
-                    0.0f);
-                cache.host_linear_conv_state.assign(
-                    (size_t)std::max(0, linear_conv_kernel_dim_ - 1) * (size_t)linear_conv_channels_,
-                    0.0f);
-                cache.linear_conv_head = 0;
-            } else {
-                auto kv_dtype = aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
-                cache.k = Tensor::allocate(ctx,
-                                           {(int64_t)linear_q_heads_, (int64_t)max_seq_len_, (int64_t)linear_head_dim_},
-                                           kv_dtype);
-                cache.v = Tensor::allocate(ctx,
-                                           {(int64_t)linear_kv_heads_, (int64_t)max_seq_len_, (int64_t)cfg_.linear_value_head_dim},
-                                           kv_dtype);
-                cache.linear_state = Tensor();
-                cache.linear_conv_state = Tensor();
-                cache.host_linear_state.clear();
-                cache.host_linear_conv_state.clear();
-                cache.linear_conv_head = 0;
-            }
         } else {
             Tensor* q_w = transpose_weight(prefix + "self_attn.q_proj.weight");
             Tensor* k_w = transpose_weight(prefix + "self_attn.k_proj.weight");
@@ -743,18 +1005,6 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
             layer.q_norm_weight = plus_one_norm_weight(prefix + "self_attn.q_norm.weight");
             layer.k_norm_weight = plus_one_norm_weight(prefix + "self_attn.k_norm.weight");
 
-            auto kv_dtype = aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? dnnl::memory::data_type::f8_e4m3 : dnnl::memory::data_type::bf16;
-            cache.k = Tensor::allocate(ctx,
-                                       {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                       kv_dtype);
-            cache.v = Tensor::allocate(ctx,
-                                       {(int64_t)full_kv_heads_, (int64_t)max_seq_len_, (int64_t)full_head_dim_},
-                                       kv_dtype);
-            cache.linear_state = Tensor();
-            cache.linear_conv_state = Tensor();
-            cache.host_linear_state.clear();
-            cache.host_linear_conv_state.clear();
-            cache.linear_conv_head = 0;
         }
 
         Tensor* gate_w = transpose_weight(prefix + "mlp.gate_proj.weight");
@@ -812,6 +1062,12 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
                               hidden_size_, cfg_.vocab_size, true);
                 tied_lm_head_ready = true;
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
+            } catch (const aila::memory::AllocationLimitExceeded&) {
+                throw;
+            } catch (const sycl::exception&) {
+                throw;
+            } catch (const dnnl::error&) {
+                throw;
             } catch (const std::exception& e) {
                 AILA_LOG_WARN("[Qwen3.5] Failed to preprocess tied lm_head, falling back to direct embed weight: %s",
                               e.what());
@@ -846,9 +1102,13 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         constexpr int kDecodeExactTile = 128;
         constexpr int kDecodeExactPartialStride = 272;
         const int max_tiles = (max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile;
+        // Four sequences is the decode batch bound, so each batched row owns a
+        // private [head, tile] block and the multi-row exact merge needs no
+        // cross-row arbitration. The size is independent of context length.
         buf_.decode_attn_partials = Tensor::allocate(
             ctx,
-            {(int64_t)max_attn_heads_, (int64_t)max_tiles, (int64_t)kDecodeExactPartialStride},
+            {4, (int64_t)max_attn_heads_, (int64_t)max_tiles,
+             (int64_t)kDecodeExactPartialStride},
             dnnl::memory::data_type::f32);
     }
 
@@ -899,35 +1159,58 @@ bool Qwen35HybridTextBackend::load(Context& ctx,
         AILA_LOG_INFO("[Qwen3.5] Set AILA_Q35_LINEAR_DELTA=0 to force legacy-attn fallback");
     }
     AILA_LOG_INFO("[Qwen3.5] KV Cache config: quantized=%s", aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT") ? "true" : "false");
+    BuildDecoderPlan();
+    sessionOwner_ = std::make_shared<const SessionOwner>();
     return true;
+}
+
+void Qwen35HybridTextBackend::BuildDecoderPlan() {
+    auto plan = std::make_unique<DecoderPlan>();
+    plan->initialNormWeight = layers_.front().input_ln_weight;
+    plan->layers.reserve(layers_.size());
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        const auto kind = !layers_[i].is_linear ? LayerKind::FullAttention
+            : use_delta_linear_ ? LayerKind::DeltaNet : LayerKind::LegacyLinearAttention;
+        plan->hasRecurrentLayers |= kind == LayerKind::DeltaNet;
+        Tensor* postMlpNorm = i + 1 < layers_.size()
+            ? layers_[i + 1].input_ln_weight : final_norm_weight_;
+        // Projection addresses remain stable after loading; bind the existing
+        // cross-layer residual + norm fusion rather than splitting its kernels.
+        plan->layers.push_back({&layers_[i], postMlpNorm, static_cast<int>(i), kind});
+    }
+    decoderPlan_ = std::move(plan);
 }
 
 void Qwen35HybridTextBackend::set_embedding_overrides(
     const std::vector<int>& positions,
     const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
     int hidden_size) {
-    if (positions.empty() || embeddings.empty()) {
+    if (positions.empty() || embeddings.empty() || hidden_size <= 0 ||
+        positions.size() > std::numeric_limits<size_t>::max() / static_cast<size_t>(hidden_size) ||
+        embeddings.size() != positions.size() * static_cast<size_t>(hidden_size)) {
         clear_embedding_overrides();
         return;
     }
-    if (hidden_size <= 0) {
-        clear_embedding_overrides();
-        return;
+    if (!context_ || !sessionOwner_) {
+        throw std::logic_error("Qwen35HybridTextBackend: embedding overrides require a loaded model");
     }
-    if (embeddings.size() != static_cast<size_t>(positions.size()) * static_cast<size_t>(hidden_size)) {
-        clear_embedding_overrides();
-        return;
-    }
-
-    embed_override_positions_ = positions;
-    embed_override_values_ = embeddings;
-    embed_override_hidden_size_ = hidden_size;
+    auto& session = DefaultSession(*context_);
+    auto newPositions = positions;
+    auto newValues = embeddings;
+    // Forward borrows the host vectors for asynchronous copies.
+    context_->synchronize();
+    session.embeddingOverridePositions_.swap(newPositions);
+    session.embeddingOverrideValues_.swap(newValues);
+    session.embeddingOverrideHiddenSize_ = hidden_size;
 }
 
 void Qwen35HybridTextBackend::clear_embedding_overrides() {
-    embed_override_positions_.clear();
-    embed_override_values_.clear();
-    embed_override_hidden_size_ = 0;
+    if (!defaultSession_) return;
+    auto& session = *defaultSession_;
+    if (!session.embeddingOverrideValues_.empty()) session.context_->synchronize();
+    session.embeddingOverridePositions_.clear();
+    session.embeddingOverrideValues_.clear();
+    session.embeddingOverrideHiddenSize_ = 0;
 }
 
 void Qwen35HybridTextBackend::set_mrope_positions(Context& ctx,
@@ -935,39 +1218,42 @@ void Qwen35HybridTextBackend::set_mrope_positions(Context& ctx,
                                                   const std::vector<int>& pos_h,
                                                   const std::vector<int>& pos_w,
                                                   int text_pos_delta) {
-    clear_mrope_positions();
-    if (pos_t.empty() || pos_h.empty() || pos_w.empty()) {
+    if (pos_t.empty() || pos_h.empty() || pos_w.empty() ||
+        pos_t.size() != pos_h.size() || pos_t.size() != pos_w.size()) {
+        clear_mrope_positions();
         return;
     }
-    if (pos_t.size() != pos_h.size() || pos_t.size() != pos_w.size()) {
-        return;
+    if (pos_t.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("Qwen35HybridTextBackend: too many MRoPE positions");
     }
-
-    const size_t bytes = pos_t.size() * sizeof(int);
-    mrope_ctx_ = &ctx;
-    mrope_prompt_len_ = static_cast<int>(pos_t.size());
-    mrope_text_pos_delta_ = text_pos_delta;
-
-    mrope_pos_t_ = static_cast<int*>(ctx.alloc_device(bytes));
-    mrope_pos_h_ = static_cast<int*>(ctx.alloc_device(bytes));
-    mrope_pos_w_ = static_cast<int*>(ctx.alloc_device(bytes));
-    ctx.memcpy_h2d(mrope_pos_t_, pos_t.data(), bytes);
-    ctx.memcpy_h2d(mrope_pos_h_, pos_h.data(), bytes);
-    ctx.memcpy_h2d(mrope_pos_w_, pos_w.data(), bytes);
+    auto& session = DefaultSession(ctx);
+    const size_t bytes = aila::memory::checked_memory_product(pos_t.size(), sizeof(int));
+    const auto shape = std::vector<int64_t>{static_cast<int64_t>(pos_t.size())};
+    auto newT = Tensor::allocate(ctx, shape, dnnl::memory::data_type::s32);
+    auto newH = Tensor::allocate(ctx, shape, dnnl::memory::data_type::s32);
+    auto newW = Tensor::allocate(ctx, shape, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(newT.data(), pos_t.data(), bytes);
+    ctx.memcpy_h2d(newH.data(), pos_h.data(), bytes);
+    ctx.memcpy_h2d(newW.data(), pos_w.data(), bytes);
+    // These blocking copies also retire earlier work borrowing the old tensors.
+    session.mropePosT_ = std::move(newT);
+    session.mropePosH_ = std::move(newH);
+    session.mropePosW_ = std::move(newW);
+    session.mropePromptLength_ = static_cast<int>(pos_t.size());
+    session.mropeTextPositionDelta_ = text_pos_delta;
 }
 
 void Qwen35HybridTextBackend::clear_mrope_positions() {
-    if (mrope_ctx_) {
-        if (mrope_pos_t_) mrope_ctx_->free_device(mrope_pos_t_);
-        if (mrope_pos_h_) mrope_ctx_->free_device(mrope_pos_h_);
-        if (mrope_pos_w_) mrope_ctx_->free_device(mrope_pos_w_);
+    if (!defaultSession_) return;
+    auto& session = *defaultSession_;
+    if (session.mropePosT_.valid() || session.mropePosH_.valid() || session.mropePosW_.valid()) {
+        session.context_->synchronize();
     }
-    mrope_pos_t_ = nullptr;
-    mrope_pos_h_ = nullptr;
-    mrope_pos_w_ = nullptr;
-    mrope_prompt_len_ = 0;
-    mrope_text_pos_delta_ = 0;
-    mrope_ctx_ = nullptr;
+    session.mropePosT_ = Tensor();
+    session.mropePosH_ = Tensor();
+    session.mropePosW_ = Tensor();
+    session.mropePromptLength_ = 0;
+    session.mropeTextPositionDelta_ = 0;
 }
 
 void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& layer, LayerCache& cache,
@@ -1018,6 +1304,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                                            allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
+        const bool grouped_heads = num_heads > q_heads;
         const int row0 = conv_head;
         const int row1 = (conv_head + 1) % conv_rows;
         const int row2 = (conv_head + 2) % conv_rows;
@@ -1071,7 +1358,7 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    if (lid < head_dim) {
+                    if (!grouped_heads && lid < head_dim) {
                         size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
                         if (write_shared_qk) {
                             conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
@@ -1162,6 +1449,10 @@ void Qwen35HybridTextBackend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                     }
                 });
         });
+        if (grouped_heads) {
+            commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
+                                       qkv_dim, conv_rows, conv_head, 1);
+        }
         cache.device_state_dirty = true;
         if (conv_rows > 0) {
             cache.linear_conv_head = (conv_head + 1) % conv_rows;
@@ -1346,6 +1637,7 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
                                            allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
+        const bool grouped_heads = num_heads > q_heads;
 
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
@@ -1392,6 +1684,29 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
 
                         if (lid < head_dim) {
                             auto conv_channel = [&](int channel) {
+                                if (grouped_heads) {
+                                    // Previous rows in this prefill are already
+                                    // available in the immutable projection input.
+                                    // Only negative positions use the initial ring;
+                                    // no work-group updates it until this kernel ends.
+                                    auto history_value = [&](int offset) {
+                                        const int prior_token = t - conv_rows + offset;
+                                        if (prior_token >= 0) {
+                                            return static_cast<float>(fused_ptr[
+                                                static_cast<size_t>(prior_token) * all_dim + channel]);
+                                        }
+                                        const int history_row =
+                                            (conv_head + prior_token + conv_rows) % conv_rows;
+                                        return conv_state_ptr[
+                                            static_cast<size_t>(history_row) * qkv_dim + channel];
+                                    };
+                                    bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
+                                    const float v = history_value(0) * static_cast<float>(w[0]) +
+                                                    history_value(1) * static_cast<float>(w[1]) +
+                                                    history_value(2) * static_cast<float>(w[2]) +
+                                                    static_cast<float>(row[channel]) * static_cast<float>(w[3]);
+                                    return silu_dev(v);
+                                }
                                 const size_t state0 = static_cast<size_t>(row0) * qkv_dim + channel;
                                 const size_t state1 = static_cast<size_t>(row1) * qkv_dim + channel;
                                 const size_t state2 = static_cast<size_t>(row2) * qkv_dim + channel;
@@ -1410,7 +1725,7 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
                         }
                         item.barrier(sycl::access::fence_space::local_space);
 
-                        if (lid < head_dim) {
+                        if (!grouped_heads && lid < head_dim) {
                             size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
                             if (write_shared_qk) {
                                 conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
@@ -1506,6 +1821,10 @@ void Qwen35HybridTextBackend::run_linear_delta_prefill_gpu_batched(
                 });
         });
 
+        if (grouped_heads) {
+            commit_linear_conv_history(ctx, fused_ptr, all_dim, conv_state_ptr,
+                                       qkv_dim, conv_rows, conv_head, seq_len);
+        }
         cache.device_state_dirty = true;
         cache.linear_conv_head = (conv_head + seq_len) % conv_rows;
         return;
@@ -1645,6 +1964,13 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
                                                     Tensor& qkv_src, Tensor& z_src,
                                                     Tensor& a_src, Tensor& b_src,
                                                     int seq_len) {
+    run_linear_delta_host(ctx, layer, cache, qkv_src, z_src, a_src, b_src, seq_len, buf_.attn_out);
+}
+
+void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                                                    Tensor& qkv_src, Tensor& z_src,
+                                                    Tensor& a_src, Tensor& b_src,
+                                                    int seq_len, Tensor& out_dst) {
     const int qkv_dim = linear_qkv_dim_;
     const int z_dim = linear_z_dim_;
     const int num_heads = linear_kv_heads_;
@@ -1788,7 +2114,7 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
 
     scratch.out_bf16.resize(scratch.out.size());
     for (size_t i = 0; i < scratch.out.size(); ++i) scratch.out_bf16[i] = bf16(scratch.out[i]);
-    ctx.memcpy_h2d(buf_.attn_out.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
+    ctx.memcpy_h2d(out_dst.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
 
     if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
         ctx.memcpy_h2d(cache.linear_state.data(), cache.host_linear_state.data(),
@@ -1801,10 +2127,156 @@ void Qwen35HybridTextBackend::run_linear_delta_host(Context& ctx, Layer& layer, 
     cache.device_state_dirty = false;
 }
 
-Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
-    if (seq_len <= 0) {
-        throw std::runtime_error("Qwen35HybridTextBackend::forward: seq_len must be positive");
+struct Qwen35HybridTextBackend::ProjectionPolicy {
+    Qwen35HybridTextBackend& model;
+
+    bf16* ResidualHidden() const { return nullptr; }
+
+    template <aila::models::HybridProjectionSlot Slot>
+    void Forward(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int count) const {
+        using SlotKind = aila::models::HybridProjectionSlot;
+        if constexpr (Slot == SlotKind::FfnDown) {
+            if (model.use_decode_ffn_custom_path(count)) {
+                model.run_decode_ffn_down_custom(ctx, layer, input, output);
+                return;
+            }
+        }
+        // Existing transposed JM weights belong only to the BF16 storage
+        // backend. The fallback continues to use the original Linear object.
+        Tensor* jmWeight = nullptr;
+        int inputWidth = 0, outputWidth = 0;
+        if constexpr (Slot == SlotKind::LinearAll) {
+            jmWeight = layer.linear_all_weight_jm;
+            inputWidth = model.hidden_size_;
+            outputWidth = model.linear_all_dim_;
+        } else if constexpr (Slot == SlotKind::LinearOutput) {
+            jmWeight = layer.linear_o_weight_jm;
+            inputWidth = model.linear_kv_dim_;
+            outputWidth = model.hidden_size_;
+        } else if constexpr (Slot == SlotKind::FullQkv) {
+            jmWeight = layer.qkv_weight_jm;
+            inputWidth = model.hidden_size_;
+            outputWidth = model.full_fused_qkv_dim_;
+        } else if constexpr (Slot == SlotKind::FullOutput) {
+            jmWeight = layer.o_weight_jm;
+            inputWidth = model.full_q_dim_;
+            outputWidth = model.hidden_size_;
+        }
+        if (jmWeight && model.use_decode_jm_custom_path(count)) {
+            model.run_decode_jm_matvec_custom(ctx, input, *jmWeight, inputWidth, outputWidth, output);
+            return;
+        }
+        aila::models::ProjectionFor<Slot>(layer).forward(ctx, input, output, count);
     }
+
+    template <aila::models::HybridProjectionSlot Slot>
+    void ForwardDecodeRows(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int count) const {
+        using SlotKind = aila::models::HybridProjectionSlot;
+        int inputWidth = model.hidden_size_, outputWidth = model.hidden_size_;
+        if constexpr (Slot == SlotKind::LinearAll) outputWidth = model.linear_all_dim_;
+        else if constexpr (Slot == SlotKind::LinearOutput) inputWidth = model.linear_kv_dim_;
+        else if constexpr (Slot == SlotKind::FullQkv) outputWidth = model.full_fused_qkv_dim_;
+        else if constexpr (Slot == SlotKind::FullOutput) inputWidth = model.full_q_dim_;
+        else {
+            static_assert(Slot == SlotKind::FfnDown, "Unsupported batched decode projection slot");
+            inputWidth = model.ff_dim_;
+        }
+        // Preserve the BF16 backend's decode JM/custom selection. A batch of
+        // independent decode rows is not a multi-token prefill operation, so a
+        // row still runs the original count=1 kernel body and reduction order.
+        if (count > 1) {
+            Tensor* jmWeight = nullptr;
+            if constexpr (Slot == SlotKind::LinearAll) jmWeight = layer.linear_all_weight_jm;
+            else if constexpr (Slot == SlotKind::LinearOutput) jmWeight = layer.linear_o_weight_jm;
+            else if constexpr (Slot == SlotKind::FullQkv) jmWeight = layer.qkv_weight_jm;
+            else if constexpr (Slot == SlotKind::FullOutput) jmWeight = layer.o_weight_jm;
+            else jmWeight = layer.down_weight_jm;
+            if (jmWeight && model.use_decode_jm_custom_path(1)) {
+                model.run_decode_jm_matvec_rows(ctx, input, *jmWeight, inputWidth, outputWidth, output, count);
+                return;
+            }
+        }
+        for (int row = 0; row < count; ++row) {
+            auto source = Tensor::view(ctx, input.data_as<bf16>() + static_cast<size_t>(row) * inputWidth,
+                                       {1, static_cast<int64_t>(inputWidth)}, input.dtype());
+            auto target = Tensor::view(ctx, output.data_as<bf16>() + static_cast<size_t>(row) * outputWidth,
+                                       {1, static_cast<int64_t>(outputWidth)}, output.dtype());
+            Forward<Slot>(ctx, layer, source, target, 1);
+        }
+    }
+
+    // Called once per row with a single-row view, so this stays the original
+    // fused helper. The width argument is the FFN dimension, not a row count.
+    bool TryFusedGateUp(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int) const {
+        if (!model.use_decode_ffn_custom_path(1)) return false;
+        model.run_decode_ffn_gate_up_swiglu_custom(ctx, layer, input, output);
+        return true;
+    }
+
+    // Multi-row gate/up. The rows kernel applies each row's own SiLU, so the
+    // caller must not run the single-row fused helper afterwards. Layout matches
+    // the per-row path: row stride is hidden_size_ for input and ff_dim_ for the
+    // gate output.
+    bool TryFusedGateUpRows(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int rows) const {
+        if (rows < 2 || !layer.gate_up_weight_jm) return false;
+        if (!model.use_decode_ffn_custom_path(1)) return false;
+        model.run_decode_ffn_gate_up_swiglu_rows(ctx, layer, input, output, rows);
+        return true;
+    }
+};
+
+void Qwen35HybridTextBackend::ExecuteLayer(
+    const LayerPlan& plan, const LayerExecution& execution) {
+    aila::models::HybridLayerExecutor::Execute(*this, plan, execution, ProjectionPolicy{*this});
+}
+
+bool Qwen35HybridTextBackend::SupportsDecodeBatch() const noexcept {
+    return aila::models::HybridDecodeBatchExecutor::Supported(*this);
+}
+
+Tensor& Qwen35HybridTextBackend::ForwardDecodeBatch(
+    Context& ctx, const std::vector<Session*>& sessions, const int* tokenIdsDevice) {
+    const bool grouped = linear_kv_heads_ > linear_q_heads_;
+    const bool defaultFastpath = supports_default_grouped_linear_delta_fastpath(
+        linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_, std::max(0, linear_conv_kernel_dim_ - 1));
+    static const bool experimental = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
+    static const bool forceHost = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
+    const bool useHost = grouped && (forceHost || (!defaultFastpath && !experimental));
+    return aila::models::HybridDecodeBatchExecutor::Execute(
+        *this, ctx, sessions, tokenIdsDevice, ProjectionPolicy{*this}, useHost);
+}
+
+Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
+    return ForwardImpl(ctx, DefaultSession(ctx), token_ids_device, seq_len, false);
+}
+
+Tensor& Qwen35HybridTextBackend::Forward(
+    Context& ctx, Session& session, const int* token_ids_device, int seq_len) {
+    return ForwardImpl(ctx, session, token_ids_device, seq_len, true);
+}
+
+Tensor& Qwen35HybridTextBackend::ForwardLegacyLogits(
+    Context& ctx, Session& session, const int* token_ids_device, int seq_len) {
+    return ForwardImpl(ctx, session, token_ids_device, seq_len, false);
+}
+
+Tensor& Qwen35HybridTextBackend::ForwardImpl(
+    Context& ctx, Session& session, const int* token_ids_device, int seq_len, bool lastTokenOnly) {
+    ValidateSession(session);
+    if (&ctx != context_) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend::Forward: context does not match the loaded model");
+    }
+    if (seq_len <= 0 || !token_ids_device) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend::Forward: token IDs must be non-null and count positive");
+    }
+    const int start_pos = session.currentLength_;
+    if (seq_len > session.Capacity() - start_pos) {
+        throw std::invalid_argument("Qwen35HybridTextBackend::Forward: context window exceeded");
+    }
+    const int cached_len = start_pos + seq_len;
     static const bool s_profile_decode = aila::env::read_flag("AILA_PROFILE_Q35_DECODE", false);
     static const bool s_profile_prefill = aila::env::read_flag("AILA_PROFILE_Q35_PREFILL", false);
     static const int s_decode_every = std::max(1, aila::env::read_int_raw("AILA_PROFILE_Q35_DECODE_EVERY", 32));
@@ -1816,23 +2288,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     bool profile_enabled = profile_decode || profile_prefill;
     std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
     bool profile_host_only = profile_enabled && s_profile_host_only;
-    auto time_stage = [&](ProfileStage stage, auto&& fn) {
-        if (!profile_enabled) {
-            fn();
-            return;
-        }
-        auto t0 = std::chrono::high_resolution_clock::now();
-        fn();
-        if (!profile_host_only) ctx.synchronize();
-        auto t1 = std::chrono::high_resolution_clock::now();
-        stage_ms[static_cast<size_t>(stage)] +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-    };
-    int start_pos = current_len_;
-    int cached_len = start_pos + seq_len;
-    if (cached_len > max_seq_len_) {
-        throw std::runtime_error("Qwen35HybridTextBackend::forward: context window exceeded");
-    }
+    const StageProfiler time_stage{ctx, stage_ms, profile_enabled, profile_host_only};
 
     ensure_runtime_buffers(ctx, seq_len);
     if (seq_len > 1) {
@@ -1845,18 +2301,18 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
 
     time_stage(ProfileStage::EmbedNorm, [&] {
         ops::embedding_lookup(ctx, *embed_weight_, token_ids_device, seq_len, buf_.hidden, hidden_size_);
-        if (!embed_override_positions_.empty() && embed_override_hidden_size_ == hidden_size_) {
+        if (!session.embeddingOverridePositions_.empty() && session.embeddingOverrideHiddenSize_ == hidden_size_) {
             bf16* hidden_ptr = static_cast<bf16*>(buf_.hidden.data());
-            for (size_t i = 0; i < embed_override_positions_.size(); ++i) {
-                int pos = embed_override_positions_[i];
+            for (size_t i = 0; i < session.embeddingOverridePositions_.size(); ++i) {
+                int pos = session.embeddingOverridePositions_[i];
                 if (pos < start_pos || pos >= start_pos + seq_len) continue;
                 int local_row = pos - start_pos;
-                const bf16* src = embed_override_values_.data() + i * static_cast<size_t>(hidden_size_);
+                const bf16* src = session.embeddingOverrideValues_.data() + i * static_cast<size_t>(hidden_size_);
                 bf16* dst = hidden_ptr + static_cast<size_t>(local_row) * static_cast<size_t>(hidden_size_);
                 ctx.queue().memcpy(dst, src, static_cast<size_t>(hidden_size_) * sizeof(bf16));
             }
         }
-        ops::rms_norm(ctx, buf_.hidden, *layers_[0].input_ln_weight, cfg_.rms_norm_eps,
+        ops::rms_norm(ctx, buf_.hidden, *decoderPlan_->initialNormWeight, cfg_.rms_norm_eps,
                       buf_.normed, seq_len, hidden_size_);
     });
 
@@ -1884,435 +2340,28 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     bool use_grouped_linear_gpu = grouped_linear_heads && !force_host_grouped_linear &&
                                   (default_grouped_linear_fastpath || experimental_grouped_linear_gpu);
     bool use_host_grouped_linear = grouped_linear_heads && !use_grouped_linear_gpu;
-    auto log_row_stats = [&](const char* tag, Tensor& t, int row, int width) {
-        if (row < 0) return;
-        bf16* ptr = static_cast<bf16*>(t.data()) + (size_t)row * width;
-        std::vector<bf16> h_row((size_t)width);
-        ctx.memcpy_d2h(h_row.data(), ptr, h_row.size() * sizeof(bf16));
-        double mean = 0.0;
-        double abs_mean = 0.0;
-        float max_abs = 0.0f;
-        for (int d = 0; d < width; ++d) {
-            float v = static_cast<float>(h_row[(size_t)d]);
-            mean += v;
-            abs_mean += std::abs(v);
-            max_abs = std::max(max_abs, std::abs(v));
-        }
-        mean /= (double)width;
-        abs_mean /= (double)width;
-        float v0 = static_cast<float>(h_row[0]);
-        float v1 = static_cast<float>(h_row[1]);
-        float v2 = static_cast<float>(h_row[2]);
-        float v3 = static_cast<float>(h_row[3]);
-        AILA_LOG_INFO("[Q35L0] %s mean=%.6f abs_mean=%.6f max_abs=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f",
-                      tag, mean, abs_mean, max_abs, v0, v1, v2, v3);
-    };
-
-    for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-        auto& layer = layers_[i];
-        auto& cache = layer_caches_[i];
-        int dbg_row = seq_len - 1;
-        bool debug_this_layer = (debug_layer_detail_idx >= 0 && debug_layer_detail_idx == i);
-        if (debug_this_layer && seq_len > 0) {
-            char tag[64];
-            std::snprintf(tag, sizeof(tag), "layer%d_input_ln_out", i);
-            log_row_stats(tag, buf_.normed, dbg_row, hidden_size_);
-        }
-
-        if (layer.is_linear) {
-            if (use_delta_linear_) {
-                if (seq_len == 1) {
-                    time_stage(ProfileStage::LinearProj, [&] {
-                        if (use_decode_jm_custom_path(seq_len) && layer.linear_all_weight_jm != nullptr) {
-                            run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.linear_all_weight_jm,
-                                                        hidden_size_, linear_all_dim_, buf_.linear_all);
-                        } else {
-                            layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                        }
-                    });
-                    time_stage(ProfileStage::LinearDelta, [&] {
-                        bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
-                        Tensor qkv_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)linear_qkv_dim_});
-                        Tensor z_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_, {1, (int64_t)linear_z_dim_});
-                        Tensor a_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_,
-                                                     {1, (int64_t)linear_kv_heads_});
-                        Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
-                                                     {1, (int64_t)linear_kv_heads_});
-                        if (use_host_grouped_linear) {
-                            run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, 1);
-                            return;
-                        }
-                        bool compare_this_layer = debug_linear_compare &&
-                                                  (debug_linear_compare_layer < 0 || debug_linear_compare_layer == i);
-                        if (compare_this_layer) {
-                            debug_compare_linear_delta_decode(ctx, i, layer, cache, qkv_view, z_view, a_view, b_view);
-                        } else {
-                            run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
-                        }
-                    });
-                } else {
-                    time_stage(ProfileStage::LinearProj, [&] {
-                        layer.linear_all_proj.forward(ctx, buf_.normed, buf_.linear_all, seq_len);
-                    });
-                    time_stage(ProfileStage::LinearDelta, [&] {
-                        if (use_host_grouped_linear) {
-                            bf16* fused_ptr = static_cast<bf16*>(buf_.linear_all.data());
-                            bf16* qkv_ptr = static_cast<bf16*>(buf_.qkv.data());
-                            bf16* z_ptr = static_cast<bf16*>(buf_.z.data());
-                            bf16* a_ptr = static_cast<bf16*>(buf_.a.data());
-                            bf16* b_ptr = static_cast<bf16*>(buf_.b.data());
-                            const int row_width = linear_all_dim_;
-                            const int qkv_width = linear_qkv_dim_;
-                            const int z_width = linear_z_dim_;
-                            const int ab_width = linear_kv_heads_;
-                            ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(seq_len) * static_cast<size_t>(row_width)),
-                                [=](sycl::id<1> idx) {
-                                    size_t linear_idx = idx[0];
-                                    int row = static_cast<int>(linear_idx / static_cast<size_t>(row_width));
-                                    int col = static_cast<int>(linear_idx % static_cast<size_t>(row_width));
-                                    bf16 v = fused_ptr[linear_idx];
-                                    if (col < qkv_width) {
-                                        qkv_ptr[static_cast<size_t>(row) * qkv_width + col] = v;
-                                    } else if (col < qkv_width + z_width) {
-                                        z_ptr[static_cast<size_t>(row) * z_width + (col - qkv_width)] = v;
-                                    } else if (col < qkv_width + z_width + ab_width) {
-                                        a_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width)] = v;
-                                    } else {
-                                        b_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width - ab_width)] = v;
-                                    }
-                                });
-                            run_linear_delta_host(ctx, layer, cache,
-                                                  buf_.qkv, buf_.z, buf_.a, buf_.b,
-                                                  seq_len);
-                            return;
-                        }
-                        run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
-                                                             buf_.linear_all, buf_.attn_out, seq_len);
-                    });
-                }
-            } else {
-                time_stage(ProfileStage::LinearProj, [&] {
-                    layer.linear_qkv_proj.forward(ctx, buf_.normed, buf_.qkv, seq_len);
-                });
-                time_stage(ProfileStage::FullSplit, [&] {
-                    ops::split_qkv(ctx, buf_.qkv, buf_.q, buf_.k, buf_.v,
-                                   seq_len, linear_q_dim_, linear_q_dim_);
-                });
-
-                time_stage(ProfileStage::QkNormRope, [&] {
-                    std::vector<bf16> hq((size_t)seq_len * linear_q_dim_);
-                    std::vector<bf16> hk((size_t)seq_len * linear_q_dim_);
-                    std::vector<float> fq((size_t)seq_len * linear_q_dim_);
-                    std::vector<float> fk((size_t)seq_len * linear_q_dim_);
-                    ctx.memcpy_d2h(hq.data(), buf_.q.data(), hq.size() * sizeof(bf16));
-                    ctx.memcpy_d2h(hk.data(), buf_.k.data(), hk.size() * sizeof(bf16));
-                    for (size_t z = 0; z < fq.size(); ++z) {
-                        fq[z] = static_cast<float>(hq[z]);
-                        fk[z] = static_cast<float>(hk[z]);
-                    }
-                    head_l2_norm_inplace(fq, seq_len, linear_q_heads_, linear_head_dim_, cfg_.rms_norm_eps);
-                    head_l2_norm_inplace(fk, seq_len, linear_q_heads_, linear_head_dim_, cfg_.rms_norm_eps);
-                    for (size_t z = 0; z < fq.size(); ++z) {
-                        hq[z] = bf16(fq[z]);
-                        hk[z] = bf16(fk[z]);
-                    }
-                    ctx.memcpy_h2d(buf_.q.data(), hq.data(), hq.size() * sizeof(bf16));
-                    ctx.memcpy_h2d(buf_.k.data(), hk.data(), hk.size() * sizeof(bf16));
-                });
-
-                time_stage(ProfileStage::KvCache, [&] {
-                    ops::copy_to_cache(ctx, buf_.k, cache.k, seq_len, start_pos,
-                                       linear_q_heads_, linear_head_dim_, max_seq_len_);
-                    ops::copy_to_cache(ctx, buf_.v, cache.v, seq_len, start_pos,
-                                       linear_kv_heads_, cfg_.linear_value_head_dim, max_seq_len_);
-                });
-
-                time_stage(ProfileStage::Attention, [&] {
-                    if (seq_len == 1) {
-                        ops::attention_decode(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
-                                              linear_q_heads_, linear_kv_heads_, linear_head_dim_, cached_len);
-                    } else if (start_pos == 0) {
-                        ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,
-                                               seq_len, linear_q_heads_, linear_kv_heads_, linear_head_dim_);
-                    } else {
-                        ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores,
-                                                      seq_len, start_pos, linear_q_heads_, linear_kv_heads_,
-                                                      linear_head_dim_, max_seq_len_);
-                    }
-                });
-
-                time_stage(ProfileStage::AttnGate, [&] {
-                    layer.linear_z_proj.forward(ctx, buf_.normed, buf_.z, seq_len);
-                    ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * linear_kv_dim_);
-                });
-            }
-            time_stage(ProfileStage::LinearOProj, [&] {
-                if (use_decode_jm_custom_path(seq_len) && layer.linear_o_weight_jm != nullptr) {
-                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.linear_o_weight_jm,
-                                                linear_kv_dim_, hidden_size_, buf_.gate);
-                } else {
-                    layer.linear_o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
-                }
-            });
-        } else {
-            Tensor q_decode_view;
-            Tensor q_gate_decode_view;
-            Tensor k_decode_view;
-            Tensor v_decode_view;
-            Tensor* q_for_attn = &buf_.q;
-            Tensor* k_for_attn = &buf_.k;
-            Tensor* v_for_attn = &buf_.v;
-
-            if (seq_len == 1) {
-                time_stage(ProfileStage::FullQkvProj, [&] {
-                    if (use_decode_jm_custom_path(seq_len) && layer.qkv_weight_jm != nullptr) {
-                        run_decode_jm_matvec_custom(ctx, buf_.normed, *layer.qkv_weight_jm,
-                                                    hidden_size_, full_fused_qkv_dim_, buf_.full_qkv);
-                    } else {
-                        layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
-                    }
-                });
-                time_stage(ProfileStage::FullSplit, [&] {
-                    bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
-                    if (cfg_.attn_output_gate) {
-                        q_gate_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
-                        q_for_attn = &buf_.q;
-                    } else {
-                        q_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_dim_});
-                        q_for_attn = &q_decode_view;
-                    }
-                    k_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
-                    v_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_, {1, (int64_t)full_kv_dim_});
-                    k_for_attn = &k_decode_view;
-                    v_for_attn = &v_decode_view;
-                });
-            } else {
-                time_stage(ProfileStage::FullQkvProj, [&] {
-                    layer.qkv_proj.forward(ctx, buf_.normed, buf_.full_qkv, seq_len);
-                });
-                time_stage(ProfileStage::FullSplit, [&] {
-                    ops::split_qkv(ctx, buf_.full_qkv, buf_.qkv, buf_.k, buf_.v,
-                                   seq_len, full_q_proj_dim_, full_kv_dim_);
-                    if (cfg_.attn_output_gate) {
-                        ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z,
-                                          seq_len, full_q_heads_, full_head_dim_);
-                    } else {
-                        ops::copy_tensor(ctx, buf_.qkv, buf_.q, seq_len * full_q_dim_);
-                    }
-                });
-            }
-            if (debug_this_layer && seq_len > 0 && cfg_.attn_output_gate) {
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "layer%d_full_gate_z", i);
-                log_row_stats(tag, buf_.z, dbg_row, full_q_dim_);
-            }
-
-            time_stage(ProfileStage::QkNormRope, [&] {
-                if (seq_len == 1) {
-                    if (cfg_.attn_output_gate) {
-                        ops::decode_prepare_qgkv_packed_partial(ctx, q_gate_decode_view, *k_for_attn, *v_for_attn,
-                                                                buf_.q, buf_.z,
-                                                                *layer.q_norm_weight, *layer.k_norm_weight,
-                                                                cache.k, cache.v, start_pos,
-                                                                full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                                cfg_.rms_norm_eps, full_rotary_dim,
-                                                                cfg_.rope.rope_theta,
-                                                                cfg_.rope.mrope_interleaved,
-                                                                mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                                                mrope_prompt_len_, mrope_text_pos_delta_,
-                                                                cfg_.rope.mrope_section[0],
-                                                                cfg_.rope.mrope_section[1],
-                                                                cfg_.rope.mrope_section[2]);
-                    } else {
-                        ops::decode_prepare_qkv_partial(ctx, *q_for_attn, *k_for_attn, *v_for_attn,
-                                                        *layer.q_norm_weight, *layer.k_norm_weight,
-                                                        cache.k, cache.v, start_pos,
-                                                        full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                        cfg_.rms_norm_eps, full_rotary_dim,
-                                                        cfg_.rope.rope_theta,
-                                                        cfg_.rope.mrope_interleaved,
-                                                        mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                                        mrope_prompt_len_, mrope_text_pos_delta_,
-                                                        cfg_.rope.mrope_section[0],
-                                                        cfg_.rope.mrope_section[1],
-                                                        cfg_.rope.mrope_section[2]);
-                    }
-                } else {
-                    ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight,
-                                       cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
-                    ops::head_rms_norm(ctx, *k_for_attn, *layer.k_norm_weight,
-                                       cfg_.rms_norm_eps, seq_len, full_kv_heads_, full_head_dim_);
-
-                    ops::apply_rope_partial(ctx, buf_.q, *k_for_attn, seq_len, start_pos,
-                                            full_q_heads_, full_kv_heads_, full_head_dim_,
-                                            full_rotary_dim, cfg_.rope.rope_theta,
-                                            cfg_.rope.mrope_interleaved,
-                                            mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
-                                            mrope_prompt_len_, mrope_text_pos_delta_,
-                                            cfg_.rope.mrope_section[0],
-                                            cfg_.rope.mrope_section[1],
-                                            cfg_.rope.mrope_section[2]);
-                }
-            });
-            if (debug_this_layer && seq_len > 0) {
-                char tag_q[64];
-                char tag_k[64];
-                char tag_v[64];
-                std::snprintf(tag_q, sizeof(tag_q), "layer%d_full_q_after_rope", i);
-                std::snprintf(tag_k, sizeof(tag_k), "layer%d_full_k_after_rope", i);
-                std::snprintf(tag_v, sizeof(tag_v), "layer%d_full_v", i);
-                log_row_stats(tag_q, *q_for_attn, dbg_row, full_q_dim_);
-                log_row_stats(tag_k, *k_for_attn, dbg_row, full_kv_dim_);
-                log_row_stats(tag_v, *v_for_attn, dbg_row, full_kv_dim_);
-            }
-
-            time_stage(ProfileStage::KvCache, [&] {
-                if (seq_len > 1) {
-                    ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
-                                       full_kv_heads_, full_head_dim_, max_seq_len_);
-                    ops::copy_to_cache(ctx, *v_for_attn, cache.v, seq_len, start_pos,
-                                       full_kv_heads_, full_head_dim_, max_seq_len_);
-                }
-            });
-
-            time_stage(ProfileStage::Attention, [&] {
-                if (seq_len == 1) {
-                    ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
-                                          full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
-                                          &buf_.decode_attn_partials);
-                } else if (start_pos == 0) {
-                    ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores,
-                                           seq_len, full_q_heads_, full_kv_heads_, full_head_dim_);
-                } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores,
-                                                  seq_len, start_pos, full_q_heads_, full_kv_heads_,
-                                                  full_head_dim_, max_seq_len_);
-                }
-            });
-            if (debug_this_layer && seq_len > 0) {
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "layer%d_full_attn_out_pre_gate", i);
-                log_row_stats(tag, buf_.attn_out, dbg_row, full_q_dim_);
-            }
-
-            if (cfg_.attn_output_gate) {
-                time_stage(ProfileStage::AttnGate, [&] {
-                    ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, seq_len * full_q_dim_);
-                });
-                if (debug_this_layer && seq_len > 0) {
-                    char tag[64];
-                    std::snprintf(tag, sizeof(tag), "layer%d_full_attn_out_post_gate", i);
-                    log_row_stats(tag, buf_.attn_out, dbg_row, full_q_dim_);
-                }
-            }
-            time_stage(ProfileStage::FullOProj, [&] {
-                if (use_decode_jm_custom_path(seq_len) && layer.o_weight_jm != nullptr) {
-                    run_decode_jm_matvec_custom(ctx, buf_.attn_out, *layer.o_weight_jm,
-                                                full_q_dim_, hidden_size_, buf_.gate);
-                } else {
-                    layer.o_proj.forward(ctx, buf_.attn_out, buf_.gate, seq_len);
-                }
-            });
-        }
-        if (debug_this_layer && seq_len > 0) {
-            char tag[64];
-            std::snprintf(tag, sizeof(tag), "layer%d_token_mixer_out", i);
-            log_row_stats(tag, buf_.gate, dbg_row, hidden_size_);
-        }
-
-        time_stage(ProfileStage::PostAttnNorm, [&] {
-            ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.gate, *layer.post_attn_ln_weight,
-                                    cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
-        });
-        if (debug_this_layer && seq_len > 0) {
-            char tag1[64];
-            char tag2[64];
-            std::snprintf(tag1, sizeof(tag1), "layer%d_after_attn_residual", i);
-            std::snprintf(tag2, sizeof(tag2), "layer%d_post_attn_ln_out", i);
-            log_row_stats(tag1, buf_.hidden, dbg_row, hidden_size_);
-            log_row_stats(tag2, buf_.normed, dbg_row, hidden_size_);
-        }
-
-        if (use_decode_ffn_custom_path(seq_len)) {
-            time_stage(ProfileStage::FfnProj, [&] {
-                run_decode_ffn_gate_up_swiglu_custom(ctx, layer, buf_.normed, buf_.gate);
-            });
-            time_stage(ProfileStage::FfnAct, [&] {
-            });
-            time_stage(ProfileStage::DownProj, [&] {
-                run_decode_ffn_down_custom(ctx, layer, buf_.gate, buf_.up);
-            });
-        } else if (seq_len == 1) {
-            time_stage(ProfileStage::FfnProj, [&] {
-                layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
-            });
-            time_stage(ProfileStage::FfnAct, [&] {
-                ops::fused_gate_up_swiglu(ctx, buf_.gate_up, buf_.gate, ff_dim_);
-            });
-            time_stage(ProfileStage::DownProj, [&] {
-                layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
-            });
-        } else {
-            time_stage(ProfileStage::FfnProj, [&] {
-                layer.gate_up_proj.forward(ctx, buf_.normed, buf_.gate_up, seq_len);
-            });
-            time_stage(ProfileStage::FfnAct, [&] {
-                ops::split_gate_up(ctx, buf_.gate_up, buf_.gate, buf_.up, seq_len, ff_dim_);
-                ops::swiglu(ctx, buf_.gate, buf_.up, buf_.gate, seq_len * ff_dim_);
-            });
-            time_stage(ProfileStage::DownProj, [&] {
-                layer.down_proj.forward(ctx, buf_.gate, buf_.up, seq_len);
-            });
-        }
-
-        time_stage(ProfileStage::PostMlpNorm, [&] {
-            if (i < cfg_.num_hidden_layers - 1) {
-                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *layers_[i + 1].input_ln_weight,
-                                        cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
-            } else {
-                ops::fused_add_rms_norm(ctx, buf_.hidden, buf_.up, *final_norm_weight_,
-                                        cfg_.rms_norm_eps, buf_.normed, seq_len, hidden_size_);
-            }
-        });
-        if (debug_this_layer && seq_len > 0) {
-            char tag1[64];
-            char tag2[64];
-            std::snprintf(tag1, sizeof(tag1), "layer%d_after_mlp_residual", i);
-            std::snprintf(tag2, sizeof(tag2), "layer%d_next_input_ln_out", i);
-            log_row_stats(tag1, buf_.hidden, dbg_row, hidden_size_);
-            log_row_stats(tag2, buf_.normed, dbg_row, hidden_size_);
-        }
-
-        if (debug_layer_stats && seq_len > 0) {
-            const int row = seq_len - 1;
-            bf16* hidden_ptr = static_cast<bf16*>(buf_.hidden.data()) + (size_t)row * hidden_size_;
-            std::vector<bf16> h_row((size_t)hidden_size_);
-            ctx.memcpy_d2h(h_row.data(), hidden_ptr, h_row.size() * sizeof(bf16));
-
-            double mean = 0.0;
-            double abs_mean = 0.0;
-            float max_abs = 0.0f;
-            for (int d = 0; d < hidden_size_; ++d) {
-                float v = static_cast<float>(h_row[(size_t)d]);
-                mean += v;
-                abs_mean += std::abs(v);
-                max_abs = std::max(max_abs, std::abs(v));
-            }
-            mean /= (double)hidden_size_;
-            abs_mean /= (double)hidden_size_;
-            float v0 = static_cast<float>(h_row[0]);
-            float v1 = static_cast<float>(h_row[1]);
-            float v2 = static_cast<float>(h_row[2]);
-            float v3 = static_cast<float>(h_row[3]);
-            AILA_LOG_INFO("[Q35LayerStat] layer=%d mean=%.6f abs_mean=%.6f max_abs=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f",
-                          i, mean, abs_mean, max_abs, v0, v1, v2, v3);
-        }
+    const auto phase = seq_len == 1 ? ExecutionPhase::Decode : ExecutionPhase::Prefill;
+    for (const auto& plan : decoderPlan_->layers) {
+        const LayerExecution execution{
+            ctx, buf_, session.layerCaches_[static_cast<size_t>(plan.cacheIndex)],
+            phase, start_pos, seq_len, cached_len, session.Capacity(), full_rotary_dim,
+            static_cast<const int*>(session.mropePosT_.data()),
+            static_cast<const int*>(session.mropePosH_.data()),
+            static_cast<const int*>(session.mropePosW_.data()),
+            session.mropePromptLength_, session.mropeTextPositionDelta_,
+            debug_layer_stats, debug_layer_detail_idx, debug_linear_compare,
+            debug_linear_compare_layer, use_host_grouped_linear, time_stage, {}
+        };
+        ExecuteLayer(plan, execution);
     }
 
+    int output_rows = 1;
     time_stage(ProfileStage::LmHead, [&] {
         if (seq_len > 1) {
-            if (current_len_ > 0 && seq_len <= 16) {
+            if (start_pos > 0 && seq_len <= 16) {
+                output_rows = seq_len;
                 if (!buf_.logits.valid() || buf_.logits.shape(0) < seq_len) {
+                    if (buf_.logits.valid()) ctx.synchronize();
                     buf_.logits = Tensor::allocate(ctx, {seq_len, (int64_t)cfg_.vocab_size});
                 }
                 lm_head_.forward(ctx, buf_.normed, buf_.logits, seq_len);
@@ -2330,9 +2379,7 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
     });
 
     if (profile_enabled) {
-        static StageProfileTotals decode_totals;
-        static StageProfileTotals prefill_totals;
-        StageProfileTotals& totals = profile_decode ? decode_totals : prefill_totals;
+        StageProfileTotals& totals = profile_decode ? profile_->decode : profile_->prefill;
         for (size_t i = 0; i < stage_ms.size(); ++i) {
             totals.stage_ms[i] += stage_ms[i];
         }
@@ -2406,138 +2453,169 @@ Tensor& Qwen35HybridTextBackend::forward(Context& ctx, const int* token_ids_devi
         }
     }
 
-    // Take sparse snapshots of DeltaNet recurrent states
-    if (use_delta_linear_) {
-        int step = aila::env::g_q35_prefill_step_override;
-        if (step <= 0) {
-            step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
-        }
-        if (step <= 0) step = 64;
-
-        int next_len = current_len_ + seq_len;
-        bool is_prefill = (seq_len > 1);
-        bool is_step_boundary = (next_len % step == 0);
-        if (is_prefill || is_step_boundary) {
-            ctx.synchronize();
-            StateSnapshot snapshot;
-            snapshot.layers.resize(layer_caches_.size());
-            for (size_t i = 0; i < layer_caches_.size(); ++i) {
-                auto& cache = layer_caches_[i];
-                auto& layer = layers_[i];
-                if (!layer.is_linear) continue;
-
-                if (cache.device_state_dirty) {
-                    if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
-                        ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
-                                       cache.host_linear_state.size() * sizeof(float));
-                    }
-                    if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
-                        ctx.memcpy_d2h(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
-                                       cache.host_linear_conv_state.size() * sizeof(float));
-                    }
-                    cache.device_state_dirty = false;
-                }
-                snapshot.layers[i].linear_state_host = cache.host_linear_state;
-                snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
-                snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
-            }
-            snapshots_[next_len] = std::move(snapshot);
-        }
+    CaptureSnapshot(ctx, session, cached_len, seq_len);
+    session.currentLength_ = cached_len;
+    if (lastTokenOnly) {
+        auto* last = static_cast<bf16*>(buf_.logits.data()) +
+            static_cast<size_t>(output_rows - 1) * static_cast<size_t>(cfg_.vocab_size);
+        lastTokenLogits_ = Tensor::view(
+            ctx, last, {1, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
+        return lastTokenLogits_;
     }
-
-    current_len_ += seq_len;
     return buf_.logits;
 }
 
-void Qwen35HybridTextBackend::reset() {
-    current_len_ = 0;
-    clear_snapshots();
-    if (use_delta_linear_) {
-        for (auto& cache : layer_caches_) {
-            if (cache.linear_state.valid()) {
-                cache.linear_state.context()->queue().memset(
-                    cache.linear_state.data(), 0, cache.linear_state.size_bytes());
-            }
-            if (cache.linear_conv_state.valid()) {
-                cache.linear_conv_state.context()->queue().memset(
-                    cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
-            }
-            std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
-            std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
-            cache.device_state_dirty = false;
-            cache.linear_conv_head = 0;
-        }
+void Qwen35HybridTextBackend::CaptureSnapshot(
+    Context& ctx, Session& session, int nextLength, int tokenCount) {
+    if (!decoderPlan_->hasRecurrentLayers ||
+        (session.boundedSnapshots_ && session.maxSnapshots_ == 0)) {
+        return;
     }
-}
+    int step = aila::env::g_q35_prefill_step_override;
+    if (step <= 0) step = aila::env::read_int("AILA_Q35_PREFILL_STEP", 64);
+    if (step <= 0) step = 64;
+    if (tokenCount <= 1 && nextLength % step != 0) return;
 
-void Qwen35HybridTextBackend::clear_snapshots() {
-    snapshots_.clear();
-}
-
-bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
-    if (new_len >= current_len_) return true;
-    if (new_len == 0) {
-        reset();
-        return false;
+    // Preserve the existing checkpoint boundary. No per-layer synchronization
+    // is introduced into normal execution.
+    ctx.synchronize();
+    auto& snapshots = session.snapshots_;
+    if (session.boundedSnapshots_ && snapshots.find(nextLength) == snapshots.end() &&
+        snapshots.size() >= session.maxSnapshots_) {
+        const auto oldest = std::min_element(
+            snapshots.begin(), snapshots.end(),
+            [](const auto& left, const auto& right) { return left.first < right.first; });
+        snapshots.erase(oldest);
     }
-
-    if (use_delta_linear_) {
-        int best_checkpoint = -1;
-        for (const auto& pair : snapshots_) {
-            int cp = pair.first;
-            if (cp <= new_len && cp > best_checkpoint) {
-                best_checkpoint = cp;
-            }
-        }
-
-        if (best_checkpoint >= 0) {
-            const auto& snapshot = snapshots_[best_checkpoint];
-            for (size_t i = 0; i < layer_caches_.size(); ++i) {
-                auto& layer = layers_[i];
-                auto& cache = layer_caches_[i];
-                if (!layer.is_linear) continue;
-
-                cache.host_linear_state = snapshot.layers[i].linear_state_host;
-                cache.host_linear_conv_state = snapshot.layers[i].linear_conv_state_host;
-                cache.linear_conv_head = snapshot.layers[i].linear_conv_head;
-
-                if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
-                    cache.linear_state.context()->queue().memcpy(
-                        cache.linear_state.data(), cache.host_linear_state.data(),
-                        cache.host_linear_state.size() * sizeof(float));
+    // Evict before copying so snapshot payload never briefly exceeds its quota.
+    auto& snapshot = snapshots[nextLength];
+    try {
+        snapshot.layers.resize(session.layerCaches_.size());
+        for (const auto& plan : decoderPlan_->layers) {
+            if (plan.kind != LayerKind::DeltaNet) continue;
+            const auto index = static_cast<size_t>(plan.cacheIndex);
+            auto& cache = session.layerCaches_[index];
+            if (cache.device_state_dirty) {
+                if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
+                    ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
+                                   cache.host_linear_state.size() * sizeof(float));
                 }
-                if (cache.linear_conv_state.valid() && !cache.host_linear_conv_state.empty()) {
-                    cache.linear_conv_state.context()->queue().memcpy(
-                        cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
-                        cache.host_linear_conv_state.size() * sizeof(float));
+                if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
+                    ctx.memcpy_d2h(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
+                                   cache.host_linear_conv_state.size() * sizeof(float));
                 }
                 cache.device_state_dirty = false;
             }
-
-            if (!layer_caches_.empty() && layer_caches_[0].linear_state.valid()) {
-                layer_caches_[0].linear_state.context()->synchronize();
-            }
-
-            current_len_ = best_checkpoint;
-
-            for (auto it = snapshots_.begin(); it != snapshots_.end(); ) {
-                if (it->first > best_checkpoint) {
-                    it = snapshots_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            AILA_LOG_INFO("[Qwen35HybridTextBackend] Restored Mamba recurrent state from checkpoint %d (requested truncate to %d)",
-                          best_checkpoint, new_len);
-            return true;
-        } else {
-            AILA_LOG_WARN("[Qwen35HybridTextBackend] No suitable checkpoint found for truncate to %d, falling back to full reset", new_len);
-            reset();
-            return false;
+            snapshot.layers[index].linear_state_host = cache.host_linear_state;
+            snapshot.layers[index].linear_conv_state_host = cache.host_linear_conv_state;
+            snapshot.layers[index].linear_conv_head = cache.linear_conv_head;
         }
-    } else {
-        current_len_ = new_len;
-        return true;
+    } catch (...) {
+        // A partial snapshot must never become a valid rollback checkpoint.
+        snapshots.erase(nextLength);
+        throw;
     }
-};
+}
+
+void Qwen35HybridTextBackend::reset() {
+    if (defaultSession_) Reset(*defaultSession_);
+}
+
+bool Qwen35HybridTextBackend::truncate_kv_cache(int new_len) {
+    // Preserve the legacy bool API: a larger requested length is a no-op;
+    // resetting/failing to find a recurrent checkpoint reports false.
+    if (new_len >= get_current_context_len()) return true;
+    if (new_len <= 0) {
+        reset();
+        return false;
+    }
+    return Truncate(*defaultSession_, new_len) > 0;
+}
+
+void Qwen35HybridTextBackend::Reset(Session& session) {
+    ValidateSession(session);
+    session.context_->synchronize();
+    session.snapshots_.clear();
+    for (auto& cache : session.layerCaches_) {
+        if (cache.linear_state.valid()) {
+            session.context_->queue().memset(
+                cache.linear_state.data(), 0, cache.linear_state.size_bytes());
+        }
+        if (cache.linear_conv_state.valid()) {
+            session.context_->queue().memset(
+                cache.linear_conv_state.data(), 0, cache.linear_conv_state.size_bytes());
+        }
+        std::fill(cache.host_linear_state.begin(), cache.host_linear_state.end(), 0.0f);
+        std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
+        cache.device_state_dirty = false;
+        cache.linear_conv_head = 0;
+    }
+    session.currentLength_ = 0;
+}
+
+int Qwen35HybridTextBackend::Truncate(Session& session, int newLength) {
+    ValidateSession(session);
+    if (newLength < 0 || newLength > session.CurrentLength()) {
+        throw std::invalid_argument(
+            "Qwen35HybridTextBackend::Truncate: length must be between zero and the current length");
+    }
+    if (newLength == session.CurrentLength()) return newLength;
+    if (newLength == 0) {
+        Reset(session);
+        return 0;
+    }
+    if (!decoderPlan_->hasRecurrentLayers) {
+        session.currentLength_ = newLength;
+        return newLength;
+    }
+
+    int bestCheckpoint = -1;
+    for (const auto& [length, snapshot] : session.snapshots_) {
+        if (length <= newLength && length > bestCheckpoint) bestCheckpoint = length;
+    }
+    if (bestCheckpoint < 0) {
+        AILA_LOG_WARN(
+            "[Qwen35HybridTextBackend] No suitable checkpoint found for truncate to %d, falling back to full reset",
+            newLength);
+        Reset(session);
+        return 0;
+    }
+
+    // Host mirrors may be borrowed by earlier asynchronous operations.
+    session.context_->synchronize();
+    const auto& snapshot = session.snapshots_.at(bestCheckpoint);
+    for (const auto& plan : decoderPlan_->layers) {
+        if (plan.kind != LayerKind::DeltaNet) continue;
+        const auto index = static_cast<size_t>(plan.cacheIndex);
+        auto& cache = session.layerCaches_[index];
+        const auto& saved = snapshot.layers[index];
+        std::copy(saved.linear_state_host.begin(), saved.linear_state_host.end(),
+                  cache.host_linear_state.begin());
+        std::copy(saved.linear_conv_state_host.begin(), saved.linear_conv_state_host.end(),
+                  cache.host_linear_conv_state.begin());
+        cache.linear_conv_head = saved.linear_conv_head;
+        if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
+            session.context_->queue().memcpy(
+                cache.linear_state.data(), cache.host_linear_state.data(),
+                cache.host_linear_state.size() * sizeof(float));
+        }
+        if (cache.linear_conv_state.valid() && !cache.host_linear_conv_state.empty()) {
+            session.context_->queue().memcpy(
+                cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
+                cache.host_linear_conv_state.size() * sizeof(float));
+        }
+        cache.device_state_dirty = false;
+    }
+    // Drain once after all uploads, even if layer zero is a full-attention layer.
+    // Returning only after the host borrows end makes immediate reset/destruction safe.
+    session.context_->synchronize();
+    session.currentLength_ = bestCheckpoint;
+    for (auto it = session.snapshots_.begin(); it != session.snapshots_.end();) {
+        if (it->first > bestCheckpoint) it = session.snapshots_.erase(it);
+        else ++it;
+    }
+    AILA_LOG_INFO(
+        "[Qwen35HybridTextBackend] Restored Mamba recurrent state from checkpoint %d (requested truncate to %d)",
+        bestCheckpoint, newLength);
+    return bestCheckpoint;
+}

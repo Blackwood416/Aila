@@ -79,6 +79,7 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features,
 void Linear::ensure_primitive(Context& ctx, int seq_len) {
     if (seq_len == 1 && decode_inited_) return;
     if (prim_cache_.count(seq_len)) return;
+    ctx.make_primitive_cache_room(prim_cache_);
 
     auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
                                       dnnl::memory::format_tag::ab);
@@ -98,13 +99,7 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
     cp.src_md = src_md;
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        cp.scratchpad = Tensor::allocate(ctx,
-                                         {static_cast<int64_t>(scratchpad_size)},
-                                         dnnl::memory::data_type::u8);
-        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
-    }
+    cp.scratchpad_md = pd.scratchpad_desc();
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 
@@ -112,6 +107,7 @@ void Linear::ensure_primitive_f32(Context& ctx, int seq_len) {
     if (prim_cache_f32_.count(seq_len)) {
         return;
     }
+    ctx.make_primitive_cache_room(prim_cache_f32_);
     auto src_md = dnnl::memory::desc({seq_len, in_features_},
                                      dnnl::memory::data_type::bf16,
                                      dnnl::memory::format_tag::ab);
@@ -129,14 +125,7 @@ void Linear::ensure_primitive_f32(Context& ctx, int seq_len) {
     cp.src_md = src_md;
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        cp.scratchpad = Tensor::allocate(
-            ctx, {static_cast<int64_t>(scratchpad_size)},
-            dnnl::memory::data_type::u8);
-        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(
-            pd.scratchpad_desc());
-    }
+    cp.scratchpad_md = pd.scratchpad_desc();
     prim_cache_f32_.emplace(seq_len, std::move(cp));
 }
 
@@ -155,13 +144,13 @@ void Linear::forward_f32(Context& ctx, Tensor& input, Tensor& output,
         cp.args = {{DNNL_ARG_SRC, cp.src_mem},
                    {DNNL_ARG_WEIGHTS, cp.weight_mem},
                    {DNNL_ARG_DST, cp.dst_mem}};
-        if (cp.scratchpad.valid()) {
-            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
-        }
     }
     cp.src_mem.set_data_handle(input.data());
     cp.weight_mem.set_data_handle(weight_->data());
     cp.dst_mem.set_data_handle(output.data());
+    if (cp.scratchpad_md.get_size()) {
+        cp.args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(cp.scratchpad_md);
+    }
     cp.prim.execute(ctx.stream(), cp.args);
 }
 
@@ -169,6 +158,7 @@ void Linear::ensure_bias_primitive(Context& ctx, int seq_len,
                                    dnnl::memory::data_type bias_dtype) {
     const uint64_t key = fused_linear_key(seq_len, bias_dtype);
     if (bias_cache_.count(key)) return;
+    ctx.make_primitive_cache_room(bias_cache_);
 
     auto src_md = dnnl::memory::desc({seq_len, in_features_},
                                      dnnl::memory::data_type::bf16,
@@ -192,13 +182,7 @@ void Linear::ensure_bias_primitive(Context& ctx, int seq_len,
     cp.weight_md = weight_md;
     cp.bias_md = bias_md;
     cp.dst_md = dst_md;
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        cp.scratchpad = Tensor::allocate(ctx,
-                                         {static_cast<int64_t>(scratchpad_size)},
-                                         dnnl::memory::data_type::u8);
-        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
-    }
+    cp.scratchpad_md = pd.scratchpad_desc();
     bias_cache_.emplace(key, std::move(cp));
 }
 
@@ -206,6 +190,7 @@ void Linear::ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
                                               dnnl::memory::data_type bias_dtype) {
     const uint64_t key = fused_linear_key(seq_len, bias_dtype);
     if (bias_gelu_tanh_cache_.count(key)) return;
+    ctx.make_primitive_cache_room(bias_gelu_tanh_cache_);
 
     auto src_md = dnnl::memory::desc({seq_len, in_features_},
                                      dnnl::memory::data_type::bf16,
@@ -233,13 +218,7 @@ void Linear::ensure_bias_gelu_tanh_primitive(Context& ctx, int seq_len,
     cp.weight_md = weight_md;
     cp.bias_md = bias_md;
     cp.dst_md = dst_md;
-    size_t scratchpad_size = pd.scratchpad_desc().get_size();
-    if (scratchpad_size > 0) {
-        cp.scratchpad = Tensor::allocate(ctx,
-                                         {static_cast<int64_t>(scratchpad_size)},
-                                         dnnl::memory::data_type::u8);
-        cp.scratchpad_mem = cp.scratchpad.make_dnnl_memory(pd.scratchpad_desc());
-    }
+    cp.scratchpad_md = pd.scratchpad_desc();
     bias_gelu_tanh_cache_.emplace(key, std::move(cp));
 }
 
@@ -312,9 +291,6 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
                 {DNNL_ARG_WEIGHTS, cp.weight_mem},
                 {DNNL_ARG_DST, cp.dst_mem}
             };
-            if (cp.scratchpad.valid()) {
-                cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
-            }
             cp.mem_inited = true;
         } else {
             if (cp.src_ptr != input.data()) {
@@ -334,6 +310,9 @@ void Linear::forward(Context& ctx, Tensor& input, Tensor& output, int seq_len) {
             }
         }
 
+        if (cp.scratchpad_md.get_size()) {
+            cp.args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(cp.scratchpad_md);
+        }
         cp.prim.execute(ctx.stream(), cp.args);
     }
 }
@@ -378,9 +357,6 @@ void Linear::forward_bias(Context& ctx, Tensor& input, Tensor& bias,
             {DNNL_ARG_BIAS, cp.bias_mem},
             {DNNL_ARG_DST, cp.dst_mem}
         };
-        if (cp.scratchpad.valid()) {
-            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
-        }
         cp.mem_inited = true;
     } else {
         if (cp.src_ptr != input.data()) {
@@ -405,6 +381,9 @@ void Linear::forward_bias(Context& ctx, Tensor& input, Tensor& bias,
         }
     }
 
+    if (cp.scratchpad_md.get_size()) {
+        cp.args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(cp.scratchpad_md);
+    }
     cp.prim.execute(ctx.stream(), cp.args);
 }
 
@@ -433,9 +412,6 @@ void Linear::forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
             {DNNL_ARG_BIAS, cp.bias_mem},
             {DNNL_ARG_DST, cp.dst_mem}
         };
-        if (cp.scratchpad.valid()) {
-            cp.args.emplace(DNNL_ARG_SCRATCHPAD, cp.scratchpad_mem);
-        }
         cp.mem_inited = true;
     } else {
         if (cp.src_ptr != input.data()) {
@@ -460,6 +436,9 @@ void Linear::forward_bias_gelu_tanh(Context& ctx, Tensor& input, Tensor& bias,
         }
     }
 
+    if (cp.scratchpad_md.get_size()) {
+        cp.args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(cp.scratchpad_md);
+    }
     cp.prim.execute(ctx.stream(), cp.args);
 }
 

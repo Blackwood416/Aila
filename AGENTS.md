@@ -1,96 +1,161 @@
-# Aila Project Guide
+# Aila Project Guide (Post-Refactor Architecture)
 
-Aila is a high-performance SYCL-based LLM inference engine optimized for Intel Arc GPUs. It supports bitsandbytes NF4-quantized models (Qwen3, Qwen3.5 Hybrid).
+Aila is a high-performance SYCL-based LLM inference engine optimized for Intel Arc GPUs (DG2 / Alchemist, e.g. A770). It supports bitsandbytes NF4-quantized and BF16 models (Qwen3 dense, Qwen3.5 Hybrid) with shared-model multi-session execution, continuous batching, and isolated C++ HTTP/SSE serving.
 
-## Build
+---
 
-```bash
-pwsh build.ps1   # Windows + Intel oneAPI DPC++
+## 1. Quick Start & Build
+
+### Requirements
+- **OS**: Windows 10/11 x64
+- **Toolchains**:
+  - Intel oneAPI Base Toolkit 2026.1 (DPC++ compiler `icx-cl`, oneDNN 3.11, oneTBB, SYCL runtime)
+  - Microsoft Visual Studio 2022 / Build Tools (MSVC v143/v145, C++17)
+  - CMake >= 3.24, Ninja >= 1.12, Python >= 3.10, PowerShell 7 (`pwsh`)
+
+### Building the Primary Runtime (Worker, Lib, Tests)
+```powershell
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor
+```
+Artifacts produced in `build-refactor/`:
+- `Aila.exe`: Standalone CLI inference binary.
+- `AilaWorker.exe`: IPC v2 inference worker host.
+- `AilaShared.dll`: Public C ABI export (`aila_api.h`) with legacy adapter.
+- `AilaInference.dll`: Core async C ABI export (`aila_inference.h`).
+- 54 CTest test executables.
+
+### Building the HTTP/SSE Inference Server
+```powershell
+pwsh -NoProfile -File tools/server/build.ps1 -SkipDependencies
+```
+Artifacts produced in `build-refactor-server/`:
+- `AilaServer.exe`: High-concurrency Drogon-based HTTP/SSE OpenAI-compatible server (pure MSVC C++17, zero SYCL/oneDNN linkage).
+
+---
+
+## 2. System Architecture
+
+```
++-------------------------------------------------------------+
+|                  Client / OpenAI API / CLI                  |
++-------------------------------------------------------------+
+                              | HTTP / SSE (Port 8080)
++-------------------------------------------------------------+
+|               AilaServer.exe (Pure MSVC C++17)              |
+|  - Drogon HTTP / SSE Server        - ChatCodec / Jinja      |
+|  - Tokenizer / Thinking Stripper   - host::InferenceClient  |
++-------------------------------------------------------------+
+                              | Win32 Named Pipes (IPC v2)
++-------------------------------------------------------------+
+|             AilaWorker.exe (Intel oneAPI DPC++/SYCL)        |
+|  - worker::InferenceWorker         - inference::Scheduler   |
+|  - DeviceRuntime (USM Ledger)      - LoadedModel (Weights)  |
+|  - Sessions (KV Cache / DeltaNet)  - BatchDecodeExecutor    |
++-------------------------------------------------------------+
+                              | SYCL In-Order Queue
++-------------------------------------------------------------+
+|                 Intel Arc GPU (e.g. A770 16GB)              |
+|  - Packed NF4 GEMV / GEMM         - Multi-row Attention     |
+|  - XMX Joint Matrix Acceleration  - oneDNN MatMul Fallback  |
++-------------------------------------------------------------+
 ```
 
-Requires: Intel oneAPI Base Toolkit (compiler + oneDNN), CMake ≥ 3.24.
+### Resource Ownership Hierarchy
+| Component | Responsibility & Lifetime |
+|---|---|
+| `DeviceRuntime` | Manages SYCL queue/device, oneDNN engine, and explicit USM allocation ledger (`device_budget_`, `host_budget_`). |
+| `LoadedModel` | Read-only model configuration, fused NF4/BF16 weights, and static layer plans. Loaded once; shared across all sessions. |
+| `Session` | Per-conversation state: independent KV caches (Full Attention), DeltaNet recurrent matrix & conv history (Linear Attention), and checkpoint snapshots. |
+| `Request` | Single generation lifecycle: input prompt token IDs, generation limits, sampling parameters (RNG seed, temp, top-k/p, penalties), thinking budget controller, and stream cancellation flags. |
+| `Scheduler` | Round-robin token/chunk scheduler running on a dedicated worker thread. Handles dynamic continuous batching, admission limits, backpressure, and fault propagation. |
 
-## Verify
+---
 
-```bash
-# Smoke test
-pwsh smoke.ps1 -AilaExe ./build/Aila.exe -ModelDir '<model>'
+## 3. Kernel & Compute Architecture
 
-# Benchmark
-pwsh bench.ps1 -ModelDir '<model>' -PromptTokens 2048 -GenTokens 512 -BenchIters 3 -WarmupIters 1
-```
+### Quantization (BNB NF4)
+- NormalFloat 4-bit weights packed into `uint8` (2 × 4-bit nibbles per byte) with per-block float absmax and a 16-element float dequantization LUT.
+- 0.5 bytes/weight provides a fundamental 4× memory bandwidth advantage over BF16 for memory-bound decode GEMV.
 
-## Architecture
-
-### Quantization
-
-NF4 (bitsandbytes 4-bit NormalFloat) with per-block absmax. Weights stored as packed uint8 (2 × 4-bit values per byte) with float absmax per block. Quant map is a 16-element float LUT for non-linear dequant.
-
-The NF4 format is ~0.5 bytes/weight vs bf16's 2 bytes/weight — a 4× bandwidth advantage that is **fundamental** to Aila's performance. Any bf16 weight path is always slower for memory-bound GEMV.
-
-### Kernel Architecture
-
-- **Decode GEMV** (`packed_nf4_gemv_bf16`): Sub-group cooperative vec8+FMA with SG=16. Each SG processes one output row. 16 SGs per work-group (WG=256). Inner loop: uint32 load (4 packed bytes → 8 NF4 values) + vec8 bf16 input load + 8× inline dequant + FMA.
-
-- **Prefill GEMM** (`packed_nf4_gemm_bf16`): Tiled GEMM with BM=128, BN=128, BK=128. SLM staging for A (input) and B (packed weights). Inline NF4 dequant within the inner compute loop.
-
-- **Attention** (decode): Joint Matrix (XMX) QK^T for head_dim=128 linear attention. Phase 1: JM QK^T → Phase 2: softmax + vec8 V accumulation. For head_dim=256 full attention: exact partial_merge with per-tile softmax stats + cross-tile merge.
-
-- **FFN**: Fused gate+up GEMV + SiLU in one kernel (`packed_nf4_gemv_gate_up_swiglu`). No SLM barriers; SiLU computed after sub-group reduction.
+### Continuous Decode Batching (P7)
+- **Batch Bounds**: Configurable via `--decode-batch-size 1..4` (default 1).
+- **Multi-Row Decode Projections**:
+  - NF4: `run_decode_qkv_rows`, `run_decode_o_proj_rows`, `run_decode_ffn_rows` using subgroup-cooperative GEMV (1 output row per subgroup).
+  - BF16: `run_decode_jm_matvec_rows` and `run_decode_ffn_gate_up_swiglu_rows` reducing launch overhead 4× and eliminating duplicate weight loads (+57% throughput at B=4).
+- **Multi-Row Decode Attention (`attention_decode_rows`)**:
+  - `head_dim == 256` below threshold: Multi-row baseline kernel.
+  - `head_dim == 128 / 256` at or above threshold: Multi-row exact-partial-merge kernel with private `[4, head, tile, stride]` scratch blocks per sequence.
+  - `head_dim == 128` below 128 tokens: Fused multi-row Joint-Matrix kernel (`attention_decode_rows_joint_matrix_impl`) executing QKᵀ, Softmax, and V-accumulation in SLM without global DRAM scores traffic.
+  - Window/sink or mixed-threshold rows gracefully fall back to per-row dispatch.
 
 ### Model Backends
+- `Qwen3Bnb4Backend`: Dense Qwen3 models (0.6B, 4B) with BNB NF4 weights and GQA full attention.
+- `Qwen35HybridBnb4Backend`: Qwen3.5 Hybrid models (0.8B, 4B) with alternating GQA full attention (`head_dim=256`) and DeltaNet linear attention (`head_dim=128`).
+- `Qwen35HybridTextBackend`: Qwen3.5 Hybrid with unquantized BF16 weights.
+- `DiffusionGemmaBnb4Backend`: DiffusionGemma 26B A4B MoE Block Diffusion Model.
+- `Gemma4VisionEncoder` / `YOLO26`: Vision tower and object detection modules.
 
-- `Qwen35HybridBnb4Backend`: Qwen3.5 Hybrid with BNB NF4 quantization. Alternating full attention (head_dim=256, GQA) and linear attention (DeltaNet, head_dim=128) layers.
-- `Qwen3Bnb4Backend`: Qwen3 dense with BNB NF4. Standard GQA attention.
-- `Qwen35HybridTextBackend`: Qwen3.5 Hybrid with bf16 weights (no quantization). Used for vision encoder.
-- `DiffusionGemmaBnb4Backend`: DiffusionGemma 26B A4B MoE Block Diffusion Model with bitsandbytes NF4 quantization and soft self-conditioning.
-- `Gemma4VisionEncoder`: Gemma 4 Vision Tower (27 layers, 2D RoPE, 3x3 spatial pooling, unweighted RMSNorm, XMX embedding projection) supporting multimodal image-text generation.
+---
 
-### Dependency: oneDNN
+## 4. Chat Template & Reasoning Engine
 
-oneDNN provides XMX-accelerated matmul for prefill GEMM and the bf16 decode fallback. Integrated via `dnnl::sycl_interop` for zero-copy USM memory sharing.
+- **Jinja2 Templating**: Native high-speed C++ Jinja engine (`src/templates/jinja/`) formatting prompts according to tokenizer chat templates.
+- **Thinking Block Stripping**: `aila::chat::strip_thinking_blocks` automatically strips historical `<think>...</think>` blocks from external multi-turn history (`mm_history_`), preventing reasoning pollution across turns.
+- **Thinking Budget Control**: `ThinkingBudgetController` monitors reasoning token generation against `max_thinking_tokens` / `thinking_budget`. When exhausted, it forcefully injects `</think>\n` to transition the model to content generation.
 
-### SYCL Runtime
+---
 
-In-order SYCL queue (`sycl::property::queue::in_order()`). Kernels execute in submission order. Profiling (`ctx.synchronize()`) serializes the async pipeline and should only be used for relative comparison.
+## 5. Verification & Testing Guide
 
-## Coding Conventions
+### 1. CPU & ABI Unit Tests (Fast CI)
+```powershell
+ctest --test-dir build-refactor -L 'cpu|abi' --output-on-failure
+```
 
-- Kernel functions: `snake_case` in anonymous namespace
-- Class methods: `PascalCase` with `lowerCamelCase` members
-- SYCL bf16 alias: `using bf16 = sycl::ext::oneapi::bfloat16;`
-- SLM declarations: `sycl::local_accessor<T, 1> name(range, cgh);`
-- Sub-group size: `[[sycl::reqd_sub_group_size(16)]]` on kernel lambdas
-- Env vars: `static const` locals read once via `aila::env::read_*`
-- Profiling: `AILA_LOG_INFO` with structured format, profile stages via `time_stage()`
+### 2. Full CTest Suite
+```powershell
+ctest --test-dir build-refactor --output-on-failure
+```
 
-## Known Regressions
+### 3. Server Socket & Concurrency Tests (CPU Fake Worker)
+```powershell
+python tests/server/socket_tests.py --server build-refactor-server/AilaServer.exe --worker build-refactor/AilaFakeInferenceWorker.exe --mode fake --output tmp/socket-fake
+python tests/server/batching_socket_tests.py --server build-refactor-server/AilaServer.exe --worker build-refactor/AilaFakeInferenceWorker.exe --output tmp/batch-fake
+```
 
-Do not attempt these optimizations (documented in `.Codex/skills/decode-perf-optimize.md`):
-- SLM input caching in GEMV (bank conflicts: 32 banks can't serve 16 lanes × vec8)
-- bf16 weight path for decode (4× bandwidth loss vs NF4)
-- Blocked weight layout GEMV (+15ms regression)
-- Cooperative GEMV with 2 rows/subgroup
-- uint64 weight loads (Intel SIMD prefers uint32)
-- QMAP via private registers instead of SLM (45 tok/s vs 58)
-- Fused residual add in GEMV (-1.5%)
+### 4. GPU Real HTTP & Concurrency Acceptance
+```powershell
+python tests/server/socket_tests.py --server build-refactor-server/AilaServer.exe --worker build-refactor/AilaWorker.exe --model models/qwen3-0.6B-bnb-nf4-offline --mode gpu --case incremental_utf8_json_sse --output tmp/gpu-http
+python tests/server/batching_gpu_tests.py --server build-refactor-server/AilaServer.exe --worker build-refactor/AilaWorker.exe --backend qwen3_nf4 --model models/qwen3-0.6B-bnb-nf4-offline --output tmp/gpu-batching
+```
 
-## Key Files
+### 5. Service Benchmark & DXGI Memory Profiling
+```powershell
+python tools/server/service_benchmark.py --server build-refactor-server/AilaServer.exe --worker build-refactor/AilaWorker.exe --model models/qwen3-0.6B-bnb-nf4-offline --output tmp/bench-probe --mode probe
+```
 
-| File | Purpose |
-|------|---------|
-| `src/ops/Bnb4BitLinear.cpp` | NF4 GEMV/GEMM kernels |
-| `src/ops/AttentionOps.cpp` | All attention variants (JM, baseline, partial_merge) |
-| `src/ops/NormOps.cpp` | RMS norm, fused add+norm |
-| `src/ops/ElementwiseOps.cpp` | SiLU, SwiGLU, RoPE, residual add |
-| `src/models/Qwen35HybridBnb4Backend.cpp` | Qwen3.5 Hybrid BNB backend |
-| `CMakeLists.txt` | Build config, compiler flags |
-| `docs/Environment_Variables.md` | All AILA_* env vars |
-| `docs/perf-tuning.md` | Performance tuning guide |
-| `.Codex/skills/decode-perf-optimize.md` | Optimization history and methodology |
+---
 
-## TODOs / 后续改进计划
+## 6. Coding Conventions & Invariants
 
-- **Chat Template 改进**：
-  - 自动剥离用户历史输入消息（`mm_history_` 外部导入数据）中的思维链 `<think>` 块，避免多轮历史污染。
-  - 在 `GenerationConfig` 中支持 `max_thinking_tokens` (或 `thinking_budget`) 限制，在自回归生成循环中当生成 token 超过预算时强制注入 `</think>\n` 并退出思考阶段。
+- **Kernel Functions**: `snake_case` inside anonymous namespaces.
+- **Class Methods & Public Types**: `PascalCase` with `camelCase` private members.
+- **SYCL Types**: `using bf16 = sycl::ext::oneapi::bfloat16;`.
+- **Sub-group Attribute**: Explicit `[[sycl::reqd_sub_group_size(16)]]` or `[[sycl::reqd_sub_group_size(8)]]`.
+- **Environment Variables**: Cached read-once static locals via `read_env_int_local` or `aila::env::read_*`.
+- **Zero Allocations on Hot Path**: Decode loops must never issue dynamic USM allocations or rebind oneDNN descriptors. Scratchpads and intermediate buffers must be pre-allocated per execution slot.
+- **Memory Safety & Cancellation**: Canceled requests must drain submitted GPU work before freeing USM; never free device pointers while kernels may still reference them.
+
+---
+
+## 7. Known Negative Optimizations (Do Not Attempt)
+
+Documented regressions to avoid:
+- **SLM input caching in GEMV**: Bank conflicts (32 banks cannot service 16 lanes × vec8).
+- **BF16 weight path for decode GEMV**: Bandwidth loss (4× slower than packed NF4).
+- **Blocked weight layout for GEMV**: Causes +15ms regression on DG2 memory controller.
+- **2 rows per subgroup in GEMV**: Degrades register pressure and occupancy.
+- **uint64 weight loads**: Intel SIMD hardware is heavily optimized for uint32 vector loads.
+- **QMAP in private registers instead of SLM**: Reduces throughput from 58 to 45 tok/s.
+- **Fused residual add in GEMV**: -1.5% due to register bloat.
+

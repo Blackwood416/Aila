@@ -227,7 +227,11 @@ void attention_decode_exact_head256_partial_merge_impl(
   const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
   const int max_seq_len = static_cast<int>(k_cache.shape(1));
   const int num_tiles = (effective_len + tile_t - 1) / tile_t;
-  const int max_tiles = static_cast<int>(partials_buf.shape(1));
+  // The partials region may be a per-sequence 4-D block (batched decode); a
+  // single-row call always uses the first sequence's block and its tile count
+  // is the second-to-last extent.
+  const int max_tiles = static_cast<int>(
+      partials_buf.shape(partials_buf.ndim() == 4 ? 2 : 1));
   (void)max_tiles;
 
   // Phase 1: compute per-tile exact softmax stats and exp-weighted V partials.
@@ -395,7 +399,9 @@ void attention_decode_exact_head128_partial_merge_impl(
   const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
   const int max_seq_len = static_cast<int>(k_cache.shape(1));
   const int num_tiles = (effective_len + tile_t - 1) / tile_t;
-  const int max_tiles = static_cast<int>(partials_buf.shape(1));
+  // See the head_dim 256 merge: a 4-D per-sequence block uses its tile extent.
+  const int max_tiles = static_cast<int>(
+      partials_buf.shape(partials_buf.ndim() == 4 ? 2 : 1));
 
   // Phase 1: compute per-tile exact softmax stats and exp-weighted V partials.
   ctx.queue().submit([&](sycl::handler &cgh) {
@@ -707,101 +713,544 @@ void attention_decode_joint_matrix(Context &ctx, Tensor &q, Tensor &k_cache,
   }
 }
 
+// Multi-row baseline decode attention. One work-group per (sequence, head).
+// Each row keeps the single-row body verbatim, including the vec8 K dot, the
+// reduce_over_group order and the V accumulation loop, so a row output equals
+// the single-row kernel for the same cache and position.
+template <bool Quantized>
+void attention_decode_rows_baseline_impl(
+    Context &ctx, Tensor &q, int q_row_stride, Tensor &output,
+    Tensor &scores_buf, const DecodeRowGeometry *rows, int row_count,
+    int num_heads, int num_kv_heads, int head_dim, int max_cached_len,
+    int wg_size) {
+  const int o_row_stride = num_heads * head_dim;
+  bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+  (void)scores_buf;
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const int max_seq_len = static_cast<int>(rows[0].k_cache->shape(1));
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int padded = round_up(max_cached_len, 32);
+
+  const void *k_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  const void *v_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  int cached_lens[4] = {0, 0, 0, 0};
+  for (int r = 0; r < row_count; ++r) {
+    k_ptrs[r] = rows[r].k_cache->data();
+    v_ptrs[r] = rows[r].v_cache->data();
+    cached_lens[r] = rows[r].cached_len;
+  }
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> shared(sycl::range<1>(padded), cgh);
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(row_count) * static_cast<size_t>(num_heads) * wg_size,
+            wg_size),
+        [=](sycl::nd_item<1> item) {
+          const int group = static_cast<int>(item.get_group(0));
+          const int sequence = group / num_heads;
+          const int head = group % num_heads;
+          const int lid = static_cast<int>(item.get_local_id(0));
+          const int kv_head = head / heads_per_kv;
+          const int effective_len = cached_lens[sequence];
+          const bf16 *q_row = q_ptr +
+              static_cast<size_t>(sequence) * q_row_stride + head * head_dim;
+          // The attention output is always a dense num_heads*head_dim row
+          // stack, which is not necessarily the input q stride.
+          bf16 *o_row = o_ptr +
+              static_cast<size_t>(sequence) * o_row_stride + head * head_dim;
+
+          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], max_seq_len, head_dim);
+
+          for (int d = lid; d < head_dim; d += wg_size) {
+            q_cache[d] = static_cast<float>(q_row[d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int t = lid; t < effective_len; t += wg_size) {
+            float sum = 0.0f;
+            if ((head_dim & 7) == 0) {
+              for (int d = 0; d < head_dim; d += 8) {
+                sum += q_cache[d + 0] * k_acc.load(kv_head, t, d + 0);
+                sum += q_cache[d + 1] * k_acc.load(kv_head, t, d + 1);
+                sum += q_cache[d + 2] * k_acc.load(kv_head, t, d + 2);
+                sum += q_cache[d + 3] * k_acc.load(kv_head, t, d + 3);
+                sum += q_cache[d + 4] * k_acc.load(kv_head, t, d + 4);
+                sum += q_cache[d + 5] * k_acc.load(kv_head, t, d + 5);
+                sum += q_cache[d + 6] * k_acc.load(kv_head, t, d + 6);
+                sum += q_cache[d + 7] * k_acc.load(kv_head, t, d + 7);
+              }
+            } else {
+              for (int d = 0; d < head_dim; d++) {
+                sum += q_cache[d] * k_acc.load(kv_head, t, d);
+              }
+            }
+            shared[t] = sum * scale;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float max_val = -1e30f;
+          for (int t = lid; t < effective_len; t += wg_size) {
+            max_val = sycl::fmax(max_val, shared[t]);
+          }
+          max_val = sycl::reduce_over_group(item.get_group(), max_val,
+                                           sycl::maximum<float>());
+
+          float sum_val = 0.0f;
+          for (int t = lid; t < effective_len; t += wg_size) {
+            const float e = sycl::native::exp(shared[t] - max_val);
+            shared[t] = e;
+            sum_val += e;
+          }
+          sum_val = sycl::reduce_over_group(item.get_group(), sum_val,
+                                           sycl::plus<float>());
+
+          for (int t = lid; t < effective_len; t += wg_size) {
+            shared[t] = shared[t] / sum_val;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int d = lid; d < head_dim; d += wg_size) {
+            float acc = 0.0f;
+            for (int t = 0; t < effective_len; t++) {
+              acc += shared[t] * v_acc.load(kv_head, t, d);
+            }
+              o_row[d] = bf16(acc);
+            }
+          });
+  });
+}
+
+// Multi-row fused Joint-Matrix decode attention for head_dim 128 below 128 tokens.
+// One work-group per (sequence, head). Since context length is < 128 tokens (max 128 floats = 512 bytes),
+// all intermediate logits fit in local accessor (SLM) without touching global scores_buf.
+template <int TM = 1, int TN = 8, int TK = 16, int SG = 8, int WG = 128>
+void attention_decode_rows_joint_matrix_impl(
+    Context &ctx, Tensor &q, int q_row_stride, Tensor &output,
+    const DecodeRowGeometry *rows, int row_count,
+    int num_heads, int num_kv_heads, int head_dim) {
+  const int o_row_stride = num_heads * head_dim;
+  const bf16 *q_ptr = static_cast<const bf16 *>(q.data());
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const int max_seq_len = static_cast<int>(rows[0].k_cache->shape(1));
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+
+  const void *k_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  const void *v_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  int cached_lens[4] = {0, 0, 0, 0};
+  for (int r = 0; r < row_count; ++r) {
+    k_ptrs[r] = rows[r].k_cache->data();
+    v_ptrs[r] = rows[r].v_cache->data();
+    cached_lens[r] = rows[r].cached_len;
+  }
+
+  constexpr int num_sgs = WG / SG;
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<bf16, 1> q_slm(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> scores_slm(sycl::range<1>(128), cgh);
+    sycl::local_accessor<float, 1> c_local(sycl::range<1>(num_sgs * TN), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(row_count) * static_cast<size_t>(num_heads) * WG, WG),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+          auto sg = item.get_sub_group();
+          const int group = static_cast<int>(item.get_group(0));
+          const int sequence = group / num_heads;
+          const int head = group % num_heads;
+          const int lid = static_cast<int>(item.get_local_id(0));
+          const int sg_id = lid / SG;
+          const int sg_lid = static_cast<int>(sg.get_local_linear_id());
+          const int kv_head = head / heads_per_kv;
+          const int effective_len = cached_lens[sequence];
+
+          bf16 *o_head = o_ptr +
+              static_cast<size_t>(sequence) * o_row_stride + head * head_dim;
+
+          if (effective_len <= 0) {
+            if (lid * 8 < head_dim) {
+              for (int k = 0; k < 8; ++k) o_head[lid * 8 + k] = bf16(0.0f);
+            }
+            return;
+          }
+
+          const bf16 *q_head = q_ptr +
+              static_cast<size_t>(sequence) * q_row_stride + head * head_dim;
+          const bf16 *k_head = static_cast<const bf16 *>(k_ptrs[sequence]) +
+              static_cast<size_t>(kv_head) * max_seq_len * head_dim;
+          const bf16 *v_head = static_cast<const bf16 *>(v_ptrs[sequence]) +
+              static_cast<size_t>(kv_head) * max_seq_len * head_dim;
+
+          // Cooperative Q load into SLM
+          for (int d = lid; d < head_dim; d += WG) {
+            q_slm[d] = q_head[d];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Phase 1: Joint-Matrix QK^T
+          const int num_tiles = (effective_len + TN - 1) / TN;
+          for (int tile = sg_id; tile < num_tiles; tile += num_sgs) {
+            const int t0 = tile * TN;
+            const bf16 *k_tile = k_head + t0 * head_dim;
+
+            joint_matrix<sycl::sub_group, bf16, use::a, TM, TK, layout::row_major> sub_a;
+            joint_matrix<sycl::sub_group, bf16, use::b, TK, TN, layout::col_major> sub_b;
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> sub_c;
+            joint_matrix_fill(sg, sub_c, 0.0f);
+
+            for (int kb = 0; kb < head_dim; kb += TK) {
+              auto a_ptr = q_slm.get_multi_ptr<sycl::access::decorated::no>();
+              auto b_ptr = sycl::address_space_cast<
+                  sycl::access::address_space::global_space,
+                  sycl::access::decorated::no>(k_tile + kb);
+              joint_matrix_load(sg, sub_a, a_ptr + kb, TK);
+              joint_matrix_load(sg, sub_b, b_ptr, head_dim);
+              joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+            }
+
+            auto c_ptr = c_local.get_multi_ptr<sycl::access::decorated::no>();
+            joint_matrix_store(sg, sub_c, c_ptr + sg_id * TN, TN, layout::row_major);
+            sycl::group_barrier(sg);
+
+            if (sg_lid < TN) {
+              const int t = t0 + sg_lid;
+              if (t < effective_len && t < 128) {
+                scores_slm[t] = c_local[sg_id * TN + sg_lid] * scale;
+              }
+            }
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Phase 2: Softmax
+          float max_val = -1.0e38f;
+          for (int t = lid; t < effective_len; t += WG) {
+            max_val = sycl::fmax(max_val, scores_slm[t]);
+          }
+          max_val = sycl::reduce_over_group(item.get_group(), max_val, sycl::maximum<float>());
+
+          float sum_val = 0.0f;
+          for (int t = lid; t < effective_len; t += WG) {
+            const float e = sycl::native::exp(scores_slm[t] - max_val);
+            scores_slm[t] = e;
+            sum_val += e;
+          }
+          sum_val = sycl::reduce_over_group(item.get_group(), sum_val, sycl::plus<float>());
+
+          for (int t = lid; t < effective_len; t += WG) {
+            scores_slm[t] = scores_slm[t] / sum_val;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Phase 2: V Accumulation
+          using vec8 = sycl::vec<bf16, 8>;
+          if (lid * 8 < head_dim) {
+            float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            for (int t = 0; t < effective_len; ++t) {
+              const float p = scores_slm[t];
+              const vec8 v_row = *reinterpret_cast<const vec8 *>(
+                  v_head + t * head_dim + lid * 8);
+              acc[0] += p * static_cast<float>(v_row[0]);
+              acc[1] += p * static_cast<float>(v_row[1]);
+              acc[2] += p * static_cast<float>(v_row[2]);
+              acc[3] += p * static_cast<float>(v_row[3]);
+              acc[4] += p * static_cast<float>(v_row[4]);
+              acc[5] += p * static_cast<float>(v_row[5]);
+              acc[6] += p * static_cast<float>(v_row[6]);
+              acc[7] += p * static_cast<float>(v_row[7]);
+            }
+            for (int k = 0; k < 8; ++k) {
+              o_head[lid * 8 + k] = bf16(acc[k]);
+            }
+          }
+        });
+  });
+}
+
+// Multi-row exact partial merge for head_dim 128/256 decode. Every
+// (sequence, head, tile) group keeps the single-row body, rounding and
+// reduction order verbatim, and each sequence owns a private partials region so
+// rows cannot overwrite one another. A row's output therefore stays bitwise
+// identical to calling the single-row merge for that row alone.
+template <bool Quantized, int HeadDim>
+void attention_decode_rows_exact_merge_impl(
+    Context &ctx, Tensor &q, int q_row_stride, Tensor &output,
+    Tensor &partials_buf, const DecodeRowGeometry *rows, int row_count,
+    int num_heads, int num_kv_heads) {
+  constexpr int head_dim = HeadDim;
+  constexpr int tile_t = 128;
+  constexpr int tile_wg = 128;
+  constexpr int merge_wg = 128;
+  constexpr int partial_stride =
+      (HeadDim == 256) ? kDecodeExact256PartialStride : kDecodeExact128PartialStride;
+  constexpr int acc_offset =
+      (HeadDim == 256) ? kDecodeExact256PartialAccOffset : kDecodeExact128PartialAccOffset;
+
+  bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+  float *partials_ptr = static_cast<float *>(partials_buf.data());
+
+  const int o_row_stride = num_heads * head_dim;
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int max_seq_len = static_cast<int>(rows[0].k_cache->shape(1));
+  const int max_tiles = static_cast<int>(partials_buf.shape(2));
+  // Each sequence's block is separated by the buffer's own head extent, which
+  // may exceed this layer's attention head count (a hybrid model sizes it for
+  // its widest attention layer).
+  const int buffer_heads = static_cast<int>(partials_buf.shape(1));
+
+  const void *k_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  const void *v_ptrs[4] = {nullptr, nullptr, nullptr, nullptr};
+  int cached_lens[4] = {0, 0, 0, 0};
+  int row_tiles[4] = {0, 0, 0, 0};
+  for (int r = 0; r < row_count; ++r) {
+    k_ptrs[r] = rows[r].k_cache->data();
+    v_ptrs[r] = rows[r].v_cache->data();
+    cached_lens[r] = rows[r].cached_len;
+    row_tiles[r] = (cached_lens[r] + tile_t - 1) / tile_t;
+  }
+
+  // Phase 1 grid is flattened over (sequence, head, tile). row_count is at most
+  // four, so locating the owning sequence is a short prefix scan. The per-row
+  // tile counts differ, which a rectangular grid would either over-run or
+  // waste, so the flattening keeps the launched work equal to the per-row sum.
+  int total_tile_groups = 0;
+  for (int r = 0; r < row_count; ++r) total_tile_groups += num_heads * row_tiles[r];
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
+    sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(total_tile_groups) * static_cast<size_t>(tile_wg),
+            tile_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = static_cast<int>(item.get_group(0));
+          int sequence = 0;
+          int local = group;
+          for (int r = 0; r < row_count; ++r) {
+            const int groups = num_heads * row_tiles[r];
+            if (local < groups) {
+              sequence = r;
+              break;
+            }
+            local -= groups;
+          }
+          const int head = local / row_tiles[sequence];
+          const int tile_idx = local % row_tiles[sequence];
+          const int lid = static_cast<int>(item.get_local_id(0));
+          const int kv_head = head / heads_per_kv;
+          const int effective_len = cached_lens[sequence];
+          const int tile_start = tile_idx * tile_t;
+          const int tile_len = sycl::min(tile_t, effective_len - tile_start);
+          float *partial =
+              partials_ptr +
+              (static_cast<size_t>(sequence) * buffer_heads + head) * max_tiles *
+                      partial_stride +
+              static_cast<size_t>(tile_idx) * partial_stride;
+
+          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], max_seq_len, head_dim);
+
+          const bf16 *q_row =
+              q_ptr + static_cast<size_t>(sequence) * q_row_stride + head * head_dim;
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            q_cache[d] = static_cast<float>(q_row[d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score = -1e30f;
+          if (lid < tile_len) {
+            const int t = tile_start + lid;
+            score = 0.0f;
+            for (int d = 0; d < head_dim; d += 8) {
+              score += q_cache[d + 0] * k_acc.load(kv_head, t, d + 0);
+              score += q_cache[d + 1] * k_acc.load(kv_head, t, d + 1);
+              score += q_cache[d + 2] * k_acc.load(kv_head, t, d + 2);
+              score += q_cache[d + 3] * k_acc.load(kv_head, t, d + 3);
+              score += q_cache[d + 4] * k_acc.load(kv_head, t, d + 4);
+              score += q_cache[d + 5] * k_acc.load(kv_head, t, d + 5);
+              score += q_cache[d + 6] * k_acc.load(kv_head, t, d + 6);
+              score += q_cache[d + 7] * k_acc.load(kv_head, t, d + 7);
+            }
+            score *= scale;
+          }
+          logits[lid] = score;
+          const float tile_max = sycl::reduce_over_group(
+              item.get_group(), score, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_score = 0.0f;
+          if (lid < tile_len) {
+            exp_score = sycl::native::exp(logits[lid] - stats[0]);
+            logits[lid] = exp_score;
+          } else {
+            logits[lid] = 0.0f;
+          }
+          const float tile_sum = sycl::reduce_over_group(
+              item.get_group(), exp_score, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum;
+            partial[0] = stats[0];
+            partial[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            float acc = 0.0f;
+            for (int i = 0; i < tile_len; ++i) {
+              const int t = tile_start + i;
+              acc += logits[i] * v_acc.load(kv_head, t, d);
+            }
+            partial[acc_offset + d] = acc;
+          }
+        });
+  });
+
+  // Phase 2 merges each sequence's per-tile statistics and partial outputs.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> tile_factors(sycl::range<1>(max_tiles), cgh);
+    sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(row_count) * static_cast<size_t>(num_heads) *
+                static_cast<size_t>(merge_wg),
+            merge_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = static_cast<int>(item.get_group(0));
+          const int sequence = group / num_heads;
+          const int head = group % num_heads;
+          const int lid = static_cast<int>(item.get_local_id(0));
+          const int num_tiles = row_tiles[sequence];
+          const float *row_partials =
+              partials_ptr +
+              (static_cast<size_t>(sequence) * buffer_heads + head) * max_tiles *
+                  partial_stride;
+
+          if (lid == 0) {
+            float global_max = -1e30f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  row_partials + static_cast<size_t>(tile_idx) * partial_stride;
+              global_max = sycl::fmax(global_max, partial[0]);
+            }
+            float sum = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  row_partials + static_cast<size_t>(tile_idx) * partial_stride;
+              const float factor = sycl::native::exp(partial[0] - global_max);
+              tile_factors[tile_idx] = factor;
+              sum += factor * partial[1];
+            }
+            norm_sum[0] = sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float inv_sum = 1.0f / norm_sum[0];
+          bf16 *o_row =
+              o_ptr + static_cast<size_t>(sequence) * o_row_stride + head * head_dim;
+          for (int d = lid; d < head_dim; d += merge_wg) {
+            float acc = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  row_partials + static_cast<size_t>(tile_idx) * partial_stride;
+              acc += tile_factors[tile_idx] * partial[acc_offset + d];
+            }
+            o_row[d] = bf16(acc * inv_sum);
+          }
+        });
+  });
+}
 } // namespace
 
 // ============================================================
 // SYCL Kernel: Attention Decode (seq_len=1, GQA)
 // ============================================================
 
+constexpr int JM0_M = 1;
+constexpr int JM0_N = 8;
+constexpr int JM0_K = 16;
+constexpr int JM1_M = 32;
+constexpr int JM1_N = 32;
+constexpr int JM1_K = 16;
+constexpr int JM2_M = 8;
+constexpr int JM2_N = 8;
+constexpr int JM2_K = 16;
+
+struct JmDecodeConfig {
+  bool allow_jm = false;
+  int jm_tile_id = -1;
+  int jm_mode = -1;
+  int jm_supported = -1;
+  int decode_wg = 512;
+  int decode_window = 0;
+  int decode_window_start = 512;
+  int decode_sink = 0;
+};
+
+const JmDecodeConfig& get_jm_decode_config(const sycl::device &dev) {
+  static JmDecodeConfig cfg;
+  static bool initialized = false;
+  if (!initialized) {
+    cfg.jm_mode = read_env_int_local("AILA_ATTN_JM", 1);
+    cfg.decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 512);
+    if (cfg.decode_wg <= 0) cfg.decode_wg = 512;
+    cfg.decode_window = read_env_int_local("AILA_ATTN_DECODE_WINDOW", 0);
+    if (cfg.decode_window < 0) cfg.decode_window = 0;
+    cfg.decode_window_start = read_env_int_local("AILA_ATTN_DECODE_WINDOW_START", -1);
+    if (cfg.decode_window_start < 0) cfg.decode_window_start = std::max(512, cfg.decode_window);
+    cfg.decode_sink = read_env_int_local("AILA_ATTN_DECODE_SINK", -1);
+    if (cfg.decode_sink < 0) cfg.decode_sink = 0;
+
+    bool s0 = supports_jm_bf16_f32(dev, JM0_M, JM0_N, JM0_K);
+    bool s1 = supports_jm_bf16_f32(dev, JM1_M, JM1_N, JM1_K);
+    bool s2 = supports_jm_bf16_f32(dev, JM2_M, JM2_N, JM2_K);
+    cfg.jm_supported = (s0 || s1 || s2) ? 1 : 0;
+
+    int force_tile = read_env_int_local("AILA_ATTN_JM_TILE", -1);
+    if (force_tile == 2 && s2) cfg.jm_tile_id = 2;
+    else if (force_tile == 1 && s1) cfg.jm_tile_id = 1;
+    else if (force_tile == 0 && s0) cfg.jm_tile_id = 0;
+    else if (s0) cfg.jm_tile_id = 0;
+    else if (s2) cfg.jm_tile_id = 2;
+    else if (s1) cfg.jm_tile_id = 1;
+    else cfg.jm_tile_id = -1;
+
+    cfg.allow_jm = (cfg.jm_tile_id >= 0) &&
+        (cfg.jm_mode == 2 || (cfg.jm_mode == 1 && cfg.jm_supported == 1));
+    initialized = true;
+  }
+  return cfg;
+}
+
 void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       Tensor &output, Tensor &scores_buf, int num_heads,
                       int num_kv_heads, int head_dim, int cached_len,
                       Tensor *exact_partials_buf) {
-  constexpr int JM0_M = 1;
-  constexpr int JM0_N = 8;
-  constexpr int JM0_K = 16;
-  constexpr int JM1_M = 32;
-  constexpr int JM1_N = 32;
-  constexpr int JM1_K = 16;
-  constexpr int JM2_M = 8;
-  constexpr int JM2_N = 8;
-  constexpr int JM2_K = 16;
-
-  // AILA_ATTN_JM:
-  //   0 (default): disabled
-  //   1: auto (run only when runtime-reported combination is supported)
-  //   2: force (skip capability gate, for debugging only)
-  static int jm_mode = -1;
-  static int jm_supported = -1;
-  static int jm_tile_id = -1;
-  static int decode_wg = -1;
-  static int decode_window = -1;
-  static int decode_window_start = -1;
-  static int decode_sink = -1;
   static bool jm_log_once = false;
-  if (jm_mode < 0) {
-    jm_mode = read_env_int_local("AILA_ATTN_JM", 1);
-  }
-  if (decode_wg < 0) {
-    decode_wg = read_env_int_local("AILA_ATTN_DECODE_WG", 512);
-    if (decode_wg <= 0)
-      decode_wg = 512;
-  }
-  if (decode_window < 0) {
-    decode_window = read_env_int_local("AILA_ATTN_DECODE_WINDOW", 0);
-    if (decode_window < 0)
-      decode_window = 0;
-  }
-  if (decode_window_start < 0) {
-    decode_window_start =
-        read_env_int_local("AILA_ATTN_DECODE_WINDOW_START", -1);
-    if (decode_window_start < 0) {
-      decode_window_start = std::max(512, decode_window);
-    }
-  }
-  if (decode_sink < 0) {
-    decode_sink = read_env_int_local("AILA_ATTN_DECODE_SINK", -1);
-    if (decode_sink < 0) {
-      decode_sink = 0;
-    }
-    if (decode_sink < 0) {
-      decode_sink = 0;
-    }
-  }
-  if (jm_supported < 0) {
-    bool s0 =
-        supports_jm_bf16_f32(ctx.queue().get_device(), JM0_M, JM0_N, JM0_K);
-    bool s1 =
-        supports_jm_bf16_f32(ctx.queue().get_device(), JM1_M, JM1_N, JM1_K);
-    bool s2 =
-        supports_jm_bf16_f32(ctx.queue().get_device(), JM2_M, JM2_N, JM2_K);
-    jm_supported = (s0 || s1 || s2) ? 1 : 0;
-
-    int force_tile = read_env_int_local("AILA_ATTN_JM_TILE", -1);
-    if (force_tile == 2 && s2) {
-      jm_tile_id = 2;
-    } else if (force_tile == 1 && s1) {
-      jm_tile_id = 1;
-    } else if (force_tile == 0 && s0) {
-      jm_tile_id = 0;
-    } else if (s0) {
-      // Default to the conservative tile first; larger tile can be forced via
-      // env for bring-up.
-      jm_tile_id = 0;
-    } else if (s2) {
-      jm_tile_id = 2;
-    } else if (s1) {
-      jm_tile_id = 1;
-    } else {
-      jm_tile_id = -1;
-    }
-  }
-
-  // Require a supported tile regardless of mode — forcing JM without any
-  // compatible tile (e.g. on B580 where no bf16 joint_matrix tile is reported)
-  // would cause a runtime sycl::exception inside the kernel.
-  bool allow_jm = (jm_tile_id >= 0) &&
-      (jm_mode == 2 || (jm_mode == 1 && jm_supported == 1));
+  const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
+  bool allow_jm = jm_cfg.allow_jm;
+  int jm_mode = jm_cfg.jm_mode;
+  int jm_supported = jm_cfg.jm_supported;
+  int jm_tile_id = jm_cfg.jm_tile_id;
+  int decode_wg = jm_cfg.decode_wg;
+  int decode_window = jm_cfg.decode_window;
+  int decode_window_start = jm_cfg.decode_window_start;
+  int decode_sink = jm_cfg.decode_sink;
   bool apply_window = (decode_window > 0 && cached_len > decode_window_start);
   int effective_window = cached_len;
   if (apply_window) {
@@ -867,6 +1316,181 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                             decode_wg);
 }
 
+
+void attention_decode_rows(Context &ctx, Tensor &q, int q_row_stride,
+                           Tensor &output, Tensor &scores_buf,
+                           const DecodeRowGeometry *rows,
+                           int row_count, int num_heads, int num_kv_heads,
+                           int head_dim, int max_cached_len,
+                           Tensor *exact_partials_buf) {
+  if (row_count < 1 || row_count > 4 || rows == nullptr) {
+    throw std::invalid_argument("attention_decode_rows: row_count must be 1..4");
+  }
+  for (int r = 0; r < row_count; ++r) {
+    if (rows[r].k_cache == nullptr || rows[r].v_cache == nullptr ||
+        rows[r].cached_len < 0) {
+      throw std::invalid_argument("attention_decode_rows: invalid row geometry");
+    }
+  }
+  // One multi-row kernel covers a row when it matches the single-row choice
+  // exactly, so its body, rounding and reduction order are reused verbatim:
+  // baseline below the exact-merge threshold, exact partial merge at or above
+  // it. A decode window or sink makes effective_len differ from cached_len,
+  // head_dim 128 below 128 tokens prefers the joint matrix, an unusable
+  // partials region has no merge kernel, and rows straddling a threshold need
+  // two different bodies; all of those keep the original per-row calls.
+  const int window = read_env_int_local("AILA_ATTN_DECODE_WINDOW", 0);
+  const int sink = read_env_int_local("AILA_ATTN_DECODE_SINK", 0);
+  // AILA_ATTN_DECODE_ROWS=0 restores the per-row decode attention calls, which
+  // lets an A/B comparison run both variants from one binary.
+  static const bool multi_row_enabled =
+      read_env_int_local("AILA_ATTN_DECODE_ROWS", 1) != 0;
+  const bool rows_eligible =
+      multi_row_enabled && row_count > 1 && window <= 0 && sink <= 0;
+  // The multi-row merge kernels address a private region per sequence, so the
+  // partials buffer must be laid out [row, head, tile, stride]. Anything else
+  // (a 3-D single-row region, or too few rows) keeps the per-row path.
+  const bool row_partials_ok = exact_partials_buf != nullptr &&
+      exact_partials_buf->valid() && exact_partials_buf->ndim() == 4 &&
+      exact_partials_buf->shape(0) >= row_count &&
+      exact_partials_buf->shape(1) >= num_heads;
+  // Whether the single-row dispatcher would reach the exact merge depends only
+  // on the buffer being present and valid, not on this row-mapped rank.
+  const bool partialsUsable =
+      exact_partials_buf != nullptr && exact_partials_buf->valid();
+
+  auto per_row = [&]() {
+    for (int r = 0; r < row_count; ++r) {
+      // q rows live at q_row_stride in the caller buffer (the fused QKV row
+      // when there is no output gate), while the attention output is always a
+      // dense num_heads*head_dim row stack.
+      auto qRow = Tensor::view(ctx, q.data_as<bf16>() +
+          static_cast<size_t>(r) * static_cast<size_t>(q_row_stride),
+          {1, static_cast<int64_t>(num_heads) * head_dim}, q.dtype());
+      auto oRow = Tensor::view(ctx, output.data_as<bf16>() +
+          static_cast<size_t>(r) * static_cast<size_t>(num_heads) * head_dim,
+          {1, static_cast<int64_t>(num_heads) * head_dim}, output.dtype());
+      // The single-row merge indexes [head, tile, stride]; slice this row's
+      // block out of the [row, head, tile, stride] region so a per-row call
+      // cannot read another sequence's partials.
+      Tensor rowPartials;
+      if (row_partials_ok) {
+        const int64_t bufferHeads = exact_partials_buf->shape(1);
+        const int64_t maxTiles = exact_partials_buf->shape(2);
+        const int64_t stride = exact_partials_buf->shape(3);
+        auto* base = exact_partials_buf->data_as<float>() +
+            static_cast<size_t>(r) * static_cast<size_t>(bufferHeads) *
+                static_cast<size_t>(maxTiles) * static_cast<size_t>(stride);
+        rowPartials = Tensor::view(ctx, base,
+            {bufferHeads, maxTiles, stride},
+            exact_partials_buf->dtype());
+      }
+      Tensor* partialsArg = row_partials_ok ? &rowPartials : exact_partials_buf;
+      attention_decode(ctx, qRow, *rows[r].k_cache, *rows[r].v_cache, oRow,
+                       scores_buf, num_heads, num_kv_heads, head_dim,
+                       rows[r].cached_len, partialsArg);
+    }
+  };
+
+  // Without a window or sink, the single-row dispatcher picks the head_dim 256
+  // exact merge exactly when the partials region is usable and the row has
+  // reached the threshold; every other head_dim 256 row is baseline.
+  bool all_baseline = rows_eligible && head_dim == 256;
+  for (int r = 0; r < row_count && all_baseline; ++r) {
+    if (partialsUsable && rows[r].cached_len >= kDecodeExact256MinLen) {
+      all_baseline = false;
+    }
+  }
+  const int merge_min_len =
+      (head_dim == 128) ? kDecodeExact128MinLen : kDecodeExact256MinLen;
+  bool all_merge = rows_eligible && row_partials_ok &&
+                   (head_dim == 128 || head_dim == 256);
+  for (int r = 0; r < row_count && all_merge; ++r) {
+    if (rows[r].cached_len < merge_min_len) {
+      all_merge = false;
+    }
+  }
+
+  const bool quantized =
+      rows[0].k_cache->dtype() == dnnl::memory::data_type::f8_e4m3;
+  for (int r = 1; r < row_count; ++r) {
+    if ((rows[r].k_cache->dtype() == dnnl::memory::data_type::f8_e4m3) !=
+        quantized) {
+      throw std::invalid_argument("attention_decode_rows: mixed cache dtypes");
+    }
+  }
+
+  const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
+  bool all_jm = rows_eligible && jm_cfg.allow_jm && head_dim == 128 && !quantized;
+  for (int r = 0; r < row_count && all_jm; ++r) {
+    if (rows[r].cached_len >= kDecodeExact128MinLen || rows[r].cached_len <= 0) {
+      all_jm = false;
+    }
+  }
+  // Report each (head_dim, path) once so a run's evidence shows which kernel was
+  // selected, rather than inferring it from timings. The long-context merge,
+  // the short-context baseline, and the short-context joint matrix are distinct entries.
+  {
+    const int pathIndex = all_merge ? 0 : (all_baseline ? 1 : (all_jm ? 2 : 3));
+    static bool reported[2][4] = {{false, false, false, false}, {false, false, false, false}};
+    const int dimIndex = (head_dim == 128) ? 0 : 1;
+    if (!reported[dimIndex][pathIndex]) {
+      reported[dimIndex][pathIndex] = true;
+      AILA_LOG_INFO("[ATTN] decode rows=%d head_dim=%d path=%s", row_count,
+                    head_dim,
+                    all_merge ? "multi-row-exact-merge"
+                              : (all_baseline ? "multi-row-baseline"
+                                              : (all_jm ? "multi-row-joint-matrix" : "per-row")));
+    }
+  }
+  if (!all_baseline && !all_merge && !all_jm) {
+    per_row();
+    return;
+  }
+  if (all_jm) {
+    attention_decode_rows_joint_matrix_impl(
+        ctx, q, q_row_stride, output, rows, row_count, num_heads, num_kv_heads, head_dim);
+    return;
+  }
+  if (all_merge) {
+    if (head_dim == 128) {
+      if (quantized) {
+        attention_decode_rows_exact_merge_impl<true, 128>(
+            ctx, q, q_row_stride, output, *exact_partials_buf, rows, row_count,
+            num_heads, num_kv_heads);
+      } else {
+        attention_decode_rows_exact_merge_impl<false, 128>(
+            ctx, q, q_row_stride, output, *exact_partials_buf, rows, row_count,
+            num_heads, num_kv_heads);
+      }
+    } else if (quantized) {
+      attention_decode_rows_exact_merge_impl<true, 256>(
+          ctx, q, q_row_stride, output, *exact_partials_buf, rows, row_count,
+          num_heads, num_kv_heads);
+    } else {
+      attention_decode_rows_exact_merge_impl<false, 256>(
+          ctx, q, q_row_stride, output, *exact_partials_buf, rows, row_count,
+          num_heads, num_kv_heads);
+    }
+    return;
+  }
+  constexpr int wg_size = 512;
+  if (quantized) {
+    attention_decode_rows_baseline_impl<true>(
+        ctx, q, q_row_stride, output, scores_buf, rows, row_count, num_heads,
+        num_kv_heads,
+        head_dim, max_cached_len, wg_size);
+  } else {
+    attention_decode_rows_baseline_impl<false>(
+        ctx, q, q_row_stride, output, scores_buf, rows, row_count, num_heads,
+        num_kv_heads,
+        head_dim, max_cached_len, wg_size);
+  }
+}
+
+// ============================================================
+// SYCL Kernel: Attention Prefill (seq_len > 1)
+// ============================================================
 // ============================================================
 // SYCL Kernel: Attention Prefill (seq_len > 1)
 // ============================================================
@@ -3046,61 +3670,17 @@ struct MaskedAttnKeyHash {
 };
 
 struct MaskedAttnPrims {
-    bool inited = false;
-    dnnl::matmul qk_prim{};
-    dnnl::matmul pv_prim{};
-    dnnl::memory::desc qk_src_md{};
-    dnnl::memory::desc qk_w_md{};
-    dnnl::memory::desc qk_dst_md{};
-    dnnl::memory::desc pv_src_md{};
-    dnnl::memory::desc pv_w_md{};
-    dnnl::memory::desc pv_dst_md{};
-
-    bf16* expanded_q = nullptr;
-    bf16* expanded_k = nullptr;
-    bf16* expanded_v = nullptr;
-    bf16* probs_bf16 = nullptr;
-    bf16* attn_tmp = nullptr;
-    sycl::queue q;
-
-    MaskedAttnPrims() = default;
-    ~MaskedAttnPrims() {
-        if (expanded_q) sycl::free(expanded_q, q);
-        if (expanded_k) sycl::free(expanded_k, q);
-        if (expanded_v) sycl::free(expanded_v, q);
-        if (probs_bf16) sycl::free(probs_bf16, q);
-        if (attn_tmp) sycl::free(attn_tmp, q);
-    }
-    MaskedAttnPrims(MaskedAttnPrims&& other) noexcept
-        : inited(other.inited),
-          qk_prim(std::move(other.qk_prim)),
-          pv_prim(std::move(other.pv_prim)),
-          qk_src_md(other.qk_src_md),
-          qk_w_md(other.qk_w_md),
-          qk_dst_md(other.qk_dst_md),
-          pv_src_md(other.pv_src_md),
-          pv_w_md(other.pv_w_md),
-          pv_dst_md(other.pv_dst_md),
-          expanded_q(other.expanded_q),
-          expanded_k(other.expanded_k),
-          expanded_v(other.expanded_v),
-          probs_bf16(other.probs_bf16),
-          attn_tmp(other.attn_tmp),
-          q(std::move(other.q)) {
-        other.expanded_q = nullptr;
-        other.expanded_k = nullptr;
-        other.expanded_v = nullptr;
-        other.probs_bf16 = nullptr;
-        other.attn_tmp = nullptr;
-    }
+    dnnl::matmul qk_prim{}, pv_prim{};
+    dnnl::memory::desc qk_src_md{}, qk_w_md{}, qk_dst_md{};
+    dnnl::memory::desc pv_src_md{}, pv_w_md{}, pv_dst_md{};
+    dnnl::memory::desc qk_scratch_md{}, pv_scratch_md{};
+    Tensor expanded_q, expanded_k, expanded_v, probs_bf16, attn_tmp;
 };
 
-std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>&
-masked_attn_prims() {
-    static std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash>
-        cache;
-    return cache;
-}
+struct MaskedAttentionWorkspace {
+    explicit MaskedAttentionWorkspace(Context&) {}
+    std::unordered_map<MaskedAttnKey, MaskedAttnPrims, MaskedAttnKeyHash> cache;
+};
 
 template <typename T>
 auto local_ptr(T* p) {
@@ -3302,22 +3882,19 @@ void attention_prefill_masked(Context& ctx,
 
     const int groups = num_heads / num_kv_heads;
 
-    auto& cache = masked_attn_prims();
+    auto& cache = ctx.workspace<MaskedAttentionWorkspace>().cache;
     MaskedAttnKey key{q_len, kv_len, num_heads, num_kv_heads, head_dim};
-    auto& prims = cache[key];
-    if (!prims.inited) {
-        prims.inited = true;
-        prims.q = ctx.queue();
-        prims.expanded_q = sycl::malloc_device<bf16>(
-            static_cast<size_t>(num_heads) * q_len * head_dim, ctx.queue());
-        prims.expanded_k = sycl::malloc_device<bf16>(
-            static_cast<size_t>(num_heads) * head_dim * kv_len, ctx.queue());
-        prims.expanded_v = sycl::malloc_device<bf16>(
-            static_cast<size_t>(num_heads) * kv_len * head_dim, ctx.queue());
-        prims.probs_bf16 = sycl::malloc_device<bf16>(
-            static_cast<size_t>(num_heads) * q_len * kv_len, ctx.queue());
-        prims.attn_tmp = sycl::malloc_device<bf16>(
-            static_cast<size_t>(num_heads) * q_len * head_dim, ctx.queue());
+    auto entry = cache.find(key);
+    if (entry == cache.end()) {
+        ctx.make_primitive_cache_room(cache);
+        // Publish only a complete entry. Failed allocations release their
+        // tensors instead of retaining an initialized entry with null buffers.
+        MaskedAttnPrims prims;
+        prims.expanded_q = Tensor::allocate(ctx, {num_heads, q_len, head_dim});
+        prims.expanded_k = Tensor::allocate(ctx, {num_heads, head_dim, kv_len});
+        prims.expanded_v = Tensor::allocate(ctx, {num_heads, kv_len, head_dim});
+        prims.probs_bf16 = Tensor::allocate(ctx, {num_heads, q_len, kv_len});
+        prims.attn_tmp = Tensor::allocate(ctx, {num_heads, q_len, head_dim});
 
         prims.qk_src_md = dnnl::memory::desc(
             {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
@@ -3338,28 +3915,34 @@ void attention_prefill_masked(Context& ctx,
             {num_heads, q_len, head_dim}, dnnl::memory::data_type::bf16,
             dnnl::memory::format_tag::abc);
 
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         auto qk_pd = dnnl::matmul::primitive_desc(
-            ctx.engine(), prims.qk_src_md, prims.qk_w_md, prims.qk_dst_md);
+            ctx.engine(), prims.qk_src_md, prims.qk_w_md, prims.qk_dst_md, attr);
         prims.qk_prim = dnnl::matmul(qk_pd);
+        prims.qk_scratch_md = qk_pd.scratchpad_desc();
         auto pv_pd = dnnl::matmul::primitive_desc(
-            ctx.engine(), prims.pv_src_md, prims.pv_w_md, prims.pv_dst_md);
+            ctx.engine(), prims.pv_src_md, prims.pv_w_md, prims.pv_dst_md, attr);
         prims.pv_prim = dnnl::matmul(pv_pd);
+        prims.pv_scratch_md = pv_pd.scratchpad_desc();
+        entry = cache.emplace(key, std::move(prims)).first;
     }
+    auto& prims = entry->second;
 
     Tensor expanded_q = Tensor::view(
-        ctx, prims.expanded_q, {num_heads, q_len, head_dim},
+        ctx, prims.expanded_q.data(), {num_heads, q_len, head_dim},
         dnnl::memory::data_type::bf16);
     Tensor expanded_k = Tensor::view(
-        ctx, prims.expanded_k, {num_heads, head_dim, kv_len},
+        ctx, prims.expanded_k.data(), {num_heads, head_dim, kv_len},
         dnnl::memory::data_type::bf16);
     Tensor expanded_v = Tensor::view(
-        ctx, prims.expanded_v, {num_heads, kv_len, head_dim},
+        ctx, prims.expanded_v.data(), {num_heads, kv_len, head_dim},
         dnnl::memory::data_type::bf16);
     Tensor probs_bf16 = Tensor::view(
-        ctx, prims.probs_bf16, {num_heads, q_len, kv_len},
+        ctx, prims.probs_bf16.data(), {num_heads, q_len, kv_len},
         dnnl::memory::data_type::bf16);
     Tensor attn_tmp = Tensor::view(
-        ctx, prims.attn_tmp, {num_heads, q_len, head_dim},
+        ctx, prims.attn_tmp.data(), {num_heads, q_len, head_dim},
         dnnl::memory::data_type::bf16);
     AILA_LOG_DEBUG("[Attn] buffers q=%d t=%d h=%d kv=%d d=%d", q_len, kv_len,
                    num_heads, num_kv_heads, head_dim);
@@ -3403,10 +3986,12 @@ void attention_prefill_masked(Context& ctx,
     dnnl::memory q_mem = expanded_q.make_dnnl_memory(prims.qk_src_md);
     dnnl::memory k_mem = expanded_k.make_dnnl_memory(prims.qk_w_md);
     dnnl::memory scores_mem = scores_buf.make_dnnl_memory(prims.qk_dst_md);
-    prims.qk_prim.execute(ctx.stream(),
-                          {{DNNL_ARG_SRC, q_mem},
-                           {DNNL_ARG_WEIGHTS, k_mem},
-                           {DNNL_ARG_DST, scores_mem}});
+    std::unordered_map<int, dnnl::memory> qk_args{
+        {DNNL_ARG_SRC, q_mem}, {DNNL_ARG_WEIGHTS, k_mem}, {DNNL_ARG_DST, scores_mem}};
+    if (prims.qk_scratch_md.get_size()) {
+        qk_args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(prims.qk_scratch_md);
+    }
+    prims.qk_prim.execute(ctx.stream(), qk_args);
     AILA_LOG_DEBUG("[Attn] qk executed");
 
     float* scores_ptr = static_cast<float*>(scores_buf.data());
@@ -3449,10 +4034,12 @@ void attention_prefill_masked(Context& ctx,
     dnnl::memory probs_mem = probs_bf16.make_dnnl_memory(prims.pv_src_md);
     dnnl::memory v_mem = expanded_v.make_dnnl_memory(prims.pv_w_md);
     dnnl::memory attn_mem = attn_tmp.make_dnnl_memory(prims.pv_dst_md);
-    prims.pv_prim.execute(ctx.stream(),
-                          {{DNNL_ARG_SRC, probs_mem},
-                           {DNNL_ARG_WEIGHTS, v_mem},
-                           {DNNL_ARG_DST, attn_mem}});
+    std::unordered_map<int, dnnl::memory> pv_args{
+        {DNNL_ARG_SRC, probs_mem}, {DNNL_ARG_WEIGHTS, v_mem}, {DNNL_ARG_DST, attn_mem}};
+    if (prims.pv_scratch_md.get_size()) {
+        pv_args[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(prims.pv_scratch_md);
+    }
+    prims.pv_prim.execute(ctx.stream(), pv_args);
     AILA_LOG_DEBUG("[Attn] pv executed");
 
     bf16* attn_ptr = static_cast<bf16*>(attn_tmp.data());
