@@ -14,6 +14,8 @@
 
 namespace aila::proxy {
 
+class LegacyTextSession;
+
 struct AlignmentWord {
     std::string text;
     int start_ms = 0;
@@ -174,6 +176,7 @@ private:
 
     mutable std::mutex mutex_;
     runtime::WorkerProcess worker_;
+    std::unique_ptr<LegacyTextSession> text_session_;
     uint64_t next_request_id_ = 1;
     uint64_t worker_session_generation_ = 0;
     uint64_t last_remote_asr_id_ = 0;

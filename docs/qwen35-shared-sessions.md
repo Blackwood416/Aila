@@ -1,8 +1,8 @@
 # Qwen3.5 Hybrid 共享文本会话
 
-`LoadedModel::LoadQwen35Nf4` 将 Qwen3.5 Hybrid NF4 接入已有 `SessionState / RequestState / Scheduler`。权重与可变 oneDNN 绑定、激活和投影 scratch 共用一个执行槽，设备域的执行锁串行保护该槽。多个会话在完整 prefill 分块、decode 或 finalization 之间轮转。
+`LoadedModel::LoadQwen35Nf4` 与 `LoadedModel::LoadQwen35Bf16` 分别将 Qwen3.5 Hybrid NF4 / BF16 权重接入同一 `SessionState / RequestState / Scheduler` 框架。权重与可变 oneDNN 绑定、激活和投影 scratch 共用一个执行槽，设备域的执行锁串行保护该槽。多个会话在完整 prefill 分块、decode 或 finalization 之间轮转。BF16 入口仅接受未量化模型配置和 BF16 text matrix，现已接入 IPC/HTTP。
 
-该入口面向 token 文本推理，要求 BF16 KV。Qwen3.5 的旧 CLI、媒体入口和多行 logits 约定继续通过默认 Session 外观运行。共享 API 尚未提供图像输入、thinking budget 或新的公共 C ABI。[IPC v2](inference-ipc-v2-implementation.md) 的 `InferenceClient::LoadQwen35` 与 [HTTP/SSE 服务](inference-server.md) 的 `--backend qwen35_nf4` 已接入同一共享后端；聊天格式化在 HTTP 宿主完成。
+该入口面向 token 文本推理，要求 BF16 KV。Qwen3.5 的旧 CLI、媒体入口和多行 logits 约定继续通过默认 Session 外观运行。共享 API 尚未提供图像输入、thinking budget 或新的公共 C ABI。[IPC v2](inference-ipc-v2-implementation.md) 的 `InferenceClient::LoadQwen35` / `LoadQwen35Bf16` 与 [HTTP/SSE 服务](inference-server.md) 的 `--backend qwen35_nf4` / `qwen35_bf16` 分别接入相应权重后端，共用 Session 生命周期、资源预算和 Qwen3.5 聊天格式化。
 
 ## 独立状态与层执行
 
@@ -15,7 +15,7 @@
 
 加载时生成具体 Full Attention / DeltaNet LayerPlan，绑定层投影、cache 索引和下一层或最终 norm。保留 NF4 投影内核、跨层 residual/norm 融合及 in-order queue，不在每层之间增加主机同步。profiling 汇总归模型执行槽。
 
-4B 分组 DeltaNet 验证暴露了已有 fast path 的跨工作组竞争：多个 value head 的工作组读取同一份 Q/K 卷积历史，leader 提前覆盖历史时，工作组内 barrier 无法保护其他工作组。分组路径现在在计算期间只读初始历史，prefill 块内的前序 token 从投影输入读取；计算后在同一 in-order queue 上写回最后几行历史。非分组路径保留原有计算方式。这个正确性修复同时用于 NF4 后端的旧入口和显式 Session；BF16 权重后端不在本轮迁移范围内。
+4B 分组 DeltaNet 验证暴露了已有 fast path 的跨工作组竞争：多个 value head 的工作组读取同一份 Q/K 卷积历史，leader 提前覆盖历史时，工作组内 barrier 无法保护其他工作组。分组路径现在在计算期间只读初始历史，prefill 块内的前序 token 从投影输入读取；计算后在同一 in-order queue 上写回最后几行历史。非分组路径保留原有计算方式。这个正确性修复用于 NF4 与 BF16 后端的旧入口和显式 Session；各模型/分组场景的实际验收以验证记录为准。
 
 显式 `Forward` 返回最后输入 token 对应的一行 logits。旧入口在部分小块增量执行中返回多行，且张量容量可能大于本次有效行数；共享采样不根据容量猜测有效位置。新旧入口使用同一个执行实现，通过明确的返回模式区分这两种约定。
 
@@ -62,7 +62,7 @@ auto request = scheduler.Submit(session, promptTokens, options);
 
 预算公式与 backend 共用 `src/memory/SessionMemory.hpp`，在分配前校验维度和 `size_t` 溢出。Qwen3.5-0.8B 在 context 512 下，每会话 device payload 是 **26,492,928 B**：Full KV 6,291,456 B，加递归/卷积状态 20,201,472 B；4 个快照时 host payload 额度是 **101,007,360 B**。禁用快照后仍保留 20,201,472 B 的 host mirror。
 
-这些额度不包含权重、共享 workspace、oneDNN/driver 分配、STL/allocator 元数据或网络缓冲，因此不构成完整的进程内存或显存预算。host 快照按需分配，额度按上限预留；快照复制前先淘汰超额的最旧项，避免同时持有第 N+1 份快照 payload。
+这些 Session 额度与 `DeviceRuntime::SetAllocationLimits` 独立；后者还约束权重和共享 workspace 的显式 USM，详见 [执行资源](execution-resources.md)。它们不覆盖全部 oneDNN/driver 分配、STL/allocator 元数据或网络缓冲，因此不构成完整的进程内存或 WDDM 驻留显存预算。host 快照按需分配，额度按上限预留；快照复制前先淘汰超额的最旧项，避免同时持有第 N+1 份快照 payload。
 
 Forward 与 Reset/Truncate 的设备执行异常会失效共享设备域。加载和 Session 初始化已保留首次同步 SYCL/oneDNN 异常并归一为 `RuntimeFault`；成功发布前还要完成最终 drain。普通文件/配置/准入失败保持局部语义，清理 drain 失败才进一步升级为域故障。生命周期执行器查询析构 drain 留下的首因并向 Scheduler 广播，详细约定见 [IPC v2 故障语义](inference-ipc-v2.md)。
 
@@ -95,6 +95,9 @@ ctest --test-dir build-refactor -C Release -R '^AilaQwen35SessionTests$' --outpu
 $env:AILA_QWEN35_TEST_MODEL = 'E:\RiderProjects\Aila\models\qwen3.5-4B-bnb-nf4-offline'
 ctest --test-dir build-refactor -C Release -R '^AilaQwen35SessionTests$' --output-on-failure
 ./build-refactor/AilaQwen35SessionTests.exe --model $env:AILA_QWEN35_TEST_MODEL --case interleaved-logits
+
+# 未量化 BF16 text checkpoint 复用完整会话 fixture。
+./build-refactor/AilaQwen35SessionTests.exe --storage bf16 --model ./models/Qwen3.5-0.8B
 ```
 
 没有提供真实模型时 GPU fixture 返回 77，CTest 标记跳过。所有 GPU 检查、CLI 对照与 benchmark 串行运行。fixture 覆盖独立 legacy 有效末行参考、同形状逐步 logits、四会话生成/续写、快照恢复/淘汰/禁用、取消与资源回收、所有权、host/device 预算和 scoped/global KV 配置矩阵。执行结果及范围见 [refactor-validation.md](refactor-validation.md)。

@@ -5,7 +5,7 @@ server shutdown, waits a bounded interval, and only then kills that exact child.
 Fake mode writes a byte-BPE tokenizer under the output directory. It exercises
 network backpressure with roughly 4 KiB per generated token; GPU mode uses the
 provided checkpoint and does not claim to exercise that artificial byte limit.
-Both modes accept --backend qwen3_nf4|qwen35_nf4. A --case selection keeps every
+Both modes accept --backend qwen3_nf4|qwen35_nf4|qwen35_bf16. A --case selection keeps every
 assertion of the selected cases and the final resource/transport cleanup gate;
 the report explicitly lists cases excluded from a partial run.
 """
@@ -30,10 +30,11 @@ import traceback
 import uuid
 from pathlib import Path
 
-MODEL_IDS = {"qwen3_nf4": "qwen3", "qwen35_nf4": "qwen3.5"}
+MODEL_IDS = {"qwen3_nf4": "qwen3", "qwen35_nf4": "qwen3.5", "qwen35_bf16": "qwen3.5"}
 COMMON_CASES = (
     "health_models_parameters", "incremental_utf8_json_sse", "concurrent_1_2_4_fixed_seed",
     "multiturn_text_thinking_json_sse", "connection_close_expect_continue", "same_socket_reuse_pipeline",
+    "thinking_budget_json_sse_and_concurrency",
     "disconnect_isolates_other_request", "graceful_shutdown_with_active_requests",
 )
 FAKE_CASES = (
@@ -116,7 +117,7 @@ def fake_text(token_id):
     return ("é中🙂" * 450) + f":{token_id:03d};\n"
 
 
-def write_fake_tokenizer(directory, backend):
+def write_fake_tokenizer(directory, backend, tools=False):
     directory.mkdir(parents=True, exist_ok=False)
     # Match Tokenizer::byte_to_unicode, including the nonprinting-byte range.
     byte_values = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -142,8 +143,17 @@ def write_fake_tokenizer(directory, backend):
         "<|crash_worker|>": 1023,
         "<|im_start|>": 2000,
         "<|im_end|>": 2001,
+        "<think>": 2002,
+        "</think>": 2003,
         "<|endoftext|>": 2047,
     }
+    if tools:
+        special.update({f"<|tool_{name}|>": 2010 + index for index, name in enumerate(
+            ("json", "xml", "parallel", "malformed", "plain", "long", "unknown", "unfinished"))})
+        special.update({"<tool_call>": 2018, "</tool_call>": 2019})
+        fragments = ('<tool_call>{"name":"weather","arguments":{"city":"', "北京🙂" * 100, '"}}</tool_call>')
+        for index, text in enumerate(fragments):
+            vocab["".join(byte_map[byte] for byte in text.encode("utf-8"))] = 1400 + index
     vocab.update(special)
     check(len(set(vocab.values())) == len(vocab), "Duplicate fake vocabulary ID")
     check(max(vocab.values()) == 2047, "Fake vocabulary must report exactly 2048 IDs")
@@ -154,6 +164,8 @@ def write_fake_tokenizer(directory, backend):
         "{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}"
         "{%- if enable_thinking -%}{{- '<think>\\n' -}}{%- endif -%}{%- endif -%}"
     )
+    if tools:
+        template = ""  # Exercise the service's real dense/Hybrid tool fallbacks.
     (directory / "vocab.json").write_bytes(json_bytes(vocab))
     (directory / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
     write_json(directory / "tokenizer_config.json", {
@@ -167,10 +179,10 @@ def write_fake_tokenizer(directory, backend):
         },
     })
     write_json(directory / "config.json", {
-        "model_type": "qwen3_5" if backend == "qwen35_nf4" else "qwen3", "vocab_size": 2048,
+        "model_type": "qwen3" if backend == "qwen3_nf4" else "qwen3_5", "vocab_size": 2048,
     })
     manifest = {
-        "kind": "AilaFakeInferenceWorker byte-BPE HTTP fixture",
+        "kind": "AilaFakeInferenceWorker HTTP tool fixture" if tools else "AilaFakeInferenceWorker byte-BPE HTTP fixture",
         "backend": backend,
         "vocab_size": 2048,
         "output_token_ids": [0, 999],
@@ -265,7 +277,24 @@ def validate_usage(value, maximum):
     return value
 
 
-def validate_completion(value, maximum, model_id):
+def validate_tool_calls(calls):
+    check(isinstance(calls, list) and 0 < len(calls) <= 128, "Invalid tool call array")
+    ids = set()
+    for call in calls:
+        check(isinstance(call, dict) and set(call) == {"id", "type", "function"}, "Invalid tool call fields")
+        identity = call.get("id")
+        check(isinstance(identity, str) and identity and identity not in ids, "Missing or duplicate tool call ID")
+        ids.add(identity)
+        check(call.get("type") == "function", "Unsupported output tool type")
+        function = call.get("function")
+        check(isinstance(function, dict) and set(function) == {"name", "arguments"}, "Invalid output function fields")
+        check(isinstance(function["name"], str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", function["name"]), "Invalid output function name")
+        check(isinstance(function["arguments"], str) and isinstance(strict_json(function["arguments"]), dict),
+              "Tool arguments are not a string containing a strict JSON object")
+    return calls
+
+
+def validate_completion(value, maximum, model_id, allow_tools=False):
     check(value.get("object") == "chat.completion", "Wrong completion object")
     check(isinstance(value.get("id"), str) and value["id"], "Missing completion ID")
     check(value.get("model") == model_id, "Wrong served model")
@@ -273,16 +302,25 @@ def validate_completion(value, maximum, model_id):
     choices = value.get("choices")
     check(isinstance(choices, list) and len(choices) == 1, "Expected one completion choice")
     choice = choices[0]
-    check(choice.get("index") == 0 and choice.get("finish_reason") in ("length", "stop"), "Invalid completion choice")
+    reasons = ("length", "stop", "tool_calls") if allow_tools else ("length", "stop")
+    check(choice.get("index") == 0 and choice.get("finish_reason") in reasons, "Invalid completion choice")
     message = choice.get("message")
     check(isinstance(message, dict) and message.get("role") == "assistant", "Missing assistant message")
-    check(isinstance(message.get("content"), str), "Non-text completion")
+    calls = message.get("tool_calls")
+    if calls is not None:
+        check(allow_tools, "Text-only response exposed a tool call")
+        validate_tool_calls(calls)
+    check(isinstance(message.get("content"), str) or (calls and message.get("content") is None), "Invalid completion content")
+    check(choice["finish_reason"] != "tool_calls" or calls, "Tool terminal has no calls")
     check(isinstance(message.get("reasoning_content", ""), str), "Non-text reasoning")
     usage = validate_usage(value.get("usage"), maximum)
-    return {
-        "content": message["content"], "reasoning_content": message.get("reasoning_content", ""),
+    semantic = {
+        "content": message["content"] or "", "reasoning_content": message.get("reasoning_content", ""),
         "finish_reason": choice["finish_reason"], "usage": usage,
     }
+    if calls is not None:
+        semantic["tool_calls"] = calls
+    return semantic
 
 
 class SseClient:
@@ -306,6 +344,8 @@ class SseClient:
         self.created = None
         self.content = []
         self.reasoning = []
+        self.tool_calls = []
+        self.allow_tools = bool(payload.get("tools")) and payload.get("tool_choice") != "none"
         self.errors = []
         self.usage = None
         self.finish_reason = None
@@ -407,7 +447,8 @@ class SseClient:
             check(choice.get("index") == 0, "Nonzero SSE choice index")
             delta = choice.get("delta")
             check(isinstance(delta, dict), "Missing SSE delta")
-            check(set(delta) <= {"role", "content", "reasoning_content"}, "Unexpected non-text SSE delta")
+            fields = {"role", "content", "reasoning_content"} | ({"tool_calls"} if self.allow_tools else set())
+            check(set(delta) <= fields, "Unexpected SSE delta field")
             include_usage = self.payload.get("stream_options", {}).get("include_usage") is True
             check(("usage" in event and event["usage"] is None) if include_usage else "usage" not in event, "Incorrect optional usage field")
             if "role" in delta:
@@ -415,6 +456,23 @@ class SseClient:
                 self.role_count += 1
             check(self.role_count == 1, "Content preceded the assistant role")
             emitted = False
+            if "tool_calls" in delta:
+                check(isinstance(delta["tool_calls"], list) and delta["tool_calls"], "Empty tool delta")
+                for call in delta["tool_calls"]:
+                    index = integer(call.get("index"), "tool delta index")
+                    check(index <= len(self.tool_calls), "Tool delta skipped an index")
+                    function = call.get("function")
+                    check(isinstance(function, dict) and isinstance(function.get("arguments"), str), "Invalid tool delta function")
+                    if index == len(self.tool_calls):
+                        check(set(call) == {"index", "id", "type", "function"} and
+                              set(function) == {"name", "arguments"}, "Initial tool delta is missing metadata")
+                        self.tool_calls.append({"id": call["id"], "type": call["type"],
+                                                "function": {"name": function["name"], "arguments": ""}})
+                    else:
+                        check(set(call) == {"index", "function"} and set(function) == {"arguments"},
+                              "Tool continuation repeated metadata")
+                    self.tool_calls[index]["function"]["arguments"] += function["arguments"]
+                emitted = True
             for key, output in (("content", self.content), ("reasoning_content", self.reasoning)):
                 if key in delta:
                     check(isinstance(delta[key], str), f"Non-string {key}")
@@ -426,7 +484,9 @@ class SseClient:
                     self.first_content_at = time.perf_counter()
             reason = choice.get("finish_reason")
             if reason is not None:
-                check(reason in ("length", "stop") and not delta, "Invalid successful SSE terminal")
+                check(reason in (("length", "stop", "tool_calls") if self.allow_tools else ("length", "stop")) and not delta,
+                      "Invalid successful SSE terminal")
+                check(reason != "tool_calls" or self.tool_calls, "Tool terminal has no calls")
                 self.finish_reason = reason
                 self.finish_count += 1
             return True
@@ -443,7 +503,7 @@ class SseClient:
             check(not self.done_count and not self.errors, "Terminal arrived before the initial role")
         return self.id
 
-    def complete(self, allow_error=False):
+    def complete(self, allow_error=False, expected_generated=None):
         while self.next_event():
             pass
         check(self.done_count == 1, "Missing unique [DONE] terminal")
@@ -451,16 +511,22 @@ class SseClient:
             check(allow_error and len(self.errors) == 1 and self.finish_count == 0, "Unexpected failed SSE completion")
         else:
             check(self.role_count == 1 and self.finish_count == 1, "Missing role or successful finish")
+            if self.tool_calls:
+                validate_tool_calls(self.tool_calls)
             expected_usage = self.payload.get("stream_options", {}).get("include_usage") is True
             check(self.usage_count == int(expected_usage), "Wrong final usage count")
             if self.runner.mode == "fake" and self.usage:
-                check(self.usage["completion_tokens"] == self.payload["max_tokens"], "Fake request lost generated tokens")
+                expected = self.payload["max_tokens"] if expected_generated is None else expected_generated
+                check(self.usage["completion_tokens"] == expected, "Fake request lost generated tokens")
         self.wire.flush()
         return self.summary()
 
     def semantic(self):
-        return {"content": "".join(self.content), "reasoning_content": "".join(self.reasoning),
-                "finish_reason": self.finish_reason, "usage": self.usage}
+        result = {"content": "".join(self.content), "reasoning_content": "".join(self.reasoning),
+                  "finish_reason": self.finish_reason, "usage": self.usage}
+        if self.tool_calls:
+            result["tool_calls"] = self.tool_calls
+        return result
 
     def summary(self):
         return {
@@ -472,6 +538,7 @@ class SseClient:
             "wire_payload_bytes": self.bytes_received, "receive_buffer": self.receive_buffer,
             "finish_reason": self.finish_reason, "usage": self.usage, "errors": self.errors,
             "content_sha256": sha256("".join(self.content)), "reasoning_sha256": sha256("".join(self.reasoning)),
+            "tool_call_count": len(self.tool_calls), "tool_calls_sha256": sha256(json.dumps(self.tool_calls, ensure_ascii=False)),
             "artifact": str(self.artifact),
         }
 
@@ -504,12 +571,21 @@ class ServerProcess:
             self.port = reservation.getsockname()[1]
         self.command = [
             str(args.server), "--worker", str(args.worker), "--model", str(model),
-            "--backend", args.backend, "--model-id", args.model_id, "--port", str(self.port), "--context", "512",
+            "--backend", args.backend, "--model-id", args.model_id, "--port", str(self.port), "--context", str(getattr(args, "context", 512)),
             "--sessions", "4", "--max-new-tokens", "256", "--max-output-bytes", str(OUTPUT_LIMIT),
             "--stream-buffer-bytes", str(STREAM_LIMIT), "--stream-stall-ms", "5000",
             "--request-timeout-ms", "120000", "--shutdown-file", str(self.shutdown_file),
             "--report", str(self.report_file),
         ]
+        if getattr(args, "memory_sample_ms", 0):
+            self.command += ["--memory-sample-ms", str(args.memory_sample_ms)]
+        if getattr(args, "decode_batch_size", None) is not None:
+            self.command += ["--decode-batch-size", str(args.decode_batch_size)]
+        for attribute, flag in (("max_device_bytes", "--max-device-bytes"),
+                                ("max_pinned_host_bytes", "--max-pinned-host-bytes"),
+                                ("max_session_host_bytes", "--max-session-host-bytes")):
+            if getattr(args, attribute, None) is not None:
+                self.command += [flag, str(getattr(args, attribute))]
         self.stdout = (directory / "stdout.log").open("wb")
         self.stderr = (directory / "stderr.log").open("wb")
         launch = {"created_at": utc_now(), "command": self.command, "cwd": str(directory),
@@ -517,6 +593,8 @@ class ServerProcess:
                   "requested_model": None if args.model is None else str(args.model),
                   "effective_model": str(model), "shutdown_file": str(self.shutdown_file),
                   "report_file": str(self.report_file), "creationflags": "CREATE_NO_WINDOW" if os.name == "nt" else 0}
+        launch["artifacts"] = [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                               for path in (args.server, args.worker, Path(__file__).resolve())]
         write_json(directory / "launch.json", launch)
         try:
             self.process = subprocess.Popen(
@@ -637,6 +715,9 @@ class Runner:
         self.validate_health(value)
         check(value.get("model") == self.model_id and value.get("backend") == self.backend,
               "Health reports a different served model or backend")
+        if getattr(self.args, "decode_batch_size", None) is not None:
+            check(value.get("max_decode_batch_size") == self.args.decode_batch_size,
+                  "Health reports a different decode batch bound")
         return value
 
     @staticmethod
@@ -820,7 +901,7 @@ class Runner:
             reference.append(semantic)
             self.idle()
         groups = []
-        for width in (1, 2, 4):
+        for width in (1, 2, 3, 4):
             barrier = threading.Barrier(width)
             peak_active = 0
 
@@ -905,6 +986,109 @@ class Runner:
         self.idle()
         return {"variants": variants, "string_after_thinking": repeated_stats,
                 "comparison": "Full content, reasoning_content, finish_reason and token usage; no answer-quality assertion."}
+
+    def thinking_budget(self):
+        maximum = 16
+        prompt = "What is 7 times 9? State the number, then explain in one sentence."
+        variants = []
+        payloads = []
+        references = []
+        aliases = ("max_thinking_tokens", "thinking_budget", "thinking_budget_tokens")
+        for index, budget in enumerate((0, 2, 5, -1)):
+            payload = self.chat(prompt, maximum, seed=420 + index, temperature=0.6)
+            alias = aliases[index % len(aliases)]
+            payload[alias] = budget
+            if budget > 0:
+                payload.pop("enable_thinking")  # A positive explicit budget enables the trusted thinking prefix.
+            elif budget == 0:
+                payload["enable_thinking"] = True  # Zero budget takes precedence over this switch.
+            label = f"thinking_budget_{budget}"
+            value, timing = self.json_call(label + "_reference", "/v1/chat/completions", "POST", payload)
+            reference = validate_completion(value, maximum, self.model_id)
+            self.remember_id(value["id"])
+            check(reference["content"].strip(), f"{label}: no answer after thinking budget")
+            check("<think>" not in reference["content"] and "</think>" not in reference["content"] and
+                  "<think>" not in reference["reasoning_content"] and "</think>" not in reference["reasoning_content"],
+                  f"{label}: thinking marker leaked into response text")
+            if budget == 0:
+                check(not reference["reasoning_content"], "Zero budget did not suppress the thinking prefix")
+            if self.mode == "fake":
+                check(reference["usage"]["completion_tokens"] == maximum, "Budget dropped fake completion tokens")
+                expected_thinking = max(0, budget)
+                check(reference["reasoning_content"].count(";\n") == expected_thinking,
+                      "Fake reasoning tokens did not match the independent budget")
+                # The byte-BPE fixture encodes the closing marker and two newline bytes as 3 tokens.
+                expected_content = maximum - expected_thinking - (3 if budget > 0 else 0)
+                check(reference["content"].count(";\n") == expected_content,
+                      "Forced closing tokens were omitted from usage or sampled as content")
+            self.idle()
+            payloads.append(payload)
+            references.append(reference)
+            variants.append({"budget": budget, "alias": alias, "reference": timing, "usage": reference["usage"],
+                             "content_characters": len(reference["content"]),
+                             "reasoning_characters": len(reference["reasoning_content"])})
+
+        barrier = threading.Barrier(len(payloads))
+
+        def run_one(index):
+            barrier.wait(timeout=10)
+            payload = {**payloads[index], "stream": True, "stream_options": {"include_usage": True}}
+            client = self.stream(f"thinking_budget_stream_{index}", payload)
+            try:
+                stats = client.complete()
+                check(client.semantic() == references[index], "Concurrent thinking budget differs from independent JSON")
+                return stats
+            finally:
+                client.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(run_one, index) for index in range(4)]
+            streams = [future.result(timeout=self.read_timeout + 10) for future in futures]
+        check(max(item["started_at"] for item in streams) < min(item["done_at"] for item in streams),
+              "Budgeted SSE clients did not overlap")
+        for stats in streams:
+            self.remember_id(stats["id"])
+            check(self.wait_record(stats["id"])["status"] == "completed", "Budgeted SSE request was not reclaimed")
+        self.idle()
+
+        # A two-token budget cannot fit its complete closing sequence in the last slot.
+        boundary = self.chat(prompt, 3, seed=432, temperature=0.0)
+        boundary.pop("enable_thinking")
+        boundary["max_thinking_tokens"] = 2
+        value, boundary_timing = self.json_call("thinking_budget_short_reference", "/v1/chat/completions", "POST", boundary)
+        expected = validate_completion(value, 3, self.model_id)
+        self.remember_id(value["id"])
+        if self.mode == "fake":
+            check(expected["usage"]["completion_tokens"] == 2 and expected["finish_reason"] == "length" and
+                  not expected["content"] and expected["reasoning_content"].count(";\n") == 2,
+                  "Insufficient closing capacity did not produce the exact early Length completion")
+        self.idle()
+        client = self.stream("thinking_budget_short_stream",
+                             {**boundary, "stream": True, "stream_options": {"include_usage": True}})
+        try:
+            short_stream = client.complete(expected_generated=2)
+            check(client.semantic() == expected, "Early Length JSON/SSE counts or termination differ")
+        finally:
+            client.close()
+        self.remember_id(short_stream["id"])
+        self.idle()
+
+        invalid = []
+        for alias in aliases:
+            for value in (-2, True, 1.5, None):
+                payload = {**self.chat(prompt, 8), alias: value}
+                error, timing = self.json_call(f"budget_invalid_{alias}_{len(invalid)}", "/v1/chat/completions", "POST",
+                                               payload, expected=400)
+                check(error["error"].get("param") == alias, "Invalid budget did not identify its own field")
+                invalid.append({"alias": alias, "value": value, **timing})
+        error, _ = self.json_call("budget_conflicting_aliases", "/v1/chat/completions", "POST",
+                                  {**self.chat(prompt, 8), "thinking_budget": 2, "max_thinking_tokens": 2}, expected=400)
+        check(error["error"].get("code") == "invalid_parameter", "Conflicting budget aliases were accepted")
+        self.idle()
+        return {"variants": variants, "concurrent_streams": streams, "invalid_parameters": invalid,
+                "short_completion": {"reference": boundary_timing, "usage": expected["usage"],
+                                     "finish_reason": expected["finish_reason"], "stream": short_stream},
+                "comparison": "Independent JSON versus four concurrent SSE budgets, exact content/reasoning/usage; real Worker forced closing."}
 
     def close_and_expect(self):
         close_client = self.stream("connection_close", self.chat("Describe the sky.", 12, stream=True))
@@ -1226,6 +1410,8 @@ def parse_arguments():
     parser.add_argument("--mode", choices=("fake", "gpu"), required=True)
     parser.add_argument("--backend", choices=tuple(MODEL_IDS), default="qwen3_nf4")
     parser.add_argument("--model-id", help="Explicit HTTP model name; defaults to qwen3 or qwen3.5 for the selected backend")
+    parser.add_argument("--decode-batch-size", type=int, choices=(1, 2, 3, 4),
+                        help="Opt in to the configured compatible decode batch bound.")
     parser.add_argument("--case", action="append", choices=COMMON_CASES + FAKE_CASES,
                         help="Run only selected cases; repeat to select more. Omit for the complete suite.")
     parser.add_argument("--output", type=Path, required=True, help="Artifact directory; existing runs are preserved in a new child directory")
@@ -1292,6 +1478,7 @@ def main():
             ("incremental_utf8_json_sse", runner.incremental),
             ("concurrent_1_2_4_fixed_seed", runner.concurrency),
             ("multiturn_text_thinking_json_sse", runner.multiturn_thinking),
+            ("thinking_budget_json_sse_and_concurrency", runner.thinking_budget),
             ("connection_close_expect_continue", runner.close_and_expect),
             ("same_socket_reuse_pipeline", runner.ownership),
             ("disconnect_isolates_other_request", runner.disconnect),

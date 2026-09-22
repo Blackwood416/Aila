@@ -1,5 +1,6 @@
 #include "inference/RuntimeFault.hpp"
 #include "utils/DeviceException.hpp"
+#include "core/AsyncErrorState.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -282,6 +284,73 @@ void TestWeightUploadRecoveryPreservesDeviceException() {
     }
 }
 
+void TestAllocationLimitsRemainLocal() {
+    RuntimeFaultRecord fault;
+    int drains = 0;
+    bool recovered = false;
+    ExpectError(ErrorCode::ResourceLimit, "Device allocation budget exceeded", [&] {
+        Initialize(fault, [&] {
+            aila::device_failure::RecoverNonDeviceExceptions<FakeSyclException,
+                aila::memory::AllocationLimitExceeded>([&] {
+                    throw aila::memory::AllocationLimitExceeded("Device");
+                }, [&](const std::exception&) { recovered = true; });
+        }, [&] { ++drains; });
+    });
+    Expect(!fault.Faulted() && drains == 1 && !recovered,
+           "Allocation policy was swallowed by weight recovery or faulted the device");
+    bool resumed = false;
+    Initialize(fault, [&] { resumed = true; }, [&] { ++drains; });
+    Expect(resumed && drains == 2, "Domain could not load after a local allocation limit rejection");
+}
+
+void TestAsyncFailureDeliveryAndDrain() {
+    aila::AsyncErrorState errors;
+    errors.Record(nullptr);
+    Expect(!errors.Failed(), "Empty async report faulted the queue");
+    errors.Rethrow();
+    const auto first = std::make_exception_ptr(FakeSyclException("first async device lost"));
+    errors.Record(first);
+    std::vector<std::thread> reporters;
+    for (int i = 0; i < 8; ++i) {
+        reporters.emplace_back([&] {
+            for (int report = 0; report < 64; ++report) {
+                errors.Record(std::make_exception_ptr(FakeDnnlException("secondary async error")));
+            }
+        });
+    }
+    for (auto& reporter : reporters) reporter.join();
+    Expect(errors.Failed(), "Async failure was not made visible");
+    int drains = 0;
+    std::exception_ptr returned;
+    try {
+        errors.DrainAndRethrow([&] {
+            ++drains;
+            throw FakeDnnlException("secondary drain failure");
+        });
+    } catch (...) { returned = std::current_exception(); }
+    Expect(drains == 1, "A previously recorded async failure bypassed queue drain");
+    ExpectExceptionPreserved(first, returned, "Async first cause across concurrent reports and drain");
+    bool submitted = false;
+    try {
+        errors.Rethrow();
+        submitted = true;
+    } catch (const FakeSyclException&) {}
+    Expect(!submitted, "Known asynchronous failure allowed a later submission");
+
+    aila::AsyncErrorState synchronous;
+    returned = nullptr;
+    try {
+        synchronous.DrainAndRethrow([&] { std::rethrow_exception(first); });
+    } catch (...) { returned = std::current_exception(); }
+    ExpectExceptionPreserved(first, returned, "Synchronous wait failure preservation");
+
+    RuntimeFaultRecord domain;
+    ExpectError(ErrorCode::RuntimeFault, "first async device lost", [&] {
+        Initialize(domain, [] {}, [&] { errors.DrainAndRethrow([&] { ++drains; }); });
+    });
+    Expect(domain.Faulted() && drains >= 2, "Async handler report did not fault the model lifecycle domain");
+}
+
 } // namespace
 
 int main() {
@@ -293,6 +362,8 @@ int main() {
         {"host allocation failure cannot hide a device drain error", TestHostFailureDoesNotHideADeviceDrainFailure},
         {"destructor drain and bounded first diagnosis", TestDestructorDrainRecordAndBoundedDiagnosis},
         {"weight loader preserves typed device failures", TestWeightUploadRecoveryPreservesDeviceException},
+        {"allocation limits survive loader recovery and remain local", TestAllocationLimitsRemainLocal},
+        {"async faults preserve first cause, drain and block new work", TestAsyncFailureDeliveryAndDrain},
     };
     size_t failures = 0;
     for (const auto& test : tests) {

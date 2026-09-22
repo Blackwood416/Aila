@@ -1,6 +1,7 @@
 #include "worker/InferenceWorkerMain.hpp"
 
 #include "worker/InferenceWorker.hpp"
+#include "core/ExecutionTrace.hpp"
 #include "profile/Profiling.hpp"
 
 #include <bcrypt.h>
@@ -178,7 +179,12 @@ int RunInferenceWorker(HANDLE commandRead, HANDLE responseWrite, HANDLE eventWri
     const bool success = worker.Closed();
     if (!success) std::fprintf(stderr, "[Aila IPC v2] %s\n", worker.FailureMessage().c_str());
     worker.Stop();
-    return success ? 0 : 5;
+    // Stop destroys the runtime and its trace writer. A fully written close
+    // line can still fail to flush; only this surviving latch can reject it.
+    const bool traceFailed = diagnostics::ExecutionTrace::ProcessFailed();
+    if (traceFailed)
+        std::fprintf(stderr, "[Aila IPC v2] Execution trace persistence failed; Worker shutdown is not successful\n");
+    return success && !traceFailed ? 0 : 5;
 }
 
 } // namespace aila::worker

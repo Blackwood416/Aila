@@ -12,6 +12,7 @@ struct SourceState;
 using Source = std::shared_ptr<SourceState>;
 
 Source create_source();
+bool is_active(const Source& source) noexcept;
 void invalidate(const Source& source) noexcept;
 void await_quiescent(const Source& source) noexcept;
 void retire(Source& current, Source& retired_head) noexcept;

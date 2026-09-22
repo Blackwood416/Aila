@@ -1,4 +1,5 @@
 #include "proxy/ProxyEngine.hpp"
+#include "proxy/LegacyTextSession.hpp"
 
 #include "aila_api.h"
 #include "runtime/RuntimeDirectory.hpp"
@@ -280,6 +281,15 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
             module_path, runtime::runtime_directory_override());
         const std::filesystem::path worker_executable =
             runtime::require_worker_executable(runtime_directory);
+        text_session_ = LegacyTextSession::TryCreate(
+            runtime_directory, module_path.parent_path(), std::string(model_directory), max_seq_len, log_source_);
+        if (text_session_) {
+            initialized_ = true;
+            ++worker_session_generation_;
+            if (worker_session_generation_ == 0) ++worker_session_generation_;
+            clear_error_locked();
+            return true;
+        }
         worker_.start(
             runtime_directory,
             worker_executable,
@@ -312,6 +322,10 @@ bool ProxyEngine::init(std::string_view model_directory, int max_seq_len) {
         active_asr_stream_ids_.clear();
         clear_error_locked();
         return true;
+    } catch (const LegacyTextError& exception) {
+        shutdown_locked();
+        set_error_locked(exception.Code(), exception.what());
+        return false;
     } catch (const std::exception& exception) {
         shutdown_locked();
         set_error_locked(AILA_ERR_RUNTIME, exception.what());
@@ -334,6 +348,11 @@ void ProxyEngine::reset_context() {
         return;
     }
     try {
+        if (text_session_) {
+            text_session_->Reset();
+            clear_error_locked();
+            return;
+        }
         const ipc::Frame response = request_locked("engine.reset", "{}");
         if (accept_lifecycle_response_locked(response, "engine.reset")) {
             clear_error_locked();
@@ -358,6 +377,11 @@ int ProxyEngine::context_length() {
         return 0;
     }
     try {
+        if (text_session_) {
+            const auto length = text_session_->ContextLength();
+            clear_error_locked();
+            return length;
+        }
         const ipc::Frame response = request_locked("engine.context_length", "{}");
         if (!accept_lifecycle_response_locked(response, "engine.context_length")) {
             return 0;
@@ -406,6 +430,18 @@ bool ProxyEngine::generate_text(
         return false;
     }
     try {
+        if (text_session_) {
+            try {
+                output = text_session_->Generate(method, std::string(input), LegacyTextSession::Config(config)).text;
+                if (output.find('\0') != std::string::npos || !simdjson::validate_utf8(output))
+                    throw malformed_response("generation result was not C-string-safe UTF-8");
+                clear_error_locked();
+                return true;
+            } catch (const LegacyTextError& error) {
+                set_error_locked(error.Code(), error.what());
+                return false;
+            }
+        }
         return generate_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
@@ -451,6 +487,18 @@ bool ProxyEngine::generate_text_v2(
         return false;
     }
     try {
+        if (text_session_) {
+            try {
+                output = text_session_->Generate(method, std::string(input), LegacyTextSession::Config(config)).text;
+                if (output.find('\0') != std::string::npos || !simdjson::validate_utf8(output))
+                    throw malformed_response("generation result was not C-string-safe UTF-8");
+                clear_error_locked();
+                return true;
+            } catch (const LegacyTextError& error) {
+                set_error_locked(error.Code(), error.what());
+                return false;
+            }
+        }
         return generate_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
@@ -490,6 +538,28 @@ int ProxyEngine::generate_stream(
     }
     stream_active_ = true;
     try {
+        if (text_session_) {
+            try {
+                const auto result = text_session_->Generate(method, std::string(input), LegacyTextSession::Config(config),
+                    [&](const std::string& piece) {
+                        if (piece.find('\0') != std::string::npos || !simdjson::validate_utf8(piece))
+                            throw malformed_response("token stream event was not C-string-safe UTF-8");
+                        lock.unlock();
+                        int status;
+                        try { status = callback(piece.c_str(), user_data); }
+                        catch (...) { lock.lock(); throw; }
+                        lock.lock();
+                        return status == 0;
+                    });
+                stream_active_ = false;
+                clear_error_locked();
+                return result.aborted ? 1 : 0;
+            } catch (const LegacyTextError& error) {
+                stream_active_ = false;
+                set_error_locked(error.Code(), error.what());
+                return -1;
+            }
+        }
         const int result = stream_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
@@ -541,6 +611,26 @@ int ProxyEngine::generate_stream_v2(
     }
     stream_active_ = true;
     try {
+        if (text_session_) {
+            try {
+                const auto result = text_session_->Generate(method, std::string(input), LegacyTextSession::Config(config), {},
+                    [&](const aila::chat::StructuredStreamEvent& event) {
+                        lock.unlock();
+                        int status;
+                        try { status = LegacyTextSession::Deliver(event, callback, user_data); }
+                        catch (...) { lock.lock(); throw; }
+                        lock.lock();
+                        return status == 0;
+                    });
+                stream_active_ = false;
+                clear_error_locked();
+                return result.aborted ? 1 : 0;
+            } catch (const LegacyTextError& error) {
+                stream_active_ = false;
+                set_error_locked(error.Code(), error.what());
+                return -1;
+            }
+        }
         const int result = stream_payload_locked(
             method,
             std::string("{\"input\":") + json_string(input) +
@@ -585,6 +675,10 @@ bool ProxyEngine::transcribe(
         !valid_optional_c_string(system_prompt) || !valid_asr_legacy_config(config) ||
         !finite_float_bits(segment_sec) || segment_sec < 0.0f) {
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "ASR transcription arguments are invalid");
+        return false;
+    }
+    if (text_session_) {
+        set_error_locked(AILA_ERR_MODEL_CAPABILITY, "This text model does not support ASR");
         return false;
     }
     stream_active_ = true;
@@ -1445,6 +1539,10 @@ int ProxyEngine::synthesize_stream(
         set_error_locked(AILA_ERR_INVALID_ARGUMENT, "TTS stream arguments are invalid");
         return AILA_ERR_INVALID_ARGUMENT;
     }
+    if (text_session_) {
+        set_error_locked(AILA_ERR_MODEL_CAPABILITY, "This text model does not support TTS");
+        return AILA_ERR_MODEL_CAPABILITY;
+    }
     stream_active_ = true;
     try {
         ipc::Frame request;
@@ -1599,6 +1697,14 @@ ipc::Frame ProxyEngine::request_locked(
     request.header.method = std::move(method);
     request.header.payload_json = std::move(payload_json);
     request.attachment = std::move(attachment);
+    if (text_session_) {
+        ipc::Frame response;
+        response.header = request.header;
+        response.header.kind = "error";
+        response.header.payload_json = std::string("{\"code\":") + std::to_string(AILA_ERR_MODEL_CAPABILITY) +
+            ",\"message\":\"This text model does not support the requested media capability\"}";
+        return response;
+    }
     return worker_.request(request, std::chrono::minutes(10));
 }
 
@@ -1986,6 +2092,7 @@ void ProxyEngine::shutdown_locked() noexcept {
     active_asr_stream_ids_.clear();
     deferred_asr_destroy_ids_.clear();
     last_remote_asr_id_ = 0;
+    text_session_.reset();
     try {
         worker_.shutdown(std::chrono::seconds(2));
     } catch (...) {
@@ -1999,6 +2106,7 @@ void ProxyEngine::retire_log_source_locked() noexcept {
 void ProxyEngine::set_log_level(int level) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (text_session_) { text_session_->SetLogLevel(level); return; }
         if (!worker_.healthy()) return;
         const ipc::Frame response = request_locked(
             "log.set_level",

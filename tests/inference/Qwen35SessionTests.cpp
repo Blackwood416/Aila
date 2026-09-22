@@ -3,6 +3,7 @@
 #include "inference/Scheduler.hpp"
 #include "inference/Session.hpp"
 #include "models/Qwen35HybridBnb4Backend.hpp"
+#include "models/Qwen35HybridTextBackend.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include "utils/ModelSpec.hpp"
@@ -46,6 +47,13 @@ constexpr int kGenerated = 6;
 constexpr int kContinuationGenerated = 3;
 constexpr int kMaxSteps = 2 * kCapacity;
 constexpr auto kRequestTimeout = 90s;
+bool denseWeights = false;
+
+std::shared_ptr<LoadedModel> load_hybrid(std::shared_ptr<DeviceRuntime> runtime,
+                                       const std::string& directory, ModelOptions options) {
+    return denseWeights ? LoadedModel::LoadQwen35Bf16(std::move(runtime), directory, options)
+                        : LoadedModel::LoadQwen35Nf4(std::move(runtime), directory, options);
+}
 
 void expect(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -314,7 +322,10 @@ LogitsTrace capture_legacy_last_rows(const std::string& modelDirectory, const Pl
     Context context;
     {
         ModelWeights weights;
-        Qwen35HybridBnb4Backend backend;
+        std::unique_ptr<IModelBackend> backendOwner;
+        if (denseWeights) backendOwner = std::make_unique<Qwen35HybridTextBackend>();
+        else backendOwner = std::make_unique<Qwen35HybridBnb4Backend>();
+        auto& backend = *backendOwner;
         Tensor tokenIds;
         // Destruct before tokenIds/backend/weights on every exceptional exit.
         DrainContextOnExit drain(context);
@@ -349,6 +360,7 @@ LogitsTrace capture_legacy_last_rows(const std::string& modelDirectory, const Pl
         }
     }
     context.synchronize();
+    context.release_execution_resources();
     expect(context.current_allocated_bytes() == 0, "Legacy reference retained tracked device allocations");
     // This Context is destroyed before any DeviceRuntime is created. Q35's
     // attention paths never enter the process-wide masked-attention cache.
@@ -1013,7 +1025,7 @@ void test_byte_budget_and_disabled_snapshots(const std::shared_ptr<DeviceRuntime
     options.maxRecurrentSnapshots = hostBudget ? kSnapshots : 0;
     if (hostBudget) options.maxSessionHostBytes = one_byte_below_two(reference.hostBytes);
     else options.maxSessionCacheBytes = one_byte_below_two(reference.cacheBytes);
-    auto model = LoadedModel::LoadQwen35Nf4(runtime, modelDirectory, options);
+    auto model = load_hybrid(runtime, modelDirectory, options);
     expect(model->SessionReservationBytes() == reference.cacheBytes,
            label + ": snapshot policy changed the Full KV/recurrent device payload");
     if (hostBudget) {
@@ -1065,6 +1077,7 @@ void run_tests(const std::string& modelDirectory, const std::string& selectedCas
     const auto cases = make_cases(tokenizer);
     const bool fullFixture = selectedCase == "all";
     std::cout << "[INFO] Fixture case: " << selectedCase << std::endl;
+    std::cout << "[INFO] Weight storage: " << (denseWeights ? "bf16" : "nf4") << std::endl;
     const auto legacyPlan = make_plan(cases[0].prompt, {11, 3, 7, 16, 19, 1, 3, 1});
     LogitsTrace legacyTrace;
     if (fullFixture || selectedCase == "legacy-last-rows") {
@@ -1079,7 +1092,7 @@ void run_tests(const std::string& modelDirectory, const std::string& selectedCas
     options.maxRecurrentSnapshots = kSnapshots;
     if (fullFixture) {
         std::cout << "[RUN] Effective quantized KV is rejected before shared Hybrid model allocation" << std::endl;
-        quantized_matrix(runtime, [&] { LoadedModel::LoadQwen35Nf4(runtime, modelDirectory, options); },
+        quantized_matrix(runtime, [&] { load_hybrid(runtime, modelDirectory, options); },
                            "Hybrid model admission");
     }
     std::shared_ptr<LoadedModel> model;
@@ -1087,7 +1100,7 @@ void run_tests(const std::string& modelDirectory, const std::string& selectedCas
         std::cout << "[RUN] Scoped BF16 overrides global quantized KV for shared Hybrid model load" << std::endl;
         ScopedEnvironment global("AILA_KV_QUANT", "1");
         ScopedKvOverride override(true);
-        model = LoadedModel::LoadQwen35Nf4(runtime, modelDirectory, options);
+        model = load_hybrid(runtime, modelDirectory, options);
     }
     expect(model->MaxSequenceLength() == kCapacity && model->VocabSize() > 0,
            "Loaded Hybrid model has invalid metadata");
@@ -1137,18 +1150,26 @@ int main(int argc, char** argv) {
     try {
         std::string modelDirectory;
         std::string selectedCase = "all";
-        bool caseSpecified = false;
+        bool caseSpecified = false, storageSpecified = false;
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
             if (argument == "--help") {
-                std::cout << "Usage: Qwen35SessionTests [--model <Qwen3.5 Hybrid NF4 directory>]\n"
+                std::cout << "Usage: Qwen35SessionTests [--model <Qwen3.5 Hybrid directory>] [--storage nf4|bf16]\n"
                              "                         [--case all|four-sessions|interleaved-logits|legacy-last-rows]\n"
-                             "Fallback environment variable: AILA_QWEN35_TEST_MODEL\n"
+                             "Fallback environment: AILA_QWEN35_TEST_MODEL (NF4), AILA_QWEN35_BF16_TEST_MODEL (BF16)\n"
                              "Real GPU fixture: four shared sessions, Scheduler, recurrent rollback,\n"
                              "resource budgets and BF16 scoped/global KV admission. Context 512.\n"
                              "Default: all. A selected case runs before other inference scenarios,\n"
                              "so each isolated repro starts from a fresh workspace.\n";
                 return 0;
+            }
+            if (argument == "--storage") {
+                expect(!storageSpecified && i + 1 < argc, "Expected one --storage nf4|bf16");
+                const std::string storage = argv[++i];
+                expect(storage == "nf4" || storage == "bf16", "Unknown weight storage");
+                denseWeights = storage == "bf16";
+                storageSpecified = true;
+                continue;
             }
             if (argument == "--case") {
                 expect(i + 1 < argc && !caseSpecified, "Expected one optional --case <name>");
@@ -1164,9 +1185,10 @@ int main(int argc, char** argv) {
             modelDirectory = argv[++i];
             expect(!modelDirectory.empty(), "Model directory must not be empty");
         }
-        if (modelDirectory.empty()) modelDirectory = environment_value("AILA_QWEN35_TEST_MODEL").value_or("");
+        const char* modelEnvironment = denseWeights ? "AILA_QWEN35_BF16_TEST_MODEL" : "AILA_QWEN35_TEST_MODEL";
+        if (modelDirectory.empty()) modelDirectory = environment_value(modelEnvironment).value_or("");
         if (modelDirectory.empty()) {
-            std::cout << "[SKIP] Specify --model <directory> or AILA_QWEN35_TEST_MODEL for the real Hybrid GPU fixture.\n";
+            std::cout << "[SKIP] Specify --model <directory> or " << modelEnvironment << " for the real Hybrid GPU fixture.\n";
             return 77;
         }
         expect(std::filesystem::is_directory(modelDirectory), "Model directory does not exist: " + modelDirectory);

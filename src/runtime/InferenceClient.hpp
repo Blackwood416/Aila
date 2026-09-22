@@ -60,6 +60,7 @@ public:
 struct InferenceClientOptions {
     wire::Limits limits;
     std::vector<std::string> requiredCapabilities = wire::default_capabilities();
+    uint32_t maxDecodeBatchSize = 1; // Optional continuous_batching_v1, 1..4 and <= maxActiveRequests.
     std::chrono::milliseconds handshakeTimeout{2000};
     std::chrono::milliseconds commandTimeout{30000};
     std::chrono::milliseconds shutdownTimeout{10000};
@@ -69,12 +70,17 @@ struct InferenceModelOptions {
     uint32_t maxSequenceLength = 4096;
     uint32_t maxSessions = 4;
     uint64_t maxSessionCacheBytes = 0;
+    std::optional<wire::AllocationLimits> allocationLimits;
 };
 
 struct InferenceRequestOptions {
     wire::GenerationOptions generation;
     uint32_t prefillChunkSize = 512;
     std::vector<int32_t> stopTokenIds;
+    std::optional<wire::ThinkingBudgetOptions> thinkingBudget;
+    bool prefillOnly = false;
+    bool forceHostSampling = false;
+    bool legacyPrefillLogits = false;
 };
 
 struct InferenceClientSnapshot {
@@ -92,6 +98,9 @@ struct InferenceClientSnapshot {
     uint64_t receivedEventOrdinal = 0;
     uint64_t droppedLogs = 0;
     std::string error;
+    uint64_t queuedLogs = 0;
+    uint64_t logQueueBytes = 0;
+    uint64_t peakLogQueueBytes = 0;
 };
 
 struct InferenceRequestSnapshot {
@@ -129,6 +138,18 @@ struct InferenceReadResult {
     std::optional<InferenceReadEvent> event;
 };
 
+struct InferenceLogEvent {
+    uint64_t eventOrdinal = 0;
+    int32_t level = 0;
+    std::string epoch;
+    std::string message;
+};
+struct InferenceLogReadResult {
+    InferenceReadStatus status = InferenceReadStatus::Timeout;
+    std::optional<InferenceLogEvent> event;
+    uint64_t droppedLogs = 0; // Host queue drops, independent of Worker drops.
+};
+
 class InferenceModel;
 class InferenceSession;
 class InferenceRequest;
@@ -157,15 +178,31 @@ public:
     std::shared_ptr<InferenceModel> LoadQwen35(
         const std::string& modelDirectory, InferenceModelOptions options = {},
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Explicit BF16 weights; LoadQwen35 retains the NF4 default. Both Hybrid
+    // loaders use BF16 KV and the same Session lifecycle and allocation limits.
+    std::shared_ptr<InferenceModel> LoadQwen35Bf16(
+        const std::string& modelDirectory, InferenceModelOptions options = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     wire::WorkerInfo Query(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Optional runtime_memory_v1. One bounded RPC; a busy execution domain is
+    // reported as Busy, never as a zero or previously cached allocation count.
+    wire::RuntimeMemoryInfo QueryMemory(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     InferenceClientSnapshot Snapshot() const;
+    // Bounded by limits.maxLogQueueBytes. Overflow drops new logs, never token
+    // events. Poll with zero; queued logs remain readable after Shutdown/fault.
+    InferenceLogReadResult ReadLog(std::chrono::milliseconds timeout);
+    // Nonblocking release of this Client's log consumer; children stay usable.
+    // Wakes a blocked ReadLog, discards queued logs and prevents re-opening.
+    void CloseLogStream() noexcept;
+    // Optional worker_log_control_v1; 0=debug, 1=info, 2=warning, 3=error.
+    void SetLogLevel(uint32_t level, std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     // Idempotent and shared by concurrent callers. Stops new user operations,
     // auto-drains unread tokens, then validates the eventOrdinal close barrier.
     void Shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
 
 private:
     explicit InferenceClient(std::shared_ptr<detail::InferenceConnection> connection);
-    std::shared_ptr<InferenceModel> LoadNf4(
+    std::shared_ptr<InferenceModel> LoadModel(
         const std::string& backend, const std::string& modelDirectory,
         InferenceModelOptions options, std::chrono::milliseconds timeout);
     std::shared_ptr<detail::InferenceConnection> connection_;
@@ -201,13 +238,26 @@ public:
     std::shared_ptr<InferenceRequest> Submit(
         std::vector<int32_t> promptIds, InferenceRequestOptions options = {},
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Optional prefill_only_v1. Appends a prefix without sampling or producing
+    // token events. The returned Request supports the same read/cancel/release
+    // contract as generation; its sole event is Completed/Length on success.
+    std::shared_ptr<InferenceRequest> Prefill(
+        std::vector<int32_t> promptIds, uint32_t chunkSize = 512,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     wire::SessionInfo Query(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Optional session_context_v1. Busy Sessions reject mutation. Timeout only
+    // ends this RPC wait; a submitted operation may still complete remotely.
+    wire::SessionInfo Reset(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Returns actual restored checkpoint length, possibly below requested.
+    wire::SessionInfo Truncate(uint32_t length,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     void Release() noexcept;
 
 private:
     friend class InferenceModel;
     InferenceSession(std::shared_ptr<detail::InferenceConnection> connection,
                      wire::SessionInfo info, uint32_t vocabSize);
+    wire::SessionInfo ContextOperation(wire::Method method, uint32_t length, std::chrono::milliseconds timeout);
     std::shared_ptr<detail::InferenceConnection> connection_;
     wire::SessionInfo info_;
     uint32_t vocabSize_;

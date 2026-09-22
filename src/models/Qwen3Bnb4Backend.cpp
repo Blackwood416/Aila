@@ -247,7 +247,10 @@ void Qwen3Bnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     if (buf_.hidden.valid()) ctx.synchronize();
 
     int H = hidden_size_;
-    int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
+    // Decode batches contain independent rows: B may exceed a very small
+    // per-Session context capacity. Existing single-sequence calls have
+    // already validated seq_len <= max_seq_len_, so their capacity is intact.
+    int new_cap = std::max(seq_len, std::min(max_seq_len_, round_up_seq(seq_len, 64)));
 
     buf_.hidden   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
     buf_.normed   = Tensor::allocate(ctx, {(int64_t)new_cap, H});
@@ -257,8 +260,11 @@ void Qwen3Bnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.v        = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)kv_dim_});
     buf_.attn_out = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)q_dim_});
     buf_.gate_up  = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * ff_dim_)});
-    buf_.gate     = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
-    buf_.up       = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
+    // These buffers also hold attention/down projections of hidden width.
+    // Their producers and consumers use the logical projection row stride.
+    const int projection_capacity = std::max(ff_dim_, H);
+    buf_.gate     = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
+    buf_.up       = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
 
     runtime_seq_capacity_ = new_cap;
     AILA_LOG_INFO("[Qwen3Bnb4] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);
@@ -334,6 +340,7 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
     fused_weights_.clear();
     linear_scratch_ = Bnb4BitLinearScratch();
     lm_head_ = Linear();
+    decodeBatchLogitsView_ = Tensor();
     buf_ = Buffers();
     runtime_seq_capacity_ = 0;
     prefill_scores_capacity_ = 0;
@@ -557,9 +564,13 @@ bool Qwen3Bnb4Backend::load(Context& ctx, ModelWeights& weights, const ModelSpec
         constexpr int kDecodeExactTile = 128;
         const int partial_stride = (cfg_.head_dim == 256) ? 272 : 144;
         const int max_tiles = (max_seq_len + kDecodeExactTile - 1) / kDecodeExactTile;
+        // Per-sequence partials block: the decode batch bound is four rows, so
+        // up to four independent sequences can merge in one launch and each row
+        // reads only its own statistics.
         buf_.decode_attn_partials = Tensor::allocate(
             ctx,
-            {(int64_t)cfg_.num_attention_heads, (int64_t)max_tiles, (int64_t)partial_stride},
+            {4, (int64_t)cfg_.num_attention_heads, (int64_t)max_tiles,
+             (int64_t)partial_stride},
             dnnl::memory::data_type::f32);
     }
 
@@ -739,6 +750,151 @@ Tensor& Qwen3Bnb4Backend::forward(Context& ctx, const int* token_ids_device, int
     }
     if (!defaultSession_) defaultSession_ = CreateSessionImpl(ctx);
     return Forward(ctx, *defaultSession_, token_ids_device, seq_len);
+}
+
+bool Qwen3Bnb4Backend::SupportsDecodeBatch() const noexcept {
+    static const bool profile = aila::env::read_flag("AILA_PROFILE_Q3_DECODE", false);
+    static const bool fusedResidual = aila::env::read_flag("AILA_FUSE_RESIDUAL_ADD", false);
+    return decoderPlan_ && !profile && !fusedResidual;
+}
+
+Tensor& Qwen3Bnb4Backend::ForwardDecodeBatch(
+    Context& ctx, const std::vector<Session*>& sessions, const int* deviceTokenIds) {
+    if (sessions.empty() || sessions.size() > 4) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: batch size must be 1..4");
+    }
+    if (!deviceTokenIds) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: token IDs must be non-null");
+    }
+    if (&ctx != context_) {
+        throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: context does not match the loaded model");
+    }
+
+    const int batchSize = static_cast<int>(sessions.size());
+    std::array<int, 4> positions{};
+    for (int row = 0; row < batchSize; ++row) {
+        if (!sessions[row]) {
+            throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: Session must be non-null");
+        }
+        ValidateSession(*sessions[row]);
+        for (int earlier = 0; earlier < row; ++earlier) {
+            if (sessions[earlier] == sessions[row]) {
+                throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: duplicate Session");
+            }
+        }
+        positions[row] = sessions[row]->CurrentLength();
+        if (positions[row] >= sessions[row]->Capacity()) {
+            throw std::invalid_argument("Qwen3Bnb4Backend::ForwardDecodeBatch: context window exceeded");
+        }
+    }
+    if (batchSize == 1) {
+        return Forward(ctx, *sessions.front(), deviceTokenIds, 1);
+    }
+    if (!SupportsDecodeBatch()) {
+        throw std::invalid_argument("Qwen3 decode profiling/residual configuration requires the original single-sequence path");
+    }
+
+    // Reserve the row workspace before touching any Session's KV. These
+    // tensors contain dense logical rows even when their allocation's second
+    // dimension is larger than the width of the current projection.
+    ensure_runtime_buffers(ctx, batchSize);
+    if (!buf_.decode_batch_logits.valid()) {
+        buf_.decode_batch_logits = Tensor::allocate(
+            ctx, {4, static_cast<int64_t>(cfg_.vocab_size)});
+    }
+    decodeBatchLogitsView_ = Tensor::view(
+        ctx, buf_.decode_batch_logits.data(),
+        {batchSize, static_cast<int64_t>(cfg_.vocab_size)}, buf_.decode_batch_logits.dtype());
+
+    auto row_view = [&](Tensor& tensor, int row, int width) {
+        auto* pointer = tensor.data_as<bf16>() + static_cast<size_t>(row) * width;
+        return Tensor::view(ctx, pointer, {1, static_cast<int64_t>(width)}, tensor.dtype());
+    };
+    auto normalize_rows = [&](Tensor& input, Tensor& weight, Tensor& output) {
+        for (int r = 0; r < batchSize; ++r) {
+            auto source = row_view(input, r, hidden_size_);
+            auto target = row_view(output, r, hidden_size_);
+            ops::rms_norm(ctx, source, weight, cfg_.rms_norm_eps, target, 1, hidden_size_);
+        }
+    };
+    auto add_normalize_rows = [&](Tensor& input, Tensor& residual, Tensor& weight, Tensor& output) {
+        for (int r = 0; r < batchSize; ++r) {
+            auto source = row_view(input, r, hidden_size_);
+            auto added = row_view(residual, r, hidden_size_);
+            auto target = row_view(output, r, hidden_size_);
+            ops::fused_add_rms_norm(ctx, source, added, weight, cfg_.rms_norm_eps, target, 1, hidden_size_);
+        }
+    };
+
+    ops::embedding_lookup(ctx, *embed_weight_, deviceTokenIds, batchSize, buf_.hidden, hidden_size_);
+    normalize_rows(buf_.hidden, *decoderPlan_->initialNormWeight, buf_.normed);
+
+    for (const auto& plan : decoderPlan_->layers) {
+        auto& layer = *plan.layer;
+        layer.qkv_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.normed, buf_.qkv, batchSize);
+        ops::DecodeRowGeometry attentionRows[4];
+        int maxAttentionLen = 0;
+        for (int row = 0; row < batchSize; ++row) {
+            auto& cache = sessions[row]->cache_;
+            auto* qkv = buf_.qkv.data_as<bf16>() + static_cast<size_t>(row) * fused_qkv_dim_;
+            auto q = Tensor::view(ctx, qkv, {1, static_cast<int64_t>(q_dim_)});
+            auto k = Tensor::view(ctx, qkv + q_dim_, {1, static_cast<int64_t>(kv_dim_)});
+            auto v = Tensor::view(ctx, qkv + q_dim_ + kv_dim_, {1, static_cast<int64_t>(kv_dim_)});
+            auto& keyCache = cache.k_cache(plan.cacheIndex);
+            auto& valueCache = cache.v_cache(plan.cacheIndex);
+            ops::decode_prepare_qkv(ctx, q, k, v, buf_.rope_freq,
+                                    *layer.q_norm_weight, *layer.k_norm_weight,
+                                    keyCache, valueCache, positions[row],
+                                    cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                    cfg_.head_dim, cfg_.rms_norm_eps, cfg_.rope_theta);
+            attentionRows[row].k_cache = &keyCache;
+            attentionRows[row].v_cache = &valueCache;
+            attentionRows[row].cached_len = positions[row] + 1;
+            maxAttentionLen = std::max(maxAttentionLen, positions[row] + 1);
+        }
+        // One multi-row launch for every independent sequence. Each row keeps
+        // the single-row kernel body, so a row's output stays bitwise identical
+        // to the per-row attention_decode it replaces; a head_dim 128 row below
+        // the exact-merge threshold still needs the joint-matrix kernel and
+        // falls back per row inside attention_decode_rows.
+        ops::attention_decode_rows(ctx, buf_.qkv, fused_qkv_dim_, buf_.attn_out,
+                                   buf_.decode_scores, attentionRows, batchSize,
+                                   cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                   cfg_.head_dim, maxAttentionLen,
+                                   &buf_.decode_attn_partials);
+
+        // Residual fusion is a single-row GEMV option. Keep the existing
+        // explicit residual/norm semantics for multi-row projections.
+        layer.o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.gate, batchSize);
+        add_normalize_rows(buf_.hidden, buf_.gate, *layer.post_attn_ln_weight, buf_.normed);
+        // Preserve decode's gate/up weight and activation rounding boundaries.
+        // The fused kernel accumulates unrounded dequantized weights and applies
+        // SwiGLU before BF16 output; a multi-row projection changes both steps.
+        for (int row = 0; row < batchSize; ++row) {
+            auto normalized = row_view(buf_.normed, row, hidden_size_);
+            auto gate = row_view(buf_.gate, row, ff_dim_);
+            if (!Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                    ctx, layer.gate_up_proj, normalized, gate, ff_dim_)) {
+                auto gateUp = row_view(buf_.gate_up, row, 2 * ff_dim_);
+                layer.gate_up_proj.forward(ctx, linear_scratch_, normalized, gateUp, 1);
+                ops::fused_gate_up_swiglu(ctx, gateUp, gate, ff_dim_);
+            }
+        }
+        layer.down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.gate, buf_.up, batchSize);
+        add_normalize_rows(buf_.hidden, buf_.up, *plan.postMlpNormWeight, buf_.normed);
+    }
+
+    // Keep the single-row LM head's reduction and vocabulary layout. Sampling
+    // is owned by each Request and consumes its row before this slot is reused.
+    for (int row = 0; row < batchSize; ++row) {
+        auto normalized = row_view(buf_.normed, row, hidden_size_);
+        auto logits = row_view(buf_.decode_batch_logits, row, cfg_.vocab_size);
+        lm_head_.forward(ctx, normalized, logits, 1);
+    }
+    // Publish logical lengths only after every row's complete forward has
+    // been submitted. The caller drains/handles asynchronous device failures.
+    for (auto* session : sessions) session->cache_.advance(1);
+    return decodeBatchLogitsView_;
 }
 
 Tensor& Qwen3Bnb4Backend::Forward(Context& ctx, Session& session,

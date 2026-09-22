@@ -147,6 +147,21 @@ void run_assistant_output_parser_tests() {
         AILA_CHAT_EXPECT_EQ(result.tool_calls.size(), static_cast<size_t>(1));
         AILA_CHAT_EXPECT_EQ(result.tool_calls[0].function.arguments_json, std::string(R"({"query":"{not json}"})"));
     }
+
+    {
+        const std::string text = "<think>\nStep 1: plan\n</think>\nHello, world!";
+        AILA_CHAT_EXPECT_EQ(strip_thinking_blocks(text), std::string("Hello, world!"));
+    }
+
+    {
+        const std::string text = "Pre-text\n<think>inner reasoning</think>\nPost-text";
+        AILA_CHAT_EXPECT_EQ(strip_thinking_blocks(text), std::string("Pre-text\n\nPost-text"));
+    }
+
+    {
+        const std::string text = "</think>\n\nDirect answer without open tag";
+        AILA_CHAT_EXPECT_EQ(strip_thinking_blocks(text), std::string("Direct answer without open tag"));
+    }
 }
 
 } // namespace aila::chat::test

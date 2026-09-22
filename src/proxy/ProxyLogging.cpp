@@ -186,6 +186,14 @@ Dispatcher& dispatcher() {
 
 Source create_source() { return std::make_shared<SourceState>(); }
 
+bool is_active(const Source& source) noexcept {
+    if (!source) return false;
+    try {
+        std::lock_guard<std::mutex> lock(source->mutex);
+        return source->active;
+    } catch (...) { return false; }
+}
+
 void invalidate(const Source& source) noexcept {
     if (!source) return;
     try {

@@ -16,6 +16,7 @@ struct InferenceModelOptions {
     int maxSequenceLength = 4096;
     size_t maxSessions = 4;
     size_t maxSessionCacheBytes = 0;
+    std::optional<ipc::v2::AllocationLimits> allocationLimits;
 };
 
 // The protocol/controller is ordinary C++. Only the real factory adapter
@@ -27,6 +28,7 @@ public:
     virtual int VocabSize() const noexcept = 0;
     virtual int MaxSequenceLength() const noexcept = 0;
     virtual size_t SessionReservationBytes() const noexcept = 0;
+    virtual std::optional<ipc::v2::ModelMemoryInfo> MemoryInfo() const { return {}; }
 };
 
 class InferenceModelFactory {
@@ -36,9 +38,14 @@ public:
         const std::string& directory, InferenceModelOptions options) = 0;
     virtual std::shared_ptr<InferenceModel> LoadQwen35(
         const std::string& directory, InferenceModelOptions options) = 0;
+    virtual std::shared_ptr<InferenceModel> LoadQwen35Bf16(
+        const std::string& directory, InferenceModelOptions options) = 0;
     // Called on the lifecycle executor after resource destruction. A recorded
     // asynchronous error must propagate even when a destructor could not throw.
     virtual std::string RuntimeFaultMessage() const { return {}; }
+    // Runs on the lifecycle executor. Implementations must never initialize a
+    // device for observation or wait for a busy execution lock.
+    virtual ipc::v2::RuntimeMemoryInfo QueryRuntimeMemory() const { return {}; }
 };
 
 std::unique_ptr<InferenceModelFactory> MakeSharedInferenceModelFactory();

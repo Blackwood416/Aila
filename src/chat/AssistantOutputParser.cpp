@@ -453,4 +453,11 @@ AssistantChatResult parse_assistant_output(const std::string& raw_text) {
     return result;
 }
 
+std::string strip_thinking_blocks(const std::string& raw_text) {
+    std::string reasoning;
+    std::string without_thinking = extract_thinking(raw_text, reasoning);
+    without_thinking = recover_orphan_think_close(std::move(without_thinking), reasoning);
+    return strip_leading_think_close_artifacts(without_thinking);
+}
+
 } // namespace aila::chat

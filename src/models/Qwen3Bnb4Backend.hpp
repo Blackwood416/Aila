@@ -77,6 +77,15 @@ public:
     // before the next forward call (including calls through the legacy API).
     Tensor& Forward(Context& ctx, Session& session,
                     const int* tokenIdsDevice, int count);
+    // One token for each distinct Session, in the supplied row order. B=1
+    // retains Forward's original decode path; B=2..4 shares each layer's
+    // projections while positional/KV attention stays per Session. The
+    // returned contiguous [B, vocab] BF16 view uses the execution slot.
+    // Validate the whole group before submission. After an execution failure
+    // the caller must invalidate every participating Session, as with Forward.
+    bool SupportsDecodeBatch() const noexcept;
+    Tensor& ForwardDecodeBatch(Context& ctx, const std::vector<Session*>& sessions,
+                               const int* deviceTokenIds);
     void Reset(Session& session);
     // Returns the restored length. Invalid lengths leave the Session intact.
     int Truncate(Session& session, int newLength);
@@ -134,10 +143,13 @@ private:
         Tensor hidden, normed, qkv;
         Tensor q, k, v, attn_out;
         Tensor gate_up, gate, up, logits;
+        Tensor decode_batch_logits;
         Tensor decode_scores, scores, incr_scores;
         Tensor rope_freq;
         Tensor decode_attn_partials; // cache for head_dim=256 decode exact partials
     } buf_;
+
+    Tensor decodeBatchLogitsView_;
 
     int runtime_seq_capacity_ = 0;
     int prefill_scores_capacity_ = 0;

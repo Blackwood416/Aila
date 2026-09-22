@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ipc/IpcProtocol.hpp"
+#include "generation/ThinkingBudget.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,9 @@ enum class Method {
     WorkerConfigure, WorkerQuery, ModelLoad, SessionCreate, SessionQuery,
     RequestSubmit, RequestCancel, RequestQuery, RequestAck, HandleRelease,
     WorkerShutdown,
+    SessionReset, SessionTruncate,
+    WorkerSetLogLevel,
+    WorkerMemoryQuery,
 };
 enum class ObjectType { Model, Session, Request };
 enum class RequestStatus { Queued, Prefill, Decode, Finalizing, Completed, Cancelled, Failed };
@@ -31,6 +35,7 @@ enum class ErrorCode {
     StaleEpoch, InvalidHandle, ProtocolError, RequestFailed, TransportError,
 };
 enum class DomainStatus { Starting, Ready, Stopping, Faulted, Closed };
+enum class RuntimeMemoryState { Uninitialized, Busy, Ready };
 enum class ResponseKind { Result, Error, Accepted };
 enum class SubmissionPhase { None, Accepted, Rejected, Completed };
 enum class EventKind { Token, Terminal, DomainFault, Log };
@@ -42,12 +47,14 @@ std::string_view to_string(RequestStatus value) noexcept;
 std::string_view to_string(EndReason value) noexcept;
 std::string_view to_string(ErrorCode value) noexcept;
 std::string_view to_string(DomainStatus value) noexcept;
+std::string_view to_string(RuntimeMemoryState value) noexcept;
 bool parse_method(std::string_view value, Method& output) noexcept;
 bool parse_object_type(std::string_view value, ObjectType& output) noexcept;
 bool parse_request_status(std::string_view value, RequestStatus& output) noexcept;
 bool parse_end_reason(std::string_view value, EndReason& output) noexcept;
 bool parse_error_code(std::string_view value, ErrorCode& output) noexcept;
 bool parse_domain_status(std::string_view value, DomainStatus& output) noexcept;
+bool parse_runtime_memory_state(std::string_view value, RuntimeMemoryState& output) noexcept;
 bool is_terminal(RequestStatus value) noexcept;
 bool valid_epoch(std::string_view value) noexcept;
 
@@ -56,7 +63,8 @@ struct ValidationError {
     std::string message;
 };
 
-// The first wire revision permits lowering these bounds, not increasing them.
+// Default/hello bounds retain the original wire revision. The optional
+// extended_generation_v1 configuration raises only maxGeneratedTokens.
 // maxSessionCacheBytes == 0 means no byte ceiling beyond the session count.
 // The offered hard limit may also be zero; then a finite requested ceiling is valid.
 struct Limits {
@@ -88,6 +96,12 @@ struct Limits {
 };
 
 Limits hard_limits() noexcept;
+inline constexpr uint32_t kExtendedMaxGeneratedTokens = 32768;
+Limits extended_generation_limits() noexcept;
+// Interpret the optional configure capability without changing old hello
+// fields. A Worker advertising a lower generation ceiling still keeps it.
+Limits configure_limits_ceiling(const Limits& offered,
+                                const std::vector<std::string>& requiredCapabilities);
 // Keep existing Qwen3 callers compatible with Workers that predate Hybrid.
 std::vector<std::string> default_capabilities();
 // All capabilities published by current real and CPU fixture Workers.
@@ -96,6 +110,10 @@ std::vector<std::string> supported_capabilities();
 std::string_view model_capability(std::string_view backend, std::string_view kvType = "bf16") noexcept;
 bool validate_limits(const Limits& requested, ValidationError& error,
                      const Limits& ceiling = hard_limits());
+// Optional continuous_batching_v1. One retains the original scheduling path;
+// larger values bound compatible decode rows without changing admission limits.
+inline constexpr uint32_t kMaxDecodeBatchSize = 4;
+bool validate_decode_batch_size(uint32_t size, const Limits& limits, ValidationError& error);
 bool negotiate(const Limits& requested, const std::vector<std::string>& requiredCapabilities,
                const Limits& offered, const std::vector<std::string>& availableCapabilities,
                Limits& selected, ValidationError& error);
@@ -144,6 +162,47 @@ struct GenerationOptions {
     double frequencyPenalty = 0.0;
 };
 
+// Optional thinking_budget_v1 extension; default commands retain their schema.
+using ThinkingBudgetOptions = aila::generation::ThinkingBudgetOptions;
+
+// Optional allocation_limits_v1 model-load extension. Zero means no byte
+// ceiling. Device/pinned limits cover explicitly owned USM; the host Session
+// limit covers recurrent mirrors/checkpoint payload, not process RSS.
+struct AllocationLimits {
+    uint64_t maxDeviceBytes = 0;
+    uint64_t maxPinnedHostBytes = 0;
+    uint64_t maxSessionHostBytes = 0;
+    bool operator==(const AllocationLimits& other) const noexcept {
+        return maxDeviceBytes == other.maxDeviceBytes &&
+            maxPinnedHostBytes == other.maxPinnedHostBytes &&
+            maxSessionHostBytes == other.maxSessionHostBytes;
+    }
+};
+
+struct ModelMemoryInfo {
+    AllocationLimits limits;
+    uint64_t residentDeviceBytes = 0; // At load completion, before Sessions.
+    uint64_t sessionHostReservationBytes = 0;
+};
+
+// Optional runtime_memory_v1. Explicit Context-owned USM, not RSS/WDDM or
+// library-private allocation. Peaks persist across model unload/limit changes.
+struct RuntimeMemoryUsage {
+    uint64_t deviceBytes = 0;
+    uint64_t peakDeviceBytes = 0;
+    uint64_t pinnedHostBytes = 0;
+    uint64_t peakPinnedHostBytes = 0;
+    uint64_t deviceAllocations = 0;
+    uint64_t pinnedHostAllocations = 0;
+    uint64_t deviceLimitBytes = 0;
+    uint64_t pinnedHostLimitBytes = 0;
+};
+struct RuntimeMemoryInfo {
+    RuntimeMemoryState state = RuntimeMemoryState::Uninitialized;
+    // Present only for Ready. Busy/uninitialized must not imply zero usage.
+    std::optional<RuntimeMemoryUsage> usage;
+};
+
 // Only fields belonging to method are serialized. Parsing validates each
 // method's exact schema and returns a fresh value, never partly changes output.
 struct Command {
@@ -151,6 +210,8 @@ struct Command {
     uint64_t rpcId = 0;
     std::string epoch;
     Limits limits;
+    uint32_t maxDecodeBatchSize = 1; // worker.configure; omitted on wire when one.
+    uint32_t logLevel = 1; // Optional worker_log_control_v1, levels 0..3.
     std::vector<std::string> requiredCapabilities;
     std::string backend = "qwen3_nf4";
     std::string modelDirectory;
@@ -159,12 +220,18 @@ struct Command {
     uint32_t maxSessions = 4;
     uint64_t maxSessionCacheBytes = 0;
     uint64_t modelId = 0;
+    std::optional<AllocationLimits> allocationLimits;
     uint64_t sessionId = 0;
+    uint32_t contextLength = 0; // session.truncate target; reply may restore an earlier checkpoint.
     uint64_t inferenceId = 0;
     uint32_t prefillChunkSize = 512;
     std::vector<int32_t> promptIds;
     std::vector<int32_t> stopTokenIds;
     GenerationOptions generation;
+    std::optional<ThinkingBudgetOptions> thinkingBudget;
+    bool prefillOnly = false; // Optional prefill_only_v1; maxNewTokens must be zero.
+    bool forceHostSampling = false; // Optional host_sampling_v1.
+    bool legacyPrefillLogits = false; // Optional legacy_prefill_logits_v1.
     ObjectType objectType = ObjectType::Request;
     uint64_t objectId = 0;
     uint64_t consumedSequence = 0;
@@ -191,6 +258,7 @@ struct ModelInfo {
     uint32_t maxSequenceLength = 0;
     uint64_t sessionReservationBytes = 0;
     std::vector<std::string> capabilities;
+    std::optional<ModelMemoryInfo> memory;
 };
 struct SessionInfo {
     uint64_t sessionId = 0;
@@ -238,8 +306,11 @@ struct Response {
     Summary summary; // Final submit or cancel's status.
     uint32_t tokenWindow = 32;
     Limits limits; // worker.configure result
+    uint32_t maxDecodeBatchSize = 1; // Exact configure acknowledgement, optional on wire.
     std::vector<std::string> capabilities; // worker.configure result
     WorkerInfo worker; // Also supplies domainStatus for configure/shutdown.
+    RuntimeMemoryInfo runtimeMemory; // worker.memory_query, runtime_memory_v1.
+    uint32_t logLevel = 1; // worker.set_log_level result echoes the applied level.
     ModelInfo model;
     SessionInfo session;
     RequestInfo request;

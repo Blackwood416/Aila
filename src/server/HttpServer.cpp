@@ -199,7 +199,52 @@ public:
         chat.maxPromptTokens = std::min<uint32_t>(4096, this->options.contextTokens);
         chat.maxNewTokens = this->options.maxNewTokens;
         chat.maxOutputBytes = this->options.maxOutputBytes;
-        chat.family = this->options.backend == "qwen35_nf4" ? ModelFamily::Qwen35Hybrid : ModelFamily::Qwen3Dense;
+        chat.family = this->options.backend == "qwen3_nf4" ? ModelFamily::Qwen3Dense : ModelFamily::Qwen35Hybrid;
+    }
+    ~Service() { StopMemorySampling(); }
+
+    void StartMemorySampling() {
+        if (options.memorySampleInterval == 0ms) return;
+        memorySamplingStopped = false; // Started before the shutdown thread/HTTP loop.
+        memoryThread = std::thread([this] {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (!memoryStopRequested) {
+                lock.unlock();
+                std::optional<wire::RuntimeMemoryInfo> sample;
+                const char* error = nullptr;
+                try {
+                    sample = client->QueryMemory(1s);
+                    if (sample->usage && (sample->usage->deviceLimitBytes != options.maxDeviceBytes ||
+                        sample->usage->pinnedHostLimitBytes != options.maxPinnedHostBytes)) {
+                        sample.reset();
+                        error = "limit_mismatch";
+                    }
+                }
+                catch (const host::InferenceClientError& failure) {
+                    error = failure.Code() == host::ClientErrorCode::Timeout ? "timeout" : "query_failed";
+                } catch (...) { error = "query_failed"; }
+                lock.lock();
+                memoryObservedAt = Clock::now();
+                memoryInfo = std::move(sample);
+                memoryError = error;
+                ++memorySamples;
+                if (error) {
+                    ++memoryFailures;
+                    // A timed-out RPC can still be pending. Never accumulate
+                    // more diagnostic calls or silently retry a failed sample.
+                    break;
+                }
+                if (memoryInfo->state == wire::RuntimeMemoryState::Busy) ++memoryBusySamples;
+                if (memoryChanged.wait_for(lock, options.memorySampleInterval, [&] { return memoryStopRequested; })) break;
+            }
+            memorySamplingStopped = true;
+        });
+    }
+
+    void StopMemorySampling() {
+        { std::lock_guard<std::mutex> lock(mutex); memoryStopRequested = true; }
+        memoryChanged.notify_all();
+        if (memoryThread.joinable()) memoryThread.join();
     }
 
     void Connected(const trantor::TcpConnectionPtr& connection) {
@@ -355,6 +400,7 @@ public:
     }
 
     bool FinishShutdown() {
+        StopMemorySampling();
         bool graceful = true;
         try { client->Shutdown(30s); }
         catch (const std::exception& error) { graceful = false; std::cerr << "Worker shutdown: " << error.what() << '\n'; }
@@ -374,6 +420,43 @@ public:
             stopping.load() && snapshot.status == wire::DomainStatus::Ready ? "stopping" : std::string(wire::to_string(snapshot.status));
         value["model"] = options.modelId;
         value["backend"] = options.backend;
+        value["max_decode_batch_size"] = options.maxDecodeBatchSize;
+        if (model->Info().memory) {
+            const auto& memory = *model->Info().memory;
+            auto& budget = value["memory"];
+            budget["max_device_bytes"] = Json::UInt64(memory.limits.maxDeviceBytes);
+            budget["max_pinned_host_bytes"] = Json::UInt64(memory.limits.maxPinnedHostBytes);
+            budget["max_session_host_bytes"] = Json::UInt64(memory.limits.maxSessionHostBytes);
+            budget["model_resident_device_bytes_at_load"] = Json::UInt64(memory.residentDeviceBytes);
+            budget["session_host_reservation_bytes"] = Json::UInt64(memory.sessionHostReservationBytes);
+            budget["session_device_reservation_bytes"] = Json::UInt64(model->Info().sessionReservationBytes);
+        }
+        if (options.memorySampleInterval != 0ms) {
+            auto& sample = value["runtime_memory"];
+            sample["interval_ms"] = Json::Int64(options.memorySampleInterval.count());
+            sample["epoch"] = snapshot.epoch;
+            sample["samples"] = Json::UInt64(memorySamples);
+            sample["busy_samples"] = Json::UInt64(memoryBusySamples);
+            sample["failures"] = Json::UInt64(memoryFailures);
+            sample["sampling_stopped"] = memorySamplingStopped;
+            sample["state"] = memoryError ? "error" : memoryInfo ? std::string(wire::to_string(memoryInfo->state)) : "pending";
+            sample["error"] = memoryError ? Json::Value(memoryError) : Json::Value();
+            sample["age_ms"] = memorySamples ? Json::Value(Json::Int64(
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - memoryObservedAt).count())) : Json::Value();
+            sample["memory"] = Json::Value();
+            if (memoryInfo && memoryInfo->usage) {
+                const auto& usage = *memoryInfo->usage;
+                auto& data = sample["memory"];
+                data["device_bytes"] = Json::UInt64(usage.deviceBytes);
+                data["peak_device_bytes"] = Json::UInt64(usage.peakDeviceBytes);
+                data["pinned_host_bytes"] = Json::UInt64(usage.pinnedHostBytes);
+                data["peak_pinned_host_bytes"] = Json::UInt64(usage.peakPinnedHostBytes);
+                data["device_allocations"] = Json::UInt64(usage.deviceAllocations);
+                data["pinned_host_allocations"] = Json::UInt64(usage.pinnedHostAllocations);
+                data["device_limit_bytes"] = Json::UInt64(usage.deviceLimitBytes);
+                data["pinned_host_limit_bytes"] = Json::UInt64(usage.pinnedHostLimitBytes);
+            }
+        }
         value["active_requests"] = Json::UInt64(active.size());
         auto& counters = value["counters"];
         counters["admitted"] = Json::UInt64(admitted); counters["rejected"] = Json::UInt64(rejected);
@@ -428,6 +511,14 @@ private:
     uint64_t socketOptionCallbacks = 0, socketOptionFailures = 0;
     int minSendBuffer = 0, maxSendBuffer = 0;
     bool shutdownGraceful = false, shutdownIdle = false;
+    // The HTTP loop holds mutex only while copying CPU state, never during RPC.
+    std::thread memoryThread;
+    std::condition_variable memoryChanged;
+    bool memoryStopRequested = false, memorySamplingStopped = true;
+    std::optional<wire::RuntimeMemoryInfo> memoryInfo;
+    Clock::time_point memoryObservedAt{};
+    const char* memoryError = nullptr;
+    uint64_t memorySamples = 0, memoryBusySamples = 0, memoryFailures = 0;
 };
 
 RequestRun::RequestRun(std::shared_ptr<Service> service, const trantor::TcpConnectionPtr& connection,
@@ -701,7 +792,7 @@ void RequestRun::Execute() noexcept {
                 else SendJson(std::move(completion.json), completion.httpStatus);
                 break;
             }
-            auto frames = output->PushText(service->tokenizer->decode(next.event->tokenId));
+            auto frames = output->PushText(DecodeChatToken(*service->tokenizer, prepared, next.event->tokenId));
             if (streaming && !OfferAll(std::move(frames))) break;
         }
     } catch (const ApiError& error) {
@@ -728,25 +819,40 @@ void RequestRun::Execute() noexcept {
 } // namespace
 
 int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested) {
+    if (options.memorySampleInterval < 0ms || options.memorySampleInterval > 60000ms ||
+        (options.memorySampleInterval != 0ms && options.memorySampleInterval < 100ms))
+        throw std::invalid_argument("--memory-sample-ms must be 0 or 100..60000");
     const auto capability = wire::model_capability(options.backend);
     if (capability.empty()) throw std::invalid_argument("Unsupported server backend: " + options.backend);
+    wire::Limits serverLimits;
+    serverLimits.maxActiveRequests = options.maxSessions;
+    wire::ValidationError batchingError;
+    if (!wire::validate_decode_batch_size(options.maxDecodeBatchSize, serverLimits, batchingError))
+        throw std::invalid_argument("--decode-batch-size must be 1..4 and not exceed --sessions");
     aila::set_log_level(aila::LogLevel::Warning);
     auto tokenizer = std::make_shared<Tokenizer>();
     if (!tokenizer->load(options.modelDirectory.u8string())) throw std::runtime_error("Could not load the model tokenizer");
     host::InferenceClientOptions clientOptions;
+    clientOptions.limits.maxActiveRequests = options.maxSessions;
+    clientOptions.maxDecodeBatchSize = options.maxDecodeBatchSize;
     clientOptions.handshakeTimeout = 10s;
     clientOptions.commandTimeout = 120s;
     clientOptions.shutdownTimeout = 30s;
     if (std::find(clientOptions.requiredCapabilities.begin(), clientOptions.requiredCapabilities.end(), capability) ==
         clientOptions.requiredCapabilities.end()) clientOptions.requiredCapabilities.emplace_back(capability);
+    clientOptions.requiredCapabilities.emplace_back("allocation_limits_v1");
+    if (options.memorySampleInterval != 0ms) clientOptions.requiredCapabilities.emplace_back("runtime_memory_v1");
     auto client = host::InferenceClient::Start(options.workerExecutable.parent_path(), options.workerExecutable,
                                               options.expectedBuildId, clientOptions);
     host::InferenceModelOptions modelOptions;
     modelOptions.maxSequenceLength = options.contextTokens;
     modelOptions.maxSessions = options.maxSessions;
-    auto model = options.backend == "qwen35_nf4"
-        ? client->LoadQwen35(options.modelDirectory.u8string(), modelOptions)
-        : client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
+    modelOptions.allocationLimits = wire::AllocationLimits{
+        options.maxDeviceBytes, options.maxPinnedHostBytes, options.maxSessionHostBytes};
+    std::shared_ptr<host::InferenceModel> model;
+    if (options.backend == "qwen3_nf4") model = client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
+    else if (options.backend == "qwen35_nf4") model = client->LoadQwen35(options.modelDirectory.u8string(), modelOptions);
+    else model = client->LoadQwen35Bf16(options.modelDirectory.u8string(), modelOptions);
     if (tokenizer->vocab_size() <= 0 || static_cast<uint32_t>(tokenizer->vocab_size()) > model->Info().vocabSize)
         throw std::runtime_error("Tokenizer vocabulary does not fit the loaded model");
     auto service = std::make_shared<Service>(options, client, model, tokenizer);
@@ -804,13 +910,17 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
         ready["event"] = "ready"; ready["address"] = "127.0.0.1";
         ready["port"] = service->options.port; ready["model"] = service->options.modelId;
         ready["backend"] = service->options.backend;
+        ready["max_decode_batch_size"] = service->options.maxDecodeBatchSize;
         ready["worker_build_id"] = service->options.expectedBuildId;
         ready["epoch"] = service->client->Snapshot().epoch;
         std::cout << JsonText(ready) << std::endl;
     });
     app.addListener("127.0.0.1", options.port);
     std::atomic<bool> appEnded{false}, shutdownSucceeded{false};
-    std::thread shutdownThread([&] {
+    std::thread shutdownThread;
+    try {
+        service->StartMemorySampling();
+        shutdownThread = std::thread([&] {
         while (!stopRequested.load() && !appEnded.load()) {
             if (!options.shutdownFile.empty()) {
                 std::error_code error;
@@ -821,7 +931,8 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
         service->BeginShutdown();
         shutdownSucceeded.store(service->FinishShutdown());
         if (!appEnded.load()) app.getLoop()->queueInLoop([&app] { app.quit(); });
-    });
+        });
+    } catch (...) { service->StopMemorySampling(); throw; }
     try { app.run(); }
     catch (...) { appEnded.store(true); stopRequested.store(true); shutdownThread.join(); throw; }
     appEnded.store(true);

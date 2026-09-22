@@ -2,6 +2,7 @@
 #include "inference/RuntimeFault.hpp"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <limits>
 #include <list>
@@ -26,11 +27,14 @@ std::string_view BoundedError(std::string_view error) noexcept {
 void ValidateOptions(const SchedulerOptions& options) {
     if (options.maxActiveRequests == 0 || options.maxOutstandingRequests == 0 ||
         options.maxActiveRequests > options.maxOutstandingRequests ||
+        options.maxDecodeBatchSize == 0 || options.maxDecodeBatchSize > MaxDecodeBatchSize ||
+        options.maxDecodeBatchSize > options.maxActiveRequests ||
         options.maxPromptTokens == 0 || options.maxGeneratedTokens == 0 ||
         options.maxStopTokenIds == 0 ||
         options.maxOutstandingTokens == 0 || options.maxPrefillChunkSize <= 0 ||
         options.maxBufferedTokensPerRequest == 0) {
-        throw Error(ErrorCode::InvalidArgument, "Scheduler limits must be positive and active <= outstanding");
+        throw Error(ErrorCode::InvalidArgument,
+                    "Scheduler limits must be positive, active <= outstanding, and decode batch <= active and 4");
     }
 }
 
@@ -65,6 +69,8 @@ struct ScheduledRequestState {
     std::weak_ptr<SchedulerState> scheduler;
     std::unique_ptr<AdmissionCredit> credit;
     std::shared_ptr<RequestState> request;
+    const void* decodeBatchKey = nullptr; // Immutable, captured outside scheduler/stream locks.
+    bool activeSlot = false; // Protected by the scheduler queue mutex.
     std::vector<BufferedToken> buffer;
     size_t bufferHead = 0;
     size_t buffered = 0;
@@ -98,13 +104,15 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
     }
 
     void Shutdown() noexcept {
-        std::shared_ptr<ScheduledRequestState> runningRequest;
+        std::array<std::shared_ptr<ScheduledRequestState>, MaxDecodeBatchSize> runningRequests;
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
-            runningRequest = running;
+            runningRequests = running;
         }
-        if (runningRequest) runningRequest->Cancel(RequestEndReason::SchedulerStopped);
+        for (const auto& entry : runningRequests) {
+            if (entry) entry->Cancel(RequestEndReason::SchedulerStopped);
+        }
         changed.notify_all();
         // Check before acquiring joinMutex: an external join may already be
         // waiting for this callback to return.
@@ -114,13 +122,15 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
     }
 
     void Fault(std::string_view message) noexcept {
-        std::shared_ptr<ScheduledRequestState> runningRequest;
+        std::array<std::shared_ptr<ScheduledRequestState>, MaxDecodeBatchSize> runningRequests;
         {
             std::lock_guard<std::mutex> lock(mutex);
             fault.Record(message);
-            runningRequest = running;
+            runningRequests = running;
         }
-        if (runningRequest) runningRequest->Cancel(RequestEndReason::RuntimeFault);
+        for (const auto& entry : runningRequests) {
+            if (entry) entry->Cancel(RequestEndReason::RuntimeFault);
+        }
         changed.notify_all();
     }
 
@@ -148,6 +158,14 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
             std::lock_guard<std::mutex> queueLock(mutex);
             std::lock_guard<std::mutex> lock(entry->mutex);
             if (entry->terminalReady) return;
+            // A reader can return the admission credit as soon as this terminal
+            // is visible. Retire the active slot in the same queue transaction
+            // so Snapshot never counts an active request without its credit,
+            // even while another completed batch row is still being destroyed.
+            if (entry->activeSlot) {
+                entry->activeSlot = false;
+                --activeRequests;
+            }
             if (fault.Faulted()) {
                 status = RequestStatus::Failed;
                 reason = RequestEndReason::RuntimeFault;
@@ -175,128 +193,205 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
         entry->changed.notify_all();
     }
 
-    bool RunOne(const std::shared_ptr<ScheduledRequestState>& entry) noexcept {
+    std::shared_ptr<RequestState> PrepareOne(
+        const std::shared_ptr<ScheduledRequestState>& entry, size_t& processed) {
+        bool domainFaulted = false;
+        bool shutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            domainFaulted = fault.Faulted();
+            shutdown = stopping;
+        }
+        if (domainFaulted) entry->Cancel(RequestEndReason::RuntimeFault);
+        else if (shutdown) entry->Cancel(RequestEndReason::SchedulerStopped);
+
         std::shared_ptr<RequestState> request;
-        size_t processed = 0;
-        try {
-            bool domainFaulted = false;
-            bool shutdown = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                domainFaulted = fault.Faulted();
-                shutdown = stopping;
-            }
-            if (domainFaulted) entry->Cancel(RequestEndReason::RuntimeFault);
-            else if (shutdown) entry->Cancel(RequestEndReason::SchedulerStopped);
+        bool full = false;
+        {
+            std::lock_guard<std::mutex> lock(entry->mutex);
+            request = entry->request;
+            processed = entry->snapshot.promptTokensProcessed;
+            // Finalizing cannot emit another token; a full ring must not
+            // turn successful finalization into slow-consumer cancellation.
+            full = !entry->detached && entry->buffered == entry->buffer.size() &&
+                   entry->snapshot.status != RequestStatus::Finalizing;
+        }
+        if (full) entry->Cancel(RequestEndReason::OutputBackpressure);
+        // Pending-cancel maintenance must never execute a token-producing step.
+        if (entry->cancellation.load(std::memory_order_acquire) != RequestEndReason::None) {
+            request->Cancel();
+        }
+        return request;
+    }
 
-            bool full = false;
-            {
-                std::lock_guard<std::mutex> lock(entry->mutex);
-                request = entry->request;
-                processed = entry->snapshot.promptTokensProcessed;
-                // Finalizing consumes the last emitted token but cannot emit
-                // another. A full ring must not turn successful finalization
-                // into a slow-consumer cancellation.
-                full = !entry->detached && entry->buffered == entry->buffer.size() &&
-                       entry->snapshot.status != RequestStatus::Finalizing;
-            }
-            if (full) entry->Cancel(RequestEndReason::OutputBackpressure);
-            // Also observe the scheduler marker directly. Pending-cancel
-            // maintenance must never execute a token-producing step.
-            if (entry->cancellation.load(std::memory_order_acquire) != RequestEndReason::None) {
-                request->Cancel();
-            }
-
-            const auto step = request->Step();
-            const auto progress = request->Progress();
-            processed = progress.promptTokensProcessed;
-            if (IsTerminal(step.status)) {
-                RequestStatus status = step.status;
-                RequestEndReason reason = RequestEndReason::Failed;
-                auto errorCode = progress.errorCode;
-                std::string_view error = progress.ErrorMessage();
-                if (errorCode == ErrorCode::RuntimeFault) {
-                    Fault(error);
-                    status = RequestStatus::Failed;
-                    reason = RequestEndReason::RuntimeFault;
-                    errorCode = ErrorCode::RuntimeFault;
-                } else if (status == RequestStatus::Completed) {
-                    reason = progress.generatedTokens == entry->maxNewTokens
-                                 ? RequestEndReason::Length : RequestEndReason::StopToken;
-                } else if (status == RequestStatus::Cancelled) {
-                    reason = entry->cancellation.load(std::memory_order_acquire);
-                    if (reason == RequestEndReason::None) reason = RequestEndReason::Cancelled;
-                    if (reason == RequestEndReason::OutputBackpressure) {
-                        errorCode = ErrorCode::ResourceLimit;
-                        error = "Request output buffer is full";
-                    } else if (reason == RequestEndReason::SchedulerStopped) {
-                        errorCode = ErrorCode::SchedulerStopped;
-                        error = "Scheduler has been shut down";
-                    }
-                }
-                request.reset();
-                Complete(entry, status, reason, errorCode, error, processed);
-                return true;
-            }
-
-            {
-                // No sample may be published after ReportRuntimeFault returns.
-                // Both locks protect host-only, preallocated state; device
-                // work, destruction and callbacks stay outside these locks.
-                std::lock_guard<std::mutex> queueLock(mutex);
-                domainFaulted = fault.Faulted();
-                if (!domainFaulted) {
-                    std::lock_guard<std::mutex> lock(entry->mutex);
-                    auto& snapshot = entry->snapshot;
-                    snapshot.status = step.status;
-                    snapshot.promptTokensProcessed = processed;
-                    if (step.tokenId && !entry->detached) {
-                        const size_t tail = (entry->bufferHead + entry->buffered) % entry->buffer.size();
-                        entry->buffer[tail] = {*step.tokenId, step.status, processed};
-                        ++entry->buffered;
-                        ++snapshot.generatedTokens;
-                        snapshot.bufferedTokens = entry->buffered;
-                    }
+    bool PublishOne(const std::shared_ptr<ScheduledRequestState>& entry,
+                    std::shared_ptr<RequestState>& request,
+                    const StepResult& step, const RequestProgress& progress) {
+        const size_t processed = progress.promptTokensProcessed;
+        if (IsTerminal(step.status)) {
+            RequestStatus status = step.status;
+            RequestEndReason reason = RequestEndReason::Failed;
+            auto errorCode = progress.errorCode;
+            std::string_view error = progress.ErrorMessage();
+            if (errorCode == ErrorCode::RuntimeFault) {
+                Fault(error);
+                status = RequestStatus::Failed;
+                reason = RequestEndReason::RuntimeFault;
+                errorCode = ErrorCode::RuntimeFault;
+            } else if (status == RequestStatus::Completed) {
+                reason = progress.endReason;
+            } else if (status == RequestStatus::Cancelled) {
+                reason = entry->cancellation.load(std::memory_order_acquire);
+                if (reason == RequestEndReason::None) reason = RequestEndReason::Cancelled;
+                if (reason == RequestEndReason::OutputBackpressure) {
+                    errorCode = ErrorCode::ResourceLimit;
+                    error = "Request output buffer is full";
+                } else if (reason == RequestEndReason::SchedulerStopped) {
+                    errorCode = ErrorCode::SchedulerStopped;
+                    error = "Scheduler has been shut down";
                 }
             }
-            if (domainFaulted) {
-                // The report may arrive after Step prepared its result (even
-                // in a deferred log callback). Retire it without a new sample.
-                request->Cancel();
-                request->Step();
-                request.reset();
-                Complete(entry, RequestStatus::Failed, RequestEndReason::RuntimeFault,
-                         ErrorCode::RuntimeFault, {}, processed);
-                return true;
-            }
-            entry->changed.notify_all();
-            return false;
-        } catch (const std::exception& error) {
-            // A failure outside Request::Step must still release the session
-            // lease safely. Progress itself has fixed, nonallocating storage.
-            if (request) {
-                request->Cancel();
-                try { request->Step(); } catch (...) {}
-                request.reset();
-            }
-            Complete(entry, RequestStatus::Failed, RequestEndReason::Failed,
-                     std::nullopt, error.what(), processed);
-            return true;
-        } catch (...) {
-            if (request) {
-                request->Cancel();
-                try { request->Step(); } catch (...) {}
-                request.reset();
-            }
-            Complete(entry, RequestStatus::Failed, RequestEndReason::Failed,
-                     std::nullopt, "Unknown scheduler request failure", processed);
+            request.reset();
+            Complete(entry, status, reason, errorCode, error, processed);
             return true;
         }
+
+        bool domainFaulted = false;
+        {
+            // No sample may be published after ReportRuntimeFault returns.
+            // Both locks protect host-only, preallocated state; device
+            // work, destruction and callbacks stay outside these locks.
+            std::lock_guard<std::mutex> queueLock(mutex);
+            domainFaulted = fault.Faulted();
+            if (!domainFaulted) {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                auto& snapshot = entry->snapshot;
+                snapshot.status = step.status;
+                snapshot.promptTokensProcessed = processed;
+                if (step.tokenId && !entry->detached) {
+                    const size_t tail = (entry->bufferHead + entry->buffered) % entry->buffer.size();
+                    entry->buffer[tail] = {*step.tokenId, step.status, processed};
+                    ++entry->buffered;
+                    ++snapshot.generatedTokens;
+                    snapshot.bufferedTokens = entry->buffered;
+                }
+            }
+        }
+        if (domainFaulted) {
+            // A report can arrive after Step prepared a sample, including
+            // from a deferred logging callback. Retire it without publication.
+            request->Cancel();
+            request->Step();
+            request.reset();
+            Complete(entry, RequestStatus::Failed, RequestEndReason::RuntimeFault,
+                     ErrorCode::RuntimeFault, {}, processed);
+            return true;
+        }
+        entry->changed.notify_all();
+        return false;
+    }
+
+    void FailOne(const std::shared_ptr<ScheduledRequestState>& entry,
+                 std::optional<ErrorCode> code, std::string_view error) noexcept {
+        std::shared_ptr<RequestState> request;
+        size_t processed = 0;
+        {
+            std::lock_guard<std::mutex> lock(entry->mutex);
+            request = entry->request;
+            processed = entry->snapshot.promptTokensProcessed;
+        }
+        // Failures outside Step must also retire the session at a safe boundary.
+        // Request::Cancel is observed before any further Forward is allowed.
+        if (request) {
+            request->Cancel();
+            try {
+                request->Step();
+                processed = request->Progress().promptTokensProcessed;
+            } catch (...) {}
+            request.reset();
+        }
+        Complete(entry, RequestStatus::Failed, RequestEndReason::Failed, code, error, processed);
+    }
+
+    bool RunOne(const std::shared_ptr<ScheduledRequestState>& entry) noexcept {
+        try {
+            size_t processed = 0;
+            auto request = PrepareOne(entry, processed);
+            const auto step = request->Step();
+            return PublishOne(entry, request, step, request->Progress());
+        } catch (const Error& error) {
+            if (error.Code() == ErrorCode::RuntimeFault) Fault(error.what());
+            FailOne(entry, error.Code(), error.what());
+        } catch (const std::exception& error) {
+            FailOne(entry, std::nullopt, error.what());
+        } catch (...) {
+            FailOne(entry, std::nullopt, "Unknown scheduler request failure");
+        }
+        return true;
+    }
+
+    // One bit per input node marks terminal completion. A batch-wide execution
+    // error fails this group; a RuntimeFault is recorded before publishing any
+    // row, including a successful row returned alongside another row's failure.
+    unsigned RunBatch(const std::list<std::shared_ptr<ScheduledRequestState>>& entries) noexcept {
+        const unsigned allCompleted = (1u << entries.size()) - 1u;
+        std::optional<ErrorCode> failureCode;
+        std::array<char, MaxErrorBytes> failure{};
+        size_t failureSize = 0;
+        auto retainFailure = [&](std::optional<ErrorCode> code, std::string_view message) {
+            failureCode = code;
+            const auto bounded = BoundedError(message);
+            failureSize = bounded.size();
+            std::copy_n(bounded.data(), failureSize, failure.data());
+        };
+        try {
+            std::vector<std::shared_ptr<RequestState>> requests;
+            requests.reserve(entries.size());
+            for (const auto& entry : entries) {
+                size_t processed = 0;
+                requests.push_back(PrepareOne(entry, processed));
+            }
+            const auto steps = RequestState::StepDecodeBatch(requests);
+            std::array<RequestProgress, MaxDecodeBatchSize> progress;
+            for (size_t i = 0; i < requests.size(); ++i) {
+                progress[i] = requests[i]->Progress();
+                if (progress[i].errorCode == ErrorCode::RuntimeFault) Fault(progress[i].ErrorMessage());
+            }
+            unsigned completed = 0;
+            size_t index = 0;
+            for (const auto& entry : entries) {
+                if (PublishOne(entry, requests[index], steps[index], progress[index])) completed |= 1u << index;
+                ++index;
+            }
+            return completed;
+        } catch (const Error& error) {
+            if (error.Code() == ErrorCode::RuntimeFault) Fault(error.what());
+            retainFailure(error.Code(), error.what());
+        } catch (const std::exception& error) {
+            retainFailure(std::nullopt, error.what());
+        } catch (...) {
+            retainFailure(std::nullopt, "Unknown scheduler decode batch failure");
+        }
+        for (const auto& entry : entries) {
+            FailOne(entry, failureCode, {failure.data(), failureSize});
+        }
+        return allCompleted;
+    }
+
+    const void* EligibleBatchKey(const std::shared_ptr<ScheduledRequestState>& entry) const noexcept {
+        // Called with the scheduler mutex held. Read only the preallocated
+        // stream snapshot and immutable model identity, never Progress/Step.
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        if (entry->detached || entry->cancellation.load(std::memory_order_acquire) != RequestEndReason::None ||
+            (entry->snapshot.status != RequestStatus::Decode && entry->snapshot.status != RequestStatus::Finalizing)) {
+            return nullptr;
+        }
+        return entry->decodeBatchKey;
     }
 
     void Run() noexcept {
         // Splicing list nodes rotates requests without allocating in the hot
-        // path. The running node remains local until all locks are released.
+        // queue path. Running nodes remain retained until locks are released.
         std::list<std::shared_ptr<ScheduledRequestState>> current;
         bool lastWasQueuedCancellation = false;
         for (;;) {
@@ -307,6 +402,7 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
                 if (waiting.empty() && runnable.empty() && (stopping || fault.Faulted())) break;
 
                 while (activeRequests < options.maxActiveRequests && !waiting.empty()) {
+                    waiting.front()->activeSlot = true;
                     runnable.splice(runnable.end(), waiting, waiting.begin());
                     ++activeRequests;
                 }
@@ -328,31 +424,55 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
                     current.splice(current.end(), runnable, runnable.begin());
                     wasActive = true;
                     lastWasQueuedCancellation = false;
+                    // The oldest runnable request anchors this quantum. Take
+                    // only ready peers of its model, then rotate every selected
+                    // row to the tail. An unselected prefill/other model becomes
+                    // the next anchor; decode batches cannot keep overtaking it.
+                    const void* batchKey = options.maxDecodeBatchSize > 1
+                        ? EligibleBatchKey(current.front()) : nullptr;
+                    if (batchKey && !stopping && !fault.Faulted()) {
+                        for (auto it = runnable.begin(); it != runnable.end() &&
+                             current.size() < options.maxDecodeBatchSize;) {
+                            auto candidate = it++;
+                            if (EligibleBatchKey(*candidate) == batchKey) {
+                                current.splice(current.end(), runnable, candidate);
+                            }
+                        }
+                    }
                 } else {
                     continue;
                 }
-                running = current.front();
+                size_t index = 0;
+                for (const auto& entry : current) running[index++] = entry;
             }
 
-            const bool completed = RunOne(current.front());
+            const unsigned completed = current.size() == 1
+                ? (RunOne(current.front()) ? 1u : 0u) : RunBatch(current);
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (completed) {
-                    if (wasActive) --activeRequests;
-                } else if (wasActive) {
-                    // Give newly eligible requests a turn before the one
-                    // that just finished its quantum is appended again.
+                if (wasActive) {
+                    // Admit newly eligible requests before appending every
+                    // surviving batch row. Completed unread streams retain
+                    // admission credits, but no longer occupy an active slot.
                     while (activeRequests < options.maxActiveRequests && !waiting.empty()) {
+                        waiting.front()->activeSlot = true;
                         runnable.splice(runnable.end(), waiting, waiting.begin());
                         ++activeRequests;
                     }
-                    runnable.splice(runnable.end(), current, current.begin());
-                } else {
+                    size_t index = 0;
+                    for (auto it = current.begin(); it != current.end(); ++index) {
+                        auto selected = it++;
+                        if (!(completed & (1u << index))) {
+                            runnable.splice(runnable.end(), current, selected);
+                        }
+                    }
+                } else if (!completed) {
                     // A maintenance node never owns an active slot. Preserve
                     // accounting even if a future maintenance action yields.
                     waiting.splice(waiting.end(), current, current.begin());
                 }
-                running.reset(); // current still owns it until after unlock.
+                // current/runnable still own all nodes until after unlock.
+                for (auto& entry : running) entry.reset();
             }
             // Destructors can drain device work and invoke deferred log
             // callbacks. Neither scheduler nor stream locks may be held.
@@ -365,8 +485,8 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
     std::condition_variable changed;
     std::list<std::shared_ptr<ScheduledRequestState>> waiting;
     std::list<std::shared_ptr<ScheduledRequestState>> runnable;
-    std::shared_ptr<ScheduledRequestState> running;
-    size_t activeRequests = 0; // Includes the currently executing node.
+    std::array<std::shared_ptr<ScheduledRequestState>, MaxDecodeBatchSize> running;
+    size_t activeRequests = 0; // Includes all currently executing batch rows.
     size_t outstandingRequests = 0;
     size_t reservedTokens = 0;
     size_t reservedCacheBytes = 0;
@@ -513,7 +633,8 @@ std::shared_ptr<ScheduledRequest> Scheduler::Submit(
     std::shared_ptr<SessionState> session, std::vector<int> promptIds, RequestOptions options) {
     const auto retained = state;
     const auto& limits = retained->options;
-    if (!session || promptIds.empty() || options.generation.max_new_tokens <= 0 ||
+    if (!session || promptIds.empty() ||
+        (options.prefillOnly ? options.generation.max_new_tokens != 0 : options.generation.max_new_tokens <= 0) ||
         options.prefillChunkSize <= 0) {
         throw Error(ErrorCode::InvalidArgument, "A session, prompt, and positive request limits are required");
     }
@@ -564,6 +685,7 @@ std::shared_ptr<ScheduledRequest> Scheduler::Submit(
     // them outside the scheduler mutex, then recheck shutdown before enqueue.
     try {
         entry->request = RequestState::Create(std::move(session), std::move(promptIds), std::move(options));
+        entry->decodeBatchKey = entry->request->DecodeBatchKey();
     } catch (const Error& error) {
         if (error.Code() == ErrorCode::RuntimeFault) retained->Fault(error.what());
         throw;

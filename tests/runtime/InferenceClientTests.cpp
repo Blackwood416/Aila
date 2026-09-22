@@ -134,6 +134,7 @@ public:
         case wire::Method::WorkerConfigure:
             limits_ = command.limits;
             response.limits = limits_;
+            response.maxDecodeBatchSize = command.maxDecodeBatchSize;
             response.capabilities = hello_.capabilities;
             response.worker.domainStatus = wire::DomainStatus::Ready;
             break;
@@ -142,10 +143,21 @@ public:
             response.worker.accepting = !shuttingDown_;
             response.worker.stopping = shuttingDown_;
             break;
+        case wire::Method::WorkerSetLogLevel:
+            response.logLevel = command.logLevel;
+            break;
+        case wire::Method::WorkerMemoryQuery:
+            response.runtimeMemory = {wire::RuntimeMemoryState::Ready,
+                wire::RuntimeMemoryUsage{4096, (uint64_t{1} << 53) + 1, 16, 128, 4, 1, 8192, 64}};
+            break;
         case wire::Method::ModelLoad:
             response.model = {++modelId_, 2048, command.maxSequenceLength, 4096,
                               {std::string(wire::model_capability(command.backend, command.kvType)),
                                "token_requests_v1", "session_lifecycle_v1"}};
+            if (command.allocationLimits) {
+                response.model.memory = wire::ModelMemoryInfo{*command.allocationLimits, 0, 0};
+                response.model.capabilities.emplace_back("allocation_limits_v1");
+            }
             models_.emplace(response.model.modelId, response.model);
             break;
         case wire::Method::SessionCreate: {
@@ -157,6 +169,12 @@ public:
         }
         case wire::Method::SessionQuery:
             response.session = sessions_.at(command.sessionId);
+            break;
+        case wire::Method::SessionReset:
+        case wire::Method::SessionTruncate:
+            response.session = sessions_.at(command.sessionId);
+            response.session.contextLength = command.method == wire::Method::SessionReset ? 0 : command.contextLength;
+            sessions_.at(command.sessionId) = response.session;
             break;
         case wire::Method::RequestSubmit: {
             Record record;
@@ -527,12 +545,13 @@ private:
 };
 
 struct Fixture {
-    std::shared_ptr<ControlledTransport> transport = std::make_shared<ControlledTransport>();
+    std::shared_ptr<ControlledTransport> transport;
     std::shared_ptr<InferenceClient> client;
     std::shared_ptr<InferenceModel> model;
     std::vector<std::shared_ptr<InferenceSession>> sessions;
 
-    explicit Fixture(InferenceClientOptions options = {}, size_t sessionCount = 2) {
+    explicit Fixture(InferenceClientOptions options = {}, size_t sessionCount = 2, wire::Hello hello = Hello())
+        : transport(std::make_shared<ControlledTransport>(std::move(hello))) {
         options.commandTimeout = 1s;
         options.shutdownTimeout = 1s;
         client = InferenceClient::Connect(transport, ExpectedIdentity(), options);
@@ -1057,10 +1076,88 @@ void ShutdownCrossPipeFenceAndEof() {
         }
         Get(close);
         const auto state = fixture.client->Snapshot();
-        Expect(state.receivedEventOrdinal == (responseFirst ? 2 : 1) && state.droppedLogs == state.receivedEventOrdinal,
+        Expect(state.receivedEventOrdinal == (responseFirst ? 2 : 1) && state.droppedLogs == 0 &&
+               state.queuedLogs == state.receivedEventOrdinal,
                "Shutdown truncated its independent event pipe");
+        for (uint64_t i = 1; i <= state.receivedEventOrdinal; ++i) {
+            const auto log = fixture.client->ReadLog(0ms);
+            Expect(log.status == InferenceReadStatus::Event && log.event->eventOrdinal == i,
+                   "Shutdown lost a queued log before the close barrier");
+        }
+        Expect(fixture.client->ReadLog(0ms).status == InferenceReadStatus::Closed, "Closed log stream did not end");
         fixture.Close();
     }
+}
+
+void BoundedLogsAndIndependentInference() {
+    InferenceClientOptions options;
+    options.limits.maxLogQueueBytes = 2048;
+    Fixture fixture(options);
+    Expect(fixture.client->ReadLog(0ms).status == InferenceReadStatus::Timeout, "Empty live log stream did not time out");
+    const std::string message = u8"层执行：开始 α\n";
+    fixture.transport->ProcessedEvent(fixture.transport->Log(message));
+    const auto first = fixture.client->ReadLog(0ms);
+    Expect(first.status == InferenceReadStatus::Event && first.event->message == message && first.event->level == 2 &&
+           first.event->eventOrdinal == 1 && first.event->epoch == fixture.client->Snapshot().epoch && !first.droppedLogs,
+           "Log content, UTF-8, level or identity changed");
+    auto [request, submit] = fixture.Submit(0, 2);
+    uint64_t serial = 0;
+    for (unsigned i = 0; i < 80; ++i) serial = fixture.transport->Log("burst-" + std::to_string(i));
+    fixture.transport->ProcessedEvent(serial);
+    const auto flooded = fixture.client->Snapshot();
+    Expect(flooded.queuedLogs && flooded.droppedLogs && flooded.queuedLogs + flooded.droppedLogs == 80 &&
+           flooded.logQueueBytes <= options.limits.maxLogQueueBytes &&
+           flooded.peakLogQueueBytes <= options.limits.maxLogQueueBytes, "Log overflow was not bounded/accounted");
+    fixture.transport->Token(submit, 1, 201);
+    fixture.transport->Token(submit, 2, 202);
+    fixture.transport->Finish(submit, 2);
+    Expect(ReadToken(request, 1).tokenId == 201 && ReadToken(request, 2).tokenId == 202,
+           "A full log queue lost or blocked token delivery");
+    ReadTerminal(request);
+    fixture.Acked(request, 3);
+    Expect(fixture.client->Query().accepting, "Log overflow blocked control traffic");
+    for (uint64_t i = 0; i < flooded.queuedLogs; ++i) {
+        const auto log = fixture.client->ReadLog(0ms);
+        Expect(log.status == InferenceReadStatus::Event && log.event->message == "burst-" + std::to_string(i) &&
+               log.droppedLogs == flooded.droppedLogs, "Overflow replaced older logs or changed the drop counter");
+    }
+    Expect(fixture.client->Snapshot().logQueueBytes == 0, "Consumed log quota was not returned");
+    std::promise<void> started;
+    auto pending = std::async(std::launch::async, [&] { started.set_value(); return fixture.client->ReadLog(2s); });
+    started.get_future().wait();
+    fixture.client->CloseLogStream();
+    Expect(Get(pending).status == InferenceReadStatus::Closed, "Log consumer release did not wake its reader");
+    fixture.transport->ProcessedEvent(fixture.transport->Log("after log consumer release"));
+    Expect(fixture.client->Snapshot().droppedLogs == flooded.droppedLogs + 1 && fixture.client->Query().accepting,
+           "Released log consumer retained new logs or stopped the connection");
+    fixture.Close();
+}
+
+void WorkerLogLevelNegotiationAndEcho() {
+    {
+        Fixture oldPeer;
+        ExpectError([&] { oldPeer.client->SetLogLevel(0); }, ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(oldPeer.transport->History(), wire::Method::WorkerSetLogLevel) == 0 && oldPeer.client->Query().accepting,
+               "Old peer received an unsupported log command or lost its connection");
+        oldPeer.Close();
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    Fixture fixture({}, 1, hello);
+    for (uint32_t level = 0; level <= 3; ++level) {
+        fixture.client->SetLogLevel(level);
+        Expect(fixture.transport->Take(wire::Method::WorkerSetLogLevel).logLevel == level, "Wrong log control dispatch");
+    }
+    ExpectError([&] { fixture.client->SetLogLevel(4); }, ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+    Expect(Count(fixture.transport->History(), wire::Method::WorkerSetLogLevel) == 4, "Invalid log level emitted an RPC");
+    fixture.transport->Hold(wire::Method::WorkerSetLogLevel);
+    auto setting = std::async(std::launch::async, [&] { fixture.client->SetLogLevel(0); });
+    const auto command = fixture.transport->Take(wire::Method::WorkerSetLogLevel);
+    auto response = fixture.transport->Base(command);
+    response.logLevel = 1;
+    fixture.transport->Reply(std::move(response));
+    ExpectError([&] { Get(setting); }, ClientErrorCode::ProtocolError);
+    fixture.transport->WaitStopped();
 }
 
 void BrokenWriterAndProcessExitFailure() {
@@ -1087,12 +1184,22 @@ void BrokenWriterAndProcessExitFailure() {
     }
 }
 
-void HybridModelNegotiationAndLoading() {
+std::shared_ptr<InferenceModel> LoadModel(const std::shared_ptr<InferenceClient>& client,
+                                         const std::string& backend, InferenceModelOptions options = {}) {
+    if (backend == "qwen3_nf4") return client->LoadQwen3("C:\\fake-qwen3", options);
+    if (backend == "qwen35_nf4") return client->LoadQwen35("C:\\fake-hybrid", options);
+    if (backend == "qwen35_bf16") return client->LoadQwen35Bf16("C:\\fake-hybrid-bf16", options);
+    throw std::invalid_argument("Unknown fixture backend");
+}
+
+void HybridModelNegotiationAndLoading(bool bf16) {
+    const std::string backend = bf16 ? "qwen35_bf16" : "qwen35_nf4";
+    const std::string capability = bf16 ? "qwen35_bf16_bf16_kv" : "qwen35_nf4_bf16_kv";
     {
         // The default handshake must still work with a Qwen3-only v2 peer.
         auto transport = std::make_shared<ControlledTransport>();
         auto client = InferenceClient::Connect(transport, ExpectedIdentity());
-        ExpectError([&] { client->LoadQwen35("C:\\fake-hybrid"); },
+        ExpectError([&] { LoadModel(client, backend); },
                     ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
         Expect(Count(transport->History(), wire::Method::ModelLoad) == 0,
                "Unsupported Hybrid load consumed a wire command or model slot");
@@ -1110,13 +1217,13 @@ void HybridModelNegotiationAndLoading() {
         options.maxSequenceLength = 512;
         options.maxSessions = 2;
         options.maxSessionCacheBytes = 8192;
-        auto model = client->LoadQwen35("C:\\fake-hybrid", options);
+        auto model = LoadModel(client, backend, options);
         const auto command = transport->Take(wire::Method::ModelLoad);
-        Expect(command.backend == "qwen35_nf4" && command.kvType == "bf16" &&
+        Expect(command.backend == backend && command.kvType == "bf16" &&
                    command.maxSequenceLength == 512 && command.maxSessions == 2 && command.maxSessionCacheBytes == 8192,
                "Hybrid model load options changed in transit");
         const auto& capabilities = model->Info().capabilities;
-        Expect(std::find(capabilities.begin(), capabilities.end(), "qwen35_nf4_bf16_kv") != capabilities.end() &&
+        Expect(std::find(capabilities.begin(), capabilities.end(), capability) != capabilities.end() &&
                    std::find(capabilities.begin(), capabilities.end(), "qwen3_nf4_bf16_kv") == capabilities.end(),
                "Model capabilities describe a different backend");
         auto session = model->CreateSession();
@@ -1139,29 +1246,46 @@ void HybridModelNegotiationAndLoading() {
         response.worker.domainStatus = wire::DomainStatus::Ready;
         transport->Reply(std::move(response));
         auto client = Get(connected);
-        ExpectError([&] { client->LoadQwen35("C:\\fake-hybrid"); },
+        ExpectError([&] { LoadModel(client, backend); },
                     ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
         Expect(Count(transport->History(), wire::Method::ModelLoad) == 0,
                "Client used hello instead of the configured model capabilities");
         auto model = client->LoadQwen3("C:\\fake-qwen3");
         client->Shutdown(2s);
     }
+    if (bf16) {
+        // A Worker with Hybrid NF4 support still cannot load BF16 weights.
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        hello.capabilities.erase(std::remove(hello.capabilities.begin(), hello.capabilities.end(), capability),
+                                 hello.capabilities.end());
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        ExpectError([&] { LoadModel(client, backend); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::ModelLoad) == 0,
+               "BF16 load was sent to an NF4-only Worker");
+        auto model = client->LoadQwen35("C:\\fake-hybrid");
+        Expect(client->Query().accepting && !transport->Forced(), "Rejected BF16 load broke NF4 compatibility");
+        client->Shutdown(2s);
+    }
 }
 
 void ModelCapabilityMismatchAndConfigureConsistency() {
-    for (const bool hybrid : {false, true}) {
+    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
         auto hello = Hello();
         hello.capabilities = wire::supported_capabilities();
         auto transport = std::make_shared<ControlledTransport>(hello);
         auto client = InferenceClient::Connect(transport, ExpectedIdentity());
         transport->Hold(wire::Method::ModelLoad);
         auto loaded = std::async(std::launch::async, [&] {
-            return hybrid ? client->LoadQwen35("C:\\fake-hybrid") : client->LoadQwen3("C:\\fake-qwen3");
+            return LoadModel(client, backend);
         });
         const auto command = transport->Take(wire::Method::ModelLoad);
         auto response = transport->Base(command);
         response.model = {1, 2048, command.maxSequenceLength, 4096,
-            {hybrid ? "qwen3_nf4_bf16_kv" : "qwen35_nf4_bf16_kv", "token_requests_v1", "session_lifecycle_v1"}};
+            {backend == "qwen35_nf4" ? "qwen35_bf16_bf16_kv" : "qwen35_nf4_bf16_kv",
+             "token_requests_v1", "session_lifecycle_v1"}};
         transport->Reply(std::move(response));
         ExpectError([&] { Get(loaded); }, ClientErrorCode::ProtocolError);
         transport->WaitStopped();
@@ -1180,6 +1304,421 @@ void ModelCapabilityMismatchAndConfigureConsistency() {
         ExpectError([&] { Get(connected); }, ClientErrorCode::ProtocolError);
         Expect(transport->Forced(), "Configure published a capability absent from hello");
     }
+}
+
+void ExtendedGenerationNegotiation() {
+    InferenceClientOptions options;
+    options.limits.maxGeneratedTokens = 2048;
+    {
+        auto transport = std::make_shared<ControlledTransport>();
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::WorkerConfigure) == 0 && transport->Stopped(),
+               "Extended configuration reached an old peer or leaked its connection");
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    for (const bool changeLimit : {false, true}) {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        transport->Hold(wire::Method::WorkerConfigure);
+        auto connected = std::async(std::launch::async, [&] {
+            return InferenceClient::Connect(transport, ExpectedIdentity(), options);
+        });
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        Expect(command.limits.maxGeneratedTokens == 2048 &&
+                   std::find(command.requiredCapabilities.begin(), command.requiredCapabilities.end(), "extended_generation_v1") != command.requiredCapabilities.end(),
+               "Explicit generation limit lost its required capability");
+        auto response = transport->Base(command);
+        response.limits = command.limits;
+        response.capabilities = hello.capabilities;
+        response.worker.domainStatus = wire::DomainStatus::Ready;
+        if (changeLimit) response.limits.maxGeneratedTokens = 1024;
+        transport->Reply(std::move(response));
+        if (changeLimit) {
+            ExpectError([&] { Get(connected); }, ClientErrorCode::ProtocolError);
+            Expect(transport->Stopped(), "Silently reduced limits did not close the connection");
+        } else {
+            auto client = Get(connected);
+            client->Shutdown(2s);
+        }
+    }
+    auto transport = std::make_shared<ControlledTransport>(hello);
+    auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+    const auto ordinary = transport->Take(wire::Method::WorkerConfigure);
+    Expect(ordinary.limits.maxGeneratedTokens == 1024 &&
+               std::find(ordinary.requiredCapabilities.begin(), ordinary.requiredCapabilities.end(), "extended_generation_v1") == ordinary.requiredCapabilities.end(),
+           "Ordinary callers changed their configuration contract");
+    client->Shutdown(2s);
+}
+
+void DecodeBatchingNegotiationAndEcho() {
+    for (uint32_t size : {uint32_t{0}, uint32_t{5}, uint32_t{0xffffffff}}) {
+        auto transport = std::make_shared<ControlledTransport>();
+        InferenceClientOptions options;
+        options.maxDecodeBatchSize = size;
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+        Expect(transport->History().empty(), "Invalid decode batch size consumed a wire command");
+    }
+    {
+        auto transport = std::make_shared<ControlledTransport>();
+        InferenceClientOptions options;
+        options.limits.maxActiveRequests = 1;
+        options.maxDecodeBatchSize = 2;
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+        Expect(transport->History().empty(), "Decode batching bypassed the selected active bound");
+    }
+    {
+        auto transport = std::make_shared<ControlledTransport>();
+        InferenceClientOptions options;
+        options.maxDecodeBatchSize = 2;
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::WorkerConfigure) == 0 && transport->Stopped(),
+               "Batching configuration reached an old Worker");
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    for (uint32_t size : {uint32_t{1}, uint32_t{2}, uint32_t{4}}) {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        InferenceClientOptions options;
+        options.maxDecodeBatchSize = size;
+        // Explicit callers must not receive a duplicate required capability.
+        if (size == 4) options.requiredCapabilities.emplace_back("continuous_batching_v1");
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity(), options);
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        Expect(command.maxDecodeBatchSize == size &&
+               std::count(command.requiredCapabilities.begin(), command.requiredCapabilities.end(),
+                          "continuous_batching_v1") == (size > 1 ? 1 : 0),
+               "Decode batching opt-in or its required capability changed");
+        Expect(command.limits.maxActiveRequests == options.limits.maxActiveRequests &&
+               command.limits.maxOutstandingTokens == options.limits.maxOutstandingTokens &&
+               command.limits.maxSessions == options.limits.maxSessions,
+               "Decode batching silently widened admission limits");
+        client->Shutdown(2s);
+        Expect(!transport->Forced(), "Batching configuration prevented graceful shutdown");
+    }
+    for (const auto sizes : {std::pair<uint32_t, uint32_t>{4, 1}, {2, 3}, {1, 2}}) {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        transport->Hold(wire::Method::WorkerConfigure);
+        InferenceClientOptions options;
+        options.maxDecodeBatchSize = sizes.first;
+        auto connected = std::async(std::launch::async, [&] {
+            return InferenceClient::Connect(transport, ExpectedIdentity(), options);
+        });
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        auto response = transport->Base(command);
+        response.limits = command.limits;
+        response.capabilities = hello.capabilities;
+        response.maxDecodeBatchSize = sizes.second;
+        response.worker.domainStatus = wire::DomainStatus::Ready;
+        transport->Reply(std::move(response));
+        ExpectError([&] { Get(connected); }, ClientErrorCode::ProtocolError);
+        Expect(transport->Stopped(), "Changed or unsolicited batch acknowledgement did not close transport");
+    }
+    {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        transport->Hold(wire::Method::WorkerConfigure);
+        InferenceClientOptions options;
+        options.maxDecodeBatchSize = 2;
+        auto connected = std::async(std::launch::async, [&] {
+            return InferenceClient::Connect(transport, ExpectedIdentity(), options);
+        });
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        auto response = transport->Base(command);
+        response.limits = command.limits;
+        response.capabilities = wire::default_capabilities();
+        response.worker.domainStatus = wire::DomainStatus::Ready;
+        transport->Reply(std::move(response));
+        ExpectError([&] { Get(connected); }, ClientErrorCode::ProtocolError);
+        Expect(transport->Stopped(), "Configure removed the required batching capability");
+    }
+}
+
+void RequestPolicyNegotiation() {
+    for (const std::string missing : {"host_sampling_v1", "thinking_budget_close_once_v1", "legacy_prefill_logits_v1"}) {
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto& capabilities = hello.capabilities;
+        capabilities.erase(std::remove(capabilities.begin(), capabilities.end(), missing), capabilities.end());
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        auto model = client->LoadQwen3("C:\\fake-qwen3");
+        auto session = model->CreateSession();
+        InferenceRequestOptions options;
+        options.forceHostSampling = true;
+        options.legacyPrefillLogits = true;
+        options.thinkingBudget = wire::ThinkingBudgetOptions{2, 10, 11, true, {11, 3}, true};
+        ExpectError([&] { session->Submit({1}, options); }, ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::RequestSubmit) == 0 && client->Query().accepting,
+               "Unnegotiated policy reached the Worker or closed the connection");
+        client->Shutdown(2s);
+    }
+}
+
+void PrefillNegotiationAndRouting() {
+    {
+        Fixture oldPeer;
+        ExpectError([&] { oldPeer.sessions[0]->Prefill({1, 2}, 2); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(oldPeer.transport->History(), wire::Method::RequestSubmit) == 0 && oldPeer.client->Query().accepting,
+               "Unnegotiated replay reached the Worker or broke the connection");
+        oldPeer.Close();
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    auto transport = std::make_shared<ControlledTransport>(hello);
+    auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+    auto model = client->LoadQwen3("C:\\fake-qwen3");
+    auto session = model->CreateSession();
+    auto submitting = std::async(std::launch::async, [&] { return session->Prefill({1, 2, 3}, 2); });
+    const auto command = transport->Take(wire::Method::RequestSubmit);
+    Expect(command.prefillOnly && command.generation.maxNewTokens == 0 && command.prefillChunkSize == 2 &&
+               command.promptIds == std::vector<int32_t>({1, 2, 3}), "Replay options changed before sending");
+    transport->ReplyHeld(command);
+    auto request = Get(submitting);
+    transport->Finish(command, 0);
+    const auto event = ReadTerminal(request);
+    Expect(event.sequence == 1 && event.summary.generatedTokens == 0 &&
+               event.summary.promptTokensProcessed == 3 && event.summary.endReason == wire::EndReason::Length,
+           "Zero-token request did not deliver exactly its own terminal");
+    client->Shutdown(2s);
+    Expect(!transport->Forced(), "Replay prevented graceful shutdown");
+}
+
+void ThinkingBudgetNegotiationAndRouting() {
+    InferenceRequestOptions options;
+    options.generation.maxNewTokens = 3;
+    options.thinkingBudget = wire::ThinkingBudgetOptions{2, 10, 11, true, {11, 3}};
+    {
+        Fixture oldPeer;
+        ExpectError([&] { oldPeer.sessions[0]->Submit({1}, options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(oldPeer.transport->History(), wire::Method::RequestSubmit) == 0 && oldPeer.client->Query().accepting,
+               "Unnegotiated thinking budget reached the Worker or broke the connection");
+        oldPeer.Close();
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    auto transport = std::make_shared<ControlledTransport>(hello);
+    auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+    auto model = client->LoadQwen3("C:\\fake-qwen3");
+    auto session = model->CreateSession();
+    auto invalid = options;
+    invalid.thinkingBudget->openTokenId = static_cast<int32_t>(model->Info().vocabSize);
+    ExpectError([&] { session->Submit({1}, invalid); }, ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+    Expect(Count(transport->History(), wire::Method::RequestSubmit) == 0, "Invalid thinking token reached the Worker");
+    auto submitting = std::async(std::launch::async, [&] { return session->Submit({1}, options); });
+    const auto command = transport->Take(wire::Method::RequestSubmit);
+    Expect(command.thinkingBudget && command.thinkingBudget->maxTokens == 2 &&
+               command.thinkingBudget->promptOpensThink && command.thinkingBudget->closeTokenIds == std::vector<int32_t>({11, 3}),
+           "Thinking metadata was dropped or changed before sending");
+    transport->ReplyHeld(command);
+    auto request = Get(submitting);
+    transport->Token(command, 1, 101);
+    transport->Finish(command, 1); // Length may finish early when a complete close cannot fit.
+    Expect(ReadToken(request, 1).tokenId == 101 && ReadTerminal(request).summary.endReason == wire::EndReason::Length,
+           "Early budget length completion lost its own terminal");
+    client->Shutdown(2s);
+    Expect(!transport->Forced(), "Budget extension prevented graceful shutdown");
+}
+
+void AllocationLimitsNegotiationAndAcknowledgement() {
+    InferenceModelOptions options;
+    options.allocationLimits = wire::AllocationLimits{1024 * 1024, 65536, 8192};
+    {
+        auto transport = std::make_shared<ControlledTransport>();
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        ExpectError([&] { client->LoadQwen3("C:\\fake-qwen3", options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::ModelLoad) == 0 && client->Query().accepting,
+               "Unnegotiated allocation limits reached the Worker or broke the connection");
+        client->Shutdown(2s);
+    }
+    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        auto model = LoadModel(client, backend, options);
+        const auto command = transport->Take(wire::Method::ModelLoad);
+        Expect(command.allocationLimits && *command.allocationLimits == *options.allocationLimits &&
+               model->Info().memory && model->Info().memory->limits == *options.allocationLimits,
+               "Allocation limits changed across the command/result route");
+        auto session = model->CreateSession();
+        Expect(session->Query().contextLength == 0, "Budgeted model could not create a session");
+        client->Shutdown(2s);
+    }
+    for (bool omit : {false, true}) {
+        auto hello = Hello();
+        hello.capabilities = wire::supported_capabilities();
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        transport->Hold(wire::Method::ModelLoad);
+        auto loading = std::async(std::launch::async, [&] { return client->LoadQwen3("C:\\fake-qwen3", options); });
+        const auto command = transport->Take(wire::Method::ModelLoad);
+        auto response = transport->Base(command);
+        response.model = {1, 2048, command.maxSequenceLength, 4096,
+            {"qwen3_nf4_bf16_kv", "token_requests_v1", "session_lifecycle_v1", "allocation_limits_v1"}};
+        if (!omit) {
+            response.model.memory = wire::ModelMemoryInfo{*options.allocationLimits, 0, 0};
+            ++response.model.memory->limits.maxDeviceBytes;
+        }
+        transport->Reply(std::move(response));
+        ExpectError([&] { Get(loading); }, ClientErrorCode::ProtocolError);
+        transport->WaitStopped();
+        Expect(transport->Forced(), "Worker silently omitted or changed requested allocation limits");
+    }
+}
+
+void SessionContextNegotiationAndResponseValidation() {
+    {
+        Fixture oldPeer;
+        const auto before = oldPeer.transport->History().size();
+        ExpectError([&] { oldPeer.sessions[0]->Reset(); }, ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        ExpectError([&] { oldPeer.sessions[0]->Truncate(0); }, ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(oldPeer.transport->History().size() == before, "Unsupported context operations emitted RPCs");
+        Expect(oldPeer.sessions[0]->Query().contextLength == 0, "Capability rejection broke old query");
+        oldPeer.Close();
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    {
+        Fixture fixture({}, 1, hello);
+        auto session = fixture.sessions[0];
+        ExpectError([&] { session->Truncate(UINT32_MAX); }, ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+        Expect(Count(fixture.transport->History(), wire::Method::SessionTruncate) == 0,
+               "Unrepresentable truncate target reached the peer");
+        fixture.transport->Hold(wire::Method::SessionTruncate);
+        auto truncate = std::async(std::launch::async, [&] { return session->Truncate(9); });
+        auto command = fixture.transport->Take(wire::Method::SessionTruncate);
+        Expect(command.sessionId == session->Info().sessionId && command.contextLength == 9,
+               "Truncate changed Session or requested length");
+        auto response = fixture.transport->Base(command);
+        response.session = session->Info();
+        response.session.contextLength = 4; // Independent peer checkpoint, below the target.
+        fixture.transport->Reply(response);
+        Expect(Get(truncate).contextLength == 4, "Client replaced actual checkpoint with requested length");
+        Expect(session->Reset().contextLength == 0 && session->Query().contextLength == 0, "Reset/query disagreed");
+        fixture.Close();
+    }
+    // Payloads are individually valid; only the correlation with the command
+    // reveals the malicious identity, cache metadata or restoration length.
+    for (unsigned mutation = 0; mutation < 5; ++mutation) {
+        Fixture fixture({}, 1, hello);
+        auto session = fixture.sessions[0];
+        fixture.transport->Hold(wire::Method::SessionTruncate);
+        auto truncate = std::async(std::launch::async, [&] { return session->Truncate(4); });
+        const auto command = fixture.transport->Take(wire::Method::SessionTruncate);
+        auto response = fixture.transport->Base(command);
+        response.session = session->Info();
+        response.session.contextLength = 4;
+        switch (mutation) {
+        case 0: ++response.session.sessionId; break;
+        case 1: ++response.session.modelId; break;
+        case 2: ++response.session.capacity; break;
+        case 3: ++response.session.cacheBytes; break;
+        case 4: response.session.contextLength = 5; break;
+        }
+        fixture.transport->Reply(response);
+        ExpectError([&] { Get(truncate); }, ClientErrorCode::ProtocolError);
+        fixture.transport->WaitStopped();
+        Expect(fixture.transport->Forced(), "Invalid context response left the connection usable");
+    }
+}
+
+void SessionContextTimeoutAndRelease() {
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    {
+        Fixture fixture({}, 2, hello);
+        fixture.transport->Hold(wire::Method::SessionReset);
+        ExpectError([&] { fixture.sessions[0]->Reset(20ms); }, ClientErrorCode::Timeout);
+        const auto reset = fixture.transport->Take(wire::Method::SessionReset);
+        auto [peer, command] = fixture.Submit(1, 1);
+        fixture.transport->Token(command, 1);
+        fixture.transport->Finish(command, 1);
+        ReadToken(peer, 1);
+        ReadTerminal(peer);
+        fixture.Acked(peer, 2);
+        fixture.transport->ProcessedResponse(fixture.transport->ReplyHeld(reset));
+        Expect(fixture.sessions[0]->Query().contextLength == 0 && !fixture.transport->Stopped(),
+               "Late reset response poisoned independent requests or query");
+        fixture.Close();
+    }
+    {
+        Fixture fixture({}, 1, hello);
+        fixture.transport->Hold(wire::Method::SessionReset);
+        auto session = fixture.sessions[0];
+        auto resetting = std::async(std::launch::async, [&] { return session->Reset(); });
+        const auto reset = fixture.transport->Take(wire::Method::SessionReset);
+        session->Release();
+        fixture.model->Release();
+        fixture.client.reset();
+        Expect(Count(fixture.transport->History(), wire::Method::WorkerShutdown) == 0,
+               "Last-parent release dropped the pending context operation owner");
+        fixture.transport->ReplyHeld(reset);
+        Expect(Get(resetting).contextLength == 0, "Pending reset failed when its parent was released");
+        fixture.transport->WaitStopped();
+        Expect(!fixture.transport->Forced(), "Pending reset prevented graceful last-owner shutdown");
+        ExpectError([&] { session->Reset(); }, ClientErrorCode::InvalidHandle);
+    }
+}
+
+void SessionContextPreservesControlReserve() {
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    InferenceClientOptions options;
+    options.limits.maxPendingCommands = 3;
+    options.limits.reservedControlCommands = 1;
+    Fixture fixture(options, 2, hello);
+    fixture.transport->Hold(wire::Method::SessionReset);
+    fixture.transport->Hold(wire::Method::SessionTruncate);
+    auto first = std::async(std::launch::async, [&] { return fixture.sessions[0]->Reset(); });
+    const auto reset = fixture.transport->Take(wire::Method::SessionReset);
+    auto second = std::async(std::launch::async, [&] { return fixture.sessions[1]->Truncate(0); });
+    const auto truncate = fixture.transport->Take(wire::Method::SessionTruncate);
+    ExpectError([&] { fixture.sessions[0]->Reset(); }, ClientErrorCode::ResourceLimit);
+    Expect(fixture.sessions[0]->Query().sessionId == fixture.sessions[0]->Info().sessionId,
+           "Queued mutations consumed the reserved control capacity");
+    fixture.transport->ReplyHeld(reset);
+    fixture.transport->ReplyHeld(truncate);
+    Expect(Get(first).contextLength == 0 && Get(second).contextLength == 0, "Admitted context calls did not complete");
+    fixture.Close();
+}
+
+void RuntimeMemoryCapabilityAndControlReserve() {
+    {
+        Fixture legacy;
+        ExpectError([&] { legacy.client->QueryMemory(); }, ClientErrorCode::RemoteError,
+                    wire::ErrorCode::UnsupportedCapability);
+        Expect(legacy.client->Query().accepting, "Optional memory query broke an old Worker");
+        legacy.Close();
+    }
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    InferenceClientOptions options;
+    options.limits.maxPendingCommands = 3;
+    options.limits.reservedControlCommands = 1;
+    Fixture fixture(options, 1, hello);
+    fixture.transport->Hold(wire::Method::WorkerMemoryQuery);
+    auto first = std::async(std::launch::async, [&] { return fixture.client->QueryMemory(); });
+    const auto firstCommand = fixture.transport->Take(wire::Method::WorkerMemoryQuery);
+    auto second = std::async(std::launch::async, [&] { return fixture.client->QueryMemory(); });
+    const auto secondCommand = fixture.transport->Take(wire::Method::WorkerMemoryQuery);
+    ExpectError([&] { fixture.client->QueryMemory(); }, ClientErrorCode::ResourceLimit);
+    Expect(fixture.client->Query().accepting, "Memory queries consumed reserved control capacity");
+    fixture.transport->ReplyHeld(firstCommand);
+    auto busy = fixture.transport->Base(secondCommand);
+    busy.runtimeMemory = {wire::RuntimeMemoryState::Busy, std::nullopt};
+    fixture.transport->Reply(std::move(busy));
+    const auto ready = Get(first), unavailable = Get(second);
+    Expect(ready.state == wire::RuntimeMemoryState::Ready && ready.usage &&
+           ready.usage->peakDeviceBytes == (uint64_t{1} << 53) + 1, "Memory RPC lost its exact counters");
+    Expect(unavailable.state == wire::RuntimeMemoryState::Busy && !unavailable.usage,
+           "Busy RPC published a zero or stale snapshot");
+    fixture.Close();
 }
 
 void HandshakeAndReusedObjectIds() {
@@ -1236,9 +1775,22 @@ int main() {
         {"domain fault preserves drain", DomainFaultAllowsDrainAndStopsAdmission},
         {"shared shutdown and abandoned delivery", ShutdownDiscardsAndHasOneSharedResult},
         {"shutdown event fence and EOF races", ShutdownCrossPipeFenceAndEof},
+        {"bounded log consumption and independent inference", BoundedLogsAndIndependentInference},
+        {"Worker log capability and exact level acknowledgement", WorkerLogLevelNegotiationAndEcho},
         {"blocked writer and abnormal process exit", BrokenWriterAndProcessExitFailure},
-        {"Hybrid model negotiation and loading", HybridModelNegotiationAndLoading},
+        {"Hybrid NF4 model negotiation and loading", [] { HybridModelNegotiationAndLoading(false); }},
+        {"Hybrid BF16 model negotiation and loading", [] { HybridModelNegotiationAndLoading(true); }},
         {"model capability mismatch and configure consistency", ModelCapabilityMismatchAndConfigureConsistency},
+        {"allocation limits negotiation and acknowledgement", AllocationLimitsNegotiationAndAcknowledgement},
+        {"thinking budget negotiation and routing", ThinkingBudgetNegotiationAndRouting},
+        {"request policy capability rejection before RPC", RequestPolicyNegotiation},
+        {"extended generation old-peer rejection and exact configure echo", ExtendedGenerationNegotiation},
+        {"decode batching capability, admission bound and exact configure echo", DecodeBatchingNegotiationAndEcho},
+        {"prefill-only negotiation and zero-token terminal routing", PrefillNegotiationAndRouting},
+        {"Session context capability and correlated response validation", SessionContextNegotiationAndResponseValidation},
+        {"Session context late response and pending owner release", SessionContextTimeoutAndRelease},
+        {"Session mutations preserve reserved control admission", SessionContextPreservesControlReserve},
+        {"runtime memory capability, exact response and reserved control", RuntimeMemoryCapabilityAndControlReserve},
         {"handshake rejection and stale object IDs", HandshakeAndReusedObjectIds},
     };
     for (const auto& test : tests) {

@@ -223,7 +223,8 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
             // Tensor allocation/upload uses SYCL here; it does not execute
             // oneDNN primitives. Keep device failures visible to the model
             // lifecycle boundary instead of returning a partial weight set.
-            aila::device_failure::RecoverNonDeviceExceptions<sycl::exception>([&] {
+            aila::device_failure::RecoverNonDeviceExceptions<
+                sycl::exception, aila::memory::AllocationLimitExceeded>([&] {
                 const size_t bytes = meta.byte_offset_end - meta.byte_offset_start;
                 if (bytes == 0) {
                     // Zero-byte tensors are metadata placeholders (e.g. bnb
@@ -246,6 +247,8 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
                       (fail > 0 ? (" , " + std::to_string(fail) + " failed").c_str() : ""));
         AILA_LOG_INFO("[SafeTensors] Skipped %d zero-byte metadata tensors", skipped);
 
+    } catch (const aila::memory::AllocationLimitExceeded&) {
+        throw;
     } catch (const std::exception& e) {
         AILA_LOG_ERROR("[SafeTensors] Load failed: %s", e.what());
         throw;

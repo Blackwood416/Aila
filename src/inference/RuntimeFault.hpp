@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inference/Session.hpp"
+#include "memory/AllocationBudget.hpp"
 
 #include <algorithm>
 #include <array>
@@ -83,6 +84,10 @@ void RunDeviceLifecycle(RuntimeFaultRecord& fault, Work&& work, Drain&& drain) {
         fault.DrainNoThrow(drain);
         fault.CheckUsable();
         throw;
+    } catch (const aila::memory::AllocationLimitExceeded& error) {
+        fault.DrainNoThrow(drain);
+        fault.CheckUsable();
+        throw Error(ErrorCode::ResourceLimit, error.what());
     } catch (const std::invalid_argument& error) {
         fault.DrainNoThrow(drain);
         fault.CheckUsable();

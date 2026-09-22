@@ -261,7 +261,8 @@ void TestLittleEndianTokens() {
 void TestAllCommands() {
     const wire::Method methods[]{wire::Method::WorkerConfigure, wire::Method::WorkerQuery, wire::Method::ModelLoad,
         wire::Method::SessionCreate, wire::Method::SessionQuery, wire::Method::RequestSubmit, wire::Method::RequestCancel,
-        wire::Method::RequestQuery, wire::Method::RequestAck, wire::Method::HandleRelease, wire::Method::WorkerShutdown};
+        wire::Method::RequestQuery, wire::Method::RequestAck, wire::Method::HandleRelease, wire::Method::WorkerShutdown,
+        wire::Method::SessionReset, wire::Method::SessionTruncate, wire::Method::WorkerSetLogLevel, wire::Method::WorkerMemoryQuery};
     for (const auto method : methods) {
         const auto input = Command(method);
         const Frame frame = Make(input);
@@ -281,6 +282,56 @@ void TestAllCommands() {
     }
 }
 
+void TestRequestPolicyExtensions() {
+    auto command = Command(wire::Method::RequestSubmit);
+    command.thinkingBudget = wire::ThinkingBudgetOptions{2, 10, 11, true, {11, 3}, true};
+    command.forceHostSampling = true;
+    command.legacyPrefillLogits = true;
+    const auto frame = Make(command);
+    wire::Command parsed;
+    wire::ValidationError error;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.forceHostSampling && parsed.legacyPrefillLogits && parsed.thinkingBudget && parsed.thinkingBudget->closeOnce,
+           "Request policies changed in transit");
+    for (const std::string field : {"closeOnce", "hostSampling", "legacyPrefillLogits"}) {
+        for (const char* replacement : {"false", "null", "1", "\"true\""}) {
+            auto bad = frame;
+            Replace(bad.header.payload_json, "\"" + field + "\":true", "\"" + field + "\":" + replacement);
+            Expect(!wire::parse_command(bad, parsed, error), "Invalid request policy value was accepted");
+        }
+    }
+}
+
+void TestPrefillOnlyExtension() {
+    auto command = Command(wire::Method::RequestSubmit);
+    Expect(Make(command).header.payload_json.find("prefillOnly") == std::string::npos,
+           "Ordinary generation changed its wire schema");
+    command.prefillOnly = true;
+    command.generation.maxNewTokens = 0;
+    command.stopTokenIds.clear();
+    const auto frame = Make(command);
+    wire::Command parsed;
+    wire::ValidationError error;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.prefillOnly && parsed.generation.maxNewTokens == 0 && parsed.promptIds == command.promptIds,
+           "Replay mode or prefix changed in transit");
+    for (const char* replacement : {"false", "null", "1", "\"true\""}) {
+        auto bad = frame;
+        Replace(bad.header.payload_json, "\"prefillOnly\":true", std::string("\"prefillOnly\":") + replacement);
+        Expect(!wire::parse_command(bad, parsed, error), "Invalid replay mode was accepted");
+    }
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        auto bad = command;
+        if (invalid == 0) bad.generation.maxNewTokens = 1;
+        if (invalid == 1) bad.prefillOnly = false;
+        if (invalid == 2) bad.promptIds.clear();
+        if (invalid == 3) bad.stopTokenIds = {9};
+        if (invalid == 4) bad.thinkingBudget = wire::ThinkingBudgetOptions{1, 10, 11, true, {11}};
+        Frame ignored;
+        Expect(!wire::make_command(bad, ignored, error), "Contradictory replay options were encoded");
+    }
+}
+
 void TestModelCapabilities() {
     const std::vector<std::string> legacy{
         "token_requests_v1", "qwen3_nf4_bf16_kv", "session_lifecycle_v1", "multi_inflight_v1",
@@ -288,11 +339,26 @@ void TestModelCapabilities() {
     Expect(wire::default_capabilities() == legacy, "Legacy Qwen3 required capabilities changed");
     auto current = legacy;
     current.emplace_back("qwen35_nf4_bf16_kv");
-    Expect(wire::supported_capabilities() == current, "Worker capabilities omitted Hybrid or changed Qwen3");
+    current.emplace_back("allocation_limits_v1");
+    const auto nf4Only = current;
+    current.emplace_back("qwen35_bf16_bf16_kv");
+    current.emplace_back("thinking_budget_v1");
+    current.emplace_back("session_context_v1");
+    current.emplace_back("prefill_only_v1");
+    current.emplace_back("thinking_budget_close_once_v1");
+    current.emplace_back("host_sampling_v1");
+    current.emplace_back("legacy_prefill_logits_v1");
+    current.emplace_back("extended_generation_v1");
+    current.emplace_back("worker_log_control_v1");
+    current.emplace_back("runtime_memory_v1");
+    current.emplace_back("continuous_batching_v1");
+    Expect(wire::supported_capabilities() == current, "Worker capabilities omitted a backend or changed Qwen3");
     Expect(wire::model_capability("qwen3_nf4") == "qwen3_nf4_bf16_kv" &&
-           wire::model_capability("qwen35_nf4", "bf16") == "qwen35_nf4_bf16_kv",
+           wire::model_capability("qwen35_nf4", "bf16") == "qwen35_nf4_bf16_kv" &&
+           wire::model_capability("qwen35_bf16", "bf16") == "qwen35_bf16_bf16_kv",
            "Backend capability mapping was incorrect");
     Expect(wire::model_capability("qwen35_nf4", "fp8").empty() &&
+           wire::model_capability("qwen35_bf16", "fp8").empty() &&
            wire::model_capability("qwen3_nf4", "BF16").empty() &&
            wire::model_capability("future_nf4").empty(), "Unknown backend or KV type was advertised");
 
@@ -302,7 +368,11 @@ void TestModelCapabilities() {
            error.code == wire::ErrorCode::UnsupportedCapability, "Legacy Worker accepted Hybrid requirements");
     Success(wire::negotiate({}, legacy, {}, current, selected, error), error);
     Success(wire::negotiate({}, {"qwen35_nf4_bf16_kv"}, {}, current, selected, error), error);
-    for (const char* backend : {"qwen3_nf4", "qwen35_nf4"}) {
+    Expect(!wire::negotiate({}, {"qwen35_bf16_bf16_kv"}, {}, nf4Only, selected, error) &&
+           error.code == wire::ErrorCode::UnsupportedCapability, "NF4 Worker accepted BF16 weights");
+    Success(wire::negotiate({}, nf4Only, {}, current, selected, error), error);
+    Success(wire::negotiate({}, {"qwen35_bf16_bf16_kv"}, {}, current, selected, error), error);
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
         auto command = Command(wire::Method::ModelLoad);
         command.backend = backend;
         Frame sent = Make(command);
@@ -314,7 +384,7 @@ void TestModelCapabilities() {
         Success(wire::parse_command(received, parsed, error), error);
         Expect(parsed.backend == backend && parsed.kvType == "bf16" &&
                received.header.protocol == 2 && received.header.abi == 1,
-               "NF4 model command round trip changed backend or wire version");
+               "Model command round trip changed backend or wire version");
 
         auto invalid = sent;
         Replace(invalid.header.payload_json, "\"bf16\"", "\"fp8\"");
@@ -327,6 +397,52 @@ void TestModelCapabilities() {
     wire::Command parsed;
     Expect(!wire::parse_command(invalid, parsed, error) && error.code == wire::ErrorCode::UnsupportedModel,
            "Unknown model backend lost local UnsupportedModel semantics");
+}
+
+void TestExtendedGenerationLimits() {
+    auto configure = Command(wire::Method::WorkerConfigure);
+    configure.limits.maxGeneratedTokens = 2048;
+    wire::ValidationError error;
+    Frame frame;
+    Expect(!wire::make_command(configure, frame, error), "Larger generation limit did not require its capability");
+    configure.requiredCapabilities.emplace_back("extended_generation_v1");
+    frame = Make(configure);
+    wire::Command parsed;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.limits.maxGeneratedTokens == 2048 && parsed.limits.maxSessions == 4 &&
+               parsed.limits.maxOutstandingTokens == 32768 && parsed.limits.tokenWindow == 32,
+           "Generation extension changed unrelated reservations");
+    Expect(!wire::validate_limits(configure.limits, error), "Default validation silently expanded its limits");
+    auto reduced = wire::hard_limits();
+    reduced.maxGeneratedTokens = 512;
+    Expect(wire::configure_limits_ceiling(reduced, configure.requiredCapabilities).maxGeneratedTokens == 512,
+           "Extension bypassed a lower offered ceiling");
+    configure.limits.maxGeneratedTokens = wire::kExtendedMaxGeneratedTokens;
+    Success(wire::make_command(configure, frame, error), error);
+    ++configure.limits.maxGeneratedTokens;
+    Expect(!wire::make_command(configure, frame, error), "Extended limit overflow was accepted");
+
+    auto limits = wire::hard_limits();
+    limits.maxGeneratedTokens = 2048;
+    auto submit = Command(wire::Method::RequestSubmit);
+    submit.generation.maxNewTokens = 1100;
+    Success(wire::make_command(submit, frame, error, limits), error);
+    Success(wire::parse_command(frame, parsed, error, limits), error);
+    Expect(!wire::parse_command(frame, parsed, error), "Default connection accepted an extended request");
+    auto summary = CompleteSummary();
+    summary.generatedTokens = 1100;
+    summary.eventCount = 1101;
+    wire::Event event;
+    Success(wire::make_event(Terminal(summary), frame, error, limits), error);
+    Success(wire::parse_event(frame, event, error, limits), error);
+    Expect(event.sequence == 1101 && !wire::parse_event(frame, event, error),
+           "Terminal count was truncated or accepted outside negotiated limits");
+    auto ack = Command(wire::Method::RequestAck);
+    ack.consumedSequence = 1101;
+    Success(wire::make_command(ack, frame, error, limits), error);
+    Success(wire::parse_command(frame, parsed, error, limits), error);
+    Expect(parsed.consumedSequence == 1101 && !wire::parse_command(frame, parsed, error),
+           "Extended terminal ACK lost its bound");
 }
 
 void TestStrictCommandPayloads() {
@@ -406,11 +522,84 @@ wire::Response Result(wire::Method method) {
     return response;
 }
 
+void TestDecodeBatchingConfiguration() {
+    wire::ValidationError error;
+    auto command = Command(wire::Method::WorkerConfigure);
+    const auto ordinary = Make(command);
+    wire::Command parsed;
+    Success(wire::parse_command(ordinary, parsed, error), error);
+    Expect(parsed.maxDecodeBatchSize == 1 &&
+           ordinary.header.payload_json.find("max_decode_batch_size") == std::string::npos,
+           "Default configure changed the legacy payload");
+    command.requiredCapabilities.emplace_back("continuous_batching_v1");
+    for (uint32_t size = 1; size <= 4; ++size) {
+        command.maxDecodeBatchSize = size;
+        const auto frame = Make(command);
+        Success(wire::parse_command(frame, parsed, error), error);
+        Expect(parsed.maxDecodeBatchSize == size, "Decode batch bound changed in transit");
+    }
+    Frame frame;
+    for (uint32_t size : {uint32_t{0}, uint32_t{5}, (std::numeric_limits<uint32_t>::max)()}) {
+        command.maxDecodeBatchSize = size;
+        Expect(!wire::make_command(command, frame, error) && error.code == wire::ErrorCode::InvalidArgument,
+               "Out-of-range decode batch bound was encoded");
+    }
+    command.maxDecodeBatchSize = 3;
+    command.limits.maxActiveRequests = 2;
+    Expect(!wire::make_command(command, frame, error), "Decode batch bound exceeded active admission");
+    command.maxDecodeBatchSize = 2;
+    Success(wire::make_command(command, frame, error), error);
+    command.requiredCapabilities = wire::default_capabilities();
+    Expect(!wire::make_command(command, frame, error) && error.code == wire::ErrorCode::UnsupportedCapability,
+           "Decode batching was enabled without a required capability");
+    command.requiredCapabilities.emplace_back("continuous_batching_v1");
+    const auto valid = Make(command);
+    for (const char* value : {"0", "3", "5", "-1", "1.5", "true", "null", "\"2\"", "4294967296"}) {
+        auto bad = valid;
+        NumberField(bad.header.payload_json, "max_decode_batch_size", value);
+        parsed.maxDecodeBatchSize = 99;
+        Expect(!wire::parse_command(bad, parsed, error) && parsed.maxDecodeBatchSize == 99,
+               "Invalid configure batch field was accepted or partly changed output");
+    }
+    auto duplicate = valid;
+    Replace(duplicate.header.payload_json, "\"max_decode_batch_size\":2",
+            "\"max_decode_batch_size\":2,\"max_decode_batch_size\":2");
+    RejectCommand(duplicate);
+    auto unrelated = Make(Command(wire::Method::WorkerQuery));
+    unrelated.header.payload_json.insert(1, "\"max_decode_batch_size\":2,");
+    RejectCommand(unrelated);
+
+    auto result = Result(wire::Method::WorkerConfigure);
+    Success(wire::make_response(result, frame, error), error);
+    wire::Response response;
+    Success(wire::parse_response(frame, response, error), error);
+    Expect(response.maxDecodeBatchSize == 1 &&
+           frame.header.payload_json.find("max_decode_batch_size") == std::string::npos,
+           "Default configure response changed its legacy payload");
+    result.maxDecodeBatchSize = 2;
+    Expect(!wire::make_response(result, frame, error), "Batch response omitted its capability");
+    result.capabilities.emplace_back("continuous_batching_v1");
+    Success(wire::make_response(result, frame, error), error);
+    Success(wire::parse_response(frame, response, error), error);
+    Expect(response.maxDecodeBatchSize == 2, "Configure acknowledgement lost its batch bound");
+    for (const char* value : {"0", "5", "-1", "true", "null", "\"2\"", "4294967296"}) {
+        auto bad = frame;
+        NumberField(bad.header.payload_json, "max_decode_batch_size", value);
+        response.maxDecodeBatchSize = 99;
+        Expect(!wire::parse_response(bad, response, error) && response.maxDecodeBatchSize == 99 &&
+               error.code == wire::ErrorCode::ProtocolError,
+               "Invalid batch acknowledgement was accepted or partly changed output");
+    }
+    result.limits.maxActiveRequests = 1;
+    Expect(!wire::make_response(result, frame, error), "Batch acknowledgement exceeded selected active limit");
+}
+
 void TestResponsesAndHandshake() {
     wire::ValidationError error;
     const wire::Method methods[]{wire::Method::WorkerConfigure, wire::Method::WorkerQuery, wire::Method::ModelLoad,
         wire::Method::SessionCreate, wire::Method::SessionQuery, wire::Method::RequestCancel,
-        wire::Method::RequestQuery, wire::Method::RequestAck, wire::Method::HandleRelease, wire::Method::WorkerShutdown};
+        wire::Method::RequestQuery, wire::Method::RequestAck, wire::Method::HandleRelease, wire::Method::WorkerShutdown,
+        wire::Method::SessionReset, wire::Method::SessionTruncate, wire::Method::WorkerSetLogLevel, wire::Method::WorkerMemoryQuery};
     for (const auto method : methods) {
         auto response = Result(method);
         Frame frame;
@@ -433,7 +622,7 @@ void TestResponsesAndHandshake() {
     busy.session.contextLength = 10;
     Expect(!wire::make_response(busy, frame, error), "Busy session reported an exact length");
 
-    for (const char* backend : {"qwen3_nf4", "qwen35_nf4"}) {
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
         auto result = Result(wire::Method::ModelLoad);
         result.model.capabilities = {std::string(wire::model_capability(backend))};
         Success(wire::make_response(result, frame, error), error);
@@ -464,6 +653,36 @@ void TestResponsesAndHandshake() {
     Expect(!wire::parse_hello(malformed, parsed, error), "Unknown hard limit accepted");
     hello.supportedProtocols = {1, 2};
     Expect(!wire::make_hello(hello, frame, error), "v2 launch mode advertised a live protocol switch");
+}
+
+void TestWorkerLogControl() {
+    wire::ValidationError error;
+    for (uint32_t level = 0; level <= 3; ++level) {
+        auto command = Command(wire::Method::WorkerSetLogLevel);
+        command.logLevel = level;
+        wire::Command parsed;
+        Success(wire::parse_command(Make(command), parsed, error), error);
+        Expect(parsed.logLevel == level, "Log control level changed");
+        auto response = Result(wire::Method::WorkerSetLogLevel);
+        response.logLevel = level;
+        Frame frame;
+        Success(wire::make_response(response, frame, error), error);
+        wire::Response decoded;
+        Success(wire::parse_response(frame, decoded, error), error);
+        Expect(decoded.logLevel == level, "Log control response changed");
+    }
+    for (const char* value : {"-1", "4", "1.5", "null", "true", "4294967296"}) {
+        auto frame = Make(Command(wire::Method::WorkerSetLogLevel));
+        NumberField(frame.header.payload_json, "level", value);
+        RejectCommand(frame);
+    }
+    auto missing = Make(Command(wire::Method::WorkerSetLogLevel));
+    Replace(missing.header.payload_json, ",\"level\":1", "");
+    RejectCommand(missing);
+    auto response = Result(wire::Method::WorkerSetLogLevel);
+    response.logLevel = 4;
+    Frame output;
+    Expect(!wire::make_response(response, output, error), "Invalid applied log level accepted");
 }
 
 void TestAcceptedAndRejected() {
@@ -616,22 +835,215 @@ void TestTokenLogDomainAndQuery() {
     Expect(!wire::make_response(query, frame, error), "Query acknowledged events not sent");
 }
 
+void TestThinkingBudgetExtension() {
+    auto command = Command(wire::Method::RequestSubmit);
+    auto plain = Make(command);
+    Expect(plain.header.payload_json.find("thinkingBudget") == std::string::npos,
+           "Default submit changed its old-peer schema");
+    command.thinkingBudget = wire::ThinkingBudgetOptions{2, 10, 11, true, {11, 3}};
+    const auto frame = Make(command);
+    wire::Command parsed;
+    wire::ValidationError error;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.thinkingBudget && parsed.thinkingBudget->maxTokens == 2 &&
+               parsed.thinkingBudget->openTokenId == 10 && parsed.thinkingBudget->closeTokenId == 11 &&
+               parsed.thinkingBudget->promptOpensThink && parsed.thinkingBudget->closeTokenIds == std::vector<int32_t>({11, 3}),
+           "Thinking token metadata changed in transit");
+    for (const char* number : {"-1", "1.5", "4294967296", "true", "null"}) {
+        auto bad = frame;
+        NumberField(bad.header.payload_json, "maxTokens", number);
+        RejectCommand(bad);
+    }
+    for (const auto& edit : std::vector<std::pair<std::string, std::string>>{
+             {"\"openTokenId\":10", "\"openTokenId\":2147483648"},
+             {"\"closeTokenId\":11", "\"closeTokenId\":10"},
+             {"\"promptOpensThink\":true", "\"promptOpensThink\":1"},
+             {"\"closeTokenIds\":[11,3]", "\"closeTokenIds\":[]"},
+             {"\"closeTokenIds\":[11,3]", "\"closeTokenIds\":[3,11]"},
+             {"\"closeTokenIds\":[11,3]", "\"closeTokenIds\":[11,10]"},
+             {"\"closeTokenIds\":[11,3]", "\"closeTokenIds\":[11,9]"},
+             {"\"closeTokenIds\":[11,3]", "\"closeTokenIds\":[11,-1]"},
+             {"\"maxTokens\":2", "\"maxTokens\":2,\"maxTokens\":1"},
+             {"\"maxTokens\":2", "\"maxTokens\":2,\"extra\":true"}}) {
+        auto bad = frame;
+        Replace(bad.header.payload_json, edit.first, edit.second);
+        RejectCommand(bad);
+    }
+    command.thinkingBudget->closeTokenIds.resize(17, 3);
+    Expect(!wire::make_command(command, plain, error), "Unbounded thinking close sequence was encoded");
+    const auto defaults = wire::default_capabilities(), supported = wire::supported_capabilities();
+    Expect(std::find(defaults.begin(), defaults.end(), "thinking_budget_v1") == defaults.end() &&
+               std::find(supported.begin(), supported.end(), "thinking_budget_v1") != supported.end(),
+           "Thinking capability changed required defaults or was not offered");
+}
+
+void TestSessionContextExtension() {
+    const auto defaults = wire::default_capabilities(), supported = wire::supported_capabilities();
+    Expect(std::find(defaults.begin(), defaults.end(), "session_context_v1") == defaults.end() &&
+           std::find(supported.begin(), supported.end(), "session_context_v1") != supported.end(),
+           "Context capability changed required defaults or was not offered");
+    auto command = Command(wire::Method::SessionTruncate);
+    command.contextLength = 129;
+    auto frame = Make(command);
+    wire::Command parsed;
+    wire::ValidationError error;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.sessionId == command.sessionId && parsed.contextLength == 129,
+           "Truncate identity/target changed in transit");
+    for (const char* value : {"-1", "1.5", "2147483648", "4294967296", "true", "null"}) {
+        auto bad = frame;
+        NumberField(bad.header.payload_json, "contextLength", value);
+        RejectCommand(bad);
+    }
+    for (const char* field : {"\"contextLength\":129,\"contextLength\":129", "\"contextLength\":129,\"extra\":0"}) {
+        auto bad = frame;
+        Replace(bad.header.payload_json, "\"contextLength\":129", field);
+        RejectCommand(bad);
+    }
+    command.contextLength = UINT32_MAX;
+    Expect(!wire::make_command(command, frame, error), "Unrepresentable truncate length was encoded");
+    auto reset = Make(Command(wire::Method::SessionReset));
+    Replace(reset.header.payload_json, "\"sessionId\":7", "\"sessionId\":7,\"contextLength\":0");
+    RejectCommand(reset);
+    auto query = Make(Command(wire::Method::SessionQuery));
+    Expect(query.header.payload_json == Make(Command(wire::Method::SessionReset)).header.payload_json,
+           "Reset changed the identity-only payload shape");
+    for (const auto method : {wire::Method::SessionReset, wire::Method::SessionTruncate}) {
+        auto response = Result(method);
+        Success(wire::make_response(response, frame, error), error);
+        wire::Response received;
+        Success(wire::parse_response(frame, received, error), error);
+        Expect(received.session.contextLength == 0 && !received.session.busy, "Completed mutation lost actual length");
+        auto bad = frame;
+        NumberField(bad.header.payload_json, "contextLength", "null");
+        Expect(!wire::parse_response(bad, received, error), "Completed mutation allowed unknown length");
+        response.session.busy = true;
+        response.session.contextLength.reset();
+        Expect(!wire::make_response(response, frame, error), "Completed mutation claimed Busy");
+        response.session.busy = false;
+        response.session.contextLength = 5;
+        if (method == wire::Method::SessionReset)
+            Expect(!wire::make_response(response, frame, error), "Reset returned a nonzero length");
+        else Success(wire::make_response(response, frame, error), error);
+    }
+}
+
+void TestAllocationLimitsExtension() {
+    auto command = Command(wire::Method::ModelLoad);
+    Expect(Make(command).header.payload_json.find("allocationLimits") == std::string::npos,
+           "Legacy load schema acquired an unrequested extension");
+    command.allocationLimits = wire::AllocationLimits{1234567890123ULL, 4096, 20201472};
+    auto frame = Make(command);
+    wire::Command parsed;
+    wire::ValidationError error;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.allocationLimits && *parsed.allocationLimits == *command.allocationLimits,
+           "Allocation byte limits did not survive a round trip");
+    for (const char* invalid : {"-1", "1.5", "null", "18446744073709551616"}) {
+        auto bad = frame;
+        NumberField(bad.header.payload_json, "maxDeviceBytes", invalid);
+        RejectCommand(bad);
+    }
+    auto bad = frame;
+    Replace(bad.header.payload_json, "\"maxPinnedHostBytes\":4096", "\"maxPinnedHostBytes\":4096,\"maxPinnedHostBytes\":4096");
+    RejectCommand(bad);
+    bad = frame;
+    Replace(bad.header.payload_json, "\"maxPinnedHostBytes\":4096", "\"unknownBudget\":4096");
+    RejectCommand(bad);
+
+    auto result = Result(wire::Method::ModelLoad);
+    result.model.capabilities.emplace_back("allocation_limits_v1");
+    result.model.memory = wire::ModelMemoryInfo{*command.allocationLimits, 8192, 1024};
+    Success(wire::make_response(result, frame, error), error);
+    wire::Response received;
+    Success(wire::parse_response(frame, received, error), error);
+    Expect(received.model.memory && received.model.memory->limits == *command.allocationLimits &&
+           received.model.memory->residentDeviceBytes == 8192 && received.model.memory->sessionHostReservationBytes == 1024,
+           "Model allocation acknowledgement lost its accounting");
+    result.model.memory->limits.maxDeviceBytes = 8191;
+    Expect(!wire::make_response(result, frame, error), "Over-budget model residency was accepted");
+}
+
+void TestRuntimeMemory() {
+    auto command = Make(Command(wire::Method::WorkerMemoryQuery));
+    Expect(command.header.payload_json == std::string("{\"epoch\":\"") + Epoch + "\"}",
+           "Memory observation acquired mutation fields");
+    auto badCommand = command;
+    Replace(badCommand.header.payload_json, "}", ",\"synchronize\":true}");
+    RejectCommand(badCommand);
+    wire::ValidationError error;
+    wire::Response parsed;
+    Frame frame;
+    auto result = Result(wire::Method::WorkerMemoryQuery);
+    for (const auto state : {wire::RuntimeMemoryState::Uninitialized, wire::RuntimeMemoryState::Busy}) {
+        result.runtimeMemory = {state, std::nullopt};
+        Success(wire::make_response(result, frame, error), error);
+        Success(wire::parse_response(frame, parsed, error), error);
+        Expect(parsed.runtimeMemory.state == state && !parsed.runtimeMemory.usage, "Unknown usage became zero usage");
+        Replace(frame.header.payload_json, "\"memory\":null", "\"memory\":{}");
+        Expect(!wire::parse_response(frame, parsed, error), "Unavailable state accepted memory payload");
+    }
+    const wire::RuntimeMemoryUsage usage{4096, (uint64_t{1} << 53) + 1, 16, 128, 4, 1, 8192, 64};
+    result.runtimeMemory = {wire::RuntimeMemoryState::Ready, usage};
+    Success(wire::make_response(result, frame, error), error);
+    Success(wire::parse_response(frame, parsed, error), error);
+    Expect(parsed.runtimeMemory.usage && parsed.runtimeMemory.usage->peakDeviceBytes == usage.peakDeviceBytes &&
+           parsed.runtimeMemory.usage->deviceBytes == 4096 && parsed.runtimeMemory.usage->pinnedHostBytes == 16,
+           "Memory bytes lost precision or identity");
+    const auto good = frame;
+    for (const char* key : {"deviceBytes", "peakDeviceBytes", "pinnedHostBytes", "peakPinnedHostBytes",
+                            "deviceAllocations", "pinnedHostAllocations", "deviceLimitBytes", "pinnedHostLimitBytes"}) {
+        for (const char* invalid : {"-1", "1.5", "true", "null", "18446744073709551616"}) {
+            auto bad = good;
+            NumberField(bad.header.payload_json, key, invalid);
+            parsed.rpcId = 999;
+            Expect(!wire::parse_response(bad, parsed, error) && parsed.rpcId == 999,
+                   "Invalid memory count was accepted or changed parse output");
+        }
+    }
+    for (int invalid = 0; invalid != 8; ++invalid) {
+        auto bad = good;
+        if (invalid == 0) NumberField(bad.header.payload_json, "deviceBytes", "8193");
+        if (invalid == 1) NumberField(bad.header.payload_json, "peakDeviceBytes", "4095");
+        if (invalid == 2) NumberField(bad.header.payload_json, "deviceAllocations", "0");
+        if (invalid == 3) NumberField(bad.header.payload_json, "pinnedHostAllocations", "17");
+        if (invalid == 4) NumberField(bad.header.payload_json, "pinnedHostLimitBytes", "15");
+        if (invalid == 5) Replace(bad.header.payload_json, "\"state\":\"ready\"", "\"state\":\"cached\"");
+        if (invalid == 6) Replace(bad.header.payload_json, "\"deviceBytes\":4096", "\"deviceBytes\":4096,\"extra\":0");
+        if (invalid == 7) Replace(bad.header.payload_json, "\"deviceBytes\":4096", "\"deviceBytes\":4096,\"deviceBytes\":4096");
+        Expect(!wire::parse_response(bad, parsed, error), "Inconsistent memory observation was accepted");
+    }
+    result.runtimeMemory.usage = wire::RuntimeMemoryUsage{0, 4096, 0, 128, 0, 0, 1, 1};
+    Success(wire::make_response(result, frame, error), error); // Peak may exceed a later lower limit.
+    result.runtimeMemory.state = wire::RuntimeMemoryState::Busy;
+    Expect(!wire::make_response(result, frame, error), "Busy response published an old snapshot");
+}
+
 } // namespace
 
 int main() {
     const std::pair<const char*, void (*)()> tests[]{
         {"versions and stable names", TestVersionsAndNames},
         {"limits and capability negotiation", TestLimitsAndNegotiation},
+        {"explicit extended generation, reservation and terminal bounds", TestExtendedGenerationLimits},
+        {"decode batching opt-in, strict schema and exact bounds", TestDecodeBatchingConfiguration},
         {"prefix and strict envelope", TestPrefixAndEnvelope},
         {"little endian token attachment", TestLittleEndianTokens},
-        {"all eleven commands", TestAllCommands},
+        {"all supported commands", TestAllCommands},
         {"model backends and capability compatibility", TestModelCapabilities},
+        {"optional prefill-only mode and strict schema", TestPrefillOnlyExtension},
+        {"single-close and host sampler request policy schema", TestRequestPolicyExtensions},
+        {"optional allocation limits and acknowledgement", TestAllocationLimitsExtension},
+        {"optional thinking budget and strict token metadata", TestThinkingBudgetExtension},
+        {"optional Session reset/truncate and strict actual length", TestSessionContextExtension},
         {"strict command payloads", TestStrictCommandPayloads},
         {"result schemas and handshake", TestResponsesAndHandshake},
         {"accepted and rejected submit", TestAcceptedAndRejected},
         {"terminal and final agreement", TestTerminalAndFinalAgreement},
         {"terminal reasons and escaped bounds", TestEveryTerminalReasonAndEscaping},
         {"token log domain and query events", TestTokenLogDomainAndQuery},
+        {"optional Worker log level and strict schema", TestWorkerLogControl},
+        {"optional runtime memory states, exact integers and invariants", TestRuntimeMemory},
     };
     for (const auto& test : tests) {
         try {

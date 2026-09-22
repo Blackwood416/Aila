@@ -2,6 +2,7 @@
 
 #include "inference/Scheduler.hpp"
 #include "ipc/InferenceProtocol.hpp"
+#include "profile/Profiling.hpp"
 #include "simdjson.h"
 
 #include <algorithm>
@@ -89,6 +90,10 @@ core::RequestOptions CoreOptions(const wire::Command& command) {
     core::RequestOptions options;
     options.prefillChunkSize = static_cast<int>(command.prefillChunkSize);
     options.stopTokenIds.assign(command.stopTokenIds.begin(), command.stopTokenIds.end());
+    options.thinkingBudget = command.thinkingBudget;
+    options.prefillOnly = command.prefillOnly;
+    options.forceHostSampling = command.forceHostSampling;
+    options.legacyPrefillLogits = command.legacyPrefillLogits;
     auto& target = options.generation;
     const auto& source = command.generation;
     target.max_new_tokens = static_cast<int>(source.maxNewTokens);
@@ -105,9 +110,10 @@ core::RequestOptions CoreOptions(const wire::Command& command) {
     return options;
 }
 
-core::SchedulerOptions CoreLimits(const wire::Limits& limits) {
+core::SchedulerOptions CoreLimits(const wire::Limits& limits, uint32_t maxDecodeBatchSize) {
     core::SchedulerOptions options;
     options.maxActiveRequests = limits.maxActiveRequests;
+    options.maxDecodeBatchSize = maxDecodeBatchSize;
     options.maxOutstandingRequests = limits.maxOutstandingRequests;
     options.maxPromptTokens = limits.maxPromptTokens;
     options.maxGeneratedTokens = limits.maxGeneratedTokens;
@@ -120,7 +126,8 @@ core::SchedulerOptions CoreLimits(const wire::Limits& limits) {
 }
 
 bool IsControl(std::string_view method) noexcept {
-    return method != "model.load" && method != "session.create" && method != "request.submit";
+    return method != "model.load" && method != "session.create" && method != "request.submit" &&
+        method != "session.reset" && method != "session.truncate" && method != "worker.memory_query";
 }
 
 struct CommandFailure : std::runtime_error {
@@ -187,10 +194,12 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         size_t cacheLimit = 0;
         size_t sessions = 0; // Includes allocation/reaper jobs, not just handles.
         std::shared_ptr<InferenceModel> model;
+        std::optional<wire::ModelMemoryInfo> memory;
     };
     struct SessionRecord {
         uint64_t id = 0;
         bool closed = false;
+        bool contextPending = false; // Control-thread reservation spans queueing through publication.
         std::shared_ptr<ModelRecord> model;
         std::shared_ptr<core::SessionState> session;
     };
@@ -467,7 +476,8 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         if (configured || stopping.load()) throw CommandFailure(wire::ErrorCode::InvalidArgument, "Worker limits are already fixed");
         wire::Limits selected;
         wire::ValidationError error;
-        if (!wire::negotiate(command.limits, command.requiredCapabilities, wire::hard_limits(),
+        if (!wire::negotiate(command.limits, command.requiredCapabilities,
+                             wire::configure_limits_ceiling(wire::hard_limits(), command.requiredCapabilities),
                              wire::supported_capabilities(), selected, error)) {
             throw CommandFailure(error.code, error.message);
         }
@@ -477,7 +487,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
             selected.maxTerminalFrameBytes + selected.maxFinalFrameBytes + selected.maxTokenFrameBytes;
         if (reservedBase > selected.maxTransportBytes || oneRequest > selected.maxTransportBytes - reservedBase)
             throw CommandFailure(wire::ErrorCode::InvalidArgument, "Transport budget cannot reserve control, handle, log and request slots");
-        auto newScheduler = std::make_unique<core::Scheduler>(CoreLimits(selected));
+        auto newScheduler = std::make_unique<core::Scheduler>(CoreLimits(selected, command.maxDecodeBatchSize));
         {
             std::scoped_lock lock(inputMutex, logMutex);
             if (pendingCommands > selected.maxPendingCommands || ingressBytes > selected.maxIngressBytes)
@@ -492,16 +502,44 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         configured = true;
         auto response = ResponseFor(*input);
         response.limits = limits;
+        response.maxDecodeBatchSize = command.maxDecodeBatchSize;
         response.capabilities = wire::supported_capabilities();
         response.worker.domainStatus = wire::DomainStatus::Ready;
         SendResponse(std::move(response), input);
+    }
+
+    void QueryRuntimeMemory(const std::shared_ptr<Input>& input) {
+        RequireReady();
+        if (lifecyclePending) {
+            // Load/create/release may be waiting for GPU work. Do not queue
+            // observation behind that wait or accumulate diagnostic jobs.
+            auto response = ResponseFor(*input);
+            response.runtimeMemory = {wire::RuntimeMemoryState::Busy, std::nullopt};
+            SendResponse(std::move(response), input);
+            return;
+        }
+        auto self = shared_from_this();
+        Lifecycle([self, input] {
+            wire::RuntimeMemoryInfo memory;
+            std::exception_ptr failure;
+            try {
+                self->RequireReady();
+                memory = self->factory->QueryRuntimeMemory();
+            } catch (...) { failure = std::current_exception(); }
+            self->Post([self, input, memory, failure] {
+                if (failure) { self->RejectException(input, failure); return; }
+                auto response = self->ResponseFor(*input);
+                response.runtimeMemory = memory;
+                self->SendResponse(std::move(response), input);
+            });
+        });
     }
 
     void LoadModel(const std::shared_ptr<Input>& input, const wire::Command& command) {
         RequireReady();
         if (liveModels >= limits.maxLoadedModels) throw CommandFailure(wire::ErrorCode::ResourceLimit, "Loaded model limit reached");
         if (wire::model_capability(command.backend).empty())
-            throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Worker supports Qwen3 and Qwen3.5 Hybrid NF4");
+            throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Worker supports Qwen3 NF4 and Qwen3.5 Hybrid NF4/BF16");
         const auto capability = wire::model_capability(command.backend, command.kvType);
         if (capability.empty())
             throw CommandFailure(wire::ErrorCode::InvalidArgument, "Shared inference requires BF16 KV");
@@ -516,21 +554,29 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         record->cacheLimit = static_cast<size_t>(command.maxSessionCacheBytes);
         if (limits.maxSessionCacheBytes && (!record->cacheLimit || record->cacheLimit > limits.maxSessionCacheBytes))
             record->cacheLimit = static_cast<size_t>(limits.maxSessionCacheBytes);
-        const InferenceModelOptions options{static_cast<int>(command.maxSequenceLength), record->sessionLimit, record->cacheLimit};
+        const InferenceModelOptions options{static_cast<int>(command.maxSequenceLength), record->sessionLimit,
+                                             record->cacheLimit, command.allocationLimits};
         auto self = shared_from_this();
         ++liveModels;
         try {
             Lifecycle([self, input, record, directory = command.modelDirectory,
-                       hybrid = command.backend == "qwen35_nf4", options] {
+                       backend = command.backend, options] {
                 std::exception_ptr failure;
                 try {
                     self->RequireReady();
-                    record->model = hybrid ? self->factory->LoadQwen35(directory, options)
-                                          : self->factory->LoadQwen3(directory, options);
+                    if (backend == "qwen3_nf4") record->model = self->factory->LoadQwen3(directory, options);
+                    else if (backend == "qwen35_nf4") record->model = self->factory->LoadQwen35(directory, options);
+                    else if (backend == "qwen35_bf16") record->model = self->factory->LoadQwen35Bf16(directory, options);
+                    else throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Unsupported model backend");
                     self->CheckLifecycleFault();
                     self->RequireReady();
                     if (!record->model || record->model->VocabSize() <= 0 || record->model->MaxSequenceLength() <= 0)
                         throw core::Error(core::ErrorCode::RuntimeFault, "Model factory returned invalid metadata");
+                    record->memory = record->model->MemoryInfo();
+                    if (record->memory.has_value() != options.allocationLimits.has_value() ||
+                        (record->memory && !(record->memory->limits == *options.allocationLimits))) {
+                        throw core::Error(core::ErrorCode::RuntimeFault, "Model factory did not enforce allocation limits");
+                    }
                 } catch (...) {
                     failure = std::current_exception();
                     record->model.reset();
@@ -550,6 +596,10 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
                         static_cast<uint32_t>(record->model->MaxSequenceLength()),
                         record->model->SessionReservationBytes(),
                         {std::string(record->capability), "token_requests_v1", "session_lifecycle_v1"}};
+                    if (record->memory) {
+                        response.model.memory = record->memory;
+                        response.model.capabilities.emplace_back("allocation_limits_v1");
+                    }
                     self->SendResponse(std::move(response), input);
                 });
             });
@@ -614,10 +664,63 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         }
     }
 
+    void ChangeContext(const std::shared_ptr<Input>& input, const wire::Command& command) {
+        RequireReady();
+        auto record = Session(command.sessionId);
+        if (record->contextPending || record->session->Busy())
+            throw CommandFailure(wire::ErrorCode::Busy, "Session already has an active context operation or request");
+        auto self = shared_from_this();
+        record->contextPending = true;
+        try {
+            Lifecycle([self, input, record, method = command.method, length = command.contextLength] {
+                std::exception_ptr failure;
+                uint32_t restored = 0;
+                try {
+                    self->RequireReady();
+                    if (method == wire::Method::SessionReset) record->session->Reset();
+                    else restored = static_cast<uint32_t>(record->session->Truncate(static_cast<int>(length)));
+                    self->CheckLifecycleFault();
+                    self->RequireReady();
+                } catch (...) {
+                    failure = std::current_exception();
+                    bool runtimeCause = false;
+                    try { std::rethrow_exception(failure); }
+                    catch (const core::Error& error) {
+                        runtimeCause = error.Code() == core::ErrorCode::RuntimeFault;
+                        // Stop subsequent lifecycle jobs before waiting for
+                        // this operation's control-thread response publication.
+                        if (runtimeCause) self->PublishFault(error.what());
+                    } catch (...) {}
+                    // Keep completion bookkeeping even if the final drain
+                    // discovers a device fault after a local exception.
+                    try {
+                        self->CheckLifecycleFault();
+                        if (!runtimeCause && self->domainFaulted.load()) self->RequireReady();
+                    }
+                    catch (...) { failure = std::current_exception(); }
+                }
+                self->Post([self, input, record, restored, failure] {
+                    record->contextPending = false;
+                    if (failure) { self->RejectException(input, failure); return; }
+                    if (self->stopping.load() || self->domainFaulted.load()) {
+                        self->Reject(input, self->domainFaulted.load() ? wire::ErrorCode::RuntimeFault : wire::ErrorCode::SchedulerStopped,
+                                     "Worker stopped before context operation publication");
+                        return;
+                    }
+                    auto response = self->ResponseFor(*input);
+                    response.session = {record->id, record->model->id,
+                        static_cast<uint32_t>(record->session->Capacity()), record->session->CacheBytes(), false, restored};
+                    self->SendResponse(std::move(response), input);
+                });
+            });
+        } catch (...) { record->contextPending = false; throw; }
+    }
+
     void Submit(const std::shared_ptr<Input>& input, wire::Command command) {
         RequireReady();
         auto session = Session(command.sessionId);
-        if (session->session->Busy()) throw CommandFailure(wire::ErrorCode::Busy, "Session already has an active request");
+        if (session->contextPending || session->session->Busy())
+            throw CommandFailure(wire::ErrorCode::Busy, "Session already has an active context operation or request");
         const uint64_t tokens = command.promptIds.size() + uint64_t(command.generation.maxNewTokens);
         const uint64_t bytes = uint64_t(limits.tokenWindow) * limits.maxTokenFrameBytes +
             limits.maxTerminalFrameBytes + limits.maxFinalFrameBytes + limits.maxTokenFrameBytes;
@@ -735,6 +838,16 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
                     auto response = ResponseFor(*input); response.worker = QueryWorker();
                     SendResponse(std::move(response), input); break;
                 }
+                case wire::Method::WorkerMemoryQuery: QueryRuntimeMemory(input); break;
+                case wire::Method::WorkerSetLogLevel: {
+                    // Profiling's threshold is synchronized independently of
+                    // GPU execution. No lifecycle/GPU work or caller callback.
+                    aila::set_log_level(static_cast<aila::LogLevel>(command.logLevel));
+                    minimumLogLevel.store(command.logLevel);
+                    auto response = ResponseFor(*input);
+                    response.logLevel = command.logLevel;
+                    SendResponse(std::move(response), input); break;
+                }
                 case wire::Method::ModelLoad: LoadModel(input, command); break;
                 case wire::Method::SessionCreate: CreateSession(input, command); break;
                 case wire::Method::SessionQuery: {
@@ -742,10 +855,12 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
                     auto response = ResponseFor(*input);
                     response.session = {session->id, session->model->id,
                         static_cast<uint32_t>(session->session->Capacity()), session->session->CacheBytes(),
-                        session->session->Busy(), std::nullopt};
+                        session->contextPending || session->session->Busy(), std::nullopt};
                     if (!response.session.busy) response.session.contextLength = session->session->ContextLength();
                     SendResponse(std::move(response), input); break;
                 }
+                case wire::Method::SessionReset:
+                case wire::Method::SessionTruncate: ChangeContext(input, command); break;
                 case wire::Method::RequestSubmit: Submit(input, std::move(command)); break;
                 case wire::Method::RequestCancel: {
                     auto record = Request(command.inferenceId);
@@ -931,7 +1046,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
     }
 
     void Log(int level, std::string_view message) noexcept {
-        if (level < 0 || level > 3 || !logsAccepting.load()) return;
+        if (level < 0 || level > 3 || static_cast<uint32_t>(level) < minimumLogLevel.load() || !logsAccepting.load()) return;
         try {
             auto bounded = BoundedMessage(message);
             const uint64_t bytes = bounded.size() * 6 + 512;
@@ -1093,6 +1208,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
     std::mutex logMutex;
     std::deque<LogMessage> logs;
     std::atomic<bool> logsAccepting{true};
+    std::atomic<uint32_t> minimumLogLevel{0};
     std::atomic<uint64_t> logLimit{64 * 1024}, droppedLogs{0};
     uint64_t logBytes = 0;
     std::shared_ptr<Input> shutdownCommand;

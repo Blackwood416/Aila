@@ -1,17 +1,19 @@
 # 共享推理 IPC v2 实施协议
 
-日期：2026-09-08。**状态：Qwen3 与 Qwen3.5 Hybrid NF4 token 入口均已接入 IPC v2。** codec、Worker controller/管道外壳、普通 C++ `InferenceClient`/Win32 transport 及设备故障处理共用一套实现，旧 Worker/Proxy 和公共 C ABI 保持 v1。普通 C++ [HTTP/SSE 服务](inference-server.md) 已使用这两种后端。实现入口见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)，Qwen3 首片验证快照保留在第 10 节，各批实际证据见 [refactor-validation.md](refactor-validation.md) 第 10–12 节，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
+日期：2026-09-09。**状态：Qwen3 NF4 与 Qwen3.5 Hybrid NF4/BF16 token 入口均已接入 IPC v2。** codec、Worker controller/管道外壳、普通 C++ `InferenceClient`/Win32 transport 及设备故障处理共用一套实现，旧 Worker/Proxy 和公共 C ABI 保持 v1。普通 C++ [HTTP/SSE 服务](inference-server.md) 已接入三种权重后端。实现入口见 [IPC v2 实现记录](inference-ipc-v2-implementation.md)，各批实际证据见 [refactor-validation.md](refactor-validation.md)，BF16 远端接入见第 18 节，阶段安排见 [refactor-roadmap.md](refactor-roadmap.md)。
 
 本文保留 v2 的协议契约。实现位于 `src/ipc/InferenceProtocol.*`、`src/runtime/InferenceClient.*`、`src/runtime/InferencePipeTransport.cpp` 和 `src/worker/{InferenceWorker,InferenceWorkerMain}.*`，通过 `SharedInferenceEngine.cpp` 接入已有 Model/Session/Scheduler。进程内资源与调度语义见 [shared-sessions.md](shared-sessions.md) 和 [scheduler.md](scheduler.md)。协议枚举使用稳定字符串，不直接发送 C++ 枚举的整数值或结构体内存。
 
+2026-09-12 新增可选的 [连续 decode 合批](continuous-batching.md) 配置；本轮实现的 CPU 集成与设备/HTTP 实测待主代理完成。下方已有验证快照保留其原始范围，不作为新增功能的通过记录。
+
 ## 1. 首片边界及兼容模式
 
-- 一个 v2 Worker 拥有一个 `DeviceRuntime` 设备域和一个 `Scheduler`，最多加载一个 Qwen3 或 Qwen3.5 Hybrid NF4 模型；共享 BF16 KV Session，Hybrid 同时隔离递归/卷积状态和 host mirror，按完整 prefill/decode 步骤轮转。已有 NF4 算子、融合和 in-order queue 不变。
+- 一个 v2 Worker 拥有一个 `DeviceRuntime` 设备域和一个 `Scheduler`，最多加载一个 Qwen3 NF4 或 Qwen3.5 Hybrid NF4/BF16 模型；各 Session 独立持有 BF16 KV，Hybrid 同时隔离递归/卷积状态和 host mirror。默认按完整 prefill/decode 步骤轮转；显式配置后，可将同 LoadedModel/固定 adapter 的就绪 decode 行按层聚合，prefill 仍独立轮转，in-order queue 保持原约定。
 - v1 `--ffi-worker`、`WorkerDispatcher`、`CApiWorkerEngine` 继续提供旧命令。新增私有启动模式 `--ffi-worker-v2`；同一进程启动后固定模式，不在已建立的管道上切换协议。
 - v2 使用 `protocol=2`；`abi=1` 仍表示现有公共 C ABI 版本。IPC 版本与公共 ABI 版本分别管理。现有 `kProtocolVersion=1` 不应直接全局改为 2，让旧调用方无意中发送新协议。
-- 新的宿主端内部 C++ API 选择 v2；旧公开函数先继续使用 v1。首片不把旧 `generate_chat_json` 翻译成 token 请求，也不声称已迁移聊天模板、reasoning、工具解析、音视频或 thinking budget。
+- 新的宿主端内部 C++ API 和独立异步 C ABI 选择 v2；旧公开函数默认继续使用 v1。可通过 `AILA_LEGACY_TEXT_V2=1` 启用 [旧文本适配器](legacy-text-adapter.md)，由宿主处理模板、reasoning、工具解析和历史，再提交 token 请求。媒体驱动仍使用 v1。
 - 旧文本流回调仍在发起旧同步调用的线程执行。ASR/TTS 派生句柄继续强持有 `ProxyEngine` owner；销毁 `AilaEngine` 外壳不等于提前销毁派生句柄的 Worker。既有 TTS 自身的线程约定也不改变。
-- 将来旧文本 API 适配 v2 时，只等待自己的请求，并在原调用线程消费该请求的事件；不能把用户回调搬到 IPC reader、sender 或 Scheduler 线程。未迁移的旧 Engine 不与新 Scheduler 在同一进程内同时执行。
+- 旧文本适配器只等待自己的请求，在原调用线程消费事件并调用用户回调；IPC reader、sender 和 Scheduler 不执行这些回调。未迁移的旧 Engine 不与新 Scheduler 在同一进程内同时执行。
 
 选择独立启动模式的依据是当前 `WorkerProcess` 严格校验每帧 protocol/ABI，且响应与事件有独立 reader。原地升级还需处理两条管道中遗留 v1 日志的切换屏障，首片没有引入这项复杂度的必要。新宿主遇到不支持 v2 的 Worker 明确返回 `UnsupportedProtocol`，不静默退化为串行推理；现有 build ID、运行目录、可执行文件和 PATH 隔离校验继续执行。
 
@@ -23,12 +25,16 @@ Worker 在创建 GPU 资源前发送唯一 `kind=handshake, method=worker.hello,
 | --- | --- |
 | `epoch` | OS 生成的 128 位随机值，32 个小写十六进制字符；每次 Worker 启动重新生成 |
 | `supportedProtocols` | 首片为 `[2]`；表示当前启动模式支持的协议 |
-| `capabilities` | 实际可用的字符串集合；当前为 `token_requests_v1`、`qwen3_nf4_bf16_kv`、`qwen35_nf4_bf16_kv`、`session_lifecycle_v1`、`multi_inflight_v1`、`cumulative_ack_v1`、`domain_epoch_v1` |
+| `capabilities` | 实际可用的字符串集合；当前为 `token_requests_v1`、`qwen3_nf4_bf16_kv`、`qwen35_nf4_bf16_kv`、`qwen35_bf16_bf16_kv`、`session_lifecycle_v1`、`multi_inflight_v1`、`cumulative_ack_v1`、`domain_epoch_v1`、`allocation_limits_v1`、`thinking_budget_v1`、`session_context_v1`、`prefill_only_v1`、`thinking_budget_close_once_v1`、`host_sampling_v1`、`legacy_prefill_logits_v1`、`extended_generation_v1`、`worker_log_control_v1`、`runtime_memory_v1`、`continuous_batching_v1` |
 | `hardLimits` | 本文准入表的上限；包含帧、对象、调度及传输限制 |
 
 宿主先保留原身份校验，再发送 `worker.configure`，携带 `epoch`、`requiredCapabilities` 和不超过 hardLimits 的 `limits`。Worker 返回选定的完整 limits 和 capabilities；宿主确认能力齐全、数值合法后进入 Ready。未知必需能力返回 `UnsupportedCapability`，超上限参数返回 `InvalidArgument`，不能悄悄改变请求中的限制。未配置时只允许 configure、worker.query 和 shutdown；configure 成功后不能再次修改域的限额。
 
-握手读取先使用现有有界 bootstrap 帧限制；configure 后按 v2 的较小限制读取。默认宿主必需能力保留原 Qwen3 集合，新增 Hybrid 是可选扩展；`LoadQwen35` 检查 configure 结果含 `qwen35_nf4_bf16_kv`，缺少时局部拒绝，不发送加载命令。configure 不能返回 hello 未声明的能力，model.load 的成功结果必须含所请求后端能力。能力协商不放宽 build ID 校验。当前不发布 FP8 KV、运行中 LoRA 替换、文本解码或 HTTP wire 能力；聊天与 HTTP 由宿主层完成。
+可选 `extended_generation_v1` 是上述默认生成上限的显式扩展：hello 的原字段和 `hardLimits.maxGeneratedTokens=1024` 保持兼容；只有 configure 的 requiredCapabilities 包含该能力时，生成额度可申请至 32768。该扩展只改变 maxGeneratedTokens，其他 limits 仍受 hello 上限约束；若 Worker 发布了低于 1024 的生成上限，扩展不能覆盖它。新 Client 在调用者显式设置 maxGeneratedTokens>1024 时自动将此能力列为必需，旧 peer 在发送 configure 前被拒绝。configure 响应必须精确回显申请值，不能把 2048 静默降成 1024。普通调用方仍按原 1024 上限握手。
+
+可选 `continuous_batching_v1` 只扩展 configure payload，不向 `Limits` 或 hello 的 hardLimits 增加字段。`max_decode_batch_size` 是可选 u32，缺省为 1；合法值为 1..4 且不超过配置的 `maxActiveRequests`。普通 Client 的默认 `maxDecodeBatchSize=1` 省略该字段，不要求新能力；显式大于 1 时自动加入 requiredCapabilities。缺能力的旧 peer 在发送 configure 前被拒绝，Worker 也拒绝没有对应 required capability 的扩展配置。成功响应必须精确回显批上限，省略解析为 1；宿主拒绝静默降级、提高或未请求的上限。配置在本 Worker 生命周期内固定，活动/在途请求、Session、cache、token 和传输额度不随之扩大。能力表示调度接口可用，不表示所有模型/诊断模式都具备原生合批路径；执行边界见 [连续 decode 合批](continuous-batching.md)。
+
+握手读取先使用现有有界 bootstrap 帧限制；configure 后按 v2 的较小限制读取。默认宿主必需能力保留原 Qwen3 集合，Hybrid 与 BF16 权重是可选扩展；`LoadQwen35` / `LoadQwen35Bf16` 分别检查 configure 结果含 `qwen35_nf4_bf16_kv` / `qwen35_bf16_bf16_kv`，缺少时局部拒绝，不发送加载命令。两者复用原有 `model.load` 字段；仅提供 Hybrid NF4 的旧 Worker 不会被当作支持 BF16 权重。configure 不能返回 hello 未声明的能力，model.load 的成功结果必须含所请求后端能力。能力协商不放宽 build ID 校验。当前不发布 FP8 KV、运行中 LoRA 替换、文本解码或 HTTP wire 能力；聊天与 HTTP 由宿主层完成。
 
 ## 3. 帧、关联与句柄标识
 
@@ -88,11 +94,15 @@ Scheduler 的 `Read(terminal)` 会归还其调度额度。IPC sender 读到 term
 
 | 方法 | 输入 payload | 成功响应的专用字段 |
 | --- | --- | --- |
-| `worker.configure` | `requiredCapabilities: string[]`, `limits: object` | `capabilities`, `limits`, `domainStatus: "ready"` |
+| `worker.configure` | `requiredCapabilities: string[]`, `limits: object`；可选 `max_decode_batch_size: u32`，默认 1，范围 1..4 且不超过 maxActiveRequests | `capabilities`, `limits`, `domainStatus: "ready"`；可选 `max_decode_batch_size` 精确回显，值为 1 时省略 |
 | `worker.query` | 无 | `domainStatus`, Scheduler 的 accepting/stopping/faulted 和各额度计数，传输计数；不遍历所有请求输出 |
-| `model.load` | `backend: "qwen3_nf4" / "qwen35_nf4"`, `modelDirectory: string`, `kvType: "bf16"`, `maxSequenceLength: u32`, `maxSessions: u32`, `maxSessionCacheBytes: u64` | `modelId`, `vocabSize`, `maxSequenceLength`, `sessionReservationBytes`, 所加载后端的实际能力 |
+| `worker.set_log_level` | `level: u32`，仅 0/1/2/3；需 `worker_log_control_v1` | `level`，精确回显已应用的 Worker 级别 |
+| `worker.memory_query` | 无；需 `runtime_memory_v1` | `state: "uninitialized" / "busy" / "ready"`，`memory: object/null`；仅ready时有本次账本 |
+| `model.load` | `backend: "qwen3_nf4" / "qwen35_nf4" / "qwen35_bf16"`, `modelDirectory: string`, `kvType: "bf16"`, `maxSequenceLength: u32`, `maxSessions: u32`, `maxSessionCacheBytes: u64` | `modelId`, `vocabSize`, `maxSequenceLength`, `sessionReservationBytes`, 所加载后端的实际能力 |
 | `session.create` | `modelId` | `sessionId`, `modelId`, `capacity`, `cacheBytes`, `contextLength: 0` |
 | `session.query` | `sessionId` | `modelId`, `capacity`, `cacheBytes`, `busy`, `contextLength: u32/null`；Busy 时长度为 null，不能假称得到精确缓存前缀 |
+| `session.reset` | `sessionId`；需 `session_context_v1` | `sessionId`, `modelId`, `capacity`, `cacheBytes`, `busy: false`, `contextLength: 0` |
+| `session.truncate` | `sessionId`, `contextLength: u32`；需 `session_context_v1` | 同 reset 的 Session 元数据；`contextLength` 是实际恢复长度，可能小于请求值 |
 | `request.submit` | 见下文；header requestId 即 inferenceId | 一次 accepted，再一次最终 result/error，见下一节 |
 | `request.cancel` | `inferenceId` | `cancelRequested: bool`, 最近 executionStatus；已终结时为 false，不改变原终态 |
 | `request.query` | `inferenceId` | executionStatus、endReason、promptTokensProcessed、generatedTokens、bufferedTokens、lastSentSequence、lastAcknowledgedSequence、completionReady、eventCount 或 null、errorCode/message |
@@ -100,9 +110,17 @@ Scheduler 的 `Read(terminal)` 会归还其调度额度。IPC sender 读到 term
 | `handle.release` | `type: "model"/"session"/"request"`, `id: u64` | `releaseAccepted: true`；Request 可以仍处于内部收尾状态 |
 | `worker.shutdown` | `graceMs: u32`，不得超过配置的关闭上限 | `domainStatus: "closed"`, `lastEventOrdinal`，仅在设备收尾及事件发送屏障后返回 |
 
-`session.reset` 和 `session.truncate {sessionId, length}` 尚未加入。两者只允许空闲 Session；未来 truncate 响应必须含实际 `restoredLength`，不能将请求的 length 当作返回值。当前通过销毁并新建 Session 完成取消后的重用。Hybrid 远端固定关闭 recurrent snapshots，但保留续写所需的 host mirror；device reservation 含 Full KV、递归矩阵和卷积状态，host mirror 受 Session 数量限制，未纳入 v2 device 字节额度。
+`worker_log_control_v1` 只增加独立命令，不改变原日志事件或默认必需能力。级别在 Worker 控制线程应用到共享 logger，0/1/2/3 为 debug/info/warning/error，不提交 GPU 工作；响应前已产生的低级别日志可能仍在有界队列中。设置对所有 Model/Session 生效，超时不撤销已提交命令。Client 在发送前检查能力和输入，并核对响应级别；默认新 Client 通过独立有界队列提供日志读取，丢弃日志仍推进连接 eventOrdinal，不影响关闭屏障或 token credit。
 
-`session.query` 的 idle 精确读取也要先取得会话操作资格，不能让新 submit 与查询的长度读取交错。Busy 快照不等待 GPU。model.load/session.create/destruction 可能取得设备锁，必须在 lifecycle executor 上执行，禁止在 command reader 内分配 KV、加载权重或析构最后设备引用。
+`runtime_memory_v1` 保留protocol 2及旧默认能力，独立返回严格uint64的 `deviceBytes`、`peakDeviceBytes`、`pinnedHostBytes`、`peakPinnedHostBytes`、`deviceAllocations`、`pinnedHostAllocations`、`deviceLimitBytes`、`pinnedHostLimitBytes`。busy/未初始化必须为null，ready必须包含全部字段；当前值不得超过峰值或非零上限，存活分配数量与零字节一致。历史峰值可超过后续降低的上限。该查询计入普通命令额度，不占用取消/ACK的保留容量；有生命周期操作未结束时立即返回busy，其余情况在生命周期线程用try-lock读取CPU账本，不初始化设备或同步队列。范围和宿主缓存语义见 [运行时分配快照](runtime-memory.md)。
+
+`session_context_v1` 是可选扩展，默认必需能力列表保持不变；旧 peer 未提供该能力时，Client 在发送 RPC 前返回 `UnsupportedCapability`。truncate 目标不得超过 `INT32_MAX` 或当前上下文长度，响应的实际长度不得超过目标。reset/truncate 在控制线程检查 Busy 并预留 Session 后排入生命周期执行器，预留持续到结果发布。期间同 Session 的 submit/变更返回 `Busy`，query 立即返回 busy/null。
+
+Hybrid 远端仍固定关闭 recurrent snapshots，但保留续写所需的 host mirror。非平凡回滚可能恢复到 0，调用者应从响应的实际 `contextLength` 补算前缀，不能把请求长度当作恢复成功的长度。Qwen3 可以精确截断连续 KV。device reservation 含 Full KV、递归矩阵和卷积状态；host mirror 可由独立 Session host payload 额度限制。
+
+RPC 等待超时不撤销已提交的上下文操作。调用者应查询到 idle 后再决定后续动作。释放 Session/Model 句柄不会销毁已排队操作持有的资源；shutdown 等待生命周期任务安全结束，并拒绝在 stopping 后发布成功结果。reset/truncate 使用普通命令额度，保留取消、查询、ACK、释放的控制额度。设备故障在生命周期线程发现时立即停止域内后续工作，终态和响应仍经原有控制/传输路径收尾。
+
+`session.query` 的 idle 精确读取由控制线程与 submit/变更预留串行化；底层读取持有 Session 的操作锁。Busy 快照不等待 GPU。model.load/session.create/reset/truncate/destruction 可能取得设备锁，必须在 lifecycle executor 上执行，禁止在 command reader 内分配 KV、加载权重或析构最后设备引用。
 
 `request.submit` 的 payload 示例：
 
@@ -131,7 +149,11 @@ Scheduler 的 `Read(terminal)` 会归还其调度额度。IPC sender 读到 term
 
 attachment 必须恰为 `promptTokenCount * 4` 字节，逐个 little-endian int32 解码，且 token 在词表范围内。禁止复制本机 `int` 内存作为跨进程协议约定。首片只有 token IDs，没有文本、媒体或任意附件；stop IDs 放在有界 JSON 数组中。
 
-generation 字段在 wire 上全部显式填写，宿主 convenience API 可以使用当前 `GenerationConfig` 的默认值补齐。映射到同名 C++ 参数，验证 finite、采样温度、topP/topK 和 penalties 的规则与 `RequestState` 一致。`prefillChunkSize` 必须在协商上限内，prompt 非空，maxNewTokens 正数，已有缓存 + prompt + maxNewTokens 不超过 capacity。thinking/decodeChunk/streamChunk 等未迁移字段不接受，内部 `thinking_budget_tokens` 固定为 -1。当前 mt19937 固定 seed 使用 samplingSeed 的低 32 位，v2 首片保留并记录这个行为，不擅自改变采样结果。
+generation 字段在 wire 上全部显式填写，宿主 convenience API 可以使用当前 `GenerationConfig` 的默认值补齐。映射到同名 C++ 参数，验证 finite、采样温度、topP/topK 和 penalties 的规则与 `RequestState` 一致。`prefillChunkSize` 必须在协商上限内，prompt 非空，maxNewTokens 正数，已有缓存 + prompt + maxNewTokens 不超过 capacity。decodeChunk/streamChunk 等未迁移字段不接受。内部 `thinking_budget_tokens` 默认 -1；可选的顶层 `thinkingBudget` 通过 `thinking_budget_v1` 能力传递预算与 tokenizer 标记，字段及完整关闭、提前 Length 的语义见 [请求级预算](thinking-budget.md)。当前 mt19937 固定 seed 使用 samplingSeed 的低 32 位，v2 首片保留并记录这个行为，不擅自改变采样结果。
+
+可选 `prefillOnly:true` 需要 `prefill_only_v1`，复用 `request.submit` 的路由、准入和终态。此时 maxNewTokens 必须为 0，prompt 非空，不接受 stop IDs 或 thinkingBudget。执行只消费输入，不采样、不消耗 RNG、不输出 token；成功产生唯一 `Completed/Length` 终态，generatedTokens=0、eventCount=1。取消保留已完成的 prompt 分块，调用者查询实际上下文后补算。
+
+三个独立的可选生成策略保留旧文本兼容语义：`thinkingBudget.closeOnce:true` 需要 `thinking_budget_close_once_v1`，每请求最多强制关闭一次；顶层 `hostSampling:true` 需要 `host_sampling_v1`，明确选择 host sampler；顶层 `legacyPrefillLogits:true` 需要 `legacy_prefill_logits_v1`，保留旧 Hybrid 在非初始 2–16 token 分块返回多行 logits 时从第一行采样的行为。默认请求继续使用最后有效行。字段省略表示默认；出现时只能是布尔 true，其他类型、false 和 null 均拒绝。缺少所需能力时 Client 在发送 RPC 前局部拒绝，已有连接仍可使用。
 
 准入依次预留宿主路由与传输预算、Worker 传输预算、Scheduler 预算和 Session 租约。任何一层失败都回滚之前的预留。只有 `Scheduler::Submit` 成功且 Worker request entry 已发布后，才允许 accepted 或事件离开 Worker。解析和所有内存预留完成前不得发 accepted；已接受后发生的失败必须作为有终态的请求收尾。
 
@@ -188,7 +210,7 @@ AND terminal 摘要与 final 摘要相同
 | 限制 | 首片默认 | 归还或适用边界 |
 | --- | ---: | --- |
 | Scheduler active/outstanding | 4 / 64 | 沿用现有 Scheduler；outstanding 包含 core 终态尚未被读取的流 |
-| prompt/generated/stop IDs | 4096 / 1024 / 64 | 每请求；生成事件总数最多 1025 |
+| prompt/generated/stop IDs | 4096 / 1024 / 64 | 默认每请求；显式协商 extended_generation_v1 后 generated 可至 32768，事件总数为 generated + 1 |
 | outstanding token reservation | 32768 | prompt + maxNewTokens；IPC 镜像额度直到终态 ACK，不因 core 提前归还而放宽 |
 | prefill chunk/core token ring | 512 / 128 | 沿用现有 Scheduler |
 | maxLoadedModels/maxSessions | 1 / 4 | 包含父句柄已关闭但仍被子对象强持有的资源 |
@@ -281,7 +303,7 @@ SafeTensors 的逐 tensor 恢复会原样传播 SYCL 上传异常，Qwen3.5 tied
 
 ## 10. 首个可交付纵向切片
 
-最小命令集为第 5 节的 11 项，覆盖能力协商、加载/释放父对象、创建独立 Session、提交/取消/查询、消费确认和关闭。首片输入输出均为 token，普通 C++ 宿主不加载 oneAPI DLL。代码已接通；以下保留首片验收要求，运行状态单独列在后文，不能将已编译等同于 GPU 验收通过。
+原最小命令集为 11 项，第 5 节现在还包含可选的 reset/truncate 两项。输入输出均为 token，普通 C++ 宿主不加载 oneAPI DLL。以下保留首片验收要求，后续扩展的运行证据见 [验证记录](refactor-validation.md)，不能将已编译等同于 GPU 验收通过。
 
 1. v2 codec/schema、private host connection 和 CPU fake Worker 已实现；验证两个 submit 可同时处于 accepted，在 A 仍生成时 B 能 accepted，cancel/query/release 有独立结果路由。客户端受控 transport 单测已通过；用 gate 控制步骤，不依赖 sleep 猜测交错。
 2. 接入现有 Model/Session/Scheduler，运行同模型 A/B 和 1/2/4 Session token 测试；对照直接进程内请求，保持各请求分块形状、seed 和 penalties 一致。

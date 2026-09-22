@@ -38,11 +38,27 @@ struct SamplingInput {
     const GenerationConfig& config;
     const std::vector<int>& generatedIds;
     std::mt19937& rng;
+    bool forceHost = false;
+    bool legacyPrefillLogits = false;
 };
 
 struct ExecutionResult {
     int tokenId = -1; // No sample was requested.
     std::vector<float> logits; // Populated only when explicitly requested.
+};
+
+inline constexpr size_t MaxDecodeBatchSize = 4;
+
+class SessionBackend;
+
+// One independent sequence per row. The token is consumed at that session's
+// own position; row count must never be passed to a single-sequence Forward.
+// All pointers are borrowed until the synchronous batch has drained.
+struct BackendDecodeInput {
+    SessionBackend* backend = nullptr;
+    int tokenId = -1;
+    const SamplingInput* sampling = nullptr;
+    bool captureLogits = false;
 };
 
 // Device-independent seam for a real model session and CPU test executors.
@@ -62,9 +78,23 @@ public:
     virtual ExecutionResult Forward(const std::vector<int>& tokenIds,
                                     const SamplingInput* sampling,
                                     bool captureLogits) = 0;
+    // Identity of immutable weights, adapter combination and execution slot.
+    // A null key explicitly disables grouping; matching model paths/families
+    // alone are insufficient. The key remains stable for this backend's life.
+    virtual const void* DecodeBatchKey() const noexcept { return nullptr; }
+    virtual std::vector<ExecutionResult> ForwardDecodeBatch(
+        const std::vector<BackendDecodeInput>& rows);
 };
 
 class RequestState;
+class SessionState;
+
+struct SessionDecodeInput {
+    SessionState* session = nullptr;
+    int tokenId = -1;
+    const SamplingInput* sampling = nullptr;
+    bool captureLogits = false;
+};
 
 // A session has one active request. Read-only snapshots may wait for a step;
 // mutations fail with Busy instead of changing an active request's cache.
@@ -78,11 +108,18 @@ public:
     int Capacity() const noexcept { return capacity; }
     int VocabSize() const noexcept { return vocabSize; }
     size_t CacheBytes() const noexcept { return cacheBytes; }
+    const void* DecodeBatchKey() const noexcept { return backend->DecodeBatchKey(); }
     bool Busy() const noexcept { return busy.load(); }
 
     void Reset();
     int Truncate(int length);
     std::vector<float> ForwardLogits(const std::vector<int>& tokenIds);
+    // Explicit diagnostic/model API: acquires every idle session atomically
+    // with respect to execution (Busy rolls all acquired leases back). Input
+    // validation finishes for all rows before any backend work is submitted.
+    static std::vector<std::vector<float>> ForwardDecodeBatchLogits(
+        const std::vector<std::shared_ptr<SessionState>>& sessions,
+        const std::vector<int>& tokenIds);
 
 private:
     friend class RequestState;
@@ -91,6 +128,8 @@ private:
     ExecutionResult Execute(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
                             bool captureLogits = false);
+    static std::vector<ExecutionResult> ExecuteDecodeBatch(
+        const std::vector<SessionDecodeInput>& rows);
 
     std::unique_ptr<SessionBackend> backend;
     const int capacity;

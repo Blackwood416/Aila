@@ -1,13 +1,77 @@
 #pragma once
 
 #include "IModelBackend.hpp"
+#include "HybridLayerExecution.hpp"
 #include "../ops/Ops.hpp"
+#include <cstddef>
+#include <memory>
 #include <vector>
 #include <unordered_map>
 #include <sycl/sycl.hpp>
 
 class Qwen35HybridTextBackend : public IModelBackend {
+    struct SessionOwner {};
+
+    struct LayerCache {
+        Tensor k;
+        Tensor v;
+        Tensor linear_state; // f32 [value heads, key dim, value dim]
+        Tensor linear_conv_state; // f32 [kernel - 1, conv channels]
+        std::vector<float> host_linear_state;
+        std::vector<float> host_linear_conv_state;
+        bool device_state_dirty = false;
+        int linear_conv_head = 0;
+    };
+    struct LayerStateSnapshot {
+        std::vector<float> linear_state_host;
+        std::vector<float> linear_conv_state_host;
+        int linear_conv_head = 0;
+    };
+    struct StateSnapshot {
+        std::vector<LayerStateSnapshot> layers;
+    };
+
 public:
+    // Weights, mutable oneDNN bindings, activations and logits use one
+    // serialized execution slot. Every Session owns independent model state.
+    class Session {
+    public:
+        ~Session();
+        Session(const Session&) = delete;
+        Session& operator=(const Session&) = delete;
+        Session(Session&&) = delete;
+        Session& operator=(Session&&) = delete;
+
+        int CurrentLength() const { return currentLength_; }
+        int Capacity() const { return capacity_; }
+        std::size_t CacheBytes() const { return cacheBytes_; }
+        // Float payload only: persistent host mirrors and bounded snapshots.
+        std::size_t HostReservationBytes() const { return hostReservationBytes_; }
+
+    private:
+        friend class Qwen35HybridTextBackend;
+        friend struct aila::models::HybridDecodeBatchExecutor;
+        Session(Context& ctx, int capacity, std::shared_ptr<const SessionOwner> owner,
+                bool boundedSnapshots, std::size_t maxSnapshots);
+        Context* context_ = nullptr;
+        std::shared_ptr<const SessionOwner> owner_;
+        int currentLength_ = 0;
+        int capacity_ = 0;
+        std::size_t cacheBytes_ = 0;
+        std::size_t hostReservationBytes_ = 0;
+        bool boundedSnapshots_ = true;
+        std::size_t maxSnapshots_ = 4;
+        std::vector<LayerCache> layerCaches_;
+        std::unordered_map<int, StateSnapshot> snapshots_;
+        Tensor mropePosT_, mropePosH_, mropePosW_;
+        int mropePromptLength_ = 0;
+        int mropeTextPositionDelta_ = 0;
+        std::vector<int> embeddingOverridePositions_;
+        std::vector<sycl::ext::oneapi::bfloat16> embeddingOverrideValues_;
+        int embeddingOverrideHiddenSize_ = 0;
+    };
+
+    Qwen35HybridTextBackend();
     ~Qwen35HybridTextBackend() override;
 
     bool load(Context& ctx,
@@ -19,11 +83,27 @@ public:
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;
-    int get_current_context_len() const override { return current_len_; }
+    int get_current_context_len() const override {
+        return defaultSession_ ? defaultSession_->CurrentLength() : 0;
+    }
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen35Hybrid; }
     bool supports_vision_embedding_override() const override { return true; }
+
+    // Explicit sessions require BF16 KV and the DeltaNet path. The legacy
+    // default session retains its cache/storage and multi-row logits behavior.
+    std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
+    // Borrowed last-token row, consumed before another operation on the slot.
+    Tensor& Forward(Context& ctx, Session& session, const int* tokenIdsDevice, int count);
+    bool SupportsDecodeBatch() const noexcept;
+    Tensor& ForwardDecodeBatch(Context& ctx, const std::vector<Session*>& sessions,
+                               const int* tokenIdsDevice);
+    // Legacy text ABI compatibility: retain the original multi-row layout.
+    Tensor& ForwardLegacyLogits(Context& ctx, Session& session, const int* tokenIdsDevice, int count);
+    void Reset(Session& session);
+    // Restore the nearest retained checkpoint <= length, or reset to zero.
+    int Truncate(Session& session, int length);
 
     void set_embedding_overrides(const std::vector<int>& positions,
                                  const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
@@ -76,18 +156,6 @@ private:
         std::vector<float> host_linear_norm;      // [head_dim]
     };
 
-    struct LayerCache {
-        Tensor k;
-        Tensor v;
-        // DeltaNet recurrent state S per head: [num_heads, key_dim, value_dim] (f32)
-        Tensor linear_state;
-        Tensor linear_conv_state; // [kernel-1, conv_channels] (f32)
-        std::vector<float> host_linear_state;
-        std::vector<float> host_linear_conv_state;
-        bool device_state_dirty = false;
-        int linear_conv_head = 0; // Ring-buffer head for the oldest conv row.
-    };
-
     struct Buffers {
         Tensor hidden;
         Tensor normed;
@@ -111,6 +179,27 @@ private:
         Tensor incr_scores;
     } buf_;
 
+    friend struct aila::models::HybridLayerExecutor;
+    friend struct aila::models::HybridDecodeBatchExecutor;
+    using ExecutionPhase = aila::models::HybridExecutionPhase;
+    using LayerKind = aila::models::HybridLayerKind;
+    using LayerPlan = aila::models::HybridLayerPlan<Layer>;
+    using DecoderPlan = aila::models::HybridDecoderPlan<Layer>;
+    using LayerExecution = aila::models::HybridLayerExecution<
+        Buffers, LayerCache, aila::models::Bf16ProjectionWorkspace>;
+    struct ProjectionPolicy;
+    struct ProfileState;
+
+    void BuildDecoderPlan();
+    void ExecuteLayer(const LayerPlan& plan, const LayerExecution& execution);
+    Tensor& ForwardImpl(Context& ctx, Session& session, const int* tokenIdsDevice,
+                        int count, bool lastTokenOnly);
+    std::unique_ptr<Session> CreateSessionImpl(Context& ctx, bool quantizedKv,
+                                              bool boundedSnapshots, std::size_t maxSnapshots);
+    Session& DefaultSession(Context& ctx);
+    void ValidateSession(const Session& session) const;
+    void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount);
+
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void ensure_prefill_scores(Context& ctx, int seq_len);
     void ensure_incr_prefill_scores(Context& ctx, int seq_len, int total_len);
@@ -132,6 +221,14 @@ private:
     void run_decode_jm_matvec_custom(Context& ctx, Tensor& input,
                                      const Tensor& weight_jm,
                                      int in_dim, int out_dim, Tensor& output);
+    // Multi-row variants for independent decode sequences. Each row keeps the
+    // original per-row vec8/FMA order and reduction; only the launch count and
+    // weight re-reads are reduced by mapping rows onto one grid.
+    void run_decode_jm_matvec_rows(Context& ctx, Tensor& input,
+                                   const Tensor& weight_jm,
+                                   int in_dim, int out_dim, Tensor& output, int rows);
+    void run_decode_ffn_gate_up_swiglu_rows(Context& ctx, const Layer& layer,
+                                            Tensor& input, Tensor& output, int rows);
     void debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
                                            Layer& layer, LayerCache& cache,
                                            Tensor& qkv_src, Tensor& z_src,
@@ -139,6 +236,9 @@ private:
     void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
                                Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                int seq_len);
+    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                               Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
+                               int seq_len, Tensor& out_dst);
     static float softplus(float x);
     static float silu(float x);
     static void head_l2_norm_inplace(std::vector<float>& x, int seq_len, int num_heads, int head_dim, float eps);
@@ -152,13 +252,20 @@ private:
     Tensor* embed_weight_ = nullptr;
     Tensor* final_norm_weight_ = nullptr;
     Linear lm_head_;
+    Tensor batchLogits_, batchLogitsView_;
 
     std::vector<Layer> layers_;
-    std::vector<LayerCache> layer_caches_;
     std::vector<Tensor> fused_weights_;
+    Context* context_ = nullptr;
+    std::shared_ptr<const SessionOwner> sessionOwner_;
+    std::unique_ptr<Session> defaultSession_;
+    std::unique_ptr<const DecoderPlan> decoderPlan_;
+    std::unique_ptr<ProfileState> profile_;
+    Tensor lastTokenLogits_;
+    bool explicitSessionsCreated_ = false;
+    bool legacyQuantizedKv_ = false;
 
     int max_seq_len_ = 0;
-    int current_len_ = 0;
     int runtime_seq_capacity_ = 0;
     int prefill_scores_capacity_ = 0;
     int incr_prefill_seq_cap_ = 0;
@@ -210,25 +317,4 @@ private:
         std::vector<sycl::ext::oneapi::bfloat16> out_bf16;
     } linear_delta_scratch_;
 
-    std::vector<int> embed_override_positions_;
-    std::vector<sycl::ext::oneapi::bfloat16> embed_override_values_;
-    int embed_override_hidden_size_ = 0;
-
-    Context* mrope_ctx_ = nullptr;
-    int* mrope_pos_t_ = nullptr;
-    int* mrope_pos_h_ = nullptr;
-    int* mrope_pos_w_ = nullptr;
-    int mrope_prompt_len_ = 0;
-    int mrope_text_pos_delta_ = 0;
-
-    struct LayerStateSnapshot {
-        std::vector<float> linear_state_host;
-        std::vector<float> linear_conv_state_host;
-        int linear_conv_head = 0;
-    };
-    struct StateSnapshot {
-        std::vector<LayerStateSnapshot> layers;
-    };
-    std::unordered_map<int, StateSnapshot> snapshots_;
-    void clear_snapshots();
 };

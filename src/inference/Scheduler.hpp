@@ -15,6 +15,9 @@ struct ScheduledRequestState;
 
 struct SchedulerOptions {
     size_t maxActiveRequests = 4;
+    // Opt-in continuous decode batching, bounded by maxActiveRequests and 4.
+    // One retains the original round-robin execution/numerical path.
+    size_t maxDecodeBatchSize = 1;
     // Includes queued/running requests and completed streams whose terminal
     // event has not been read. Reading the terminal or dropping the handle
     // returns the reservation after execution has safely ended.
@@ -28,17 +31,6 @@ struct SchedulerOptions {
     // Optional admission limit for the already allocated Session caches.
     // This is not a total VRAM limit; model/workspace memory is excluded.
     size_t maxSessionCacheBytes = 0;
-};
-
-enum class RequestEndReason {
-    None,
-    Length,
-    StopToken,
-    Cancelled,
-    OutputBackpressure,
-    SchedulerStopped,
-    RuntimeFault,
-    Failed,
 };
 
 enum class RequestEventKind { Token, Terminal };
@@ -108,7 +100,10 @@ private:
 };
 
 // One submission thread per Scheduler, round-robin at complete forward
-// boundaries (one prefill chunk or one decode/finalization step). Use one
+// boundaries (one prefill chunk or a compatible decode/finalization batch).
+// Each batch is rebuilt from ready requests of the same LoadedModel; prefill
+// remains chunked and cannot starve behind repeatedly formed decode batches.
+// Use one
 // Scheduler for a device execution domain. A RuntimeFault stops admission
 // and fails its remaining requests; ordinary request errors are isolated.
 //

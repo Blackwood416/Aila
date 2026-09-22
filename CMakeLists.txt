@@ -154,6 +154,14 @@ set(JINJA_SOURCES
 # Core library sources (everything except main.cpp and CLI)
 set(LIB_SOURCES
     ${CHAT_SOURCES}
+    src/engine/AsrText.cpp
+    src/engine/EngineLoad.cpp
+    src/engine/EngineContext.cpp
+    src/engine/EngineGeneration.cpp
+    src/engine/EngineAudio.cpp
+    src/engine/EngineAudioCache.cpp
+    src/engine/EngineBenchmark.cpp
+    src/engine/EngineDetection.cpp
     src/ops/Linear.cpp
     src/ops/Bnb4BitLinear.cpp
     src/ops/NormOps.cpp
@@ -164,6 +172,7 @@ set(LIB_SOURCES
     src/ops/Transpose.cpp
     src/ops/ConvOps.cpp
     src/memory/KVCache.cpp
+    src/core/ExecutionTrace.cpp
     src/inference/Model.cpp
     src/inference/Session.cpp
     src/inference/Request.cpp
@@ -312,6 +321,13 @@ if(WIN32)
         src/proxy/AilaProxyApi.cpp
         src/proxy/ProxyEngine.cpp
         src/proxy/ProxyLogging.cpp
+        src/proxy/LegacyTextSession.cpp
+        src/proxy/LegacyInferenceBridge.cpp
+        src/utils/Tokenizer.cpp
+        src/utils/ModelSpec.cpp
+        src/profile/Profiling.cpp
+        ${CHAT_SOURCES}
+        ${JINJA_SOURCES}
         src/runtime/RuntimeDirectory.cpp
         src/runtime/ChildEnvironment.cpp
         src/runtime/WorkerProcess.cpp
@@ -320,7 +336,8 @@ if(WIN32)
     )
     target_compile_options(AilaShared PRIVATE
         -fno-sycl
-        -Wno-unused-command-line-argument)
+        -Wno-unused-command-line-argument
+        /fp:precise)
     target_link_options(AilaShared PRIVATE -fno-sycl)
     set_target_properties(AilaShared PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -412,6 +429,25 @@ target_link_libraries(AilaSchedulerTests PRIVATE Threads::Threads)
 add_test(NAME AilaSchedulerTests COMMAND AilaSchedulerTests)
 set_tests_properties(AilaSchedulerTests PROPERTIES LABELS "cpu;inference" TIMEOUT 60)
 
+add_executable(AilaSessionBatchTests
+    tests/inference/SessionBatchTests.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
+    src/profile/Profiling.cpp)
+target_include_directories(AilaSessionBatchTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(AilaSessionBatchTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaSessionBatchTests PRIVATE -fno-sycl)
+target_link_options(AilaSessionBatchTests PRIVATE -fno-sycl)
+if(MSVC)
+    target_compile_options(AilaSessionBatchTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaSessionBatchTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaSessionBatchTests PRIVATE Threads::Threads)
+add_test(NAME AilaSessionBatchTests COMMAND AilaSessionBatchTests)
+set_tests_properties(AilaSessionBatchTests PROPERTIES LABELS "cpu;inference;batch" TIMEOUT 30)
+
 add_executable(AilaSessionMemoryTests tests/inference/SessionMemoryTests.cpp)
 target_include_directories(AilaSessionMemoryTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -421,6 +457,70 @@ target_compile_options(AilaSessionMemoryTests PRIVATE -fno-sycl)
 target_link_options(AilaSessionMemoryTests PRIVATE -fno-sycl)
 add_test(NAME AilaSessionMemoryTests COMMAND AilaSessionMemoryTests)
 set_tests_properties(AilaSessionMemoryTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
+
+add_executable(AilaExecutionResourcesTests tests/inference/ExecutionResourcesTests.cpp)
+target_compile_definitions(AilaExecutionResourcesTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaExecutionResourcesTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaExecutionResourcesTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaExecutionResourcesTests PRIVATE AilaLib)
+add_test(NAME AilaExecutionResourcesTests COMMAND AilaExecutionResourcesTests)
+set_tests_properties(AilaExecutionResourcesTests PROPERTIES
+    LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu TIMEOUT 300)
+
+add_executable(AilaLoraExecutionTests tests/inference/LoraExecutionTests.cpp)
+target_compile_definitions(AilaLoraExecutionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaLoraExecutionTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaLoraExecutionTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaLoraExecutionTests PRIVATE AilaLib)
+add_test(NAME AilaLoraExecutionFusedTests COMMAND AilaLoraExecutionTests fused)
+add_test(NAME AilaLoraExecutionDnnlTests COMMAND AilaLoraExecutionTests dnnl)
+set_tests_properties(AilaLoraExecutionFusedTests AilaLoraExecutionDnnlTests PROPERTIES
+    LABELS "gpu;inference;lora" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu TIMEOUT 120)
+
+add_executable(AilaLayerReferenceTests tests/inference/LayerReferenceTests.cpp)
+target_compile_definitions(AilaLayerReferenceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaLayerReferenceTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaLayerReferenceTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaLayerReferenceTests PRIVATE AilaLib)
+# Explicit --write/--compare inputs prevent a test from generating its own oracle.
+add_test(NAME AilaLayerReferenceTests COMMAND AilaLayerReferenceTests)
+set_tests_properties(AilaLayerReferenceTests PROPERTIES
+    LABELS "gpu;inference;reference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+foreach(batchTarget IN ITEMS Qwen3Batch HybridBatch BatchInference DecodeRowProjection)
+    add_executable(Aila${batchTarget}Tests tests/inference/${batchTarget}Tests.cpp)
+    target_compile_definitions(Aila${batchTarget}Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+    if(MSVC)
+        target_compile_options(Aila${batchTarget}Tests PRIVATE /fp:precise)
+    else()
+        target_compile_options(Aila${batchTarget}Tests PRIVATE -fno-fast-math)
+    endif()
+    target_link_libraries(Aila${batchTarget}Tests PRIVATE AilaLib)
+    add_test(NAME Aila${batchTarget}Tests COMMAND Aila${batchTarget}Tests)
+    set_tests_properties(Aila${batchTarget}Tests PROPERTIES
+        LABELS "gpu;inference;batch" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
+endforeach()
+
+add_executable(AilaModelAllocationTests tests/inference/ModelAllocationTests.cpp)
+target_compile_definitions(AilaModelAllocationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaModelAllocationTests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaModelAllocationTests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaModelAllocationTests PRIVATE AilaLib)
+add_test(NAME AilaModelAllocationTests COMMAND AilaModelAllocationTests)
+set_tests_properties(AilaModelAllocationTests PROPERTIES
+    LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
 add_executable(AilaQwen3SessionTests tests/inference/Qwen3SessionTests.cpp)
 target_compile_definitions(AilaQwen3SessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
@@ -457,9 +557,19 @@ else()
 endif()
 target_link_libraries(AilaQwen35SessionTests PRIVATE AilaLib)
 add_test(NAME AilaQwen35SessionTests COMMAND AilaQwen35SessionTests)
-set_tests_properties(AilaQwen35SessionTests PROPERTIES
+add_test(NAME AilaQwen35Bf16SessionTests COMMAND AilaQwen35SessionTests --storage bf16)
+set_tests_properties(AilaQwen35SessionTests AilaQwen35Bf16SessionTests PROPERTIES
     LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
     SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_executable(AilaQwen35GroupedBf16Tests tests/inference/Qwen35GroupedBf16Tests.cpp)
+target_compile_definitions(AilaQwen35GroupedBf16Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+if(MSVC)
+    target_compile_options(AilaQwen35GroupedBf16Tests PRIVATE /fp:precise)
+else()
+    target_compile_options(AilaQwen35GroupedBf16Tests PRIVATE -fno-fast-math)
+endif()
+target_link_libraries(AilaQwen35GroupedBf16Tests PRIVATE AilaLib)
 
 add_executable(AilaDeferredLoggingTests
     tests/inference/DeferredLoggingTests.cpp
@@ -474,6 +584,13 @@ set_tests_properties(AilaDeferredLoggingTests PROPERTIES LABELS "cpu;inference" 
 
 find_program(AILA_PWSH_EXECUTABLE NAMES pwsh)
 if(AILA_PWSH_EXECUTABLE)
+    add_test(NAME AilaQwen35GroupedBf16Tests
+        COMMAND "${AILA_PWSH_EXECUTABLE}" -NoProfile -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/inference/Qwen35GroupedBf16Tests.ps1"
+            -Executable "$<TARGET_FILE:AilaQwen35GroupedBf16Tests>"
+            -OutputRoot "${CMAKE_CURRENT_BINARY_DIR}/Testing/Temporary")
+    set_tests_properties(AilaQwen35GroupedBf16Tests PROPERTIES
+        LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu TIMEOUT 600)
     add_test(NAME AilaTokenTraceComparisonTests
         COMMAND "${AILA_PWSH_EXECUTABLE}" -NoProfile -File
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/inference/TokenTraceComparisonTests.ps1")
@@ -484,7 +601,9 @@ add_test(
     COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/RuntimeDllSelectionTests.cmake"
 )
 
-add_executable(AilaBnb4BitLinearKernelTests tests/ops/Bnb4BitLinearKernelTests.cpp)
+add_executable(AilaBnb4BitLinearKernelTests
+    tests/ops/Bnb4BitLinearKernelTests.cpp
+    src/core/ExecutionTrace.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -495,7 +614,9 @@ target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE
     DNNL::dnnl simdjson AilaSyclOptions)
 add_test(NAME AilaBnb4BitLinearKernelTests COMMAND AilaBnb4BitLinearKernelTests)
 
-add_executable(AilaConvOpsKernelTests tests/ops/ConvOpsKernelTests.cpp)
+add_executable(AilaConvOpsKernelTests
+    tests/ops/ConvOpsKernelTests.cpp
+    src/core/ExecutionTrace.cpp)
 target_compile_definitions(AilaConvOpsKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaConvOpsKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -515,7 +636,8 @@ target_include_directories(AilaYolo26InferRefAdapter PRIVATE
 target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
 
 add_executable(AilaDiffusionGemmaNf4InferRefAdapter
-    tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp)
+    tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp
+    src/core/ExecutionTrace.cpp)
 target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
@@ -536,6 +658,7 @@ target_include_directories(AilaDiffusionGemmaModelSpecTests PRIVATE
 )
 target_link_libraries(AilaDiffusionGemmaModelSpecTests PRIVATE AilaLib)
 add_test(NAME AilaDiffusionGemmaModelSpecTests COMMAND AilaDiffusionGemmaModelSpecTests)
+set_tests_properties(AilaDiffusionGemmaModelSpecTests PROPERTIES LABELS "gpu;models;ops" TIMEOUT 120)
 
 add_executable(AilaDiffusionGemmaFusionTests
     tests/ops/DiffusionGemmaFusionTests.cpp
@@ -695,11 +818,31 @@ target_compile_options(AilaRuntimeFaultTests PRIVATE -fno-sycl -Wno-unused-comma
 target_link_options(AilaRuntimeFaultTests PRIVATE -fno-sycl)
 target_include_directories(AilaRuntimeFaultTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaRuntimeFaultTests PRIVATE Threads::Threads)
 if(WIN32)
     target_link_directories(AilaRuntimeFaultTests PRIVATE "${AILA_COMPILER_ROOT}/lib")
 endif()
 add_test(NAME AilaRuntimeFaultTests COMMAND AilaRuntimeFaultTests)
 set_tests_properties(AilaRuntimeFaultTests PROPERTIES LABELS "cpu;inference" TIMEOUT 30)
+
+add_executable(AilaExecutionTraceTests
+    tests/inference/ExecutionTraceTests.cpp
+    src/core/ExecutionTrace.cpp)
+target_compile_definitions(AilaExecutionTraceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(AilaExecutionTraceTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+target_link_options(AilaExecutionTraceTests PRIVATE -fno-sycl)
+target_include_directories(AilaExecutionTraceTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaExecutionTraceTests PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_directories(AilaExecutionTraceTests PRIVATE "${AILA_COMPILER_ROOT}/lib")
+    set_target_properties(AilaExecutionTraceTests PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_link_libraries(AilaExecutionTraceTests PRIVATE simdjson_proxy)
+else()
+    target_link_libraries(AilaExecutionTraceTests PRIVATE simdjson)
+endif()
+add_test(NAME AilaExecutionTraceTests COMMAND AilaExecutionTraceTests)
+set_tests_properties(AilaExecutionTraceTests PROPERTIES LABELS "cpu;inference;diagnostics" TIMEOUT 30)
 
 if(WIN32)
     get_filename_component(AILA_WORKER_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -742,6 +885,21 @@ if(WIN32)
         target_compile_options(AilaInferenceClient PRIVATE -fno-fast-math)
     endif()
 
+    # Public asynchronous token ABI uses the same CRT as InferenceClient.
+    # The old MT proxy remains a separate DLL with its unchanged ABI.
+    add_library(AilaInference SHARED src/runtime/AilaInferenceApi.cpp)
+    target_compile_definitions(AilaInference PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN AILA_INFERENCE_BUILDING_DLL)
+    target_include_directories(AilaInference PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(AilaInference PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaInference PRIVATE -fno-sycl)
+    target_link_libraries(AilaInference PRIVATE AilaInferenceClient AilaBuildIdentity)
+    if(MSVC)
+        target_compile_options(AilaInference PRIVATE /fp:precise)
+    else()
+        target_compile_options(AilaInference PRIVATE -fno-fast-math)
+    endif()
+
     add_executable(AilaInferenceClientTests tests/runtime/InferenceClientTests.cpp)
     target_compile_definitions(AilaInferenceClientTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(AilaInferenceClientTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
@@ -767,12 +925,26 @@ if(WIN32)
     add_dependencies(AilaQwen3IpcSessionTests AilaWorker)
     add_test(NAME AilaQwen3IpcSessionTests COMMAND AilaQwen3IpcSessionTests)
     add_test(NAME AilaQwen35IpcSessionTests COMMAND AilaQwen3IpcSessionTests --backend qwen35_nf4)
-    set_tests_properties(AilaQwen3IpcSessionTests AilaQwen35IpcSessionTests PROPERTIES
+    add_test(NAME AilaQwen35Bf16IpcSessionTests COMMAND AilaQwen3IpcSessionTests --backend qwen35_bf16)
+    set_tests_properties(AilaQwen3IpcSessionTests AilaQwen35IpcSessionTests AilaQwen35Bf16IpcSessionTests PROPERTIES
         LABELS "gpu;inference;ipc" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+    foreach(fixture IN ITEMS IpcBenchmark)
+        add_executable(Aila${fixture} tests/inference/${fixture}.cpp)
+        target_compile_definitions(Aila${fixture} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB
+            AILA_IPC_WORKER_PATH="$<TARGET_FILE:AilaWorker>")
+        target_link_libraries(Aila${fixture} PRIVATE AilaLib AilaInferenceClient AilaBuildIdentity)
+        if(MSVC)
+            target_compile_options(Aila${fixture} PRIVATE /fp:precise)
+        else()
+            target_compile_options(Aila${fixture} PRIVATE -fno-fast-math)
+        endif()
+        add_dependencies(Aila${fixture} AilaWorker)
+    endforeach()
     add_executable(AilaFakeInferenceWorker
         tests/runtime/FakeInferenceWorkerMain.cpp
         src/worker/InferenceWorkerMain.cpp
+        src/core/ExecutionTrace.cpp
         src/ipc/Win32Pipe.cpp
         src/inference/Session.cpp
         src/inference/Request.cpp
@@ -782,6 +954,60 @@ if(WIN32)
     target_compile_options(AilaFakeInferenceWorker PRIVATE -fno-sycl -Wno-unused-command-line-argument)
     target_link_options(AilaFakeInferenceWorker PRIVATE -fno-sycl)
     target_link_libraries(AilaFakeInferenceWorker PRIVATE AilaInferenceWorkerCore AilaBuildIdentity bcrypt)
+
+    add_executable(AilaInferenceCHeaderTests
+        tests/runtime/InferenceCHeaderTests.c tests/runtime/InferenceCHeaderMain.cpp)
+    target_compile_definitions(AilaInferenceCHeaderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaInferenceCHeaderTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaInferenceCHeaderTests PRIVATE -fno-sycl)
+    target_link_libraries(AilaInferenceCHeaderTests PRIVATE AilaInference)
+    add_test(NAME AilaInferenceCHeaderTests COMMAND AilaInferenceCHeaderTests)
+    set_tests_properties(AilaInferenceCHeaderTests PROPERTIES LABELS "cpu;inference;abi" TIMEOUT 15)
+    add_executable(AilaInferenceCApiGpuTests tests/inference/InferenceCApiTests.cpp)
+    target_compile_definitions(AilaInferenceCApiGpuTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(AilaInferenceCApiGpuTests PRIVATE -fno-sycl -Wno-unused-command-line-argument)
+    target_link_options(AilaInferenceCApiGpuTests PRIVATE -fno-sycl)
+    target_link_libraries(AilaInferenceCApiGpuTests PRIVATE AilaInference AilaInferenceClient AilaBuildIdentity)
+    if(MSVC)
+        target_compile_options(AilaInferenceCApiGpuTests PRIVATE /fp:precise)
+    else()
+        target_compile_options(AilaInferenceCApiGpuTests PRIVATE -fno-fast-math)
+    endif()
+    add_dependencies(AilaInferenceCApiGpuTests AilaWorker)
+    add_test(NAME AilaInferenceCApiGpuTests COMMAND AilaInferenceCApiGpuTests)
+    set_tests_properties(AilaInferenceCApiGpuTests PROPERTIES
+        LABELS "gpu;inference;abi;ipc" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME AilaInferenceCApiTests COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/inference_c_api_tests.py
+            --dll $<TARGET_FILE:AilaInference> --worker $<TARGET_FILE:AilaFakeInferenceWorker>)
+        set_tests_properties(AilaInferenceCApiTests PROPERTIES LABELS "cpu;inference;abi;ipc" TIMEOUT 90)
+        add_test(NAME AilaLegacyTextApiTests COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/legacy_text_api_tests.py
+            --dll $<TARGET_FILE:AilaShared> --worker $<TARGET_FILE:AilaFakeInferenceWorker>)
+        set_tests_properties(AilaLegacyTextApiTests PROPERTIES LABELS "cpu;inference;abi;ipc" TIMEOUT 120)
+    endif()
+
+    add_executable(AilaLegacyTextSessionTests
+        tests/runtime/LegacyTextSessionTests.cpp
+        src/proxy/LegacyTextSession.cpp
+        src/proxy/LegacyInferenceBridge.cpp
+        src/proxy/ProxyLogging.cpp
+        src/utils/Tokenizer.cpp
+        src/utils/ModelSpec.cpp
+        src/profile/Profiling.cpp
+        ${CHAT_SOURCES} ${JINJA_SOURCES})
+    target_compile_definitions(AilaLegacyTextSessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+    target_compile_options(AilaLegacyTextSessionTests PRIVATE -fno-sycl -Wno-unused-command-line-argument /fp:precise)
+    target_link_options(AilaLegacyTextSessionTests PRIVATE -fno-sycl)
+    set_target_properties(AilaLegacyTextSessionTests PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_include_directories(AilaLegacyTextSessionTests PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+    target_link_directories(AilaLegacyTextSessionTests PRIVATE "${AILA_COMPILER_ROOT}/lib")
+    target_link_libraries(AilaLegacyTextSessionTests PRIVATE simdjson_proxy AilaBuildIdentity Threads::Threads)
+    add_test(NAME AilaLegacyTextSessionTests COMMAND AilaLegacyTextSessionTests)
+    set_tests_properties(AilaLegacyTextSessionTests PROPERTIES LABELS "cpu;inference;abi" TIMEOUT 30)
 
     add_executable(AilaInferencePipeTests tests/runtime/InferencePipeTests.cpp)
     target_compile_definitions(AilaInferencePipeTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
@@ -1071,6 +1297,9 @@ set(target_kind "${TARGET_KIND}")
 
 set(search_dirs [==[@AILA_RUNTIME_SEARCH_DIRS@]==])
 set(extra_root_dlls [==[@AILA_ONEAPI_RUNTIME_ROOT_DLLS@]==])
+if(HOST_ONLY)
+    set(extra_root_dlls)
+endif()
 
 set(search_dll_names)
 foreach(search_dir IN LISTS search_dirs)
@@ -1132,6 +1361,13 @@ endif()
 list(REMOVE_DUPLICATES resolved_deps)
 
 foreach(dep IN LISTS resolved_deps)
+    if(HOST_ONLY)
+        get_filename_component(host_dependency_name "${dep}" NAME)
+        string(TOLOWER "${host_dependency_name}" host_dependency_name)
+        if(host_dependency_name MATCHES "(sycl|dnnl|onednn|ze_loader|ur_adapter|ur_loader)")
+            message(FATAL_ERROR "Host-only package depends on GPU runtime: ${dep}")
+        endif()
+    endif()
     if(EXISTS "${dep}")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dep}" "${target_dir}"
@@ -1171,12 +1407,24 @@ endif()
 
     set(AILA_RELEASE_BIN_DIR "${CMAKE_BINARY_DIR}/Release/bin")
     set(AILA_RELEASE_RUNTIME_DIR "${AILA_RELEASE_BIN_DIR}/aila_runtime")
+    set(AILA_RELEASE_INCLUDE_DIR "${CMAKE_BINARY_DIR}/Release/include")
+    set(AILA_RELEASE_LIB_DIR "${CMAKE_BINARY_DIR}/Release/lib")
 
     add_custom_target(release
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${AILA_RELEASE_BIN_DIR}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_RUNTIME_DIR}/licenses/soxr"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AILA_RELEASE_INCLUDE_DIR}" "${AILA_RELEASE_LIB_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaShared>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaInference>" "${AILA_RELEASE_BIN_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:AilaInference>" "${AILA_RELEASE_LIB_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/include/aila_inference.h" "${AILA_RELEASE_INCLUDE_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+            "-DTARGET_PATH=$<TARGET_FILE:AilaInference>"
+            "-DTARGET_DIR=${AILA_RELEASE_BIN_DIR}"
+            "-DTARGET_KIND=LIBRARY"
+            "-DHOST_ONLY=ON"
+            -P "${CMAKE_CURRENT_BINARY_DIR}/copy_runtime_dependencies.cmake"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Aila>" "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:AilaWorker>" "${AILA_RELEASE_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/third_party/soxr/LICENCE" "${AILA_RELEASE_RUNTIME_DIR}/licenses/soxr/"
@@ -1194,5 +1442,5 @@ endif()
         COMMENT "Staging release binaries and third-party licenses in ${AILA_RELEASE_BIN_DIR}"
         VERBATIM
     )
-    add_dependencies(release Aila AilaShared AilaWorker soxr)
+    add_dependencies(release Aila AilaShared AilaInference AilaWorker soxr)
 endif()

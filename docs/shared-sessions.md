@@ -1,6 +1,6 @@
 # 共享模型文本会话
 
-当前实现位于 `src/inference`，支持进程内的 Qwen3 与 Qwen3.5 Hybrid NF4 文本推理，共享会话使用 BF16 KV。旧 `InferenceEngine`、CLI 和 C ABI 保留原有入口；两个 NF4 后端的旧入口使用默认会话外观，缓存按需创建。Token API 支持手动步进和自动 [Scheduler](scheduler.md)。本文描述进程内的资源与故障语义；Hybrid 的详细约定见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)，跨进程接口约定见 [IPC v2](inference-ipc-v2.md)，服务层进度见 [重构路线图](refactor-roadmap.md)。
+当前实现位于 `src/inference`，支持进程内的 Qwen3 NF4、Qwen3.5 Hybrid NF4 与 BF16 文本权重，共享会话使用 BF16 KV。旧 `InferenceEngine`、CLI 和 C ABI 保留原有入口；已迁移后端的旧入口使用默认会话外观，缓存按需创建。Token API 支持手动步进和自动 [Scheduler](scheduler.md)。本文描述进程内的资源与故障语义；Hybrid 的详细约定见 [qwen35-shared-sessions.md](qwen35-shared-sessions.md)，跨进程接口约定见 [IPC v2](inference-ipc-v2.md)，服务层进度见 [重构路线图](refactor-roadmap.md)。
 
 ## 资源与执行约定
 
@@ -27,9 +27,9 @@
 | `SessionReservationBytes()` / `SessionState::CacheBytes()` | 每 Session 的 device cache/state 字节数 |
 | `SessionHostReservationBytes()` | 每 Session 的 host payload 预留；Qwen3 为 0，Hybrid 为常驻 mirror × `(1 + maxRecurrentSnapshots)` |
 
-host 快照按需分配，额度按最大保留数量预留；禁用快照仍保留 mirror。这些额度不包含权重、执行 scratch、oneDNN/driver 分配、STL/allocator 元数据及网络缓冲，不能当作总内存或总显存准入。`DeviceRuntime::Memory()` 也只返回 Context 记账的 USM。
+host 快照按需分配，额度按最大保留数量预留；禁用快照仍保留 mirror。Session 额度之外，`DeviceRuntime::SetAllocationLimits(deviceBytes, pinnedHostBytes)` 可在加载前限制整个 Context 的显式 USM，包含权重和执行 scratch；`Memory()` 提供两类 USM 的当前量、峰值、分配数量及上限。缓存所有权、增长时新旧缓冲共存、局部额度失败恢复及计量范围详见 [执行资源](execution-resources.md)。这些额度不包含全部 oneDNN/driver 分配、STL/allocator 元数据及网络缓冲，不能当作总 RSS 或 WDDM 驻留显存上限。
 
-共享会话的权重仍为 NF4，KV 要求 BF16。Qwen3 检查 `AILA_KV_QUANT=0`；Qwen3.5 检查有效 `AILA_VLM_KV_QUANT`，未设置时回退到 `AILA_KV_QUANT`，显式 scoped 值 0 优先于全局值 1。新接口在加载及显式创建会话时拒绝量化 KV，返回 `InvalidArgument`；旧入口保留原有配置语义。既有 FP8 路径的验证证据见 [refactor-validation.md](refactor-validation.md)。
+共享会话的 KV 要求 BF16。Qwen3 检查 `AILA_KV_QUANT=0`；Qwen3.5 检查有效 `AILA_VLM_KV_QUANT`，未设置时回退到 `AILA_KV_QUANT`，显式 scoped 值 0 优先于全局值 1。新接口在加载及显式创建会话时拒绝量化 KV，返回 `InvalidArgument`；旧入口保留原有配置语义。既有 FP8 路径的验证证据见 [refactor-validation.md](refactor-validation.md)。
 
 ## 使用步骤
 
@@ -69,7 +69,7 @@ while (!IsTerminal(requestA->Snapshot().status) ||
 }
 ```
 
-Qwen3.5 使用 `LoadedModel::LoadQwen35Nf4`，其余 Request/Scheduler 接口相同；可通过 `maxRecurrentSnapshots` 和 `maxSessionHostBytes` 设置回滚及 host 预算。
+Qwen3.5 NF4 使用 `LoadedModel::LoadQwen35Nf4`，未量化 BF16 text checkpoint 使用 `LoadedModel::LoadQwen35Bf16`；后者检查模型配置及 text matrix dtype。其余 Request/Scheduler 接口相同，可通过 `maxRecurrentSnapshots` 和 `maxSessionHostBytes` 设置回滚及 host 预算。BF16 text 入口目前仅在进程内提供，IPC/HTTP 仍明确选择 NF4 后端。
 
 `RequestState::Create()` 将输入追加到已有缓存，要求非空输入，并预留 `已有缓存 + 输入 + max_new_tokens` 的容量。它不推断聊天前缀、不复用其他会话历史。每个 Session 同时只能有一个请求；重复提交及活动期间的 `Reset/Truncate/ForwardLogits` 返回 `ErrorCode::Busy`。`Step()` 也拒绝并发或递归调用。
 
@@ -85,7 +85,7 @@ Qwen3 的 `Truncate(length)` 恢复到指定长度；Hybrid 向前截断时返�
 
 ## 设备域故障与生命周期
 
-执行步骤及 Reset/Truncate 的设备变更异常会归一为 `ErrorCode::RuntimeFault`，使当前设备域失效；其他会话的后续执行也会失败。设备域通过 `RuntimeFaultRecord` 在固定存储中保留首个诊断，最多 1024 字节并保持 UTF-8 边界。同步异常先记录再 drain，成功 drain 不会清除故障，后续 drain/析构异常也不会覆盖首因；空诊断使用默认设备故障消息。
+执行步骤及 Reset/Truncate 的设备变更异常会归一为 `ErrorCode::RuntimeFault`，使当前设备域失效；其他会话的后续执行也会失败。配置的分配额度拒绝属于 `ResourceLimit`：Forward 先 drain 并 Reset 受影响会话，其余会话可以继续使用。设备域通过 `RuntimeFaultRecord` 在固定存储中保留首个诊断，最多 1024 字节并保持 UTF-8 边界。同步设备异常先记录再 drain，成功 drain 不会清除故障，后续 drain/析构异常也不会覆盖首因；空诊断使用默认设备故障消息。
 
 `DeviceRuntime::Create()` 对 Context 构造时的 SYCL/oneDNN 异常使用相同分类；构造失败时尚无已发布的设备域可供排空。`LoadQwen3Nf4`、`LoadQwen35Nf4` 及显式 Session 初始化通过 `RunDeviceLifecycle` 处理已存在设备域上的创建工作：
 
@@ -108,7 +108,7 @@ Qwen3 的 `Truncate(length)` 恢复到指定长度；Hybrid 向前截断时返�
 
 当前 Token API 支持 greedy、固定 seed 采样、已有 repetition/presence/frequency penalties，以及显式停止 token。它继承现有采样算子的行为；不改变旧生成接口的采样规则。`thinking_budget_tokens` 必须为 -1；聊天模板、thinking budget、工具调用和文本流解析尚未迁入这个低层驱动，旧接口继续支持原有能力。
 
-`LoadQwen3Nf4` 与 `LoadQwen35Nf4` 分别接受对应模型的 NF4 文本权重。BF16 权重策略复用、视觉、ASR/TTS、Diffusion 等共享会话能力尚未迁移，继续使用旧入口；Hybrid 媒体 setter 只作用于旧默认 Session。发布显式 Session 后，backend 拒绝 reload 或 LoRA 替换。完整显存预算及 IPC/HTTP 服务层的进度以 [重构路线图](refactor-roadmap.md) 为准；接口约定见 [IPC v2 文档](inference-ipc-v2.md)，独立 HTTP 依赖探针的结果见 [refactor-http-probe.md](refactor-http-probe.md)。
+`LoadQwen3Nf4` 与 `LoadQwen35Nf4` 分别接受对应模型的 NF4 文本权重，`LoadQwen35Bf16` 复用同一共享会话执行、采样、预算和故障框架。视觉、ASR/TTS、Diffusion 等共享会话能力尚未迁移，继续使用旧入口；Hybrid 媒体 setter 只作用于旧默认 Session。发布显式 Session 后，backend 拒绝 reload 或 LoRA 替换。后续批执行及 IPC/HTTP 服务层的进度以 [重构路线图](refactor-roadmap.md) 为准；接口约定见 [IPC v2 文档](inference-ipc-v2.md)，独立 HTTP 依赖探针的结果见 [refactor-http-probe.md](refactor-http-probe.md)。
 
 本轮主任务已统一验证 `AilaRuntimeFaultTests` 的 7 组 CPU 用例通过，覆盖同步 SYCL/oneDNN 类型注入、首因不被后续 drain 覆盖、成功工作仍需通过最终 drain、普通 host/file/参数/准入失败保持局部、清理设备故障覆盖普通失败、析构与有界诊断、权重恢复边界。`AilaSchedulerTests` 新增的 3 组生命周期故障用例也已通过，整个测试目标为 22/22；覆盖已完成未读流保留、Submit 准入竞争回滚及日志回调重入报告。CPU 测试使用可注入的异常类型和 drain/gate，不创建 SYCL Context，不代表真实 GPU/driver 故障注入。
 

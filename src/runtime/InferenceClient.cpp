@@ -25,7 +25,8 @@ void require(bool condition, const std::string& message) {
 
 bool control_method(wire::Method method) {
     return method != wire::Method::ModelLoad && method != wire::Method::SessionCreate &&
-        method != wire::Method::RequestSubmit;
+        method != wire::Method::RequestSubmit && method != wire::Method::SessionReset &&
+        method != wire::Method::SessionTruncate && method != wire::Method::WorkerMemoryQuery;
 }
 
 bool identity_equal(const wire::Identity& a, const wire::Identity& b) {
@@ -125,6 +126,8 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
     bool markerTurn = true;
     size_t owners = 0;
     size_t threadsRunning = 0;
+    std::mutex threadJoinMutex;
+    std::vector<std::thread> ioThreads;
     wire::DomainStatus status = wire::DomainStatus::Starting;
     std::string failure;
     ClientErrorCode failureCode = ClientErrorCode::Closed;
@@ -145,6 +148,11 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
     uint64_t peakIngress = 0;
     uint64_t peakTransport = 0;
     uint64_t droppedLogs = 0;
+    struct BufferedLog { InferenceLogEvent event; uint64_t bytes; };
+    std::deque<BufferedLog> logs;
+    uint64_t logQueueBytes = 0;
+    uint64_t peakLogQueueBytes = 0;
+    bool logsClosed = false;
     Clock::time_point writeStarted;
     Clock::time_point shutdownDeadline;
     uint32_t shutdownGraceMs = 0;
@@ -159,8 +167,24 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
         : transport(std::move(value)), expected(std::move(identity)), options(std::move(settings)),
           limits(options.limits) {
         failure.reserve(wire::kMaxErrorBytes);
+        ioThreads.reserve(4);
         routes.reserve(limits.maxRetainedRequestHandles);
         releaseMarks.reserve(static_cast<size_t>(limits.maxPendingCommands) + limits.maxSessions + limits.maxLoadedModels);
+    }
+
+    ~InferenceConnection() {
+        // Without an explicit Shutdown the final owner is normally the last
+        // I/O thread. Release remains asynchronous; only that thread detaches.
+        for (auto& thread : ioThreads) {
+            if (!thread.joinable()) continue;
+            if (thread.get_id() == std::this_thread::get_id()) thread.detach();
+            else thread.join();
+        }
+    }
+
+    void JoinThreads() {
+        std::lock_guard<std::mutex> lock(threadJoinMutex);
+        for (auto& thread : ioThreads) if (thread.joinable()) thread.join();
     }
 
     std::chrono::milliseconds Timeout(std::chrono::milliseconds timeout) const {
@@ -344,12 +368,57 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             throw InferenceClientError(ClientErrorCode::RemoteError, error.message, error.code);
         }
         if (command.method == wire::Method::ModelLoad) {
+            if (command.allocationLimits &&
+                std::find(capabilities.begin(), capabilities.end(), "allocation_limits_v1") == capabilities.end()) {
+                throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate allocation_limits_v1", wire::ErrorCode::UnsupportedCapability);
+            }
             const auto capability = wire::model_capability(command.backend, command.kvType);
             if (std::find(capabilities.begin(), capabilities.end(), capability) == capabilities.end()) {
                 throw InferenceClientError(ClientErrorCode::RemoteError,
                     "Worker did not negotiate the requested model capability: " + std::string(capability),
                     wire::ErrorCode::UnsupportedCapability);
             }
+        }
+        if (command.method == wire::Method::RequestSubmit && command.thinkingBudget &&
+            std::find(capabilities.begin(), capabilities.end(), "thinking_budget_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate thinking_budget_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::RequestSubmit && command.prefillOnly &&
+            std::find(capabilities.begin(), capabilities.end(), "prefill_only_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate prefill_only_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::RequestSubmit && command.thinkingBudget && command.thinkingBudget->closeOnce &&
+            std::find(capabilities.begin(), capabilities.end(), "thinking_budget_close_once_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate thinking_budget_close_once_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::RequestSubmit && command.forceHostSampling &&
+            std::find(capabilities.begin(), capabilities.end(), "host_sampling_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate host_sampling_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::RequestSubmit && command.legacyPrefillLogits &&
+            std::find(capabilities.begin(), capabilities.end(), "legacy_prefill_logits_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate legacy_prefill_logits_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if ((command.method == wire::Method::SessionReset || command.method == wire::Method::SessionTruncate) &&
+            std::find(capabilities.begin(), capabilities.end(), "session_context_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate session_context_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::WorkerSetLogLevel &&
+            std::find(capabilities.begin(), capabilities.end(), "worker_log_control_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate worker_log_control_v1", wire::ErrorCode::UnsupportedCapability);
+        }
+        if (command.method == wire::Method::WorkerMemoryQuery &&
+            std::find(capabilities.begin(), capabilities.end(), "runtime_memory_v1") == capabilities.end()) {
+            throw InferenceClientError(ClientErrorCode::RemoteError,
+                    "Worker did not negotiate runtime_memory_v1", wire::ErrorCode::UnsupportedCapability);
         }
         command.rpcId = 0;
     }
@@ -576,6 +645,9 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             } else {
                 auto item = found->second;
                 require(response.method == item->command.method, "RPC response method mismatch");
+                if (response.kind == wire::ResponseKind::Result && response.method == wire::Method::WorkerSetLogLevel) {
+                    require(response.logLevel == item->command.logLevel, "Worker changed the requested log level");
+                }
                 if (response.kind == wire::ResponseKind::Result && response.method == wire::Method::ModelLoad) {
                     // The v2 lifecycle executor publishes successful creations
                     // in allocation order; failed IDs may leave gaps.
@@ -585,6 +657,12 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                     require(std::find(response.model.capabilities.begin(), response.model.capabilities.end(),
                                       wire::model_capability(item->command.backend, item->command.kvType)) != response.model.capabilities.end(),
                             "Loaded model does not support the requested backend/KV type");
+                    require(response.model.memory.has_value() == item->command.allocationLimits.has_value(),
+                            "Model allocation limit acknowledgement is missing or unsolicited");
+                    if (item->command.allocationLimits) {
+                        require(response.model.memory->limits == *item->command.allocationLimits,
+                                "Worker changed the requested allocation limits");
+                    }
                     lastModelId = response.model.modelId;
                 }
                 if (response.kind == wire::ResponseKind::Result && response.method == wire::Method::SessionCreate) {
@@ -596,12 +674,17 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                             "Created session capacity/cache reservation mismatch");
                     lastSessionId = response.session.sessionId;
                 }
-                if (response.kind == wire::ResponseKind::Result && response.method == wire::Method::SessionQuery) {
+                if (response.kind == wire::ResponseKind::Result &&
+                    (response.method == wire::Method::SessionQuery || response.method == wire::Method::SessionReset ||
+                     response.method == wire::Method::SessionTruncate)) {
                     require(response.session.sessionId == item->command.sessionId &&
                             response.session.modelId == item->command.modelId &&
                             response.session.capacity == item->command.maxSequenceLength &&
                             response.session.cacheBytes == item->command.maxSessionCacheBytes,
-                            "Session query identity/metadata mismatch");
+                            "Session operation identity/metadata mismatch");
+                    if (response.method == wire::Method::SessionTruncate)
+                        require(response.session.contextLength && *response.session.contextLength <= item->command.contextLength,
+                                "Session truncate restored beyond its requested length");
                 }
                 if (response.kind == wire::ResponseKind::Result && response.method == wire::Method::RequestQuery && item->route) {
                     require(response.request.summary.generatedTokens <= item->route->maxGenerated &&
@@ -678,9 +761,21 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                     "Worker eventOrdinal is duplicated or discontinuous");
             lastOrdinal = event.eventOrdinal;
             if (event.kind == wire::EventKind::Log) {
-                // No user callback on the reader. This internal API currently
-                // exposes only a drop count; there is no unbounded log queue.
-                ++droppedLogs;
+                // Charge the same conservative payload allowance as Worker;
+                // even empty strings consume a slot's overhead. Log pressure
+                // cannot consume request credit or fail the connection.
+                const uint64_t bytes = event.message.size() * 6 + 512;
+                if (logsClosed || logQueueBytes > limits.maxLogQueueBytes ||
+                    bytes > limits.maxLogQueueBytes - logQueueBytes) {
+                    ++droppedLogs;
+                } else {
+                    try {
+                        logs.push_back({{event.eventOrdinal, event.logLevel,
+                            std::move(event.epoch), std::move(event.message)}, bytes});
+                        logQueueBytes += bytes;
+                        peakLogQueueBytes = std::max(peakLogQueueBytes, logQueueBytes);
+                    } catch (...) { ++droppedLogs; }
+                }
             } else if (event.kind == wire::EventKind::DomainFault) {
                 status = wire::DomainStatus::Faulted;
             } else {
@@ -825,7 +920,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             ++threadsRunning;
         }
         try {
-            std::thread([self, function] {
+            ioThreads.emplace_back([self, function] {
                 try { (self.get()->*function)(); }
                 catch (const InferenceClientError& error) { self->Fail(error.Code(), error.what(), error.RemoteCode()); }
                 catch (const std::exception& error) { self->Fail(ClientErrorCode::ProtocolError, error.what()); }
@@ -833,7 +928,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                 std::lock_guard<std::mutex> lock(self->mutex);
                 --self->threadsRunning;
                 self->changed.notify_all();
-            }).detach();
+            });
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex);
             --threadsRunning;
@@ -870,7 +965,8 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                 if (dead) throw InferenceClientError(failureCode, failure, failureRemoteCode);
                 wire::ValidationError error;
                 wire::Limits selected;
-                if (!wire::negotiate(limits, options.requiredCapabilities, hello.hardLimits,
+                if (!wire::negotiate(limits, options.requiredCapabilities,
+                                     wire::configure_limits_ceiling(hello.hardLimits, options.requiredCapabilities),
                                      hello.capabilities, selected, error)) {
                     throw InferenceClientError(ClientErrorCode::RemoteError, error.message, error.code);
                 }
@@ -879,6 +975,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             command.method = wire::Method::WorkerConfigure;
             command.requiredCapabilities = options.requiredCapabilities;
             command.limits = limits;
+            command.maxDecodeBatchSize = options.maxDecodeBatchSize;
             auto response = Call(std::move(command), options.handshakeTimeout, true);
             wire::ValidationError error;
             wire::Limits selected;
@@ -887,6 +984,8 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             // Requesting the selected response limits against the original
             // request also rejects a peer that silently increased a bound.
             require(wire::validate_limits(response.limits, error, limits), "Worker changed negotiated limits: " + error.message);
+            require(response.maxDecodeBatchSize == options.maxDecodeBatchSize,
+                    "Worker changed the requested decode batch size");
             transport->SetLimits(response.limits);
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -902,6 +1001,7 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             }
         } catch (...) {
             Fail(ClientErrorCode::Closed, "Inference connection initialization failed");
+            JoinThreads();
             throw;
         }
     }
@@ -916,6 +1016,10 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
         command.prefillChunkSize = request.prefillChunkSize;
         command.stopTokenIds = std::move(request.stopTokenIds);
         command.generation = request.generation;
+        command.thinkingBudget = std::move(request.thinkingBudget);
+        command.prefillOnly = request.prefillOnly;
+        command.forceHostSampling = request.forceHostSampling;
+        command.legacyPrefillLogits = request.legacyPrefillLogits;
         auto route = std::make_shared<InferenceRoute>();
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -929,6 +1033,10 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
                 }
             }
             const uint64_t tokenReservation = command.promptIds.size() + static_cast<uint64_t>(command.generation.maxNewTokens);
+            if (command.thinkingBudget) {
+                if (const char* message = aila::generation::ValidateThinkingBudget(*command.thinkingBudget, vocabSize, command.stopTokenIds))
+                    throw InferenceClientError(ClientErrorCode::RemoteError, message, wire::ErrorCode::InvalidArgument);
+            }
             const uint64_t byteReservation = (static_cast<uint64_t>(limits.tokenWindow) + 1) * limits.maxTokenFrameBytes +
                 limits.maxTerminalFrameBytes + limits.maxFinalFrameBytes;
             if (outstanding >= limits.maxOutstandingRequests || routes.size() >= limits.maxRetainedRequestHandles ||
@@ -991,11 +1099,13 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
             event.summary.promptTokensProcessed = token.promptTokens;
             event.summary.generatedTokens = token.generatedTokens;
         } else if (route->complete) {
-            route->userTerminalConsumed = true;
             event.terminal = true;
             event.localFailure = route->localFailure;
+            // Copy diagnostic text before committing consumption. Allocation
+            // failure must leave this terminal available to a later reader.
             event.summary = route->localFailure ? route->localSummary : route->terminal.summary;
             event.sequence = route->localFailure ? 0 : route->terminal.sequence;
+            route->userTerminalConsumed = true;
             if (!route->localFailure) {
                 route->wireTerminalConsumed = true;
                 route->consumed = route->terminal.sequence;
@@ -1015,7 +1125,11 @@ struct InferenceConnection : std::enable_shared_from_this<InferenceConnection> {
         std::unique_lock<std::mutex> lock(mutex);
         RequestShutdownLocked(timeout);
         changed.wait(lock, [&] { return dead; });
-        changed.wait(lock, [&] { return threadsRunning == 0; });
+        lock.unlock();
+        // A counter reaching zero precedes destruction of thread captures and
+        // the CRT trampoline. A DLL consumer may unload immediately on return.
+        JoinThreads();
+        lock.lock();
         if (!graceful) throw InferenceClientError(failureCode, failure, failureRemoteCode);
     }
 };
@@ -1046,11 +1160,14 @@ std::shared_ptr<InferenceTransport> StartInferencePipeTransport(
 
 InferenceClient::InferenceClient(std::shared_ptr<detail::InferenceConnection> connection)
     : connection_(std::move(connection)) { connection_->AddOwner(); }
-InferenceClient::~InferenceClient() { connection_->ReleaseOwner(); }
+InferenceClient::~InferenceClient() { CloseLogStream(); connection_->ReleaseOwner(); }
 
 std::shared_ptr<InferenceClient> InferenceClient::Start(
     const std::filesystem::path& runtime, const std::filesystem::path& executable,
     const std::string& buildId, InferenceClientOptions options) {
+    wire::ValidationError error;
+    if (!wire::validate_decode_batch_size(options.maxDecodeBatchSize, options.limits, error))
+        throw InferenceClientError(ClientErrorCode::RemoteError, error.message, wire::ErrorCode::InvalidArgument);
     ExpectedInferenceIdentity expected;
     auto transport = StartInferencePipeTransport(runtime, executable, buildId, expected);
     return Connect(std::move(transport), std::move(expected), std::move(options));
@@ -1059,10 +1176,19 @@ std::shared_ptr<InferenceClient> InferenceClient::Start(
 std::shared_ptr<InferenceClient> InferenceClient::Connect(
     std::shared_ptr<InferenceTransport> transport, ExpectedInferenceIdentity identity, InferenceClientOptions options) {
     wire::ValidationError error;
-    if (!transport || !wire::validate_limits(options.limits, error) || options.handshakeTimeout <= 0ms ||
+    if (!transport || !wire::validate_limits(options.limits, error, wire::extended_generation_limits()) ||
+        !wire::validate_decode_batch_size(options.maxDecodeBatchSize, options.limits, error) || options.handshakeTimeout <= 0ms ||
         options.commandTimeout <= 0ms || options.shutdownTimeout <= 0ms) {
         throw InferenceClientError(ClientErrorCode::RemoteError, "Invalid inference client configuration: " + error.message,
                                    wire::ErrorCode::InvalidArgument);
+    }
+    if (options.limits.maxGeneratedTokens > wire::hard_limits().maxGeneratedTokens &&
+        std::find(options.requiredCapabilities.begin(), options.requiredCapabilities.end(), "extended_generation_v1") == options.requiredCapabilities.end()) {
+        options.requiredCapabilities.emplace_back("extended_generation_v1");
+    }
+    if (options.maxDecodeBatchSize > 1 &&
+        std::find(options.requiredCapabilities.begin(), options.requiredCapabilities.end(), "continuous_batching_v1") == options.requiredCapabilities.end()) {
+        options.requiredCapabilities.emplace_back("continuous_batching_v1");
     }
     auto connection = std::make_shared<detail::InferenceConnection>(std::move(transport), std::move(identity), std::move(options));
     connection->Initialize();
@@ -1072,15 +1198,20 @@ std::shared_ptr<InferenceClient> InferenceClient::Connect(
 
 std::shared_ptr<InferenceModel> InferenceClient::LoadQwen3(
     const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
-    return LoadNf4("qwen3_nf4", directory, options, timeout);
+    return LoadModel("qwen3_nf4", directory, options, timeout);
 }
 
 std::shared_ptr<InferenceModel> InferenceClient::LoadQwen35(
     const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
-    return LoadNf4("qwen35_nf4", directory, options, timeout);
+    return LoadModel("qwen35_nf4", directory, options, timeout);
 }
 
-std::shared_ptr<InferenceModel> InferenceClient::LoadNf4(
+std::shared_ptr<InferenceModel> InferenceClient::LoadQwen35Bf16(
+    const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
+    return LoadModel("qwen35_bf16", directory, options, timeout);
+}
+
+std::shared_ptr<InferenceModel> InferenceClient::LoadModel(
     const std::string& backend, const std::string& directory, InferenceModelOptions options,
     std::chrono::milliseconds timeout) {
     OperationOwner operation(connection_);
@@ -1091,6 +1222,7 @@ std::shared_ptr<InferenceModel> InferenceClient::LoadNf4(
     command.maxSequenceLength = options.maxSequenceLength;
     command.maxSessions = options.maxSessions;
     command.maxSessionCacheBytes = options.maxSessionCacheBytes;
+    command.allocationLimits = options.allocationLimits;
     const auto response = connection_->Call(std::move(command), timeout);
     std::unique_ptr<InferenceModel> handle;
     try { handle.reset(new InferenceModel(connection_, response.model)); }
@@ -1109,7 +1241,48 @@ InferenceClientSnapshot InferenceClient::Snapshot() const {
     const auto& core = *connection_;
     return {core.status, core.hello.epoch, core.outstanding, core.routes.size(), core.pendingCount,
             core.queued.size(), core.reservedTokens, core.ingressBytes, core.transportBytes,
-            core.peakIngress, core.peakTransport, core.lastOrdinal, core.droppedLogs, core.failure};
+            core.peakIngress, core.peakTransport, core.lastOrdinal, core.droppedLogs, core.failure,
+            core.logs.size(), core.logQueueBytes, core.peakLogQueueBytes};
+}
+
+InferenceLogReadResult InferenceClient::ReadLog(std::chrono::milliseconds timeout) {
+    auto& core = *connection_;
+    std::unique_lock<std::mutex> lock(core.mutex);
+    core.changed.wait_for(lock, std::max(timeout, 0ms), [&] {
+        return !core.logs.empty() || core.logsClosed || core.dead;
+    });
+    if (core.logs.empty()) return {core.logsClosed || core.dead ? InferenceReadStatus::Closed
+        : InferenceReadStatus::Timeout, {}, core.droppedLogs};
+    // Copy before consuming, so a host allocation failure leaves the message
+    // available. The C boundary's following POD conversion cannot allocate.
+    InferenceLogReadResult result{InferenceReadStatus::Event, core.logs.front().event, core.droppedLogs};
+    core.logQueueBytes -= core.logs.front().bytes;
+    core.logs.pop_front();
+    return result;
+}
+
+void InferenceClient::CloseLogStream() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(connection_->mutex);
+        connection_->logsClosed = true;
+        connection_->droppedLogs += connection_->logs.size();
+        connection_->logs.clear();
+        connection_->logQueueBytes = 0;
+        connection_->changed.notify_all();
+    } catch (...) {}
+}
+
+void InferenceClient::SetLogLevel(uint32_t level, std::chrono::milliseconds timeout) {
+    wire::Command command;
+    command.method = wire::Method::WorkerSetLogLevel;
+    command.logLevel = level;
+    connection_->Call(std::move(command), timeout);
+}
+
+wire::RuntimeMemoryInfo InferenceClient::QueryMemory(std::chrono::milliseconds timeout) {
+    wire::Command command;
+    command.method = wire::Method::WorkerMemoryQuery;
+    return connection_->Call(std::move(command), timeout).runtimeMemory;
 }
 
 void InferenceClient::Shutdown(std::chrono::milliseconds timeout) { connection_->Shutdown(timeout); }
@@ -1160,14 +1333,34 @@ std::shared_ptr<InferenceRequest> InferenceSession::Submit(
     catch (...) { connection_->ReleaseRequest(route); throw; }
     return std::shared_ptr<InferenceRequest>(std::move(handle));
 }
+std::shared_ptr<InferenceRequest> InferenceSession::Prefill(
+    std::vector<int32_t> tokens, uint32_t chunkSize, std::chrono::milliseconds timeout) {
+    InferenceRequestOptions options;
+    options.generation.maxNewTokens = 0;
+    options.prefillChunkSize = chunkSize;
+    options.prefillOnly = true;
+    return Submit(std::move(tokens), std::move(options), timeout);
+}
 wire::SessionInfo InferenceSession::Query(std::chrono::milliseconds timeout) {
+    return ContextOperation(wire::Method::SessionQuery, 0, timeout);
+}
+wire::SessionInfo InferenceSession::Reset(std::chrono::milliseconds timeout) {
+    return ContextOperation(wire::Method::SessionReset, 0, timeout);
+}
+wire::SessionInfo InferenceSession::Truncate(uint32_t length, std::chrono::milliseconds timeout) {
+    return ContextOperation(wire::Method::SessionTruncate, length, timeout);
+}
+wire::SessionInfo InferenceSession::ContextOperation(wire::Method method, uint32_t length,
+                                                    std::chrono::milliseconds timeout) {
+    OperationOwner operation(connection_);
     if (released_.load()) throw InferenceClientError(ClientErrorCode::InvalidHandle, "Inference session is released");
     wire::Command command;
-    command.method = wire::Method::SessionQuery;
+    command.method = method;
     command.sessionId = info_.sessionId;
     command.modelId = info_.modelId;
     command.maxSequenceLength = info_.capacity;
     command.maxSessionCacheBytes = info_.cacheBytes;
+    command.contextLength = length;
     return connection_->Call(std::move(command), timeout, false, {}, &released_).session;
 }
 

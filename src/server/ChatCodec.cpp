@@ -5,6 +5,8 @@
 #include "chat/ChatFormatter.hpp"
 #include "chat/ChatJson.hpp"
 #include "chat/StructuredStreamParser.hpp"
+#include "profile/Profiling.hpp"
+#include "utils/EnvUtils.hpp"
 #include "utils/Tokenizer.hpp"
 
 #include <json/json.h>
@@ -15,6 +17,8 @@
 #include <initializer_list>
 #include <limits>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace aila::server {
@@ -23,6 +27,9 @@ namespace wire = ipc::v2;
 
 constexpr size_t kMaxBodyBytes = 1024 * 1024;
 constexpr size_t kMaxMessages = 256;
+constexpr size_t kMaxTools = 128;
+constexpr size_t kMaxToolArgumentBytes = 64 * 1024;
+constexpr size_t kToolArgumentDeltaBytes = 1024;
 constexpr size_t kErrorReserveBytes = 2048;
 constexpr size_t kMinimumOutputBytes = 4096;
 constexpr const char* kDoneFrame = "data: [DONE]\n\n";
@@ -180,24 +187,113 @@ double Number(const Json::Value& value, const std::string& param) {
     return number;
 }
 
+std::string Identifier(const Json::Value& value, const std::string& param, size_t maximum = 64) {
+    auto name = String(value, param, false, maximum);
+    for (const unsigned char character : name) {
+        if (!(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
+            !(character >= '0' && character <= '9') && character != '_' && character != '-') {
+            Invalid(param, "Identifiers may contain only ASCII letters, digits, underscores and hyphens");
+        }
+    }
+    return name;
+}
+
+std::string ToolArguments(const Json::Value& value, const std::string& param) {
+    const auto text = String(value, param, false, kMaxToolArgumentBytes);
+    try { (void)ParseBody(text); return text; }
+    catch (const ApiError&) { Invalid(param, "Function arguments must encode one strict JSON object"); }
+}
+
+void ValidateTools(const Json::Value& root) {
+    std::unordered_set<std::string> names;
+    if (root.isMember("tools")) {
+        const auto& tools = root["tools"];
+        if (!tools.isArray() || tools.size() > kMaxTools) Invalid("tools", "Expected at most 128 function tools");
+        for (Json::ArrayIndex index = 0; index < tools.size(); ++index) {
+            const auto& tool = tools[index];
+            const auto prefix = "tools[" + std::to_string(index) + "]";
+            Fields(tool, {"type", "function"}, prefix);
+            if (String(tool["type"], prefix + ".type") != "function") Invalid(prefix + ".type", "Only function tools are supported");
+            const auto& function = tool["function"];
+            const auto fn = prefix + ".function";
+            Fields(function, {"name", "description", "parameters", "strict"}, fn);
+            if (!names.insert(Identifier(function["name"], fn + ".name")).second) Invalid(fn + ".name", "Tool names must be unique");
+            if (function.isMember("description")) String(function["description"], fn + ".description", true, 16384);
+            if (function.isMember("parameters") && (!function["parameters"].isObject() ||
+                JsonText(function["parameters"]).size() > kMaxToolArgumentBytes)) {
+                Invalid(fn + ".parameters", "Function parameters must be a JSON object of at most 64 KiB");
+            }
+            if (function.isMember("strict") && Boolean(function["strict"], fn + ".strict")) {
+                throw ApiError(400, "unsupported_parameter", "Schema-constrained generation (strict=true) is not supported", fn + ".strict");
+            }
+        }
+    }
+    if (!root.isMember("tool_choice")) return;
+    const auto& choice = root["tool_choice"];
+    if (choice.isString()) {
+        const auto text = choice.asString();
+        if (text != "auto" && text != "none" && text != "required") Invalid("tool_choice", "Expected auto, none, required, or a named function");
+        if (text == "required" && names.empty()) Invalid("tool_choice", "A required call needs at least one declared tool");
+    } else {
+        Fields(choice, {"type", "function"}, "tool_choice");
+        if (String(choice["type"], "tool_choice.type") != "function") Invalid("tool_choice.type", "Only function choices are supported");
+        Fields(choice["function"], {"name"}, "tool_choice.function");
+        const auto name = Identifier(choice["function"]["name"], "tool_choice.function.name");
+        if (!names.count(name)) Invalid("tool_choice.function.name", "The chosen function must be declared in tools");
+    }
+}
+
 void ValidateMessages(const Json::Value& messages) {
     if (!messages.isArray() || messages.empty() || messages.size() > kMaxMessages) {
         Invalid("messages", "Expected between 1 and 256 text messages");
     }
+    std::unordered_set<std::string> callIds;
+    std::unordered_map<std::string, std::string> pendingCalls;
     for (Json::ArrayIndex index = 0; index < messages.size(); ++index) {
         const auto& message = messages[index];
         const std::string prefix = "messages[" + std::to_string(index) + "]";
-        Fields(message, {"role", "content", "name", "reasoning_content"}, prefix);
+        Fields(message, {"role", "content", "name", "reasoning_content", "tool_calls", "tool_call_id"}, prefix);
         const auto role = String(message["role"], prefix + ".role", false, 16);
-        if (role != "system" && role != "developer" && role != "user" && role != "assistant") {
-            throw ApiError(400, "unsupported_message_role", "Only system, developer, user and assistant text messages are supported", prefix + ".role");
+        if (role != "system" && role != "developer" && role != "user" && role != "assistant" && role != "tool") {
+            throw ApiError(400, "unsupported_message_role", "Only system, developer, user, assistant and tool messages are supported", prefix + ".role");
         }
+        if (role != "tool" && !pendingCalls.empty()) Invalid(prefix + ".role", "All pending tool calls require results before the next message");
         if (message.isMember("name")) String(message["name"], prefix + ".name", false, 64);
         if (message.isMember("reasoning_content")) {
             if (role != "assistant") Invalid(prefix + ".reasoning_content", "Only assistant messages may carry reasoning_content");
             String(message["reasoning_content"], prefix + ".reasoning_content");
         }
+        if (role == "tool") {
+            const auto id = Identifier(message["tool_call_id"], prefix + ".tool_call_id", 160);
+            const auto found = pendingCalls.find(id);
+            if (found == pendingCalls.end()) Invalid(prefix + ".tool_call_id", "Tool result must match one pending assistant call");
+            if (message.isMember("name") && message["name"].asString() != found->second) Invalid(prefix + ".name", "Tool result name differs from its call");
+            pendingCalls.erase(found);
+        } else if (message.isMember("tool_call_id")) {
+            Invalid(prefix + ".tool_call_id", "Only tool messages may carry tool_call_id");
+        }
+        const bool hasCalls = message.isMember("tool_calls");
+        if (hasCalls) {
+            const auto parameter = prefix + ".tool_calls";
+            const auto& calls = message["tool_calls"];
+            if (role != "assistant" || !calls.isArray() || calls.empty() || calls.size() > kMaxTools) {
+                Invalid(parameter, "Only assistant messages may carry between 1 and 128 function calls");
+            }
+            for (Json::ArrayIndex callIndex = 0; callIndex < calls.size(); ++callIndex) {
+                const auto& call = calls[callIndex];
+                const auto path = parameter + "[" + std::to_string(callIndex) + "]";
+                Fields(call, {"id", "type", "function"}, path);
+                const auto id = Identifier(call["id"], path + ".id", 160);
+                if (!callIds.insert(id).second) Invalid(path + ".id", "Tool call IDs must be unique throughout the history");
+                if (String(call["type"], path + ".type") != "function") Invalid(path + ".type", "Only function calls are supported");
+                Fields(call["function"], {"name", "arguments"}, path + ".function");
+                const auto name = Identifier(call["function"]["name"], path + ".function.name");
+                ToolArguments(call["function"]["arguments"], path + ".function.arguments");
+                pendingCalls.emplace(id, name);
+            }
+        }
         const auto& content = message["content"];
+        if (hasCalls && content.isNull()) continue;
         if (content.isString()) continue;
         if (!content.isArray() || content.empty() || content.size() > 256) {
             Invalid(prefix + ".content", "Message content must be text or an array of text parts");
@@ -212,6 +308,7 @@ void ValidateMessages(const Json::Value& messages) {
             String(part["text"], parameter + ".text");
         }
     }
+    if (!pendingCalls.empty()) Invalid("messages", "Tool history ends with unresolved assistant calls");
 }
 
 GenerationConfig GenerationConfigFor(const wire::GenerationOptions& wireOptions) {
@@ -239,6 +336,102 @@ const char* FallbackTemplate() {
            "{%- if enable_thinking -%}{{- '<think>\\n' -}}"
            "{%- else -%}{{- '<think>\\n</think>\\n' -}}{%- endif -%}"
            "{%- endif -%}";
+}
+
+const char* ToolFallbackTemplate() {
+    return R"JINJA(
+{%- if tools -%}
+{{- '<|im_start|>system\n# Tools\n\n<tools>' -}}
+{%- for tool in tools -%}{{- '\n' + (tool | tojson) -}}{%- endfor -%}
+{{- '\n</tools>\nReturn each function call as <tool_call>{"name":"function_name","arguments":{}}</tool_call>. Use only declared functions.\n' -}}
+{%- if tool_choice == 'required' -%}{{- 'You must call at least one tool.\n' -}}
+{%- elif tool_choice == 'function' -%}{{- 'You must call ' + tool_choice_function_name + '.\n' -}}{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{{- '<|im_start|>' + message.role + '\n' -}}
+{%- if message.role == 'tool' -%}
+{{- '<tool_response>\n{"tool_call_id":' + (message.tool_call_id | tojson) + ',"content":' + (message.content | tojson) + '}\n</tool_response>' -}}
+{%- else -%}
+{{- message.content -}}
+{%- if message.tool_calls is defined -%}
+{%- for call in message.tool_calls -%}
+{{- '\n<tool_call>\n{"id":' + (call.id | tojson) + ',"name":' + (call.function.name | tojson) + ',"arguments":' + (call.function.arguments | tojson) + '}\n</tool_call>' -}}
+{%- endfor -%}{%- endif -%}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if enable_thinking -%}{{- '<think>\n' -}}
+{%- else -%}{{- '<think>\n</think>\n' -}}{%- endif -%}
+{%- endif -%}
+)JINJA";
+}
+
+std::string Trim(std::string_view text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return {};
+    return std::string(text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1));
+}
+
+chat::ChatToolCall ParseToolEvent(const chat::StructuredStreamEvent& event, const std::string& requestId) {
+    try {
+        // The legacy parser deliberately recovers missing outer tags. HTTP
+        // requires a complete block before publishing a callable object.
+        constexpr std::string_view open = "<tool_call>", close = "</tool_call>";
+        const auto& text = event.text;
+        if (text.size() < open.size() + close.size() || text.compare(0, open.size(), open) != 0 ||
+            text.compare(text.size() - close.size(), close.size(), close) != 0) Invalid("", "Incomplete tool block");
+        const auto inner = Trim(std::string_view(text).substr(open.size(), text.size() - open.size() - close.size()));
+        chat::ChatToolCall call;
+        if (!inner.empty() && inner.front() == '{') {
+            const auto json = ParseBody(inner);
+            Fields(json, {"id", "name", "arguments"});
+            if (json.isMember("id")) Identifier(json["id"], "id", 160);
+            call.function.name = Identifier(json["name"], "name");
+            // Qwen JSON templates use object arguments. Also accept a string
+            // containing that object, as in a Chat Completions history call.
+            if (json["arguments"].isObject()) {
+                // Validate with the strict reader, but forward the original
+                // object bytes. Re-serializing a DOM would round decimal
+                // arguments to double precision or normalize signed zero.
+                simdjson::ondemand::parser rawParser;
+                const simdjson::padded_string padded(inner);
+                simdjson::ondemand::document document;
+                std::string_view arguments;
+                if (rawParser.iterate(padded).get(document) != simdjson::SUCCESS ||
+                    document["arguments"].raw_json().get(arguments) != simdjson::SUCCESS) Invalid("arguments", "Missing raw arguments");
+                call.function.arguments_json = ToolArguments(Json::Value(std::string(arguments)), "arguments");
+            } else {
+                call.function.arguments_json = ToolArguments(json["arguments"], "arguments");
+            }
+        } else {
+            if (event.tool_calls.size() != 1) Invalid("", "Malformed XML tool block");
+            call = event.tool_calls.front();
+            Identifier(Json::Value(call.function.name), "name");
+            if (inner.rfind("<function=", 0) == 0) {
+                const auto end = inner.find("</function>");
+                if (end == std::string::npos || end + 11 != inner.size()) Invalid("", "Extra content in XML tool block");
+            } else {
+                // Reject permissive legacy prefix/suffix recovery, including
+                // text after a self-closing named tag.
+                const auto start = "<" + call.function.name;
+                const auto end = inner.find('>');
+                if (inner.rfind(start, 0) != 0 || end == std::string::npos ||
+                    (end > 0 && inner[end - 1] == '/' && end + 1 != inner.size())) Invalid("", "Extra content in XML tool block");
+            }
+            call.function.arguments_json = ToolArguments(Json::Value(call.function.arguments_json), "arguments");
+        }
+        return call;
+    } catch (const ApiError& error) {
+        static const bool diagnostics = aila::env::read_int_raw("AILA_SERVER_TOOL_DIAGNOSTICS", 0) != 0;
+        if (diagnostics) {
+            const auto block = SafeDiagnostic(JsonText(Json::Value(event.text)), 4096);
+            AILA_LOG_WARN("[HTTP tools] request=%s reason=%s block=%s", requestId.c_str(), error.what(), block.c_str());
+        }
+        throw ApiError(502, "invalid_tool_call", "Model tool output is invalid: " + SafeDiagnostic(error.what(), 256));
+    }
 }
 
 bool StartsInReasoning(const std::string& prompt) {
@@ -293,11 +486,14 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     const auto root = ParseBody(body);
     Fields(root, {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens",
                   "temperature", "top_p", "top_k", "seed", "repetition_penalty", "presence_penalty",
-                  "frequency_penalty", "n", "enable_thinking"});
+                  "frequency_penalty", "n", "enable_thinking", "max_thinking_tokens",
+                  "thinking_budget", "thinking_budget_tokens", "tools", "tool_choice", "parallel_tool_calls"});
     const auto requestedModel = String(root["model"], "model", false, 256);
     if (requestedModel != settings.modelId) throw ApiError(404, "model_not_found", "Requested model is not served by this process", "model");
     ValidateMessages(root["messages"]);
+    ValidateTools(root);
     PreparedChat prepared;
+    if (root.isMember("parallel_tool_calls")) prepared.parallelToolCalls = Boolean(root["parallel_tool_calls"], "parallel_tool_calls");
     if (root.isMember("stream")) prepared.stream = Boolean(root["stream"], "stream");
     if (root.isMember("stream_options")) {
         if (!prepared.stream) Invalid("stream_options", "stream_options requires stream=true");
@@ -335,13 +531,27 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     }
     if (root.isMember("presence_penalty")) generation.presencePenalty = Number(root["presence_penalty"], "presence_penalty");
     if (root.isMember("frequency_penalty")) generation.frequencyPenalty = Number(root["frequency_penalty"], "frequency_penalty");
-    const bool thinking = root.isMember("enable_thinking") && Boolean(root["enable_thinking"], "enable_thinking");
+    const char* budgetField = nullptr;
+    std::optional<uint32_t> thinkingBudget;
+    for (const char* field : {"max_thinking_tokens", "thinking_budget", "thinking_budget_tokens"}) {
+        if (!root.isMember(field)) continue;
+        if (budgetField) Invalid(field, "Supply only one thinking budget field");
+        budgetField = field;
+        const auto& value = root[field];
+        if (value.type() == Json::intValue && value.isInt64() && value.asInt64() == -1) continue;
+        thinkingBudget = static_cast<uint32_t>(Unsigned(value, field, settings.maxNewTokens));
+    }
+    bool thinking = root.isMember("enable_thinking") ? Boolean(root["enable_thinking"], "enable_thinking")
+        : thinkingBudget && *thinkingBudget > 0;
+    if (thinkingBudget && *thinkingBudget == 0) thinking = false;
 
     // Only this normalized object reaches the existing permissive ChatJson
     // reader; request-provided template kwargs and overrides never do.
     Json::Value normalized(Json::objectValue);
     normalized["messages"] = root["messages"];
+    for (const char* field : {"tools", "tool_choice"}) if (root.isMember(field)) normalized[field] = root[field];
     for (auto& message : normalized["messages"]) {
+        if (message["content"].isNull()) message["content"] = "";
         if (!message["content"].isArray()) continue;
         std::string content;
         for (const auto& part : message["content"]) content += part["text"].asString();
@@ -350,7 +560,9 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     }
     normalized["chat_template_kwargs"]["enable_thinking"] = thinking;
     std::string error;
-    if (!chat::parse_chat_request_json(JsonText(normalized), GenerationConfigFor(generation), prepared.chatRequest, &error)) {
+    auto generationConfig = GenerationConfigFor(generation);
+    if (thinkingBudget) generationConfig.thinking_budget_tokens = static_cast<int>(*thinkingBudget);
+    if (!chat::parse_chat_request_json(JsonText(normalized), generationConfig, prepared.chatRequest, &error)) {
         throw ApiError(400, "invalid_messages", "Could not parse validated chat messages", "messages");
     }
     if (tokenizer.vocab_size() <= 0) throw ApiError(500, "tokenizer_unavailable", "Server tokenizer is not loaded");
@@ -358,8 +570,12 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     // Select the trusted checkpoint template (or the fixed service fallback)
     // explicitly so environment/request paths cannot override the HTTP route.
     auto renderRequest = prepared.chatRequest;
+    const bool hasToolHistory = std::any_of(renderRequest.messages.begin(), renderRequest.messages.end(),
+        [](const chat::ChatMessage& message) { return !message.tool_calls.empty() || message.role == chat::ChatRole::Tool; });
+    const bool useToolFallback = hasToolHistory || (!renderRequest.tools.empty() && renderRequest.tool_choice != chat::ToolChoice::None);
     renderRequest.template_options.template_override_text = !tokenizer.chat_template().empty() ? tokenizer.chat_template()
-        : settings.family == ModelFamily::Qwen35Hybrid ? chat::qwen35_fixed_chat_template() : FallbackTemplate();
+        : settings.family == ModelFamily::Qwen35Hybrid ? chat::qwen35_fixed_chat_template()
+        : useToolFallback ? ToolFallbackTemplate() : FallbackTemplate();
     chat::ChatFormatInput input;
     input.request = &renderRequest;
     input.family = settings.family;
@@ -391,8 +607,33 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
         }
     }
     if (prepared.options.stopTokenIds.empty()) throw ApiError(500, "tokenizer_failed", "Model tokenizer has no valid EOS token");
+    if (thinkingBudget) {
+        wire::ThinkingBudgetOptions budget;
+        budget.maxTokens = *thinkingBudget;
+        budget.openTokenId = tokenizer.special_token_id("<think>");
+        budget.closeTokenId = tokenizer.special_token_id("</think>");
+        budget.promptOpensThink = prepared.startsInReasoning;
+        budget.closeTokenIds.push_back(budget.closeTokenId);
+        const auto suffix = tokenizer.encode("\n\n");
+        budget.closeTokenIds.insert(budget.closeTokenIds.end(), suffix.begin(), suffix.end());
+        if (aila::generation::ValidateThinkingBudget(budget, static_cast<uint32_t>(tokenizer.vocab_size()),
+                                                    prepared.options.stopTokenIds)) {
+            throw ApiError(400, "unsupported_thinking_budget", "Model tokenizer cannot encode the required thinking markers", budgetField);
+        }
+        prepared.options.thinkingBudget = std::move(budget);
+    }
     prepared.options.prefillChunkSize = std::min(hard.maxPrefillChunkSize, settings.maxPromptTokens);
     return prepared;
+}
+
+std::string DecodeChatToken(const Tokenizer& tokenizer, const PreparedChat& prepared, int32_t tokenId) {
+    if (!prepared.chatRequest.tools.empty() && prepared.chatRequest.tool_choice != chat::ToolChoice::None) {
+        for (const char* marker : {"<tool_call>", "</tool_call>"}) {
+            const int markerId = tokenizer.special_token_id(marker);
+            if (markerId >= 0 && tokenId == markerId) return marker;
+        }
+    }
+    return tokenizer.decode(tokenId);
 }
 
 struct ChatOutput::State {
@@ -408,6 +649,12 @@ struct ChatOutput::State {
     bool begun = false;
     bool finished = false;
     bool toolBlockSeen = false;
+    bool extractTools;
+    bool parallelToolCalls;
+    bool requireTool;
+    std::string forcedFunction;
+    std::unordered_set<std::string> declaredTools;
+    Json::Value toolCalls{Json::arrayValue};
     std::optional<ApiError> failure;
     chat::StructuredStreamParser parser;
     std::string pendingUtf8;
@@ -420,7 +667,12 @@ struct ChatOutput::State {
     State(ChatIdentity value, const PreparedChat& prepared, size_t limit)
         : identity(std::move(value)), stream(prepared.stream), includeUsage(prepared.includeUsage),
           startsInReasoning(prepared.startsInReasoning), promptTokens(prepared.promptIds.size()),
-          maxGenerated(prepared.options.generation.maxNewTokens), maximum(limit), normalLimit(limit - kErrorReserveBytes) {
+          maxGenerated(prepared.options.generation.maxNewTokens), maximum(limit), normalLimit(limit - kErrorReserveBytes),
+          extractTools(!prepared.chatRequest.tools.empty() && prepared.chatRequest.tool_choice != chat::ToolChoice::None),
+          parallelToolCalls(prepared.parallelToolCalls),
+          requireTool(prepared.chatRequest.tool_choice == chat::ToolChoice::Required || prepared.chatRequest.tool_choice == chat::ToolChoice::Function),
+          forcedFunction(prepared.chatRequest.tool_choice == chat::ToolChoice::Function ? prepared.chatRequest.tool_choice_function_name : "") {
+        for (const auto& tool : prepared.chatRequest.tools) declaredTools.insert(tool.name);
         if (startsInReasoning) {
             std::vector<chat::StructuredStreamEvent> ignored;
             parser.push("<think>", ignored);
@@ -477,12 +729,58 @@ struct ChatOutput::State {
         text.clear();
     }
 
+    void AddTool(const chat::StructuredStreamEvent& event, std::vector<std::string>& frames) {
+        const auto call = ParseToolEvent(event, identity.id);
+        if (!declaredTools.count(call.function.name)) throw ApiError(502, "invalid_tool_call", "Model called a function that was not declared in tools");
+        if ((!forcedFunction.empty() && call.function.name != forcedFunction) || (!parallelToolCalls && !toolCalls.empty())) {
+            throw ApiError(502, "tool_choice_violation", "Model output violates tool_choice or parallel_tool_calls");
+        }
+        if (toolCalls.size() >= kMaxTools) throw ApiError(502, "tool_call_limit_exceeded", "Model returned more than 128 function calls");
+        const auto index = toolCalls.size();
+        Json::Value value(Json::objectValue);
+        value["id"] = "call_" + identity.id + "_" + std::to_string(index);
+        value["type"] = "function";
+        value["function"]["name"] = call.function.name;
+        value["function"]["arguments"] = call.function.arguments_json;
+        toolCalls.append(value);
+        if (!stream) return;
+        // Validate the complete arguments before streaming. Bound each delta
+        // independently of model tokenization and JSON escaping so it fits
+        // the HTTP handoff's 16 KiB frame limit. Only the first carries ID/name.
+        const auto& arguments = call.function.arguments_json;
+        for (size_t offset = 0; offset < arguments.size();) {
+            size_t end = offset;
+            while (end < arguments.size()) {
+                const auto length = static_cast<size_t>(ScalarLength(arguments, end));
+                if (end + length - offset > kToolArgumentDeltaBytes) break;
+                end += length;
+            }
+            Json::Value deltaCall(Json::objectValue);
+            deltaCall["index"] = index;
+            if (offset == 0) {
+                deltaCall["id"] = value["id"];
+                deltaCall["type"] = "function";
+                deltaCall["function"]["name"] = call.function.name;
+            }
+            deltaCall["function"]["arguments"] = arguments.substr(offset, end - offset);
+            Json::Value delta(Json::objectValue);
+            delta["tool_calls"].append(std::move(deltaCall));
+            AddDelta(delta, frames);
+            offset = end;
+        }
+    }
+
     void AppendEvents(const std::vector<chat::StructuredStreamEvent>& events, std::string& deltaText,
                       std::string& deltaField, std::vector<std::string>& frames) {
         for (const auto& event : events) {
             if (event.type != chat::StructuredStreamEventType::ContentDelta &&
                 event.type != chat::StructuredStreamEventType::ReasoningDelta &&
                 event.type != chat::StructuredStreamEventType::ToolCallDelta) continue;
+            if (event.type == chat::StructuredStreamEventType::ToolCallDelta && extractTools) {
+                FlushDelta(deltaText, deltaField, frames);
+                AddTool(event, frames);
+                continue;
+            }
             const bool isReasoning = event.type == chat::StructuredStreamEventType::ReasoningDelta;
             const std::string field = isReasoning ? "reasoning_content" : "content";
             if (!deltaText.empty() && deltaField != field) FlushDelta(deltaText, deltaField, frames);
@@ -590,21 +888,24 @@ struct ChatOutput::State {
             std::vector<chat::StructuredStreamEvent> events;
             parser.finish(events);
             Events(events, frames);
-            // Reuse the complete-output parser for tool recovery diagnostics;
-            // canonical deltas remain the authoritative visible strings so a
-            // recognized tool block is never removed from a text-only API.
-            auto parsed = chat::parse_assistant_output(startsInReasoning ? "<think>" + rawText : rawText);
-            if (toolBlockSeen || !parsed.tool_calls.empty()) warnings.emplace_back("Unsolicited tool_call output was retained as text; no tool was executed");
-            for (const auto& warning : parsed.warnings) {
-                if (warnings.size() == 4) break;
-                warnings.push_back(SafeDiagnostic(warning, 256));
+            if (requireTool && toolCalls.empty()) throw ApiError(502, "tool_choice_violation", "Model did not return the required function call");
+            if (!extractTools) {
+                // Preserve the existing no-tools/none response, including raw
+                // unsolicited tool blocks and bounded recovery diagnostics.
+                auto parsed = chat::parse_assistant_output(startsInReasoning ? "<think>" + rawText : rawText);
+                if (toolBlockSeen || !parsed.tool_calls.empty()) warnings.emplace_back("Unsolicited tool_call output was retained as text; no tool was executed");
+                for (const auto& warning : parsed.warnings) {
+                    if (warnings.size() == 4) break;
+                    warnings.push_back(SafeDiagnostic(warning, 256));
+                }
             }
-            const char* reason = summary.endReason == wire::EndReason::Length ? "length" : "stop";
+            const char* reason = summary.endReason == wire::EndReason::Length ? "length" : !toolCalls.empty() ? "tool_calls" : "stop";
             auto value = Envelope(false);
             Json::Value message(Json::objectValue);
             message["role"] = "assistant";
-            message["content"] = content;
+            message["content"] = content.empty() && !toolCalls.empty() ? Json::Value(Json::nullValue) : Json::Value(content);
             message["reasoning_content"] = reasoning;
+            if (!toolCalls.empty()) message["tool_calls"] = toolCalls;
             Json::Value choice(Json::objectValue);
             choice["index"] = 0;
             choice["message"] = std::move(message);

@@ -172,13 +172,14 @@ void WriteHybridTokenizer(const fs::path& path, bool withVision) {
     const std::vector<std::pair<const char*, int>> markers = {
         {"<|endoftext|>", 248044}, {"<|im_start|>", 248045}, {"<|im_end|>", 248046},
         {"<|vision_start|>", 248053}, {"<|vision_end|>", 248054}, {"<|image_pad|>", 248056},
+        {"<tool_call>", 248058}, {"</tool_call>", 248059},
         {"<think>", 248068}, {"</think>", 248069}
     };
     for (const auto& [content, id] : markers) {
         Json::Value token(Json::objectValue);
         token["content"] = content;
         token["id"] = id;
-        token["special"] = id != 248068 && id != 248069;
+        token["special"] = id != 248068 && id != 248069 && id != 248058 && id != 248059;
         tokenizer["added_tokens"].append(std::move(token));
     }
     Write(path / "tokenizer.json", Serialize(tokenizer));
@@ -297,9 +298,11 @@ struct StreamView {
     size_t errors = 0;
     Json::Value usage;
     Json::Value error;
+    Json::Value toolCalls{Json::arrayValue};
+    size_t toolDeltas = 0;
 };
 
-StreamView Inspect(const std::vector<std::string>& frames, bool includeUsage) {
+StreamView Inspect(const std::vector<std::string>& frames, bool includeUsage, bool allowTools = false) {
     StreamView result;
     for (const auto& frame : frames) {
         Expect(result.done == 0, "An SSE frame was emitted after [DONE]");
@@ -330,7 +333,28 @@ StreamView Inspect(const std::vector<std::string>& frames, bool includeUsage) {
         Expect(choice["index"].asInt() == 0 && choice["delta"].isObject() && !choice.isMember("message"),
                "Stream choice must contain a delta, not a message");
         const auto& delta = choice["delta"];
-        Expect(!delta.isMember("tool_calls"), "Text-only SSE exposed a tool invocation");
+        if (delta.isMember("tool_calls")) {
+            Expect(allowTools && delta["tool_calls"].isArray() && !delta["tool_calls"].empty(), "Unexpected SSE tool invocation");
+            for (const auto& call : delta["tool_calls"]) {
+                Expect(call["index"].isUInt(), "Tool delta has no unsigned index");
+                const auto index = call["index"].asUInt();
+                Expect(index <= result.toolCalls.size() && call["function"].isObject(), "Tool delta skipped an index");
+                if (index == result.toolCalls.size()) {
+                    Expect(call["id"].isString() && !call["id"].asString().empty() && call["type"].asString() == "function" &&
+                        call["function"]["name"].isString() && !call["function"]["name"].asString().empty(), "Initial tool delta is incomplete");
+                    auto assembled = call;
+                    assembled.removeMember("index");
+                    assembled["function"]["arguments"] = "";
+                    result.toolCalls.append(std::move(assembled));
+                } else {
+                    Expect(!call.isMember("id") && !call.isMember("type") && !call["function"].isMember("name"), "Tool metadata was repeated");
+                }
+                Expect(call["function"]["arguments"].isString(), "Tool argument delta is not a string");
+                auto& arguments = result.toolCalls[index]["function"]["arguments"];
+                arguments = arguments.asString() + call["function"]["arguments"].asString();
+                ++result.toolDeltas;
+            }
+        }
         if (delta.isMember("role")) {
             Expect(result.roles == 0 && result.content.empty() && result.reasoning.empty(), "Assistant role was not first");
             Expect(delta["role"].asString() == "assistant" && delta["content"].asString().empty(), "Invalid initial role delta");
@@ -350,12 +374,12 @@ StreamView Inspect(const std::vector<std::string>& frames, bool includeUsage) {
 }
 
 void CheckFailure(const ChatCompletion& completion, const std::vector<std::string>& frames,
-                  const std::string& code, int status, bool includeUsage = false) {
+                  const std::string& code, int status, bool includeUsage = false, bool allowTools = false) {
     Expect(completion.failed && completion.httpStatus == status, "Failed generation was reported as successful");
     const auto value = Parse(completion.json);
     Expect(value["error"]["code"].asString() == code && !value.isMember("choices") && !value.isMember("usage"),
            "Failure JSON has the wrong schema/code");
-    const auto stream = Inspect(frames, includeUsage);
+    const auto stream = Inspect(frames, includeUsage, allowTools);
     Expect(stream.done == 1 && stream.errors == 1 && stream.finishes == 0 && stream.usageChunks == 0,
            "Failed SSE must contain one error and [DONE], without a success finish or usage");
     Expect(stream.error["code"].asString() == code, "SSE and nonstream error codes differ");
@@ -507,13 +531,44 @@ void StrictJson(const Fixture& fixture) {
     ExpectError([&] { fixture.Raw(std::string(1024 * 1024 + 1, ' ')); }, 413, "request_too_large");
 }
 
+void ThinkingBudgetParameters(const Fixture& fixture) {
+    for (const char* field : {"max_thinking_tokens", "thinking_budget", "thinking_budget_tokens"}) {
+        auto body = Request(); body[field] = 2;
+        const auto prepared = fixture.Prepare(body);
+        Expect(prepared.startsInReasoning && prepared.options.thinkingBudget &&
+                   prepared.options.thinkingBudget->maxTokens == 2 && prepared.options.thinkingBudget->promptOpensThink &&
+                   prepared.options.thinkingBudget->openTokenId == 259 && prepared.options.thinkingBudget->closeTokenId == 260 &&
+                   fixture.tokenizer.decode(std::vector<int>(prepared.options.thinkingBudget->closeTokenIds.begin(),
+                                                            prepared.options.thinkingBudget->closeTokenIds.end())) == "</think>\n\n",
+               "Budget did not use the trusted template/tokenizer closing sequence");
+        body[field] = 0; body["enable_thinking"] = true;
+        const auto zero = fixture.Prepare(body);
+        Expect(!zero.startsInReasoning && zero.options.thinkingBudget && zero.options.thinkingBudget->maxTokens == 0,
+               "Zero budget did not select a no-think prompt");
+        body[field] = -1;
+        Expect(!fixture.Prepare(body).options.thinkingBudget, "Disabled budget changed the IPC schema");
+        for (const auto& bad : {Json::Value(-2), Json::Value(1.5), Json::Value(true), Json::Value(), Json::Value(1025)}) {
+            body[field] = bad;
+            ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", field);
+        }
+    }
+    auto duplicate = Request(); duplicate["max_thinking_tokens"] = 2; duplicate["thinking_budget"] = 2;
+    ExpectError([&] { fixture.Prepare(duplicate); }, 400, "invalid_parameter");
+    auto body = Request(); body["max_thinking_tokens"] = 1;
+    auto settings = fixture.settings; settings.family = ModelFamily::Qwen35Hybrid;
+    const auto hybrid = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    Expect(hybrid.options.thinkingBudget && hybrid.options.thinkingBudget->openTokenId == 248068 &&
+               hybrid.options.thinkingBudget->closeTokenId == 248069 && hybrid.startsInReasoning,
+           "Hybrid budget hard-coded Qwen3 thinking IDs");
+}
+
 void UnsupportedFields(const Fixture& fixture) {
-    for (const char* field : {"tools", "tool_choice", "stop", "max_thinking_tokens", "thinking_budget", "thinking_budget_tokens",
+    for (const char* field : {"stop",
                               "chat_template_kwargs", "template_override", "template_override_path", "response_format", "logprobs", "user"}) {
         auto body = Request(); body[field] = Json::nullValue;
         ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_parameter", field);
     }
-    for (const char* field : {"tool_calls", "tool_call_id", "extra"}) {
+    for (const char* field : {"extra"}) {
         auto body = Request(); body["messages"][0][field] = "unsupported";
         ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_parameter", std::string("messages[0].") + field);
     }
@@ -539,7 +594,7 @@ void InvalidMessages(const Fixture& fixture) {
         auto body = Request(); body["messages"] = invalid;
         ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "messages");
     }
-    for (const char* role : {"tool", "invalid", "USER"}) {
+    for (const char* role : {"invalid", "USER"}) {
         auto body = Request(); body["messages"][0]["role"] = role;
         ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_message_role", "messages[0].role");
     }
@@ -936,6 +991,375 @@ void FragmentationAndReasoning() {
     Expect(Inspect(RunOutput(scalars, 1).frames, true).content == scalars, "Valid UTF-8 boundary scalars were altered");
 }
 
+Json::Value Tool(const std::string& name) {
+    Json::Value tool(Json::objectValue);
+    tool["type"] = "function";
+    tool["function"]["name"] = name;
+    tool["function"]["description"] = "Look up a city";
+    tool["function"]["parameters"] = Parse(R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})");
+    return tool;
+}
+
+Json::Value ToolRequest() {
+    auto body = Request();
+    body["tools"].append(Tool("weather"));
+    body["tools"].append(Tool("calc"));
+    return body;
+}
+
+Json::Value HistoryCall(const std::string& id, const std::string& name = "weather") {
+    Json::Value call(Json::objectValue);
+    call["id"] = id;
+    call["type"] = "function";
+    call["function"]["name"] = name;
+    call["function"]["arguments"] = R"({"city":"北京"})";
+    return call;
+}
+
+Json::Value ToolHistory() {
+    auto body = ToolRequest();
+    Json::Value assistant(Json::objectValue);
+    assistant["role"] = "assistant";
+    assistant["content"] = Json::nullValue;
+    assistant["tool_calls"].append(HistoryCall("call_a"));
+    assistant["tool_calls"].append(HistoryCall("call_b", "old_tool"));
+    body["messages"].append(assistant);
+    Json::Value response(Json::objectValue);
+    response["role"] = "tool";
+    response["content"] = "Result for old_tool";
+    response["tool_call_id"] = "call_b";
+    body["messages"].append(response);
+    response["content"] = "晴天";
+    response["name"] = "weather";
+    response["tool_call_id"] = "call_a";
+    body["messages"].append(response);
+    return body;
+}
+
+PreparedChat ToolOutputRequest(bool stream = true) {
+    auto prepared = OutputRequest(stream, true);
+    for (const auto* name : {"weather", "calc"}) {
+        aila::chat::ChatTool tool;
+        tool.name = name;
+        prepared.chatRequest.tools.push_back(std::move(tool));
+    }
+    return prepared;
+}
+
+void ToolDefinitionsAndChoice(const Fixture& fixture) {
+    auto body = ToolRequest();
+    auto prepared = fixture.Prepare(body);
+    Expect(prepared.chatRequest.tools.size() == 2 && prepared.parallelToolCalls &&
+        prepared.chatRequest.tool_choice == aila::chat::ToolChoice::Auto, "Tool defaults were lost");
+    Expect(prepared.chatRequest.tools[0].name == "weather" &&
+        Parse(prepared.chatRequest.tools[0].parameters_json) == body["tools"][0]["function"]["parameters"], "Tool schema was altered");
+    body["parallel_tool_calls"] = false;
+    body["tools"][0]["function"]["strict"] = false;
+    for (const auto& choice : {"none", "auto", "required"}) {
+        body["tool_choice"] = choice;
+        Expect(!fixture.Prepare(body).parallelToolCalls, "parallel_tool_calls was ignored");
+    }
+    body["tool_choice"] = Parse(R"({"type":"function","function":{"name":"calc"}})");
+    prepared = fixture.Prepare(body);
+    Expect(prepared.chatRequest.tool_choice == aila::chat::ToolChoice::Function &&
+        prepared.chatRequest.tool_choice_function_name == "calc", "Named tool choice was lost");
+    body["tools"][0]["function"].removeMember("parameters");
+    Expect(fixture.Prepare(body).chatRequest.tools[0].parameters_json == "{}", "Omitted parameters did not default to an object");
+    body = Request(); body["tools"] = Json::arrayValue; body["tool_choice"] = "none";
+    Expect(fixture.Prepare(body).chatRequest.tools.empty(), "Empty tools changed the text contract");
+}
+
+void InvalidToolDefinitions(const Fixture& fixture) {
+    for (const auto& invalid : {Json::Value(), Json::Value(4), Json::Value(Json::objectValue)}) {
+        auto body = ToolRequest(); body["tools"] = invalid;
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools");
+    }
+    auto body = ToolRequest();
+    body["tools"] = Json::arrayValue;
+    for (size_t index = 0; index < 129; ++index) body["tools"].append(Tool("t" + std::to_string(index)));
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools");
+    for (const auto& name : std::vector<std::string>{"", "with space", "dot.name", "工具", "bad\nname", std::string(65, 'a')}) {
+        body = ToolRequest(); body["tools"][0]["function"]["name"] = name;
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[0].function.name");
+    }
+    body = ToolRequest(); body["tools"][1] = body["tools"][0];
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[1].function.name");
+    for (const char* field : {"type", "function"}) {
+        body = ToolRequest(); body["tools"][0].removeMember(field);
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", std::string("tools[0].") + field);
+    }
+    body = ToolRequest(); body["tools"][0]["function"]["strict"] = true;
+    ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_parameter", "tools[0].function.strict");
+    body["tools"][0]["function"]["strict"] = "false";
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[0].function.strict");
+    for (const auto& invalid : {Json::Value(), Json::Value("{}"), Json::Value(Json::arrayValue)}) {
+        body = ToolRequest(); body["tools"][0]["function"]["parameters"] = invalid;
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[0].function.parameters");
+    }
+    body = ToolRequest(); body["tools"][0]["function"]["parameters"]["description"] = std::string(65536, 'x');
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[0].function.parameters");
+    body = ToolRequest(); body["tools"][0]["function"]["description"] = std::string(16385, 'x');
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tools[0].function.description");
+    body = ToolRequest(); body["tools"][0]["function"]["extra"] = false;
+    ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_parameter", "tools[0].function.extra");
+    for (const auto& invalid : {Json::Value(), Json::Value("sometimes"), Json::Value(false), Json::Value(Json::arrayValue)}) {
+        body = ToolRequest(); body["tool_choice"] = invalid;
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tool_choice");
+    }
+    body = Request(); body["tool_choice"] = "required";
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tool_choice");
+    body = ToolRequest(); body["tool_choice"] = Parse(R"({"type":"function","function":{"name":"missing"}})");
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "tool_choice.function.name");
+    body = ToolRequest(); body["parallel_tool_calls"] = 0;
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "parallel_tool_calls");
+}
+
+void ToolHistoryValidation(const Fixture& fixture) {
+    auto body = ToolHistory();
+    auto prepared = fixture.Prepare(body);
+    Expect(prepared.chatRequest.messages[1].tool_calls.size() == 2 &&
+        prepared.chatRequest.messages[2].tool_call_id == "call_b", "Tool history correlation was lost");
+    body["messages"][1].removeMember("content");
+    fixture.Prepare(body);
+    body["tools"] = Json::arrayValue;
+    fixture.Prepare(body); // Historical functions need not be currently offered.
+    const std::vector<std::pair<std::string, std::function<void(Json::Value&)>>> invalid = {
+        {"messages[1].tool_calls[1].id", [](auto& b) { b["messages"][1]["tool_calls"][1]["id"] = "call_a"; }},
+        {"messages[2].tool_call_id", [](auto& b) { b["messages"][2]["tool_call_id"] = "unknown"; }},
+        {"messages[3].tool_call_id", [](auto& b) { b["messages"][3]["tool_call_id"] = "call_b"; }},
+        {"messages[2].role", [](auto& b) { b["messages"][2] = Request()["messages"][0]; }},
+        {"messages[3].name", [](auto& b) { b["messages"][3]["name"] = "calc"; }},
+        {"messages[1].tool_calls", [](auto& b) { b["messages"][1]["tool_calls"] = Json::arrayValue; }},
+        {"messages[1].tool_calls[0].type", [](auto& b) { b["messages"][1]["tool_calls"][0]["type"] = "custom"; }},
+        {"messages[0].tool_calls", [](auto& b) { b["messages"][0]["tool_calls"] = b["messages"][1]["tool_calls"]; }},
+        {"messages[0].tool_call_id", [](auto& b) { b["messages"][0]["tool_call_id"] = "call_a"; }},
+        {"messages", [](auto& b) { b["messages"].resize(3); }},
+        {"messages[3].content", [](auto& b) { b["messages"][3]["content"] = Json::nullValue; }},
+    };
+    for (const auto& [parameter, mutate] : invalid) {
+        body = ToolHistory(); mutate(body);
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", parameter);
+    }
+    for (const auto& arguments : std::vector<std::string>{"", "[]", "null", "{\"x\":1,\"x\":2}", "{\"x\":01}", "{\"x\":\"\\ud800\"}",
+                                  "{} {}", "{\"x\":", std::string(65537, ' ')}) {
+        body = ToolHistory(); body["messages"][1]["tool_calls"][0]["function"]["arguments"] = arguments;
+        ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "messages[1].tool_calls[0].function.arguments");
+    }
+    body = ToolHistory(); body["messages"].append(body["messages"][1]);
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "messages[4].tool_calls[0].id");
+}
+
+void ToolTemplates(const Fixture& fixture) {
+    auto body = ToolHistory(); body["tool_choice"] = "required";
+    const auto dense = PrepareChat(Serialize(body), fixture.fallback, fixture.settings);
+    const auto prompt = fixture.fallback.decode(std::vector<int>(dense.promptIds.begin(), dense.promptIds.end()));
+    Expect(prompt.find("<tools>") != std::string::npos && prompt.find("You must call at least one tool") != std::string::npos &&
+        prompt.find("call_a") != std::string::npos && prompt.find("call_b") != std::string::npos &&
+        prompt.find("old_tool") != std::string::npos && prompt.find("晴天") != std::string::npos &&
+        prompt.find("\"city\"") != std::string::npos, "Fallback lost tool definitions, history, or choice");
+    body = ToolRequest(); body["tool_choice"] = Parse(R"({"type":"function","function":{"name":"calc"}})");
+    const auto named = PrepareChat(Serialize(body), fixture.fallback, fixture.settings);
+    const auto namedPrompt = fixture.fallback.decode(std::vector<int>(named.promptIds.begin(), named.promptIds.end()));
+    Expect(namedPrompt.find("weather") == std::string::npos && namedPrompt.find("You must call calc") != std::string::npos,
+        "Named choice did not filter fallback tools");
+    body["tool_choice"] = "none";
+    const auto none = PrepareChat(Serialize(body), fixture.fallback, fixture.settings);
+    Expect(none.promptIds == PrepareChat(Serialize(Request()), fixture.fallback, fixture.settings).promptIds,
+        "Disabled tools changed the no-tool fallback prompt");
+    auto settings = fixture.settings; settings.family = ModelFamily::Qwen35Hybrid;
+    body = ToolHistory(); body["tool_choice"] = "required";
+    const auto hybrid = PrepareChat(Serialize(body), fixture.hybrid, settings);
+    const auto hybridPrompt = fixture.hybrid.decode(std::vector<int>(hybrid.promptIds.begin(), hybrid.promptIds.end()));
+    Expect(hybridPrompt.find("<tools>") != std::string::npos && hybridPrompt.find("<function=weather>") != std::string::npos &&
+        hybridPrompt.find("晴天") != std::string::npos && hybridPrompt.find("MUST call at least one") != std::string::npos,
+        "Hybrid fixed template lost tool definitions/history/choice");
+}
+
+void ToolOutputFormatsAndFragmentation() {
+    const std::vector<std::pair<std::string, std::string>> blocks = {
+        {R"(<tool_call>{"name":"weather","arguments":{"city":"北京","flags":[true,null,2]}}</tool_call>)", R"({"city":"北京","flags":[true,null,2]})"},
+        {R"(<tool_call>{"name":"weather","arguments":"{\"city\":\"北京\"}"}</tool_call>)", R"({"city":"北京"})"},
+        {"<tool_call>\n<function=weather>\n<parameter=city>北京</parameter>\n</function>\n</tool_call>", R"({"city":"北京"})"},
+        {R"(<tool_call><weather city="北京" /></tool_call>)", R"({"city":"北京"})"},
+        {R"(<tool_call><weather city="北京"></weather></tool_call>)", R"({"city":"北京"})"},
+    };
+    for (const auto& [block, expected] : blocks) {
+        const auto plain = RunOutput(ToolOutputRequest(false), block, block.size());
+        const auto message = Parse(plain.completion.json)["choices"][0]["message"];
+        Expect(message["content"].isNull() && message["tool_calls"].size() == 1 &&
+            Parse(message["tool_calls"][0]["function"]["arguments"].asString()) == Parse(expected), "JSON tool result is malformed");
+        Expect(plain.completion.warnings.empty(), "Valid tool output emitted legacy diagnostics");
+        for (const auto size : {size_t(1), size_t(7), block.size()}) {
+            const auto stream = RunOutput(ToolOutputRequest(), block, size);
+            const auto view = Inspect(stream.frames, true, true);
+            Expect(view.content.empty() && view.reasoning.empty() && view.toolCalls == message["tool_calls"] &&
+                view.finishReason == "tool_calls" && view.done == 1 && view.finishes == 1 && view.usageChunks == 1,
+                "Fragmented SSE differs from the tool completion");
+            Expect(stream.completion.json == plain.completion.json, "Stream/nonstream tool JSON changed");
+        }
+    }
+    const std::string first = blocks[0].first;
+    const std::string second = R"(<tool_call>{"name":"calc","arguments":{"x":3}}</tool_call>)";
+    const auto run = RunOutput(ToolOutputRequest(), "<think>Plan</think>Before " + first + "\n" + second + " after", 1);
+    const auto view = Inspect(run.frames, true, true);
+    Expect(view.toolCalls.size() == 2 && view.toolCalls[0]["id"] != view.toolCalls[1]["id"] &&
+        view.content == "Before \n after" && view.reasoning == "Plan", "Mixed tool/reasoning/text output lost order or IDs");
+    const auto length = RunOutput(ToolOutputRequest(), first, 2, wire::EndReason::Length);
+    Expect(Inspect(length.frames, true, true).finishReason == "length", "Tools hid a token length termination");
+    auto prepared = ToolOutputRequest(); prepared.chatRequest.tool_choice = aila::chat::ToolChoice::None;
+    const auto none = RunOutput(prepared, first, 1);
+    Expect(Inspect(none.frames, true).content == first && !none.completion.warnings.empty(), "tool_choice=none changed raw text behavior");
+    const auto automatic = RunOutput(ToolOutputRequest(), "No tool needed.", 2);
+    Expect(Inspect(automatic.frames, true, true).finishReason == "stop", "Auto requires a spurious tool call");
+}
+
+void ExpectToolFailure(const PreparedChat& prepared, const std::string& text, const std::string& code,
+                       wire::EndReason reason = wire::EndReason::StopToken) {
+    ChatOutput output(Identity(), prepared);
+    auto frames = output.Begin();
+    try {
+        for (const char byte : text) Append(frames, output.PushText(std::string_view(&byte, 1)));
+    } catch (const ApiError& error) { Expect(error.code == code, "Unexpected early tool failure: " + error.code); }
+    const auto result = output.Finish(Summary(prepared, 5, reason));
+    Append(frames, result.sseFrames);
+    CheckFailure(result, frames, code, 502, true, true);
+    Expect(output.Finish(Summary(prepared)).sseFrames.empty() && output.Fail(ApiError(500, "later", "later")).sseFrames.empty(),
+        "Tool failure emitted a second terminal");
+}
+
+void ToolOutputPolicyAndErrors() {
+    const std::string call = R"(<tool_call>{"name":"weather","arguments":{"city":"北京"}}</tool_call>)";
+    auto prepared = ToolOutputRequest(); prepared.chatRequest.tool_choice = aila::chat::ToolChoice::Required;
+    ExpectToolFailure(prepared, "No tool.", "tool_choice_violation");
+    ExpectToolFailure(prepared, "", "tool_choice_violation", wire::EndReason::Length);
+    RunOutput(prepared, call, 1);
+    prepared.chatRequest.tool_choice = aila::chat::ToolChoice::Function;
+    prepared.chatRequest.tool_choice_function_name = "calc";
+    ExpectToolFailure(prepared, call, "tool_choice_violation");
+    prepared.chatRequest.tool_choice_function_name = "weather";
+    RunOutput(prepared, call, 1);
+    prepared = ToolOutputRequest(); prepared.parallelToolCalls = false;
+    RunOutput(prepared, call, 1);
+    ExpectToolFailure(prepared, call + call, "tool_choice_violation");
+    const std::vector<std::string> malformed = {
+        "<tool_call>broken</tool_call>", "<tool_call><function=weather></function>",
+        R"(<tool_call>{"name":"weather","arguments":{}})",
+        R"(<tool_call>{"name":"missing","arguments":{}}</tool_call>)",
+        R"(<tool_call>{"name":"weather","arguments":[]}</tool_call>)",
+        R"(<tool_call>{"name":"weather","arguments":{"x":1,"x":2}}</tool_call>)",
+        R"(<tool_call>{"name":"weather","name":"calc","arguments":{}}</tool_call>)",
+        R"(<tool_call>{"name":"weather","arguments":"{\"x\":01}"}</tool_call>)",
+        R"(<tool_call>{"name":"weather","arguments":{"x":"\ud800"}}</tool_call>)",
+        "<tool_call>prefix<function=weather></function></tool_call>",
+        "<tool_call><function=weather></function>suffix</tool_call>",
+        "<tool_call><function=weather></function><function=calc></function></tool_call>",
+        "<tool_call><function=weather><parameter=x>one</parameter><parameter=x>two</parameter></function></tool_call>",
+        "<tool_call><weather/>suffix</tool_call>",
+    };
+    for (const auto& text : malformed) {
+        ExpectToolFailure(ToolOutputRequest(), text, "invalid_tool_call");
+        ExpectToolFailure(ToolOutputRequest(), text, "invalid_tool_call", wire::EndReason::Length);
+    }
+    std::string tooMany;
+    for (size_t index = 0; index < 129; ++index) tooMany += call;
+    ExpectToolFailure(ToolOutputRequest(), tooMany, "tool_call_limit_exceeded");
+    ChatOutput cancelled(Identity(), ToolOutputRequest());
+    auto frames = cancelled.Begin(); Append(frames, cancelled.PushText(call));
+    auto summary = Summary(ToolOutputRequest()); summary.status = wire::RequestStatus::Cancelled; summary.endReason = wire::EndReason::Cancelled;
+    const auto result = cancelled.Finish(summary); Append(frames, result.sseFrames);
+    CheckFailure(result, frames, "request_cancelled", 409, true, true);
+}
+
+void HybridToolMarkerTokens(const Fixture& fixture) {
+    auto settings = fixture.settings; settings.family = ModelFamily::Qwen35Hybrid;
+    auto prepared = PrepareChat(Serialize(ToolRequest()), fixture.hybrid, settings);
+    prepared.stream = true; prepared.includeUsage = true;
+    Expect(fixture.hybrid.special_token_id("<tool_call>") == 248058 &&
+        fixture.hybrid.special_token_id("</tool_call>") == 248059, "Hybrid tool fixture lost real added-token IDs");
+    Expect(fixture.hybrid.decode(248058).empty() && fixture.hybrid.decode(248059).empty(),
+        "The legacy tokenizer control-token behavior changed");
+    const auto inner = fixture.hybrid.encode(R"({"name":"weather","arguments":{"city":"北京"}})");
+    for (const bool atomicOpen : {false, true}) for (const bool atomicClose : {false, true}) {
+        std::vector<int> tokens;
+        if (atomicOpen) tokens.push_back(248058);
+        else for (const unsigned char byte : std::string("<tool_call>")) tokens.push_back(byte);
+        tokens.insert(tokens.end(), inner.begin(), inner.end());
+        if (atomicClose) tokens.push_back(248059);
+        else for (const unsigned char byte : std::string("</tool_call>")) tokens.push_back(byte);
+        ChatOutput output(Identity(), prepared);
+        auto frames = output.Begin();
+        for (const int token : tokens) Append(frames, output.PushText(DecodeChatToken(fixture.hybrid, prepared, token)));
+        const auto completion = output.Finish(Summary(prepared)); Append(frames, completion.sseFrames);
+        const auto view = Inspect(frames, true, true);
+        Expect(!completion.failed && view.toolCalls.size() == 1 && view.finishReason == "tool_calls" &&
+            Parse(view.toolCalls[0]["function"]["arguments"].asString()) == Parse(R"({"city":"北京"})"),
+            "Atomic or mixed-BPE tool markers were lost in the HTTP decode path");
+        if (!atomicOpen && atomicClose) {
+            ChatOutput previousDecode(Identity(), prepared);
+            for (const int token : tokens) previousDecode.PushText(fixture.hybrid.decode(token));
+            const auto previous = previousDecode.Finish(Summary(prepared));
+            Expect(previous.failed && Parse(previous.json)["error"]["code"].asString() == "invalid_tool_call",
+                "The former HTTP decode path no longer reproduces its lost-closing-marker failure");
+        }
+    }
+    prepared.chatRequest.tool_choice = aila::chat::ToolChoice::None;
+    Expect(DecodeChatToken(fixture.hybrid, prepared, 248058).empty(), "tool_choice=none changed legacy text decoding");
+    prepared.chatRequest.tool_choice = aila::chat::ToolChoice::Auto; prepared.chatRequest.tools.clear();
+    Expect(DecodeChatToken(fixture.hybrid, prepared, 248059).empty(), "Absent tools changed legacy text decoding");
+}
+
+void ToolArgumentPrecision() {
+    const std::string arguments = R"({ "large":18446744073709551615, "decimal":0.123456789012345678901234, "zero":-0.0, "tiny":1e-100 })";
+    for (const bool stringArguments : {false, true}) {
+        const auto raw = "<tool_call>{\"name\":\"calc\",\"arguments\":" +
+            (stringArguments ? Serialize(Json::Value(arguments)) : arguments) + "}</tool_call>";
+        const auto run = RunOutput(ToolOutputRequest(), raw, 1);
+        const auto view = Inspect(run.frames, true, true);
+        Expect(view.toolCalls[0]["function"]["arguments"].asString() == arguments,
+            "Tool argument precision or original JSON spelling was changed");
+        const auto message = Parse(run.completion.json)["choices"][0]["message"];
+        Expect(message["tool_calls"] == view.toolCalls, "Argument precision differs between JSON and SSE");
+    }
+}
+
+void ToolOutputFrameAndByteBounds() {
+    std::string payload;
+    for (size_t index = 0; index < 2200; ++index) payload += "北京🙂\x01";
+    Json::Value raw(Json::objectValue);
+    raw["name"] = "weather"; raw["arguments"]["city"] = payload;
+    const auto text = "<tool_call>" + Serialize(raw) + "</tool_call>";
+    const auto plain = RunOutput(ToolOutputRequest(false), text, text.size());
+    const auto run = RunOutput(ToolOutputRequest(), text, 31);
+    const auto view = Inspect(run.frames, true, true);
+    Expect(view.toolDeltas > 16 && view.toolCalls == Parse(plain.completion.json)["choices"][0]["message"]["tool_calls"],
+        "Large tool arguments were not reassembled exactly");
+    for (const auto& frame : run.frames) Expect(frame.size() <= 16384, "Tool delta exceeds the HTTP handoff frame limit");
+    Expect(Parse(view.toolCalls[0]["function"]["arguments"].asString())["city"].asString() == payload, "Argument chunks split a Unicode scalar or escape");
+    raw["arguments"]["city"] = std::string(65536, 'x');
+    ExpectToolFailure(ToolOutputRequest(), "<tool_call>" + Serialize(raw) + "</tool_call>", "invalid_tool_call");
+    ChatOutput bounded(Identity(), ToolOutputRequest(), 4096);
+    auto frames = bounded.Begin();
+    ExpectError([&] { bounded.PushText(text); }, 502, "output_limit_exceeded");
+    const auto failed = bounded.Finish(Summary(ToolOutputRequest())); Append(frames, failed.sseFrames);
+    CheckFailure(failed, frames, "output_limit_exceeded", 502, true, true);
+    Expect(FrameBytes(frames) <= 4096, "Tool quota failure exhausted its error reserve");
+    raw["arguments"]["city"] = std::string(650, '\\');
+    const auto escaped = "<tool_call>" + Serialize(raw) + "</tool_call>";
+    Expect(escaped.size() < 2048, "Serialized tool quota fixture hit the raw quota first");
+    for (const bool streaming : {false, true}) {
+        auto prepared = ToolOutputRequest(streaming);
+        ChatOutput serialized(Identity(), prepared, 4096);
+        auto emitted = serialized.Begin();
+        try { Append(emitted, serialized.PushText(escaped)); }
+        catch (const ApiError& error) { Expect(streaming && error.code == "output_limit_exceeded", "Unexpected tool quota exception"); }
+        const auto failure = serialized.Finish(Summary(prepared)); Append(emitted, failure.sseFrames);
+        Expect(failure.failed && Parse(failure.json)["error"]["code"].asString() == "output_limit_exceeded",
+            "Serialized tool arguments escaped the output quota");
+        if (streaming) CheckFailure(failure, emitted, "output_limit_exceeded", 502, true, true);
+        Expect(FrameBytes(emitted) <= 4096, "Serialized tool quota failure exceeded its reserve");
+    }
+}
+
 void ToolBlocksRemainText() {
     const std::vector<std::string> blocks = {
         "<tool_call><function=calc><parameter=x>1</parameter></function></tool_call>",
@@ -1240,6 +1664,7 @@ int main() {
         const std::vector<std::pair<const char*, std::function<void()>>> tests = {
             {"defaults and trusted template", [&] { DefaultsAndTemplate(fixture); }},
             {"supported parameters and uint64 seeds", [&] { SupportedParameters(fixture); }},
+            {"thinking budget aliases, bounds and model token metadata", [&] { ThinkingBudgetParameters(fixture); }},
             {"message roles and text parts", [&] { MessagesAndContentParts(fixture); }},
             {"strict JSON and Unicode input", [&] { StrictJson(fixture); }},
             {"unsupported feature rejection", [&] { UnsupportedFields(fixture); }},
@@ -1254,6 +1679,15 @@ int main() {
             {"Hybrid limits and template failures", [&] { HybridLimitsAndTemplateFailures(fixture); }},
             {"nonstream and SSE schema", NonstreamAndSseSchema},
             {"fragmentation and reasoning channels", FragmentationAndReasoning},
+            {"tool definitions and call choices", [&] { ToolDefinitionsAndChoice(fixture); }},
+            {"strict tool definition validation", [&] { InvalidToolDefinitions(fixture); }},
+            {"tool history correlation and arguments", [&] { ToolHistoryValidation(fixture); }},
+            {"tool-aware dense and Hybrid templates", [&] { ToolTemplates(fixture); }},
+            {"tool output JSON/XML, fragmentation and SSE parity", ToolOutputFormatsAndFragmentation},
+            {"tool output policy, malformed calls and cancellation", ToolOutputPolicyAndErrors},
+            {"tool output frame and byte bounds", ToolOutputFrameAndByteBounds},
+            {"tool argument decimal precision and original spelling", ToolArgumentPrecision},
+            {"Hybrid added-token and mixed-BPE tool delimiters", [&] { HybridToolMarkerTokens(fixture); }},
             {"unsolicited tools retained as text", ToolBlocksRemainText},
             {"UTF-8 output validation", OutputUtf8Errors},
             {"UTF-8 length-boundary replacement", LengthTruncatedUtf8},

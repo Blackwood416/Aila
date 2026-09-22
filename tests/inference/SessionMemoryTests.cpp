@@ -1,4 +1,5 @@
 #include "memory/SessionMemory.hpp"
+#include "memory/AllocationBudget.hpp"
 
 #include <climits>
 #include <iostream>
@@ -102,6 +103,38 @@ void TestInvalidAndOverflow() {
     ExpectInvalid([&] { aila::memory::qwen35_session_memory(hybrid, INT_MAX, 4); });
 }
 
+void TestAllocationBudget() {
+    using aila::memory::AllocationBudget;
+    using aila::memory::AllocationLimitExceeded;
+    AllocationBudget budget;
+    budget.SetLimit(100);
+    budget.Acquire(40, "Device");
+    budget.Acquire(60, "Device");
+    Expect(budget.Current() == 100 && budget.Peak() == 100 && budget.Count() == 2,
+           "Exact allocation budget boundary must be admissible");
+    bool rejected = false;
+    try { budget.Acquire(1, "Device"); } catch (const AllocationLimitExceeded&) { rejected = true; }
+    Expect(rejected && budget.Current() == 100 && budget.Count() == 2 && budget.Peak() == 100,
+           "Rejected allocation changed the ledger");
+    rejected = false;
+    try { budget.SetLimit(99); } catch (const AllocationLimitExceeded&) { rejected = true; }
+    Expect(rejected && budget.Limit() == 100, "Failed budget shrink changed the limit");
+    budget.Release(60);
+    budget.SetLimit(50);
+    budget.Acquire(10, "Device");
+    budget.Release(40);
+    budget.Release(10);
+    Expect(budget.Current() == 0 && budget.Count() == 0 && budget.Peak() == 100,
+           "Allocation release/reuse lost accounting or its peak");
+    budget.SetLimit(0);
+    budget.Acquire((std::numeric_limits<size_t>::max)(), "Device");
+    rejected = false;
+    try { budget.Acquire(1, "Device"); } catch (const AllocationLimitExceeded&) { rejected = true; }
+    Expect(rejected && budget.Current() == (std::numeric_limits<size_t>::max)(),
+           "Unlimited budget allowed integer overflow");
+    budget.Release((std::numeric_limits<size_t>::max)());
+}
+
 } // namespace
 
 int main() {
@@ -109,7 +142,8 @@ int main() {
         TestKnownModelShapes();
         TestLayerTypesAndConvolution();
         TestInvalidAndOverflow();
-        std::cout << "Session memory reservation tests passed (known models, layer plans, overflow).\n";
+        TestAllocationBudget();
+        std::cout << "Session memory reservation tests passed (known models, layer plans, overflow, allocation budgets).\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

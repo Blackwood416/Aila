@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IModelBackend.hpp"
+#include "HybridLayerExecution.hpp"
 #include "../ops/Bnb4BitLinear.hpp"
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
@@ -104,6 +105,7 @@ public:
 
     private:
         friend class Qwen35HybridBnb4Backend;
+        friend struct aila::models::HybridDecodeBatchExecutor;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
                 bool boundedSnapshots, std::size_t maxSnapshots);
@@ -151,6 +153,12 @@ public:
     // execution slot and must be consumed before another forward.
     Tensor& Forward(Context& ctx, Session& session,
                     const int* tokenIdsDevice, int count);
+    bool SupportsDecodeBatch() const noexcept;
+    Tensor& ForwardDecodeBatch(Context& ctx, const std::vector<Session*>& sessions,
+                               const int* tokenIdsDevice);
+    // Legacy text ABI compatibility: retain the original multi-row layout.
+    Tensor& ForwardLegacyLogits(Context& ctx, Session& session,
+                                const int* tokenIdsDevice, int count);
     void Reset(Session& session);
     // Recurrent state restores the nearest retained checkpoint <= newLength;
     // otherwise resets to zero. Invalid lengths leave the Session intact.
@@ -168,20 +176,15 @@ public:
     void clear_mrope_positions() override;
 
 private:
-    enum class ExecutionPhase { Prefill, Decode };
-    enum class LayerKind { FullAttention, DeltaNet };
-    struct LayerPlan {
-        Qwen35HybridBnB4Layer* layer = nullptr;
-        Tensor* postMlpNormWeight = nullptr;
-        int cacheIndex = 0;
-        LayerKind kind = LayerKind::FullAttention;
-    };
-    struct DecoderPlan {
-        Tensor* initialNormWeight = nullptr;
-        bool hasRecurrentLayers = false;
-        std::vector<LayerPlan> layers;
-    };
-    struct LayerExecution;
+    friend struct aila::models::HybridLayerExecutor;
+    friend struct aila::models::HybridDecodeBatchExecutor;
+    using ExecutionPhase = aila::models::HybridExecutionPhase;
+    using LayerKind = aila::models::HybridLayerKind;
+    using LayerPlan = aila::models::HybridLayerPlan<Qwen35HybridBnB4Layer>;
+    using DecoderPlan = aila::models::HybridDecoderPlan<Qwen35HybridBnB4Layer>;
+    using LayerExecution = aila::models::HybridLayerExecution<
+        Qwen35HybridBnB4Buffers, LayerCache, aila::models::Nf4ProjectionWorkspace>;
+    struct ProjectionPolicy;
     struct ProfileState;
 
     void BuildDecoderPlan();
@@ -220,6 +223,7 @@ private:
     Qwen35HybridDeltaScratch linear_delta_scratch_;
     Linear lm_head_;
     Tensor lastTokenLogits_;
+    Tensor batchLogits_, batchLogitsView_;
 
     Tensor* embed_weight_ = nullptr;
     Tensor* final_norm_weight_ = nullptr;
@@ -246,6 +250,9 @@ private:
                                 LayerCache& cache,
                                 Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
                                 int seq_len);
+    void run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                                Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,
+                                int seq_len, Tensor& out_dst);
     void run_linear_delta_decode_host(Context& ctx, Layer& layer,
                                        LayerCache& cache,
                                        Tensor& qkv_src, Tensor& z_src, Tensor& a_src, Tensor& b_src,

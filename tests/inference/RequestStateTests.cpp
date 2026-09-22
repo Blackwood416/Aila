@@ -43,6 +43,12 @@ struct FakeModel {
     // Represents model resources retained by a session, independently of a
     // caller's model handle. No device runtime is linked into this test.
     int marker = 19;
+    bool batchEnabled = false;
+    std::vector<size_t> batchWidths;
+    std::function<void()> duringBatch;
+    std::optional<ErrorCode> batchFailure;
+    bool ordinaryBatchFailure = false;
+    bool invalidBatchResultCount = false;
 };
 
 struct FakeState {
@@ -53,6 +59,8 @@ struct FakeState {
     std::vector<std::vector<int>> inputs;
     std::vector<std::vector<int>> samplingHistories;
     std::vector<GenerationConfig> samplingConfigs;
+    std::vector<bool> hostSampling;
+    std::vector<bool> legacyPrefillLogits;
     std::vector<int> samples;
     size_t samplesTaken = 0;
     size_t capturedLogits = 0;
@@ -84,6 +92,25 @@ public:
     size_t CacheBytes() const override {
         return static_cast<size_t>(state->capacity) * sizeof(int);
     }
+    const void* DecodeBatchKey() const noexcept override {
+        return model->batchEnabled ? model.get() : nullptr;
+    }
+    std::vector<ExecutionResult> ForwardDecodeBatch(const std::vector<BackendDecodeInput>& rows) override {
+        std::vector<ExecutionResult> results;
+        for (const auto& row : rows) {
+            auto* peer = dynamic_cast<FakeBackend*>(row.backend);
+            Expect(peer && peer->model == model, "Fake decode batch mixed model identities");
+        }
+        model->batchWidths.push_back(rows.size());
+        if (model->duringBatch) model->duringBatch();
+        if (model->batchFailure) throw Error(*model->batchFailure, "fake shared batch failure");
+        if (model->ordinaryBatchFailure) throw std::runtime_error("fake ordinary batch failure");
+        for (const auto& row : rows) {
+            results.push_back(row.backend->Forward({row.tokenId}, row.sampling, row.captureLogits));
+        }
+        if (model->invalidBatchResultCount) results.pop_back();
+        return results;
+    }
     void Reset() override {
         if (state->failReset) throw std::runtime_error("fake reset failed");
         state->context.clear();
@@ -113,6 +140,8 @@ public:
         if (sampling) {
             state->samplingHistories.push_back(sampling->generatedIds);
             state->samplingConfigs.push_back(sampling->config);
+            state->hostSampling.push_back(sampling->forceHost);
+            state->legacyPrefillLogits.push_back(sampling->legacyPrefillLogits);
             // Includes all consumed context and prior outputs so interleaving
             // catches both cache and penalty-history contamination.
             for (const int tokenId : sampling->generatedIds) {
@@ -178,6 +207,181 @@ std::vector<int> Complete(const std::shared_ptr<RequestState>& request) {
         }
     }
     throw std::runtime_error("Request did not terminate within the test bound");
+}
+
+void TestPrefillOnlyAndCancelledReplay() {
+    const std::vector<int> prefix{1, 2, 3, 4, 5};
+    auto options = Options(0, 2);
+    options.prefillOnly = true;
+    auto fixture = MakeFixture();
+    auto replay = RequestState::Create(fixture.session, prefix, options);
+    Expect(fixture.session->Busy(), "Prefill did not acquire the Session");
+    ExpectError(ErrorCode::Busy, [&] { fixture.session->Reset(); });
+    Expect(Complete(replay).empty() && fixture.state->context == prefix &&
+               fixture.state->inputs == std::vector<std::vector<int>>({{1, 2}, {3, 4}, {5}}) &&
+               fixture.state->samplesTaken == 0 && fixture.state->capturedLogits == 0,
+           "Prefill emitted tokens, sampled, captured logits, or changed the chunk boundaries");
+    Expect(replay->Snapshot().endReason == RequestEndReason::Length &&
+               replay->Snapshot().promptTokensProcessed == prefix.size() && !fixture.session->Busy(),
+           "Prefill completion did not report/retain exactly the prompt");
+    auto direct = MakeFixture();
+    direct.session->ForwardLogits(prefix);
+    Expect(Complete(RequestState::Create(fixture.session, {6}, Options())) ==
+               Complete(RequestState::Create(direct.session, {6}, Options())),
+           "Prefill changed the following request's context, RNG or penalties");
+    auto exact = MakeFixture(5);
+    Expect(Complete(RequestState::Create(exact.session, prefix, options)).empty() && exact.session->ContextLength() == 5,
+           "Prefill incorrectly reserved an extra generated token at capacity");
+    fixture = MakeFixture();
+    replay = RequestState::Create(fixture.session, prefix, options);
+    replay->Cancel();
+    Expect(replay->Step().status == RequestStatus::Cancelled && fixture.state->inputs.empty(),
+           "Queued prefill cancellation entered the backend");
+    replay = RequestState::Create(fixture.session, prefix, options);
+    fixture.state->duringForward = [&] { replay->Cancel(); };
+    Expect(replay->Step().status == RequestStatus::Cancelled &&
+               fixture.state->context == std::vector<int>({1, 2}) && !fixture.session->Busy(),
+           "Active prefill cancellation lost its completed prefix or Session lease");
+    fixture.state->duringForward = {};
+    Expect(Complete(RequestState::Create(fixture.session, {3, 4, 5}, options)).empty() &&
+               fixture.state->context == prefix && fixture.state->samplesTaken == 0,
+           "Cancelled prefill could not replay only its missing suffix");
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        auto bad = options;
+        if (invalid == 0) bad.generation.max_new_tokens = 1;
+        if (invalid == 1) bad.stopTokenIds = {2};
+        if (invalid == 2) bad.generation.thinking_budget_tokens = 0;
+        if (invalid == 3) bad.thinkingBudget = aila::generation::ThinkingBudgetOptions{1, 10, 11, true, {11}};
+        ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::Create(fixture.session, {1}, bad); });
+        Expect(!fixture.session->Busy(), "Invalid prefill acquired the Session");
+    }
+}
+
+RequestOptions ThinkingOptions(int maximum, uint32_t budget, bool opens = true) {
+    auto options = Options(maximum, 2);
+    options.thinkingBudget = aila::generation::ThinkingBudgetOptions{budget, 10, 11, opens, {11, 3}};
+    return options;
+}
+
+void TestSingleCloseAndHostSamplingPolicy() {
+    auto fixture = MakeFixture();
+    fixture.state->samples = {20, 21, 10, 22, 23, 24, 25, 26};
+    auto options = ThinkingOptions(10, 2);
+    options.thinkingBudget->closeOnce = true;
+    options.forceHostSampling = true;
+    options.legacyPrefillLogits = true;
+    auto request = RequestState::Create(fixture.session, {1}, options);
+    Expect(Complete(request) == std::vector<int>({20, 21, 11, 3, 10, 22, 23, 24, 25, 26}),
+           "One-shot policy forced a second close after the model reopened thinking");
+    Expect(fixture.state->samplesTaken == 8 &&
+               fixture.state->hostSampling == std::vector<bool>(8, true) &&
+               fixture.state->legacyPrefillLogits == std::vector<bool>(8, true),
+           "One-shot policy consumed RNG for forced tokens or lost a sampling policy");
+    auto peer = MakeFixture();
+    peer.state->samples = {20, 21, 10, 22};
+    auto regular = RequestState::Create(peer.session, {1}, ThinkingOptions(8, 2));
+    Expect(Complete(regular) == std::vector<int>({20, 21, 11, 3, 10, 11, 3, 22}) &&
+               peer.state->hostSampling == std::vector<bool>(4, false) &&
+               peer.state->legacyPrefillLogits == std::vector<bool>(4, false),
+           "Compatibility policies changed ordinary Request defaults");
+}
+
+void TestThinkingBudgetClosesAndAccounts() {
+    auto fixture = MakeFixture();
+    fixture.state->samples = {20, 21, 22, 23, 24, 25};
+    auto request = RequestState::Create(fixture.session, {1, 2, 4}, ThinkingOptions(8, 2));
+    Expect(Complete(request) == std::vector<int>({20, 21, 11, 3, 22, 23, 24, 25}),
+           "Thinking close sequence was not emitted at the budget boundary");
+    Expect(fixture.state->samplesTaken == 6 && fixture.state->samplingHistories[2] == std::vector<int>({20, 21, 11, 3}),
+           "Forced close burned RNG or was missing from the penalty history");
+    Expect(fixture.state->context == std::vector<int>({1, 2, 4, 20, 21, 11, 3, 22, 23, 24, 25}),
+           "Forced close/final token did not enter the session cache");
+    Expect(request->Progress().endReason == RequestEndReason::Length && !fixture.session->Busy(),
+           "Budgeted completion lost its terminal reason or lease");
+    fixture.state->samples.push_back(26);
+    Expect(Complete(RequestState::Create(fixture.session, {5}, Options(1))) == std::vector<int>({26}),
+           "Session could not continue after a forced close");
+}
+
+void TestThinkingBudgetZeroNaturalAndReopened() {
+    auto zero = MakeFixture();
+    zero.state->samples = {20};
+    Expect(Complete(RequestState::Create(zero.session, {1, 2, 4}, ThinkingOptions(3, 0))) ==
+               std::vector<int>({11, 3, 20}) && zero.state->samplesTaken == 1,
+           "Zero budget must close an open prompt before sampling");
+    auto natural = MakeFixture();
+    natural.state->samples = {20, 11, 21, 10, 22, 23};
+    Expect(Complete(RequestState::Create(natural.session, {1}, ThinkingOptions(8, 2))) ==
+               std::vector<int>({20, 11, 21, 10, 22, 11, 3, 23}),
+           "Natural close/reopen reset the per-request thinking count");
+    auto reopened = MakeFixture();
+    reopened.state->samples = {10, 10, 20};
+    Expect(Complete(RequestState::Create(reopened.session, {1}, ThinkingOptions(7, 0, false))) ==
+               std::vector<int>({10, 11, 3, 10, 11, 3, 20}),
+           "Model-opened thinking escaped a zero or already exhausted budget");
+}
+
+void TestThinkingBudgetLengthAndCancellation() {
+    auto shortOutput = MakeFixture();
+    shortOutput.state->samples = {20, 21, 22};
+    auto request = RequestState::Create(shortOutput.session, {1}, ThinkingOptions(3, 2));
+    Expect(Complete(request) == std::vector<int>({20, 21}), "Insufficient close space emitted a partial marker sequence");
+    Expect(request->Snapshot().endReason == RequestEndReason::Length && shortOutput.state->samplesTaken == 2 &&
+               shortOutput.state->context == std::vector<int>({1, 20, 21}),
+           "Early length finish sampled extra output or failed to flush the last token");
+    auto none = MakeFixture();
+    auto noOutput = RequestState::Create(none.session, {1, 2, 4}, ThinkingOptions(1, 0));
+    Expect(Complete(noOutput).empty() && noOutput->Progress().endReason == RequestEndReason::Length &&
+               none.state->samplesTaken == 0 && none.state->context == std::vector<int>({1, 2, 4}),
+           "No-room budget did not consume its prompt without sampling");
+    auto cancelled = MakeFixture();
+    auto cancel = RequestState::Create(cancelled.session, {1}, ThinkingOptions(4, 0));
+    Expect(cancel->Step().tokenId == 11, "Missing first forced marker");
+    cancel->Cancel();
+    const auto end = cancel->Step();
+    Expect(end.becameTerminal && end.status == RequestStatus::Cancelled && !end.tokenId &&
+               cancelled.state->samplesTaken == 0 && cancelled.state->inputs.size() == 1 && !cancelled.session->Busy(),
+           "Cancel during forced close submitted more work or leaked the Session");
+}
+
+void TestThinkingBudgetValidationAndIsolation() {
+    auto fixture = MakeFixture();
+    auto invalid = [&](RequestOptions options) {
+        ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::Create(fixture.session, {1}, options); });
+        Expect(!fixture.session->Busy() && fixture.state->inputs.empty(), "Invalid thinking options acquired or executed the Session");
+    };
+    auto options = ThinkingOptions(8, 2);
+    options.thinkingBudget->closeTokenIds.clear(); invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->closeTokenIds = {3, 11}; invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->closeTokenIds = {11, 64}; invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->closeTokenIds = {11, 10}; invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->closeTokenIds = {11, 11}; invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->closeTokenIds.resize(17, 3); invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->openTokenId = 11; invalid(options);
+    options = ThinkingOptions(8, 2); options.stopTokenIds = {11}; invalid(options);
+    options = ThinkingOptions(8, 2); options.stopTokenIds = {3}; invalid(options);
+    options = ThinkingOptions(8, 2); options.generation.thinking_budget_tokens = 3; invalid(options);
+    options = ThinkingOptions(8, 2); options.thinkingBudget->maxTokens = UINT32_MAX; invalid(options);
+
+    const auto make = [] {
+        auto result = MakeFixture();
+        result.state->samples = {20, 21, 22, 23, 24, 25, 26, 27};
+        return result;
+    };
+    auto a = make(), b = make(), referenceA = make(), referenceB = make();
+    const auto optionsA = ThinkingOptions(8, 2), optionsB = ThinkingOptions(7, 0);
+    const auto expectedA = Complete(RequestState::Create(referenceA.session, {1, 2, 4}, optionsA));
+    const auto expectedB = Complete(RequestState::Create(referenceB.session, {6}, optionsB));
+    auto requestA = RequestState::Create(a.session, {1, 2, 4}, optionsA);
+    auto requestB = RequestState::Create(b.session, {6}, optionsB);
+    for (int i = 0; i < 32; ++i) {
+        if (!IsTerminal(requestA->Progress().status)) requestA->Step();
+        if (!IsTerminal(requestB->Progress().status)) requestB->Step();
+    }
+    Expect(requestA->Snapshot().generatedIds == expectedA && requestB->Snapshot().generatedIds == expectedB &&
+               a.state->samplingHistories == referenceA.state->samplingHistories &&
+               b.state->samplingHistories == referenceB.state->samplingHistories,
+           "Interleaved requests contaminated their thinking state or penalty history");
 }
 
 void TestSessionMutations() {
@@ -707,11 +911,420 @@ void TestDeferredLogCallbackRetainsRequest() {
            "Deferred log callback changed the outer Step result or consumed prefix");
 }
 
+
+struct BatchedRun {
+    std::vector<std::vector<int>> tokens;
+    std::vector<size_t> terminals;
+};
+
+BatchedRun CompleteBatched(const std::vector<std::shared_ptr<RequestState>>& requests) {
+    BatchedRun output{std::vector<std::vector<int>>(requests.size()), std::vector<size_t>(requests.size())};
+    const auto observe = [&](size_t index, const StepResult& step) {
+        if (step.tokenId) output.tokens[index].push_back(*step.tokenId);
+        if (step.becameTerminal) ++output.terminals[index];
+        Expect(!step.tokenId || !IsTerminal(step.status), "Batched terminal also published a token");
+    };
+    for (size_t turn = 0; turn < 128; ++turn) {
+        std::vector<std::shared_ptr<RequestState>> decode;
+        std::vector<size_t> indices;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto status = requests[i]->Progress().status;
+            if (status == RequestStatus::Queued || status == RequestStatus::Prefill) {
+                observe(i, requests[i]->Step());
+                status = requests[i]->Progress().status;
+            }
+            if (!IsTerminal(status)) {
+                if (status == RequestStatus::Decode || status == RequestStatus::Finalizing) {
+                    indices.push_back(i);
+                    decode.push_back(requests[i]);
+                }
+            }
+        }
+        if (!decode.empty()) {
+            const auto results = RequestState::StepDecodeBatch(decode);
+            Expect(results.size() == decode.size(), "Decode results lost their row mapping");
+            for (size_t i = 0; i < results.size(); ++i) observe(indices[i], results[i]);
+        }
+        if (std::all_of(requests.begin(), requests.end(), [](const auto& request) {
+                return IsTerminal(request->Progress().status);
+            })) {
+            for (size_t i = 0; i < requests.size(); ++i) {
+                Expect(requests[i]->Progress().status == RequestStatus::Completed && output.terminals[i] == 1 &&
+                           output.tokens[i] == requests[i]->Snapshot().generatedIds,
+                       "Decode batch lost output, failed, or produced more than one terminal");
+                const auto repeated = RequestState::StepDecodeBatch({requests[i]});
+                Expect(!repeated.front().becameTerminal && !repeated.front().tokenId,
+                       "Repeated batched step reopened a terminal request");
+            }
+            return output;
+        }
+    }
+    throw std::runtime_error("Decode batch did not finish within the CPU turn bound");
+}
+
+void TestDecodeBatchMatchesIndependentRows() {
+    for (const size_t width : {size_t{1}, size_t{2}, size_t{4}}) {
+        auto model = std::make_shared<FakeModel>();
+        model->batchEnabled = true;
+        std::vector<Fixture> fixtures;
+        std::vector<Fixture> references;
+        std::vector<std::shared_ptr<RequestState>> requests;
+        std::vector<std::vector<int>> expected;
+        for (size_t i = 0; i < width; ++i) {
+            auto options = Options(static_cast<int>(i * 2 + 1), static_cast<int>(i + 1), 700 + i);
+            options.generation.do_sample = i % 2 != 0;
+            options.generation.repetition_penalty = 1.1f + static_cast<float>(i) * 0.1f;
+            options.forceHostSampling = i % 2 != 0;
+            options.legacyPrefillLogits = i >= 2;
+            std::vector<int> prompt(i + 1, static_cast<int>(i + 2));
+            fixtures.push_back(MakeFixture(128, 64, model));
+            references.push_back(MakeFixture());
+            expected.push_back(Complete(RequestState::Create(references.back().session, prompt, options)));
+            requests.push_back(RequestState::Create(fixtures.back().session, prompt, options));
+        }
+        const auto output = CompleteBatched(requests);
+        Expect(output.tokens == expected, "Batched independent RNG/configuration changed full output sequences");
+        for (size_t i = 0; i < width; ++i) {
+            Expect(fixtures[i].state->context == references[i].state->context &&
+                       fixtures[i].state->samplingHistories == references[i].state->samplingHistories &&
+                       fixtures[i].state->hostSampling == references[i].state->hostSampling &&
+                       fixtures[i].state->legacyPrefillLogits == references[i].state->legacyPrefillLogits &&
+                       !fixtures[i].session->Busy(),
+                   "Batch rows contaminated cache/history/sampling policy or leaked a lease");
+        }
+        if (width == 1) {
+            Expect(model->batchWidths.empty(), "B=1 invoked a changed batch execution path");
+        } else {
+            Expect(!model->batchWidths.empty() &&
+                       *std::max_element(model->batchWidths.begin(), model->batchWidths.end()) <= width,
+                   "Multiple ready rows never reached the shared batch entry");
+        }
+    }
+}
+
+void TestDecodeBatchThinkingStopAndFinalization() {
+    auto model = std::make_shared<FakeModel>();
+    model->batchEnabled = true;
+    std::vector<RequestOptions> settings{ThinkingOptions(8, 2), ThinkingOptions(3, 2), Options(5), Options(1)};
+    settings[0].forceHostSampling = true;
+    settings[0].legacyPrefillLogits = true;
+    settings[2].stopTokenIds = {22};
+    std::vector<Fixture> fixtures, references;
+    std::vector<std::shared_ptr<RequestState>> requests;
+    std::vector<std::vector<int>> expected;
+    for (size_t i = 0; i < settings.size(); ++i) {
+        fixtures.push_back(MakeFixture(128, 64, model));
+        references.push_back(MakeFixture());
+        fixtures.back().state->samples = references.back().state->samples = {20, 21, 22, 23, 24, 25};
+        const std::vector<int> prompt{static_cast<int>(i + 1)};
+        expected.push_back(Complete(RequestState::Create(references.back().session, prompt, settings[i])));
+        requests.push_back(RequestState::Create(fixtures.back().session, prompt, settings[i]));
+    }
+    const auto output = CompleteBatched(requests);
+    Expect(output.tokens == expected && output.tokens[1] == std::vector<int>({20, 21}) &&
+               output.tokens[2] == std::vector<int>({20, 21}),
+           "Batch thinking close/early length/stop handling changed output");
+    for (size_t i = 0; i < fixtures.size(); ++i) {
+        Expect(fixtures[i].state->context == references[i].state->context &&
+                   fixtures[i].state->samplingHistories == references[i].state->samplingHistories &&
+                   fixtures[i].state->samplesTaken == references[i].state->samplesTaken,
+               "Forced close, stop, or finalization sampled extra RNG or consumed wrong tokens");
+    }
+    Expect(requests[2]->Progress().endReason == RequestEndReason::StopToken &&
+               requests[1]->Progress().endReason == RequestEndReason::Length,
+           "Mixed batch rows lost independent terminal reasons");
+    Expect(std::find(model->batchWidths.begin(), model->batchWidths.end(), size_t{4}) != model->batchWidths.end(),
+           "Test did not combine decode with a finalizing row");
+}
+
+void TestDecodeBatchValidationAndCancelledRows() {
+    auto model = std::make_shared<FakeModel>();
+    model->batchEnabled = true;
+    auto a = MakeFixture(128, 64, model), b = MakeFixture(128, 64, model);
+    auto first = RequestState::Create(a.session, {1}, Options(3));
+    auto second = RequestState::Create(b.session, {2}, Options(3));
+    first->Step();
+    const auto before = a.state->context;
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({}); });
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({first, nullptr}); });
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({first, first}); });
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({first, second}); });
+    Expect(a.state->context == before && b.state->context.empty() && a.session->Busy() && b.session->Busy(),
+           "Invalid batch partially advanced a valid row or released its lease");
+    second->Step();
+
+    auto differentModel = std::make_shared<FakeModel>();
+    differentModel->batchEnabled = true;
+    auto c = MakeFixture(128, 64, differentModel);
+    auto third = RequestState::Create(c.session, {3}, Options(3));
+    third->Step();
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({first, third}); });
+    auto unsupported = MakeFixture();
+    auto noBatch = RequestState::Create(unsupported.session, {4}, Options(2));
+    noBatch->Step();
+    ExpectError(ErrorCode::InvalidArgument, [&] { RequestState::StepDecodeBatch({first, noBatch}); });
+
+    first->Cancel();
+    const auto secondBefore = b.state->context.size();
+    const auto results = RequestState::StepDecodeBatch({first, second});
+    Expect(results[0].status == RequestStatus::Cancelled && results[0].becameTerminal && !results[0].tokenId &&
+               a.state->context == before && b.state->context.size() == secondBefore + 1 &&
+               results[1].tokenId && model->batchWidths.empty(),
+           "A cancelled row submitted pending work or prevented the B=1 peer fallback");
+    const auto repeated = RequestState::StepDecodeBatch({first, second});
+    Expect(!repeated[0].becameTerminal && repeated[0].status == RequestStatus::Cancelled &&
+               repeated[1].tokenId,
+           "Terminal row reopened or blocked its continuing peer");
+    Complete(second);
+    third->Cancel(); third->Step();
+    noBatch->Cancel(); noBatch->Step();
+}
+
+void TestDecodeBatchConcurrentCancellationAndReentry() {
+    auto model = std::make_shared<FakeModel>();
+    model->batchEnabled = true;
+    auto a = MakeFixture(128, 64, model), b = MakeFixture(128, 64, model), reference = MakeFixture();
+    const auto optionsA = Options(4, 1, 100), optionsB = Options(5, 1, 200);
+    const auto expectedB = Complete(RequestState::Create(reference.session, {2}, optionsB));
+    auto first = RequestState::Create(a.session, {1}, optionsA);
+    auto second = RequestState::Create(b.session, {2}, optionsB);
+    first->Step(); second->Step();
+    ForwardGate gate;
+    model->duringBatch = [&] { gate.Enter(); };
+    auto executing = std::async(std::launch::async, [&] {
+        return RequestState::StepDecodeBatch({first, second});
+    });
+    std::future<RequestSnapshot> firstSnapshot, secondSnapshot;
+    try {
+        Expect(gate.AwaitEntry(), "Batch did not reach the held shared Forward");
+        ExpectError(ErrorCode::Busy, [&] { first->Step(); });
+        ExpectError(ErrorCode::Busy, [&] { second->Step(); });
+        ExpectError(ErrorCode::Busy, [&] { RequestState::StepDecodeBatch({second, first}); });
+        ExpectError(ErrorCode::Busy, [&] { b.session->Reset(); });
+        firstSnapshot = std::async(std::launch::async, [first] { return first->Snapshot(); });
+        secondSnapshot = std::async(std::launch::async, [second] { return second->Snapshot(); });
+        Expect(firstSnapshot.wait_for(20ms) == std::future_status::timeout &&
+                   secondSnapshot.wait_for(20ms) == std::future_status::timeout,
+               "A batch snapshot observed mutable in-flight row state");
+        first->Cancel();
+    } catch (...) {
+        gate.Release();
+        executing.wait();
+        if (firstSnapshot.valid()) firstSnapshot.wait();
+        if (secondSnapshot.valid()) secondSnapshot.wait();
+        throw;
+    }
+    gate.Release();
+    const auto results = executing.get();
+    model->duringBatch = {};
+    Expect(results[0].status == RequestStatus::Cancelled && results[0].becameTerminal && !results[0].tokenId &&
+               a.state->context.size() == 2 && !a.session->Busy(),
+           "In-flight batch cancellation failed to drain input or suppressed the wrong row");
+    Expect(firstSnapshot.get().status == RequestStatus::Cancelled &&
+               secondSnapshot.get().status == results[1].status && results[1].tokenId,
+           "Batch snapshots did not describe the completed boundary");
+    Complete(second);
+    Expect(second->Snapshot().generatedIds == expectedB && b.state->context == reference.state->context,
+           "Cancelled peer/reentrant Step changed another row's RNG, history, or cache");
+}
+
+void TestDecodeBatchSharedFailuresAndInvalidResults() {
+    for (int mode = 0; mode < 4; ++mode) {
+        auto model = std::make_shared<FakeModel>();
+        model->batchEnabled = true;
+        auto a = MakeFixture(128, 64, model), b = MakeFixture(128, 64, model);
+        auto first = RequestState::Create(a.session, {1}, Options(4));
+        auto second = RequestState::Create(b.session, {2}, Options(4));
+        first->Step(); second->Step();
+        const auto firstHistory = first->Snapshot().generatedIds, secondHistory = second->Snapshot().generatedIds;
+        if (mode == 0) model->ordinaryBatchFailure = true;
+        if (mode == 1) model->batchFailure = ErrorCode::ResourceLimit;
+        if (mode == 2) model->batchFailure = ErrorCode::RuntimeFault;
+        if (mode == 3) model->invalidBatchResultCount = true;
+        const auto result = RequestState::StepDecodeBatch({first, second});
+        for (size_t row = 0; row < result.size(); ++row) {
+            const auto& request = row == 0 ? first : second;
+            Expect(result[row].status == RequestStatus::Failed && result[row].becameTerminal &&
+                       !result[row].tokenId && !request->Progress().ErrorMessage().empty(),
+                   "Shared batch failure did not terminate every submitted row once");
+            const auto expectedCode = mode == 0 ? std::optional<ErrorCode>{}
+                : mode == 1 ? std::optional<ErrorCode>{ErrorCode::ResourceLimit}
+                            : std::optional<ErrorCode>{ErrorCode::RuntimeFault};
+            Expect(request->Progress().errorCode == expectedCode,
+                   "Batch failure lost ordinary/resource/runtime error classification");
+        }
+        Expect(!a.session->Busy() && !b.session->Busy() &&
+                   first->Snapshot().generatedIds == firstHistory && second->Snapshot().generatedIds == secondHistory,
+               "Failed batch leaked a lease or exposed a partially prepared sample");
+        const auto repeated = RequestState::StepDecodeBatch({first, second});
+        Expect(!repeated[0].becameTerminal && !repeated[1].becameTerminal,
+               "Repeated failed batch published duplicate terminals");
+    }
+}
+
+void TestDecodeBatchMalformedLastRowRejectsWholeGroup() {
+    for (const bool invalidSample : {true, false}) {
+        const std::string label = invalidSample ? "Last-row invalid sample: " : "Last-row incomplete consume: ";
+        auto model = std::make_shared<FakeModel>();
+        model->batchEnabled = true;
+        std::vector<Fixture> fixtures;
+        std::vector<std::shared_ptr<RequestState>> requests;
+        std::vector<RequestSnapshot> before;
+        for (size_t row = 0; row < MaxDecodeBatchSize; ++row) {
+            fixtures.push_back(MakeFixture(128, 64, model));
+            auto& fixture = fixtures.back();
+            fixture.state->samples = {static_cast<int>(10 + row), static_cast<int>(20 + row)};
+            requests.push_back(RequestState::Create(fixture.session, {static_cast<int>(row + 1)}, Options(4)));
+            const auto prefill = requests.back()->Step();
+            Expect(prefill.status == RequestStatus::Decode && prefill.tokenId == fixture.state->samples[0] &&
+                       fixture.state->inputs.size() == 1 && fixture.state->samplesTaken == 1,
+                   label + "fixture did not reach decode after exactly one prefill");
+            before.push_back(requests.back()->Snapshot());
+        }
+        auto& last = *fixtures.back().state;
+        if (invalidSample) last.samples[1] = last.vocabSize;
+        else last.incompleteConsume = true;
+
+        const auto result = RequestState::StepDecodeBatch(requests);
+        Expect(result.size() == requests.size() && model->batchWidths == std::vector<size_t>{requests.size()},
+               label + "call did not execute exactly one complete batch");
+        for (size_t row = 0; row < requests.size(); ++row) {
+            const auto& fixture = fixtures[row];
+            const auto snapshot = requests[row]->Snapshot();
+            const size_t expectedContext = !invalidSample && row + 1 == requests.size() ? 1 : 2;
+            Expect(fixture.state->inputs.size() == 2 && fixture.state->samplesTaken == 2 &&
+                       fixture.state->inputs.back() == std::vector<int>{before[row].generatedIds.back()} &&
+                       fixture.state->context.size() == expectedContext,
+                   label + "failure was not discovered after every row prepared its result");
+            Expect(result[row].status == RequestStatus::Failed && result[row].becameTerminal && !result[row].tokenId &&
+                       snapshot.status == RequestStatus::Failed && snapshot.endReason == RequestEndReason::RuntimeFault &&
+                       snapshot.errorCode == ErrorCode::RuntimeFault && !snapshot.error.empty(),
+                   label + "a submitted row escaped the shared RuntimeFault terminal");
+            Expect(snapshot.generatedIds == before[row].generatedIds &&
+                       snapshot.promptTokensProcessed == before[row].promptTokensProcessed && !fixture.session->Busy(),
+                   label + "a prepared token was published or a failed request retained its lease");
+        }
+
+        last.incompleteConsume = false;
+        last.samples.clear();
+        // Keep the failed requests alive while new requests acquire every lease.
+        // A repeated terminal step must not release a replacement's ownership.
+        std::vector<std::shared_ptr<RequestState>> replacements;
+        for (const auto& fixture : fixtures) {
+            replacements.push_back(RequestState::Create(fixture.session, {7}, Options(1)));
+        }
+        const auto repeated = RequestState::StepDecodeBatch(requests);
+        Expect(repeated.size() == requests.size() && model->batchWidths.size() == 1,
+               label + "repeated terminal step submitted another batch");
+        for (size_t row = 0; row < requests.size(); ++row) {
+            const auto& fixture = fixtures[row];
+            Expect(repeated[row].status == RequestStatus::Failed && !repeated[row].becameTerminal && !repeated[row].tokenId &&
+                       requests[row]->Snapshot().generatedIds == before[row].generatedIds && fixture.session->Busy(),
+                   label + "repeated failure published output, repeated a terminal, or released a replacement lease");
+            replacements[row]->Cancel();
+            const auto cancelled = replacements[row]->Step();
+            Expect(cancelled.status == RequestStatus::Cancelled && cancelled.becameTerminal && !cancelled.tokenId &&
+                       !fixture.session->Busy() && fixture.state->inputs.size() == 2 && fixture.state->samplesTaken == 2,
+                   label + "replacement lease could not be released without extra backend work");
+        }
+    }
+}
+
+void TestDecodeBatchDeferredCallbacksRetainEveryRow() {
+    auto model = std::make_shared<FakeModel>();
+    model->batchEnabled = true;
+    auto a = MakeFixture(128, 64, model), b = MakeFixture(128, 64, model);
+    std::vector<std::shared_ptr<RequestState>> requests{
+        RequestState::Create(a.session, {1}, Options(3)),
+        RequestState::Create(b.session, {2}, Options(3))};
+    requests[0]->Step(); requests[1]->Step();
+    struct Probe {
+        std::vector<std::shared_ptr<RequestState>>* requests;
+        std::vector<std::weak_ptr<RequestState>> weak;
+        size_t calls = 0;
+        size_t retained = 0;
+        size_t busy = 0;
+        size_t snapshots = 0;
+    } probe{&requests, {requests[0], requests[1]}};
+    struct RestoreLogging {
+        aila::LogLevel level = aila::get_log_level();
+        ~RestoreLogging() {
+            aila::set_log_callback(nullptr);
+            aila::set_log_level(level);
+        }
+    } restore;
+    aila::set_log_level(aila::LogLevel::Info);
+    aila::set_log_callback([](int, const char* message, void* userData) {
+        if (std::strcmp(message, "RequestStateTests deferred batch") != 0) return;
+        auto& probe = *static_cast<Probe*>(userData);
+        ++probe.calls;
+        probe.requests->clear();
+        for (const auto& weak : probe.weak) {
+            if (auto request = weak.lock()) {
+                ++probe.retained;
+                if (request->Snapshot().status == RequestStatus::Decode) ++probe.snapshots;
+                try { request->Step(); }
+                catch (const Error& error) { if (error.Code() == ErrorCode::Busy) ++probe.busy; }
+            }
+        }
+    }, &probe);
+    model->duringBatch = [] { AILA_LOG_INFO("RequestStateTests deferred batch"); };
+    const auto result = RequestState::StepDecodeBatch(requests);
+    Expect(result.size() == 2 && result[0].tokenId && result[1].tokenId && probe.calls == 1 &&
+               probe.retained == 2 && probe.busy == 2 && probe.snapshots == 2 &&
+               probe.weak[0].expired() && probe.weak[1].expired() && !a.session->Busy() && !b.session->Busy(),
+           "Batch callback observed locks, lost ownership, or reentered a completed step guard");
+}
+
+void TestSessionBatchLogitsAndAdmission() {
+    auto model = std::make_shared<FakeModel>();
+    model->batchEnabled = true;
+    auto a = MakeFixture(8, 64, model), b = MakeFixture(8, 64, model);
+    auto refA = MakeFixture(8), refB = MakeFixture(8);
+    a.session->ForwardLogits({1, 2}); refA.session->ForwardLogits({1, 2});
+    b.session->ForwardLogits({3}); refB.session->ForwardLogits({3});
+    const auto result = SessionState::ForwardDecodeBatchLogits({b.session, a.session}, {5, 4});
+    Expect(result == std::vector<std::vector<float>>({refB.session->ForwardLogits({5}), refA.session->ForwardLogits({4})}) &&
+               a.state->context == refA.state->context && b.state->context == refB.state->context,
+           "Batch diagnostic logits did not preserve independent positions and input row order");
+    const auto calls = model->batchWidths.size();
+    const auto beforeA = a.state->context, beforeB = b.state->context;
+    ExpectError(ErrorCode::InvalidArgument, [&] {
+        SessionState::ForwardDecodeBatchLogits({a.session, a.session}, {1, 2});
+    });
+    ExpectError(ErrorCode::InvalidArgument, [&] {
+        SessionState::ForwardDecodeBatchLogits({a.session, b.session}, {1, 64});
+    });
+    auto busy = RequestState::Create(b.session, {1}, Options(1));
+    ExpectError(ErrorCode::Busy, [&] {
+        SessionState::ForwardDecodeBatchLogits({a.session, b.session}, {1, 2});
+    });
+    Expect(!a.session->Busy() && b.session->Busy() && a.state->context == beforeA && b.state->context == beforeB &&
+               model->batchWidths.size() == calls,
+           "Rejected batch leaked an earlier lease or consumed a valid row before validation finished");
+    busy->Cancel(); busy->Step();
+    b.session->ForwardLogits(std::vector<int>(6, 1));
+    ExpectError(ErrorCode::ContextOverflow, [&] {
+        SessionState::ForwardDecodeBatchLogits({a.session, b.session}, {1, 2});
+    });
+    Expect(a.state->context == beforeA && b.state->context.size() == 8 && !a.session->Busy() && !b.session->Busy(),
+           "Capacity rejection partially advanced the other diagnostic row");
+    const auto scalar = SessionState::ForwardDecodeBatchLogits({a.session}, {6});
+    Expect(scalar.front() == refA.session->ForwardLogits({6}) && model->batchWidths.size() == calls,
+           "Diagnostic B=1 did not use the original scalar Forward path");
+}
+
 } // namespace
 
 int main() {
     const std::vector<std::pair<const char*, void (*)()>> tests{
         {"session mutations and actual truncate length", TestSessionMutations},
+        {"prefill without sampling, capacity and cancelled replay", TestPrefillOnlyAndCancelledReplay},
+        {"thinking budget closes, accounts and continues", TestThinkingBudgetClosesAndAccounts},
+        {"single reasoning close and explicit host sampler policy", TestSingleCloseAndHostSamplingPolicy},
+        {"thinking zero budget, natural close and reopen", TestThinkingBudgetZeroNaturalAndReopened},
+        {"thinking close length boundary and cancellation", TestThinkingBudgetLengthAndCancellation},
+        {"thinking validation and request isolation", TestThinkingBudgetValidationAndIsolation},
         {"backend metadata and mutation exceptions", TestBackendMetadataAndFailures},
         {"chunked generation and final token retention", TestChunkedGenerationAndFinalization},
         {"stop tokens are neither published nor cached", TestStopTokens},
@@ -726,6 +1339,14 @@ int main() {
         {"cancel and destroy A while B continues", TestCancelledSessionDoesNotAffectPeer},
         {"strong ownership and snapshot value semantics", TestStrongOwnershipAndSnapshotCopy},
         {"deferred log callback retains request and Step guard", TestDeferredLogCallbackRetainsRequest},
+        {"decode batches preserve independent rows and B=1", TestDecodeBatchMatchesIndependentRows},
+        {"batch thinking, stop and finalization remain row-local", TestDecodeBatchThinkingStopAndFinalization},
+        {"batch validation and cancelled-row B=1 fallback", TestDecodeBatchValidationAndCancelledRows},
+        {"batch in-flight cancellation, snapshots and reentry", TestDecodeBatchConcurrentCancellationAndReentry},
+        {"batch failures and invalid result count retire all rows", TestDecodeBatchSharedFailuresAndInvalidResults},
+        {"malformed last batch row suppresses every prepared token", TestDecodeBatchMalformedLastRowRejectsWholeGroup},
+        {"deferred batch callbacks retain all rows and guards", TestDecodeBatchDeferredCallbacksRetainEveryRow},
+        {"batch logits row order and transactional admission", TestSessionBatchLogitsAndAdmission},
     };
     int failures = 0;
     for (const auto& test : tests) {

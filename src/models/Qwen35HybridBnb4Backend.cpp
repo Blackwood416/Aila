@@ -1,4 +1,6 @@
 #include "Qwen35HybridBnb4Backend.hpp"
+#include "HybridLayerExecutor.hpp"
+#include "HybridDecodeBatchExecutor.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include "memory/SessionMemory.hpp"
@@ -12,66 +14,15 @@
 #include <limits>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using aila::models::ProfileStage;
+using aila::models::StageProfileTotals;
+using aila::models::StageProfiler;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 int round_up_seq(int v, int granularity) {
     return ((v + granularity - 1) / granularity) * granularity;
 }
-
-enum class ProfileStage : int {
-    EmbedNorm = 0,
-    LinearProj,
-    LinearDelta,
-    LinearOProj,
-    FullQkvProj,
-    FullSplit,
-    QkNormRope,
-    KvCache,
-    Attention,
-    AttnGate,
-    FullOProj,
-    PostAttnNorm,
-    FfnProj,
-    FfnAct,
-    DownProj,
-    PostMlpNorm,
-    LmHead,
-    Count,
-};
-
-struct StageProfileTotals {
-    std::array<double, static_cast<size_t>(ProfileStage::Count)> stage_ms{};
-    int calls = 0;
-    int tokens = 0;
-
-    void reset() {
-        stage_ms.fill(0.0);
-        calls = 0;
-        tokens = 0;
-    }
-};
-
-struct StageProfiler {
-    Context& context;
-    std::array<double, static_cast<size_t>(ProfileStage::Count)>& stageMs;
-    bool enabled;
-    bool hostOnly;
-
-    template <typename Fn>
-    void operator()(ProfileStage stage, Fn&& fn) const {
-        if (!enabled) {
-            fn();
-            return;
-        }
-        auto t0 = std::chrono::high_resolution_clock::now();
-        fn();
-        if (!hostOnly) context.synchronize();
-        auto t1 = std::chrono::high_resolution_clock::now();
-        stageMs[static_cast<size_t>(stage)] +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-    }
-};
 
 bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
     if (!dev.has(sycl::aspect::ext_intel_matrix)) {
@@ -166,31 +117,6 @@ struct Qwen35HybridBnb4Backend::ProfileState {
     StageProfileTotals prefill;
 };
 
-struct Qwen35HybridBnb4Backend::LayerExecution {
-    Context& context;
-    Qwen35HybridBnB4Buffers& buffers;
-    Bnb4BitLinearScratch& linearScratch;
-    LayerCache& cache;
-    ExecutionPhase phase;
-    int startPosition;
-    int tokenCount;
-    int cachedLength;
-    int cacheCapacity;
-    int fullRotaryDimension;
-    const int* mropePositionT;
-    const int* mropePositionH;
-    const int* mropePositionW;
-    int mropePromptLength;
-    int mropeTextPositionDelta;
-    bf16* residualHidden;
-    bool debugLayerStats;
-    int debugLayerDetail;
-    bool debugLinearCompare;
-    int debugLinearCompareLayer;
-    bool useHostGroupedLinear;
-    const StageProfiler& profiler;
-};
-
 float Qwen35HybridBnb4Backend::softplus(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return std::exp(x);
@@ -244,7 +170,7 @@ void Qwen35HybridBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) 
     // Replacing a shared execution buffer must not free USM still referenced
     // by the preceding Session's submitted work.
     if (buf_.hidden.valid()) ctx.synchronize();
-    int new_cap = std::min(max_seq_len_, round_up_seq(seq_len, 64));
+    int new_cap = std::max(seq_len, std::min(max_seq_len_, round_up_seq(seq_len, 64)));
     buf_.hidden = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.normed = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)hidden_size_});
     buf_.qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_qkv_dim_});
@@ -258,8 +184,11 @@ void Qwen35HybridBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) 
     buf_.attn_out = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)max_attn_dim_});
     buf_.full_qkv = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)full_fused_qkv_dim_});
     buf_.gate_up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)(2 * ff_dim_)});
-    buf_.gate = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
-    buf_.up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)ff_dim_});
+    // Attention/down output uses hidden width; FFN activation uses ff_dim_.
+    // Keep physical capacity sufficient for either logical row layout.
+    const int projection_capacity = std::max(ff_dim_, hidden_size_);
+    buf_.gate = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
+    buf_.up = Tensor::allocate(ctx, {(int64_t)new_cap, (int64_t)projection_capacity});
 
     runtime_seq_capacity_ = new_cap;
     AILA_LOG_INFO("[Qwen3.5] Runtime buffers resized: seq_cap=%d", runtime_seq_capacity_);
@@ -1047,6 +976,8 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
                 AILA_LOG_INFO("[Qwen3.5] lm_head (tied, preprocessed copy)");
             } catch (const sycl::exception&) {
                 throw;
+            } catch (const aila::memory::AllocationLimitExceeded&) {
+                throw;
             } catch (const dnnl::error&) {
                 throw;
             } catch (const std::exception& e) {
@@ -1122,9 +1053,12 @@ bool Qwen35HybridBnb4Backend::load(Context& ctx,
         constexpr int kDecodeExactTile = 128;
         constexpr int kDecodeExactPartialStride = 272;
         const int max_tiles = (max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile;
+        // Per-sequence block so the multi-row exact merge can run one launch for
+        // up to four independent decode rows.
         buf_.decode_attn_partials = Tensor::allocate(
             ctx,
-            {(int64_t)max_attn_heads_, (int64_t)max_tiles, (int64_t)kDecodeExactPartialStride},
+            {4, (int64_t)max_attn_heads_, (int64_t)max_tiles,
+             (int64_t)kDecodeExactPartialStride},
             dnnl::memory::data_type::f32);
     }
 
@@ -1976,6 +1910,13 @@ void Qwen35HybridBnb4Backend::run_linear_delta_host(Context& ctx, Layer& layer, 
                                                     Tensor& qkv_src, Tensor& z_src,
                                                     Tensor& a_src, Tensor& b_src,
                                                     int seq_len) {
+    run_linear_delta_host(ctx, layer, cache, qkv_src, z_src, a_src, b_src, seq_len, buf_.attn_out);
+}
+
+void Qwen35HybridBnb4Backend::run_linear_delta_host(Context& ctx, Layer& layer, LayerCache& cache,
+                                                    Tensor& qkv_src, Tensor& z_src,
+                                                    Tensor& a_src, Tensor& b_src,
+                                                    int seq_len, Tensor& out_dst) {
     const int qkv_dim = linear_qkv_dim_;
     const int z_dim = linear_z_dim_;
     const int num_heads = linear_kv_heads_;
@@ -2119,7 +2060,7 @@ void Qwen35HybridBnb4Backend::run_linear_delta_host(Context& ctx, Layer& layer, 
 
     scratch.out_bf16.resize(scratch.out.size());
     for (size_t i = 0; i < scratch.out.size(); ++i) scratch.out_bf16[i] = bf16(scratch.out[i]);
-    ctx.memcpy_h2d(buf_.attn_out.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
+    ctx.memcpy_h2d(out_dst.data(), scratch.out_bf16.data(), scratch.out_bf16.size() * sizeof(bf16));
 
     if (cache.linear_state.valid() && !cache.host_linear_state.empty()) {
         ctx.memcpy_h2d(cache.linear_state.data(), cache.host_linear_state.data(),
@@ -2132,435 +2073,57 @@ void Qwen35HybridBnb4Backend::run_linear_delta_host(Context& ctx, Layer& layer, 
     cache.device_state_dirty = false;
 }
 
+struct Qwen35HybridBnb4Backend::ProjectionPolicy {
+    const aila::models::Nf4ProjectionWorkspace& workspace;
+
+    bf16* ResidualHidden() const { return workspace.residualHidden; }
+
+    template <aila::models::HybridProjectionSlot Slot>
+    void Forward(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int count) const {
+        using SlotKind = aila::models::HybridProjectionSlot;
+        auto& linear = aila::models::ProjectionFor<Slot>(layer);
+        if constexpr (Slot == SlotKind::LinearOutput || Slot == SlotKind::FullOutput || Slot == SlotKind::FfnDown) {
+            linear.forward(ctx, workspace.scratch, input, output, count, workspace.residualHidden);
+        } else {
+            linear.forward(ctx, workspace.scratch, input, output, count);
+        }
+    }
+
+    template <aila::models::HybridProjectionSlot Slot>
+    void ForwardDecodeRows(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int count) const {
+        aila::models::ProjectionFor<Slot>(layer).ForwardDecodeRows(ctx, workspace.scratch, input, output, count);
+    }
+
+    bool TryFusedGateUp(Context& ctx, Layer& layer, Tensor& input, Tensor& output, int width) const {
+        return Bnb4BitLinear::try_forward_decode_gate_up_swiglu(ctx, layer.gate_up_proj, input, output, width);
+    }
+
+    // The NF4 fused helper already applies SiLU per call and takes a single row
+    // view here, so multi-row gate/up keeps the original per-row launches.
+    bool TryFusedGateUpRows(Context&, Layer&, Tensor&, Tensor&, int) const { return false; }
+};
+
 void Qwen35HybridBnb4Backend::ExecuteLayer(
     const LayerPlan& plan, const LayerExecution& execution) {
-    auto& ctx = execution.context;
-    auto& buf = execution.buffers;
-    auto& linearScratch = execution.linearScratch;
-    auto& layer = *plan.layer;
-    auto& cache = execution.cache;
-    const auto& time_stage = execution.profiler;
-    const int i = plan.cacheIndex;
-    const int seq_len = execution.tokenCount;
-    const int start_pos = execution.startPosition;
-    const int cached_len = execution.cachedLength;
-    const int full_rotary_dim = execution.fullRotaryDimension;
-    const bool decode = execution.phase == ExecutionPhase::Decode;
-    bf16* hidden_ptr_for_residual = execution.residualHidden;
-    const bool debug_layer_stats = execution.debugLayerStats;
-    const int debug_layer_detail_idx = execution.debugLayerDetail;
-    const bool debug_linear_compare = execution.debugLinearCompare;
-    const int debug_linear_compare_layer = execution.debugLinearCompareLayer;
-    const bool use_host_grouped_linear = execution.useHostGroupedLinear;
-    auto log_row_stats = [&](const char* tag, Tensor& t, int row, int width) {
-        if (row < 0) return;
-        bf16* ptr = static_cast<bf16*>(t.data()) + (size_t)row * width;
-        std::vector<bf16> h_row((size_t)width);
-        ctx.memcpy_d2h(h_row.data(), ptr, h_row.size() * sizeof(bf16));
-        double mean = 0.0;
-        double abs_mean = 0.0;
-        float max_abs = 0.0f;
-        for (int d = 0; d < width; ++d) {
-            float v = static_cast<float>(h_row[(size_t)d]);
-            mean += v;
-            abs_mean += std::abs(v);
-            max_abs = std::max(max_abs, std::abs(v));
-        }
-        mean /= (double)width;
-        abs_mean /= (double)width;
-        float v0 = static_cast<float>(h_row[0]);
-        float v1 = static_cast<float>(h_row[1]);
-        float v2 = static_cast<float>(h_row[2]);
-        float v3 = static_cast<float>(h_row[3]);
-        AILA_LOG_INFO("[Q35L0] %s mean=%.6f abs_mean=%.6f max_abs=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f",
-                      tag, mean, abs_mean, max_abs, v0, v1, v2, v3);
-    };
+    aila::models::HybridLayerExecutor::Execute(*this, plan, execution, ProjectionPolicy{execution.projection});
+}
 
-    // Entry and exit retain the normalized input / residual stream contract.
-    int dbg_row = seq_len - 1;
-    bool debug_this_layer = (debug_layer_detail_idx >= 0 && debug_layer_detail_idx == i);
-    if (debug_this_layer && seq_len > 0) {
-        char tag[64];
-        std::snprintf(tag, sizeof(tag), "layer%d_input_ln_out", i);
-        log_row_stats(tag, buf.normed, dbg_row, hidden_size_);
-    }
+bool Qwen35HybridBnb4Backend::SupportsDecodeBatch() const noexcept {
+    return aila::models::HybridDecodeBatchExecutor::Supported(*this);
+}
 
-    if (plan.kind == LayerKind::DeltaNet) {
-        if (use_delta_linear_) {
-            if (decode) {
-                time_stage(ProfileStage::LinearProj, [&] {
-                    layer.linear_all_proj.forward(ctx, linearScratch, buf.normed, buf.linear_all, seq_len);
-                });
-                time_stage(ProfileStage::LinearDelta, [&] {
-                    bf16* fused_ptr = static_cast<bf16*>(buf.linear_all.data());
-                    Tensor qkv_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)linear_qkv_dim_});
-                    Tensor z_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_, {1, (int64_t)linear_z_dim_});
-                    Tensor a_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_,
-                                                 {1, (int64_t)linear_kv_heads_});
-                    Tensor b_view = Tensor::view(ctx, fused_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_,
-                                                 {1, (int64_t)linear_kv_heads_});
-                    if (use_host_grouped_linear) {
-                        run_linear_delta_host(ctx, layer, cache, qkv_view, z_view, a_view, b_view, 1);
-                        return;
-                    }
-                    bool compare_this_layer = debug_linear_compare &&
-                                              (debug_linear_compare_layer < 0 || debug_linear_compare_layer == i);
-                    if (compare_this_layer) {
-                        debug_compare_linear_delta_decode(ctx, i, layer, cache, qkv_view, z_view, a_view, b_view);
-                    } else {
-                        run_linear_delta_decode_gpu(ctx, layer, cache, qkv_view, z_view, a_view, b_view);
-                    }
-                });
-            } else {
-                time_stage(ProfileStage::LinearProj, [&] {
-                    layer.linear_all_proj.forward(ctx, linearScratch, buf.normed, buf.linear_all, seq_len);
-                });
-                time_stage(ProfileStage::LinearDelta, [&] {
-                    if (use_host_grouped_linear) {
-                        bf16* fused_ptr = static_cast<bf16*>(buf.linear_all.data());
-                        bf16* qkv_ptr = static_cast<bf16*>(buf.qkv.data());
-                        bf16* z_ptr = static_cast<bf16*>(buf.z.data());
-                        bf16* a_ptr = static_cast<bf16*>(buf.a.data());
-                        bf16* b_ptr = static_cast<bf16*>(buf.b.data());
-                        const int row_width = linear_all_dim_;
-                        const int qkv_width = linear_qkv_dim_;
-                        const int z_width = linear_z_dim_;
-                        const int ab_width = linear_kv_heads_;
-                        ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(seq_len) * static_cast<size_t>(row_width)),
-                            [=](sycl::id<1> idx) {
-                                size_t linear_idx = idx[0];
-                                int row = static_cast<int>(linear_idx / static_cast<size_t>(row_width));
-                                int col = static_cast<int>(linear_idx % static_cast<size_t>(row_width));
-                                bf16 v = fused_ptr[linear_idx];
-                                if (col < qkv_width) {
-                                    qkv_ptr[static_cast<size_t>(row) * qkv_width + col] = v;
-                                } else if (col < qkv_width + z_width) {
-                                    z_ptr[static_cast<size_t>(row) * z_width + (col - qkv_width)] = v;
-                                } else if (col < qkv_width + z_width + ab_width) {
-                                    a_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width)] = v;
-                                } else {
-                                    b_ptr[static_cast<size_t>(row) * ab_width + (col - qkv_width - z_width - ab_width)] = v;
-                                }
-                            });
-                        run_linear_delta_host(ctx, layer, cache,
-                                              buf.qkv, buf.z, buf.a, buf.b,
-                                              seq_len);
-                        return;
-                    }
-                    run_linear_delta_prefill_gpu_batched(ctx, layer, cache,
-                                                         buf.linear_all, buf.attn_out, seq_len);
-                });
-            }
-        } else {
-            time_stage(ProfileStage::LinearProj, [&] {
-                layer.linear_qkv_proj.forward(ctx, linearScratch, buf.normed, buf.qkv, seq_len);
-            });
-            time_stage(ProfileStage::FullSplit, [&] {
-                ops::split_qkv(ctx, buf.qkv, buf.q, buf.k, buf.v,
-                               seq_len, linear_q_dim_, linear_q_dim_);
-            });
-
-            time_stage(ProfileStage::QkNormRope, [&] {
-                std::vector<bf16> hq((size_t)seq_len * linear_q_dim_);
-                std::vector<bf16> hk((size_t)seq_len * linear_q_dim_);
-                std::vector<float> fq((size_t)seq_len * linear_q_dim_);
-                std::vector<float> fk((size_t)seq_len * linear_q_dim_);
-                ctx.memcpy_d2h(hq.data(), buf.q.data(), hq.size() * sizeof(bf16));
-                ctx.memcpy_d2h(hk.data(), buf.k.data(), hk.size() * sizeof(bf16));
-                for (size_t z = 0; z < fq.size(); ++z) {
-                    fq[z] = static_cast<float>(hq[z]);
-                    fk[z] = static_cast<float>(hk[z]);
-                }
-                head_l2_norm_inplace(fq, seq_len, linear_q_heads_, linear_head_dim_, cfg_.rms_norm_eps);
-                head_l2_norm_inplace(fk, seq_len, linear_q_heads_, linear_head_dim_, cfg_.rms_norm_eps);
-                for (size_t z = 0; z < fq.size(); ++z) {
-                    hq[z] = bf16(fq[z]);
-                    hk[z] = bf16(fk[z]);
-                }
-                ctx.memcpy_h2d(buf.q.data(), hq.data(), hq.size() * sizeof(bf16));
-                ctx.memcpy_h2d(buf.k.data(), hk.data(), hk.size() * sizeof(bf16));
-            });
-
-            time_stage(ProfileStage::KvCache, [&] {
-                ops::copy_to_cache(ctx, buf.k, cache.k, seq_len, start_pos,
-                                   linear_q_heads_, linear_head_dim_, execution.cacheCapacity);
-                ops::copy_to_cache(ctx, buf.v, cache.v, seq_len, start_pos,
-                                   linear_kv_heads_, cfg_.linear_value_head_dim, execution.cacheCapacity);
-            });
-
-            time_stage(ProfileStage::Attention, [&] {
-                if (decode) {
-                    ops::attention_decode(ctx, buf.q, cache.k, cache.v, buf.attn_out, buf.decode_scores,
-                                          linear_q_heads_, linear_kv_heads_, linear_head_dim_, cached_len);
-                } else if (start_pos == 0) {
-                    ops::attention_prefill(ctx, buf.q, buf.k, buf.v, buf.attn_out, buf.scores,
-                                           seq_len, linear_q_heads_, linear_kv_heads_, linear_head_dim_);
-                } else {
-                    ops::attention_prefill_cached(ctx, buf.q, cache.k, cache.v, buf.attn_out, buf.incr_scores,
-                                                  seq_len, start_pos, linear_q_heads_, linear_kv_heads_,
-                                                  linear_head_dim_, execution.cacheCapacity);
-                }
-            });
-
-            time_stage(ProfileStage::AttnGate, [&] {
-                layer.linear_z_proj.forward(ctx, linearScratch, buf.normed, buf.z, seq_len);
-                ops::sigmoid_mul(ctx, buf.attn_out, buf.z, buf.attn_out, seq_len * linear_kv_dim_);
-            });
-        }
-        time_stage(ProfileStage::LinearOProj, [&] {
-            layer.linear_o_proj.forward(ctx, linearScratch, buf.attn_out, buf.gate, seq_len, hidden_ptr_for_residual);
-        });
-    } else {
-        Tensor q_decode_view;
-        Tensor q_gate_decode_view;
-        Tensor k_decode_view;
-        Tensor v_decode_view;
-        Tensor* q_for_attn = &buf.q;
-        Tensor* k_for_attn = &buf.k;
-        Tensor* v_for_attn = &buf.v;
-
-        if (decode) {
-            time_stage(ProfileStage::FullQkvProj, [&] {
-                layer.qkv_proj.forward(ctx, linearScratch, buf.normed, buf.full_qkv, seq_len);
-            });
-            time_stage(ProfileStage::FullSplit, [&] {
-                bf16* fused_ptr = static_cast<bf16*>(buf.full_qkv.data());
-                if (cfg_.attn_output_gate) {
-                    q_gate_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
-                    q_for_attn = &buf.q;
-                } else {
-                    q_decode_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_dim_});
-                    q_for_attn = &q_decode_view;
-                }
-                k_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
-                v_decode_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_, {1, (int64_t)full_kv_dim_});
-                k_for_attn = &k_decode_view;
-                v_for_attn = &v_decode_view;
-            });
-        } else {
-            time_stage(ProfileStage::FullQkvProj, [&] {
-                layer.qkv_proj.forward(ctx, linearScratch, buf.normed, buf.full_qkv, seq_len);
-            });
-            time_stage(ProfileStage::FullSplit, [&] {
-                ops::split_qkv(ctx, buf.full_qkv, buf.qkv, buf.k, buf.v,
-                               seq_len, full_q_proj_dim_, full_kv_dim_);
-                if (cfg_.attn_output_gate) {
-                    ops::split_q_gate(ctx, buf.qkv, buf.q, buf.z,
-                                      seq_len, full_q_heads_, full_head_dim_);
-                } else {
-                    ops::copy_tensor(ctx, buf.qkv, buf.q, seq_len * full_q_dim_);
-                }
-            });
-        }
-        if (debug_this_layer && seq_len > 0 && cfg_.attn_output_gate) {
-            char tag[64];
-            std::snprintf(tag, sizeof(tag), "layer%d_full_gate_z", i);
-            log_row_stats(tag, buf.z, dbg_row, full_q_dim_);
-        }
-
-        time_stage(ProfileStage::QkNormRope, [&] {
-            if (decode) {
-                if (cfg_.attn_output_gate) {
-                    ops::decode_prepare_qgkv_packed_partial(ctx, q_gate_decode_view, *k_for_attn, *v_for_attn,
-                                                            buf.q, buf.z,
-                                                            *layer.q_norm_weight, *layer.k_norm_weight,
-                                                            cache.k, cache.v, start_pos,
-                                                            full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                            cfg_.rms_norm_eps, full_rotary_dim,
-                                                            cfg_.rope.rope_theta,
-                                                            cfg_.rope.mrope_interleaved,
-                                                            execution.mropePositionT, execution.mropePositionH, execution.mropePositionW,
-                                                            execution.mropePromptLength, execution.mropeTextPositionDelta,
-                                                            cfg_.rope.mrope_section[0],
-                                                            cfg_.rope.mrope_section[1],
-                                                            cfg_.rope.mrope_section[2]);
-                } else {
-                    ops::decode_prepare_qkv_partial(ctx, *q_for_attn, *k_for_attn, *v_for_attn,
-                                                    *layer.q_norm_weight, *layer.k_norm_weight,
-                                                    cache.k, cache.v, start_pos,
-                                                    full_q_heads_, full_kv_heads_, full_head_dim_,
-                                                    cfg_.rms_norm_eps, full_rotary_dim,
-                                                    cfg_.rope.rope_theta,
-                                                    cfg_.rope.mrope_interleaved,
-                                                    execution.mropePositionT, execution.mropePositionH, execution.mropePositionW,
-                                                    execution.mropePromptLength, execution.mropeTextPositionDelta,
-                                                    cfg_.rope.mrope_section[0],
-                                                    cfg_.rope.mrope_section[1],
-                                                    cfg_.rope.mrope_section[2]);
-                }
-            } else {
-                ops::head_rms_norm(ctx, buf.q, *layer.q_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len, full_q_heads_, full_head_dim_);
-                ops::head_rms_norm(ctx, *k_for_attn, *layer.k_norm_weight,
-                                   cfg_.rms_norm_eps, seq_len, full_kv_heads_, full_head_dim_);
-
-                ops::apply_rope_partial(ctx, buf.q, *k_for_attn, seq_len, start_pos,
-                                        full_q_heads_, full_kv_heads_, full_head_dim_,
-                                        full_rotary_dim, cfg_.rope.rope_theta,
-                                        cfg_.rope.mrope_interleaved,
-                                        execution.mropePositionT, execution.mropePositionH, execution.mropePositionW,
-                                        execution.mropePromptLength, execution.mropeTextPositionDelta,
-                                        cfg_.rope.mrope_section[0],
-                                        cfg_.rope.mrope_section[1],
-                                        cfg_.rope.mrope_section[2]);
-            }
-        });
-        if (debug_this_layer && seq_len > 0) {
-            char tag_q[64];
-            char tag_k[64];
-            char tag_v[64];
-            std::snprintf(tag_q, sizeof(tag_q), "layer%d_full_q_after_rope", i);
-            std::snprintf(tag_k, sizeof(tag_k), "layer%d_full_k_after_rope", i);
-            std::snprintf(tag_v, sizeof(tag_v), "layer%d_full_v", i);
-            log_row_stats(tag_q, *q_for_attn, dbg_row, full_q_dim_);
-            log_row_stats(tag_k, *k_for_attn, dbg_row, full_kv_dim_);
-            log_row_stats(tag_v, *v_for_attn, dbg_row, full_kv_dim_);
-        }
-
-        time_stage(ProfileStage::KvCache, [&] {
-            if (seq_len > 1) {
-                ops::copy_to_cache(ctx, *k_for_attn, cache.k, seq_len, start_pos,
-                                   full_kv_heads_, full_head_dim_, execution.cacheCapacity);
-                ops::copy_to_cache(ctx, *v_for_attn, cache.v, seq_len, start_pos,
-                                   full_kv_heads_, full_head_dim_, execution.cacheCapacity);
-            }
-        });
-
-        time_stage(ProfileStage::Attention, [&] {
-            if (decode) {
-                ops::attention_decode(ctx, *q_for_attn, cache.k, cache.v, buf.attn_out, buf.decode_scores,
-                                      full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
-                                      &buf.decode_attn_partials);
-            } else if (start_pos == 0) {
-                ops::attention_prefill(ctx, buf.q, buf.k, buf.v, buf.attn_out, buf.scores,
-                                       seq_len, full_q_heads_, full_kv_heads_, full_head_dim_);
-            } else {
-                ops::attention_prefill_cached(ctx, buf.q, cache.k, cache.v, buf.attn_out, buf.incr_scores,
-                                              seq_len, start_pos, full_q_heads_, full_kv_heads_,
-                                              full_head_dim_, execution.cacheCapacity);
-            }
-        });
-        if (debug_this_layer && seq_len > 0) {
-            char tag[64];
-            std::snprintf(tag, sizeof(tag), "layer%d_full_attn_out_pre_gate", i);
-            log_row_stats(tag, buf.attn_out, dbg_row, full_q_dim_);
-        }
-
-        if (cfg_.attn_output_gate) {
-            time_stage(ProfileStage::AttnGate, [&] {
-                ops::sigmoid_mul(ctx, buf.attn_out, buf.z, buf.attn_out, seq_len * full_q_dim_);
-            });
-            if (debug_this_layer && seq_len > 0) {
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "layer%d_full_attn_out_post_gate", i);
-                log_row_stats(tag, buf.attn_out, dbg_row, full_q_dim_);
-            }
-        }
-        time_stage(ProfileStage::FullOProj, [&] {
-            layer.o_proj.forward(ctx, linearScratch, buf.attn_out, buf.gate, seq_len, hidden_ptr_for_residual);
-        });
-    }
-    if (debug_this_layer && seq_len > 0) {
-        char tag[64];
-        std::snprintf(tag, sizeof(tag), "layer%d_token_mixer_out", i);
-        log_row_stats(tag, buf.gate, dbg_row, hidden_size_);
-    }
-
-    time_stage(ProfileStage::PostAttnNorm, [&] {
-        if (hidden_ptr_for_residual) {
-            ops::rms_norm(ctx, buf.gate, *layer.post_attn_ln_weight,
-                          cfg_.rms_norm_eps, buf.normed, seq_len, hidden_size_);
-        } else {
-            ops::fused_add_rms_norm(ctx, buf.hidden, buf.gate, *layer.post_attn_ln_weight,
-                                    cfg_.rms_norm_eps, buf.normed, seq_len, hidden_size_);
-        }
-    });
-    if (debug_this_layer && seq_len > 0) {
-        char tag1[64];
-        char tag2[64];
-        std::snprintf(tag1, sizeof(tag1), "layer%d_after_attn_residual", i);
-        std::snprintf(tag2, sizeof(tag2), "layer%d_post_attn_ln_out", i);
-        log_row_stats(tag1, buf.hidden, dbg_row, hidden_size_);
-        log_row_stats(tag2, buf.normed, dbg_row, hidden_size_);
-    }
-
-    if (decode) {
-        // Fused gate+up GEMV + SiLU in one kernel (no SLM, vec8+FMA).
-        // Falls back to separate path if packed weights are unavailable.
-        bool fused_ok = false;
-        time_stage(ProfileStage::FfnProj, [&] {
-            fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-                ctx, layer.gate_up_proj, buf.normed, buf.gate, ff_dim_);
-            if (!fused_ok) {
-                layer.gate_up_proj.forward(ctx, linearScratch, buf.normed, buf.gate_up, seq_len);
-            }
-        });
-        if (fused_ok) {
-            time_stage(ProfileStage::FfnAct, [&] { });
-        } else {
-            time_stage(ProfileStage::FfnAct, [&] {
-                ops::fused_gate_up_swiglu(ctx, buf.gate_up, buf.gate, ff_dim_);
-            });
-        }
-        time_stage(ProfileStage::DownProj, [&] {
-            layer.down_proj.forward(ctx, linearScratch, buf.gate, buf.up, seq_len, hidden_ptr_for_residual);
-        });
-    } else {
-        time_stage(ProfileStage::FfnProj, [&] {
-            layer.gate_up_proj.forward(ctx, linearScratch, buf.normed, buf.gate_up, seq_len);
-        });
-        time_stage(ProfileStage::FfnAct, [&] {
-            ops::split_gate_up(ctx, buf.gate_up, buf.gate, buf.up, seq_len, ff_dim_);
-            ops::swiglu(ctx, buf.gate, buf.up, buf.gate, seq_len * ff_dim_);
-        });
-        time_stage(ProfileStage::DownProj, [&] {
-            layer.down_proj.forward(ctx, linearScratch, buf.gate, buf.up, seq_len, hidden_ptr_for_residual);
-        });
-    }
-
-    time_stage(ProfileStage::PostMlpNorm, [&] {
-        if (hidden_ptr_for_residual) {
-            ops::rms_norm(ctx, buf.up, *plan.postMlpNormWeight,
-                          cfg_.rms_norm_eps, buf.normed, seq_len, hidden_size_);
-        } else {
-            ops::fused_add_rms_norm(ctx, buf.hidden, buf.up, *plan.postMlpNormWeight,
-                                    cfg_.rms_norm_eps, buf.normed, seq_len, hidden_size_);
-        }
-    });
-    if (debug_this_layer && seq_len > 0) {
-        char tag1[64];
-        char tag2[64];
-        std::snprintf(tag1, sizeof(tag1), "layer%d_after_mlp_residual", i);
-        std::snprintf(tag2, sizeof(tag2), "layer%d_next_input_ln_out", i);
-        log_row_stats(tag1, buf.hidden, dbg_row, hidden_size_);
-        log_row_stats(tag2, buf.normed, dbg_row, hidden_size_);
-    }
-
-    if (debug_layer_stats && seq_len > 0) {
-        const int row = seq_len - 1;
-        bf16* hidden_ptr = static_cast<bf16*>(buf.hidden.data()) + (size_t)row * hidden_size_;
-        std::vector<bf16> h_row((size_t)hidden_size_);
-        ctx.memcpy_d2h(h_row.data(), hidden_ptr, h_row.size() * sizeof(bf16));
-
-        double mean = 0.0;
-        double abs_mean = 0.0;
-        float max_abs = 0.0f;
-        for (int d = 0; d < hidden_size_; ++d) {
-            float v = static_cast<float>(h_row[(size_t)d]);
-            mean += v;
-            abs_mean += std::abs(v);
-            max_abs = std::max(max_abs, std::abs(v));
-        }
-        mean /= (double)hidden_size_;
-        abs_mean /= (double)hidden_size_;
-        float v0 = static_cast<float>(h_row[0]);
-        float v1 = static_cast<float>(h_row[1]);
-        float v2 = static_cast<float>(h_row[2]);
-        float v3 = static_cast<float>(h_row[3]);
-        AILA_LOG_INFO("[Q35LayerStat] layer=%d mean=%.6f abs_mean=%.6f max_abs=%.6f v0=%.6f v1=%.6f v2=%.6f v3=%.6f",
-                      i, mean, abs_mean, max_abs, v0, v1, v2, v3);
-    }
-
+Tensor& Qwen35HybridBnb4Backend::ForwardDecodeBatch(
+    Context& ctx, const std::vector<Session*>& sessions, const int* tokenIdsDevice) {
+    const bool grouped = linear_kv_heads_ > linear_q_heads_;
+    const bool defaultFastpath = supports_default_grouped_linear_delta_fastpath(
+        linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_, std::max(0, linear_conv_kernel_dim_ - 1));
+    static const bool experimental = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GROUPED_LINEAR_GPU", false);
+    static const bool forceHost = aila::env::read_flag("AILA_Q35_FORCE_HOST_GROUPED_LINEAR", false);
+    const bool useHost = grouped && (forceHost || (!defaultFastpath && !experimental));
+    const aila::models::Nf4ProjectionWorkspace workspace{linear_scratch_, nullptr};
+    return aila::models::HybridDecodeBatchExecutor::Execute(
+        *this, ctx, sessions, tokenIdsDevice, ProjectionPolicy{workspace}, useHost);
 }
 
 Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_device, int seq_len) {
@@ -2570,6 +2133,11 @@ Tensor& Qwen35HybridBnb4Backend::forward(Context& ctx, const int* token_ids_devi
 Tensor& Qwen35HybridBnb4Backend::Forward(
     Context& ctx, Session& session, const int* token_ids_device, int seq_len) {
     return ForwardImpl(ctx, session, token_ids_device, seq_len, true);
+}
+
+Tensor& Qwen35HybridBnb4Backend::ForwardLegacyLogits(
+    Context& ctx, Session& session, const int* token_ids_device, int seq_len) {
+    return ForwardImpl(ctx, session, token_ids_device, seq_len, false);
 }
 
 Tensor& Qwen35HybridBnb4Backend::ForwardImpl(
@@ -2661,14 +2229,15 @@ Tensor& Qwen35HybridBnb4Backend::ForwardImpl(
     const auto phase = seq_len == 1 ? ExecutionPhase::Decode : ExecutionPhase::Prefill;
     for (const auto& plan : decoderPlan_->layers) {
         const LayerExecution execution{
-            ctx, buf_, linear_scratch_, session.layerCaches_[static_cast<size_t>(plan.cacheIndex)],
+            ctx, buf_, session.layerCaches_[static_cast<size_t>(plan.cacheIndex)],
             phase, start_pos, seq_len, cached_len, session.Capacity(), full_rotary_dim,
             static_cast<const int*>(session.mropePosT_.data()),
             static_cast<const int*>(session.mropePosH_.data()),
             static_cast<const int*>(session.mropePosW_.data()),
             session.mropePromptLength_, session.mropeTextPositionDelta_,
-            hidden_ptr_for_residual, debug_layer_stats, debug_layer_detail_idx,
-            debug_linear_compare, debug_linear_compare_layer, use_host_grouped_linear, time_stage
+            debug_layer_stats, debug_layer_detail_idx,
+            debug_linear_compare, debug_linear_compare_layer, use_host_grouped_linear, time_stage,
+            {linear_scratch_, hidden_ptr_for_residual}
         };
         ExecuteLayer(plan, execution);
     }

@@ -37,6 +37,7 @@ struct ChatSettings {
 struct PreparedChat {
     bool stream = false;
     bool includeUsage = false;
+    bool parallelToolCalls = true;
     std::vector<int32_t> promptIds;
     runtime::InferenceRequestOptions options;
     chat::ChatRequest chatRequest;
@@ -44,11 +45,15 @@ struct PreparedChat {
     bool startsInReasoning = false;
 };
 
-// Strict text-only OpenAI-style input. Unknown fields and unsupported features
+// Strict text and function-tool OpenAI-style input. Unknown fields and unsupported features
 // are rejected before template rendering or inference admission. Each request
 // uses a fresh Session; prompt + requested generation must fit its capacity.
 PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer,
                          const ChatSettings& settings);
+
+// Tool markers can be added-token IDs that legacy Tokenizer::decode hides.
+// Preserve them only for an HTTP request that actually offers function tools.
+std::string DecodeChatToken(const Tokenizer& tokenizer, const PreparedChat& prepared, int32_t tokenId);
 
 struct ChatIdentity {
     std::string id;

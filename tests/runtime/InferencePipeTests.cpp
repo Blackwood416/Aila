@@ -171,8 +171,11 @@ host::InferenceRequestOptions RequestOptions(uint32_t count) {
 
 class Run final {
 public:
-    explicit Run(host::InferenceClientOptions options = ClientOptions(), bool hybridModel = false)
-        : hybrid(hybridModel), limits(options.limits) {
+    explicit Run(host::InferenceClientOptions options = ClientOptions(), std::string selectedBackend = "qwen3_nf4",
+                 std::string fixtureDirectory = {})
+        : backend(std::move(selectedBackend)), limits(options.limits),
+          modelDirectory(fixtureDirectory.empty() ?
+              (backend == "qwen3_nf4" ? "fake-pipe-model" : "fake-pipe-hybrid-model") : std::move(fixtureDirectory)) {
         const fs::path executable = fs::absolute(fs::path(AILA_FAKE_INFERENCE_WORKER_PATH)).lexically_normal();
         Expect(fs::is_regular_file(executable), "Fake inference Worker executable is missing");
         client = host::InferenceClient::Start(executable.parent_path(), executable, AILA_BUILD_ID, std::move(options));
@@ -182,11 +185,10 @@ public:
         Expect(model->Epoch() == client->Snapshot().epoch && wire::valid_epoch(model->Epoch()),
                "Model was not bound to the negotiated epoch");
         const auto& capabilities = model->Info().capabilities;
-        const auto expected = hybrid ? "qwen35_nf4_bf16_kv" : "qwen3_nf4_bf16_kv";
-        const auto other = hybrid ? "qwen3_nf4_bf16_kv" : "qwen35_nf4_bf16_kv";
-        Expect(std::find(capabilities.begin(), capabilities.end(), expected) != capabilities.end() &&
-                   std::find(capabilities.begin(), capabilities.end(), other) == capabilities.end(),
-               "Loaded model capabilities do not match the selected backend");
+        for (const char* candidate : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+            const bool advertised = std::find(capabilities.begin(), capabilities.end(), wire::model_capability(candidate)) != capabilities.end();
+            Expect(advertised == (backend == candidate), "Loaded model capabilities do not match the selected backend");
+        }
     }
     ~Run() {
         if (client) {
@@ -198,8 +200,9 @@ public:
         options.maxSequenceLength = SessionCapacity;
         options.maxSessions = limits.maxSessions;
         options.maxSessionCacheBytes = limits.maxSessionCacheBytes;
-        return hybrid ? client->LoadQwen35("fake-pipe-hybrid-model", options, 3s)
-                      : client->LoadQwen3("fake-pipe-model", options, 3s);
+        if (backend == "qwen3_nf4") return client->LoadQwen3(modelDirectory, options, 3s);
+        if (backend == "qwen35_nf4") return client->LoadQwen35(modelDirectory, options, 3s);
+        return client->LoadQwen35Bf16(modelDirectory, options, 3s);
     }
     void ExpectBounds() const {
         const auto local = client->Snapshot();
@@ -223,8 +226,9 @@ public:
                 local.reservedTokens == 0 && local.transportBytes == 0;
         }, "Released requests did not return host/Worker reservations");
     }
-    const bool hybrid;
+    const std::string backend;
     wire::Limits limits;
+    const std::string modelDirectory;
     std::shared_ptr<host::InferenceClient> client;
     std::shared_ptr<host::InferenceModel> model;
 };
@@ -292,8 +296,38 @@ void ExpectCompleted(const Captured& captured, const std::vector<int32_t>& expec
            "Healthy CPU request did not finish at its requested length");
 }
 
-void ConcurrentSessions(bool hybrid) {
-    Run run(ClientOptions(), hybrid);
+void TestPrefillOnlyReplay() {
+    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+        Run run(ClientOptions(), backend);
+        const auto a = run.model->CreateSession();
+        const auto b = run.model->CreateSession();
+        const auto replay = a->Prefill({11, 12, 13, 14, 15}, 2);
+        const auto peer = b->Submit({21, 22}, RequestOptions(8));
+        const auto result = Drain(replay);
+        ExpectCompleted(result, {});
+        Expect(result.terminal.sequence == 1 && result.terminal.summary.promptTokensProcessed == 5 &&
+                   a->Query().contextLength == 5, "Pipe replay sampled or retained the wrong prefix");
+        ExpectCompleted(Drain(peer), ExpectedTokens({21, 22}, 8));
+        replay->Release();
+        peer->Release();
+        run.WaitForNoRequests();
+        const auto restored = a->Truncate(3).contextLength.value();
+        Expect(restored <= 3, "Truncate exceeded requested prefix");
+        const std::vector<int32_t> accepted{11, 12, 13, 51, 52};
+        const auto repair = a->Prefill({accepted.begin() + restored, accepted.end()}, 2);
+        ExpectCompleted(Drain(repair), {});
+        Expect(a->Query().contextLength == accepted.size(), "Pipe replay did not repair a checkpoint gap");
+        repair->Release();
+        const auto next = a->Submit({61}, RequestOptions(4));
+        ExpectCompleted(Drain(next), ExpectedTokens({61}, 4, 5));
+        next->Release();
+        run.WaitForNoRequests();
+        run.client->Shutdown();
+    }
+}
+
+void ConcurrentSessions(const std::string& backend) {
+    Run run(ClientOptions(), backend);
     const auto a = run.model->CreateSession();
     const auto b = run.model->CreateSession();
     const std::vector<int32_t> promptA{11, 12, 13}, promptB{71, 72, 73};
@@ -320,8 +354,50 @@ void ConcurrentSessions(bool hybrid) {
     run.client->Shutdown();
 }
 
-void TestConcurrentSessions() { ConcurrentSessions(false); }
-void TestHybridConcurrentSessions() { ConcurrentSessions(true); }
+void TestSessionContext() {
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+        Run run(ClientOptions(), backend);
+        auto session = run.model->CreateSession(), reference = run.model->CreateSession();
+        const std::vector<int32_t> prompt{21, 22, 23};
+        auto initial = session->Submit(prompt, RequestOptions(6));
+        const auto captured = Drain(initial);
+        ExpectCompleted(captured, ExpectedTokens(prompt, 6));
+        initial->Release();
+        std::vector<int32_t> history = prompt;
+        history.insert(history.end(), captured.tokens.begin(), captured.tokens.end());
+        auto expected = reference->Submit(history, RequestOptions(4));
+        const auto referenceTokens = Drain(expected);
+        expected->Release();
+        const auto restored = session->Truncate(4);
+        Expect(restored.contextLength == 4 && !restored.busy, "Fake checkpoint did not restore exact context");
+        std::vector<int32_t> replay(history.begin() + *restored.contextLength, history.end());
+        auto resumed = session->Submit(replay, RequestOptions(4));
+        ExpectCompleted(Drain(resumed), referenceTokens.tokens);
+        resumed->Release();
+        ExpectRemoteError([&] { session->Truncate(14); }, wire::ErrorCode::InvalidArgument);
+        Expect(session->Query().contextLength == 13 && reference->Query().contextLength == 13,
+               "Invalid truncate changed context or peer state");
+        Expect(session->Reset().contextLength == 0, "Remote reset did not clear context");
+        auto resetRun = session->Submit(prompt, RequestOptions(6));
+        ExpectCompleted(Drain(resetRun), captured.tokens);
+        resetRun->Release();
+        auto slow = session->Submit({1022, 2}, RequestOptions(2));
+        ExpectRemoteError([&] { session->Reset(); }, wire::ErrorCode::Busy);
+        ExpectRemoteError([&] { session->Truncate(0); }, wire::ErrorCode::Busy);
+        ExpectCompleted(Drain(slow), ExpectedTokens({1022, 2}, 2, 9));
+        slow->Release();
+        run.model->Release();
+        Expect(session->Reset().contextLength == 0, "Parent release prevented a surviving Session reset");
+        session->Release(); reference->Release();
+        ExpectUnavailable([&] { session->Truncate(0); });
+        run.WaitForNoRequests();
+        run.client->Shutdown(5s);
+    }
+}
+
+void TestConcurrentSessions() { ConcurrentSessions("qwen3_nf4"); }
+void TestHybridConcurrentSessions() { ConcurrentSessions("qwen35_nf4"); }
+void TestHybridBf16ConcurrentSessions() { ConcurrentSessions("qwen35_bf16"); }
 
 void TestCancelReleaseAndParentLifetime() {
     Run run;
@@ -463,6 +539,46 @@ void TestOldEpochDoesNotRebindHandles() {
     fresh.client->Shutdown();
 }
 
+void TestFinalTraceFlushFailureRejectsShutdown() {
+    Run run(ClientOptions(), "qwen3_nf4", "fake-pipe-trace-close-failure-model");
+    const auto session = run.model->CreateSession();
+    const std::vector<int32_t> prompt{111, 112, 113};
+    const auto request = session->Submit(prompt, RequestOptions(4));
+    ExpectCompleted(Drain(request), ExpectedTokens(prompt, 4));
+    request->Release();
+    session->Release();
+    run.model->Release();
+    run.WaitForNoRequests();
+    WaitUntil([&] { return run.client->Query(1s).reservedSessionCacheBytes == 0; },
+              "Close-failure fixture did not finish ordinary session cleanup");
+    Expect(run.client->Query(1s).accepting, "Final-close fixture failed before shutdown");
+
+    std::string firstFailure;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        bool rejected = false;
+        try { run.client->Shutdown(5s); }
+        catch (const host::InferenceClientError& error) {
+            rejected = true;
+            const std::string message = error.what();
+            Expect(error.Code() == host::ClientErrorCode::Closed &&
+                       error.RemoteCode() == wire::ErrorCode::TransportError &&
+                       message.find("Worker did not exit cleanly after shutdown barrier") != std::string::npos &&
+                       message.find("Worker exit code ") != std::string::npos,
+                   "Trace-close failure did not reach the host through final Worker exit: " + message);
+            if (attempt == 0) firstFailure = message;
+            else Expect(message == firstFailure, "Repeated Shutdown lost the final-close failure");
+        }
+        Expect(rejected, "A complete trace_close row hid its flush failure from host Shutdown");
+    }
+    const auto failed = run.client->Snapshot();
+    Expect(failed.status == wire::DomainStatus::Faulted && failed.error == firstFailure &&
+               failed.outstandingRequests == 0 && failed.retainedRequestHandles == 0 &&
+               failed.pendingCommands == 0 && failed.reservedTokens == 0 &&
+               failed.ingressBytes == 0 && failed.transportBytes == 0,
+           "Final trace flush failure reported a graceful close or leaked host reservations");
+    ExpectUnavailable([&] { (void)run.client->Query(); });
+}
+
 void ExpectSingleLocalFailure(const std::shared_ptr<host::InferenceRequest>& request, uint64_t alreadyDelivered) {
     uint64_t delivered = alreadyDelivered;
     const auto deadline = Clock::now() + 4s;
@@ -526,7 +642,7 @@ void TestRepeatedLifecycleAndHandleStability() {
     const DWORD baseline = ProcessHandleCount();
     for (unsigned cycle = 0; cycle < 5; ++cycle) {
         {
-            Run run(ClientOptions(), cycle % 2 != 0);
+            Run run(ClientOptions(), cycle % 3 == 0 ? "qwen3_nf4" : cycle % 3 == 1 ? "qwen35_nf4" : "qwen35_bf16");
             for (unsigned iteration = 0; iteration < 3; ++iteration) {
                 const auto a = ReuseSessionSlot(run.model);
                 const auto b = ReuseSessionSlot(run.model);
@@ -569,10 +685,14 @@ int main() {
     const std::pair<const char*, void (*)()> tests[]{
         {"concurrent real-pipe sessions and cache continuation", TestConcurrentSessions},
         {"Hybrid real-pipe sessions and cache continuation", TestHybridConcurrentSessions},
+        {"Hybrid BF16 real-pipe sessions and cache continuation", TestHybridBf16ConcurrentSessions},
+        {"three-backend context reset/truncate/replay", TestSessionContext},
+        {"three-backend prefill-only replay and continuation", TestPrefillOnlyReplay},
         {"cancel, release and parent lifetime", TestCancelReleaseAndParentLifetime},
         {"stopped consumer and private release drain", TestStoppedConsumerDoesNotBlockPeer},
         {"unread completion and concurrent shutdown", TestUnreadCompletionAndConcurrentShutdown},
         {"old epoch handles cannot rebind", TestOldEpochDoesNotRebindHandles},
+        {"final trace flush failure rejects post-barrier shutdown", TestFinalTraceFlushFailureRejectsShutdown},
         {"Worker crash produces one local terminal", TestWorkerCrashFailsEachStreamOnce},
         {"repeated lifecycle and OS handle stability", TestRepeatedLifecycleAndHandleStability},
     };

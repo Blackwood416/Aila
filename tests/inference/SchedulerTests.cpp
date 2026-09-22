@@ -115,10 +115,26 @@ private:
 
 enum class Failure { None, Ordinary, InvalidArgument, RuntimeFault };
 
+struct FakeBatch {
+    std::function<void(size_t)> duringBatch;
+    std::function<void(size_t)> afterBatch;
+    std::vector<std::vector<int>> Groups() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return groups;
+    }
+    size_t Record(std::vector<int> ids) {
+        std::lock_guard<std::mutex> lock(mutex);
+        groups.push_back(std::move(ids));
+        return groups.size();
+    }
+    mutable std::mutex mutex;
+    std::vector<std::vector<int>> groups;
+};
+
 struct FakeState {
     explicit FakeState(int id, int capacity, size_t cacheBytes,
-                       std::shared_ptr<ExecutionTrace> trace)
-        : id(id), capacity(capacity), cacheBytes(cacheBytes), trace(std::move(trace)) {}
+                       std::shared_ptr<ExecutionTrace> trace, std::shared_ptr<FakeBatch> batch)
+        : id(id), capacity(capacity), cacheBytes(cacheBytes), trace(std::move(trace)), batch(std::move(batch)) {}
 
     std::vector<int> Context() const {
         std::lock_guard<std::mutex> lock(mutex);
@@ -138,9 +154,12 @@ struct FakeState {
     const size_t cacheBytes;
     const int vocabSize = 128;
     const std::shared_ptr<ExecutionTrace> trace;
+    const std::shared_ptr<FakeBatch> batch;
     // Configured before Submit, then read only by request operations.
     std::function<void(size_t, bool)> duringForward;
     std::function<void()> duringContextLength;
+    std::function<void()> duringDestruction;
+    std::atomic<bool> destructionCallbackFailed{false};
     std::vector<int> samples;
     Failure failure = Failure::None;
     Failure contextFailure = Failure::None;
@@ -158,6 +177,13 @@ struct FakeState {
 class FakeBackend final : public SessionBackend {
 public:
     explicit FakeBackend(std::shared_ptr<FakeState> state) : state(std::move(state)) {}
+    ~FakeBackend() override {
+        try {
+            if (state->duringDestruction) state->duringDestruction();
+        } catch (...) {
+            state->destructionCallbackFailed.store(true);
+        }
+    }
     int ContextLength() const override {
         if (state->duringContextLength) state->duringContextLength();
         if (state->contextFailure == Failure::RuntimeFault) {
@@ -172,6 +198,24 @@ public:
     int Capacity() const override { return state->capacity; }
     int VocabSize() const override { return state->vocabSize; }
     size_t CacheBytes() const override { return state->cacheBytes; }
+    const void* DecodeBatchKey() const noexcept override { return state->batch.get(); }
+    std::vector<ExecutionResult> ForwardDecodeBatch(const std::vector<BackendDecodeInput>& rows) override {
+        Expect(state->batch != nullptr, "Unsupported fake backend received a batch");
+        std::vector<int> ids;
+        for (const auto& row : rows) {
+            auto* peer = dynamic_cast<FakeBackend*>(row.backend);
+            Expect(peer && peer->state->batch == state->batch, "Decode batch mixed loaded model identities");
+            ids.push_back(peer->state->id);
+        }
+        const size_t call = state->batch->Record(std::move(ids));
+        if (state->batch->duringBatch) state->batch->duringBatch(call);
+        std::vector<ExecutionResult> result;
+        for (const auto& row : rows) {
+            result.push_back(row.backend->Forward({row.tokenId}, row.sampling, row.captureLogits));
+        }
+        if (state->batch->afterBatch) state->batch->afterBatch(call);
+        return result;
+    }
     void Reset() override {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->context.clear();
@@ -236,8 +280,8 @@ struct Fixture {
 
 Fixture MakeFixture(int id = 1,
                     std::shared_ptr<ExecutionTrace> trace = std::make_shared<ExecutionTrace>(),
-                    int capacity = 128, size_t cacheBytes = 64) {
-    auto state = std::make_shared<FakeState>(id, capacity, cacheBytes, std::move(trace));
+                    int capacity = 128, size_t cacheBytes = 64, std::shared_ptr<FakeBatch> batch = {}) {
+    auto state = std::make_shared<FakeState>(id, capacity, cacheBytes, std::move(trace), std::move(batch));
     auto session = std::make_shared<SessionState>(std::make_unique<FakeBackend>(state));
     return {std::move(state), std::move(session)};
 }
@@ -331,6 +375,39 @@ void ExpectNoReservations(const Scheduler& scheduler) {
            "Scheduler leaked requests, active slots, or admission reservations");
 }
 
+void TestPrefillAdmissionCancellationAndPeer() {
+    auto a = MakeFixture(1);
+    auto b = MakeFixture(2);
+    Scheduler scheduler(Limits());
+    ForwardGate gate;
+    a.state->duringForward = [action = gate.Action()](size_t, bool sampling) {
+        Expect(!sampling, "Replay reached the sampler");
+        action();
+    };
+    auto options = Options(0, 99);
+    options.prefillOnly = true;
+    auto replay = scheduler.Submit(a.session, {1, 2, 3, 4, 5}, options);
+    gate.AwaitEntry();
+    const auto reserved = scheduler.Snapshot();
+    Expect(reserved.reservedTokens == 5 && reserved.outstandingRequests == 1,
+           "Replay did not reserve its prompt-only token count");
+    auto peer = scheduler.Submit(b.session, {6, 7}, Options());
+    replay->Cancel();
+    gate.Release();
+    const auto cancelled = Drain(replay);
+    ExpectEnd(cancelled, RequestStatus::Cancelled, RequestEndReason::Cancelled);
+    Expect(cancelled.tokens.empty() && cancelled.terminal.sequence == 1 &&
+               cancelled.terminal.promptTokensProcessed == 2 && a.state->Context() == std::vector<int>({1, 2}),
+           "Cancelled scheduled replay did not retain exactly one clamped prompt chunk");
+    ExpectEnd(Drain(peer), RequestStatus::Completed, RequestEndReason::Length);
+    a.state->duringForward = {};
+    const auto repaired = Drain(scheduler.Submit(a.session, {3, 4, 5}, options));
+    ExpectEnd(repaired, RequestStatus::Completed, RequestEndReason::Length);
+    Expect(repaired.tokens.empty() && a.state->Context() == std::vector<int>({1, 2, 3, 4, 5}) &&
+               a.state->Histories().empty(), "Scheduled replay recovery sampled or corrupted the accepted prefix");
+    ExpectNoReservations(scheduler);
+}
+
 std::vector<int> RunDirect(const Fixture& fixture, const std::vector<int>& prompt,
                            RequestOptions options) {
     auto request = RequestState::Create(fixture.session, prompt, std::move(options));
@@ -344,6 +421,26 @@ std::vector<int> RunDirect(const Fixture& fixture, const std::vector<int>& promp
         }
     }
     throw std::runtime_error("Serial reference did not finish");
+}
+
+void TestThinkingBudgetEarlyLengthAndPeer() {
+    Scheduler scheduler(Limits());
+    auto a = MakeFixture(1), b = MakeFixture(2);
+    a.state->samples = {20, 21, 22};
+    b.state->samples = {30, 31, 32};
+    auto options = Options(3);
+    options.thinkingBudget = aila::generation::ThinkingBudgetOptions{2, 10, 11, true, {11, 3}};
+    auto limited = scheduler.Submit(a.session, {1}, options);
+    auto peer = scheduler.Submit(b.session, {2}, Options(3));
+    const auto result = Drain(limited);
+    ExpectEnd(result, RequestStatus::Completed, RequestEndReason::Length);
+    Expect(result.tokens == std::vector<int>({20, 21}) && a.state->Context() == std::vector<int>({1, 20, 21}),
+           "Thinking close overflow did not retain exact emitted/consumed prefix");
+    const auto other = Drain(peer);
+    ExpectEnd(other, RequestStatus::Completed, RequestEndReason::Length);
+    Expect(other.tokens == std::vector<int>({30, 31, 32}), "Budgeted request damaged a peer");
+    ExpectNoReservations(scheduler);
+    scheduler.Shutdown();
 }
 
 void TestValidationAndAdmissionFailures() {
@@ -1338,13 +1435,399 @@ void TestShutdownWhileSubmitIsInitializing() {
     fixture.session->Reset();
 }
 
+
+void TestDecodeBatchConfigurationAndFallback() {
+    for (const size_t size : {size_t{0}, size_t{3}, size_t{5}}) {
+        auto limits = Limits();
+        limits.maxDecodeBatchSize = size;
+        ExpectError(ErrorCode::InvalidArgument, [&] { Scheduler rejected(limits); });
+    }
+    auto large = Limits();
+    large.maxActiveRequests = 5;
+    large.maxDecodeBatchSize = 5;
+    ExpectError(ErrorCode::InvalidArgument, [&] { Scheduler rejected(large); });
+    auto limits = Limits();
+    limits.maxDecodeBatchSize = 2;
+    Scheduler scheduler(limits);
+    ForwardGate initial;
+    auto first = MakeFixture(1), second = MakeFixture(2), reference = MakeFixture();
+    const auto expected = RunDirect(reference, {2}, Options(4));
+    first.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    auto a = scheduler.Submit(first.session, {1}, Options(4));
+    initial.AwaitEntry();
+    auto b = scheduler.Submit(second.session, {2}, Options(4));
+    initial.Release();
+    ExpectEnd(Drain(a), RequestStatus::Completed, RequestEndReason::Length);
+    const auto result = Drain(b);
+    ExpectEnd(result, RequestStatus::Completed, RequestEndReason::Length);
+    Expect(result.tokens == expected && second.state->Context() == reference.state->Context(),
+           "Unsupported batch backend did not fall back to independent scalar execution");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestDecodeBatchDynamicMembershipAndPrefillFairness() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 4;
+    limits.maxDecodeBatchSize = 4;
+    Scheduler scheduler(limits);
+    ForwardGate initial, grouped;
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto model = std::make_shared<FakeBatch>();
+    auto a = MakeFixture(1, trace, 128, 64, model);
+    auto b = MakeFixture(2, trace, 128, 64, model);
+    auto c = MakeFixture(3, trace, 128, 64, model);
+    auto prefill = MakeFixture(4, trace);
+    auto replacement = MakeFixture(5, trace, 128, 64, model);
+    std::atomic<bool> prefillAdvancedBeforeSecondBatch{false};
+    a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    model->duringBatch = [hold = grouped.Action(), prefillState = prefill.state,
+                          &prefillAdvancedBeforeSecondBatch](size_t call) {
+        if (call == 1) hold();
+        if (call == 2) prefillAdvancedBeforeSecondBatch.store(prefillState->Inputs().size() >= 2);
+    };
+    const auto optionsA = Options(5, 2, 110), optionsB = Options(4, 2, 220), optionsE = Options(3, 2, 330);
+    auto refA = MakeFixture(), refB = MakeFixture(), refE = MakeFixture();
+    const auto expectedA = RunDirect(refA, {1}, optionsA);
+    const auto expectedB = RunDirect(refB, {2}, optionsB);
+    const auto expectedE = RunDirect(refE, {5}, optionsE);
+    auto streamA = scheduler.Submit(a.session, {1}, optionsA);
+    initial.AwaitEntry();
+    auto streamB = scheduler.Submit(b.session, {2}, optionsB);
+    auto streamC = scheduler.Submit(c.session, {3}, Options(8));
+    auto streamPrefill = scheduler.Submit(prefill.session, {4, 4, 4, 4, 4, 4, 4, 4}, Options(1));
+    initial.Release();
+    grouped.AwaitEntry();
+    Expect(scheduler.Snapshot().activeRequests == 4, "Selected batch rows lost active-slot accounting");
+    auto streamE = scheduler.Submit(replacement.session, {5}, optionsE);
+    Expect(scheduler.Snapshot().queuedRequests == 1 && replacement.state->Inputs().empty(),
+           "A full active set executed a newly submitted replacement early");
+    streamC->Cancel();
+    Expect(c.session->Busy(), "Cancellation released an in-flight batch row before its boundary");
+    grouped.Release();
+    const auto resultA = Drain(streamA), resultB = Drain(streamB), resultC = Drain(streamC);
+    const auto resultPrefill = Drain(streamPrefill), resultE = Drain(streamE);
+    for (const auto* result : {&resultA, &resultB, &resultPrefill, &resultE}) {
+        ExpectEnd(*result, RequestStatus::Completed, RequestEndReason::Length);
+    }
+    ExpectEnd(resultC, RequestStatus::Cancelled, RequestEndReason::Cancelled);
+    Expect(resultA.tokens == expectedA && resultB.tokens == expectedB && resultE.tokens == expectedE &&
+               a.state->Context() == refA.state->Context() && b.state->Context() == refB.state->Context() &&
+               replacement.state->Context() == refE.state->Context(),
+           "Removing/adding a batch row changed an independent request sequence or cache");
+    const auto groups = model->Groups();
+    Expect(groups.size() >= 2 && groups[0] == std::vector<int>({1, 2, 3}) &&
+               groups[1] == std::vector<int>({1, 2, 5}) && prefillAdvancedBeforeSecondBatch.load(),
+           "Batch membership was not rebuilt or decode overtook the oldest prefill repeatedly");
+    Expect(resultC.tokens.size() == 1 && c.state->Context().size() == 2 && c.state->Inputs().size() == 2 &&
+               !c.session->Busy() && trace->MaximumInFlight() == 1,
+           "Batch cancellation failed to drain exactly its selected input on one submission thread");
+    const auto entries = trace->Entries();
+    const auto worker = entries.front().thread;
+    Expect(worker != std::this_thread::get_id() &&
+               std::all_of(entries.begin(), entries.end(), [worker](const auto& entry) { return entry.thread == worker; }),
+           "Continuous batching introduced a second submission thread");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestDecodeBatchIdentityAndWidthBound() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 4;
+    limits.maxDecodeBatchSize = 2;
+    Scheduler scheduler(limits);
+    ForwardGate initial;
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto firstModel = std::make_shared<FakeBatch>(), secondModel = std::make_shared<FakeBatch>();
+    auto a = MakeFixture(1, trace, 128, 64, firstModel), b = MakeFixture(2, trace, 128, 64, secondModel);
+    auto c = MakeFixture(3, trace, 128, 64, firstModel), d = MakeFixture(4, trace, 128, 64, secondModel);
+    a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    auto streamA = scheduler.Submit(a.session, {1}, Options(4));
+    initial.AwaitEntry();
+    auto streamB = scheduler.Submit(b.session, {2}, Options(4));
+    auto streamC = scheduler.Submit(c.session, {3}, Options(4));
+    auto streamD = scheduler.Submit(d.session, {4}, Options(4));
+    initial.Release();
+    for (const auto& stream : {streamA, streamB, streamC, streamD}) {
+        ExpectEnd(Drain(stream), RequestStatus::Completed, RequestEndReason::Length);
+    }
+    const auto one = firstModel->Groups(), two = secondModel->Groups();
+    Expect(!one.empty() && !two.empty(), "Compatible rows from two models never reached their own batch entries");
+    for (const auto& group : one) {
+        Expect(group.size() == 2 && (group == std::vector<int>({1, 3}) || group == std::vector<int>({3, 1})),
+               "First batch exceeded its cap or mixed model identity");
+    }
+    for (const auto& group : two) {
+        Expect(group.size() == 2 && (group == std::vector<int>({2, 4}) || group == std::vector<int>({4, 2})),
+               "Second batch exceeded its cap or mixed model identity");
+    }
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestDecodeBatchBackpressureAndFullRingFinalization() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 3;
+    limits.maxDecodeBatchSize = 3;
+    limits.maxBufferedTokensPerRequest = 1;
+    Scheduler scheduler(limits);
+    ForwardGate initial, grouped;
+    auto model = std::make_shared<FakeBatch>();
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto slow = MakeFixture(1, trace, 128, 64, model);
+    auto a = MakeFixture(2, trace, 128, 64, model), b = MakeFixture(3, trace, 128, 64, model);
+    slow.state->samples = {11, 12};
+    a.state->samples = {21};
+    b.state->samples = {31};
+    slow.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    model->duringBatch = [hold = grouped.Action()](size_t call) { if (call == 1) hold(); };
+    auto blocked = scheduler.Submit(slow.session, {1}, Options(4));
+    initial.AwaitEntry();
+    auto streamA = scheduler.Submit(a.session, {2}, Options(1));
+    auto streamB = scheduler.Submit(b.session, {3}, Options(1));
+    initial.Release();
+    grouped.AwaitEntry();
+    Expect(streamA->Snapshot().bufferedTokens == 1 && streamB->Snapshot().bufferedTokens == 1 &&
+               streamA->Snapshot().status == RequestStatus::Finalizing &&
+               streamB->Snapshot().status == RequestStatus::Finalizing,
+           "Batch test did not retain full rings on both finalizing rows");
+    grouped.Release();
+    const auto resultA = Drain(streamA), resultB = Drain(streamB), resultSlow = Drain(blocked);
+    ExpectEnd(resultA, RequestStatus::Completed, RequestEndReason::Length);
+    ExpectEnd(resultB, RequestStatus::Completed, RequestEndReason::Length);
+    ExpectEnd(resultSlow, RequestStatus::Cancelled, RequestEndReason::OutputBackpressure);
+    Expect(resultSlow.tokens == std::vector<int>({11}) && slow.state->Inputs().size() == 1 &&
+               resultA.tokens == std::vector<int>({21}) && resultB.tokens == std::vector<int>({31}) &&
+               a.state->Context() == std::vector<int>({2, 21}) && b.state->Context() == std::vector<int>({3, 31}) &&
+               model->Groups() == std::vector<std::vector<int>>({{2, 3}}),
+           "Backpressure submitted an extra row, discarded output, or cancelled grouped finalization");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestDecodeBatchSharedErrorScope() {
+    for (const auto failure : {Failure::Ordinary, Failure::InvalidArgument, Failure::RuntimeFault}) {
+        auto limits = Limits();
+        limits.maxActiveRequests = 3;
+        limits.maxDecodeBatchSize = 3;
+        Scheduler scheduler(limits);
+        ForwardGate initial;
+        auto trace = std::make_shared<ExecutionTrace>();
+        auto model = std::make_shared<FakeBatch>();
+        auto a = MakeFixture(1, trace, 128, 64, model), b = MakeFixture(2, trace, 128, 64, model);
+        auto independent = MakeFixture(3, trace), pending = MakeFixture(4, trace);
+        b.state->failure = failure;
+        b.state->failOnCall = 2; // First row has prepared a sample when the second row fails.
+        a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+        auto streamA = scheduler.Submit(a.session, {1}, Options(4));
+        initial.AwaitEntry();
+        auto streamB = scheduler.Submit(b.session, {2}, Options(4));
+        auto streamIndependent = scheduler.Submit(independent.session, {3}, Options(3));
+        auto streamPending = scheduler.Submit(pending.session, {4}, Options(2));
+        initial.Release();
+        const auto resultA = Drain(streamA), resultB = Drain(streamB);
+        const auto resultIndependent = Drain(streamIndependent), resultPending = Drain(streamPending);
+        const auto reason = failure == Failure::RuntimeFault ? RequestEndReason::RuntimeFault : RequestEndReason::Failed;
+        ExpectEnd(resultA, RequestStatus::Failed, reason);
+        ExpectEnd(resultB, RequestStatus::Failed, reason);
+        Expect(resultA.tokens.size() == 1 && resultB.tokens.size() == 1,
+               "Shared failure exposed the first row's partially prepared sample");
+        if (failure == Failure::RuntimeFault) {
+            ExpectEnd(resultIndependent, RequestStatus::Failed, RequestEndReason::RuntimeFault);
+            ExpectEnd(resultPending, RequestStatus::Failed, RequestEndReason::RuntimeFault);
+            Expect(scheduler.Snapshot().faulted && !scheduler.Snapshot().accepting &&
+                       pending.state->Inputs().empty() && resultPending.tokens.empty(),
+                   "Batch RuntimeFault did not block admission and pending device work");
+            for (const auto* result : {&resultA, &resultB, &resultIndependent, &resultPending}) {
+                Expect(result->terminal.errorCode == ErrorCode::RuntimeFault &&
+                           result->terminal.error == b.state->failureMessage,
+                       "Batch fault lost the device domain's first failure");
+            }
+        } else {
+            ExpectEnd(resultIndependent, RequestStatus::Completed, RequestEndReason::Length);
+            ExpectEnd(resultPending, RequestStatus::Completed, RequestEndReason::Length);
+            Expect(!scheduler.Snapshot().faulted && scheduler.Snapshot().accepting &&
+                       resultIndependent.tokens.size() == 3 && resultPending.tokens.size() == 2,
+                   "Ordinary batch error escaped into unrelated model requests");
+            const auto code = failure == Failure::Ordinary ? std::optional<ErrorCode>{}
+                                                           : std::optional<ErrorCode>{ErrorCode::InvalidArgument};
+            Expect(resultA.terminal.errorCode == code && resultB.terminal.errorCode == code,
+                   "Shared ordinary batch error lost its typed classification");
+        }
+        scheduler.Shutdown();
+        ExpectNoReservations(scheduler);
+    }
+}
+
+void TestDecodeBatchReentrantShutdownCancelsAllRunningRows() {
+    auto limits = Limits();
+    limits.maxActiveRequests = 2;
+    limits.maxDecodeBatchSize = 2;
+    Scheduler scheduler(limits);
+    ForwardGate initial;
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto model = std::make_shared<FakeBatch>();
+    auto a = MakeFixture(1, trace, 128, 64, model), b = MakeFixture(2, trace, 128, 64, model);
+    auto pending = MakeFixture(3, trace);
+    std::atomic<bool> shutdownReturned{false};
+    model->duringBatch = [&](size_t call) {
+        if (call == 1) {
+            scheduler.Shutdown();
+            shutdownReturned.store(true);
+        }
+    };
+    a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    auto streamA = scheduler.Submit(a.session, {1}, Options(4));
+    initial.AwaitEntry();
+    auto streamB = scheduler.Submit(b.session, {2}, Options(4));
+    auto streamPending = scheduler.Submit(pending.session, {3}, Options(2));
+    initial.Release();
+    const auto resultA = Drain(streamA), resultB = Drain(streamB), resultPending = Drain(streamPending);
+    for (const auto* result : {&resultA, &resultB, &resultPending}) {
+        ExpectEnd(*result, RequestStatus::Cancelled, RequestEndReason::SchedulerStopped);
+    }
+    Expect(shutdownReturned.load() && resultA.tokens.size() == 1 && resultB.tokens.size() == 1 &&
+               a.state->Context().size() == 2 && b.state->Context().size() == 2 && pending.state->Inputs().empty(),
+           "Reentrant shutdown self-joined, missed a running batch row, or ran pending work");
+    scheduler.Shutdown();
+    ExpectNoReservations(scheduler);
+}
+
+void TestDecodeBatchDeferredFaultSuppressesAllPreparedRows() {
+    for (const int newTokens : {1, 3}) {
+        auto limits = Limits();
+        limits.maxDecodeBatchSize = 2;
+        Scheduler scheduler(limits);
+        ForwardGate initial;
+        auto trace = std::make_shared<ExecutionTrace>();
+        auto model = std::make_shared<FakeBatch>();
+        auto a = MakeFixture(1, trace, 128, 64, model), b = MakeFixture(2, trace, 128, 64, model);
+        a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+        struct Probe {
+            Scheduler* scheduler;
+            size_t calls = 0;
+            bool returned = false;
+        } probe{&scheduler};
+        struct RestoreLogging {
+            aila::LogLevel level = aila::get_log_level();
+            ~RestoreLogging() {
+                aila::set_log_callback(nullptr);
+                aila::set_log_level(level);
+            }
+        } restore;
+        aila::set_log_level(aila::LogLevel::Info);
+        aila::set_log_callback([](int, const char* message, void* userData) {
+            if (std::strcmp(message, "SchedulerTests deferred batch fault") != 0) return;
+            auto& probe = *static_cast<Probe*>(userData);
+            ++probe.calls;
+            probe.scheduler->ReportRuntimeFault("fake batch lifecycle fault");
+            probe.returned = true;
+        }, &probe);
+        model->afterBatch = [](size_t call) { if (call == 1) AILA_LOG_INFO("SchedulerTests deferred batch fault"); };
+        auto streamA = scheduler.Submit(a.session, {1}, Options(newTokens));
+        initial.AwaitEntry();
+        auto streamB = scheduler.Submit(b.session, {2}, Options(newTokens));
+        initial.Release();
+        const auto resultA = Drain(streamA), resultB = Drain(streamB);
+        for (const auto* result : {&resultA, &resultB}) {
+            ExpectEnd(*result, RequestStatus::Failed, RequestEndReason::RuntimeFault);
+            Expect(result->tokens.size() == 1 && result->terminal.error == "fake batch lifecycle fault",
+                   "Deferred batch fault exposed prepared output or an unpublished successful terminal");
+        }
+        Expect(probe.calls == 1 && probe.returned && !a.session->Busy() && !b.session->Busy(),
+               "Deferred batch lifecycle report did not retire every row safely");
+        scheduler.Shutdown();
+        ExpectNoReservations(scheduler);
+    }
+}
+
+void TestDecodeBatchTerminalReleasesActiveSlotBeforeCredit() {
+    auto limits = Limits();
+    limits.maxDecodeBatchSize = 2;
+    limits.maxOutstandingRequests = 2;
+    limits.maxOutstandingTokens = 6;
+    limits.maxSessionCacheBytes = 128;
+    Scheduler scheduler(limits);
+    ForwardGate initial, destruction;
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto model = std::make_shared<FakeBatch>();
+    auto a = MakeFixture(1, trace, 128, 64, model), b = MakeFixture(2, trace, 128, 64, model);
+    auto replacement = MakeFixture(3, trace);
+    a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    b.state->duringDestruction = destruction.Action();
+    auto streamA = scheduler.Submit(a.session, {1}, Options(2));
+    initial.AwaitEntry();
+    auto streamB = scheduler.Submit(b.session, {2}, Options(2));
+    // Leave the request as the last Session owner. Its completion must destroy
+    // the backend before publishing B's terminal, after publishing A's terminal.
+    b.session.reset();
+    initial.Release();
+    destruction.AwaitEntry();
+    Expect(model->Groups() == std::vector<std::vector<int>>({{1, 2}, {1, 2}}),
+           "Accounting test did not reach grouped decode and finalization");
+    const auto resultA = Drain(streamA);
+    ExpectEnd(resultA, RequestStatus::Completed, RequestEndReason::Length);
+    const auto held = scheduler.Snapshot();
+    Expect(held.outstandingRequests == 1 && held.queuedRequests == 0 && held.activeRequests == 1 &&
+               held.reservedTokens == 3 && held.reservedSessionCacheBytes == 64,
+           "Consuming a completed batch row released its credit before its active slot");
+    // Reuse all three kinds of returned admission while the same batch still
+    // owns B. The queued replacement must not execute during B's destruction.
+    auto streamReplacement = scheduler.Submit(replacement.session, {3}, Options(2));
+    const auto admitted = scheduler.Snapshot();
+    Expect(admitted.outstandingRequests == 2 && admitted.queuedRequests == 1 && admitted.activeRequests == 1 &&
+               admitted.reservedTokens == 6 && admitted.reservedSessionCacheBytes == 128 &&
+               replacement.state->Inputs().empty(),
+           "Replacing a consumed batch row broke admission or execution accounting");
+    destruction.Release();
+    ExpectEnd(Drain(streamB), RequestStatus::Completed, RequestEndReason::Length);
+    ExpectEnd(Drain(streamReplacement), RequestStatus::Completed, RequestEndReason::Length);
+    scheduler.Shutdown();
+    Expect(resultA.tokens.size() == 2 && !b.state->destructionCallbackFailed.load(),
+           "Batch accounting regression did not complete its controlled destruction");
+    ExpectNoReservations(scheduler);
+}
+
+void TestDroppedDecodeBatchRowRetainsSessionUntilSafe() {
+    auto limits = Limits();
+    limits.maxDecodeBatchSize = 2;
+    Scheduler scheduler(limits);
+    ForwardGate initial, grouped;
+    auto trace = std::make_shared<ExecutionTrace>();
+    auto model = std::make_shared<FakeBatch>();
+    auto a = MakeFixture(1, trace, 128, 64, model), b = MakeFixture(2, trace, 128, 64, model);
+    std::weak_ptr<SessionState> weakA = a.session;
+    auto reference = MakeFixture();
+    const auto expected = RunDirect(reference, {2}, Options(4));
+    a.state->duringForward = [hold = initial.Action()](size_t call, bool) { if (call == 1) hold(); };
+    model->duringBatch = [hold = grouped.Action()](size_t call) { if (call == 1) hold(); };
+    auto dropped = scheduler.Submit(a.session, {1}, Options(4));
+    initial.AwaitEntry();
+    auto peer = scheduler.Submit(b.session, {2}, Options(4));
+    initial.Release();
+    grouped.AwaitEntry();
+    a.session.reset();
+    dropped.reset();
+    Expect(!weakA.expired() && scheduler.Snapshot().outstandingRequests == 2,
+           "Dropping an executing batch row released its session or admission too early");
+    grouped.Release();
+    const auto result = Drain(peer);
+    ExpectEnd(result, RequestStatus::Completed, RequestEndReason::Length);
+    scheduler.Shutdown();
+    Expect(weakA.expired() && result.tokens == expected && b.state->Context() == reference.state->Context(),
+           "Dropped batch row leaked ownership or changed its continuing peer");
+    ExpectNoReservations(scheduler);
+}
+
 } // namespace
 
 int main() {
     const std::vector<std::pair<const char*, void (*)()>> tests{
         {"configuration, request validation and rejected admission", TestValidationAndAdmissionFailures},
+        {"thinking early length, peer isolation and reservation release", TestThinkingBudgetEarlyLengthAndPeer},
         {"Read timeout/closed and finalization with a full ring", TestReadAndFinalizationWithFullRing},
         {"stop token terminal and output ordering", TestStopTokenTerminal},
+        {"prefill admission, cancellation, peer progress and recovery", TestPrefillAdmissionCancellationAndPeer},
         {"stop-token admission counts valid repeated IDs", TestStopTokenAdmissionLimit},
         {"fair single-thread scheduling and fixed-seed reference", TestFairRoundRobinAndSeededReference},
         {"active limit, pending cancel and dropped pending handle", TestActiveLimitPendingCancelAndDrop},
@@ -1364,6 +1847,15 @@ int main() {
         {"deferred callback fault suppresses a prepared token", TestDeferredCallbackFaultSuppressesPreparedToken},
         {"worker log callback destroys Scheduler owner safely", TestLogCallbackDestroysSchedulerOwner},
         {"Shutdown races Submit after reserve but before enqueue", TestShutdownWhileSubmitIsInitializing},
+        {"decode batch limits and unsupported scalar fallback", TestDecodeBatchConfigurationAndFallback},
+        {"continuous batch membership and prefill fairness", TestDecodeBatchDynamicMembershipAndPrefillFairness},
+        {"batch identity isolation and width bound", TestDecodeBatchIdentityAndWidthBound},
+        {"batch backpressure preserves full-ring finalization", TestDecodeBatchBackpressureAndFullRingFinalization},
+        {"batch shared errors and device-domain fault scope", TestDecodeBatchSharedErrorScope},
+        {"reentrant shutdown cancels every running batch row", TestDecodeBatchReentrantShutdownCancelsAllRunningRows},
+        {"deferred fault suppresses all prepared batch rows", TestDecodeBatchDeferredFaultSuppressesAllPreparedRows},
+        {"batch terminal releases its active slot before its admission credit", TestDecodeBatchTerminalReleasesActiveSlotBeforeCredit},
+        {"dropped batch row retains its session until safe", TestDroppedDecodeBatchRowRetainsSessionUntilSafe},
     };
     size_t failures = 0;
     for (const auto& test : tests) {

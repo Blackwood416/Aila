@@ -29,6 +29,9 @@ constexpr std::pair<Method, std::string_view> MethodNames[] = {
     {Method::RequestCancel, "request.cancel"}, {Method::RequestQuery, "request.query"},
     {Method::RequestAck, "request.ack"}, {Method::HandleRelease, "handle.release"},
     {Method::WorkerShutdown, "worker.shutdown"},
+    {Method::SessionReset, "session.reset"}, {Method::SessionTruncate, "session.truncate"},
+    {Method::WorkerSetLogLevel, "worker.set_log_level"},
+    {Method::WorkerMemoryQuery, "worker.memory_query"},
 };
 constexpr std::pair<ObjectType, std::string_view> ObjectNames[] = {
     {ObjectType::Model, "model"}, {ObjectType::Session, "session"}, {ObjectType::Request, "request"},
@@ -58,6 +61,10 @@ constexpr std::pair<DomainStatus, std::string_view> DomainNames[] = {
     {DomainStatus::Starting, "starting"}, {DomainStatus::Ready, "ready"},
     {DomainStatus::Stopping, "stopping"}, {DomainStatus::Faulted, "faulted"},
     {DomainStatus::Closed, "closed"},
+};
+constexpr std::pair<RuntimeMemoryState, std::string_view> MemoryStateNames[] = {
+    {RuntimeMemoryState::Uninitialized, "uninitialized"}, {RuntimeMemoryState::Busy, "busy"},
+    {RuntimeMemoryState::Ready, "ready"},
 };
 
 template <typename T, size_t N>
@@ -310,6 +317,118 @@ bool ReadLimits(Object object, Limits& limits, ValidationError& error, ErrorCode
 #undef AILA_READ_LIMIT
     return true;
 }
+
+bool AllocationLimitsJson(const AllocationLimits& limits, std::string& output, ValidationError& error) {
+    Json json;
+    json.U64("maxDeviceBytes", limits.maxDeviceBytes);
+    json.U64("maxPinnedHostBytes", limits.maxPinnedHostBytes);
+    json.U64("maxSessionHostBytes", limits.maxSessionHostBytes);
+    return json.Finish(output, error);
+}
+
+bool ReadAllocationLimits(Object object, AllocationLimits& limits, ValidationError& error, ErrorCode code) {
+    return Fields(object, {"maxDeviceBytes", "maxPinnedHostBytes", "maxSessionHostBytes"}, {}, error, code) &&
+        Unsigned(object, "maxDeviceBytes", limits.maxDeviceBytes, error, code) &&
+        Unsigned(object, "maxPinnedHostBytes", limits.maxPinnedHostBytes, error, code) &&
+        Unsigned(object, "maxSessionHostBytes", limits.maxSessionHostBytes, error, code);
+}
+
+bool ReadOptionalAllocationLimits(Object object, std::optional<AllocationLimits>& limits,
+                                  ValidationError& error, ErrorCode code) {
+    if (object.at_key("allocationLimits").error() == simdjson::NO_SUCH_FIELD) return true;
+    Object child;
+    AllocationLimits value;
+    if (!ChildObject(object, "allocationLimits", child, error, code) ||
+        !ReadAllocationLimits(child, value, error, code)) return false;
+    limits = value;
+    return true;
+}
+
+bool ModelMemoryJson(const ModelMemoryInfo& memory, std::string& output, ValidationError& error) {
+    std::string limits;
+    if (!AllocationLimitsJson(memory.limits, limits, error)) return false;
+    Json json;
+    json.ObjectValue("limits", limits);
+    json.U64("residentDeviceBytes", memory.residentDeviceBytes);
+    json.U64("sessionHostReservationBytes", memory.sessionHostReservationBytes);
+    return json.Finish(output, error);
+}
+
+bool ReadOptionalModelMemory(Object object, std::optional<ModelMemoryInfo>& memory,
+                             ValidationError& error, ErrorCode code) {
+    if (object.at_key("memory").error() == simdjson::NO_SUCH_FIELD) return true;
+    Object child, limits;
+    ModelMemoryInfo value;
+    if (!ChildObject(object, "memory", child, error, code) ||
+        !Fields(child, {"limits", "residentDeviceBytes", "sessionHostReservationBytes"}, {}, error, code) ||
+        !ChildObject(child, "limits", limits, error, code) ||
+        !ReadAllocationLimits(limits, value.limits, error, code) ||
+        !Unsigned(child, "residentDeviceBytes", value.residentDeviceBytes, error, code) ||
+        !Unsigned(child, "sessionHostReservationBytes", value.sessionHostReservationBytes, error, code)) return false;
+    if (value.limits.maxDeviceBytes && value.residentDeviceBytes > value.limits.maxDeviceBytes)
+        return Fail(error, code, "Model residency exceeds its device allocation limit");
+    memory = value;
+    return true;
+}
+
+#define AILA_V2_MEMORY_FIELDS(X) \
+    X(deviceBytes) X(peakDeviceBytes) X(pinnedHostBytes) X(peakPinnedHostBytes) \
+    X(deviceAllocations) X(pinnedHostAllocations) X(deviceLimitBytes) X(pinnedHostLimitBytes)
+
+bool ValidMemoryUsage(const RuntimeMemoryUsage& value, ValidationError& error, ErrorCode code) {
+    if (value.deviceBytes > value.peakDeviceBytes || value.pinnedHostBytes > value.peakPinnedHostBytes ||
+        (value.deviceLimitBytes && value.deviceBytes > value.deviceLimitBytes) ||
+        (value.pinnedHostLimitBytes && value.pinnedHostBytes > value.pinnedHostLimitBytes) ||
+        (value.deviceBytes == 0) != (value.deviceAllocations == 0) ||
+        (value.pinnedHostBytes == 0) != (value.pinnedHostAllocations == 0) ||
+        value.deviceAllocations > value.deviceBytes || value.pinnedHostAllocations > value.pinnedHostBytes)
+        return Fail(error, code, "Inconsistent runtime allocation counters");
+    // A previous model can have had a higher limit: lifetime peaks are not
+    // constrained by the current limit after all models have been released.
+    return true;
+}
+
+bool WriteRuntimeMemory(Json& json, const RuntimeMemoryInfo& memory, ValidationError& error) {
+    if (Name(memory.state, MemoryStateNames).empty() ||
+        (memory.state == RuntimeMemoryState::Ready) != memory.usage.has_value())
+        return Fail(error, ErrorCode::InvalidArgument, "Runtime memory state/usage mismatch");
+    json.String("state", Name(memory.state, MemoryStateNames));
+    if (!memory.usage) { json.Null("memory"); return true; }
+    if (!ValidMemoryUsage(*memory.usage, error, ErrorCode::InvalidArgument)) return false;
+    Json data;
+#define AILA_WRITE_MEMORY(field) data.U64(#field, memory.usage->field);
+    AILA_V2_MEMORY_FIELDS(AILA_WRITE_MEMORY)
+#undef AILA_WRITE_MEMORY
+    std::string encoded;
+    if (!data.Finish(encoded, error)) return false;
+    json.ObjectValue("memory", encoded);
+    return true;
+}
+
+bool ReadRuntimeMemory(Object object, RuntimeMemoryInfo& memory, ValidationError& error, ErrorCode code) {
+    if (!Fields(object, {"epoch", "state", "memory"}, {}, error, code) ||
+        !Enum(object, "state", memory.state, parse_runtime_memory_state, error, code)) return false;
+    if (memory.state != RuntimeMemoryState::Ready) {
+        Element element;
+        if (object.at_key("memory").get(element) != simdjson::SUCCESS || !element.is_null())
+            return Fail(error, code, "Unavailable runtime memory must be null");
+        return true;
+    }
+    Object data;
+    RuntimeMemoryUsage usage;
+#define AILA_MEMORY_NAME(field) #field,
+    if (!ChildObject(object, "memory", data, error, code) ||
+        !Fields(data, {AILA_V2_MEMORY_FIELDS(AILA_MEMORY_NAME)}, {}, error, code)) return false;
+#undef AILA_MEMORY_NAME
+#define AILA_READ_MEMORY(field) if (!Unsigned(data, #field, usage.field, error, code)) return false;
+    AILA_V2_MEMORY_FIELDS(AILA_READ_MEMORY)
+#undef AILA_READ_MEMORY
+    if (!ValidMemoryUsage(usage, error, code)) return false;
+    memory.usage = usage;
+    return true;
+}
+#undef AILA_V2_MEMORY_FIELDS
+
 bool CapabilityName(std::string_view name) noexcept {
     if (name.empty() || name.size() > MaxCapabilityBytes) return false;
     for (const char value : name) {
@@ -422,12 +541,14 @@ std::string_view to_string(RequestStatus value) noexcept { return Name(value, St
 std::string_view to_string(EndReason value) noexcept { return Name(value, ReasonNames); }
 std::string_view to_string(ErrorCode value) noexcept { return Name(value, ErrorNames); }
 std::string_view to_string(DomainStatus value) noexcept { return Name(value, DomainNames); }
+std::string_view to_string(RuntimeMemoryState value) noexcept { return Name(value, MemoryStateNames); }
 bool parse_method(std::string_view value, Method& output) noexcept { return ParseName(value, output, MethodNames); }
 bool parse_object_type(std::string_view value, ObjectType& output) noexcept { return ParseName(value, output, ObjectNames); }
 bool parse_request_status(std::string_view value, RequestStatus& output) noexcept { return ParseName(value, output, StatusNames); }
 bool parse_end_reason(std::string_view value, EndReason& output) noexcept { return ParseName(value, output, ReasonNames); }
 bool parse_error_code(std::string_view value, ErrorCode& output) noexcept { return ParseName(value, output, ErrorNames); }
 bool parse_domain_status(std::string_view value, DomainStatus& output) noexcept { return ParseName(value, output, DomainNames); }
+bool parse_runtime_memory_state(std::string_view value, RuntimeMemoryState& output) noexcept { return ParseName(value, output, MemoryStateNames); }
 bool is_terminal(RequestStatus value) noexcept {
     return value == RequestStatus::Completed || value == RequestStatus::Cancelled || value == RequestStatus::Failed;
 }
@@ -437,6 +558,20 @@ bool valid_epoch(std::string_view value) noexcept {
     return true;
 }
 Limits hard_limits() noexcept { return {}; }
+Limits extended_generation_limits() noexcept {
+    auto limits = hard_limits();
+    limits.maxGeneratedTokens = kExtendedMaxGeneratedTokens;
+    return limits;
+}
+Limits configure_limits_ceiling(const Limits& offered,
+                                const std::vector<std::string>& requiredCapabilities) {
+    auto ceiling = offered;
+    if (ceiling.maxGeneratedTokens == hard_limits().maxGeneratedTokens &&
+        std::find(requiredCapabilities.begin(), requiredCapabilities.end(), "extended_generation_v1") != requiredCapabilities.end()) {
+        ceiling.maxGeneratedTokens = kExtendedMaxGeneratedTokens;
+    }
+    return ceiling;
+}
 std::vector<std::string> default_capabilities() {
     return {"token_requests_v1", "qwen3_nf4_bf16_kv", "session_lifecycle_v1", "multi_inflight_v1",
             "cumulative_ack_v1", "domain_epoch_v1"};
@@ -444,18 +579,40 @@ std::vector<std::string> default_capabilities() {
 std::vector<std::string> supported_capabilities() {
     auto capabilities = default_capabilities();
     capabilities.emplace_back("qwen35_nf4_bf16_kv");
+    capabilities.emplace_back("allocation_limits_v1");
+    capabilities.emplace_back("qwen35_bf16_bf16_kv");
+    capabilities.emplace_back("thinking_budget_v1");
+    capabilities.emplace_back("session_context_v1");
+    capabilities.emplace_back("prefill_only_v1");
+    capabilities.emplace_back("thinking_budget_close_once_v1");
+    capabilities.emplace_back("host_sampling_v1");
+    capabilities.emplace_back("legacy_prefill_logits_v1");
+    capabilities.emplace_back("extended_generation_v1");
+    capabilities.emplace_back("worker_log_control_v1");
+    capabilities.emplace_back("runtime_memory_v1");
+    capabilities.emplace_back("continuous_batching_v1");
     return capabilities;
 }
 std::string_view model_capability(std::string_view backend, std::string_view kvType) noexcept {
     if (kvType != "bf16") return {};
     if (backend == "qwen3_nf4") return "qwen3_nf4_bf16_kv";
     if (backend == "qwen35_nf4") return "qwen35_nf4_bf16_kv";
+    if (backend == "qwen35_bf16") return "qwen35_bf16_bf16_kv";
     return {};
+}
+
+bool validate_decode_batch_size(uint32_t size, const Limits& limits, ValidationError& error) {
+    return Guard(error, [&] {
+        if (size == 0 || size > kMaxDecodeBatchSize || size > limits.maxActiveRequests)
+            return Fail(error, ErrorCode::InvalidArgument,
+                        "max_decode_batch_size must be in 1..4 and not exceed maxActiveRequests");
+        return true;
+    });
 }
 
 bool validate_limits(const Limits& requested, ValidationError& error, const Limits& ceiling) {
     return Guard(error, [&] {
-        const Limits absolute = hard_limits();
+        const Limits absolute = extended_generation_limits();
 #define AILA_CHECK_LIMIT(field) \
         if constexpr (std::string_view(#field) != std::string_view("maxSessionCacheBytes")) { \
             if (requested.field == 0 || requested.field > ceiling.field || ceiling.field > absolute.field) \
@@ -492,7 +649,7 @@ bool negotiate(const Limits& requested, const std::vector<std::string>& required
                const Limits& offered, const std::vector<std::string>& availableCapabilities,
                Limits& selected, ValidationError& error) {
     return Guard(error, [&] {
-        if (!validate_limits(offered, error) || !validate_limits(requested, error, offered) ||
+        if (!validate_limits(offered, error, extended_generation_limits()) ||
             !Capabilities(requiredCapabilities, error, ErrorCode::InvalidArgument) ||
             !Capabilities(availableCapabilities, error, ErrorCode::InvalidArgument)) return false;
         for (const auto& required : requiredCapabilities) {
@@ -500,6 +657,7 @@ bool negotiate(const Limits& requested, const std::vector<std::string>& required
                 return Fail(error, ErrorCode::UnsupportedCapability, "A required capability is not offered by the Worker");
             }
         }
+        if (!validate_limits(requested, error, offered)) return false;
         selected = requested;
         return true;
     });
@@ -633,7 +791,8 @@ bool GenerationJson(const GenerationOptions& generation, std::string& output, Va
     json.Number("frequencyPenalty", generation.frequencyPenalty);
     return json.Finish(output, error);
 }
-bool ReadGeneration(Object object, GenerationOptions& generation, ValidationError& error, const Limits& limits) {
+bool ReadGeneration(Object object, GenerationOptions& generation, ValidationError& error, const Limits& limits,
+                    bool prefillOnly) {
     constexpr auto code = ErrorCode::InvalidArgument;
     if (!Fields(object, {"maxNewTokens", "doSample", "temperature", "topK", "topP", "useFixedSeed",
                          "samplingSeed", "repetitionPenalty", "presencePenalty", "frequencyPenalty"}, {}, error, code) ||
@@ -647,7 +806,7 @@ bool ReadGeneration(Object object, GenerationOptions& generation, ValidationErro
         !Number(object, "repetitionPenalty", generation.repetitionPenalty, error, code) ||
         !Number(object, "presencePenalty", generation.presencePenalty, error, code) ||
         !Number(object, "frequencyPenalty", generation.frequencyPenalty, error, code)) return false;
-    if (generation.maxNewTokens == 0 || generation.temperature < 0 ||
+    if ((prefillOnly ? generation.maxNewTokens != 0 : generation.maxNewTokens == 0) || generation.temperature < 0 ||
         (generation.doSample && static_cast<float>(generation.temperature) <= 0) ||
         generation.topK > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()) ||
         generation.topP <= 0 || generation.topP > 1 || static_cast<float>(generation.topP) <= 0 ||
@@ -657,6 +816,56 @@ bool ReadGeneration(Object object, GenerationOptions& generation, ValidationErro
     if (generation.maxNewTokens > limits.maxGeneratedTokens) return Fail(error, ErrorCode::ResourceLimit, "Generation token limit exceeded");
     return true;
 }
+bool ThinkingBudgetJson(const ThinkingBudgetOptions& budget, const std::vector<int32_t>& stops,
+                        std::string& output, ValidationError& error) {
+    if (const char* message = aila::generation::ValidateThinkingBudget(budget, uint32_t{1} << 31, stops))
+        return Fail(error, ErrorCode::InvalidArgument, message);
+    Json json;
+    json.U64("maxTokens", budget.maxTokens);
+    json.U64("openTokenId", static_cast<uint32_t>(budget.openTokenId));
+    json.U64("closeTokenId", static_cast<uint32_t>(budget.closeTokenId));
+    json.Bool("promptOpensThink", budget.promptOpensThink);
+    json.Integers("closeTokenIds", budget.closeTokenIds);
+    if (budget.closeOnce) json.Bool("closeOnce", true);
+    return json.Finish(output, error);
+}
+
+bool ReadOptionalThinkingBudget(Object object, std::optional<ThinkingBudgetOptions>& budget,
+                                const std::vector<int32_t>& stops, ValidationError& error) {
+    if (object.at_key("thinkingBudget").error() == simdjson::NO_SUCH_FIELD) return true;
+    constexpr auto code = ErrorCode::InvalidArgument;
+    Object child;
+    ThinkingBudgetOptions value;
+    uint32_t open = 0, close = 0;
+    if (!ChildObject(object, "thinkingBudget", child, error, code) ||
+        !Fields(child, {"maxTokens", "openTokenId", "closeTokenId", "promptOpensThink", "closeTokenIds"}, {"closeOnce"}, error, code) ||
+        !Unsigned(child, "maxTokens", value.maxTokens, error, code) ||
+        !Unsigned(child, "openTokenId", open, error, code) ||
+        !Unsigned(child, "closeTokenId", close, error, code) ||
+        !Boolean(child, "promptOpensThink", value.promptOpensThink, error, code)) return false;
+    if (child.at_key("closeOnce").error() != simdjson::NO_SUCH_FIELD &&
+        (!Boolean(child, "closeOnce", value.closeOnce, error, code) || !value.closeOnce))
+        return Fail(error, code, "closeOnce must be true when present");
+    if (open >= (uint32_t{1} << 31) || close >= (uint32_t{1} << 31))
+        return Fail(error, code, "Thinking marker ID exceeds int32 range");
+    value.openTokenId = static_cast<int32_t>(open);
+    value.closeTokenId = static_cast<int32_t>(close);
+    simdjson::dom::array array;
+    if (child.at_key("closeTokenIds").get_array().get(array) != simdjson::SUCCESS ||
+        array.size() > aila::generation::kMaxThinkingCloseTokens)
+        return Fail(error, code, "closeTokenIds must be an array of at most 16 token IDs");
+    for (const auto element : array) {
+        uint64_t token = 0;
+        if (element.get_uint64().get(token) != simdjson::SUCCESS || token >= (uint64_t{1} << 31))
+            return Fail(error, code, "closeTokenIds must contain nonnegative int32 token IDs");
+        value.closeTokenIds.push_back(static_cast<int32_t>(token));
+    }
+    if (const char* message = aila::generation::ValidateThinkingBudget(value, uint32_t{1} << 31, stops))
+        return Fail(error, code, message);
+    budget = std::move(value);
+    return true;
+}
+
 bool ReadStopIds(Object object, std::vector<int32_t>& values, ValidationError& error, const Limits& limits) {
     simdjson::dom::array array;
     if (object.at_key("stopTokenIds").get_array().get(array) != simdjson::SUCCESS) {
@@ -677,24 +886,42 @@ bool NoAttachment(const Frame& frame, ValidationError& error, ErrorCode code) {
     return frame.attachment.empty() || Fail(error, code, "This method does not accept an attachment");
 }
 
+bool ReadDecodeBatchSize(Object object, uint32_t& size, const Limits& limits,
+                        const std::vector<std::string>& capabilities,
+                        ValidationError& error, ErrorCode code) {
+    if (object.at_key("max_decode_batch_size").error() != simdjson::NO_SUCH_FIELD &&
+        !Unsigned(object, "max_decode_batch_size", size, error, code)) return false;
+    if (!validate_decode_batch_size(size, limits, error)) { error.code = code; return false; }
+    if (size > 1 && std::find(capabilities.begin(), capabilities.end(), "continuous_batching_v1") == capabilities.end())
+        return Fail(error, code == ErrorCode::InvalidArgument ? ErrorCode::UnsupportedCapability : code,
+                    "Decode batching requires continuous_batching_v1");
+    return true;
+}
+
 } // namespace
 
 bool make_command(const Command& command, Frame& frame, ValidationError& error, const Limits& limits) {
     return Guard(error, [&] {
-        if (!validate_limits(limits, error)) return false;
+        if (!validate_limits(limits, error, extended_generation_limits())) return false;
         Frame candidate = BaseFrame("request", to_string(command.method), command.rpcId);
         Json json(limits.maxHeaderBytes);
         json.String("epoch", command.epoch);
         switch (command.method) {
         case Method::WorkerConfigure: {
-            if (!Capabilities(command.requiredCapabilities, error, ErrorCode::InvalidArgument)) return false;
+            if (!Capabilities(command.requiredCapabilities, error, ErrorCode::InvalidArgument) ||
+                !validate_decode_batch_size(command.maxDecodeBatchSize, command.limits, error)) return false;
             std::string configuration;
             if (!LimitsJson(command.limits, configuration, error)) return false;
             json.Strings("requiredCapabilities", command.requiredCapabilities);
             json.ObjectValue("limits", configuration);
+            if (command.maxDecodeBatchSize > 1) json.U64("max_decode_batch_size", command.maxDecodeBatchSize);
             break;
         }
         case Method::WorkerQuery:
+        case Method::WorkerMemoryQuery:
+            break;
+        case Method::WorkerSetLogLevel:
+            json.U64("level", command.logLevel);
             break;
         case Method::ModelLoad:
             json.String("backend", command.backend);
@@ -703,12 +930,22 @@ bool make_command(const Command& command, Frame& frame, ValidationError& error, 
             json.U64("maxSequenceLength", command.maxSequenceLength);
             json.U64("maxSessions", command.maxSessions);
             json.U64("maxSessionCacheBytes", command.maxSessionCacheBytes);
+            if (command.allocationLimits) {
+                std::string value;
+                if (!AllocationLimitsJson(*command.allocationLimits, value, error)) return false;
+                json.ObjectValue("allocationLimits", value);
+            }
             break;
         case Method::SessionCreate:
             json.U64("modelId", command.modelId);
             break;
         case Method::SessionQuery:
+        case Method::SessionReset:
             json.U64("sessionId", command.sessionId);
+            break;
+        case Method::SessionTruncate:
+            json.U64("sessionId", command.sessionId);
+            json.U64("contextLength", command.contextLength);
             break;
         case Method::RequestSubmit: {
             if (command.stopTokenIds.size() > limits.maxStopTokenIds ||
@@ -724,6 +961,14 @@ bool make_command(const Command& command, Frame& frame, ValidationError& error, 
             json.U64("prefillChunkSize", command.prefillChunkSize);
             json.Integers("stopTokenIds", command.stopTokenIds);
             json.ObjectValue("generation", generation);
+            if (command.prefillOnly) json.Bool("prefillOnly", true);
+            if (command.forceHostSampling) json.Bool("hostSampling", true);
+            if (command.legacyPrefillLogits) json.Bool("legacyPrefillLogits", true);
+            if (command.thinkingBudget) {
+                std::string budget;
+                if (!ThinkingBudgetJson(*command.thinkingBudget, command.stopTokenIds, budget, error)) return false;
+                json.ObjectValue("thinkingBudget", budget);
+            }
             break;
         }
         case Method::RequestCancel:
@@ -766,26 +1011,35 @@ bool parse_command(const Frame& frame, Command& command, ValidationError& error,
         switch (parsed.method) {
         case Method::WorkerConfigure: {
             Object configuration;
-            if (!Fields(object, {"epoch", "requiredCapabilities", "limits"}, {}, error, code) ||
+            if (!Fields(object, {"epoch", "requiredCapabilities", "limits"}, {"max_decode_batch_size"}, error, code) ||
                 !ReadCapabilities(object, "requiredCapabilities", parsed.requiredCapabilities, error, code) ||
                 !ChildObject(object, "limits", configuration, error, code) ||
                 !ReadLimits(configuration, parsed.limits, error, code) ||
-                !validate_limits(parsed.limits, error, limits)) return false;
+                !validate_limits(parsed.limits, error, configure_limits_ceiling(limits, parsed.requiredCapabilities)) ||
+                !ReadDecodeBatchSize(object, parsed.maxDecodeBatchSize, parsed.limits,
+                                    parsed.requiredCapabilities, error, code)) return false;
             break;
         }
         case Method::WorkerQuery:
+        case Method::WorkerMemoryQuery:
             if (!Fields(object, {"epoch"}, {}, error, code)) return false;
             break;
+        case Method::WorkerSetLogLevel:
+            if (!Fields(object, {"epoch", "level"}, {}, error, code) ||
+                !Unsigned(object, "level", parsed.logLevel, error, code)) return false;
+            if (parsed.logLevel > 3) return Fail(error, code, "Log level must be in 0..3");
+            break;
         case Method::ModelLoad:
-            if (!Fields(object, {"epoch", "backend", "modelDirectory", "kvType", "maxSequenceLength", "maxSessions", "maxSessionCacheBytes"}, {}, error, code) ||
+            if (!Fields(object, {"epoch", "backend", "modelDirectory", "kvType", "maxSequenceLength", "maxSessions", "maxSessionCacheBytes"}, {"allocationLimits"}, error, code) ||
                 !Text(object, "backend", parsed.backend, 64, error, code) ||
                 !Text(object, "modelDirectory", parsed.modelDirectory, MaxModelPathBytes, error, code) ||
                 !Text(object, "kvType", parsed.kvType, 16, error, code) ||
                 !Unsigned(object, "maxSequenceLength", parsed.maxSequenceLength, error, code) ||
                 !Unsigned(object, "maxSessions", parsed.maxSessions, error, code) ||
-                !Unsigned(object, "maxSessionCacheBytes", parsed.maxSessionCacheBytes, error, code)) return false;
+                !Unsigned(object, "maxSessionCacheBytes", parsed.maxSessionCacheBytes, error, code) ||
+                !ReadOptionalAllocationLimits(object, parsed.allocationLimits, error, code)) return false;
             if (model_capability(parsed.backend).empty())
-                return Fail(error, ErrorCode::UnsupportedModel, "The v2 token API supports qwen3_nf4 and qwen35_nf4");
+                return Fail(error, ErrorCode::UnsupportedModel, "The v2 token API supports qwen3_nf4, qwen35_nf4 and qwen35_bf16");
             if (model_capability(parsed.backend, parsed.kvType).empty() || parsed.modelDirectory.empty() || parsed.maxSequenceLength == 0 ||
                 parsed.maxSequenceLength > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()) ||
                 parsed.maxSessions == 0 || parsed.maxSessions > limits.maxSessions ||
@@ -797,20 +1051,40 @@ bool parse_command(const Frame& frame, Command& command, ValidationError& error,
             if (!Fields(object, {"epoch", "modelId"}, {}, error, code) || !Id(object, "modelId", parsed.modelId, error, code)) return false;
             break;
         case Method::SessionQuery:
+        case Method::SessionReset:
             if (!Fields(object, {"epoch", "sessionId"}, {}, error, code) || !Id(object, "sessionId", parsed.sessionId, error, code)) return false;
+            break;
+        case Method::SessionTruncate:
+            if (!Fields(object, {"epoch", "sessionId", "contextLength"}, {}, error, code) ||
+                !Id(object, "sessionId", parsed.sessionId, error, code) ||
+                !Unsigned(object, "contextLength", parsed.contextLength, error, code)) return false;
+            if (parsed.contextLength > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()))
+                return Fail(error, code, "Truncate length exceeds int32 range");
             break;
         case Method::RequestSubmit: {
             uint64_t tokenCount = 0;
             std::string encoding;
             Object generation;
-            if (!Fields(object, {"epoch", "sessionId", "promptTokenCount", "promptEncoding", "prefillChunkSize", "stopTokenIds", "generation"}, {}, error, code) ||
+            if (!Fields(object, {"epoch", "sessionId", "promptTokenCount", "promptEncoding", "prefillChunkSize", "stopTokenIds", "generation"}, {"thinkingBudget", "prefillOnly", "hostSampling", "legacyPrefillLogits"}, error, code) ||
                 !Id(object, "sessionId", parsed.sessionId, error, code) ||
                 !Unsigned(object, "promptTokenCount", tokenCount, error, code) ||
                 !Text(object, "promptEncoding", encoding, 16, error, code) ||
                 !Unsigned(object, "prefillChunkSize", parsed.prefillChunkSize, error, code) ||
                 !ReadStopIds(object, parsed.stopTokenIds, error, limits) ||
-                !ChildObject(object, "generation", generation, error, code) ||
-                !ReadGeneration(generation, parsed.generation, error, limits)) return false;
+                !ChildObject(object, "generation", generation, error, code)) return false;
+            if (object.at_key("prefillOnly").error() != simdjson::NO_SUCH_FIELD &&
+                (!Boolean(object, "prefillOnly", parsed.prefillOnly, error, code) || !parsed.prefillOnly))
+                return Fail(error, code, "prefillOnly must be true when present");
+            if (object.at_key("hostSampling").error() != simdjson::NO_SUCH_FIELD &&
+                (!Boolean(object, "hostSampling", parsed.forceHostSampling, error, code) || !parsed.forceHostSampling))
+                return Fail(error, code, "hostSampling must be true when present");
+            if (object.at_key("legacyPrefillLogits").error() != simdjson::NO_SUCH_FIELD &&
+                (!Boolean(object, "legacyPrefillLogits", parsed.legacyPrefillLogits, error, code) || !parsed.legacyPrefillLogits))
+                return Fail(error, code, "legacyPrefillLogits must be true when present");
+            if (!ReadGeneration(generation, parsed.generation, error, limits, parsed.prefillOnly) ||
+                !ReadOptionalThinkingBudget(object, parsed.thinkingBudget, parsed.stopTokenIds, error)) return false;
+            if (parsed.prefillOnly && (!parsed.stopTokenIds.empty() || parsed.thinkingBudget))
+                return Fail(error, code, "Prefill-only requests cannot have stop tokens or a thinking budget");
             if (encoding != "i32le" || tokenCount == 0 || parsed.prefillChunkSize == 0 || parsed.prefillChunkSize > limits.maxPrefillChunkSize) {
                 return Fail(error, code, "Invalid token encoding, empty prompt, or prefill chunk size");
             }
@@ -1126,6 +1400,8 @@ bool ValidModelInfo(const ModelInfo& model, ValidationError& error) {
         model.maxSequenceLength > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()) || model.sessionReservationBytes == 0) {
         return Fail(error, ErrorCode::ProtocolError, "Invalid model metadata");
     }
+    if (model.memory && std::find(model.capabilities.begin(), model.capabilities.end(), "allocation_limits_v1") == model.capabilities.end())
+        return Fail(error, ErrorCode::ProtocolError, "Memory metadata requires allocation_limits_v1");
     return true;
 }
 
@@ -1163,14 +1439,22 @@ bool make_response(const Response& response, Frame& frame, ValidationError& erro
             case Method::WorkerConfigure: {
                 std::string configuration;
                 if (!Capabilities(response.capabilities, error, ErrorCode::InvalidArgument) ||
+                    !validate_decode_batch_size(response.maxDecodeBatchSize, response.limits, error) ||
                     !LimitsJson(response.limits, configuration, error)) return false;
                 json.String("domainStatus", to_string(response.worker.domainStatus));
                 json.Strings("capabilities", response.capabilities);
                 json.ObjectValue("limits", configuration);
+                if (response.maxDecodeBatchSize > 1) json.U64("max_decode_batch_size", response.maxDecodeBatchSize);
                 break;
             }
             case Method::WorkerQuery:
                 WriteWorker(json, response.worker);
+                break;
+            case Method::WorkerMemoryQuery:
+                if (!WriteRuntimeMemory(json, response.runtimeMemory, error)) return false;
+                break;
+            case Method::WorkerSetLogLevel:
+                json.U64("level", response.logLevel);
                 break;
             case Method::ModelLoad:
                 if (!Capabilities(response.model.capabilities, error, ErrorCode::InvalidArgument)) return false;
@@ -1179,14 +1463,21 @@ bool make_response(const Response& response, Frame& frame, ValidationError& erro
                 json.U64("maxSequenceLength", response.model.maxSequenceLength);
                 json.U64("sessionReservationBytes", response.model.sessionReservationBytes);
                 json.Strings("capabilities", response.model.capabilities);
+                if (response.model.memory) {
+                    std::string value;
+                    if (!ModelMemoryJson(*response.model.memory, value, error)) return false;
+                    json.ObjectValue("memory", value);
+                }
                 break;
             case Method::SessionCreate:
             case Method::SessionQuery:
+            case Method::SessionReset:
+            case Method::SessionTruncate:
                 json.U64("sessionId", response.session.sessionId);
                 json.U64("modelId", response.session.modelId);
                 json.U64("capacity", response.session.capacity);
                 json.U64("cacheBytes", response.session.cacheBytes);
-                if (response.method == Method::SessionQuery) json.Bool("busy", response.session.busy);
+                if (response.method != Method::SessionCreate) json.Bool("busy", response.session.busy);
                 if (response.session.contextLength) json.U64("contextLength", *response.session.contextLength);
                 else json.Null("contextLength");
                 break;
@@ -1286,29 +1577,42 @@ bool parse_response(const Frame& frame, Response& response, ValidationError& err
             switch (parsed.method) {
             case Method::WorkerConfigure: {
                 Object configuration;
-                if (!Fields(object, {"epoch", "domainStatus", "capabilities", "limits"}, {}, error, code) ||
+                if (!Fields(object, {"epoch", "domainStatus", "capabilities", "limits"}, {"max_decode_batch_size"}, error, code) ||
                     !Enum(object, "domainStatus", parsed.worker.domainStatus, parse_domain_status, error, code) ||
                     !ReadCapabilities(object, "capabilities", parsed.capabilities, error, code) ||
                     !ChildObject(object, "limits", configuration, error, code) ||
                     !ReadLimits(configuration, parsed.limits, error, code) ||
-                    !validate_limits(parsed.limits, error, limits)) return false;
+                    !validate_limits(parsed.limits, error, limits) ||
+                    !ReadDecodeBatchSize(object, parsed.maxDecodeBatchSize, parsed.limits,
+                                        parsed.capabilities, error, code)) return false;
                 if (parsed.worker.domainStatus != DomainStatus::Ready) return Fail(error, code, "Configured Worker must be ready");
                 break;
             }
             case Method::WorkerQuery:
                 if (!ReadWorker(object, parsed.worker, error, limits)) return false;
                 break;
+            case Method::WorkerMemoryQuery:
+                if (!ReadRuntimeMemory(object, parsed.runtimeMemory, error, code)) return false;
+                break;
+            case Method::WorkerSetLogLevel:
+                if (!Fields(object, {"epoch", "level"}, {}, error, code) ||
+                    !Unsigned(object, "level", parsed.logLevel, error, code)) return false;
+                if (parsed.logLevel > 3) return Fail(error, code, "Invalid applied log level");
+                break;
             case Method::ModelLoad:
-                if (!Fields(object, {"epoch", "modelId", "vocabSize", "maxSequenceLength", "sessionReservationBytes", "capabilities"}, {}, error, code) ||
+                if (!Fields(object, {"epoch", "modelId", "vocabSize", "maxSequenceLength", "sessionReservationBytes", "capabilities"}, {"memory"}, error, code) ||
                     !Id(object, "modelId", parsed.model.modelId, error, code) ||
                     !Unsigned(object, "vocabSize", parsed.model.vocabSize, error, code) ||
                     !Unsigned(object, "maxSequenceLength", parsed.model.maxSequenceLength, error, code) ||
                     !Unsigned(object, "sessionReservationBytes", parsed.model.sessionReservationBytes, error, code) ||
                     !ReadCapabilities(object, "capabilities", parsed.model.capabilities, error, code) ||
+                    !ReadOptionalModelMemory(object, parsed.model.memory, error, code) ||
                     !ValidModelInfo(parsed.model, error)) return false;
                 break;
             case Method::SessionCreate:
-            case Method::SessionQuery: {
+            case Method::SessionQuery:
+            case Method::SessionReset:
+            case Method::SessionTruncate: {
                 if (parsed.method == Method::SessionCreate) {
                     if (!Fields(object, {"epoch", "sessionId", "modelId", "capacity", "cacheBytes", "contextLength"}, {}, error, code)) return false;
                 } else if (!Fields(object, {"epoch", "sessionId", "modelId", "capacity", "cacheBytes", "busy", "contextLength"}, {}, error, code) ||
@@ -1322,9 +1626,13 @@ bool parse_response(const Frame& frame, Response& response, ValidationError& err
                     if (error.message.empty()) Fail(error, code, "Invalid session metadata");
                     return false;
                 }
-                if (parsed.method == Method::SessionCreate && parsed.session.contextLength != std::optional<uint32_t>{0}) {
-                    return Fail(error, code, "New sessions must have zero context length");
+                if ((parsed.method == Method::SessionCreate || parsed.method == Method::SessionReset) &&
+                    parsed.session.contextLength != std::optional<uint32_t>{0}) {
+                    return Fail(error, code, "New or reset sessions must have zero context length");
                 }
+                if ((parsed.method == Method::SessionReset || parsed.method == Method::SessionTruncate) &&
+                    (parsed.session.busy || !parsed.session.contextLength))
+                    return Fail(error, code, "A completed context operation requires an idle Session and actual context length");
                 break;
             }
             case Method::RequestCancel:
