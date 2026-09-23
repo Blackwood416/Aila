@@ -6,6 +6,7 @@
 #include "../src/models/Qwen3Bnb4Backend.hpp"
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/DiffusionGemmaBnb4Backend.hpp"
+#include "../src/models/Qwen4ExpBnb4Backend.hpp"
 #include "../src/generation/DiffusionGemmaGenerator.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"

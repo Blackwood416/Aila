@@ -1,0 +1,280 @@
+#include "HyperConnectionOps.hpp"
+
+namespace ops {
+
+void grouped_rms_norm(
+    Context& ctx, const bf16* x, const float* w, float eps, bf16* out,
+    int rows, int groups, int group_dim, bool plus_one) {
+    constexpr int wg = 256;
+    const int total_groups = rows * groups;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(total_groups) * wg),
+                              sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int group_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int r = group_idx / groups;
+                const int g = group_idx % groups;
+                const size_t row_base = static_cast<size_t>(r) * (groups * group_dim);
+                const size_t stream_base = row_base + static_cast<size_t>(g) * group_dim;
+                const size_t w_base = static_cast<size_t>(g) * group_dim;
+
+                float sum_sq = 0.0f;
+                for (int i = lid; i < group_dim; i += wg) {
+                    float v = static_cast<float>(x[stream_base + i]);
+                    sum_sq += v * v;
+                }
+                red_slm[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = wg / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        red_slm[lid] += red_slm[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
+
+                for (int i = lid; i < group_dim; i += wg) {
+                    float v = static_cast<float>(x[stream_base + i]);
+                    float scale = inv_rms;
+                    if (w) {
+                        float w_val = w[w_base + i];
+                        scale *= (plus_one ? (1.0f + w_val) : w_val);
+                    }
+                    out[stream_base + i] = bf16(v * scale);
+                }
+            });
+    });
+}
+
+void grouped_rms_norm(
+    Context& ctx, Tensor& x, Tensor& w, float eps, Tensor& out,
+    int rows, int groups, int group_dim, bool plus_one) {
+    grouped_rms_norm(
+        ctx, static_cast<const bf16*>(x.data()),
+        w.valid() ? static_cast<const float*>(w.data()) : nullptr,
+        eps, static_cast<bf16*>(out.data()),
+        rows, groups, group_dim, plus_one);
+}
+
+void hc_mix_reduce(
+    Context& ctx, const bf16* N, const bf16* mix, bf16* out,
+    int rows, int group_dim, int groups) {
+    constexpr int wg = 256;
+    const size_t total_elements = static_cast<size_t>(rows) * group_dim;
+    const size_t num_wgs = (total_elements + wg - 1) / wg;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t idx = item.get_global_id(0);
+                if (idx < total_elements) {
+                    const int r = static_cast<int>(idx / group_dim);
+                    const int d = static_cast<int>(idx % group_dim);
+                    const size_t row_stride = static_cast<size_t>(groups) * group_dim;
+                    const size_t row_base = static_cast<size_t>(r) * row_stride;
+
+                    float sum = 0.0f;
+                    for (int g = 0; g < groups; ++g) {
+                        size_t off = row_base + static_cast<size_t>(g) * group_dim + d;
+                        sum += static_cast<float>(mix[off]) * static_cast<float>(N[off]);
+                    }
+                    out[idx] = bf16(sum / static_cast<float>(groups));
+                }
+            });
+    });
+}
+
+template <typename TInj>
+static void hc_inject_add_impl(
+    Context& ctx, bf16* H, const bf16* y, const TInj* inj,
+    int rows, int group_dim, int groups) {
+    constexpr int wg = 256;
+    const size_t total = static_cast<size_t>(rows) * groups * group_dim;
+    const size_t num_wgs = (total + wg - 1) / wg;
+    const size_t group_stride = static_cast<size_t>(groups) * group_dim;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t idx = item.get_global_id(0);
+                if (idx < total) {
+                    const int r = static_cast<int>(idx / group_stride);
+                    const size_t rem = idx % group_stride;
+                    const int g = static_cast<int>(rem / group_dim);
+                    const int d = static_cast<int>(rem % group_dim);
+
+                    float h_val = static_cast<float>(H[idx]);
+                    float inj_val = static_cast<float>(inj[static_cast<size_t>(r) * groups + g]);
+                    float y_val = static_cast<float>(y[static_cast<size_t>(r) * group_dim + d]);
+                    H[idx] = bf16(h_val + inj_val * y_val);
+                }
+            });
+    });
+}
+
+void hc_inject_add(
+    Context& ctx, bf16* H, const bf16* y, const float* inj,
+    int rows, int group_dim, int groups) {
+    hc_inject_add_impl(ctx, H, y, inj, rows, group_dim, groups);
+}
+
+void hc_inject_add(
+    Context& ctx, bf16* H, const bf16* y, const bf16* inj,
+    int rows, int group_dim, int groups) {
+    hc_inject_add_impl(ctx, H, y, inj, rows, group_dim, groups);
+}
+
+void ple_gate_value(
+    Context& ctx, const bf16* K, const bf16* Q, const bf16* V, bf16* GV,
+    int rows, int hc_count, int hidden_size) {
+    constexpr int wg = 256;
+    const int total_pairs = rows * hc_count;
+    const float inv_sqrt_d = 1.0f / sycl::sqrt(static_cast<float>(hidden_size));
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+        sycl::local_accessor<float, 1> gate_slm(sycl::range<1>(1), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(total_pairs) * wg),
+                              sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int pair_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int r = pair_idx / hc_count;
+                const int s = pair_idx % hc_count;
+                const size_t stream_stride = static_cast<size_t>(hc_count) * hidden_size;
+                const size_t base = static_cast<size_t>(r) * stream_stride + static_cast<size_t>(s) * hidden_size;
+
+                float dot = 0.0f;
+                for (int d = lid; d < hidden_size; d += wg) {
+                    dot += static_cast<float>(K[base + d]) * static_cast<float>(Q[base + d]);
+                }
+                red_slm[lid] = dot;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = wg / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        red_slm[lid] += red_slm[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (lid == 0) {
+                    float g_raw = red_slm[0] * inv_sqrt_d;
+                    float sign = (g_raw >= 0.0f ? 1.0f : -1.0f);
+                    float g_clamped = sycl::max(sycl::fabs(g_raw), 1.0e-6f);
+                    float g = sign * sycl::sqrt(g_clamped);
+                    gate_slm[0] = 1.0f / (1.0f + sycl::native::exp(-g));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const float gate = gate_slm[0];
+                const size_t v_base = static_cast<size_t>(r) * hidden_size;
+                for (int d = lid; d < hidden_size; d += wg) {
+                    GV[base + d] = bf16(gate * static_cast<float>(V[v_base + d]));
+                }
+            });
+    });
+}
+
+void ple_dilated_conv_silu_add(
+    Context& ctx, const bf16* gv_normed, const bf16* gv,
+    float* conv_state, int& conv_head, const bf16* conv_w, bf16* out,
+    int rows, int channels, int kernel_size, int dilation) {
+    const int state_len = (kernel_size - 1) * dilation;
+    constexpr int wg = 256;
+    const size_t num_wgs = (static_cast<size_t>(channels) + wg - 1) / wg;
+
+    auto silu_dev = [](float x) {
+        return x / (1.0f + sycl::native::exp(-x));
+    };
+
+    if (rows == 1) {
+        const int row0 = conv_head;
+        const int row1 = (conv_head + 3) % state_len;
+        const int row2 = (conv_head + 6) % state_len;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int c = static_cast<int>(item.get_global_id(0));
+                    if (c < channels) {
+                        const bf16* w = conv_w + static_cast<size_t>(c) * kernel_size;
+                        float tap0 = conv_state[static_cast<size_t>(row0) * channels + c];
+                        float tap1 = conv_state[static_cast<size_t>(row1) * channels + c];
+                        float tap2 = conv_state[static_cast<size_t>(row2) * channels + c];
+                        float tap3 = static_cast<float>(gv_normed[c]);
+                        float conv_val = tap0 * static_cast<float>(w[0]) +
+                                         tap1 * static_cast<float>(w[1]) +
+                                         tap2 * static_cast<float>(w[2]) +
+                                         tap3 * static_cast<float>(w[3]);
+                        float silu_val = silu_dev(conv_val);
+                        out[c] = bf16(static_cast<float>(gv[c]) + silu_val);
+                        conv_state[static_cast<size_t>(conv_head) * channels + c] = tap3;
+                    }
+                });
+        });
+        conv_head = (conv_head + 1) % state_len;
+        return;
+    }
+
+    const int initial_conv_head = conv_head;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int c = static_cast<int>(item.get_global_id(0));
+                if (c < channels) {
+                    const bf16* w = conv_w + static_cast<size_t>(c) * kernel_size;
+                    auto history_val = [&](int t, int tap_idx) {
+                        int prior = t - (3 - tap_idx) * 3;
+                        if (prior >= 0) {
+                            return static_cast<float>(gv_normed[static_cast<size_t>(prior) * channels + c]);
+                        }
+                        int hist_row = (initial_conv_head + prior + state_len * 100) % state_len;
+                        return conv_state[static_cast<size_t>(hist_row) * channels + c];
+                    };
+
+                    for (int t = 0; t < rows; ++t) {
+                        float tap0 = history_val(t, 0);
+                        float tap1 = history_val(t, 1);
+                        float tap2 = history_val(t, 2);
+                        float tap3 = static_cast<float>(gv_normed[static_cast<size_t>(t) * channels + c]);
+                        float conv_val = tap0 * static_cast<float>(w[0]) +
+                                         tap1 * static_cast<float>(w[1]) +
+                                         tap2 * static_cast<float>(w[2]) +
+                                         tap3 * static_cast<float>(w[3]);
+                        float silu_val = silu_dev(conv_val);
+                        size_t out_idx = static_cast<size_t>(t) * channels + c;
+                        out[out_idx] = bf16(static_cast<float>(gv[out_idx]) + silu_val);
+                    }
+                }
+            });
+    });
+
+    const int rows_to_copy = std::min(rows, state_len);
+    const int first_token = rows - rows_to_copy;
+    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(rows_to_copy) * channels),
+        [=](sycl::id<1> index) {
+            const size_t c = index[0] % static_cast<size_t>(channels);
+            const int token = first_token + static_cast<int>(index[0] / channels);
+            const int row = (initial_conv_head + token % state_len) % state_len;
+            conv_state[static_cast<size_t>(row) * channels + c] =
+                static_cast<float>(gv_normed[static_cast<size_t>(token) * channels + c]);
+        });
+
+    conv_head = (initial_conv_head + rows) % state_len;
+}
+
+} // namespace ops

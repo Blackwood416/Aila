@@ -135,6 +135,7 @@ struct Message {
 enum class ModelFamily {
     Qwen3Dense,
     Qwen35Hybrid,
+    Qwen4Exp,
     Qwen3ASR,
     Qwen3TTS,
     Qwen3ForceAligner,  // NEW
@@ -259,6 +260,79 @@ inline bool is_supported_qwen35_hybrid_text_spec(const Qwen35TextConfig& cfg) {
     return is_exact_qwen35_hybrid_0p8b_spec(cfg) ||
            is_exact_qwen35_hybrid_4b_spec(cfg) ||
            is_exact_qwen35_hybrid_9b_spec(cfg);
+}
+
+// ============================================================
+// Qwen4Exp (Qwen3.8-Flash-Next) Model Configuration
+// ============================================================
+struct Qwen4ExpTextConfig {
+    int hidden_size = 2560;
+    int num_attention_heads = 24;
+    int num_key_value_heads = 2;
+    int head_dim = 256;
+    int num_hidden_layers = 48;
+    int intermediate_size = 0;
+    int vocab_size = 248320;
+    int max_position_embeddings = 262144;
+    float rms_norm_eps = 1e-6f;
+    bool tie_word_embeddings = false;
+    int bos_token_id = 248044;
+    int eos_token_id = 248044;
+
+    int full_attention_interval = 4;
+    std::vector<std::string> layer_types;
+
+    // GatedDeltaNet
+    int linear_num_key_heads = 16;
+    int linear_num_value_heads = 48;
+    int linear_key_head_dim = 128;
+    int linear_value_head_dim = 128;
+    int linear_conv_kernel_dim = 4;
+
+    // MoE
+    int moe_intermediate_size = 640;
+    int shared_expert_intermediate_size = 640;
+    int num_experts = 512;
+    int num_experts_per_tok = 10;
+    bool norm_topk_prob = true;
+    float router_aux_loss_coef = 0.001f;
+    bool output_router_logits = false;
+    std::string output_gate_type = "sigmoid";
+
+    // Hyper-Connection
+    int hc_count = 4;
+    int hc_lowrank = 320;
+
+    // PLE (Pattern-based Layer Embedding)
+    std::vector<int> ple_layer_ids = {2};
+    int ple_embed_dim = 2560;
+    int ple_conv_kernel_size = 4;
+    int ngram_size = 3;
+    int heads_per_ngram = 8;
+    int64_t ngram_vocab_size_base = 20000000;
+    int make_ngram_vocab_size_divisible_by = 128;
+    int split_ngram_parts = 128;
+
+    // QSA Indexer
+    int indexer_n_heads = 4;
+    int indexer_kv_heads = 1;
+    int indexer_head_dim = 128;
+    int indexer_budget = 2048;
+    int indexer_compress_ratio = 4;
+
+    RopeSpec rope{};
+};
+
+inline bool is_exact_qwen4exp_text_spec(const Qwen4ExpTextConfig& cfg) {
+    return cfg.hidden_size == 2560 &&
+           cfg.num_attention_heads == 24 &&
+           cfg.num_key_value_heads == 2 &&
+           cfg.head_dim == 256 &&
+           cfg.num_hidden_layers == 48 &&
+           cfg.hc_count == 4 &&
+           cfg.hc_lowrank == 320 &&
+           cfg.num_experts == 512 &&
+           cfg.num_experts_per_tok == 10;
 }
 
 inline bool is_supported_qwen35_hybrid_0p8b_spec(const Qwen35TextConfig& cfg) {
@@ -408,6 +482,7 @@ struct ModelSpec {
 
     // Qwen3.5 path
     Qwen35TextConfig qwen35_text{};
+    Qwen4ExpTextConfig qwen4exp_text{};
     VisionConfig vision{};
 
     // DiffusionGemma path

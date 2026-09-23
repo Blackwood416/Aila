@@ -27,7 +27,7 @@ struct TensorShape {
 };
 
 enum DataType {
-    DT_F16, DT_BF16, DT_F32, DT_F64, DT_U8, DT_S8, DT_UNKNOWN
+    DT_F16, DT_BF16, DT_F32, DT_F64, DT_U8, DT_S8, DT_I32, DT_I64, DT_UNKNOWN
 };
 
 struct TensorMeta {
@@ -51,6 +51,65 @@ struct Bnb4BitQuantState {
     int nested_blocksize = 0;
     std::string nested_dtype;
     float nested_offset = 0.0f;
+};
+
+struct HostTensorView {
+    const uint8_t* ptr = nullptr;
+    std::vector<int64_t> shape;
+    DataType dtype = DT_UNKNOWN;
+    size_t bytes = 0;
+    const uint8_t* data() const { return ptr; }
+    bool valid() const { return ptr != nullptr; }
+    int64_t numel() const {
+        if (shape.empty()) return 0;
+        int64_t n = 1;
+        for (auto d : shape) n *= d;
+        return n;
+    }
+};
+
+struct HostTensorEntry {
+    size_t shard_index = 0;
+    TensorMeta meta{};
+    const uint8_t* tensor_data_start = nullptr;
+    const uint8_t* data_ptr = nullptr;
+};
+
+struct Bnb4BitHostWeightRef {
+    std::string name;
+    HostTensorView packed_weight{};
+    HostTensorView absmax{};
+    HostTensorView quant_map{};
+    HostTensorView nested_absmax{};
+    HostTensorView nested_quant_map{};
+    HostTensorView packed_quant_state{};
+    Bnb4BitQuantState quant_state{};
+
+    bool valid() const {
+        return packed_weight.valid() && absmax.valid() && quant_map.valid() &&
+               (quant_state.shape.size() == 2 || quant_state.shape.size() == 3);
+    }
+    int64_t logical_out_features() const {
+        if (quant_state.shape.size() == 3) return quant_state.shape[0] * quant_state.shape[1];
+        return quant_state.shape.size() > 0 ? quant_state.shape[0] : 0;
+    }
+    int64_t logical_in_features() const {
+        return quant_state.shape.size() > 0 ? quant_state.shape.back() : 0;
+    }
+    int64_t logical_numel() const {
+        int64_t numel = 1;
+        for (int64_t dim : quant_state.shape) numel *= dim;
+        return numel;
+    }
+    int64_t packed_num_bytes() const {
+        return packed_weight.valid() ? static_cast<int64_t>(packed_weight.bytes) : 0;
+    }
+    const uint8_t* packed_ptr() const { return packed_weight.ptr; }
+    const uint8_t* absmax_codes_ptr() const { return absmax.ptr; }
+    const float* absmax_f32_ptr() const { return reinterpret_cast<const float*>(absmax.ptr); }
+    const float* quant_map_ptr() const { return reinterpret_cast<const float*>(quant_map.ptr); }
+    const float* nested_absmax_ptr() const { return reinterpret_cast<const float*>(nested_absmax.ptr); }
+    const float* nested_quant_map_ptr() const { return reinterpret_cast<const float*>(nested_quant_map.ptr); }
 };
 
 struct Bnb4BitWeightRef {
@@ -125,11 +184,30 @@ public:
 
     size_t size() const { return tensors_.size(); }
 
+    bool has_host(const std::string& name) const;
+    HostTensorView host_view(const std::string& name) const;
+    std::vector<std::string> host_names() const;
+    size_t host_size() const;
+
+    Tensor& upload(const std::string& name);
+    Tensor& upload(const std::string& name, Context& ctx);
+
+    void set_context(Context* ctx) { ctx_ = ctx; }
+    Context* context() const { return ctx_; }
+
+    const std::vector<std::unique_ptr<MemoryMappedFile>>& mmaps() const { return mmaps_; }
+    const std::unordered_map<std::string, HostTensorEntry>& host_index() const { return host_index_; }
+
 private:
     std::unordered_map<std::string, Tensor> tensors_;
 
     // 保持 mmap 文件存活 (权重数据来自 mmap, GPU 拷贝后可释放)
     friend ModelWeights LoadSafetensors(const std::string& path, Context& ctx);
+    std::vector<std::unique_ptr<MemoryMappedFile>> mmaps_;
+    std::unordered_map<std::string, HostTensorEntry> host_index_;
+    Context* ctx_ = nullptr;
+
+    friend ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx);
     std::unique_ptr<MemoryMappedFile> mmap_file_;
 };
 
@@ -144,6 +222,19 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx);
 // 1) 优先 model.safetensors
 // 2) 否则使用 model.safetensors.index.json + 分片 safetensors
 ModelWeights LoadModelWeightsFromDir(const std::string& model_dir, Context& ctx);
+
+ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx = nullptr);
+ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context& ctx);
+
+bool parse_bnb_4bit_quant_state_json(const std::string& json_text,
+                                     Bnb4BitQuantState& out,
+                                     std::string* error_message = nullptr);
+
+bool LoadBnb4BitHostRef(const ModelWeights& weights,
+                        const std::string& name,
+                        Bnb4BitHostWeightRef& out,
+                        std::string* error_message = nullptr,
+                        int64_t in_features_hint = 0);
 
 // 从 bitsandbytes 4-bit checkpoint 条目组装运行时视图
 bool LoadBnb4BitWeightRef(Context& ctx,

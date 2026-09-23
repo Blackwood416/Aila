@@ -171,6 +171,9 @@ set(LIB_SOURCES
     src/ops/SamplingOps.cpp
     src/ops/Transpose.cpp
     src/ops/ConvOps.cpp
+    src/ops/GatedDeltaNetOps.cpp
+    src/ops/HyperConnectionOps.cpp
+    src/ops/MoeExpertOps.cpp
     src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp
     src/inference/Model.cpp
@@ -187,6 +190,9 @@ set(LIB_SOURCES
     src/models/Qwen3ForceAlignerBnb4Backend.cpp
     src/models/Qwen3TTSBackend.cpp
     src/models/DiffusionGemmaBnb4Backend.cpp
+    src/models/Qwen4ExpExpertCache.cpp
+    src/models/Qwen4ExpPle.cpp
+    src/models/Qwen4ExpBnb4Backend.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -647,6 +653,59 @@ target_include_directories(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
 )
 target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
     DNNL::dnnl simdjson AilaSyclOptions)
+
+add_executable(AilaQwen4ExpInferRefAdapter
+    tests/inferref/Qwen4ExpInferRefAdapter.cpp
+    src/core/ExecutionTrace.cpp)
+target_compile_definitions(AilaQwen4ExpInferRefAdapter PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQwen4ExpInferRefAdapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpInferRefAdapter PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
+
+add_executable(AilaQwen4ExpModelSpecTests
+    tests/models/Qwen4ExpModelSpecTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpModelSpecTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpModelSpecTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaQwen4ExpModelSpecTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpModelSpecTests COMMAND AilaQwen4ExpModelSpecTests)
+set_tests_properties(AilaQwen4ExpModelSpecTests PROPERTIES LABELS "cpu;modelspec" TIMEOUT 60)
+
+add_executable(AilaQwen4ExpKernelTests
+    tests/ops/Qwen4ExpKernelTests.cpp
+    src/core/ExecutionTrace.cpp
+)
+target_compile_definitions(AilaQwen4ExpKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpKernelTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpKernelTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpKernelTests COMMAND AilaQwen4ExpKernelTests)
+set_tests_properties(AilaQwen4ExpKernelTests PROPERTIES LABELS "gpu;ops;qwen4exp" TIMEOUT 60)
+
+add_executable(AilaQwen4ExpModuleTests
+    tests/models/Qwen4ExpModuleTests.cpp
+    src/core/ExecutionTrace.cpp
+)
+target_compile_definitions(AilaQwen4ExpModuleTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpModuleTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpModuleTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpModuleTests COMMAND AilaQwen4ExpModuleTests)
+set_tests_properties(AilaQwen4ExpModuleTests PROPERTIES LABELS "gpu;models;qwen4_exp" TIMEOUT 120)
 
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp

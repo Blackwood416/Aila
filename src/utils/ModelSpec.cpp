@@ -21,6 +21,15 @@ void set_error(std::string* err, const std::string& msg) {
     if (err) *err = msg;
 }
 
+bool read_int64(simdjson::dom::element root, const char* key, int64_t& out) {
+    simdjson::dom::element v;
+    if (root.at_key(key).get(v) != simdjson::SUCCESS) return false;
+    int64_t x = 0;
+    if (v.get_int64().get(x) != simdjson::SUCCESS) return false;
+    out = x;
+    return true;
+}
+
 bool read_int64(simdjson::dom::element root, const char* key, int& out) {
     simdjson::dom::element v;
     if (root.at_key(key).get(v) != simdjson::SUCCESS) return false;
@@ -297,6 +306,122 @@ void parse_qwen3_asr(simdjson::dom::element root, ModelSpec& spec) {
                 }
             }
         }
+    }
+}
+
+void parse_qwen4exp_text_config(simdjson::dom::element text_cfg_elem, Qwen4ExpTextConfig& cfg) {
+    read_int64(text_cfg_elem, "hidden_size", cfg.hidden_size);
+    read_int64(text_cfg_elem, "num_attention_heads", cfg.num_attention_heads);
+    read_int64(text_cfg_elem, "num_key_value_heads", cfg.num_key_value_heads);
+    read_int64(text_cfg_elem, "head_dim", cfg.head_dim);
+    read_int64(text_cfg_elem, "num_hidden_layers", cfg.num_hidden_layers);
+    read_int64(text_cfg_elem, "intermediate_size", cfg.intermediate_size);
+    read_int64(text_cfg_elem, "vocab_size", cfg.vocab_size);
+    read_int64(text_cfg_elem, "max_position_embeddings", cfg.max_position_embeddings);
+    read_float(text_cfg_elem, "rms_norm_eps", cfg.rms_norm_eps);
+    read_bool(text_cfg_elem, "tie_word_embeddings", cfg.tie_word_embeddings);
+    read_int64(text_cfg_elem, "bos_token_id", cfg.bos_token_id);
+    read_int64(text_cfg_elem, "eos_token_id", cfg.eos_token_id);
+
+    read_int64(text_cfg_elem, "full_attention_interval", cfg.full_attention_interval);
+
+    read_int64(text_cfg_elem, "linear_num_key_heads", cfg.linear_num_key_heads);
+    read_int64(text_cfg_elem, "linear_num_value_heads", cfg.linear_num_value_heads);
+    read_int64(text_cfg_elem, "linear_key_head_dim", cfg.linear_key_head_dim);
+    read_int64(text_cfg_elem, "linear_value_head_dim", cfg.linear_value_head_dim);
+    read_int64(text_cfg_elem, "linear_conv_kernel_dim", cfg.linear_conv_kernel_dim);
+
+    read_int64(text_cfg_elem, "moe_intermediate_size", cfg.moe_intermediate_size);
+    read_int64(text_cfg_elem, "shared_expert_intermediate_size", cfg.shared_expert_intermediate_size);
+    read_int64(text_cfg_elem, "num_experts", cfg.num_experts);
+    read_int64(text_cfg_elem, "num_experts_per_tok", cfg.num_experts_per_tok);
+    read_bool(text_cfg_elem, "norm_topk_prob", cfg.norm_topk_prob);
+    read_float(text_cfg_elem, "router_aux_loss_coef", cfg.router_aux_loss_coef);
+    read_bool(text_cfg_elem, "output_router_logits", cfg.output_router_logits);
+    cfg.output_gate_type = read_string(text_cfg_elem, "output_gate_type", cfg.output_gate_type);
+
+    read_int64(text_cfg_elem, "hc_count", cfg.hc_count);
+    read_int64(text_cfg_elem, "hc_lowrank", cfg.hc_lowrank);
+
+    read_int64_array(text_cfg_elem, "ple_layer_ids", cfg.ple_layer_ids);
+    read_int64(text_cfg_elem, "ple_embed_dim", cfg.ple_embed_dim);
+    read_int64(text_cfg_elem, "ple_conv_kernel_size", cfg.ple_conv_kernel_size);
+    read_int64(text_cfg_elem, "ngram_size", cfg.ngram_size);
+    read_int64(text_cfg_elem, "heads_per_ngram", cfg.heads_per_ngram);
+    {
+        int64_t base = 0;
+        if (read_int64(text_cfg_elem, "ngram_vocab_size_base", base)) {
+            cfg.ngram_vocab_size_base = base;
+        }
+    }
+    read_int64(text_cfg_elem, "make_ngram_vocab_size_divisible_by", cfg.make_ngram_vocab_size_divisible_by);
+    read_int64(text_cfg_elem, "split_ngram_parts", cfg.split_ngram_parts);
+
+    read_int64(text_cfg_elem, "indexer_n_heads", cfg.indexer_n_heads);
+    read_int64(text_cfg_elem, "indexer_kv_heads", cfg.indexer_kv_heads);
+    read_int64(text_cfg_elem, "indexer_head_dim", cfg.indexer_head_dim);
+    read_int64(text_cfg_elem, "indexer_budget", cfg.indexer_budget);
+    read_int64(text_cfg_elem, "indexer_compress_ratio", cfg.indexer_compress_ratio);
+
+    simdjson::dom::element rope_elem;
+    if (text_cfg_elem.at_key("rope_parameters").get(rope_elem) == simdjson::SUCCESS) {
+        read_float(rope_elem, "rope_theta", cfg.rope.rope_theta);
+        read_float(rope_elem, "partial_rotary_factor", cfg.rope.partial_rotary_factor);
+        read_bool(rope_elem, "mrope_interleaved", cfg.rope.mrope_interleaved);
+        simdjson::dom::element section_elem;
+        if (rope_elem.at_key("mrope_section").get(section_elem) == simdjson::SUCCESS) {
+            auto arr = section_elem.get_array();
+            size_t idx = 0;
+            for (auto x : arr) {
+                if (idx >= cfg.rope.mrope_section.size()) break;
+                int64_t v = 0;
+                if (x.get_int64().get(v) == simdjson::SUCCESS) {
+                    cfg.rope.mrope_section[idx++] = static_cast<int>(v);
+                }
+            }
+        }
+    }
+
+    simdjson::dom::element layer_types_elem;
+    if (text_cfg_elem.at_key("layer_types").get(layer_types_elem) == simdjson::SUCCESS) {
+        cfg.layer_types.clear();
+        for (auto x : layer_types_elem.get_array()) {
+            std::string_view sv;
+            if (x.get_string().get(sv) == simdjson::SUCCESS) {
+                cfg.layer_types.emplace_back(sv);
+            }
+        }
+    }
+}
+
+void parse_qwen4exp(simdjson::dom::element root, ModelSpec& spec) {
+    spec.family = ModelFamily::Qwen4Exp;
+    auto& cfg = spec.qwen4exp_text;
+    auto& vis = spec.vision;
+
+    read_int64(root, "image_token_id", vis.image_token_id);
+    read_int64(root, "video_token_id", vis.video_token_id);
+    read_int64(root, "vision_start_token_id", vis.vision_start_token_id);
+    read_int64(root, "vision_end_token_id", vis.vision_end_token_id);
+
+    simdjson::dom::element text_cfg_elem;
+    if (root.at_key("text_config").get(text_cfg_elem) == simdjson::SUCCESS) {
+        parse_qwen4exp_text_config(text_cfg_elem, cfg);
+    } else {
+        parse_qwen4exp_text_config(root, cfg);
+    }
+
+    simdjson::dom::element vis_cfg_elem;
+    if (root.at_key("vision_config").get(vis_cfg_elem) == simdjson::SUCCESS) {
+        vis.enabled = true;
+        read_int64(vis_cfg_elem, "depth", vis.depth);
+        read_int64(vis_cfg_elem, "hidden_size", vis.hidden_size);
+        read_int64(vis_cfg_elem, "out_hidden_size", vis.out_hidden_size);
+        read_int64(vis_cfg_elem, "intermediate_size", vis.intermediate_size);
+        read_int64(vis_cfg_elem, "num_heads", vis.num_heads);
+        read_int64(vis_cfg_elem, "patch_size", vis.patch_size);
+        read_int64(vis_cfg_elem, "temporal_patch_size", vis.temporal_patch_size);
+        read_int64(vis_cfg_elem, "spatial_merge_size", vis.spatial_merge_size);
     }
 }
 
@@ -705,6 +830,8 @@ bool load_from_dir(const std::string& model_dir,
             parse_qwen3_asr(root, spec);
         } else if (spec.model_type == "qwen3_tts") {
             parse_qwen3_tts(root, spec);
+        } else if (spec.model_type == "qwen4_exp" || spec.model_type == "qwen4_exp_text") {
+            parse_qwen4exp(root, spec);
         } else if (spec.model_type == "qwen3_5" || spec.model_type == "qwen3_5_text") {
             parse_qwen35(root, spec);
         } else if (spec.model_type == "diffusion_gemma") {

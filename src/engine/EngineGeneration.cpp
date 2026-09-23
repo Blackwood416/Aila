@@ -61,7 +61,7 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
         if (!backend_ || !ctx_ || len <= 0) return nullptr;
 
         int chunk_size = len;
-        if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
+        if (model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) {
             int configured = aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 512);
             if (configured > 0) {
                 chunk_size = std::max(1, std::min(configured, len));
@@ -190,6 +190,7 @@ aila::chat::ChatFormatInput InferenceEngine::make_chat_format_input(const aila::
 std::string InferenceEngine::current_model_family_name() const {
         switch (model_spec_.family) {
         case ModelFamily::Yolo26: return "yolo26";
+        case ModelFamily::Qwen4Exp: return "qwen4_exp";
         case ModelFamily::Qwen35Hybrid: return "qwen3_5_hybrid";
         case ModelFamily::Qwen3Dense: return "qwen3";
         default: return "unknown";
@@ -527,12 +528,12 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                    text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
         };
         bool restore_open_think_prefix =
-            model_spec_.family == ModelFamily::Qwen35Hybrid &&
+            (model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) &&
             (rendered_ends_with(rendered.text, "<think>\n") ||
              rendered_ends_with(rendered.text, "<think>\r\n") ||
              rendered_ends_with(rendered.text, "<think>"));
         int recurrent_prefill_anchor = 0;
-        if (model_spec_.family == ModelFamily::Qwen35Hybrid &&
+        if ((model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) &&
             total_vision_tokens == 0 && total_audio_tokens == 0) {
             std::string stable_err;
             aila::chat::ChatFormatTextResult stable_rendered;
@@ -854,7 +855,7 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
 
         auto t_start = std::chrono::high_resolution_clock::now();
         Tensor* logits_ptr = nullptr;
-        bool tokenwise_prefill = (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
+        bool tokenwise_prefill = (model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) &&
                                  aila::env::read_flag("AILA_Q35_PREFILL_TOKENWISE", false);
         if (!tokenwise_prefill) {
             int snapshot_after_len =

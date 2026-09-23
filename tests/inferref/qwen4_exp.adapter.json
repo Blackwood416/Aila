@@ -1,0 +1,23 @@
+{
+  "format": "inferref-engine-adapter",
+  "format_version": "0.2",
+  "name": "aila-qwen4-exp-adapter",
+  "target_device": "xpu",
+  "capabilities": {
+    "device_types": ["xpu"],
+    "dtypes": ["uint8", "bfloat16", "float32"],
+    "max_rank": 3,
+    "features": []
+  },
+  "command": [
+    "pwsh",
+    "-NoProfile",
+    "-File",
+    "{adapter_dir}/run_qwen4_exp_adapter.ps1",
+    "{testcase}",
+    "{output}"
+  ],
+  "cwd": ".",
+  "timeout_seconds": 60,
+  "max_output_chars": 65536
+}

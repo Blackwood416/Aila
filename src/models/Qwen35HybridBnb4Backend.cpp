@@ -4,6 +4,7 @@
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include "memory/SessionMemory.hpp"
+#include "ops/GatedDeltaNetOps.hpp"
 #include <array>
 #include <algorithm>
 #include <cstdio>
@@ -46,70 +47,16 @@ bool supports_jm_bf16_f32(const sycl::device& dev, int m, int n, int k) {
     return false;
 }
 
-bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,
-                                        int head_k_dim, int head_v_dim,
-                                        int kernel, int conv_rows,
-                                        bool allow_grouped_fastpath = false) {
-    return q_heads > 0 &&
-           kv_heads > 0 &&
-           (kv_heads % q_heads) == 0 &&
-           (allow_grouped_fastpath || q_heads == kv_heads) &&
-           head_k_dim == head_v_dim &&
-           head_k_dim == 128 &&
-           kernel == 4 &&
-           conv_rows == 3;
-}
-
-bool supports_default_grouped_linear_delta_fastpath(int q_heads, int kv_heads,
-                                                    int head_k_dim, int head_v_dim,
-                                                    int kernel, int conv_rows) {
-    return kv_heads > q_heads &&
-           supports_linear_delta_gqa_fastpath(q_heads, kv_heads,
-                                              head_k_dim, head_v_dim,
-                                              kernel, conv_rows,
-                                              true);
-}
-
-// Grouped value heads run in separate work-groups but share Q/K history.
-// Keep that history read-only during their computation, then commit the final
-// input rows on the in-order queue after every reader has finished.
-void commit_linear_conv_history(Context& ctx, const bf16* input, int input_stride,
-                                float* history, int channels, int history_rows,
-                                int initial_head, int token_count) {
-    const int rows_to_copy = std::min(token_count, history_rows);
-    const int first_token = token_count - rows_to_copy;
-    ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(rows_to_copy) * channels),
-        [=](sycl::id<1> index) {
-            const size_t channel = index[0] % static_cast<size_t>(channels);
-            const int token = first_token + static_cast<int>(index[0] / channels);
-            const int row = (initial_head + token % history_rows) % history_rows;
-            history[static_cast<size_t>(row) * channels + channel] =
-                static_cast<float>(input[static_cast<size_t>(token) * input_stride + channel]);
-        });
-}
-
-int linear_delta_gqa_group_size(int q_heads, int kv_heads) {
-    if (q_heads <= 0 || kv_heads <= 0 || (kv_heads % q_heads) != 0) {
-        return 0;
-    }
-    return kv_heads / q_heads;
-}
-
-int linear_delta_key_head_for_value_head(int value_head, int q_heads, int kv_heads) {
-    int group_size = linear_delta_gqa_group_size(q_heads, kv_heads);
-    if (group_size <= 0) {
-        return std::clamp(value_head, 0, std::max(0, q_heads - 1));
-    }
-    return std::min(value_head / group_size, q_heads - 1);
-}
-
-bool linear_delta_is_group_leader(int value_head, int q_heads, int kv_heads) {
-    int group_size = linear_delta_gqa_group_size(q_heads, kv_heads);
-    if (group_size <= 0) {
-        return value_head < q_heads;
-    }
-    return (value_head % group_size) == 0;
-}
+using ops::supports_linear_delta_gqa_fastpath;
+using ops::supports_default_grouped_linear_delta_fastpath;
+using ops::commit_linear_conv_history;
+using ops::linear_delta_gqa_group_size;
+using ops::linear_delta_key_head_for_value_head;
+using ops::linear_delta_is_group_leader;
+using ops::GateActivation;
+using ops::DeltaNetGeometry;
+using ops::DeltaNetWeights;
+using ops::DeltaNetState;
 }
 
 struct Qwen35HybridBnb4Backend::ProfileState {
@@ -1202,598 +1149,63 @@ void Qwen35HybridBnb4Backend::run_linear_delta_decode_gpu(Context& ctx, Layer& l
                                                           Tensor& qkv_src, Tensor& z_src,
                                                           Tensor& a_src, Tensor& b_src,
                                                           Tensor& out_dst) {
-    const int qkv_dim = linear_qkv_dim_;
-    const int z_dim = linear_z_dim_;
-    const int q_dim = linear_q_dim_;
-    const int kv_dim = linear_kv_dim_;
-    const int num_heads = linear_kv_heads_;
-    const int q_heads = std::max(1, linear_q_heads_);
-    const int head_k_dim = linear_head_dim_;
-    const int head_v_dim = cfg_.linear_value_head_dim;
-    const int kernel = linear_conv_kernel_dim_;
-    const int conv_rows = std::max(0, kernel - 1);
-    const int conv_head = (conv_rows > 0) ? (cache.linear_conv_head % conv_rows) : 0;
-    const float eps = cfg_.rms_norm_eps;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
-    constexpr int wg = 256;
+    DeltaNetGeometry geom = DeltaNetGeometry::create(
+        linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_, cfg_.rms_norm_eps, GateActivation::Silu);
+    DeltaNetWeights weights;
+    weights.conv_weight = static_cast<const bf16*>(layer.linear_conv1d_weight->data());
+    weights.norm_weight = static_cast<const float*>(layer.linear_norm_weight->data());
+    weights.a_log = static_cast<const float*>(layer.linear_A_log->data());
+    weights.dt_bias = static_cast<const bf16*>(layer.linear_dt_bias->data());
 
-    bf16* qkv_ptr = static_cast<bf16*>(qkv_src.data());
-    bf16* z_ptr = static_cast<bf16*>(z_src.data());
-    bf16* a_ptr = static_cast<bf16*>(a_src.data());
-    bf16* b_ptr = static_cast<bf16*>(b_src.data());
-    bf16* out_ptr = static_cast<bf16*>(out_dst.data());
-    float* state_ptr = static_cast<float*>(cache.linear_state.data());
-    float* conv_state_ptr = cache.linear_conv_state.valid()
+    DeltaNetState state;
+    state.state = static_cast<float*>(cache.linear_state.data());
+    state.conv_state = cache.linear_conv_state.valid()
         ? static_cast<float*>(cache.linear_conv_state.data())
         : nullptr;
-    bf16* conv_w_ptr = static_cast<bf16*>(layer.linear_conv1d_weight->data());
-    float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
-    float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
-    bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
-    static const bool s_gqa_fastpath_cached = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
-    bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
-    bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
-        q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
-    bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
+    state.conv_head = cache.linear_conv_head;
+    state.device_state_dirty = cache.device_state_dirty;
 
-    if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
-                                           allow_grouped_fastpath)) {
-        constexpr int head_dim = 128;
-        constexpr int head_wg = 128;
-        const bool grouped_heads = num_heads > q_heads;
-        const int row0 = conv_head;
-        const int row1 = (conv_head + 1) % conv_rows;
-        const int row2 = (conv_head + 2) % conv_rows;
-        ctx.queue().submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> head_params(sycl::range<1>(2), cgh);
+    ops::run_linear_delta_decode_gpu(
+        ctx, geom, weights, state,
+        static_cast<const bf16*>(qkv_src.data()),
+        static_cast<const bf16*>(z_src.data()),
+        static_cast<const bf16*>(a_src.data()),
+        static_cast<const bf16*>(b_src.data()),
+        static_cast<bf16*>(out_dst.data()));
 
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
-                [=](sycl::nd_item<1> item) {
-                    auto softplus_dev = [](float x) {
-                        if (x > 20.0f) return x;
-                        if (x < -20.0f) return sycl::native::exp(x);
-                        return sycl::log1p(sycl::native::exp(x));
-                    };
-                    auto silu_dev = [](float x) {
-                        return x / (1.0f + sycl::native::exp(-x));
-                    };
-
-                    int hv = static_cast<int>(item.get_group(0));
-                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
-                    bool write_shared_qk = linear_delta_is_group_leader(hv, q_heads, num_heads);
-                    int lid = static_cast<int>(item.get_local_id(0));
-                    int q_base = hk * head_dim;
-                    int k_base = q_dim + hk * head_dim;
-                    int v_base = q_dim + q_dim + hv * head_dim;
-                    int z_base = hv * head_dim;
-                    float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
-                    float v_reg = 0.0f;
-                    float z_reg = 0.0f;
-
-                    if (lid < head_dim) {
-                        auto conv_channel = [&](int channel) {
-                            const size_t state0 = static_cast<size_t>(row0) * qkv_dim + channel;
-                            const size_t state1 = static_cast<size_t>(row1) * qkv_dim + channel;
-                            const size_t state2 = static_cast<size_t>(row2) * qkv_dim + channel;
-                            bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
-                            float v = conv_state_ptr[state0] * static_cast<float>(w[0]) +
-                                      conv_state_ptr[state1] * static_cast<float>(w[1]) +
-                                      conv_state_ptr[state2] * static_cast<float>(w[2]) +
-                                      static_cast<float>(qkv_ptr[channel]) * static_cast<float>(w[3]);
-                            return silu_dev(v);
-                        };
-
-                        q_local[lid] = conv_channel(q_base + lid);
-                        k_local[lid] = conv_channel(k_base + lid);
-                        v_reg = conv_channel(v_base + lid);
-                        z_reg = static_cast<float>(z_ptr[z_base + lid]);
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    if (!grouped_heads && lid < head_dim) {
-                        size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
-                        if (write_shared_qk) {
-                            conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
-                            conv_state_ptr[dst + k_base + lid] = static_cast<float>(qkv_ptr[k_base + lid]);
-                        }
-                        conv_state_ptr[dst + v_base + lid] = static_cast<float>(qkv_ptr[v_base + lid]);
-                    }
-
-                    float q_sq = (lid < head_dim) ? (q_local[lid] * q_local[lid]) : 0.0f;
-                    float k_sq = (lid < head_dim) ? (k_local[lid] * k_local[lid]) : 0.0f;
-                    q_sq = sycl::reduce_over_group(item.get_group(), q_sq, sycl::plus<float>());
-                    k_sq = sycl::reduce_over_group(item.get_group(), k_sq, sycl::plus<float>());
-                    float q_scale = 1.0f / sycl::sqrt(q_sq + eps);
-                    float k_scale = 1.0f / sycl::sqrt(k_sq + eps);
-
-                    if (lid < head_dim) {
-                        q_local[lid] *= q_scale;
-                        k_local[lid] *= k_scale;
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    if (lid == 0) {
-                        float beta = 1.0f / (1.0f + sycl::native::exp(-static_cast<float>(b_ptr[hv])));
-                        float alpha = static_cast<float>(a_ptr[hv]);
-                        float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
-                                    * (-sycl::native::exp(a_log_ptr[hv]));
-                        head_params[0] = beta;
-                        head_params[1] = sycl::native::exp(g_pre);
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    float beta = head_params[0];
-                    float decay = head_params[1];
-
-                    if (lid < head_dim) {
-                        const int dv = lid;
-                        float acc = 0.0f;
-                        for (int j = 0; j < head_dim; j += 8) {
-                            const size_t b = static_cast<size_t>(j) * head_dim + dv;
-                            float sv0 = S[b + 0 * head_dim] * decay;
-                            float sv1 = S[b + 1 * head_dim] * decay;
-                            float sv2 = S[b + 2 * head_dim] * decay;
-                            float sv3 = S[b + 3 * head_dim] * decay;
-                            float sv4 = S[b + 4 * head_dim] * decay;
-                            float sv5 = S[b + 5 * head_dim] * decay;
-                            float sv6 = S[b + 6 * head_dim] * decay;
-                            float sv7 = S[b + 7 * head_dim] * decay;
-                            S[b + 0 * head_dim] = sv0;
-                            S[b + 1 * head_dim] = sv1;
-                            S[b + 2 * head_dim] = sv2;
-                            S[b + 3 * head_dim] = sv3;
-                            S[b + 4 * head_dim] = sv4;
-                            S[b + 5 * head_dim] = sv5;
-                            S[b + 6 * head_dim] = sv6;
-                            S[b + 7 * head_dim] = sv7;
-                            acc += sv0 * k_local[j + 0] + sv1 * k_local[j + 1] +
-                                   sv2 * k_local[j + 2] + sv3 * k_local[j + 3] +
-                                   sv4 * k_local[j + 4] + sv5 * k_local[j + 5] +
-                                   sv6 * k_local[j + 6] + sv7 * k_local[j + 7];
-                        }
-
-                        float dval = (v_reg - acc) * beta;
-                        float out = 0.0f;
-                        for (int j = 0; j < head_dim; j += 8) {
-                            const size_t b = static_cast<size_t>(j) * head_dim + dv;
-                            float sv0 = S[b + 0 * head_dim] + k_local[j + 0] * dval;
-                            float sv1 = S[b + 1 * head_dim] + k_local[j + 1] * dval;
-                            float sv2 = S[b + 2 * head_dim] + k_local[j + 2] * dval;
-                            float sv3 = S[b + 3 * head_dim] + k_local[j + 3] * dval;
-                            float sv4 = S[b + 4 * head_dim] + k_local[j + 4] * dval;
-                            float sv5 = S[b + 5 * head_dim] + k_local[j + 5] * dval;
-                            float sv6 = S[b + 6 * head_dim] + k_local[j + 6] * dval;
-                            float sv7 = S[b + 7 * head_dim] + k_local[j + 7] * dval;
-                            S[b + 0 * head_dim] = sv0;
-                            S[b + 1 * head_dim] = sv1;
-                            S[b + 2 * head_dim] = sv2;
-                            S[b + 3 * head_dim] = sv3;
-                            S[b + 4 * head_dim] = sv4;
-                            S[b + 5 * head_dim] = sv5;
-                            S[b + 6 * head_dim] = sv6;
-                            S[b + 7 * head_dim] = sv7;
-                            out += sv0 * q_local[j + 0] + sv1 * q_local[j + 1] +
-                                   sv2 * q_local[j + 2] + sv3 * q_local[j + 3] +
-                                   sv4 * q_local[j + 4] + sv5 * q_local[j + 5] +
-                                   sv6 * q_local[j + 6] + sv7 * q_local[j + 7];
-                        }
-                        out_local[dv] = out * scale;
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-
-                    float out_sq = (lid < head_dim) ? (out_local[lid] * out_local[lid]) : 0.0f;
-                    out_sq = sycl::reduce_over_group(item.get_group(), out_sq, sycl::plus<float>());
-                    float out_scale = 1.0f / sycl::sqrt(out_sq / static_cast<float>(head_dim) + eps);
-
-                    if (lid < head_dim) {
-                        float n = out_local[lid] * out_scale * norm_w_ptr[lid];
-                        out_ptr[hv * head_dim + lid] = bf16(n * silu_dev(z_reg));
-                    }
-                });
-        });
-        if (grouped_heads) {
-            commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
-                                       qkv_dim, conv_rows, conv_head, 1);
-        }
-        cache.device_state_dirty = true;
-        if (conv_rows > 0) {
-            cache.linear_conv_head = (conv_head + 1) % conv_rows;
-        }
-        return;
-    }
-
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> q_local(sycl::range<1>(q_dim), cgh);
-        sycl::local_accessor<float, 1> k_local(sycl::range<1>(q_dim), cgh);
-        sycl::local_accessor<float, 1> v_local(sycl::range<1>(kv_dim), cgh);
-        sycl::local_accessor<float, 1> z_local(sycl::range<1>(z_dim), cgh);
-        sycl::local_accessor<float, 1> out_local(sycl::range<1>(kv_dim), cgh);
-        sycl::local_accessor<float, 1> q_scale_local(sycl::range<1>(q_heads), cgh);
-        sycl::local_accessor<float, 1> k_scale_local(sycl::range<1>(q_heads), cgh);
-        sycl::local_accessor<float, 1> out_scale_local(sycl::range<1>(num_heads), cgh);
-
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(wg), sycl::range<1>(wg)),
-            [=](sycl::nd_item<1> item) {
-                auto softplus_dev = [](float x) {
-                    if (x > 20.0f) return x;
-                    if (x < -20.0f) return sycl::exp(x);
-                    return sycl::log1p(sycl::exp(x));
-                };
-                auto silu_dev = [](float x) {
-                    return x / (1.0f + sycl::exp(-x));
-                };
-
-                int lid = static_cast<int>(item.get_local_id(0));
-
-                for (int i = lid; i < z_dim; i += wg) {
-                    z_local[i] = static_cast<float>(z_ptr[i]);
-                }
-
-                for (int c = lid; c < qkv_dim; c += wg) {
-                    float v = 0.0f;
-                    bf16* w = conv_w_ptr + static_cast<size_t>(c) * kernel;
-                    if (conv_rows > 0 && conv_state_ptr) {
-                        for (int j = 0; j < kernel - 1; ++j) {
-                            int row = (conv_head + j) % conv_rows;
-                            v += conv_state_ptr[static_cast<size_t>(row) * qkv_dim + c]
-                                * static_cast<float>(w[j]);
-                        }
-                    }
-                    v += static_cast<float>(qkv_ptr[c]) * static_cast<float>(w[kernel - 1]);
-                    float y = silu_dev(v);
-                    if (c < q_dim) {
-                        q_local[c] = y;
-                    } else if (c < q_dim + q_dim) {
-                        k_local[c - q_dim] = y;
-                    } else {
-                        v_local[c - q_dim - q_dim] = y;
-                    }
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                if (conv_rows > 0 && conv_state_ptr) {
-                    size_t dst_base = static_cast<size_t>(conv_head) * qkv_dim;
-                    for (int idx = lid; idx < qkv_dim; idx += wg) {
-                        conv_state_ptr[dst_base + idx] = static_cast<float>(qkv_ptr[idx]);
-                    }
-                }
-
-                for (int h = lid; h < q_heads; h += wg) {
-                    float q_sum = 0.0f;
-                    float k_sum = 0.0f;
-                    int base = h * head_k_dim;
-                    for (int d = 0; d < head_k_dim; ++d) {
-                        float qv = q_local[base + d];
-                        float kv = k_local[base + d];
-                        q_sum += qv * qv;
-                        k_sum += kv * kv;
-                    }
-                    q_scale_local[h] = 1.0f / sycl::sqrt(q_sum + eps);
-                    k_scale_local[h] = 1.0f / sycl::sqrt(k_sum + eps);
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int idx = lid; idx < q_dim; idx += wg) {
-                    int h = idx / head_k_dim;
-                    q_local[idx] *= q_scale_local[h];
-                    k_local[idx] *= k_scale_local[h];
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int idx = lid; idx < kv_dim; idx += wg) {
-                    int hv = idx / head_v_dim;
-                    int dv = idx % head_v_dim;
-                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
-                    float* S = state_ptr + static_cast<size_t>(hv) * head_k_dim * head_v_dim;
-
-                    float beta = 1.0f / (1.0f + sycl::exp(-static_cast<float>(b_ptr[hv])));
-                    float alpha = static_cast<float>(a_ptr[hv]);
-                    float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
-                                * (-sycl::exp(a_log_ptr[hv]));
-                    float decay = sycl::exp(g_pre);
-
-                    float acc = 0.0f;
-                    for (int j = 0; j < head_k_dim; ++j) {
-                        size_t off = static_cast<size_t>(j) * head_v_dim + dv;
-                        float sv = S[off] * decay;
-                        S[off] = sv;
-                        acc += sv * k_local[hk * head_k_dim + j];
-                    }
-
-                    float d = (v_local[idx] - acc) * beta;
-                    float out = 0.0f;
-                    for (int j = 0; j < head_k_dim; ++j) {
-                        size_t off = static_cast<size_t>(j) * head_v_dim + dv;
-                        float sv = S[off] + k_local[hk * head_k_dim + j] * d;
-                        S[off] = sv;
-                        out += sv * q_local[hk * head_k_dim + j];
-                    }
-                    out_local[idx] = out * scale;
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int h = lid; h < num_heads; h += wg) {
-                    float sum_sq = 0.0f;
-                    int base = h * head_v_dim;
-                    for (int d = 0; d < head_v_dim; ++d) {
-                        float v = out_local[base + d];
-                        sum_sq += v * v;
-                    }
-                    out_scale_local[h] = 1.0f / sycl::sqrt(
-                        sum_sq / static_cast<float>(head_v_dim) + eps);
-                }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int idx = lid; idx < kv_dim; idx += wg) {
-                    int hv = idx / head_v_dim;
-                    int dv = idx % head_v_dim;
-                    float n = out_local[idx] * out_scale_local[hv] * norm_w_ptr[dv];
-                    float zg = z_local[idx];
-                    out_ptr[idx] = bf16(n * silu_dev(zg));
-                }
-            });
-    });
-
-    cache.device_state_dirty = true;
-    if (conv_rows > 0) {
-        cache.linear_conv_head = (conv_head + 1) % conv_rows;
-    }
+    cache.linear_conv_head = state.conv_head;
+    cache.device_state_dirty = state.device_state_dirty;
 }
 
 void Qwen35HybridBnb4Backend::run_linear_delta_prefill_gpu_batched(
     Context& ctx, Layer& layer, LayerCache& cache,
     Tensor& fused_all, Tensor& out_dst, int seq_len) {
+    DeltaNetGeometry geom = DeltaNetGeometry::create(
+        linear_q_heads_, linear_kv_heads_, linear_head_dim_, cfg_.linear_value_head_dim,
+        linear_conv_kernel_dim_, cfg_.rms_norm_eps, GateActivation::Silu);
+    DeltaNetWeights weights;
+    weights.conv_weight = static_cast<const bf16*>(layer.linear_conv1d_weight->data());
+    weights.norm_weight = static_cast<const float*>(layer.linear_norm_weight->data());
+    weights.a_log = static_cast<const float*>(layer.linear_A_log->data());
+    weights.dt_bias = static_cast<const bf16*>(layer.linear_dt_bias->data());
 
-    const int qkv_dim = linear_qkv_dim_;
-    const int z_dim = linear_z_dim_;
-    const int q_dim = linear_q_dim_;
-    const int kv_dim = linear_kv_dim_;
-    const int num_heads = linear_kv_heads_;
-    const int q_heads = std::max(1, linear_q_heads_);
-    const int head_k_dim = linear_head_dim_;
-    const int head_v_dim = cfg_.linear_value_head_dim;
-    const int kernel = linear_conv_kernel_dim_;
-    const int conv_rows = std::max(0, kernel - 1);
-    int conv_head = (conv_rows > 0) ? (cache.linear_conv_head % conv_rows) : 0;
-    const float eps = cfg_.rms_norm_eps;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_k_dim));
-    const int all_dim = linear_all_dim_;
-
-    bf16* fused_ptr = static_cast<bf16*>(fused_all.data());
-    bf16* out_ptr = static_cast<bf16*>(out_dst.data());
-    float* state_ptr = static_cast<float*>(cache.linear_state.data());
-    float* conv_state_ptr = cache.linear_conv_state.valid()
+    DeltaNetState state;
+    state.state = static_cast<float*>(cache.linear_state.data());
+    state.conv_state = cache.linear_conv_state.valid()
         ? static_cast<float*>(cache.linear_conv_state.data())
         : nullptr;
-    bf16* conv_w_ptr = static_cast<bf16*>(layer.linear_conv1d_weight->data());
-    float* norm_w_ptr = static_cast<float*>(layer.linear_norm_weight->data());
-    float* a_log_ptr = static_cast<float*>(layer.linear_A_log->data());
-    bf16* dt_bias_ptr = static_cast<bf16*>(layer.linear_dt_bias->data());
-    static const bool s_gqa_fastpath_cached = aila::env::read_flag("AILA_Q35_EXPERIMENTAL_GQA_FASTPATH", false);
-    bool experimental_gqa_fastpath = s_gqa_fastpath_cached;
-    bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
-        q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
-    bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
+    state.conv_head = cache.linear_conv_head;
+    state.device_state_dirty = cache.device_state_dirty;
 
-    if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
-                                           allow_grouped_fastpath)) {
-        constexpr int head_dim = 128;
-        constexpr int head_wg = 128;
-        const bool grouped_heads = num_heads > q_heads;
+    ops::run_linear_delta_prefill_gpu_batched(
+        ctx, geom, weights, state,
+        static_cast<const bf16*>(fused_all.data()),
+        static_cast<bf16*>(out_dst.data()),
+        seq_len);
 
-        ctx.queue().submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
-            sycl::local_accessor<float, 1> head_params(sycl::range<1>(2), cgh);
-
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
-                [=](sycl::nd_item<1> item) {
-                    auto softplus_dev = [](float x) {
-                        if (x > 20.0f) return x;
-                        if (x < -20.0f) return sycl::native::exp(x);
-                        return sycl::log1p(sycl::native::exp(x));
-                    };
-                    auto silu_dev = [](float x) {
-                        return x / (1.0f + sycl::native::exp(-x));
-                    };
-
-                    int hv = static_cast<int>(item.get_group(0));
-                    int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
-                    bool write_shared_qk = linear_delta_is_group_leader(hv, q_heads, num_heads);
-                    int lid = static_cast<int>(item.get_local_id(0));
-                    int q_base = hk * head_dim;
-                    int k_base = q_dim + hk * head_dim;
-                    int v_base = q_dim + q_dim + hv * head_dim;
-                    int z_base_offset = qkv_dim + hv * head_dim;
-                    int a_offset = qkv_dim + z_dim;
-                    int b_offset = qkv_dim + z_dim + num_heads;
-                    float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
-
-                    int local_conv_head = conv_head;
-
-                    for (int t = 0; t < seq_len; ++t) {
-                        bf16* row = fused_ptr + static_cast<size_t>(t) * all_dim;
-                        bf16* out_row = out_ptr + static_cast<size_t>(t) * kv_dim;
-
-                        float v_reg = 0.0f;
-                        float z_reg = 0.0f;
-
-                        const int row0 = local_conv_head;
-                        const int row1 = (local_conv_head + 1) % conv_rows;
-                        const int row2 = (local_conv_head + 2) % conv_rows;
-
-                        if (lid < head_dim) {
-                            auto conv_channel = [&](int channel) {
-                                if (grouped_heads) {
-                                    // Previous rows in this prefill are already
-                                    // available in the immutable projection input.
-                                    // Only negative positions use the initial ring;
-                                    // no work-group updates it until this kernel ends.
-                                    auto history_value = [&](int offset) {
-                                        const int prior_token = t - conv_rows + offset;
-                                        if (prior_token >= 0) {
-                                            return static_cast<float>(fused_ptr[
-                                                static_cast<size_t>(prior_token) * all_dim + channel]);
-                                        }
-                                        const int history_row =
-                                            (conv_head + prior_token + conv_rows) % conv_rows;
-                                        return conv_state_ptr[
-                                            static_cast<size_t>(history_row) * qkv_dim + channel];
-                                    };
-                                    bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
-                                    const float v = history_value(0) * static_cast<float>(w[0]) +
-                                                    history_value(1) * static_cast<float>(w[1]) +
-                                                    history_value(2) * static_cast<float>(w[2]) +
-                                                    static_cast<float>(row[channel]) * static_cast<float>(w[3]);
-                                    return silu_dev(v);
-                                }
-                                const size_t state0 = static_cast<size_t>(row0) * qkv_dim + channel;
-                                const size_t state1 = static_cast<size_t>(row1) * qkv_dim + channel;
-                                const size_t state2 = static_cast<size_t>(row2) * qkv_dim + channel;
-                                bf16* w = conv_w_ptr + static_cast<size_t>(channel) * kernel;
-                                float v = conv_state_ptr[state0] * static_cast<float>(w[0]) +
-                                          conv_state_ptr[state1] * static_cast<float>(w[1]) +
-                                          conv_state_ptr[state2] * static_cast<float>(w[2]) +
-                                          static_cast<float>(row[channel]) * static_cast<float>(w[3]);
-                                return silu_dev(v);
-                            };
-
-                            q_local[lid] = conv_channel(q_base + lid);
-                            k_local[lid] = conv_channel(k_base + lid);
-                            v_reg = conv_channel(v_base + lid);
-                            z_reg = static_cast<float>(row[z_base_offset + lid]);
-                        }
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        if (!grouped_heads && lid < head_dim) {
-                            size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
-                            if (write_shared_qk) {
-                                conv_state_ptr[dst + q_base + lid] = static_cast<float>(row[q_base + lid]);
-                                conv_state_ptr[dst + k_base + lid] = static_cast<float>(row[k_base + lid]);
-                            }
-                            conv_state_ptr[dst + v_base + lid] = static_cast<float>(row[v_base + lid]);
-                        }
-
-                        float q_sq = (lid < head_dim) ? (q_local[lid] * q_local[lid]) : 0.0f;
-                        float k_sq = (lid < head_dim) ? (k_local[lid] * k_local[lid]) : 0.0f;
-                        q_sq = sycl::reduce_over_group(item.get_group(), q_sq, sycl::plus<float>());
-                        k_sq = sycl::reduce_over_group(item.get_group(), k_sq, sycl::plus<float>());
-                        float q_scale = 1.0f / sycl::sqrt(q_sq + eps);
-                        float k_scale = 1.0f / sycl::sqrt(k_sq + eps);
-
-                        if (lid < head_dim) {
-                            q_local[lid] *= q_scale;
-                            k_local[lid] *= k_scale;
-                        }
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        if (lid == 0) {
-                            float beta = 1.0f / (1.0f + sycl::native::exp(-static_cast<float>(row[b_offset + hv])));
-                            float alpha = static_cast<float>(row[a_offset + hv]);
-                            float g_pre = softplus_dev(alpha + static_cast<float>(dt_bias_ptr[hv]))
-                                        * (-sycl::native::exp(a_log_ptr[hv]));
-                            head_params[0] = beta;
-                            head_params[1] = sycl::native::exp(g_pre);
-                        }
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        float beta = head_params[0];
-                        float decay = head_params[1];
-
-                        if (lid < head_dim) {
-                            const int dv = lid;
-                            float acc = 0.0f;
-                            for (int j = 0; j < head_dim; j += 4) {
-                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                                float sv0 = S[off0] * decay;
-                                float sv1 = S[off1] * decay;
-                                float sv2 = S[off2] * decay;
-                                float sv3 = S[off3] * decay;
-                                S[off0] = sv0;
-                                S[off1] = sv1;
-                                S[off2] = sv2;
-                                S[off3] = sv3;
-                                acc += sv0 * k_local[j + 0] +
-                                       sv1 * k_local[j + 1] +
-                                       sv2 * k_local[j + 2] +
-                                       sv3 * k_local[j + 3];
-                            }
-
-                            float dval = (v_reg - acc) * beta;
-                            float out = 0.0f;
-                            for (int j = 0; j < head_dim; j += 4) {
-                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                                float sv0 = S[off0] + k_local[j + 0] * dval;
-                                float sv1 = S[off1] + k_local[j + 1] * dval;
-                                float sv2 = S[off2] + k_local[j + 2] * dval;
-                                float sv3 = S[off3] + k_local[j + 3] * dval;
-                                S[off0] = sv0;
-                                S[off1] = sv1;
-                                S[off2] = sv2;
-                                S[off3] = sv3;
-                                out += sv0 * q_local[j + 0] +
-                                       sv1 * q_local[j + 1] +
-                                       sv2 * q_local[j + 2] +
-                                       sv3 * q_local[j + 3];
-                            }
-                            out_local[dv] = out * scale;
-                        }
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        float out_sq = (lid < head_dim) ? (out_local[lid] * out_local[lid]) : 0.0f;
-                        out_sq = sycl::reduce_over_group(item.get_group(), out_sq, sycl::plus<float>());
-                        float out_scale = 1.0f / sycl::sqrt(out_sq / static_cast<float>(head_dim) + eps);
-
-                        if (lid < head_dim) {
-                            float n = out_local[lid] * out_scale * norm_w_ptr[lid];
-                            out_row[hv * head_dim + lid] = bf16(n * silu_dev(z_reg));
-                        }
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        local_conv_head = (local_conv_head + 1) % conv_rows;
-                    }
-                });
-        });
-
-        if (grouped_heads) {
-            commit_linear_conv_history(ctx, fused_ptr, all_dim, conv_state_ptr,
-                                       qkv_dim, conv_rows, conv_head, seq_len);
-        }
-        cache.device_state_dirty = true;
-        cache.linear_conv_head = (conv_head + seq_len) % conv_rows;
-        return;
-    }
-
-    // Fallback: per-token iteration for non-standard shapes
-    bf16* out_base = static_cast<bf16*>(out_dst.data());
-    const int64_t fused_stride = fused_all.shape(1);
-    const int64_t out_stride = out_dst.shape(1);
-    for (int t = 0; t < seq_len; ++t) {
-        bf16* row_ptr = fused_ptr + static_cast<size_t>(t) * fused_stride;
-        Tensor qkv_view = Tensor::view(ctx, row_ptr, {1, (int64_t)qkv_dim});
-        Tensor z_view = Tensor::view(ctx, row_ptr + qkv_dim, {1, (int64_t)z_dim});
-        Tensor a_view = Tensor::view(ctx, row_ptr + qkv_dim + z_dim,
-                                     {1, (int64_t)num_heads});
-        Tensor b_view = Tensor::view(ctx, row_ptr + qkv_dim + z_dim + num_heads,
-                                     {1, (int64_t)num_heads});
-        Tensor out_view = Tensor::view(ctx,
-                                       out_base + static_cast<size_t>(t) * out_stride,
-                                       {1, (int64_t)kv_dim});
-        run_linear_delta_decode_gpu(ctx, layer, cache,
-                                    qkv_view, z_view, a_view, b_view, out_view);
-    }
+    cache.linear_conv_head = state.conv_head;
+    cache.device_state_dirty = state.device_state_dirty;
 }
 
 void Qwen35HybridBnb4Backend::debug_compare_linear_delta_decode(Context& ctx, int layer_idx,
