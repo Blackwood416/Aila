@@ -693,6 +693,18 @@ target_link_libraries(AilaQwen4ExpKernelTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpKernelTests COMMAND AilaQwen4ExpKernelTests)
 set_tests_properties(AilaQwen4ExpKernelTests PROPERTIES LABELS "gpu;ops;qwen4exp" TIMEOUT 60)
 
+add_executable(AilaQwen4ExpMoeBench
+    perf/qwen4exp/q4e_moe_bench.cpp
+    src/core/ExecutionTrace.cpp
+)
+target_compile_definitions(AilaQwen4ExpMoeBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpMoeBench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpMoeBench PRIVATE AilaLib)
+
 add_executable(AilaQwen4ExpModuleTests
     tests/models/Qwen4ExpModuleTests.cpp
     src/core/ExecutionTrace.cpp

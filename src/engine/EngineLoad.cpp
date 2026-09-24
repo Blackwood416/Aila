@@ -449,8 +449,6 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
             run_init_warmup = false;
         } else if (model_spec_.family == ModelFamily::Qwen3TTS) {
             run_init_warmup = false;
-        } else if (model_spec_.family == ModelFamily::Qwen4Exp) {
-            run_init_warmup = false;
         } else if (model_spec_.family == ModelFamily::DiffusionGemma) {
             // vLLM-style warmup: one or more dummy full-canvas decoder passes
             // at init amortize SYCL kernel JIT, oneDNN primitive creation,
@@ -648,8 +646,10 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                                   model_spec_.qwen35_text.num_attention_heads,
                                   model_spec_.qwen35_text.num_key_value_heads);
                 }
-            } else {
+            } else if (init_warmup_mode == 0) {
                 AILA_LOG_INFO("[Warmup] Skipping init warmup (AILA_INIT_WARMUP=0)");
+            } else {
+                AILA_LOG_INFO("[Warmup] Skipping init warmup for this model family. Set AILA_INIT_WARMUP=1 to force.");
             }
             AILA_LOG_INFO("[Memory] Warmup skipped: current=%.2f MB, peak=%.2f MB",
                           to_mb(ctx_->current_allocated_bytes()),

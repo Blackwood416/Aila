@@ -205,8 +205,18 @@ void test_synthetic_qwen4exp_modelspec() {
     std::cout << "[Qwen4ExpModelSpecTests] Synthetic fixture passed.\n";
 }
 
+static std::string resolve_qwen4exp_model_dir() {
+    const char* env_dir = std::getenv("AILA_QWEN4EXP_MODEL_DIR");
+    if (env_dir && fs::exists(env_dir)) return env_dir;
+    const std::string candidate_c = "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    if (fs::exists(candidate_c)) return candidate_c;
+    const std::string candidate_f = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    if (fs::exists(candidate_f)) return candidate_f;
+    return candidate_c;
+}
+
 void test_real_qwen4exp_modelspec_if_present() {
-    const std::string model_dir = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/config.json")) {
         std::cout << "[Qwen4ExpModelSpecTests] Real model directory not found, skipping real model spec test.\n";
         return;

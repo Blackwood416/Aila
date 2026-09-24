@@ -104,7 +104,7 @@ continue to run inference in-process.
 | `AILA_THINKING_BUDGET` | int | `-1` | Thinking budget: `-1` = disabled, `0` = no-think prompt mode, `>0` = max generated tokens inside `<think>` |
 | `AILA_STREAM_OUTPUT` | int | auto | Force streaming (`1`) or non-streaming (`0`). Auto-detected from terminal type when not set |
 | `AILA_LOG_LEVEL` | string | `info` | Minimum log level: `verbose` (-1), `debug` (0), `info` (1), `warning` (2), `error` (3). Accepts names (case-insensitive) or numeric values |
-| `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (enabled for DiffusionGemma, skipped for unsupported specs) |
+| `AILA_INIT_WARMUP` | int | `-1` (auto) | Init warmup: `0` = skip, `1` = force, `-1` = auto (enabled except for Qwen3-TTS and unsupported Qwen3.5 specs). Moves first-use kernel JIT out of the first request (~15 s for Qwen3.8-Flash-Next on A770) |
 | `AILA_DG_WARMUP_PASSES` | int | `1` | DiffusionGemma warmup: number of dummy full-canvas decoder passes run at init (vLLM-style JIT/primitive amortization) |
 | `AILA_DG_WARMUP_CANVAS` | int | `0` | DiffusionGemma warmup canvas override: `0` = real canvas length, `>0` = smaller dummy canvas (JIT cost is shape-independent; only compute scales) |
 | `AILA_DG_MOE_BATCHED` | int | `1` | DiffusionGemma MoE batched-transfer path: single flat gather + one d2h for all expert groups instead of one blocking h2d/d2h per group. Bitwise identical to the per-group host path (`0` restores it) |
@@ -263,6 +263,50 @@ larger than 4 GiB. Do not treat it as an Aila runtime requirement.
 | `AILA_DG_SOFTMAX_DUMP_DIR` | path | empty | Debug-only row-0 dump of soft logits, bf16 probabilities, and soft embedding; does not enable layer/decoder dumps, but adds an explicit synchronization |
 | `AILA_DG_MOE_ROUTE_HIST` | bool | `false` | Print the stable expert-major MoE route histogram (`M` rows per expert, active experts, and maximum M) used by the host/GPU paths |
 | `AILA_PROFILE_DG` | bool | `false` | Synchronize DiffusionGemma decoder sub-phase boundaries and report projection, attention, dense MLP, router, MoE, and post-processing wall time |
+
+---
+
+## Qwen3.8-Flash-Next (AILA_Q4E_*)
+
+Routed experts stay in the memory-mapped checkpoint and are swapped into a GPU LRU
+slot pool on demand. Each slot holds one expert's packed NF4 gate_up + down and either
+compact u8 absmax codes (default for compatible nested checkpoints) or expanded f32 absmax.
+
+### Expert Cache
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_Q4E_EXPERT_CACHE_MB` | int | `0` (auto) | GPU expert slot pool size. Auto = device memory (or the context allocation limit) minus the static weights, the full-attention KV for `max_seq_len`, and `AILA_Q4E_VRAM_RESERVE_MB`; at least 1024 MB. Prefill acquires a layer's experts in one batch only when the pool holds `num_experts + top_k` slots (~1.4 GB) |
+| `AILA_Q4E_VRAM_RESERVE_MB` | int | `2560` | Headroom kept free by the auto cache size for runtime buffers, oneDNN scratch and the desktop. On a 16 GB A770 driving a display, ~1 GB free VRAM after warmup slowed all kernels ~2x |
+| `AILA_Q4E_EXPERT_CHUNK_MB` | int | `1024` | Size of each device allocation backing the slot pool (Level Zero caps single allocations near 4 GB) |
+| `AILA_Q4E_STAGING_MB` | int | `128` | Pinned host staging buffer for miss uploads; split in two halves so one fills while the other DMAs |
+| `AILA_Q4E_FILL_THREADS` | int | `min(8, cores)` | Host threads (including the caller) that copy packed weights and absmax codes into staging, or expand absmax to f32 when compact mode is disabled |
+| `AILA_Q4E_FILL_PARTS` | int | `8` | Parts each expert is split into across fill threads |
+| `AILA_Q4E_ABSMAX_CODES` | bool | `true` | Keep nested u8 absmax codes in each GPU expert slot and reconstruct scales in the MoE kernels. Applies only when every expert layer has aligned nested NF4 metadata; otherwise falls back to f32 slots. `0` restores host f32 expansion. On this A770, slots shrink from 2,764,800 to 2,534,400 bytes (3463 to 3778 slots in the 9131 MB pool) |
+| `AILA_Q4E_PREFETCH` | bool | `true` | Decode: route layer L's MoE input through layer L+1's router and stage the predicted experts on the fill threads while the GPU runs layer L+1's attention |
+| `AILA_Q4E_PREFETCH_TOPN` | int | `10` | Number of most-probable predicted experts to prefetch |
+| `AILA_Q4E_PREFILL_DEMOTE` | bool | `true` | Batched prefill keeps each layer's `slots / layers` most-used experts hot and queues the rest for eviction first, so decode after a long prompt still finds every layer's hottest experts (plain LRU would keep only the last layers) |
+| `AILA_Q4E_PREDICT_STATS` | bool | `false` | With `AILA_PROFILE_Q4E_DECODE`, log how often the next-layer prediction matched the real routing |
+
+### Kernels / State
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from the host mmap instead of keeping the 1.3 GB table in VRAM (the auto expert cache grows by ~460 slots). `0` uploads the table |
+| `AILA_Q4E_DENSE_GEMV` | bool | `true` | Single-row bf16 projections (hyper-connection, router, shared-expert gate) use the native GEMV instead of oneDNN |
+| `AILA_Q4E_HC_FUSED` | bool | `true` | Decode hyper-connection runs as two fused kernels (down + inject, up + mix) |
+| `AILA_Q4E_MOE_SHARED_FUSED` | bool | `false` | Experimental gated shared-expert add inside MoE down. Changes a few BF16 values in layer 0 and caused a decode-route regression on the fixed benchmark; keep disabled by default |
+| `AILA_Q4E_PREFILL_STEP` | int | `64` | Decode positions between recurrent-state snapshots used for context rollback |
+
+### Profiling / Debug
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_PROFILE_Q4E_DECODE` | bool | `false` | Per-forward `[Q4E Profile]` line: total time, router sync, acquire (host fill / DMA wait / prefetch wait), cache hits and bytes uploaded |
+| `AILA_PROFILE_Q4E_STAGES` | bool | `false` | With `AILA_PROFILE_Q4E_DECODE`, synchronize after every stage and log per-stage time (relative cost only) |
+| `AILA_DEBUG_Q4E_DUMP_DIR` | path | empty | Dump per-layer hidden states, the final mixer output and logits for numerical comparison |
+| `AILA_DEBUG_Q4E_ROUTE_TRACE` | path | empty | Write every expert-cache acquire as int32 `{layer, count, ids...}` for offline replacement-policy simulation with `perf/qwen4exp/q4e_cache_sim.py` |
+| `AILA_DEBUG_Q4E_FAKE_HITS` | bool | `false` | Treat every expert as resident (no fill or DMA; outputs are wrong). Measures the decode floor at a 100% hit rate; use with `--bench`, since the garbage logits hit EOS at once |
 
 ---
 

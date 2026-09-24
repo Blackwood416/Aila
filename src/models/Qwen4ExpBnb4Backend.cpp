@@ -3,6 +3,7 @@
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -127,7 +128,26 @@ Qwen4ExpBnb4Backend::Session::~Session() {
 Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
-Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() = default;
+Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
+    free_pinned_host_buffers();
+}
+
+void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
+    if (!context_) return;
+    context_->synchronize();
+    if (router_host_ids_) context_->free_host(router_host_ids_);
+    if (router_host_weights_) context_->free_host(router_host_weights_);
+    router_host_ids_ = nullptr;
+    router_host_weights_ = nullptr;
+    if (pred_host_ids_) context_->free_host(pred_host_ids_);
+    if (pred_host_weights_) context_->free_host(pred_host_weights_);
+    pred_host_ids_ = nullptr;
+    pred_host_weights_ = nullptr;
+    if (embed_host_ids_) context_->free_host(embed_host_ids_);
+    if (embed_host_rows_) context_->free_host(embed_host_rows_);
+    embed_host_ids_ = nullptr;
+    embed_host_rows_ = nullptr;
+}
 
 // ============================================================================
 // Load
@@ -234,7 +254,14 @@ bool Qwen4ExpBnb4Backend::load(
     };
 
     AILA_LOG_INFO("[Qwen4Exp] Uploading model embed_tokens and lm_head...");
-    embed_weight_ = &weights.upload("model.language_model.embed_tokens.weight", ctx);
+    const std::string embed_name = "model.language_model.embed_tokens.weight";
+    static const bool s_host_embed = aila::env::read_flag("AILA_Q4E_HOST_EMBED", true);
+    embed_host_ = s_host_embed ? weights.host_view(embed_name) : HostTensorView{};
+    if (!(embed_host_.valid() && embed_host_.dtype == DT_BF16 && embed_host_.shape.size() == 2 &&
+          embed_host_.shape[1] == hidden_size_)) {
+        embed_host_ = {};
+        embed_weight_ = &weights.upload(embed_name, ctx);
+    }
 
     Tensor& raw_lm_head = weights.upload("lm_head.weight", ctx);
     lm_head_weight_transposed_ = Tensor::allocate(ctx, {hidden_size_, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
@@ -245,15 +272,19 @@ bool Qwen4ExpBnb4Backend::load(
 
     // Hyper-Connection Mixer
     AILA_LOG_INFO("[Qwen4Exp] Loading hyper_connection_mixer...");
-    std::string mixer_prefix = "model.language_model.hyper_connection_mixer.";
-    weights.upload(mixer_prefix + "hc_norm.weight", ctx);
-    mixer_.hc_norm_weight = ensure_f32(mixer_prefix + "hc_norm.weight");
-
-    weights.upload(mixer_prefix + "input_mix_weight_down.weight", ctx);
-    mixer_.input_mix_weight_down.init(ctx, weights.get(mixer_prefix + "input_mix_weight_down.weight"), 10240, 320, false);
-
-    weights.upload(mixer_prefix + "input_mix_weight_up.weight", ctx);
-    mixer_.input_mix_weight_up.init(ctx, weights.get(mixer_prefix + "input_mix_weight_up.weight"), 320, 10240, false);
+    auto load_hc = [&](const std::string& hc_prefix, Qwen4ExpHyperConnectionLayer& hc, bool with_inject) {
+        weights.upload(hc_prefix + "hc_norm.weight", ctx);
+        hc.hc_norm_weight = ensure_f32(hc_prefix + "hc_norm.weight");
+        hc.mix_down_w = &weights.upload(hc_prefix + "input_mix_weight_down.weight", ctx);
+        hc.input_mix_weight_down.init(ctx, *hc.mix_down_w, 10240, 320, false);
+        hc.mix_up_w = &weights.upload(hc_prefix + "input_mix_weight_up.weight", ctx);
+        hc.input_mix_weight_up.init(ctx, *hc.mix_up_w, 320, 10240, false);
+        if (with_inject) {
+            hc.inject_w = &weights.upload(hc_prefix + "block_inject_weight.weight", ctx);
+            hc.block_inject_weight.init(ctx, *hc.inject_w, 10240, 4, false);
+        }
+    };
+    load_hc("model.language_model.hyper_connection_mixer.", mixer_, false);
 
     // Layers
     AILA_LOG_INFO("[Qwen4Exp] Loading %d layers...", cfg_.num_hidden_layers);
@@ -270,27 +301,8 @@ bool Qwen4ExpBnb4Backend::load(
         }
         layer.is_linear = is_linear;
 
-        // Attn HyperConnection
-        std::string attn_hc_prefix = prefix + "attn_hyper_connection.";
-        weights.upload(attn_hc_prefix + "hc_norm.weight", ctx);
-        layer.attn_hc.hc_norm_weight = ensure_f32(attn_hc_prefix + "hc_norm.weight");
-        weights.upload(attn_hc_prefix + "input_mix_weight_down.weight", ctx);
-        layer.attn_hc.input_mix_weight_down.init(ctx, weights.get(attn_hc_prefix + "input_mix_weight_down.weight"), 10240, 320, false);
-        weights.upload(attn_hc_prefix + "input_mix_weight_up.weight", ctx);
-        layer.attn_hc.input_mix_weight_up.init(ctx, weights.get(attn_hc_prefix + "input_mix_weight_up.weight"), 320, 10240, false);
-        weights.upload(attn_hc_prefix + "block_inject_weight.weight", ctx);
-        layer.attn_hc.block_inject_weight.init(ctx, weights.get(attn_hc_prefix + "block_inject_weight.weight"), 10240, 4, false);
-
-        // MLP HyperConnection
-        std::string mlp_hc_prefix = prefix + "mlp_hyper_connection.";
-        weights.upload(mlp_hc_prefix + "hc_norm.weight", ctx);
-        layer.mlp_hc.hc_norm_weight = ensure_f32(mlp_hc_prefix + "hc_norm.weight");
-        weights.upload(mlp_hc_prefix + "input_mix_weight_down.weight", ctx);
-        layer.mlp_hc.input_mix_weight_down.init(ctx, weights.get(mlp_hc_prefix + "input_mix_weight_down.weight"), 10240, 320, false);
-        weights.upload(mlp_hc_prefix + "input_mix_weight_up.weight", ctx);
-        layer.mlp_hc.input_mix_weight_up.init(ctx, weights.get(mlp_hc_prefix + "input_mix_weight_up.weight"), 320, 10240, false);
-        weights.upload(mlp_hc_prefix + "block_inject_weight.weight", ctx);
-        layer.mlp_hc.block_inject_weight.init(ctx, weights.get(mlp_hc_prefix + "block_inject_weight.weight"), 10240, 4, false);
+        load_hc(prefix + "attn_hyper_connection.", layer.attn_hc, true);
+        load_hc(prefix + "mlp_hyper_connection.", layer.mlp_hc, true);
 
         // Attention
         if (is_linear) {
@@ -351,11 +363,11 @@ bool Qwen4ExpBnb4Backend::load(
         }
 
         // MoE Router & Shared Expert
-        weights.upload(prefix + "mlp.gate.weight", ctx);
-        layer.router_gate.init(ctx, weights.get(prefix + "mlp.gate.weight"), hidden_size_, cfg_.num_experts, false);
+        layer.router_w = &weights.upload(prefix + "mlp.gate.weight", ctx);
+        layer.router_gate.init(ctx, *layer.router_w, hidden_size_, cfg_.num_experts, false);
 
-        weights.upload(prefix + "mlp.shared_expert_gate.weight", ctx);
-        layer.shared_expert_gate.init(ctx, weights.get(prefix + "mlp.shared_expert_gate.weight"), hidden_size_, 1, false);
+        layer.shared_expert_gate_w = &weights.upload(prefix + "mlp.shared_expert_gate.weight", ctx);
+        layer.shared_expert_gate.init(ctx, *layer.shared_expert_gate_w, hidden_size_, 1, false);
 
         Bnb4BitLinear shared_gate_proj, shared_up_proj;
         if (!init_quant_linear(prefix + "mlp.shared_expert.gate_proj.weight", shared_gate_proj) ||
@@ -378,14 +390,42 @@ bool Qwen4ExpBnb4Backend::load(
         return false;
     }
 
-    // Expert Cache
-    AILA_LOG_INFO("[Qwen4Exp] Initializing Expert Cache (6.5 GB)...");
-    if (!expert_cache_.init(ctx, weights, cfg_.num_hidden_layers, 0,
+    // Expert Cache: AILA_Q4E_EXPERT_CACHE_MB, or by default the VRAM left after static weights
+    // minus headroom for session state, prefill workspace and the desktop. On a 16 GB A770
+    // driving a display, ~1 GB free after warmup already slowed every kernel ~2x (WDDM paging);
+    // ~2 GB free did not.
+    size_t expert_cache_bytes = 0;
+    const int expert_cache_mb = aila::env::read_int("AILA_Q4E_EXPERT_CACHE_MB", 0);
+    if (expert_cache_mb > 0) {
+        expert_cache_bytes = static_cast<size_t>(expert_cache_mb) << 20;
+    } else {
+        size_t vram = ctx.queue().get_device().get_info<sycl::info::device::global_mem_size>();
+        if (ctx.device_allocation_limit() > 0) vram = std::min(vram, ctx.device_allocation_limit());
+        const size_t full_layers = static_cast<size_t>(
+            std::count_if(layers_.begin(), layers_.end(), [](const Qwen4ExpLayer& l) { return !l.is_linear; }));
+        const size_t kv_bytes = full_layers * 2 * cfg_.num_key_value_heads * cfg_.head_dim * sizeof(bf16) *
+                                static_cast<size_t>(max_seq_len_);
+        const size_t reserve =
+            (static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20) + kv_bytes;
+        const size_t min_bytes = static_cast<size_t>(1024) << 20;
+        const size_t used = ctx.current_allocated_bytes() + reserve;
+        expert_cache_bytes = vram > used + min_bytes ? vram - used : min_bytes;
+    }
+    AILA_LOG_INFO("[Qwen4Exp] Initializing Expert Cache (%.0f MB)...", expert_cache_bytes / (1024.0 * 1024.0));
+    if (!expert_cache_.init(ctx, weights, cfg_.num_hidden_layers, expert_cache_bytes,
                             cfg_.num_experts, hidden_size_, cfg_.moe_intermediate_size, 64, error_message)) {
         return false;
     }
 
     ensure_runtime_buffers(ctx, 1);
+    // Batched prefill acquire needs every unique expert of a layer resident at once.
+    if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
+        prefill_expert_slot_.assign(cfg_.num_experts, -1);
+        prefill_expert_uses_.assign(cfg_.num_experts, 0);
+    } else {
+        AILA_LOG_WARN("[Qwen4Exp] Expert cache has %d slots (< %d): prefill acquires experts per token",
+                      expert_cache_.num_slots(), cfg_.num_experts + cfg_.num_experts_per_tok);
+    }
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
     return true;
 }
@@ -428,11 +468,14 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 
     // MoE buffers
     buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
-    buf_.router_ids_dev = Tensor::allocate(ctx, {cap, 10}, dnnl::memory::data_type::s32);
-    buf_.router_weights_dev = Tensor::allocate(ctx, {cap, 10}, dnnl::memory::data_type::f32);
-    buf_.host_router_ids.resize(static_cast<size_t>(cap) * 10);
-    buf_.host_router_weights.resize(static_cast<size_t>(cap) * 10);
-    buf_.moe_h = Tensor::allocate(ctx, {10, 640}, dnnl::memory::data_type::bf16);
+    free_pinned_host_buffers();
+    router_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    router_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
+    if (embed_host_.valid()) {
+        embed_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * sizeof(int)));
+        embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
+    }
+    buf_.moe_h = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
     buf_.moe_acc_f32 = Tensor::allocate(ctx, {hidden_size_}, dnnl::memory::data_type::f32);
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
@@ -449,6 +492,83 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // ============================================================================
 // Forward Implementation
 // ============================================================================
+
+void Qwen4ExpBnb4Backend::EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count) {
+    if (!embed_host_.valid()) {
+        ops::embedding_lookup(ctx, *embed_weight_, tokenIdsDevice, count, buf_.x, hidden_size_);
+        return;
+    }
+    // The blocking readback also drains the previous h2d, so the pinned rows can be reused.
+    ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
+    const size_t row_bytes = static_cast<size_t>(hidden_size_) * sizeof(bf16);
+    const int64_t rows = embed_host_.shape[0];
+    for (int t = 0; t < count; ++t) {
+        const int id = embed_host_ids_[t];
+        if (id < 0 || id >= rows) {
+            throw std::runtime_error("Qwen4ExpBnb4Backend: token id " + std::to_string(id) + " outside the embedding table");
+        }
+        std::memcpy(embed_host_rows_ + static_cast<size_t>(t) * row_bytes,
+                    embed_host_.ptr + static_cast<size_t>(id) * row_bytes, row_bytes);
+    }
+    ctx.memcpy_h2d_async(buf_.x.data(), embed_host_rows_, static_cast<size_t>(count) * row_bytes);
+}
+
+void Qwen4ExpBnb4Backend::DenseLinear(
+    Context& ctx, Linear& linear, Tensor* raw_weight,
+    Tensor& input, Tensor& output, int count, int out_features, int in_features) {
+    static const bool s_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
+    if (count == 1 && s_native_gemv && raw_weight) {
+        ops::bf16_gemv_bf16(ctx, *raw_weight, input.data_as<bf16>(), output.data_as<bf16>(),
+                            out_features, in_features);
+        return;
+    }
+    linear.forward(ctx, input, output, count);
+}
+
+void Qwen4ExpBnb4Backend::RunHyperConnection(
+    Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject) {
+    const int hc_dim = 4 * hidden_size_;
+    const int lowrank = cfg_.hc_lowrank;
+    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(buf_.hidden4.data()),
+                          static_cast<const float*>(hc.hc_norm_weight->data()),
+                          cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
+                          count, 4, hidden_size_, true);
+
+    static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
+    if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
+        ops::hc_decode_down_inject(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
+                                   hc.mix_down_w->data_as<bf16>(),
+                                   with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
+                                   static_cast<bf16*>(buf_.hc_mix_down.data()),
+                                   static_cast<float*>(buf_.hc_inject_f32.data()),
+                                   lowrank, hidden_size_, 4);
+        ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
+                              hc.mix_up_w->data_as<bf16>(),
+                              static_cast<const bf16*>(buf_.hc_N.data()),
+                              static_cast<bf16*>(buf_.x.data()),
+                              lowrank, hidden_size_, 4);
+        return;
+    }
+
+    DenseLinear(ctx, hc.input_mix_weight_down, hc.mix_down_w, buf_.hc_N, buf_.hc_mix_down,
+                count, lowrank, hc_dim);
+    apply_silu_div4(ctx, buf_.hc_mix_down, static_cast<size_t>(count) * lowrank);
+
+    DenseLinear(ctx, hc.input_mix_weight_up, hc.mix_up_w, buf_.hc_mix_down, buf_.hc_mix_up,
+                count, hc_dim, lowrank);
+    apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * hc_dim);
+
+    ops::hc_mix_reduce(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
+                       static_cast<const bf16*>(buf_.hc_mix_up.data()),
+                       static_cast<bf16*>(buf_.x.data()),
+                       count, hidden_size_, 4);
+
+    if (with_inject) {
+        DenseLinear(ctx, hc.block_inject_weight, hc.inject_w, buf_.hc_N, buf_.hc_inject_buf,
+                    count, 4, hc_dim);
+        apply_two_sigmoid_div4(ctx, buf_.hc_inject_buf, buf_.hc_inject_f32, static_cast<size_t>(count) * 4);
+    }
+}
 
 Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     Context& ctx, Session& session,
@@ -467,7 +587,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     ensure_runtime_buffers(ctx, count);
 
     // 1. Embedding lookup + optional vision embedding override
-    ops::embedding_lookup(ctx, *embed_weight_, tokenIdsDevice, count, buf_.x, hidden_size_);
+    EmbedTokens(ctx, tokenIdsDevice, count);
 
     if (!session.embeddingOverridePositions_.empty() &&
         session.embeddingOverrideHiddenSize_ == hidden_size_) {
@@ -499,7 +619,49 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     });
 
     const int full_rotary_dim = 64;
+    constexpr int kMaxTopK = 16; // moe_decode_* kernels capture at most 16 slots
+    const int top_k = cfg_.num_experts_per_tok;
+    if (top_k > kMaxTopK) {
+        throw std::runtime_error("Qwen4ExpBnb4Backend: num_experts_per_tok exceeds 16");
+    }
     static const std::string s_dump_dir = aila::env::read_string("AILA_DEBUG_Q4E_DUMP_DIR", "");
+    static const bool s_profile = aila::env::read_flag("AILA_PROFILE_Q4E_DECODE", false);
+    using prof_clock = std::chrono::steady_clock;
+    auto prof_ms = [](prof_clock::time_point a, prof_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto prof_t0 = prof_clock::now();
+    double prof_router_sync_ms = 0.0;
+    double prof_acquire_ms = 0.0;
+    const ExpertCacheStats prof_stats0 = expert_cache_.stats();
+
+    // AILA_PROFILE_Q4E_STAGES serializes after every stage; use for relative cost only.
+    static const bool s_stages = aila::env::read_flag("AILA_PROFILE_Q4E_STAGES", false);
+    enum { kStagePle, kStageHc, kStageLinearAttn, kStageFullAttn, kStageRouter,
+           kStageExperts, kStageShared, kStageHead, kStageCount };
+    double stage_ms[kStageCount] = {};
+    auto stage_t = prof_clock::now();
+    static const bool s_predict_stats = aila::env::read_flag("AILA_Q4E_PREDICT_STATS", false);
+    // Decode-time speculative prefetch of layer L+1 experts (predicted from layer L's MoE input)
+    // overlapping host fill + PCIe DMA with GPU compute of layer L+1's attention.
+    static const bool s_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH", true);
+    static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
+    // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
+    static const int s_prefetch_topn = std::max(1, aila::env::read_int("AILA_Q4E_PREFETCH_TOPN", 10));
+    if ((s_prefetch || s_predict_stats) && !pred_host_ids_) {
+        pred_scores_ = Tensor::allocate(ctx, {1, cfg_.num_experts}, dnnl::memory::data_type::bf16);
+        pred_host_ids_ = static_cast<int*>(ctx.alloc_host(kMaxTopK * sizeof(int)));
+        pred_host_weights_ = static_cast<float*>(ctx.alloc_host(kMaxTopK * sizeof(float)));
+    }
+    std::array<int, kMaxTopK> pred_ids{};
+    bool have_pred = false;
+    auto stage = [&](int s) {
+        if (!s_stages) return;
+        ctx.synchronize();
+        const auto now = prof_clock::now();
+        stage_ms[s] += prof_ms(stage_t, now);
+        stage_t = now;
+    };
 
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
@@ -515,25 +677,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ops::residual_add(ctx, buf_.hidden4, buf_.ple_out, count * 10240);
         }
 
+        stage(kStagePle);
+
         // 2.1. Attn Hyper-Connection
-        ops::grouped_rms_norm(ctx, static_cast<const bf16*>(buf_.hidden4.data()),
-                              static_cast<const float*>(layer.attn_hc.hc_norm_weight->data()),
-                              cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-                              count, 4, hidden_size_, true);
-
-        layer.attn_hc.input_mix_weight_down.forward(ctx, buf_.hc_N, buf_.hc_mix_down, count);
-        apply_silu_div4(ctx, buf_.hc_mix_down, static_cast<size_t>(count) * 320);
-
-        layer.attn_hc.input_mix_weight_up.forward(ctx, buf_.hc_mix_down, buf_.hc_mix_up, count);
-        apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * 10240);
-
-        ops::hc_mix_reduce(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
-                           static_cast<const bf16*>(buf_.hc_mix_up.data()),
-                           static_cast<bf16*>(buf_.x.data()),
-                           count, hidden_size_, 4);
-
-        layer.attn_hc.block_inject_weight.forward(ctx, buf_.hc_N, buf_.hc_inject_buf, count);
-        apply_two_sigmoid_div4(ctx, buf_.hc_inject_buf, buf_.hc_inject_f32, static_cast<size_t>(count) * 4);
+        RunHyperConnection(ctx, layer.attn_hc, count, true);
+        stage(kStageHc);
 
         // 2.2. Attention Computation
         if (layer.is_linear) {
@@ -634,6 +782,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
         }
 
+        stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
+
         // 2.3. Attn Residual Add
         ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
                            static_cast<const bf16*>(buf_.y.data()),
@@ -641,62 +791,53 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                            count, hidden_size_, 4);
 
         // 2.4. MLP Hyper-Connection
-        ops::grouped_rms_norm(ctx, static_cast<const bf16*>(buf_.hidden4.data()),
-                              static_cast<const float*>(layer.mlp_hc.hc_norm_weight->data()),
-                              cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-                              count, 4, hidden_size_, true);
-
-        layer.mlp_hc.input_mix_weight_down.forward(ctx, buf_.hc_N, buf_.hc_mix_down, count);
-        apply_silu_div4(ctx, buf_.hc_mix_down, static_cast<size_t>(count) * 320);
-
-        layer.mlp_hc.input_mix_weight_up.forward(ctx, buf_.hc_mix_down, buf_.hc_mix_up, count);
-        apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * 10240);
-
-        ops::hc_mix_reduce(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
-                           static_cast<const bf16*>(buf_.hc_mix_up.data()),
-                           static_cast<bf16*>(buf_.x.data()),
-                           count, hidden_size_, 4);
-
-        layer.mlp_hc.block_inject_weight.forward(ctx, buf_.hc_N, buf_.hc_inject_buf, count);
-        apply_two_sigmoid_div4(ctx, buf_.hc_inject_buf, buf_.hc_inject_f32, static_cast<size_t>(count) * 4);
+        RunHyperConnection(ctx, layer.mlp_hc, count, true);
+        stage(kStageHc);
 
         // 2.5. MoE Computation
-        layer.router_gate.forward(ctx, buf_.x, buf_.router_scores, count);
+        DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
+                    count, cfg_.num_experts, hidden_size_);
+        // Top-k writes straight into pinned host memory; the queue wait is the only readback.
         ops::router_softmax_topk_device(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
-            static_cast<int*>(buf_.router_ids_dev.data()),
-            static_cast<float*>(buf_.router_weights_dev.data()),
-            count, 512, 10, true);
-
-        ctx.memcpy_d2h(buf_.host_router_ids.data(), buf_.router_ids_dev.data(), count * 10 * sizeof(int));
-        ctx.memcpy_d2h(buf_.host_router_weights.data(), buf_.router_weights_dev.data(), count * 10 * sizeof(float));
-
-        for (int t = 0; t < count; ++t) {
-            const int* t_ids = buf_.host_router_ids.data() + t * 10;
-            const float* t_weights = buf_.host_router_weights.data() + t * 10;
-            int slots[10];
-            expert_cache_.acquire(L, t_ids, 10, slots);
-
-            ops::MoeExpertSlotDev dev_slots[10];
-            expert_cache_.get_slots_dev(slots, 10, dev_slots);
-
-            const bf16* x_t = static_cast<const bf16*>(buf_.x.data()) + t * hidden_size_;
-            bf16* y_t = static_cast<bf16*>(buf_.y.data()) + t * hidden_size_;
-
-            ops::moe_decode_gate_up_swiglu_grouped(
-                ctx, dev_slots, nullptr, x_t,
-                static_cast<bf16*>(buf_.moe_h.data()),
-                10, hidden_size_, cfg_.moe_intermediate_size, 64);
-
-            ops::moe_decode_down_weighted_accumulate(
-                ctx, dev_slots, nullptr, t_weights,
-                static_cast<const bf16*>(buf_.moe_h.data()),
-                nullptr, y_t,
-                10, cfg_.moe_intermediate_size, hidden_size_, 64);
+            router_host_ids_, router_host_weights_,
+            count, cfg_.num_experts, top_k, true);
+        const bool predict_next = (s_prefetch || s_predict_stats) && count == 1 && L + 1 < cfg_.num_hidden_layers;
+        if (predict_next) {
+            // Route this layer's MoE input through the next layer's router to guess its experts.
+            DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
+                        1, cfg_.num_experts, hidden_size_);
+            ops::router_softmax_topk_device(
+                ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
+                pred_host_ids_, pred_host_weights_, 1, cfg_.num_experts, top_k, true);
         }
 
-        // Shared Expert
-        layer.shared_expert_gate.forward(ctx, buf_.x, buf_.shared_gate_buf, count);
+        const auto prof_router_t0 = prof_clock::now();
+        ctx.synchronize();
+        const auto prof_router_t1 = prof_clock::now();
+        if (predict_next || have_pred) {
+            if (have_pred && s_predict_stats) {
+                for (int k = 0; k < top_k; ++k) {
+                    const int e = router_host_ids_[k];
+                    const bool in_pred = std::find(pred_ids.begin(), pred_ids.begin() + top_k, e) != pred_ids.begin() + top_k;
+                    pred_overlap_ += in_pred ? 1 : 0;
+                    if (!expert_cache_.contains(L, e)) {
+                        ++pred_miss_total_;
+                        pred_miss_hit_ += in_pred ? 1 : 0;
+                    }
+                }
+                pred_total_ += top_k;
+            }
+            have_pred = predict_next;
+            if (predict_next) std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
+        }
+        prof_router_sync_ms += prof_ms(prof_router_t0, prof_router_t1);
+        stage(kStageRouter);
+
+        // Shared expert only depends on x: submit it before acquire so the GPU runs it
+        // while the host fills missed routed experts.
+        DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
+                    count, 1, hidden_size_);
         if (count == 1) {
             bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
                 ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
@@ -712,13 +853,88 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                            static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
             layer.shared_down_proj.forward(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
         }
-        add_shared_expert_to_y(ctx, buf_.y, buf_.shared_out_buf, buf_.shared_gate_buf, count, hidden_size_);
+        // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
+        // instead of a blocking round trip per token), then map slots back per token.
+        const auto prof_acq_batch_t0 = prof_clock::now();
+        const bool batch_acquire = count > 1 && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        if (batch_acquire) {
+            std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
+            prefill_unique_.clear();
+            for (int i = 0; i < count * top_k; ++i) {
+                const int e = router_host_ids_[i];
+                if (prefill_expert_uses_[e]++ == 0) {
+                    prefill_unique_.push_back(e);
+                }
+            }
+            prefill_unique_slots_.resize(prefill_unique_.size());
+            expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
+                                  prefill_unique_slots_.data());
+            for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                prefill_expert_slot_[prefill_unique_[u]] = prefill_unique_slots_[u];
+            }
+            // A long prompt touches several times the cache capacity, so plain LRU would leave
+            // only the last layers resident for decode. Keep each layer's share of its most-used
+            // experts hot and queue the rest for eviction, least used first.
+            static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
+            const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
+            if (s_prefill_demote && prefill_unique_.size() > keep) {
+                std::stable_sort(prefill_unique_.begin(), prefill_unique_.end(), [&](int a, int b) {
+                    return prefill_expert_uses_[a] > prefill_expert_uses_[b];
+                });
+                expert_cache_.demote(L, prefill_unique_.data() + keep,
+                                     static_cast<int>(prefill_unique_.size() - keep));
+            }
+        }
+        prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
+
+        for (int t = 0; t < count; ++t) {
+            const int* t_ids = router_host_ids_ + t * top_k;
+            const float* t_weights = router_host_weights_ + t * top_k;
+            int slots[kMaxTopK];
+            if (batch_acquire) {
+                for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
+            } else {
+                const auto prof_acq_t0 = prof_clock::now();
+                expert_cache_.acquire(L, t_ids, top_k, slots);
+                prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
+                if (s_prefetch && predict_next) {
+                    expert_cache_.prefetch_async(L + 1, pred_ids.data(), std::min(top_k, s_prefetch_topn));
+                }
+            }
+
+            ops::MoeExpertSlotDev dev_slots[kMaxTopK];
+            expert_cache_.get_slots_dev(slots, top_k, dev_slots);
+
+            const bf16* x_t = static_cast<const bf16*>(buf_.x.data()) + t * hidden_size_;
+            bf16* y_t = static_cast<bf16*>(buf_.y.data()) + t * hidden_size_;
+
+            ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, dev_slots, nullptr, x_t,
+                static_cast<bf16*>(buf_.moe_h.data()),
+                top_k, hidden_size_, cfg_.moe_intermediate_size, 64);
+
+            ops::moe_decode_down_weighted_accumulate(
+                ctx, dev_slots, nullptr, t_weights,
+                static_cast<const bf16*>(buf_.moe_h.data()),
+                nullptr, y_t,
+                top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
+                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
+                                    static_cast<size_t>(t) * hidden_size_ : nullptr,
+                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
+        }
+        stage(kStageExperts);
+
+        if (!s_fuse_shared) {
+            add_shared_expert_to_y(ctx, buf_.y, buf_.shared_out_buf, buf_.shared_gate_buf,
+                                   count, hidden_size_);
+        }
 
         // 2.6. MLP Residual Add
         ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
                            static_cast<const bf16*>(buf_.y.data()),
                            static_cast<const float*>(buf_.hc_inject_f32.data()),
                            count, hidden_size_, 4);
+        stage(kStageShared);
 
         if (!s_dump_dir.empty()) {
             std::string dump_path = s_dump_dir + "/layer_" + std::to_string(L) + ".bin";
@@ -727,21 +943,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     // 3. Final Hyper-Connection Mixer
-    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(buf_.hidden4.data()),
-                          static_cast<const float*>(mixer_.hc_norm_weight->data()),
-                          cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-                          count, 4, hidden_size_, true);
-
-    mixer_.input_mix_weight_down.forward(ctx, buf_.hc_N, buf_.hc_mix_down, count);
-    apply_silu_div4(ctx, buf_.hc_mix_down, static_cast<size_t>(count) * 320);
-
-    mixer_.input_mix_weight_up.forward(ctx, buf_.hc_mix_down, buf_.hc_mix_up, count);
-    apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * 10240);
-
-    ops::hc_mix_reduce(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
-                       static_cast<const bf16*>(buf_.hc_mix_up.data()),
-                       static_cast<bf16*>(buf_.x.data()),
-                       count, hidden_size_, 4);
+    RunHyperConnection(ctx, mixer_, count, false);
 
     if (!s_dump_dir.empty()) {
         std::string mixer_path = s_dump_dir + "/mixer.bin";
@@ -762,13 +964,49 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
     }
 
+    stage(kStageHead);
+
     if (!s_dump_dir.empty()) {
         std::string logits_path = s_dump_dir + "/logits.bin";
         dump_hidden_row(ctx, logits_path, buf_.logits, 0, cfg_.vocab_size);
     }
 
+    expert_cache_.wait_prefetch();
     CaptureSnapshot(ctx, session, cached_len, count);
     session.currentLength_ = cached_len;
+
+    if (s_profile) {
+        ctx.synchronize();
+        const ExpertCacheStats& s1 = expert_cache_.stats();
+        const uint64_t hits = s1.hit_count - prof_stats0.hit_count;
+        const uint64_t misses = s1.miss_count - prof_stats0.miss_count;
+        AILA_LOG_INFO("[Q4E Profile] pos=%d count=%d total=%.2fms router_sync=%.2fms acquire=%.2fms "
+                      "(fill=%.2fms dma_wait=%.2fms pf_wait=%.2fms pf=%llu/%llu) hit=%llu/%llu xfer=%.1fMB",
+                      start_pos, count, prof_ms(prof_t0, prof_clock::now()),
+                      prof_router_sync_ms, prof_acquire_ms,
+                      (s1.fill_ns - prof_stats0.fill_ns) * 1e-6,
+                      (s1.dma_wait_ns - prof_stats0.dma_wait_ns) * 1e-6,
+                      (s1.prefetch_wait_ns - prof_stats0.prefetch_wait_ns) * 1e-6,
+                      static_cast<unsigned long long>(s1.prefetch_used - prof_stats0.prefetch_used),
+                      static_cast<unsigned long long>(s1.prefetch_issued - prof_stats0.prefetch_issued),
+                      static_cast<unsigned long long>(hits),
+                      static_cast<unsigned long long>(hits + misses),
+                      (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0));
+        if (s_predict_stats && pred_total_ > 0) {
+            AILA_LOG_INFO("[Q4E Predict] next-layer overlap=%.1f%% misses_predicted=%llu/%llu (%.1f%%)",
+                          100.0 * pred_overlap_ / pred_total_,
+                          static_cast<unsigned long long>(pred_miss_hit_),
+                          static_cast<unsigned long long>(pred_miss_total_),
+                          pred_miss_total_ ? 100.0 * pred_miss_hit_ / pred_miss_total_ : 0.0);
+        }
+        if (s_stages) {
+            AILA_LOG_INFO("[Q4E Stages] ple=%.2f hc=%.2f linear_attn=%.2f full_attn=%.2f router=%.2f "
+                          "experts=%.2f (acquire=%.2f) shared=%.2f head=%.2f ms",
+                          stage_ms[kStagePle], stage_ms[kStageHc], stage_ms[kStageLinearAttn],
+                          stage_ms[kStageFullAttn], stage_ms[kStageRouter], stage_ms[kStageExperts],
+                          prof_acquire_ms, stage_ms[kStageShared], stage_ms[kStageHead]);
+        }
+    }
     return lastTokenLogits_;
 }
 
@@ -992,4 +1230,3 @@ void Qwen4ExpBnb4Backend::clear_mrope_positions() {
     session.mropePromptLength_ = 0;
     session.mropeTextPositionDelta_ = 0;
 }
-

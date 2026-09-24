@@ -44,6 +44,21 @@ void hc_inject_add(
     Context& ctx, bf16* H, const bf16* y, const bf16* inj,
     int rows, int group_dim, int groups);
 
+// Single-row (decode) hyper-connection, stage A. One work-group per output row:
+//   act[r] = silu(bf16(W_down[r] . N) / groups)          r < lowrank
+//   inj[g] = 2 * sigmoid(bf16(W_inject[g] . N) / groups)  g < groups (skipped if W_inject null)
+// N: [groups * group_dim] bf16; W_down: [lowrank, groups * group_dim]; W_inject: [groups, groups * group_dim]
+void hc_decode_down_inject(
+    Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
+    bf16* act, float* inj, int lowrank, int group_dim, int groups);
+
+// Single-row (decode) hyper-connection, stage B. One sub-group per output dim d:
+//   x[d] = mean_g( sigmoid(bf16(W_up[g * group_dim + d] . act)) * N[g * group_dim + d] )
+// W_up: [groups * group_dim, lowrank]; act: [lowrank]; x: [group_dim]
+void hc_decode_up_mix(
+    Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
+    bf16* x, int lowrank, int group_dim, int groups);
+
 // PLE Gate-Value computation:
 // g[s] = sum_d (K[s, d] * Q[s, d]) / sqrt(hidden_size)
 // g = sign(g) * sqrt(max(|g|, 1e-6))

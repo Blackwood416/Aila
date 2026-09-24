@@ -22,13 +22,16 @@ class Context {
     using TraceStage = aila::diagnostics::ExecutionStage;
 public:
     Context() : Context(nullptr) {}
-    explicit Context(Trace* trace)
+    explicit Context(Trace* trace, bool enableProfiling = false)
         : trace_(trace), async_errors_(std::make_shared<aila::AsyncErrorState>()),
           q_(sycl::default_selector_v,
              [errors = async_errors_](sycl::exception_list exceptions) noexcept {
                  for (const auto& error : exceptions) errors->Record(error);
              },
-             sycl::property::queue::in_order()) {
+             enableProfiling
+                 ? sycl::property_list{sycl::property::queue::in_order(),
+                                       sycl::property::queue::enable_profiling()}
+                 : sycl::property_list{sycl::property::queue::in_order()}) {
         TraceScope stage(trace_, TraceStage::ContextInitialize);
         eng_ = dnnl::sycl_interop::make_engine(q_.get_device(), q_.get_context());
         stream_ = dnnl::sycl_interop::make_stream(eng_, q_);

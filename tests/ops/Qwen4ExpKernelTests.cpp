@@ -211,6 +211,86 @@ void test_hc_inject_add(Context& ctx) {
     check_close(gpu_out, ref_out, "hc_inject_add", 1e-2f);
 }
 
+void test_hc_decode_fused(Context& ctx, bool with_inject) {
+    constexpr int groups = 4;
+    constexpr int group_dim = 2560;
+    constexpr int lowrank = 320;
+    constexpr int k_dim = groups * group_dim;
+    auto round_bf16 = [](float v) { return static_cast<float>(bf16(v)); };
+    auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+
+    std::mt19937 rng(with_inject ? 789 : 790);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<bf16> N_host(k_dim), w_down(static_cast<size_t>(lowrank) * k_dim),
+        w_inject(static_cast<size_t>(groups) * k_dim), w_up(static_cast<size_t>(k_dim) * lowrank);
+    for (auto& v : N_host) v = bf16(dist(rng));
+    for (auto& v : w_down) v = bf16(dist(rng) * 0.02f);
+    for (auto& v : w_inject) v = bf16(dist(rng) * 0.02f);
+    for (auto& v : w_up) v = bf16(dist(rng) * 0.2f);
+
+    // CPU reference, rounding to bf16 where the PyTorch reference does.
+    std::vector<float> ref_act(lowrank), ref_inj(groups), ref_x(group_dim);
+    for (int r = 0; r < lowrank; ++r) {
+        double dot = 0.0;
+        for (int k = 0; k < k_dim; ++k) {
+            dot += static_cast<double>(w_down[static_cast<size_t>(r) * k_dim + k]) * static_cast<float>(N_host[k]);
+        }
+        const float v = round_bf16(static_cast<float>(dot)) / groups;
+        ref_act[r] = round_bf16(v * sigmoid(v));
+    }
+    for (int g = 0; g < groups; ++g) {
+        double dot = 0.0;
+        for (int k = 0; k < k_dim; ++k) {
+            dot += static_cast<double>(w_inject[static_cast<size_t>(g) * k_dim + k]) * static_cast<float>(N_host[k]);
+        }
+        ref_inj[g] = 2.0f * sigmoid(round_bf16(static_cast<float>(dot)) / groups);
+    }
+    for (int d = 0; d < group_dim; ++d) {
+        float mixed = 0.0f;
+        for (int g = 0; g < groups; ++g) {
+            const size_t row = static_cast<size_t>(g) * group_dim + d;
+            double dot = 0.0;
+            for (int k = 0; k < lowrank; ++k) {
+                dot += static_cast<double>(w_up[row * lowrank + k]) * ref_act[k];
+            }
+            mixed += round_bf16(sigmoid(round_bf16(static_cast<float>(dot)))) * static_cast<float>(N_host[row]);
+        }
+        ref_x[d] = mixed / groups;
+    }
+
+    Tensor N_dev = Tensor::allocate(ctx, {k_dim}, dnnl::memory::data_type::bf16);
+    Tensor wd_dev = Tensor::allocate(ctx, {lowrank, k_dim}, dnnl::memory::data_type::bf16);
+    Tensor wi_dev = Tensor::allocate(ctx, {groups, k_dim}, dnnl::memory::data_type::bf16);
+    Tensor wu_dev = Tensor::allocate(ctx, {k_dim, lowrank}, dnnl::memory::data_type::bf16);
+    Tensor act_dev = Tensor::allocate(ctx, {lowrank}, dnnl::memory::data_type::bf16);
+    Tensor inj_dev = Tensor::allocate(ctx, {groups}, dnnl::memory::data_type::f32);
+    Tensor x_dev = Tensor::allocate(ctx, {group_dim}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(N_dev.data(), N_host.data(), N_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(wd_dev.data(), w_down.data(), w_down.size() * sizeof(bf16));
+    ctx.memcpy_h2d(wi_dev.data(), w_inject.data(), w_inject.size() * sizeof(bf16));
+    ctx.memcpy_h2d(wu_dev.data(), w_up.data(), w_up.size() * sizeof(bf16));
+    const std::vector<float> inj_sentinel(groups, -7.0f);
+    ctx.memcpy_h2d(inj_dev.data(), inj_sentinel.data(), groups * sizeof(float));
+
+    ops::hc_decode_down_inject(ctx, N_dev.data_as<bf16>(), wd_dev.data_as<bf16>(),
+                               with_inject ? wi_dev.data_as<bf16>() : nullptr,
+                               act_dev.data_as<bf16>(), inj_dev.data_as<float>(),
+                               lowrank, group_dim, groups);
+    ops::hc_decode_up_mix(ctx, act_dev.data_as<bf16>(), wu_dev.data_as<bf16>(), N_dev.data_as<bf16>(),
+                          x_dev.data_as<bf16>(), lowrank, group_dim, groups);
+    ctx.synchronize();
+
+    std::vector<bf16> act(lowrank), x(group_dim);
+    std::vector<float> inj(groups);
+    ctx.memcpy_d2h(act.data(), act_dev.data(), act.size() * sizeof(bf16));
+    ctx.memcpy_d2h(x.data(), x_dev.data(), x.size() * sizeof(bf16));
+    ctx.memcpy_d2h(inj.data(), inj_dev.data(), inj.size() * sizeof(float));
+    const std::string tag = with_inject ? " (inject)" : " (mixer)";
+    check_close(act, ref_act, "hc_decode_down_inject act" + tag, 1e-2f);
+    check_close(x, ref_x, "hc_decode_up_mix x" + tag, 1e-2f);
+    check_close_f32(inj, with_inject ? ref_inj : inj_sentinel, "hc_decode_down_inject inj" + tag, 1e-2f);
+}
+
 void test_ple_gate_value(Context& ctx) {
     constexpr int rows = 2;
     constexpr int hc_count = 4;
@@ -529,6 +609,61 @@ void test_moe_decode_gate_up_and_down(Context& ctx) {
     std::vector<bf16> gpu_out(out_features);
     ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), out_features * sizeof(bf16));
     check_close(gpu_out, ref_out, "moe_decode_down_weighted_accumulate", 2e-2f);
+
+    // Fused shared-expert addition must preserve the bf16 rounding point of
+    // the previous two-kernel sequence: first route, then add gated shared.
+    std::vector<bf16> shared_host(out_features);
+    for (bf16& value : shared_host) value = bf16(in_dist(rng));
+    const bf16 shared_gate_host(0.3f);
+    Tensor shared_dev = Tensor::allocate(ctx, {out_features}, dnnl::memory::data_type::bf16);
+    Tensor gate_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(shared_dev.data(), shared_host.data(), out_features * sizeof(bf16));
+    ctx.memcpy_h2d(gate_dev.data(), &shared_gate_host, sizeof(bf16));
+    const float gate = static_cast<float>(shared_gate_host);
+    const float gate_act = 1.0f / (1.0f + std::exp(-gate));
+    std::vector<float> ref_fused(out_features);
+    for (int i = 0; i < out_features; ++i) {
+        ref_fused[i] = static_cast<float>(bf16(
+            static_cast<float>(gpu_out[i]) + gate_act * static_cast<float>(shared_host[i])));
+    }
+    Tensor separate_dev = Tensor::allocate(ctx, {out_features}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(separate_dev.data(), gpu_out.data(), out_features * sizeof(bf16));
+    auto* separate_ptr = static_cast<bf16*>(separate_dev.data());
+    const auto* shared_ptr = static_cast<const bf16*>(shared_dev.data());
+    const auto* gate_ptr = static_cast<const bf16*>(gate_dev.data());
+    ctx.queue().parallel_for(sycl::range<1>(out_features), [=](sycl::id<1> id) {
+        const float gate_value = static_cast<float>(gate_ptr[0]);
+        const float sigmoid = 1.0f / (1.0f + sycl::native::exp(-gate_value));
+        separate_ptr[id] = bf16(static_cast<float>(separate_ptr[id]) +
+                                sigmoid * static_cast<float>(shared_ptr[id]));
+    });
+    ctx.synchronize();
+    std::vector<bf16> separate_host(out_features);
+    ctx.memcpy_d2h(separate_host.data(), separate_dev.data(), out_features * sizeof(bf16));
+    ops::moe_decode_down_weighted_accumulate(
+        ctx, slots.data(), nullptr, weights_host.data(),
+        static_cast<const bf16*>(h_dev.data()), nullptr,
+        static_cast<bf16*>(out_dev.data()),
+        num_active_experts, intermediate_size, out_features, blocksize,
+        static_cast<const bf16*>(shared_dev.data()),
+        static_cast<const bf16*>(gate_dev.data()));
+    ctx.synchronize();
+    ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), out_features * sizeof(bf16));
+    check_close(gpu_out, ref_fused, "moe_decode_down_fused_shared", 2e-2f);
+    int exact_mismatches = 0;
+    float max_separate_diff = 0.0f;
+    for (int i = 0; i < out_features; ++i) {
+        if (gpu_out[i] != separate_host[i]) {
+            ++exact_mismatches;
+            max_separate_diff = std::max(max_separate_diff,
+                std::abs(static_cast<float>(gpu_out[i]) - static_cast<float>(separate_host[i])));
+        }
+    }
+    if (exact_mismatches != 0) {
+        throw std::runtime_error("fused shared add differs from two-kernel result: " +
+                                 std::to_string(exact_mismatches) + " values, max abs " +
+                                 std::to_string(max_separate_diff));
+    }
 }
 
 void test_gated_delta_net_sigmoid(Context& ctx) {
@@ -562,6 +697,8 @@ int main() {
         test_grouped_rms_norm(ctx);
         test_hc_mix_reduce(ctx);
         test_hc_inject_add(ctx);
+        test_hc_decode_fused(ctx, true);
+        test_hc_decode_fused(ctx, false);
         test_ple_gate_value(ctx);
         test_ple_dilated_conv_silu_add(ctx);
         test_router_softmax_topk(ctx);

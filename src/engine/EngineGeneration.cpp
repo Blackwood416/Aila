@@ -27,17 +27,18 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
             }
         }
 
+        if (actual_len > accepted_len) {
+            // Truncation left extra tokens behind; rebuild from scratch.
+            backend_->reset();
+            actual_len = 0;
+        }
         if (actual_len < prompt_len) {
             replay_range(prompt_ids, actual_len, prompt_len - actual_len);
             actual_len = backend_->get_current_context_len();
-        } else if (actual_len > prompt_len) {
-            if (!backend_->truncate_kv_cache(prompt_len)) {
-                backend_->reset();
-                replay_range(prompt_ids, 0, prompt_len);
-            }
-            actual_len = backend_->get_current_context_len();
         }
 
+        // The backend now holds a prefix of prompt + generated (typically only the last
+        // sampled token was never fed), so only the missing generated tail is replayed.
         int generated_start = std::max(0, actual_len - prompt_len);
         if (generated_start < static_cast<int>(generated_ids.size())) {
             replay_range(generated_ids,
@@ -944,6 +945,11 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
             tokenizer_.special_token_id("</think>"));
         int effective_chunk_size = streaming ? std::max(1, tuned_cfg.stream_chunk_size)
                                              : std::max(1, tuned_cfg.decode_chunk_size);
+        if (model_spec_.family == ModelFamily::Qwen4Exp) {
+            // Every Qwen4Exp forward already syncs with the host per layer (expert routing),
+            // so decoding ahead saves nothing and an EOS inside the chunk costs a replay.
+            effective_chunk_size = 1;
+        }
         bool use_chunked_fast_decode =
             !think_budget.should_disable_chunked_decode() &&
             (!tuned_cfg.has_penalties()) &&

@@ -27,8 +27,9 @@ void expect(bool cond, const std::string& msg) {
 // 1. Expert Cache Unit Tests
 // ---------------------------------------------------------------------------
 
-void test_expert_cache_lru_and_dequant(Context& ctx) {
-    std::cout << "[Test] Running expert cache LRU and dequantization unit tests...\n";
+void test_expert_cache_lru_and_dequant(Context& ctx, bool compact) {
+    std::cout << "[Test] Running expert cache LRU and dequantization unit tests (nested codes="
+              << compact << ")...\n";
 
     constexpr int num_layers = 2;
     constexpr int num_experts_per_layer = 8;
@@ -65,6 +66,9 @@ void test_expert_cache_lru_and_dequant(Context& ctx) {
         gu_nested_qmap[i] = static_cast<float>(i) / 256.0f;
         dn_nested_qmap[i] = static_cast<float>(i) / 256.0f;
     }
+    // Vary per nested block so a wrong expert offset shows up in dequant checks.
+    for (size_t j = 0; j < gu_nested_absmax.size(); ++j) gu_nested_absmax[j] = 1.25f + 0.01f * static_cast<float>(j);
+    for (size_t j = 0; j < dn_nested_absmax.size(); ++j) dn_nested_absmax[j] = 0.75f + 0.01f * static_cast<float>(j);
 
     std::mt19937 rng(12345);
     for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>(rng() & 0xFF);
@@ -131,14 +135,16 @@ void test_expert_cache_lru_and_dequant(Context& ctx) {
     ModelWeights dummy_weights;
     Qwen4ExpExpertCache cache;
 
-    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp * sizeof(float) +
-                              dn_packed_per_exp + dn_absmax_per_exp * sizeof(float);
+    const size_t scale_bytes = compact ? sizeof(uint8_t) : sizeof(float);
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp * scale_bytes +
+                              dn_packed_per_exp + dn_absmax_per_exp * scale_bytes;
     const size_t cache_bytes = 4 * slot_bytes; // exactly 4 slots!
 
     std::string err;
     bool ok = cache.init(ctx, dummy_weights, num_layers, cache_bytes,
-                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err);
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, compact);
     expect(ok, "cache init failed: " + err);
+    expect(cache.uses_nested_codes() == compact, "nested-code mode mismatch");
     expect(cache.num_slots() == 4, "expected 4 slots, got " + std::to_string(cache.num_slots()));
 
     cache.set_layer_expert_ref(0, gu_ref, dn_ref);
@@ -160,13 +166,124 @@ void test_expert_cache_lru_and_dequant(Context& ctx) {
     expect(std::memcmp(read_gu_packed.data(), gu_packed_host.data(), gu_packed_per_exp) == 0,
            "gate_up packed mismatch on device");
 
-    std::vector<float> read_gu_absmax(gu_absmax_per_exp);
-    ctx.memcpy_d2h(read_gu_absmax.data(), dev_slot0.gate_up_absmax, gu_absmax_per_exp * sizeof(float));
-    for (size_t i = 0; i < gu_absmax_per_exp; ++i) {
-        uint8_t code = gu_absmax_codes[i];
-        float expected_val = gu_nested_qmap[code] * gu_nested_absmax[i / 256] + 0.05f;
-        float diff = std::abs(read_gu_absmax[i] - expected_val);
-        expect(diff < 1e-5f, "absmax dequant mismatch at index " + std::to_string(i));
+    if (compact) {
+        std::vector<uint8_t> read_codes(gu_absmax_per_exp);
+        ctx.memcpy_d2h(read_codes.data(), dev_slot0.gate_up_nested.codes, read_codes.size());
+        expect(std::memcmp(read_codes.data(), gu_absmax_codes.data(), read_codes.size()) == 0,
+               "nested absmax code mismatch");
+        std::vector<float> read_scale(gu_absmax_per_exp / 256);
+        ctx.memcpy_d2h(read_scale.data(), dev_slot0.gate_up_nested.nested_absmax,
+                       read_scale.size() * sizeof(float));
+        for (size_t i = 0; i < read_scale.size(); ++i) {
+            expect(read_scale[i] == gu_nested_absmax[i], "nested scale mismatch");
+        }
+        Tensor reconstructed = Tensor::allocate(ctx, {gu_absmax_per_exp}, dnnl::memory::data_type::f32);
+        const auto nested = dev_slot0.gate_up_nested;
+        auto* reconstructed_ptr = static_cast<float*>(reconstructed.data());
+        ctx.queue().parallel_for(sycl::range<1>(gu_absmax_per_exp), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const float q = nested.nested_quant_map[nested.codes[i]];
+            const float scale = nested.nested_absmax[i / nested.blocksize];
+            reconstructed_ptr[i] = sycl::fma(sycl::fma(q, scale, 0.0f), 1.0f, nested.offset);
+        });
+        ctx.synchronize();
+        std::vector<float> gpu_scales(gu_absmax_per_exp);
+        ctx.memcpy_d2h(gpu_scales.data(), reconstructed.data(), gu_absmax_per_exp * sizeof(float));
+        for (size_t i = 0; i < gu_absmax_per_exp; ++i) {
+            const float host_scale = gu_nested_qmap[gu_absmax_codes[i]] * gu_nested_absmax[i / 256] + 0.05f;
+            expect(gpu_scales[i] == host_scale,
+                   "nested GPU/host f32 scale rounding mismatch at " + std::to_string(i));
+        }
+    } else {
+        std::vector<float> read_gu_absmax(gu_absmax_per_exp);
+        ctx.memcpy_d2h(read_gu_absmax.data(), dev_slot0.gate_up_absmax, gu_absmax_per_exp * sizeof(float));
+        for (size_t i = 0; i < gu_absmax_per_exp; ++i) {
+            uint8_t code = gu_absmax_codes[i];
+            float expected_val = gu_nested_qmap[code] * gu_nested_absmax[i / 256] + 0.05f;
+            float diff = std::abs(read_gu_absmax[i] - expected_val);
+            expect(diff < 1e-5f, "absmax dequant mismatch at index " + std::to_string(i));
+        }
+    }
+
+    // Exercise both cache representations through the actual MoE kernels.
+    // The CPU reference reconstructs nested scales from the original host
+    // codes, rather than reading the GPU slot layout back.
+    std::vector<ops::MoeExpertSlotDev> kernel_slots(3);
+    cache.get_slots_dev(slots1, 3, kernel_slots.data());
+    Tensor qmap_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
+    ctx.memcpy_h2d(qmap_dev.data(), qmap.data(), 16 * sizeof(float));
+    std::vector<bf16> x_host(hidden_size);
+    for (int i = 0; i < hidden_size; ++i) x_host[i] = bf16(std::sin(i * 0.13f) * 0.1f);
+    Tensor x_dev = Tensor::allocate(ctx, {hidden_size}, dnnl::memory::data_type::bf16);
+    Tensor h_dev = Tensor::allocate(ctx, {3 * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor out_dev = Tensor::allocate(ctx, {hidden_size}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+    const float expert_weights[3] = {0.2f, 0.3f, 0.5f};
+    auto matrix_weight = [&](const std::vector<uint8_t>& packed,
+                             const std::vector<uint8_t>& codes,
+                             const std::vector<float>& scales,
+                             const std::vector<float>& nested_map,
+                             size_t packed_per_expert, size_t absmax_per_expert,
+                             int expert, int row, int col, int width, float offset) {
+        const size_t packed_index = static_cast<size_t>(expert) * packed_per_expert +
+                                    static_cast<size_t>(row) * (width / 2) + col / 2;
+        const uint8_t byte = packed[packed_index];
+        const int nibble = col % 2 == 0 ? byte >> 4 : byte & 0xF;
+        const size_t scale_index = static_cast<size_t>(expert) * absmax_per_expert +
+                                   static_cast<size_t>(row) * (width / blocksize) + col / blocksize;
+        const float absmax = nested_map[codes[scale_index]] * scales[scale_index / 256] + offset;
+        return qmap[nibble] * absmax;
+    };
+    std::vector<bf16> h_ref(3 * intermediate_size);
+    for (int e = 0; e < 3; ++e) {
+        for (int row = 0; row < intermediate_size; ++row) {
+            float gate = 0.0f, up = 0.0f;
+            for (int col = 0; col < hidden_size; ++col) {
+                const float x = static_cast<float>(x_host[col]);
+                gate += x * matrix_weight(gu_packed_host, gu_absmax_codes, gu_nested_absmax,
+                                          gu_nested_qmap, gu_packed_per_exp, gu_absmax_per_exp,
+                                          e, row, col, hidden_size, 0.05f);
+                up += x * matrix_weight(gu_packed_host, gu_absmax_codes, gu_nested_absmax,
+                                        gu_nested_qmap, gu_packed_per_exp, gu_absmax_per_exp,
+                                        e, row + intermediate_size, col, hidden_size, 0.05f);
+            }
+            h_ref[e * intermediate_size + row] = bf16(gate / (1.0f + std::exp(-gate)) * up);
+        }
+    }
+    std::vector<float> out_ref(hidden_size, 0.0f);
+    for (int e = 0; e < 3; ++e) {
+        for (int row = 0; row < hidden_size; ++row) {
+            float sum = 0.0f;
+            for (int col = 0; col < intermediate_size; ++col) {
+                sum += static_cast<float>(h_ref[e * intermediate_size + col]) *
+                       matrix_weight(dn_packed_host, dn_absmax_codes, dn_nested_absmax,
+                                     dn_nested_qmap, dn_packed_per_exp, dn_absmax_per_exp,
+                                     e, row, col, intermediate_size, 0.03f);
+            }
+            out_ref[row] += expert_weights[e] * sum;
+        }
+    }
+    ops::moe_decode_gate_up_swiglu_grouped(
+        ctx, kernel_slots.data(), static_cast<const float*>(qmap_dev.data()),
+        static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_dev.data()),
+        3, hidden_size, intermediate_size, blocksize);
+    ops::moe_decode_down_weighted_accumulate(
+        ctx, kernel_slots.data(), static_cast<const float*>(qmap_dev.data()),
+        expert_weights, static_cast<const bf16*>(h_dev.data()), nullptr,
+        static_cast<bf16*>(out_dev.data()), 3, intermediate_size, hidden_size, blocksize);
+    ctx.synchronize();
+    std::vector<bf16> h_actual(h_ref.size()), out_actual(hidden_size);
+    ctx.memcpy_d2h(h_actual.data(), h_dev.data(), h_actual.size() * sizeof(bf16));
+    ctx.memcpy_d2h(out_actual.data(), out_dev.data(), out_actual.size() * sizeof(bf16));
+    for (size_t i = 0; i < h_ref.size(); ++i) {
+        expect(std::isfinite(static_cast<float>(h_actual[i])) &&
+               std::abs(static_cast<float>(h_actual[i]) - static_cast<float>(h_ref[i])) < 0.03f,
+               "MoE gate/up CPU reference mismatch at " + std::to_string(i));
+    }
+    for (size_t i = 0; i < out_ref.size(); ++i) {
+        expect(std::isfinite(static_cast<float>(out_actual[i])) &&
+               std::abs(static_cast<float>(out_actual[i]) - out_ref[i]) < 0.03f + 0.02f * std::abs(out_ref[i]),
+               "MoE down CPU reference mismatch at " + std::to_string(i));
     }
 
     // Test 2: acquire experts [1, 2] -> both hit!
@@ -200,6 +317,95 @@ void test_expert_cache_lru_and_dequant(Context& ctx) {
     int req5[2] = {4, 4};
     cache.acquire(0, req5, 2, slots5);
     expect(slots5[0] == slots4[1] && slots5[1] == slots4[1], "duplicate experts in batch must resolve to same slot");
+
+    // Test 6: fill-only prefetch. Layer 1 experts {7, 6} plus resident layer-0 expert 4
+    // (skipped). Prefetch must not bind or evict anything; acquire then serves expert 7
+    // from the prefetch staging and fills expert 3 normally.
+    const bool resident_before[3] = {cache.contains(0, 2), cache.contains(0, 4), cache.contains(0, 5)};
+    const uint64_t misses_before = cache.stats().miss_count;
+    int pf_req[3] = {7, 6, 4};
+    cache.prefetch_async(1, pf_req, 2);
+    cache.prefetch_async(0, pf_req + 2, 1); // joins the previous job; resident -> nothing staged
+    expect(cache.stats().prefetch_issued == 2, "expected 2 staged prefetches, got " +
+           std::to_string(cache.stats().prefetch_issued));
+    // Restage layer 1 (the second call replaced the staged set).
+    cache.prefetch_async(1, pf_req, 2);
+    expect(!cache.contains(1, 7) && !cache.contains(1, 6), "prefetch must not bind slots");
+    expect(cache.contains(0, 2) == resident_before[0] && cache.contains(0, 4) == resident_before[1] &&
+           cache.contains(0, 5) == resident_before[2], "prefetch must not evict");
+
+    int slots6[2] = {-1, -1};
+    int req6[2] = {7, 3};
+    cache.acquire(1, req6, 2, slots6);
+    expect(cache.stats().prefetch_used == 1, "expected expert 7 served from prefetch staging");
+    expect(cache.stats().miss_count == misses_before + 2, "both layer-1 experts are misses");
+
+    auto check_slot = [&](int slot, int expert, const char* what) {
+        ops::MoeExpertSlotDev dev = cache.get_slot_dev(slot);
+        std::vector<uint8_t> gu(gu_packed_per_exp), dn(dn_packed_per_exp);
+        ctx.memcpy_d2h(gu.data(), dev.gate_up_packed, gu.size());
+        ctx.memcpy_d2h(dn.data(), dev.down_packed, dn.size());
+        expect(std::memcmp(gu.data(), gu_packed_host.data() + expert * gu_packed_per_exp, gu.size()) == 0,
+               std::string(what) + ": gate_up packed mismatch");
+        expect(std::memcmp(dn.data(), dn_packed_host.data() + expert * dn_packed_per_exp, dn.size()) == 0,
+               std::string(what) + ": down packed mismatch");
+        if (compact) {
+            std::vector<uint8_t> gua(gu_absmax_per_exp), dna(dn_absmax_per_exp);
+            ctx.memcpy_d2h(gua.data(), dev.gate_up_nested.codes, gua.size());
+            ctx.memcpy_d2h(dna.data(), dev.down_nested.codes, dna.size());
+            expect(std::memcmp(gua.data(), gu_absmax_codes.data() + expert * gu_absmax_per_exp, gua.size()) == 0,
+                   std::string(what) + ": gate_up codes mismatch");
+            expect(std::memcmp(dna.data(), dn_absmax_codes.data() + expert * dn_absmax_per_exp, dna.size()) == 0,
+                   std::string(what) + ": down codes mismatch");
+            std::vector<float> gu_scale(gu_absmax_per_exp / 256), dn_scale(dn_absmax_per_exp / 256);
+            ctx.memcpy_d2h(gu_scale.data(), dev.gate_up_nested.nested_absmax,
+                           gu_scale.size() * sizeof(float));
+            ctx.memcpy_d2h(dn_scale.data(), dev.down_nested.nested_absmax,
+                           dn_scale.size() * sizeof(float));
+            for (size_t i = 0; i < gu_scale.size(); ++i) {
+                expect(gu_scale[i] == gu_nested_absmax[expert * gu_scale.size() + i],
+                       std::string(what) + ": gate_up nested scale offset mismatch");
+            }
+            for (size_t i = 0; i < dn_scale.size(); ++i) {
+                expect(dn_scale[i] == dn_nested_absmax[expert * dn_scale.size() + i],
+                       std::string(what) + ": down nested scale offset mismatch");
+            }
+            return;
+        }
+        std::vector<float> gua(gu_absmax_per_exp), dna(dn_absmax_per_exp);
+        ctx.memcpy_d2h(gua.data(), dev.gate_up_absmax, gua.size() * sizeof(float));
+        ctx.memcpy_d2h(dna.data(), dev.down_absmax, dna.size() * sizeof(float));
+        for (size_t i = 0; i < gu_absmax_per_exp; ++i) {
+            const size_t g = expert * gu_absmax_per_exp + i;
+            const float want = gu_nested_qmap[gu_absmax_codes[g]] * gu_nested_absmax[g / 256] + 0.05f;
+            expect(std::abs(gua[i] - want) < 1e-5f, std::string(what) + ": gate_up absmax mismatch");
+        }
+        for (size_t i = 0; i < dn_absmax_per_exp; ++i) {
+            const size_t g = expert * dn_absmax_per_exp + i;
+            const float want = dn_nested_qmap[dn_absmax_codes[g]] * dn_nested_absmax[g / 256] + 0.03f;
+            expect(std::abs(dna[i] - want) < 1e-5f, std::string(what) + ": down absmax mismatch");
+        }
+    };
+    check_slot(slots6[0], 7, "prefetched expert 7");
+    check_slot(slots6[1], 3, "filled expert 3");
+
+    // Demotion: a demoted expert is evicted before older, non-demoted ones.
+    int slots7[2] = {-1, -1};
+    cache.acquire(1, req6, 2, slots7); // both hits -> most recently used
+    bool layer0_before[num_experts_per_layer];
+    for (int e = 0; e < num_experts_per_layer; ++e) layer0_before[e] = cache.contains(0, e);
+    const int demoted[1] = {7};
+    cache.demote(1, demoted, 1);
+    int slots8[1] = {-1};
+    const int req8[1] = {5};
+    cache.acquire(1, req8, 1, slots8);
+    expect(slots8[0] == slots7[0], "demoted expert 7's slot must be the victim");
+    expect(!cache.contains(1, 7) && cache.contains(1, 3) && cache.contains(1, 5),
+           "demotion must evict only expert 7");
+    for (int e = 0; e < num_experts_per_layer; ++e) {
+        expect(cache.contains(0, e) == layer0_before[e], "demotion must keep older layer-0 experts");
+    }
+    check_slot(slots8[0], 5, "expert 5 in the demoted slot");
 
     std::cout << "[PASS] Expert cache LRU and dequantization tests passed. Final hit rate: "
               << (cache.stats().hit_rate() * 100.0) << "%\n";
@@ -392,8 +598,18 @@ void test_ple_lookup_and_dequant(Context& ctx) {
 // 3. Real Model Integration Test (if present)
 // ---------------------------------------------------------------------------
 
+static std::string resolve_qwen4exp_model_dir() {
+    const char* env_dir = std::getenv("AILA_QWEN4EXP_MODEL_DIR");
+    if (env_dir && fs::exists(env_dir)) return env_dir;
+    const std::string candidate_c = "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    if (fs::exists(candidate_c)) return candidate_c;
+    const std::string candidate_f = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    if (fs::exists(candidate_f)) return candidate_f;
+    return candidate_c;
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx) {
-    const std::string model_dir = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
         std::cout << "[Test] Real model directory " << model_dir << " not found, skipping real model tests.\n";
         return;
@@ -450,7 +666,8 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
 int main() {
     try {
         Context ctx;
-        test_expert_cache_lru_and_dequant(ctx);
+        test_expert_cache_lru_and_dequant(ctx, false);
+        test_expert_cache_lru_and_dequant(ctx, true);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);

@@ -13,11 +13,21 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 
 namespace ops {
 
+struct MoeNestedScaleDev {
+    const uint8_t* codes = nullptr;
+    const float* nested_absmax = nullptr;
+    const float* nested_quant_map = nullptr;
+    float offset = 0.0f;
+    int blocksize = 0;
+};
+
 struct MoeExpertSlotDev {
     const uint8_t* gate_up_packed = nullptr; // [2 * intermediate_size, in_features / 2]
     const float* gate_up_absmax = nullptr;   // [2 * intermediate_size, in_features / blocksize]
     const uint8_t* down_packed = nullptr;    // [out_features, intermediate_size / 2]
     const float* down_absmax = nullptr;      // [out_features, intermediate_size / blocksize]
+    MoeNestedScaleDev gate_up_nested{};
+    MoeNestedScaleDev down_nested{};
 };
 
 // 512-expert Top-K Router (Device)
@@ -46,7 +56,7 @@ void router_softmax_topk_host(
 
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
-void moe_decode_gate_up_swiglu_grouped(
+sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
     const MoeExpertSlotDev* slots,
     const float* quant_map,
@@ -59,7 +69,7 @@ void moe_decode_gate_up_swiglu_grouped(
 
 // Slotted expert decode down-projection with weighted accumulation:
 // out = sum_k (weight[k] * down_k(h[k]))
-void moe_decode_down_weighted_accumulate(
+sycl::event moe_decode_down_weighted_accumulate(
     Context& ctx,
     const MoeExpertSlotDev* slots,
     const float* quant_map,
@@ -70,7 +80,9 @@ void moe_decode_down_weighted_accumulate(
     int num_active_experts,
     int in_features = 640,
     int out_features = 2560,
-    int blocksize = 64);
+    int blocksize = 64,
+    const bf16* shared_out = nullptr,
+    const bf16* shared_gate = nullptr);
 
 // Flat SwiGLU activation: out[t * intermediate_size + i] = silu(gate) * up
 void moe_silu_gate_up_mul_flat(

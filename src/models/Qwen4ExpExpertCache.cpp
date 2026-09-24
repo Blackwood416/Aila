@@ -1,10 +1,135 @@
 #include "Qwen4ExpExpertCache.hpp"
+#include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iostream>
+#include <iterator>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+
+
+// Persistent worker pool for host-side expert staging fills. `threads` counts
+// the caller: run() executes on the caller plus workers; start() hands the job
+// to the workers only and returns, and wait() joins it (the caller helps).
+class ExpertFillPool {
+public:
+    explicit ExpertFillPool(int threads) {
+        for (int i = 1; i < threads; ++i) {
+            workers_.emplace_back([this] { WorkerLoop(); });
+        }
+    }
+
+    ~ExpertFillPool() {
+        wait();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
+
+    int thread_count() const { return static_cast<int>(workers_.size()) + 1; }
+    bool busy() const { return in_flight_; }
+
+    void run(int total, std::function<void(int)> fn) {
+        if (total <= 0) return;
+        if (workers_.empty() || total == 1) {
+            for (int i = 0; i < total; ++i) fn(i);
+            return;
+        }
+        start(total, std::move(fn));
+        wait();
+    }
+
+    // Requires no job in flight (call wait() first).
+    void start(int total, std::function<void(int)> fn) {
+        if (total <= 0) return;
+        if (workers_.empty()) {
+            for (int i = 0; i < total; ++i) fn(i);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_fn_ = std::move(fn);
+            total_ = total;
+            next_.store(0, std::memory_order_relaxed);
+            done_.store(0, std::memory_order_relaxed);
+            has_job_ = true;
+            ++generation_;
+        }
+        in_flight_ = true;
+        cv_.notify_all();
+    }
+
+    void wait() {
+        if (!in_flight_) return;
+        Drain(&job_fn_, total_);
+        while (done_.load(std::memory_order_acquire) < total_) {
+            std::this_thread::yield();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            has_job_ = false;
+        }
+        // Workers that captured this job must leave Drain before it is replaced.
+        while (active_.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
+        job_fn_ = nullptr;
+        in_flight_ = false;
+    }
+
+private:
+    void Drain(const std::function<void(int)>* fn, int total) {
+        for (;;) {
+            const int i = next_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) break;
+            (*fn)(i);
+            done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    void WorkerLoop() {
+        uint64_t seen = 0;
+        for (;;) {
+            int total = 0;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&] { return stop_ || (generation_ != seen && has_job_); });
+                if (stop_) return;
+                seen = generation_;
+                total = total_;
+                active_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            Drain(&job_fn_, total);
+            active_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    bool has_job_ = false;
+    bool in_flight_ = false; // owner-thread only
+    uint64_t generation_ = 0;
+    std::function<void(int)> job_fn_;
+    int total_ = 0;
+    std::atomic<int> next_{0};
+    std::atomic<int> done_{0};
+    std::atomic<int> active_{0};
+};
+
+Qwen4ExpExpertCache::Qwen4ExpExpertCache() = default;
 
 Qwen4ExpExpertCache::~Qwen4ExpExpertCache() {
     cleanup();
@@ -38,10 +163,13 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     dn_packed_offset_ = other.dn_packed_offset_;
     dn_absmax_offset_ = other.dn_absmax_offset_;
     slot_bytes_ = other.slot_bytes_;
+    compact_nested_ = other.compact_nested_;
 
     num_slots_ = other.num_slots_;
     dev_pool_bytes_ = other.dev_pool_bytes_;
-    dev_pool_ptr_ = other.dev_pool_ptr_;
+    dev_pool_chunks_ = std::move(other.dev_pool_chunks_);
+    slot_dev_base_ = std::move(other.slot_dev_base_);
+    layer_meta_allocs_ = std::move(other.layer_meta_allocs_);
 
     staging_buffer_bytes_ = other.staging_buffer_bytes_;
     pinned_staging_ptr_ = other.pinned_staging_ptr_;
@@ -55,38 +183,91 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     slots_dev_ = std::move(other.slots_dev_);
     stats_ = other.stats_;
     initialized_ = other.initialized_;
+    fill_pool_ = std::move(other.fill_pool_);
+    fill_parts_ = other.fill_parts_;
+    prefetch_staging_ptr_ = other.prefetch_staging_ptr_;
+    prefetch_staging_slots_ = other.prefetch_staging_slots_;
+    prefetch_items_ = std::move(other.prefetch_items_);
+    prefetch_in_flight_ = other.prefetch_in_flight_;
+    copy_q_ = std::move(other.copy_q_);
+
+    host_pool_enabled_ = other.host_pool_enabled_;
+    host_pool_bytes_ = other.host_pool_bytes_;
+    num_host_slots_ = other.num_host_slots_;
+    host_pool_chunks_ = std::move(other.host_pool_chunks_);
+    host_slot_ptrs_ = std::move(other.host_slot_ptrs_);
+    host_key_to_slot_ = std::move(other.host_key_to_slot_);
+    host_slot_to_key_ = std::move(other.host_slot_to_key_);
+    host_lru_list_ = std::move(other.host_lru_list_);
+    host_slot_iters_ = std::move(other.host_slot_iters_);
+    other.prefetch_staging_ptr_ = nullptr;
+    other.prefetch_in_flight_ = false;
+
+    other.host_pool_chunks_.clear();
+    other.host_slot_ptrs_.clear();
+    other.host_key_to_slot_.clear();
+    other.host_slot_to_key_.clear();
+    other.host_lru_list_.clear();
+    other.host_slot_iters_.clear();
+    other.host_pool_bytes_ = 0;
+    other.num_host_slots_ = 0;
+    other.host_pool_enabled_ = false;
 
     other.ctx_ = nullptr;
     other.weights_ = nullptr;
-    other.dev_pool_ptr_ = nullptr;
+    other.dev_pool_chunks_.clear();
+    other.slot_dev_base_.clear();
+    other.layer_meta_allocs_.clear();
     other.pinned_staging_ptr_ = nullptr;
     other.dev_pool_bytes_ = 0;
     other.staging_buffer_bytes_ = 0;
     other.num_slots_ = 0;
+    other.compact_nested_ = false;
     other.initialized_ = false;
 
     return *this;
 }
 
 void Qwen4ExpExpertCache::cleanup() {
+    try {
+        wait_prefetch();
+    } catch (...) {}
     if (ctx_) {
         try {
             ctx_->synchronize();
         } catch (...) {}
-        if (dev_pool_ptr_) {
-            ctx_->free_device(dev_pool_ptr_);
-            dev_pool_ptr_ = nullptr;
+        // The copy queue may still use pool/staging pointers after the main
+        // queue has drained. Wait before releasing either allocation.
+        if (copy_q_) {
+            try { copy_q_->wait_and_throw(); } catch (...) {}
+        }
+        for (uint8_t* meta : layer_meta_allocs_) {
+            if (meta) ctx_->free_device(meta);
+        }
+        if (prefetch_staging_ptr_) {
+            ctx_->free_host(prefetch_staging_ptr_);
+            prefetch_staging_ptr_ = nullptr;
+        }
+        for (uint8_t* chunk : dev_pool_chunks_) {
+            ctx_->free_device(chunk);
         }
         if (pinned_staging_ptr_) {
             ctx_->free_host(pinned_staging_ptr_);
             pinned_staging_ptr_ = nullptr;
         }
+        for (void* chunk : host_pool_chunks_) {
+            ctx_->free_host(chunk);
+        }
     }
+    dev_pool_chunks_.clear();
+    layer_meta_allocs_.clear();
+    slot_dev_base_.clear();
     ctx_ = nullptr;
     weights_ = nullptr;
     dev_pool_bytes_ = 0;
     staging_buffer_bytes_ = 0;
     num_slots_ = 0;
+    compact_nested_ = false;
     initialized_ = false;
     layer_weights_.clear();
     lru_list_.clear();
@@ -95,6 +276,23 @@ void Qwen4ExpExpertCache::cleanup() {
     slot_to_key_.clear();
     slot_reserved_.clear();
     slots_dev_.clear();
+    host_pool_chunks_.clear();
+    host_slot_ptrs_.clear();
+    host_key_to_slot_.clear();
+    host_slot_to_key_.clear();
+    host_lru_list_.clear();
+    host_slot_iters_.clear();
+    host_pool_bytes_ = 0;
+    num_host_slots_ = 0;
+    host_pool_enabled_ = false;
+    fill_pool_.reset();
+    prefetch_items_.clear();
+    if (copy_q_) {
+        try {
+            copy_q_->wait();
+        } catch (...) {}
+        copy_q_.reset();
+    }
 }
 
 bool Qwen4ExpExpertCache::init(Context& ctx,
@@ -105,7 +303,8 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
                               int hidden_size,
                               int intermediate_size,
                               int blocksize,
-                              std::string* error_message) {
+                              std::string* error_message,
+                              bool force_nested_codes) {
     cleanup();
 
     ctx_ = &ctx;
@@ -121,13 +320,45 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     const int gu_rows = 2 * intermediate_size_;
     gu_packed_bytes_ = static_cast<size_t>(gu_rows) * (hidden_size_ / 2);
     gu_absmax_count_ = static_cast<size_t>(gu_rows) * (hidden_size_ / blocksize_);
-    gu_absmax_bytes_ = gu_absmax_count_ * sizeof(float);
 
     // down: hidden_size rows, intermediate_size cols
     const int dn_rows = hidden_size_;
     dn_packed_bytes_ = static_cast<size_t>(dn_rows) * (intermediate_size_ / 2);
     dn_absmax_count_ = static_cast<size_t>(dn_rows) * (intermediate_size_ / blocksize_);
-    dn_absmax_bytes_ = dn_absmax_count_ * sizeof(float);
+
+    // Load host refs before sizing the pool: nested u8 codes use one byte per
+    // absmax instead of four, so the same VRAM budget can hold more experts.
+    layer_weights_.resize(num_layers_);
+    for (int L = 0; L < num_layers_; ++L) {
+        std::string gu_name = "model.language_model.layers." + std::to_string(L) + ".mlp.experts.gate_up_proj";
+        std::string dn_name = "model.language_model.layers." + std::to_string(L) + ".mlp.experts.down_proj";
+        if (weights.has_host(gu_name) && weights.has_host(dn_name)) {
+            if (LoadBnb4BitHostRef(weights, gu_name, layer_weights_[L].gate_up, error_message, hidden_size_) &&
+                LoadBnb4BitHostRef(weights, dn_name, layer_weights_[L].down, error_message, intermediate_size_)) {
+                layer_weights_[L].valid = true;
+            }
+        }
+    }
+    const auto eligible = [&](const LayerWeights& lw) {
+        return lw.valid && lw.gate_up.quant_state.nested && lw.down.quant_state.nested &&
+               lw.gate_up.absmax.dtype == DT_U8 && lw.down.absmax.dtype == DT_U8 &&
+               lw.gate_up.nested_absmax.valid() && lw.gate_up.nested_absmax.dtype == DT_F32 &&
+               lw.gate_up.nested_quant_map.valid() && lw.gate_up.nested_quant_map.dtype == DT_F32 &&
+               lw.gate_up.nested_quant_map.bytes >= 256 * sizeof(float) &&
+               lw.down.nested_absmax.valid() && lw.down.nested_absmax.dtype == DT_F32 &&
+               lw.down.nested_quant_map.valid() && lw.down.nested_quant_map.dtype == DT_F32 &&
+               lw.down.nested_quant_map.bytes >= 256 * sizeof(float) &&
+               lw.gate_up.quant_state.nested_blocksize > 0 &&
+               lw.down.quant_state.nested_blocksize > 0 &&
+               gu_absmax_count_ % static_cast<size_t>(lw.gate_up.quant_state.nested_blocksize) == 0 &&
+               dn_absmax_count_ % static_cast<size_t>(lw.down.quant_state.nested_blocksize) == 0;
+    };
+    const bool all_nested = !layer_weights_.empty() &&
+                            std::all_of(layer_weights_.begin(), layer_weights_.end(), eligible);
+    compact_nested_ = force_nested_codes ||
+                      (aila::env::read_flag("AILA_Q4E_ABSMAX_CODES", true) && all_nested);
+    gu_absmax_bytes_ = gu_absmax_count_ * (compact_nested_ ? sizeof(uint8_t) : sizeof(float));
+    dn_absmax_bytes_ = dn_absmax_count_ * (compact_nested_ ? sizeof(uint8_t) : sizeof(float));
 
     gu_packed_offset_ = 0;
     gu_absmax_offset_ = gu_packed_bytes_;
@@ -135,7 +366,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     dn_absmax_offset_ = dn_packed_offset_ + dn_packed_bytes_;
     slot_bytes_ = dn_absmax_offset_ + dn_absmax_bytes_;
 
-    if (slot_bytes_ == 0) {
+    if (slot_bytes_ == 0 || (compact_nested_ && dn_packed_offset_ % alignof(uint32_t) != 0)) {
         if (error_message) *error_message = "Qwen4ExpExpertCache: invalid slot geometry";
         return false;
     }
@@ -150,25 +381,91 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     dev_pool_bytes_ = static_cast<size_t>(num_slots_) * slot_bytes_;
 
     try {
-        dev_pool_ptr_ = static_cast<uint8_t*>(ctx_->alloc_device(dev_pool_bytes_));
+        const int chunk_mb = std::max(64, aila::env::read_int("AILA_Q4E_EXPERT_CHUNK_MB", 1024));
+        const int slots_per_chunk = std::max(1, static_cast<int>(static_cast<size_t>(chunk_mb) * 1024 * 1024 / slot_bytes_));
+        slot_dev_base_.resize(num_slots_);
+        for (int s0 = 0; s0 < num_slots_; s0 += slots_per_chunk) {
+            const int n = std::min(slots_per_chunk, num_slots_ - s0);
+            uint8_t* chunk = static_cast<uint8_t*>(ctx_->alloc_device(static_cast<size_t>(n) * slot_bytes_));
+            dev_pool_chunks_.push_back(chunk);
+            for (int i = 0; i < n; ++i) {
+                slot_dev_base_[s0 + i] = chunk + static_cast<size_t>(i) * slot_bytes_;
+            }
+        }
     } catch (const std::exception& e) {
         if (error_message) *error_message = std::string("Qwen4ExpExpertCache device alloc failed: ") + e.what();
         cleanup();
         return false;
     }
 
-    // Pinned host staging buffer for DDR3 -> PCIe 3.0 DMA
-    staging_buffer_bytes_ = std::max<size_t>(slot_bytes_ * 16, static_cast<size_t>(64) * 1024 * 1024);
+    // Pinned host staging buffer for DDR3 -> PCIe 3.0 DMA (double-buffered in acquire()).
+    const size_t staging_mb = static_cast<size_t>(std::max(16, aila::env::read_int("AILA_Q4E_STAGING_MB", 128)));
+    staging_buffer_bytes_ = std::max<size_t>(slot_bytes_ * 16, staging_mb * 1024 * 1024);
     if (cache_bytes < staging_buffer_bytes_) {
         staging_buffer_bytes_ = std::max<size_t>(slot_bytes_ * 2, cache_bytes);
     }
 
     try {
         pinned_staging_ptr_ = static_cast<uint8_t*>(ctx_->alloc_host(staging_buffer_bytes_));
+        // Prefetch stages at most one layer's top-k guesses.
+        prefetch_staging_slots_ = 16;
+        prefetch_staging_ptr_ = static_cast<uint8_t*>(ctx_->alloc_host(static_cast<size_t>(prefetch_staging_slots_) * slot_bytes_));
+        copy_q_ = std::make_unique<sycl::queue>(
+            ctx_->queue().get_context(), ctx_->queue().get_device(),
+            sycl::property_list{sycl::property::queue::in_order(),
+                                sycl::ext::intel::property::queue::immediate_command_list()});
     } catch (const std::exception& e) {
         if (error_message) *error_message = std::string("Qwen4ExpExpertCache pinned host alloc failed: ") + e.what();
         cleanup();
         return false;
+    }
+
+    // Initialize Hot Host RAM Pool (pinned USM host memory allocated in 1 GB chunks).
+    // Default 32768 MB (32 GiB). If <= 0, disabled. Only enabled for full model runs (cache_bytes >= 1GB).
+    const int host_ram_mb = aila::env::read_int("AILA_Q4E_HOT_RAM_MB", 8192);
+    if (host_ram_mb > 0 && cache_bytes >= 1024ULL * 1024ULL * 1024ULL) {
+        size_t target_host_bytes = static_cast<size_t>(host_ram_mb) * 1024ULL * 1024ULL;
+        const size_t total_model_experts = static_cast<size_t>(num_layers_) * num_experts_per_layer_;
+        const size_t max_needed_bytes = total_model_experts * slot_bytes_;
+        target_host_bytes = std::min(target_host_bytes, max_needed_bytes);
+        const size_t chunk_bytes = 1024ULL * 1024ULL * 1024ULL;
+        size_t allocated = 0;
+        while (allocated < target_host_bytes) {
+            size_t this_chunk = std::min(chunk_bytes, target_host_bytes - allocated);
+            size_t slots_in_chunk = this_chunk / slot_bytes_;
+            if (slots_in_chunk == 0) break;
+            size_t alloc_bytes = slots_in_chunk * slot_bytes_;
+            void* chunk_ptr = nullptr;
+            try {
+                chunk_ptr = ctx_->alloc_host(alloc_bytes);
+            } catch (const std::exception& e) {
+                AILA_LOG_WARN("[Q4E ExpertCache] Host pool allocation stopped at %zu MB: %s",
+                              allocated / (1024 * 1024), e.what());
+                break;
+            }
+            host_pool_chunks_.push_back(chunk_ptr);
+            for (size_t s = 0; s < slots_in_chunk; ++s) {
+                host_slot_ptrs_.push_back(static_cast<uint8_t*>(chunk_ptr) + s * slot_bytes_);
+            }
+            allocated += alloc_bytes;
+        }
+        host_pool_bytes_ = allocated;
+        num_host_slots_ = static_cast<int>(host_slot_ptrs_.size());
+        if (num_host_slots_ > 0) {
+            host_pool_enabled_ = true;
+            host_slot_to_key_.assign(num_host_slots_, UINT64_MAX);
+            host_slot_iters_.resize(num_host_slots_);
+            host_lru_list_.clear();
+            host_key_to_slot_.clear();
+            for (int h = 0; h < num_host_slots_; ++h) {
+                host_lru_list_.push_back(h);
+                auto it = host_lru_list_.end();
+                --it;
+                host_slot_iters_[h] = it;
+            }
+            AILA_LOG_INFO("[Q4E ExpertCache] Hot Host RAM Pool initialized: slots=%d pool=%.1fMB",
+                          num_host_slots_, host_pool_bytes_ / (1024.0 * 1024.0));
+        }
     }
 
     // Setup slot tracking & descriptors
@@ -177,6 +474,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     key_to_slot_.clear();
     slot_to_key_.assign(num_slots_, UINT64_MAX);
     slot_reserved_.assign(num_slots_, false);
+
     slots_dev_.resize(num_slots_);
 
     for (int s = 0; s < num_slots_; ++s) {
@@ -185,28 +483,38 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
         --it;
         slot_iters_[s] = it;
 
-        uint8_t* base = dev_pool_ptr_ + static_cast<size_t>(s) * slot_bytes_;
+        uint8_t* base = slot_dev_base_[s];
         slots_dev_[s].gate_up_packed = base + gu_packed_offset_;
-        slots_dev_[s].gate_up_absmax = reinterpret_cast<const float*>(base + gu_absmax_offset_);
+        slots_dev_[s].gate_up_absmax = compact_nested_ ? nullptr : reinterpret_cast<const float*>(base + gu_absmax_offset_);
         slots_dev_[s].down_packed = base + dn_packed_offset_;
-        slots_dev_[s].down_absmax = reinterpret_cast<const float*>(base + dn_absmax_offset_);
+        slots_dev_[s].down_absmax = compact_nested_ ? nullptr : reinterpret_cast<const float*>(base + dn_absmax_offset_);
     }
 
-    // Load expert references from weights
-    layer_weights_.resize(num_layers_);
-    for (int L = 0; L < num_layers_; ++L) {
-        std::string gu_name = "model.language_model.layers." + std::to_string(L) + ".mlp.experts.gate_up_proj";
-        std::string dn_name = "model.language_model.layers." + std::to_string(L) + ".mlp.experts.down_proj";
-
-        if (weights.has_host(gu_name) && weights.has_host(dn_name)) {
-            if (LoadBnb4BitHostRef(weights, gu_name, layer_weights_[L].gate_up, error_message, hidden_size_) &&
-                LoadBnb4BitHostRef(weights, dn_name, layer_weights_[L].down, error_message, intermediate_size_)) {
-                layer_weights_[L].valid = true;
+    layer_meta_allocs_.resize(num_layers_, nullptr);
+    try {
+        if (compact_nested_) {
+            for (int L = 0; L < num_layers_; ++L) {
+                if (layer_weights_[L].valid) configure_layer_nested_metadata(L);
             }
         }
+    } catch (const std::exception& e) {
+        if (error_message) *error_message = std::string("Qwen4ExpExpertCache nested metadata failed: ") + e.what();
+        cleanup();
+        return false;
     }
 
     stats_ = {};
+
+    const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    int fill_threads = aila::env::read_int("AILA_Q4E_FILL_THREADS", std::min(8, hw));
+    fill_threads = std::clamp(fill_threads, 1, hw);
+    fill_parts_ = std::clamp(aila::env::read_int("AILA_Q4E_FILL_PARTS", 8), 1, 64);
+
+    fill_pool_ = std::make_unique<ExpertFillPool>(fill_threads);
+    AILA_LOG_INFO("[Q4E ExpertCache] slots=%d slot_bytes=%zu pool=%.1fMB nested_codes=%d fill_threads=%d fill_parts=%d",
+                  num_slots_, slot_bytes_, dev_pool_bytes_ / (1024.0 * 1024.0),
+                  compact_nested_ ? 1 : 0, fill_threads, fill_parts_);
+
     initialized_ = true;
     return true;
 }
@@ -220,6 +528,91 @@ void Qwen4ExpExpertCache::set_layer_expert_ref(int layer,
     layer_weights_[layer].gate_up = gate_up;
     layer_weights_[layer].down = down;
     layer_weights_[layer].valid = true;
+    if (compact_nested_) configure_layer_nested_metadata(layer);
+}
+
+void Qwen4ExpExpertCache::configure_layer_nested_metadata(int layer) {
+    if (!compact_nested_) return;
+    if (layer < 0 || layer >= num_layers_ || !layer_weights_[layer].valid) {
+        throw std::invalid_argument("Qwen4ExpExpertCache: invalid layer for nested metadata");
+    }
+    auto& lw = layer_weights_[layer];
+    const auto valid_matrix = [](const Bnb4BitHostWeightRef& ref, size_t per_expert_count) {
+        return ref.quant_state.nested && ref.absmax.dtype == DT_U8 &&
+               ref.nested_absmax.valid() && ref.nested_absmax.dtype == DT_F32 &&
+               ref.nested_quant_map.valid() && ref.nested_quant_map.dtype == DT_F32 &&
+               ref.nested_quant_map.bytes >= 256 * sizeof(float) &&
+               ref.quant_state.nested_blocksize > 0 &&
+               per_expert_count % static_cast<size_t>(ref.quant_state.nested_blocksize) == 0;
+    };
+    if (!valid_matrix(lw.gate_up, gu_absmax_count_) ||
+        !valid_matrix(lw.down, dn_absmax_count_)) {
+        throw std::invalid_argument("Qwen4ExpExpertCache: nested codes require aligned u8 absmax and f32 metadata");
+    }
+    for (uint64_t key : slot_to_key_) {
+        if (key != UINT64_MAX && static_cast<int>(key >> 32) == layer) {
+            throw std::logic_error("Qwen4ExpExpertCache: cannot replace metadata for resident experts");
+        }
+    }
+    const size_t gu_scales_bytes = lw.gate_up.nested_absmax.bytes;
+    const size_t gu_map_bytes = lw.gate_up.nested_quant_map.bytes;
+    const size_t dn_scales_bytes = lw.down.nested_absmax.bytes;
+    const size_t dn_map_bytes = lw.down.nested_quant_map.bytes;
+    const size_t total_bytes = gu_scales_bytes + gu_map_bytes + dn_scales_bytes + dn_map_bytes;
+    std::vector<uint8_t> host(total_bytes);
+    size_t offset = 0;
+    auto append = [&](const HostTensorView& view) {
+        std::memcpy(host.data() + offset, view.ptr, view.bytes);
+        offset += view.bytes;
+    };
+    append(lw.gate_up.nested_absmax);
+    append(lw.gate_up.nested_quant_map);
+    append(lw.down.nested_absmax);
+    append(lw.down.nested_quant_map);
+    uint8_t* dev = static_cast<uint8_t*>(ctx_->alloc_device(total_bytes));
+    try {
+        ctx_->memcpy_h2d(dev, host.data(), total_bytes);
+    } catch (...) {
+        ctx_->free_device(dev);
+        throw;
+    }
+    if (layer_meta_allocs_.size() <= static_cast<size_t>(layer)) {
+        layer_meta_allocs_.resize(static_cast<size_t>(layer) + 1, nullptr);
+    }
+    if (layer_meta_allocs_[layer]) ctx_->free_device(layer_meta_allocs_[layer]);
+    layer_meta_allocs_[layer] = dev;
+    offset = 0;
+    lw.gu_nested_absmax_dev = reinterpret_cast<const float*>(dev + offset);
+    offset += gu_scales_bytes;
+    lw.gu_nested_qmap_dev = reinterpret_cast<const float*>(dev + offset);
+    offset += gu_map_bytes;
+    lw.dn_nested_absmax_dev = reinterpret_cast<const float*>(dev + offset);
+    offset += dn_scales_bytes;
+    lw.dn_nested_qmap_dev = reinterpret_cast<const float*>(dev + offset);
+}
+
+void Qwen4ExpExpertCache::bind_slot_nested_metadata(int slot, int layer, int expert_id) {
+    if (!compact_nested_) return;
+    const auto& lw = layer_weights_.at(layer);
+    if (!lw.gu_nested_absmax_dev || !lw.dn_nested_absmax_dev ||
+        expert_id < 0 || expert_id >= num_experts_per_layer_) {
+        throw std::runtime_error("Qwen4ExpExpertCache: missing nested metadata for expert");
+    }
+    auto& dev = slots_dev_.at(slot);
+    const int gu_block = lw.gate_up.quant_state.nested_blocksize;
+    const int dn_block = lw.down.quant_state.nested_blocksize;
+    dev.gate_up_nested.codes = slot_dev_base_[slot] + gu_absmax_offset_;
+    dev.gate_up_nested.nested_absmax = lw.gu_nested_absmax_dev +
+        static_cast<size_t>(expert_id) * (gu_absmax_count_ / static_cast<size_t>(gu_block));
+    dev.gate_up_nested.nested_quant_map = lw.gu_nested_qmap_dev;
+    dev.gate_up_nested.offset = lw.gate_up.quant_state.nested_offset;
+    dev.gate_up_nested.blocksize = gu_block;
+    dev.down_nested.codes = slot_dev_base_[slot] + dn_absmax_offset_;
+    dev.down_nested.nested_absmax = lw.dn_nested_absmax_dev +
+        static_cast<size_t>(expert_id) * (dn_absmax_count_ / static_cast<size_t>(dn_block));
+    dev.down_nested.nested_quant_map = lw.dn_nested_qmap_dev;
+    dev.down_nested.offset = lw.down.quant_state.nested_offset;
+    dev.down_nested.blocksize = dn_block;
 }
 
 void Qwen4ExpExpertCache::acquire(int layer,
@@ -229,12 +622,43 @@ void Qwen4ExpExpertCache::acquire(int layer,
     if (!initialized_ || count <= 0 || expert_ids == nullptr || out_slots == nullptr) {
         return;
     }
+    // AILA_DEBUG_Q4E_ROUTE_TRACE: append int32 {layer, count, ids[count]} per call, for offline
+    // replacement-policy simulation (perf/qwen4exp/q4e_cache_sim.py).
+    static FILE* s_trace = [] {
+        const std::string path = aila::env::read_string("AILA_DEBUG_Q4E_ROUTE_TRACE", "");
+        return path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
+    }();
+    if (s_trace) {
+        const int header[2] = {layer, count};
+        std::fwrite(header, sizeof(int), 2, s_trace);
+        std::fwrite(expert_ids, sizeof(int), static_cast<size_t>(count), s_trace);
+        std::fflush(s_trace);
+    }
+    // AILA_DEBUG_Q4E_FAKE_HITS: treat every expert as resident (no fill/DMA, wrong outputs) to
+    // measure the decode time floor of a 100% hit rate.
+    static const bool s_fake_hits = aila::env::read_flag("AILA_DEBUG_Q4E_FAKE_HITS", false);
+    if (s_fake_hits) {
+        for (int i = 0; i < count; ++i) {
+            out_slots[i] = (layer * num_experts_per_layer_ + expert_ids[i]) % num_slots_;
+            bind_slot_nested_metadata(out_slots[i], layer, expert_ids[i]);
+        }
+        stats_.hit_count += static_cast<uint64_t>(count);
+        return;
+    }
+
+    if (prefetch_in_flight_) {
+        const auto t_wait = std::chrono::steady_clock::now();
+        wait_prefetch();
+        stats_.prefetch_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_wait).count());
+    }
 
     struct MissInfo {
         int batch_index;
         int layer;
         int expert_id;
         int slot_id;
+        const uint8_t* prefilled; // staged by prefetch_async, or null
     };
 
     std::vector<MissInfo> misses;
@@ -292,6 +716,9 @@ void Qwen4ExpExpertCache::acquire(int layer,
             throw std::runtime_error("Qwen4ExpExpertCache: all slots reserved in batch, count exceeds num_slots");
         }
 
+        // Validate the descriptor before mutating the cache's LRU and key maps.
+        bind_slot_nested_metadata(victim_slot, layer, expert);
+
         // Evict old key if bound
         uint64_t old_key = slot_to_key_[victim_slot];
         if (old_key != UINT64_MAX) {
@@ -308,28 +735,151 @@ void Qwen4ExpExpertCache::acquire(int layer,
         slot_reserved_[victim_slot] = true;
         batch_reserved_slots.push_back(victim_slot);
 
+        const uint8_t* prefilled = nullptr;
+        for (size_t p = 0; p < prefetch_items_.size(); ++p) {
+            if (prefetch_items_[p].layer == layer && prefetch_items_[p].expert_id == expert) {
+                prefilled = prefetch_staging_ptr_ + p * slot_bytes_;
+                ++stats_.prefetch_used;
+                break;
+            }
+        }
+
         out_slots[i] = victim_slot;
-        misses.push_back({i, layer, expert, victim_slot});
+        misses.push_back({i, layer, expert, victim_slot, prefilled});
         ++stats_.miss_count;
     }
 
-    // Phase 3: populate pinned staging buffer & initiate DMA copies
+    // Phase 3: DMA prefetched misses right away, then fill the rest into pinned staging.
     if (!misses.empty()) {
-        const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
-        for (size_t m = 0; m < misses.size(); m += staging_capacity) {
-            int chunk_size = std::min<int>(staging_capacity, static_cast<int>(misses.size() - m));
-            for (int c = 0; c < chunk_size; ++c) {
-                const auto& miss = misses[m + c];
-                uint8_t* staging_slot = pinned_staging_ptr_ + static_cast<size_t>(c) * slot_bytes_;
-                load_expert_to_staging(miss.layer, miss.expert_id, staging_slot);
-
-                uint8_t* dev_slot = dev_pool_ptr_ + static_cast<size_t>(miss.slot_id) * slot_bytes_;
-                ctx_->memcpy_h2d_async(dev_slot, staging_slot, slot_bytes_);
+        // Copies run on the immediate copy queue so each starts as soon as it is submitted
+        // (the batched main queue would hold them until synchronize()). They must not
+        // overtake main-queue work that may still read a victim slot.
+        const sycl::event main_done = ctx_->queue().ext_oneapi_submit_barrier();
+        auto copy_to_slot = [&](int slot_id, const uint8_t* src) {
+            copy_q_->submit([&](sycl::handler& cgh) {
+                cgh.depends_on(main_done);
+                cgh.memcpy(slot_dev_base_[slot_id], src, slot_bytes_);
+            });
+        };
+        std::vector<MissInfo> to_fill;
+        to_fill.reserve(misses.size());
+        for (const auto& miss : misses) {
+            if (miss.prefilled) {
+                copy_to_slot(miss.slot_id, miss.prefilled);
                 stats_.total_transferred_bytes += slot_bytes_;
+                continue;
             }
-            ctx_->synchronize();
+            if (host_pool_enabled_) {
+                const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
+                auto h_it = host_key_to_slot_.find(key);
+                if (h_it != host_key_to_slot_.end()) {
+                    const int hslot = h_it->second;
+                    host_lru_list_.erase(host_slot_iters_[hslot]);
+                    host_lru_list_.push_front(hslot);
+                    host_slot_iters_[hslot] = host_lru_list_.begin();
+
+                    const uint8_t* src = host_slot_ptrs_[hslot];
+                    copy_to_slot(miss.slot_id, src);
+                    stats_.total_transferred_bytes += slot_bytes_;
+                    ++stats_.host_pool_hits;
+                    continue;
+                }
+            }
+            to_fill.push_back(miss);
         }
+
+        if (host_pool_enabled_ && !to_fill.empty()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int parts = fill_parts_;
+            const size_t n_fill = to_fill.size();
+            std::vector<int> assigned_hslots(n_fill);
+            std::vector<std::atomic<int>> parts_left(n_fill);
+
+            for (size_t c = 0; c < n_fill; ++c) {
+                const auto& miss = to_fill[c];
+                const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
+                int victim_hslot = host_lru_list_.back();
+                const uint64_t old_key = host_slot_to_key_[victim_hslot];
+                if (old_key != UINT64_MAX) {
+                    host_key_to_slot_.erase(old_key);
+                }
+                host_key_to_slot_[key] = victim_hslot;
+                host_slot_to_key_[victim_hslot] = key;
+
+                host_lru_list_.erase(host_slot_iters_[victim_hslot]);
+                host_lru_list_.push_front(victim_hslot);
+                host_slot_iters_[victim_hslot] = host_lru_list_.begin();
+
+                assigned_hslots[c] = victim_hslot;
+                parts_left[c].store(parts, std::memory_order_relaxed);
+                ++stats_.host_pool_misses;
+            }
+
+            const std::function<void(int)> fill_task = [&](int task) {
+                const int c = task / parts;
+                const auto& miss = to_fill[c];
+                uint8_t* host_slot_ptr = host_slot_ptrs_[assigned_hslots[c]];
+                load_expert_to_staging(miss.layer, miss.expert_id, host_slot_ptr, task % parts, parts);
+                if (parts_left[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    copy_to_slot(miss.slot_id, host_slot_ptr);
+                }
+            };
+            fill_pool_->run(static_cast<int>(n_fill) * parts, fill_task);
+            stats_.total_transferred_bytes += static_cast<uint64_t>(n_fill) * slot_bytes_;
+            stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        } else if (!to_fill.empty()) {
+            // Double-buffered staging: while one half DMAs, the other half is being filled.
+        const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
+        const int half_capacity = std::max(1, staging_capacity / 2);
+        sycl::event half_done[2];
+        bool half_busy[2] = {false, false};
+        auto timed_wait = [&](sycl::event& ev) {
+            const auto t_sync = std::chrono::steady_clock::now();
+            ev.wait_and_throw();
+            stats_.dma_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_sync).count());
+        };
+        int chunk_index = 0;
+        for (size_t m = 0; m < to_fill.size(); ++chunk_index) {
+            const int chunk_size = std::min<int>(half_capacity, static_cast<int>(to_fill.size() - m));
+            const int half = chunk_index % 2;
+            if (half_busy[half]) timed_wait(half_done[half]);
+            uint8_t* chunk_base = pinned_staging_ptr_ + static_cast<size_t>(half) * half_capacity * slot_bytes_;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const int parts = fill_parts_;
+            // The thread finishing an expert's last part submits its h2d copy, so DMA of
+            // early experts overlaps the fill of later ones (SYCL queues are thread-safe).
+            std::vector<std::atomic<int>> parts_left(static_cast<size_t>(chunk_size));
+            for (auto& p : parts_left) p.store(parts, std::memory_order_relaxed);
+            const std::function<void(int)> fill_task = [&](int task) {
+                const int c = task / parts;
+                const auto& miss = to_fill[m + c];
+                uint8_t* staging_slot = chunk_base + static_cast<size_t>(c) * slot_bytes_;
+                load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts);
+                if (parts_left[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    copy_to_slot(miss.slot_id, staging_slot);
+                }
+            };
+            fill_pool_->run(chunk_size * parts, fill_task);
+            stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
+            stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+
+            half_done[half] = copy_q_->ext_oneapi_submit_barrier();
+            half_busy[half] = true;
+            m += static_cast<size_t>(chunk_size);
+        }
+        } // end of else if (!to_fill.empty())
+
+        // Staging (and prefetch staging) is reused by the next call: drain before returning.
+        const auto t_sync = std::chrono::steady_clock::now();
+        copy_q_->wait_and_throw();
+        stats_.dma_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_sync).count());
     }
+    prefetch_items_.clear();
 
     // Phase 4: release batch reservations
     for (int s : batch_reserved_slots) {
@@ -337,80 +887,145 @@ void Qwen4ExpExpertCache::acquire(int layer,
     }
 }
 
-void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot) {
-    if (layer < 0 || layer >= static_cast<int>(layer_weights_.size()) || !layer_weights_[layer].valid) {
-        std::memset(staging_slot, 0, slot_bytes_);
+void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int count) {
+    if (!initialized_ || count <= 0 || expert_ids == nullptr) {
         return;
     }
+    static const bool s_fake_hits = aila::env::read_flag("AILA_DEBUG_Q4E_FAKE_HITS", false);
+    if (s_fake_hits) return; // acquire() binds nothing in this mode
+    wait_prefetch();
 
-    const auto& gu_ref = layer_weights_[layer].gate_up;
-    const auto& dn_ref = layer_weights_[layer].down;
-
-    // 1. Packed gate_up
-    if (gu_ref.packed_weight.valid() && gu_ref.packed_weight.ptr) {
-        const uint8_t* src = gu_ref.packed_weight.ptr + static_cast<size_t>(expert_id) * gu_packed_bytes_;
-        std::memcpy(staging_slot + gu_packed_offset_, src, gu_packed_bytes_);
-    } else {
-        std::memset(staging_slot + gu_packed_offset_, 0, gu_packed_bytes_);
-    }
-
-    // 2. Absmax gate_up
-    float* gu_absmax_dst = reinterpret_cast<float*>(staging_slot + gu_absmax_offset_);
-    if (gu_ref.absmax.valid() && gu_ref.absmax.ptr) {
-        int64_t expert_absmax_offset = static_cast<int64_t>(expert_id) * gu_absmax_count_;
-        if (gu_ref.quant_state.nested) {
-            const uint8_t* qabsmax = gu_ref.absmax_codes_ptr() + expert_absmax_offset;
-            const float* nested_absmax = gu_ref.nested_absmax_ptr();
-            const float* nested_quant_map = gu_ref.nested_quant_map_ptr();
-            const int nested_blocksize = gu_ref.quant_state.nested_blocksize > 0 ? gu_ref.quant_state.nested_blocksize : 256;
-            const float nested_offset = gu_ref.quant_state.nested_offset;
-
-            for (size_t i = 0; i < gu_absmax_count_; ++i) {
-                int64_t global_idx = expert_absmax_offset + static_cast<int64_t>(i);
-                int64_t n_blk = global_idx / nested_blocksize;
-                uint8_t code = qabsmax[i];
-                gu_absmax_dst[i] = nested_quant_map[code] * nested_absmax[n_blk] + nested_offset;
-            }
-        } else {
-            const float* absmax_f32 = gu_ref.absmax_f32_ptr() + expert_absmax_offset;
-            std::memcpy(gu_absmax_dst, absmax_f32, gu_absmax_count_ * sizeof(float));
+    // Fill-only: stage predicted, non-resident experts in pinned memory. No slot is bound
+    // and nothing is evicted, so a wrong guess costs idle CPU time only; acquire() DMAs the
+    // staged copy if the expert really misses.
+    prefetch_items_.clear();
+    for (int i = 0; i < count && static_cast<int>(prefetch_items_.size()) < prefetch_staging_slots_; ++i) {
+        const int expert = expert_ids[i];
+        if (expert < 0 || expert >= num_experts_per_layer_ || contains(layer, expert)) continue;
+        if (host_pool_enabled_) {
+            const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
+            if (host_key_to_slot_.count(key) != 0) continue;
         }
+        bool dup = false;
+        for (const auto& item : prefetch_items_) dup = dup || item.expert_id == expert;
+        if (!dup) prefetch_items_.push_back({layer, expert});
+    }
+    if (prefetch_items_.empty()) return;
+
+    const int n = static_cast<int>(prefetch_items_.size());
+    const int parts = fill_parts_;
+    stats_.prefetch_issued += static_cast<uint64_t>(n);
+    prefetch_in_flight_ = true;
+
+
+
+    fill_pool_->start(n * parts, [this, parts](int task) {
+        const int c = task / parts;
+        const PrefetchItem& item = prefetch_items_[c];
+        load_expert_to_staging(item.layer, item.expert_id,
+                               prefetch_staging_ptr_ + static_cast<size_t>(c) * slot_bytes_,
+                               task % parts, parts);
+    });
+}
+
+void Qwen4ExpExpertCache::wait_prefetch() {
+    if (!prefetch_in_flight_) return;
+    if (fill_pool_) fill_pool_->wait();
+    prefetch_in_flight_ = false;
+}
+
+void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
+    if (!initialized_ || expert_ids == nullptr) return;
+    for (int i = 0; i < count; ++i) {
+        const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_ids[i]);
+        const auto it = key_to_slot_.find(key);
+        if (it == key_to_slot_.end()) continue;
+        const int slot = it->second;
+        lru_list_.erase(slot_iters_[slot]);
+        lru_list_.push_back(slot);
+        slot_iters_[slot] = std::prev(lru_list_.end());
+    }
+}
+
+namespace {
+
+inline void part_range(size_t len, int part, int nparts, size_t& begin, size_t& end) {
+    begin = len * static_cast<size_t>(part) / static_cast<size_t>(nparts);
+    end = len * static_cast<size_t>(part + 1) / static_cast<size_t>(nparts);
+}
+
+// Copies packed bytes and either keeps nested absmax codes or expands absmax
+// to f32 for the [part, nparts) slice of one expert matrix.
+void fill_expert_matrix(const Bnb4BitHostWeightRef& ref, int expert_id,
+                        uint8_t* packed_dst, size_t packed_bytes,
+                        uint8_t* absmax_dst, size_t absmax_count, bool compact_nested,
+                        int part, int nparts) {
+    size_t b0 = 0, b1 = 0;
+    part_range(packed_bytes, part, nparts, b0, b1);
+    if (ref.packed_weight.valid()) {
+        const uint8_t* src = ref.packed_weight.ptr + static_cast<size_t>(expert_id) * packed_bytes;
+        std::memcpy(packed_dst + b0, src + b0, b1 - b0);
     } else {
-        std::memset(gu_absmax_dst, 0, gu_absmax_bytes_);
+        std::memset(packed_dst + b0, 0, b1 - b0);
     }
 
-    // 3. Packed down
-    if (dn_ref.packed_weight.valid() && dn_ref.packed_weight.ptr) {
-        const uint8_t* src = dn_ref.packed_weight.ptr + static_cast<size_t>(expert_id) * dn_packed_bytes_;
-        std::memcpy(staging_slot + dn_packed_offset_, src, dn_packed_bytes_);
-    } else {
-        std::memset(staging_slot + dn_packed_offset_, 0, dn_packed_bytes_);
-    }
-
-    // 4. Absmax down
-    float* dn_absmax_dst = reinterpret_cast<float*>(staging_slot + dn_absmax_offset_);
-    if (dn_ref.absmax.valid() && dn_ref.absmax.ptr) {
-        int64_t expert_absmax_offset = static_cast<int64_t>(expert_id) * dn_absmax_count_;
-        if (dn_ref.quant_state.nested) {
-            const uint8_t* qabsmax = dn_ref.absmax_codes_ptr() + expert_absmax_offset;
-            const float* nested_absmax = dn_ref.nested_absmax_ptr();
-            const float* nested_quant_map = dn_ref.nested_quant_map_ptr();
-            const int nested_blocksize = dn_ref.quant_state.nested_blocksize > 0 ? dn_ref.quant_state.nested_blocksize : 256;
-            const float nested_offset = dn_ref.quant_state.nested_offset;
-
-            for (size_t i = 0; i < dn_absmax_count_; ++i) {
-                int64_t global_idx = expert_absmax_offset + static_cast<int64_t>(i);
-                int64_t n_blk = global_idx / nested_blocksize;
-                uint8_t code = qabsmax[i];
-                dn_absmax_dst[i] = nested_quant_map[code] * nested_absmax[n_blk] + nested_offset;
-            }
+    size_t a0 = 0, a1 = 0;
+    part_range(absmax_count, part, nparts, a0, a1);
+    if (compact_nested) {
+        if (ref.absmax.valid()) {
+            const size_t expert_base = static_cast<size_t>(expert_id) * absmax_count;
+            std::memcpy(absmax_dst + a0, ref.absmax_codes_ptr() + expert_base + a0, a1 - a0);
         } else {
-            const float* absmax_f32 = dn_ref.absmax_f32_ptr() + expert_absmax_offset;
-            std::memcpy(dn_absmax_dst, absmax_f32, dn_absmax_count_ * sizeof(float));
+            std::memset(absmax_dst + a0, 0, a1 - a0);
         }
-    } else {
-        std::memset(dn_absmax_dst, 0, dn_absmax_bytes_);
+        return;
     }
+    float* absmax_f32 = reinterpret_cast<float*>(absmax_dst);
+    if (!ref.absmax.valid()) {
+        std::memset(absmax_f32 + a0, 0, (a1 - a0) * sizeof(float));
+        return;
+    }
+    const size_t expert_base = static_cast<size_t>(expert_id) * absmax_count;
+    if (!ref.quant_state.nested) {
+        std::memcpy(absmax_f32 + a0, ref.absmax_f32_ptr() + expert_base + a0, (a1 - a0) * sizeof(float));
+        return;
+    }
+    const uint8_t* codes = ref.absmax_codes_ptr() + expert_base;
+    const float* nested_absmax = ref.nested_absmax_ptr();
+    const float* nested_quant_map = ref.nested_quant_map_ptr();
+    const size_t nested_blocksize = ref.quant_state.nested_blocksize > 0
+                                        ? static_cast<size_t>(ref.quant_state.nested_blocksize) : 256;
+    const float nested_offset = ref.quant_state.nested_offset;
+    size_t i = a0;
+    while (i < a1) {
+        const size_t global = expert_base + i;
+        const float scale = nested_absmax[global / nested_blocksize];
+        const size_t run_end = std::min(a1, i + (nested_blocksize - global % nested_blocksize));
+        for (; i < run_end; ++i) {
+            absmax_f32[i] = nested_quant_map[codes[i]] * scale + nested_offset;
+        }
+    }
+}
+
+} // namespace
+
+void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
+                                                 int part, int nparts) {
+    if (layer < 0 || layer >= static_cast<int>(layer_weights_.size()) || !layer_weights_[layer].valid) {
+        size_t b0 = 0, b1 = 0;
+        part_range(slot_bytes_, part, nparts, b0, b1);
+        std::memset(staging_slot + b0, 0, b1 - b0);
+        return;
+    }
+    const auto& lw = layer_weights_[layer];
+    fill_expert_matrix(lw.gate_up, expert_id,
+                       staging_slot + gu_packed_offset_, gu_packed_bytes_,
+                       staging_slot + gu_absmax_offset_, gu_absmax_count_, compact_nested_,
+                       part, nparts);
+    fill_expert_matrix(lw.down, expert_id,
+                       staging_slot + dn_packed_offset_, dn_packed_bytes_,
+                       staging_slot + dn_absmax_offset_, dn_absmax_count_, compact_nested_,
+                       part, nparts);
 }
 
 void Qwen4ExpExpertCache::log_stats(int layer) const {

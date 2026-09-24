@@ -23,6 +23,10 @@ struct Qwen4ExpHyperConnectionLayer {
     Linear input_mix_weight_down;     // (10240, 320)
     Linear input_mix_weight_up;       // (320, 10240)
     Linear block_inject_weight;       // (10240, 4)
+    // Raw [out, in] bf16 weights for the native decode GEMV path.
+    Tensor* mix_down_w = nullptr;
+    Tensor* mix_up_w = nullptr;
+    Tensor* inject_w = nullptr;
 };
 
 struct Qwen4ExpLayer {
@@ -51,6 +55,8 @@ struct Qwen4ExpLayer {
     // MoE
     Linear router_gate;            // (2560, 512) bf16
     Linear shared_expert_gate;     // (2560, 1) bf16
+    Tensor* router_w = nullptr;          // raw [512, 2560]
+    Tensor* shared_expert_gate_w = nullptr; // raw [1, 2560]
     Bnb4BitLinear shared_gate_up_proj; // (1280, 2560)
     Bnb4BitLinear shared_down_proj;    // (2560, 640)
 };
@@ -98,10 +104,7 @@ struct Qwen4ExpBuffers {
 
     // MoE
     Tensor router_scores;      // [max_seq, 512]
-    Tensor router_ids_dev;     // [max_seq, 10]
-    Tensor router_weights_dev; // [max_seq, 10]
-    std::vector<int> host_router_ids;
-    std::vector<float> host_router_weights;
+
     Tensor moe_h;              // [10, 640]
     Tensor moe_acc_f32;        // [2560]
     Tensor shared_gate_buf;    // [max_seq, 1]
@@ -204,6 +207,14 @@ private:
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount);
     void ensure_runtime_buffers(Context& ctx, int seq_len);
+    void free_pinned_host_buffers();
+    // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
+    void EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count);
+    // bf16 Linear with raw [out, in] weight: native GEMV for one row, oneDNN otherwise.
+    void DenseLinear(Context& ctx, Linear& linear, Tensor* raw_weight,
+                     Tensor& input, Tensor& output, int count, int out_features, int in_features);
+    // grouped norm -> low-rank mix -> x = mean_s(mix * N); optionally inject = 2*sigmoid(W N / 4).
+    void RunHyperConnection(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject);
 
     ModelSpec spec_;
     Qwen4ExpTextConfig cfg_;
@@ -224,12 +235,32 @@ private:
     Qwen4ExpPle ple_;
     Qwen4ExpExpertCache expert_cache_;
 
-    Tensor* embed_weight_ = nullptr;
+    Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0
+    // Otherwise rows are gathered from the mmap per forward: decode needs one 5 KB row, and the
+    // 1.3 GB table left in VRAM would displace ~460 expert slots.
+    HostTensorView embed_host_{};
+    int* embed_host_ids_ = nullptr;      // pinned [runtime_seq_capacity_]
+    uint8_t* embed_host_rows_ = nullptr; // pinned [runtime_seq_capacity_, hidden] bf16
     Tensor lm_head_weight_transposed_;
     Linear lm_head_;
     Tensor lastTokenLogits_;
 
     Qwen4ExpBuffers buf_;
+    // Pinned host [runtime_seq_capacity_, top_k] router outputs written directly by the top-k kernel.
+    int* router_host_ids_ = nullptr;
+    float* router_host_weights_ = nullptr;
+
+    // Prefill batched expert acquire scratch (expert -> slot / token uses for the current layer).
+    std::vector<int> prefill_expert_slot_;
+    std::vector<int> prefill_expert_uses_;
+    std::vector<int> prefill_unique_;
+    std::vector<int> prefill_unique_slots_;
+
+    // AILA_Q4E_PREDICT_STATS diagnostic: next-layer expert prediction quality.
+    Tensor pred_scores_;
+    int* pred_host_ids_ = nullptr;
+    float* pred_host_weights_ = nullptr;
+    uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
 };

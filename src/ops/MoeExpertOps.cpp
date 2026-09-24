@@ -189,9 +189,29 @@ void router_softmax_topk_device(
     });
 }
 
-void moe_decode_gate_up_swiglu_grouped(
+namespace {
+
+template <bool UseNested>
+inline float load_expert_absmax(const float* absmax_f32,
+                                const MoeNestedScaleDev& nested,
+                                size_t index) {
+    if constexpr (UseNested) {
+        // Match the host fill's two f32 rounding steps. A single contracted
+        // FMA changes some reconstructed absmax values by 1 ULP, which can
+        // change greedy routing after the 48-layer recurrence.
+        const float product = sycl::fma(
+            nested.nested_quant_map[nested.codes[index]],
+            nested.nested_absmax[index / static_cast<size_t>(nested.blocksize)], 0.0f);
+        return sycl::fma(product, 1.0f, nested.offset);
+    } else {
+        return absmax_f32[index];
+    }
+}
+
+template <bool UseNested>
+sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
-    const MoeExpertSlotDev* slots,
+    const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
     const float* quant_map,
     const bf16* x,
     bf16* h,
@@ -199,14 +219,6 @@ void moe_decode_gate_up_swiglu_grouped(
     int in_features,
     int intermediate_size,
     int blocksize) {
-    if (num_active_experts <= 0) return;
-
-    std::array<MoeExpertSlotDev, 16> slot_ptrs{};
-    const int k_capped = std::min(num_active_experts, 16);
-    for (int i = 0; i < k_capped; ++i) {
-        slot_ptrs[static_cast<size_t>(i)] = slots[i];
-    }
-
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     constexpr size_t wg_size = 256;
@@ -215,7 +227,7 @@ void moe_decode_gate_up_swiglu_grouped(
     const size_t total_rows = static_cast<size_t>(num_active_experts) * intermediate_size;
     const size_t num_groups = (total_rows + rows_per_group - 1) / rows_per_group;
 
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    return ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
 
         cgh.parallel_for(
@@ -251,8 +263,39 @@ void moe_decode_gate_up_swiglu_grouped(
                             slot.gate_up_packed + gate_byte_base + byte_offset);
                         const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
                             slot.gate_up_packed + up_byte_base + byte_offset);
-                        const float ga = slot.gate_up_absmax[gate_block_base + (byte_offset / (blocksize / 2))];
-                        const float ua = slot.gate_up_absmax[up_block_base + (byte_offset / (blocksize / 2))];
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            // Each half-subgroup shares one outer scale block.
+                            // Use fixed broadcast sources because subgroup
+                            // collectives require a uniform source lane.
+                            const int leader = sg_lane < 8 ? 0 : 8;
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(x + byte_offset * 2);
 
                         const uint8_t gb0 = static_cast<uint8_t>(g4);
@@ -295,36 +338,30 @@ void moe_decode_gate_up_swiglu_grouped(
     });
 }
 
-void moe_decode_down_weighted_accumulate(
+template <bool UseNested>
+sycl::event launch_moe_decode_down_weighted_accumulate(
     Context& ctx,
-    const MoeExpertSlotDev* slots,
+    const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
+    const std::array<float, 16>& weight_ptrs,
     const float* quant_map,
-    const float* weights,
     const bf16* h,
     float* acc_f32,
     bf16* out_bf16,
     int num_active_experts,
     int in_features,
     int out_features,
-    int blocksize) {
-    if (num_active_experts <= 0) return;
-
-    std::array<MoeExpertSlotDev, 16> slot_ptrs{};
-    std::array<float, 16> weight_ptrs{};
-    const int k_capped = std::min(num_active_experts, 16);
-    for (int i = 0; i < k_capped; ++i) {
-        slot_ptrs[static_cast<size_t>(i)] = slots[i];
-        weight_ptrs[static_cast<size_t>(i)] = weights[i];
-    }
-
+    int blocksize,
+    const bf16* shared_out,
+    const bf16* shared_gate) {
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
+    const int k_capped = std::min(num_active_experts, 16);
     constexpr size_t wg_size = 256;
     constexpr size_t sub_group_size = 16;
     constexpr size_t rows_per_group = wg_size / sub_group_size;
     const size_t num_groups = (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
 
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    return ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
 
         cgh.parallel_for(
@@ -358,7 +395,22 @@ void moe_decode_down_weighted_accumulate(
                         for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
                             const uint32_t d4 = *reinterpret_cast<const uint32_t*>(
                                 slot.down_packed + byte_base + byte_offset);
-                            const float da = slot.down_absmax[block_base + (byte_offset / (blocksize / 2))];
+                            const size_t scale_index = block_base + (byte_offset / (blocksize / 2));
+                            float da;
+                            if (blocksize == 64) {
+                                const float da_leader = (sg_lane == 0 || sg_lane == 8)
+                                    ? load_expert_absmax<UseNested>(
+                                          slot.down_absmax, slot.down_nested, scale_index)
+                                    : 0.0f;
+                                const float da0 = sycl::group_broadcast(
+                                    item.get_sub_group(), da_leader, 0);
+                                const float da8 = sycl::group_broadcast(
+                                    item.get_sub_group(), da_leader, 8);
+                                da = sg_lane < 8 ? da0 : da8;
+                            } else {
+                                da = load_expert_absmax<UseNested>(
+                                    slot.down_absmax, slot.down_nested, scale_index);
+                            }
                             const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
 
                             const uint8_t db0 = static_cast<uint8_t>(d4);
@@ -385,11 +437,85 @@ void moe_decode_down_weighted_accumulate(
                         acc_f32[row] += total_val;
                     }
                     if (out_bf16) {
-                        out_bf16[row] = bf16(acc_f32 ? acc_f32[row] : total_val);
+                        const bf16 routed = bf16(acc_f32 ? acc_f32[row] : total_val);
+                        if (shared_out && shared_gate) {
+                            const float gate = static_cast<float>(shared_gate[0]);
+                            const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                            out_bf16[row] = bf16(static_cast<float>(routed) +
+                                                 gate_act * static_cast<float>(shared_out[row]));
+                        } else {
+                            out_bf16[row] = routed;
+                        }
                     }
                 }
             });
     });
+}
+
+} // namespace
+
+sycl::event moe_decode_gate_up_swiglu_grouped(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int num_active_experts,
+    int in_features,
+    int intermediate_size,
+    int blocksize) {
+    if (num_active_experts <= 0) return {};
+
+    std::array<MoeExpertSlotDev, 16> slot_ptrs{};
+    const int k_capped = std::min(num_active_experts, 16);
+    for (int i = 0; i < k_capped; ++i) {
+        slot_ptrs[static_cast<size_t>(i)] = slots[i];
+    }
+
+    if (slots[0].gate_up_nested.codes != nullptr) {
+        return launch_moe_decode_gate_up_swiglu_grouped<true>(
+            ctx, slot_ptrs, quant_map, x, h, num_active_experts,
+            in_features, intermediate_size, blocksize);
+    }
+    return launch_moe_decode_gate_up_swiglu_grouped<false>(
+        ctx, slot_ptrs, quant_map, x, h, num_active_experts,
+        in_features, intermediate_size, blocksize);
+}
+
+sycl::event moe_decode_down_weighted_accumulate(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const float* weights,
+    const bf16* h,
+    float* acc_f32,
+    bf16* out_bf16,
+    int num_active_experts,
+    int in_features,
+    int out_features,
+    int blocksize,
+    const bf16* shared_out,
+    const bf16* shared_gate) {
+    if (num_active_experts <= 0) return {};
+
+    std::array<MoeExpertSlotDev, 16> slot_ptrs{};
+    std::array<float, 16> weight_ptrs{};
+    const int k_capped = std::min(num_active_experts, 16);
+    for (int i = 0; i < k_capped; ++i) {
+        slot_ptrs[static_cast<size_t>(i)] = slots[i];
+        weight_ptrs[static_cast<size_t>(i)] = weights[i];
+    }
+
+    if (slots[0].down_nested.codes != nullptr) {
+        return launch_moe_decode_down_weighted_accumulate<true>(
+            ctx, slot_ptrs, weight_ptrs, quant_map, h, acc_f32, out_bf16,
+            num_active_experts, in_features, out_features, blocksize,
+            shared_out, shared_gate);
+    }
+    return launch_moe_decode_down_weighted_accumulate<false>(
+        ctx, slot_ptrs, weight_ptrs, quant_map, h, acc_f32, out_bf16,
+        num_active_experts, in_features, out_features, blocksize,
+        shared_out, shared_gate);
 }
 
 void moe_silu_gate_up_mul_flat(
