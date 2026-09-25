@@ -32,7 +32,7 @@ struct MoeExpertSlotDev {
 
 // 512-expert Top-K Router (Device)
 // Each workgroup computes one token, WG size = 512
-void router_softmax_topk_device(
+sycl::event router_softmax_topk_device(
     Context& ctx,
     const bf16* router_scores_ptr,
     const bf16* per_expert_scale_ptr,

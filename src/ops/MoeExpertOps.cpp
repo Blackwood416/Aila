@@ -60,7 +60,7 @@ void router_softmax_topk_host(
     }
 }
 
-void router_softmax_topk_device(
+sycl::event router_softmax_topk_device(
     Context& ctx,
     const bf16* router_scores_ptr,
     const bf16* per_expert_scale_ptr,
@@ -84,11 +84,11 @@ void router_softmax_topk_device(
             ids_host.data(), w_host.data(), tokens, num_experts, top_k, norm_topk_prob);
         ctx.memcpy_h2d(expert_ids_dev, ids_host.data(), ids_host.size() * sizeof(int));
         ctx.memcpy_h2d(expert_weights_dev, w_host.data(), w_host.size() * sizeof(float));
-        return;
+        return {};
     }
 
     constexpr int wg = 512;
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    return ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> scores_slm(sycl::range<1>(wg), cgh);
         sycl::local_accessor<int, 1> indices_slm(sycl::range<1>(wg), cgh);
         sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);

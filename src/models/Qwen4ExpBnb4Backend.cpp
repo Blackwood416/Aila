@@ -978,8 +978,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // 2.5. MoE Computation
         DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
                     count, cfg_.num_experts, hidden_size_);
-        // Top-k writes straight into pinned host memory; the queue wait is the only readback.
-        ops::router_softmax_topk_device(
+        // Top-k writes straight into pinned host memory; the event wait is the only readback.
+        sycl::event route_event = ops::router_softmax_topk_device(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
@@ -990,13 +990,33 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             // Route this layer's MoE input through the next layer's router to guess its experts.
             DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
                         count, cfg_.num_experts, hidden_size_);
-            ops::router_softmax_topk_device(
+            route_event = ops::router_softmax_topk_device(
                 ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
                 pred_host_ids_, pred_host_weights_, count, cfg_.num_experts, top_k, true);
         }
 
+        // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
+        // concurrently while the host fills missed routed experts and sets up dispatch.
+        DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
+                    count, 1, hidden_size_);
+        if (count == 1) {
+            bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
+            if (!fused_ok) {
+                layer.shared_gate_up_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, 1);
+                ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
+                                               static_cast<bf16*>(buf_.shared_inter_buf.data()), 1, cfg_.shared_expert_intermediate_size);
+            }
+            layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, 1);
+        } else {
+            layer.shared_gate_up_proj.forward(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, count);
+            ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
+                                           static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
+            layer.shared_down_proj.forward(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
+        }
+
         const auto prof_router_t0 = prof_clock::now();
-        ctx.synchronize();
+        route_event.wait();
         const auto prof_router_t1 = prof_clock::now();
         if (predict_next || have_pred) {
             if (have_pred && s_predict_stats && count == 1) {
@@ -1016,26 +1036,6 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         prof_router_sync_ms += prof_ms(prof_router_t0, prof_router_t1);
         stage(kStageRouter);
-
-        // Shared expert only depends on x: submit it before acquire so the GPU runs it
-        // while the host fills missed routed experts.
-        DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
-                    count, 1, hidden_size_);
-        if (count == 1) {
-            bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-                ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
-            if (!fused_ok) {
-                layer.shared_gate_up_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, 1);
-                ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
-                                               static_cast<bf16*>(buf_.shared_inter_buf.data()), 1, cfg_.shared_expert_intermediate_size);
-            }
-            layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, 1);
-        } else {
-            layer.shared_gate_up_proj.forward(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, count);
-            ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
-                                           static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
-            layer.shared_down_proj.forward(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
-        }
         // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
         // instead of a blocking round trip per token), then map slots back per token.
         const auto prof_acq_batch_t0 = prof_clock::now();
