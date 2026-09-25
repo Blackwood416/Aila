@@ -266,8 +266,10 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     embed_host_rows_ = nullptr;
     if (batch_slots_host_) context_->free_host(batch_slots_host_);
     if (batch_slots_dev_) context_->free_device(batch_slots_dev_);
+    if (batch_weights_dev_) context_->free_device(batch_weights_dev_);
     batch_slots_host_ = nullptr;
     batch_slots_dev_ = nullptr;
+    batch_weights_dev_ = nullptr;
 }
 
 // ============================================================================
@@ -612,6 +614,8 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
     batch_slots_dev_ = static_cast<ops::MoeExpertSlotDev*>(
         ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
+    batch_weights_dev_ = static_cast<float*>(
+        ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     buf_.moe_h = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
@@ -1094,6 +1098,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
             ctx.queue().memcpy(batch_slots_dev_, batch_slots_host_,
                                static_cast<size_t>(count) * top_k * sizeof(ops::MoeExpertSlotDev));
+            ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
+                               static_cast<size_t>(count) * top_k * sizeof(float));
 
             const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
             bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
@@ -1105,7 +1111,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 &batch_dma_event, expert_cache_.uses_nested_codes());
 
             ops::moe_prefill_down_rows(
-                ctx, batch_slots_dev_, router_host_weights_, nullptr, h_ptr, y_ptr,
+                ctx, batch_slots_dev_, batch_weights_dev_, nullptr, h_ptr, y_ptr,
                 count, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,

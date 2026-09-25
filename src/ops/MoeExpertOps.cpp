@@ -691,8 +691,14 @@ sycl::event launch_moe_prefill_down_rows(
                     const size_t token_expert_base = static_cast<size_t>(token) * num_active_experts;
                     const bf16* h_token = h + token_expert_base * in_features;
 
+                    float exp_weights[16];
+                    const int k_capped = std::min(num_active_experts, 16);
+                    for (int e = 0; e < k_capped; ++e) {
+                        exp_weights[e] = weights[token_expert_base + e];
+                    }
+
                     for (int e = 0; e < num_active_experts; ++e) {
-                        const float w_exp = weights[token_expert_base + e];
+                        const float w_exp = (e < 16) ? exp_weights[e] : weights[token_expert_base + e];
                         if (w_exp == 0.0f) continue;
 
                         const auto& slot = slots[token_expert_base + e];
