@@ -1267,20 +1267,28 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
     auto& snapshot = snapshots[nextLength];
     try {
         snapshot.layers.resize(session.layerCaches_.size());
+        sycl::event last_d2h_event{};
         for (size_t i = 0; i < layers_.size(); ++i) {
             if (!layers_[i].is_linear) continue;
             auto& cache = session.layerCaches_[i];
             if (cache.device_state_dirty) {
                 if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
-                    ctx.memcpy_d2h(cache.host_linear_state.data(), cache.linear_state.data(),
-                                   cache.host_linear_state.size() * sizeof(float));
+                    last_d2h_event = ctx.memcpy_d2h_async(cache.host_linear_state.data(), cache.linear_state.data(),
+                                                          cache.host_linear_state.size() * sizeof(float));
                 }
                 if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
-                    ctx.memcpy_d2h(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
-                                   cache.host_linear_conv_state.size() * sizeof(float));
+                    last_d2h_event = ctx.memcpy_d2h_async(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
+                                                          cache.host_linear_conv_state.size() * sizeof(float));
                 }
                 cache.device_state_dirty = false;
             }
+        }
+        if (last_d2h_event != sycl::event{}) {
+            last_d2h_event.wait_and_throw();
+        }
+        for (size_t i = 0; i < layers_.size(); ++i) {
+            if (!layers_[i].is_linear) continue;
+            auto& cache = session.layerCaches_[i];
             snapshot.layers[i].linear_state_host = cache.host_linear_state;
             snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
             snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
@@ -1313,6 +1321,7 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         return 0;
     }
     const auto& snapshot = session.snapshots_.at(target);
+    sycl::event last_h2d_event{};
     for (size_t i = 0; i < layers_.size(); ++i) {
         if (!layers_[i].is_linear) continue;
         auto& cache = session.layerCaches_[i];
@@ -1321,14 +1330,17 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         cache.host_linear_conv_state = snap_layer.linear_conv_state_host;
         cache.linear_conv_head = snap_layer.linear_conv_head;
         if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
-            session.context_->memcpy_h2d(cache.linear_state.data(), cache.host_linear_state.data(),
-                                         cache.host_linear_state.size() * sizeof(float));
+            last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_state.data(), cache.host_linear_state.data(),
+                                                                cache.host_linear_state.size() * sizeof(float));
         }
         if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
-            session.context_->memcpy_h2d(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
-                                         cache.host_linear_conv_state.size() * sizeof(float));
+            last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
+                                                                cache.host_linear_conv_state.size() * sizeof(float));
         }
         cache.device_state_dirty = false;
+    }
+    if (last_h2d_event != sycl::event{}) {
+        last_h2d_event.wait_and_throw();
     }
     ple_.restore_snapshot(*session.context_, session.ple_state_, snapshot.ple_snapshot);
 

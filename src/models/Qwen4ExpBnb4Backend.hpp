@@ -84,7 +84,6 @@ struct Qwen4ExpBuffers {
     Tensor hc_inject_f32; // [max_seq, 4]
     Tensor x;             // [max_seq, 2560]
     Tensor y;             // [max_seq, 2560]
-    Tensor ple_out;       // [max_seq, 10240]
 
     // Full Attention
     Tensor full_qkv;      // [max_seq, 13312]
@@ -92,7 +91,6 @@ struct Qwen4ExpBuffers {
     Tensor z;             // [max_seq, 6144]
     Tensor k;             // [max_seq, 512]
     Tensor v;             // [max_seq, 512]
-    Tensor qkv;           // [max_seq, 12288]
     Tensor attn_out;      // [max_seq, 6144]
     Tensor decode_scores; // [24, max_seq]
     Tensor decode_attn_partials; // [24, 64 * 256]
@@ -106,7 +104,6 @@ struct Qwen4ExpBuffers {
     Tensor router_scores;      // [max_seq, 512]
 
     Tensor moe_h;              // [10, 640]
-    Tensor moe_acc_f32;        // [2560]
     Tensor shared_gate_buf;    // [max_seq, 1]
     Tensor shared_gate_up_buf; // [max_seq, 1280]
     Tensor shared_inter_buf;   // [max_seq, 640]
