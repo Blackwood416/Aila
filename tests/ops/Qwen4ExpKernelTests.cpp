@@ -730,6 +730,209 @@ void test_moe_decode_gate_up_and_down(Context& ctx) {
     }
 }
 
+void test_moe_prefill_gate_up_and_down(Context& ctx) {
+    constexpr int in_features = 2560;
+    constexpr int intermediate_size = 640;
+    constexpr int out_features = 2560;
+    constexpr int blocksize = 64;
+    constexpr int num_active_experts = 4;
+    constexpr int tokens = 2;
+
+    std::mt19937 rng(444);
+    std::uniform_int_distribution<int> u8_dist(0, 255);
+    std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
+    std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
+
+    const size_t gu_packed_bytes = static_cast<size_t>(2 * intermediate_size) * (in_features / 2);
+    const size_t gu_absmax_count = static_cast<size_t>(2 * intermediate_size) * (in_features / blocksize);
+    const size_t down_packed_bytes = static_cast<size_t>(out_features) * (intermediate_size / 2);
+    const size_t down_absmax_count = static_cast<size_t>(out_features) * (intermediate_size / blocksize);
+
+    const int total_expert_slots = tokens * num_active_experts;
+    std::vector<std::vector<uint8_t>> gu_packed(total_expert_slots, std::vector<uint8_t>(gu_packed_bytes));
+    std::vector<std::vector<float>> gu_absmax(total_expert_slots, std::vector<float>(gu_absmax_count));
+    std::vector<std::vector<uint8_t>> down_packed(total_expert_slots, std::vector<uint8_t>(down_packed_bytes));
+    std::vector<std::vector<float>> down_absmax(total_expert_slots, std::vector<float>(down_absmax_count));
+
+    for (int e = 0; e < total_expert_slots; ++e) {
+        for (size_t i = 0; i < gu_packed_bytes; ++i) gu_packed[e][i] = static_cast<uint8_t>(u8_dist(rng));
+        for (size_t i = 0; i < gu_absmax_count; ++i) gu_absmax[e][i] = f_dist(rng);
+        for (size_t i = 0; i < down_packed_bytes; ++i) down_packed[e][i] = static_cast<uint8_t>(u8_dist(rng));
+        for (size_t i = 0; i < down_absmax_count; ++i) down_absmax[e][i] = f_dist(rng);
+    }
+
+    std::vector<bf16> x_host(tokens * in_features);
+    for (size_t i = 0; i < x_host.size(); ++i) x_host[i] = bf16(in_dist(rng));
+
+    std::vector<float> weights_host(tokens * num_active_experts);
+    for (int t = 0; t < tokens; ++t) {
+        float sum = 0.0f;
+        for (int e = 0; e < num_active_experts; ++e) {
+            float w = f_dist(rng);
+            weights_host[t * num_active_experts + e] = w;
+            sum += w;
+        }
+        for (int e = 0; e < num_active_experts; ++e) {
+            weights_host[t * num_active_experts + e] /= sum;
+        }
+    }
+
+    std::vector<bf16> shared_host(tokens * out_features);
+    std::vector<bf16> gate_host(tokens);
+    for (size_t i = 0; i < shared_host.size(); ++i) shared_host[i] = bf16(in_dist(rng));
+    for (int t = 0; t < tokens; ++t) gate_host[t] = bf16(in_dist(rng));
+
+    // Allocate GPU buffers
+    std::vector<Tensor> gu_packed_dev, gu_absmax_dev, down_packed_dev, down_absmax_dev;
+    std::vector<ops::MoeExpertSlotDev> slots(total_expert_slots);
+    for (int e = 0; e < total_expert_slots; ++e) {
+        gu_packed_dev.push_back(Tensor::allocate(ctx, {gu_packed_bytes}, dnnl::memory::data_type::u8));
+        gu_absmax_dev.push_back(Tensor::allocate(ctx, {gu_absmax_count}, dnnl::memory::data_type::f32));
+        down_packed_dev.push_back(Tensor::allocate(ctx, {down_packed_bytes}, dnnl::memory::data_type::u8));
+        down_absmax_dev.push_back(Tensor::allocate(ctx, {down_absmax_count}, dnnl::memory::data_type::f32));
+
+        ctx.memcpy_h2d(gu_packed_dev[e].data(), gu_packed[e].data(), gu_packed_bytes);
+        ctx.memcpy_h2d(gu_absmax_dev[e].data(), gu_absmax[e].data(), gu_absmax_count * sizeof(float));
+        ctx.memcpy_h2d(down_packed_dev[e].data(), down_packed[e].data(), down_packed_bytes);
+        ctx.memcpy_h2d(down_absmax_dev[e].data(), down_absmax[e].data(), down_absmax_count * sizeof(float));
+
+        slots[e].gate_up_packed = static_cast<const uint8_t*>(gu_packed_dev[e].data());
+        slots[e].gate_up_absmax = static_cast<const float*>(gu_absmax_dev[e].data());
+        slots[e].down_packed = static_cast<const uint8_t*>(down_packed_dev[e].data());
+        slots[e].down_absmax = static_cast<const float*>(down_absmax_dev[e].data());
+    }
+
+    Tensor x_dev = Tensor::allocate(ctx, {tokens, in_features}, dnnl::memory::data_type::bf16);
+    Tensor shared_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor gate_dev = Tensor::allocate(ctx, {tokens, 1}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(shared_dev.data(), shared_host.data(), shared_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(gate_dev.data(), gate_host.data(), gate_host.size() * sizeof(bf16));
+
+    // Copy slots to device buffer
+    auto* slots_dev_buf = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_expert_slots * sizeof(ops::MoeExpertSlotDev)));
+    ctx.memcpy_h2d(slots_dev_buf, slots.data(), total_expert_slots * sizeof(ops::MoeExpertSlotDev));
+
+    // Pinned host weights for down projection
+    auto* weights_pinned = static_cast<float*>(
+        ctx.alloc_host(weights_host.size() * sizeof(float)));
+    std::memcpy(weights_pinned, weights_host.data(), weights_host.size() * sizeof(float));
+
+    // 1. Run reference using decode kernel per token
+    Tensor ref_h_dev = Tensor::allocate(ctx, {tokens * num_active_experts * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor ref_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor ref_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+    for (int t = 0; t < tokens; ++t) {
+        const auto* x_t = static_cast<const bf16*>(x_dev.data()) + t * in_features;
+        auto* h_t = static_cast<bf16*>(ref_h_dev.data()) + t * num_active_experts * intermediate_size;
+        auto* y_t = static_cast<bf16*>(ref_y_dev.data()) + t * out_features;
+        auto* y_fused_t = static_cast<bf16*>(ref_y_fused_dev.data()) + t * out_features;
+        const auto* t_slots = slots.data() + t * num_active_experts;
+        const auto* t_weights = weights_host.data() + t * num_active_experts;
+
+        ops::moe_decode_gate_up_swiglu_grouped(
+            ctx, t_slots, nullptr, x_t, h_t,
+            num_active_experts, in_features, intermediate_size, blocksize);
+
+        ops::moe_decode_down_weighted_accumulate(
+            ctx, t_slots, nullptr, t_weights,
+            h_t, nullptr, y_t,
+            num_active_experts, intermediate_size, out_features, blocksize);
+
+        ops::moe_decode_down_weighted_accumulate(
+            ctx, t_slots, nullptr, t_weights,
+            h_t, nullptr, y_fused_t,
+            num_active_experts, intermediate_size, out_features, blocksize,
+            static_cast<const bf16*>(shared_dev.data()) + t * out_features,
+            static_cast<const bf16*>(gate_dev.data()) + t);
+    }
+    ctx.synchronize();
+
+    std::vector<bf16> ref_h(tokens * num_active_experts * intermediate_size);
+    std::vector<bf16> ref_y(tokens * out_features);
+    std::vector<bf16> ref_y_fused(tokens * out_features);
+    ctx.memcpy_d2h(ref_h.data(), ref_h_dev.data(), ref_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(ref_y.data(), ref_y_dev.data(), ref_y.size() * sizeof(bf16));
+    ctx.memcpy_d2h(ref_y_fused.data(), ref_y_fused_dev.data(), ref_y_fused.size() * sizeof(bf16));
+
+    // 2. Run batched prefill kernels
+    Tensor prefill_h_dev = Tensor::allocate(ctx, {tokens * num_active_experts * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor prefill_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor prefill_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+    ops::moe_prefill_gate_up_rows(
+        ctx, slots_dev_buf, nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(prefill_h_dev.data()),
+        tokens, num_active_experts, in_features, intermediate_size, blocksize);
+
+    ops::moe_prefill_down_rows(
+        ctx, slots_dev_buf, weights_pinned, nullptr,
+        static_cast<const bf16*>(prefill_h_dev.data()),
+        static_cast<bf16*>(prefill_y_dev.data()),
+        tokens, num_active_experts, intermediate_size, out_features, blocksize);
+
+    ops::moe_prefill_down_rows(
+        ctx, slots_dev_buf, weights_pinned, nullptr,
+        static_cast<const bf16*>(prefill_h_dev.data()),
+        static_cast<bf16*>(prefill_y_fused_dev.data()),
+        tokens, num_active_experts, intermediate_size, out_features, blocksize,
+        static_cast<const bf16*>(shared_dev.data()),
+        static_cast<const bf16*>(gate_dev.data()));
+
+    ctx.synchronize();
+
+    std::vector<bf16> prefill_h(tokens * num_active_experts * intermediate_size);
+    std::vector<bf16> prefill_y(tokens * out_features);
+    std::vector<bf16> prefill_y_fused(tokens * out_features);
+    ctx.memcpy_d2h(prefill_h.data(), prefill_h_dev.data(), prefill_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(prefill_y.data(), prefill_y_dev.data(), prefill_y.size() * sizeof(bf16));
+    ctx.memcpy_d2h(prefill_y_fused.data(), prefill_y_fused_dev.data(), prefill_y_fused.size() * sizeof(bf16));
+
+    // 3. Verify bit-exact match against per-token decode kernels
+    int h_mismatches = 0;
+    for (size_t i = 0; i < ref_h.size(); ++i) {
+        if (prefill_h[i] != ref_h[i]) {
+            ++h_mismatches;
+        }
+    }
+    if (h_mismatches != 0) {
+        throw std::runtime_error("moe_prefill_gate_up_rows bit-exact mismatch: " +
+                                 std::to_string(h_mismatches) + " of " + std::to_string(ref_h.size()));
+    }
+    std::cout << "[PASS] moe_prefill_gate_up_rows bit-exact match with decode kernel\n";
+
+    int y_mismatches = 0;
+    for (size_t i = 0; i < ref_y.size(); ++i) {
+        if (prefill_y[i] != ref_y[i]) {
+            ++y_mismatches;
+        }
+    }
+    if (y_mismatches != 0) {
+        throw std::runtime_error("moe_prefill_down_rows bit-exact mismatch: " +
+                                 std::to_string(y_mismatches) + " of " + std::to_string(ref_y.size()));
+    }
+    std::cout << "[PASS] moe_prefill_down_rows bit-exact match with decode kernel\n";
+
+    int y_fused_mismatches = 0;
+    for (size_t i = 0; i < ref_y_fused.size(); ++i) {
+        if (prefill_y_fused[i] != ref_y_fused[i]) {
+            ++y_fused_mismatches;
+        }
+    }
+    if (y_fused_mismatches != 0) {
+        throw std::runtime_error("moe_prefill_down_rows (fused) bit-exact mismatch: " +
+                                 std::to_string(y_fused_mismatches) + " of " + std::to_string(ref_y_fused.size()));
+    }
+    std::cout << "[PASS] moe_prefill_down_rows (fused) bit-exact match with decode kernel\n";
+
+    // Clean up
+    ctx.free_device(slots_dev_buf);
+    ctx.free_host(weights_pinned);
+}
+
 void test_gated_delta_net_sigmoid(Context& ctx) {
     constexpr int q_heads = 16;
     constexpr int v_heads = 48;
@@ -1137,6 +1340,7 @@ int main() {
         test_ple_dilated_conv_silu_add_residual(ctx);
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
+        test_moe_prefill_gate_up_and_down(ctx);
         test_gated_delta_net_sigmoid(ctx);
         test_attention_decode_gate_fusion(ctx);
         test_attention_prefill_gate_fusion(ctx);

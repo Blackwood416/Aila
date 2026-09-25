@@ -249,6 +249,9 @@ private:
     // Pinned host [runtime_seq_capacity_, top_k] router outputs written directly by the top-k kernel.
     int* router_host_ids_ = nullptr;
     float* router_host_weights_ = nullptr;
+    // S1 Batched prefill MoE slot descriptors (host pinned buffer and device mirror).
+    ops::MoeExpertSlotDev* batch_slots_host_ = nullptr;
+    ops::MoeExpertSlotDev* batch_slots_dev_ = nullptr;
 
     // Prefill batched expert acquire scratch (expert -> slot / token uses for the current layer).
     std::vector<int> prefill_expert_slot_;

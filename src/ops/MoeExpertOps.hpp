@@ -117,6 +117,79 @@ sycl::event moe_decode_down_weighted_accumulate(
     const bf16* shared_out = nullptr,
     const bf16* shared_gate = nullptr);
 
+// Batched prefill expert gate_up GEMV with SwiGLU: h[t, k, intermediate_size] = silu(gate) * up
+sycl::event moe_prefill_gate_up_rows(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int tokens,
+    int num_active_experts,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+inline sycl::event moe_prefill_gate_up_rows(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int tokens,
+    int num_active_experts,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event& dep_event,
+    bool use_nested = false) {
+    return moe_prefill_gate_up_rows(
+        ctx, slots, quant_map, x, h, tokens, num_active_experts,
+        in_features, intermediate_size, blocksize, &dep_event, use_nested);
+}
+
+// Batched prefill expert down-projection with weighted accumulation:
+// y[t] = sum_k (weight[t, k] * down_k(h[t, k]))
+sycl::event moe_prefill_down_rows(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* weights,
+    const float* quant_map,
+    const bf16* h,
+    bf16* y,
+    int tokens,
+    int num_active_experts,
+    int in_features = 640,
+    int out_features = 2560,
+    int blocksize = 64,
+    const bf16* shared_out = nullptr,
+    const bf16* shared_gate = nullptr,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+inline sycl::event moe_prefill_down_rows(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* weights,
+    const float* quant_map,
+    const bf16* h,
+    bf16* y,
+    int tokens,
+    int num_active_experts,
+    int in_features,
+    int out_features,
+    int blocksize,
+    const bf16* shared_out,
+    const bf16* shared_gate,
+    const sycl::event& dep_event,
+    bool use_nested = false) {
+    return moe_prefill_down_rows(
+        ctx, slots, weights, quant_map, h, y, tokens, num_active_experts,
+        in_features, out_features, blocksize, shared_out, shared_gate, &dep_event, use_nested);
+}
+
 // Flat SwiGLU activation: out[t * intermediate_size + i] = silu(gate) * up
 void moe_silu_gate_up_mul_flat(
     Context& ctx,
