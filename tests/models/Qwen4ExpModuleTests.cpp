@@ -1,6 +1,7 @@
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
 #include "models/Qwen4ExpExpertCache.hpp"
+#include "models/Qwen4ExpBnb4Backend.hpp"
 #include "models/Qwen4ExpPle.hpp"
 #include "utils/SafeTensors.hpp"
 #include "utils/EnvUtils.hpp"
@@ -1410,6 +1411,238 @@ void test_host_slot_reservation_and_demand_priority(Context& ctx) {
     std::cout << "[PASS] Phase S2 host slot reservation & demand fill priority verified successfully.\n";
 }
 
+void test_host_slot_contention_and_dma_protection(Context& ctx) {
+    std::cout << "[Test] Running Phase S2 host slot contention & DMA protection test...\n";
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 16;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 7 + 13) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x12);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.25f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xBB);
+    for (size_t i = 0; i < total_dn_packed; ++i) dn_packed_host[i] = static_cast<uint8_t>((i * 11 + 3) % 251);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x34);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 0.75f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.1f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes; // 2 GPU slots
+
+    // Extreme stress test: ONLY 1 Host Slot!
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=1");
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // 1. Warm up expert 0 -> occupies the single host slot 0
+    int req1[1] = {0};
+    int slots1[1] = {-1};
+    cache.acquire(0, req1, 1, slots1);
+    cache.wait_copy();
+    expect(cache.host_contains(0, 0), "expert 0 must be in host slot");
+
+    // 2. In a single batch acquire {0, 1}:
+    // Expert 0 is a host hit. It reserves host slot 0 and starts async DMA.
+    // Expert 1 is a miss. Since only 1 host slot exists, slot 0 MUST NOT be overwritten until expert 0 DMA finishes!
+    int req2[2] = {0, 1};
+    int slots2[2] = {-1, -1};
+    cache.acquire(0, req2, 2, slots2);
+    cache.wait_copy();
+    expect(slots2[0] >= 0 && slots2[1] >= 0, "both slots must be acquired");
+    expect(slots2[0] != slots2[1], "GPU slots must be distinct");
+
+    // Verify GPU content of expert 0
+    ops::MoeExpertSlotDev dev_slot0 = cache.get_slot_dev(slots2[0]);
+    std::vector<uint8_t> read_back0(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back0.data(), dev_slot0.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back0.data(), gu_packed_host.data() + 0 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "expert 0 data was corrupted during concurrent host slot reuse!");
+
+    // Verify GPU content of expert 1
+    ops::MoeExpertSlotDev dev_slot1 = cache.get_slot_dev(slots2[1]);
+    std::vector<uint8_t> read_back1(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back1.data(), dev_slot1.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back1.data(), gu_packed_host.data() + 1 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "expert 1 data verification failed");
+
+    // 3. Test prefetch cancellation and wait safety (must not deadlock)
+    int pf[4] = {2, 3, 4, 5};
+    cache.prefetch_async(0, pf, 4);
+    cache.cancel_prefetch_for_testing();
+    cache.wait_prefetch(); // Must return cleanly without infinite loop!
+
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S2 host slot contention & DMA protection verified successfully.\n";
+}
+
+void test_snapshot_capture_and_truncate(Context& ctx) {
+    std::cout << "[Test] Running Phase S5 batched async snapshot capture & truncate test...\n";
+
+    Qwen4ExpBnb4Backend backend;
+    backend.init_for_testing(ctx, 4); // 4 layers: 0, 1, 2 linear, 3 attention
+    auto session = backend.CreateSession(ctx, /*maxSnapshots=*/3);
+    expect(session != nullptr, "CreateSession failed");
+
+    auto& caches = session->layer_caches_for_testing();
+    expect(caches.size() == 48, "expected 48 layer caches allocated in session");
+
+    // Initialize test patterns in Layer 0 and Layer 1 linear states
+    const size_t state_size = 48 * 128 * 128;
+    const size_t conv_size = 3 * 10240;
+    std::vector<float> l0_state_pat(state_size, 3.14159f);
+    std::vector<float> l0_conv_pat(conv_size, 2.71828f);
+    std::vector<float> l1_state_pat(state_size, 1.41421f);
+    std::vector<float> l1_conv_pat(conv_size, 0.57721f);
+
+    ctx.memcpy_h2d(caches[0].linear_state.data(), l0_state_pat.data(), state_size * sizeof(float));
+    ctx.memcpy_h2d(caches[0].linear_conv_state.data(), l0_conv_pat.data(), conv_size * sizeof(float));
+    caches[0].linear_conv_head = 42;
+    caches[0].device_state_dirty = true;
+
+    ctx.memcpy_h2d(caches[1].linear_state.data(), l1_state_pat.data(), state_size * sizeof(float));
+    ctx.memcpy_h2d(caches[1].linear_conv_state.data(), l1_conv_pat.data(), conv_size * sizeof(float));
+    caches[1].linear_conv_head = 7;
+    caches[1].device_state_dirty = true;
+
+    // 1. Capture snapshot at length 10
+    backend.capture_snapshot_for_testing(ctx, *session, 10, 10);
+    expect(!caches[0].device_state_dirty, "device_state_dirty must be cleared after snapshot");
+    expect(!caches[1].device_state_dirty, "device_state_dirty must be cleared after snapshot");
+    expect(session->snapshots_for_testing().count(10) == 1, "snapshot 10 must exist");
+
+    // 2. Mutate device state to all zeros
+    ctx.queue().memset(caches[0].linear_state.data(), 0, state_size * sizeof(float)).wait_and_throw();
+    ctx.queue().memset(caches[0].linear_conv_state.data(), 0, conv_size * sizeof(float)).wait_and_throw();
+    caches[0].linear_conv_head = 0;
+    ctx.queue().memset(caches[1].linear_state.data(), 0, state_size * sizeof(float)).wait_and_throw();
+    ctx.queue().memset(caches[1].linear_conv_state.data(), 0, conv_size * sizeof(float)).wait_and_throw();
+    caches[1].linear_conv_head = 0;
+
+    // 3. Truncate to length 10 -> must restore snapshot 10
+    int restored = backend.Truncate(*session, 10);
+    expect(restored == 10, "Truncate must restore length 10");
+    expect(session->CurrentLength() == 10, "CurrentLength must be 10");
+    expect(caches[0].linear_conv_head == 42, "Layer 0 conv head must be restored to 42");
+    expect(caches[1].linear_conv_head == 7, "Layer 1 conv head must be restored to 7");
+
+    // Verify GPU device data restored correctly
+    std::vector<float> read_l0_state(state_size);
+    std::vector<float> read_l0_conv(conv_size);
+    std::vector<float> read_l1_state(state_size);
+    std::vector<float> read_l1_conv(conv_size);
+
+    ctx.memcpy_d2h(read_l0_state.data(), caches[0].linear_state.data(), state_size * sizeof(float));
+    ctx.memcpy_d2h(read_l0_conv.data(), caches[0].linear_conv_state.data(), conv_size * sizeof(float));
+    ctx.memcpy_d2h(read_l1_state.data(), caches[1].linear_state.data(), state_size * sizeof(float));
+    ctx.memcpy_d2h(read_l1_conv.data(), caches[1].linear_conv_state.data(), conv_size * sizeof(float));
+
+    expect(read_l0_state[0] == 3.14159f && read_l0_state[state_size - 1] == 3.14159f, "Layer 0 linear state restoration failed");
+    expect(read_l0_conv[0] == 2.71828f && read_l0_conv[conv_size - 1] == 2.71828f, "Layer 0 conv state restoration failed");
+    expect(read_l1_state[0] == 1.41421f && read_l1_state[state_size - 1] == 1.41421f, "Layer 1 linear state restoration failed");
+    expect(read_l1_conv[0] == 0.57721f && read_l1_conv[conv_size - 1] == 0.57721f, "Layer 1 conv state restoration failed");
+
+    // 4. Test bounded snapshot eviction with maxSnapshots = 3
+    // Snapshots: add 20, 30, 40 -> total 4 snapshots, so snapshot 10 must be evicted!
+    caches[0].device_state_dirty = true;
+    caches[1].device_state_dirty = true;
+    backend.capture_snapshot_for_testing(ctx, *session, 20, 10);
+
+    caches[0].device_state_dirty = true;
+    caches[1].device_state_dirty = true;
+    backend.capture_snapshot_for_testing(ctx, *session, 30, 10);
+
+    caches[0].device_state_dirty = true;
+    caches[1].device_state_dirty = true;
+    backend.capture_snapshot_for_testing(ctx, *session, 40, 10);
+
+    expect(session->snapshots_for_testing().count(10) == 0, "snapshot 10 must be evicted when maxSnapshots exceeded");
+    expect(session->snapshots_for_testing().count(20) == 1, "snapshot 20 must be retained");
+    expect(session->snapshots_for_testing().count(30) == 1, "snapshot 30 must be retained");
+    expect(session->snapshots_for_testing().count(40) == 1, "snapshot 40 must be retained");
+
+    // Truncate to 35 -> nearest checkpoint <= 35 is 30
+    restored = backend.Truncate(*session, 35);
+    expect(restored == 30, "Truncate to 35 must restore checkpoint 30");
+
+    // Truncate to 15 -> no checkpoint <= 15 (10 was evicted), must reset to 0
+    restored = backend.Truncate(*session, 15);
+    expect(restored == 0, "Truncate to 15 must reset to 0");
+    expect(session->CurrentLength() == 0, "CurrentLength must be 0 after reset");
+
+    std::cout << "[PASS] Phase S5 batched async snapshot capture & truncate verified successfully.\n";
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -1476,6 +1709,8 @@ int main() {
         test_fine_grained_demand_prefetch(ctx);
         test_slru_host_cache_and_anti_thrashing(ctx);
         test_host_slot_reservation_and_demand_priority(ctx);
+        test_host_slot_contention_and_dma_protection(ctx);
+        test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);

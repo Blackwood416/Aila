@@ -115,6 +115,8 @@ public:
         if (hslot < 0 || hslot >= num_host_slots_) return false;
         return host_slot_reserved_[hslot];
     }
+    bool host_has_dma_in_flight(int layer, int expert_id) const;
+    void cancel_prefetch_for_testing() { cancel_prefetch(); }
     size_t host_protected_count() const { return host_protected_list_.size(); }
     size_t host_probationary_count() const { return host_probationary_list_.size(); }
     size_t host_empty_count() const { return host_empty_slots_.size(); }
@@ -265,6 +267,7 @@ private:
     std::vector<bool> host_slot_is_protected_;
     std::vector<bool> host_slot_reserved_;
     std::vector<int> batch_reserved_hslots_scratch_;
+    std::vector<sycl::event> host_slot_dma_events_;
     float protected_ratio_ = 0.75f;
     void touch_host_slot(int hslot);
     int pick_victim_hslot();

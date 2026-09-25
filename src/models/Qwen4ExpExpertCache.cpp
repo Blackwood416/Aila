@@ -130,6 +130,7 @@ public:
         while (prefetch_job_.active_workers.load(std::memory_order_acquire) != 0) {
             std::this_thread::yield();
         }
+        prefetch_job_.done.store(prefetch_job_.total, std::memory_order_release);
         prefetch_job_.in_flight.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -138,8 +139,7 @@ public:
     }
 
     void wait_prefetch_job() {
-        if (!prefetch_job_.in_flight.load(std::memory_order_acquire) &&
-            prefetch_job_.done.load(std::memory_order_acquire) >= prefetch_job_.total) {
+        if (!prefetch_job_.in_flight.load(std::memory_order_acquire)) {
             return;
         }
         for (;;) {
@@ -623,6 +623,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
             host_slot_iters_.resize(num_host_slots_);
             host_slot_is_protected_.assign(num_host_slots_, false);
             host_slot_reserved_.assign(num_host_slots_, false);
+            host_slot_dma_events_.assign(num_host_slots_, sycl::event{});
             batch_reserved_hslots_scratch_.clear();
             batch_reserved_hslots_scratch_.reserve(num_host_slots_);
             host_empty_slots_.clear();
@@ -803,26 +804,77 @@ void Qwen4ExpExpertCache::bind_slot_nested_metadata(int slot, int layer, int exp
 }
 
 int Qwen4ExpExpertCache::pick_victim_hslot() {
-    while (!host_empty_slots_.empty()) {
-        int h = host_empty_slots_.back();
-        host_empty_slots_.pop_back();
+    auto is_event_complete = [](const sycl::event& ev) -> bool {
+        if (ev == sycl::event{}) return true;
+        try {
+            return ev.get_info<sycl::info::event::command_execution_status>() ==
+                   sycl::info::event_command_status::complete;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    // 1. Try unreserved empty slots first
+    for (auto it = host_empty_slots_.rbegin(); it != host_empty_slots_.rend(); ++it) {
+        int h = *it;
         if (h >= 0 && h < num_host_slots_ && !host_slot_reserved_[h]) {
+            host_empty_slots_.erase(std::next(it).base());
             return h;
         }
     }
+    // 2. Try unreserved probationary slots whose DMA is already complete
+    for (auto r_it = host_probationary_list_.rbegin(); r_it != host_probationary_list_.rend(); ++r_it) {
+        int h = *r_it;
+        if (!host_slot_reserved_[h] && is_event_complete(host_slot_dma_events_[h])) {
+            return h;
+        }
+    }
+    // 3. Try unreserved protected slots whose DMA is already complete
+    for (auto r_it = host_protected_list_.rbegin(); r_it != host_protected_list_.rend(); ++r_it) {
+        int h = *r_it;
+        if (!host_slot_reserved_[h] && is_event_complete(host_slot_dma_events_[h])) {
+            return h;
+        }
+    }
+    // 4. If all unreserved candidates have in-flight DMAs, pick LRU unreserved slot and wait on its DMA
     for (auto r_it = host_probationary_list_.rbegin(); r_it != host_probationary_list_.rend(); ++r_it) {
         int h = *r_it;
         if (!host_slot_reserved_[h]) {
+            if (host_slot_dma_events_[h] != sycl::event{}) {
+                try {
+                    host_slot_dma_events_[h].wait_and_throw();
+                } catch (...) {}
+                host_slot_dma_events_[h] = sycl::event{};
+            }
             return h;
         }
     }
     for (auto r_it = host_protected_list_.rbegin(); r_it != host_protected_list_.rend(); ++r_it) {
         int h = *r_it;
         if (!host_slot_reserved_[h]) {
+            if (host_slot_dma_events_[h] != sycl::event{}) {
+                try {
+                    host_slot_dma_events_[h].wait_and_throw();
+                } catch (...) {}
+                host_slot_dma_events_[h] = sycl::event{};
+            }
             return h;
         }
     }
-    return 0;
+    return -1;
+}
+
+bool Qwen4ExpExpertCache::host_has_dma_in_flight(int layer, int expert_id) const {
+    if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+    int hslot = host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)];
+    if (hslot < 0 || hslot >= num_host_slots_) return false;
+    if (host_slot_dma_events_[hslot] == sycl::event{}) return false;
+    try {
+        return host_slot_dma_events_[hslot].get_info<sycl::info::event::command_execution_status>() !=
+               sycl::info::event_command_status::complete;
+    } catch (...) {
+        return false;
+    }
 }
 
 void Qwen4ExpExpertCache::touch_host_slot(int hslot) {
@@ -893,8 +945,15 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
 
     if (host_pool_enabled_) {
         for (auto& item : prefetch_items_) {
-            if (!item.ready.load(std::memory_order_acquire)) {
-                if (item.hslot >= 0) {
+            if (item.hslot >= 0 && item.hslot < num_host_slots_) {
+                bool in_batch = false;
+                for (int b : batch_reserved_hslots_scratch_) {
+                    if (b == item.hslot) { in_batch = true; break; }
+                }
+                if (!in_batch) {
+                    host_slot_reserved_[item.hslot] = false;
+                }
+                if (!item.ready.load(std::memory_order_acquire)) {
                     const int flat = expert_flat_index(item.layer, item.expert_id);
                     if (host_layer_expert_to_slot_[flat] == item.hslot) {
                         host_layer_expert_to_slot_[flat] = -1;
@@ -908,9 +967,7 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
                     }
                     host_slot_is_protected_[item.hslot] = false;
                     host_empty_slots_.push_back(item.hslot);
-                }
-            } else {
-                if (item.hslot >= 0) {
+                } else {
                     host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
                 }
             }
@@ -1115,12 +1172,41 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             const size_t max_chunk = std::max(1, num_host_slots_);
 
             for (size_t m = 0; m < to_fill_scratch_.size(); ) {
-                const size_t chunk_size = std::min(max_chunk, to_fill_scratch_.size() - m);
+                size_t avail_hslots = 0;
+                for (int h = 0; h < num_host_slots_; ++h) {
+                    if (!host_slot_reserved_[h]) ++avail_hslots;
+                }
+
+                if (avail_hslots == 0) {
+                    copy_q_->wait_and_throw();
+                    for (int h : batch_reserved_hslots_scratch_) {
+                        host_slot_reserved_[h] = false;
+                        host_slot_dma_events_[h] = sycl::event{};
+                    }
+                    batch_reserved_hslots_scratch_.clear();
+                    for (int h = 0; h < num_host_slots_; ++h) {
+                        if (!host_slot_reserved_[h]) ++avail_hslots;
+                    }
+                }
+
+                const size_t chunk_size = std::min(std::max<size_t>(1, avail_hslots), to_fill_scratch_.size() - m);
                 assigned_hslots_scratch_.resize(chunk_size);
 
                 for (size_t c = 0; c < chunk_size; ++c) {
                     const auto& miss = to_fill_scratch_[m + c];
                     int victim_hslot = pick_victim_hslot();
+                    if (victim_hslot < 0) {
+                        copy_q_->wait_and_throw();
+                        for (int h : batch_reserved_hslots_scratch_) {
+                            host_slot_reserved_[h] = false;
+                            host_slot_dma_events_[h] = sycl::event{};
+                        }
+                        batch_reserved_hslots_scratch_.clear();
+                        victim_hslot = pick_victim_hslot();
+                        if (victim_hslot < 0) {
+                            throw std::runtime_error("Qwen4ExpExpertCache: no unreserved host slot available in pool");
+                        }
+                    }
                     if (!host_slot_reserved_[victim_hslot]) {
                         host_slot_reserved_[victim_hslot] = true;
                         batch_reserved_hslots_scratch_.push_back(victim_hslot);
@@ -1174,6 +1260,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     copy_q_->wait_and_throw();
                     for (int h : batch_reserved_hslots_scratch_) {
                         host_slot_reserved_[h] = false;
+                        host_slot_dma_events_[h] = sycl::event{};
                     }
                     batch_reserved_hslots_scratch_.clear();
                 }
@@ -1232,6 +1319,9 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         if (copy_q_) {
             dma_done_event = copy_q_->ext_oneapi_submit_barrier();
             last_dma_event_ = dma_done_event;
+            for (int h : batch_reserved_hslots_scratch_) {
+                host_slot_dma_events_[h] = dma_done_event;
+            }
         }
     }
 
@@ -1286,6 +1376,11 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
         for (int c = 0; c < n; ++c) {
             auto& item = prefetch_items_[c];
             int victim_hslot = pick_victim_hslot();
+            if (victim_hslot < 0) {
+                prefetch_items_.resize(c);
+                break;
+            }
+            host_slot_reserved_[victim_hslot] = true;
             const uint64_t old_key = host_slot_to_key_[victim_hslot];
             if (old_key != UINT64_MAX) {
                 int old_layer = static_cast<int>(old_key >> 32);
@@ -1314,7 +1409,13 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
         }
     }
 
-    fill_pool_->start(n * parts, [this, parts](int task) {
+    if (prefetch_items_.empty()) {
+        prefetch_in_flight_ = false;
+        return;
+    }
+
+    const int effective_n = static_cast<int>(prefetch_items_.size());
+    fill_pool_->start(effective_n * parts, [this, parts](int task) {
         const int c = task / parts;
         const int p = task % parts;
         if (c >= static_cast<int>(prefetch_items_.size())) return;
@@ -1344,9 +1445,10 @@ void Qwen4ExpExpertCache::wait_prefetch() {
     if (fill_pool_) fill_pool_->wait();
     if (host_pool_enabled_) {
         for (auto& item : prefetch_items_) {
-            if (item.parts_remaining.load(std::memory_order_acquire) == 0) {
-                item.ready.store(true, std::memory_order_release);
-                if (item.hslot >= 0) {
+            if (item.hslot >= 0 && item.hslot < num_host_slots_) {
+                host_slot_reserved_[item.hslot] = false;
+                if (item.parts_remaining.load(std::memory_order_acquire) == 0) {
+                    item.ready.store(true, std::memory_order_release);
                     host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
                 }
             }

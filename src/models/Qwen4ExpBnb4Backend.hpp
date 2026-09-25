@@ -138,6 +138,9 @@ public:
         int CurrentLength() const { return currentLength_; }
         int Capacity() const { return capacity_; }
 
+        const std::unordered_map<int, StateSnapshot>& snapshots_for_testing() const { return snapshots_; }
+        std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
+
     private:
         friend class Qwen4ExpBnb4Backend;
         Session(Context& ctx, int capacity,
@@ -185,6 +188,19 @@ public:
                                 const int* tokenIdsDevice, int count);
     void Reset(Session& session);
     int Truncate(Session& session, int newLength);
+
+    void init_for_testing(Context& ctx, int num_layers = 4) {
+        context_ = &ctx;
+        max_seq_len_ = 64;
+        layers_.resize(num_layers);
+        for (int i = 0; i < num_layers; ++i) {
+            layers_[i].is_linear = ((i + 1) % 4 != 0);
+        }
+    }
+    void capture_snapshot_for_testing(Context& ctx, Session& session, int nextLength, int count = 1) {
+        CaptureSnapshot(ctx, session, nextLength, count);
+        session.currentLength_ = nextLength;
+    }
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,
