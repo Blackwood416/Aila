@@ -9,9 +9,11 @@ uncommitted in the working tree** (section 9 lists the files).
 This session implemented **Stage 4: Prefill Cross-Layer Asynchronous Pipeline Overlap & Speculative Prefetch** on the Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path:
 
 1. **Prefill Next-Layer Speculative Expert Routing & Prefetch**:
-   - Lifted the decode-only restriction (`count == 1`) on `predict_next` in `src/models/Qwen4ExpBnb4Backend.cpp`, enabling speculative next-layer expert evaluation across all `count` tokens during prefill.
+   - Extended `predict_next` in `src/models/Qwen4ExpBnb4Backend.cpp` to evaluate speculative next-layer expert routing across all tokens during prefill when prefetch is enabled (`AILA_Q4E_PREFILL_PREFETCH_MAX > 0`), while avoiding wasted GPU compute when disabled.
    - Dynamic buffer sizing: pre-allocated `pred_scores_` (`[cap, cfg_.num_experts]`) and pinned host memory `pred_host_ids_` / `pred_host_weights_` (`cap * top_k`) in `ensure_runtime_buffers`, eliminating single-token lazy allocation.
-   - In `batch_acquire`, aggregated predicted expert IDs across all tokens, frequency-ranked them (prioritizing experts chosen by the most tokens), and launched asynchronous background staging into the 16 GiB Hot Host RAM Pool via `expert_cache_.prefetch_async(L + 1, ...)`.
+   - Hot-path zero-allocation scratch buffers: added `prefill_pred_unique_` and `prefill_pred_uses_` backend members pre-allocated at load time, eliminating 48 dynamic heap allocations per prefill step.
+   - Decoupled prefetch execution: moved prefill next-layer prefetch to layer-level execution outside `batch_acquire`, ensuring prefetch into the 16 GiB Hot Host RAM Pool functions seamlessly even under constrained GPU cache sizes.
+   - Token-loop isolation: strictly guarded per-token decode prefetch with `count == 1`, completely preventing stale/uninitialized ID prefetch submissions and serial CPU stalls during non-batched prefill.
    - Result: Layer L+1's predicted experts stream from NVMe/disk into the host pool concurrently with GPU execution of Layer L's MoE compute, shared expert, and residual add, plus Layer L+1's Attention and MLP HC!
    - Prefill host fill time on `story.json` dropped from **1,876.90 ms** down to **525.90 ms** (**-72.0% reduction**, saving >1.35 seconds). Prefill latency dropped to **2442.74 ms** (down from 2615.2 ms in Stage 3).
 
@@ -20,7 +22,7 @@ This session implemented **Stage 4: Prefill Cross-Layer Asynchronous Pipeline Ov
    - Introduced `AILA_Q4E_PREFILL_PREFETCH_MAX` (default 48): tuned to match the ~15-25 ms GPU execution window of Layer L, ensuring zero page-cache thrashing while covering the highest-frequency experts.
 
 3. **Verification & Golden Equivalence**:
-   - Added `test_prefill_speculative_prefetch` in `tests/models/Qwen4ExpModuleTests.cpp` proving 100% Host Pool hits and bit-exact GPU contents on prefill speculative prefetch.
+   - Added `test_prefill_speculative_prefetch` in `tests/models/Qwen4ExpModuleTests.cpp` proving 100% Host Pool hits, multi-token frequency ranking, quota capping, and bit-exact GPU contents on prefill speculative prefetch.
    - Full CTest suite passed 100% (57/57 tests).
    - Real-model end-to-end greedy output verified: **100% bit-exact match** on both `story.json` and `lighthouse_274.json`.
 

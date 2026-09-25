@@ -930,6 +930,46 @@ void test_prefill_speculative_prefetch(Context& ctx) {
                "prefetched expert content mismatch on GPU");
     }
 
+    // Phase 2: Multi-token frequency ranking, deduplication, and quota capping verification
+    // Simulate prefill tokens: Token 0=[10,11], Token 1=[12,10], Token 2=[10,12], Token 3=[13,10]
+    // Expert 10 has 4 votes, Expert 12 has 2 votes, Experts 11 and 13 have 1 vote each.
+    const int raw_token_preds[8] = {10, 11, 12, 10, 10, 12, 13, 10};
+    std::vector<int> pred_unique;
+    std::vector<int> pred_uses(num_experts_per_layer, 0);
+    for (int e : raw_token_preds) {
+        if (e >= 0 && e < num_experts_per_layer && pred_uses[e]++ == 0) {
+            pred_unique.push_back(e);
+        }
+    }
+    std::stable_sort(pred_unique.begin(), pred_unique.end(), [&](int a, int b) {
+        return pred_uses[a] > pred_uses[b];
+    });
+    expect(pred_unique.size() == 4, "expected 4 unique experts");
+    expect(pred_unique[0] == 10, "expert 10 (4 votes) must rank first");
+    expect(pred_unique[1] == 12, "expert 12 (2 votes) must rank second");
+
+    // Cap prefetch quota to top-2 experts: [10, 12]
+    constexpr int prefetch_quota = 2;
+    cache.prefetch_async(1, pred_unique.data(), prefetch_quota);
+
+    // Layer 1 acquires [10, 12, 11, 13]: exactly the 2 prefetched experts must hit Host Pool, others fill on-demand
+    int l1_freq_req[4] = {10, 12, 11, 13};
+    int l1_freq_slots[4] = {-1, -1, -1, -1};
+    prev_host_hits = cache.stats().host_pool_hits;
+    cache.acquire(1, l1_freq_req, 4, l1_freq_slots);
+    expect(cache.stats().host_pool_hits == prev_host_hits + 2,
+           "exactly the 2 prefetched high-frequency experts must hit Host Pool");
+    cache.wait_copy();
+
+    for (int i = 0; i < 4; ++i) {
+        expect(l1_freq_slots[i] >= 0, "slot must be valid");
+        ops::MoeExpertSlotDev dev_slot = cache.get_slot_dev(l1_freq_slots[i]);
+        std::vector<uint8_t> read_gu(gu_packed_per_exp);
+        ctx.memcpy_d2h(read_gu.data(), dev_slot.gate_up_packed, gu_packed_per_exp);
+        expect(std::memcmp(read_gu.data(), gu_packed_host.data() + l1_freq_req[i] * gu_packed_per_exp, gu_packed_per_exp) == 0,
+               "expert content mismatch on GPU in frequency ranking test");
+    }
+
     _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
     _putenv("AILA_TEST_Q4E_HOST_POOL=");
     std::cout << "[PASS] Prefill speculative next-layer prefetch verified successfully.\n";

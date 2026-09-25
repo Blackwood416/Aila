@@ -521,6 +521,8 @@ bool Qwen4ExpBnb4Backend::load(
         AILA_LOG_WARN("[Qwen4Exp] Expert cache has %d slots (< %d): prefill acquires experts per token",
                       expert_cache_.num_slots(), cfg_.num_experts + cfg_.num_experts_per_tok);
     }
+    prefill_pred_uses_.assign(cfg_.num_experts, 0);
+    prefill_pred_unique_.reserve(cfg_.num_experts);
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
     return true;
 }
@@ -794,6 +796,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
     static const int s_prefetch_topn = std::max(1, aila::env::read_int("AILA_Q4E_PREFETCH_TOPN", 10));
+    static const int s_prefill_prefetch_max = aila::env::read_int("AILA_Q4E_PREFILL_PREFETCH_MAX", 48);
     // Note: pred_scores_, pred_host_ids_, and pred_host_weights_ are pre-allocated in ensure_runtime_buffers
     std::array<int, kMaxTopK> pred_ids{};
     bool have_pred = false;
@@ -946,7 +949,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
-        const bool predict_next = (s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers);
+        const bool predict_next = (count == 1)
+            ? ((s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
+            : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers));
         if (predict_next) {
             // Route this layer's MoE input through the next layer's router to guess its experts.
             DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
@@ -1029,22 +1034,22 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 expert_cache_.demote(L, prefill_unique_.data() + keep,
                                      static_cast<int>(prefill_unique_.size() - keep));
             }
-            if (s_prefetch && predict_next) {
-                std::vector<int> pred_unique;
-                std::vector<int> pred_uses(cfg_.num_experts, 0);
-                for (int i = 0; i < count * top_k; ++i) {
-                    const int e = pred_host_ids_[i];
-                    if (e >= 0 && e < cfg_.num_experts && pred_uses[e]++ == 0) {
-                        pred_unique.push_back(e);
-                    }
+        }
+        if (s_prefetch && predict_next && count > 1) {
+            prefill_pred_unique_.clear();
+            std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
+            const int total_preds = count * top_k;
+            for (int i = 0; i < total_preds; ++i) {
+                const int e = pred_host_ids_[i];
+                if (e >= 0 && e < cfg_.num_experts && prefill_pred_uses_[e]++ == 0) {
+                    prefill_pred_unique_.push_back(e);
                 }
-                std::stable_sort(pred_unique.begin(), pred_unique.end(), [&](int a, int b) {
-                    return pred_uses[a] > pred_uses[b];
-                });
-                static const int s_prefill_prefetch_max = aila::env::read_int("AILA_Q4E_PREFILL_PREFETCH_MAX", 48);
-                const int prefetch_count = std::min(static_cast<int>(pred_unique.size()), s_prefill_prefetch_max);
-                expert_cache_.prefetch_async(L + 1, pred_unique.data(), prefetch_count);
             }
+            std::stable_sort(prefill_pred_unique_.begin(), prefill_pred_unique_.end(), [&](int a, int b) {
+                return prefill_pred_uses_[a] > prefill_pred_uses_[b];
+            });
+            const int prefetch_count = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
+            expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(), prefetch_count);
         }
         prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
 
@@ -1060,7 +1065,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 const auto prof_acq_t0 = prof_clock::now();
                 dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
                 prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
-                if (s_prefetch && predict_next) {
+                if (s_prefetch && predict_next && count == 1) {
                     expert_cache_.prefetch_async(L + 1, pred_ids.data(), std::min(top_k, s_prefetch_topn));
                 }
             }
