@@ -109,6 +109,12 @@ public:
         if (hslot < 0 || hslot >= num_host_slots_) return false;
         return host_slot_is_protected_[hslot];
     }
+    bool host_is_reserved(int layer, int expert_id) const {
+        if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+        int hslot = host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)];
+        if (hslot < 0 || hslot >= num_host_slots_) return false;
+        return host_slot_reserved_[hslot];
+    }
     size_t host_protected_count() const { return host_protected_list_.size(); }
     size_t host_probationary_count() const { return host_probationary_list_.size(); }
     size_t host_empty_count() const { return host_empty_slots_.size(); }
@@ -257,6 +263,8 @@ private:
     std::list<int> host_protected_list_;
     std::vector<std::list<int>::iterator> host_slot_iters_;
     std::vector<bool> host_slot_is_protected_;
+    std::vector<bool> host_slot_reserved_;
+    std::vector<int> batch_reserved_hslots_scratch_;
     float protected_ratio_ = 0.75f;
     void touch_host_slot(int hslot);
     int pick_victim_hslot();
