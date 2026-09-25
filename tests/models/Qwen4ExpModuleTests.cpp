@@ -1109,6 +1109,176 @@ void test_fine_grained_demand_prefetch(Context& ctx) {
     std::cout << "[PASS] Phase S2 fine-grained demand prefetch & GPU hit bypass verified successfully.\n";
 }
 
+void test_slru_host_cache_and_anti_thrashing(Context& ctx) {
+    std::cout << "[Test] Running Phase S3 2-tier SLRU host cache & anti-thrashing test...\n";
+
+    constexpr int num_layers = 2;
+    constexpr int num_experts_per_layer = 16;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size; // 128
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2); // 16384 bytes
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize); // 512
+    const size_t dn_rows = hidden_size; // 256
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2); // 8192 bytes
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize); // 256
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed, 0x33);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x11);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.0f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0x77);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x22);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 1.0f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.1f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes; // Only 2 GPU slots to trigger frequent GPU miss & Host lookup
+
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=4"); // 4 Host slots
+    _putenv("AILA_Q4E_HOST_PROTECTED_RATIO=0.5"); // 50% = 2 protected, 2 probationary
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    expect(cache.host_pool_enabled(), "host pool must be enabled");
+    expect(cache.num_host_slots() == 4, "expected 4 host slots");
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+    cache.set_layer_expert_ref(1, gu_ref, dn_ref);
+
+    // Initial state: 4 empty slots
+    expect(cache.host_empty_count() == 4, "expected 4 empty host slots");
+    expect(cache.host_probationary_count() == 0, "expected 0 probationary host slots");
+    expect(cache.host_protected_count() == 0, "expected 0 protected host slots");
+
+    // 1. Acquire Expert 0 on Layer 0:
+    // Misses GPU and Host Pool -> demand fill into Host Pool.
+    // Must be placed in probationary segment.
+    int req0[1] = {0};
+    int slot0[1] = {-1};
+    cache.acquire(0, req0, 1, slot0);
+    expect(cache.host_contains(0, 0), "expert 0 must be in host pool");
+    expect(!cache.host_is_protected(0, 0), "first touch must remain in probationary segment");
+    expect(cache.host_protected_count() == 0, "no protected slots yet");
+
+    // 2. Acquire Expert 1 on Layer 0:
+    int req1[1] = {1};
+    int slot1[1] = {-1};
+    cache.acquire(0, req1, 1, slot1);
+    expect(cache.host_contains(0, 1), "expert 1 must be in host pool");
+    expect(!cache.host_is_protected(0, 1), "first touch must remain in probationary segment");
+
+    // 3. Acquire Expert 2 on Layer 0: (GPU slots = 2, so Expert 0 is evicted from GPU!)
+    int req2[1] = {2};
+    int slot2[1] = {-1};
+    cache.acquire(0, req2, 1, slot2);
+    expect(!cache.contains(0, 0), "expert 0 must have been evicted from GPU cache");
+    expect(cache.host_contains(0, 0), "expert 0 must still be in host pool");
+
+    // 4. Second touch of Expert 0:
+    // Hits Host Pool! Must be promoted to protected segment.
+    uint64_t prev_h_hits = cache.stats().host_pool_hits;
+    cache.acquire(0, req0, 1, slot0);
+    expect(cache.stats().host_pool_hits == prev_h_hits + 1, "expert 0 must hit host pool");
+    expect(cache.host_is_protected(0, 0), "second touch must promote expert 0 to protected segment");
+    expect(cache.host_protected_count() == 1, "expected 1 protected host slot");
+
+    // 5. Fill remaining host capacity:
+    // Host has 4 slots: Expert 0 is protected. Expert 1, 2 are probationary.
+    // Acquire Expert 3 (fills 4th slot, probationary).
+    int req3[1] = {3};
+    int slot3[1] = {-1};
+    cache.acquire(0, req3, 1, slot3);
+    expect(cache.host_contains(0, 3), "expert 3 must be in host pool");
+    expect(!cache.host_is_protected(0, 3), "expert 3 must be probationary");
+
+    // Now host pool is full (1 protected [0], 3 probationary [3, 2, 1]).
+    // Evict a slot by acquiring Expert 4:
+    // With SLRU, probationary victim (Expert 1) must be evicted! Protected slot (0) must NOT be evicted!
+    int req4[1] = {4};
+    int slot4[1] = {-1};
+    cache.acquire(0, req4, 1, slot4);
+    expect(cache.host_contains(0, 0), "protected expert 0 MUST NOT be evicted by new fill");
+    expect(cache.host_is_protected(0, 0), "expert 0 must remain protected");
+    expect(!cache.host_contains(0, 1), "probationary LRU expert 1 should have been evicted");
+
+    // 6. Test Demote anti-thrashing:
+    // Expert 0 is protected. Demote expert 0.
+    int demote_e[1] = {0};
+    cache.demote(0, demote_e, 1);
+    expect(!cache.host_is_protected(0, 0), "demoted expert must no longer be protected");
+    expect(cache.host_protected_count() == 0, "protected count must drop to 0 after demoting sole protected expert");
+
+    // Because expert 0 was demoted to the tail of probationary list, the NEXT eviction must pick expert 0!
+    int req5[1] = {5};
+    int slot5[1] = {-1};
+    cache.acquire(0, req5, 1, slot5);
+    expect(!cache.host_contains(0, 0), "demoted expert 0 must be the first victim evicted");
+    expect(cache.host_contains(0, 5), "expert 5 must now reside in host pool");
+
+    _putenv("AILA_Q4E_HOST_PROTECTED_RATIO=");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S3 2-tier SLRU host cache & anti-thrashing verified successfully.\n";
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -1173,6 +1343,7 @@ int main() {
         test_hot_host_ram_pool_and_prefetch(ctx);
         test_prefill_speculative_prefetch(ctx);
         test_fine_grained_demand_prefetch(ctx);
+        test_slru_host_cache_and_anti_thrashing(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);

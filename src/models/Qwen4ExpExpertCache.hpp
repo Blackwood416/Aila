@@ -103,6 +103,17 @@ public:
         if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
         return host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)] >= 0;
     }
+    bool host_is_protected(int layer, int expert_id) const {
+        if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+        int hslot = host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)];
+        if (hslot < 0 || hslot >= num_host_slots_) return false;
+        return host_slot_is_protected_[hslot];
+    }
+    size_t host_protected_count() const { return host_protected_list_.size(); }
+    size_t host_probationary_count() const { return host_probationary_list_.size(); }
+    size_t host_empty_count() const { return host_empty_slots_.size(); }
+    float host_protected_ratio() const { return protected_ratio_; }
+    void set_host_protected_ratio(float ratio) { protected_ratio_ = std::max(0.0f, std::min(1.0f, ratio)); }
     void reset_stats() { stats_ = {}; }
     void log_stats(int layer = -1) const;
 
@@ -241,8 +252,14 @@ private:
     std::vector<uint8_t*> host_slot_ptrs_;
     std::vector<int> host_layer_expert_to_slot_;
     std::vector<uint64_t> host_slot_to_key_;
-    std::list<int> host_lru_list_;
+    std::vector<int> host_empty_slots_;
+    std::list<int> host_probationary_list_;
+    std::list<int> host_protected_list_;
     std::vector<std::list<int>::iterator> host_slot_iters_;
+    std::vector<bool> host_slot_is_protected_;
+    float protected_ratio_ = 0.75f;
+    void touch_host_slot(int hslot);
+    int pick_victim_hslot();
 
     struct MissInfo {
         int batch_index;
