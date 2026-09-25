@@ -285,6 +285,7 @@ compact u8 absmax codes (default for compatible nested checkpoints) or expanded 
 | `AILA_Q4E_ABSMAX_CODES` | bool | `true` | Keep nested u8 absmax codes in each GPU expert slot and reconstruct scales in the MoE kernels. Applies only when every expert layer has aligned nested NF4 metadata; otherwise falls back to f32 slots. `0` restores host f32 expansion. On this A770, slots shrink from 2,764,800 to 2,534,400 bytes (3463 to 3778 slots in the 9131 MB pool) |
 | `AILA_Q4E_PREFETCH` | bool | `true` | Decode: route layer L's MoE input through layer L+1's router and stage the predicted experts on the fill threads while the GPU runs layer L+1's attention |
 | `AILA_Q4E_PREFETCH_TOPN` | int | `10` | Number of most-probable predicted experts to prefetch |
+| `AILA_Q4E_PREFILL_PREFETCH_MAX` | int | `48` | Maximum unique predicted experts to asynchronously prefetch per layer during prefill into the Hot Host RAM Pool (hides host fill latency behind GPU compute while preventing OS page-cache thrashing) |
 | `AILA_Q4E_PREFILL_DEMOTE` | bool | `true` | Batched prefill keeps each layer's `slots / layers` most-used experts hot and queues the rest for eviction first, so decode after a long prompt still finds every layer's hottest experts (plain LRU would keep only the last layers) |
 | `AILA_Q4E_PREDICT_STATS` | bool | `false` | With `AILA_PROFILE_Q4E_DECODE`, log how often the next-layer prediction matched the real routing |
 

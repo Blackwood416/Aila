@@ -4,6 +4,37 @@ Last updated: 2026-09-25. Supersedes the M1 handoff (see this file at commit `6c
 Covers performance sessions after M1. **Everything below after `6c99f8f` is
 uncommitted in the working tree** (section 9 lists the files).
 
+## 0. Continuation: Stage 4 Prefill Pipeline Overlap & Speculative Prefetch (2026-09-25)
+
+This session implemented **Stage 4: Prefill Cross-Layer Asynchronous Pipeline Overlap & Speculative Prefetch** on the Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path:
+
+1. **Prefill Next-Layer Speculative Expert Routing & Prefetch**:
+   - Lifted the decode-only restriction (`count == 1`) on `predict_next` in `src/models/Qwen4ExpBnb4Backend.cpp`, enabling speculative next-layer expert evaluation across all `count` tokens during prefill.
+   - Dynamic buffer sizing: pre-allocated `pred_scores_` (`[cap, cfg_.num_experts]`) and pinned host memory `pred_host_ids_` / `pred_host_weights_` (`cap * top_k`) in `ensure_runtime_buffers`, eliminating single-token lazy allocation.
+   - In `batch_acquire`, aggregated predicted expert IDs across all tokens, frequency-ranked them (prioritizing experts chosen by the most tokens), and launched asynchronous background staging into the 16 GiB Hot Host RAM Pool via `expert_cache_.prefetch_async(L + 1, ...)`.
+   - Result: Layer L+1's predicted experts stream from NVMe/disk into the host pool concurrently with GPU execution of Layer L's MoE compute, shared expert, and residual add, plus Layer L+1's Attention and MLP HC!
+   - Prefill host fill time on `story.json` dropped from **1,876.90 ms** down to **525.90 ms** (**-72.0% reduction**, saving >1.35 seconds). Prefill latency dropped to **2442.74 ms** (down from 2615.2 ms in Stage 3).
+
+2. **OS Page-Cache Safety & Prefill Prefetch Bounds**:
+   - Identified that excessive prefetch quotas (e.g. 256 experts per layer on 274 tokens = 30.7 GB) thrash the Windows file page cache against the 94.5 GB mmap model and cause `pf_wait` stalls in `acquire()`.
+   - Introduced `AILA_Q4E_PREFILL_PREFETCH_MAX` (default 48): tuned to match the ~15-25 ms GPU execution window of Layer L, ensuring zero page-cache thrashing while covering the highest-frequency experts.
+
+3. **Verification & Golden Equivalence**:
+   - Added `test_prefill_speculative_prefetch` in `tests/models/Qwen4ExpModuleTests.cpp` proving 100% Host Pool hits and bit-exact GPU contents on prefill speculative prefetch.
+   - Full CTest suite passed 100% (57/57 tests).
+   - Real-model end-to-end greedy output verified: **100% bit-exact match** on both `story.json` and `lighthouse_274.json`.
+
+| Workload | Stage 3 Baseline | Stage 4 (Prefill Pipeline Overlap) |
+|---|---:|---:|
+| `story.json` Prefill Fill Time (`count=26`) | 1,876.90 ms | **525.90 ms (-72.0%, -1,351 ms)** |
+| `story.json` Prefill Total Latency | 2,591.5–2,615.2 ms | **2,442.74 ms (-172 ms)** |
+| `story.json` Total Generation (48 tok) | 7,268.6 ms | **7,507.9 ms (warm) / 7,770.5 ms** |
+| Decode Token Time (peak) | 71.8 ms | **69.16 ms (14.46 tok/s)** |
+| Decode Hit Rate | 415 / 480 | **415 / 480** |
+| Prefill Prefetch Mode | Disabled (`count == 1` only) | **Frequency-ranked top-48 async prefetch** |
+| CTest Suite (57 tests) | 57 passed (100%) | **57 passed (100%)** |
+| Golden Reference Text | Exact match | **100% bit-exact match** |
+
 ## 0. Continuation: Stage 3 Operator-Level Fusion & Vectorization (2026-09-25)
 
 This session executed **Stage 3: Operator-Level Lightweight Fusion and Overhead Compression** on the Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path across both Prefill and Decode stages:

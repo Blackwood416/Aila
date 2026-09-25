@@ -569,9 +569,12 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 
     // MoE buffers
     buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
+    pred_scores_ = Tensor::allocate(ctx, {cap, cfg_.num_experts}, dnnl::memory::data_type::bf16);
     free_pinned_host_buffers();
     router_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
     router_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
+    pred_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    pred_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     if (embed_host_.valid()) {
         embed_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * sizeof(int)));
         embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
@@ -791,11 +794,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
     static const int s_prefetch_topn = std::max(1, aila::env::read_int("AILA_Q4E_PREFETCH_TOPN", 10));
-    if ((s_prefetch || s_predict_stats) && !pred_host_ids_) {
-        pred_scores_ = Tensor::allocate(ctx, {1, cfg_.num_experts}, dnnl::memory::data_type::bf16);
-        pred_host_ids_ = static_cast<int*>(ctx.alloc_host(kMaxTopK * sizeof(int)));
-        pred_host_weights_ = static_cast<float*>(ctx.alloc_host(kMaxTopK * sizeof(float)));
-    }
+    // Note: pred_scores_, pred_host_ids_, and pred_host_weights_ are pre-allocated in ensure_runtime_buffers
     std::array<int, kMaxTopK> pred_ids{};
     bool have_pred = false;
     auto stage = [&](int s) {
@@ -947,21 +946,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
-        const bool predict_next = (s_prefetch || s_predict_stats) && count == 1 && L + 1 < cfg_.num_hidden_layers;
+        const bool predict_next = (s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers);
         if (predict_next) {
             // Route this layer's MoE input through the next layer's router to guess its experts.
             DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
-                        1, cfg_.num_experts, hidden_size_);
+                        count, cfg_.num_experts, hidden_size_);
             ops::router_softmax_topk_device(
                 ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
-                pred_host_ids_, pred_host_weights_, 1, cfg_.num_experts, top_k, true);
+                pred_host_ids_, pred_host_weights_, count, cfg_.num_experts, top_k, true);
         }
 
         const auto prof_router_t0 = prof_clock::now();
         ctx.synchronize();
         const auto prof_router_t1 = prof_clock::now();
         if (predict_next || have_pred) {
-            if (have_pred && s_predict_stats) {
+            if (have_pred && s_predict_stats && count == 1) {
                 for (int k = 0; k < top_k; ++k) {
                     const int e = router_host_ids_[k];
                     const bool in_pred = std::find(pred_ids.begin(), pred_ids.begin() + top_k, e) != pred_ids.begin() + top_k;
@@ -973,8 +972,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
                 pred_total_ += top_k;
             }
-            have_pred = predict_next;
-            if (predict_next) std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
+            have_pred = predict_next && (count == 1);
+            if (predict_next && count == 1) std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
         }
         prof_router_sync_ms += prof_ms(prof_router_t0, prof_router_t1);
         stage(kStageRouter);
@@ -1029,6 +1028,22 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 });
                 expert_cache_.demote(L, prefill_unique_.data() + keep,
                                      static_cast<int>(prefill_unique_.size() - keep));
+            }
+            if (s_prefetch && predict_next) {
+                std::vector<int> pred_unique;
+                std::vector<int> pred_uses(cfg_.num_experts, 0);
+                for (int i = 0; i < count * top_k; ++i) {
+                    const int e = pred_host_ids_[i];
+                    if (e >= 0 && e < cfg_.num_experts && pred_uses[e]++ == 0) {
+                        pred_unique.push_back(e);
+                    }
+                }
+                std::stable_sort(pred_unique.begin(), pred_unique.end(), [&](int a, int b) {
+                    return pred_uses[a] > pred_uses[b];
+                });
+                static const int s_prefill_prefetch_max = aila::env::read_int("AILA_Q4E_PREFILL_PREFETCH_MAX", 48);
+                const int prefetch_count = std::min(static_cast<int>(pred_unique.size()), s_prefill_prefetch_max);
+                expert_cache_.prefetch_async(L + 1, pred_unique.data(), prefetch_count);
             }
         }
         prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
