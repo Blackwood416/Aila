@@ -167,9 +167,45 @@ private:
     // Immediate-submission in-order queue for miss DMA (see acquire()).
     std::unique_ptr<sycl::queue> copy_q_;
     sycl::event last_dma_event_{};
-    struct PrefetchItem { int layer; int expert_id; int hslot = -1; }; // index == prefetch staging slot
+    struct PrefetchItem {
+        int layer = -1;
+        int expert_id = -1;
+        int hslot = -1;
+        std::atomic<uint32_t> claimed_parts{0};
+        std::atomic<int> parts_remaining{0};
+        std::atomic<bool> cancelled{false};
+        std::atomic<bool> ready{false};
+
+        PrefetchItem() = default;
+        PrefetchItem(int l, int e, int h, int parts)
+            : layer(l), expert_id(e), hslot(h), claimed_parts(0), parts_remaining(parts), cancelled(false), ready(false) {}
+
+        PrefetchItem(const PrefetchItem& o)
+            : layer(o.layer), expert_id(o.expert_id), hslot(o.hslot),
+              claimed_parts(o.claimed_parts.load(std::memory_order_relaxed)),
+              parts_remaining(o.parts_remaining.load(std::memory_order_relaxed)),
+              cancelled(o.cancelled.load(std::memory_order_relaxed)),
+              ready(o.ready.load(std::memory_order_relaxed)) {}
+
+        PrefetchItem& operator=(const PrefetchItem& o) {
+            if (this != &o) {
+                layer = o.layer;
+                expert_id = o.expert_id;
+                hslot = o.hslot;
+                claimed_parts.store(o.claimed_parts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                parts_remaining.store(o.parts_remaining.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                cancelled.store(o.cancelled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                ready.store(o.ready.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            return *this;
+        }
+    };
     std::vector<PrefetchItem> prefetch_items_;
     bool prefetch_in_flight_ = false;
+
+    std::unique_ptr<std::atomic<uint8_t>[]> host_slot_state_; // 0=Empty, 1=Filling, 2=Ready
+    void cancel_prefetch();
+    void ensure_prefetch_item_ready(PrefetchItem& item, int prefetch_idx);
 
     struct LayerWeights {
         Bnb4BitHostWeightRef gate_up{};

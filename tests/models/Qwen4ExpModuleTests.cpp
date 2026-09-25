@@ -975,6 +975,140 @@ void test_prefill_speculative_prefetch(Context& ctx) {
     std::cout << "[PASS] Prefill speculative next-layer prefetch verified successfully.\n";
 }
 
+void test_fine_grained_demand_prefetch(Context& ctx) {
+    std::cout << "[Test] Running Phase S2 fine-grained demand prefetch & GPU hit bypass test...\n";
+
+    constexpr int num_layers = 2;
+    constexpr int num_experts_per_layer = 16;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size; // 128
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2); // 16384 bytes
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize); // 512
+    const size_t dn_rows = hidden_size; // 256
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2); // 8192 bytes
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize); // 256
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed, 0x55);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x12);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.25f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xAA);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x34);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 0.75f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.1f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 8 * slot_bytes; // 8 GPU slots
+
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=16");
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+    cache.set_layer_expert_ref(1, gu_ref, dn_ref);
+
+    // Warm up Layer 0 experts [0, 1, 2, 3] on GPU
+    int l0_req[4] = {0, 1, 2, 3};
+    int l0_slots[4] = {-1, -1, -1, -1};
+    cache.acquire(0, l0_req, 4, l0_slots);
+    expect(cache.stats().miss_count == 4, "expected 4 initial misses");
+
+    // Launch heavy speculative prefetch for Layer 1: 8 experts [4, 5, 6, 7, 8, 9, 10, 11]
+    int l1_pf[8] = {4, 5, 6, 7, 8, 9, 10, 11};
+    cache.prefetch_async(1, l1_pf, 8);
+
+    // Test Case A: 100% GPU hit path must return immediately without waiting for prefetch
+    const uint64_t wait_before = cache.stats().prefetch_wait_ns;
+    int l0_hit_slots[4] = {-1, -1, -1, -1};
+    cache.acquire(0, l0_req, 4, l0_hit_slots);
+    expect(cache.stats().hit_count == 4, "expected 4 GPU hits");
+    expect(cache.stats().prefetch_wait_ns == wait_before,
+           "100% GPU hit path must NOT incur any prefetch wait time");
+    for (int i = 0; i < 4; ++i) {
+        expect(l0_hit_slots[i] == l0_slots[i], "GPU hit slot mismatch");
+    }
+
+    // Test Case B: Fine-grained demand wait.
+    // Layer 1 only needs expert 7 (single expert from the 8 prefetched).
+    // Acquire must only wait for expert 7 and not wait for the remaining 7 unneeded experts.
+    int l1_single_req[1] = {7};
+    int l1_single_slot[1] = {-1};
+    uint64_t prev_hits = cache.stats().host_pool_hits;
+    cache.acquire(1, l1_single_req, 1, l1_single_slot);
+    expect(cache.stats().host_pool_hits == prev_hits + 1, "demanded expert 7 must hit Host Pool");
+    expect(cache.stats().prefetch_used >= 1, "demanded expert 7 must increment prefetch_used");
+    cache.wait_copy();
+
+    ops::MoeExpertSlotDev dev_slot7 = cache.get_slot_dev(l1_single_slot[0]);
+    std::vector<uint8_t> read_gu7(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_gu7.data(), dev_slot7.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_gu7.data(), gu_packed_host.data() + 7 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "demanded expert 7 content mismatch on GPU");
+
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S2 fine-grained demand prefetch & GPU hit bypass verified successfully.\n";
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -1038,6 +1172,7 @@ int main() {
         test_expert_cache_lru_and_dequant(ctx, true);
         test_hot_host_ram_pool_and_prefetch(ctx);
         test_prefill_speculative_prefetch(ctx);
+        test_fine_grained_demand_prefetch(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);
