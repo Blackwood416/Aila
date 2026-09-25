@@ -73,16 +73,16 @@ copy immediate:                                              H2D --------↑ dma
 
 优先级表示实施顺序；工作量仅用于拆分任务，不是工期承诺。所有新实验开关默认关闭，成熟路径保留回退。
 
-| 阶段 | 交付 | 主要收益来源 | 工作量 / 风险 |
+| 阶段 | 交付 | 主要收益来源 | 状态 / 提交 |
 |---|---|---|---|
-| S0 | 小范围耗时口径补齐 + host 热路径去分配 | 可比性、CPU 分配和提交成本 | 小 / 低 |
-| S1 | prefill MoE 两个批量 kernel | 大幅减少 host 提交，保持计算顺序 | 中 / 中，首选主项 |
-| S2 | host slot 生命周期 + demand-first fill | 避免无关预取阻塞、保护 DMA source | 中 / 中，decode 首选主项 |
-| S3 | router event 边界与 shared 提前提交 | 用真实独立计算覆盖 CPU acquire | 中 / 中 |
-| S4 | expert-major prefill / 热专家 XMX | 同专家多 token 权重复用 | 大 / 中高，数值实验 |
-| S5 | 快照异步批量回读、workspace 回收 | TTFT、尾延迟、内存余量 | 中 / 中 |
-| E1 | 静态子图、预测轻量化 | 降提交成本和预测成本 | 实验，依赖 S2/S3 |
-| E2 | DeltaNet 分块、HC/LM head 专项、AOT | 第二阶段计算与启动优化 | 按证据选做 |
+| S0 | 小范围耗时口径补齐 + host 热路径去分配 | 可比性、CPU 分配和提交成本 | 已完成 (`9abc996`) |
+| S1 | prefill MoE 两个批量 kernel | 大幅减少 host 提交，保持计算顺序 | 已完成 (`b51a2cc`, `645b9d4`) |
+| S2 | host slot 生命周期 + demand-first fill | 避免无关预取阻塞、保护 DMA source | 已完成 (`26838e1`, `cac125b`) |
+| S3 | router event 边界与 shared 提前提交 + 2-tier SLRU | 用真实独立计算覆盖 CPU acquire 与抗抖动 | 已完成 (`49a69e8`, `3ae5d20`) |
+| S5 | 快照异步批量回读、workspace 回收 | TTFT、尾延迟、内存余量 | 已完成 (`d8205c1`) |
+| S4 | expert-major prefill / 热专家 XMX | 同专家多 token 权重复用 | 规划中（数值实验候选） |
+| E1 | 静态子图、预测轻量化 | 降提交成本和预测成本 | 实验性候选 |
+| E2 | DeltaNet 分块、HC/LM head 专项、AOT | 第二阶段计算与启动优化 | 实验性候选 |
 
 可以先独立实施 S1 与 S0；S4 不应作为 S1 的前置条件。S2/S3 先保留 layer router 的顺序依赖，不一次重写整个 scheduler。
 
