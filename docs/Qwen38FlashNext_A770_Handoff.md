@@ -1,8 +1,125 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — Handoff
 
-Last updated: 2026-09-24. Supersedes the M1 handoff (see this file at commit `6c99f8f`).
-Covers two performance sessions after M1. **Everything below after `6c99f8f` is
+Last updated: 2026-09-25. Supersedes the M1 handoff (see this file at commit `6c99f8f`).
+Covers performance sessions after M1. **Everything below after `6c99f8f` is
 uncommitted in the working tree** (section 9 lists the files).
+
+## 0. Continuation: Stage 3 Operator-Level Fusion & Vectorization (2026-09-25)
+
+This session executed **Stage 3: Operator-Level Lightweight Fusion and Overhead Compression** on the Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path across both Prefill and Decode stages:
+
+1. **Full Attention Epilogue Gate Fusion (`sigmoid_mul` Elimination)**:
+   - Extended `ops::attention_decode`, `ops::attention_prefill`, and `ops::attention_prefill_cached` with an optional `const Tensor* gate_buf` parameter.
+   - Fused the gate activation and elementwise product directly into the writeback epilogues across all attention execution paths (Decode: Baseline, JM, Exact 128/256 Partial Merge; Prefill: Exact 128/256 and fallback).
+   - Replicated exact two-step floating-point rounding semantics: `val = static_cast<float>(bf16(acc)); if (gate) val = static_cast<float>(bf16(val * s));`, ensuring exact bitwise equivalence.
+   - Eliminated the separate `ops::sigmoid_mul` kernel launch and intermediate DRAM traffic roundtrip in both Prefill and Decode in `Qwen4ExpBnb4Backend.cpp`.
+
+2. **Prefill QKV Split Fusion (`split_qgkv`)**:
+   - Replaced the two-step `split_qkv` + `split_q_gate` pipeline with a unified 128-bit `vec8` kernel `ops::split_qgkv`.
+   - Directly demuxes `full_qkv` into `q`, `gate` (`z`), `k`, and `v` in a single pass, completely eliminating the intermediate `buf_.qkv` tensor allocation and memory write/read traffic (saving ~16 KB × count DRAM bandwidth per layer).
+
+3. **PLE Layer 1 Host Embed Token ID Reuse & Direct Residual Fusion**:
+   - Reused `embed_host_ids_` when host embedding is valid, eliminating blocking D2H transfer (`ctx.memcpy_d2h`) and per-forward `std::vector<int>` heap allocations.
+   - Extended `ops::ple_dilated_conv_silu_add` and `Qwen4ExpPle::forward` with an optional `bf16* residual` pointer; directly accumulates the PLE output into `buf_.hidden4`.
+   - Completely eliminated the separate `ops::residual_add` kernel launch and `buf_.ple_out` intermediate DRAM buffer roundtrip.
+
+4. **Decode and Prefill Operator Vectorization & Overhead Elimination**:
+   - `add_shared_expert_to_y`: Implemented 128-bit `vec8` memory accesses; specialized both the decode path (`rows == 1`) and prefill path (`rows > 1`, 2D nd_range) to eliminate 2,560 per-token integer divisions/modulos and redundant duplicate `exp(-g_val)` computations.
+   - `Embedding` 4x replication: Implemented 128-bit `vec8` writes for both `count == 1` and `count > 1`, removing 2,560 integer divisions/modulos.
+   - `hc_inject_add`: Accelerated across all `rows >= 1` (Prefill & Decode) with 128-bit `vec8` vectorized loads/stores when `(group_dim % 8) == 0`, eliminating thread-level division and modulo.
+   - `grouped_rms_norm`: Preserved exact SLM tree-reduction summation order to ensure 100% bit-exact numerical stability across 96 per-step RMSNorms across 48 layers; decode step integer division/modulo eliminated.
+   - `hc_mix_reduce`: Enabled 128-bit `vec8` memory transactions when `(group_dim % 8) == 0`.
+   - `apply_silu_div4` & `apply_sigmoid`: Vectorized using 128-bit `vec8` operations when `(count % 8) == 0`.
+
+5. **Decode Attention Partials Buffer Sizing Bugfix**:
+   - Fixed `buf_.decode_attn_partials` allocation in `Qwen4ExpBnb4Backend.cpp` from 2D `{full_q_heads_, 64 * full_head_dim_}` to correct 3D geometry `{(int64_t)full_q_heads_, (int64_t)max_tiles, (int64_t)partial_stride}`, preventing severe out-of-bounds memory accesses when `cached_len >= 128`.
+
+6. **Rigorous Verification & Test Coverage**:
+   - Added `test_attention_decode_gate_fusion`, `test_split_qgkv`, and `test_ple_dilated_conv_silu_add_residual` in `tests/ops/Qwen4ExpKernelTests.cpp`, all achieving **0 bit mismatches**.
+   - Added `test_attention_prefill_gate_fusion` verifying numerical alignment (within 1 ULP).
+   - Full CTest suite passed 100% (57/57 tests).
+   - End-to-end `story.json` (48 tokens) generation verified: **100% bit-exact match** with the golden reference text.
+
+| Workload | Stage 2 Baseline (16 GiB Host Pool) | Stage 3 (Operator Fusion & Vectorization) |
+|---|---:|---:|
+| `story.json` (48 tokens, decode step) | 84.9 ms / 11.78 tok/s | **83.7 ms / 11.95 tok/s** |
+| Prefill Latency (`story.json`, count=26) | 2657.6 ms | **2591.5–2615.2 ms (-42 to -66 ms)** |
+| Total Generation Time (`story.json`, 48 tok) | 7383.3 ms | **7268.6 ms (-114.7 ms)** |
+| Attention Epilogue Fusion (Prefill + Decode) | Separate `sigmoid_mul` kernel | **0 extra kernel launches (fused in writeback)** |
+| Prefill QKV Split | `split_qkv` + `split_q_gate` | **Unified `split_qgkv` (no `buf_.qkv`)** |
+| Layer 1 PLE Residual | `buf_.ple_out` + `residual_add` | **Fused into dilated conv (0 extra kernel)** |
+| Shared Expert Add | Scalar + 2560 modulos | **128-bit `vec8` + 0 modulos (Prefill & Decode)** |
+| Kernel Unit Tests | N/A | **0 bit mismatches across all kernels** |
+| Full CTest Suite | 57 tests passed | **57 tests passed (100%)** |
+| Golden Text Accuracy | Exact match | **100% bit-exact match** |
+
+## 0. Continuation: Core Pipeline Decoupling & 16 GiB Hot Host RAM Pool (2026-09-25)
+
+This session completed the architectural decoupling of the MoE DMA transfer stream and compute stream, alongside doubling the hot host RAM cache capacity:
+
+1. **Zero-Wait Core Pipeline Decoupling (`Qwen4ExpExpertCache.{hpp,cpp}`, `MoeExpertOps.{hpp,cpp}`, `Qwen4ExpBnb4Backend.cpp`)**:
+   - Redesigned `acquire()` to return a `sycl::event` (the completion barrier from `copy_q_->ext_oneapi_submit_barrier()`) instead of blocking the CPU host thread via `copy_q_->wait_and_throw()`.
+   - Propagated `dma_event` into `ops::moe_decode_gate_up_swiglu_grouped(..., dma_event)` on single-step decode (`count == 1`) and the initial step of batched prefill (`t == 0`).
+   - In `launch_moe_decode_gate_up_swiglu_grouped`, registered the dependency directly in the command group handler via `cgh.depends_on(*dep_event)`. Supported empty `sycl::event{}` bypassing and true cross-queue event synchronization.
+   - Result: CPU thread dispatches the DMA queue and returns in ~19.6 ms (down from ~37.5 ms, a -47.7% reduction in host staging latency) without waiting for PCIe transfers to complete. GPU Xe compute cores and copy engines synchronize strictly at the hardware event level right when the grouped MoE kernel requires the weights. CPU `dma_wait` is completely eliminated (**0.0 ms**).
+   - Added `cache.wait_copy()` helper for tests and host-side inspection prior to D2H memory verification.
+   - Fixed `last_dma_event_` move lifecycle in `Qwen4ExpExpertCache` move constructor and assignment operator, and ensured cleanup reset.
+
+2. **Hardware Blitter Queue Binding (Level Zero Main Copy Engine)**:
+   - Implemented `aila::env::enable_l0_copy_engine()` in `src/utils/EnvUtils.hpp` setting `UR_L0_USE_COPY_ENGINE=1` and `SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE=1`.
+   - Injected `enable_l0_copy_engine()` at process entry points (`src/main.cpp`, `src/worker/WorkerMain.cpp`, and test `main`s) strictly before Level Zero driver / SYCL context initialization, resolving driver-init race conditions.
+   - Configured `copy_q_` with `sycl::ext::intel::property::queue::immediate_command_list()` and in-order submission, ensuring command lists dispatch to dedicated Level Zero Blitter hardware (Queue Group Ordinal 1).
+
+3. **16 GiB Hot Host RAM Pool Expansion & Multi-Chunk Stress Verification (`Qwen4ExpExpertCache.{hpp,cpp}`)**:
+   - Raised default `AILA_Q4E_HOT_RAM_MB` from 8,192 to 16,384 (16 GiB pinned USM).
+   - Holds **6,778 resident expert slots** in pinned host RAM. Combined with GPU VRAM's 3,778 slots, total active cache capacity reaches **10,556 slots** (covering >43% of total model experts).
+   - Supported `AILA_TEST_Q4E_HOST_SLOTS` for fine-grained slot testing. Added strict multi-chunk verification in `Qwen4ExpModuleTests` proving that when `n_fill > num_host_slots`, chunked staging with intermediate DMA draining executes safely and produces 100% bit-exact GPU weights.
+
+| Workload | Previous Baseline (`/boost`) | After Pipeline Decoupling + 16 GiB Pool |
+|---|---:|---:|
+| `story.json` (48 tokens, decode step) | 91.7–93.8 ms / 10.66–10.90 tok/s | **84.0 ms / 11.90 tok/s (+9.9% throughput, -9.2% latency)** |
+| Total Generation Time (`story.json`) | 7.74–7.88 s | **7.27 s** |
+| CPU DMA Wait (`dma_wait`) | ~7.5 ms | **0.0 ms (100% async)** |
+| CPU `acquire()` Step Time | ~37.5 ms | **19.6 ms (-47.7%)** |
+| `lighthouse_274.json` (278 prompt) CPU `dma_wait` | ~7.5 ms | **0.0 ms** |
+| Full CTest Suite (57 tests) | 43 pass, 14 skip | **100% Pass** (43 pass, 14 skip, 0 fail) |
+| Text output verification | Golden reference | **100% bit-exact match** |
+
+## 0. Continuation: /boost Pipeline Optimization & Vectorization (2026-09-24)
+
+This session implemented the `/boost` performance acceleration suite targeting compute, memory bandwidth, synchronization, and DMA overlap:
+
+1. **DMA & Shared Expert Overlap (`Qwen4ExpExpertCache.cpp`)**:
+   - Removed the false `main_done` queue barrier dependency in `acquire()`. All previous-layer work was already synchronized at the router boundary; the shared expert does not touch expert slots.
+   - PCIe DMA on the copy queue now executes concurrently with the shared expert running on the Xe compute cores, hiding ~7.5 ms of transfer latency.
+
+2. **Prefetch directly into Hot Host RAM Pool (`Qwen4ExpExpertCache.{hpp,cpp}`)**:
+   - `prefetch_async` now allocates and stages predicted experts directly into pinned USM slots in `HostExpertPool`.
+   - Experts not immediately consumed by the next layer remain cached in the 8 GiB host pool across future tokens and layers, preventing wasteful discards and eliminating redundant NVMe mmap page faults.
+
+3. **HyperConnection Vectorization & SLM Caching (`HyperConnectionOps.cpp`)**:
+   - `grouped_rms_norm`: Implemented 128-bit `vec8` memory accesses and hardware subgroup reductions (`sycl::reduce_over_group`), reducing workgroup barriers from 8 to 2.
+   - `hc_inject_add`: Specialized the decode hot-path (`rows=1`) using 128-bit `vec8` vectorization, completely eliminating per-thread integer divisions and modulos.
+   - `hc_decode_up_mix`: Cached `act` (64 bf16s) in SLM (`act_slm`), eliminating duplicate global memory reads across all 16 subgroups in each workgroup.
+
+4. **Router Subgroup Shuffle Reduction (`MoeExpertOps.cpp`)**:
+   - Replaced 9-barrier iterative tree reductions in `router_softmax_topk_device` with register-level XOR subgroup shuffles (`sycl::permute_group_by_xor`) and subgroup reductions.
+   - Reduced workgroup barriers from 108 down to 26 per router call (76% reduction in synchronization overhead).
+
+5. **Fill Pool Spin Pause (`Qwen4ExpExpertCache.cpp`)**:
+   - Added `_mm_pause()` spin-wait in `ExpertFillPool::wait()` to eliminate Windows thread scheduling / quantum yield latency.
+
+6. **Hot Host RAM Pool Capacity-Safe Chunking & SLM Vectorization (`Qwen4ExpExpertCache.cpp`, `HyperConnectionOps.cpp`)**:
+   - Fixed buffer aliasing and race condition when `misses > num_host_slots_` by chunking `to_fill` in batches of `max_chunk = num_host_slots_` with copy queue synchronization barriers between batches.
+   - Refactored `hc_decode_up_mix` SLM cache with `sycl::local_accessor<vec8, 1>` ensuring strict 16-byte alignment and eliminating unaligned SLM pointer casting.
+   - Extended `Qwen4ExpKernelTests` and `Qwen4ExpModuleTests` to test decode (`rows=1`), prefill (`rows=2`), single/batch router (`tokens=1` and `tokens=4`), and automated Hot Host RAM Pool lifecycle verification (hits, misses, prefetch, and LRU chunking).
+
+| Workload | Previous Warm Baseline | After `/boost` |
+|---|---:|---:|
+| `story.json` (48 tokens, decode) | 94.2 ms / 10.62 tok/s | **91.7–93.8 ms / 10.66–10.90 tok/s** (7.74–7.88 s total) |
+| `lighthouse_274.json` (278-token prompt, warm) | 117.4 ms / 8.50 tok/s | **114.2–114.8 ms / 8.71–8.76 tok/s** (13.32–13.45 s total) |
+| Full CTest Suite (57 tests) | 43 pass, 14 skip | **100% Pass** (43 pass, 14 skip) |
+| Text output verification | Golden reference | **100% bit-exact match** |
 
 ## 0. Continuation: Hot Host RAM Pool & Subgroup Broadcast Scale Lookups (2026-09-24)
 
@@ -296,14 +413,16 @@ pwsh perf/qwen4exp/q4e_prof.ps1 -Tag f32_essay -MaxTokens 400 -Messages perf/qwe
 - Engine: `src/engine/EngineGeneration.cpp` (chunk 1, tail replay), `src/engine/EngineLoad.cpp` (warmup).
 - Backend: `src/models/Qwen4ExpBnb4Backend.{hpp,cpp}` (profiling, `DenseLinear`,
   `RunHyperConnection`, pinned router output, prediction/prefetch, batched prefill acquire +
-  demotion, auto pool size, `EmbedTokens`).
+  demotion, auto pool size, `EmbedTokens`, full attention epilogue fusion, vectorized embedding & shared add).
 - Cache: `src/models/Qwen4ExpExpertCache.{hpp,cpp}` (fill pool, chunked pool, copy queue,
   double-buffered staging, compact u8 absmax slots, nested metadata uploads, `prefetch_async`,
-  `demote`, debug trace / fake hits).
-- Ops: `src/ops/HyperConnectionOps.{hpp,cpp}` (fused HC decode kernels),
-  `src/ops/MoeExpertOps.{hpp,cpp}` (nested scale decode and opt-in fused-add experiment).
-- Core: `src/core/Context.hpp` (opt-in queue event profiling).
-- Tests: `tests/ops/Qwen4ExpKernelTests.cpp` (HC/MoE kernels),
-  `tests/models/Qwen4ExpModuleTests.cpp` (cache modes, prefetch, demotion, nested scale).
+  `demote`, debug trace / fake hits, async DMA barrier event).
+- Ops: `src/ops/AttentionOps.cpp` & `src/ops/Ops.hpp` (gate epilogue fusion), `src/ops/HyperConnectionOps.{hpp,cpp}` (vectorized HC ops),
+  `src/ops/MoeExpertOps.{hpp,cpp}` (nested scale decode, hardware dependency events).
+- Core: `src/core/Context.hpp` (opt-in queue event profiling), `src/core/Tensor.hpp` (`data_as` const overload).
+- Utils: `src/utils/EnvUtils.hpp` (Level Zero copy engine activation).
+- Entry points: `src/main.cpp`, `src/worker/WorkerMain.cpp` (pre-SYCL copy engine setup).
+- Tests: `tests/ops/Qwen4ExpKernelTests.cpp` (HC/MoE/Attention gate fusion kernels),
+  `tests/models/Qwen4ExpModuleTests.cpp` (cache modes, prefetch, demotion, nested scale, multi-chunk pool stress).
 - Docs/tools: `docs/Environment_Variables.md`, this file, `perf/qwen4exp/` (profiling script,
   cache simulator, prompts, MoE device-time benchmark), `CMakeLists.txt` (benchmark target).

@@ -92,6 +92,7 @@ void convert_args_to_utf8(int& argc, char**& argv) {
 #endif
 
 int main(int argc, char** argv) {
+    aila::env::enable_l0_copy_engine();
     if (aila::env::disable_persistent_sycl_cache()) {
         std::fprintf(
             stderr,

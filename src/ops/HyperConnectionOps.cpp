@@ -8,6 +8,7 @@ void grouped_rms_norm(
     constexpr int wg = 256;
     const int total_groups = rows * groups;
 
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
 
@@ -65,7 +66,51 @@ void grouped_rms_norm(
 
 void hc_mix_reduce(
     Context& ctx, const bf16* N, const bf16* mix, bf16* out,
-    int rows, int group_dim, int groups) {
+    int rows, int group_dim, int groups, bool apply_sigmoid_to_mix) {
+    if ((group_dim % 8) == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        const int dim8 = group_dim / 8;
+        constexpr int wg = 64;
+        const size_t num_wgs_per_row = (dim8 + wg - 1) / wg;
+        const float inv_groups = 1.0f / static_cast<float>(groups);
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(rows), num_wgs_per_row * wg),
+                                  sycl::range<2>(1, wg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t r = item.get_group(0);
+                    const size_t d8 = item.get_global_id(1);
+                    if (d8 < static_cast<size_t>(dim8)) {
+                        const size_t row_stride = static_cast<size_t>(groups) * group_dim;
+                        const size_t row_base = r * row_stride;
+
+                        float sum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                        for (int g = 0; g < groups; ++g) {
+                            const size_t off = row_base + static_cast<size_t>(g) * group_dim + d8 * 8;
+                            const vec8 vm = *reinterpret_cast<const vec8*>(mix + off);
+                            const vec8 vn = *reinterpret_cast<const vec8*>(N + off);
+#pragma unroll
+                            for (int v = 0; v < 8; ++v) {
+                                float m = static_cast<float>(vm[v]);
+                                if (apply_sigmoid_to_mix) {
+                                    m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-m))));
+                                }
+                                sum[v] += m * static_cast<float>(vn[v]);
+                            }
+                        }
+                        vec8 vout;
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            vout[v] = bf16(sum[v] * inv_groups);
+                        }
+                        *reinterpret_cast<vec8*>(out + r * group_dim + d8 * 8) = vout;
+                    }
+                });
+        });
+        return;
+    }
+
     constexpr int wg = 256;
     const size_t total_elements = static_cast<size_t>(rows) * group_dim;
     const size_t num_wgs = (total_elements + wg - 1) / wg;
@@ -84,7 +129,11 @@ void hc_mix_reduce(
                     float sum = 0.0f;
                     for (int g = 0; g < groups; ++g) {
                         size_t off = row_base + static_cast<size_t>(g) * group_dim + d;
-                        sum += static_cast<float>(mix[off]) * static_cast<float>(N[off]);
+                        float m = static_cast<float>(mix[off]);
+                        if (apply_sigmoid_to_mix) {
+                            m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-m))));
+                        }
+                        sum += m * static_cast<float>(N[off]);
                     }
                     out[idx] = bf16(sum / static_cast<float>(groups));
                 }
@@ -96,6 +145,45 @@ template <typename TInj>
 static void hc_inject_add_impl(
     Context& ctx, bf16* H, const bf16* y, const TInj* inj,
     int rows, int group_dim, int groups) {
+    if (group_dim % 8 == 0) {
+        constexpr size_t wg = 64;
+        using vec8 = sycl::vec<bf16, 8>;
+        const size_t dim8 = static_cast<size_t>(group_dim / 8);
+        const size_t num_wgs_per_group = (dim8 + wg - 1) / wg;
+        const size_t total_groups = static_cast<size_t>(rows) * groups;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(total_groups, num_wgs_per_group * wg),
+                                  sycl::range<2>(1, wg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t rg = item.get_group(0);
+                    const size_t i = item.get_global_id(1);
+
+                    if (i < dim8) {
+                        size_t r;
+                        if (groups == 4) {
+                            r = rg >> 2;
+                        } else {
+                            r = (rows == 1) ? 0 : (rg / groups);
+                        }
+
+                        const float inj_val = static_cast<float>(inj[rg]);
+                        const size_t g_offset = rg * group_dim + i * 8;
+                        const size_t y_offset = r * group_dim + i * 8;
+
+                        vec8 vh = *reinterpret_cast<const vec8*>(H + g_offset);
+                        const vec8 vy = *reinterpret_cast<const vec8*>(y + y_offset);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            vh[v] = bf16(static_cast<float>(vh[v]) + inj_val * static_cast<float>(vy[v]));
+                        }
+                        *reinterpret_cast<vec8*>(H + g_offset) = vh;
+                    }
+                });
+        });
+        return;
+    }
+
     constexpr int wg = 256;
     const size_t total = static_cast<size_t>(rows) * groups * group_dim;
     const size_t num_wgs = (total + wg - 1) / wg;
@@ -281,7 +369,8 @@ void ple_gate_value(
 void ple_dilated_conv_silu_add(
     Context& ctx, const bf16* gv_normed, const bf16* gv,
     float* conv_state, int& conv_head, const bf16* conv_w, bf16* out,
-    int rows, int channels, int kernel_size, int dilation) {
+    int rows, int channels, int kernel_size, int dilation,
+    bf16* residual) {
     const int state_len = (kernel_size - 1) * dilation;
     constexpr int wg = 256;
     const size_t num_wgs = (static_cast<size_t>(channels) + wg - 1) / wg;
@@ -311,7 +400,12 @@ void ple_dilated_conv_silu_add(
                                          tap2 * static_cast<float>(w[2]) +
                                          tap3 * static_cast<float>(w[3]);
                         float silu_val = silu_dev(conv_val);
-                        out[c] = bf16(static_cast<float>(gv[c]) + silu_val);
+                        float res_val = static_cast<float>(gv[c]) + silu_val;
+                        bf16 ple_elem = bf16(res_val);
+                        if (out) out[c] = ple_elem;
+                        if (residual) {
+                            residual[c] = bf16(static_cast<float>(residual[c]) + static_cast<float>(ple_elem));
+                        }
                         conv_state[static_cast<size_t>(conv_head) * channels + c] = tap3;
                     }
                 });
@@ -348,7 +442,12 @@ void ple_dilated_conv_silu_add(
                                          tap3 * static_cast<float>(w[3]);
                         float silu_val = silu_dev(conv_val);
                         size_t out_idx = static_cast<size_t>(t) * channels + c;
-                        out[out_idx] = bf16(static_cast<float>(gv[out_idx]) + silu_val);
+                        float res_val = static_cast<float>(gv[out_idx]) + silu_val;
+                        bf16 ple_elem = bf16(res_val);
+                        if (out) out[out_idx] = ple_elem;
+                        if (residual) {
+                            residual[out_idx] = bf16(static_cast<float>(residual[out_idx]) + static_cast<float>(ple_elem));
+                        }
                     }
                 }
             });

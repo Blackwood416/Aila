@@ -491,6 +491,7 @@ int run(const Handles& handles) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    aila::env::enable_l0_copy_engine();
     if (aila::env::disable_persistent_sycl_cache()) {
         std::fprintf(
             stderr,

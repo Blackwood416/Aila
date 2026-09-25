@@ -3,6 +3,8 @@
 #include "ops/HyperConnectionOps.hpp"
 #include "ops/MoeExpertOps.hpp"
 #include "ops/GatedDeltaNetOps.hpp"
+#include "ops/Ops.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,14 +63,13 @@ void check_close_f32(const std::vector<float>& actual, const std::vector<float>&
     std::cout << "[PASS] " << name << " (max_diff=" << max_diff << " <= " << tol << ")\n";
 }
 
-void test_grouped_rms_norm(Context& ctx) {
-    constexpr int rows = 2;
+static void run_grouped_rms_norm_test(Context& ctx, int rows) {
     constexpr int groups = 4;
     constexpr int group_dim = 2560;
     constexpr float eps = 1e-6f;
     const size_t total = rows * groups * group_dim;
 
-    std::mt19937 rng(42);
+    std::mt19937 rng(42 + rows);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     std::vector<bf16> x_host(total);
@@ -110,24 +111,28 @@ void test_grouped_rms_norm(Context& ctx) {
 
     std::vector<bf16> gpu_out(total);
     ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), total * sizeof(bf16));
-    check_close(gpu_out, ref_out, "grouped_rms_norm (plus_one=true)", 1e-2f);
+    check_close(gpu_out, ref_out, "grouped_rms_norm rows=" + std::to_string(rows) + " (plus_one=true)", 1e-2f);
 }
 
-void test_hc_mix_reduce(Context& ctx) {
-    constexpr int rows = 2;
+void test_grouped_rms_norm(Context& ctx) {
+    run_grouped_rms_norm_test(ctx, 1);
+    run_grouped_rms_norm_test(ctx, 2);
+}
+
+static void run_hc_mix_reduce_test(Context& ctx, int rows, bool apply_sigmoid_to_mix) {
     constexpr int groups = 4;
     constexpr int group_dim = 2560;
-    const size_t total_in = rows * groups * group_dim;
-    const size_t total_out = rows * group_dim;
+    const size_t total_in = static_cast<size_t>(rows) * groups * group_dim;
+    const size_t total_out = static_cast<size_t>(rows) * group_dim;
 
-    std::mt19937 rng(123);
+    std::mt19937 rng(123 + rows + (apply_sigmoid_to_mix ? 500 : 0));
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     std::vector<bf16> N_host(total_in);
     std::vector<bf16> mix_host(total_in);
     for (size_t i = 0; i < total_in; ++i) {
         N_host[i] = bf16(dist(rng));
-        mix_host[i] = bf16(1.0f / (1.0f + std::exp(-dist(rng)))); // sigmoid-like
+        mix_host[i] = bf16(dist(rng));
     }
 
     std::vector<float> ref_out(total_out);
@@ -136,7 +141,11 @@ void test_hc_mix_reduce(Context& ctx) {
             float sum = 0.0f;
             for (int g = 0; g < groups; ++g) {
                 size_t off = static_cast<size_t>(r) * (groups * group_dim) + g * group_dim + d;
-                sum += static_cast<float>(mix_host[off]) * static_cast<float>(N_host[off]);
+                float m = static_cast<float>(mix_host[off]);
+                if (apply_sigmoid_to_mix) {
+                    m = static_cast<float>(bf16(1.0f / (1.0f + std::exp(-m))));
+                }
+                sum += m * static_cast<float>(N_host[off]);
             }
             ref_out[r * group_dim + d] = sum / static_cast<float>(groups);
         }
@@ -152,23 +161,31 @@ void test_hc_mix_reduce(Context& ctx) {
     ops::hc_mix_reduce(ctx, static_cast<const bf16*>(N_dev.data()),
                        static_cast<const bf16*>(mix_dev.data()),
                        static_cast<bf16*>(out_dev.data()),
-                       rows, group_dim, groups);
+                       rows, group_dim, groups, apply_sigmoid_to_mix);
     ctx.synchronize();
 
     std::vector<bf16> gpu_out(total_out);
     ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), total_out * sizeof(bf16));
-    check_close(gpu_out, ref_out, "hc_mix_reduce", 1e-2f);
+    std::string tag = "hc_mix_reduce rows=" + std::to_string(rows) +
+                      (apply_sigmoid_to_mix ? " (fused sigmoid)" : " (plain)");
+    check_close(gpu_out, ref_out, tag, 1e-2f);
 }
 
-void test_hc_inject_add(Context& ctx) {
-    constexpr int rows = 2;
+void test_hc_mix_reduce(Context& ctx) {
+    for (int r : {1, 2, 4, 32}) {
+        run_hc_mix_reduce_test(ctx, r, false);
+        run_hc_mix_reduce_test(ctx, r, true);
+    }
+}
+
+static void run_hc_inject_add_test(Context& ctx, int rows) {
     constexpr int groups = 4;
     constexpr int group_dim = 2560;
     const size_t total_H = rows * groups * group_dim;
     const size_t total_y = rows * group_dim;
     const size_t total_inj = rows * groups;
 
-    std::mt19937 rng(456);
+    std::mt19937 rng(456 + rows);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     std::vector<bf16> H_host(total_H);
@@ -208,7 +225,12 @@ void test_hc_inject_add(Context& ctx) {
 
     std::vector<bf16> gpu_out(total_H);
     ctx.memcpy_d2h(gpu_out.data(), H_dev.data(), total_H * sizeof(bf16));
-    check_close(gpu_out, ref_out, "hc_inject_add", 1e-2f);
+    check_close(gpu_out, ref_out, "hc_inject_add rows=" + std::to_string(rows), 1e-2f);
+}
+
+void test_hc_inject_add(Context& ctx) {
+    run_hc_inject_add_test(ctx, 1);
+    run_hc_inject_add_test(ctx, 2);
 }
 
 void test_hc_decode_fused(Context& ctx, bool with_inject) {
@@ -429,12 +451,11 @@ void test_ple_dilated_conv_silu_add(Context& ctx) {
     }
 }
 
-void test_router_softmax_topk(Context& ctx) {
-    constexpr int tokens = 4;
+static void run_router_softmax_topk_test(Context& ctx, int tokens) {
     constexpr int num_experts = 512;
     constexpr int top_k = 10;
 
-    std::mt19937 rng(2026);
+    std::mt19937 rng(2026 + tokens);
     std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
 
     std::vector<bf16> scores_host(tokens * num_experts);
@@ -477,7 +498,12 @@ void test_router_softmax_topk(Context& ctx) {
             }
         }
     }
-    check_close_f32(gpu_weights, ref_weights, "router_softmax_topk_device weights", 1e-4f);
+    check_close_f32(gpu_weights, ref_weights, "router_softmax_topk_device weights tokens=" + std::to_string(tokens), 1e-4f);
+}
+
+void test_router_softmax_topk(Context& ctx) {
+    run_router_softmax_topk_test(ctx, 1);
+    run_router_softmax_topk_test(ctx, 4);
 }
 
 void test_moe_decode_gate_up_and_down(Context& ctx) {
@@ -599,6 +625,44 @@ void test_moe_decode_gate_up_and_down(Context& ctx) {
     ctx.memcpy_d2h(gpu_h.data(), h_dev.data(), gpu_h.size() * sizeof(bf16));
     check_close(gpu_h, ref_h, "moe_decode_gate_up_swiglu_grouped", 2e-2f);
 
+    // Verify hardware event dependency: submit barrier, pass as dep_event
+    sycl::event dummy_ev = ctx.queue().ext_oneapi_submit_barrier();
+    ops::moe_decode_gate_up_swiglu_grouped(
+        ctx, slots.data(), nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(h_dev.data()),
+        num_active_experts, in_features, intermediate_size, blocksize,
+        dummy_ev);
+    ctx.synchronize();
+    ctx.memcpy_d2h(gpu_h.data(), h_dev.data(), gpu_h.size() * sizeof(bf16));
+    check_close(gpu_h, ref_h, "moe_decode_gate_up_swiglu_grouped with dep_event", 2e-2f);
+
+    // Verify true cross-queue hardware event dependency from separate in-order queue
+    sycl::queue copy_q(ctx.queue().get_context(), ctx.queue().get_device(),
+                       sycl::property::queue::in_order());
+    sycl::event cross_q_ev = copy_q.ext_oneapi_submit_barrier();
+    ops::moe_decode_gate_up_swiglu_grouped(
+        ctx, slots.data(), nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(h_dev.data()),
+        num_active_experts, in_features, intermediate_size, blocksize,
+        cross_q_ev);
+    ctx.synchronize();
+    ctx.memcpy_d2h(gpu_h.data(), h_dev.data(), gpu_h.size() * sizeof(bf16));
+    check_close(gpu_h, ref_h, "moe_decode_gate_up_swiglu_grouped with cross_q dep_event", 2e-2f);
+
+    // Verify empty/default-constructed event does not throw and completes correctly
+    sycl::event empty_ev{};
+    ops::moe_decode_gate_up_swiglu_grouped(
+        ctx, slots.data(), nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(h_dev.data()),
+        num_active_experts, in_features, intermediate_size, blocksize,
+        empty_ev);
+    ctx.synchronize();
+    ctx.memcpy_d2h(gpu_h.data(), h_dev.data(), gpu_h.size() * sizeof(bf16));
+    check_close(gpu_h, ref_h, "moe_decode_gate_up_swiglu_grouped with empty dep_event", 2e-2f);
+
     ops::moe_decode_down_weighted_accumulate(
         ctx, slots.data(), nullptr, weights_host.data(),
         static_cast<const bf16*>(h_dev.data()), nullptr,
@@ -686,9 +750,378 @@ void test_gated_delta_net_sigmoid(Context& ctx) {
     std::cout << "[PASS] DeltaNetGeometry dimension calculations validated\n";
 }
 
+static void run_attention_decode_gate_fusion_case(
+    Context& ctx, int num_heads, int num_kv_heads, int head_dim,
+    int cached_len, int max_seq_len, bool with_partials) {
+    const int total_q = num_heads * head_dim;
+    const size_t total_kv = static_cast<size_t>(num_kv_heads) * max_seq_len * head_dim;
+
+    std::mt19937 rng(1337 + head_dim + cached_len);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> q_host(total_q);
+    std::vector<bf16> k_host(total_kv);
+    std::vector<bf16> v_host(total_kv);
+    std::vector<bf16> gate_host(total_q);
+
+    for (size_t i = 0; i < total_q; ++i) {
+        q_host[i] = bf16(dist(rng));
+        gate_host[i] = bf16(dist(rng));
+    }
+    for (size_t i = 0; i < total_kv; ++i) {
+        k_host[i] = bf16(dist(rng));
+        v_host[i] = bf16(dist(rng));
+    }
+
+    Tensor q_dev = Tensor::allocate(ctx, {1, total_q}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {(int64_t)num_kv_heads, (int64_t)max_seq_len, (int64_t)head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(ctx, {(int64_t)num_kv_heads, (int64_t)max_seq_len, (int64_t)head_dim}, dnnl::memory::data_type::bf16);
+    Tensor gate_dev = Tensor::allocate(ctx, {1, total_q}, dnnl::memory::data_type::bf16);
+    Tensor out_fused_dev = Tensor::allocate(ctx, {1, total_q}, dnnl::memory::data_type::bf16);
+    Tensor out_sep_dev = Tensor::allocate(ctx, {1, total_q}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_seq_len}, dnnl::memory::data_type::f32);
+
+    ctx.memcpy_h2d(q_dev.data(), q_host.data(), total_q * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k_host.data(), total_kv * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), v_host.data(), total_kv * sizeof(bf16));
+    ctx.memcpy_h2d(gate_dev.data(), gate_host.data(), total_q * sizeof(bf16));
+
+    Tensor partials_dev;
+    Tensor* partials_ptr = nullptr;
+    if (with_partials) {
+        constexpr int kDecodeExactTile = 128;
+        const int partial_stride = (head_dim == 256) ? 272 : 144;
+        const int max_tiles = (max_seq_len + kDecodeExactTile - 1) / kDecodeExactTile;
+        partials_dev = Tensor::allocate(
+            ctx,
+            {(int64_t)num_heads, (int64_t)max_tiles, (int64_t)partial_stride},
+            dnnl::memory::data_type::f32);
+        partials_ptr = &partials_dev;
+    }
+
+    // 1. Run fused attention decode
+    ops::attention_decode(
+        ctx, q_dev, k_dev, v_dev, out_fused_dev, scores_dev,
+        num_heads, num_kv_heads, head_dim, cached_len,
+        partials_ptr, &gate_dev);
+    ctx.synchronize();
+
+    // 2. Run unfused attention decode followed by separate sigmoid_mul
+    ops::attention_decode(
+        ctx, q_dev, k_dev, v_dev, out_sep_dev, scores_dev,
+        num_heads, num_kv_heads, head_dim, cached_len,
+        partials_ptr, nullptr);
+    ops::sigmoid_mul(ctx, out_sep_dev, gate_dev, out_sep_dev, total_q);
+    ctx.synchronize();
+
+    std::vector<bf16> fused_host(total_q);
+    std::vector<bf16> sep_host(total_q);
+    ctx.memcpy_d2h(fused_host.data(), out_fused_dev.data(), total_q * sizeof(bf16));
+    ctx.memcpy_d2h(sep_host.data(), out_sep_dev.data(), total_q * sizeof(bf16));
+
+    int exact_mismatches = 0;
+    float max_diff = 0.0f;
+    for (int i = 0; i < total_q; ++i) {
+        if (fused_host[i] != sep_host[i]) {
+            ++exact_mismatches;
+            max_diff = std::max(max_diff, std::abs(static_cast<float>(fused_host[i]) - static_cast<float>(sep_host[i])));
+        }
+    }
+
+    const std::string tag = "attention_decode_gate_fusion (h=" + std::to_string(num_heads) +
+                            ", kv=" + std::to_string(num_kv_heads) +
+                            ", dim=" + std::to_string(head_dim) +
+                            ", len=" + std::to_string(cached_len) +
+                            (with_partials ? ", partials=true" : ", partials=false") + ")";
+    if (exact_mismatches != 0) {
+        throw std::runtime_error(tag + " failed: " + std::to_string(exact_mismatches) +
+                                 " mismatches, max_diff=" + std::to_string(max_diff));
+    }
+    std::cout << "[PASS] " << tag << " (0 bit mismatches)\n";
+}
+
+void test_attention_decode_gate_fusion(Context& ctx) {
+    // Qwen4Exp geometry: head_dim=128, num_heads=20, num_kv_heads=4
+    run_attention_decode_gate_fusion_case(ctx, 20, 4, 128, 32, 256, false);
+    run_attention_decode_gate_fusion_case(ctx, 20, 4, 128, 160, 256, true);
+    // Standard head_dim=256 geometry
+    run_attention_decode_gate_fusion_case(ctx, 4, 2, 256, 32, 1024, false);
+    run_attention_decode_gate_fusion_case(ctx, 4, 2, 256, 1024, 1024, true);
+}
+
+void test_split_qgkv(Context& ctx) {
+    constexpr int num_heads = 16;
+    constexpr int num_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int q_proj_dim = num_heads * 2 * head_dim;
+    constexpr int kv_dim = num_kv_heads * head_dim;
+    constexpr int total_row = q_proj_dim + 2 * kv_dim;
+
+    for (int seq_len : {1, 4, 32, 256}) {
+        const size_t total_src = static_cast<size_t>(seq_len) * total_row;
+        const size_t total_q = static_cast<size_t>(seq_len) * num_heads * head_dim;
+        const size_t total_kv = static_cast<size_t>(seq_len) * num_kv_heads * head_dim;
+
+        std::mt19937 rng(12345 + seq_len);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<bf16> src_host(total_src);
+        for (size_t i = 0; i < total_src; ++i) src_host[i] = bf16(dist(rng));
+
+        Tensor src_dev = Tensor::allocate(ctx, {seq_len, total_row}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(src_dev.data(), src_host.data(), total_src * sizeof(bf16));
+
+        // 1. Unified split_qgkv
+        Tensor q_dev1 = Tensor::allocate(ctx, {seq_len, (int64_t)num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor g_dev1 = Tensor::allocate(ctx, {seq_len, (int64_t)num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor k_dev1 = Tensor::allocate(ctx, {seq_len, (int64_t)num_kv_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v_dev1 = Tensor::allocate(ctx, {seq_len, (int64_t)num_kv_heads * head_dim}, dnnl::memory::data_type::bf16);
+
+        ops::split_qgkv(ctx, src_dev, q_dev1, g_dev1, k_dev1, v_dev1, seq_len, num_heads, num_kv_heads, head_dim);
+
+        // 2. Reference two-step: split_qkv + split_q_gate
+        Tensor q_proj_dev = Tensor::allocate(ctx, {seq_len, q_proj_dim}, dnnl::memory::data_type::bf16);
+        Tensor q_dev2 = Tensor::allocate(ctx, {seq_len, (int64_t)num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor g_dev2 = Tensor::allocate(ctx, {seq_len, (int64_t)num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor k_dev2 = Tensor::allocate(ctx, {seq_len, (int64_t)num_kv_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v_dev2 = Tensor::allocate(ctx, {seq_len, (int64_t)num_kv_heads * head_dim}, dnnl::memory::data_type::bf16);
+
+        ops::split_qkv(ctx, src_dev, q_proj_dev, k_dev2, v_dev2, seq_len, q_proj_dim, kv_dim);
+        ops::split_q_gate(ctx, q_proj_dev, q_dev2, g_dev2, seq_len, num_heads, head_dim);
+        ctx.synchronize();
+
+        std::vector<bf16> q1(total_q), q2(total_q), g1(total_q), g2(total_q);
+        std::vector<bf16> k1(total_kv), k2(total_kv), v1(total_kv), v2(total_kv);
+        ctx.memcpy_d2h(q1.data(), q_dev1.data(), total_q * sizeof(bf16));
+        ctx.memcpy_d2h(q2.data(), q_dev2.data(), total_q * sizeof(bf16));
+        ctx.memcpy_d2h(g1.data(), g_dev1.data(), total_q * sizeof(bf16));
+        ctx.memcpy_d2h(g2.data(), g_dev2.data(), total_q * sizeof(bf16));
+        ctx.memcpy_d2h(k1.data(), k_dev1.data(), total_kv * sizeof(bf16));
+        ctx.memcpy_d2h(k2.data(), k_dev2.data(), total_kv * sizeof(bf16));
+        ctx.memcpy_d2h(v1.data(), v_dev1.data(), total_kv * sizeof(bf16));
+        ctx.memcpy_d2h(v2.data(), v_dev2.data(), total_kv * sizeof(bf16));
+
+        if (q1 != q2 || g1 != g2 || k1 != k2 || v1 != v2) {
+            throw std::runtime_error("test_split_qgkv bitwise mismatch at seq_len=" + std::to_string(seq_len));
+        }
+        std::cout << "[PASS] split_qgkv seq_len=" << seq_len << " (0 bit mismatches vs split_qkv + split_q_gate)\n";
+    }
+}
+
+void test_ple_dilated_conv_silu_add_residual(Context& ctx) {
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int dilation = 3;
+    constexpr int state_len = 9;
+
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> conv_w(channels * kernel_size);
+    for (size_t i = 0; i < conv_w.size(); ++i) conv_w[i] = bf16(dist(rng) * 0.1f);
+    Tensor conv_w_dev = Tensor::allocate(ctx, {channels, kernel_size}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(conv_w_dev.data(), conv_w.data(), conv_w.size() * sizeof(bf16));
+
+    for (int rows : {1, 4}) {
+        std::vector<bf16> gv_normed(rows * channels), gv(rows * channels), h_init(rows * channels);
+        for (size_t i = 0; i < gv_normed.size(); ++i) {
+            gv_normed[i] = bf16(dist(rng));
+            gv[i] = bf16(dist(rng));
+            h_init[i] = bf16(dist(rng));
+        }
+
+        Tensor gv_normed_dev = Tensor::allocate(ctx, {rows, channels}, dnnl::memory::data_type::bf16);
+        Tensor gv_dev = Tensor::allocate(ctx, {rows, channels}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(gv_normed_dev.data(), gv_normed.data(), gv_normed.size() * sizeof(bf16));
+        ctx.memcpy_h2d(gv_dev.data(), gv.data(), gv.size() * sizeof(bf16));
+
+        // 1. Fused path (accumulate directly into h1)
+        Tensor h1_dev = Tensor::allocate(ctx, {rows, channels}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(h1_dev.data(), h_init.data(), h_init.size() * sizeof(bf16));
+        Tensor state1_dev = Tensor::allocate(ctx, {state_len, channels}, dnnl::memory::data_type::f32);
+        std::vector<float> zeros(state_len * channels, 0.0f);
+        ctx.memcpy_h2d(state1_dev.data(), zeros.data(), zeros.size() * sizeof(float));
+        int head1 = 0;
+
+        ops::ple_dilated_conv_silu_add(
+            ctx, static_cast<const bf16*>(gv_normed_dev.data()),
+            static_cast<const bf16*>(gv_dev.data()),
+            static_cast<float*>(state1_dev.data()),
+            head1,
+            static_cast<const bf16*>(conv_w_dev.data()),
+            nullptr, rows, channels, kernel_size, dilation,
+            static_cast<bf16*>(h1_dev.data()));
+
+        // 2. Unfused path (out into ple_out, then residual_add into h2)
+        Tensor h2_dev = Tensor::allocate(ctx, {rows, channels}, dnnl::memory::data_type::bf16);
+        Tensor ple_out_dev = Tensor::allocate(ctx, {rows, channels}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(h2_dev.data(), h_init.data(), h_init.size() * sizeof(bf16));
+        Tensor state2_dev = Tensor::allocate(ctx, {state_len, channels}, dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(state2_dev.data(), zeros.data(), zeros.size() * sizeof(float));
+        int head2 = 0;
+
+        ops::ple_dilated_conv_silu_add(
+            ctx, static_cast<const bf16*>(gv_normed_dev.data()),
+            static_cast<const bf16*>(gv_dev.data()),
+            static_cast<float*>(state2_dev.data()),
+            head2,
+            static_cast<const bf16*>(conv_w_dev.data()),
+            static_cast<bf16*>(ple_out_dev.data()), rows, channels, kernel_size, dilation,
+            nullptr);
+        ops::residual_add(ctx, h2_dev, ple_out_dev, rows * channels);
+        ctx.synchronize();
+
+        std::vector<bf16> h1(rows * channels), h2(rows * channels);
+        ctx.memcpy_d2h(h1.data(), h1_dev.data(), h1.size() * sizeof(bf16));
+        ctx.memcpy_d2h(h2.data(), h2_dev.data(), h2.size() * sizeof(bf16));
+
+        if (h1 != h2) {
+            throw std::runtime_error("ple_dilated_conv_silu_add residual fusion mismatch at rows=" + std::to_string(rows));
+        }
+        std::cout << "[PASS] ple_dilated_conv_silu_add residual fusion rows=" << rows << " (0 bit mismatches)\n";
+    }
+}
+
+void test_attention_prefill_gate_fusion(Context& ctx) {
+    for (auto [head_dim, seq_len] : {
+             std::pair{128, 8},
+             std::pair{128, 256},
+             std::pair{256, 8}
+         }) {
+        const int num_heads = (head_dim == 128) ? 8 : 4;
+        const int num_kv_heads = 2;
+        const int q_dim = num_heads * head_dim;
+        const int kv_dim = num_kv_heads * head_dim;
+
+        std::mt19937 rng(888 + head_dim + seq_len);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        std::vector<bf16> q_h(seq_len * q_dim), k_h(seq_len * kv_dim), v_h(seq_len * kv_dim), z_h(seq_len * q_dim);
+        for (auto& x : q_h) x = bf16(dist(rng));
+        for (auto& x : k_h) x = bf16(dist(rng));
+        for (auto& x : v_h) x = bf16(dist(rng));
+        for (auto& x : z_h) x = bf16(dist(rng));
+
+        Tensor q_dev = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor k_dev = Tensor::allocate(ctx, {seq_len, kv_dim}, dnnl::memory::data_type::bf16);
+        Tensor v_dev = Tensor::allocate(ctx, {seq_len, kv_dim}, dnnl::memory::data_type::bf16);
+        Tensor z_dev = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+
+        ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k_dev.data(), k_h.data(), k_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v_dev.data(), v_h.data(), v_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(z_dev.data(), z_h.data(), z_h.size() * sizeof(bf16));
+
+        Tensor out_fused = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor out_sep = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {num_heads, seq_len, seq_len}, dnnl::memory::data_type::f32);
+
+        // 1. Fused attention_prefill
+        ops::attention_prefill(ctx, q_dev, k_dev, v_dev, out_fused, scores, seq_len, num_heads, num_kv_heads, head_dim, &z_dev);
+
+        // 2. Unfused attention_prefill + sigmoid_mul
+        ops::attention_prefill(ctx, q_dev, k_dev, v_dev, out_sep, scores, seq_len, num_heads, num_kv_heads, head_dim, nullptr);
+        ops::sigmoid_mul(ctx, out_sep, z_dev, out_sep, seq_len * q_dim);
+        ctx.synchronize();
+
+        std::vector<bf16> fused(seq_len * q_dim), sep(seq_len * q_dim);
+        ctx.memcpy_d2h(fused.data(), out_fused.data(), fused.size() * sizeof(bf16));
+        ctx.memcpy_d2h(sep.data(), out_sep.data(), sep.size() * sizeof(bf16));
+
+        float max_diff = 0.0f;
+        int bit_diffs = 0;
+        for (size_t i = 0; i < fused.size(); ++i) {
+            float f_v = static_cast<float>(fused[i]);
+            float s_v = static_cast<float>(sep[i]);
+            float diff = std::abs(f_v - s_v);
+            if (diff > max_diff) max_diff = diff;
+            if (fused[i] != sep[i]) bit_diffs++;
+        }
+        if (max_diff > 0.002f) {
+            throw std::runtime_error("attention_prefill gate fusion mismatch at head_dim=" +
+                                     std::to_string(head_dim) + " seq_len=" + std::to_string(seq_len) +
+                                     " max_diff=" + std::to_string(max_diff));
+        }
+        std::cout << "[PASS] attention_prefill gate fusion head_dim=" << head_dim
+                  << " seq_len=" << seq_len
+                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n";
+    }
+}
+
+void test_attention_prefill_cached_gate_fusion(Context& ctx) {
+    for (auto [head_dim, seq_len, start_pos] : {
+             std::tuple{128, 8, 16},
+             std::tuple{128, 128, 128},
+             std::tuple{256, 8, 16}
+         }) {
+        const int num_heads = (head_dim == 128) ? 8 : 4;
+        const int num_kv_heads = 2;
+        const int max_seq_len = 512;
+        const int q_dim = num_heads * head_dim;
+        const int kv_dim = num_kv_heads * head_dim;
+        const int total_len = start_pos + seq_len;
+
+        std::mt19937 rng(999 + head_dim + seq_len);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        std::vector<bf16> q_h(seq_len * q_dim), k_h(num_kv_heads * max_seq_len * head_dim),
+                          v_h(num_kv_heads * max_seq_len * head_dim), z_h(seq_len * q_dim);
+        for (auto& x : q_h) x = bf16(dist(rng));
+        for (auto& x : k_h) x = bf16(dist(rng));
+        for (auto& x : v_h) x = bf16(dist(rng));
+        for (auto& x : z_h) x = bf16(dist(rng));
+
+        Tensor q_dev = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, max_seq_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, max_seq_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor z_dev = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+
+        ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k_dev.data(), k_h.data(), k_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v_dev.data(), v_h.data(), v_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(z_dev.data(), z_h.data(), z_h.size() * sizeof(bf16));
+
+        Tensor out_fused = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor out_sep = Tensor::allocate(ctx, {seq_len, q_dim}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {num_heads, seq_len, total_len}, dnnl::memory::data_type::f32);
+
+        // 1. Fused attention_prefill_cached
+        ops::attention_prefill_cached(ctx, q_dev, k_dev, v_dev, out_fused, scores,
+                                      seq_len, start_pos, num_heads, num_kv_heads, head_dim, max_seq_len, &z_dev);
+
+        // 2. Unfused attention_prefill_cached + sigmoid_mul
+        ops::attention_prefill_cached(ctx, q_dev, k_dev, v_dev, out_sep, scores,
+                                      seq_len, start_pos, num_heads, num_kv_heads, head_dim, max_seq_len, nullptr);
+        ops::sigmoid_mul(ctx, out_sep, z_dev, out_sep, seq_len * q_dim);
+        ctx.synchronize();
+
+        std::vector<bf16> fused(seq_len * q_dim), sep(seq_len * q_dim);
+        ctx.memcpy_d2h(fused.data(), out_fused.data(), fused.size() * sizeof(bf16));
+        ctx.memcpy_d2h(sep.data(), out_sep.data(), sep.size() * sizeof(bf16));
+
+        float max_diff = 0.0f;
+        int bit_diffs = 0;
+        for (size_t i = 0; i < fused.size(); ++i) {
+            float f_v = static_cast<float>(fused[i]);
+            float s_v = static_cast<float>(sep[i]);
+            float diff = std::abs(f_v - s_v);
+            if (diff > max_diff) max_diff = diff;
+            if (fused[i] != sep[i]) bit_diffs++;
+        }
+        if (max_diff > 0.002f) {
+            throw std::runtime_error("attention_prefill_cached gate fusion mismatch at head_dim=" +
+                                     std::to_string(head_dim) + " start_pos=" + std::to_string(start_pos) +
+                                     " seq_len=" + std::to_string(seq_len) + " max_diff=" + std::to_string(max_diff));
+        }
+        std::cout << "[PASS] attention_prefill_cached gate fusion head_dim=" << head_dim
+                  << " seq_len=" << seq_len << " start_pos=" << start_pos
+                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n";
+    }
+}
+
 } // namespace
 
 int main() {
+    aila::env::enable_l0_copy_engine();
     try {
         Context ctx;
         std::cout << "Starting Qwen4Exp Kernel Tests on device: "
@@ -701,9 +1134,14 @@ int main() {
         test_hc_decode_fused(ctx, false);
         test_ple_gate_value(ctx);
         test_ple_dilated_conv_silu_add(ctx);
+        test_ple_dilated_conv_silu_add_residual(ctx);
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
         test_gated_delta_net_sigmoid(ctx);
+        test_attention_decode_gate_fusion(ctx);
+        test_attention_prefill_gate_fusion(ctx);
+        test_attention_prefill_cached_gate_fusion(ctx);
+        test_split_qgkv(ctx);
 
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;

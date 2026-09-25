@@ -455,7 +455,8 @@ void Qwen4ExpPle::forward(
     const int* input_ids,
     int num_tokens,
     const bf16* hidden_states,
-    bf16* out) {
+    bf16* out,
+    bf16* residual) {
     if (num_tokens <= 0) return;
 
     // 1. Compute n-gram IDs
@@ -505,7 +506,8 @@ void Qwen4ExpPle::forward(
                                   state.conv_head,
                                   conv1d_w_ptr_,
                                   out,
-                                  num_tokens, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION);
+                                  num_tokens, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION,
+                                  residual);
 }
 
 void Qwen4ExpPle::init_state(Context& ctx, Qwen4ExpPleState& state) const {

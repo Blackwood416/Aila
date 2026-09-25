@@ -101,6 +101,8 @@ public:
 
     template<typename T>
     T* data_as() { return static_cast<T*>(data_ptr_); }
+    template<typename T>
+    const T* data_as() const { return static_cast<const T*>(data_ptr_); }
 
     const std::vector<int64_t>& shape() const { return shape_; }
     int64_t shape(int dim) const { return shape_[dim]; }

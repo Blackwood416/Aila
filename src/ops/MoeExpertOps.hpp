@@ -65,7 +65,40 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int num_active_experts,
     int in_features = 2560,
     int intermediate_size = 640,
-    int blocksize = 64);
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr);
+
+inline sycl::event moe_decode_gate_up_swiglu_grouped(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int num_active_experts,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event& dep_event) {
+    return moe_decode_gate_up_swiglu_grouped(
+        ctx, slots, quant_map, x, h, num_active_experts,
+        in_features, intermediate_size, blocksize, &dep_event);
+}
+
+inline sycl::event moe_decode_gate_up_swiglu_grouped(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int num_active_experts,
+    const sycl::event& dep_event,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64) {
+    return moe_decode_gate_up_swiglu_grouped(
+        ctx, slots, quant_map, x, h, num_active_experts,
+        in_features, intermediate_size, blocksize, &dep_event);
+}
 
 // Slotted expert decode down-projection with weighted accumulation:
 // out = sum_k (weight[k] * down_k(h[k]))

@@ -20,6 +20,25 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 namespace {
 
 void apply_silu_div4(Context& ctx, Tensor& buf, size_t count) {
+    if ((count % 8) == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        vec8* ptr8 = reinterpret_cast<vec8*>(buf.data());
+        size_t count8 = count / 8;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(count8), [=](sycl::id<1> idx) {
+                vec8 v_in = ptr8[idx];
+                vec8 v_out;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    float v = static_cast<float>(v_in[k]) * 0.25f;
+                    float s = 1.0f / (1.0f + sycl::native::exp(-v));
+                    v_out[k] = bf16(v * s);
+                }
+                ptr8[idx] = v_out;
+            });
+        });
+        return;
+    }
     bf16* ptr = static_cast<bf16*>(buf.data());
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(count), [=](sycl::id<1> idx) {
@@ -31,6 +50,25 @@ void apply_silu_div4(Context& ctx, Tensor& buf, size_t count) {
 }
 
 void apply_sigmoid(Context& ctx, Tensor& buf, size_t count) {
+    if ((count % 8) == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        vec8* ptr8 = reinterpret_cast<vec8*>(buf.data());
+        size_t count8 = count / 8;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(count8), [=](sycl::id<1> idx) {
+                vec8 v_in = ptr8[idx];
+                vec8 v_out;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    float v = static_cast<float>(v_in[k]);
+                    float s = 1.0f / (1.0f + sycl::native::exp(-v));
+                    v_out[k] = bf16(s);
+                }
+                ptr8[idx] = v_out;
+            });
+        });
+        return;
+    }
     bf16* ptr = static_cast<bf16*>(buf.data());
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(count), [=](sycl::id<1> idx) {
@@ -54,11 +92,68 @@ void apply_two_sigmoid_div4(Context& ctx, Tensor& in_buf, Tensor& out_f32, size_
 }
 
 void add_shared_expert_to_y(Context& ctx, Tensor& y, Tensor& shared_out, Tensor& shared_gate, int rows, int hidden_size) {
-    const size_t total = static_cast<size_t>(rows) * hidden_size;
     bf16* y_ptr = static_cast<bf16*>(y.data());
     const bf16* s_ptr = static_cast<const bf16*>(shared_out.data());
     const bf16* g_ptr = static_cast<const bf16*>(shared_gate.data());
 
+    if ((hidden_size % 8) == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        const int dim8 = hidden_size / 8;
+        constexpr int wg = 64;
+        const size_t num_wgs_per_row = (dim8 + wg - 1) / wg;
+
+        if (rows == 1) {
+            ctx.queue().submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<1>(sycl::range<1>(num_wgs_per_row * wg), sycl::range<1>(wg)),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                        const size_t d8 = item.get_global_id(0);
+                        if (d8 < static_cast<size_t>(dim8)) {
+                            const float g_val = static_cast<float>(g_ptr[0]);
+                            const float gate_act = 1.0f / (1.0f + sycl::native::exp(-g_val));
+                            const size_t elem_offset = d8 * 8;
+                            const vec8 s_vec = *reinterpret_cast<const vec8*>(s_ptr + elem_offset);
+                            vec8 y_vec = *reinterpret_cast<const vec8*>(y_ptr + elem_offset);
+#pragma unroll
+                            for (int v = 0; v < 8; ++v) {
+                                float s_val = static_cast<float>(s_vec[v]);
+                                float y_val = static_cast<float>(y_vec[v]);
+                                y_vec[v] = bf16(y_val + gate_act * s_val);
+                            }
+                            *reinterpret_cast<vec8*>(y_ptr + elem_offset) = y_vec;
+                        }
+                    });
+            });
+            return;
+        }
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(rows), num_wgs_per_row * wg),
+                                  sycl::range<2>(1, wg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t r = item.get_group(0);
+                    const size_t d8 = item.get_global_id(1);
+                    if (d8 < static_cast<size_t>(dim8)) {
+                        const float g_val = static_cast<float>(g_ptr[r]);
+                        const float gate_act = 1.0f / (1.0f + sycl::native::exp(-g_val));
+                        const size_t elem_offset = r * hidden_size + d8 * 8;
+                        const vec8 s_vec = *reinterpret_cast<const vec8*>(s_ptr + elem_offset);
+                        vec8 y_vec = *reinterpret_cast<const vec8*>(y_ptr + elem_offset);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            float s_val = static_cast<float>(s_vec[v]);
+                            float y_val = static_cast<float>(y_vec[v]);
+                            y_vec[v] = bf16(y_val + gate_act * s_val);
+                        }
+                        *reinterpret_cast<vec8*>(y_ptr + elem_offset) = y_vec;
+                    }
+                });
+        });
+        return;
+    }
+
+    const size_t total = static_cast<size_t>(rows) * hidden_size;
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
             size_t r = idx[0] / hidden_size;
@@ -459,7 +554,13 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.qkv = Tensor::allocate(ctx, {cap, full_q_proj_dim_}, dnnl::memory::data_type::bf16);
     buf_.attn_out = Tensor::allocate(ctx, {cap, full_q_dim_}, dnnl::memory::data_type::bf16);
     buf_.decode_scores = Tensor::allocate(ctx, {full_q_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
-    buf_.decode_attn_partials = Tensor::allocate(ctx, {full_q_heads_, 64 * full_head_dim_}, dnnl::memory::data_type::f32);
+    constexpr int kDecodeExactTile = 128;
+    const int partial_stride = (full_head_dim_ == 256) ? 272 : 144;
+    const int max_tiles = (max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile;
+    buf_.decode_attn_partials = Tensor::allocate(
+        ctx,
+        {(int64_t)full_q_heads_, (int64_t)max_tiles, (int64_t)partial_stride},
+        dnnl::memory::data_type::f32);
     buf_.scores = Tensor::allocate(ctx, {full_q_heads_, cap, cap}, dnnl::memory::data_type::f32);
     buf_.incr_scores = Tensor::allocate(ctx, {full_q_heads_, cap, max_seq_len_}, dnnl::memory::data_type::f32);
 
@@ -607,16 +708,58 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     bf16* hidden4_ptr = static_cast<bf16*>(buf_.hidden4.data());
     const int h_size = hidden_size_;
 
-    ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(count) * h_size), [=](sycl::id<1> idx) {
-            size_t t = idx[0] / h_size;
-            size_t d = idx[0] % h_size;
-            bf16 val = embed_ptr[idx[0]];
-            for (int s = 0; s < 4; ++s) {
-                hidden4_ptr[t * 10240 + s * h_size + d] = val;
-            }
+    if (count == 1 && (h_size % 8 == 0)) {
+        using vec8 = sycl::vec<bf16, 8>;
+        const int dim8 = h_size / 8;
+        constexpr int wg = 256;
+        const size_t num_wgs = (dim8 + wg - 1) / wg;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int i = static_cast<int>(item.get_global_id(0));
+                    if (i < dim8) {
+                        const vec8 val = *reinterpret_cast<const vec8*>(embed_ptr + i * 8);
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            *reinterpret_cast<vec8*>(hidden4_ptr + s * h_size + i * 8) = val;
+                        }
+                    }
+                });
         });
-    });
+    } else if (h_size % 8 == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        const int dim8 = h_size / 8;
+        constexpr int wg = 256;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(count, wg), sycl::range<2>(1, wg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t t = item.get_group(0);
+                    const int lid = static_cast<int>(item.get_local_id(1));
+                    const size_t t_embed_base = t * h_size;
+                    const size_t t_hidden_base = t * 10240;
+                    for (int i = lid; i < dim8; i += wg) {
+                        const vec8 val = *reinterpret_cast<const vec8*>(embed_ptr + t_embed_base + i * 8);
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            *reinterpret_cast<vec8*>(hidden4_ptr + t_hidden_base + s * h_size + i * 8) = val;
+                        }
+                    }
+                });
+        });
+    } else {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(static_cast<size_t>(count) * h_size), [=](sycl::id<1> idx) {
+                size_t t = idx[0] / h_size;
+                size_t d = idx[0] % h_size;
+                bf16 val = embed_ptr[idx[0]];
+                for (int s = 0; s < 4; ++s) {
+                    hidden4_ptr[t * 10240 + s * h_size + d] = val;
+                }
+            });
+        });
+    }
 
     const int full_rotary_dim = 64;
     constexpr int kMaxTopK = 16; // moe_decode_* kernels capture at most 16 slots
@@ -668,13 +811,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
 
-        // 2.0. PLE on Layer 1
+        // 2.0. PLE on Layer 1 (Epilogue Residual Fused)
         if (L == 1) {
-            std::vector<int> host_ids(count);
-            ctx.memcpy_d2h(host_ids.data(), tokenIdsDevice, count * sizeof(int));
-            ple_.forward(ctx, session.ple_state_, host_ids.data(), count,
-                         hidden4_ptr, static_cast<bf16*>(buf_.ple_out.data()));
-            ops::residual_add(ctx, buf_.hidden4, buf_.ple_out, count * 10240);
+            const int* ids_ptr = embed_host_ids_;
+            std::vector<int> fallback_host_ids;
+            if (!embed_host_.valid()) {
+                fallback_host_ids.resize(count);
+                ctx.memcpy_d2h(fallback_host_ids.data(), tokenIdsDevice, count * sizeof(int));
+                ids_ptr = fallback_host_ids.data();
+            }
+            ple_.forward(ctx, session.ple_state_, ids_ptr, count,
+                         hidden4_ptr, nullptr, hidden4_ptr);
         }
 
         stage(kStagePle);
@@ -745,14 +892,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 ops::attention_decode(
                     ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
                     full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
-                    &buf_.decode_attn_partials);
+                    &buf_.decode_attn_partials, &buf_.z);
 
-                ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, 1 * full_q_dim_);
                 layer.o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.y, 1);
             } else {
                 layer.qkv_proj.forward(ctx, linear_scratch_, buf_.x, buf_.full_qkv, count);
-                ops::split_qkv(ctx, buf_.full_qkv, buf_.qkv, buf_.k, buf_.v, count, full_q_proj_dim_, full_kv_dim_);
-                ops::split_q_gate(ctx, buf_.qkv, buf_.q, buf_.z, count, full_q_heads_, full_head_dim_);
+                ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
+                                full_q_heads_, full_kv_heads_, full_head_dim_);
 
                 ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight, cfg_.rms_norm_eps, count, full_q_heads_, full_head_dim_);
                 ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight, cfg_.rms_norm_eps, count, full_kv_heads_, full_head_dim_);
@@ -772,12 +918,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
 
                 if (start_pos == 0) {
-                    ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_);
+                    ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
                 } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity());
+                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
                 }
 
-                ops::sigmoid_mul(ctx, buf_.attn_out, buf_.z, buf_.attn_out, count * full_q_dim_);
                 layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
             }
         }
@@ -857,6 +1002,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // instead of a blocking round trip per token), then map slots back per token.
         const auto prof_acq_batch_t0 = prof_clock::now();
         const bool batch_acquire = count > 1 && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        sycl::event batch_dma_event{};
         if (batch_acquire) {
             std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
             prefill_unique_.clear();
@@ -867,8 +1013,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
             }
             prefill_unique_slots_.resize(prefill_unique_.size());
-            expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
-                                  prefill_unique_slots_.data());
+            batch_dma_event = expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
+                                                    prefill_unique_slots_.data());
             for (size_t u = 0; u < prefill_unique_.size(); ++u) {
                 prefill_expert_slot_[prefill_unique_[u]] = prefill_unique_slots_[u];
             }
@@ -891,11 +1037,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             const int* t_ids = router_host_ids_ + t * top_k;
             const float* t_weights = router_host_weights_ + t * top_k;
             int slots[kMaxTopK];
+            sycl::event dma_event{};
             if (batch_acquire) {
                 for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
+                if (t == 0) dma_event = batch_dma_event;
             } else {
                 const auto prof_acq_t0 = prof_clock::now();
-                expert_cache_.acquire(L, t_ids, top_k, slots);
+                dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
                 prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
                 if (s_prefetch && predict_next) {
                     expert_cache_.prefetch_async(L + 1, pred_ids.data(), std::min(top_k, s_prefetch_topn));
@@ -911,7 +1059,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ops::moe_decode_gate_up_swiglu_grouped(
                 ctx, dev_slots, nullptr, x_t,
                 static_cast<bf16*>(buf_.moe_h.data()),
-                top_k, hidden_size_, cfg_.moe_intermediate_size, 64);
+                top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
+                dma_event);
 
             ops::moe_decode_down_weighted_accumulate(
                 ctx, dev_slots, nullptr, t_weights,

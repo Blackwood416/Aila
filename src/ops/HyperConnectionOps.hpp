@@ -28,9 +28,10 @@ void grouped_rms_norm(
 // N: [rows, groups * group_dim]
 // mix: [rows, groups * group_dim]
 // out: [rows, group_dim]
+// apply_sigmoid_to_mix: if true, computes sigmoid on mix in-register before multiplying with N
 void hc_mix_reduce(
     Context& ctx, const bf16* N, const bf16* mix, bf16* out,
-    int rows, int group_dim, int groups);
+    int rows, int group_dim, int groups, bool apply_sigmoid_to_mix = false);
 
 // Hyper-connection residual injection add: H[r, g * group_dim + d] += inj[r, g] * y[r, d]
 // H: [rows, groups * group_dim] (in-out)
@@ -85,6 +86,7 @@ void ple_gate_value(
 void ple_dilated_conv_silu_add(
     Context& ctx, const bf16* gv_normed, const bf16* gv,
     float* conv_state, int& conv_head, const bf16* conv_w, bf16* out,
-    int rows, int channels = 10240, int kernel_size = 4, int dilation = 3);
+    int rows, int channels = 10240, int kernel_size = 4, int dilation = 3,
+    bf16* residual = nullptr);
 
 } // namespace ops

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
@@ -349,7 +349,8 @@ namespace ops {
                           Tensor& output, Tensor& scores_buf,
                           int num_heads, int num_kv_heads, int head_dim,
                           int cached_len,
-                          Tensor* exact_partials_buf = nullptr);
+                          Tensor* exact_partials_buf = nullptr,
+                          const Tensor* gate_buf = nullptr);
 
     // Per-row decode geometry for the multi-row entry point below. Rows are
     // independent sequences, so each carries its own cache and position.
@@ -383,7 +384,8 @@ namespace ops {
                            Tensor& q, Tensor& k, Tensor& v,
                            Tensor& output, Tensor& scores_buf,
                            int seq_len,
-                           int num_heads, int num_kv_heads, int head_dim);
+                           int num_heads, int num_kv_heads, int head_dim,
+                           const Tensor* gate_buf = nullptr);
 
     // Bidirectional Attention (vision prefill)
     // q/k/v/output: [seq_len, num_heads * head_dim]
@@ -407,7 +409,8 @@ namespace ops {
                                   Tensor& output, Tensor& scores_buf,
                                   int seq_len, int start_pos,
                                   int num_heads, int num_kv_heads,
-                                  int head_dim, int max_seq_len);
+                                  int head_dim, int max_seq_len,
+                                  const Tensor* gate_buf = nullptr);
 
     // Masked prefill attention (DiffusionGemma encoder/decoder).
     // q: [q_len, num_heads * head_dim] bf16
@@ -523,6 +526,16 @@ namespace ops {
     void split_q_gate(Context& ctx, Tensor& q_gate, Tensor& q, Tensor& gate,
                       int seq_len, int num_heads, int head_dim);
 
+    // Direct split of packed QGKV:
+    // src:  [seq_len, num_heads * (2 * head_dim) + 2 * (num_kv_heads * head_dim)]
+    // q:    [seq_len, num_heads * head_dim]
+    // gate: [seq_len, num_heads * head_dim]
+    // k:    [seq_len, num_kv_heads * head_dim]
+    // v:    [seq_len, num_kv_heads * head_dim]
+    void split_qgkv(Context& ctx, Tensor& src, Tensor& q, Tensor& gate,
+                    Tensor& k, Tensor& v, int seq_len,
+                    int num_heads, int num_kv_heads, int head_dim);
+
     // Argmax: 返回 logits 中最大值索引 (旧版，带内部分配)
     int argmax(Context& ctx, Tensor& logits, int vocab_size);
 
@@ -637,14 +650,7 @@ namespace ops {
     // src: [R, C], dst: [C, R]
     void transpose(Context& ctx, Tensor& src, Tensor& dst);
 
-    // Incremental attention prefill with pre-existing KV cache.
-    // Processes q[new_tokens, heads*dim] against cached K/V from prior steps.
-    void attention_prefill_cached(Context& ctx,
-                                   Tensor& q, Tensor& k_cache, Tensor& v_cache,
-                                   Tensor& output, Tensor& scores_buf,
-                                   int seq_len, int start_pos,
-                                   int num_heads, int num_kv_heads,
-                                   int head_dim, int max_seq_len);
+
 
     // Sinusoidal position embedding (in-place add, used by audio encoder).
     // input: [seq_len, d_model] bf16, modified in-place.

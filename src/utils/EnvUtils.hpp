@@ -163,5 +163,33 @@ inline bool disable_persistent_sycl_cache() {
 #endif
 }
 
+// UR_L0_USE_COPY_ENGINE=1 enables the dedicated hardware Copy Engine (Blitter)
+// in Level Zero / Unified Runtime for PCIe DMA operations, preventing memory
+// copies from stalling the Xe Core compute engine. Must be set before the
+// Level Zero driver initializes (i.e. before the first Context/device creation).
+inline void enable_l0_copy_engine() {
+#ifdef _WIN32
+    char* existing = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&existing, &len, "UR_L0_USE_COPY_ENGINE") == 0 && existing) {
+        free(existing);
+    } else {
+        _putenv_s("UR_L0_USE_COPY_ENGINE", "1");
+    }
+    if (_dupenv_s(&existing, &len, "SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE") == 0 && existing) {
+        free(existing);
+    } else {
+        _putenv_s("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1");
+    }
+#else
+    if (!std::getenv("UR_L0_USE_COPY_ENGINE")) {
+        setenv("UR_L0_USE_COPY_ENGINE", "1", 1);
+    }
+    if (!std::getenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE")) {
+        setenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1", 1);
+    }
+#endif
+}
+
 } // namespace env
 } // namespace aila

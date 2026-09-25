@@ -66,16 +66,18 @@ public:
     // count: number of active experts (e.g. top_k = 10)
     // out_slots: filled with slot indices in [0, num_slots - 1]
     // Crucial guarantee: slots acquired in the same batch will never evict each other.
-    void acquire(int layer,
-                 const int* expert_ids,
-                 int count,
-                 int* out_slots);
+    // Returns: SYCL event tracking completion of DMA transfers (or default-constructed host event if all hit).
+    sycl::event acquire(int layer,
+                        const int* expert_ids,
+                        int count,
+                        int* out_slots);
 
     // Starts filling predicted non-resident experts into a pinned prefetch staging area on
     // the worker threads and returns immediately. Binds no slot; the next acquire() joins
     // the fill and DMAs staged experts that actually miss instead of filling them again.
     void prefetch_async(int layer, const int* expert_ids, int count);
     void wait_prefetch();
+    void wait_copy();
 
     // Moves resident experts to the eviction end of the LRU in the given order, so the last
     // one listed is evicted first. Non-resident experts are ignored.
@@ -159,7 +161,8 @@ private:
 
     // Immediate-submission in-order queue for miss DMA (see acquire()).
     std::unique_ptr<sycl::queue> copy_q_;
-    struct PrefetchItem { int layer; int expert_id; }; // index == prefetch staging slot
+    sycl::event last_dma_event_{};
+    struct PrefetchItem { int layer; int expert_id; int hslot = -1; }; // index == prefetch staging slot
     std::vector<PrefetchItem> prefetch_items_;
     bool prefetch_in_flight_ = false;
 

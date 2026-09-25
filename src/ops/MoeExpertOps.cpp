@@ -108,49 +108,93 @@ void router_softmax_topk_device(
                 red_slm[tid] = s;
                 item.barrier(sycl::access::fence_space::local_space);
 
+                const int sg_id = tid / 16;
+                const int sg_lane = tid % 16;
+                auto sg = item.get_sub_group();
+
                 // Max reduction
-                for (int stride = 256; stride > 0; stride >>= 1) {
-                    if (tid < stride) {
-                        red_slm[tid] = sycl::max(red_slm[tid], red_slm[tid + stride]);
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
+                float sg_max = sycl::reduce_over_group(sg, s, sycl::maximum<float>());
+                if (sg_lane == 0) {
+                    red_slm[sg_id] = sg_max;
                 }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                if (sg_id == 0) {
+                    float m = sycl::max(red_slm[sg_lane], red_slm[sg_lane + 16]);
+                    float final_max = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+                    if (sg_lane == 0) {
+                        red_slm[0] = final_max;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
                 const float max_score = red_slm[0];
                 item.barrier(sycl::access::fence_space::local_space);
 
                 // Softmax
                 float exp_val = sycl::native::exp(s - max_score);
                 scores_slm[tid] = exp_val;
-                red_slm[tid] = exp_val;
+                float sg_sum = sycl::reduce_over_group(sg, exp_val, sycl::plus<>());
+                if (sg_lane == 0) {
+                    red_slm[sg_id] = sg_sum;
+                }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                for (int stride = 256; stride > 0; stride >>= 1) {
-                    if (tid < stride) {
-                        red_slm[tid] += red_slm[tid + stride];
+                if (sg_id == 0) {
+                    float s2 = red_slm[sg_lane] + red_slm[sg_lane + 16];
+                    float final_sum = sycl::reduce_over_group(sg, s2, sycl::plus<>());
+                    if (sg_lane == 0) {
+                        red_slm[0] = final_sum;
                     }
-                    item.barrier(sycl::access::fence_space::local_space);
                 }
+                item.barrier(sycl::access::fence_space::local_space);
                 const float inv_sum = 1.0f / red_slm[0];
                 scores_slm[tid] = exp_val * inv_sum;
                 item.barrier(sycl::access::fence_space::local_space);
 
                 // Top-K Selection
                 for (int k = 0; k < top_k; ++k) {
-                    float cand = (tid >= k) ? scores_slm[tid] : -1.0e30f;
-                    red_slm[tid] = cand;
-                    red_idx_slm[tid] = tid;
+                    float cand_val = (tid >= k) ? scores_slm[tid] : -1.0e30f;
+                    int cand_idx = tid;
+
+                    // Reduce within subgroup via XOR shuffles
+#pragma unroll
+                    for (int offset = 8; offset > 0; offset >>= 1) {
+                        float other_val = sycl::permute_group_by_xor(sg, cand_val, offset);
+                        int other_idx = sycl::permute_group_by_xor(sg, cand_idx, offset);
+                        if (other_val > cand_val || (other_val == cand_val && other_idx < cand_idx)) {
+                            cand_val = other_val;
+                            cand_idx = other_idx;
+                        }
+                    }
+                    if (sg_lane == 0) {
+                        red_slm[sg_id] = cand_val;
+                        red_idx_slm[sg_id] = cand_idx;
+                    }
                     item.barrier(sycl::access::fence_space::local_space);
 
-                    for (int stride = 256; stride > 0; stride >>= 1) {
-                        if (tid < stride) {
-                            if (red_slm[tid + stride] > red_slm[tid] ||
-                                (red_slm[tid + stride] == red_slm[tid] && red_idx_slm[tid + stride] < red_idx_slm[tid])) {
-                                red_slm[tid] = red_slm[tid + stride];
-                                red_idx_slm[tid] = red_idx_slm[tid + stride];
+                    if (sg_id == 0) {
+                        float v0 = red_slm[sg_lane];
+                        int i0 = red_idx_slm[sg_lane];
+                        float v1 = red_slm[sg_lane + 16];
+                        int i1 = red_idx_slm[sg_lane + 16];
+                        if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                            v0 = v1;
+                            i0 = i1;
+                        }
+#pragma unroll
+                        for (int offset = 8; offset > 0; offset >>= 1) {
+                            float other_val = sycl::permute_group_by_xor(sg, v0, offset);
+                            int other_idx = sycl::permute_group_by_xor(sg, i0, offset);
+                            if (other_val > v0 || (other_val == v0 && other_idx < i0)) {
+                                v0 = other_val;
+                                i0 = other_idx;
                             }
                         }
-                        item.barrier(sycl::access::fence_space::local_space);
+                        if (sg_lane == 0) {
+                            red_idx_slm[0] = i0;
+                        }
                     }
+                    item.barrier(sycl::access::fence_space::local_space);
 
                     if (tid == 0) {
                         int best_pos = red_idx_slm[0];
@@ -218,7 +262,8 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     int num_active_experts,
     int in_features,
     int intermediate_size,
-    int blocksize) {
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     constexpr size_t wg_size = 256;
@@ -228,6 +273,9 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     const size_t num_groups = (total_rows + rows_per_group - 1) / rows_per_group;
 
     return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
 
         cgh.parallel_for(
@@ -463,7 +511,8 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int num_active_experts,
     int in_features,
     int intermediate_size,
-    int blocksize) {
+    int blocksize,
+    const sycl::event* dep_event) {
     if (num_active_experts <= 0) return {};
 
     std::array<MoeExpertSlotDev, 16> slot_ptrs{};
@@ -475,11 +524,11 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     if (slots[0].gate_up_nested.codes != nullptr) {
         return launch_moe_decode_gate_up_swiglu_grouped<true>(
             ctx, slot_ptrs, quant_map, x, h, num_active_experts,
-            in_features, intermediate_size, blocksize);
+            in_features, intermediate_size, blocksize, dep_event);
     }
     return launch_moe_decode_gate_up_swiglu_grouped<false>(
         ctx, slot_ptrs, quant_map, x, h, num_active_experts,
-        in_features, intermediate_size, blocksize);
+        in_features, intermediate_size, blocksize, dep_event);
 }
 
 sycl::event moe_decode_down_weighted_accumulate(

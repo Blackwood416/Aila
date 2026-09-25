@@ -600,24 +600,48 @@ void bias_add_inplace(Context& ctx, Tensor& input, Tensor& bias, int rows, int c
 // ============================================================
 
 void residual_add(Context& ctx, Tensor& a, Tensor& b, int n) {
+    if (n <= 0) return;
     using vec8 = sycl::vec<bf16, 8>;
     vec8* a_ptr = reinterpret_cast<vec8*>(a.data());
-    vec8* b_ptr = reinterpret_cast<vec8*>(b.data());
+    const vec8* b_ptr = reinterpret_cast<const vec8*>(b.data());
     
     int n8 = n / 8;
+    constexpr int wg = 256;
+    size_t num_wgs = (static_cast<size_t>(n8) + wg - 1) / wg;
 
-    ctx.queue().parallel_for(sycl::range<1>(n8),
-        [=](sycl::id<1> i) {
-            vec8 va = a_ptr[i];
-            vec8 vb = b_ptr[i];
-            vec8 vo;
-            for (int k = 0; k < 8; ++k) {
-                float f_a = static_cast<float>(va[k]);
-                float f_b = static_cast<float>(vb[k]);
-                vo[k] = bf16(f_a + f_b);
-            }
-            a_ptr[i] = vo;
+    if (num_wgs > 0) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    size_t i = item.get_global_id(0);
+                    if (i < static_cast<size_t>(n8)) {
+                        vec8 va = a_ptr[i];
+                        const vec8 vb = b_ptr[i];
+                        vec8 vo;
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            float f_a = static_cast<float>(va[k]);
+                            float f_b = static_cast<float>(vb[k]);
+                            vo[k] = bf16(f_a + f_b);
+                        }
+                        a_ptr[i] = vo;
+                    }
+                });
         });
+    }
+
+    int tail_start = n8 * 8;
+    int tail_count = n - tail_start;
+    if (tail_count > 0) {
+        bf16* raw_a = static_cast<bf16*>(a.data()) + tail_start;
+        const bf16* raw_b = static_cast<const bf16*>(b.data()) + tail_start;
+        ctx.queue().parallel_for(sycl::range<1>(tail_count), [=](sycl::id<1> idx) {
+            float f_a = static_cast<float>(raw_a[idx[0]]);
+            float f_b = static_cast<float>(raw_b[idx[0]]);
+            raw_a[idx[0]] = bf16(f_a + f_b);
+        });
+    }
 }
 
 // ============================================================
@@ -775,6 +799,102 @@ void split_q_gate(Context& ctx, Tensor& q_gate, Tensor& q, Tensor& gate,
 
             q_ptr[dst_base + d] = src[src_base + d];
             g_ptr[dst_base + d] = src[src_base + head_dim + d];
+        });
+}
+
+void split_qgkv(Context& ctx, Tensor& src, Tensor& q, Tensor& gate,
+                Tensor& k, Tensor& v, int seq_len,
+                int num_heads, int num_kv_heads, int head_dim) {
+    if (seq_len <= 0) return;
+    const bf16* src_ptr = static_cast<const bf16*>(src.data());
+    bf16* q_ptr = static_cast<bf16*>(q.data());
+    bf16* g_ptr = static_cast<bf16*>(gate.data());
+    bf16* k_ptr = static_cast<bf16*>(k.data());
+    bf16* v_ptr = static_cast<bf16*>(v.data());
+
+    const size_t q_dim = static_cast<size_t>(num_heads) * head_dim;
+    const size_t kv_dim = static_cast<size_t>(num_kv_heads) * head_dim;
+    const size_t q_proj_dim = static_cast<size_t>(num_heads) * 2 * head_dim;
+    const size_t total_row = q_proj_dim + 2 * kv_dim;
+
+    if (head_dim % 8 == 0) {
+        using vec8 = sycl::vec<bf16, 8>;
+        const size_t dim8 = static_cast<size_t>(head_dim / 8);
+        const size_t q_blocks = static_cast<size_t>(num_heads) * dim8;
+        const size_t kv_blocks = static_cast<size_t>(num_kv_heads) * dim8;
+        const size_t total_blocks_per_token = q_blocks + kv_blocks;
+
+        const bool is_pow2 = (dim8 & (dim8 - 1)) == 0;
+        int shift_calc = 0;
+        if (is_pow2) {
+            while ((size_t(1) << shift_calc) < dim8) ++shift_calc;
+        }
+        const int shift = shift_calc;
+        const size_t dim8_mask = is_pow2 ? (dim8 - 1) : 0;
+
+        constexpr size_t wg = 256;
+        const size_t num_wgs_per_token = (total_blocks_per_token + wg - 1) / wg;
+        const size_t grid_blocks = num_wgs_per_token * wg;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(seq_len), grid_blocks),
+                                  sycl::range<2>(1, wg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t s = item.get_group(0);
+                    const size_t b = item.get_global_id(1);
+                    if (b < total_blocks_per_token) {
+                        const size_t src_row_base = s * total_row;
+
+                        if (b < q_blocks) {
+                            const size_t h = is_pow2 ? (b >> shift) : (b / dim8);
+                            const size_t d8 = is_pow2 ? (b & dim8_mask) : (b % dim8);
+                            const size_t src_q_off = src_row_base + h * (2 * head_dim) + d8 * 8;
+                            const size_t src_g_off = src_q_off + head_dim;
+                            const size_t dst_off = s * q_dim + h * head_dim + d8 * 8;
+
+                            const vec8 v_q = *reinterpret_cast<const vec8*>(src_ptr + src_q_off);
+                            const vec8 v_g = *reinterpret_cast<const vec8*>(src_ptr + src_g_off);
+                            *reinterpret_cast<vec8*>(q_ptr + dst_off) = v_q;
+                            *reinterpret_cast<vec8*>(g_ptr + dst_off) = v_g;
+                        } else {
+                            const size_t kv_b = b - q_blocks;
+                            const size_t kv_h = is_pow2 ? (kv_b >> shift) : (kv_b / dim8);
+                            const size_t d8 = is_pow2 ? (kv_b & dim8_mask) : (kv_b % dim8);
+                            const size_t src_k_off = src_row_base + q_proj_dim + kv_h * head_dim + d8 * 8;
+                            const size_t src_v_off = src_row_base + q_proj_dim + kv_dim + kv_h * head_dim + d8 * 8;
+                            const size_t dst_off = s * kv_dim + kv_h * head_dim + d8 * 8;
+
+                            const vec8 v_k = *reinterpret_cast<const vec8*>(src_ptr + src_k_off);
+                            const vec8 v_v = *reinterpret_cast<const vec8*>(src_ptr + src_v_off);
+                            *reinterpret_cast<vec8*>(k_ptr + dst_off) = v_k;
+                            *reinterpret_cast<vec8*>(v_ptr + dst_off) = v_v;
+                        }
+                    }
+                });
+        });
+        return;
+    }
+
+    // Fallback for non-multiple-of-8 head_dim
+    ctx.queue().parallel_for(sycl::range<2>(static_cast<size_t>(seq_len), q_dim),
+        [=](sycl::id<2> idx) {
+            size_t s = idx[0];
+            size_t i = idx[1];
+            size_t h = i / head_dim;
+            size_t d = i % head_dim;
+            size_t src_q_off = s * total_row + h * 2 * head_dim + d;
+            size_t src_g_off = src_q_off + head_dim;
+            q_ptr[s * q_dim + i] = src_ptr[src_q_off];
+            g_ptr[s * q_dim + i] = src_ptr[src_g_off];
+        });
+
+    ctx.queue().parallel_for(sycl::range<2>(static_cast<size_t>(seq_len), kv_dim),
+        [=](sycl::id<2> idx) {
+            size_t s = idx[0];
+            size_t i = idx[1];
+            k_ptr[s * kv_dim + i] = src_ptr[s * total_row + q_proj_dim + i];
+            v_ptr[s * kv_dim + i] = src_ptr[s * total_row + q_proj_dim + kv_dim + i];
         });
 }
 

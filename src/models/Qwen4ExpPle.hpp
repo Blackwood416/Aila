@@ -108,7 +108,8 @@ public:
         const int* input_ids,
         int num_tokens,
         const sycl::ext::oneapi::bfloat16* hidden_states,
-        sycl::ext::oneapi::bfloat16* out);
+        sycl::ext::oneapi::bfloat16* out,
+        sycl::ext::oneapi::bfloat16* residual = nullptr);
 
     // Session state helpers
     void init_state(Context& ctx, Qwen4ExpPleState& state) const;

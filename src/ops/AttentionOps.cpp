@@ -101,7 +101,8 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
                                     Tensor &scores_buf, int num_heads,
                                     int num_kv_heads, int head_dim, int cached_len,
                                     int tail_start, int sink_len, int effective_len,
-                                    int wg_size) {
+                                    int wg_size,
+                                    const bf16 *gate_ptr = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -184,7 +185,13 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
               int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
               acc += shared[t] * v_acc.load(kv_head, cache_t, d);
             }
-            o_ptr[head * head_dim + d] = bf16(acc);
+            float val = static_cast<float>(bf16(acc));
+            if (gate_ptr != nullptr) {
+              float g_v = static_cast<float>(gate_ptr[head * head_dim + d]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_ptr[head * head_dim + d] = bf16(val);
           }
         });
   });
@@ -195,15 +202,17 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                Tensor &scores_buf, int num_heads,
                                int num_kv_heads, int head_dim, int cached_len,
                                int tail_start, int sink_len, int effective_len,
-                               int wg_size) {
+                               int wg_size,
+                               const Tensor *gate_buf = nullptr) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_baseline_impl<true>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr);
   } else {
     attention_decode_baseline_impl<false>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr);
   }
 }
 
@@ -211,7 +220,8 @@ template <bool Quantized>
 void attention_decode_exact_head256_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
-    int sink_len, int effective_len) {
+    int sink_len, int effective_len,
+    const bf16 *gate_ptr = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -358,7 +368,13 @@ void attention_decode_exact_head256_partial_merge_impl(
               acc += tile_factors[tile_idx] *
                      partial[kDecodeExact256PartialAccOffset + d];
             }
-            o_ptr[head * head_dim + d] = bf16(acc * inv_sum);
+            float val = static_cast<float>(bf16(acc * inv_sum));
+            if (gate_ptr != nullptr) {
+              float g_v = static_cast<float>(gate_ptr[head * head_dim + d]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_ptr[head * head_dim + d] = bf16(val);
           }
         });
   });
@@ -367,15 +383,17 @@ void attention_decode_exact_head256_partial_merge_impl(
 void attention_decode_exact_head256_partial_merge(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
-    int sink_len, int effective_len) {
+    int sink_len, int effective_len,
+    const Tensor *gate_buf = nullptr) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_exact_head256_partial_merge_impl<true>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len);
+        tail_start, sink_len, effective_len, gate_ptr);
   } else {
     attention_decode_exact_head256_partial_merge_impl<false>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len);
+        tail_start, sink_len, effective_len, gate_ptr);
   }
 }
 
@@ -383,7 +401,8 @@ template <bool Quantized>
 void attention_decode_exact_head128_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
-    int sink_len, int effective_len) {
+    int sink_len, int effective_len,
+    const bf16 *gate_ptr = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -522,7 +541,13 @@ void attention_decode_exact_head128_partial_merge_impl(
             acc += tile_factors[tile_idx] *
                    partial[kDecodeExact128PartialAccOffset + lid];
           }
-          o_ptr[head * head_dim + lid] = bf16(acc * inv_sum);
+          float val = static_cast<float>(bf16(acc * inv_sum));
+          if (gate_ptr != nullptr) {
+            float g_v = static_cast<float>(gate_ptr[head * head_dim + lid]);
+            float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+            val = static_cast<float>(bf16(val * s));
+          }
+          o_ptr[head * head_dim + lid] = bf16(val);
         });
   });
 }
@@ -530,15 +555,17 @@ void attention_decode_exact_head128_partial_merge_impl(
 void attention_decode_exact_head128_partial_merge(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
-    int sink_len, int effective_len) {
+    int sink_len, int effective_len,
+    const Tensor *gate_buf = nullptr) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_exact_head128_partial_merge_impl<true>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len);
+        tail_start, sink_len, effective_len, gate_ptr);
   } else {
     attention_decode_exact_head128_partial_merge_impl<false>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len);
+        tail_start, sink_len, effective_len, gate_ptr);
   }
 }
 
@@ -548,7 +575,8 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
                                          Tensor &output, Tensor &scores_buf,
                                          int num_heads, int num_kv_heads,
                                          int head_dim, int cached_len,
-                                         int attn_start, int wg_size) {
+                                         int attn_start, int wg_size,
+                                         const bf16 *gate_ptr = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   bf16 *k_ptr = static_cast<bf16 *>(k_cache.data());
   bf16 *v_ptr = static_cast<bf16 *>(v_cache.data());
@@ -685,8 +713,15 @@ void attention_decode_joint_matrix_tiled(Context &ctx, Tensor &q,
               acc[6] += p * static_cast<float>(v_row[6]);
               acc[7] += p * static_cast<float>(v_row[7]);
             }
-            for (int k = 0; k < 8; k++)
-              o_ptr[head * head_dim + lid * 8 + k] = bf16(acc[k]);
+            for (int k = 0; k < 8; k++) {
+              float val = static_cast<float>(bf16(acc[k]));
+              if (gate_ptr != nullptr) {
+                float g_v = static_cast<float>(gate_ptr[head * head_dim + lid * 8 + k]);
+                float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+                val = static_cast<float>(bf16(val * s));
+              }
+              o_ptr[head * head_dim + lid * 8 + k] = bf16(val);
+            }
           }
         });
   });
@@ -697,19 +732,21 @@ void attention_decode_joint_matrix(Context &ctx, Tensor &q, Tensor &k_cache,
                                    Tensor &scores_buf, int num_heads,
                                    int num_kv_heads, int head_dim,
                                    int cached_len, int attn_start, int tile_id,
-                                   int wg_size) {
+                                   int wg_size,
+                                   const Tensor *gate_buf = nullptr) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (tile_id == 2) {
     attention_decode_joint_matrix_tiled<8, 8, 16, 8>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, attn_start, wg_size);
+        head_dim, cached_len, attn_start, wg_size, gate_ptr);
   } else if (tile_id == 1) {
     attention_decode_joint_matrix_tiled<32, 32, 16, 16>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, attn_start, wg_size);
+        head_dim, cached_len, attn_start, wg_size, gate_ptr);
   } else {
     attention_decode_joint_matrix_tiled<1, 8, 16, 8>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, attn_start, wg_size);
+        head_dim, cached_len, attn_start, wg_size, gate_ptr);
   }
 }
 
@@ -1240,7 +1277,8 @@ const JmDecodeConfig& get_jm_decode_config(const sycl::device &dev) {
 void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       Tensor &output, Tensor &scores_buf, int num_heads,
                       int num_kv_heads, int head_dim, int cached_len,
-                      Tensor *exact_partials_buf) {
+                      Tensor *exact_partials_buf,
+                      const Tensor *gate_buf) {
   static bool jm_log_once = false;
   const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
   bool allow_jm = jm_cfg.allow_jm;
@@ -1291,14 +1329,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
       exact_partials_buf && exact_partials_buf->valid()) {
     attention_decode_exact_head128_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
-        num_kv_heads, tail_start, sink_len, effective_len);
+        num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
     return;
   }
 
   if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0) {
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
-                                  attn_start, jm_tile_id, decode_wg);
+                                  attn_start, jm_tile_id, decode_wg, gate_buf);
     return;
   }
 
@@ -1306,14 +1344,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
       exact_partials_buf && exact_partials_buf->valid()) {
     attention_decode_exact_head256_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
-        num_kv_heads, tail_start, sink_len, effective_len);
+        num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
     return;
   }
 
   attention_decode_baseline(ctx, q, k_cache, v_cache, output, scores_buf,
                             num_heads, num_kv_heads, head_dim, cached_len,
                             tail_start, sink_len, effective_len,
-                            decode_wg);
+                            decode_wg, gate_buf);
 }
 
 
@@ -1497,7 +1535,9 @@ void attention_decode_rows(Context &ctx, Tensor &q, int q_row_stride,
 
 void attention_prefill(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
                        Tensor &output, Tensor &scores_buf, int seq_len,
-                       int num_heads, int num_kv_heads, int head_dim) {
+                       int num_heads, int num_kv_heads, int head_dim,
+                       const Tensor *gate_buf) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (head_dim == 128 && seq_len >= kPrefillExact128MinSeq) {
     bf16 *q_ptr = static_cast<bf16 *>(q.data());
     bf16 *k_ptr = static_cast<bf16 *>(k.data());
@@ -1603,7 +1643,14 @@ void attention_prefill(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
 
             const float inv_l = 1.0f / merge_state[1];
             bf16 *o_row = o_ptr + qi * q_total + h * exact_head_dim;
-            o_row[lid] = bf16(acc_local[lid] * inv_l);
+            const bf16 *g_row = gate_ptr ? gate_ptr + qi * q_total + h * exact_head_dim : nullptr;
+            float val = static_cast<float>(bf16(acc_local[lid] * inv_l));
+            if (g_row) {
+              float g_v = static_cast<float>(g_row[lid]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_row[lid] = bf16(val);
           });
     });
     return;
@@ -1718,8 +1765,15 @@ void attention_prefill(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
 
             const float inv_l = 1.0f / merge_state[1];
             bf16 *o_row = o_ptr + qi * q_total + h * exact_head_dim;
+            const bf16 *g_row = gate_ptr ? gate_ptr + qi * q_total + h * exact_head_dim : nullptr;
             for (int d = lid; d < exact_head_dim; d += wg_size) {
-              o_row[d] = bf16(acc_local[d] * inv_l);
+              float val = static_cast<float>(bf16(acc_local[d] * inv_l));
+              if (g_row) {
+                float g_v = static_cast<float>(g_row[d]);
+                float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+                val = static_cast<float>(bf16(val * s));
+              }
+              o_row[d] = bf16(val);
             }
           });
     });
@@ -1797,7 +1851,13 @@ void attention_prefill(Context &ctx, Tensor &q, Tensor &k, Tensor &v,
               static_cast<float>(v_ptr[t * k_total + kv_h * head_dim + d]);
           acc += row[t] * vv;
         }
-        o_ptr[qi * q_total + h * head_dim + d] = bf16(acc);
+        float val = static_cast<float>(bf16(acc));
+        if (gate_ptr) {
+          float g_v = static_cast<float>(gate_ptr[qi * q_total + h * head_dim + d]);
+          float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+          val = static_cast<float>(bf16(val * s));
+        }
+        o_ptr[qi * q_total + h * head_dim + d] = bf16(val);
       });
 }
 
@@ -3273,7 +3333,8 @@ void attention_prefill_cached_impl(Context& ctx,
                                    Tensor& output, Tensor& scores_buf,
                                    int seq_len, int start_pos,
                                    int num_heads, int num_kv_heads,
-                                   int head_dim, int max_seq_len) {
+                                   int head_dim, int max_seq_len,
+                                   const bf16* gate_ptr = nullptr) {
   const int total_len = start_pos + seq_len;
   if (head_dim == 128 && total_len >= kPrefillCachedExact128MinTotal) {
     bf16 *q_ptr = static_cast<bf16 *>(q.data());
@@ -3382,7 +3443,14 @@ void attention_prefill_cached_impl(Context& ctx,
 
             const float inv_l = 1.0f / merge_state[1];
             bf16 *o_row = o_ptr + qi * q_total + h * exact_head_dim;
-            o_row[lid] = bf16(acc_local[lid] * inv_l);
+            const bf16 *g_row = gate_ptr ? gate_ptr + qi * q_total + h * exact_head_dim : nullptr;
+            float val = static_cast<float>(bf16(acc_local[lid] * inv_l));
+            if (g_row) {
+              float g_v = static_cast<float>(g_row[lid]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_row[lid] = bf16(val);
           });
     });
     return;
@@ -3499,8 +3567,15 @@ void attention_prefill_cached_impl(Context& ctx,
 
             const float inv_l = 1.0f / merge_state[1];
             bf16 *o_row = o_ptr + qi * q_total + h * exact_head_dim;
+            const bf16 *g_row = gate_ptr ? gate_ptr + qi * q_total + h * exact_head_dim : nullptr;
             for (int d = lid; d < exact_head_dim; d += wg_size) {
-              o_row[d] = bf16(acc_local[d] * inv_l);
+              float val = static_cast<float>(bf16(acc_local[d] * inv_l));
+              if (g_row) {
+                float g_v = static_cast<float>(g_row[d]);
+                float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+                val = static_cast<float>(bf16(val * s));
+              }
+              o_row[d] = bf16(val);
             }
           });
     });
@@ -3578,7 +3653,13 @@ void attention_prefill_cached_impl(Context& ctx,
           float vv = v_acc.load(kv_h, t, d);
           acc += row[t] * vv;
         }
-        o_ptr[qi * q_total + h * head_dim + d] = bf16(acc);
+        float val = static_cast<float>(bf16(acc));
+        if (gate_ptr) {
+          float g_v = static_cast<float>(gate_ptr[qi * q_total + h * head_dim + d]);
+          float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+          val = static_cast<float>(bf16(val * s));
+        }
+        o_ptr[qi * q_total + h * head_dim + d] = bf16(val);
       });
 }
 
@@ -3587,15 +3668,17 @@ void attention_prefill_cached(Context& ctx,
                               Tensor& output, Tensor& scores_buf,
                               int seq_len, int start_pos,
                               int num_heads, int num_kv_heads,
-                              int head_dim, int max_seq_len) {
+                              int head_dim, int max_seq_len,
+                              const Tensor* gate_buf) {
+  const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_prefill_cached_impl<true>(
         ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
-        num_heads, num_kv_heads, head_dim, max_seq_len);
+        num_heads, num_kv_heads, head_dim, max_seq_len, gate_ptr);
   } else {
     attention_prefill_cached_impl<false>(
         ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
-        num_heads, num_kv_heads, head_dim, max_seq_len);
+        num_heads, num_kv_heads, head_dim, max_seq_len, gate_ptr);
   }
 }
 
