@@ -184,7 +184,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     layer_weights_ = std::move(other.layer_weights_);
     lru_list_ = std::move(other.lru_list_);
     slot_iters_ = std::move(other.slot_iters_);
-    key_to_slot_ = std::move(other.key_to_slot_);
+    layer_expert_to_slot_ = std::move(other.layer_expert_to_slot_);
     slot_to_key_ = std::move(other.slot_to_key_);
     slot_reserved_ = std::move(other.slot_reserved_);
     slots_dev_ = std::move(other.slots_dev_);
@@ -205,7 +205,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     num_host_slots_ = other.num_host_slots_;
     host_pool_chunks_ = std::move(other.host_pool_chunks_);
     host_slot_ptrs_ = std::move(other.host_slot_ptrs_);
-    host_key_to_slot_ = std::move(other.host_key_to_slot_);
+    host_layer_expert_to_slot_ = std::move(other.host_layer_expert_to_slot_);
     host_slot_to_key_ = std::move(other.host_slot_to_key_);
     host_lru_list_ = std::move(other.host_lru_list_);
     host_slot_iters_ = std::move(other.host_slot_iters_);
@@ -214,13 +214,21 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
 
     other.host_pool_chunks_.clear();
     other.host_slot_ptrs_.clear();
-    other.host_key_to_slot_.clear();
+    other.host_layer_expert_to_slot_.clear();
     other.host_slot_to_key_.clear();
     other.host_lru_list_.clear();
     other.host_slot_iters_.clear();
     other.host_pool_bytes_ = 0;
     other.num_host_slots_ = 0;
     other.host_pool_enabled_ = false;
+
+    misses_scratch_ = std::move(other.misses_scratch_);
+    batch_reserved_slots_scratch_ = std::move(other.batch_reserved_slots_scratch_);
+    to_fill_scratch_ = std::move(other.to_fill_scratch_);
+    assigned_hslots_scratch_ = std::move(other.assigned_hslots_scratch_);
+    parts_left_scratch_ = std::move(other.parts_left_scratch_);
+    parts_left_capacity_ = other.parts_left_capacity_;
+    other.parts_left_capacity_ = 0;
 
     other.ctx_ = nullptr;
     other.weights_ = nullptr;
@@ -281,19 +289,25 @@ void Qwen4ExpExpertCache::cleanup() {
     layer_weights_.clear();
     lru_list_.clear();
     slot_iters_.clear();
-    key_to_slot_.clear();
+    layer_expert_to_slot_.clear();
     slot_to_key_.clear();
     slot_reserved_.clear();
     slots_dev_.clear();
     host_pool_chunks_.clear();
     host_slot_ptrs_.clear();
-    host_key_to_slot_.clear();
+    host_layer_expert_to_slot_.clear();
     host_slot_to_key_.clear();
     host_lru_list_.clear();
     host_slot_iters_.clear();
     host_pool_bytes_ = 0;
     num_host_slots_ = 0;
     host_pool_enabled_ = false;
+    misses_scratch_.clear();
+    batch_reserved_slots_scratch_.clear();
+    to_fill_scratch_.clear();
+    assigned_hslots_scratch_.clear();
+    parts_left_scratch_.reset();
+    parts_left_capacity_ = 0;
     fill_pool_.reset();
     prefetch_items_.clear();
     last_dma_event_ = sycl::event{};
@@ -488,7 +502,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
             host_slot_to_key_.assign(num_host_slots_, UINT64_MAX);
             host_slot_iters_.resize(num_host_slots_);
             host_lru_list_.clear();
-            host_key_to_slot_.clear();
+            host_layer_expert_to_slot_.assign(static_cast<size_t>(num_layers_) * num_experts_per_layer_, -1);
             for (int h = 0; h < num_host_slots_; ++h) {
                 host_lru_list_.push_back(h);
                 auto it = host_lru_list_.end();
@@ -503,7 +517,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     // Setup slot tracking & descriptors
     lru_list_.clear();
     slot_iters_.resize(num_slots_);
-    key_to_slot_.clear();
+    layer_expert_to_slot_.assign(static_cast<size_t>(num_layers_) * num_experts_per_layer_, -1);
     slot_to_key_.assign(num_slots_, UINT64_MAX);
     slot_reserved_.assign(num_slots_, false);
 
@@ -543,6 +557,19 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     fill_parts_ = std::clamp(aila::env::read_int("AILA_Q4E_FILL_PARTS", 8), 1, 64);
 
     fill_pool_ = std::make_unique<ExpertFillPool>(fill_threads);
+
+    misses_scratch_.clear();
+    misses_scratch_.reserve(num_experts_per_layer_);
+    batch_reserved_slots_scratch_.clear();
+    batch_reserved_slots_scratch_.reserve(num_experts_per_layer_);
+    to_fill_scratch_.clear();
+    to_fill_scratch_.reserve(num_experts_per_layer_);
+    assigned_hslots_scratch_.clear();
+    assigned_hslots_scratch_.reserve(std::max(1, num_host_slots_));
+    parts_left_capacity_ = std::max(static_cast<size_t>(num_experts_per_layer_), static_cast<size_t>(std::max(1, num_host_slots_)));
+    parts_left_scratch_ = std::make_unique<std::atomic<int>[]>(parts_left_capacity_);
+    prefetch_items_.reserve(std::max(prefetch_staging_slots_, num_host_slots_));
+
     AILA_LOG_INFO("[Q4E ExpertCache] slots=%d slot_bytes=%zu pool=%.1fMB nested_codes=%d fill_threads=%d fill_parts=%d",
                   num_slots_, slot_bytes_, dev_pool_bytes_ / (1024.0 * 1024.0),
                   compact_nested_ ? 1 : 0, fill_threads, fill_parts_);
@@ -689,34 +716,20 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             std::chrono::steady_clock::now() - t_wait).count());
     }
 
-    struct MissInfo {
-        int batch_index;
-        int layer;
-        int expert_id;
-        int slot_id;
-        const uint8_t* prefilled; // staged by prefetch_async, or null
-    };
-
-    std::vector<MissInfo> misses;
-    misses.reserve(count);
-
-    std::vector<int> batch_reserved_slots;
-    batch_reserved_slots.reserve(count);
+    misses_scratch_.clear();
+    batch_reserved_slots_scratch_.clear();
 
     // Phase 1: check hits and deduplicate within this batch
     for (int i = 0; i < count; ++i) {
         int expert = expert_ids[i];
-        uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
-        auto it = key_to_slot_.find(key);
-        if (it != key_to_slot_.end()) {
-            int slot = it->second;
+        int flat_idx = expert_flat_index(layer, expert);
+        int slot = layer_expert_to_slot_[flat_idx];
+        if (slot >= 0) {
             out_slots[i] = slot;
             if (!slot_reserved_[slot]) {
                 slot_reserved_[slot] = true;
-                batch_reserved_slots.push_back(slot);
-                lru_list_.erase(slot_iters_[slot]);
-                lru_list_.push_front(slot);
-                slot_iters_[slot] = lru_list_.begin();
+                batch_reserved_slots_scratch_.push_back(slot);
+                lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
             }
             ++stats_.hit_count;
         } else {
@@ -728,12 +741,12 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     for (int i = 0; i < count; ++i) {
         if (out_slots[i] >= 0) continue;
         int expert = expert_ids[i];
-        uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
+        int flat_idx = expert_flat_index(layer, expert);
 
         // Check if another miss earlier in this same batch already bound this key
-        auto it = key_to_slot_.find(key);
-        if (it != key_to_slot_.end()) {
-            out_slots[i] = it->second;
+        int bound_slot = layer_expert_to_slot_[flat_idx];
+        if (bound_slot >= 0) {
+            out_slots[i] = bound_slot;
             continue;
         }
 
@@ -748,7 +761,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         }
 
         if (victim_slot < 0) {
-            for (int s : batch_reserved_slots) slot_reserved_[s] = false;
+            for (int s : batch_reserved_slots_scratch_) slot_reserved_[s] = false;
             throw std::runtime_error("Qwen4ExpExpertCache: all slots reserved in batch, count exceeds num_slots");
         }
 
@@ -758,18 +771,19 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         // Evict old key if bound
         uint64_t old_key = slot_to_key_[victim_slot];
         if (old_key != UINT64_MAX) {
-            key_to_slot_.erase(old_key);
+            int old_layer = static_cast<int>(old_key >> 32);
+            int old_expert = static_cast<int>(old_key & 0xFFFFFFFF);
+            layer_expert_to_slot_[expert_flat_index(old_layer, old_expert)] = -1;
         }
-        key_to_slot_[key] = victim_slot;
+        uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
+        layer_expert_to_slot_[flat_idx] = victim_slot;
         slot_to_key_[victim_slot] = key;
 
         // Move victim to MRU (front) and reserve for this batch
-        lru_list_.erase(slot_iters_[victim_slot]);
-        lru_list_.push_front(victim_slot);
-        slot_iters_[victim_slot] = lru_list_.begin();
+        lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[victim_slot]);
 
         slot_reserved_[victim_slot] = true;
-        batch_reserved_slots.push_back(victim_slot);
+        batch_reserved_slots_scratch_.push_back(victim_slot);
 
         const uint8_t* prefilled = nullptr;
         for (size_t p = 0; p < prefetch_items_.size(); ++p) {
@@ -783,13 +797,13 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         }
 
         out_slots[i] = victim_slot;
-        misses.push_back({i, layer, expert, victim_slot, prefilled});
+        misses_scratch_.push_back({i, layer, expert, victim_slot, prefilled});
         ++stats_.miss_count;
     }
 
     // Phase 3: DMA prefetched misses right away, then fill the rest into pinned staging.
     sycl::event dma_done_event{};
-    if (!misses.empty()) {
+    if (!misses_scratch_.empty()) {
         // Copies run on the immediate copy queue so each starts as soon as it is submitted.
         // All previous-layer work was already drained by ctx.synchronize() at the router boundary;
         // the shared expert submitted right before acquire() does not touch expert slots.
@@ -799,23 +813,18 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 cgh.memcpy(slot_dev_base_[slot_id], src, slot_bytes_);
             });
         };
-        std::vector<MissInfo> to_fill;
-        to_fill.reserve(misses.size());
-        for (const auto& miss : misses) {
+        to_fill_scratch_.clear();
+        for (const auto& miss : misses_scratch_) {
             if (miss.prefilled) {
                 copy_to_slot(miss.slot_id, miss.prefilled);
                 stats_.total_transferred_bytes += slot_bytes_;
                 continue;
             }
             if (host_pool_enabled_) {
-                const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
-                auto h_it = host_key_to_slot_.find(key);
-                if (h_it != host_key_to_slot_.end()) {
-                    const int hslot = h_it->second;
-                    host_lru_list_.erase(host_slot_iters_[hslot]);
-                    host_lru_list_.push_front(hslot);
-                    host_slot_iters_[hslot] = host_lru_list_.begin();
-
+                int h_flat = expert_flat_index(miss.layer, miss.expert_id);
+                int hslot = host_layer_expert_to_slot_[h_flat];
+                if (hslot >= 0) {
+                    host_lru_list_.splice(host_lru_list_.begin(), host_lru_list_, host_slot_iters_[hslot]);
                     const uint8_t* src = host_slot_ptrs_[hslot];
                     copy_to_slot(miss.slot_id, src);
                     stats_.total_transferred_bytes += slot_bytes_;
@@ -823,45 +832,44 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     continue;
                 }
             }
-            to_fill.push_back(miss);
+            to_fill_scratch_.push_back(miss);
         }
 
-        if (host_pool_enabled_ && !to_fill.empty()) {
+        if (host_pool_enabled_ && !to_fill_scratch_.empty()) {
             const auto t0 = std::chrono::steady_clock::now();
             const int parts = fill_parts_;
             const size_t max_chunk = std::max(1, num_host_slots_);
 
-            for (size_t m = 0; m < to_fill.size(); ) {
-                const size_t chunk_size = std::min(max_chunk, to_fill.size() - m);
-                std::vector<int> assigned_hslots(chunk_size);
-                std::vector<std::atomic<int>> parts_left(chunk_size);
+            for (size_t m = 0; m < to_fill_scratch_.size(); ) {
+                const size_t chunk_size = std::min(max_chunk, to_fill_scratch_.size() - m);
+                assigned_hslots_scratch_.resize(chunk_size);
 
                 for (size_t c = 0; c < chunk_size; ++c) {
-                    const auto& miss = to_fill[m + c];
-                    const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
+                    const auto& miss = to_fill_scratch_[m + c];
                     int victim_hslot = host_lru_list_.back();
                     const uint64_t old_key = host_slot_to_key_[victim_hslot];
                     if (old_key != UINT64_MAX) {
-                        host_key_to_slot_.erase(old_key);
+                        int old_layer = static_cast<int>(old_key >> 32);
+                        int old_expert = static_cast<int>(old_key & 0xFFFFFFFF);
+                        host_layer_expert_to_slot_[expert_flat_index(old_layer, old_expert)] = -1;
                     }
-                    host_key_to_slot_[key] = victim_hslot;
+                    const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
+                    host_layer_expert_to_slot_[expert_flat_index(miss.layer, miss.expert_id)] = victim_hslot;
                     host_slot_to_key_[victim_hslot] = key;
 
-                    host_lru_list_.erase(host_slot_iters_[victim_hslot]);
-                    host_lru_list_.push_front(victim_hslot);
-                    host_slot_iters_[victim_hslot] = host_lru_list_.begin();
+                    host_lru_list_.splice(host_lru_list_.begin(), host_lru_list_, host_slot_iters_[victim_hslot]);
 
-                    assigned_hslots[c] = victim_hslot;
-                    parts_left[c].store(parts, std::memory_order_relaxed);
+                    assigned_hslots_scratch_[c] = victim_hslot;
+                    parts_left_scratch_[c].store(parts, std::memory_order_relaxed);
                     ++stats_.host_pool_misses;
                 }
 
                 const std::function<void(int)> fill_task = [&](int task) {
                     const int c = task / parts;
-                    const auto& miss = to_fill[m + c];
-                    uint8_t* host_slot_ptr = host_slot_ptrs_[assigned_hslots[c]];
+                    const auto& miss = to_fill_scratch_[m + c];
+                    uint8_t* host_slot_ptr = host_slot_ptrs_[assigned_hslots_scratch_[c]];
                     load_expert_to_staging(miss.layer, miss.expert_id, host_slot_ptr, task % parts, parts);
-                    if (parts_left[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         copy_to_slot(miss.slot_id, host_slot_ptr);
                     }
                 };
@@ -869,56 +877,57 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
 
                 m += chunk_size;
-                if (m < to_fill.size()) {
+                if (m < to_fill_scratch_.size()) {
                     // Drain in-flight copies of this chunk before the next chunk could evict and overwrite the same host slots
                     copy_q_->wait_and_throw();
                 }
             }
             stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count());
-        } else if (!to_fill.empty()) {
+        } else if (!to_fill_scratch_.empty()) {
             // Double-buffered staging: while one half DMAs, the other half is being filled.
-        const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
-        const int half_capacity = std::max(1, staging_capacity / 2);
-        sycl::event half_done[2];
-        bool half_busy[2] = {false, false};
-        auto timed_wait = [&](sycl::event& ev) {
-            const auto t_sync = std::chrono::steady_clock::now();
-            ev.wait_and_throw();
-            stats_.dma_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t_sync).count());
-        };
-        int chunk_index = 0;
-        for (size_t m = 0; m < to_fill.size(); ++chunk_index) {
-            const int chunk_size = std::min<int>(half_capacity, static_cast<int>(to_fill.size() - m));
-            const int half = chunk_index % 2;
-            if (half_busy[half]) timed_wait(half_done[half]);
-            uint8_t* chunk_base = pinned_staging_ptr_ + static_cast<size_t>(half) * half_capacity * slot_bytes_;
-
-            const auto t0 = std::chrono::steady_clock::now();
-            const int parts = fill_parts_;
-            // The thread finishing an expert's last part submits its h2d copy, so DMA of
-            // early experts overlaps the fill of later ones (SYCL queues are thread-safe).
-            std::vector<std::atomic<int>> parts_left(static_cast<size_t>(chunk_size));
-            for (auto& p : parts_left) p.store(parts, std::memory_order_relaxed);
-            const std::function<void(int)> fill_task = [&](int task) {
-                const int c = task / parts;
-                const auto& miss = to_fill[m + c];
-                uint8_t* staging_slot = chunk_base + static_cast<size_t>(c) * slot_bytes_;
-                load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts);
-                if (parts_left[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    copy_to_slot(miss.slot_id, staging_slot);
-                }
+            const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
+            const int half_capacity = std::max(1, staging_capacity / 2);
+            sycl::event half_done[2];
+            bool half_busy[2] = {false, false};
+            auto timed_wait = [&](sycl::event& ev) {
+                const auto t_sync = std::chrono::steady_clock::now();
+                ev.wait_and_throw();
+                stats_.dma_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t_sync).count());
             };
-            fill_pool_->run(chunk_size * parts, fill_task);
-            stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
-            stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0).count());
+            int chunk_index = 0;
+            for (size_t m = 0; m < to_fill_scratch_.size(); ++chunk_index) {
+                const int chunk_size = std::min<int>(half_capacity, static_cast<int>(to_fill_scratch_.size() - m));
+                const int half = chunk_index % 2;
+                if (half_busy[half]) timed_wait(half_done[half]);
+                uint8_t* chunk_base = pinned_staging_ptr_ + static_cast<size_t>(half) * half_capacity * slot_bytes_;
 
-            half_done[half] = copy_q_->ext_oneapi_submit_barrier();
-            half_busy[half] = true;
-            m += static_cast<size_t>(chunk_size);
-        }
+                const auto t0 = std::chrono::steady_clock::now();
+                const int parts = fill_parts_;
+                // The thread finishing an expert's last part submits its h2d copy, so DMA of
+                // early experts overlaps the fill of later ones (SYCL queues are thread-safe).
+                for (size_t c = 0; c < static_cast<size_t>(chunk_size); ++c) {
+                    parts_left_scratch_[c].store(parts, std::memory_order_relaxed);
+                }
+                const std::function<void(int)> fill_task = [&](int task) {
+                    const int c = task / parts;
+                    const auto& miss = to_fill_scratch_[m + c];
+                    uint8_t* staging_slot = chunk_base + static_cast<size_t>(c) * slot_bytes_;
+                    load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts);
+                    if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        copy_to_slot(miss.slot_id, staging_slot);
+                    }
+                };
+                fill_pool_->run(chunk_size * parts, fill_task);
+                stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
+                stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+
+                half_done[half] = copy_q_->ext_oneapi_submit_barrier();
+                half_busy[half] = true;
+                m += static_cast<size_t>(chunk_size);
+            }
         } // end of else if (!to_fill.empty())
 
         // Capture completion of all DMA operations on copy_q_ with a SYCL hardware barrier.
@@ -932,7 +941,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     prefetch_items_.clear();
 
     // Phase 4: release batch reservations
-    for (int s : batch_reserved_slots) {
+    for (int s : batch_reserved_slots_scratch_) {
         slot_reserved_[s] = false;
     }
 
@@ -956,8 +965,7 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
         const int expert = expert_ids[i];
         if (expert < 0 || expert >= num_experts_per_layer_ || contains(layer, expert)) continue;
         if (host_pool_enabled_) {
-            const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
-            if (host_key_to_slot_.count(key) != 0) continue;
+            if (host_layer_expert_to_slot_[expert_flat_index(layer, expert)] >= 0) continue;
         }
         bool dup = false;
         for (const auto& item : prefetch_items_) dup = dup || item.expert_id == expert;
@@ -973,18 +981,18 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
     if (host_pool_enabled_) {
         for (int c = 0; c < n; ++c) {
             auto& item = prefetch_items_[c];
-            const uint64_t key = (static_cast<uint64_t>(item.layer) << 32) | static_cast<uint32_t>(item.expert_id);
             int victim_hslot = host_lru_list_.back();
             const uint64_t old_key = host_slot_to_key_[victim_hslot];
             if (old_key != UINT64_MAX) {
-                host_key_to_slot_.erase(old_key);
+                int old_layer = static_cast<int>(old_key >> 32);
+                int old_expert = static_cast<int>(old_key & 0xFFFFFFFF);
+                host_layer_expert_to_slot_[expert_flat_index(old_layer, old_expert)] = -1;
             }
-            host_key_to_slot_[key] = victim_hslot;
+            const uint64_t key = (static_cast<uint64_t>(item.layer) << 32) | static_cast<uint32_t>(item.expert_id);
+            host_layer_expert_to_slot_[expert_flat_index(item.layer, item.expert_id)] = victim_hslot;
             host_slot_to_key_[victim_hslot] = key;
 
-            host_lru_list_.erase(host_slot_iters_[victim_hslot]);
-            host_lru_list_.push_front(victim_hslot);
-            host_slot_iters_[victim_hslot] = host_lru_list_.begin();
+            host_lru_list_.splice(host_lru_list_.begin(), host_lru_list_, host_slot_iters_[victim_hslot]);
 
             item.hslot = victim_hslot;
         }
@@ -1016,13 +1024,11 @@ void Qwen4ExpExpertCache::wait_copy() {
 void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
     if (!initialized_ || expert_ids == nullptr) return;
     for (int i = 0; i < count; ++i) {
-        const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_ids[i]);
-        const auto it = key_to_slot_.find(key);
-        if (it == key_to_slot_.end()) continue;
-        const int slot = it->second;
-        lru_list_.erase(slot_iters_[slot]);
-        lru_list_.push_back(slot);
-        slot_iters_[slot] = std::prev(lru_list_.end());
+        int e = expert_ids[i];
+        if (e < 0 || e >= num_experts_per_layer_) continue;
+        int slot = layer_expert_to_slot_[expert_flat_index(layer, e)];
+        if (slot < 0) continue;
+        lru_list_.splice(lru_list_.end(), lru_list_, slot_iters_[slot]);
     }
 }
 

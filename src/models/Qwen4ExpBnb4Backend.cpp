@@ -19,6 +19,28 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 
 namespace {
 
+template <typename T, typename Compare>
+void stable_sort_with_scratch(T* arr, size_t n, T* scratch, Compare comp) {
+    if (n <= 1) return;
+    for (size_t width = 1; width < n; width *= 2) {
+        for (size_t i = 0; i < n; i += 2 * width) {
+            size_t mid = std::min(i + width, n);
+            size_t end = std::min(i + 2 * width, n);
+            size_t p = i, q = mid, k = i;
+            while (p < mid && q < end) {
+                if (comp(arr[q], arr[p])) {
+                    scratch[k++] = arr[q++];
+                } else {
+                    scratch[k++] = arr[p++];
+                }
+            }
+            while (p < mid) scratch[k++] = arr[p++];
+            while (q < end) scratch[k++] = arr[q++];
+        }
+        std::copy(scratch, scratch + n, arr);
+    }
+}
+
 void apply_silu_div4(Context& ctx, Tensor& buf, size_t count) {
     if ((count % 8) == 0) {
         using vec8 = sycl::vec<bf16, 8>;
@@ -517,12 +539,15 @@ bool Qwen4ExpBnb4Backend::load(
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
         prefill_expert_slot_.assign(cfg_.num_experts, -1);
         prefill_expert_uses_.assign(cfg_.num_experts, 0);
+        prefill_unique_.reserve(cfg_.num_experts);
+        prefill_unique_slots_.reserve(cfg_.num_experts);
     } else {
         AILA_LOG_WARN("[Qwen4Exp] Expert cache has %d slots (< %d): prefill acquires experts per token",
                       expert_cache_.num_slots(), cfg_.num_experts + cfg_.num_experts_per_tok);
     }
     prefill_pred_uses_.assign(cfg_.num_experts, 0);
     prefill_pred_unique_.reserve(cfg_.num_experts);
+    sort_scratch_.resize(cfg_.num_experts);
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
     return true;
 }
@@ -545,7 +570,6 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.hc_inject_f32 = Tensor::allocate(ctx, {cap, 4}, dnnl::memory::data_type::f32);
     buf_.x = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
     buf_.y = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
-    buf_.ple_out = Tensor::allocate(ctx, {cap, 10240}, dnnl::memory::data_type::bf16);
 
     // Full Attention buffers
     buf_.full_qkv = Tensor::allocate(ctx, {cap, full_fused_qkv_dim_}, dnnl::memory::data_type::bf16);
@@ -553,7 +577,6 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.z = Tensor::allocate(ctx, {cap, full_q_dim_}, dnnl::memory::data_type::bf16);
     buf_.k = Tensor::allocate(ctx, {cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
     buf_.v = Tensor::allocate(ctx, {cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
-    buf_.qkv = Tensor::allocate(ctx, {cap, full_q_proj_dim_}, dnnl::memory::data_type::bf16);
     buf_.attn_out = Tensor::allocate(ctx, {cap, full_q_dim_}, dnnl::memory::data_type::bf16);
     buf_.decode_scores = Tensor::allocate(ctx, {full_q_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
     constexpr int kDecodeExactTile = 128;
@@ -582,7 +605,6 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
     }
     buf_.moe_h = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
-    buf_.moe_acc_f32 = Tensor::allocate(ctx, {hidden_size_}, dnnl::memory::data_type::f32);
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
     buf_.shared_inter_buf = Tensor::allocate(ctx, {cap, 640}, dnnl::memory::data_type::bf16);
@@ -1028,9 +1050,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
             const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
             if (s_prefill_demote && prefill_unique_.size() > keep) {
-                std::stable_sort(prefill_unique_.begin(), prefill_unique_.end(), [&](int a, int b) {
-                    return prefill_expert_uses_[a] > prefill_expert_uses_[b];
-                });
+                stable_sort_with_scratch(
+                    prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
+                    [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
                 expert_cache_.demote(L, prefill_unique_.data() + keep,
                                      static_cast<int>(prefill_unique_.size() - keep));
             }
@@ -1045,9 +1067,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     prefill_pred_unique_.push_back(e);
                 }
             }
-            std::stable_sort(prefill_pred_unique_.begin(), prefill_pred_unique_.end(), [&](int a, int b) {
-                return prefill_pred_uses_[a] > prefill_pred_uses_[b];
-            });
+            stable_sort_with_scratch(
+                prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
+                [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
             const int prefetch_count = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
             expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(), prefetch_count);
         }

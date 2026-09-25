@@ -5,11 +5,11 @@
 #include "ops/MoeExpertOps.hpp"
 #include "utils/SafeTensors.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 class ExpertFillPool;
@@ -96,7 +96,12 @@ public:
 
     const ExpertCacheStats& stats() const { return stats_; }
     bool contains(int layer, int expert_id) const {
-        return key_to_slot_.count((static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_id)) != 0;
+        if (!initialized_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+        return layer_expert_to_slot_[expert_flat_index(layer, expert_id)] >= 0;
+    }
+    bool host_contains(int layer, int expert_id) const {
+        if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+        return host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)] >= 0;
     }
     void reset_stats() { stats_ = {}; }
     void log_stats(int layer = -1) const;
@@ -177,9 +182,13 @@ private:
     };
     std::vector<LayerWeights> layer_weights_;
 
+    inline int expert_flat_index(int layer, int expert_id) const {
+        return layer * num_experts_per_layer_ + expert_id;
+    }
+
     std::list<int> lru_list_;
     std::vector<std::list<int>::iterator> slot_iters_;
-    std::unordered_map<uint64_t, int> key_to_slot_;
+    std::vector<int> layer_expert_to_slot_;
     std::vector<uint64_t> slot_to_key_;
     std::vector<bool> slot_reserved_;
     std::vector<ops::MoeExpertSlotDev> slots_dev_;
@@ -194,10 +203,26 @@ private:
     int num_host_slots_ = 0;
     std::vector<void*> host_pool_chunks_;
     std::vector<uint8_t*> host_slot_ptrs_;
-    std::unordered_map<uint64_t, int> host_key_to_slot_;
+    std::vector<int> host_layer_expert_to_slot_;
     std::vector<uint64_t> host_slot_to_key_;
     std::list<int> host_lru_list_;
     std::vector<std::list<int>::iterator> host_slot_iters_;
+
+    struct MissInfo {
+        int batch_index;
+        int layer;
+        int expert_id;
+        int slot_id;
+        const uint8_t* prefilled; // staged by prefetch_async, or null
+    };
+
+    // Preallocated scratch to avoid hot-path heap allocations
+    std::vector<MissInfo> misses_scratch_;
+    std::vector<int> batch_reserved_slots_scratch_;
+    std::vector<MissInfo> to_fill_scratch_;
+    std::vector<int> assigned_hslots_scratch_;
+    std::unique_ptr<std::atomic<int>[]> parts_left_scratch_;
+    size_t parts_left_capacity_ = 0;
 
     std::unique_ptr<ExpertFillPool> fill_pool_;
     int fill_parts_ = 8;

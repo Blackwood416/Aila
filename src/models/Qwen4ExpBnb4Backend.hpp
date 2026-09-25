@@ -259,6 +259,7 @@ private:
     // Prefill speculative next-layer prefetch scratch.
     std::vector<int> prefill_pred_unique_;
     std::vector<int> prefill_pred_uses_;
+    std::vector<int> sort_scratch_;
 
     // AILA_Q4E_PREDICT_STATS diagnostic: next-layer expert prediction quality.
     Tensor pred_scores_;
