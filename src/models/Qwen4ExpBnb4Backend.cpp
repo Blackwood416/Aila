@@ -1,4 +1,5 @@
 #include "Qwen4ExpBnb4Backend.hpp"
+#include "../ops/QsaIndexerOps.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
@@ -228,6 +229,7 @@ Qwen4ExpBnb4Backend::Session::Session(
         } else {
             cache.k = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
             cache.v = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
+            cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
         }
     }
 }
@@ -302,10 +304,7 @@ bool Qwen4ExpBnb4Backend::load(
     spec_ = spec;
     cfg_ = spec.qwen4exp_text;
     hidden_size_ = cfg_.hidden_size;
-    max_seq_len_ = std::min(max_seq_len, 2048);
-    if (max_seq_len > 2048) {
-        AILA_LOG_WARN("[Qwen4Exp] Clamping max_seq_len=%d to 2048 (M1 limit; QSA indexer in M2 will support full context)", max_seq_len);
-    }
+    max_seq_len_ = max_seq_len;
 
     full_q_heads_ = cfg_.num_attention_heads;
     full_kv_heads_ = cfg_.num_key_value_heads;
@@ -506,6 +505,16 @@ bool Qwen4ExpBnb4Backend::load(
             layer.q_norm_weight = plus_one_norm(prefix + "self_attn.q_norm.weight");
             weights.upload(prefix + "self_attn.k_norm.weight", ctx);
             layer.k_norm_weight = plus_one_norm(prefix + "self_attn.k_norm.weight");
+
+            // QSA Indexer (M2)
+            const std::string index_qk_name = prefix + "self_attn.indexer.index_qk_proj.weight";
+            if (weights.has_host(index_qk_name) || weights.has(index_qk_name)) {
+                const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                layer.index_qk_weight = &weights.upload(index_qk_name, ctx);
+                layer.index_qk_proj.init(ctx, *layer.index_qk_weight, hidden_size_, indexer_out_dim, false);
+                layer.index_q_norm_weight = plus_one_norm(prefix + "self_attn.indexer.q_layernorm.weight");
+                layer.index_k_norm_weight = plus_one_norm(prefix + "self_attn.indexer.k_layernorm.weight");
+            }
         }
 
         // MoE Router & Shared Expert
@@ -623,6 +632,15 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         dnnl::memory::data_type::f32);
     buf_.scores = Tensor::allocate(ctx, {full_q_heads_, cap, cap}, dnnl::memory::data_type::f32);
     buf_.incr_scores = Tensor::allocate(ctx, {full_q_heads_, cap, max_seq_len_}, dnnl::memory::data_type::f32);
+
+    // QSA Indexer buffers (M2)
+    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+    const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+    buf_.indexer_qk = Tensor::allocate(ctx, {cap, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    buf_.indexer_q = Tensor::allocate(ctx, {cap, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    const int max_complete_blocks = (max_seq_len_ + 3) / 4;
+    buf_.indexer_block_scores = Tensor::allocate(ctx, {max_complete_blocks}, dnnl::memory::data_type::f32);
+    buf_.indexer_active_tokens = Tensor::allocate(ctx, {std::max(max_seq_len_, cfg_.indexer_budget + cfg_.indexer_compress_ratio)}, dnnl::memory::data_type::s32);
 
     // Linear Attention buffers
     buf_.linear_all = Tensor::allocate(ctx, {cap, linear_all_dim_}, dnnl::memory::data_type::bf16);
@@ -985,13 +1003,57 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     cfg_.rope.mrope_section[1],
                     cfg_.rope.mrope_section[2]);
 
+                const int* active_indices = nullptr;
+                int num_active_tokens = 0;
+                if (layer.index_qk_weight && layer.index_q_norm_weight && layer.index_k_norm_weight && cache.indexer_k.valid()) {
+                    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                    DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
+                                1, indexer_out_dim, hidden_size_);
+
+                    ops::qsa_prepare_q_and_cache_k(
+                        ctx, buf_.indexer_qk, *layer.index_q_norm_weight, cache.indexer_k, buf_.indexer_q,
+                        start_pos, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                        (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                        (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                        (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                        session.mropePromptLength_, session.mropeTextPositionDelta_,
+                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+
+                    const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+                    const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
+                    const int num_complete_blocks = cached_len / compress_ratio;
+
+                    if (num_complete_blocks > block_topk) {
+                        ops::qsa_compute_block_scores(
+                            ctx, buf_.indexer_q, cache.indexer_k, *layer.index_k_norm_weight, buf_.indexer_block_scores,
+                            num_complete_blocks, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                            session.mropePromptLength_, session.mropeTextPositionDelta_,
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+
+                        num_active_tokens = ops::qsa_select_topk_and_expand_tokens(
+                            ctx, buf_.indexer_block_scores, num_complete_blocks, block_topk,
+                            cached_len, compress_ratio, buf_.indexer_active_tokens);
+                        active_indices = buf_.indexer_active_tokens.data_as<int>();
+                    }
+                }
+
                 ops::attention_decode(
                     ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
                     full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
-                    &buf_.decode_attn_partials, &buf_.z);
+                    &buf_.decode_attn_partials, &buf_.z, active_indices, num_active_tokens);
 
                 layer.o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.y, 1);
             } else {
+                if (layer.index_qk_weight && cache.indexer_k.valid()) {
+                    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                    DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
+                                count, indexer_out_dim, hidden_size_);
+                    ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                }
+
                 layer.qkv_proj.forward(ctx, linear_scratch_, buf_.x, buf_.full_qkv, count);
                 ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
                                 full_q_heads_, full_kv_heads_, full_head_dim_);

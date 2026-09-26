@@ -52,6 +52,12 @@ struct Qwen4ExpLayer {
     Tensor* q_norm_weight = nullptr; // [256] f32 (1+w)
     Tensor* k_norm_weight = nullptr; // [256] f32 (1+w)
 
+    // QSA Indexer (M2)
+    Linear index_qk_proj;          // (2560, 640) bf16
+    Tensor* index_qk_weight = nullptr; // raw [640, 2560]
+    Tensor* index_q_norm_weight = nullptr; // [128] f32 (1+w)
+    Tensor* index_k_norm_weight = nullptr; // [128] f32 (1+w)
+
     // MoE
     Linear router_gate;            // (2560, 512) bf16
     Linear shared_expert_gate;     // (2560, 1) bf16
@@ -65,6 +71,7 @@ struct Qwen4ExpLayerCache {
     // Full Attention
     Tensor k;
     Tensor v;
+    Tensor indexer_k; // [capacity, 128] bf16
 
     // Linear Attention
     Tensor linear_state;
@@ -96,6 +103,12 @@ struct Qwen4ExpBuffers {
     Tensor decode_attn_partials; // [24, 64 * 256]
     Tensor scores;        // [24, max_seq, max_seq]
     Tensor incr_scores;   // [24, max_seq, max_seq]
+
+    // QSA Indexer
+    Tensor indexer_qk;           // [max_seq, 640]
+    Tensor indexer_q;            // [max_seq, 512]
+    Tensor indexer_block_scores; // [max_blocks] f32
+    Tensor indexer_active_tokens;// [2051] s32
 
     // Linear Attention
     Tensor linear_all;    // [max_seq, 16480]

@@ -174,6 +174,7 @@ set(LIB_SOURCES
     src/ops/GatedDeltaNetOps.cpp
     src/ops/HyperConnectionOps.cpp
     src/ops/MoeExpertOps.cpp
+    src/ops/QsaIndexerOps.cpp
     src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp
     src/inference/Model.cpp

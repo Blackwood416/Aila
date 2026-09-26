@@ -350,7 +350,9 @@ namespace ops {
                           int num_heads, int num_kv_heads, int head_dim,
                           int cached_len,
                           Tensor* exact_partials_buf = nullptr,
-                          const Tensor* gate_buf = nullptr);
+                          const Tensor* gate_buf = nullptr,
+                          const int* active_indices = nullptr,
+                          int num_active_tokens = 0);
 
     // Per-row decode geometry for the multi-row entry point below. Rows are
     // independent sequences, so each carries its own cache and position.

@@ -3,6 +3,7 @@
 #include "models/Qwen4ExpExpertCache.hpp"
 #include "models/Qwen4ExpBnb4Backend.hpp"
 #include "models/Qwen4ExpPle.hpp"
+#include "ops/QsaIndexerOps.hpp"
 #include "utils/SafeTensors.hpp"
 #include "utils/EnvUtils.hpp"
 
@@ -2368,6 +2369,82 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
     std::cout << "[PASS] Real model Expert Cache verified successfully.\n";
 }
 
+void test_qsa_indexer_long_context_dispatch(Context& ctx) {
+    std::cout << "[Test] Running QSA Indexer Long Context (>2048) Dispatch Unit Test...\n";
+    constexpr int cached_len = 2400;
+    constexpr int compress_ratio = 4;
+    constexpr int block_topk = 512;
+    constexpr int num_complete_blocks = cached_len / compress_ratio; // 600
+    expect(num_complete_blocks > block_topk, "Expected num_complete_blocks > 512");
+
+    Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+    Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+
+    std::vector<float> scores_h(num_complete_blocks);
+    for (int i = 0; i < num_complete_blocks; ++i) {
+        scores_h[i] = static_cast<float>(i % 50);
+    }
+    ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), num_complete_blocks * sizeof(float));
+
+    int num_active = ops::qsa_select_topk_and_expand_tokens(
+        ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+    ctx.synchronize();
+
+    expect(num_active == 512 * 4 + 0, "Expected 2048 active tokens (2400 % 4 == 0)");
+    std::vector<int> tokens_h(num_active);
+    ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+
+    for (int i = 1; i < num_active; ++i) {
+        expect(tokens_h[i] > tokens_h[i - 1], "Active tokens must be strictly increasing");
+        expect(tokens_h[i] < cached_len, "Active token index out of range");
+    }
+
+    std::cout << "[PASS] QSA Indexer Long Context Dispatch verified: num_active=" << num_active
+              << ", strictly sorted, zero out-of-bounds.\n";
+}
+
+void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {
+    const std::string model_dir = resolve_qwen4exp_model_dir();
+    if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
+        std::cout << "[Test] Real model directory " << model_dir << " not found, skipping real model QSA indexer tests.\n";
+        return;
+    }
+
+    std::cout << "[Test] Verifying QSA Indexer weights on real model from " << model_dir << "...\n";
+    ModelWeights weights = LoadModelWeightsLazy(model_dir, &ctx);
+
+    int verified_layers = 0;
+    for (int l = 0; l < 48; ++l) {
+        if ((l + 1) % 4 != 0) continue; // Skip linear attention layers
+
+        std::string prefix = "model.language_model.layers." + std::to_string(l) + ".";
+        std::string qk_name = prefix + "self_attn.indexer.index_qk_proj.weight";
+        std::string qn_name = prefix + "self_attn.indexer.q_layernorm.weight";
+        std::string kn_name = prefix + "self_attn.indexer.k_layernorm.weight";
+
+        expect(weights.has_host(qk_name) || weights.has(qk_name), "Missing " + qk_name);
+        expect(weights.has_host(qn_name) || weights.has(qn_name), "Missing " + qn_name);
+        expect(weights.has_host(kn_name) || weights.has(kn_name), "Missing " + kn_name);
+
+        auto qk_info = weights.host_view(qk_name);
+        expect(qk_info.valid(), "Invalid host view for " + qk_name);
+        expect(qk_info.shape.size() == 2 && qk_info.shape[0] == 640 && qk_info.shape[1] == 2560,
+               "Shape mismatch for " + qk_name);
+
+        auto qn_info = weights.host_view(qn_name);
+        expect(qn_info.valid() && qn_info.shape.size() == 1 && qn_info.shape[0] == 128,
+               "Shape mismatch for " + qn_name);
+
+        auto kn_info = weights.host_view(kn_name);
+        expect(kn_info.valid() && kn_info.shape.size() == 1 && kn_info.shape[0] == 128,
+               "Shape mismatch for " + kn_name);
+
+        verified_layers++;
+    }
+    expect(verified_layers == 12, "Expected 12 full attention layers with QSA indexers, verified: " + std::to_string(verified_layers));
+    std::cout << "[PASS] Verified all 12 QSA Indexer weight tensors (index_qk_proj [640, 2560], q_layernorm [128], k_layernorm [128]).\n";
+}
+
 } // namespace
 
 int main() {
@@ -2391,6 +2468,8 @@ int main() {
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);
+        test_qsa_indexer_long_context_dispatch(ctx);
+        test_real_model_qsa_indexer_weights_if_present(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;
     } catch (const std::exception& e) {

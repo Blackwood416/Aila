@@ -1,0 +1,127 @@
+#pragma once
+
+#include "core/Context.hpp"
+#include "core/Tensor.hpp"
+#include <vector>
+
+namespace ops {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+// Prepares Q (RMSNorm with 1+w + RoPE) and writes raw K into cache for QSA indexer (decode: count == 1).
+// indexer_qk: [1, 640] (first 512 for q [4, 128], last 128 for token_k [1, 128])
+// q_norm_w:   [128] (preprocessed with 1.0 + w)
+// k_cache:    [capacity, 128] (raw keys cached before norm and RoPE)
+// q_out:      [4, 128] (normed and RoPE-rotated query heads)
+// pos:        current token position
+void qsa_prepare_q_and_cache_k(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    int pos,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+// Batched write of raw K into k_cache (prefill: count > 1).
+// indexer_qk: [count, 640]
+// k_cache:    [capacity, 128]
+void qsa_cache_k_batched(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    Tensor& k_cache,
+    int start_pos,
+    int count);
+
+// Computes attention scores for complete key blocks (each block is 4 tokens).
+// For block b = 0 .. num_complete_blocks - 1:
+// 1. Mean-pools 4 raw keys: k_pooled = mean(k_cache[4*b .. 4*b+3])
+// 2. RMSNorm with k_norm_w (1+w)
+// 3. RoPE at group_starts = 4 * b
+// 4. Dot product with 4 query heads in q [4, 128], relu, sum over 4 heads, divided by sqrt(128).
+// Writes to scores_out [num_complete_blocks].
+void qsa_compute_block_scores(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& scores_out,
+    int num_complete_blocks,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+// Selects top-k (default 512) active blocks and expands them into individual token indices,
+// appending any trailing tokens [num_complete_blocks * 4 .. cached_len - 1].
+// Returns the total number of active tokens (<= 2051).
+int qsa_select_topk_and_expand_tokens(
+    Context& ctx,
+    const Tensor& scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    Tensor& active_tokens_out);
+
+// CPU host reference functions for verification and testing
+void qsa_prepare_q_and_cache_k_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    int pos,
+    int capacity,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+void qsa_compute_block_scores_host(
+    const bf16* q,
+    const bf16* k_cache,
+    const bf16* k_norm_w,
+    float* scores_out,
+    int num_complete_blocks,
+    int capacity,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+int qsa_select_topk_and_expand_tokens_host(
+    const float* scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    int* active_tokens_out);
+
+} // namespace ops

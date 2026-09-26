@@ -3,6 +3,7 @@
 #include "ops/HyperConnectionOps.hpp"
 #include "ops/MoeExpertOps.hpp"
 #include "ops/GatedDeltaNetOps.hpp"
+#include "ops/QsaIndexerOps.hpp"
 #include "ops/Ops.hpp"
 #include "utils/EnvUtils.hpp"
 
@@ -1547,6 +1548,304 @@ void test_attention_prefill_cached_gate_fusion(Context& ctx) {
     }
 }
 
+static void test_qsa_prepare_q_and_cache_k(Context& ctx) {
+    std::cout << "[Test] Running QSA prepare Q and cache K test...\n";
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int kTotalDim = 640;
+    constexpr int capacity = 32;
+    constexpr int pos = 7;
+    constexpr float theta = 10000000.0f;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> qk_h(kTotalDim);
+    std::vector<bf16> qn_w_h(kHeadDim);
+    std::vector<bf16> k_cache_init(capacity * kHeadDim, bf16(0.0f));
+
+    for (auto& v : qk_h) v = bf16(dist(rng));
+    for (auto& v : qn_w_h) v = bf16(1.0f + dist(rng) * 0.1f);
+
+    // Host reference run
+    std::vector<bf16> k_cache_ref = k_cache_init;
+    std::vector<bf16> q_out_ref(kNumHeads * kHeadDim);
+    ops::qsa_prepare_q_and_cache_k_host(
+        qk_h.data(), qn_w_h.data(), k_cache_ref.data(), q_out_ref.data(),
+        pos, capacity, theta);
+
+    // GPU device run
+    Tensor qk_dev = Tensor::allocate(ctx, {1, kTotalDim}, dnnl::memory::data_type::bf16);
+    Tensor qn_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {capacity, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_dev = Tensor::allocate(ctx, {1, kNumHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(qk_dev.data(), qk_h.data(), qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(qn_dev.data(), qn_w_h.data(), qn_w_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), k_cache_init.data(), k_cache_init.size() * sizeof(bf16));
+
+    ops::qsa_prepare_q_and_cache_k(ctx, qk_dev, qn_dev, k_cache_dev, q_out_dev, pos, theta);
+    ctx.synchronize();
+
+    std::vector<bf16> q_out_gpu(kNumHeads * kHeadDim);
+    std::vector<bf16> k_cache_gpu(capacity * kHeadDim);
+    ctx.memcpy_d2h(q_out_gpu.data(), q_out_dev.data(), q_out_gpu.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_cache_gpu.data(), k_cache_dev.data(), k_cache_gpu.size() * sizeof(bf16));
+
+    // Check q_out
+    float max_q_diff = 0.0f;
+    for (size_t i = 0; i < q_out_gpu.size(); ++i) {
+        float diff = std::abs(static_cast<float>(q_out_gpu[i]) - static_cast<float>(q_out_ref[i]));
+        if (diff > max_q_diff) max_q_diff = diff;
+    }
+    if (max_q_diff > 0.01f) {
+        throw std::runtime_error("test_qsa_prepare_q_and_cache_k: q_out mismatch, max_diff=" + std::to_string(max_q_diff));
+    }
+
+    // Check k_cache at pos
+    for (int d = 0; d < kHeadDim; ++d) {
+        if (k_cache_gpu[pos * kHeadDim + d] != qk_h[kNumHeads * kHeadDim + d]) {
+            throw std::runtime_error("test_qsa_prepare_q_and_cache_k: k_cache mismatch at d=" + std::to_string(d));
+        }
+    }
+    std::cout << "[PASS] QSA prepare Q and cache K (max_q_diff=" << max_q_diff << " <= 0.01)\n";
+}
+
+static void test_qsa_cache_k_batched(Context& ctx) {
+    std::cout << "[Test] Running QSA batched K cache test...\n";
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int kTotalDim = 640;
+    constexpr int capacity = 64;
+    constexpr int start_pos = 16;
+    constexpr int count = 20;
+
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> qk_h(count * kTotalDim);
+    std::vector<bf16> k_cache_init(capacity * kHeadDim, bf16(0.0f));
+    for (auto& v : qk_h) v = bf16(dist(rng));
+
+    Tensor qk_dev = Tensor::allocate(ctx, {count, kTotalDim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {capacity, kHeadDim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(qk_dev.data(), qk_h.data(), qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), k_cache_init.data(), k_cache_init.size() * sizeof(bf16));
+
+    ops::qsa_cache_k_batched(ctx, qk_dev, k_cache_dev, start_pos, count);
+    ctx.synchronize();
+
+    std::vector<bf16> k_cache_gpu(capacity * kHeadDim);
+    ctx.memcpy_d2h(k_cache_gpu.data(), k_cache_dev.data(), k_cache_gpu.size() * sizeof(bf16));
+
+    for (int t = 0; t < count; ++t) {
+        for (int d = 0; d < kHeadDim; ++d) {
+            bf16 expected = qk_h[t * kTotalDim + kNumHeads * kHeadDim + d];
+            bf16 actual = k_cache_gpu[(start_pos + t) * kHeadDim + d];
+            if (expected != actual) {
+                throw std::runtime_error("test_qsa_cache_k_batched mismatch at t=" + std::to_string(t) + " d=" + std::to_string(d));
+            }
+        }
+    }
+    std::cout << "[PASS] QSA batched K cache (count=" << count << ", 0 bit mismatches)\n";
+}
+
+static void test_qsa_compute_block_scores(Context& ctx) {
+    std::cout << "[Test] Running QSA compute block scores test...\n";
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int num_blocks = 32;
+    constexpr int num_tokens = num_blocks * 4;
+    constexpr float theta = 10000000.0f;
+
+    std::mt19937 rng(456);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> q_h(kNumHeads * kHeadDim);
+    std::vector<bf16> k_cache_h(num_tokens * kHeadDim);
+    std::vector<bf16> kn_w_h(kHeadDim);
+    for (auto& v : q_h) v = bf16(dist(rng));
+    for (auto& v : k_cache_h) v = bf16(dist(rng));
+    for (auto& v : kn_w_h) v = bf16(1.0f + dist(rng) * 0.1f);
+
+    // Host reference run
+    std::vector<float> scores_ref(num_blocks);
+    ops::qsa_compute_block_scores_host(
+        q_h.data(), k_cache_h.data(), kn_w_h.data(), scores_ref.data(),
+        num_blocks, num_tokens, theta);
+
+    // GPU device run
+    Tensor q_dev = Tensor::allocate(ctx, {1, kNumHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {num_tokens, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor kn_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), k_cache_h.data(), k_cache_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(kn_dev.data(), kn_w_h.data(), kn_w_h.size() * sizeof(bf16));
+
+    ops::qsa_compute_block_scores(ctx, q_dev, k_cache_dev, kn_dev, scores_dev, num_blocks, theta);
+    ctx.synchronize();
+
+    std::vector<float> scores_gpu(num_blocks);
+    ctx.memcpy_d2h(scores_gpu.data(), scores_dev.data(), scores_gpu.size() * sizeof(float));
+
+    float max_diff = 0.0f;
+    for (int b = 0; b < num_blocks; ++b) {
+        float diff = std::abs(scores_gpu[b] - scores_ref[b]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    if (max_diff > 0.01f) {
+        throw std::runtime_error("test_qsa_compute_block_scores: score mismatch, max_diff=" + std::to_string(max_diff));
+    }
+    std::cout << "[PASS] QSA compute block scores (num_blocks=" << num_blocks << ", max_diff=" << max_diff << " <= 0.01)\n";
+}
+
+static void test_qsa_select_topk_and_expand_tokens(Context& ctx) {
+    std::cout << "[Test] Running QSA select top-k and expand tokens test...\n";
+    // Case 1: num_complete_blocks > 512 (e.g. 600 blocks)
+    {
+        constexpr int num_blocks = 600;
+        constexpr int block_topk = 512;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio + 3; // 2403 tokens
+
+        std::mt19937 rng(789);
+        std::uniform_real_distribution<float> dist(0.0f, 100.0f);
+        std::vector<float> scores_h(num_blocks);
+        for (auto& s : scores_h) s = dist(rng);
+
+        std::vector<int> tokens_ref(block_topk * compress_ratio + 3);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+
+        if (gpu_count != ref_count) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: token count mismatch, gpu=" +
+                                     std::to_string(gpu_count) + " ref=" + std::to_string(ref_count));
+        }
+
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != tokens_ref[i]) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: index mismatch at i=" +
+                                         std::to_string(i) + " gpu=" + std::to_string(tokens_gpu[i]) +
+                                         " ref=" + std::to_string(tokens_ref[i]));
+            }
+        }
+        std::cout << "[PASS] QSA select top-512 and expand tokens (num_blocks=600 -> " << gpu_count << " active tokens, 0 mismatches)\n";
+    }
+
+    // Case 2: num_complete_blocks <= 512 (e.g. 50 blocks)
+    {
+        constexpr int num_blocks = 50;
+        constexpr int block_topk = 512;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio + 2; // 202 tokens
+
+        std::vector<float> scores_h(num_blocks, 1.0f);
+        std::vector<int> tokens_ref(cached_len);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+
+        if (gpu_count != ref_count || gpu_count != cached_len) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: dense count mismatch");
+        }
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != i) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: dense identity mismatch at " + std::to_string(i));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k dense identity fallback (cached_len=202, 0 mismatches)\n";
+    }
+}
+
+static void test_attention_decode_with_qsa_indices(Context& ctx) {
+    std::cout << "[Test] Running Attention Decode with QSA Active Indices test...\n";
+    constexpr int num_heads = 24;
+    constexpr int num_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int cached_len = 2400; // > 2048
+    constexpr int num_active = 2051; // 512 blocks * 4 + 3 tail tokens
+
+    std::mt19937 rng(999);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> q_h(num_heads * head_dim);
+    for (auto& v : q_h) v = bf16(dist(rng));
+
+    // Active indices: select 512 distinct blocks out of 600 complete blocks, plus 3 tail tokens
+    std::vector<int> active_indices_h(num_active);
+    for (int b = 0; b < 512; ++b) {
+        int blk = b;
+        for (int c = 0; c < 4; ++c) {
+            active_indices_h[b * 4 + c] = blk * 4 + c;
+        }
+    }
+    for (int c = 0; c < 3; ++c) {
+        active_indices_h[512 * 4 + c] = 2397 + c;
+    }
+
+    Tensor q_dev = Tensor::allocate(ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor out_dev = Tensor::allocate(ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores_buf = Tensor::allocate(ctx, {num_heads, cached_len}, dnnl::memory::data_type::f32);
+    Tensor active_idx_dev = Tensor::allocate(ctx, {num_active}, dnnl::memory::data_type::s32);
+
+    constexpr int kDecodeExactTile = 128;
+    const int partial_stride = 272;
+    const int max_tiles = (cached_len + kDecodeExactTile - 1) / kDecodeExactTile;
+    Tensor partials_dev = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, (int64_t)partial_stride}, dnnl::memory::data_type::f32);
+
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(active_idx_dev.data(), active_indices_h.data(), active_indices_h.size() * sizeof(int));
+
+    std::vector<bf16> kv_init(num_kv_heads * cached_len * head_dim);
+    for (size_t i = 0; i < kv_init.size(); ++i) kv_init[i] = bf16(dist(rng) * 0.1f);
+    ctx.memcpy_h2d(k_dev.data(), kv_init.data(), kv_init.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), kv_init.data(), kv_init.size() * sizeof(bf16));
+
+    ops::attention_decode(
+        ctx, q_dev, k_dev, v_dev, out_dev, scores_buf,
+        num_heads, num_kv_heads, head_dim, cached_len,
+        &partials_dev, /*gate_buf=*/nullptr,
+        active_idx_dev.data_as<int>(), num_active);
+    ctx.synchronize();
+
+    std::vector<bf16> out_h(num_heads * head_dim);
+    ctx.memcpy_d2h(out_h.data(), out_dev.data(), out_h.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < out_h.size(); ++i) {
+        float val = static_cast<float>(out_h[i]);
+        if (std::isnan(val) || std::isinf(val)) {
+            throw std::runtime_error("test_attention_decode_with_qsa_indices: NaN or Inf detected in attention output at index " + std::to_string(i));
+        }
+    }
+    std::cout << "[PASS] Attention decode with QSA active indices (cached_len=" << cached_len
+              << ", num_active=" << num_active << ", all outputs valid and finite)\n";
+}
+
 } // namespace
 
 int main() {
@@ -1572,6 +1871,13 @@ int main() {
         test_attention_prefill_gate_fusion(ctx);
         test_attention_prefill_cached_gate_fusion(ctx);
         test_split_qgkv(ctx);
+
+        // QSA Indexer (M2) tests
+        test_qsa_prepare_q_and_cache_k(ctx);
+        test_qsa_cache_k_batched(ctx);
+        test_qsa_compute_block_scores(ctx);
+        test_qsa_select_topk_and_expand_tokens(ctx);
+        test_attention_decode_with_qsa_indices(ctx);
 
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;

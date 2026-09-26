@@ -102,7 +102,8 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
                                     int num_kv_heads, int head_dim, int cached_len,
                                     int tail_start, int sink_len, int effective_len,
                                     int wg_size,
-                                    const bf16 *gate_ptr = nullptr) {
+                                    const bf16 *gate_ptr = nullptr,
+                                    const int *active_indices = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -135,7 +136,7 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
           item.barrier(sycl::access::fence_space::local_space);
 
           for (int t = lid; t < effective_len; t += wg_size) {
-            int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
+            int cache_t = active_indices ? active_indices[t] : ((t < sink_len) ? t : (tail_start + (t - sink_len)));
             float sum = 0.0f;
             if ((head_dim & 7) == 0) {
               for (int d = 0; d < head_dim; d += 8) {
@@ -182,7 +183,7 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
           for (int d = lid; d < head_dim; d += wg_size) {
             float acc = 0.0f;
             for (int t = 0; t < effective_len; t++) {
-              int cache_t = (t < sink_len) ? t : (tail_start + (t - sink_len));
+              int cache_t = active_indices ? active_indices[t] : ((t < sink_len) ? t : (tail_start + (t - sink_len)));
               acc += shared[t] * v_acc.load(kv_head, cache_t, d);
             }
             float val = static_cast<float>(bf16(acc));
@@ -203,16 +204,17 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                int num_kv_heads, int head_dim, int cached_len,
                                int tail_start, int sink_len, int effective_len,
                                int wg_size,
-                               const Tensor *gate_buf = nullptr) {
+                               const Tensor *gate_buf = nullptr,
+                               const int *active_indices = nullptr) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_baseline_impl<true>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices);
   } else {
     attention_decode_baseline_impl<false>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices);
   }
 }
 
@@ -221,7 +223,8 @@ void attention_decode_exact_head256_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
-    const bf16 *gate_ptr = nullptr) {
+    const bf16 *gate_ptr = nullptr,
+    const int *active_indices = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -275,8 +278,8 @@ void attention_decode_exact_head256_partial_merge_impl(
           float score = -1e30f;
           if (lid < tile_len) {
             const int t = tile_start + lid;
-            const int cache_t =
-                (t < sink_len) ? t : (tail_start + (t - sink_len));
+            const int cache_t = active_indices ? active_indices[t] :
+                ((t < sink_len) ? t : (tail_start + (t - sink_len)));
             score = 0.0f;
             for (int d = 0; d < head_dim; d += 8) {
               score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
@@ -318,8 +321,8 @@ void attention_decode_exact_head256_partial_merge_impl(
             float acc = 0.0f;
             for (int i = 0; i < tile_len; ++i) {
               const int t = tile_start + i;
-              const int cache_t =
-                  (t < sink_len) ? t : (tail_start + (t - sink_len));
+              const int cache_t = active_indices ? active_indices[t] :
+                  ((t < sink_len) ? t : (tail_start + (t - sink_len)));
               acc += logits[i] * v_acc.load(kv_head, cache_t, d);
             }
             partial[kDecodeExact256PartialAccOffset + d] = acc;
@@ -384,16 +387,17 @@ void attention_decode_exact_head256_partial_merge(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
-    const Tensor *gate_buf = nullptr) {
+    const Tensor *gate_buf = nullptr,
+    const int *active_indices = nullptr) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_exact_head256_partial_merge_impl<true>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr);
+        tail_start, sink_len, effective_len, gate_ptr, active_indices);
   } else {
     attention_decode_exact_head256_partial_merge_impl<false>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr);
+        tail_start, sink_len, effective_len, gate_ptr, active_indices);
   }
 }
 
@@ -1278,7 +1282,9 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       Tensor &output, Tensor &scores_buf, int num_heads,
                       int num_kv_heads, int head_dim, int cached_len,
                       Tensor *exact_partials_buf,
-                      const Tensor *gate_buf) {
+                      const Tensor *gate_buf,
+                      const int *active_indices,
+                      int num_active_tokens) {
   static bool jm_log_once = false;
   const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
   bool allow_jm = jm_cfg.allow_jm;
@@ -1289,26 +1295,35 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
   int decode_window = jm_cfg.decode_window;
   int decode_window_start = jm_cfg.decode_window_start;
   int decode_sink = jm_cfg.decode_sink;
-  bool apply_window = (decode_window > 0 && cached_len > decode_window_start);
-  int effective_window = cached_len;
-  if (apply_window) {
-    effective_window = std::min(cached_len, decode_window);
-  }
-  int tail_start = cached_len - effective_window;
+
+  int effective_len = cached_len;
+  int tail_start = 0;
   int sink_len = 0;
-  if (apply_window && decode_sink > 0) {
-    sink_len = std::min(decode_sink, std::max(0, cached_len - effective_window));
-  }
-  int effective_len = effective_window + sink_len;
+  bool contiguous_mode = true;
 
-  // If sink and tail overlap, fall back to full context contiguous view.
-  if (effective_len >= cached_len) {
-    tail_start = 0;
-    sink_len = 0;
-    effective_len = cached_len;
-  }
+  if (active_indices != nullptr && num_active_tokens > 0) {
+    effective_len = num_active_tokens;
+    contiguous_mode = false;
+  } else {
+    bool apply_window = (decode_window > 0 && cached_len > decode_window_start);
+    int effective_window = cached_len;
+    if (apply_window) {
+      effective_window = std::min(cached_len, decode_window);
+    }
+    tail_start = cached_len - effective_window;
+    if (apply_window && decode_sink > 0) {
+      sink_len = std::min(decode_sink, std::max(0, cached_len - effective_window));
+    }
+    effective_len = effective_window + sink_len;
 
-  bool contiguous_mode = (sink_len == 0);
+    // If sink and tail overlap, fall back to full context contiguous view.
+    if (effective_len >= cached_len) {
+      tail_start = 0;
+      sink_len = 0;
+      effective_len = cached_len;
+    }
+    contiguous_mode = (sink_len == 0);
+  }
   int attn_start = tail_start;
 
   if (!jm_log_once && jm_mode > 0) {
@@ -1326,14 +1341,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     jm_log_once = true;
   }
   if (head_dim == 128 && cached_len > 0 && effective_len >= kDecodeExact128MinLen &&
-      exact_partials_buf && exact_partials_buf->valid()) {
+      exact_partials_buf && exact_partials_buf->valid() && !active_indices) {
     attention_decode_exact_head128_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
         num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
     return;
   }
 
-  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0) {
+  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0 && !active_indices) {
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
                                   attn_start, jm_tile_id, decode_wg, gate_buf);
@@ -1344,14 +1359,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
       exact_partials_buf && exact_partials_buf->valid()) {
     attention_decode_exact_head256_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
-        num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
+        num_kv_heads, tail_start, sink_len, effective_len, gate_buf, active_indices);
     return;
   }
 
   attention_decode_baseline(ctx, q, k_cache, v_cache, output, scores_buf,
                             num_heads, num_kv_heads, head_dim, cached_len,
                             tail_start, sink_len, effective_len,
-                            decode_wg, gate_buf);
+                            decode_wg, gate_buf, active_indices);
 }
 
 
