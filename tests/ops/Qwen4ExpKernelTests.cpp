@@ -501,16 +501,35 @@ static void run_router_softmax_topk_test(Context& ctx, int tokens) {
     check_close_f32(gpu_weights, ref_weights, "router_softmax_topk_device weights tokens=" + std::to_string(tokens), 1e-4f);
 }
 
-static void run_router_topk_ids_test(Context& ctx, int tokens) {
+static void run_router_topk_ids_test(Context& ctx, int tokens, int test_mode = 0) {
     constexpr int num_experts = 512;
     constexpr int top_k = 10;
 
-    std::mt19937 rng(2027 + tokens);
+    std::mt19937 rng(2027 + tokens + test_mode * 100);
     std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
 
     std::vector<bf16> scores_host(tokens * num_experts);
     for (size_t i = 0; i < scores_host.size(); ++i) {
-        scores_host[i] = bf16(dist(rng));
+        if (test_mode == 1) {
+            // Negative logits
+            scores_host[i] = bf16(dist(rng) - 50.0f);
+        } else if (test_mode == 2) {
+            // Extremely negative logits that broke naive thresholding
+            scores_host[i] = bf16(-1.0e35f);
+        } else if (test_mode == 3) {
+            // Tied logits to verify deterministic index tie-breaking
+            scores_host[i] = bf16(static_cast<float>((i % 16) * 2));
+        } else {
+            scores_host[i] = bf16(dist(rng));
+        }
+    }
+    if (test_mode == 2) {
+        // Give top experts distinctly ordered scores
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < top_k; ++k) {
+                scores_host[t * num_experts + k * 3] = bf16(-1.0e32f + static_cast<float>(top_k - k));
+            }
+        }
     }
 
     std::vector<int> ref_ids(tokens * top_k);
@@ -535,7 +554,8 @@ static void run_router_topk_ids_test(Context& ctx, int tokens) {
         for (int k = 0; k < top_k; ++k) {
             size_t idx = static_cast<size_t>(t) * top_k + k;
             if (gpu_ids[idx] != ref_ids[idx]) {
-                throw std::runtime_error("Router topk IDs mismatch at token " + std::to_string(t) +
+                throw std::runtime_error("Router topk IDs mismatch at mode=" + std::to_string(test_mode) +
+                                         " token " + std::to_string(t) +
                                          " k=" + std::to_string(k) + ": gpu=" +
                                          std::to_string(gpu_ids[idx]) + " ref=" +
                                          std::to_string(ref_ids[idx]));
@@ -547,8 +567,13 @@ static void run_router_topk_ids_test(Context& ctx, int tokens) {
 void test_router_softmax_topk(Context& ctx) {
     run_router_softmax_topk_test(ctx, 1);
     run_router_softmax_topk_test(ctx, 4);
-    run_router_topk_ids_test(ctx, 1);
-    run_router_topk_ids_test(ctx, 4);
+    // Phase E1: Test standard, negative, extreme negative, and tied logits
+    run_router_topk_ids_test(ctx, 1, 0);
+    run_router_topk_ids_test(ctx, 4, 0);
+    run_router_topk_ids_test(ctx, 16, 0);
+    run_router_topk_ids_test(ctx, 4, 1); // Negative logits
+    run_router_topk_ids_test(ctx, 4, 2); // Extremely negative logits
+    run_router_topk_ids_test(ctx, 4, 3); // Tied logits
 }
 
 void test_moe_decode_gate_up_and_down(Context& ctx) {
@@ -1014,14 +1039,32 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
     }
 
     // 4. Expert-major prefill kernels (Phase S4)
+    // Construct true expert-major bucketing matching Qwen4ExpBnb4Backend:
     const int total_acts = tokens * num_active_experts;
     std::vector<int> em_tokens(total_acts);
     std::vector<int> em_ranks(total_acts);
     std::vector<ops::MoeExpertSlotDev> em_slots(total_acts);
-    for (int act = 0; act < total_acts; ++act) {
-        em_tokens[act] = act % tokens;
-        em_ranks[act] = act / tokens;
-        em_slots[act] = slots[em_tokens[act] * num_active_experts + em_ranks[act]];
+
+    std::vector<int> expert_counts(num_unique_experts, 0);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < num_active_experts; ++k) {
+            int e = (t * 7 + k) % num_unique_experts;
+            expert_counts[e]++;
+        }
+    }
+    std::vector<int> expert_offsets(num_unique_experts + 1, 0);
+    for (int e = 0; e < num_unique_experts; ++e) {
+        expert_offsets[e + 1] = expert_offsets[e] + expert_counts[e];
+    }
+    std::vector<int> expert_pos = expert_offsets;
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < num_active_experts; ++k) {
+            int e = (t * 7 + k) % num_unique_experts;
+            int pos = expert_pos[e]++;
+            em_tokens[pos] = t;
+            em_ranks[pos] = k;
+            em_slots[pos] = expert_pool[e];
+        }
     }
 
     Tensor em_tokens_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
@@ -1111,7 +1154,9 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
 void test_moe_prefill_gate_up_and_down(Context& ctx) {
     run_moe_prefill_case(ctx, 2, 4, false);
     run_moe_prefill_case(ctx, 2, 10, true);
+    run_moe_prefill_case(ctx, 26, 10, false);
     run_moe_prefill_case(ctx, 26, 10, true);
+    run_moe_prefill_case(ctx, 64, 10, true);
 }
 
 void test_gated_delta_net_sigmoid(Context& ctx) {

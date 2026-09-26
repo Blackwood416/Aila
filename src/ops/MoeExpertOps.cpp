@@ -277,6 +277,7 @@ sycl::event router_topk_ids_device(
         sycl::local_accessor<float, 1> scores_slm(sycl::range<1>(wg), cgh);
         sycl::local_accessor<float, 1> red_slm(sycl::range<1>(32), cgh);
         sycl::local_accessor<int, 1> red_idx_slm(sycl::range<1>(32), cgh);
+        sycl::local_accessor<int, 1> selected_ids(sycl::range<1>(64), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tokens) * wg),
@@ -295,8 +296,15 @@ sycl::event router_topk_ids_device(
 
                 // Top-K selection directly on raw logits without softmax
                 for (int k = 0; k < top_k; ++k) {
-                    float cand_val = scores_slm[tid];
-                    int cand_idx = tid;
+                    bool already_selected = false;
+                    for (int prev = 0; prev < k; ++prev) {
+                        if (selected_ids[prev] == tid) {
+                            already_selected = true;
+                            break;
+                        }
+                    }
+                    float cand_val = already_selected ? -1.0e38f : scores_slm[tid];
+                    int cand_idx = already_selected ? 999999 : tid;
 
                     // Reduce within subgroup via XOR shuffles
 #pragma unroll
@@ -340,8 +348,8 @@ sycl::event router_topk_ids_device(
 
                     if (tid == 0) {
                         int best_pos = red_idx_slm[0];
+                        selected_ids[k] = best_pos;
                         expert_ids_dev[token * top_k + k] = best_pos;
-                        scores_slm[best_pos] = -1.0e30f;
                     }
                     item.barrier(sycl::access::fence_space::local_space);
                 }

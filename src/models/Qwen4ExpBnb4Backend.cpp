@@ -1136,7 +1136,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             const int total_acts = count * top_k;
             std::fill_n(expert_counts_host_, cfg_.num_experts, 0);
             for (int i = 0; i < total_acts; ++i) {
-                expert_counts_host_[router_host_ids_[i]]++;
+                const int e = router_host_ids_[i];
+                if (e >= 0 && e < cfg_.num_experts) {
+                    expert_counts_host_[e]++;
+                }
             }
             expert_offsets_host_[0] = 0;
             for (int e = 0; e < cfg_.num_experts; ++e) {
@@ -1147,10 +1150,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 for (int k = 0; k < top_k; ++k) {
                     const int i = t * top_k + k;
                     const int e = router_host_ids_[i];
-                    const int pos = expert_curr_pos_host_[e]++;
-                    expert_map_token_host_[pos] = t;
-                    expert_map_rank_host_[pos] = k;
-                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+                    if (e >= 0 && e < cfg_.num_experts) {
+                        const int pos = expert_curr_pos_host_[e]++;
+                        expert_map_token_host_[pos] = t;
+                        expert_map_rank_host_[pos] = k;
+                        expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+                    }
                 }
             }
 
