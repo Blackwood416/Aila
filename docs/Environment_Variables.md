@@ -415,3 +415,5 @@ an inherited path. See [execution-tracing.md](execution-tracing.md).
 | `AILA_Q4E_FILL_PARTS` | int (1-64) | `8` | Number of parallel chunks per expert file read / dequantization during host staging. |
 | `AILA_Q4E_HOST_PROTECTED_RATIO` | float | `0.75` | Protected list ratio for the host 2-tier Segmented LRU (SLRU) cache to resist cache scan thrashing. |
 | `AILA_Q4E_PREFILL_PREFETCH_MAX` | int | `32` | Maximum number of unique predicted experts to prefetch asynchronously into host pool during prefill. |
+| `AILA_Q4E_ASYNC_DEQUANT` | bool | `true` | Phase N2 asynchronous on-demand weight dequantization for Qwen4Exp prefill projections, eliminating per-projection `ctx.synchronize()` stalls on the in-order SYCL queue. |
+| `AILA_BNB4_PREFILL_ASYNC_DEQUANT` | bool | `false` | Global fallback override to bypass `ctx.synchronize()` after on-demand weight dequantization in `Bnb4BitLinear::forward`. |

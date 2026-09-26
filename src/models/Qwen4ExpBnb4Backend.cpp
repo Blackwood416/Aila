@@ -341,6 +341,7 @@ bool Qwen4ExpBnb4Backend::load(
         if (weights.has(weight_name + ".quant_state.bitsandbytes__nf4")) weights.erase(weight_name + ".quant_state.bitsandbytes__nf4");
     };
 
+    static const bool s_q4e_async_dequant = aila::env::read_flag("AILA_Q4E_ASYNC_DEQUANT", true);
     auto init_quant_linear = [&](const std::string& name, Bnb4BitLinear& linear) -> bool {
         upload_bnb(name);
         Bnb4BitWeightRef ref;
@@ -352,6 +353,9 @@ bool Qwen4ExpBnb4Backend::load(
         if (!linear.init(ctx, ref, &local_error)) {
             if (error_message) *error_message = local_error;
             return false;
+        }
+        if (s_q4e_async_dequant) {
+            linear.set_allow_async_dequant(true);
         }
         return true;
     };
@@ -1373,6 +1377,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                       static_cast<unsigned long long>(hits),
                       static_cast<unsigned long long>(hits + misses),
                       (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0));
+        if (count > 1) {
+            auto dstats = Bnb4BitLinear::get_prefill_dispatch_stats();
+            AILA_LOG_INFO("[Q4E Prefill Dispatch] linear calls: fused_gemm=%llu cached=%llu on_demand=%llu sync_waits=%llu",
+                          static_cast<unsigned long long>(dstats.fused_gemm),
+                          static_cast<unsigned long long>(dstats.cached_weight),
+                          static_cast<unsigned long long>(dstats.on_demand_dequant),
+                          static_cast<unsigned long long>(dstats.sync_wait));
+        }
         if (s_predict_stats && pred_total_ > 0) {
             AILA_LOG_INFO("[Q4E Predict] next-layer overlap=%.1f%% misses_predicted=%llu/%llu (%.1f%%)",
                           100.0 * pred_overlap_ / pred_total_,

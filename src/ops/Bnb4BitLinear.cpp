@@ -19,6 +19,14 @@ using namespace sycl::ext::oneapi::experimental::matrix;
 
 namespace {
 
+struct AtomicPrefillDispatchStats {
+    std::atomic<uint64_t> fused_gemm{0};
+    std::atomic<uint64_t> cached_weight{0};
+    std::atomic<uint64_t> on_demand_dequant{0};
+    std::atomic<uint64_t> sync_wait{0};
+};
+static AtomicPrefillDispatchStats g_prefill_dispatch_stats;
+
 int round_up_seq(int value, int granularity) {
     return ((value + granularity - 1) / granularity) * granularity;
 }
@@ -1803,6 +1811,8 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
         weight_.quant_state.shape = {total_out_features, (int64_t)in_features};
         in_features_ = in_features;
         out_features_ = static_cast<int>(total_out_features);
+        allow_dense_xmx_ = first->allow_dense_xmx_;
+        allow_async_dequant_ = first->allow_async_dequant_;
 
         finish_init(ctx);
         ctx.synchronize();
@@ -2195,6 +2205,7 @@ void Bnb4BitLinear::forward(Context& ctx,
         in_features_ > 0 && (in_features_ % blocksize) == 0 &&
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
+        g_prefill_dispatch_stats.fused_gemm.fetch_add(1, std::memory_order_relaxed);
         scratch.ensure(ctx, seq_len, in_features_, out_features_, false);
         Tensor fused_input = Tensor::view(
             ctx, scratch.input_bf16.data(), {seq_len, (int64_t)in_features_},
@@ -2235,6 +2246,7 @@ void Bnb4BitLinear::forward(Context& ctx,
     Tensor* weight_bf16 = nullptr;
     if (cache_dequantized_weight_) {
         weight_bf16 = &cached_weight_bf16_;
+        g_prefill_dispatch_stats.cached_weight.fetch_add(1, std::memory_order_relaxed);
     } else {
         scratch_weight_bf16 = Tensor::view(ctx, scratch.weight_bf16.data(),
                                           {(int64_t)in_features_, (int64_t)out_features_},
@@ -2246,8 +2258,14 @@ void Bnb4BitLinear::forward(Context& ctx,
                        static_cast<size_t>(seq_len) * static_cast<size_t>(in_features_) * sizeof(bf16));
 
     if (!cache_dequantized_weight_ || !cached_weight_ready_) {
+        g_prefill_dispatch_stats.on_demand_dequant.fetch_add(1, std::memory_order_relaxed);
         dequantize_weight(ctx, *weight_bf16);
-        ctx.synchronize();
+        const bool async_dequant = allow_async_dequant_ ||
+                                   aila::env::read_flag("AILA_BNB4_PREFILL_ASYNC_DEQUANT", false);
+        if (!async_dequant) {
+            ctx.synchronize();
+            g_prefill_dispatch_stats.sync_wait.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     ensure_primitive(ctx, seq_len);
 
@@ -3563,5 +3581,21 @@ void run_fused_softmax_soft_embed_xmx(
                 }
             });
     });
+}
+
+Bnb4BitLinear::PrefillDispatchStats Bnb4BitLinear::get_prefill_dispatch_stats() {
+    PrefillDispatchStats s;
+    s.fused_gemm = g_prefill_dispatch_stats.fused_gemm.load(std::memory_order_relaxed);
+    s.cached_weight = g_prefill_dispatch_stats.cached_weight.load(std::memory_order_relaxed);
+    s.on_demand_dequant = g_prefill_dispatch_stats.on_demand_dequant.load(std::memory_order_relaxed);
+    s.sync_wait = g_prefill_dispatch_stats.sync_wait.load(std::memory_order_relaxed);
+    return s;
+}
+
+void Bnb4BitLinear::reset_prefill_dispatch_stats() {
+    g_prefill_dispatch_stats.fused_gemm.store(0, std::memory_order_relaxed);
+    g_prefill_dispatch_stats.cached_weight.store(0, std::memory_order_relaxed);
+    g_prefill_dispatch_stats.on_demand_dequant.store(0, std::memory_order_relaxed);
+    g_prefill_dispatch_stats.sync_wait.store(0, std::memory_order_relaxed);
 }
 

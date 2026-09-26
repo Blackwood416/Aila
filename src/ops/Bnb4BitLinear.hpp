@@ -85,6 +85,18 @@ public:
     void set_allow_dense_xmx(bool value) { allow_dense_xmx_ = value; }
     bool allow_dense_xmx() const { return allow_dense_xmx_; }
 
+    void set_allow_async_dequant(bool value) { allow_async_dequant_ = value; }
+    bool allow_async_dequant() const { return allow_async_dequant_; }
+
+    struct PrefillDispatchStats {
+        uint64_t fused_gemm = 0;
+        uint64_t cached_weight = 0;
+        uint64_t on_demand_dequant = 0;
+        uint64_t sync_wait = 0;
+    };
+    static PrefillDispatchStats get_prefill_dispatch_stats();
+    static void reset_prefill_dispatch_stats();
+
     void set_lora(std::vector<LoraAttachment>&& attachments) {
         lora_attachments_ = std::move(attachments);
     }
@@ -109,6 +121,7 @@ private:
     bool cache_dequantized_weight_ = false;
     bool cached_weight_ready_ = false;
     bool allow_dense_xmx_ = false;
+    bool allow_async_dequant_ = false;
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;
     dnnl::memory::desc decode_weight_md_;
