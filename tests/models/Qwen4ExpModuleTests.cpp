@@ -1941,6 +1941,154 @@ void test_fill_parts_64_bitmap(Context& ctx) {
     std::cout << "[PASS] Phase S2/N0 64-part bitmap CPU boundary & prefetch verified successfully.\n";
 }
 
+void test_small_gpu_cache_token_fallback_reader_protection(Context& ctx) {
+    std::cout << "[Test] Running small GPU cache token fallback reader protection test...\n";
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 4;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 17 + 5) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x44);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.0f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xEE);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x77);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 1.0f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.25f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes; // only 2 GPU slots!
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // Token 0 requests experts {0, 1}
+    int req0[2] = {0, 1};
+    int slots0[2] = {-1, -1};
+    sycl::event dma_ev0 = cache.acquire(0, req0, 2, slots0);
+    expect(slots0[0] >= 0 && slots0[1] >= 0, "token 0 acquire must succeed");
+
+    // Launch an asynchronous reader kernel on ctx.queue() that reads slot 0
+    // and copies its gate_up_packed content into token 0's device buffer.
+    void* dev_out0 = ctx.alloc_device(gu_packed_per_exp);
+    ops::MoeExpertSlotDev dev_s0 = cache.get_slot_dev(slots0[0]);
+    sycl::event token0_read_event = ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.depends_on(dma_ev0);
+        const uint8_t* src = dev_s0.gate_up_packed;
+        uint8_t* dst = static_cast<uint8_t*>(dev_out0);
+        cgh.parallel_for(sycl::range<1>(gu_packed_per_exp), [=](sycl::id<1> idx) {
+            dst[idx] = src[idx];
+        });
+    });
+
+    // In token fallback: before acquiring experts {2, 3} for Token 1 (which would evict slots 0 and 1),
+    // caller MUST wait for previous token's reader event:
+    token0_read_event.wait_and_throw();
+
+    // Now Token 1 acquires experts {2, 3} -> this safely evicts slots 0 and 1
+    int req1[2] = {2, 3};
+    int slots1[2] = {-1, -1};
+    sycl::event dma_ev1 = cache.acquire(0, req1, 2, slots1);
+    expect(slots1[0] >= 0 && slots1[1] >= 0, "token 1 acquire must succeed");
+
+    // Launch Token 1 reader kernel
+    void* dev_out1 = ctx.alloc_device(gu_packed_per_exp);
+    ops::MoeExpertSlotDev dev_s2 = cache.get_slot_dev(slots1[0]);
+    sycl::event token1_read_event = ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.depends_on(dma_ev1);
+        const uint8_t* src = dev_s2.gate_up_packed;
+        uint8_t* dst = static_cast<uint8_t*>(dev_out1);
+        cgh.parallel_for(sycl::range<1>(gu_packed_per_exp), [=](sycl::id<1> idx) {
+            dst[idx] = src[idx];
+        });
+    });
+    token1_read_event.wait_and_throw();
+
+    // Verify token 0 read the original data of expert 0
+    std::vector<uint8_t> host_out0(gu_packed_per_exp);
+    ctx.memcpy_d2h(host_out0.data(), dev_out0, gu_packed_per_exp);
+    expect(std::memcmp(host_out0.data(), gu_packed_host.data(), gu_packed_per_exp) == 0,
+           "token 0 read corrupted by token 1 eviction");
+
+    // Verify token 1 read the data of expert 2
+    std::vector<uint8_t> host_out1(gu_packed_per_exp);
+    ctx.memcpy_d2h(host_out1.data(), dev_out1, gu_packed_per_exp);
+    expect(std::memcmp(host_out1.data(), gu_packed_host.data() + 2 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "token 1 read data mismatch");
+
+    ctx.free_device(dev_out0);
+    ctx.free_device(dev_out1);
+
+    std::cout << "[PASS] Small GPU cache token fallback reader protection verified successfully.\n";
+}
+
 void test_snapshot_capture_and_truncate(Context& ctx) {
     std::cout << "[Test] Running Phase S5 batched async snapshot capture & truncate test...\n";
 
@@ -2108,6 +2256,7 @@ int main() {
         test_host_prefetch_hit_dma_protection(ctx);
         test_expert_cache_move_lifecycle(ctx);
         test_fill_parts_64_bitmap(ctx);
+        test_small_gpu_cache_token_fallback_reader_protection(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);

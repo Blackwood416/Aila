@@ -639,12 +639,14 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
 
     if (s_expert_major || s_moe_rows) {
+        batch_weights_dev_ = static_cast<float*>(
+            ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
+    }
+    if (s_moe_rows && !s_expert_major) {
         batch_slots_host_ = static_cast<ops::MoeExpertSlotDev*>(
             ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
         batch_slots_dev_ = static_cast<ops::MoeExpertSlotDev*>(
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
-        batch_weights_dev_ = static_cast<float*>(
-            ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     }
     buf_.moe_h = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
@@ -670,6 +672,8 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
         expert_map_slot_dev_ = static_cast<ops::MoeExpertSlotDev*>(
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
+    } else {
+        buf_.moe_down_acc = Tensor{};
     }
 
     if (!buf_.logits.valid()) {
@@ -892,6 +896,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage_t = now;
     };
 
+    sycl::event fallback_last_down_event{};
+
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
@@ -1096,9 +1102,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
         // instead of a blocking round trip per token), then map slots back per token.
         const auto prof_acq_batch_t0 = prof_clock::now();
-        const bool batch_acquire = count > 1 && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        const bool can_batch = count > 1 && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        bool batch_acquire = false;
         sycl::event batch_dma_event{};
-        if (batch_acquire) {
+        if (can_batch) {
             std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
             prefill_unique_.clear();
             for (int i = 0; i < count * top_k; ++i) {
@@ -1107,26 +1114,29 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     prefill_unique_.push_back(e);
                 }
             }
-            prefill_unique_slots_.resize(prefill_unique_.size());
-            batch_dma_event = expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
-                                                    prefill_unique_slots_.data());
-            for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                prefill_expert_slot_[prefill_unique_[u]] = prefill_unique_slots_[u];
-            }
-            // A long prompt touches several times the cache capacity, so plain LRU would leave
-            // only the last layers resident for decode. Keep each layer's share of its most-used
-            // experts hot and queue the rest for eviction, least used first.
-            static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
-            const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
-            if (s_prefill_demote && prefill_unique_.size() > keep) {
-                stable_sort_with_scratch(
-                    prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
-                    [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
-                expert_cache_.demote(L, prefill_unique_.data() + keep,
-                                     static_cast<int>(prefill_unique_.size() - keep));
+            if (prefill_unique_.size() <= static_cast<size_t>(expert_cache_.num_slots())) {
+                batch_acquire = true;
+                prefill_unique_slots_.resize(prefill_unique_.size());
+                batch_dma_event = expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
+                                                        prefill_unique_slots_.data());
+                for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                    prefill_expert_slot_[prefill_unique_[u]] = prefill_unique_slots_[u];
+                }
+                // A long prompt touches several times the cache capacity, so plain LRU would leave
+                // only the last layers resident for decode. Keep each layer's share of its most-used
+                // experts hot and queue the rest for eviction, least used first.
+                static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
+                const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
+                if (s_prefill_demote && prefill_unique_.size() > keep) {
+                    stable_sort_with_scratch(
+                        prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
+                        [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
+                    expert_cache_.demote(L, prefill_unique_.data() + keep,
+                                         static_cast<int>(prefill_unique_.size() - keep));
+                }
             }
         }
-        if (s_prefetch && predict_next && count > 1) {
+        if (s_prefetch && predict_next && count > 1 && batch_acquire) {
             prefill_pred_unique_.clear();
             std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
             const int total_preds = count * top_k;
@@ -1233,7 +1243,6 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
                 nullptr, expert_cache_.uses_nested_codes());
         } else {
-            sycl::event last_down_event{};
             for (int t = 0; t < count; ++t) {
                 const int* t_ids = router_host_ids_ + t * top_k;
                 const float* t_weights = router_host_weights_ + t * top_k;
@@ -1243,9 +1252,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
                     if (t == 0) dma_event = batch_dma_event;
                 } else {
-                    if (t > 0 && last_down_event != sycl::event{}) {
+                    if (count > 1 && fallback_last_down_event != sycl::event{}) {
                         // Protect GPU readers from previous token before acquiring/evicting slots
-                        last_down_event.wait_and_throw();
+                        fallback_last_down_event.wait_and_throw();
+                        fallback_last_down_event = sycl::event{};
                     }
                     const auto prof_acq_t0 = prof_clock::now();
                     dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
@@ -1267,14 +1277,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
                     dma_event);
 
-                last_down_event = ops::moe_decode_down_weighted_accumulate(
-                    ctx, dev_slots, nullptr, t_weights,
-                    static_cast<const bf16*>(buf_.moe_h.data()),
-                    nullptr, y_t,
-                    top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
-                                        static_cast<size_t>(t) * hidden_size_ : nullptr,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
+                if (!batch_acquire && count > 1) {
+                    fallback_last_down_event = ops::moe_decode_down_weighted_accumulate(
+                        ctx, dev_slots, nullptr, t_weights,
+                        static_cast<const bf16*>(buf_.moe_h.data()),
+                        nullptr, y_t,
+                        top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
+                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
+                                            static_cast<size_t>(t) * hidden_size_ : nullptr,
+                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
+                } else {
+                    ops::moe_decode_down_weighted_accumulate(
+                        ctx, dev_slots, nullptr, t_weights,
+                        static_cast<const bf16*>(buf_.moe_h.data()),
+                        nullptr, y_t,
+                        top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
+                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
+                                            static_cast<size_t>(t) * hidden_size_ : nullptr,
+                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
+                }
             }
         }
         stage(kStageExperts);
@@ -1295,6 +1316,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             std::string dump_path = s_dump_dir + "/layer_" + std::to_string(L) + ".bin";
             dump_hidden_row(ctx, dump_path, buf_.hidden4, count - 1, 10240);
         }
+    }
+
+    if (fallback_last_down_event != sycl::event{}) {
+        fallback_last_down_event.wait_and_throw();
+        fallback_last_down_event = sycl::event{};
     }
 
     // 3. Final Hyper-Connection Mixer
