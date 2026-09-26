@@ -54,6 +54,24 @@ void router_softmax_topk_host(
     int top_k = 10,
     bool norm_topk_prob = true);
 
+// Lightweight 512-expert Top-K Router (Device, IDs only)
+// Skips softmax exp, sum reductions, and weights normalization.
+sycl::event router_topk_ids_device(
+    Context& ctx,
+    const bf16* router_scores_ptr,
+    int* expert_ids_dev,
+    int tokens,
+    int num_experts = 512,
+    int top_k = 10);
+
+// Lightweight 512-expert Top-K Router (Host CPU Reference, IDs only)
+void router_topk_ids_host(
+    const bf16* router_scores_ptr,
+    int* expert_ids,
+    int tokens,
+    int num_experts = 512,
+    int top_k = 10);
+
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
 sycl::event moe_decode_gate_up_swiglu_grouped(

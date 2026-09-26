@@ -60,6 +60,29 @@ void router_softmax_topk_host(
     }
 }
 
+void router_topk_ids_host(
+    const bf16* router_scores_ptr,
+    int* expert_ids,
+    int tokens,
+    int num_experts,
+    int top_k) {
+    for (int t = 0; t < tokens; ++t) {
+        const bf16* row = router_scores_ptr + static_cast<size_t>(t) * num_experts;
+        std::vector<std::pair<float, int>> items(num_experts);
+        for (int i = 0; i < num_experts; ++i) {
+            items[static_cast<size_t>(i)] = {static_cast<float>(row[i]), i};
+        }
+        std::partial_sort(items.begin(), items.begin() + top_k, items.end(),
+                          [](const auto& a, const auto& b) {
+                              if (a.first != b.first) return a.first > b.first;
+                              return a.second < b.second;
+                          });
+        for (int k = 0; k < top_k; ++k) {
+            expert_ids[t * top_k + k] = items[static_cast<size_t>(k)].second;
+        }
+    }
+}
+
 sycl::event router_softmax_topk_device(
     Context& ctx,
     const bf16* router_scores_ptr,
@@ -228,6 +251,99 @@ sycl::event router_softmax_topk_device(
                         }
                         expert_weights_dev[token * top_k + k] = w;
                     }
+                }
+            });
+    });
+}
+
+sycl::event router_topk_ids_device(
+    Context& ctx,
+    const bf16* router_scores_ptr,
+    int* expert_ids_dev,
+    int tokens,
+    int num_experts,
+    int top_k) {
+    if (num_experts != 512) {
+        std::vector<bf16> scores_host(static_cast<size_t>(tokens) * num_experts);
+        ctx.memcpy_d2h(scores_host.data(), router_scores_ptr, scores_host.size() * sizeof(bf16));
+        std::vector<int> ids_host(static_cast<size_t>(tokens) * top_k);
+        router_topk_ids_host(scores_host.data(), ids_host.data(), tokens, num_experts, top_k);
+        ctx.memcpy_h2d(expert_ids_dev, ids_host.data(), ids_host.size() * sizeof(int));
+        return {};
+    }
+
+    constexpr int wg = 512;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> scores_slm(sycl::range<1>(wg), cgh);
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(32), cgh);
+        sycl::local_accessor<int, 1> red_idx_slm(sycl::range<1>(32), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tokens) * wg),
+                              sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int token = static_cast<int>(item.get_group(0));
+                const int tid = static_cast<int>(item.get_local_id(0));
+                const bf16* row = router_scores_ptr + static_cast<size_t>(token) * num_experts;
+
+                scores_slm[tid] = static_cast<float>(row[tid]);
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int sg_id = tid / 16;
+                const int sg_lane = tid % 16;
+                auto sg = item.get_sub_group();
+
+                // Top-K selection directly on raw logits without softmax
+                for (int k = 0; k < top_k; ++k) {
+                    float cand_val = scores_slm[tid];
+                    int cand_idx = tid;
+
+                    // Reduce within subgroup via XOR shuffles
+#pragma unroll
+                    for (int offset = 8; offset > 0; offset >>= 1) {
+                        float other_val = sycl::permute_group_by_xor(sg, cand_val, offset);
+                        int other_idx = sycl::permute_group_by_xor(sg, cand_idx, offset);
+                        if (other_val > cand_val || (other_val == cand_val && other_idx < cand_idx)) {
+                            cand_val = other_val;
+                            cand_idx = other_idx;
+                        }
+                    }
+                    if (sg_lane == 0) {
+                        red_slm[sg_id] = cand_val;
+                        red_idx_slm[sg_id] = cand_idx;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    if (sg_id == 0) {
+                        float v0 = red_slm[sg_lane];
+                        int i0 = red_idx_slm[sg_lane];
+                        float v1 = red_slm[sg_lane + 16];
+                        int i1 = red_idx_slm[sg_lane + 16];
+                        if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                            v0 = v1;
+                            i0 = i1;
+                        }
+#pragma unroll
+                        for (int offset = 8; offset > 0; offset >>= 1) {
+                            float other_val = sycl::permute_group_by_xor(sg, v0, offset);
+                            int other_idx = sycl::permute_group_by_xor(sg, i0, offset);
+                            if (other_val > v0 || (other_val == v0 && other_idx < i0)) {
+                                v0 = other_val;
+                                i0 = other_idx;
+                            }
+                        }
+                        if (sg_lane == 0) {
+                            red_idx_slm[0] = i0;
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    if (tid == 0) {
+                        int best_pos = red_idx_slm[0];
+                        expert_ids_dev[token * top_k + k] = best_pos;
+                        scores_slm[best_pos] = -1.0e30f;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
                 }
             });
     });

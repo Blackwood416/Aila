@@ -501,9 +501,54 @@ static void run_router_softmax_topk_test(Context& ctx, int tokens) {
     check_close_f32(gpu_weights, ref_weights, "router_softmax_topk_device weights tokens=" + std::to_string(tokens), 1e-4f);
 }
 
+static void run_router_topk_ids_test(Context& ctx, int tokens) {
+    constexpr int num_experts = 512;
+    constexpr int top_k = 10;
+
+    std::mt19937 rng(2027 + tokens);
+    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+
+    std::vector<bf16> scores_host(tokens * num_experts);
+    for (size_t i = 0; i < scores_host.size(); ++i) {
+        scores_host[i] = bf16(dist(rng));
+    }
+
+    std::vector<int> ref_ids(tokens * top_k);
+    ops::router_topk_ids_host(
+        scores_host.data(), ref_ids.data(), tokens, num_experts, top_k);
+
+    Tensor scores_dev = Tensor::allocate(ctx, {tokens, num_experts}, dnnl::memory::data_type::bf16);
+    Tensor ids_dev = Tensor::allocate(ctx, {tokens, top_k}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(scores_dev.data(), scores_host.data(), scores_host.size() * sizeof(bf16));
+
+    ops::router_topk_ids_device(
+        ctx, static_cast<const bf16*>(scores_dev.data()),
+        static_cast<int*>(ids_dev.data()),
+        tokens, num_experts, top_k);
+    ctx.synchronize();
+
+    std::vector<int> gpu_ids(tokens * top_k);
+    ctx.memcpy_d2h(gpu_ids.data(), ids_dev.data(), gpu_ids.size() * sizeof(int));
+
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            size_t idx = static_cast<size_t>(t) * top_k + k;
+            if (gpu_ids[idx] != ref_ids[idx]) {
+                throw std::runtime_error("Router topk IDs mismatch at token " + std::to_string(t) +
+                                         " k=" + std::to_string(k) + ": gpu=" +
+                                         std::to_string(gpu_ids[idx]) + " ref=" +
+                                         std::to_string(ref_ids[idx]));
+            }
+        }
+    }
+}
+
 void test_router_softmax_topk(Context& ctx) {
     run_router_softmax_topk_test(ctx, 1);
     run_router_softmax_topk_test(ctx, 4);
+    run_router_topk_ids_test(ctx, 1);
+    run_router_topk_ids_test(ctx, 4);
 }
 
 void test_moe_decode_gate_up_and_down(Context& ctx) {

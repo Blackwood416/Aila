@@ -990,9 +990,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             // Route this layer's MoE input through the next layer's router to guess its experts.
             DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
                         count, cfg_.num_experts, hidden_size_);
-            route_event = ops::router_softmax_topk_device(
-                ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
-                pred_host_ids_, pred_host_weights_, count, cfg_.num_experts, top_k, true);
+            static const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
+            if (s_pred_ids_only) {
+                route_event = ops::router_topk_ids_device(
+                    ctx, static_cast<const bf16*>(pred_scores_.data()),
+                    pred_host_ids_, count, cfg_.num_experts, top_k);
+            } else {
+                route_event = ops::router_softmax_topk_device(
+                    ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
+                    pred_host_ids_, pred_host_weights_, count, cfg_.num_experts, top_k, true);
+            }
         }
 
         // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
