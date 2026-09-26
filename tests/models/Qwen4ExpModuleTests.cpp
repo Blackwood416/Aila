@@ -1546,6 +1546,401 @@ void test_host_slot_contention_and_dma_protection(Context& ctx) {
     std::cout << "[PASS] Phase S2 host slot contention & DMA protection verified successfully.\n";
 }
 
+void test_host_prefetch_hit_dma_protection(Context& ctx) {
+    std::cout << "[Test] Running Phase S2/N0 prefetch hit DMA protection test...\n";
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 16;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 7 + 13) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x12);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.25f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xBB);
+    for (size_t i = 0; i < total_dn_packed; ++i) dn_packed_host[i] = static_cast<uint8_t>((i * 11 + 3) % 251);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x34);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 0.75f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.1f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes; // 2 GPU slots
+
+    // Extreme stress test: ONLY 1 Host Slot!
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=1");
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // 1. Prefetch expert 0 (A) -> fills host slot 0 and reserves it
+    int pf[1] = {0};
+    cache.prefetch_async(0, pf, 1);
+    cache.wait_prefetch();
+    expect(cache.host_contains(0, 0), "expert 0 must be in host slot");
+
+    // 2. Acquire {0, 1}:
+    // 0 is prefetch hit -> transfers to batch readers, starts DMA
+    // 1 is demand miss -> needs host slot, but slot 0 is in-flight DMA reader
+    int req[2] = {0, 1};
+    int slots[2] = {-1, -1};
+    cache.acquire(0, req, 2, slots);
+
+    // 3. Immediately prefetch expert 2 (C)
+    // Must also respect DMA event on host slot 0
+    int pf2[1] = {2};
+    cache.prefetch_async(0, pf2, 1);
+    cache.wait_prefetch();
+    cache.wait_copy();
+
+    // Verify GPU content of expert 0
+    ops::MoeExpertSlotDev dev_slot0 = cache.get_slot_dev(slots[0]);
+    std::vector<uint8_t> read_back0(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back0.data(), dev_slot0.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back0.data(), gu_packed_host.data() + 0 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "expert 0 data was corrupted during concurrent prefetch-hit host slot reuse!");
+
+    // Verify GPU content of expert 1
+    ops::MoeExpertSlotDev dev_slot1 = cache.get_slot_dev(slots[1]);
+    std::vector<uint8_t> read_back1(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back1.data(), dev_slot1.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back1.data(), gu_packed_host.data() + 1 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "expert 1 data was corrupted!");
+
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S2/N0 prefetch hit DMA protection verified successfully.\n";
+}
+
+void test_expert_cache_move_lifecycle(Context& ctx) {
+    std::cout << "[Test] Running Phase S2/N0 expert cache move lifecycle test...\n";
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 16;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 7 + 13) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x12);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.25f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xBB);
+    for (size_t i = 0; i < total_dn_packed; ++i) dn_packed_host[i] = static_cast<uint8_t>((i * 11 + 3) % 251);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x34);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 0.75f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.1f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes; // 2 GPU slots
+
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=4");
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache1;
+    std::string err;
+    bool ok = cache1.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                          num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache1 init failed: " + err);
+    cache1.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // Warm up expert 0 and 1 in cache1
+    int req1[2] = {0, 1};
+    int slots1[2] = {-1, -1};
+    cache1.acquire(0, req1, 2, slots1);
+    cache1.wait_copy();
+    expect(cache1.host_contains(0, 0), "cache1 must contain expert 0");
+    expect(cache1.host_contains(0, 1), "cache1 must contain expert 1");
+
+    // Move-construct cache2 from cache1
+    Qwen4ExpExpertCache cache2(std::move(cache1));
+    expect(!cache1.is_initialized(), "cache1 must be uninitialized after move");
+    expect(cache2.is_initialized(), "cache2 must be initialized");
+    expect(cache2.host_contains(0, 0), "cache2 must retain expert 0");
+    expect(cache2.host_contains(0, 1), "cache2 must retain expert 1");
+
+    // 1. Host hit on cache2: expert 0
+    int req2[1] = {0};
+    int slots2[1] = {-1};
+    cache2.acquire(0, req2, 1, slots2);
+    cache2.wait_copy();
+    expect(slots2[0] >= 0, "cache2 hit acquire must succeed");
+
+    // 2. Miss on cache2: acquire expert 2 and 3
+    int req3[2] = {2, 3};
+    int slots3[2] = {-1, -1};
+    cache2.acquire(0, req3, 2, slots3);
+    cache2.wait_copy();
+    expect(slots3[0] >= 0 && slots3[1] >= 0, "cache2 miss acquire must succeed");
+
+    // Verify GPU content of expert 2
+    ops::MoeExpertSlotDev dev_slot2 = cache2.get_slot_dev(slots3[0]);
+    std::vector<uint8_t> read_back2(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back2.data(), dev_slot2.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back2.data(), gu_packed_host.data() + 2 * gu_packed_per_exp, gu_packed_per_exp) == 0,
+           "expert 2 data verification on moved cache failed");
+
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S2/N0 expert cache move lifecycle verified successfully.\n";
+}
+
+void test_fill_parts_64_bitmap(Context& ctx) {
+    std::cout << "[Test] Running Phase S2/N0 64-part bitmap CPU boundary & prefetch test...\n";
+
+    // 1. Pure CPU boundary checks on 64-bit atomic claim bitmap: 0, 31, 32, 33, 63
+    std::atomic<uint64_t> claimed{0};
+    const int check_parts[] = {0, 31, 32, 33, 63};
+    for (int p : check_parts) {
+        const uint64_t bit = uint64_t{1} << p;
+        uint64_t old = claimed.fetch_or(bit, std::memory_order_acq_rel);
+        expect((old & bit) == 0, "bit must not be claimed yet");
+        expect((claimed.load(std::memory_order_relaxed) & bit) != 0, "bit must be set");
+        // Second claim attempt must fail
+        old = claimed.fetch_or(bit, std::memory_order_acq_rel);
+        expect((old & bit) != 0, "duplicate claim must detect already set bit");
+    }
+
+    // 2. Synthetic prefetch & acquire with AILA_Q4E_FILL_PARTS=64
+    _putenv("AILA_Q4E_FILL_PARTS=64");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=2");
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 4;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 13 + 7) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x55);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.0f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0xCC);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x66);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 1.0f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.2f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 2 * slot_bytes;
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed with 64 parts: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // Prefetch expert 0 with 64 parts
+    int pf[1] = {0};
+    cache.prefetch_async(0, pf, 1);
+    cache.wait_prefetch();
+
+    int req[1] = {0};
+    int slots[1] = {-1};
+    cache.acquire(0, req, 1, slots);
+    cache.wait_copy();
+    expect(slots[0] >= 0, "slot must be acquired");
+
+    // Verify GPU memory for expert 0
+    ops::MoeExpertSlotDev dev_slot = cache.get_slot_dev(slots[0]);
+    std::vector<uint8_t> read_back(gu_packed_per_exp);
+    ctx.memcpy_d2h(read_back.data(), dev_slot.gate_up_packed, gu_packed_per_exp);
+    expect(std::memcmp(read_back.data(), gu_packed_host.data(), gu_packed_per_exp) == 0,
+           "expert 0 data with 64 parts verification failed");
+
+    _putenv("AILA_Q4E_FILL_PARTS=");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] Phase S2/N0 64-part bitmap CPU boundary & prefetch verified successfully.\n";
+}
+
 void test_snapshot_capture_and_truncate(Context& ctx) {
     std::cout << "[Test] Running Phase S5 batched async snapshot capture & truncate test...\n";
 
@@ -1710,6 +2105,9 @@ int main() {
         test_slru_host_cache_and_anti_thrashing(ctx);
         test_host_slot_reservation_and_demand_priority(ctx);
         test_host_slot_contention_and_dma_protection(ctx);
+        test_host_prefetch_hit_dma_protection(ctx);
+        test_expert_cache_move_lifecycle(ctx);
+        test_fill_parts_64_bitmap(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);

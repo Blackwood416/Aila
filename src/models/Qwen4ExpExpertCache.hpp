@@ -190,7 +190,7 @@ private:
         int layer = -1;
         int expert_id = -1;
         int hslot = -1;
-        std::atomic<uint32_t> claimed_parts{0};
+        std::atomic<uint64_t> claimed_parts{0};
         std::atomic<int> parts_remaining{0};
         std::atomic<bool> cancelled{false};
         std::atomic<bool> ready{false};
@@ -266,11 +266,13 @@ private:
     std::vector<std::list<int>::iterator> host_slot_iters_;
     std::vector<bool> host_slot_is_protected_;
     std::vector<bool> host_slot_reserved_;
+    std::vector<bool> host_slot_in_batch_readers_;
     std::vector<int> batch_reserved_hslots_scratch_;
     std::vector<sycl::event> host_slot_dma_events_;
     float protected_ratio_ = 0.75f;
     void touch_host_slot(int hslot);
     int pick_victim_hslot();
+    void add_batch_reader_hslot(int hslot);
 
     struct MissInfo {
         int batch_index;

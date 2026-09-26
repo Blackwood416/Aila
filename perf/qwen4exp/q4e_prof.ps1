@@ -55,6 +55,31 @@ $avg = { param($p) ($rows | Measure-Object -Property $p -Average).Average }
 $prefill = Select-String -Path $log -Pattern 'pos=0 count=(\d{2,}) total=([\d.]+)ms.*fill=([\d.]+)ms' | Select-Object -Last 1
 $gen = (Select-String -Path $log -Pattern 'Generated=\d+ in [\d.]+ ms' | Select-Object -First 1).Matches.Value
 $missMs = (& $avg 'fill') / [math]::Max(1, ((& $avg 'n') - (& $avg 'hit')))
+
+# Write sidecar JSON metadata
+$commit = & git -C $repo rev-parse HEAD 2>$null
+$exeHash = if (Test-Path $exe) { (Get-FileHash -Path $exe -Algorithm SHA256).Hash } else { "" }
+$modeLine = Select-String -Path $log -Pattern '\[Qwen4Exp\] Prefill MoE mode: ([^,]+), Router pred: (\S+)' | Select-Object -First 1
+$poolLine = Select-String -Path $log -Pattern '\[Q4E ExpertCache\] slots=(\d+) slot_bytes=(\d+) pool=([\d.]+)MB' | Select-Object -First 1
+$sidecar = [ordered]@{
+    tag = $Tag
+    timestamp = (Get-Date -Format 'o')
+    commit = "$commit".Trim()
+    exe_sha256 = $exeHash
+    max_seq = $MaxSeq
+    max_tokens = $MaxTokens
+    bench = [bool]$Bench
+    env_vars = $EnvVars
+    prefill_moe_mode = if ($modeLine) { $modeLine.Matches[0].Groups[1].Value.Trim() } else { "unknown" }
+    router_pred_mode = if ($modeLine) { $modeLine.Matches[0].Groups[2].Value.Trim() } else { "unknown" }
+    expert_slots = if ($poolLine) { [int]$poolLine.Matches[0].Groups[1].Value } else { 0 }
+    dev_pool_mb = if ($poolLine) { [double]$poolLine.Matches[0].Groups[3].Value } else { 0.0 }
+    decode_avg_ms = [math]::Round((& $avg 'total'), 2)
+    decode_tok_per_s = [math]::Round((1000.0 / (& $avg 'total')), 2)
+}
+$metaPath = Join-Path $logDir "q4e_prof_$Tag.meta.json"
+$sidecar | ConvertTo-Json -Depth 4 | Set-Content -Path $metaPath -Encoding UTF8
+
 '[{0}] steps={1} total={2:N1}ms sync={3:N1} acq={4:N1} fill={5:N1} dma={6:N1} pf_wait={14:N1} pf_used/issued={15:N1}/{16:N1} hit={7:N0}/{8:N0} xfer={9:N0}MB fill/miss={10:N3}ms tok/s={11:N2} | prefill: {12} | {13}' -f `
     $Tag, $rows.Count, (& $avg 'total'), (& $avg 'sync'), (& $avg 'acq'), (& $avg 'fill'), (& $avg 'dma'),
     (& $avg 'hit'), (& $avg 'n'), (& $avg 'mb'), $missMs, (1000.0 / (& $avg 'total')),

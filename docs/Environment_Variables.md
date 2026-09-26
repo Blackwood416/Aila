@@ -400,3 +400,18 @@ an inherited path. See [execution-tracing.md](execution-tracing.md).
 | `AILA_ATTN_VISION_BIDI_EXACT64_SG` | int | `16` | Sub-group size for vision bidirectional attention |
 | `AILA_ATTN_VISION_BIDI_EXACT64_VEC` | bool | `true` | Enable vectorization for vision bidirectional attention |
 | `AILA_ATTN_VISION_BIDI_EXACT64_VUNROLL` | bool | `true` | Enable V-unroll for vision bidirectional attention |
+---
+
+## Qwen3.8-Flash-Next (qwen4_exp)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `AILA_Q4E_EXPERT_MAJOR_PREFILL` | bool | `false` | Phase S4 expert-major prefill grouping activations by expert for gate/up and parallel down projection. Takes precedence over `AILA_Q4E_PREFILL_MOE_ROWS` when enabled. |
+| `AILA_Q4E_PREFILL_MOE_ROWS` | bool | `false` | Phase S1 batched MoE row kernels for multi-token prefill forward (`moe_prefill_gate_up_rows` and `moe_prefill_down_rows`). |
+| `AILA_Q4E_PRED_IDS_ONLY` | bool | `true` | Phase E1 lightweight speculative next-layer router prediction returning only top-k expert IDs without full softmax or weights normalization. |
+| `AILA_Q4E_EXPERT_CACHE_MB` | int | `0` | GPU VRAM budget (in MiB) for the slotted dynamic expert cache. Default `0` automatically allocates available free VRAM above the model base footprint. |
+| `AILA_Q4E_HOST_CACHE_MB` | int | `0` | Pinned host RAM pool budget (in MiB) for hot expert caching in system memory. Default `0` enables automatic sizing. |
+| `AILA_Q4E_FILL_THREADS` | int | `min(8, hw)` | Number of background worker threads in the host expert fill pool. |
+| `AILA_Q4E_FILL_PARTS` | int (1-64) | `8` | Number of parallel chunks per expert file read / dequantization during host staging. |
+| `AILA_Q4E_HOST_PROTECTED_RATIO` | float | `0.75` | Protected list ratio for the host 2-tier Segmented LRU (SLRU) cache to resist cache scan thrashing. |
+| `AILA_Q4E_PREFILL_PREFETCH_MAX` | int | `32` | Maximum number of unique predicted experts to prefetch asynchronously into host pool during prefill. |

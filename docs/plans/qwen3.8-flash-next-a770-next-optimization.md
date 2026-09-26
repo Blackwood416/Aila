@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next / A770 后续优化计划
 
+> 2026-09-26 验收更新：请以 [阶段验收与下一轮优化](qwen3.8-flash-next-a770-acceptance-2026-09-26.md) 为当前结论。本文正文保留 2026-09-25 的设计背景及旧行号，不应将尚未改写的 `[CODE]` 段落当作当前实现；下方阶段表已按验收修正。
+
 日期：2026-09-25。勘察基线：`91c9d8b`，开始勘察时工作树干净。
 
 接续 [A770 Handoff](../Qwen38FlashNext_A770_Handoff.md)，保留 [最初适配计划](qwen3.8-flash-next-bnb-nf4.md) 的模型语义和 M1–M4 边界。本轮仅做代码勘察与方案设计，没有修改运行时代码，没有构建、运行 CTest、实模生成或 GPU benchmark。以下历史性能均引自交接文档，不是本轮复测。
@@ -75,13 +77,13 @@ copy immediate:                                              H2D --------↑ dma
 
 | 阶段 | 交付 | 主要收益来源 | 状态 / 提交 |
 |---|---|---|---|
-| S0 | 小范围耗时口径补齐 + host 热路径去分配 | 可比性、CPU 分配和提交成本 | 已完成 (`9abc996`) |
-| S1 | prefill MoE 两个批量 kernel | 大幅减少 host 提交，保持计算顺序 | 已完成 (`b51a2cc`, `645b9d4`) |
-| S2 | host slot 生命周期 + demand-first fill | 避免无关预取阻塞、保护 DMA source | 已完成 (`26838e1`, `cac125b`) |
-| S3 | router event 边界与 shared 提前提交 + 2-tier SLRU | 用真实独立计算覆盖 CPU acquire 与抗抖动 | 已完成 (`49a69e8`, `3ae5d20`) |
-| S5 | 快照异步批量回读、workspace 回收 | TTFT、尾延迟、内存余量 | 已完成 (`d8205c1`) |
-| S4 | expert-major prefill / 权重多 token 复用 | 同专家多 token 权重复用、L2 高效命中 | 已完成 (`AILA_Q4E_EXPERT_MAJOR_PREFILL`, prefill 24.7s→9.6s, 100% 比特精确) |
-| E1 | 预测轻量化 (Ids-only Prediction) | 降预测成本，跳过无消费者的 softmax/weights | 已完成 (`61a46c5`, decode 83.3ms→75.4ms, 100% 比特精确) |
+| S0 | 小范围耗时口径补齐 + host 热路径去分配 | 可比性、CPU 分配和提交成本 | 去分配主项完成；观测与严格零分配仍有余项 (`9abc996`) |
+| S1 | prefill MoE 两个批量 kernel | 大幅减少 host 提交，保持计算顺序 | 已实现、代表形状测试通过；默认关闭 (`b51a2cc`, `645b9d4`) |
+| S2 | host slot 生命周期 + demand-first fill | 避免无关预取阻塞、保护 DMA source | 部分通过；prefetch DMA reservation、move、part 位图待修，见新验收 R1–R3 |
+| S3 | router event 边界与 shared 提前提交 + 2-tier SLRU | 用真实独立计算覆盖 CPU acquire 与抗抖动 | event 重排已实现；SLRU 独立性能收益未建立 (`49a69e8`, `3ae5d20`) |
+| S5 | 快照异步批量回读、workspace 回收 | TTFT、尾延迟、内存余量 | 第一阶段完成；pinned slab 与二次 CPU copy 未处理 (`d8205c1`) |
+| S4 | expert-major prefill / 权重多 token 复用 | 专家局部性与 down 并行度 | 已实现三个 kernel、默认关闭；24.7s→9.6s 存在冷热混淆，显式 tile 权重复用未实现 |
+| E1 | 预测轻量化 (Ids-only Prediction) | 降预测成本，跳过无消费者的 softmax/weights | 已实现且默认开启；边界测试通过，83.3ms→75.4ms 不能单独归因于该项 (`61a46c5`, `05055aa`) |
 | E2 | DeltaNet 分块、HC/LM head 专项、AOT | 第二阶段计算与启动优化 | 实验性候选 |
 
 可以先独立实施 S1 与 S0；S4 不应作为 S1 的前置条件。S2/S3 先保留 layer router 的顺序依赖，不一次重写整个 scheduler。
