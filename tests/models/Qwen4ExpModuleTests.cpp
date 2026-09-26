@@ -2371,36 +2371,132 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
 
 void test_qsa_indexer_long_context_dispatch(Context& ctx) {
     std::cout << "[Test] Running QSA Indexer Long Context (>2048) Dispatch Unit Test...\n";
-    constexpr int cached_len = 2400;
-    constexpr int compress_ratio = 4;
-    constexpr int block_topk = 512;
-    constexpr int num_complete_blocks = cached_len / compress_ratio; // 600
-    expect(num_complete_blocks > block_topk, "Expected num_complete_blocks > 512");
+    // 1. Long context dispatch (2400 tokens, 600 blocks) compared against host reference
+    {
+        constexpr int cached_len = 2400;
+        constexpr int compress_ratio = 4;
+        constexpr int block_topk = 512;
+        constexpr int num_complete_blocks = cached_len / compress_ratio; // 600
+        expect(num_complete_blocks > block_topk, "Expected num_complete_blocks > 512");
 
-    Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
-    Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+        Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
 
-    std::vector<float> scores_h(num_complete_blocks);
-    for (int i = 0; i < num_complete_blocks; ++i) {
-        scores_h[i] = static_cast<float>(i % 50);
+        std::vector<float> scores_h(num_complete_blocks);
+        for (int i = 0; i < num_complete_blocks; ++i) {
+            scores_h[i] = static_cast<float>(i % 50);
+        }
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), num_complete_blocks * sizeof(float));
+
+        std::vector<int> tokens_ref(block_topk * compress_ratio);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_complete_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        int num_active = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+        ctx.synchronize();
+
+        expect(num_active == ref_count, "Active count must match host reference");
+        expect(num_active == 512 * 4 + 0, "Expected 2048 active tokens (2400 % 4 == 0)");
+        std::vector<int> tokens_h(num_active);
+        ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+
+        for (int i = 0; i < num_active; ++i) {
+            expect(tokens_h[i] == tokens_ref[i], "Active token at " + std::to_string(i) +
+                   " must match host reference: gpu=" + std::to_string(tokens_h[i]) +
+                   " ref=" + std::to_string(tokens_ref[i]));
+            if (i > 0) {
+                expect(tokens_h[i] > tokens_h[i - 1], "Active tokens must be strictly increasing");
+            }
+            expect(tokens_h[i] < cached_len, "Active token index out of range");
+        }
     }
-    ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), num_complete_blocks * sizeof(float));
 
-    int num_active = ops::qsa_select_topk_and_expand_tokens(
-        ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
-    ctx.synchronize();
+    // 2. Boundary test: cached_len = 2051 (num_complete_blocks = 512 -> dense passthrough)
+    {
+        constexpr int cached_len = 2051;
+        constexpr int compress_ratio = 4;
+        constexpr int block_topk = 512;
+        constexpr int num_complete_blocks = cached_len / compress_ratio; // 512
+        expect(num_complete_blocks <= block_topk, "Expected num_complete_blocks <= 512");
 
-    expect(num_active == 512 * 4 + 0, "Expected 2048 active tokens (2400 % 4 == 0)");
-    std::vector<int> tokens_h(num_active);
-    ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+        Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
 
-    for (int i = 1; i < num_active; ++i) {
-        expect(tokens_h[i] > tokens_h[i - 1], "Active tokens must be strictly increasing");
-        expect(tokens_h[i] < cached_len, "Active token index out of range");
+        int num_active = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+        ctx.synchronize();
+
+        expect(num_active == cached_len, "Boundary 2051: dense mode must select all tokens");
+        std::vector<int> tokens_h(num_active);
+        ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+        for (int i = 0; i < num_active; ++i) {
+            expect(tokens_h[i] == i, "Boundary 2051 must be dense identity");
+        }
     }
 
-    std::cout << "[PASS] QSA Indexer Long Context Dispatch verified: num_active=" << num_active
-              << ", strictly sorted, zero out-of-bounds.\n";
+    // 3. Boundary test: cached_len = 2052 (num_complete_blocks = 513 -> sparse transition)
+    {
+        constexpr int cached_len = 2052;
+        constexpr int compress_ratio = 4;
+        constexpr int block_topk = 512;
+        constexpr int num_complete_blocks = cached_len / compress_ratio; // 513
+        expect(num_complete_blocks > block_topk, "Expected num_complete_blocks == 513 > 512");
+
+        std::vector<float> scores_h(num_complete_blocks);
+        // Make block 0 have the lowest score, so block 0 is dropped
+        scores_h[0] = 0.0f;
+        for (int i = 1; i < num_complete_blocks; ++i) scores_h[i] = 10.0f + static_cast<float>(i);
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+        Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), num_complete_blocks * sizeof(float));
+
+        int num_active = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+        ctx.synchronize();
+
+        expect(num_active == 512 * 4, "Boundary 2052: sparse mode must select 2048 tokens (512 blocks)");
+        std::vector<int> tokens_h(num_active);
+        ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+        // Block 0 (tokens 0..3) should be dropped; active tokens start at 4
+        expect(tokens_h[0] == 4, "Dropped block 0: first active token must be 4");
+        for (int i = 1; i < num_active; ++i) {
+            expect(tokens_h[i] > tokens_h[i - 1], "Boundary 2052 active tokens must be strictly increasing");
+        }
+    }
+
+    // 4. Boundary test: cached_len = 2055 (513 complete blocks + 3 tail tokens = 2051 active tokens)
+    {
+        constexpr int cached_len = 2055;
+        constexpr int compress_ratio = 4;
+        constexpr int block_topk = 512;
+        constexpr int num_complete_blocks = cached_len / compress_ratio; // 513
+
+        std::vector<float> scores_h(num_complete_blocks);
+        for (int i = 0; i < num_complete_blocks; ++i) scores_h[i] = static_cast<float>(i + 1);
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+        Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), num_complete_blocks * sizeof(float));
+
+        int num_active = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+        ctx.synchronize();
+
+        expect(num_active == 512 * 4 + 3, "Boundary 2055 must select 2051 active tokens (512 blocks * 4 + 3 tail)");
+        std::vector<int> tokens_h(num_active);
+        ctx.memcpy_d2h(tokens_h.data(), active_tokens_dev.data(), num_active * sizeof(int));
+        // Tail tokens must be 2052, 2053, 2054
+        expect(tokens_h[2048] == 2052, "Tail token 0 mismatch");
+        expect(tokens_h[2049] == 2053, "Tail token 1 mismatch");
+        expect(tokens_h[2050] == 2054, "Tail token 2 mismatch");
+        for (int i = 1; i < num_active; ++i) {
+            expect(tokens_h[i] > tokens_h[i - 1], "Boundary 2055 active tokens must be strictly increasing");
+        }
+    }
+
+    std::cout << "[PASS] QSA Indexer Long Context Dispatch verified: 2400 tokens, 2051/2052/2055 boundary transitions, 100% matched.\n";
 }
 
 void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {

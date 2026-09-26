@@ -121,6 +121,7 @@ void qsa_cache_k_batched(
     Tensor& k_cache,
     int start_pos,
     int count) {
+    if (count <= 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
 
@@ -261,6 +262,8 @@ int qsa_select_topk_and_expand_tokens(
     int cached_len,
     int compress_ratio,
     Tensor& active_tokens_out) {
+    if (cached_len <= 0) return 0;
+
     if (num_complete_blocks <= block_topk) {
         // All complete blocks + tail are selected: dense identity [0 .. cached_len - 1]
         int* out_ptr = active_tokens_out.data_as<int>();
@@ -279,8 +282,10 @@ int qsa_select_topk_and_expand_tokens(
     constexpr int kWgSize = 256;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> local_scores(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<int, 1> local_cnt(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<float, 1> local_max(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<float, 1> local_min(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> local_cnt_gt(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> local_cnt_ge(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(512), cgh);
         sycl::local_accessor<int, 1> blk_counter(sycl::range<1>(1), cgh);
 
@@ -289,81 +294,118 @@ int qsa_select_topk_and_expand_tokens(
             [=](sycl::nd_item<1> item) {
                 const int lid = item.get_local_id(0);
 
-                // 1. Find max score across blocks
-                float max_val = 0.0f;
+                // 1. Find min and max score across blocks
+                float max_val = -1e30f;
+                float min_val = 1e30f;
                 for (int b = lid; b < num_complete_blocks; b += kWgSize) {
-                    max_val = sycl::fmax(max_val, scores_ptr[b]);
+                    float s = scores_ptr[b];
+                    max_val = sycl::fmax(max_val, s);
+                    min_val = sycl::fmin(min_val, s);
                 }
-                local_scores[lid] = max_val;
+                local_max[lid] = max_val;
+                local_min[lid] = min_val;
                 item.barrier(sycl::access::fence_space::local_space);
 
                 for (int s = kWgSize / 2; s > 0; s >>= 1) {
                     if (lid < s) {
-                        local_scores[lid] = sycl::fmax(local_scores[lid], local_scores[lid + s]);
+                        local_max[lid] = sycl::fmax(local_max[lid], local_max[lid + s]);
+                        local_min[lid] = sycl::fmin(local_min[lid], local_min[lid + s]);
                     }
                     item.barrier(sycl::access::fence_space::local_space);
                 }
-                const float global_max = local_scores[0];
+                const float global_max = local_max[0];
+                const float global_min = local_min[0];
                 item.barrier(sycl::access::fence_space::local_space);
 
-                // 2. Binary search on [0.0, global_max] for threshold
-                float low = 0.0f;
+                float low = global_min;
                 float high = global_max;
-                for (int iter = 0; iter < 28; ++iter) {
-                    const float mid = (low + high) * 0.5f;
-                    int cnt = 0;
-                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
-                        if (scores_ptr[b] >= mid) {
-                            cnt++;
-                        }
-                    }
-                    local_cnt[lid] = cnt;
-                    item.barrier(sycl::access::fence_space::local_space);
 
-                    for (int s = kWgSize / 2; s > 0; s >>= 1) {
-                        if (lid < s) {
-                            local_cnt[lid] += local_cnt[lid + s];
+                if (global_max > global_min) {
+                    // 2. Binary search for threshold separating top-k
+                    for (int iter = 0; iter < 32; ++iter) {
+                        const float mid = (low + high) * 0.5f;
+                        int cnt_gt = 0;
+                        int cnt_ge = 0;
+                        for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                            float s = scores_ptr[b];
+                            if (s > mid) cnt_gt++;
+                            if (s >= mid) cnt_ge++;
                         }
+                        local_cnt_gt[lid] = cnt_gt;
+                        local_cnt_ge[lid] = cnt_ge;
                         item.barrier(sycl::access::fence_space::local_space);
-                    }
-                    const int total_cnt = local_cnt[0];
-                    item.barrier(sycl::access::fence_space::local_space);
 
-                    if (total_cnt >= block_topk) {
-                        low = mid;
-                    } else {
-                        high = mid;
+                        for (int s = kWgSize / 2; s > 0; s >>= 1) {
+                            if (lid < s) {
+                                local_cnt_gt[lid] += local_cnt_gt[lid + s];
+                                local_cnt_ge[lid] += local_cnt_ge[lid + s];
+                            }
+                            item.barrier(sycl::access::fence_space::local_space);
+                        }
+                        const int total_gt = local_cnt_gt[0];
+                        const int total_ge = local_cnt_ge[0];
+                        item.barrier(sycl::access::fence_space::local_space);
+
+                        if (total_gt >= block_topk) {
+                            low = mid;
+                        } else if (total_ge < block_topk) {
+                            high = mid;
+                        } else {
+                            // Exact hit: total_gt < block_topk && total_ge >= block_topk
+                            low = mid;
+                            high = mid;
+                            break;
+                        }
                     }
                 }
-                const float thresh = low;
-                item.barrier(sycl::access::fence_space::local_space);
 
                 // 3. Thread 0 gathers top block_topk blocks in strictly ascending block order
                 if (lid == 0) {
-                    int count_greater = 0;
-                    for (int b = 0; b < num_complete_blocks; ++b) {
-                        if (scores_ptr[b] > thresh) {
-                            count_greater++;
+                    if (global_max <= global_min) {
+                        for (int b = 0; b < block_topk; ++b) {
+                            selected_blocks[b] = b;
                         }
-                    }
-                    int needed_equal = (count_greater < block_topk) ? (block_topk - count_greater) : 0;
-                    int added = 0;
-                    for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
-                        if (scores_ptr[b] > thresh) {
-                            selected_blocks[added++] = b;
-                        } else if (scores_ptr[b] == thresh && needed_equal > 0) {
-                            selected_blocks[added++] = b;
-                            needed_equal--;
-                        }
-                    }
-                    if (added < block_topk) {
-                        for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
-                            if (scores_ptr[b] < thresh) {
-                                selected_blocks[added++] = b;
+                        blk_counter[0] = block_topk;
+                    } else {
+                        int count_high = 0;
+                        for (int b = 0; b < num_complete_blocks; ++b) {
+                            if (scores_ptr[b] > high) {
+                                count_high++;
                             }
                         }
+                        const int needed_ties = block_topk - count_high;
+                        int added = 0;
+                        int ties_added = 0;
+                        for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
+                            float s = scores_ptr[b];
+                            if (s > high) {
+                                selected_blocks[added++] = b;
+                            } else if (s >= low && ties_added < needed_ties) {
+                                selected_blocks[added++] = b;
+                                ties_added++;
+                            }
+                        }
+                        // Safety fallback if extreme float rounding left added < block_topk
+                        if (added < block_topk) {
+                            for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
+                                float s = scores_ptr[b];
+                                if (s < low) {
+                                    selected_blocks[added++] = b;
+                                }
+                            }
+                        }
+                        // Ensure strictly increasing order in case safety fallback was hit
+                        for (int i = 1; i < block_topk; ++i) {
+                            int key = selected_blocks[i];
+                            int j = i - 1;
+                            while (j >= 0 && selected_blocks[j] > key) {
+                                selected_blocks[j + 1] = selected_blocks[j];
+                                j--;
+                            }
+                            selected_blocks[j + 1] = key;
+                        }
+                        blk_counter[0] = added;
                     }
-                    blk_counter[0] = added;
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 

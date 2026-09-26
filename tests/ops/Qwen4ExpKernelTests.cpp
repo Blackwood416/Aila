@@ -1778,6 +1778,81 @@ static void test_qsa_select_topk_and_expand_tokens(Context& ctx) {
         }
         std::cout << "[PASS] QSA select top-k dense identity fallback (cached_len=202, 0 mismatches)\n";
     }
+
+    // Case 3: Clustered/tied scores (blocks with highest scores placed at the tail of the block array)
+    {
+        constexpr int num_blocks = 600;
+        constexpr int block_topk = 512;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio + 1; // 2401 tokens (1 tail token)
+
+        std::vector<float> scores_h(num_blocks);
+        for (int i = 0; i < 100; ++i) scores_h[i] = 1.0f;
+        for (int i = 100; i < 300; ++i) scores_h[i] = 2.0f;
+        for (int i = 300; i < 500; ++i) scores_h[i] = 3.0f;
+        for (int i = 500; i < 600; ++i) scores_h[i] = 5.0f; // highest scores at the end
+
+        std::vector<int> tokens_ref(block_topk * compress_ratio + 1);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+
+        if (gpu_count != ref_count) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: clustered count mismatch");
+        }
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != tokens_ref[i]) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: clustered index mismatch at i=" +
+                                         std::to_string(i) + " gpu=" + std::to_string(tokens_gpu[i]) +
+                                         " ref=" + std::to_string(tokens_ref[i]));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k clustered/tied scores (600 blocks -> " << gpu_count << " active tokens, 0 mismatches vs host)\n";
+    }
+
+    // Case 4: All-zero scores (common when all QK dot products <= 0 after ReLU)
+    {
+        constexpr int num_blocks = 600;
+        constexpr int block_topk = 512;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio;
+
+        std::vector<float> scores_h(num_blocks, 0.0f);
+        std::vector<int> tokens_ref(block_topk * compress_ratio);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+
+        if (gpu_count != ref_count) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: all-zero count mismatch");
+        }
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != tokens_ref[i]) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: all-zero index mismatch at i=" +
+                                         std::to_string(i) + " gpu=" + std::to_string(tokens_gpu[i]) +
+                                         " ref=" + std::to_string(tokens_ref[i]));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k all-zero scores (0 mismatches vs host)\n";
+    }
 }
 
 static void test_attention_decode_with_qsa_indices(Context& ctx) {
@@ -1836,14 +1911,57 @@ static void test_attention_decode_with_qsa_indices(Context& ctx) {
     std::vector<bf16> out_h(num_heads * head_dim);
     ctx.memcpy_d2h(out_h.data(), out_dev.data(), out_h.size() * sizeof(bf16));
 
-    for (size_t i = 0; i < out_h.size(); ++i) {
-        float val = static_cast<float>(out_h[i]);
-        if (std::isnan(val) || std::isinf(val)) {
-            throw std::runtime_error("test_attention_decode_with_qsa_indices: NaN or Inf detected in attention output at index " + std::to_string(i));
+    // Deep verification: compute CPU reference attention with active_indices and compare
+    std::vector<float> ref_out(num_heads * head_dim, 0.0f);
+    const int heads_per_kv = num_heads / num_kv_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    float max_attn_diff = 0.0f;
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_head = h / heads_per_kv;
+        std::vector<float> scores(num_active);
+        float max_s = -1e30f;
+        for (int t = 0; t < num_active; ++t) {
+            int cache_t = active_indices_h[t];
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += static_cast<float>(q_h[h * head_dim + d]) *
+                       static_cast<float>(kv_init[kv_head * cached_len * head_dim + cache_t * head_dim + d]);
+            }
+            float s = dot * scale;
+            scores[t] = s;
+            if (s > max_s) max_s = s;
+        }
+        float sum_exp = 0.0f;
+        for (int t = 0; t < num_active; ++t) {
+            scores[t] = std::exp(scores[t] - max_s);
+            sum_exp += scores[t];
+        }
+        const float inv_sum = 1.0f / sum_exp;
+        for (int d = 0; d < head_dim; ++d) {
+            float acc = 0.0f;
+            for (int t = 0; t < num_active; ++t) {
+                int cache_t = active_indices_h[t];
+                acc += scores[t] * static_cast<float>(kv_init[kv_head * cached_len * head_dim + cache_t * head_dim + d]);
+            }
+            float expected_val = static_cast<float>(bf16(acc * inv_sum));
+            float actual_val = static_cast<float>(out_h[h * head_dim + d]);
+            if (std::isnan(actual_val) || std::isinf(actual_val)) {
+                throw std::runtime_error("test_attention_decode_with_qsa_indices: NaN or Inf detected at h=" +
+                                         std::to_string(h) + " d=" + std::to_string(d));
+            }
+            float diff = std::abs(actual_val - expected_val);
+            if (diff > max_attn_diff) max_attn_diff = diff;
         }
     }
+
+    if (max_attn_diff > 0.015f) {
+        throw std::runtime_error("test_attention_decode_with_qsa_indices: attention output mismatch against CPU reference, max_diff=" +
+                                 std::to_string(max_attn_diff));
+    }
+
     std::cout << "[PASS] Attention decode with QSA active indices (cached_len=" << cached_len
-              << ", num_active=" << num_active << ", all outputs valid and finite)\n";
+              << ", num_active=" << num_active << ", max_attn_diff=" << max_attn_diff << " <= 0.015)\n";
 }
 
 } // namespace
