@@ -2089,6 +2089,135 @@ void test_small_gpu_cache_token_fallback_reader_protection(Context& ctx) {
     std::cout << "[PASS] Small GPU cache token fallback reader protection verified successfully.\n";
 }
 
+void test_fill_pool_handoff_and_stale_prefetch_cleanup(Context& ctx) {
+    std::cout << "[Test] Running ExpertFillPool handoff and stale prefetch cleanup test...\n";
+
+    _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=4");
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts_per_layer = 8;
+    constexpr int hidden_size = 256;
+    constexpr int intermediate_size = 64;
+    constexpr int blocksize = 64;
+
+    const int gu_rows = 2 * intermediate_size;
+    const size_t gu_packed_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / 2);
+    const size_t gu_absmax_per_exp = static_cast<size_t>(gu_rows) * (hidden_size / blocksize);
+    const size_t dn_rows = hidden_size;
+    const size_t dn_packed_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / 2);
+    const size_t dn_absmax_per_exp = static_cast<size_t>(dn_rows) * (intermediate_size / blocksize);
+
+    const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
+    const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
+    const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
+    const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+
+    std::vector<uint8_t> gu_packed_host(total_gu_packed);
+    for (size_t i = 0; i < total_gu_packed; ++i) gu_packed_host[i] = static_cast<uint8_t>((i * 19 + 3) % 251);
+    std::vector<uint8_t> gu_absmax_codes(total_gu_absmax, 0x33);
+    std::vector<float> gu_nested_absmax(total_gu_absmax / 256 + 1, 1.0f);
+    std::vector<float> gu_nested_qmap(256, 0.5f);
+
+    std::vector<uint8_t> dn_packed_host(total_dn_packed, 0x88);
+    std::vector<uint8_t> dn_absmax_codes(total_dn_absmax, 0x44);
+    std::vector<float> dn_nested_absmax(total_dn_absmax / 256 + 1, 1.0f);
+    std::vector<float> dn_nested_qmap(256, 0.5f);
+    std::vector<float> qmap(16, 0.25f);
+
+    Bnb4BitHostWeightRef gu_ref;
+    gu_ref.name = "gu";
+    gu_ref.packed_weight.ptr = gu_packed_host.data();
+    gu_ref.packed_weight.bytes = total_gu_packed;
+    gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+    gu_ref.packed_weight.dtype = DT_U8;
+    gu_ref.absmax.ptr = gu_absmax_codes.data();
+    gu_ref.absmax.bytes = total_gu_absmax;
+    gu_ref.absmax.shape = {static_cast<int64_t>(total_gu_absmax)};
+    gu_ref.absmax.dtype = DT_U8;
+    gu_ref.quant_map.ptr = reinterpret_cast<const uint8_t*>(qmap.data());
+    gu_ref.quant_map.bytes = 16 * sizeof(float);
+    gu_ref.quant_map.shape = {16};
+    gu_ref.quant_map.dtype = DT_F32;
+    gu_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(gu_nested_absmax.data());
+    gu_ref.nested_absmax.bytes = gu_nested_absmax.size() * sizeof(float);
+    gu_ref.nested_absmax.dtype = DT_F32;
+    gu_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(gu_nested_qmap.data());
+    gu_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    gu_ref.nested_quant_map.dtype = DT_F32;
+    gu_ref.quant_state.quant_type = "nf4";
+    gu_ref.quant_state.blocksize = blocksize;
+    gu_ref.quant_state.nested = true;
+    gu_ref.quant_state.nested_blocksize = 256;
+    gu_ref.quant_state.nested_offset = 0.05f;
+
+    Bnb4BitHostWeightRef dn_ref = gu_ref;
+    dn_ref.name = "dn";
+    dn_ref.packed_weight.ptr = dn_packed_host.data();
+    dn_ref.packed_weight.bytes = total_dn_packed;
+    dn_ref.packed_weight.shape = {static_cast<int64_t>(num_experts_per_layer * dn_rows), intermediate_size / 2};
+    dn_ref.absmax.ptr = dn_absmax_codes.data();
+    dn_ref.absmax.bytes = total_dn_absmax;
+    dn_ref.absmax.shape = {static_cast<int64_t>(total_dn_absmax)};
+    dn_ref.nested_absmax.ptr = reinterpret_cast<const uint8_t*>(dn_nested_absmax.data());
+    dn_ref.nested_absmax.bytes = dn_nested_absmax.size() * sizeof(float);
+    dn_ref.nested_quant_map.ptr = reinterpret_cast<const uint8_t*>(dn_nested_qmap.data());
+    dn_ref.nested_quant_map.bytes = 256 * sizeof(float);
+    dn_ref.quant_state.blocksize = blocksize;
+    dn_ref.quant_state.nested = true;
+    dn_ref.quant_state.nested_blocksize = 256;
+    dn_ref.quant_state.nested_offset = 0.03f;
+
+    const size_t slot_bytes = gu_packed_per_exp + gu_absmax_per_exp +
+                              dn_packed_per_exp + dn_absmax_per_exp;
+    const size_t gpu_cache_bytes = 4 * slot_bytes;
+
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, num_layers, gpu_cache_bytes,
+                         num_experts_per_layer, hidden_size, intermediate_size, blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, gu_ref, dn_ref);
+
+    // 1. Stress rapid handoff between async prefetch and demand acquire
+    for (int iter = 0; iter < 20; ++iter) {
+        int pf_ids[2] = {(iter * 2) % num_experts_per_layer, (iter * 2 + 1) % num_experts_per_layer};
+        cache.prefetch_async(0, pf_ids, 2);
+
+        // Demand acquire for different experts while prefetch is in flight
+        int dem_ids[2] = {(iter * 2 + 2) % num_experts_per_layer, (iter * 2 + 3) % num_experts_per_layer};
+        int dem_slots[2] = {-1, -1};
+        cache.acquire(0, dem_ids, 2, dem_slots);
+        expect(dem_slots[0] >= 0 && dem_slots[1] >= 0, "demand acquire must succeed");
+        cache.wait_copy();
+    }
+
+    // 2. Test stale prefetch cleanup:
+    // Prefetch expert 0, wait_prefetch(), then acquire expert 1 (leaving expert 0 unconsumed).
+    // Acquire must clean up stale prefetch item so expert 0 is not treated as a phantom in-flight item.
+    int pf[1] = {0};
+    cache.prefetch_async(0, pf, 1);
+    cache.wait_prefetch();
+
+    int req1[1] = {1};
+    int slots1[1] = {-1};
+    cache.acquire(0, req1, 1, slots1);
+    cache.wait_copy();
+    expect(slots1[0] >= 0, "acquire expert 1 must succeed");
+
+    // Acquire expert 2: should not have any stale prefetch leftovers
+    int req2[1] = {2};
+    int slots2[1] = {-1};
+    cache.acquire(0, req2, 1, slots2);
+    cache.wait_copy();
+    expect(slots2[0] >= 0, "acquire expert 2 must succeed");
+
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
+    _putenv("AILA_TEST_Q4E_HOST_POOL=");
+    std::cout << "[PASS] ExpertFillPool handoff and stale prefetch cleanup verified successfully.\n";
+}
+
 void test_snapshot_capture_and_truncate(Context& ctx) {
     std::cout << "[Test] Running Phase S5 batched async snapshot capture & truncate test...\n";
 
@@ -2257,6 +2386,7 @@ int main() {
         test_expert_cache_move_lifecycle(ctx);
         test_fill_parts_64_bitmap(ctx);
         test_small_gpu_cache_token_fallback_reader_protection(ctx);
+        test_fill_pool_handoff_and_stale_prefetch_cleanup(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);

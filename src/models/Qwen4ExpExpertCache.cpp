@@ -29,12 +29,16 @@ public:
     }
 
     ~ExpertFillPool() {
-        cancel_prefetch_job();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stop_ = true;
+            demand_job_.admitting = false;
+            demand_job_.in_flight = false;
+            prefetch_job_.admitting = false;
+            prefetch_job_.in_flight = false;
         }
-        cv_.notify_all();
+        cv_work_.notify_all();
+        cv_done_.notify_all();
         for (auto& w : workers_) {
             if (w.joinable()) w.join();
         }
@@ -42,8 +46,8 @@ public:
 
     int thread_count() const { return static_cast<int>(workers_.size()) + 1; }
     bool busy() const {
-        return demand_job_.in_flight.load(std::memory_order_acquire) ||
-               prefetch_job_.in_flight.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
+        return demand_job_.in_flight || prefetch_job_.in_flight;
     }
 
     // Run a high-priority demand job on workers + calling thread, waiting until complete.
@@ -53,42 +57,48 @@ public:
             for (int i = 0; i < total; ++i) fn(i);
             return;
         }
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            demand_job_.generation.fetch_add(1, std::memory_order_relaxed);
             demand_job_.fn = std::move(fn);
             demand_job_.total = total;
-            demand_job_.next.store(0, std::memory_order_relaxed);
-            demand_job_.done.store(0, std::memory_order_relaxed);
-            demand_job_.in_flight.store(true, std::memory_order_release);
+            demand_job_.next = 0;
+            demand_job_.done = 0;
+            demand_job_.admitting = true;
+            demand_job_.in_flight = true;
         }
-        cv_.notify_all();
+        cv_work_.notify_all();
 
-        // Main thread helps drain demand tasks
+        // Main thread helps execute demand tasks
         for (;;) {
-            const int task = demand_job_.next.fetch_add(1, std::memory_order_relaxed);
-            if (task >= demand_job_.total) break;
-            if (demand_job_.fn) demand_job_.fn(task);
-            demand_job_.done.fetch_add(1, std::memory_order_release);
+            std::function<void(int)> task_fn;
+            int task_id = -1;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (demand_job_.admitting && demand_job_.next < demand_job_.total) {
+                    task_id = demand_job_.next++;
+                    task_fn = demand_job_.fn;
+                }
+            }
+            if (task_id < 0) break;
+            task_fn(task_id);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                demand_job_.done++;
+                if (demand_job_.done >= demand_job_.total) {
+                    cv_done_.notify_all();
+                }
+            }
         }
 
-        // Spin-pause wait for any worker executing a demand task
-        for (int spin = 0; spin < 500 && demand_job_.done.load(std::memory_order_acquire) < total; ++spin) {
-            _mm_pause();
-        }
-        while (demand_job_.done.load(std::memory_order_acquire) < total) {
-            std::this_thread::yield();
-        }
-        demand_job_.in_flight.store(false, std::memory_order_release);
-        demand_job_.next.store(demand_job_.total, std::memory_order_release);
-        for (int spin = 0; spin < 500 && demand_job_.active_workers.load(std::memory_order_acquire) != 0; ++spin) {
-            _mm_pause();
-        }
-        while (demand_job_.active_workers.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
-        }
+        // Wait until all tasks are completed and all active workers have finished
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_done_.wait(lock, [&] {
+                return demand_job_.done >= demand_job_.total && demand_job_.active_workers == 0;
+            });
+            demand_job_.admitting = false;
+            demand_job_.in_flight = false;
             demand_job_.fn = nullptr;
         }
     }
@@ -105,19 +115,18 @@ public:
             for (int i = 0; i < total; ++i) fn(i);
             return;
         }
-        if (prefetch_job_.in_flight.load(std::memory_order_acquire)) {
-            cancel_prefetch_job();
-        }
+        cancel_prefetch_job();
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            prefetch_job_.generation.fetch_add(1, std::memory_order_relaxed);
             prefetch_job_.fn = std::move(fn);
             prefetch_job_.total = total;
-            prefetch_job_.next.store(0, std::memory_order_relaxed);
-            prefetch_job_.done.store(0, std::memory_order_relaxed);
-            prefetch_job_.in_flight.store(true, std::memory_order_release);
+            prefetch_job_.next = 0;
+            prefetch_job_.done = 0;
+            prefetch_job_.admitting = true;
+            prefetch_job_.in_flight = true;
         }
-        cv_.notify_all();
+        cv_work_.notify_all();
     }
 
     void start(int total, std::function<void(int)> fn) {
@@ -125,52 +134,52 @@ public:
     }
 
     void cancel_prefetch_job() {
-        if (!prefetch_job_.in_flight.load(std::memory_order_acquire)) return;
-        prefetch_job_.in_flight.store(false, std::memory_order_release);
-        prefetch_job_.next.store(prefetch_job_.total, std::memory_order_release);
-        for (int spin = 0; spin < 500 && prefetch_job_.active_workers.load(std::memory_order_acquire) != 0; ++spin) {
-            _mm_pause();
-        }
-        while (prefetch_job_.active_workers.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
-        }
-        prefetch_job_.done.store(prefetch_job_.total, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            prefetch_job_.fn = nullptr;
-        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!prefetch_job_.in_flight && !prefetch_job_.admitting) return;
+
+        prefetch_job_.admitting = false;
+        prefetch_job_.in_flight = false;
+        prefetch_job_.next = prefetch_job_.total;
+
+        cv_done_.wait(lock, [&] {
+            return prefetch_job_.active_workers == 0;
+        });
+
+        prefetch_job_.done = prefetch_job_.total;
+        prefetch_job_.fn = nullptr;
     }
 
     void wait_prefetch_job() {
-        if (!prefetch_job_.in_flight.load(std::memory_order_acquire)) {
-            return;
-        }
+        // Main thread helps execute prefetch tasks
         for (;;) {
-            const int task = prefetch_job_.next.fetch_add(1, std::memory_order_relaxed);
-            if (task >= prefetch_job_.total) break;
-            if (prefetch_job_.fn) prefetch_job_.fn(task);
-            if (prefetch_job_.done.fetch_add(1, std::memory_order_release) + 1 == prefetch_job_.total) {
-                prefetch_job_.in_flight.store(false, std::memory_order_release);
+            std::function<void(int)> task_fn;
+            int task_id = -1;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (prefetch_job_.admitting && prefetch_job_.next < prefetch_job_.total) {
+                    task_id = prefetch_job_.next++;
+                    task_fn = prefetch_job_.fn;
+                }
+            }
+            if (task_id < 0) break;
+            task_fn(task_id);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                prefetch_job_.done++;
+                if (prefetch_job_.done >= prefetch_job_.total) {
+                    cv_done_.notify_all();
+                }
             }
         }
-        for (int spin = 0; spin < 500 && prefetch_job_.done.load(std::memory_order_acquire) < prefetch_job_.total; ++spin) {
-            _mm_pause();
-        }
-        while (prefetch_job_.done.load(std::memory_order_acquire) < prefetch_job_.total) {
-            std::this_thread::yield();
-        }
-        prefetch_job_.in_flight.store(false, std::memory_order_release);
-        prefetch_job_.next.store(prefetch_job_.total, std::memory_order_release);
-        for (int spin = 0; spin < 500 && prefetch_job_.active_workers.load(std::memory_order_acquire) != 0; ++spin) {
-            _mm_pause();
-        }
-        while (prefetch_job_.active_workers.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            prefetch_job_.fn = nullptr;
-        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_done_.wait(lock, [&] {
+            return prefetch_job_.done >= prefetch_job_.total && prefetch_job_.active_workers == 0;
+        });
+
+        prefetch_job_.admitting = false;
+        prefetch_job_.in_flight = false;
+        prefetch_job_.fn = nullptr;
     }
 
     void cancel() {
@@ -185,67 +194,66 @@ private:
     struct TaskJob {
         std::function<void(int)> fn;
         int total = 0;
-        std::atomic<int> generation{0};
-        std::atomic<int> next{0};
-        std::atomic<int> done{0};
-        std::atomic<bool> in_flight{false};
-        std::atomic<int> active_workers{0};
+        int next = 0;
+        int done = 0;
+        int active_workers = 0;
+        bool in_flight = false;
+        bool admitting = false;
     };
 
     void WorkerLoop() {
         for (;;) {
-            // 1. Demand tasks have absolute priority
-            if (demand_job_.in_flight.load(std::memory_order_acquire)) {
-                const int gen = demand_job_.generation.load(std::memory_order_relaxed);
-                demand_job_.active_workers.fetch_add(1, std::memory_order_acq_rel);
-                if (demand_job_.in_flight.load(std::memory_order_acquire) &&
-                    demand_job_.generation.load(std::memory_order_relaxed) == gen) {
-                    const int task = demand_job_.next.fetch_add(1, std::memory_order_relaxed);
-                    if (task < demand_job_.total) {
-                        if (demand_job_.fn) demand_job_.fn(task);
-                        demand_job_.done.fetch_add(1, std::memory_order_release);
-                        demand_job_.active_workers.fetch_sub(1, std::memory_order_acq_rel);
-                        continue;
-                    }
+            std::function<void(int)> task_fn;
+            int task_id = -1;
+            bool is_demand = false;
+
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_work_.wait(lock, [&] {
+                    return stop_ ||
+                           (demand_job_.admitting && demand_job_.next < demand_job_.total) ||
+                           (prefetch_job_.admitting && prefetch_job_.next < prefetch_job_.total);
+                });
+                if (stop_) return;
+
+                if (demand_job_.admitting && demand_job_.next < demand_job_.total) {
+                    task_id = demand_job_.next++;
+                    task_fn = demand_job_.fn;
+                    demand_job_.active_workers++;
+                    is_demand = true;
+                } else if (prefetch_job_.admitting && prefetch_job_.next < prefetch_job_.total) {
+                    task_id = prefetch_job_.next++;
+                    task_fn = prefetch_job_.fn;
+                    prefetch_job_.active_workers++;
+                    is_demand = false;
                 }
-                demand_job_.active_workers.fetch_sub(1, std::memory_order_acq_rel);
             }
 
-            // 2. Prefetch tasks run when no demand tasks remain
-            if (prefetch_job_.in_flight.load(std::memory_order_acquire)) {
-                const int gen = prefetch_job_.generation.load(std::memory_order_relaxed);
-                prefetch_job_.active_workers.fetch_add(1, std::memory_order_acq_rel);
-                if (prefetch_job_.in_flight.load(std::memory_order_acquire) &&
-                    prefetch_job_.generation.load(std::memory_order_relaxed) == gen) {
-                    const int task = prefetch_job_.next.fetch_add(1, std::memory_order_relaxed);
-                    if (task < prefetch_job_.total) {
-                        if (prefetch_job_.fn) prefetch_job_.fn(task);
-                        if (prefetch_job_.done.fetch_add(1, std::memory_order_release) + 1 == prefetch_job_.total) {
-                            prefetch_job_.in_flight.store(false, std::memory_order_release);
-                        }
-                        prefetch_job_.active_workers.fetch_sub(1, std::memory_order_acq_rel);
-                        continue;
+            if (task_id >= 0 && task_fn) {
+                task_fn(task_id);
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (is_demand) {
+                    demand_job_.active_workers--;
+                    demand_job_.done++;
+                    if (demand_job_.done >= demand_job_.total || demand_job_.active_workers == 0) {
+                        cv_done_.notify_all();
+                    }
+                } else {
+                    prefetch_job_.active_workers--;
+                    prefetch_job_.done++;
+                    if (prefetch_job_.done >= prefetch_job_.total || prefetch_job_.active_workers == 0) {
+                        cv_done_.notify_all();
                     }
                 }
-                prefetch_job_.active_workers.fetch_sub(1, std::memory_order_acq_rel);
             }
-
-            // 3. Sleep if idle
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [&] {
-                return stop_ ||
-                       (demand_job_.in_flight.load(std::memory_order_relaxed) &&
-                        demand_job_.next.load(std::memory_order_relaxed) < demand_job_.total) ||
-                       (prefetch_job_.in_flight.load(std::memory_order_relaxed) &&
-                        prefetch_job_.next.load(std::memory_order_relaxed) < prefetch_job_.total);
-            });
-            if (stop_) return;
         }
     }
 
     std::vector<std::thread> workers_;
     std::mutex mutex_;
-    std::condition_variable cv_;
+    std::condition_variable cv_work_;
+    std::condition_variable cv_done_;
     bool stop_ = false;
     TaskJob demand_job_;
     TaskJob prefetch_job_;
@@ -957,9 +965,9 @@ void Qwen4ExpExpertCache::ensure_prefetch_item_ready(PrefetchItem& item, int c) 
 }
 
 void Qwen4ExpExpertCache::cancel_prefetch() {
-    if (!prefetch_in_flight_) return;
+    if (!prefetch_in_flight_ && prefetch_items_.empty()) return;
 
-    if (fill_pool_) {
+    if (prefetch_in_flight_ && fill_pool_) {
         fill_pool_->cancel();
     }
 
@@ -986,7 +994,7 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
                     host_slot_is_protected_[h] = false;
                     host_empty_slots_.push_back(h);
                 } else {
-                    host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
+                    host_slot_state_[h].store(2 /* Ready */, std::memory_order_release);
                 }
             }
         }
@@ -1034,6 +1042,25 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     }
     batch_reserved_hslots_scratch_.clear();
 
+    struct AcquireGuard {
+        Qwen4ExpExpertCache* self;
+        bool committed = false;
+        ~AcquireGuard() {
+            if (!committed && self) {
+                for (int s : self->batch_reserved_slots_scratch_) {
+                    self->slot_reserved_[s] = false;
+                }
+                for (int h : self->batch_reserved_hslots_scratch_) {
+                    self->host_slot_reserved_[h] = false;
+                    self->host_slot_in_batch_readers_[h] = false;
+                }
+                self->batch_reserved_slots_scratch_.clear();
+                self->batch_reserved_hslots_scratch_.clear();
+                self->misses_scratch_.clear();
+            }
+        }
+    } guard{this, false};
+
     // Phase 1: check hits and deduplicate within this batch
     int hit_count_in_batch = 0;
     for (int i = 0; i < count; ++i) {
@@ -1057,9 +1084,11 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     // Fast-path: 100% GPU cache hits!
     // No wait on prefetch, zero stall! Background prefetch continues asynchronously!
     if (hit_count_in_batch == count) {
+        guard.committed = true;
         for (int s : batch_reserved_slots_scratch_) {
             slot_reserved_[s] = false;
         }
+        batch_reserved_slots_scratch_.clear();
         return {};
     }
 
@@ -1340,11 +1369,10 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         }
     }
 
-    if (prefetch_in_flight_) {
-        cancel_prefetch();
-    }
+    cancel_prefetch();
 
     // Phase 4: release batch reservations
+    guard.committed = true;
     for (int s : batch_reserved_slots_scratch_) {
         slot_reserved_[s] = false;
     }
@@ -1352,6 +1380,8 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         host_slot_reserved_[h] = false;
         host_slot_in_batch_readers_[h] = false;
     }
+    batch_reserved_slots_scratch_.clear();
+    batch_reserved_hslots_scratch_.clear();
 
     return dma_done_event;
 }

@@ -1302,6 +1302,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
             }
         }
+        if (fallback_last_down_event != sycl::event{}) {
+            fallback_last_down_event.wait_and_throw();
+            fallback_last_down_event = sycl::event{};
+        }
         stage(kStageExperts);
 
         if (!s_fuse_shared) {
