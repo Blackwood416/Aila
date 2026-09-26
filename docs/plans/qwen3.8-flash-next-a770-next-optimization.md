@@ -80,8 +80,8 @@ copy immediate:                                              H2D --------↑ dma
 | S2 | host slot 生命周期 + demand-first fill | 避免无关预取阻塞、保护 DMA source | 已完成 (`26838e1`, `cac125b`) |
 | S3 | router event 边界与 shared 提前提交 + 2-tier SLRU | 用真实独立计算覆盖 CPU acquire 与抗抖动 | 已完成 (`49a69e8`, `3ae5d20`) |
 | S5 | 快照异步批量回读、workspace 回收 | TTFT、尾延迟、内存余量 | 已完成 (`d8205c1`) |
-| S4 | expert-major prefill / 热专家 XMX | 同专家多 token 权重复用 | 规划中（数值实验候选） |
-| E1 | 静态子图、预测轻量化 | 降提交成本和预测成本 | 实验性候选 |
+| S4 | expert-major prefill / 权重多 token 复用 | 同专家多 token 权重复用、L2 高效命中 | 已完成 (`AILA_Q4E_EXPERT_MAJOR_PREFILL`, prefill 24.7s→9.6s, 100% 比特精确) |
+| E1 | 预测轻量化 (Ids-only Prediction) | 降预测成本，跳过无消费者的 softmax/weights | 已完成 (`61a46c5`, decode 83.3ms→75.4ms, 100% 比特精确) |
 | E2 | DeltaNet 分块、HC/LM head 专项、AOT | 第二阶段计算与启动优化 | 实验性候选 |
 
 可以先独立实施 S1 与 S0；S4 不应作为 S1 的前置条件。S2/S3 先保留 layer router 的顺序依赖，不一次重写整个 scheduler。

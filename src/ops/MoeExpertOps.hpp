@@ -216,4 +216,49 @@ void moe_silu_gate_up_mul_flat(
     int total_tokens,
     int intermediate_size);
 
+// Phase S4: Expert-Major Prefill Gate/Up and Down
+sycl::event moe_expert_major_prefill_gate_up(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_acts,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+sycl::event moe_expert_major_prefill_down(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* h,
+    float* down_acc,
+    int total_acts,
+    int top_k,
+    int in_features = 640,
+    int out_features = 2560,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+sycl::event moe_ordered_accumulate_down_rows(
+    Context& ctx,
+    const float* down_acc,
+    const float* weights,
+    bf16* y,
+    int tokens,
+    int top_k,
+    int out_features = 2560,
+    const bf16* shared_out = nullptr,
+    const bf16* shared_gate = nullptr,
+    const sycl::event* dep_event = nullptr);
+
 } // namespace ops

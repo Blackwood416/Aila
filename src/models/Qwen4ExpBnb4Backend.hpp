@@ -108,6 +108,7 @@ struct Qwen4ExpBuffers {
     Tensor shared_gate_up_buf; // [max_seq, 1280]
     Tensor shared_inter_buf;   // [max_seq, 640]
     Tensor shared_out_buf;     // [max_seq, 2560]
+    Tensor moe_down_acc;       // [max_seq, top_k, 2560] f32 (Phase S4 expert-major down accumulation)
 
     // Output
     Tensor logits;
@@ -266,6 +267,17 @@ private:
     ops::MoeExpertSlotDev* batch_slots_host_ = nullptr;
     ops::MoeExpertSlotDev* batch_slots_dev_ = nullptr;
     float* batch_weights_dev_ = nullptr;
+
+    // Phase S4: Expert-major prefill bucket sort and mapping tables (host pinned and device mirrors).
+    int* expert_offsets_host_ = nullptr;
+    int* expert_counts_host_ = nullptr;
+    int* expert_curr_pos_host_ = nullptr;
+    int* expert_map_token_host_ = nullptr;
+    int* expert_map_rank_host_ = nullptr;
+    ops::MoeExpertSlotDev* expert_map_slot_host_ = nullptr;
+    int* expert_map_token_dev_ = nullptr;
+    int* expert_map_rank_dev_ = nullptr;
+    ops::MoeExpertSlotDev* expert_map_slot_dev_ = nullptr;
 
     // Prefill batched expert acquire scratch (expert -> slot / token uses for the current layer).
     std::vector<int> prefill_expert_slot_;

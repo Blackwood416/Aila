@@ -270,6 +270,25 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     batch_slots_host_ = nullptr;
     batch_slots_dev_ = nullptr;
     batch_weights_dev_ = nullptr;
+
+    if (expert_offsets_host_) context_->free_host(expert_offsets_host_);
+    if (expert_counts_host_) context_->free_host(expert_counts_host_);
+    if (expert_curr_pos_host_) context_->free_host(expert_curr_pos_host_);
+    if (expert_map_token_host_) context_->free_host(expert_map_token_host_);
+    if (expert_map_rank_host_) context_->free_host(expert_map_rank_host_);
+    if (expert_map_slot_host_) context_->free_host(expert_map_slot_host_);
+    if (expert_map_token_dev_) context_->free_device(expert_map_token_dev_);
+    if (expert_map_rank_dev_) context_->free_device(expert_map_rank_dev_);
+    if (expert_map_slot_dev_) context_->free_device(expert_map_slot_dev_);
+    expert_offsets_host_ = nullptr;
+    expert_counts_host_ = nullptr;
+    expert_curr_pos_host_ = nullptr;
+    expert_map_token_host_ = nullptr;
+    expert_map_rank_host_ = nullptr;
+    expert_map_slot_host_ = nullptr;
+    expert_map_token_dev_ = nullptr;
+    expert_map_rank_dev_ = nullptr;
+    expert_map_slot_dev_ = nullptr;
 }
 
 // ============================================================================
@@ -621,6 +640,23 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
     buf_.shared_inter_buf = Tensor::allocate(ctx, {cap, 640}, dnnl::memory::data_type::bf16);
     buf_.shared_out_buf = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
+    buf_.moe_down_acc = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, hidden_size_}, dnnl::memory::data_type::f32);
+
+    expert_offsets_host_ = static_cast<int*>(ctx.alloc_host((cfg_.num_experts + 1) * sizeof(int)));
+    expert_counts_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
+    expert_curr_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
+    expert_map_token_host_ = static_cast<int*>(
+        ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    expert_map_rank_host_ = static_cast<int*>(
+        ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    expert_map_slot_host_ = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
+    expert_map_token_dev_ = static_cast<int*>(
+        ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    expert_map_rank_dev_ = static_cast<int*>(
+        ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
+    expert_map_slot_dev_ = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
 
     if (!buf_.logits.valid()) {
         buf_.logits = Tensor::allocate(ctx, {1, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
@@ -1094,8 +1130,62 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
 
+        static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
         static const bool s_prefill_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
-        if (batch_acquire && s_prefill_moe_rows && count > 1) {
+        if (batch_acquire && s_expert_major_prefill && count > 1) {
+            const int total_acts = count * top_k;
+            std::fill_n(expert_counts_host_, cfg_.num_experts, 0);
+            for (int i = 0; i < total_acts; ++i) {
+                expert_counts_host_[router_host_ids_[i]]++;
+            }
+            expert_offsets_host_[0] = 0;
+            for (int e = 0; e < cfg_.num_experts; ++e) {
+                expert_offsets_host_[e + 1] = expert_offsets_host_[e] + expert_counts_host_[e];
+                expert_curr_pos_host_[e] = expert_offsets_host_[e];
+            }
+            for (int t = 0; t < count; ++t) {
+                for (int k = 0; k < top_k; ++k) {
+                    const int i = t * top_k + k;
+                    const int e = router_host_ids_[i];
+                    const int pos = expert_curr_pos_host_[e]++;
+                    expert_map_token_host_[pos] = t;
+                    expert_map_rank_host_[pos] = k;
+                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+                }
+            }
+
+            ctx.queue().memcpy(expert_map_slot_dev_, expert_map_slot_host_,
+                               static_cast<size_t>(total_acts) * sizeof(ops::MoeExpertSlotDev));
+            ctx.queue().memcpy(expert_map_token_dev_, expert_map_token_host_,
+                               static_cast<size_t>(total_acts) * sizeof(int));
+            ctx.queue().memcpy(expert_map_rank_dev_, expert_map_rank_host_,
+                               static_cast<size_t>(total_acts) * sizeof(int));
+            ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
+                               static_cast<size_t>(total_acts) * sizeof(float));
+
+            const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
+            bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
+            bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
+
+            sycl::event gu_event = ops::moe_expert_major_prefill_gate_up(
+                ctx, expert_map_slot_dev_, expert_map_token_dev_, expert_map_rank_dev_,
+                nullptr, x_ptr, h_ptr, total_acts, top_k,
+                hidden_size_, cfg_.moe_intermediate_size, 64,
+                &batch_dma_event, expert_cache_.uses_nested_codes());
+
+            sycl::event dn_event = ops::moe_expert_major_prefill_down(
+                ctx, expert_map_slot_dev_, expert_map_token_dev_, expert_map_rank_dev_,
+                nullptr, h_ptr, static_cast<float*>(buf_.moe_down_acc.data()),
+                total_acts, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
+                &gu_event, expert_cache_.uses_nested_codes());
+
+            ops::moe_ordered_accumulate_down_rows(
+                ctx, static_cast<const float*>(buf_.moe_down_acc.data()), batch_weights_dev_,
+                y_ptr, count, top_k, hidden_size_,
+                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
+                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
+                &dn_event);
+        } else if (batch_acquire && s_prefill_moe_rows && count > 1) {
             for (int t = 0; t < count; ++t) {
                 const int* t_ids = router_host_ids_ + t * top_k;
                 ops::MoeExpertSlotDev* t_batch_slots = batch_slots_host_ + t * top_k;

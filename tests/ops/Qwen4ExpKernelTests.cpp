@@ -1013,10 +1013,96 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
                                  std::to_string(y_fused_mismatches) + " of " + std::to_string(ref_y_fused.size()));
     }
 
+    // 4. Expert-major prefill kernels (Phase S4)
+    const int total_acts = tokens * num_active_experts;
+    std::vector<int> em_tokens(total_acts);
+    std::vector<int> em_ranks(total_acts);
+    std::vector<ops::MoeExpertSlotDev> em_slots(total_acts);
+    for (int act = 0; act < total_acts; ++act) {
+        em_tokens[act] = act % tokens;
+        em_ranks[act] = act / tokens;
+        em_slots[act] = slots[em_tokens[act] * num_active_experts + em_ranks[act]];
+    }
+
+    Tensor em_tokens_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    Tensor em_ranks_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    ops::MoeExpertSlotDev* em_slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+    Tensor em_h_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor em_down_acc_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+    Tensor em_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor em_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(em_tokens_dev.data(), em_tokens.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(em_ranks_dev.data(), em_ranks.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(em_slots_dev, em_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+    sycl::event em_gu = ops::moe_expert_major_prefill_gate_up(
+        ctx, em_slots_dev,
+        static_cast<const int*>(em_tokens_dev.data()),
+        static_cast<const int*>(em_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(em_h_dev.data()),
+        total_acts, num_active_experts, in_features, intermediate_size, blocksize,
+        nullptr, use_nested);
+
+    sycl::event em_dn = ops::moe_expert_major_prefill_down(
+        ctx, em_slots_dev,
+        static_cast<const int*>(em_tokens_dev.data()),
+        static_cast<const int*>(em_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(em_h_dev.data()),
+        static_cast<float*>(em_down_acc_dev.data()),
+        total_acts, num_active_experts, intermediate_size, out_features, blocksize,
+        &em_gu, use_nested);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(em_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(em_y_dev.data()),
+        tokens, num_active_experts, out_features,
+        nullptr, nullptr, &em_dn);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(em_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(em_y_fused_dev.data()),
+        tokens, num_active_experts, out_features,
+        static_cast<const bf16*>(shared_dev.data()),
+        static_cast<const bf16*>(gate_dev.data()),
+        &em_dn);
+
+    ctx.synchronize();
+
+    std::vector<bf16> em_h(total_acts * intermediate_size);
+    std::vector<bf16> em_y(tokens * out_features);
+    std::vector<bf16> em_y_fused(tokens * out_features);
+    ctx.memcpy_d2h(em_h.data(), em_h_dev.data(), em_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(em_y.data(), em_y_dev.data(), em_y.size() * sizeof(bf16));
+    ctx.memcpy_d2h(em_y_fused.data(), em_y_fused_dev.data(), em_y_fused.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < ref_h.size(); ++i) {
+        if (em_h[i] != ref_h[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_gate_up bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y.size(); ++i) {
+        if (em_y[i] != ref_y[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y_fused.size(); ++i) {
+        if (em_y_fused[i] != ref_y_fused[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down (fused) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    ctx.free_device(em_slots_dev);
+
     std::cout << "[PASS] moe_prefill tokens=" << tokens
               << " k=" << num_active_experts
               << " nested=" << (use_nested ? "true" : "false")
-              << " bit-exact match (0 mismatches across " << ref_y.size() << " values)\n";
+              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, both S1 and S4)\n";
 
     ctx.free_device(slots_dev_buf);
     ctx.free_device(weights_dev);
