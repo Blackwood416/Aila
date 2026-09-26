@@ -1010,32 +1010,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
                                 1, indexer_out_dim, hidden_size_);
 
-                    ops::qsa_prepare_q_and_cache_k(
-                        ctx, buf_.indexer_qk, *layer.index_q_norm_weight, cache.indexer_k, buf_.indexer_q,
-                        start_pos, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                    const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+                    const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
+                    num_active_tokens = ops::qsa_prepare_causal_query_and_select_tokens(
+                        ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
+                        cache.indexer_k, buf_.indexer_q, buf_.indexer_block_scores,
+                        buf_.indexer_active_tokens, start_pos, block_topk, compress_ratio,
+                        cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
                         (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
                         (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                         (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                         session.mropePromptLength_, session.mropeTextPositionDelta_,
                         cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
-
-                    const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
-                    const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
-                    const int num_complete_blocks = cached_len / compress_ratio;
-
-                    if (num_complete_blocks > block_topk) {
-                        ops::qsa_compute_block_scores(
-                            ctx, buf_.indexer_q, cache.indexer_k, *layer.index_k_norm_weight, buf_.indexer_block_scores,
-                            num_complete_blocks, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
-                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
-                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
-                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
-                            session.mropePromptLength_, session.mropeTextPositionDelta_,
-                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
-
-                        num_active_tokens = ops::qsa_select_topk_and_expand_tokens(
-                            ctx, buf_.indexer_block_scores, num_complete_blocks, block_topk,
-                            cached_len, compress_ratio, buf_.indexer_active_tokens);
+                    if (num_active_tokens > 0) {
                         active_indices = buf_.indexer_active_tokens.data_as<int>();
                     }
                 }
@@ -1047,11 +1034,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
                 layer.o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.y, 1);
             } else {
-                if (layer.index_qk_weight && cache.indexer_k.valid()) {
+                const bool has_qsa_indexer = layer.index_qk_weight && layer.index_q_norm_weight &&
+                                             layer.index_k_norm_weight && cache.indexer_k.valid();
+                if (has_qsa_indexer) {
                     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
                     DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
                                 count, indexer_out_dim, hidden_size_);
-                    ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
                 }
 
                 layer.qkv_proj.forward(ctx, linear_scratch_, buf_.x, buf_.full_qkv, count);
@@ -1075,13 +1063,78 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
                 }
 
-                if (start_pos == 0) {
-                    ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
-                } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
-                }
+                const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+                const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
+                const bool sparse_prefill = has_qsa_indexer &&
+                    (start_pos + count) / compress_ratio > block_topk;
+                if (sparse_prefill) {
+                    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                    const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+                    const int q_dim = full_q_heads_ * full_head_dim_;
+                    const bf16* indexer_qk_base = buf_.indexer_qk.data_as<bf16>();
+                    bf16* indexer_q_base = buf_.indexer_q.data_as<bf16>();
+                    bf16* q_base = buf_.q.data_as<bf16>();
+                    bf16* z_base = buf_.z.data_as<bf16>();
+                    bf16* attn_out_base = buf_.attn_out.data_as<bf16>();
 
-                layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                    // The upstream indexer builds a separate mask from each query's
+                    // causal visible prefix. Keep this row-wise path as the correctness
+                    // oracle for chunked prefill and appends across the sparse threshold.
+                    for (int row = 0; row < count; ++row) {
+                        const int pos = start_pos + row;
+                        Tensor indexer_qk_row = Tensor::view(
+                            ctx, const_cast<bf16*>(indexer_qk_base + static_cast<size_t>(row) * indexer_out_dim),
+                            {1, indexer_out_dim});
+                        Tensor indexer_q_row = Tensor::view(
+                            ctx, indexer_q_base + static_cast<size_t>(row) * indexer_q_dim,
+                            {cfg_.indexer_n_heads, cfg_.indexer_head_dim});
+                        Tensor q_row = Tensor::view(
+                            ctx, q_base + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                        Tensor z_row = Tensor::view(
+                            ctx, z_base + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                        Tensor attn_out_row = Tensor::view(
+                            ctx, attn_out_base + static_cast<size_t>(row) * q_dim, {1, q_dim});
+
+                        const int num_active_tokens = ops::qsa_prepare_causal_query_and_select_tokens(
+                            ctx, indexer_qk_row, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
+                            cache.indexer_k, indexer_q_row, buf_.indexer_block_scores,
+                            buf_.indexer_active_tokens, pos, block_topk, compress_ratio,
+                            cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                            session.mropePromptLength_, session.mropeTextPositionDelta_,
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                        const int visible_len = pos + 1;
+                        int attention_active_tokens = num_active_tokens;
+                        if (attention_active_tokens == 0) {
+                            // Keep prefill causal semantics independent of optional decode
+                            // window/sink settings by passing an explicit dense prefix.
+                            attention_active_tokens = ops::qsa_select_topk_and_expand_tokens(
+                                ctx, buf_.indexer_block_scores, visible_len / compress_ratio,
+                                block_topk, visible_len, compress_ratio, buf_.indexer_active_tokens);
+                        }
+                        ops::attention_decode(
+                            ctx, q_row, cache.k, cache.v, attn_out_row, buf_.decode_scores,
+                            full_q_heads_, full_kv_heads_, full_head_dim_, visible_len,
+                            &buf_.decode_attn_partials, &z_row,
+                            buf_.indexer_active_tokens.data_as<int>(), attention_active_tokens);
+                    }
+                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                } else {
+                    if (has_qsa_indexer) {
+                        // Short chunks stay on the existing batched dense prefill path;
+                        // only a query whose visible prefix exceeds the block budget uses
+                        // the row-wise QSA correctness path above.
+                        ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                    }
+                    if (start_pos == 0) {
+                        ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
+                    } else {
+                        ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
+                    }
+                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                }
             }
         }
 

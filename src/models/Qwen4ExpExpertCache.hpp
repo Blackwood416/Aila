@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,9 @@ public:
     // count: number of active experts (e.g. top_k = 10)
     // out_slots: filled with slot indices in [0, num_slots - 1]
     // Crucial guarantee: slots acquired in the same batch will never evict each other.
+    // A request with more unique experts than GPU slots is rejected before cache state changes.
+    // If an exception occurs after a slot binding or DMA submission, the cache becomes poisoned;
+    // callers must destroy/reinitialize it before using the GPU cache again.
     // Returns: SYCL event tracking completion of DMA transfers (or default-constructed host event if all hit).
     sycl::event acquire(int layer,
                         const int* expert_ids,
@@ -85,10 +89,12 @@ public:
 
     // Device slot descriptors for kernel launches
     ops::MoeExpertSlotDev get_slot_dev(int slot_id) const {
+        if (faulted_) throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned; reinitialize before use");
         return slots_dev_[slot_id];
     }
 
     void get_slots_dev(const int* slot_ids, int count, ops::MoeExpertSlotDev* out_slot_devs) const {
+        if (faulted_) throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned; reinitialize before use");
         for (int i = 0; i < count; ++i) {
             out_slot_devs[i] = slots_dev_[slot_ids[i]];
         }
@@ -96,7 +102,7 @@ public:
 
     const ExpertCacheStats& stats() const { return stats_; }
     bool contains(int layer, int expert_id) const {
-        if (!initialized_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+        if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
         return layer_expert_to_slot_[expert_flat_index(layer, expert_id)] >= 0;
     }
     bool host_contains(int layer, int expert_id) const {
@@ -128,7 +134,8 @@ public:
     int num_slots() const { return num_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
     bool uses_nested_codes() const { return compact_nested_; }
-    bool is_initialized() const { return initialized_; }
+    bool is_initialized() const { return initialized_ && !faulted_; }
+    bool is_faulted() const { return faulted_; }
 
     size_t gu_packed_bytes() const { return gu_packed_bytes_; }
     size_t gu_absmax_count() const { return gu_absmax_count_; }
@@ -250,6 +257,7 @@ private:
 
     ExpertCacheStats stats_{};
     bool initialized_ = false;
+    bool faulted_ = false;
 
     // Host fill parallelism (AILA_Q4E_FILL_THREADS / AILA_Q4E_FILL_PARTS)
     // Hot Host RAM Pool (pinned USM host memory allocated in 1 GB chunks)

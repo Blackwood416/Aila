@@ -412,6 +412,29 @@ void test_expert_cache_lru_and_dequant(Context& ctx, bool compact) {
     }
     check_slot(slots8[0], 5, "expert 5 in the demoted slot");
 
+    // A request larger than the GPU slot pool must fail before publishing any
+    // key-to-slot bindings. Retrying its first miss must perform a real fill.
+    const int over_capacity_req[5] = {6, 0, 1, 2, 3};
+    int over_capacity_slots[5] = {-1, -1, -1, -1, -1};
+    const uint64_t misses_before_over_capacity = cache.stats().miss_count;
+    bool rejected_over_capacity = false;
+    try {
+        cache.acquire(0, over_capacity_req, 5, over_capacity_slots);
+    } catch (const std::runtime_error&) {
+        rejected_over_capacity = true;
+    }
+    expect(rejected_over_capacity, "unique expert request larger than GPU pool must be rejected");
+    expect(!cache.is_faulted(), "preflight capacity rejection must leave the cache usable");
+    expect(!cache.contains(0, 6), "failed over-capacity acquire must not publish expert 6 as resident");
+    expect(cache.stats().miss_count == misses_before_over_capacity,
+           "preflight capacity rejection must not count partial misses");
+
+    int retry_slot[1] = {-1};
+    cache.acquire(0, over_capacity_req, 1, retry_slot);
+    expect(cache.stats().miss_count == misses_before_over_capacity + 1,
+           "retry after capacity rejection must be a real miss/fill");
+    check_slot(retry_slot[0], 6, "expert 6 retry after over-capacity rejection");
+
     std::cout << "[PASS] Expert cache LRU and dequantization tests passed. Final hit rate: "
               << (cache.stats().hit_rate() * 100.0) << "%\n";
 }
@@ -2499,6 +2522,101 @@ void test_qsa_indexer_long_context_dispatch(Context& ctx) {
     std::cout << "[PASS] QSA Indexer Long Context Dispatch verified: 2400 tokens, 2051/2052/2055 boundary transitions, 100% matched.\n";
 }
 
+void test_qsa_causal_prefill_append_chunk(Context& ctx) {
+    std::cout << "[Test] Running QSA causal prefill append-chunk boundary test...\n";
+    constexpr int initial_len = 2050;
+    constexpr int append_count = 4;
+    constexpr int capacity = initial_len + append_count;
+    constexpr int compress_ratio = 4;
+    constexpr int block_topk = 512;
+    constexpr int indexer_heads = 4;
+    constexpr int indexer_head_dim = 128;
+    constexpr int indexer_q_dim = indexer_heads * indexer_head_dim;
+    constexpr int indexer_out_dim = indexer_q_dim + indexer_head_dim;
+    constexpr float theta = 1000000.0f;
+
+    std::vector<bf16> indexer_qk_h(append_count * indexer_out_dim);
+    std::vector<bf16> q_norm_h(indexer_head_dim, bf16(1.0f));
+    std::vector<bf16> k_norm_h(indexer_head_dim, bf16(1.0f));
+    std::vector<bf16> raw_k_h(capacity * indexer_head_dim, bf16(0.0f));
+    for (int p = 0; p < initial_len; ++p) {
+        for (int d = 0; d < indexer_head_dim; ++d) {
+            raw_k_h[static_cast<size_t>(p) * indexer_head_dim + d] =
+                bf16(std::sin(0.013f * p + 0.071f * d) * 0.2f);
+        }
+    }
+    for (int row = 0; row < append_count; ++row) {
+        for (int d = 0; d < indexer_out_dim; ++d) {
+            indexer_qk_h[static_cast<size_t>(row) * indexer_out_dim + d] =
+                bf16(std::sin(0.17f * row + 0.031f * d) * 0.3f);
+        }
+    }
+
+    Tensor qk_dev = Tensor::allocate(ctx, {append_count, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_norm_dev = Tensor::allocate(ctx, {indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_norm_dev = Tensor::allocate(ctx, {indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {capacity, indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_dev = Tensor::allocate(ctx, {append_count, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {capacity / compress_ratio}, dnnl::memory::data_type::f32);
+    Tensor active_dev = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::s32);
+    ctx.memcpy_h2d(qk_dev.data(), indexer_qk_h.data(), indexer_qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(q_norm_dev.data(), q_norm_h.data(), q_norm_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_norm_dev.data(), k_norm_h.data(), k_norm_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), raw_k_h.data(),
+                   static_cast<size_t>(initial_len) * indexer_head_dim * sizeof(bf16));
+
+    for (int row = 0; row < append_count; ++row) {
+        const int pos = initial_len + row;
+        const int visible_len = pos + 1;
+        Tensor qk_row = Tensor::view(
+            ctx, qk_dev.data_as<bf16>() + static_cast<size_t>(row) * indexer_out_dim,
+            {1, indexer_out_dim});
+        Tensor q_row = Tensor::view(
+            ctx, q_out_dev.data_as<bf16>() + static_cast<size_t>(row) * indexer_q_dim,
+            {indexer_heads, indexer_head_dim});
+        const int gpu_sparse_count = ops::qsa_prepare_causal_query_and_select_tokens(
+            ctx, qk_row, q_norm_dev, k_norm_dev, k_cache_dev, q_row,
+            scores_dev, active_dev, pos, block_topk, compress_ratio, theta);
+
+        std::vector<bf16> q_ref(indexer_q_dim);
+        ops::qsa_prepare_q_and_cache_k_host(
+            indexer_qk_h.data() + static_cast<size_t>(row) * indexer_out_dim,
+            q_norm_h.data(), raw_k_h.data(), q_ref.data(), pos, capacity, theta);
+        const int num_complete_blocks = visible_len / compress_ratio;
+        std::vector<float> scores_ref(num_complete_blocks);
+        ops::qsa_compute_block_scores_host(
+            q_ref.data(), raw_k_h.data(), k_norm_h.data(), scores_ref.data(),
+            num_complete_blocks, capacity, theta);
+        std::vector<int> tokens_ref(capacity);
+        const int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_ref.data(), num_complete_blocks, block_topk, visible_len,
+            compress_ratio, tokens_ref.data());
+
+        const bool sparse = num_complete_blocks > block_topk;
+        expect((gpu_sparse_count > 0) == sparse,
+               "QSA causal sparse transition must be decided from this query's visible prefix");
+        const int actual_count = sparse ? gpu_sparse_count : visible_len;
+        expect(actual_count == ref_count,
+               "QSA append row active-token count must match its causal host prefix at pos=" + std::to_string(pos));
+        std::vector<int> tokens_gpu(actual_count);
+        if (sparse) {
+            ctx.synchronize();
+            ctx.memcpy_d2h(tokens_gpu.data(), active_dev.data(), actual_count * sizeof(int));
+        } else {
+            for (int i = 0; i < visible_len; ++i) tokens_gpu[i] = i;
+        }
+        for (int i = 0; i < actual_count; ++i) {
+            expect(tokens_gpu[i] == tokens_ref[i],
+                   "QSA append row visible-token set mismatch at pos=" + std::to_string(pos) +
+                   " index=" + std::to_string(i));
+            expect(tokens_gpu[i] < visible_len,
+                   "QSA append row must not expose a future token at pos=" + std::to_string(pos));
+        }
+    }
+    ctx.synchronize();
+    std::cout << "[PASS] QSA append chunk uses per-query causal prefixes across visible lengths 2051..2054, including incomplete tails.\n";
+}
+
 void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -2707,6 +2825,7 @@ int main() {
         test_ple_lookup_and_dequant(ctx);
         test_real_model_ple_and_cache_if_present(ctx);
         test_qsa_indexer_long_context_dispatch(ctx);
+        test_qsa_causal_prefill_append_chunk(ctx);
         test_real_model_qsa_indexer_weights_if_present(ctx);
         test_qsa_indexer_end_to_end_pipeline(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";

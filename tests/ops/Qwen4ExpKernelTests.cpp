@@ -1908,6 +1908,45 @@ static void test_qsa_select_topk_and_expand_tokens(Context& ctx) {
         }
         std::cout << "[PASS] QSA select top-k non-positive parameter guards verified (clean zero returns)\n";
     }
+
+    // Case 7: Distinct small scores inside the former floating-threshold interval.
+    {
+        constexpr int num_blocks = 514;
+        constexpr int block_topk = 512;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio;
+        std::vector<float> scores_h(num_blocks, 1000000.0f);
+        scores_h[0] = 0.0001f;
+        scores_h[1] = 0.0002f;
+        scores_h[2] = 0.0f;
+
+        std::vector<int> tokens_ref(block_topk * compress_ratio);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+        if (gpu_count != ref_count) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: threshold regression count mismatch");
+        }
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != tokens_ref[i]) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: exact threshold mismatch at i=" +
+                                         std::to_string(i) + " gpu=" + std::to_string(tokens_gpu[i]) +
+                                         " ref=" + std::to_string(tokens_ref[i]));
+            }
+        }
+        if (tokens_gpu[0] != 4 || tokens_gpu[4] != 12) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: exact selection must keep block 1 and drop block 0/2");
+        }
+        std::cout << "[PASS] QSA exact top-k selects 0.0002 over 0.0001 in the former unresolved threshold interval\n";
+    }
 }
 
 static void test_attention_decode_with_qsa_indices(Context& ctx) {

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — Handoff
 
-> Current follow-up (2026-09-26): [acceptance review and next optimization plan](plans/qwen3.8-flash-next-a770-acceptance-2026-09-26.md), reviewed at `05055aa`. The historical sections below predate S0–S5/E1; their uncommitted-state and performance claims are not the current acceptance status.
+> Current follow-up (2026-09-26): [W0 implementation record](plans/qwen3.8-flash-next-a770-w0-implementation-484b086.md) and [incremental acceptance / systems brainstorm](plans/qwen3.8-flash-next-a770-review-and-brainstorm-484b086.md). F1/F2/F3 now have working-tree implementations and targeted test results; real-checkpoint long-context alignment and performance remain open. The historical sections below predate S0–S5/E1 and are not the current acceptance status.
 
 Last updated: 2026-09-25. Supersedes the M1 handoff (see this file at commit `6c99f8f`).
 Covers performance sessions after M1. **Everything below after `6c99f8f` is

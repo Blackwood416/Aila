@@ -67,8 +67,9 @@ void qsa_compute_block_scores(
     int mrope_section_h = 0,
     int mrope_section_w = 0);
 
-// Selects top-k (default 512) active blocks and expands them into individual token indices,
-// appending any trailing tokens [num_complete_blocks * 4 .. cached_len - 1].
+// Selects the exact top-k active blocks (ties prefer lower block ids) and expands them into
+// individual token indices, appending any trailing tokens
+// [num_complete_blocks * compress_ratio .. cached_len - 1]. NaN scores rank below numeric scores.
 // Returns the total number of active tokens (<= 2051).
 int qsa_select_topk_and_expand_tokens(
     Context& ctx,
@@ -78,6 +79,33 @@ int qsa_select_topk_and_expand_tokens(
     int cached_len,
     int compress_ratio,
     Tensor& active_tokens_out);
+
+// Prepares one causal prefill query at absolute position pos, writes its raw K,
+// and selects sparse active tokens from exactly the visible prefix [0, pos].
+// Returns 0 when the prefix fits the dense budget; otherwise returns the active
+// token count and writes indices to active_tokens_out.
+int qsa_prepare_causal_query_and_select_tokens(
+    Context& ctx,
+    const Tensor& indexer_qk_row,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out_row,
+    Tensor& scores_out,
+    Tensor& active_tokens_out,
+    int pos,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
 
 // CPU host reference functions for verification and testing
 void qsa_prepare_q_and_cache_k_host(

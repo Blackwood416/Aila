@@ -1,10 +1,24 @@
 #include "ops/QsaIndexerOps.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace ops {
 
 namespace {
+
+// Map IEEE-754 values to an unsigned key with the same order as numeric comparison.
+// QSA scores are non-negative, but keeping the helper well-defined for the public
+// operator also gives NaNs a deterministic lowest rank and treats signed zero as a tie.
+inline std::uint32_t qsa_score_order_key(float score) {
+    std::uint32_t bits = sycl::bit_cast<std::uint32_t>(score);
+    const std::uint32_t magnitude = bits & 0x7fffffffU;
+    if ((magnitude & 0x7f800000U) == 0x7f800000U && (magnitude & 0x007fffffU) != 0) {
+        return 0U; // NaNs rank below every numeric score.
+    }
+    if (magnitude == 0U) bits = 0U; // +0 and -0 compare equal.
+    return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
+}
 
 inline float calculate_rotary_position(
     int global_pos, int d, float pos_scalar,
@@ -283,134 +297,72 @@ int qsa_select_topk_and_expand_tokens(
     constexpr int kWgSize = 256;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> local_max(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<float, 1> local_min(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<int, 1> local_cnt_gt(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<int, 1> local_cnt_ge(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
-        sycl::local_accessor<int, 1> blk_counter(sycl::range<1>(1), cgh);
+        sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
+        sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(kWgSize, kWgSize),
             [=](sycl::nd_item<1> item) {
                 const int lid = item.get_local_id(0);
 
-                // 1. Find min and max score across blocks
-                float max_val = -1e30f;
-                float min_val = 1e30f;
-                for (int b = lid; b < num_complete_blocks; b += kWgSize) {
-                    float s = scores_ptr[b];
-                    max_val = sycl::fmax(max_val, s);
-                    min_val = sycl::fmin(min_val, s);
+                // Radix-select the exact kth-largest ordered float key. Every lane
+                // scans a disjoint subset; each bit decision is a work-group reduction.
+                if (lid == 0) {
+                    cutoff_key[0] = 0U;
+                    remaining_rank[0] = block_topk;
                 }
-                local_max[lid] = max_val;
-                local_min[lid] = min_val;
                 item.barrier(sycl::access::fence_space::local_space);
-
-                for (int s = kWgSize / 2; s > 0; s >>= 1) {
-                    if (lid < s) {
-                        local_max[lid] = sycl::fmax(local_max[lid], local_max[lid + s]);
-                        local_min[lid] = sycl::fmin(local_min[lid], local_min[lid + s]);
+                std::uint32_t prefix_mask = 0U;
+                for (int bit = 31; bit >= 0; --bit) {
+                    const std::uint32_t bit_mask = std::uint32_t{1} << bit;
+                    const std::uint32_t prefix = cutoff_key[0];
+                    int count_one = 0;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if ((key & prefix_mask) == prefix && (key & bit_mask) != 0U) {
+                            ++count_one;
+                        }
+                    }
+                    local_cnt_one[lid] = count_one;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) {
+                        if (local_cnt_one[0] >= remaining_rank[0]) {
+                            cutoff_key[0] |= bit_mask;
+                        } else {
+                            remaining_rank[0] -= local_cnt_one[0];
+                        }
                     }
                     item.barrier(sycl::access::fence_space::local_space);
-                }
-                const float global_max = local_max[0];
-                const float global_min = local_min[0];
-                item.barrier(sycl::access::fence_space::local_space);
-
-                float low = global_min;
-                float high = global_max;
-
-                if (global_max > global_min) {
-                    // 2. Binary search for threshold separating top-k
-                    for (int iter = 0; iter < 32; ++iter) {
-                        const float mid = (low + high) * 0.5f;
-                        int cnt_gt = 0;
-                        int cnt_ge = 0;
-                        for (int b = lid; b < num_complete_blocks; b += kWgSize) {
-                            float s = scores_ptr[b];
-                            if (s > mid) cnt_gt++;
-                            if (s >= mid) cnt_ge++;
-                        }
-                        local_cnt_gt[lid] = cnt_gt;
-                        local_cnt_ge[lid] = cnt_ge;
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        for (int s = kWgSize / 2; s > 0; s >>= 1) {
-                            if (lid < s) {
-                                local_cnt_gt[lid] += local_cnt_gt[lid + s];
-                                local_cnt_ge[lid] += local_cnt_ge[lid + s];
-                            }
-                            item.barrier(sycl::access::fence_space::local_space);
-                        }
-                        const int total_gt = local_cnt_gt[0];
-                        const int total_ge = local_cnt_ge[0];
-                        item.barrier(sycl::access::fence_space::local_space);
-
-                        if (total_gt >= block_topk) {
-                            low = mid;
-                        } else if (total_ge < block_topk) {
-                            high = mid;
-                        } else {
-                            // Exact hit: total_gt < block_topk && total_ge >= block_topk
-                            low = mid;
-                            high = mid;
-                            break;
-                        }
-                    }
+                    prefix_mask |= bit_mask;
                 }
 
-                // 3. Thread 0 gathers top block_topk blocks in strictly ascending block order
+                // Thread 0 emits the selected set in ascending block order. Equal
+                // scores therefore use the documented block-id tie break.
                 if (lid == 0) {
-                    if (global_max <= global_min) {
-                        for (int b = 0; b < block_topk; ++b) {
-                            selected_blocks[b] = b;
+                    const std::uint32_t threshold = cutoff_key[0];
+                    int above_count = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        if (qsa_score_order_key(scores_ptr[b]) > threshold) ++above_count;
+                    }
+                    int ties_needed = block_topk - above_count;
+                    int added = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (key > threshold || (key == threshold && ties_needed > 0)) {
+                            selected_blocks[added++] = b;
+                            if (key == threshold) --ties_needed;
                         }
-                        blk_counter[0] = block_topk;
-                    } else {
-                        int count_high = 0;
-                        for (int b = 0; b < num_complete_blocks; ++b) {
-                            if (scores_ptr[b] > high) {
-                                count_high++;
-                            }
-                        }
-                        const int needed_ties = block_topk - count_high;
-                        int added = 0;
-                        int ties_added = 0;
-                        for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
-                            float s = scores_ptr[b];
-                            if (s > high) {
-                                selected_blocks[added++] = b;
-                            } else if (s >= low && ties_added < needed_ties) {
-                                selected_blocks[added++] = b;
-                                ties_added++;
-                            }
-                        }
-                        // Safety fallback if extreme float rounding left added < block_topk
-                        if (added < block_topk) {
-                            for (int b = 0; b < num_complete_blocks && added < block_topk; ++b) {
-                                float s = scores_ptr[b];
-                                if (s < low) {
-                                    selected_blocks[added++] = b;
-                                }
-                            }
-                        }
-                        // Ensure strictly increasing order in case safety fallback was hit
-                        for (int i = 1; i < block_topk; ++i) {
-                            int key = selected_blocks[i];
-                            int j = i - 1;
-                            while (j >= 0 && selected_blocks[j] > key) {
-                                selected_blocks[j + 1] = selected_blocks[j];
-                                j--;
-                            }
-                            selected_blocks[j + 1] = key;
-                        }
-                        blk_counter[0] = added;
                     }
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                // 4. Parallel token expansion for the selected blocks
+                // Expand selected blocks and append the incomplete trailing block.
                 for (int idx = lid; idx < block_topk; idx += kWgSize) {
                     const int blk = selected_blocks[idx];
                     for (int c = 0; c < compress_ratio; ++c) {
@@ -429,6 +381,49 @@ int qsa_select_topk_and_expand_tokens(
 
     const int tail_len = cached_len - (num_complete_blocks * compress_ratio);
     return block_topk * compress_ratio + tail_len;
+}
+
+int qsa_prepare_causal_query_and_select_tokens(
+    Context& ctx,
+    const Tensor& indexer_qk_row,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out_row,
+    Tensor& scores_out,
+    Tensor& active_tokens_out,
+    int pos,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
+        throw std::invalid_argument("qsa_prepare_causal_query_and_select_tokens: invalid position or block geometry");
+    }
+    const int visible_len = pos + 1;
+    qsa_prepare_q_and_cache_k(
+        ctx, indexer_qk_row, q_norm_w, k_cache, q_out_row, pos, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+
+    const int num_complete_blocks = visible_len / compress_ratio;
+    if (num_complete_blocks <= block_topk) {
+        return 0;
+    }
+    qsa_compute_block_scores(
+        ctx, q_out_row, k_cache, k_norm_w, scores_out, num_complete_blocks, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+    return qsa_select_topk_and_expand_tokens(
+        ctx, scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_tokens_out);
 }
 
 // ============================================================================
@@ -591,7 +586,9 @@ int qsa_select_topk_and_expand_tokens_host(
     std::partial_sort(
         items.begin(), items.begin() + block_topk, items.end(),
         [](const auto& a, const auto& b) {
-            if (a.first != b.first) return a.first > b.first;
+            const std::uint32_t a_key = qsa_score_order_key(a.first);
+            const std::uint32_t b_key = qsa_score_order_key(b.first);
+            if (a_key != b_key) return a_key > b_key;
             return a.second < b.second;
         });
 

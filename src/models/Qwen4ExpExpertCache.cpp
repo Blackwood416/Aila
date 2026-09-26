@@ -330,6 +330,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     slots_dev_ = std::move(other.slots_dev_);
     stats_ = other.stats_;
     initialized_ = other.initialized_;
+    faulted_ = other.faulted_;
     fill_pool_ = std::move(other.fill_pool_);
     fill_parts_ = other.fill_parts_;
 
@@ -367,6 +368,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     other.prefetch_in_flight_ = false;
     other.last_dma_event_ = sycl::event{};
     other.initialized_ = false;
+    other.faulted_ = false;
     other.num_slots_ = 0;
     other.num_host_slots_ = 0;
     other.host_pool_enabled_ = false;
@@ -418,6 +420,7 @@ void Qwen4ExpExpertCache::cleanup() {
     num_slots_ = 0;
     compact_nested_ = false;
     initialized_ = false;
+    faulted_ = false;
     layer_weights_.clear();
     lru_list_.clear();
     slot_iters_.clear();
@@ -1011,6 +1014,30 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     if (!initialized_ || count <= 0 || expert_ids == nullptr || out_slots == nullptr) {
         return {};
     }
+    if (faulted_) {
+        throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned after a failed acquire; reinitialize before use");
+    }
+    if (layer < 0 || layer >= num_layers_) {
+        throw std::invalid_argument("Qwen4ExpExpertCache: invalid layer in acquire");
+    }
+    int unique_experts = 0;
+    for (int i = 0; i < count; ++i) {
+        const int expert = expert_ids[i];
+        if (expert < 0 || expert >= num_experts_per_layer_) {
+            throw std::invalid_argument("Qwen4ExpExpertCache: invalid expert id in acquire");
+        }
+        bool already_seen = false;
+        for (int j = 0; j < i; ++j) {
+            if (expert_ids[j] == expert) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (!already_seen) ++unique_experts;
+    }
+    if (unique_experts > num_slots_) {
+        throw std::runtime_error("Qwen4ExpExpertCache: unique expert demand exceeds GPU slot capacity");
+    }
     // AILA_DEBUG_Q4E_ROUTE_TRACE: append int32 {layer, count, ids[count]} per call, for offline
     // replacement-policy simulation (perf/qwen4exp/q4e_cache_sim.py).
     static FILE* s_trace = [] {
@@ -1045,8 +1072,16 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     struct AcquireGuard {
         Qwen4ExpExpertCache* self;
         bool committed = false;
+        bool bindings_published = false;
+        bool dma_submitted = false;
         ~AcquireGuard() {
             if (!committed && self) {
+                if (dma_submitted && self->copy_q_) {
+                    try { self->copy_q_->wait(); } catch (...) {}
+                }
+                if (bindings_published || dma_submitted) {
+                    self->faulted_ = true;
+                }
                 for (int s : self->batch_reserved_slots_scratch_) {
                     self->slot_reserved_[s] = false;
                 }
@@ -1059,7 +1094,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 self->misses_scratch_.clear();
             }
         }
-    } guard{this, false};
+    } guard{this, false, false, false};
 
     // Phase 1: check hits and deduplicate within this batch
     int hit_count_in_batch = 0;
@@ -1134,6 +1169,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
         layer_expert_to_slot_[flat_idx] = victim_slot;
         slot_to_key_[victim_slot] = key;
+        guard.bindings_published = true;
 
         // Move victim to MRU (front) and reserve for this batch
         lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[victim_slot]);
@@ -1157,6 +1193,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             copy_q_->submit([&](sycl::handler& cgh) {
                 cgh.memcpy(slot_dev_base_[slot_id], src, slot_bytes_);
             });
+            guard.dma_submitted = true;
         };
         to_fill_scratch_.clear();
 
@@ -1390,6 +1427,9 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
     if (!initialized_ || count <= 0 || expert_ids == nullptr) {
         return;
     }
+    if (faulted_) {
+        throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned after a failed acquire; reinitialize before use");
+    }
     static const bool s_fake_hits = aila::env::read_flag("AILA_DEBUG_Q4E_FAKE_HITS", false);
     if (s_fake_hits) return; // acquire() binds nothing in this mode
 
@@ -1515,6 +1555,9 @@ void Qwen4ExpExpertCache::wait_copy() {
 
 void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
     if (!initialized_ || expert_ids == nullptr) return;
+    if (faulted_) {
+        throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned after a failed acquire; reinitialize before use");
+    }
     for (int i = 0; i < count; ++i) {
         int e = expert_ids[i];
         if (e < 0 || e >= num_experts_per_layer_) continue;
