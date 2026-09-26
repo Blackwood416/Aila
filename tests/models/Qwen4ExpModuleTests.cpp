@@ -2541,6 +2541,148 @@ void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {
     std::cout << "[PASS] Verified all 12 QSA Indexer weight tensors (index_qk_proj [640, 2560], q_layernorm [128], k_layernorm [128]).\n";
 }
 
+void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
+    std::cout << "[Test] Running QSA Indexer End-to-End Pipeline (>2048 Context) Integration Test...\n";
+    constexpr int hidden_size = 2560;
+    constexpr int indexer_out_dim = 640;
+    constexpr int index_head_dim = 128;
+    constexpr int num_q_heads = 4;
+    constexpr int num_heads = 24;
+    constexpr int num_kv_heads = 2;
+    constexpr int full_head_dim = 256;
+    constexpr int cached_len = 2400; // 600 complete blocks
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int num_complete_blocks = cached_len / compress_ratio;
+    constexpr float rope_theta = 1000000.0f;
+
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+
+    // 1. Allocate and initialize index_qk weights, q_norm_w, k_norm_w
+    std::vector<bf16> index_qk_w_h(indexer_out_dim * hidden_size);
+    for (auto& v : index_qk_w_h) v = bf16(dist(rng) * 0.05f);
+    std::vector<bf16> q_norm_w_h(index_head_dim, bf16(1.0f));
+    std::vector<bf16> k_norm_w_h(index_head_dim, bf16(1.0f));
+
+    Tensor index_qk_w_dev = Tensor::allocate(ctx, {indexer_out_dim, hidden_size}, dnnl::memory::data_type::bf16);
+    Tensor q_norm_w_dev = Tensor::allocate(ctx, {index_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_norm_w_dev = Tensor::allocate(ctx, {index_head_dim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(index_qk_w_dev.data(), index_qk_w_h.data(), index_qk_w_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(q_norm_w_dev.data(), q_norm_w_h.data(), q_norm_w_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_norm_w_dev.data(), k_norm_w_h.data(), k_norm_w_h.size() * sizeof(bf16));
+
+    Linear index_qk_proj;
+    index_qk_proj.init(ctx, index_qk_w_dev, hidden_size, indexer_out_dim, false);
+
+    // 2. Query token hidden state x [1, hidden_size] and pre-existing k_cache [cached_len, 128]
+    std::vector<bf16> x_h(hidden_size);
+    for (auto& v : x_h) v = bf16(dist(rng));
+    std::vector<bf16> k_cache_h(cached_len * index_head_dim);
+    for (auto& v : k_cache_h) v = bf16(dist(rng) * 0.2f);
+
+    Tensor x_dev = Tensor::allocate(ctx, {1, hidden_size}, dnnl::memory::data_type::bf16);
+    Tensor indexer_qk_dev = Tensor::allocate(ctx, {1, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {cached_len, index_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_dev = Tensor::allocate(ctx, {num_q_heads, index_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
+    Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(x_dev.data(), x_h.data(), x_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), k_cache_h.data(), k_cache_h.size() * sizeof(bf16));
+
+    // 3. Forward index_qk_proj
+    index_qk_proj.forward(ctx, x_dev, indexer_qk_dev, 1);
+
+    // 4. Prepare Q and cache K for current decode step (pos = 2399)
+    const int current_pos = cached_len - 1;
+    ops::qsa_prepare_q_and_cache_k(
+        ctx, indexer_qk_dev, q_norm_w_dev, k_cache_dev, q_out_dev, current_pos, rope_theta);
+
+    // 5. Compute block scores
+    ops::qsa_compute_block_scores(
+        ctx, q_out_dev, k_cache_dev, k_norm_w_dev, scores_dev, num_complete_blocks, rope_theta);
+
+    // 6. Select Top-512 blocks + tail
+    int num_active = ops::qsa_select_topk_and_expand_tokens(
+        ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+    ctx.synchronize();
+
+    expect(num_active == block_topk * compress_ratio, "Pipeline: active tokens must equal 2048");
+
+    // 7. Verify against CPU reference for block scores and active token selection
+    std::vector<bf16> indexer_qk_h(indexer_out_dim);
+    ctx.memcpy_d2h(indexer_qk_h.data(), indexer_qk_dev.data(), indexer_qk_h.size() * sizeof(bf16));
+
+    std::vector<bf16> q_ref(num_q_heads * index_head_dim);
+    ops::qsa_prepare_q_and_cache_k_host(
+        indexer_qk_h.data(), q_norm_w_h.data(), k_cache_h.data(), q_ref.data(),
+        current_pos, cached_len, rope_theta);
+
+    std::vector<float> scores_ref(num_complete_blocks);
+    ops::qsa_compute_block_scores_host(
+        q_ref.data(), k_cache_h.data(), k_norm_w_h.data(), scores_ref.data(),
+        num_complete_blocks, cached_len, rope_theta);
+
+    std::vector<float> scores_gpu(num_complete_blocks);
+    ctx.memcpy_d2h(scores_gpu.data(), scores_dev.data(), num_complete_blocks * sizeof(float));
+
+    float max_score_diff = 0.0f;
+    for (int i = 0; i < num_complete_blocks; ++i) {
+        float diff = std::abs(scores_gpu[i] - scores_ref[i]);
+        if (diff > max_score_diff) max_score_diff = diff;
+    }
+    expect(max_score_diff < 1e-3f, "Pipeline: QSA block scores mismatch vs host, max_diff=" + std::to_string(max_score_diff));
+
+    std::vector<int> tokens_ref(num_active);
+    int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+        scores_ref.data(), num_complete_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+    expect(ref_count == num_active, "Pipeline: active tokens count mismatch vs host");
+
+    std::vector<int> tokens_gpu(num_active);
+    ctx.memcpy_d2h(tokens_gpu.data(), active_tokens_dev.data(), num_active * sizeof(int));
+    for (int i = 0; i < num_active; ++i) {
+        expect(tokens_gpu[i] == tokens_ref[i], "Pipeline: active token index mismatch at " + std::to_string(i));
+    }
+
+    // 8. Full attention decode with QSA active indices
+    Tensor q_full_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_full_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_full_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor attn_out_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores_buf = Tensor::allocate(ctx, {num_heads, cached_len}, dnnl::memory::data_type::f32);
+    constexpr int kDecodeExactTile = 128;
+    const int max_tiles = (cached_len + kDecodeExactTile - 1) / kDecodeExactTile;
+    Tensor partials_dev = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, 272}, dnnl::memory::data_type::f32);
+
+    std::vector<bf16> q_full_h(num_heads * full_head_dim);
+    for (auto& v : q_full_h) v = bf16(dist(rng));
+    ctx.memcpy_h2d(q_full_dev.data(), q_full_h.data(), q_full_h.size() * sizeof(bf16));
+
+    std::vector<bf16> kv_full_h(num_kv_heads * cached_len * full_head_dim);
+    for (auto& v : kv_full_h) v = bf16(dist(rng) * 0.1f);
+    ctx.memcpy_h2d(k_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
+
+    ops::attention_decode(
+        ctx, q_full_dev, k_full_dev, v_full_dev, attn_out_dev, scores_buf,
+        num_heads, num_kv_heads, full_head_dim, cached_len,
+        &partials_dev, /*gate_buf=*/nullptr,
+        active_tokens_dev.data_as<int>(), num_active);
+    ctx.synchronize();
+
+    std::vector<bf16> attn_out_h(num_heads * full_head_dim);
+    ctx.memcpy_d2h(attn_out_h.data(), attn_out_dev.data(), attn_out_h.size() * sizeof(bf16));
+    for (size_t i = 0; i < attn_out_h.size(); ++i) {
+        float val = static_cast<float>(attn_out_h[i]);
+        expect(!std::isnan(val) && !std::isinf(val), "Pipeline: attention output NaN or Inf");
+    }
+
+    std::cout << "[PASS] QSA Indexer End-to-End Pipeline (>2048) fully verified: scores diff="
+              << max_score_diff << " < 1e-3, 0 token mismatches, attention outputs finite & valid.\n";
+}
+
 } // namespace
 
 int main() {
@@ -2566,6 +2708,7 @@ int main() {
         test_real_model_ple_and_cache_if_present(ctx);
         test_qsa_indexer_long_context_dispatch(ctx);
         test_real_model_qsa_indexer_weights_if_present(ctx);
+        test_qsa_indexer_end_to_end_pipeline(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;
     } catch (const std::exception& e) {

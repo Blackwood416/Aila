@@ -51,6 +51,7 @@ void qsa_prepare_q_and_cache_k(
     int mrope_section_h,
     int mrope_section_w) {
     (void)mrope_section_t;
+    if (pos < 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
     const bf16* qn_ptr = q_norm_w.data_as<bf16>();
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
@@ -262,7 +263,7 @@ int qsa_select_topk_and_expand_tokens(
     int cached_len,
     int compress_ratio,
     Tensor& active_tokens_out) {
-    if (cached_len <= 0) return 0;
+    if (cached_len <= 0 || block_topk <= 0) return 0;
 
     if (num_complete_blocks <= block_topk) {
         // All complete blocks + tail are selected: dense identity [0 .. cached_len - 1]
@@ -286,7 +287,7 @@ int qsa_select_topk_and_expand_tokens(
         sycl::local_accessor<float, 1> local_min(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<int, 1> local_cnt_gt(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<int, 1> local_cnt_ge(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(512), cgh);
+        sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
         sycl::local_accessor<int, 1> blk_counter(sycl::range<1>(1), cgh);
 
         cgh.parallel_for(
@@ -451,8 +452,8 @@ void qsa_prepare_q_and_cache_k_host(
     int mrope_section_t,
     int mrope_section_h,
     int mrope_section_w) {
-    (void)capacity;
     (void)mrope_section_t;
+    if (pos < 0 || (capacity > 0 && pos >= capacity)) return;
     constexpr int kHeadDim = 128;
     constexpr int kRotaryDim = 64;
     constexpr int kHalfDim = 32;
@@ -574,6 +575,7 @@ int qsa_select_topk_and_expand_tokens_host(
     int cached_len,
     int compress_ratio,
     int* active_tokens_out) {
+    if (cached_len <= 0 || block_topk <= 0) return 0;
     if (num_complete_blocks <= block_topk) {
         for (int i = 0; i < cached_len; ++i) {
             active_tokens_out[i] = i;

@@ -1447,6 +1447,7 @@ void test_attention_prefill_gate_fusion(Context& ctx) {
 
         // 1. Fused attention_prefill
         ops::attention_prefill(ctx, q_dev, k_dev, v_dev, out_fused, scores, seq_len, num_heads, num_kv_heads, head_dim, &z_dev);
+        ctx.synchronize();
 
         // 2. Unfused attention_prefill + sigmoid_mul
         ops::attention_prefill(ctx, q_dev, k_dev, v_dev, out_sep, scores, seq_len, num_heads, num_kv_heads, head_dim, nullptr);
@@ -1473,7 +1474,7 @@ void test_attention_prefill_gate_fusion(Context& ctx) {
         }
         std::cout << "[PASS] attention_prefill gate fusion head_dim=" << head_dim
                   << " seq_len=" << seq_len
-                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n";
+                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n" << std::flush;
     }
 }
 
@@ -1517,6 +1518,7 @@ void test_attention_prefill_cached_gate_fusion(Context& ctx) {
         // 1. Fused attention_prefill_cached
         ops::attention_prefill_cached(ctx, q_dev, k_dev, v_dev, out_fused, scores,
                                       seq_len, start_pos, num_heads, num_kv_heads, head_dim, max_seq_len, &z_dev);
+        ctx.synchronize();
 
         // 2. Unfused attention_prefill_cached + sigmoid_mul
         ops::attention_prefill_cached(ctx, q_dev, k_dev, v_dev, out_sep, scores,
@@ -1544,7 +1546,7 @@ void test_attention_prefill_cached_gate_fusion(Context& ctx) {
         }
         std::cout << "[PASS] attention_prefill_cached gate fusion head_dim=" << head_dim
                   << " seq_len=" << seq_len << " start_pos=" << start_pos
-                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n";
+                  << " (max_diff=" << max_diff << " <= 0.002, 1-ULP diffs=" << bit_diffs << "/" << fused.size() << ")\n" << std::flush;
     }
 }
 
@@ -1853,10 +1855,63 @@ static void test_qsa_select_topk_and_expand_tokens(Context& ctx) {
         }
         std::cout << "[PASS] QSA select top-k all-zero scores (0 mismatches vs host)\n";
     }
+
+    // Case 5: Large Top-K (block_topk = 1024 > 512, verifies dynamic SLM sizing)
+    {
+        constexpr int num_blocks = 1200;
+        constexpr int block_topk = 1024;
+        constexpr int compress_ratio = 4;
+        constexpr int cached_len = num_blocks * compress_ratio + 2; // 4802 tokens
+
+        std::vector<float> scores_h(num_blocks);
+        for (int i = 0; i < num_blocks; ++i) {
+            scores_h[i] = static_cast<float>((i * 73) % 200);
+        }
+
+        std::vector<int> tokens_ref(block_topk * compress_ratio + 2);
+        int ref_count = ops::qsa_select_topk_and_expand_tokens_host(
+            scores_h.data(), num_blocks, block_topk, cached_len, compress_ratio, tokens_ref.data());
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        Tensor tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+
+        int gpu_count = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, cached_len, compress_ratio, tokens_dev);
+        ctx.synchronize();
+
+        if (gpu_count != ref_count) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: large top-k count mismatch");
+        }
+        std::vector<int> tokens_gpu(gpu_count);
+        ctx.memcpy_d2h(tokens_gpu.data(), tokens_dev.data(), gpu_count * sizeof(int));
+        for (int i = 0; i < gpu_count; ++i) {
+            if (tokens_gpu[i] != tokens_ref[i]) {
+                throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: large top-k index mismatch at i=" +
+                                         std::to_string(i) + " gpu=" + std::to_string(tokens_gpu[i]) +
+                                         " ref=" + std::to_string(tokens_ref[i]));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k large top-k (block_topk=1024 > 512, " << gpu_count << " active tokens, 0 mismatches vs host)\n";
+    }
+
+    // Case 6: Edge parameter boundary conditions (non-positive cached_len or block_topk)
+    {
+        Tensor dummy_scores = Tensor::allocate(ctx, {10}, dnnl::memory::data_type::f32);
+        Tensor dummy_tokens = Tensor::allocate(ctx, {10}, dnnl::memory::data_type::s32);
+        int count_zero_len = ops::qsa_select_topk_and_expand_tokens(ctx, dummy_scores, 10, 5, 0, 4, dummy_tokens);
+        int count_neg_len = ops::qsa_select_topk_and_expand_tokens(ctx, dummy_scores, 10, 5, -4, 4, dummy_tokens);
+        int count_zero_topk = ops::qsa_select_topk_and_expand_tokens(ctx, dummy_scores, 10, 0, 16, 4, dummy_tokens);
+        int count_neg_topk = ops::qsa_select_topk_and_expand_tokens(ctx, dummy_scores, 10, -1, 16, 4, dummy_tokens);
+        if (count_zero_len != 0 || count_neg_len != 0 || count_zero_topk != 0 || count_neg_topk != 0) {
+            throw std::runtime_error("test_qsa_select_topk_and_expand_tokens: non-positive parameter guard failed");
+        }
+        std::cout << "[PASS] QSA select top-k non-positive parameter guards verified (clean zero returns)\n";
+    }
 }
 
 static void test_attention_decode_with_qsa_indices(Context& ctx) {
-    std::cout << "[Test] Running Attention Decode with QSA Active Indices test...\n";
+    std::cout << "[Test] Running Attention Decode with QSA Active Indices test...\n" << std::flush;
     constexpr int num_heads = 24;
     constexpr int num_kv_heads = 2;
     constexpr int head_dim = 256;
@@ -1962,6 +2017,116 @@ static void test_attention_decode_with_qsa_indices(Context& ctx) {
 
     std::cout << "[PASS] Attention decode with QSA active indices (cached_len=" << cached_len
               << ", num_active=" << num_active << ", max_attn_diff=" << max_attn_diff << " <= 0.015)\n";
+
+    // Part 2: Non-contiguous / sparse active block indices with Epilogue Gate Fusion
+    {
+        constexpr int num_active_sparse = 512 * 4 + 2; // 2050 tokens
+        std::vector<int> sparse_indices_h(num_active_sparse);
+        // Select 512 sparse blocks out of 600 complete blocks (skipping every 7th block to create realistic non-contiguous gaps within cached_len=2400)
+        int picked_blocks = 0;
+        for (int b = 0; b < 600 && picked_blocks < 512; ++b) {
+            if ((b % 7) == 3) continue; // gap
+            for (int c = 0; c < 4; ++c) {
+                sparse_indices_h[picked_blocks * 4 + c] = b * 4 + c;
+            }
+            picked_blocks++;
+        }
+        if (picked_blocks != 512) {
+            throw std::runtime_error("test_attention_decode_with_qsa_indices: failed to pick 512 sparse blocks");
+        }
+        sparse_indices_h[512 * 4 + 0] = cached_len - 2;
+        sparse_indices_h[512 * 4 + 1] = cached_len - 1;
+
+        std::vector<bf16> gate_h(num_heads * head_dim);
+        for (auto& v : gate_h) v = bf16(dist(rng) * 0.5f);
+
+        Tensor sparse_idx_dev = Tensor::allocate(ctx, {num_active_sparse}, dnnl::memory::data_type::s32);
+        Tensor gate_dev = Tensor::allocate(ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(sparse_idx_dev.data(), sparse_indices_h.data(), sparse_indices_h.size() * sizeof(int));
+        ctx.memcpy_h2d(gate_dev.data(), gate_h.data(), gate_h.size() * sizeof(bf16));
+
+        ops::attention_decode(
+            ctx, q_dev, k_dev, v_dev, out_dev, scores_buf,
+            num_heads, num_kv_heads, head_dim, cached_len,
+            &partials_dev, &gate_dev,
+            sparse_idx_dev.data_as<int>(), num_active_sparse);
+        ctx.synchronize();
+
+        ctx.memcpy_d2h(out_h.data(), out_dev.data(), out_h.size() * sizeof(bf16));
+
+        float max_gate_diff = 0.0f;
+        for (int h = 0; h < num_heads; ++h) {
+            const int kv_head = h / heads_per_kv;
+            std::vector<float> scores(num_active_sparse);
+            float max_s = -1e30f;
+            for (int t = 0; t < num_active_sparse; ++t) {
+                int cache_t = sparse_indices_h[t];
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += static_cast<float>(q_h[h * head_dim + d]) *
+                           static_cast<float>(kv_init[kv_head * cached_len * head_dim + cache_t * head_dim + d]);
+                }
+                float s = dot * scale;
+                scores[t] = s;
+                if (s > max_s) max_s = s;
+            }
+            float sum_exp = 0.0f;
+            for (int t = 0; t < num_active_sparse; ++t) {
+                scores[t] = std::exp(scores[t] - max_s);
+                sum_exp += scores[t];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int d = 0; d < head_dim; ++d) {
+                float acc = 0.0f;
+                for (int t = 0; t < num_active_sparse; ++t) {
+                    int cache_t = sparse_indices_h[t];
+                    acc += scores[t] * static_cast<float>(kv_init[kv_head * cached_len * head_dim + cache_t * head_dim + d]);
+                }
+                float val = static_cast<float>(bf16(acc * inv_sum));
+                float g_v = static_cast<float>(gate_h[h * head_dim + d]);
+                float s = 1.0f / (1.0f + std::exp(-g_v));
+                val = static_cast<float>(bf16(val * s));
+                float expected_val = val;
+                float actual_val = static_cast<float>(out_h[h * head_dim + d]);
+                if (std::isnan(actual_val) || std::isinf(actual_val)) {
+                    throw std::runtime_error("test_attention_decode_with_qsa_indices (gate): NaN/Inf detected");
+                }
+                float diff = std::abs(actual_val - expected_val);
+                if (diff > max_gate_diff) max_gate_diff = diff;
+            }
+        }
+        if (max_gate_diff > 0.015f) {
+            throw std::runtime_error("test_attention_decode_with_qsa_indices (gate): mismatch, diff=" + std::to_string(max_gate_diff));
+        }
+        std::cout << "[PASS] Attention decode with sparse non-contiguous QSA indices & Epilogue Gate Fusion (max_gate_diff="
+                  << max_gate_diff << " <= 0.015)\n";
+    }
+
+    // Part 3: Baseline decode fallback with active indices (partials_buf == nullptr)
+    {
+        ops::attention_decode(
+            ctx, q_dev, k_dev, v_dev, out_dev, scores_buf,
+            num_heads, num_kv_heads, head_dim, cached_len,
+            /*exact_partials_buf=*/nullptr, /*gate_buf=*/nullptr,
+            active_idx_dev.data_as<int>(), num_active);
+        ctx.synchronize();
+
+        ctx.memcpy_d2h(out_h.data(), out_dev.data(), out_h.size() * sizeof(bf16));
+        float max_base_diff = 0.0f;
+        for (int h = 0; h < num_heads; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                float actual_val = static_cast<float>(out_h[h * head_dim + d]);
+                float expected_val = ref_out[h * head_dim + d];
+                float diff = std::abs(actual_val - expected_val);
+                if (diff > max_base_diff) max_base_diff = diff;
+            }
+        }
+        if (max_base_diff > 0.015f) {
+            throw std::runtime_error("test_attention_decode_with_qsa_indices (baseline fallback): mismatch, diff=" + std::to_string(max_base_diff));
+        }
+        std::cout << "[PASS] Attention decode baseline fallback with QSA active indices (max_base_diff="
+                  << max_base_diff << " <= 0.015)\n";
+    }
 }
 
 } // namespace
@@ -2000,7 +2165,10 @@ int main() {
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "Test failed: " << e.what() << "\n";
+        std::cout << "Test failed: " << e.what() << "\n" << std::flush;
+        return 1;
+    } catch (...) {
+        std::cout << "Test failed: unknown exception\n" << std::flush;
         return 1;
     }
 }
