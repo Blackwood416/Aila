@@ -614,4 +614,290 @@ int qsa_select_topk_and_expand_tokens_host(
     return block_topk * compress_ratio + tail_len;
 }
 
+void qsa_compute_block_scores_upstream_ref(
+    const bf16* q,
+    const bf16* k_cache,
+    const bf16* k_norm_w_raw,
+    float* scores_out,
+    int num_complete_blocks,
+    float theta,
+    float eps) {
+    constexpr int kHeadDim = 128;
+    constexpr int kRotaryDim = 64;
+    constexpr int kHalfDim = 32;
+    constexpr int kNumHeads = 4;
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+
+    std::vector<float> inv_freq(kHalfDim);
+    for (int d = 0; d < kHalfDim; ++d) {
+        inv_freq[d] = 1.0f / std::pow(theta, (2.0f * d) / static_cast<float>(kRotaryDim));
+    }
+
+    for (int b = 0; b < num_complete_blocks; ++b) {
+        // 1. Mean pool 4 tokens into bf16
+        std::vector<bf16> pooled_k(kHeadDim);
+        float sum_sq = 0.0f;
+        for (int d = 0; d < kHeadDim; ++d) {
+            float k0 = static_cast<float>(k_cache[(4 * b + 0) * kHeadDim + d]);
+            float k1 = static_cast<float>(k_cache[(4 * b + 1) * kHeadDim + d]);
+            float k2 = static_cast<float>(k_cache[(4 * b + 2) * kHeadDim + d]);
+            float k3 = static_cast<float>(k_cache[(4 * b + 3) * kHeadDim + d]);
+            bf16 pk = bf16((k0 + k1 + k2 + k3) * 0.25f);
+            pooled_k[d] = pk;
+            float pk_f = static_cast<float>(pk);
+            sum_sq += pk_f * pk_f;
+        }
+
+        // 2. RMSNorm with (1.0 + w_raw), output rounded to bf16
+        float k_rsqrt = 1.0f / std::sqrt(sum_sq / static_cast<float>(kHeadDim) + eps);
+        std::vector<bf16> normed_k(kHeadDim);
+        for (int d = 0; d < kHeadDim; ++d) {
+            float norm_val = static_cast<float>(pooled_k[d]) * k_rsqrt * (1.0f + static_cast<float>(k_norm_w_raw[d]));
+            normed_k[d] = bf16(norm_val);
+        }
+
+        // 3. RoPE at position 4 * b, rotated in bf16
+        const float blk_pos = static_cast<float>(4 * b);
+        std::vector<bf16> rotated_k = normed_k;
+        for (int d = 0; d < kHalfDim; ++d) {
+            float angle = blk_pos * inv_freq[d];
+            bf16 c = bf16(std::cos(angle));
+            bf16 s = bf16(std::sin(angle));
+            bf16 x1 = normed_k[d];
+            bf16 x2 = normed_k[d + kHalfDim];
+            rotated_k[d] = bf16(static_cast<float>(x1) * static_cast<float>(c) - static_cast<float>(x2) * static_cast<float>(s));
+            rotated_k[d + kHalfDim] = bf16(static_cast<float>(x2) * static_cast<float>(c) + static_cast<float>(x1) * static_cast<float>(s));
+        }
+
+        // 4. Dot product with Q in float, relu, head sum, divide by sqrt(128)
+        float sum_relu_dot = 0.0f;
+        for (int h = 0; h < kNumHeads; ++h) {
+            float dot = 0.0f;
+            for (int d = 0; d < kHeadDim; ++d) {
+                dot += static_cast<float>(q[h * kHeadDim + d]) * static_cast<float>(rotated_k[d]);
+            }
+            sum_relu_dot += std::max(0.0f, dot);
+        }
+        scores_out[b] = sum_relu_dot * inv_sqrt_d;
+    }
+}
+
+void qsa_compress_key_blocks(
+    Context& ctx,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& compressed_k,
+    int start_block,
+    int num_blocks,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    (void)mrope_section_t;
+    if (num_blocks <= 0) return;
+    const bf16* k_cache_ptr = k_cache.data_as<bf16>();
+    const bf16* kn_ptr = k_norm_w.data_as<bf16>();
+    bf16* comp_k_ptr = compressed_k.data_as<bf16>();
+
+    constexpr int kHeadDim = 128;
+    constexpr int kRotaryDim = 64;
+    constexpr int kHalfDim = 32;
+    constexpr int kWgSize = 128;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_sum(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<float, 1> local_k(sycl::range<1>(kHeadDim), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_blocks * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int b = start_block + item.get_group(0);
+                const int lid = item.get_local_id(0);
+
+                // 1. Mean-pool 4 tokens
+                const size_t b0 = (static_cast<size_t>(4 * b + 0) * kHeadDim) + lid;
+                const size_t b1 = (static_cast<size_t>(4 * b + 1) * kHeadDim) + lid;
+                const size_t b2 = (static_cast<size_t>(4 * b + 2) * kHeadDim) + lid;
+                const size_t b3 = (static_cast<size_t>(4 * b + 3) * kHeadDim) + lid;
+
+                const float k0 = static_cast<float>(k_cache_ptr[b0]);
+                const float k1 = static_cast<float>(k_cache_ptr[b1]);
+                const float k2 = static_cast<float>(k_cache_ptr[b2]);
+                const float k3 = static_cast<float>(k_cache_ptr[b3]);
+                const float k_pooled_raw = (k0 + k1 + k2 + k3) * 0.25f;
+                const float k_pooled = static_cast<float>(bf16(k_pooled_raw));
+
+                // 2. RMSNorm across 128 dims
+                local_sum[lid] = k_pooled * k_pooled;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float k_rms = sycl::sqrt(local_sum[0] / static_cast<float>(kHeadDim) + 1e-6f);
+                const float k_normed = (k_pooled / k_rms) * static_cast<float>(kn_ptr[lid]);
+                local_k[lid] = k_normed;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // 3. RoPE at group_starts = 4 * b
+                const int blk_pos = 4 * b;
+                const float pos_scalar = static_cast<float>(blk_pos >= prompt_pos_len ? blk_pos + text_pos_delta : blk_pos);
+                if (lid < kHalfDim) {
+                    const float pos_val = calculate_rotary_position(
+                        blk_pos, lid, pos_scalar, interleaved, pos_t, pos_h, pos_w,
+                        prompt_pos_len, mrope_section_h, mrope_section_w);
+                    const float freq = 1.0f / sycl::pow(theta, (2.0f * lid) / static_cast<float>(kRotaryDim));
+                    const float angle = pos_val * freq;
+                    const float c = sycl::native::cos(angle);
+                    const float s = sycl::native::sin(angle);
+                    const float kv0 = local_k[lid];
+                    const float kv1 = local_k[lid + kHalfDim];
+                    comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid] = bf16(kv0 * c - kv1 * s);
+                    comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid + kHalfDim] = bf16(kv1 * c + kv0 * s);
+                } else if (lid >= kRotaryDim) {
+                    comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid] = bf16(local_k[lid]);
+                }
+            });
+    });
+}
+
+void qsa_compress_key_blocks_host(
+    const bf16* k_cache,
+    const bf16* k_norm_w,
+    bf16* compressed_k,
+    int start_block,
+    int num_blocks,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    (void)mrope_section_t;
+    constexpr int kHeadDim = 128;
+    constexpr int kRotaryDim = 64;
+    constexpr int kHalfDim = 32;
+
+    for (int idx = 0; idx < num_blocks; ++idx) {
+        const int b = start_block + idx;
+        std::vector<float> pooled_k(kHeadDim);
+        float sum_sq = 0.0f;
+        for (int d = 0; d < kHeadDim; ++d) {
+            float k0 = static_cast<float>(k_cache[(4 * b + 0) * kHeadDim + d]);
+            float k1 = static_cast<float>(k_cache[(4 * b + 1) * kHeadDim + d]);
+            float k2 = static_cast<float>(k_cache[(4 * b + 2) * kHeadDim + d]);
+            float k3 = static_cast<float>(k_cache[(4 * b + 3) * kHeadDim + d]);
+            float pk = static_cast<float>(bf16((k0 + k1 + k2 + k3) * 0.25f));
+            pooled_k[d] = pk;
+            sum_sq += pk * pk;
+        }
+
+        float k_rms = std::sqrt(sum_sq / static_cast<float>(kHeadDim) + 1e-6f);
+        std::vector<float> normed_k(kHeadDim);
+        for (int d = 0; d < kHeadDim; ++d) {
+            normed_k[d] = (pooled_k[d] / k_rms) * static_cast<float>(k_norm_w[d]);
+        }
+
+        const int blk_pos = 4 * b;
+        const float pos_scalar = static_cast<float>(blk_pos >= prompt_pos_len ? blk_pos + text_pos_delta : blk_pos);
+        for (int d = 0; d < kHalfDim; ++d) {
+            float pos_val = calculate_rotary_position(
+                blk_pos, d, pos_scalar, interleaved, pos_t, pos_h, pos_w,
+                prompt_pos_len, mrope_section_h, mrope_section_w);
+            float freq = 1.0f / std::pow(theta, (2.0f * d) / static_cast<float>(kRotaryDim));
+            float angle = pos_val * freq;
+            float c = std::cos(angle);
+            float s = std::sin(angle);
+            float kv0 = normed_k[d];
+            float kv1 = normed_k[d + kHalfDim];
+            compressed_k[static_cast<size_t>(b) * kHeadDim + d] = bf16(kv0 * c - kv1 * s);
+            compressed_k[static_cast<size_t>(b) * kHeadDim + d + kHalfDim] = bf16(kv1 * c + kv0 * s);
+        }
+        for (int d = kRotaryDim; d < kHeadDim; ++d) {
+            compressed_k[static_cast<size_t>(b) * kHeadDim + d] = bf16(normed_k[d]);
+        }
+    }
+}
+
+void qsa_compute_block_scores_compressed(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    int num_complete_blocks) {
+    if (num_complete_blocks <= 0) return;
+    const bf16* q_ptr = q.data_as<bf16>();
+    const bf16* comp_k_ptr = compressed_k.data_as<bf16>();
+    float* scores_ptr = scores_out.data_as<float>();
+
+    constexpr int kHeadDim = 128;
+    constexpr int kWgSize = 128;
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_complete_blocks * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int b = item.get_group(0);
+                const int lid = item.get_local_id(0);
+
+                const float kl = static_cast<float>(comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid]);
+                const float p0 = static_cast<float>(q_ptr[0 * kHeadDim + lid]) * kl;
+                const float p1 = static_cast<float>(q_ptr[1 * kHeadDim + lid]) * kl;
+                const float p2 = static_cast<float>(q_ptr[2 * kHeadDim + lid]) * kl;
+                const float p3 = static_cast<float>(q_ptr[3 * kHeadDim + lid]) * kl;
+
+                const float dot0 = sycl::reduce_over_group(item.get_group(), p0, sycl::plus<float>());
+                const float dot1 = sycl::reduce_over_group(item.get_group(), p1, sycl::plus<float>());
+                const float dot2 = sycl::reduce_over_group(item.get_group(), p2, sycl::plus<float>());
+                const float dot3 = sycl::reduce_over_group(item.get_group(), p3, sycl::plus<float>());
+
+                if (lid == 0) {
+                    const float r0 = sycl::max(0.0f, dot0);
+                    const float r1 = sycl::max(0.0f, dot1);
+                    const float r2 = sycl::max(0.0f, dot2);
+                    const float r3 = sycl::max(0.0f, dot3);
+                    scores_ptr[b] = (r0 + r1 + r2 + r3) * inv_sqrt_d;
+                }
+            });
+    });
+}
+
+void qsa_compute_block_scores_compressed_host(
+    const bf16* q,
+    const bf16* compressed_k,
+    float* scores_out,
+    int num_complete_blocks) {
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+
+    for (int b = 0; b < num_complete_blocks; ++b) {
+        float sum_relu_dot = 0.0f;
+        for (int h = 0; h < kNumHeads; ++h) {
+            float dot = 0.0f;
+            for (int d = 0; d < kHeadDim; ++d) {
+                dot += static_cast<float>(q[h * kHeadDim + d]) *
+                       static_cast<float>(compressed_k[static_cast<size_t>(b) * kHeadDim + d]);
+            }
+            sum_relu_dot += std::max(0.0f, dot);
+        }
+        scores_out[b] = sum_relu_dot * inv_sqrt_d;
+    }
+}
+
 } // namespace ops

@@ -558,13 +558,31 @@ bool Qwen4ExpBnb4Backend::load(
         if (ctx.device_allocation_limit() > 0) vram = std::min(vram, ctx.device_allocation_limit());
         const size_t full_layers = static_cast<size_t>(
             std::count_if(layers_.begin(), layers_.end(), [](const Qwen4ExpLayer& l) { return !l.is_linear; }));
+        const size_t linear_layers = layers_.size() - full_layers;
         const size_t kv_bytes = full_layers * 2 * cfg_.num_key_value_heads * cfg_.head_dim * sizeof(bf16) *
                                 static_cast<size_t>(max_seq_len_);
-        const size_t reserve =
-            (static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20) + kv_bytes;
+        const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
+        const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
+        const size_t total_session_state = kv_bytes + indexer_k_bytes + recurrent_bytes;
+        const size_t max_reserve =
+            static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20;
+        const size_t reserve = max_reserve + total_session_state;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
         expert_cache_bytes = vram > used + min_bytes ? vram - used : min_bytes;
+
+        AILA_LOG_INFO(
+            "[Qwen4Exp] Memory Admission Accounting: Total VRAM=%.0f MB, Static Weights=%.1f MB, "
+            "Session State=%.1f MB (KV=%.1f MB, IndexerK=%.1f MB, Recurrent=%.1f MB), "
+            "Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
+            vram / (1024.0 * 1024.0),
+            ctx.current_allocated_bytes() / (1024.0 * 1024.0),
+            total_session_state / (1024.0 * 1024.0),
+            kv_bytes / (1024.0 * 1024.0),
+            indexer_k_bytes / (1024.0 * 1024.0),
+            recurrent_bytes / (1024.0 * 1024.0),
+            max_reserve / (1024.0 * 1024.0),
+            expert_cache_bytes / (1024.0 * 1024.0));
     }
     AILA_LOG_INFO("[Qwen4Exp] Initializing Expert Cache (%.0f MB)...", expert_cache_bytes / (1024.0 * 1024.0));
     if (!expert_cache_.init(ctx, weights, cfg_.num_hidden_layers, expert_cache_bytes,
@@ -630,8 +648,14 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         ctx,
         {(int64_t)full_q_heads_, (int64_t)max_tiles, (int64_t)partial_stride},
         dnnl::memory::data_type::f32);
-    buf_.scores = Tensor::allocate(ctx, {full_q_heads_, cap, cap}, dnnl::memory::data_type::f32);
-    buf_.incr_scores = Tensor::allocate(ctx, {full_q_heads_, cap, max_seq_len_}, dnnl::memory::data_type::f32);
+    // D1: Limit dense attention scratchpads to the maximum dense prefill length (2052).
+    // Prefill exceeding this threshold runs sparse QSA attention via decode_scores and
+    // decode_attn_partials, eliminating the 6 GiB - 96 GiB incr_scores memory explosion.
+    constexpr int kDensePrefillLimit = 2052;
+    const int dense_cap = std::min(cap, kDensePrefillLimit);
+    const int dense_kv_cap = std::min(max_seq_len_, kDensePrefillLimit);
+    buf_.scores = Tensor::allocate(ctx, {full_q_heads_, dense_cap, dense_cap}, dnnl::memory::data_type::f32);
+    buf_.incr_scores = Tensor::allocate(ctx, {full_q_heads_, dense_cap, dense_kv_cap}, dnnl::memory::data_type::f32);
 
     // QSA Indexer buffers (M2)
     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;

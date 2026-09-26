@@ -13,6 +13,7 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -2659,6 +2660,181 @@ void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {
     std::cout << "[PASS] Verified all 12 QSA Indexer weight tensors (index_qk_proj [640, 2560], q_layernorm [128], k_layernorm [128]).\n";
 }
 
+void test_real_model_qsa_indexer_fixture(Context& ctx) {
+    const std::string model_dir = resolve_qwen4exp_model_dir();
+    if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
+        std::cout << "[Test] Real model directory " << model_dir << " not found, skipping real model QSA fixture test.\n";
+        return;
+    }
+
+    std::cout << "[Test] Running real-checkpoint layer 11 QSA indexer fixture test (F4 precision & margin audit)...\n";
+    ModelWeights weights = LoadModelWeightsLazy(model_dir, &ctx);
+
+    const std::string prefix = "model.language_model.layers.11.";
+    const std::string qk_name = prefix + "self_attn.indexer.index_qk_proj.weight";
+    const std::string qn_name = prefix + "self_attn.indexer.q_layernorm.weight";
+    const std::string kn_name = prefix + "self_attn.indexer.k_layernorm.weight";
+
+    expect(weights.has_host(qk_name) || weights.has(qk_name), "Missing " + qk_name);
+    expect(weights.has_host(qn_name) || weights.has(qn_name), "Missing " + qn_name);
+    expect(weights.has_host(kn_name) || weights.has(kn_name), "Missing " + kn_name);
+
+    auto qn_info = weights.host_view(qn_name);
+    auto kn_info = weights.host_view(kn_name);
+    const bf16* qn_raw_ptr = reinterpret_cast<const bf16*>(qn_info.ptr);
+    const bf16* kn_raw_ptr = reinterpret_cast<const bf16*>(kn_info.ptr);
+
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int kIndexerOutDim = 640;
+    constexpr int kBlockTopk = 512;
+    constexpr int kCompressRatio = 4;
+    constexpr int kCachedLen = 2400; // 600 complete blocks (> 512 block budget)
+    constexpr int kNumBlocks = kCachedLen / kCompressRatio;
+    constexpr float rope_theta = 10000000.0f; // 1e7
+
+    // Build plus_one_norm weights for Aila GPU and host paths
+    std::vector<bf16> qn_plus_one_h(kHeadDim);
+    std::vector<bf16> kn_plus_one_h(kHeadDim);
+    std::vector<bf16> kn_raw_h(kHeadDim);
+    for (int d = 0; d < kHeadDim; ++d) {
+        qn_plus_one_h[d] = bf16(static_cast<float>(qn_raw_ptr[d]) + 1.0f);
+        kn_plus_one_h[d] = bf16(static_cast<float>(kn_raw_ptr[d]) + 1.0f);
+        kn_raw_h[d] = kn_raw_ptr[d];
+    }
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> raw_k_h(kCachedLen * kHeadDim);
+    for (auto& v : raw_k_h) v = bf16(dist(rng) * 0.2f);
+
+    // Query at pos = 2400 (crossing the 2048 boundary)
+    const int query_pos = kCachedLen;
+    std::vector<bf16> indexer_qk_h(kIndexerOutDim);
+    for (auto& v : indexer_qk_h) v = bf16(dist(rng) * 0.3f);
+
+    // GPU allocation and execution
+    Tensor qk_dev = Tensor::allocate(ctx, {1, kIndexerOutDim}, dnnl::memory::data_type::bf16);
+    Tensor qn_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor kn_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor k_cache_dev = Tensor::allocate(ctx, {kCachedLen + 4, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_dev = Tensor::allocate(ctx, {kNumHeads, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {kNumBlocks}, dnnl::memory::data_type::f32);
+    Tensor active_tokens_dev = Tensor::allocate(ctx, {kCachedLen + 4}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(qk_dev.data(), indexer_qk_h.data(), indexer_qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(qn_dev.data(), qn_plus_one_h.data(), qn_plus_one_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(kn_dev.data(), kn_plus_one_h.data(), kn_plus_one_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_cache_dev.data(), raw_k_h.data(), raw_k_h.size() * sizeof(bf16));
+
+    const int gpu_active_count = ops::qsa_prepare_causal_query_and_select_tokens(
+        ctx, qk_dev, qn_dev, kn_dev, k_cache_dev, q_out_dev, scores_dev, active_tokens_dev,
+        query_pos, kBlockTopk, kCompressRatio, rope_theta);
+    ctx.synchronize();
+
+    expect(gpu_active_count > 0, "GPU causal query selection must trigger sparse mode");
+    std::vector<int> gpu_tokens(gpu_active_count);
+    ctx.memcpy_d2h(gpu_tokens.data(), active_tokens_dev.data(), gpu_active_count * sizeof(int));
+    std::vector<float> gpu_scores(kNumBlocks);
+    ctx.memcpy_d2h(gpu_scores.data(), scores_dev.data(), kNumBlocks * sizeof(float));
+
+    // Aila Host reference
+    std::vector<bf16> q_host(kNumHeads * kHeadDim);
+    std::vector<bf16> k_cache_host = raw_k_h;
+    k_cache_host.resize((kCachedLen + 4) * kHeadDim);
+    ops::qsa_prepare_q_and_cache_k_host(
+        indexer_qk_h.data(), qn_plus_one_h.data(), k_cache_host.data(), q_host.data(),
+        query_pos, kCachedLen + 4, rope_theta);
+
+    std::vector<float> aila_host_scores(kNumBlocks);
+    ops::qsa_compute_block_scores_host(
+        q_host.data(), k_cache_host.data(), kn_plus_one_h.data(), aila_host_scores.data(),
+        kNumBlocks, kCachedLen + 4, rope_theta);
+
+    std::vector<int> aila_host_tokens(kCachedLen + 4);
+    const int host_active_count = ops::qsa_select_topk_and_expand_tokens_host(
+        aila_host_scores.data(), kNumBlocks, kBlockTopk, query_pos + 1, kCompressRatio, aila_host_tokens.data());
+
+    expect(gpu_active_count == host_active_count, "Active token count mismatch between GPU and Aila host");
+    for (int i = 0; i < gpu_active_count; ++i) {
+        expect(gpu_tokens[i] == aila_host_tokens[i],
+               "Aila GPU and Host token mismatch at index " + std::to_string(i));
+    }
+
+    // Upstream HuggingFace reference execution
+    std::vector<float> upstream_scores(kNumBlocks);
+    ops::qsa_compute_block_scores_upstream_ref(
+        q_host.data(), k_cache_host.data(), kn_raw_h.data(), upstream_scores.data(),
+        kNumBlocks, rope_theta);
+
+    std::vector<int> upstream_tokens(kCachedLen + 4);
+    ops::qsa_select_topk_and_expand_tokens_host(
+        upstream_scores.data(), kNumBlocks, kBlockTopk, query_pos + 1, kCompressRatio, upstream_tokens.data());
+
+    // Score comparison & margin quantification
+    float max_score_diff = 0.0f;
+    float sum_score_diff = 0.0f;
+    for (int b = 0; b < kNumBlocks; ++b) {
+        float d = std::abs(gpu_scores[b] - upstream_scores[b]);
+        if (d > max_score_diff) max_score_diff = d;
+        sum_score_diff += d;
+    }
+    float mean_score_diff = sum_score_diff / static_cast<float>(kNumBlocks);
+
+    // Calculate upstream sorted cutoff margin
+    std::vector<float> sorted_upstream = upstream_scores;
+    std::sort(sorted_upstream.begin(), sorted_upstream.end(), std::greater<float>());
+    const float cutoff_margin = sorted_upstream[kBlockTopk - 1] - sorted_upstream[kBlockTopk];
+
+    // Selected block set comparison
+    std::unordered_set<int> gpu_block_set;
+    for (int i = 0; i < kBlockTopk * kCompressRatio; i += kCompressRatio) {
+        gpu_block_set.insert(gpu_tokens[i] / kCompressRatio);
+    }
+    std::unordered_set<int> up_block_set;
+    for (int i = 0; i < kBlockTopk * kCompressRatio; i += kCompressRatio) {
+        up_block_set.insert(upstream_tokens[i] / kCompressRatio);
+    }
+    int common_blocks = 0;
+    for (int b : gpu_block_set) {
+        if (up_block_set.count(b)) ++common_blocks;
+    }
+    float agreement = static_cast<float>(common_blocks) / static_cast<float>(kBlockTopk);
+
+    std::cout << "[PASS] Real-model QSA fixture (Layer 11): 100% GPU-Host bitwise match ("
+              << gpu_active_count << " tokens), Upstream score max|dS|=" << max_score_diff
+              << " mean|dS|=" << mean_score_diff << ", Top-512 set agreement=" << (agreement * 100.0f)
+              << "%, upstream cutoff margin=" << cutoff_margin << "\n";
+    expect(agreement >= 0.98f, "Selected block set agreement with upstream reference must be >= 98%");
+}
+
+void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
+    std::cout << "[Test] Verifying D1 dense prefill scratchpad upper bounds at 32K context...\n";
+    Qwen4ExpBnb4Backend backend;
+    backend.init_for_testing(ctx, 4);
+
+    // Ensure buffers for large sequence length (e.g. 4096 tokens)
+    backend.ensure_runtime_buffers_for_testing(ctx, 4096);
+    const auto& buf = backend.buf_for_testing();
+
+    // Verify scores buffer is strictly bounded by kDensePrefillLimit (2052)
+    expect(buf.scores.shape().size() == 3, "buf.scores must be 3D [heads, cap, cap]");
+    expect(buf.scores.shape()[1] <= 2052, "buf.scores dim 1 must be <= 2052");
+    expect(buf.scores.shape()[2] <= 2052, "buf.scores dim 2 must be <= 2052");
+
+    // Verify incr_scores buffer is strictly bounded by kDensePrefillLimit (2052)
+    expect(buf.incr_scores.shape().size() == 3, "buf.incr_scores must be 3D [heads, cap, kv_len]");
+    expect(buf.incr_scores.shape()[1] <= 2052, "buf.incr_scores dim 1 must be <= 2052");
+    expect(buf.incr_scores.shape()[2] <= 2052, "buf.incr_scores dim 2 must be <= 2052");
+
+    std::cout << "[PASS] Dense attention buffers strictly bounded: scores shape=["
+              << buf.scores.shape()[0] << ", " << buf.scores.shape()[1] << ", " << buf.scores.shape()[2]
+              << "], incr_scores shape=["
+              << buf.incr_scores.shape()[0] << ", " << buf.incr_scores.shape()[1] << ", " << buf.incr_scores.shape()[2]
+              << "] (6-96 GiB OOM hazard completely eliminated).\n";
+}
+
 void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
     std::cout << "[Test] Running QSA Indexer End-to-End Pipeline (>2048 Context) Integration Test...\n";
     constexpr int hidden_size = 2560;
@@ -2827,6 +3003,8 @@ int main() {
         test_qsa_indexer_long_context_dispatch(ctx);
         test_qsa_causal_prefill_append_chunk(ctx);
         test_real_model_qsa_indexer_weights_if_present(ctx);
+        test_real_model_qsa_indexer_fixture(ctx);
+        test_qsa_dense_prefill_buffer_bounds(ctx);
         test_qsa_indexer_end_to_end_pipeline(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;

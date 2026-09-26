@@ -2168,6 +2168,117 @@ static void test_attention_decode_with_qsa_indices(Context& ctx) {
     }
 }
 
+static void test_qsa_compressed_k_scoring(Context& ctx) {
+    std::cout << "[Test] Running QSA compressed K state (A1) and scoring tests...\n";
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int num_blocks = 64;
+    constexpr int num_tokens = num_blocks * 4;
+    constexpr float theta = 10000000.0f;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> raw_k_h(num_tokens * kHeadDim);
+    std::vector<bf16> kn_w_h(kHeadDim);
+    std::vector<bf16> q_h(kNumHeads * kHeadDim);
+    for (auto& v : raw_k_h) v = bf16(dist(rng) * 0.3f);
+    for (auto& v : kn_w_h) v = bf16(1.0f + dist(rng) * 0.1f);
+    for (auto& v : q_h) v = bf16(dist(rng) * 0.2f);
+
+    // 1. Host compression
+    std::vector<bf16> comp_k_host(num_blocks * kHeadDim);
+    ops::qsa_compress_key_blocks_host(
+        raw_k_h.data(), kn_w_h.data(), comp_k_host.data(), 0, num_blocks, theta);
+
+    // 2. GPU compression
+    Tensor raw_k_dev = Tensor::allocate(ctx, {num_tokens, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor kn_w_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor comp_k_dev = Tensor::allocate(ctx, {num_blocks, kHeadDim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(raw_k_dev.data(), raw_k_h.data(), raw_k_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(kn_w_dev.data(), kn_w_h.data(), kn_w_h.size() * sizeof(bf16));
+
+    ops::qsa_compress_key_blocks(ctx, raw_k_dev, kn_w_dev, comp_k_dev, 0, num_blocks, theta);
+    ctx.synchronize();
+
+    std::vector<bf16> comp_k_gpu(num_blocks * kHeadDim);
+    ctx.memcpy_d2h(comp_k_gpu.data(), comp_k_dev.data(), comp_k_gpu.size() * sizeof(bf16));
+
+    float max_comp_diff = 0.0f;
+    for (size_t i = 0; i < comp_k_host.size(); ++i) {
+        float diff = std::abs(static_cast<float>(comp_k_gpu[i]) - static_cast<float>(comp_k_host[i]));
+        if (diff > max_comp_diff) max_comp_diff = diff;
+    }
+    if (max_comp_diff > 0.01f) {
+        throw std::runtime_error("test_qsa_compressed_k_scoring: compressed K GPU vs Host mismatch, diff=" +
+                                 std::to_string(max_comp_diff));
+    }
+    std::cout << "[PASS] QSA key block compression verified (num_blocks=" << num_blocks
+              << ", max_diff=" << max_comp_diff << " <= 0.01)\n";
+
+    // 3. Compare scoring: GPU uncompressed vs GPU compressed
+    Tensor q_dev = Tensor::allocate(ctx, {1, kNumHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor scores_uncomp_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+    Tensor scores_comp_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+
+    ops::qsa_compute_block_scores(ctx, q_dev, raw_k_dev, kn_w_dev, scores_uncomp_dev, num_blocks, theta);
+    ops::qsa_compute_block_scores_compressed(ctx, q_dev, comp_k_dev, scores_comp_dev, num_blocks);
+    ctx.synchronize();
+
+    std::vector<float> scores_uncomp(num_blocks);
+    std::vector<float> scores_comp(num_blocks);
+    ctx.memcpy_d2h(scores_uncomp.data(), scores_uncomp_dev.data(), num_blocks * sizeof(float));
+    ctx.memcpy_d2h(scores_comp.data(), scores_comp_dev.data(), num_blocks * sizeof(float));
+
+    float max_score_diff = 0.0f;
+    for (int b = 0; b < num_blocks; ++b) {
+        float diff = std::abs(scores_comp[b] - scores_uncomp[b]);
+        if (diff > max_score_diff) max_score_diff = diff;
+    }
+    if (max_score_diff > 0.01f) {
+        throw std::runtime_error("test_qsa_compressed_k_scoring: compressed vs uncompressed score mismatch, diff=" +
+                                 std::to_string(max_score_diff));
+    }
+    std::cout << "[PASS] QSA compressed K scoring matches uncompressed scoring (max_score_diff="
+              << max_score_diff << " <= 0.01)\n";
+
+    // 4. Test incremental compression appending
+    // Compress first 32 blocks, then incrementally compress next 32 blocks
+    Tensor comp_k_incr = Tensor::allocate(ctx, {num_blocks, kHeadDim}, dnnl::memory::data_type::bf16);
+    ops::qsa_compress_key_blocks(ctx, raw_k_dev, kn_w_dev, comp_k_incr, 0, 32, theta);
+    ops::qsa_compress_key_blocks(ctx, raw_k_dev, kn_w_dev, comp_k_incr, 32, 32, theta);
+    ctx.synchronize();
+
+    std::vector<bf16> comp_k_incr_h(num_blocks * kHeadDim);
+    ctx.memcpy_d2h(comp_k_incr_h.data(), comp_k_incr.data(), comp_k_incr_h.size() * sizeof(bf16));
+    for (size_t i = 0; i < comp_k_incr_h.size(); ++i) {
+        float diff = std::abs(static_cast<float>(comp_k_incr_h[i]) - static_cast<float>(comp_k_gpu[i]));
+        if (diff > 1e-4f) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: incremental compression slice mismatch at " +
+                                     std::to_string(i));
+        }
+    }
+    std::cout << "[PASS] QSA incremental slice compression verified (chunked [0..32) and [32..64) identical)\n";
+
+    // 5. Test upstream reference function execution
+    std::vector<bf16> kn_raw_h(kHeadDim);
+    for (int d = 0; d < kHeadDim; ++d) {
+        kn_raw_h[d] = bf16(static_cast<float>(kn_w_h[d]) - 1.0f);
+    }
+    std::vector<float> scores_upstream(num_blocks);
+    ops::qsa_compute_block_scores_upstream_ref(
+        q_h.data(), raw_k_h.data(), kn_raw_h.data(), scores_upstream.data(), num_blocks, theta);
+    for (int b = 0; b < num_blocks; ++b) {
+        if (std::isnan(scores_upstream[b]) || std::isinf(scores_upstream[b]) || scores_upstream[b] < 0.0f) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: upstream ref produced invalid score at " +
+                                     std::to_string(b));
+        }
+    }
+    std::cout << "[PASS] QSA upstream precision reference sanity check verified (finite, non-negative scores)\n";
+}
+
 } // namespace
 
 int main() {
@@ -2194,12 +2305,13 @@ int main() {
         test_attention_prefill_cached_gate_fusion(ctx);
         test_split_qgkv(ctx);
 
-        // QSA Indexer (M2) tests
+    // QSA Indexer (M2) tests
         test_qsa_prepare_q_and_cache_k(ctx);
         test_qsa_cache_k_batched(ctx);
         test_qsa_compute_block_scores(ctx);
         test_qsa_select_topk_and_expand_tokens(ctx);
         test_attention_decode_with_qsa_indices(ctx);
+        test_qsa_compressed_k_scoring(ctx);
 
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;

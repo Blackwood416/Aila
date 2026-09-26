@@ -215,6 +215,10 @@ public:
         CaptureSnapshot(ctx, session, nextLength, count);
         session.currentLength_ = nextLength;
     }
+    void ensure_runtime_buffers_for_testing(Context& ctx, int seq_len) {
+        ensure_runtime_buffers(ctx, seq_len);
+    }
+    const Qwen4ExpBuffers& buf_for_testing() const { return buf_; }
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,

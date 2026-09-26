@@ -144,6 +144,74 @@ void qsa_compute_block_scores_host(
     int mrope_section_h = 0,
     int mrope_section_w = 0);
 
+// Upstream-faithful reference adhering strictly to HuggingFace modeling_qwen4_exp.py
+// precision boundaries: RMSNorm evaluates in f32, scales by (1.0 + weight_raw), casts
+// to bf16, RoPE rotates in bf16, and matmul is performed in f32 followed by relu / sqrt(128).
+void qsa_compute_block_scores_upstream_ref(
+    const bf16* q,
+    const bf16* k_cache,
+    const bf16* k_norm_w_raw,
+    float* scores_out,
+    int num_complete_blocks,
+    float theta,
+    float eps = 1e-6f);
+
+// Incremental QSA (A1): Compress complete key blocks into normalized + rotated vectors.
+// For block b in [start_block, start_block + num_blocks):
+// 1. Mean-pools 4 raw keys from k_cache.
+// 2. Applies RMSNorm with k_norm_w.
+// 3. Applies RoPE at group start position 4 * b.
+// 4. Writes normalized + rotated key to compressed_k[b, 128].
+void qsa_compress_key_blocks(
+    Context& ctx,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& compressed_k,
+    int start_block,
+    int num_blocks,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+void qsa_compress_key_blocks_host(
+    const bf16* k_cache,
+    const bf16* k_norm_w,
+    bf16* compressed_k,
+    int start_block,
+    int num_blocks,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+// Incremental QSA (A1): Compute block scores using pre-compressed keys.
+// Evaluates Q dot compressed_K, relu, head sum, divided by sqrt(128).
+void qsa_compute_block_scores_compressed(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    int num_complete_blocks);
+
+void qsa_compute_block_scores_compressed_host(
+    const bf16* q,
+    const bf16* compressed_k,
+    float* scores_out,
+    int num_complete_blocks);
+
 int qsa_select_topk_and_expand_tokens_host(
     const float* scores,
     int num_complete_blocks,
