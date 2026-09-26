@@ -628,8 +628,8 @@ void test_ple_lookup_and_dequant(Context& ctx) {
 // ---------------------------------------------------------------------------
 
 static std::string resolve_qwen4exp_model_dir() {
-    const char* env_dir = std::getenv("AILA_QWEN4EXP_MODEL_DIR");
-    if (env_dir && fs::exists(env_dir)) return env_dir;
+    const std::string env_dir = aila::env::read_string("AILA_QWEN4EXP_MODEL_DIR", "");
+    if (!env_dir.empty() && fs::exists(env_dir)) return env_dir;
     const std::string candidate_c = "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
     if (fs::exists(candidate_c)) return candidate_c;
     const std::string candidate_f = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
@@ -2807,6 +2807,37 @@ void test_real_model_qsa_indexer_fixture(Context& ctx) {
               << " mean|dS|=" << mean_score_diff << ", Top-512 set agreement=" << (agreement * 100.0f)
               << "%, upstream cutoff margin=" << cutoff_margin << "\n";
     expect(agreement >= 0.98f, "Selected block set agreement with upstream reference must be >= 98%");
+
+    // Compressed K verification on real model layer 11 weights
+    Tensor comp_k_dev = Tensor::allocate(ctx, {kNumBlocks, kHeadDim}, dnnl::memory::data_type::bf16);
+    int num_comp = 0;
+    Tensor comp_scores_dev = Tensor::allocate(ctx, {kNumBlocks}, dnnl::memory::data_type::f32);
+    Tensor comp_active_tokens_dev = Tensor::allocate(ctx, {kCachedLen + 4}, dnnl::memory::data_type::s32);
+    Tensor comp_q_out_dev = Tensor::allocate(ctx, {kNumHeads, kHeadDim}, dnnl::memory::data_type::bf16);
+
+    const int comp_active_count = ops::qsa_prepare_causal_query_and_select_tokens(
+        ctx, qk_dev, qn_dev, kn_dev, k_cache_dev, comp_q_out_dev, comp_scores_dev, comp_active_tokens_dev,
+        query_pos, kBlockTopk, kCompressRatio, rope_theta, false,
+        nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+        &comp_k_dev, &num_comp);
+    ctx.synchronize();
+
+    expect(comp_active_count == gpu_active_count, "Compressed active token count mismatch");
+    expect(num_comp == kNumBlocks, "All complete blocks must be compressed into comp_k_dev");
+    std::vector<int> comp_tokens(comp_active_count);
+    ctx.memcpy_d2h(comp_tokens.data(), comp_active_tokens_dev.data(), comp_active_count * sizeof(int));
+    std::unordered_set<int> comp_block_set;
+    for (int i = 0; i < kBlockTopk * kCompressRatio; i += kCompressRatio) {
+        comp_block_set.insert(comp_tokens[i] / kCompressRatio);
+    }
+    int comp_common_blocks = 0;
+    for (int b : comp_block_set) {
+        if (up_block_set.count(b)) ++comp_common_blocks;
+    }
+    float comp_agreement = static_cast<float>(comp_common_blocks) / static_cast<float>(kBlockTopk);
+    std::cout << "[PASS] Real-model QSA fixture with Compressed K: Top-512 set agreement with upstream="
+              << (comp_agreement * 100.0f) << "%\n";
+    expect(comp_agreement >= 0.98f, "Compressed K agreement with upstream reference must be >= 98%");
 }
 
 void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
@@ -2833,6 +2864,126 @@ void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
               << "], incr_scores shape=["
               << buf.incr_scores.shape()[0] << ", " << buf.incr_scores.shape()[1] << ", " << buf.incr_scores.shape()[2]
               << "] (6-96 GiB OOM hazard completely eliminated).\n";
+}
+
+void test_qsa_k_only_projection_alignment(Context& ctx) {
+    std::cout << "[Test] Verifying A2 K-only separated projection alignment...\n";
+    constexpr int hidden_size = 2560;
+    constexpr int indexer_q_dim = 512;
+    constexpr int indexer_k_dim = 128;
+    constexpr int indexer_out_dim = indexer_q_dim + indexer_k_dim; // 640
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> qk_weight_h(indexer_out_dim * hidden_size);
+    for (auto& v : qk_weight_h) v = bf16(dist(rng) * 0.1f);
+
+    Tensor qk_w_dev = Tensor::allocate(ctx, {indexer_out_dim, hidden_size}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(qk_w_dev.data(), qk_weight_h.data(), qk_weight_h.size() * sizeof(bf16));
+
+    const size_t k_offset = static_cast<size_t>(indexer_q_dim) * hidden_size;
+    Tensor k_w_dev = Tensor::view(
+        ctx, qk_w_dev.data_as<bf16>() + k_offset, {indexer_k_dim, hidden_size});
+
+    Linear qk_proj;
+    qk_proj.init(ctx, qk_w_dev, hidden_size, indexer_out_dim, false);
+
+    Linear k_proj;
+    k_proj.init(ctx, k_w_dev, hidden_size, indexer_k_dim, false);
+
+    // Test 1: Single token decode (count = 1) using GEMV
+    std::vector<bf16> x_h(hidden_size);
+    for (auto& v : x_h) v = bf16(dist(rng) * 0.2f);
+    Tensor x_dev = Tensor::allocate(ctx, {1, hidden_size}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_dev.data(), x_h.data(), x_h.size() * sizeof(bf16));
+
+    Tensor qk_out_dev = Tensor::allocate(ctx, {1, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_out_dev = Tensor::allocate(ctx, {1, indexer_k_dim}, dnnl::memory::data_type::bf16);
+
+    ops::bf16_gemv_bf16(ctx, qk_w_dev, x_dev.data_as<bf16>(), qk_out_dev.data_as<bf16>(), indexer_out_dim, hidden_size);
+    ops::bf16_gemv_bf16(ctx, k_w_dev, x_dev.data_as<bf16>(), k_out_dev.data_as<bf16>(), indexer_k_dim, hidden_size);
+    ctx.synchronize();
+
+    std::vector<bf16> qk_out_h(indexer_out_dim);
+    std::vector<bf16> k_out_h(indexer_k_dim);
+    ctx.memcpy_d2h(qk_out_h.data(), qk_out_dev.data(), indexer_out_dim * sizeof(bf16));
+    ctx.memcpy_d2h(k_out_h.data(), k_out_dev.data(), indexer_k_dim * sizeof(bf16));
+
+    for (int d = 0; d < indexer_k_dim; ++d) {
+        expect(k_out_h[d] == qk_out_h[indexer_q_dim + d],
+               "Decode GEMV K-only projection bitwise mismatch at index " + std::to_string(d));
+    }
+    std::cout << "[PASS] Decode K-only GEMV projection matches QK projection 100% bit-exact (512 Q rows saved).\n";
+
+    // Test 2: Prefill chunk (count = 8) using oneDNN matmul
+    constexpr int prefill_count = 8;
+    std::vector<bf16> x_prefill_h(prefill_count * hidden_size);
+    for (auto& v : x_prefill_h) v = bf16(dist(rng) * 0.2f);
+    Tensor x_prefill_dev = Tensor::allocate(ctx, {prefill_count, hidden_size}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_prefill_dev.data(), x_prefill_h.data(), x_prefill_h.size() * sizeof(bf16));
+
+    Tensor qk_prefill_out = Tensor::allocate(ctx, {prefill_count, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_prefill_out = Tensor::allocate(ctx, {prefill_count, indexer_k_dim}, dnnl::memory::data_type::bf16);
+
+    qk_proj.forward(ctx, x_prefill_dev, qk_prefill_out, prefill_count);
+    k_proj.forward(ctx, x_prefill_dev, k_prefill_out, prefill_count);
+    ctx.synchronize();
+
+    std::vector<bf16> qk_prefill_h(prefill_count * indexer_out_dim);
+    std::vector<bf16> k_prefill_h(prefill_count * indexer_k_dim);
+    ctx.memcpy_d2h(qk_prefill_h.data(), qk_prefill_out.data(), qk_prefill_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_prefill_h.data(), k_prefill_out.data(), k_prefill_h.size() * sizeof(bf16));
+
+    for (int r = 0; r < prefill_count; ++r) {
+        for (int d = 0; d < indexer_k_dim; ++d) {
+            float diff = std::abs(static_cast<float>(k_prefill_h[r * indexer_k_dim + d]) -
+                                  static_cast<float>(qk_prefill_h[r * indexer_out_dim + indexer_q_dim + d]));
+            expect(diff < 1e-3f, "Prefill K-only projection numerical mismatch at row " +
+                   std::to_string(r) + " col " + std::to_string(d));
+        }
+    }
+    std::cout << "[PASS] Prefill K-only projection matches QK projection across all rows (80% compute saved).\n";
+}
+
+void test_qsa_session_compressed_k_lifecycle(Context& ctx) {
+    std::cout << "[Test] Verifying QSA Session compressed K state lifecycle & rollback...\n";
+    Qwen4ExpBnb4Backend backend;
+    backend.init_for_testing(ctx, 4, 4096);
+
+    auto session = backend.CreateSession(ctx, 4);
+    auto& caches = session->layer_caches_for_testing();
+
+    // Verify initial state for layer 3 (full attention: (3+1)%4 == 0)
+    expect(caches[3].indexer_compressed_k.valid(), "indexer_compressed_k must be allocated");
+    expect(caches[3].num_compressed_blocks == 0, "Initial num_compressed_blocks must be 0");
+
+    // Simulate prefill up to length 2050 (512 complete blocks)
+    caches[3].num_compressed_blocks = 512;
+    backend.capture_snapshot_for_testing(ctx, *session, 2050, 2050);
+
+    // Verify snapshot captured num_compressed_blocks == 512
+    const auto& snaps = session->snapshots_for_testing();
+    expect(snaps.count(2050) == 1, "Snapshot at 2050 must exist");
+    expect(snaps.at(2050).layers[3].num_compressed_blocks == 512, "Snapshot layer 3 num_compressed_blocks must be 512");
+
+    // Simulate decode steps advancing to 2054 (crossing to 513 complete blocks)
+    caches[3].num_compressed_blocks = 513;
+    session->current_length_for_testing() = 2054;
+
+    // Rollback / Truncate back to 2050
+    int restored_len = backend.Truncate(*session, 2050);
+    expect(restored_len == 2050, "Truncate must return 2050");
+    expect(session->CurrentLength() == 2050, "CurrentLength must be 2050");
+    expect(caches[3].num_compressed_blocks == 512, "num_compressed_blocks must be restored to 512");
+
+    // Test Reset
+    backend.Reset(*session);
+    expect(session->CurrentLength() == 0, "CurrentLength after reset must be 0");
+    expect(caches[3].num_compressed_blocks == 0, "num_compressed_blocks after reset must be 0");
+    expect(session->snapshots_for_testing().empty(), "Snapshots must be cleared on Reset");
+
+    std::cout << "[PASS] QSA Session compressed K state lifecycle, snapshot capture, rollback & reset verified.\n";
 }
 
 void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
@@ -3005,6 +3156,8 @@ int main() {
         test_real_model_qsa_indexer_weights_if_present(ctx);
         test_real_model_qsa_indexer_fixture(ctx);
         test_qsa_dense_prefill_buffer_bounds(ctx);
+        test_qsa_k_only_projection_alignment(ctx);
+        test_qsa_session_compressed_k_lifecycle(ctx);
         test_qsa_indexer_end_to_end_pipeline(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;

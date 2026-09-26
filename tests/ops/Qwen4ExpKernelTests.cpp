@@ -2277,6 +2277,64 @@ static void test_qsa_compressed_k_scoring(Context& ctx) {
         }
     }
     std::cout << "[PASS] QSA upstream precision reference sanity check verified (finite, non-negative scores)\n";
+
+    // 6. Test qsa_prepare_causal_query_and_select_tokens with compressed_k
+    {
+        constexpr int kCapacity = 2056;
+        constexpr int kBlockTopk = 512;
+        constexpr int kCompressRatio = 4;
+        constexpr int kMaxBlocks = kCapacity / kCompressRatio;
+        Tensor k_cache = Tensor::allocate(ctx, {kCapacity, kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor comp_k = Tensor::allocate(ctx, {kMaxBlocks, kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor q_norm = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor kn_w = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor q_out = Tensor::allocate(ctx, {kNumHeads, kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {kMaxBlocks}, dnnl::memory::data_type::f32);
+        Tensor active_tokens = Tensor::allocate(ctx, {kCapacity}, dnnl::memory::data_type::s32);
+        Tensor qk_row = Tensor::allocate(ctx, {1, (kNumHeads + 1) * kHeadDim}, dnnl::memory::data_type::bf16);
+
+        std::vector<bf16> ones(kHeadDim, bf16(1.0f));
+        ctx.memcpy_h2d(q_norm.data(), ones.data(), kHeadDim * sizeof(bf16));
+        ctx.memcpy_h2d(kn_w.data(), ones.data(), kHeadDim * sizeof(bf16));
+
+        // Pre-fill k_cache up to 2050 tokens
+        std::vector<bf16> raw_k_init(2050 * kHeadDim);
+        for (size_t i = 0; i < raw_k_init.size(); ++i) raw_k_init[i] = bf16(0.05f * (i % 17));
+        ctx.memcpy_h2d(k_cache.data(), raw_k_init.data(), raw_k_init.size() * sizeof(bf16));
+
+        int num_comp = 0;
+        // Step 1: pos = 2050 (visible_len = 2051, num_complete_blocks = 512 <= 512 -> dense)
+        int active_count = ops::qsa_prepare_causal_query_and_select_tokens(
+            ctx, qk_row, q_norm, kn_w, k_cache, q_out, scores, active_tokens,
+            2050, kBlockTopk, kCompressRatio, theta, false,
+            nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+            &comp_k, &num_comp);
+        ctx.synchronize();
+        if (active_count != 0) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: pos=2050 must return 0 (dense)");
+        }
+        if (num_comp != 512) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: pos=2050 must have compressed 512 blocks, got " +
+                                     std::to_string(num_comp));
+        }
+
+        // Step 2: pos = 2051 (visible_len = 2052, num_complete_blocks = 513 > 512 -> sparse)
+        active_count = ops::qsa_prepare_causal_query_and_select_tokens(
+            ctx, qk_row, q_norm, kn_w, k_cache, q_out, scores, active_tokens,
+            2051, kBlockTopk, kCompressRatio, theta, false,
+            nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+            &comp_k, &num_comp);
+        ctx.synchronize();
+        if (active_count != 2048) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: pos=2051 must return 2048 active tokens, got " +
+                                     std::to_string(active_count));
+        }
+        if (num_comp != 513) {
+            throw std::runtime_error("test_qsa_compressed_k_scoring: pos=2051 must advance to 513 compressed blocks, got " +
+                                     std::to_string(num_comp));
+        }
+        std::cout << "[PASS] QSA causal query preparation with incremental compressed K verified across boundary.\n";
+    }
 }
 
 } // namespace

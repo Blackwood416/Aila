@@ -404,7 +404,9 @@ int qsa_prepare_causal_query_and_select_tokens(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    Tensor* compressed_k,
+    int* num_compressed_blocks) {
     if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
         throw std::invalid_argument("qsa_prepare_causal_query_and_select_tokens: invalid position or block geometry");
     }
@@ -415,13 +417,31 @@ int qsa_prepare_causal_query_and_select_tokens(
         mrope_section_t, mrope_section_h, mrope_section_w);
 
     const int num_complete_blocks = visible_len / compress_ratio;
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr && compressed_k->valid()) {
+        if (num_complete_blocks > *num_compressed_blocks) {
+            const int blocks_to_compress = num_complete_blocks - *num_compressed_blocks;
+            qsa_compress_key_blocks(
+                ctx, k_cache, k_norm_w, *compressed_k, *num_compressed_blocks,
+                blocks_to_compress, theta, interleaved, pos_t, pos_h, pos_w,
+                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = num_complete_blocks;
+        }
+    }
+
     if (num_complete_blocks <= block_topk) {
         return 0;
     }
-    qsa_compute_block_scores(
-        ctx, q_out_row, k_cache, k_norm_w, scores_out, num_complete_blocks, theta, interleaved,
-        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
-        mrope_section_t, mrope_section_h, mrope_section_w);
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr && compressed_k->valid()) {
+        qsa_compute_block_scores_compressed(
+            ctx, q_out_row, *compressed_k, scores_out, num_complete_blocks);
+    } else {
+        qsa_compute_block_scores(
+            ctx, q_out_row, k_cache, k_norm_w, scores_out, num_complete_blocks, theta, interleaved,
+            pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+            mrope_section_t, mrope_section_h, mrope_section_w);
+    }
     return qsa_select_topk_and_expand_tokens(
         ctx, scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_tokens_out);
 }
@@ -898,6 +918,69 @@ void qsa_compute_block_scores_compressed_host(
         }
         scores_out[b] = sum_relu_dot * inv_sqrt_d;
     }
+}
+
+int qsa_prepare_causal_query_and_select_tokens_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    float* scores_out,
+    int* active_tokens_out,
+    int pos,
+    int capacity,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w,
+    bf16* compressed_k,
+    int* num_compressed_blocks) {
+    if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
+        throw std::invalid_argument("qsa_prepare_causal_query_and_select_tokens_host: invalid position or block geometry");
+    }
+    const int visible_len = pos + 1;
+    qsa_prepare_q_and_cache_k_host(
+        indexer_qk, q_norm_w, k_cache, q_out, pos, capacity, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+
+    const int num_complete_blocks = visible_len / compress_ratio;
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr) {
+        if (num_complete_blocks > *num_compressed_blocks) {
+            const int blocks_to_compress = num_complete_blocks - *num_compressed_blocks;
+            qsa_compress_key_blocks_host(
+                k_cache, k_norm_w, compressed_k, *num_compressed_blocks,
+                blocks_to_compress, theta, interleaved, pos_t, pos_h, pos_w,
+                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = num_complete_blocks;
+        }
+    }
+
+    if (num_complete_blocks <= block_topk) {
+        return 0;
+    }
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr) {
+        qsa_compute_block_scores_compressed_host(
+            q_out, compressed_k, scores_out, num_complete_blocks);
+    } else {
+        qsa_compute_block_scores_host(
+            q_out, k_cache, k_norm_w, scores_out, num_complete_blocks, capacity, theta, interleaved,
+            pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+            mrope_section_t, mrope_section_h, mrope_section_w);
+    }
+    return qsa_select_topk_and_expand_tokens_host(
+        scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_tokens_out);
 }
 
 } // namespace ops

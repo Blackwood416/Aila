@@ -52,9 +52,11 @@ struct Qwen4ExpLayer {
     Tensor* q_norm_weight = nullptr; // [256] f32 (1+w)
     Tensor* k_norm_weight = nullptr; // [256] f32 (1+w)
 
-    // QSA Indexer (M2)
+    // QSA Indexer (M2 & W2)
     Linear index_qk_proj;          // (2560, 640) bf16
+    Linear index_k_proj;           // (2560, 128) bf16 (A2: K-only projection for <= 2051)
     Tensor* index_qk_weight = nullptr; // raw [640, 2560]
+    Tensor index_k_weight;         // view [128, 2560] pointing to K rows of index_qk_weight
     Tensor* index_q_norm_weight = nullptr; // [128] f32 (1+w)
     Tensor* index_k_norm_weight = nullptr; // [128] f32 (1+w)
 
@@ -72,6 +74,8 @@ struct Qwen4ExpLayerCache {
     Tensor k;
     Tensor v;
     Tensor indexer_k; // [capacity, 128] bf16
+    Tensor indexer_compressed_k; // [capacity / 4, 128] bf16 (A1)
+    int num_compressed_blocks = 0; // Number of complete blocks compressed (A1)
 
     // Linear Attention
     Tensor linear_state;
@@ -134,6 +138,7 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         std::vector<float> linear_state_host;
         std::vector<float> linear_conv_state_host;
         int linear_conv_head = 0;
+        int num_compressed_blocks = 0;
     };
     struct StateSnapshot {
         std::vector<LayerStateSnapshot> layers;
@@ -154,6 +159,7 @@ public:
 
         const std::unordered_map<int, StateSnapshot>& snapshots_for_testing() const { return snapshots_; }
         std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
+        int& current_length_for_testing() { return currentLength_; }
 
     private:
         friend class Qwen4ExpBnb4Backend;
@@ -203,9 +209,9 @@ public:
     void Reset(Session& session);
     int Truncate(Session& session, int newLength);
 
-    void init_for_testing(Context& ctx, int num_layers = 4) {
+    void init_for_testing(Context& ctx, int num_layers = 4, int max_seq_len = 64) {
         context_ = &ctx;
-        max_seq_len_ = 64;
+        max_seq_len_ = max_seq_len;
         layers_.resize(num_layers);
         for (int i = 0; i < num_layers; ++i) {
             layers_[i].is_linear = ((i + 1) % 4 != 0);

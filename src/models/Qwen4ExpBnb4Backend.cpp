@@ -230,6 +230,9 @@ Qwen4ExpBnb4Backend::Session::Session(
             cache.k = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
             cache.v = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
             cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
+            const int max_blocks = std::max(1, capacity / 4);
+            cache.indexer_compressed_k = Tensor::allocate(ctx, {max_blocks, 128}, dnnl::memory::data_type::bf16);
+            cache.num_compressed_blocks = 0;
         }
     }
 }
@@ -506,12 +509,18 @@ bool Qwen4ExpBnb4Backend::load(
             weights.upload(prefix + "self_attn.k_norm.weight", ctx);
             layer.k_norm_weight = plus_one_norm(prefix + "self_attn.k_norm.weight");
 
-            // QSA Indexer (M2)
+            // QSA Indexer (M2 & W2)
             const std::string index_qk_name = prefix + "self_attn.indexer.index_qk_proj.weight";
             if (weights.has_host(index_qk_name) || weights.has(index_qk_name)) {
                 const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
                 layer.index_qk_weight = &weights.upload(index_qk_name, ctx);
                 layer.index_qk_proj.init(ctx, *layer.index_qk_weight, hidden_size_, indexer_out_dim, false);
+                const int indexer_k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
+                const size_t k_offset = static_cast<size_t>(cfg_.indexer_n_heads * cfg_.indexer_head_dim) * hidden_size_;
+                layer.index_k_weight = Tensor::view(
+                    ctx, layer.index_qk_weight->data_as<bf16>() + k_offset,
+                    {indexer_k_dim, hidden_size_});
+                layer.index_k_proj.init(ctx, layer.index_k_weight, hidden_size_, indexer_k_dim, false);
                 layer.index_q_norm_weight = plus_one_norm(prefix + "self_attn.indexer.q_layernorm.weight");
                 layer.index_k_norm_weight = plus_one_norm(prefix + "self_attn.indexer.k_layernorm.weight");
             }
@@ -562,8 +571,9 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t kv_bytes = full_layers * 2 * cfg_.num_key_value_heads * cfg_.head_dim * sizeof(bf16) *
                                 static_cast<size_t>(max_seq_len_);
         const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
+        const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
-        const size_t total_session_state = kv_bytes + indexer_k_bytes + recurrent_bytes;
+        const size_t total_session_state = kv_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20;
         const size_t reserve = max_reserve + total_session_state;
@@ -573,13 +583,14 @@ bool Qwen4ExpBnb4Backend::load(
 
         AILA_LOG_INFO(
             "[Qwen4Exp] Memory Admission Accounting: Total VRAM=%.0f MB, Static Weights=%.1f MB, "
-            "Session State=%.1f MB (KV=%.1f MB, IndexerK=%.1f MB, Recurrent=%.1f MB), "
+            "Session State=%.1f MB (KV=%.1f MB, IndexerK=%.1f MB, IndexerCompressedK=%.1f MB, Recurrent=%.1f MB), "
             "Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
             vram / (1024.0 * 1024.0),
             ctx.current_allocated_bytes() / (1024.0 * 1024.0),
             total_session_state / (1024.0 * 1024.0),
             kv_bytes / (1024.0 * 1024.0),
             indexer_k_bytes / (1024.0 * 1024.0),
+            indexer_compressed_k_bytes / (1024.0 * 1024.0),
             recurrent_bytes / (1024.0 * 1024.0),
             max_reserve / (1024.0 * 1024.0),
             expert_cache_bytes / (1024.0 * 1024.0));
@@ -1030,24 +1041,60 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 const int* active_indices = nullptr;
                 int num_active_tokens = 0;
                 if (layer.index_qk_weight && layer.index_q_norm_weight && layer.index_k_norm_weight && cache.indexer_k.valid()) {
-                    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
-                    DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
-                                1, indexer_out_dim, hidden_size_);
-
                     const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
                     const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
-                    num_active_tokens = ops::qsa_prepare_causal_query_and_select_tokens(
-                        ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
-                        cache.indexer_k, buf_.indexer_q, buf_.indexer_block_scores,
-                        buf_.indexer_active_tokens, start_pos, block_topk, compress_ratio,
-                        cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
-                        (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
-                        (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
-                        (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
-                        session.mropePromptLength_, session.mropeTextPositionDelta_,
-                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
-                    if (num_active_tokens > 0) {
-                        active_indices = buf_.indexer_active_tokens.data_as<int>();
+                    const int visible_len = start_pos + 1;
+                    const int num_complete_blocks = visible_len / compress_ratio;
+
+                    static const bool s_qsa_compressed_k = aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
+                    static const bool s_qsa_k_only_proj = aila::env::read_flag("AILA_QSA_K_ONLY_PROJ", true);
+                    const bool dense_phase = (num_complete_blocks <= block_topk);
+
+                    if (dense_phase && s_qsa_k_only_proj && layer.index_k_weight.valid()) {
+                        // A2: K-only projection for visible_len <= 2051. Eliminates 80% GEMV output rows (512 Q rows skipped).
+                        const int k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
+                        Tensor k_target = Tensor::view(
+                            ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            {1, k_dim});
+                        DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, buf_.x, k_target,
+                                    1, k_dim, hidden_size_);
+
+                        // A1: If this token completed a block, incrementally compress it into indexer_compressed_k
+                        if (s_qsa_compressed_k && visible_len % compress_ratio == 0 &&
+                            num_complete_blocks > cache.num_compressed_blocks && cache.indexer_compressed_k.valid()) {
+                            const int blocks_to_compress = num_complete_blocks - cache.num_compressed_blocks;
+                            ops::qsa_compress_key_blocks(
+                                ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
+                                cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
+                                cfg_.rope.mrope_interleaved,
+                                (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                                (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                                (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                                session.mropePromptLength_, session.mropeTextPositionDelta_,
+                                cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cache.num_compressed_blocks = num_complete_blocks;
+                        }
+                        num_active_tokens = 0;
+                    } else {
+                        const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                        DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
+                                    1, indexer_out_dim, hidden_size_);
+
+                        num_active_tokens = ops::qsa_prepare_causal_query_and_select_tokens(
+                            ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
+                            cache.indexer_k, buf_.indexer_q, buf_.indexer_block_scores,
+                            buf_.indexer_active_tokens, start_pos, block_topk, compress_ratio,
+                            cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                            session.mropePromptLength_, session.mropeTextPositionDelta_,
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                            (s_qsa_compressed_k && cache.indexer_compressed_k.valid() ? &cache.indexer_compressed_k : nullptr),
+                            &cache.num_compressed_blocks);
+                        if (num_active_tokens > 0) {
+                            active_indices = buf_.indexer_active_tokens.data_as<int>();
+                        }
                     }
                 }
 
@@ -1060,10 +1107,29 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             } else {
                 const bool has_qsa_indexer = layer.index_qk_weight && layer.index_q_norm_weight &&
                                              layer.index_k_norm_weight && cache.indexer_k.valid();
+                const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+                const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
+                const bool sparse_prefill = has_qsa_indexer &&
+                    (start_pos + count) / compress_ratio > block_topk;
+
+                static const bool s_qsa_compressed_k = aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
+                static const bool s_qsa_k_only_proj = aila::env::read_flag("AILA_QSA_K_ONLY_PROJ", true);
+
                 if (has_qsa_indexer) {
-                    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
-                    DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
-                                count, indexer_out_dim, hidden_size_);
+                    if (!sparse_prefill && s_qsa_k_only_proj && layer.index_k_weight.valid()) {
+                        // A2: K-only projection for dense prefill chunks (start_pos + count <= 2051).
+                        // Skips 512 Q projection rows for all count tokens.
+                        const int k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
+                        Tensor k_target = Tensor::view(
+                            ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            {count, k_dim});
+                        DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, buf_.x, k_target,
+                                    count, k_dim, hidden_size_);
+                    } else {
+                        const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+                        DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, buf_.x, buf_.indexer_qk,
+                                    count, indexer_out_dim, hidden_size_);
+                    }
                 }
 
                 layer.qkv_proj.forward(ctx, linear_scratch_, buf_.x, buf_.full_qkv, count);
@@ -1087,10 +1153,6 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
                 }
 
-                const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
-                const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
-                const bool sparse_prefill = has_qsa_indexer &&
-                    (start_pos + count) / compress_ratio > block_topk;
                 if (sparse_prefill) {
                     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
                     const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
@@ -1100,6 +1162,26 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     bf16* q_base = buf_.q.data_as<bf16>();
                     bf16* z_base = buf_.z.data_as<bf16>();
                     bf16* attn_out_base = buf_.attn_out.data_as<bf16>();
+
+                    // Cache all raw K tokens for this chunk
+                    ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+
+                    // A1: Batch compress newly completed blocks into indexer_compressed_k
+                    const int total_complete_blocks = (start_pos + count) / compress_ratio;
+                    if (s_qsa_compressed_k && total_complete_blocks > cache.num_compressed_blocks &&
+                        cache.indexer_compressed_k.valid()) {
+                        const int blocks_to_compress = total_complete_blocks - cache.num_compressed_blocks;
+                        ops::qsa_compress_key_blocks(
+                            ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
+                            cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
+                            cfg_.rope.mrope_interleaved,
+                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                            session.mropePromptLength_, session.mropeTextPositionDelta_,
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                        cache.num_compressed_blocks = total_complete_blocks;
+                    }
 
                     // The upstream indexer builds a separate mask from each query's
                     // causal visible prefix. Keep this row-wise path as the correctness
@@ -1128,7 +1210,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                             (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
-                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                            (s_qsa_compressed_k && cache.indexer_compressed_k.valid() ? &cache.indexer_compressed_k : nullptr),
+                            &cache.num_compressed_blocks);
                         const int visible_len = pos + 1;
                         int attention_active_tokens = num_active_tokens;
                         if (attention_active_tokens == 0) {
@@ -1150,7 +1234,24 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                         // Short chunks stay on the existing batched dense prefill path;
                         // only a query whose visible prefix exceeds the block budget uses
                         // the row-wise QSA correctness path above.
-                        ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                        if (!s_qsa_k_only_proj || !layer.index_k_weight.valid()) {
+                            ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                        }
+                        const int total_complete_blocks = (start_pos + count) / compress_ratio;
+                        if (s_qsa_compressed_k && total_complete_blocks > cache.num_compressed_blocks &&
+                            cache.indexer_compressed_k.valid()) {
+                            const int blocks_to_compress = total_complete_blocks - cache.num_compressed_blocks;
+                            ops::qsa_compress_key_blocks(
+                                ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
+                                cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
+                                cfg_.rope.mrope_interleaved,
+                                (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                                (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                                (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                                session.mropePromptLength_, session.mropeTextPositionDelta_,
+                                cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cache.num_compressed_blocks = total_complete_blocks;
+                        }
                     }
                     if (start_pos == 0) {
                         ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
@@ -1589,11 +1690,14 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
             last_d2h_event.wait_and_throw();
         }
         for (size_t i = 0; i < layers_.size(); ++i) {
-            if (!layers_[i].is_linear) continue;
             auto& cache = session.layerCaches_[i];
-            snapshot.layers[i].linear_state_host = cache.host_linear_state;
-            snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
-            snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
+            if (layers_[i].is_linear) {
+                snapshot.layers[i].linear_state_host = cache.host_linear_state;
+                snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
+                snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
+            } else {
+                snapshot.layers[i].num_compressed_blocks = cache.num_compressed_blocks;
+            }
         }
         ple_.capture_snapshot(ctx, session.ple_state_, snapshot.ple_snapshot);
     } catch (...) {
@@ -1625,21 +1729,24 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
     const auto& snapshot = session.snapshots_.at(target);
     sycl::event last_h2d_event{};
     for (size_t i = 0; i < layers_.size(); ++i) {
-        if (!layers_[i].is_linear) continue;
         auto& cache = session.layerCaches_[i];
         const auto& snap_layer = snapshot.layers[i];
-        cache.host_linear_state = snap_layer.linear_state_host;
-        cache.host_linear_conv_state = snap_layer.linear_conv_state_host;
-        cache.linear_conv_head = snap_layer.linear_conv_head;
-        if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
-            last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_state.data(), cache.host_linear_state.data(),
-                                                                cache.host_linear_state.size() * sizeof(float));
+        if (layers_[i].is_linear) {
+            cache.host_linear_state = snap_layer.linear_state_host;
+            cache.host_linear_conv_state = snap_layer.linear_conv_state_host;
+            cache.linear_conv_head = snap_layer.linear_conv_head;
+            if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
+                last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_state.data(), cache.host_linear_state.data(),
+                                                                    cache.host_linear_state.size() * sizeof(float));
+            }
+            if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
+                last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
+                                                                    cache.host_linear_conv_state.size() * sizeof(float));
+            }
+            cache.device_state_dirty = false;
+        } else {
+            cache.num_compressed_blocks = snap_layer.num_compressed_blocks;
         }
-        if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
-            last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_conv_state.data(), cache.host_linear_conv_state.data(),
-                                                                cache.host_linear_conv_state.size() * sizeof(float));
-        }
-        cache.device_state_dirty = false;
     }
     if (last_h2d_event != sycl::event{}) {
         last_h2d_event.wait_and_throw();
@@ -1673,6 +1780,8 @@ void Qwen4ExpBnb4Backend::Reset(Session& session) {
             std::fill(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(), 0.0f);
             cache.device_state_dirty = false;
             cache.linear_conv_head = 0;
+        } else {
+            cache.num_compressed_blocks = 0;
         }
     }
     ple_.init_state(*session.context_, session.ple_state_);

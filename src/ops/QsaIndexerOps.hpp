@@ -105,7 +105,9 @@ int qsa_prepare_causal_query_and_select_tokens(
     int text_pos_delta = 0,
     int mrope_section_t = 0,
     int mrope_section_h = 0,
-    int mrope_section_w = 0);
+    int mrope_section_w = 0,
+    Tensor* compressed_k = nullptr,
+    int* num_compressed_blocks = nullptr);
 
 // CPU host reference functions for verification and testing
 void qsa_prepare_q_and_cache_k_host(
@@ -219,5 +221,30 @@ int qsa_select_topk_and_expand_tokens_host(
     int cached_len,
     int compress_ratio,
     int* active_tokens_out);
+
+int qsa_prepare_causal_query_and_select_tokens_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    float* scores_out,
+    int* active_tokens_out,
+    int pos,
+    int capacity,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0,
+    bf16* compressed_k = nullptr,
+    int* num_compressed_blocks = nullptr);
 
 } // namespace ops
