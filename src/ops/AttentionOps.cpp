@@ -4295,7 +4295,10 @@ void attention_prefill_qsa_batched(
   constexpr int wg_size = 64;
   const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
 
-  static const int s_heads_per_wg_env = aila::env::read_int("AILA_QSA_HEADS_PER_WG", 2);
+  const int heads_per_wg_cfg = read_env_int_local("AILA_QSA_HEADS_PER_WG", 2);
+  const int s_heads_per_wg_env = (heads_per_wg_cfg <= 0)
+      ? ((count >= 16 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) ? 4 : 2)
+      : heads_per_wg_cfg;
 
   if (s_heads_per_wg_env == 4 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) {
     // Phase P2 (R4b): Multi-Q-head parallelism (4 Q heads sharing 1 KV head per workgroup)
