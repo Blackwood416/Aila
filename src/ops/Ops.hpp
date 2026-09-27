@@ -451,7 +451,8 @@ namespace ops {
         int head_dim,
         int block_topk,
         int compress_ratio,
-        const Tensor* gate_buf = nullptr);
+        const Tensor* gate_buf = nullptr,
+        const Tensor* valid_counts = nullptr);
 
     void attention_prefill_qsa_batched_host(
         const bf16* q,
@@ -467,7 +468,8 @@ namespace ops {
         int head_dim,
         int block_topk,
         int compress_ratio,
-        const bf16* gate = nullptr);
+        const bf16* gate = nullptr,
+        const int* valid_counts = nullptr);
 
 
     // SwiGLU: output = silu(gate) * up

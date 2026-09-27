@@ -20,6 +20,15 @@ inline std::uint32_t qsa_score_order_key(float score) {
     return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
 }
 
+// Phase P2 (R4c): Total order contract for complement selection.
+// Candidate a is strictly worse than candidate b if its score key is strictly lower,
+// or if score keys are equal and its block ID is strictly greater (ties prefer smaller ID,
+// so complement selection drops the largest ID first).
+inline bool qsa_candidate_is_worse(std::uint32_t a_key, int a_id, std::uint32_t b_key, int b_id) {
+    if (a_key != b_key) return a_key < b_key;
+    return a_id > b_id;
+}
+
 inline float calculate_rotary_position(
     int global_pos, int d, float pos_scalar,
     bool interleaved, const int* pos_t, const int* pos_h, const int* pos_w,
@@ -290,6 +299,70 @@ int qsa_select_topk_and_expand_tokens(
                 });
         });
         return cached_len;
+    }
+
+    if (num_complete_blocks == block_topk + 1) {
+        // R4c: Complement selection for B = K + 1 (e.g. 513 -> 512).
+        // Find single worst block via minimum-reduction, then emit all remaining blocks.
+        const float* scores_ptr = scores.data_as<float>();
+        int* out_ptr = active_tokens_out.data_as<int>();
+        constexpr int kWgSize = 256;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<std::uint32_t, 1> local_worst_key(sycl::range<1>(kWgSize), cgh);
+            sycl::local_accessor<int, 1> local_worst_id(sycl::range<1>(kWgSize), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(kWgSize, kWgSize),
+                [=](sycl::nd_item<1> item) {
+                    const int lid = item.get_local_id(0);
+
+                    std::uint32_t my_worst_key = 0xffffffffU;
+                    int my_worst_id = -1;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (my_worst_id < 0 || qsa_candidate_is_worse(key, b, my_worst_key, my_worst_id)) {
+                            my_worst_key = key;
+                            my_worst_id = b;
+                        }
+                    }
+                    local_worst_key[lid] = my_worst_key;
+                    local_worst_id[lid] = my_worst_id;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            const std::uint32_t other_key = local_worst_key[lid + stride];
+                            const int other_id = local_worst_id[lid + stride];
+                            if (other_id >= 0) {
+                                if (local_worst_id[lid] < 0 || qsa_candidate_is_worse(other_key, other_id, local_worst_key[lid], local_worst_id[lid])) {
+                                    local_worst_key[lid] = other_key;
+                                    local_worst_id[lid] = other_id;
+                                }
+                            }
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    const int worst_id = local_worst_id[0];
+
+                    for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                        const int blk = (idx < worst_id) ? idx : (idx + 1);
+                        for (int c = 0; c < compress_ratio; ++c) {
+                            out_ptr[idx * compress_ratio + c] = blk * compress_ratio + c;
+                        }
+                    }
+
+                    const int tail_start = num_complete_blocks * compress_ratio;
+                    const int tail_len = cached_len - tail_start;
+                    if (lid < tail_len) {
+                        out_ptr[block_topk * compress_ratio + lid] = tail_start + lid;
+                    }
+                });
+        });
+
+        const int tail_len = cached_len - (num_complete_blocks * compress_ratio);
+        return block_topk * compress_ratio + tail_len;
     }
 
     const float* scores_ptr = scores.data_as<float>();
@@ -596,6 +669,31 @@ int qsa_select_topk_and_expand_tokens_host(
             active_tokens_out[i] = i;
         }
         return cached_len;
+    }
+
+    if (num_complete_blocks == block_topk + 1) {
+        // R4c: Complement selection for B = K + 1 (513 -> 512).
+        std::uint32_t worst_key = 0xffffffffU;
+        int worst_id = -1;
+        for (int i = 0; i < num_complete_blocks; ++i) {
+            const std::uint32_t key = qsa_score_order_key(scores[i]);
+            if (worst_id < 0 || qsa_candidate_is_worse(key, i, worst_key, worst_id)) {
+                worst_key = key;
+                worst_id = i;
+            }
+        }
+        for (int i = 0; i < block_topk; ++i) {
+            int b = (i < worst_id) ? i : (i + 1);
+            for (int c = 0; c < compress_ratio; ++c) {
+                active_tokens_out[i * compress_ratio + c] = b * compress_ratio + c;
+            }
+        }
+        int tail_start = num_complete_blocks * compress_ratio;
+        int tail_len = cached_len - tail_start;
+        for (int i = 0; i < tail_len; ++i) {
+            active_tokens_out[block_topk * compress_ratio + i] = tail_start + i;
+        }
+        return block_topk * compress_ratio + tail_len;
     }
 
     std::vector<std::pair<float, int>> items(num_complete_blocks);
@@ -1012,6 +1110,63 @@ int qsa_select_topk_blocks(
         return num_complete_blocks;
     }
 
+    if (num_complete_blocks == block_topk + 1) {
+        // R4c: Complement selection for B = K + 1 (513 -> 512).
+        int* out_ptr = active_blocks_out.data_as<int>();
+        const float* scores_ptr = scores.data_as<float>();
+        constexpr int kWgSize = 256;
+
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<std::uint32_t, 1> local_worst_key(sycl::range<1>(kWgSize), cgh);
+            sycl::local_accessor<int, 1> local_worst_id(sycl::range<1>(kWgSize), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(kWgSize, kWgSize),
+                [=](sycl::nd_item<1> item) {
+                    const int lid = item.get_local_id(0);
+
+                    std::uint32_t my_worst_key = 0xffffffffU;
+                    int my_worst_id = -1;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (my_worst_id < 0 || qsa_candidate_is_worse(key, b, my_worst_key, my_worst_id)) {
+                            my_worst_key = key;
+                            my_worst_id = b;
+                        }
+                    }
+                    local_worst_key[lid] = my_worst_key;
+                    local_worst_id[lid] = my_worst_id;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            const std::uint32_t other_key = local_worst_key[lid + stride];
+                            const int other_id = local_worst_id[lid + stride];
+                            if (other_id >= 0) {
+                                if (local_worst_id[lid] < 0 || qsa_candidate_is_worse(other_key, other_id, local_worst_key[lid], local_worst_id[lid])) {
+                                    local_worst_key[lid] = other_key;
+                                    local_worst_id[lid] = other_id;
+                                }
+                            }
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    const int worst_id = local_worst_id[0];
+
+                    for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                        out_ptr[idx] = (idx < worst_id) ? idx : (idx + 1);
+                    }
+
+                    if (lid < tail_len) {
+                        out_ptr[block_topk + lid] = tail_start + lid;
+                    }
+                });
+        });
+
+        return block_topk;
+    }
+
     const float* scores_ptr = scores.data_as<float>();
     int* out_ptr = active_blocks_out.data_as<int>();
     constexpr int kWgSize = 256;
@@ -1110,6 +1265,26 @@ int qsa_select_topk_blocks_host(
             active_blocks_out[num_complete_blocks + t] = tail_start + t;
         }
         return num_complete_blocks;
+    }
+
+    if (num_complete_blocks == block_topk + 1) {
+        // R4c: Complement selection for B = K + 1 (513 -> 512).
+        std::uint32_t worst_key = 0xffffffffU;
+        int worst_id = -1;
+        for (int b = 0; b < num_complete_blocks; ++b) {
+            const std::uint32_t key = qsa_score_order_key(scores[b]);
+            if (worst_id < 0 || qsa_candidate_is_worse(key, b, worst_key, worst_id)) {
+                worst_key = key;
+                worst_id = b;
+            }
+        }
+        for (int i = 0; i < block_topk; ++i) {
+            active_blocks_out[i] = (i < worst_id) ? i : (i + 1);
+        }
+        for (int t = 0; t < tail_len; ++t) {
+            active_blocks_out[block_topk + t] = tail_start + t;
+        }
+        return block_topk;
     }
 
     struct Candidate {
@@ -1516,16 +1691,19 @@ void qsa_select_topk_blocks_batched(
     int max_complete_blocks,
     int start_pos,
     int block_topk,
-    int compress_ratio) {
+    int compress_ratio,
+    Tensor* valid_counts_out) {
     if (query_count <= 0 || block_topk <= 0) return;
     const float* scores_ptr = scores.data_as<float>();
     int* out_ptr = active_blocks_out.data_as<int>();
+    int* valid_counts_ptr = (valid_counts_out && valid_counts_out->valid()) ? valid_counts_out->data_as<int>() : nullptr;
 
     constexpr int kWgSize = 256;
     const size_t out_stride = static_cast<size_t>(block_topk + 4);
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<std::uint32_t, 1> local_worst_key(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
         sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
         sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
@@ -1550,6 +1728,56 @@ void qsa_select_topk_blocks_batched(
                     }
                     if (lid < tail_len) {
                         my_out[num_complete_blocks + lid] = tail_start + lid;
+                    }
+                    if (valid_counts_ptr != nullptr && lid == 0) {
+                        valid_counts_ptr[query * 2 + 0] = num_complete_blocks;
+                        valid_counts_ptr[query * 2 + 1] = tail_len;
+                    }
+                    return;
+                }
+
+                if (valid_counts_ptr != nullptr && lid == 0) {
+                    valid_counts_ptr[query * 2 + 0] = block_topk;
+                    valid_counts_ptr[query * 2 + 1] = tail_len;
+                }
+
+                if (num_complete_blocks == block_topk + 1) {
+                    // R4c: Complement selection for B = K + 1 (513 -> 512).
+                    std::uint32_t my_worst_key = 0xffffffffU;
+                    int my_worst_id = -1;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(my_scores[b]);
+                        if (my_worst_id < 0 || qsa_candidate_is_worse(key, b, my_worst_key, my_worst_id)) {
+                            my_worst_key = key;
+                            my_worst_id = b;
+                        }
+                    }
+                    local_worst_key[lid] = my_worst_key;
+                    local_cnt_one[lid] = my_worst_id;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            const std::uint32_t other_key = local_worst_key[lid + stride];
+                            const int other_id = local_cnt_one[lid + stride];
+                            if (other_id >= 0) {
+                                if (local_cnt_one[lid] < 0 || qsa_candidate_is_worse(other_key, other_id, local_worst_key[lid], local_cnt_one[lid])) {
+                                    local_worst_key[lid] = other_key;
+                                    local_cnt_one[lid] = other_id;
+                                }
+                            }
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    const int worst_id = local_cnt_one[0];
+
+                    for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                        my_out[idx] = (idx < worst_id) ? idx : (idx + 1);
+                    }
+
+                    if (lid < tail_len) {
+                        my_out[block_topk + lid] = tail_start + lid;
                     }
                     return;
                 }
@@ -1623,17 +1851,131 @@ void qsa_select_topk_blocks_batched_host(
     int max_complete_blocks,
     int start_pos,
     int block_topk,
-    int compress_ratio) {
+    int compress_ratio,
+    int* valid_counts_out) {
     const size_t out_stride = static_cast<size_t>(block_topk + 4);
     for (int query = 0; query < query_count; ++query) {
         const int pos = start_pos + query;
         const int visible_len = pos + 1;
         const int num_complete_blocks = visible_len / compress_ratio;
+        const int tail_start = num_complete_blocks * compress_ratio;
+        const int tail_len = std::max(0, visible_len - tail_start);
         const float* my_scores = scores + static_cast<size_t>(query) * max_complete_blocks;
         int* my_out = active_blocks_out + static_cast<size_t>(query) * out_stride;
-        qsa_select_topk_blocks_host(
+        const int num_act = qsa_select_topk_blocks_host(
             my_scores, num_complete_blocks, block_topk, visible_len, compress_ratio, my_out);
+        if (valid_counts_out) {
+            valid_counts_out[query * 2 + 0] = num_act;
+            valid_counts_out[query * 2 + 1] = tail_len;
+        }
     }
+}
+
+void qsa_pre_indexer_batched(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    Tensor* compressed_k,
+    int* num_compressed_blocks,
+    int start_pos,
+    int count,
+    int compress_ratio,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    if (count <= 0) return;
+
+    // 1. Cache raw K tokens for this chunk
+    qsa_cache_k_batched(ctx, indexer_qk, k_cache, start_pos, count);
+
+    // 2. Compress newly completed blocks if compressed_k is valid
+    if (compressed_k != nullptr && compressed_k->valid() && num_compressed_blocks != nullptr) {
+        const int total_complete_blocks = (start_pos + count) / compress_ratio;
+        if (total_complete_blocks > *num_compressed_blocks) {
+            const int start_block = *num_compressed_blocks;
+            const int blocks_to_compress = total_complete_blocks - start_block;
+            qsa_compress_key_blocks(
+                ctx, k_cache, k_norm_w, *compressed_k,
+                start_block, blocks_to_compress, theta, interleaved,
+                pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+                mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = total_complete_blocks;
+        }
+    }
+
+    // 3. Prepare queries (norm + RoPE)
+    qsa_prepare_q_batched(
+        ctx, indexer_qk, q_norm_w, q_out,
+        start_pos, count, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+}
+
+void qsa_pre_indexer_batched_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    bf16* compressed_k,
+    int* num_compressed_blocks,
+    int start_pos,
+    int count,
+    int compress_ratio,
+    int capacity,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    if (count <= 0) return;
+
+    // 1. Cache raw K tokens for this chunk
+    constexpr int kOutDim = 640;
+    constexpr int kHeadDim = 128;
+    for (int r = 0; r < count; ++r) {
+        const int pos = start_pos + r;
+        const bf16* k_src = indexer_qk + static_cast<size_t>(r) * kOutDim + 512;
+        bf16* k_dst = k_cache + static_cast<size_t>(pos) * kHeadDim;
+        std::copy(k_src, k_src + kHeadDim, k_dst);
+    }
+
+    // 2. Compress newly completed blocks if compressed_k is valid
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr) {
+        const int total_complete_blocks = (start_pos + count) / compress_ratio;
+        if (total_complete_blocks > *num_compressed_blocks) {
+            const int start_block = *num_compressed_blocks;
+            const int blocks_to_compress = total_complete_blocks - start_block;
+            qsa_compress_key_blocks_host(
+                k_cache, k_norm_w, compressed_k,
+                start_block, blocks_to_compress, theta, interleaved,
+                pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+                mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = total_complete_blocks;
+        }
+    }
+
+    // 3. Prepare queries
+    qsa_prepare_q_batched_host(
+        indexer_qk, q_norm_w, q_out,
+        start_pos, count, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
 }
 
 } // namespace ops

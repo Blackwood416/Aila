@@ -116,6 +116,7 @@ struct Qwen4ExpBuffers {
     Tensor indexer_active_blocks;// [516] s32 (Phase A3)
     Tensor qsa_tile_block_scores;// [kQsaQueryTile, max_blocks] f32 (Phase A4)
     Tensor qsa_tile_active_blocks;// [kQsaQueryTile, 516] s32 (Phase A4)
+    Tensor qsa_tile_valid_counts;// [qsa_query_tile_, 2] s32 (Phase P2)
 
 
     // Linear Attention
@@ -232,6 +233,7 @@ public:
         ensure_runtime_buffers(ctx, seq_len);
     }
     const Qwen4ExpBuffers& buf_for_testing() const { return buf_; }
+    int qsa_query_tile() const { return qsa_query_tile_; }
 
     bool supports_vision_embedding_override() const override { return true; }
     void set_embedding_overrides(const std::vector<int>& positions,
@@ -272,6 +274,7 @@ private:
     int linear_q_heads_ = 16, linear_kv_heads_ = 48, linear_head_dim_ = 128;
     int linear_q_dim_ = 2048, linear_kv_dim_ = 6144, linear_qkv_dim_ = 10240;
     int linear_z_dim_ = 6144, linear_all_dim_ = 16480;
+    int qsa_query_tile_ = 64;
 
     Context* context_ = nullptr;
     std::shared_ptr<const SessionOwner> sessionOwner_;

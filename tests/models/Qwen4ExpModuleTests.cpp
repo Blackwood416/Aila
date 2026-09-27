@@ -3068,6 +3068,14 @@ void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
     expect(buf.incr_scores.shape()[1] <= 2052, "buf.incr_scores dim 1 must be <= 2052");
     expect(buf.incr_scores.shape()[2] <= 2052, "buf.incr_scores dim 2 must be <= 2052");
 
+    // Phase P2 (R4a): Verify bounded arena buffers for QSA batch tiles
+    expect(buf.qsa_tile_valid_counts.valid(), "buf.qsa_tile_valid_counts must be allocated");
+    expect(backend.qsa_query_tile() >= 16 && backend.qsa_query_tile() <= 64,
+           "backend.qsa_query_tile() must be bounded in [16, 64]");
+    expect(buf.qsa_tile_valid_counts.shape()[0] == backend.qsa_query_tile(),
+           "buf.qsa_tile_valid_counts rows must match qsa_query_tile");
+    expect(buf.qsa_tile_valid_counts.shape()[1] == 2, "buf.qsa_tile_valid_counts cols must be 2");
+
     std::cout << "[PASS] Dense attention buffers strictly bounded: scores shape=["
               << buf.scores.shape()[0] << ", " << buf.scores.shape()[1] << ", " << buf.scores.shape()[2]
               << "], incr_scores shape=["
@@ -3259,9 +3267,11 @@ void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
         ctx, q_out_dev, k_cache_dev, k_norm_w_dev, scores_dev, num_complete_blocks, rope_theta);
 
     // 6. Select Top-512 blocks + tail
+    std::cout << "[P2 Debug] Before ops::qsa_select_topk_and_expand_tokens" << std::endl;
     int num_active = ops::qsa_select_topk_and_expand_tokens(
         ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
     ctx.synchronize();
+    std::cout << "[P2 Debug] After ops::qsa_select_topk_and_expand_tokens: num_active=" << num_active << std::endl;
 
     expect(num_active == block_topk * compress_ratio, "Pipeline: active tokens must equal 2048");
 
@@ -3319,12 +3329,14 @@ void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
     ctx.memcpy_h2d(k_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
     ctx.memcpy_h2d(v_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
 
+    std::cout << "[P2 Debug] Before ops::attention_decode" << std::endl;
     ops::attention_decode(
         ctx, q_full_dev, k_full_dev, v_full_dev, attn_out_dev, scores_buf,
         num_heads, num_kv_heads, full_head_dim, cached_len,
         &partials_dev, /*gate_buf=*/nullptr,
         active_tokens_dev.data_as<int>(), num_active);
     ctx.synchronize();
+    std::cout << "[P2 Debug] After ops::attention_decode" << std::endl;
 
     std::vector<bf16> attn_out_h(num_heads * full_head_dim);
     ctx.memcpy_d2h(attn_out_h.data(), attn_out_dev.data(), attn_out_h.size() * sizeof(bf16));
@@ -3334,11 +3346,11 @@ void test_qsa_indexer_end_to_end_pipeline(Context& ctx) {
     }
 
     std::cout << "[PASS] QSA Indexer End-to-End Pipeline (>2048) fully verified: scores diff="
-              << max_score_diff << " < 1e-3, 0 token mismatches, attention outputs finite & valid.\n";
+              << max_score_diff << " < 1e-3, 0 token mismatches, attention outputs finite & valid." << std::endl;
 }
 
 void test_qsa_block_native_decode_alignment(Context& ctx) {
-    std::cout << "[Test] Running QSA Block-Native Decode Alignment (A3) Test...\n";
+    std::cout << "[Test] Running QSA Block-Native Decode Alignment (A3) Test..." << std::endl;
     constexpr int num_heads = 24;
     constexpr int num_kv_heads = 2;
     constexpr int full_head_dim = 256;
@@ -3434,7 +3446,7 @@ void test_qsa_block_native_decode_alignment(Context& ctx) {
 }
 
 void test_qsa_batched_prefill_oracle_alignment(Context& ctx) {
-    std::cout << "[Test] Running QSA Batched Prefill vs Oracle Alignment (A4) Test...\n";
+    std::cout << "[Test] Running QSA Batched Prefill vs Oracle Alignment (A4) Test..." << std::endl;
     constexpr int start_pos = 2040;
     constexpr int count = 80; // spans pos 2040..2119 (crosses dense 2050 -> sparse 2051 threshold, spans 2 tiles: 64 + 16)
     constexpr int capacity = 2300;
@@ -3596,7 +3608,411 @@ void test_qsa_batched_prefill_oracle_alignment(Context& ctx) {
         if (d > max_diff) max_diff = d;
     }
     expect(max_diff < 2e-2f, "Batched Prefill: output mismatch vs row-wise oracle, max_diff=" + std::to_string(max_diff));
-    std::cout << "[PASS] QSA Batched Prefill (A4) matches row-wise oracle across threshold (max_diff=" << max_diff << " < 0.02).\n";
+    std::cout << "[PASS] QSA Batched Prefill (A4) matches row-wise oracle across threshold (max_diff=" << max_diff << " < 0.02)." << std::endl;
+}
+
+void test_qsa_complement_selection_513(Context& ctx) {
+    std::cout << "[Test] Running QSA Complement Selection B=513 (R4c) Tests..." << std::endl;
+    constexpr int block_topk = 512;
+    constexpr int num_blocks = 513; // B = K + 1
+    constexpr int compress_ratio = 4;
+    constexpr int visible_len = num_blocks * compress_ratio + 2; // 2054 tokens, tail_len = 2
+
+    auto verify_case = [&](const std::string& case_name, const std::vector<float>& host_scores, int expected_dropped_idx) {
+        expect(host_scores.size() == num_blocks, "Scores vector size mismatch");
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_blocks}, dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(scores_dev.data(), host_scores.data(), num_blocks * sizeof(float));
+
+        // 1. Test qsa_select_topk_blocks
+        Tensor out_blocks_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
+        std::vector<int> out_blocks_host(block_topk + 4, -1);
+        int num_sel_host = ops::qsa_select_topk_blocks_host(
+            host_scores.data(), num_blocks, block_topk, visible_len, compress_ratio, out_blocks_host.data());
+        int num_sel_dev = ops::qsa_select_topk_blocks(
+            ctx, scores_dev, num_blocks, block_topk, visible_len, compress_ratio, out_blocks_dev);
+        ctx.synchronize();
+
+        expect(num_sel_host == block_topk, case_name + ": host num_active_blocks must be 512");
+        expect(num_sel_dev == block_topk, case_name + ": dev num_active_blocks must be 512");
+
+        std::vector<int> out_blocks_dev_h(block_topk + 4, -1);
+        ctx.memcpy_d2h(out_blocks_dev_h.data(), out_blocks_dev.data(), (block_topk + 4) * sizeof(int));
+
+        for (int i = 0; i < block_topk; ++i) {
+            expect(out_blocks_host[i] == out_blocks_dev_h[i],
+                   case_name + ": dev vs host mismatch at index " + std::to_string(i));
+            int expected_block = (i < expected_dropped_idx) ? i : (i + 1);
+            expect(out_blocks_dev_h[i] == expected_block,
+                   case_name + ": expected block " + std::to_string(expected_block) + " but got " + std::to_string(out_blocks_dev_h[i]));
+        }
+
+        constexpr int tail_start = num_blocks * compress_ratio;
+        constexpr int tail_len = visible_len - tail_start; // 2
+        for (int t = 0; t < tail_len; ++t) {
+            expect(out_blocks_dev_h[block_topk + t] == tail_start + t,
+                   case_name + ": tail token mismatch at tail " + std::to_string(t));
+        }
+
+        // 2. Test qsa_select_topk_and_expand_tokens
+        const int max_tokens = (block_topk + 1) * compress_ratio + 4;
+        Tensor out_toks_dev = Tensor::allocate(ctx, {max_tokens}, dnnl::memory::data_type::s32);
+        std::vector<int> out_toks_host(max_tokens, -1);
+        int num_toks_host = ops::qsa_select_topk_and_expand_tokens_host(
+            host_scores.data(), num_blocks, block_topk, visible_len, compress_ratio, out_toks_host.data());
+        int num_toks_dev = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_blocks, block_topk, visible_len, compress_ratio, out_toks_dev);
+        ctx.synchronize();
+
+        expect(num_toks_host == block_topk * compress_ratio + tail_len, case_name + ": host token count mismatch");
+        expect(num_toks_dev == num_toks_host, case_name + ": dev token count mismatch");
+
+        std::vector<int> out_toks_dev_h(max_tokens, -1);
+        ctx.memcpy_d2h(out_toks_dev_h.data(), out_toks_dev.data(), max_tokens * sizeof(int));
+        for (int i = 0; i < num_toks_host; ++i) {
+            expect(out_toks_host[i] == out_toks_dev_h[i],
+                   case_name + ": token expand dev vs host mismatch at " + std::to_string(i));
+        }
+
+        // 3. Test qsa_select_topk_blocks_batched with valid_counts_out
+        Tensor batched_scores = Tensor::allocate(ctx, {2, num_blocks}, dnnl::memory::data_type::f32);
+        std::vector<float> batched_scores_h(2 * num_blocks);
+        std::copy(host_scores.begin(), host_scores.end(), batched_scores_h.begin());
+        std::copy(host_scores.begin(), host_scores.end(), batched_scores_h.begin() + num_blocks);
+        ctx.memcpy_h2d(batched_scores.data(), batched_scores_h.data(), batched_scores_h.size() * sizeof(float));
+
+        Tensor batched_out_blocks = Tensor::allocate(ctx, {2, block_topk + 4}, dnnl::memory::data_type::s32);
+        Tensor batched_valid_counts = Tensor::allocate(ctx, {2, 2}, dnnl::memory::data_type::s32);
+        std::vector<int> batched_out_blocks_h(2 * (block_topk + 4), -1);
+        std::vector<int> batched_valid_counts_h(4, -1);
+
+        const int start_pos_test = 513 * 4;
+        ops::qsa_select_topk_blocks_batched_host(
+            batched_scores_h.data(), batched_out_blocks_h.data(), 2, num_blocks, start_pos_test, block_topk, compress_ratio,
+            batched_valid_counts_h.data());
+        ops::qsa_select_topk_blocks_batched(
+            ctx, batched_scores, batched_out_blocks, 2, num_blocks, start_pos_test, block_topk, compress_ratio,
+            &batched_valid_counts);
+        ctx.synchronize();
+
+        std::vector<int> dev_counts_h(4, -1);
+        ctx.memcpy_d2h(dev_counts_h.data(), batched_valid_counts.data(), 4 * sizeof(int));
+        expect(dev_counts_h[0] == block_topk && dev_counts_h[1] == 1,
+               case_name + ": batched valid counts dev mismatch row 0");
+        expect(dev_counts_h[2] == block_topk && dev_counts_h[3] == 2,
+               case_name + ": batched valid counts dev mismatch row 1");
+        expect(batched_valid_counts_h[0] == dev_counts_h[0] && batched_valid_counts_h[1] == dev_counts_h[1],
+               case_name + ": host vs dev valid counts mismatch row 0");
+        expect(batched_valid_counts_h[2] == dev_counts_h[2] && batched_valid_counts_h[3] == dev_counts_h[3],
+               case_name + ": host vs dev valid counts mismatch row 1");
+    };
+
+    // Scenario A: Worst at index 0
+    {
+        std::vector<float> scores(num_blocks);
+        for (int i = 0; i < num_blocks; ++i) scores[i] = 10.0f + static_cast<float>(i) * 0.1f;
+        scores[0] = -100.0f;
+        verify_case("WorstAtIndex0", scores, 0);
+    }
+
+    // Scenario B: Worst at index 512 (last)
+    {
+        std::vector<float> scores(num_blocks);
+        for (int i = 0; i < num_blocks; ++i) scores[i] = 10.0f + static_cast<float>(i) * 0.1f;
+        scores[512] = -100.0f;
+        verify_case("WorstAtIndex512", scores, 512);
+    }
+
+    // Scenario C: Worst in middle (index 250)
+    {
+        std::vector<float> scores(num_blocks);
+        for (int i = 0; i < num_blocks; ++i) scores[i] = 10.0f + static_cast<float>(i) * 0.1f;
+        scores[250] = -100.0f;
+        verify_case("WorstAtIndex250", scores, 250);
+    }
+
+    // Scenario D: Tie-break (equal worst scores at index 100 and index 300)
+    // Contract: score tie -> smaller ID preferred -> drop larger ID (index 300).
+    {
+        std::vector<float> scores(num_blocks, 5.0f);
+        scores[100] = -50.0f;
+        scores[300] = -50.0f;
+        verify_case("TieBreakDropLargerID", scores, 300);
+    }
+
+    // Scenario E: IEEE floating point special cases
+    {
+        std::vector<float> scores(num_blocks, 1.0f);
+        scores[400] = -1e30f;
+        verify_case("NegativeLargeWorst", scores, 400);
+    }
+
+    std::cout << "[PASS] QSA Complement Selection B=513 (R4c) all scenarios passed bit-exact.\n";
+}
+
+void test_qsa_batched_multi_q_head_attention(Context& ctx) {
+    std::cout << "[Test] Running QSA Batched Multi-Q-Head Parallel Attention (R4b) Test...\n";
+    constexpr int count = 4;
+    constexpr int start_pos = 2052;
+    constexpr int num_heads = 24;
+    constexpr int num_kv_heads = 2; // 12 Q heads per KV head
+    constexpr int head_dim = 256;
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int capacity = 2200;
+    constexpr int q_dim = num_heads * head_dim;
+
+    std::mt19937 rng(4321);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+
+    Tensor q_dev = Tensor::allocate(ctx, {count, q_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor z_dev = Tensor::allocate(ctx, {count, q_dim}, dnnl::memory::data_type::bf16);
+    Tensor out_gpu = Tensor::allocate(ctx, {count, q_dim}, dnnl::memory::data_type::bf16);
+    Tensor active_blocks_dev = Tensor::allocate(ctx, {count, block_topk + 4}, dnnl::memory::data_type::s32);
+    Tensor valid_counts_dev = Tensor::allocate(ctx, {count, 2}, dnnl::memory::data_type::s32);
+
+    std::vector<bf16> q_h(count * q_dim);
+    std::vector<bf16> k_h(num_kv_heads * capacity * head_dim);
+    std::vector<bf16> v_h(num_kv_heads * capacity * head_dim);
+    std::vector<bf16> z_h(count * q_dim);
+    std::vector<int> active_blocks_h(count * (block_topk + 4));
+    std::vector<int> valid_counts_h(count * 2);
+
+    for (auto& v : q_h) v = bf16(dist(rng));
+    for (auto& v : k_h) v = bf16(dist(rng));
+    for (auto& v : v_h) v = bf16(dist(rng));
+    for (auto& v : z_h) v = bf16(dist(rng));
+
+    for (int r = 0; r < count; ++r) {
+        const int pos = start_pos + r;
+        const int visible_len = pos + 1;
+        const int num_complete_blocks = visible_len / compress_ratio;
+        const int tail_start = num_complete_blocks * compress_ratio;
+        const int tail_len = visible_len - tail_start;
+
+        valid_counts_h[r * 2 + 0] = block_topk;
+        valid_counts_h[r * 2 + 1] = tail_len;
+
+        for (int b = 0; b < block_topk; ++b) {
+            active_blocks_h[r * (block_topk + 4) + b] = b;
+        }
+        for (int t = 0; t < tail_len; ++t) {
+            active_blocks_h[r * (block_topk + 4) + block_topk + t] = tail_start + t;
+        }
+    }
+
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k_h.data(), k_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), v_h.data(), v_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(z_dev.data(), z_h.data(), z_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(active_blocks_dev.data(), active_blocks_h.data(), active_blocks_h.size() * sizeof(int));
+    ctx.memcpy_h2d(valid_counts_dev.data(), valid_counts_h.data(), valid_counts_h.size() * sizeof(int));
+
+    // Test Case 1: With gate (z) and with valid_counts
+    {
+        ops::attention_prefill_qsa_batched(
+            ctx, q_dev, k_dev, v_dev, active_blocks_dev, out_gpu,
+            count, start_pos, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, &z_dev, &valid_counts_dev);
+        ctx.synchronize();
+
+        std::vector<bf16> out_gpu_h(count * q_dim);
+        std::vector<bf16> out_ref_h(count * q_dim);
+        ctx.memcpy_d2h(out_gpu_h.data(), out_gpu.data(), out_gpu_h.size() * sizeof(bf16));
+
+        ops::attention_prefill_qsa_batched_host(
+            q_h.data(), k_h.data(), v_h.data(), active_blocks_h.data(), out_ref_h.data(),
+            count, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, z_h.data(), valid_counts_h.data());
+
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < out_gpu_h.size(); ++i) {
+            float g = static_cast<float>(out_gpu_h[i]);
+            float r = static_cast<float>(out_ref_h[i]);
+            expect(!std::isnan(g) && !std::isinf(g), "Multi-Q GPU output contains NaN/Inf");
+            float diff = std::abs(g - r);
+            if (diff > max_diff) max_diff = diff;
+        }
+        expect(max_diff < 0.02f, "Multi-Q Attention with gate: GPU vs Host mismatch max_diff=" + std::to_string(max_diff));
+        std::cout << "  Multi-Q with gate max_diff = " << max_diff << " (PASS)\n";
+    }
+
+    // Test Case 2: Without gate (nullptr) and with valid_counts
+    {
+        ops::attention_prefill_qsa_batched(
+            ctx, q_dev, k_dev, v_dev, active_blocks_dev, out_gpu,
+            count, start_pos, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, nullptr, &valid_counts_dev);
+        ctx.synchronize();
+
+        std::vector<bf16> out_gpu_h(count * q_dim);
+        std::vector<bf16> out_ref_h(count * q_dim);
+        ctx.memcpy_d2h(out_gpu_h.data(), out_gpu.data(), out_gpu_h.size() * sizeof(bf16));
+
+        ops::attention_prefill_qsa_batched_host(
+            q_h.data(), k_h.data(), v_h.data(), active_blocks_h.data(), out_ref_h.data(),
+            count, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, nullptr, valid_counts_h.data());
+
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < out_gpu_h.size(); ++i) {
+            float g = static_cast<float>(out_gpu_h[i]);
+            float r = static_cast<float>(out_ref_h[i]);
+            expect(!std::isnan(g) && !std::isinf(g), "Multi-Q GPU output without gate contains NaN/Inf");
+            float diff = std::abs(g - r);
+            if (diff > max_diff) max_diff = diff;
+        }
+        expect(max_diff < 0.02f, "Multi-Q Attention without gate: GPU vs Host mismatch max_diff=" + std::to_string(max_diff));
+        std::cout << "  Multi-Q without gate max_diff = " << max_diff << " (PASS)\n";
+    }
+
+    // Test Case 3: Without valid_counts (fallback to on-the-fly arithmetic)
+    {
+        ops::attention_prefill_qsa_batched(
+            ctx, q_dev, k_dev, v_dev, active_blocks_dev, out_gpu,
+            count, start_pos, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, &z_dev, nullptr);
+        ctx.synchronize();
+
+        std::vector<bf16> out_gpu_h(count * q_dim);
+        std::vector<bf16> out_ref_h(count * q_dim);
+        ctx.memcpy_d2h(out_gpu_h.data(), out_gpu.data(), out_gpu_h.size() * sizeof(bf16));
+
+        ops::attention_prefill_qsa_batched_host(
+            q_h.data(), k_h.data(), v_h.data(), active_blocks_h.data(), out_ref_h.data(),
+            count, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, z_h.data(), nullptr);
+
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < out_gpu_h.size(); ++i) {
+            float diff = std::abs(static_cast<float>(out_gpu_h[i]) - static_cast<float>(out_ref_h[i]));
+            if (diff > max_diff) max_diff = diff;
+        }
+        expect(max_diff < 0.02f, "Multi-Q Attention without valid_counts: GPU vs Host mismatch max_diff=" + std::to_string(max_diff));
+        std::cout << "  Multi-Q fallback on-the-fly arithmetic max_diff = " << max_diff << " (PASS)\n";
+    }
+
+    std::cout << "[PASS] QSA Batched Multi-Q-Head Parallel Attention (R4b) tests passed.\n";
+}
+
+void test_qsa_pre_indexer_fusion_reentrant(Context& ctx) {
+    std::cout << "[Test] Running QSA Pre-Indexer Fusion Reentrancy (R4d) Test...\n";
+    constexpr int total_count = 178;
+    constexpr int capacity = 256;
+    constexpr int compress_ratio = 4;
+    constexpr int indexer_heads = 4;
+    constexpr int indexer_head_dim = 128;
+    constexpr int indexer_q_dim = indexer_heads * indexer_head_dim;
+    constexpr int indexer_out_dim = indexer_q_dim + indexer_head_dim;
+    constexpr float rope_theta = 1000000.0f;
+
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+
+    std::vector<bf16> indexer_qk_h(total_count * indexer_out_dim);
+    for (auto& v : indexer_qk_h) v = bf16(dist(rng));
+    std::vector<bf16> qn_w_h(indexer_head_dim, bf16(1.0f));
+    std::vector<bf16> kn_w_h(indexer_head_dim, bf16(1.0f));
+
+    Tensor indexer_qk_dev = Tensor::allocate(ctx, {total_count, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    Tensor qn_dev = Tensor::allocate(ctx, {indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor kn_dev = Tensor::allocate(ctx, {indexer_head_dim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(indexer_qk_dev.data(), indexer_qk_h.data(), indexer_qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(qn_dev.data(), qn_w_h.data(), qn_w_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(kn_dev.data(), kn_w_h.data(), kn_w_h.size() * sizeof(bf16));
+
+    // Approach 1: Monolithic single call (start_pos = 0, count = total_count)
+    Tensor k_cache_mono = Tensor::allocate(ctx, {capacity, indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor comp_k_mono = Tensor::allocate(ctx, {capacity / compress_ratio, indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_mono = Tensor::allocate(ctx, {total_count, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    int num_comp_mono = 0;
+
+    ops::qsa_pre_indexer_batched(
+        ctx, indexer_qk_dev, qn_dev, kn_dev,
+        k_cache_mono, q_out_mono, &comp_k_mono, &num_comp_mono,
+        0, total_count, compress_ratio, rope_theta);
+    ctx.synchronize();
+
+    // Approach 2: Chunked reentrant calls across 3 chunks: [0..64), [64..128), [128..178)
+    Tensor k_cache_chunk = Tensor::allocate(ctx, {capacity, indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor comp_k_chunk = Tensor::allocate(ctx, {capacity / compress_ratio, indexer_head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_out_chunk = Tensor::allocate(ctx, {total_count, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    int num_comp_chunk = 0;
+
+    const std::vector<std::pair<int, int>> chunks = {{0, 64}, {64, 64}, {128, 50}};
+    for (const auto& [chunk_start, chunk_count] : chunks) {
+        Tensor qk_chunk = Tensor::view(
+            ctx, indexer_qk_dev.data_as<bf16>() + static_cast<size_t>(chunk_start) * indexer_out_dim,
+            {chunk_count, indexer_out_dim});
+        Tensor q_chunk = Tensor::view(
+            ctx, q_out_chunk.data_as<bf16>() + static_cast<size_t>(chunk_start) * indexer_q_dim,
+            {chunk_count, indexer_q_dim});
+
+        ops::qsa_pre_indexer_batched(
+            ctx, qk_chunk, qn_dev, kn_dev,
+            k_cache_chunk, q_chunk, &comp_k_chunk, &num_comp_chunk,
+            chunk_start, chunk_count, compress_ratio, rope_theta);
+    }
+    ctx.synchronize();
+
+    expect(num_comp_mono == total_count / compress_ratio, "Mono compressed block count mismatch");
+    expect(num_comp_chunk == num_comp_mono, "Chunked compressed block count mismatch");
+
+    // Compare k_cache
+    std::vector<bf16> k_mono_h(total_count * indexer_head_dim);
+    std::vector<bf16> k_chunk_h(total_count * indexer_head_dim);
+    ctx.memcpy_d2h(k_mono_h.data(), k_cache_mono.data(), k_mono_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_chunk_h.data(), k_cache_chunk.data(), k_chunk_h.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < k_mono_h.size(); ++i) {
+        expect(k_mono_h[i] == k_chunk_h[i], "k_cache bit-exact mismatch between mono and chunked at " + std::to_string(i));
+    }
+
+    // Compare compressed_k
+    std::vector<bf16> comp_mono_h(num_comp_mono * indexer_head_dim);
+    std::vector<bf16> comp_chunk_h(num_comp_chunk * indexer_head_dim);
+    ctx.memcpy_d2h(comp_mono_h.data(), comp_k_mono.data(), comp_mono_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(comp_chunk_h.data(), comp_k_chunk.data(), comp_chunk_h.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < comp_mono_h.size(); ++i) {
+        expect(comp_mono_h[i] == comp_chunk_h[i], "compressed_k bit-exact mismatch between mono and chunked at " + std::to_string(i));
+    }
+
+    // Compare q_out
+    std::vector<bf16> q_mono_h(total_count * indexer_q_dim);
+    std::vector<bf16> q_chunk_h(total_count * indexer_q_dim);
+    ctx.memcpy_d2h(q_mono_h.data(), q_out_mono.data(), q_mono_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(q_chunk_h.data(), q_out_chunk.data(), q_chunk_h.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < q_mono_h.size(); ++i) {
+        expect(q_mono_h[i] == q_chunk_h[i], "q_out bit-exact mismatch between mono and chunked at " + std::to_string(i));
+    }
+
+    // Approach 3: Compare against Host reference
+    std::vector<bf16> k_cache_ref(capacity * indexer_head_dim);
+    std::vector<bf16> comp_k_ref((capacity / compress_ratio) * indexer_head_dim);
+    std::vector<bf16> q_out_ref(total_count * indexer_q_dim);
+    int num_comp_ref = 0;
+
+    ops::qsa_pre_indexer_batched_host(
+        indexer_qk_h.data(), qn_w_h.data(), kn_w_h.data(),
+        k_cache_ref.data(), q_out_ref.data(), comp_k_ref.data(), &num_comp_ref,
+        0, total_count, compress_ratio, capacity, rope_theta);
+
+    expect(num_comp_ref == num_comp_mono, "Host compressed block count mismatch");
+
+    float max_q_diff = 0.0f;
+    for (size_t i = 0; i < q_mono_h.size(); ++i) {
+        float d = std::abs(static_cast<float>(q_mono_h[i]) - static_cast<float>(q_out_ref[i]));
+        if (d > max_q_diff) max_q_diff = d;
+    }
+    expect(max_q_diff < 0.01f, "GPU vs Host q_out mismatch max_diff=" + std::to_string(max_q_diff));
+
+    std::cout << "[PASS] QSA Pre-Indexer Fusion Reentrancy (R4d) verified bit-exact across chunks (max_q_diff="
+              << max_q_diff << ").\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -4460,10 +4876,18 @@ int main() {
         test_qsa_indexer_end_to_end_pipeline(ctx);
         test_qsa_block_native_decode_alignment(ctx);
         test_qsa_batched_prefill_oracle_alignment(ctx);
+        test_qsa_complement_selection_513(ctx);
+        test_qsa_batched_multi_q_head_attention(ctx);
+        test_qsa_pre_indexer_fusion_reentrant(ctx);
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "AilaQwen4ExpModuleTests FAILED: " << e.what() << "\n";
+        std::cout << "[ERROR CATCH] AilaQwen4ExpModuleTests FAILED: " << e.what() << std::endl;
+        std::cerr << "AilaQwen4ExpModuleTests FAILED: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cout << "[ERROR CATCH] AilaQwen4ExpModuleTests FAILED: unknown exception" << std::endl;
+        std::cerr << "AilaQwen4ExpModuleTests FAILED: unknown exception" << std::endl;
         return 1;
     }
 }

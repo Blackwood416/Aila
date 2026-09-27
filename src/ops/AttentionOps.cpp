@@ -4268,7 +4268,8 @@ void attention_prefill_qsa_batched(
     int head_dim,
     int block_topk,
     int compress_ratio,
-    const Tensor* gate_buf) {
+    const Tensor* gate_buf,
+    const Tensor* valid_counts) {
   if (count <= 0) return;
   if (head_dim != 256) {
     throw std::invalid_argument("attention_prefill_qsa_batched requires head_dim == 256");
@@ -4286,56 +4287,467 @@ void attention_prefill_qsa_batched(
   const int* active_blocks_ptr = active_blocks.data_as<int>();
   bf16* o_ptr = output.data_as<bf16>();
   const bf16* gate_ptr = (gate_buf && gate_buf->valid()) ? gate_buf->data_as<bf16>() : nullptr;
+  const int* valid_counts_ptr = (valid_counts && valid_counts->valid()) ? valid_counts->data_as<int>() : nullptr;
 
-  const int heads_per_kv = num_heads / num_kv_heads;
+  const int heads_per_kv = std::max(1, (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1);
   const int max_seq_len = static_cast<int>(k_cache.shape(1));
   const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
   constexpr int wg_size = 64;
   const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
 
-  ctx.queue().submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+  static const int s_heads_per_wg_env = aila::env::read_int("AILA_QSA_HEADS_PER_WG", 2);
 
-    cgh.parallel_for(
-        sycl::nd_range<1>(static_cast<size_t>(count) * num_heads * wg_size, wg_size),
-        [=](sycl::nd_item<1> item) {
-          const int group = item.get_group(0);
-          const int row = group / num_heads;
-          const int head = group % num_heads;
-          const int lid = item.get_local_id(0);
-          const int kv_head = head / heads_per_kv;
-          const int pos = start_pos + row;
-          const int visible_len = pos + 1;
-          const int num_complete_blocks = visible_len / compress_ratio;
-          const bool is_sparse = (num_complete_blocks > block_topk);
-          const int num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
-          const int tail_start = num_complete_blocks * compress_ratio;
-          const int tail_len = std::max(0, visible_len - tail_start);
+  if (s_heads_per_wg_env == 4 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) {
+    // Phase P2 (R4b): Multi-Q-head parallelism (4 Q heads sharing 1 KV head per workgroup)
+    const int num_groups = num_heads / 4;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 2> q_cache(sycl::range<2>(4, head_dim), cgh);
 
-          const size_t q_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
-          for (int d = lid; d < head_dim; d += wg_size) {
-            q_cache[d] = static_cast<float>(q_ptr[q_head_offset + d]);
-          }
-          item.barrier(sycl::access::fence_space::local_space);
+      cgh.parallel_for(
+          sycl::nd_range<1>(static_cast<size_t>(count) * num_groups * wg_size, wg_size),
+          [=](sycl::nd_item<1> item) {
+            const int group = item.get_group(0);
+            const int row = group / num_groups;
+            const int g_idx = group % num_groups;
+            const int lid = item.get_local_id(0);
+            const int h0 = g_idx * 4;
+            const int kv_head = h0 / heads_per_kv;
 
-          const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
-          const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+            int num_active_blocks = 0;
+            int tail_len = 0;
+            int tail_start = 0;
+            bool is_sparse = false;
 
-          float running_max = -1e30f;
-          float running_sum = 0.0f;
-          const int d0 = lid;
-          const int d1 = lid + 64;
-          const int d2 = lid + 128;
-          const int d3 = lid + 192;
-          float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            if (valid_counts_ptr != nullptr) {
+              num_active_blocks = valid_counts_ptr[row * 2 + 0];
+              tail_len = valid_counts_ptr[row * 2 + 1];
+              is_sparse = (num_active_blocks >= block_topk);
+              const int pos = start_pos + row;
+              tail_start = (pos + 1) - tail_len;
+            } else {
+              const int pos = start_pos + row;
+              const int visible_len = pos + 1;
+              const int num_complete_blocks = visible_len / compress_ratio;
+              is_sparse = (num_complete_blocks > block_topk);
+              num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+              tail_start = num_complete_blocks * compress_ratio;
+              tail_len = std::max(0, visible_len - tail_start);
+            }
 
-          // Loop over active blocks
-          for (int b = 0; b < num_active_blocks; ++b) {
-            const int blk = is_sparse ? my_blocks[b] : b;
-            const int base_t = blk * compress_ratio;
+            for (int k = 0; k < 4; ++k) {
+              const size_t q_off = (static_cast<size_t>(row) * num_heads + (h0 + k)) * head_dim;
+              for (int d = lid; d < head_dim; d += wg_size) {
+                q_cache[k][d] = static_cast<float>(q_ptr[q_off + d]);
+              }
+            }
+            item.barrier(sycl::access::fence_space::local_space);
 
-            for (int c = 0; c < compress_ratio; ++c) {
-              const int cache_t = base_t + c;
+            const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
+            const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+
+            float running_max[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+            float running_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int d0 = lid;
+            const int d1 = lid + 64;
+            const int d2 = lid + 128;
+            const int d3 = lid + 192;
+            float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float acc2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float acc3[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            // Loop over active blocks
+            for (int b = 0; b < num_active_blocks; ++b) {
+              const int blk = is_sparse ? my_blocks[b] : b;
+              const int base_t = blk * compress_ratio;
+
+              for (int c = 0; c < compress_ratio; ++c) {
+                const int cache_t = base_t + c;
+                const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+
+                float rescale[4];
+                float exp_score[4];
+                for (int k = 0; k < 4; ++k) {
+                  const float local_dot = q_cache[k][d0] * k0 + q_cache[k][d1] * k1 + q_cache[k][d2] * k2 + q_cache[k][d3] * k3;
+                  const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+                  const float score = dot * scale;
+                  const float new_max = sycl::fmax(running_max[k], score);
+                  rescale[k] = (running_max[k] <= -1e20f) ? 0.0f : sycl::native::exp(running_max[k] - new_max);
+                  exp_score[k] = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+                  running_sum[k] = running_sum[k] * rescale[k] + exp_score[k];
+                  running_max[k] = new_max;
+                }
+
+                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+                for (int k = 0; k < 4; ++k) {
+                  acc0[k] = acc0[k] * rescale[k] + exp_score[k] * v0;
+                  acc1[k] = acc1[k] * rescale[k] + exp_score[k] * v1;
+                  acc2[k] = acc2[k] * rescale[k] + exp_score[k] * v2;
+                  acc3[k] = acc3[k] * rescale[k] + exp_score[k] * v3;
+                }
+              }
+            }
+
+            // Loop over tail tokens
+            for (int t = 0; t < tail_len; ++t) {
+              const int cache_t = tail_start + t;
+              const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+
+              float rescale[4];
+              float exp_score[4];
+              for (int k = 0; k < 4; ++k) {
+                const float local_dot = q_cache[k][d0] * k0 + q_cache[k][d1] * k1 + q_cache[k][d2] * k2 + q_cache[k][d3] * k3;
+                const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+                const float score = dot * scale;
+                const float new_max = sycl::fmax(running_max[k], score);
+                rescale[k] = (running_max[k] <= -1e20f) ? 0.0f : sycl::native::exp(running_max[k] - new_max);
+                exp_score[k] = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+                running_sum[k] = running_sum[k] * rescale[k] + exp_score[k];
+                running_max[k] = new_max;
+              }
+
+              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+              for (int k = 0; k < 4; ++k) {
+                acc0[k] = acc0[k] * rescale[k] + exp_score[k] * v0;
+                acc1[k] = acc1[k] * rescale[k] + exp_score[k] * v1;
+                acc2[k] = acc2[k] * rescale[k] + exp_score[k] * v2;
+                acc3[k] = acc3[k] * rescale[k] + exp_score[k] * v3;
+              }
+            }
+
+            for (int k = 0; k < 4; ++k) {
+              const float inv_sum = (running_sum[k] > 0.0f) ? (1.0f / running_sum[k]) : 0.0f;
+              float o0 = static_cast<float>(bf16(acc0[k] * inv_sum));
+              float o1 = static_cast<float>(bf16(acc1[k] * inv_sum));
+              float o2 = static_cast<float>(bf16(acc2[k] * inv_sum));
+              float o3 = static_cast<float>(bf16(acc3[k] * inv_sum));
+
+              const size_t out_head_offset = (static_cast<size_t>(row) * num_heads + (h0 + k)) * head_dim;
+              if (gate_ptr != nullptr) {
+                const float g0 = static_cast<float>(gate_ptr[out_head_offset + d0]);
+                const float g1 = static_cast<float>(gate_ptr[out_head_offset + d1]);
+                const float g2 = static_cast<float>(gate_ptr[out_head_offset + d2]);
+                const float g3 = static_cast<float>(gate_ptr[out_head_offset + d3]);
+                o0 = static_cast<float>(bf16(o0 * (1.0f / (1.0f + sycl::native::exp(-g0)))));
+                o1 = static_cast<float>(bf16(o1 * (1.0f / (1.0f + sycl::native::exp(-g1)))));
+                o2 = static_cast<float>(bf16(o2 * (1.0f / (1.0f + sycl::native::exp(-g2)))));
+                o3 = static_cast<float>(bf16(o3 * (1.0f / (1.0f + sycl::native::exp(-g3)))));
+              }
+
+              o_ptr[out_head_offset + d0] = bf16(o0);
+              o_ptr[out_head_offset + d1] = bf16(o1);
+              o_ptr[out_head_offset + d2] = bf16(o2);
+              o_ptr[out_head_offset + d3] = bf16(o3);
+            }
+          });
+    });
+  } else if (s_heads_per_wg_env >= 2 && (num_heads % 2 == 0) && (heads_per_kv % 2 == 0)) {
+    // Phase P2 (R4b): Multi-Q-head parallelism (2 Q heads sharing 1 KV head per workgroup)
+    const int num_pairs = num_heads / 2;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> q_cache0(sycl::range<1>(head_dim), cgh);
+      sycl::local_accessor<float, 1> q_cache1(sycl::range<1>(head_dim), cgh);
+
+      cgh.parallel_for(
+          sycl::nd_range<1>(static_cast<size_t>(count) * num_pairs * wg_size, wg_size),
+          [=](sycl::nd_item<1> item) {
+            const int group = item.get_group(0);
+            const int row = group / num_pairs;
+            const int pair_idx = group % num_pairs;
+            const int lid = item.get_local_id(0);
+            const int head0 = pair_idx * 2;
+            const int head1 = pair_idx * 2 + 1;
+            const int kv_head = head0 / heads_per_kv;
+
+            int num_active_blocks = 0;
+            int tail_len = 0;
+            int tail_start = 0;
+            bool is_sparse = false;
+
+            if (valid_counts_ptr != nullptr) {
+              num_active_blocks = valid_counts_ptr[row * 2 + 0];
+              tail_len = valid_counts_ptr[row * 2 + 1];
+              is_sparse = (num_active_blocks >= block_topk);
+              const int pos = start_pos + row;
+              tail_start = (pos + 1) - tail_len;
+            } else {
+              const int pos = start_pos + row;
+              const int visible_len = pos + 1;
+              const int num_complete_blocks = visible_len / compress_ratio;
+              is_sparse = (num_complete_blocks > block_topk);
+              num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+              tail_start = num_complete_blocks * compress_ratio;
+              tail_len = std::max(0, visible_len - tail_start);
+            }
+
+            const size_t q_head0_offset = (static_cast<size_t>(row) * num_heads + head0) * head_dim;
+            const size_t q_head1_offset = (static_cast<size_t>(row) * num_heads + head1) * head_dim;
+            for (int d = lid; d < head_dim; d += wg_size) {
+              q_cache0[d] = static_cast<float>(q_ptr[q_head0_offset + d]);
+              q_cache1[d] = static_cast<float>(q_ptr[q_head1_offset + d]);
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
+            const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+
+            float running_max0 = -1e30f, running_max1 = -1e30f;
+            float running_sum0 = 0.0f, running_sum1 = 0.0f;
+            const int d0 = lid;
+            const int d1 = lid + 64;
+            const int d2 = lid + 128;
+            const int d3 = lid + 192;
+            float acc0_0 = 0.0f, acc1_0 = 0.0f, acc2_0 = 0.0f, acc3_0 = 0.0f;
+            float acc0_1 = 0.0f, acc1_1 = 0.0f, acc2_1 = 0.0f, acc3_1 = 0.0f;
+
+            // Loop over active blocks
+            for (int b = 0; b < num_active_blocks; ++b) {
+              const int blk = is_sparse ? my_blocks[b] : b;
+              const int base_t = blk * compress_ratio;
+
+              for (int c = 0; c < compress_ratio; ++c) {
+                const int cache_t = base_t + c;
+                const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+
+                const float local_dot0 = q_cache0[d0] * k0 + q_cache0[d1] * k1 + q_cache0[d2] * k2 + q_cache0[d3] * k3;
+                const float local_dot1 = q_cache1[d0] * k0 + q_cache1[d1] * k1 + q_cache1[d2] * k2 + q_cache1[d3] * k3;
+
+                const float dot0 = sycl::reduce_over_group(item.get_group(), local_dot0, sycl::plus<float>());
+                const float dot1 = sycl::reduce_over_group(item.get_group(), local_dot1, sycl::plus<float>());
+
+                const float score0 = dot0 * scale;
+                const float score1 = dot1 * scale;
+
+                const float new_max0 = sycl::fmax(running_max0, score0);
+                const float rescale0 = (running_max0 <= -1e20f) ? 0.0f : sycl::native::exp(running_max0 - new_max0);
+                const float exp_score0 = sycl::native::exp(sycl::fmax(-88.0f, score0 - new_max0));
+                running_sum0 = running_sum0 * rescale0 + exp_score0;
+                running_max0 = new_max0;
+
+                const float new_max1 = sycl::fmax(running_max1, score1);
+                const float rescale1 = (running_max1 <= -1e20f) ? 0.0f : sycl::native::exp(running_max1 - new_max1);
+                const float exp_score1 = sycl::native::exp(sycl::fmax(-88.0f, score1 - new_max1));
+                running_sum1 = running_sum1 * rescale1 + exp_score1;
+                running_max1 = new_max1;
+
+                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+                acc0_0 = acc0_0 * rescale0 + exp_score0 * v0;
+                acc1_0 = acc1_0 * rescale0 + exp_score0 * v1;
+                acc2_0 = acc2_0 * rescale0 + exp_score0 * v2;
+                acc3_0 = acc3_0 * rescale0 + exp_score0 * v3;
+
+                acc0_1 = acc0_1 * rescale1 + exp_score1 * v0;
+                acc1_1 = acc1_1 * rescale1 + exp_score1 * v1;
+                acc2_1 = acc2_1 * rescale1 + exp_score1 * v2;
+                acc3_1 = acc3_1 * rescale1 + exp_score1 * v3;
+              }
+            }
+
+            // Loop over tail tokens
+            for (int t = 0; t < tail_len; ++t) {
+              const int cache_t = tail_start + t;
+              const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+
+              const float local_dot0 = q_cache0[d0] * k0 + q_cache0[d1] * k1 + q_cache0[d2] * k2 + q_cache0[d3] * k3;
+              const float local_dot1 = q_cache1[d0] * k0 + q_cache1[d1] * k1 + q_cache1[d2] * k2 + q_cache1[d3] * k3;
+
+              const float dot0 = sycl::reduce_over_group(item.get_group(), local_dot0, sycl::plus<float>());
+              const float dot1 = sycl::reduce_over_group(item.get_group(), local_dot1, sycl::plus<float>());
+
+              const float score0 = dot0 * scale;
+              const float score1 = dot1 * scale;
+
+              const float new_max0 = sycl::fmax(running_max0, score0);
+              const float rescale0 = (running_max0 <= -1e20f) ? 0.0f : sycl::native::exp(running_max0 - new_max0);
+              const float exp_score0 = sycl::native::exp(sycl::fmax(-88.0f, score0 - new_max0));
+              running_sum0 = running_sum0 * rescale0 + exp_score0;
+              running_max0 = new_max0;
+
+              const float new_max1 = sycl::fmax(running_max1, score1);
+              const float rescale1 = (running_max1 <= -1e20f) ? 0.0f : sycl::native::exp(running_max1 - new_max1);
+              const float exp_score1 = sycl::native::exp(sycl::fmax(-88.0f, score1 - new_max1));
+              running_sum1 = running_sum1 * rescale1 + exp_score1;
+              running_max1 = new_max1;
+
+              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+              acc0_0 = acc0_0 * rescale0 + exp_score0 * v0;
+              acc1_0 = acc1_0 * rescale0 + exp_score0 * v1;
+              acc2_0 = acc2_0 * rescale0 + exp_score0 * v2;
+              acc3_0 = acc3_0 * rescale0 + exp_score0 * v3;
+
+              acc0_1 = acc0_1 * rescale1 + exp_score1 * v0;
+              acc1_1 = acc1_1 * rescale1 + exp_score1 * v1;
+              acc2_1 = acc2_1 * rescale1 + exp_score1 * v2;
+              acc3_1 = acc3_1 * rescale1 + exp_score1 * v3;
+            }
+
+            const float inv_sum0 = (running_sum0 > 0.0f) ? (1.0f / running_sum0) : 0.0f;
+            float o0_0 = static_cast<float>(bf16(acc0_0 * inv_sum0));
+            float o1_0 = static_cast<float>(bf16(acc1_0 * inv_sum0));
+            float o2_0 = static_cast<float>(bf16(acc2_0 * inv_sum0));
+            float o3_0 = static_cast<float>(bf16(acc3_0 * inv_sum0));
+
+            const float inv_sum1 = (running_sum1 > 0.0f) ? (1.0f / running_sum1) : 0.0f;
+            float o0_1 = static_cast<float>(bf16(acc0_1 * inv_sum1));
+            float o1_1 = static_cast<float>(bf16(acc1_1 * inv_sum1));
+            float o2_1 = static_cast<float>(bf16(acc2_1 * inv_sum1));
+            float o3_1 = static_cast<float>(bf16(acc3_1 * inv_sum1));
+
+            const size_t out_head0_offset = (static_cast<size_t>(row) * num_heads + head0) * head_dim;
+            const size_t out_head1_offset = (static_cast<size_t>(row) * num_heads + head1) * head_dim;
+
+            if (gate_ptr != nullptr) {
+              const float g0_0 = static_cast<float>(gate_ptr[out_head0_offset + d0]);
+              const float g1_0 = static_cast<float>(gate_ptr[out_head0_offset + d1]);
+              const float g2_0 = static_cast<float>(gate_ptr[out_head0_offset + d2]);
+              const float g3_0 = static_cast<float>(gate_ptr[out_head0_offset + d3]);
+              o0_0 = static_cast<float>(bf16(o0_0 * (1.0f / (1.0f + sycl::native::exp(-g0_0)))));
+              o1_0 = static_cast<float>(bf16(o1_0 * (1.0f / (1.0f + sycl::native::exp(-g1_0)))));
+              o2_0 = static_cast<float>(bf16(o2_0 * (1.0f / (1.0f + sycl::native::exp(-g2_0)))));
+              o3_0 = static_cast<float>(bf16(o3_0 * (1.0f / (1.0f + sycl::native::exp(-g3_0)))));
+
+              const float g0_1 = static_cast<float>(gate_ptr[out_head1_offset + d0]);
+              const float g1_1 = static_cast<float>(gate_ptr[out_head1_offset + d1]);
+              const float g2_1 = static_cast<float>(gate_ptr[out_head1_offset + d2]);
+              const float g3_1 = static_cast<float>(gate_ptr[out_head1_offset + d3]);
+              o0_1 = static_cast<float>(bf16(o0_1 * (1.0f / (1.0f + sycl::native::exp(-g0_1)))));
+              o1_1 = static_cast<float>(bf16(o1_1 * (1.0f / (1.0f + sycl::native::exp(-g1_1)))));
+              o2_1 = static_cast<float>(bf16(o2_1 * (1.0f / (1.0f + sycl::native::exp(-g2_1)))));
+              o3_1 = static_cast<float>(bf16(o3_1 * (1.0f / (1.0f + sycl::native::exp(-g3_1)))));
+            }
+
+            o_ptr[out_head0_offset + d0] = bf16(o0_0);
+            o_ptr[out_head0_offset + d1] = bf16(o1_0);
+            o_ptr[out_head0_offset + d2] = bf16(o2_0);
+            o_ptr[out_head0_offset + d3] = bf16(o3_0);
+
+            o_ptr[out_head1_offset + d0] = bf16(o0_1);
+            o_ptr[out_head1_offset + d1] = bf16(o1_1);
+            o_ptr[out_head1_offset + d2] = bf16(o2_1);
+            o_ptr[out_head1_offset + d3] = bf16(o3_1);
+          });
+    });
+  } else {
+    // Baseline 1 head per workgroup fallback
+    ctx.queue().submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+
+      cgh.parallel_for(
+          sycl::nd_range<1>(static_cast<size_t>(count) * num_heads * wg_size, wg_size),
+          [=](sycl::nd_item<1> item) {
+            const int group = item.get_group(0);
+            const int row = group / num_heads;
+            const int head = group % num_heads;
+            const int lid = item.get_local_id(0);
+            const int kv_head = head / heads_per_kv;
+
+            int num_active_blocks = 0;
+            int tail_len = 0;
+            int tail_start = 0;
+            bool is_sparse = false;
+
+            if (valid_counts_ptr != nullptr) {
+              num_active_blocks = valid_counts_ptr[row * 2 + 0];
+              tail_len = valid_counts_ptr[row * 2 + 1];
+              is_sparse = (num_active_blocks >= block_topk);
+              const int pos = start_pos + row;
+              tail_start = (pos + 1) - tail_len;
+            } else {
+              const int pos = start_pos + row;
+              const int visible_len = pos + 1;
+              const int num_complete_blocks = visible_len / compress_ratio;
+              is_sparse = (num_complete_blocks > block_topk);
+              num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+              tail_start = num_complete_blocks * compress_ratio;
+              tail_len = std::max(0, visible_len - tail_start);
+            }
+
+            const size_t q_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
+            for (int d = lid; d < head_dim; d += wg_size) {
+              q_cache[d] = static_cast<float>(q_ptr[q_head_offset + d]);
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
+            const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+
+            float running_max = -1e30f;
+            float running_sum = 0.0f;
+            const int d0 = lid;
+            const int d1 = lid + 64;
+            const int d2 = lid + 128;
+            const int d3 = lid + 192;
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+            // Loop over active blocks
+            for (int b = 0; b < num_active_blocks; ++b) {
+              const int blk = is_sparse ? my_blocks[b] : b;
+              const int base_t = blk * compress_ratio;
+
+              for (int c = 0; c < compress_ratio; ++c) {
+                const int cache_t = base_t + c;
+                const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+                const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
+                const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+                const float score = dot * scale;
+
+                const float new_max = sycl::fmax(running_max, score);
+                const float rescale = (running_max <= -1e20f) ? 0.0f : sycl::native::exp(running_max - new_max);
+                const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+                running_sum = running_sum * rescale + exp_score;
+                running_max = new_max;
+
+                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+                acc0 = acc0 * rescale + exp_score * v0;
+                acc1 = acc1 * rescale + exp_score * v1;
+                acc2 = acc2 * rescale + exp_score * v2;
+                acc3 = acc3 * rescale + exp_score * v3;
+              }
+            }
+
+            // Loop over tail tokens
+            for (int t = 0; t < tail_len; ++t) {
+              const int cache_t = tail_start + t;
               const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
               const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
               const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
@@ -4361,61 +4773,32 @@ void attention_prefill_qsa_batched(
               acc2 = acc2 * rescale + exp_score * v2;
               acc3 = acc3 * rescale + exp_score * v3;
             }
-          }
 
-          // Loop over tail tokens
-          for (int t = 0; t < tail_len; ++t) {
-            const int cache_t = tail_start + t;
-            const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-            const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-            const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-            const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-            const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
-            const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
-            const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
-            const float score = dot * scale;
+            const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+            float o0 = static_cast<float>(bf16(acc0 * inv_sum));
+            float o1 = static_cast<float>(bf16(acc1 * inv_sum));
+            float o2 = static_cast<float>(bf16(acc2 * inv_sum));
+            float o3 = static_cast<float>(bf16(acc3 * inv_sum));
 
-            const float new_max = sycl::fmax(running_max, score);
-            const float rescale = (running_max <= -1e20f) ? 0.0f : sycl::native::exp(running_max - new_max);
-            const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
-            running_sum = running_sum * rescale + exp_score;
-            running_max = new_max;
+            const size_t out_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
+            if (gate_ptr != nullptr) {
+              const float g0 = static_cast<float>(gate_ptr[out_head_offset + d0]);
+              const float g1 = static_cast<float>(gate_ptr[out_head_offset + d1]);
+              const float g2 = static_cast<float>(gate_ptr[out_head_offset + d2]);
+              const float g3 = static_cast<float>(gate_ptr[out_head_offset + d3]);
+              o0 = static_cast<float>(bf16(o0 * (1.0f / (1.0f + sycl::native::exp(-g0)))));
+              o1 = static_cast<float>(bf16(o1 * (1.0f / (1.0f + sycl::native::exp(-g1)))));
+              o2 = static_cast<float>(bf16(o2 * (1.0f / (1.0f + sycl::native::exp(-g2)))));
+              o3 = static_cast<float>(bf16(o3 * (1.0f / (1.0f + sycl::native::exp(-g3)))));
+            }
 
-            const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-            const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-            const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-            const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
-
-            acc0 = acc0 * rescale + exp_score * v0;
-            acc1 = acc1 * rescale + exp_score * v1;
-            acc2 = acc2 * rescale + exp_score * v2;
-            acc3 = acc3 * rescale + exp_score * v3;
-          }
-
-          const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
-          float o0 = static_cast<float>(bf16(acc0 * inv_sum));
-          float o1 = static_cast<float>(bf16(acc1 * inv_sum));
-          float o2 = static_cast<float>(bf16(acc2 * inv_sum));
-          float o3 = static_cast<float>(bf16(acc3 * inv_sum));
-
-          const size_t out_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
-          if (gate_ptr != nullptr) {
-            const float g0 = static_cast<float>(gate_ptr[out_head_offset + d0]);
-            const float g1 = static_cast<float>(gate_ptr[out_head_offset + d1]);
-            const float g2 = static_cast<float>(gate_ptr[out_head_offset + d2]);
-            const float g3 = static_cast<float>(gate_ptr[out_head_offset + d3]);
-            o0 = static_cast<float>(bf16(o0 * (1.0f / (1.0f + sycl::native::exp(-g0)))));
-            o1 = static_cast<float>(bf16(o1 * (1.0f / (1.0f + sycl::native::exp(-g1)))));
-            o2 = static_cast<float>(bf16(o2 * (1.0f / (1.0f + sycl::native::exp(-g2)))));
-            o3 = static_cast<float>(bf16(o3 * (1.0f / (1.0f + sycl::native::exp(-g3)))));
-          }
-
-          o_ptr[out_head_offset + d0] = bf16(o0);
-          o_ptr[out_head_offset + d1] = bf16(o1);
-          o_ptr[out_head_offset + d2] = bf16(o2);
-          o_ptr[out_head_offset + d3] = bf16(o3);
-        });
-  });
+            o_ptr[out_head_offset + d0] = bf16(o0);
+            o_ptr[out_head_offset + d1] = bf16(o1);
+            o_ptr[out_head_offset + d2] = bf16(o2);
+            o_ptr[out_head_offset + d3] = bf16(o3);
+          });
+    });
+  }
 }
 
 void attention_prefill_qsa_batched_host(
@@ -4432,7 +4815,8 @@ void attention_prefill_qsa_batched_host(
     int head_dim,
     int block_topk,
     int compress_ratio,
-    const bf16* gate) {
+    const bf16* gate,
+    const int* valid_counts) {
   if (count <= 0) return;
   if (head_dim != 256) {
     throw std::invalid_argument("attention_prefill_qsa_batched_host requires head_dim == 256");
@@ -4440,18 +4824,31 @@ void attention_prefill_qsa_batched_host(
   if (block_topk <= 0 || compress_ratio <= 0) {
     throw std::invalid_argument("attention_prefill_qsa_batched_host requires positive block_topk and compress_ratio");
   }
-  const int heads_per_kv = num_heads / num_kv_heads;
+  const int heads_per_kv = std::max(1, (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 1);
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
 
   for (int row = 0; row < count; ++row) {
-    const int pos = start_pos + row;
-    const int visible_len = pos + 1;
-    const int num_complete_blocks = visible_len / compress_ratio;
-    const bool is_sparse = (num_complete_blocks > block_topk);
-    const int num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
-    const int tail_start = num_complete_blocks * compress_ratio;
-    const int tail_len = std::max(0, visible_len - tail_start);
+    int num_active_blocks = 0;
+    int tail_len = 0;
+    int tail_start = 0;
+    bool is_sparse = false;
+
+    if (valid_counts != nullptr) {
+      num_active_blocks = valid_counts[row * 2 + 0];
+      tail_len = valid_counts[row * 2 + 1];
+      is_sparse = (num_active_blocks >= block_topk);
+      const int pos = start_pos + row;
+      tail_start = (pos + 1) - tail_len;
+    } else {
+      const int pos = start_pos + row;
+      const int visible_len = pos + 1;
+      const int num_complete_blocks = visible_len / compress_ratio;
+      is_sparse = (num_complete_blocks > block_topk);
+      num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+      tail_start = num_complete_blocks * compress_ratio;
+      tail_len = std::max(0, visible_len - tail_start);
+    }
     const int* my_blocks = active_blocks + static_cast<size_t>(row) * active_blocks_stride;
 
     std::vector<int> active_tokens;

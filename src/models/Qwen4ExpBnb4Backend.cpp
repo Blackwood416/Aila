@@ -686,9 +686,16 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.indexer_active_tokens = Tensor::allocate(ctx, {std::max(max_seq_len_, cfg_.indexer_budget + cfg_.indexer_compress_ratio)}, dnnl::memory::data_type::s32);
     const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / (cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4);
     buf_.indexer_active_blocks = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
-    constexpr int kQsaQueryTile = 64;
-    buf_.qsa_tile_block_scores = Tensor::allocate(ctx, {kQsaQueryTile, max_complete_blocks}, dnnl::memory::data_type::f32);
-    buf_.qsa_tile_active_blocks = Tensor::allocate(ctx, {kQsaQueryTile, block_topk + 4}, dnnl::memory::data_type::s32);
+    static const int s_qsa_logits_budget = aila::env::read_int("AILA_QSA_LOGITS_BUDGET_BYTES", 4 * 1024 * 1024);
+    const size_t row_bytes = static_cast<size_t>(max_complete_blocks) * sizeof(float);
+    int default_tile = 64;
+    if (row_bytes > 0) {
+        default_tile = std::clamp(static_cast<int>(s_qsa_logits_budget / row_bytes), 16, 64);
+    }
+    qsa_query_tile_ = aila::env::read_int("AILA_QSA_QUERY_TILE", default_tile);
+    buf_.qsa_tile_block_scores = Tensor::allocate(ctx, {qsa_query_tile_, max_complete_blocks}, dnnl::memory::data_type::f32);
+    buf_.qsa_tile_active_blocks = Tensor::allocate(ctx, {qsa_query_tile_, block_topk + 4}, dnnl::memory::data_type::s32);
+    buf_.qsa_tile_valid_counts = Tensor::allocate(ctx, {qsa_query_tile_, 2}, dnnl::memory::data_type::s32);
 
 
     // Linear Attention buffers
@@ -1229,41 +1236,24 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     bf16* z_base = buf_.z.data_as<bf16>();
                     bf16* attn_out_base = buf_.attn_out.data_as<bf16>();
 
-                    // Cache all raw K tokens for this chunk
-                    ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
-
-                    // A1: Batch compress newly completed blocks into indexer_compressed_k
-                    const int total_complete_blocks = (start_pos + count) / compress_ratio;
-                    if (s_qsa_compressed_k && total_complete_blocks > cache.num_compressed_blocks &&
-                        cache.indexer_compressed_k.valid()) {
-                        const int blocks_to_compress = total_complete_blocks - cache.num_compressed_blocks;
-                        ops::qsa_compress_key_blocks(
-                            ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
-                            cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
-                            cfg_.rope.mrope_interleaved,
-                            (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
-                            (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
-                            (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
-                            session.mropePromptLength_, session.mropeTextPositionDelta_,
-                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
-                        cache.num_compressed_blocks = total_complete_blocks;
-                    }
-
                     static const bool s_batched_qsa_prefill = aila::env::read_flag("AILA_QSA_BATCHED_PREFILL", true);
                     if (s_batched_qsa_prefill && cache.indexer_compressed_k.valid()) {
-                        // Phase A4: True batched QSA prefill attention in tiles of kQsaQueryTile (64)
-                        ops::qsa_prepare_q_batched(
-                            ctx, buf_.indexer_qk, *layer.index_q_norm_weight, buf_.indexer_q,
-                            start_pos, count, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                        // Phase P2 (R4d): Reentrant fused pre-indexer (raw K caching + block compression + Q norm/RoPE)
+                        ops::qsa_pre_indexer_batched(
+                            ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
+                            cache.indexer_k, buf_.indexer_q,
+                            (s_qsa_compressed_k && cache.indexer_compressed_k.valid() ? &cache.indexer_compressed_k : nullptr),
+                            &cache.num_compressed_blocks,
+                            start_pos, count, compress_ratio,
+                            cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
                             (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
                             (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                             (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
                             cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
 
-                        constexpr int kQsaQueryTile = 64;
-                        for (int tile_offset = 0; tile_offset < count; tile_offset += kQsaQueryTile) {
-                            const int tile_count = std::min(kQsaQueryTile, count - tile_offset);
+                        for (int tile_offset = 0; tile_offset < count; tile_offset += qsa_query_tile_) {
+                            const int tile_count = std::min(qsa_query_tile_, count - tile_offset);
                             const int tile_start_pos = start_pos + tile_offset;
                             const int tile_max_blocks = std::max(1, (tile_start_pos + tile_count) / compress_ratio);
 
@@ -1279,6 +1269,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             Tensor attn_out_tile = Tensor::view(
                                 ctx, buf_.attn_out.data_as<bf16>() + static_cast<size_t>(tile_offset) * q_dim,
                                 {tile_count, q_dim});
+                            Tensor valid_counts_tile = Tensor::view(
+                                ctx, buf_.qsa_tile_valid_counts.data_as<int>(),
+                                {tile_count, 2});
 
                             ops::qsa_compute_block_scores_compressed_batched(
                                 ctx, q_tile, cache.indexer_compressed_k, buf_.qsa_tile_block_scores,
@@ -1286,14 +1279,32 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
                             ops::qsa_select_topk_blocks_batched(
                                 ctx, buf_.qsa_tile_block_scores, buf_.qsa_tile_active_blocks,
-                                tile_count, tile_max_blocks, tile_start_pos, block_topk, compress_ratio);
+                                tile_count, tile_max_blocks, tile_start_pos, block_topk, compress_ratio,
+                                &valid_counts_tile);
 
                             ops::attention_prefill_qsa_batched(
                                 ctx, q_full_tile, cache.k, cache.v, buf_.qsa_tile_active_blocks, attn_out_tile,
                                 tile_count, tile_start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
-                                block_topk, compress_ratio, &z_tile);
+                                block_topk, compress_ratio, &z_tile, &valid_counts_tile);
                         }
                     } else {
+                        // Fallback: cache raw K and compress blocks before row-by-row execution
+                        ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                        const int total_complete_blocks = (start_pos + count) / compress_ratio;
+                        if (s_qsa_compressed_k && total_complete_blocks > cache.num_compressed_blocks &&
+                            cache.indexer_compressed_k.valid()) {
+                            const int blocks_to_compress = total_complete_blocks - cache.num_compressed_blocks;
+                            ops::qsa_compress_key_blocks(
+                                ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
+                                cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
+                                cfg_.rope.mrope_interleaved,
+                                (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                                (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                                (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                                session.mropePromptLength_, session.mropeTextPositionDelta_,
+                                cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cache.num_compressed_blocks = total_complete_blocks;
+                        }
                         // The upstream indexer builds a separate mask from each query's
                         // causal visible prefix. Keep this row-wise path as the correctness
                         // oracle for chunked prefill and appends across the sparse threshold.

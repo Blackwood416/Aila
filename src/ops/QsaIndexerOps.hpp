@@ -373,7 +373,7 @@ void qsa_compute_block_scores_compressed_batched_host(
     int compress_ratio,
     int start_pos);
 
-// Phase A4: Batched Radix Top-K block selection
+// Phase A4 & P2: Batched Radix Top-K block selection with R4c Complement Selection and valid counts
 void qsa_select_topk_blocks_batched(
     Context& ctx,
     const Tensor& scores,
@@ -382,7 +382,8 @@ void qsa_select_topk_blocks_batched(
     int max_complete_blocks,
     int start_pos,
     int block_topk,
-    int compress_ratio);
+    int compress_ratio,
+    Tensor* valid_counts_out = nullptr);
 
 void qsa_select_topk_blocks_batched_host(
     const float* scores,
@@ -391,7 +392,57 @@ void qsa_select_topk_blocks_batched_host(
     int max_complete_blocks,
     int start_pos,
     int block_topk,
-    int compress_ratio);
+    int compress_ratio,
+    int* valid_counts_out = nullptr);
+
+// Phase P2 (R4d): Reentrant Batched Pre-Indexer
+// Fuses raw K caching, query preparation (norm + RoPE), and block compression
+// for newly completed blocks in a single, safe, reentrant entry point.
+void qsa_pre_indexer_batched(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    Tensor* compressed_k,
+    int* num_compressed_blocks,
+    int start_pos,
+    int count,
+    int compress_ratio,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+void qsa_pre_indexer_batched_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    bf16* compressed_k,
+    int* num_compressed_blocks,
+    int start_pos,
+    int count,
+    int compress_ratio,
+    int capacity,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
 
 } // namespace ops
 
