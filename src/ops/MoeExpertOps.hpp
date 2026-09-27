@@ -101,7 +101,8 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int in_features = 2560,
     int intermediate_size = 640,
     int blocksize = 64,
-    const sycl::event* dep_event = nullptr);
+    const sycl::event* dep_event = nullptr,
+    const int* token_ids = nullptr);
 
 inline sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
@@ -151,6 +152,24 @@ sycl::event moe_decode_down_weighted_accumulate(
     int blocksize = 64,
     const bf16* shared_out = nullptr,
     const bf16* shared_gate = nullptr);
+
+// Slotted expert decode down-projection writing directly to rank slots of down_acc (unweighted FP32):
+// down_acc[(token * top_k + rank) * out_features + row] = down_k(h[k])_row
+sycl::event moe_decode_down_to_rank_f32(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* ranks,
+    const bf16* h,
+    float* down_acc,
+    int num_active_experts,
+    int top_k = 10,
+    int in_features = 640,
+    int out_features = 2560,
+    int blocksize = 64,
+    const int* token_ids = nullptr,
+    const float* quant_map = nullptr,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
 
 // Batched prefill expert gate_up GEMV with SwiGLU: h[t, k, intermediate_size] = silu(gate) * up
 sycl::event moe_prefill_gate_up_rows(

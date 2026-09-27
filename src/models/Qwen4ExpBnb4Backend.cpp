@@ -610,6 +610,7 @@ bool Qwen4ExpBnb4Backend::load(
     }
 
     ensure_runtime_buffers(ctx, 1);
+    expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
     // Batched prefill acquire needs every unique expert of a layer resident at once.
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
         prefill_expert_slot_.assign(cfg_.num_experts, -1);
@@ -1898,23 +1899,49 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             expert_cache_.record_consumer_reader_fences(
                 prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
         } else {
-            for (int t = 0; t < count; ++t) {
-                const int* t_ids = router_host_ids_ + t * top_k;
-                const float* t_weights = router_host_weights_ + t * top_k;
-                int slots[kMaxTopK];
-                sycl::event dma_event{};
-                if (batch_acquire) {
-                    for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
-                    if (t == 0) dma_event = batch_dma_event;
-                } else {
-                    const auto prof_acq_t0 = prof_clock::now();
-                    dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
-                    prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
+            static const bool s_cpu_expert_dispatch = aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false);
+            bool hetero_executed = false;
+            if (s_cpu_expert_dispatch && count <= 4 && !batch_acquire) {
+                auto& plan = expert_executor_.plan_layer(L, router_host_ids_, router_host_weights_, count, top_k, true);
+                if (plan.cpu_tasks > 0) {
+                    expert_executor_.ensure_gpu_pending(plan);
                     if (s_prefetch && predict_next && count == 1) {
                         ensure_prediction_ready();
                         expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
                     }
+                    const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
+                    bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
+                    bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
+                    const bf16* sh_out = s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr;
+                    const bf16* sh_gate = s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr;
+
+                    sycl::event hetero_ev = expert_executor_.execute_hetero_decode(
+                        ctx, plan, x_ptr, h_ptr, router_host_weights_,
+                        y_ptr, count, top_k, sh_out, sh_gate, expert_cache_.uses_nested_codes());
+
+                    fallback_last_down_event = hetero_ev;
+                    hetero_executed = true;
                 }
+            }
+
+            if (!hetero_executed) {
+                for (int t = 0; t < count; ++t) {
+                    const int* t_ids = router_host_ids_ + t * top_k;
+                    const float* t_weights = router_host_weights_ + t * top_k;
+                    int slots[kMaxTopK];
+                    sycl::event dma_event{};
+                    if (batch_acquire) {
+                        for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
+                        if (t == 0) dma_event = batch_dma_event;
+                    } else {
+                        const auto prof_acq_t0 = prof_clock::now();
+                        dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
+                        prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
+                        if (s_prefetch && predict_next && count == 1) {
+                            ensure_prediction_ready();
+                            expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
+                        }
+                    }
 
                 ops::MoeExpertSlotDev dev_slots[kMaxTopK];
                 expert_cache_.get_slots_dev(slots, top_k, dev_slots);
@@ -1951,6 +1978,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
                 expert_cache_.record_consumer_reader_fences(slots, top_k, down_ev);
             }
+        }
         }
         if (fallback_last_down_event != sycl::event{}) {
             fallback_last_down_event.wait_and_throw();

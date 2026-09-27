@@ -8,6 +8,7 @@
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
 #include "Qwen4ExpExpertCache.hpp"
+#include "Qwen4ExpExpertExecutor.hpp"
 #include "Qwen4ExpPle.hpp"
 #include "engine/Types.hpp"
 
@@ -246,6 +247,9 @@ public:
                              int text_pos_delta) override;
     void clear_mrope_positions() override;
 
+    const aila::HeteroExecutionStats& hetero_stats() const { return expert_executor_.stats(); }
+    aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
+
 private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly);
@@ -285,6 +289,7 @@ private:
     Qwen4ExpPle ple_;
     PleTicket ple_ticket_;
     Qwen4ExpExpertCache expert_cache_;
+    aila::Qwen4ExpExpertExecutor expert_executor_;
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0
     // Otherwise rows are gathered from the mmap per forward: decode needs one 5 KB row, and the
