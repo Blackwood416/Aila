@@ -72,6 +72,9 @@ public:
         int top_k,
         bool enable_hetero = false);
 
+    // Ensure all pending GPU tasks are acquired/staged into GPU slots and record final_dma_event
+    void ensure_gpu_pending(LayerMoePlan& plan);
+
     // Record execution completion
     void record_execution_complete(LayerMoePlan& plan, sycl::event finish_event);
 

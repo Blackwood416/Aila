@@ -34,8 +34,19 @@ LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(
     active_plan_.layer = layer;
     active_plan_.token_count = token_count;
     active_plan_.top_k = top_k;
+    if (token_count <= 0 || !router_host_ids) {
+        return active_plan_;
+    }
+
     const int total = token_count * top_k;
     active_plan_.total_tasks = total;
+
+    if (total > static_cast<int>(active_plan_.entries.capacity())) {
+        active_plan_.entries.reserve(total);
+        active_plan_.ready_gpu_indices.reserve(total);
+        active_plan_.pending_gpu_indices.reserve(total);
+        active_plan_.cpu_indices.reserve(total);
+    }
 
     for (int t = 0; t < token_count; ++t) {
         for (int r = 0; r < top_k; ++r) {
@@ -80,17 +91,55 @@ LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(
     return active_plan_;
 }
 
+void Qwen4ExpExpertExecutor::ensure_gpu_pending(LayerMoePlan& plan) {
+    if (!cache_ || plan.pending_gpu_indices.empty()) {
+        return;
+    }
+
+    // Collect unique pending expert IDs
+    std::vector<int> pending_experts;
+    pending_experts.reserve(plan.pending_gpu_indices.size());
+    for (int idx : plan.pending_gpu_indices) {
+        int eid = plan.entries[idx].expert_id;
+        if (std::find(pending_experts.begin(), pending_experts.end(), eid) == pending_experts.end()) {
+            pending_experts.push_back(eid);
+        }
+    }
+
+    std::vector<int> assigned_slots(pending_experts.size(), -1);
+    sycl::event dma_ev = cache_->acquire(plan.layer, pending_experts.data(),
+                                         static_cast<int>(pending_experts.size()),
+                                         assigned_slots.data());
+    plan.final_dma_event = dma_ev;
+
+    // Update entries with assigned slots
+    for (int idx : plan.pending_gpu_indices) {
+        int eid = plan.entries[idx].expert_id;
+        for (size_t i = 0; i < pending_experts.size(); ++i) {
+            if (pending_experts[i] == eid) {
+                plan.entries[idx].gpu_slot = assigned_slots[i];
+                break;
+            }
+        }
+    }
+}
+
 void Qwen4ExpExpertExecutor::record_execution_complete(LayerMoePlan& plan, sycl::event finish_event) {
     if (!cache_) return;
+    const int max_slot = cache_->num_slots();
+    std::vector<bool> seen(max_slot, false);
+
     for (int idx : plan.ready_gpu_indices) {
         int slot = plan.entries[idx].gpu_slot;
-        if (slot >= 0) {
+        if (slot >= 0 && slot < max_slot && !seen[slot]) {
+            seen[slot] = true;
             cache_->record_consumer_reader_fence(slot, finish_event);
         }
     }
     for (int idx : plan.pending_gpu_indices) {
         int slot = plan.entries[idx].gpu_slot;
-        if (slot >= 0) {
+        if (slot >= 0 && slot < max_slot && !seen[slot]) {
+            seen[slot] = true;
             cache_->record_consumer_reader_fence(slot, finish_event);
         }
     }

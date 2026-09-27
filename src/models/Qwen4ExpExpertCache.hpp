@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -313,6 +314,9 @@ public:
         if (!host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return 0;
         return host_slot_records_[hslot].cpu_readers.load(std::memory_order_relaxed);
     }
+    FillTicket prepare_host(int layer, int expert_id, int priority = 0);
+    GpuExpertTicket ensure_gpu(int layer, int expert_id, int priority = 0);
+    GpuExpertTicket ensure_gpu(const HostExpertLease& lease, int priority = 0);
 
 private:
     void cleanup();
@@ -453,6 +457,7 @@ private:
     std::vector<int> batch_reserved_hslots_scratch_;
     std::vector<sycl::event> host_slot_dma_events_;
     float protected_ratio_ = 0.75f;
+    std::unique_ptr<std::mutex> host_list_mutex_;
     void touch_host_slot(int hslot);
     int pick_victim_hslot();
     void add_batch_reader_hslot(int hslot);

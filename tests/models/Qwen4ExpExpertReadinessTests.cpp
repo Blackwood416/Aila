@@ -3,6 +3,7 @@
 #include "models/Qwen4ExpExpertExecutor.hpp"
 #include "utils/SafeTensors.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -131,7 +132,7 @@ struct SyntheticExpertWeights {
 };
 
 void test_query_residency_and_gpu_tickets(Context& ctx) {
-    std::cout << "[Test 1] Testing query_residency and ticket states...\n";
+    std::cout << "[Test 1] Testing query_residency, prepare_host, and ensure_gpu tickets...\n";
     SyntheticExpertWeights synth;
     ModelWeights dummy_weights;
     Qwen4ExpExpertCache cache;
@@ -145,39 +146,164 @@ void test_query_residency_and_gpu_tickets(Context& ctx) {
                          synth.num_experts_per_layer, synth.hidden_size,
                          synth.intermediate_size, synth.blocksize, &err, true);
     expect(ok, "cache init failed: " + err);
+    expect(cache.host_pool_enabled(), "host pool should be enabled via env");
     cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
     cache.set_layer_expert_ref(1, synth.gu_ref, synth.dn_ref);
 
-    // Initial query on expert 0: should be non-resident on both GPU and host
+    // Initial query on expert (0, 0): should be non-resident on both GPU and host
     ExpertResidency r0 = cache.query_residency(0, 0);
     expect(!r0.gpu_resident, "expected unallocated GPU slot for expert 0");
     expect(!r0.gpu_ready, "expected unready GPU state for expert 0");
+    expect(!r0.host_resident, "expected non-resident host state for expert 0");
 
-    // Acquire experts 0, 1 into GPU cache
-    int req[2] = {0, 1};
-    int slots[2] = {-1, -1};
-    sycl::event ev = cache.acquire(0, req, 2, slots);
-    ev.wait_and_throw();
+    // Test prepare_host for expert (0, 3)
+    FillTicket ft3 = cache.prepare_host(0, 3);
+    expect(ft3.ready, "prepare_host should stage expert 3 to ready");
+    expect(ft3.hslot >= 0, "prepare_host should assign valid hslot");
+    expect(ft3.layer == 0, "prepare_host layer match");
+    expect(ft3.expert_id == 3, "prepare_host expert_id match");
 
-    // Now experts 0 and 1 must be GPU resident and GPU ready
-    ExpertResidency r_after0 = cache.query_residency(0, 0);
-    expect(r_after0.gpu_resident, "expert 0 should be GPU resident");
-    expect(r_after0.gpu_ready, "expert 0 should be GPU ready");
-    expect(r_after0.gpu_slot == slots[0], "slot mismatch for expert 0");
+    // Query residency for expert 3: host resident, but not yet GPU resident
+    ExpertResidency r3 = cache.query_residency(0, 3);
+    expect(r3.host_resident, "expert 3 should now be host resident");
+    expect(r3.host_ready, "expert 3 should be host ready");
+    expect(r3.host_slot == ft3.hslot, "host slot match");
+    expect(!r3.gpu_resident, "expert 3 should not yet be GPU resident");
 
-    ExpertResidency r_after1 = cache.query_residency(0, 1);
-    expect(r_after1.gpu_resident, "expert 1 should be GPU resident");
-    expect(r_after1.gpu_ready, "expert 1 should be GPU ready");
-    expect(r_after1.gpu_slot == slots[1], "slot mismatch for expert 1");
+    // Test ensure_gpu for expert (0, 3)
+    GpuExpertTicket gt3 = cache.ensure_gpu(0, 3);
+    expect(gt3.gpu_slot >= 0, "ensure_gpu should allocate valid GPU slot");
+    expect(gt3.layer == 0, "gpu ticket layer match");
+    expect(gt3.expert_id == 3, "gpu ticket expert_id match");
+    if (gt3.dma_event != sycl::event{}) {
+        gt3.dma_event.wait_and_throw();
+    }
 
-    // Expert 2 was not acquired, should not be GPU ready
-    ExpertResidency r_after2 = cache.query_residency(0, 2);
-    expect(!r_after2.gpu_ready, "expert 2 should not be GPU ready");
-    std::cout << "  Passed query_residency test.\n";
+    // Now expert 3 must be GPU ready
+    ExpertResidency r3_gpu = cache.query_residency(0, 3);
+    expect(r3_gpu.gpu_resident, "expert 3 should be GPU resident");
+    expect(r3_gpu.gpu_ready, "expert 3 should be GPU ready");
+    expect(r3_gpu.gpu_slot == gt3.gpu_slot, "GPU slot match");
+
+    // Expert 5 was not acquired, should not be GPU ready
+    ExpertResidency r5 = cache.query_residency(0, 5);
+    expect(!r5.gpu_ready, "expert 5 should not be GPU ready");
+    expect(!r5.host_ready, "expert 5 should not be host ready");
+    std::cout << "  Passed query_residency and tickets test.\n";
 }
 
 void test_host_lease_lifecycle_and_eviction_protection(Context& ctx) {
-    std::cout << "[Test 2] Testing HostExpertLease RAII lifecycle & eviction protection...\n";
+    std::cout << "[Test 2] Testing HostExpertLease RAII lifecycle & full pool eviction protection...\n";
+    SyntheticExpertWeights synth;
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp * sizeof(uint8_t) +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp * sizeof(uint8_t);
+    const size_t cache_bytes = 4 * slot_bytes;
+
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, synth.num_layers, cache_bytes,
+                         synth.num_experts_per_layer, synth.hidden_size,
+                         synth.intermediate_size, synth.blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    expect(cache.host_pool_enabled(), "host pool should be enabled");
+    cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
+    cache.set_layer_expert_ref(1, synth.gu_ref, synth.dn_ref);
+
+    // Stage expert (0, 0) into host pool
+    FillTicket ft0 = cache.prepare_host(0, 0);
+    expect(ft0.ready, "expert 0 should be ready in host pool");
+    const int hslot0 = ft0.hslot;
+    expect(hslot0 >= 0, "valid host slot expected");
+    expect(cache.get_host_slot_cpu_readers(hslot0) == 0, "initial cpu_readers should be 0");
+
+    // Acquire lease on expert (0, 0)
+    HostExpertLease lease0 = cache.acquire_host_lease(0, 0);
+    expect(lease0.is_valid(), "lease0 should be valid");
+    expect(lease0.hslot() == hslot0, "lease0 hslot match");
+    expect(lease0.layer() == 0, "lease0 layer match");
+    expect(lease0.expert_id() == 0, "lease0 expert_id match");
+    expect(cache.get_host_slot_cpu_readers(hslot0) == 1, "cpu_readers should be 1 during lease");
+
+    // Verify CPU host pointers in MoeExpertSlotHost
+    const auto& sh = lease0.slot_host();
+    expect(sh.gate_up_packed != nullptr, "gate_up_packed pointer valid");
+    expect(sh.down_packed != nullptr, "down_packed pointer valid");
+    expect(sh.gate_up_nested.codes != nullptr, "nested codes valid");
+    expect(sh.gate_up_nested.nested_absmax != nullptr, "nested absmax valid");
+    expect(sh.gate_up_nested.nested_quant_map != nullptr, "nested qmap valid");
+
+    // Test move semantics
+    HostExpertLease lease_moved = std::move(lease0);
+    expect(!lease0.is_valid(), "original lease should be invalidated after move");
+    expect(lease_moved.is_valid(), "moved lease should remain valid");
+    expect(cache.get_host_slot_cpu_readers(hslot0) == 1, "cpu_readers should stay 1 after move");
+
+    // Test second concurrent lease on the same slot
+    {
+        HostExpertLease lease_b = cache.acquire_host_lease(0, 0);
+        expect(lease_b.is_valid(), "second lease should be valid");
+        expect(cache.get_host_slot_cpu_readers(hslot0) == 2, "cpu_readers should be 2 for concurrent leases");
+    }
+    expect(cache.get_host_slot_cpu_readers(hslot0) == 1, "cpu_readers should return to 1 after lease_b destroyed");
+
+    // Test ensure_gpu using HostExpertLease
+    GpuExpertTicket gt_from_lease = cache.ensure_gpu(lease_moved);
+    expect(gt_from_lease.gpu_slot >= 0, "ensure_gpu from lease should succeed");
+    if (gt_from_lease.dma_event != sycl::event{}) {
+        gt_from_lease.dma_event.wait_and_throw();
+    }
+    expect(cache.query_residency(0, 0).gpu_ready, "expert 0 should now be GPU ready via lease");
+
+    // REAL EVICTION PROTECTION TEST:
+    // Host pool has 4 slots (0, 1, 2, 3). Slot 0 holds expert (0, 0) with cpu_readers == 1.
+    // Stage 3 more experts to fill the remaining 3 slots.
+    FillTicket ft1 = cache.prepare_host(0, 1); expect(ft1.ready, "exp 1 ready");
+    FillTicket ft2 = cache.prepare_host(0, 2); expect(ft2.ready, "exp 2 ready");
+    FillTicket ft3 = cache.prepare_host(0, 3); expect(ft3.ready, "exp 3 ready");
+
+    // Acquire leases on experts 1, 2, 3 as well
+    HostExpertLease l1 = cache.acquire_host_lease(0, 1); expect(l1.is_valid(), "l1 valid");
+    HostExpertLease l2 = cache.acquire_host_lease(0, 2); expect(l2.is_valid(), "l2 valid");
+    HostExpertLease l3 = cache.acquire_host_lease(0, 3); expect(l3.is_valid(), "l3 valid");
+
+    // Now ALL 4 host slots in the pool are actively leased (cpu_readers >= 1).
+    // Attempting to allocate expert (0, 4) MUST fail to find an eviction victim!
+    FillTicket ft_blocked = cache.prepare_host(0, 4);
+    expect(!ft_blocked.ready, "allocation of expert 4 MUST fail when all slots are leased");
+    expect(ft_blocked.hslot < 0, "hslot must be negative when no slot can be evicted");
+
+    // Verify expert (0, 0) and expert (0, 1) are STILL host-resident and untouched
+    expect(cache.query_residency(0, 0).host_resident, "expert 0 must still be resident and protected");
+    expect(cache.query_residency(0, 1).host_resident, "expert 1 must still be resident and protected");
+
+    // Now release lease l1 (expert 1). Now slot for expert 1 has cpu_readers == 0.
+    const int hslot1 = l1.hslot();
+    l1.release();
+    expect(cache.get_host_slot_cpu_readers(hslot1) == 0, "expert 1 readers should be 0");
+
+    // Now expert 4 CAN be prepared into the newly evictable slot 1!
+    FillTicket ft_ok = cache.prepare_host(0, 4);
+    expect(ft_ok.ready, "expert 4 should now succeed in allocating");
+    expect(ft_ok.hslot == hslot1, "expert 4 should evict slot 1");
+    expect(!cache.query_residency(0, 1).host_resident, "expert 1 should now be evicted");
+    expect(cache.query_residency(0, 4).host_resident, "expert 4 should be resident");
+
+    // Expert 0 in slot 0 was STILL protected throughout!
+    expect(cache.query_residency(0, 0).host_resident, "expert 0 was preserved in slot 0");
+
+    // Clean up remaining leases
+    lease_moved.release();
+    l2.release();
+    l3.release();
+    expect(cache.get_host_slot_cpu_readers(hslot0) == 0, "all readers released");
+
+    std::cout << "  Passed HostExpertLease lifecycle and eviction protection test.\n";
+}
+
+void test_mixed_ready_copying_and_cancellation(Context& ctx) {
+    std::cout << "[Test 3] Testing mixed ready/copying states, prefetch cancel & slot reuse...\n";
     SyntheticExpertWeights synth;
     ModelWeights dummy_weights;
     Qwen4ExpExpertCache cache;
@@ -194,61 +320,44 @@ void test_host_lease_lifecycle_and_eviction_protection(Context& ctx) {
     cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
     cache.set_layer_expert_ref(1, synth.gu_ref, synth.dn_ref);
 
-    // If host pool is enabled, test lease mechanics
-    if (cache.host_pool_enabled()) {
-        // Stage expert (0, 3) through acquire
-        int req[1] = {3};
-        int slots[1] = {-1};
-        sycl::event ev = cache.acquire(0, req, 1, slots);
-        ev.wait_and_throw();
+    // Pre-populate GPU slots with expert 0 and 1
+    int pre_req[2] = {0, 1};
+    int pre_slots[2] = {-1, -1};
+    sycl::event ev = cache.acquire(0, pre_req, 2, pre_slots);
+    ev.wait_and_throw();
 
-        // Check host residency
-        ExpertResidency r3 = cache.query_residency(0, 3);
-        if (r3.host_ready) {
-            const int hslot = r3.host_slot;
-            expect(hslot >= 0, "valid host slot expected for ready expert");
-            expect(cache.get_host_slot_cpu_readers(hslot) == 0, "initial cpu_readers should be 0");
+    ExpertResidency r0 = cache.query_residency(0, 0);
+    ExpertResidency r1 = cache.query_residency(0, 1);
+    expect(r0.gpu_ready, "expert 0 should be GPU ready");
+    expect(r1.gpu_ready, "expert 1 should be GPU ready");
 
-            // Acquire lease
-            {
-                HostExpertLease lease = cache.acquire_host_lease(0, 3);
-                expect(lease.is_valid(), "lease should be valid");
-                expect(lease.hslot() == hslot, "lease hslot match");
-                expect(lease.layer() == 0, "lease layer match");
-                expect(lease.expert_id() == 3, "lease expert_id match");
-                expect(cache.get_host_slot_cpu_readers(hslot) == 1, "cpu_readers should be 1 during lease");
+    // Unacquired expert 2: not ready
+    ExpertResidency r2 = cache.query_residency(0, 2);
+    expect(!r2.gpu_ready && !r2.gpu_resident, "expert 2 should not be resident");
 
-                // Check host pointers in MoeExpertSlotHost
-                const auto& sh = lease.slot_host();
-                expect(sh.gate_up_packed != nullptr, "gate_up_packed pointer valid");
-                expect(sh.down_packed != nullptr, "down_packed pointer valid");
-                expect(sh.gate_up_nested.codes != nullptr, "nested codes valid");
-                expect(sh.gate_up_nested.nested_absmax != nullptr, "nested absmax valid");
-                expect(sh.gate_up_nested.nested_quant_map != nullptr, "nested qmap valid");
+    // Start asynchronous prefetch for experts 2 and 3
+    int pf_req[2] = {2, 3};
+    cache.prefetch_async(0, pf_req, 2);
 
-                // Test move semantics
-                HostExpertLease lease_moved = std::move(lease);
-                expect(!lease.is_valid(), "original lease should be invalidated after move");
-                expect(lease_moved.is_valid(), "moved lease should remain valid");
-                expect(cache.get_host_slot_cpu_readers(hslot) == 1, "cpu_readers should stay 1 after move");
+    // Test cancellation of in-flight prefetch
+    cache.cancel_prefetch_for_testing();
 
-                // Test second concurrent lease on the same slot
-                {
-                    HostExpertLease lease2 = cache.acquire_host_lease(0, 3);
-                    expect(lease2.is_valid(), "second lease should be valid");
-                    expect(cache.get_host_slot_cpu_readers(hslot) == 2, "cpu_readers should be 2 for concurrent leases");
-                }
-                expect(cache.get_host_slot_cpu_readers(hslot) == 1, "cpu_readers should return to 1 after lease2 destroyed");
-            }
-            // After lease scope ends:
-            expect(cache.get_host_slot_cpu_readers(hslot) == 0, "cpu_readers should be 0 after all leases released");
-        }
-    }
-    std::cout << "  Passed HostExpertLease lifecycle test.\n";
+    // Verify slot reuse lifecycle: acquiring new experts after cancellation works seamlessly
+    int req_after[2] = {2, 3};
+    int slots_after[2] = {-1, -1};
+    sycl::event ev_after = cache.acquire(0, req_after, 2, slots_after);
+    ev_after.wait_and_throw();
+
+    ExpertResidency r2_after = cache.query_residency(0, 2);
+    ExpertResidency r3_after = cache.query_residency(0, 3);
+    expect(r2_after.gpu_ready, "expert 2 should be GPU ready after acquire");
+    expect(r3_after.gpu_ready, "expert 3 should be GPU ready after acquire");
+
+    std::cout << "  Passed mixed ready/copying and cancellation test.\n";
 }
 
-void test_expert_executor_planning(Context& ctx) {
-    std::cout << "[Test 3] Testing Qwen4ExpExpertExecutor LayerMoePlan & ready subset...\n";
+void test_expert_executor_planning_and_ready_subset(Context& ctx) {
+    std::cout << "[Test 4] Testing Qwen4ExpExpertExecutor LayerMoePlan & ready subset execution...\n";
     SyntheticExpertWeights synth;
     ModelWeights dummy_weights;
     Qwen4ExpExpertCache cache;
@@ -298,13 +407,33 @@ void test_expert_executor_planning(Context& ctx) {
         expect(entry.gpu_slot >= 0, "ready entry must have valid gpu_slot");
     }
 
-    // Verify repeated planning on hot path does not throw or corrupt
-    for (int iter = 0; iter < 100; ++iter) {
-        aila::LayerMoePlan& plan_iter = executor.plan_layer(0, route_ids, route_weights, 2, 4, false);
-        expect(plan_iter.ready_gpu_tasks == 4, "repeated plan ready tasks match");
+    // Now call ensure_gpu_pending to acquire pending experts (2, 3, 4, 5)
+    executor.ensure_gpu_pending(plan);
+    if (plan.final_dma_event != sycl::event{}) {
+        plan.final_dma_event.wait_and_throw();
     }
 
-    std::cout << "  Passed Qwen4ExpExpertExecutor planning test.\n";
+    // Now all entries should have valid gpu_slot
+    for (const auto& entry : plan.entries) {
+        expect(entry.gpu_slot >= 0, "all entries must have valid gpu_slot after ensure_gpu_pending");
+    }
+
+    // Record execution completion
+    executor.record_execution_complete(plan, sycl::event{});
+
+    // Test edge cases: token_count == 0, null router_ids
+    aila::LayerMoePlan& p_empty = executor.plan_layer(0, nullptr, nullptr, 0, 4);
+    expect(p_empty.total_tasks == 0, "empty plan for token_count=0");
+    aila::LayerMoePlan& p_null = executor.plan_layer(0, nullptr, nullptr, 2, 4);
+    expect(p_null.total_tasks == 0, "empty plan for null router_ids");
+
+    // Verify repeated planning on hot path does not throw or corrupt
+    for (int iter = 0; iter < 500; ++iter) {
+        aila::LayerMoePlan& plan_iter = executor.plan_layer(0, route_ids, route_weights, 2, 4, false);
+        expect(plan_iter.total_tasks == 8, "repeated plan total tasks match");
+    }
+
+    std::cout << "  Passed Qwen4ExpExpertExecutor planning and ready subset test.\n";
 }
 
 } // namespace
@@ -315,15 +444,25 @@ int main() {
         std::cout << " Aila Qwen4Exp Expert Readiness (H1) Tests\n";
         std::cout << "========================================\n";
 
+        // Enable hot host RAM pool for readiness unit tests
+        _putenv("AILA_TEST_Q4E_HOST_POOL=1");
+        _putenv("AILA_TEST_Q4E_HOST_SLOTS=4");
+
         Context ctx;
         test_query_residency_and_gpu_tickets(ctx);
         test_host_lease_lifecycle_and_eviction_protection(ctx);
-        test_expert_executor_planning(ctx);
+        test_mixed_ready_copying_and_cancellation(ctx);
+        test_expert_executor_planning_and_ready_subset(ctx);
+
+        _putenv("AILA_TEST_Q4E_HOST_POOL=");
+        _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
 
         std::cout << "All H1 expert readiness tests PASSED successfully!\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FATAL ERROR in readiness tests: " << e.what() << "\n";
+        _putenv("AILA_TEST_Q4E_HOST_POOL=");
+        _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
         return 1;
     }
 }

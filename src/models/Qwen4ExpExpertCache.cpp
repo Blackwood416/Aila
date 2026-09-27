@@ -270,7 +270,7 @@ private:
     TaskJob prefetch_job_;
 };
 
-Qwen4ExpExpertCache::Qwen4ExpExpertCache() = default;
+Qwen4ExpExpertCache::Qwen4ExpExpertCache() : host_list_mutex_(std::make_unique<std::mutex>()) {}
 
 Qwen4ExpExpertCache::~Qwen4ExpExpertCache() {
     cleanup();
@@ -389,6 +389,9 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     other.parts_left_capacity_ = 0;
     other.protected_ratio_ = 0.75f;
     other.stats_ = {};
+
+    host_list_mutex_ = other.host_list_mutex_ ? std::move(other.host_list_mutex_) : std::make_unique<std::mutex>();
+    if (!host_list_mutex_) host_list_mutex_ = std::make_unique<std::mutex>();
 
     return *this;
 }
@@ -849,6 +852,8 @@ void Qwen4ExpExpertCache::bind_slot_nested_metadata(int slot, int layer, int exp
 }
 
 int Qwen4ExpExpertCache::pick_victim_hslot() {
+    std::unique_lock<std::mutex> lock;
+    if (host_list_mutex_) lock = std::unique_lock<std::mutex>(*host_list_mutex_);
     auto is_available = [&](int h) {
         return !host_slot_reserved_[h] &&
                host_slot_records_[h].cpu_readers.load(std::memory_order_acquire) == 0;
@@ -914,6 +919,8 @@ bool Qwen4ExpExpertCache::host_has_dma_in_flight(int layer, int expert_id) const
 
 void Qwen4ExpExpertCache::touch_host_slot(int hslot) {
     if (!host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return;
+    std::unique_lock<std::mutex> lock;
+    if (host_list_mutex_) lock = std::unique_lock<std::mutex>(*host_list_mutex_);
     const size_t max_protected = static_cast<size_t>(num_host_slots_ * protected_ratio_);
     if (!host_slot_is_protected_[hslot]) {
         if (max_protected > 0) {
@@ -1928,8 +1935,12 @@ ExpertResidency Qwen4ExpExpertCache::query_residency(int layer, int expert_id) c
     return res;
 }
 
-void Qwen4ExpExpertCache::release_host_lease(int hslot, uint64_t /*gen*/) {
+void Qwen4ExpExpertCache::release_host_lease(int hslot, uint64_t gen) {
     if (!host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return;
+    const uint64_t cur_gen = host_slot_records_[hslot].generation.load(std::memory_order_acquire);
+    if (gen != 0 && cur_gen != gen) {
+        return;
+    }
     int prev = host_slot_records_[hslot].cpu_readers.fetch_sub(1, std::memory_order_acq_rel);
     if (prev <= 0) {
         // Underflow protection
@@ -1951,11 +1962,13 @@ HostExpertLease Qwen4ExpExpertCache::acquire_host_lease(int layer, int expert_id
     }
 
     const uint64_t expected_key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_id);
+    const uint64_t gen_before = host_slot_records_[hslot].generation.load(std::memory_order_acquire);
     host_slot_records_[hslot].cpu_readers.fetch_add(1, std::memory_order_acq_rel);
 
-    // Recheck key and state after incrementing reader count to guard against races
-    const uint64_t gen = host_slot_records_[hslot].generation.load(std::memory_order_acquire);
-    if (host_slot_to_key_[hslot] != expected_key ||
+    // Recheck key, state, and generation after incrementing reader count to guard against races
+    const uint64_t gen_after = host_slot_records_[hslot].generation.load(std::memory_order_acquire);
+    if (gen_after != gen_before ||
+        host_slot_to_key_[hslot] != expected_key ||
         host_slot_state_[hslot].load(std::memory_order_acquire) != static_cast<uint8_t>(ExpertSlotState::Ready)) {
         host_slot_records_[hslot].cpu_readers.fetch_sub(1, std::memory_order_release);
         return {};
@@ -1963,7 +1976,7 @@ HostExpertLease Qwen4ExpExpertCache::acquire_host_lease(int layer, int expert_id
 
     touch_host_slot(hslot);
     ops::MoeExpertSlotHost slot_host = get_slot_host(hslot);
-    return HostExpertLease(this, layer, expert_id, hslot, gen, slot_host);
+    return HostExpertLease(this, layer, expert_id, hslot, gen_after, slot_host);
 }
 
 ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_slot_host(int hslot) const {
@@ -2016,4 +2029,110 @@ ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_expert_slot_host(int layer, int 
     const int hslot = host_layer_expert_to_slot_[flat];
     if (hslot < 0 || hslot >= num_host_slots_) return {};
     return get_slot_host(hslot);
+}
+
+FillTicket Qwen4ExpExpertCache::prepare_host(int layer, int expert_id, int /*priority*/) {
+    FillTicket ticket{};
+    ticket.layer = layer;
+    ticket.expert_id = expert_id;
+    if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) {
+        return ticket;
+    }
+    if (!host_pool_enabled_) {
+        return ticket;
+    }
+    const int flat = expert_flat_index(layer, expert_id);
+    int hslot = host_layer_expert_to_slot_[flat];
+    if (hslot >= 0 && hslot < num_host_slots_) {
+        const uint8_t st = host_slot_state_[hslot].load(std::memory_order_acquire);
+        ticket.hslot = hslot;
+        ticket.generation = host_slot_records_[hslot].generation.load(std::memory_order_acquire);
+        ticket.ready = (st == static_cast<uint8_t>(ExpertSlotState::Ready));
+        if (ticket.ready) {
+            touch_host_slot(hslot);
+        }
+        return ticket;
+    }
+
+    int victim_hslot = pick_victim_hslot();
+    if (victim_hslot < 0) {
+        return ticket;
+    }
+    const uint64_t old_key = host_slot_to_key_[victim_hslot];
+    if (old_key != UINT64_MAX) {
+        int old_layer = static_cast<int>(old_key >> 32);
+        int old_expert = static_cast<int>(old_key & 0xFFFFFFFF);
+        host_layer_expert_to_slot_[expert_flat_index(old_layer, old_expert)] = -1;
+    }
+    const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_id);
+    host_layer_expert_to_slot_[flat] = victim_hslot;
+    host_slot_to_key_[victim_hslot] = key;
+    const uint64_t next_gen = host_slot_records_[victim_hslot].generation.load(std::memory_order_relaxed) + 1;
+    host_slot_records_[victim_hslot].generation.store(next_gen, std::memory_order_release);
+    host_slot_records_[victim_hslot].key = key;
+    host_slot_records_[victim_hslot].fill_owner = 0;
+    host_slot_state_[victim_hslot].store(static_cast<uint8_t>(ExpertSlotState::Filling), std::memory_order_release);
+
+    {
+        std::unique_lock<std::mutex> lock;
+        if (host_list_mutex_) lock = std::unique_lock<std::mutex>(*host_list_mutex_);
+        if (old_key == UINT64_MAX) {
+            host_slot_is_protected_[victim_hslot] = false;
+            host_probationary_list_.push_front(victim_hslot);
+            host_slot_iters_[victim_hslot] = host_probationary_list_.begin();
+        } else if (host_slot_is_protected_[victim_hslot]) {
+            host_slot_is_protected_[victim_hslot] = false;
+            host_probationary_list_.splice(host_probationary_list_.begin(),
+                                           host_protected_list_, host_slot_iters_[victim_hslot]);
+        } else {
+            host_probationary_list_.splice(host_probationary_list_.begin(),
+                                           host_probationary_list_, host_slot_iters_[victim_hslot]);
+        }
+    }
+
+    uint8_t* host_slot_ptr = host_slot_ptrs_[victim_hslot];
+    load_expert_to_staging(layer, expert_id, host_slot_ptr, 0, 1);
+    host_slot_state_[victim_hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+    ++stats_.host_pool_misses;
+
+    ticket.hslot = victim_hslot;
+    ticket.generation = next_gen;
+    ticket.ready = true;
+    return ticket;
+}
+
+GpuExpertTicket Qwen4ExpExpertCache::ensure_gpu(int layer, int expert_id, int /*priority*/) {
+    GpuExpertTicket ticket{};
+    ticket.layer = layer;
+    ticket.expert_id = expert_id;
+    if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) {
+        return ticket;
+    }
+    const int flat = expert_flat_index(layer, expert_id);
+    const int gslot = layer_expert_to_slot_[flat];
+    if (gslot >= 0 && gslot < num_slots_) {
+        ticket.gpu_slot = gslot;
+        ticket.gpu_generation = gpu_slot_records_[gslot].generation;
+        ticket.dma_event = gpu_slot_records_[gslot].dma_event;
+        const auto st = gpu_slot_records_[gslot].state;
+        if (st == ExpertSlotState::Ready || is_event_complete(ticket.dma_event)) {
+            ticket.ready = true;
+        }
+        return ticket;
+    }
+
+    int out_slot = -1;
+    int req = expert_id;
+    sycl::event ev = acquire(layer, &req, 1, &out_slot);
+    ticket.gpu_slot = out_slot;
+    ticket.dma_event = ev;
+    ticket.gpu_generation = (out_slot >= 0 && out_slot < num_slots_)
+        ? gpu_slot_records_[out_slot].generation : 0;
+    ticket.ready = is_event_complete(ev);
+    return ticket;
+}
+
+GpuExpertTicket Qwen4ExpExpertCache::ensure_gpu(const HostExpertLease& lease, int priority) {
+    if (!lease.is_valid()) return {};
+    return ensure_gpu(lease.layer(), lease.expert_id(), priority);
 }
