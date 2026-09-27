@@ -37,32 +37,113 @@ struct HostSlotRecord {
     std::atomic<uint64_t> generation{0};
     int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
     sycl::event source_reader_fence{};
+    std::atomic<int32_t> cpu_readers{0};
 
     HostSlotRecord() = default;
     HostSlotRecord(const HostSlotRecord& o)
         : key(o.key), generation(o.generation.load(std::memory_order_relaxed)),
-          fill_owner(o.fill_owner), source_reader_fence(o.source_reader_fence) {}
+          fill_owner(o.fill_owner), source_reader_fence(o.source_reader_fence),
+          cpu_readers(o.cpu_readers.load(std::memory_order_relaxed)) {}
     HostSlotRecord& operator=(const HostSlotRecord& o) {
         if (this != &o) {
             key = o.key;
             generation.store(o.generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
             fill_owner = o.fill_owner;
             source_reader_fence = o.source_reader_fence;
+            cpu_readers.store(o.cpu_readers.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         return *this;
     }
     HostSlotRecord(HostSlotRecord&& o) noexcept
         : key(o.key), generation(o.generation.load(std::memory_order_relaxed)),
-          fill_owner(o.fill_owner), source_reader_fence(std::move(o.source_reader_fence)) {}
+          fill_owner(o.fill_owner), source_reader_fence(std::move(o.source_reader_fence)),
+          cpu_readers(o.cpu_readers.load(std::memory_order_relaxed)) {}
     HostSlotRecord& operator=(HostSlotRecord&& o) noexcept {
         if (this != &o) {
             key = o.key;
             generation.store(o.generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
             fill_owner = o.fill_owner;
             source_reader_fence = std::move(o.source_reader_fence);
+            cpu_readers.store(o.cpu_readers.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         return *this;
     }
+};
+
+struct ExpertKey {
+    int layer = -1;
+    int expert_id = -1;
+    bool operator==(const ExpertKey& o) const { return layer == o.layer && expert_id == o.expert_id; }
+    bool operator!=(const ExpertKey& o) const { return !(*this == o); }
+};
+
+struct ExpertResidency {
+    int layer = -1;
+    int expert_id = -1;
+    bool gpu_resident = false;
+    bool gpu_ready = false;
+    bool gpu_copying = false;
+    int gpu_slot = -1;
+    uint64_t gpu_generation = 0;
+    sycl::event gpu_dma_event{};
+
+    bool host_resident = false;
+    bool host_ready = false;
+    bool host_filling = false;
+    int host_slot = -1;
+    uint64_t host_generation = 0;
+    int host_cpu_readers = 0;
+};
+
+struct FillTicket {
+    int layer = -1;
+    int expert_id = -1;
+    int hslot = -1;
+    uint64_t generation = 0;
+    bool ready = false;
+};
+
+struct GpuExpertTicket {
+    int layer = -1;
+    int expert_id = -1;
+    int gpu_slot = -1;
+    uint64_t gpu_generation = 0;
+    sycl::event dma_event{};
+    bool ready = false;
+};
+
+class Qwen4ExpExpertCache;
+
+class HostExpertLease {
+public:
+    HostExpertLease() = default;
+    HostExpertLease(Qwen4ExpExpertCache* cache, int layer, int expert_id, int hslot, uint64_t gen, ops::MoeExpertSlotHost slot_host)
+        : cache_(cache), layer_(layer), expert_id_(expert_id), hslot_(hslot), generation_(gen), slot_host_(slot_host) {}
+    ~HostExpertLease();
+
+    HostExpertLease(const HostExpertLease&) = delete;
+    HostExpertLease& operator=(const HostExpertLease&) = delete;
+
+    HostExpertLease(HostExpertLease&& o) noexcept;
+    HostExpertLease& operator=(HostExpertLease&& o) noexcept;
+
+    bool is_valid() const { return cache_ != nullptr && hslot_ >= 0; }
+    explicit operator bool() const { return is_valid(); }
+    int layer() const { return layer_; }
+    int expert_id() const { return expert_id_; }
+    int hslot() const { return hslot_; }
+    uint64_t generation() const { return generation_; }
+    const ops::MoeExpertSlotHost& slot_host() const { return slot_host_; }
+
+    void release();
+
+private:
+    Qwen4ExpExpertCache* cache_ = nullptr;
+    int layer_ = -1;
+    int expert_id_ = -1;
+    int hslot_ = -1;
+    uint64_t generation_ = 0;
+    ops::MoeExpertSlotHost slot_host_{};
 };
 
 struct ExpertCacheStats {
@@ -222,6 +303,16 @@ public:
     bool host_pool_enabled() const { return host_pool_enabled_; }
     int num_host_slots() const { return num_host_slots_; }
     size_t host_pool_bytes() const { return host_pool_bytes_; }
+
+    ExpertResidency query_residency(int layer, int expert_id) const;
+    HostExpertLease acquire_host_lease(int layer, int expert_id);
+    void release_host_lease(int hslot, uint64_t gen);
+    ops::MoeExpertSlotHost get_slot_host(int hslot) const;
+    ops::MoeExpertSlotHost get_expert_slot_host(int layer, int expert_id) const;
+    int get_host_slot_cpu_readers(int hslot) const {
+        if (!host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return 0;
+        return host_slot_records_[hslot].cpu_readers.load(std::memory_order_relaxed);
+    }
 
 private:
     void cleanup();
@@ -386,3 +477,35 @@ private:
     std::unique_ptr<ExpertFillPool> fill_pool_;
     int fill_parts_ = 8;
 };
+
+inline void HostExpertLease::release() {
+    if (cache_ && hslot_ >= 0) {
+        cache_->release_host_lease(hslot_, generation_);
+        cache_ = nullptr;
+        hslot_ = -1;
+    }
+}
+
+inline HostExpertLease::~HostExpertLease() { release(); }
+
+inline HostExpertLease::HostExpertLease(HostExpertLease&& o) noexcept
+    : cache_(o.cache_), layer_(o.layer_), expert_id_(o.expert_id_), hslot_(o.hslot_),
+      generation_(o.generation_), slot_host_(o.slot_host_) {
+    o.cache_ = nullptr;
+    o.hslot_ = -1;
+}
+
+inline HostExpertLease& HostExpertLease::operator=(HostExpertLease&& o) noexcept {
+    if (this != &o) {
+        release();
+        cache_ = o.cache_;
+        layer_ = o.layer_;
+        expert_id_ = o.expert_id_;
+        hslot_ = o.hslot_;
+        generation_ = o.generation_;
+        slot_host_ = o.slot_host_;
+        o.cache_ = nullptr;
+        o.hslot_ = -1;
+    }
+    return *this;
+}

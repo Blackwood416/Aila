@@ -30,6 +30,23 @@ struct MoeExpertSlotDev {
     MoeNestedScaleDev down_nested{};
 };
 
+struct MoeNestedScaleHost {
+    const uint8_t* codes = nullptr;
+    const float* nested_absmax = nullptr;
+    const float* nested_quant_map = nullptr;
+    float offset = 0.0f;
+    int blocksize = 0;
+};
+
+struct MoeExpertSlotHost {
+    const uint8_t* gate_up_packed = nullptr; // [2 * intermediate_size, in_features / 2]
+    const float* gate_up_absmax = nullptr;   // [2 * intermediate_size, in_features / blocksize] (unnested)
+    const uint8_t* down_packed = nullptr;    // [out_features, intermediate_size / 2]
+    const float* down_absmax = nullptr;      // [out_features, intermediate_size / blocksize] (unnested)
+    MoeNestedScaleHost gate_up_nested{};
+    MoeNestedScaleHost down_nested{};
+};
+
 // 512-expert Top-K Router (Device)
 // Each workgroup computes one token, WG size = 512
 sycl::event router_softmax_topk_device(

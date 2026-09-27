@@ -194,6 +194,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertCache.cpp
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
+    src/models/Qwen4ExpExpertExecutor.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -719,6 +720,19 @@ target_include_directories(AilaQwen4ExpModuleTests PRIVATE
 target_link_libraries(AilaQwen4ExpModuleTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpModuleTests COMMAND AilaQwen4ExpModuleTests)
 set_tests_properties(AilaQwen4ExpModuleTests PROPERTIES LABELS "gpu;models;qwen4_exp" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpExpertReadinessTests
+    tests/models/Qwen4ExpExpertReadinessTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpExpertReadinessTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpExpertReadinessTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpExpertReadinessTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpExpertReadinessTests COMMAND AilaQwen4ExpExpertReadinessTests)
+set_tests_properties(AilaQwen4ExpExpertReadinessTests PROPERTIES LABELS "gpu;models;qwen4_exp;h1" TIMEOUT 120)
 
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp
