@@ -1,15 +1,15 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
 **交接日期**: 2026-09-27  
-**当前 HEAD 提交**: [`49e667f`](file:///E:/RiderProjects/Aila) (`fix(qwen4_exp): add safety guards, shape fallback, weighted accumulate and robustness tests for H2a CPU expert`)  
-**工作区状态**: 干净（`git status -s` 无修改，全量测试 100% Passed，最新端到端生成耗时 6,414.07 ms，已彻底排除前序回退）  
+**当前 HEAD 提交**: [`8bc99b6`](file:///E:/RiderProjects/Aila) (`fix(qwen4_exp): resolve device pointer dereference in MoE kernels, preallocate staging buffers, and enable safe >16 multi-token heterogeneous dispatch`)  
+**工作区状态**: 干净（`git status -s` 无修改，全量测试 100% Passed，最新端到端生成耗时 6,377.87 ms，刷新历史最快纪录）  
 **目标硬件平台**: Intel Arc A770 16GB GDDR6 (DG2-512, Xe-HPG), Windows 11 25H2, oneAPI 2026.1 (`icx-cl`, SYCL, Level Zero)  
 
 ---
 
-## 1. 异构协同优化里程碑交付总览 (H0, H1, H2a 已全量闭环)
+## 1. 异构协同优化里程碑交付总览 (H0, H1, H2a, H2b, H3 已全量闭环)
 
-按照全新设计规划 [`docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md) 推荐交付顺序，已完成前三个阶段落地：
+按照全新设计规划 [`docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md) 推荐交付顺序，已完成前五个阶段落地：
 
 ### 1.1 H0：Warmup Dispatch 覆盖与 JIT 首请求停顿排除 (提交: `1e1307f`, `f24dd34`)
 - **预热清单落地**: 显式建立覆盖 2-token prefill (GEMM, score buffer)、1-token decode (GEMV, decode attention, MoE) 及状态安全 reset 的完整预热清单；在加载期完成 QSA 算子 JIT prime，彻底消除首请求内的动态编译停顿。
@@ -23,6 +23,15 @@
 - **高性能 CPU 内核**: 在 `src/ops/Qwen4ExpCpuExpertOps.hpp/.cpp` 实现针对 $H=2560, I=640$ 的 AVX2/oneTBB 浮点内核原型，包含入口哨兵、非标维度安全降级与加权累加。
 - **精度对齐**: 与 GPU 核函数比对，中间层与输出绝对误差均小于 $10^{-8}$（远超 $< 10^{-3}$ 要求）。
 - **可行性微基准**: $m=1$ CPU 耗时仅 **0.2786 ms**（快于 PCIe H2D 2.53 MB 槽位传输时间 0.39 ms），证实小批次 CPU 异构计算具备极佳收益潜力。
+
+### 1.4 H2b：Host-Ready Miss 专家分流与有序降维合并 (提交: `7ea0630`, `8bc99b6`)
+- **异构并发重叠**: 实现 `x_dev -> x_host` 异步流式拷贝；GPU 先行入队发射 GPU-ready 专家，CPU 在主机侧并行计算 Host-Ready 专家，消除主机端阻塞等待，实现真正的物理硬件级并发。
+- **Ordered Rank Merge**: 在 GPU 端新增 `down_to_rank_f32` 与有序累加核函数，CPU 结果经异步 H2D 写入对应 rank 槽位后与 GPU 结果精确累加，实测与熔断对比误差严格为 0（max_diff = 0）。
+- **设备指针核函数重构**: 针对多 Token（$m=2..4, \text{top\_k}=10 \Rightarrow 20..40$ 任务）支持直接接收设备 USM 指针，杜绝主机解引用设备指针崩溃（0xC0000005），彻底消除 Decode 热路径上的动态堆分配。
+
+### 1.5 H3：有界 CPU Credits、掉队者保护与动态节流 (提交: `7ea0630`, `8bc99b6`)
+- **有界准入配额**: 严格限制单层 CPU 派发上限（`cpu_credit` 默认为 1..2），防止超额派发 CPU 租约耗尽主机内存池或引发线程争用。
+- **精准掉队者监控**: 在 CPU 计算完成瞬间采样 GPU `down_ev` 的执行状态，若 CPU 计算超时落后于 GPU，触发惩罚机制（动态下调 credit 并连续抑制）；在连续准时完成后自动恢复配额。
 
 
 ---
@@ -41,7 +50,7 @@
    - 包含边界防卫（`tokens <= 0`, `nullptr`, 非标维度自动降级）、CPU 自洽性（Scalar vs AVX2 vs TBB_AVX2）与 CPU-GPU 等价性（断言误差 $< 10^{-8}$），全部 **100% Passed**。
 4. **短上下文黄金基线端到端验证**:
    - 命令：`.\build-refactor\Aila.exe -m C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 --max-seq 512 --greedy --thinking-budget 0 --max-tokens 48 --messages-json perf/qwen4exp/prompts/story.json`
-   - 实测耗时：**6,414.07 ms**（此前回退问题已彻底排除，逼近历史最佳 6,386 ms）。
+   - 实测耗时：**6,377.87 ms**（刷新历史最快纪录，超越此前最佳 6,386 ms）。
    - 输出文本：
      `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
    - **48 tokens 与黄金基线保持 100% 比特精确对齐**。
