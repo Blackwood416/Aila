@@ -623,6 +623,24 @@ bool Qwen4ExpBnb4Backend::load(
     prefill_pred_uses_.assign(cfg_.num_experts, 0);
     prefill_pred_unique_.reserve(cfg_.num_experts);
     sort_scratch_.resize(cfg_.num_experts);
+
+    // With K-only indexer projection (A2) the engine's 2-token warmup completes no QSA block, so
+    // it launches no QsaIndexerOps kernel. The first request would then pay that module's JIT
+    // (~1.2 s on A770) inside its first prefill; compress one dummy block here to move it to load.
+    for (const auto& layer : layers_) {
+        if (layer.is_linear || !layer.index_k_norm_weight) continue;
+        const int k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
+        const int ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+        Tensor dummy_k = Tensor::allocate(ctx, {ratio, k_dim}, dnnl::memory::data_type::bf16);
+        Tensor dummy_compressed = Tensor::allocate(ctx, {1, k_dim}, dnnl::memory::data_type::bf16);
+        ctx.queue().memset(dummy_k.data(), 0, static_cast<size_t>(ratio) * k_dim * sizeof(bf16));
+        ops::qsa_compress_key_blocks(ctx, dummy_k, *layer.index_k_norm_weight, dummy_compressed,
+                                     0, 1, cfg_.rope.rope_theta, false, nullptr, nullptr, nullptr,
+                                     0, 0, cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1],
+                                     cfg_.rope.mrope_section[2]);
+        ctx.synchronize();
+        break;
+    }
     const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
     const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);

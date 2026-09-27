@@ -82,6 +82,13 @@
   2. **Prefill MoE Consumer Fence**: `06c67a6` 为 baseline 逐 token MoE 记录并检查了槽位级别的 `consumer_fences_`。需排查在 `count=26` 批处理下是否存在重复事件发布与等待。
   3. **缓存与显存淘汰启发式**: `AILA_Q4E_COST_AWARE_EVICTION` 默认开启，检查在首段 prefill 阶段是否因频繁计算 8 个候选打分导致 CPU 抖动。
 
+### 3.3 结论（已解决）：回退来自首个请求内的 QsaIndexerOps JIT
+
+- **根因**：构建为 JIT（spir64，无 AOT、无持久缓存），QsaIndexerOps.cpp 的 kernel 按模块整体 JIT，首次约 1.2 s。`69d52c6` 的 A2 K-only 投影让 2-token warmup 不再执行 `qsa_cache_k_batched`，而 `qsa_compress_key_blocks` 需要至少一个完整 block（warmup 只有 2 token），于是 warmup 不再触达该模块，1.2 s JIT 落入首段 26-token prefill 的第一个 full-attn 层（逐算子同步计时：L=3 compress 1223 ms，其余层 0.13 ms）。
+- **证据**：同进程两次 pp=26 bench，full_attn 1277 → 43.6 ms；`AILA_QSA_K_ONLY_PROJ=0` 时 1223 ms 出现在 warmup 的 `qsa_cache_k_batched` 上。
+- **`router_sync` 不是回退源**：修复后首段 prefill 恢复到约 2217 ms，但 `router_sync` 仍约 270–360 ms，只是 host 等待点的归属变化。
+- **修复**：`Qwen4ExpBnb4Backend::load()` 末尾用一个 dummy block 调一次 `qsa_compress_key_blocks`，把 JIT 移到加载期。修复后首段 prefill 3376 → 2217 ms，GenerateMessages 7403 → 6241 ms，48 token 与黄金基线逐字一致。
+
 ---
 
 ## 4. 下一任 Agent 行动指南 (Actionable Next Steps)
