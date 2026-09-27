@@ -1,0 +1,434 @@
+#include "core/Context.hpp"
+#include "core/Tensor.hpp"
+#include "ops/MoeExpertOps.hpp"
+#include "ops/Qwen4ExpCpuExpertOps.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+void expect(bool cond, const std::string& msg) {
+    if (!cond) {
+        throw std::runtime_error("Test failure: " + msg);
+    }
+}
+
+struct SyntheticExpertData {
+    static constexpr int in_features = ops::cpu::kHiddenDim;             // 2560
+    static constexpr int intermediate_size = ops::cpu::kIntermediateDim; // 640
+    static constexpr int out_features = ops::cpu::kHiddenDim;            // 2560
+    static constexpr int blocksize = ops::cpu::kBlockSize;               // 64
+    static constexpr int nested_blocksize = 256;
+
+    const size_t gu_packed_bytes = static_cast<size_t>(2 * intermediate_size) * (in_features / 2); // 1,638,400 B
+    const size_t gu_absmax_count = static_cast<size_t>(2 * intermediate_size) * (in_features / blocksize); // 51,200
+    const size_t down_packed_bytes = static_cast<size_t>(out_features) * (intermediate_size / 2); // 819,200 B
+    const size_t down_absmax_count = static_cast<size_t>(out_features) * (intermediate_size / blocksize); // 25,600
+
+    std::vector<uint8_t> gu_packed;
+    std::vector<uint8_t> gu_codes;
+    std::vector<float> gu_nested_absmax;
+    std::vector<float> gu_nested_qmap;
+    std::vector<float> gu_absmax_unnested;
+
+    std::vector<uint8_t> dn_packed;
+    std::vector<uint8_t> dn_codes;
+    std::vector<float> dn_nested_absmax;
+    std::vector<float> dn_nested_qmap;
+    std::vector<float> dn_absmax_unnested;
+
+    std::vector<float> qmap;
+
+    ops::MoeExpertSlotHost host_slot_nested{};
+    ops::MoeExpertSlotHost host_slot_unnested{};
+
+    SyntheticExpertData() {
+        gu_packed.resize(gu_packed_bytes);
+        gu_codes.resize(gu_absmax_count);
+        gu_nested_absmax.assign((gu_absmax_count + nested_blocksize - 1) / nested_blocksize, 0.05f);
+        gu_nested_qmap.resize(256);
+        gu_absmax_unnested.resize(gu_absmax_count);
+
+        dn_packed.resize(down_packed_bytes);
+        dn_codes.resize(down_absmax_count);
+        dn_nested_absmax.assign((down_absmax_count + nested_blocksize - 1) / nested_blocksize, 0.04f);
+        dn_nested_qmap.resize(256);
+        dn_absmax_unnested.resize(down_absmax_count);
+
+        qmap = {
+            -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+            -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+            0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+            0.4407079219818115f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
+        };
+
+        for (int i = 0; i < 256; ++i) {
+            gu_nested_qmap[i] = static_cast<float>(i - 128) / 128.0f;
+            dn_nested_qmap[i] = static_cast<float>(i - 128) / 128.0f;
+        }
+
+        std::mt19937 rng(1337);
+        for (auto& v : gu_packed) v = static_cast<uint8_t>(rng() & 0xFF);
+        for (auto& v : gu_codes) v = static_cast<uint8_t>(rng() & 0xFF);
+        for (auto& v : dn_packed) v = static_cast<uint8_t>(rng() & 0xFF);
+        for (auto& v : dn_codes) v = static_cast<uint8_t>(rng() & 0xFF);
+
+        for (size_t i = 0; i < gu_absmax_count; ++i) {
+            float p = gu_nested_qmap[gu_codes[i]] * gu_nested_absmax[i / nested_blocksize];
+            gu_absmax_unnested[i] = p + 0.02f;
+        }
+        for (size_t i = 0; i < down_absmax_count; ++i) {
+            float p = dn_nested_qmap[dn_codes[i]] * dn_nested_absmax[i / nested_blocksize];
+            dn_absmax_unnested[i] = p + 0.01f;
+        }
+
+        // Setup host nested slot
+        host_slot_nested.gate_up_packed = gu_packed.data();
+        host_slot_nested.down_packed = dn_packed.data();
+        host_slot_nested.gate_up_nested.codes = gu_codes.data();
+        host_slot_nested.gate_up_nested.nested_absmax = gu_nested_absmax.data();
+        host_slot_nested.gate_up_nested.nested_quant_map = gu_nested_qmap.data();
+        host_slot_nested.gate_up_nested.offset = 0.02f;
+        host_slot_nested.gate_up_nested.blocksize = nested_blocksize;
+
+        host_slot_nested.down_nested.codes = dn_codes.data();
+        host_slot_nested.down_nested.nested_absmax = dn_nested_absmax.data();
+        host_slot_nested.down_nested.nested_quant_map = dn_nested_qmap.data();
+        host_slot_nested.down_nested.offset = 0.01f;
+        host_slot_nested.down_nested.blocksize = nested_blocksize;
+
+        // Setup host unnested slot
+        host_slot_unnested.gate_up_packed = gu_packed.data();
+        host_slot_unnested.down_packed = dn_packed.data();
+        host_slot_unnested.gate_up_absmax = gu_absmax_unnested.data();
+        host_slot_unnested.down_absmax = dn_absmax_unnested.data();
+    }
+};
+
+void test_cpu_self_consistency() {
+    std::cout << "\n=== [Test 1] CPU Self-Consistency: Scalar vs AVX2 vs TBB_AVX2 ===\n";
+    SyntheticExpertData synth;
+
+    const std::vector<int> test_tokens = {1, 2, 4};
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> in_dist(-0.05f, 0.05f);
+
+    for (int tokens : test_tokens) {
+        std::vector<bf16> x(tokens * synth.in_features);
+        for (auto& v : x) v = bf16(in_dist(rng));
+
+        // 1. Nested scale testing
+        std::vector<bf16> h_scalar(tokens * synth.intermediate_size);
+        std::vector<bf16> h_avx2(tokens * synth.intermediate_size);
+        std::vector<bf16> h_tbb(tokens * synth.intermediate_size);
+
+        std::vector<float> out_scalar(tokens * synth.out_features);
+        std::vector<float> out_avx2(tokens * synth.out_features);
+        std::vector<float> out_tbb(tokens * synth.out_features);
+
+        // Run Scalar
+        ops::cpu::cpu_expert_gate_up_swiglu_scalar(
+            synth.host_slot_nested, x.data(), h_scalar.data(), tokens, synth.qmap.data());
+        ops::cpu::cpu_expert_down_scalar(
+            synth.host_slot_nested, h_scalar.data(), out_scalar.data(), tokens, synth.qmap.data());
+
+        // Run AVX2
+        ops::cpu::cpu_expert_gate_up_swiglu_avx2(
+            synth.host_slot_nested, x.data(), h_avx2.data(), tokens, synth.qmap.data());
+        ops::cpu::cpu_expert_down_avx2(
+            synth.host_slot_nested, h_avx2.data(), out_avx2.data(), tokens, synth.qmap.data());
+
+        // Run TbbAvx2
+        ops::cpu::cpu_expert_gate_up_swiglu_tbb_avx2(
+            synth.host_slot_nested, x.data(), h_tbb.data(), tokens, synth.qmap.data());
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_nested, h_tbb.data(), out_tbb.data(), tokens, synth.qmap.data());
+
+        // Compare intermediate h
+        float max_diff_h_avx2 = 0.0f;
+        float max_diff_h_tbb = 0.0f;
+        for (size_t i = 0; i < h_scalar.size(); ++i) {
+            float s = static_cast<float>(h_scalar[i]);
+            float a = static_cast<float>(h_avx2[i]);
+            float t = static_cast<float>(h_tbb[i]);
+            max_diff_h_avx2 = std::max(max_diff_h_avx2, std::abs(s - a));
+            max_diff_h_tbb = std::max(max_diff_h_tbb, std::abs(s - t));
+        }
+
+        // Compare out
+        float max_diff_out_avx2 = 0.0f;
+        float max_diff_out_tbb = 0.0f;
+        for (size_t i = 0; i < out_scalar.size(); ++i) {
+            max_diff_out_avx2 = std::max(max_diff_out_avx2, std::abs(out_scalar[i] - out_avx2[i]));
+            max_diff_out_tbb = std::max(max_diff_out_tbb, std::abs(out_scalar[i] - out_tbb[i]));
+        }
+
+        std::cout << "  [Nested m=" << tokens << "] Intermediate h max_diff: AVX2="
+                  << max_diff_h_avx2 << ", TBB=" << max_diff_h_tbb << "\n";
+        std::cout << "  [Nested m=" << tokens << "] Output out max_diff: AVX2="
+                  << max_diff_out_avx2 << ", TBB=" << max_diff_out_tbb << "\n";
+
+        expect(max_diff_h_avx2 < 5e-4f, "AVX2 h diff exceeded threshold");
+        expect(max_diff_h_tbb < 5e-4f, "TBB h diff exceeded threshold");
+        expect(max_diff_out_avx2 < 5e-4f, "AVX2 out diff exceeded threshold");
+        expect(max_diff_out_tbb < 5e-4f, "TBB out diff exceeded threshold");
+
+        // 2. Unnested scale testing
+        std::vector<bf16> h_un_scalar(tokens * synth.intermediate_size);
+        std::vector<bf16> h_un_tbb(tokens * synth.intermediate_size);
+        std::vector<float> out_un_scalar(tokens * synth.out_features);
+        std::vector<float> out_un_tbb(tokens * synth.out_features);
+
+        ops::cpu::cpu_expert_gate_up_swiglu_scalar(
+            synth.host_slot_unnested, x.data(), h_un_scalar.data(), tokens, synth.qmap.data());
+        ops::cpu::cpu_expert_down_scalar(
+            synth.host_slot_unnested, h_un_scalar.data(), out_un_scalar.data(), tokens, synth.qmap.data());
+
+        ops::cpu::cpu_expert_gate_up_swiglu_tbb_avx2(
+            synth.host_slot_unnested, x.data(), h_un_tbb.data(), tokens, synth.qmap.data());
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_unnested, h_un_tbb.data(), out_un_tbb.data(), tokens, synth.qmap.data());
+
+        float max_diff_un_h = 0.0f;
+        for (size_t i = 0; i < h_un_scalar.size(); ++i) {
+            max_diff_un_h = std::max(max_diff_un_h, std::abs(static_cast<float>(h_un_scalar[i]) - static_cast<float>(h_un_tbb[i])));
+        }
+        float max_diff_un_out = 0.0f;
+        for (size_t i = 0; i < out_un_scalar.size(); ++i) {
+            max_diff_un_out = std::max(max_diff_un_out, std::abs(out_un_scalar[i] - out_un_tbb[i]));
+        }
+        expect(max_diff_un_h < 5e-4f, "Unnested TBB h diff exceeded threshold");
+        expect(max_diff_un_out < 5e-4f, "Unnested TBB out diff exceeded threshold");
+
+        // Verify cpu_expert_forward matches direct gate_up + down
+        std::vector<float> out_fwd(tokens * synth.out_features);
+        ops::cpu::cpu_expert_forward(
+            synth.host_slot_nested, x.data(), out_fwd.data(), tokens, nullptr,
+            synth.qmap.data(), 1.0f, false, synth.in_features, synth.intermediate_size,
+            synth.out_features, synth.blocksize, ops::cpu::CpuKernelBackend::TbbAvx2);
+
+        float max_diff_fwd = 0.0f;
+        for (size_t i = 0; i < out_fwd.size(); ++i) {
+            max_diff_fwd = std::max(max_diff_fwd, std::abs(out_tbb[i] - out_fwd[i]));
+        }
+        expect(max_diff_fwd < 1e-6f, "cpu_expert_forward mismatch with separate calls");
+    }
+    std::cout << "  => PASSED: CPU Self-Consistency tests.\n";
+}
+
+void test_cpu_gpu_equivalence(Context& ctx) {
+    std::cout << "\n=== [Test 2] CPU vs GPU Equivalence (Assert max_diff < 1e-3) ===\n";
+    SyntheticExpertData synth;
+
+    // Allocate GPU buffers for expert weights
+    Tensor gu_packed_dev = Tensor::allocate(ctx, {synth.gu_packed_bytes}, dnnl::memory::data_type::u8);
+    Tensor gu_codes_dev = Tensor::allocate(ctx, {synth.gu_absmax_count}, dnnl::memory::data_type::u8);
+    Tensor gu_nested_absmax_dev = Tensor::allocate(ctx, {synth.gu_nested_absmax.size()}, dnnl::memory::data_type::f32);
+    Tensor gu_nested_qmap_dev = Tensor::allocate(ctx, {synth.gu_nested_qmap.size()}, dnnl::memory::data_type::f32);
+
+    Tensor dn_packed_dev = Tensor::allocate(ctx, {synth.down_packed_bytes}, dnnl::memory::data_type::u8);
+    Tensor dn_codes_dev = Tensor::allocate(ctx, {synth.dn_codes.size()}, dnnl::memory::data_type::u8);
+    Tensor dn_nested_absmax_dev = Tensor::allocate(ctx, {synth.dn_nested_absmax.size()}, dnnl::memory::data_type::f32);
+    Tensor dn_nested_qmap_dev = Tensor::allocate(ctx, {synth.dn_nested_qmap.size()}, dnnl::memory::data_type::f32);
+
+    Tensor qmap_dev = Tensor::allocate(ctx, {synth.qmap.size()}, dnnl::memory::data_type::f32);
+
+    ctx.memcpy_h2d(gu_packed_dev.data(), synth.gu_packed.data(), synth.gu_packed_bytes);
+    ctx.memcpy_h2d(gu_codes_dev.data(), synth.gu_codes.data(), synth.gu_absmax_count);
+    ctx.memcpy_h2d(gu_nested_absmax_dev.data(), synth.gu_nested_absmax.data(), synth.gu_nested_absmax.size() * sizeof(float));
+    ctx.memcpy_h2d(gu_nested_qmap_dev.data(), synth.gu_nested_qmap.data(), synth.gu_nested_qmap.size() * sizeof(float));
+
+    ctx.memcpy_h2d(dn_packed_dev.data(), synth.dn_packed.data(), synth.down_packed_bytes);
+    ctx.memcpy_h2d(dn_codes_dev.data(), synth.dn_codes.data(), synth.dn_codes.size());
+    ctx.memcpy_h2d(dn_nested_absmax_dev.data(), synth.dn_nested_absmax.data(), synth.dn_nested_absmax.size() * sizeof(float));
+    ctx.memcpy_h2d(dn_nested_qmap_dev.data(), synth.dn_nested_qmap.data(), synth.dn_nested_qmap.size() * sizeof(float));
+
+    ctx.memcpy_h2d(qmap_dev.data(), synth.qmap.data(), synth.qmap.size() * sizeof(float));
+
+    ops::MoeExpertSlotDev dev_slot{};
+    dev_slot.gate_up_packed = static_cast<const uint8_t*>(gu_packed_dev.data());
+    dev_slot.down_packed = static_cast<const uint8_t*>(dn_packed_dev.data());
+
+    dev_slot.gate_up_nested.codes = static_cast<const uint8_t*>(gu_codes_dev.data());
+    dev_slot.gate_up_nested.nested_absmax = static_cast<const float*>(gu_nested_absmax_dev.data());
+    dev_slot.gate_up_nested.nested_quant_map = static_cast<const float*>(gu_nested_qmap_dev.data());
+    dev_slot.gate_up_nested.offset = 0.02f;
+    dev_slot.gate_up_nested.blocksize = synth.nested_blocksize;
+
+    dev_slot.down_nested.codes = static_cast<const uint8_t*>(dn_codes_dev.data());
+    dev_slot.down_nested.nested_absmax = static_cast<const float*>(dn_nested_absmax_dev.data());
+    dev_slot.down_nested.nested_quant_map = static_cast<const float*>(dn_nested_qmap_dev.data());
+    dev_slot.down_nested.offset = 0.01f;
+    dev_slot.down_nested.blocksize = synth.nested_blocksize;
+
+    const std::vector<int> test_batches = {1, 2, 3, 4};
+    std::mt19937 rng(999);
+    // Typical normalized LLM hidden state distribution
+    std::uniform_real_distribution<float> in_dist(-0.03f, 0.03f);
+
+    for (int m : test_batches) {
+        std::vector<bf16> x_host(m * synth.in_features);
+        for (auto& v : x_host) v = bf16(in_dist(rng));
+
+        Tensor x_dev = Tensor::allocate(ctx, {m, synth.in_features}, dnnl::memory::data_type::bf16);
+        Tensor h_dev = Tensor::allocate(ctx, {m, synth.intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor out_dev = Tensor::allocate(ctx, {m, synth.out_features}, dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+        // 1. GPU Computation
+        std::vector<float> gpu_out_host(m * synth.out_features);
+        std::vector<bf16> gpu_h_host(m * synth.intermediate_size);
+
+        for (int t = 0; t < m; ++t) {
+            const auto* x_t = static_cast<const bf16*>(x_dev.data()) + t * synth.in_features;
+            auto* h_t = static_cast<bf16*>(h_dev.data()) + t * synth.intermediate_size;
+            auto* out_f32_t = static_cast<float*>(out_dev.data()) + t * synth.out_features;
+
+            // Zero out acc buffer
+            std::vector<float> zero_buf(synth.out_features, 0.0f);
+            ctx.memcpy_h2d(out_f32_t, zero_buf.data(), synth.out_features * sizeof(float));
+
+            ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, &dev_slot, static_cast<const float*>(qmap_dev.data()),
+                x_t, h_t, 1, synth.in_features, synth.intermediate_size, synth.blocksize);
+
+            const float weight = 1.0f;
+            ops::moe_decode_down_weighted_accumulate(
+                ctx, &dev_slot, static_cast<const float*>(qmap_dev.data()),
+                &weight, h_t, out_f32_t, nullptr, 1, synth.intermediate_size, synth.out_features, synth.blocksize);
+        }
+        ctx.synchronize();
+
+        ctx.memcpy_d2h(gpu_h_host.data(), h_dev.data(), gpu_h_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(gpu_out_host.data(), out_dev.data(), gpu_out_host.size() * sizeof(float));
+
+        // 2. CPU Computation (testing TbbAvx2)
+        std::vector<bf16> cpu_h_host(m * synth.intermediate_size);
+        std::vector<float> cpu_out_host(m * synth.out_features);
+
+        ops::cpu::cpu_expert_gate_up_swiglu_tbb_avx2(
+            synth.host_slot_nested, x_host.data(), cpu_h_host.data(), m, synth.qmap.data(),
+            synth.in_features, synth.intermediate_size, synth.blocksize);
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_nested, cpu_h_host.data(), cpu_out_host.data(), m, synth.qmap.data(),
+            1.0f, false, synth.intermediate_size, synth.out_features, synth.blocksize);
+
+        // 3. Precision Verification
+        float max_diff_h = 0.0f;
+        for (size_t i = 0; i < cpu_h_host.size(); ++i) {
+            float g = static_cast<float>(gpu_h_host[i]);
+            float c = static_cast<float>(cpu_h_host[i]);
+            max_diff_h = std::max(max_diff_h, std::abs(g - c));
+        }
+
+        float max_diff_out = 0.0f;
+        for (size_t i = 0; i < cpu_out_host.size(); ++i) {
+            float g = gpu_out_host[i];
+            float c = cpu_out_host[i];
+            max_diff_out = std::max(max_diff_out, std::abs(g - c));
+        }
+
+        std::cout << "  [Batch m=" << m << "] Intermediate h max_diff: "
+                  << max_diff_h << " (target < 1e-3)\n";
+        std::cout << "  [Batch m=" << m << "] Output out max_diff: "
+                  << max_diff_out << " (target < 1e-3)\n";
+
+        expect(max_diff_h < 1e-3f, "m=" + std::to_string(m) + " intermediate h max_diff >= 1e-3");
+        expect(max_diff_out < 1e-3f, "m=" + std::to_string(m) + " output out max_diff >= 1e-3");
+    }
+    std::cout << "  => PASSED: CPU vs GPU Equivalence tests (max_diff < 1e-3 confirmed).\n";
+}
+
+void run_microbenchmark() {
+    std::cout << "\n=================================================================\n";
+    std::cout << "            H2a CPU Expert Microbenchmark & Feasibility            \n";
+    std::cout << "=================================================================\n";
+    SyntheticExpertData synth;
+
+    std::mt19937 rng(555);
+    std::uniform_real_distribution<float> in_dist(-0.03f, 0.03f);
+
+    auto benchmark_run = [&](int m, ops::cpu::CpuKernelBackend backend, const std::string& name) {
+        std::vector<bf16> x(m * synth.in_features);
+        for (auto& v : x) v = bf16(in_dist(rng));
+        std::vector<bf16> h(m * synth.intermediate_size);
+        std::vector<float> out(m * synth.out_features);
+
+        // Warmup
+        for (int i = 0; i < 5; ++i) {
+            ops::cpu::cpu_expert_forward(
+                synth.host_slot_nested, x.data(), out.data(), m, h.data(), synth.qmap.data(),
+                1.0f, false, synth.in_features, synth.intermediate_size, synth.out_features,
+                synth.blocksize, backend);
+        }
+
+        // Benchmark runs
+        const int iters = (backend == ops::cpu::CpuKernelBackend::Scalar) ? 10 : 50;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ops::cpu::cpu_expert_forward(
+                synth.host_slot_nested, x.data(), out.data(), m, h.data(), synth.qmap.data(),
+                1.0f, false, synth.in_features, synth.intermediate_size, synth.out_features,
+                synth.blocksize, backend);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        double per_token_ms = elapsed_ms / m;
+        double throughput_tok_s = 1000.0 / per_token_ms;
+
+        std::cout << "  | " << std::setw(3) << m
+                  << " | " << std::setw(12) << name
+                  << " | " << std::fixed << std::setprecision(4) << std::setw(9) << elapsed_ms << " ms"
+                  << " | " << std::setw(9) << per_token_ms << " ms/tok"
+                  << " | " << std::setprecision(1) << std::setw(9) << throughput_tok_s << " tok/s |\n";
+    };
+
+    std::cout << "  +-----+--------------+--------------+---------------+--------------+\n";
+    std::cout << "  |  m  | Backend      | Latency (ms) | Time/tok (ms) | Throughput   |\n";
+    std::cout << "  +-----+--------------+--------------+---------------+--------------+\n";
+
+    benchmark_run(1, ops::cpu::CpuKernelBackend::Scalar, "Scalar");
+    benchmark_run(1, ops::cpu::CpuKernelBackend::Avx2, "AVX2 (1T)");
+    benchmark_run(1, ops::cpu::CpuKernelBackend::TbbAvx2, "TBB+AVX2");
+
+    benchmark_run(2, ops::cpu::CpuKernelBackend::Avx2, "AVX2 (1T)");
+    benchmark_run(2, ops::cpu::CpuKernelBackend::TbbAvx2, "TBB+AVX2");
+
+    benchmark_run(4, ops::cpu::CpuKernelBackend::Avx2, "AVX2 (1T)");
+    benchmark_run(4, ops::cpu::CpuKernelBackend::TbbAvx2, "TBB+AVX2");
+
+    std::cout << "  +-----+--------------+--------------+---------------+--------------+\n";
+    std::cout << "  Reference PCIe H2D Slot Transfer: ~0.39 ms (~2.53 MB at 6.5 GB/s)\n";
+    std::cout << "=================================================================\n\n";
+}
+
+} // namespace
+
+int main() {
+    std::cout << "Starting Qwen4Exp CPU Expert H2a Verification Suite...\n";
+    try {
+        test_cpu_self_consistency();
+
+        Context ctx;
+        test_cpu_gpu_equivalence(ctx);
+
+        run_microbenchmark();
+
+        std::cout << "All H2a CPU Expert tests and benchmarks completed successfully!\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "FAILED with exception: " << e.what() << "\n";
+        return 1;
+    }
+}

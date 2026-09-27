@@ -174,6 +174,7 @@ set(LIB_SOURCES
     src/ops/GatedDeltaNetOps.cpp
     src/ops/HyperConnectionOps.cpp
     src/ops/MoeExpertOps.cpp
+    src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
     src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp
@@ -733,6 +734,26 @@ target_include_directories(AilaQwen4ExpExpertReadinessTests PRIVATE
 target_link_libraries(AilaQwen4ExpExpertReadinessTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpExpertReadinessTests COMMAND AilaQwen4ExpExpertReadinessTests)
 set_tests_properties(AilaQwen4ExpExpertReadinessTests PROPERTIES LABELS "gpu;models;qwen4_exp;h1" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpCpuExpertTests
+    tests/ops/Qwen4ExpCpuExpertTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpCpuExpertTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpCpuExpertTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpCpuExpertTests PRIVATE AilaLib)
+if(MSVC)
+    target_compile_options(AilaQwen4ExpCpuExpertTests PRIVATE /arch:AVX2)
+    set_source_files_properties(src/ops/Qwen4ExpCpuExpertOps.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
+else()
+    target_compile_options(AilaQwen4ExpCpuExpertTests PRIVATE -mavx2 -mfma)
+    set_source_files_properties(src/ops/Qwen4ExpCpuExpertOps.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+endif()
+add_test(NAME AilaQwen4ExpCpuExpertTests COMMAND AilaQwen4ExpCpuExpertTests)
+set_tests_properties(AilaQwen4ExpCpuExpertTests PROPERTIES LABELS "gpu;ops;qwen4exp;h2a" TIMEOUT 120)
 
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp
