@@ -1399,7 +1399,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         auto ensure_prediction_ready = [&]() {
             if (prediction_event != sycl::event{}) {
-                prediction_event.wait();
+                prediction_event.wait_and_throw();
                 prediction_event = sycl::event{};
                 if (count == 1) {
                     std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
@@ -1409,7 +1409,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         const auto prof_router_t0 = prof_clock::now();
         // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
-        actual_route_event.wait();
+        actual_route_event.wait_and_throw();
         const auto prof_router_t1 = prof_clock::now();
         if (have_pred && s_predict_stats && count == 1) {
             for (int k = 0; k < top_k; ++k) {

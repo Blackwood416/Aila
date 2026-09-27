@@ -3510,14 +3510,21 @@ void test_b1_slot_state_machine_and_generation(Context& ctx) {
     int req0[1] = {0};
     int slot0[1] = {-1};
     sycl::event ev0 = cache.acquire(0, req0, 1, slot0);
+    ExpertSlotState st_pre = cache.get_slot_state(slot0[0]);
+    expect(st_pre == ExpertSlotState::Copying || st_pre == ExpertSlotState::Ready,
+           "Slot state immediately after acquire must be Copying or Ready");
     ev0.wait();
     int s0 = slot0[0];
     expect(cache.get_slot_state(s0) == ExpertSlotState::Ready, "Slot after acquire must be Ready");
     uint64_t gen0 = cache.get_slot_generation(s0);
     expect(gen0 > 0, "Slot generation must increment upon fill");
 
+    std::atomic<bool> fence_task_ran{false};
     sycl::event fence_ev = ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.host_task([]() {});
+        cgh.host_task([&]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            fence_task_ran.store(true, std::memory_order_release);
+        });
     });
     cache.record_consumer_reader_fence(s0, fence_ev);
 
@@ -3532,6 +3539,8 @@ void test_b1_slot_state_machine_and_generation(Context& ctx) {
     int slot2[1] = {-1};
     cache.acquire(0, req2, 1, slot2).wait();
     int s2 = slot2[0];
+    expect(s2 == s0, "Eviction must reuse slot s0");
+    expect(fence_task_ran.load(std::memory_order_acquire), "Eviction must wait for consumer fence");
     expect(cache.get_slot_state(s2) == ExpertSlotState::Ready, "Evicted/re-filled slot must be Ready");
     uint64_t gen2 = cache.get_slot_generation(s2);
     expect(gen2 > gen0, "Evicted/re-filled slot must have strictly newer generation");
@@ -3605,6 +3614,7 @@ void test_b3_utility_aware_prefetch_filtering_and_metrics(Context& ctx) {
     expect(s1.prefetch_useful_bytes == 0, "Useful bytes must be 0 before acquire");
     expect(s1.prefetch_utility_ratio() == 0.0, "Utility ratio must be 0.0 before acquire");
 
+    // Acquire expert 1: consumes prefetch item
     int req1[1] = {1};
     int slot1[1] = {-1};
     cache.acquire(0, req1, 1, slot1).wait();
@@ -3612,52 +3622,99 @@ void test_b3_utility_aware_prefetch_filtering_and_metrics(Context& ctx) {
     expect(s2.prefetch_useful_bytes == harness.slot_bytes, "prefetch_useful_bytes must match slot_bytes on hit");
     expect(s2.prefetch_utility_ratio() == 1.0, "prefetch_utility_ratio must be 1.0 (100% useful)");
 
-    int req_cancel[1] = {2};
-    cache.prefetch_async(0, req_cancel, 1);
+    // Test wasted bytes: prefetch expert 2, let it complete, then cancel before consuming
+    int req_waste[1] = {2};
+    cache.prefetch_async(0, req_waste, 1);
+    cache.wait_prefetch();
     cache.cancel_prefetch_for_testing();
     const auto& s3 = cache.stats();
-    expect(s3.prefetch_cancelled_bytes > 0 || s3.prefetch_issued_bytes > s3.prefetch_useful_bytes,
-           "prefetch cancellation or unconsumed issuance must be tracked");
-    expect(s3.demand_exposed_wait_ns >= 0, "demand_exposed_wait_ns must be recorded");
+    expect(s3.prefetch_issued_bytes == 2 * harness.slot_bytes, "Two experts issued total");
+    expect(s3.prefetch_wasted_bytes == harness.slot_bytes, "Completed but unconsumed prefetch must be counted as wasted");
+
+    // Test cancelled bytes: prefetch expert 3 and cancel immediately while in flight
+    int req_cancel[1] = {3};
+    cache.prefetch_async(0, req_cancel, 1);
+    cache.cancel_prefetch_for_testing();
+    const auto& s4 = cache.stats();
+    expect(s4.prefetch_issued_bytes == 3 * harness.slot_bytes, "Three experts issued total");
+    expect(s4.prefetch_useful_bytes + s4.prefetch_wasted_bytes + s4.prefetch_cancelled_bytes == s4.prefetch_issued_bytes,
+           "All prefetch bytes must strictly conserve: useful + wasted + cancelled == issued");
+    expect(s4.demand_exposed_wait_ns >= 0, "demand_exposed_wait_ns must be recorded");
 
     std::cout << "[PASS] B3 utility-aware prefetch filtering and byte-level metrics tests passed.\n";
 }
 
 void test_b4_cost_aware_two_tier_eviction(Context& ctx) {
     std::cout << "[Test] Running B4 cost-aware two-tier eviction tests...\n";
-    _putenv("AILA_Q4E_COST_AWARE_EVICTION=1");
 
-    TestCacheHarness harness;
-    Qwen4ExpExpertCache cache;
-    harness.setup_cache(cache, ctx, 2, 4);
+    // Sub-test 1: Cost-aware eviction enabled (B4)
+    {
+        TestCacheHarness harness;
+        Qwen4ExpExpertCache cache;
+        harness.setup_cache(cache, ctx, 2, 4);
+        cache.set_cost_aware_eviction(true);
 
-    int req0[1] = {0};
-    int slot0[1] = {-1};
-    cache.acquire(0, req0, 1, slot0).wait();
+        int req0[1] = {0};
+        int slot0[1] = {-1};
+        cache.acquire(0, req0, 1, slot0).wait();
 
-    int req1[1] = {1};
-    int slot1[1] = {-1};
-    cache.acquire(0, req1, 1, slot1).wait();
+        int req1[1] = {1};
+        int slot1[1] = {-1};
+        cache.acquire(0, req1, 1, slot1).wait();
 
-    expect(cache.contains(0, 0) && cache.contains(0, 1), "GPU cache must hold experts 0 and 1");
-    expect(cache.host_contains(0, 0) && cache.host_contains(0, 1), "Host pool must hold experts 0 and 1");
+        expect(cache.contains(0, 0) && cache.contains(0, 1), "GPU cache must hold experts 0 and 1");
+        expect(cache.host_contains(0, 0) && cache.host_contains(0, 1), "Host pool must hold experts 0 and 1");
 
-    cache.acquire(0, req0, 1, slot0).wait();
+        // Prefetch 2, 3, 4 into host pool (capacity 4): evicts probationary tail (expert 0)
+        int fill_host[3] = {2, 3, 4};
+        cache.prefetch_async(0, fill_host, 3);
+        cache.wait_prefetch();
 
-    int fill_host[3] = {2, 3, 4};
-    cache.prefetch_async(0, fill_host, 3);
-    cache.wait_prefetch();
+        expect(!cache.host_contains(0, 0), "Host pool must have evicted expert 0");
+        expect(cache.host_contains(0, 1), "Host pool must retain expert 1");
+        expect(cache.contains(0, 0), "GPU cache must retain expert 0 (as LRU)");
+        expect(cache.contains(0, 1), "GPU cache must retain expert 1 (as MRU)");
 
-    if (cache.host_contains(0, 0) && !cache.host_contains(0, 1)) {
         int req5[1] = {5};
         int slot5[1] = {-1};
         cache.acquire(0, req5, 1, slot5).wait();
 
-        expect(!cache.contains(0, 0), "Cost-aware eviction must evict expert 0 (which is backed by Host RAM)");
-        expect(cache.contains(0, 1), "Cost-aware eviction must retain expert 1 (not backed by Host RAM)");
-        std::cout << "  Cost-aware eviction successfully preserved non-host-resident expert 1 in GPU.\n";
-    } else {
-        std::cout << "  (Note: host residency setup differed, verifying cost-aware flag execution without failure)\n";
+        expect(!cache.contains(0, 1), "Cost-aware eviction must evict expert 1 (which is backed by Host RAM)");
+        expect(cache.contains(0, 0), "Cost-aware eviction must retain expert 0 (saving disk reload)");
+        expect(cache.contains(0, 5), "Expert 5 must be in GPU cache");
+        std::cout << "  Cost-aware eviction successfully prioritized evicting host-backed expert 1 over expert 0.\n";
+    }
+
+    // Sub-test 2: Pure LRU baseline (cost_aware = false)
+    {
+        TestCacheHarness harness;
+        Qwen4ExpExpertCache cache_lru;
+        harness.setup_cache(cache_lru, ctx, 2, 4);
+        cache_lru.set_cost_aware_eviction(false);
+
+        int req0[1] = {0};
+        int slot0[1] = {-1};
+        cache_lru.acquire(0, req0, 1, slot0).wait();
+
+        int req1[1] = {1};
+        int slot1[1] = {-1};
+        cache_lru.acquire(0, req1, 1, slot1).wait();
+
+        int fill_host[3] = {2, 3, 4};
+        cache_lru.prefetch_async(0, fill_host, 3);
+        cache_lru.wait_prefetch();
+
+        expect(!cache_lru.host_contains(0, 0), "Host pool must have evicted expert 0");
+        expect(cache_lru.host_contains(0, 1), "Host pool must retain expert 1");
+
+        int req5[1] = {5};
+        int slot5[1] = {-1};
+        cache_lru.acquire(0, req5, 1, slot5).wait();
+
+        expect(!cache_lru.contains(0, 0), "Pure LRU must evict LRU expert 0 regardless of host residency");
+        expect(cache_lru.contains(0, 1), "Pure LRU must retain MRU expert 1");
+        expect(cache_lru.contains(0, 5), "Expert 5 must be in GPU cache");
+        std::cout << "  Pure LRU baseline successfully evicted LRU expert 0 as expected.\n";
     }
 
     std::cout << "[PASS] B4 cost-aware two-tier eviction tests passed.\n";

@@ -29,13 +29,40 @@ struct GpuSlotRecord {
     ExpertSlotState state = ExpertSlotState::Empty;
     int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
     sycl::event consumer_fence{};
+    sycl::event dma_event{};
 };
 
 struct HostSlotRecord {
     uint64_t key = UINT64_MAX;
-    uint64_t generation = 0;
+    std::atomic<uint64_t> generation{0};
     int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
     sycl::event source_reader_fence{};
+
+    HostSlotRecord() = default;
+    HostSlotRecord(const HostSlotRecord& o)
+        : key(o.key), generation(o.generation.load(std::memory_order_relaxed)),
+          fill_owner(o.fill_owner), source_reader_fence(o.source_reader_fence) {}
+    HostSlotRecord& operator=(const HostSlotRecord& o) {
+        if (this != &o) {
+            key = o.key;
+            generation.store(o.generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            fill_owner = o.fill_owner;
+            source_reader_fence = o.source_reader_fence;
+        }
+        return *this;
+    }
+    HostSlotRecord(HostSlotRecord&& o) noexcept
+        : key(o.key), generation(o.generation.load(std::memory_order_relaxed)),
+          fill_owner(o.fill_owner), source_reader_fence(std::move(o.source_reader_fence)) {}
+    HostSlotRecord& operator=(HostSlotRecord&& o) noexcept {
+        if (this != &o) {
+            key = o.key;
+            generation.store(o.generation.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            fill_owner = o.fill_owner;
+            source_reader_fence = std::move(o.source_reader_fence);
+        }
+        return *this;
+    }
 };
 
 struct ExpertCacheStats {
@@ -174,6 +201,8 @@ public:
     uint64_t get_host_slot_generation(int hslot) const;
     void record_consumer_reader_fence(int slot_id, sycl::event fence);
     void record_consumer_reader_fences(const int* slot_ids, int count, sycl::event fence);
+    void set_cost_aware_eviction(bool enable) { cost_aware_eviction_ = enable; }
+    bool cost_aware_eviction() const { return cost_aware_eviction_; }
 
     int num_slots() const { return num_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
@@ -246,11 +275,12 @@ private:
         std::atomic<int> parts_remaining{0};
         std::atomic<bool> cancelled{false};
         std::atomic<bool> ready{false};
+        bool used = false;
 
         PrefetchItem() = default;
         PrefetchItem(int l, int e, int h, int parts, uint64_t gen = 0)
             : layer(l), expert_id(e), hslot(h), expected_generation(gen),
-              claimed_parts(0), parts_remaining(parts), cancelled(false), ready(false) {}
+              claimed_parts(0), parts_remaining(parts), cancelled(false), ready(false), used(false) {}
 
         PrefetchItem(const PrefetchItem& o)
             : layer(o.layer), expert_id(o.expert_id), hslot(o.hslot),
@@ -258,7 +288,8 @@ private:
               claimed_parts(o.claimed_parts.load(std::memory_order_relaxed)),
               parts_remaining(o.parts_remaining.load(std::memory_order_relaxed)),
               cancelled(o.cancelled.load(std::memory_order_relaxed)),
-              ready(o.ready.load(std::memory_order_relaxed)) {}
+              ready(o.ready.load(std::memory_order_relaxed)),
+              used(o.used) {}
 
         PrefetchItem& operator=(const PrefetchItem& o) {
             if (this != &o) {
@@ -270,6 +301,7 @@ private:
                 parts_remaining.store(o.parts_remaining.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 cancelled.store(o.cancelled.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 ready.store(o.ready.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                used = o.used;
             }
             return *this;
         }
@@ -307,6 +339,7 @@ private:
     ExpertCacheStats stats_{};
     bool initialized_ = false;
     bool faulted_ = false;
+    bool cost_aware_eviction_ = true;
 
     // Host fill parallelism (AILA_Q4E_FILL_THREADS / AILA_Q4E_FILL_PARTS)
     // Hot Host RAM Pool (pinned USM host memory allocated in 1 GB chunks)
