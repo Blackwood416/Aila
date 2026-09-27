@@ -221,6 +221,83 @@ void hc_inject_add(
     hc_inject_add_impl(ctx, H, y, inj, rows, group_dim, groups);
 }
 
+void hc_inject_add_and_grouped_rms_norm(
+    Context& ctx,
+    bf16* H,
+    const bf16* y,
+    const float* inj,
+    const float* norm_w,
+    float eps,
+    bf16* out_N,
+    int rows,
+    int groups,
+    int group_dim,
+    bool plus_one) {
+    if (rows <= 0 || groups <= 0 || group_dim <= 0) return;
+
+    constexpr int wg = 256;
+    const int total_groups = rows * groups;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(total_groups) * wg),
+                              sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int group_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int r = (groups == 4) ? (group_idx >> 2) : (group_idx / groups);
+                const int g = (groups == 4) ? (group_idx & 3) : (group_idx % groups);
+                const size_t stream_base = static_cast<size_t>(group_idx) * group_dim;
+                const size_t y_base = static_cast<size_t>(r) * group_dim;
+                const size_t w_base = static_cast<size_t>(g) * group_dim;
+                const float inj_val = inj ? static_cast<float>(inj[group_idx]) : 0.0f;
+
+                constexpr int kMaxElemsPerThread = 16;
+                bf16 v_reg[kMaxElemsPerThread];
+                int reg_idx = 0;
+                float sum_sq = 0.0f;
+
+                for (int i = lid; i < group_dim; i += wg) {
+                    float h_val = static_cast<float>(H[stream_base + i]);
+                    float y_val = y ? static_cast<float>(y[y_base + i]) : 0.0f;
+                    bf16 new_h = bf16(h_val + inj_val * y_val);
+                    H[stream_base + i] = new_h;
+                    if (reg_idx < kMaxElemsPerThread) {
+                        v_reg[reg_idx++] = new_h;
+                    }
+                    float v = static_cast<float>(new_h);
+                    sum_sq += v * v;
+                }
+                red_slm[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = wg / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        red_slm[lid] += red_slm[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
+
+                reg_idx = 0;
+                for (int i = lid; i < group_dim; i += wg) {
+                    float v = (reg_idx < kMaxElemsPerThread)
+                        ? static_cast<float>(v_reg[reg_idx++])
+                        : static_cast<float>(H[stream_base + i]);
+                    float scale = inv_rms;
+                    if (norm_w) {
+                        float w_val = norm_w[w_base + i];
+                        scale *= (plus_one ? (1.0f + w_val) : w_val);
+                    }
+                    out_N[stream_base + i] = bf16(v * scale);
+                }
+            });
+    });
+}
+
 void hc_decode_down_inject(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
     bf16* act, float* inj, int lowrank, int group_dim, int groups) {

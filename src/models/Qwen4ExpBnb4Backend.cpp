@@ -792,14 +792,26 @@ void Qwen4ExpBnb4Backend::DenseLinear(
     linear.forward(ctx, input, output, count);
 }
 
-void Qwen4ExpBnb4Backend::RunHyperConnection(
-    Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject) {
+void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
+    Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
+    const bf16* pending_y, const float* pending_inj) {
+    if (pending_y && pending_inj) {
+        ops::hc_inject_add_and_grouped_rms_norm(
+            ctx, static_cast<bf16*>(buf_.hidden4.data()),
+            pending_y, pending_inj,
+            static_cast<const float*>(hc.hc_norm_weight->data()),
+            cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
+            count, 4, hidden_size_, true);
+    } else {
+        ops::grouped_rms_norm(
+            ctx, static_cast<const bf16*>(buf_.hidden4.data()),
+            static_cast<const float*>(hc.hc_norm_weight->data()),
+            cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
+            count, 4, hidden_size_, true);
+    }
+
     const int hc_dim = 4 * hidden_size_;
     const int lowrank = cfg_.hc_lowrank;
-    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(buf_.hidden4.data()),
-                          static_cast<const float*>(hc.hc_norm_weight->data()),
-                          cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-                          count, 4, hidden_size_, true);
 
     static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
     if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
@@ -837,6 +849,11 @@ void Qwen4ExpBnb4Backend::RunHyperConnection(
     }
 }
 
+void Qwen4ExpBnb4Backend::RunHyperConnection(
+    Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject) {
+    RunHyperConnectionCombined(ctx, hc, count, with_inject, nullptr, nullptr);
+}
+
 Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     Context& ctx, Session& session,
     const int* tokenIdsDevice, int count, bool lastTokenOnly) {
@@ -859,6 +876,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
     // 1. Embedding lookup + optional vision embedding override
     EmbedTokens(ctx, tokenIdsDevice, count);
+
+    // P0: Early PLE prepare pipeline (pure prepare + async DMA to double-buffered staging)
+    const int* ple_ids_ptr = embed_host_ids_;
+    std::vector<int> ple_fallback_host_ids;
+    if (!embed_host_.valid()) {
+        ple_fallback_host_ids.resize(count);
+        ctx.memcpy_d2h(ple_fallback_host_ids.data(), tokenIdsDevice, count * sizeof(int));
+        ple_ids_ptr = ple_fallback_host_ids.data();
+    }
+    ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
+                               &session, session.generation(), start_pos);
 
     if (!session.embeddingOverridePositions_.empty() &&
         session.embeddingOverrideHiddenSize_ == hidden_size_) {
@@ -980,17 +1008,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
 
-        // 2.0. PLE on Layer 1 (Epilogue Residual Fused)
+        // 2.0. PLE on Layer 1 (Epilogue Residual Fused via P0 PleTicket)
         if (L == 1) {
-            const int* ids_ptr = embed_host_ids_;
-            std::vector<int> fallback_host_ids;
-            if (!embed_host_.valid()) {
-                fallback_host_ids.resize(count);
-                ctx.memcpy_d2h(fallback_host_ids.data(), tokenIdsDevice, count * sizeof(int));
-                ids_ptr = fallback_host_ids.data();
+            if (!ple_ticket_.valid || ple_ticket_.session_ptr != &session ||
+                ple_ticket_.generation != session.generation() || ple_ticket_.start_pos != start_pos) {
+                ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
+                                           &session, session.generation(), start_pos);
             }
-            ple_.forward(ctx, session.ple_state_, ids_ptr, count,
+            ple_.consume(ctx, ple_ticket_, session.ple_state_,
                          hidden4_ptr, nullptr, hidden4_ptr);
+            ple_.commit(ple_ticket_, session.ple_state_);
         }
 
         stage(kStagePle);
@@ -1353,14 +1380,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
 
-        // 2.3. Attn Residual Add
-        ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
-                           static_cast<const bf16*>(buf_.y.data()),
-                           static_cast<const float*>(buf_.hc_inject_f32.data()),
-                           count, hidden_size_, 4);
-
-        // 2.4. MLP Hyper-Connection
-        RunHyperConnection(ctx, layer.mlp_hc, count, true);
+        // 2.3. Attn Residual Add & 2.4. MLP Hyper-Connection (P1 Fused)
+        static const bool s_fuse_attn_mlp_gr = aila::env::read_flag("AILA_Q4E_FUSE_ATTN_MLP_GR", true);
+        if (s_fuse_attn_mlp_gr) {
+            RunHyperConnectionCombined(ctx, layer.mlp_hc, count, true,
+                                       static_cast<const bf16*>(buf_.y.data()),
+                                       static_cast<const float*>(buf_.hc_inject_f32.data()));
+        } else {
+            ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
+                               static_cast<const bf16*>(buf_.y.data()),
+                               static_cast<const float*>(buf_.hc_inject_f32.data()),
+                               count, hidden_size_, 4);
+            RunHyperConnection(ctx, layer.mlp_hc, count, true);
+        }
         stage(kStageHc);
 
         // 2.5. MoE Computation
@@ -2116,6 +2148,8 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         last_h2d_event.wait_and_throw();
     }
     ple_.restore_snapshot(*session.context_, session.ple_state_, snapshot.ple_snapshot);
+    session.bump_generation();
+    ple_ticket_.valid = false;
 
     for (auto it = session.snapshots_.begin(); it != session.snapshots_.end(); ) {
         if (it->first > target) it = session.snapshots_.erase(it);
@@ -2149,6 +2183,8 @@ void Qwen4ExpBnb4Backend::Reset(Session& session) {
         }
     }
     ple_.init_state(*session.context_, session.ple_state_);
+    session.bump_generation();
+    ple_ticket_.valid = false;
     session.currentLength_ = 0;
     session.context_->synchronize();
 }

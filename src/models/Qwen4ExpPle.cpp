@@ -45,40 +45,58 @@ Qwen4ExpPle& Qwen4ExpPle::operator=(Qwen4ExpPle&& other) noexcept {
     owned_conv1d_w_ = std::move(other.owned_conv1d_w_);
     conv1d_w_ptr_ = other.conv1d_w_ptr_;
 
-    pinned_staging_embed_ = other.pinned_staging_embed_;
-    staging_embed_bytes_ = other.staging_embed_bytes_;
+    scratch_key_ = std::move(other.scratch_key_);
+    scratch_val_ = std::move(other.scratch_val_);
 
-    dev_embed_ = std::move(other.dev_embed_);
     key_buf_ = std::move(other.key_buf_);
     value_buf_ = std::move(other.value_buf_);
     key_normed_ = std::move(other.key_normed_);
     query_normed_ = std::move(other.query_normed_);
     gv_buf_ = std::move(other.gv_buf_);
     gv_normed_ = std::move(other.gv_normed_);
-
-    scratch_key_ = std::move(other.scratch_key_);
-    scratch_val_ = std::move(other.scratch_val_);
     initialized_ = other.initialized_;
 
-    other.ctx_ = nullptr;
-    other.conv1d_w_ptr_ = nullptr;
-    other.pinned_staging_embed_ = nullptr;
-    other.staging_embed_bytes_ = 0;
-    other.initialized_ = false;
-
+    other.cleanup();
     return *this;
 }
 
 void Qwen4ExpPle::cleanup() {
+    if (worker_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex_);
+            stop_worker_ = true;
+            has_task_ = false;
+            worker_cv_.notify_all();
+        }
+        worker_thread_.join();
+    }
+    stop_worker_ = false;
+    has_task_ = false;
+    current_task_id_ = 0;
+    completed_task_id_ = 0;
+    next_staging_slot_ = 0;
+
+    if (copy_q_) {
+        try { copy_q_->wait_and_throw(); } catch (...) {}
+        copy_q_.reset();
+    }
     if (ctx_) {
         try {
             ctx_->synchronize();
         } catch (...) {}
-        if (pinned_staging_embed_) {
-            ctx_->free_host(pinned_staging_embed_);
-            pinned_staging_embed_ = nullptr;
+        for (int s = 0; s < kNumStagingSlots; ++s) {
+            if (pinned_staging_embed_slots_[s]) {
+                ctx_->free_host(pinned_staging_embed_slots_[s]);
+                pinned_staging_embed_slots_[s] = nullptr;
+            }
+            dev_embed_slots_[s] = Tensor();
+            slot_ngram_ids_[s].clear();
+            slot_input_ids_[s].clear();
+            slot_history_[s].clear();
+            slot_h2d_events_[s] = sycl::event{};
         }
     }
+    pinned_staging_embed_ = nullptr;
     ctx_ = nullptr;
     conv1d_w_ptr_ = nullptr;
     staging_embed_bytes_ = 0;
@@ -270,10 +288,19 @@ bool Qwen4ExpPle::init(Context& ctx,
         conv1d_w_ptr_ = static_cast<const bf16*>(owned_conv1d_w_.data());
     }
 
-    // 8. Staging host buffer for DDR3 -> PCIe DMA
+    // 8. Staging host buffers (double-buffered) and device tensors for DDR3 -> PCIe DMA
     staging_embed_bytes_ = static_cast<size_t>(max_tokens_) * EMBED_DIM * sizeof(bf16);
     try {
-        pinned_staging_embed_ = ctx.alloc_host(staging_embed_bytes_);
+        for (int s = 0; s < kNumStagingSlots; ++s) {
+            pinned_staging_embed_slots_[s] = ctx.alloc_host(staging_embed_bytes_);
+            dev_embed_slots_[s] = Tensor::allocate(ctx, {max_tokens_, EMBED_DIM}, dnnl::memory::data_type::bf16);
+            slot_ngram_ids_[s].resize(static_cast<size_t>(max_tokens_) * NUM_HEADS);
+            slot_input_ids_[s].resize(static_cast<size_t>(max_tokens_));
+            slot_history_[s].resize(static_cast<size_t>(max_tokens_) + Qwen4ExpPleState::NGRAM_CONTEXT_LEN);
+            slot_h2d_events_[s] = sycl::event{};
+        }
+        pinned_staging_embed_ = pinned_staging_embed_slots_[0];
+        dev_embed_ = Tensor::view(ctx, dev_embed_slots_[0].data(), {max_tokens_, EMBED_DIM});
     } catch (const std::exception& e) {
         if (error_message) *error_message = std::string("Qwen4ExpPle pinned staging alloc failed: ") + e.what();
         cleanup();
@@ -281,7 +308,6 @@ bool Qwen4ExpPle::init(Context& ctx,
     }
 
     // 9. Pre-allocated device tensors for forward execution (hot path zero-alloc)
-    dev_embed_ = Tensor::allocate(ctx, {max_tokens_, EMBED_DIM}, dnnl::memory::data_type::bf16);
     key_buf_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
     value_buf_ = Tensor::allocate(ctx, {max_tokens_, EMBED_DIM}, dnnl::memory::data_type::bf16);
     key_normed_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
@@ -291,6 +317,24 @@ bool Qwen4ExpPle::init(Context& ctx,
 
     scratch_key_.ensure(ctx, max_tokens_, EMBED_DIM, HC_HIDDEN_SIZE, false);
     scratch_val_.ensure(ctx, max_tokens_, EMBED_DIM, EMBED_DIM, false);
+
+    try {
+        copy_q_ = std::make_unique<sycl::queue>(
+            ctx.queue().get_context(), ctx.queue().get_device(),
+            sycl::property_list{sycl::property::queue::in_order()});
+    } catch (...) {
+        copy_q_.reset();
+    }
+
+    stop_worker_ = false;
+    has_task_ = false;
+    current_task_id_ = 0;
+    completed_task_id_ = 0;
+    next_staging_slot_ = 0;
+    static const bool s_ple_async = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
+    if (s_ple_async) {
+        worker_thread_ = std::thread([this] { worker_loop(); });
+    }
 
     initialized_ = true;
     return true;
@@ -382,11 +426,23 @@ void Qwen4ExpPle::compute_ngram_ids(
     }
 }
 
-void Qwen4ExpPle::compute_ngram_ids(
-    Qwen4ExpPleState& state,
+void Qwen4ExpPle::compute_ngram_ids_pure(
+    const Qwen4ExpPleState& state,
     const int* input_ids,
     int num_tokens,
-    int64_t* out_ids) const {
+    int64_t* out_ids,
+    std::array<int, 2>& candidate_prev_tokens) const {
+    if (num_tokens <= 0) return;
+
+    if (num_tokens >= 2) {
+        candidate_prev_tokens[0] = input_ids[num_tokens - 2];
+        candidate_prev_tokens[1] = input_ids[num_tokens - 1];
+    } else if (num_tokens == 1) {
+        candidate_prev_tokens[0] = state.prev_tokens[1];
+        candidate_prev_tokens[1] = input_ids[0];
+    } else {
+        candidate_prev_tokens = state.prev_tokens;
+    }
 
     std::vector<int> history(Qwen4ExpPleState::NGRAM_CONTEXT_LEN + num_tokens);
     history[0] = state.prev_tokens[0];
@@ -398,24 +454,22 @@ void Qwen4ExpPle::compute_ngram_ids(
     compute_ngram_ids(history.data(), static_cast<int>(history.size()), num_tokens,
                       layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
                       ngram_heads_offsets_.data(), out_ids, EOS_TOKEN_ID);
-
-    if (num_tokens >= 2) {
-        state.prev_tokens[0] = input_ids[num_tokens - 2];
-        state.prev_tokens[1] = input_ids[num_tokens - 1];
-    } else if (num_tokens == 1) {
-        state.prev_tokens[0] = state.prev_tokens[1];
-        state.prev_tokens[1] = input_ids[0];
-    }
 }
 
-void Qwen4ExpPle::lookup_and_dequant(
-    Context& ctx,
-    const int64_t* ids,
+void Qwen4ExpPle::compute_ngram_ids(
+    Qwen4ExpPleState& state,
+    const int* input_ids,
     int num_tokens,
-    bf16* out_embed_dev) {
-    if (num_tokens <= 0) return;
+    int64_t* out_ids) const {
+    std::array<int, 2> candidate_next;
+    compute_ngram_ids_pure(state, input_ids, num_tokens, out_ids, candidate_next);
+    state.prev_tokens = candidate_next;
+}
 
-    bf16* staging = static_cast<bf16*>(pinned_staging_embed_);
+void Qwen4ExpPle::dequant_to_staging(const int64_t* ids, int num_tokens, int slot) {
+    if (num_tokens <= 0 || slot < 0 || slot >= kNumStagingSlots) return;
+
+    bf16* staging = static_cast<bf16*>(pinned_staging_embed_slots_[slot]);
 
     for (int t = 0; t < num_tokens; ++t) {
         bf16* tok_embed = staging + t * EMBED_DIM;
@@ -460,34 +514,167 @@ void Qwen4ExpPle::lookup_and_dequant(
             }
         }
     }
-
-    ctx.memcpy_h2d_async(out_embed_dev, staging, static_cast<size_t>(num_tokens) * EMBED_DIM * sizeof(bf16));
 }
 
-void Qwen4ExpPle::forward(
+void Qwen4ExpPle::execute_prepare_slot(int slot, int num_tokens, const std::array<int, 2>& prev_tokens) {
+    if (num_tokens <= 0 || !ctx_ || slot < 0 || slot >= kNumStagingSlots) return;
+
+    auto& hist = slot_history_[slot];
+    if (hist.size() < static_cast<size_t>(num_tokens + 2)) {
+        hist.resize(num_tokens + 2);
+    }
+    hist[0] = prev_tokens[0];
+    hist[1] = prev_tokens[1];
+    std::memcpy(hist.data() + 2, slot_input_ids_[slot].data(), static_cast<size_t>(num_tokens) * sizeof(int));
+
+    if (slot_ngram_ids_[slot].size() < static_cast<size_t>(num_tokens * NUM_HEADS)) {
+        slot_ngram_ids_[slot].resize(static_cast<size_t>(num_tokens * NUM_HEADS));
+    }
+
+    compute_ngram_ids(hist.data(), num_tokens + 2, num_tokens,
+                      layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
+                      ngram_heads_offsets_.data(), slot_ngram_ids_[slot].data(), EOS_TOKEN_ID);
+
+    dequant_to_staging(slot_ngram_ids_[slot].data(), num_tokens, slot);
+
+    const size_t bytes = static_cast<size_t>(num_tokens) * EMBED_DIM * sizeof(bf16);
+    sycl::event evt = copy_q_
+        ? copy_q_->memcpy(dev_embed_slots_[slot].data(), pinned_staging_embed_slots_[slot], bytes)
+        : ctx_->memcpy_h2d_async(dev_embed_slots_[slot].data(), pinned_staging_embed_slots_[slot], bytes);
+    slot_h2d_events_[slot] = evt;
+}
+
+void Qwen4ExpPle::worker_loop() {
+    while (true) {
+        WorkerTask task;
+        {
+            std::unique_lock<std::mutex> lock(worker_mutex_);
+            worker_cv_.wait(lock, [this] { return stop_worker_ || has_task_; });
+            if (stop_worker_) break;
+            task = worker_task_;
+            has_task_ = false;
+        }
+
+        execute_prepare_slot(task.slot, task.num_tokens, task.prev_tokens_in);
+
+        {
+            std::lock_guard<std::mutex> lock(done_mutex_);
+            completed_task_id_ = task.task_id;
+            done_cv_.notify_all();
+        }
+    }
+}
+
+void Qwen4ExpPle::wait_task(uint64_t task_id) {
+    if (task_id == 0) return;
+    std::unique_lock<std::mutex> lock(done_mutex_);
+    done_cv_.wait(lock, [this, task_id] {
+        return completed_task_id_ >= task_id || stop_worker_;
+    });
+}
+
+void Qwen4ExpPle::lookup_and_dequant(
     Context& ctx,
-    Qwen4ExpPleState& state,
+    const int64_t* ids,
+    int num_tokens,
+    bf16* out_embed_dev) {
+    if (num_tokens <= 0) return;
+    dequant_to_staging(ids, num_tokens, 0);
+    ctx.memcpy_h2d_async(out_embed_dev, pinned_staging_embed_slots_[0], static_cast<size_t>(num_tokens) * EMBED_DIM * sizeof(bf16));
+}
+
+PleTicket Qwen4ExpPle::prepare(
+    Context& ctx,
+    const Qwen4ExpPleState& state,
     const int* input_ids,
     int num_tokens,
+    const void* session_ptr,
+    uint64_t generation,
+    int start_pos) {
+    PleTicket ticket;
+    if (num_tokens <= 0) return ticket;
+
+    int slot = (next_staging_slot_++) % kNumStagingSlots;
+    ticket.staging_slot = slot;
+    ticket.session_ptr = session_ptr;
+    ticket.generation = generation;
+    ticket.start_pos = start_pos;
+    ticket.num_tokens = num_tokens;
+    ticket.prev_tokens_in = state.prev_tokens;
+
+    if (num_tokens >= 2) {
+        ticket.prev_tokens_next[0] = input_ids[num_tokens - 2];
+        ticket.prev_tokens_next[1] = input_ids[num_tokens - 1];
+    } else if (num_tokens == 1) {
+        ticket.prev_tokens_next[0] = state.prev_tokens[1];
+        ticket.prev_tokens_next[1] = input_ids[0];
+    } else {
+        ticket.prev_tokens_next = state.prev_tokens;
+    }
+
+    // Retain H2D source-reader completion: ensure any previous transfer from this slot is done
+    if (slot_h2d_events_[slot] != sycl::event{}) {
+        try { slot_h2d_events_[slot].wait_and_throw(); } catch (...) {}
+        slot_h2d_events_[slot] = sycl::event{};
+    }
+
+    if (slot_input_ids_[slot].size() < static_cast<size_t>(num_tokens)) {
+        slot_input_ids_[slot].resize(static_cast<size_t>(num_tokens));
+    }
+    std::memcpy(slot_input_ids_[slot].data(), input_ids, static_cast<size_t>(num_tokens) * sizeof(int));
+
+    static const bool s_ple_async = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
+    if (s_ple_async && worker_thread_.joinable()) {
+        uint64_t tid = 0;
+        {
+            std::lock_guard<std::mutex> lock(worker_mutex_);
+            tid = ++current_task_id_;
+            worker_task_.task_id = tid;
+            worker_task_.slot = slot;
+            worker_task_.num_tokens = num_tokens;
+            worker_task_.prev_tokens_in = ticket.prev_tokens_in;
+            has_task_ = true;
+            worker_cv_.notify_one();
+        }
+        ticket.task_id = tid;
+    } else {
+        execute_prepare_slot(slot, num_tokens, ticket.prev_tokens_in);
+        ticket.h2d_event = slot_h2d_events_[slot];
+        ticket.task_id = 0;
+    }
+
+    ticket.valid = true;
+    return ticket;
+}
+
+void Qwen4ExpPle::consume(
+    Context& ctx,
+    PleTicket& ticket,
+    Qwen4ExpPleState& state,
     const bf16* hidden_states,
     bf16* out,
     bf16* residual) {
-    if (num_tokens <= 0) return;
+    if (!ticket.valid || ticket.num_tokens <= 0) return;
 
-    // 1. Compute n-gram IDs
-    std::vector<int64_t> ngram_ids(static_cast<size_t>(num_tokens) * NUM_HEADS);
-    compute_ngram_ids(state, input_ids, num_tokens, ngram_ids.data());
+    if (ticket.task_id > 0) {
+        wait_task(ticket.task_id);
+        ticket.h2d_event = slot_h2d_events_[ticket.staging_slot];
+    }
 
-    // 2. Lookup & dequantize n-gram embeddings into dev_embed_
-    lookup_and_dequant(ctx, ngram_ids.data(), num_tokens, static_cast<bf16*>(dev_embed_.data()));
+    if (ticket.h2d_event != sycl::event{}) {
+        try { ticket.h2d_event.wait_and_throw(); } catch (...) {}
+    }
+
+    const int num_tokens = ticket.num_tokens;
+    Tensor& dev_embed = dev_embed_slots_[ticket.staging_slot];
 
     // 3. Projections
     if (num_tokens == 1) {
-        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed_, key_buf_, 1);
-        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed_, value_buf_, 1);
+        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf_, 1);
+        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf_, 1);
     } else {
-        key_proj_.forward(ctx, scratch_key_, dev_embed_, key_buf_, num_tokens);
-        value_proj_.forward(ctx, scratch_val_, dev_embed_, value_buf_, num_tokens);
+        key_proj_.forward(ctx, scratch_key_, dev_embed, key_buf_, num_tokens);
+        value_proj_.forward(ctx, scratch_val_, dev_embed, value_buf_, num_tokens);
     }
 
     // 4. Grouped RMSNorm
@@ -523,6 +710,27 @@ void Qwen4ExpPle::forward(
                                   out,
                                   num_tokens, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION,
                                   residual);
+}
+
+void Qwen4ExpPle::commit(
+    PleTicket& ticket,
+    Qwen4ExpPleState& state) {
+    if (!ticket.valid) return;
+    state.prev_tokens = ticket.prev_tokens_next;
+    ticket.valid = false;
+}
+
+void Qwen4ExpPle::forward(
+    Context& ctx,
+    Qwen4ExpPleState& state,
+    const int* input_ids,
+    int num_tokens,
+    const bf16* hidden_states,
+    bf16* out,
+    bf16* residual) {
+    PleTicket ticket = prepare(ctx, state, input_ids, num_tokens);
+    consume(ctx, ticket, state, hidden_states, out, residual);
+    commit(ticket, state);
 }
 
 void Qwen4ExpPle::init_state(Context& ctx, Qwen4ExpPleState& state) const {

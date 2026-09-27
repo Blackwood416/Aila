@@ -7,9 +7,12 @@
 #include "utils/SafeTensors.hpp"
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct Qwen4ExpPleState {
@@ -37,6 +40,20 @@ struct PleShardRef {
     int64_t rows = 0;
 };
 
+// P0 Candidate R1: PleTicket tracking session, generation, staging slot, and async DMA event.
+struct PleTicket {
+    const void* session_ptr = nullptr;
+    uint64_t generation = 0;
+    int start_pos = 0;
+    int num_tokens = 0;
+    std::array<int, 2> prev_tokens_in{248044, 248044};
+    std::array<int, 2> prev_tokens_next{248044, 248044};
+    int staging_slot = 0;
+    uint64_t task_id = 0;
+    sycl::event h2d_event{};
+    bool valid = false;
+};
+
 class Qwen4ExpPle {
 public:
     static constexpr int EOS_TOKEN_ID = 248044;
@@ -51,6 +68,7 @@ public:
     static constexpr int CONV_KERNEL_SIZE = 4;
     static constexpr int CONV_DILATION = 3;
     static constexpr int CONV_STATE_LEN = 9;
+    static constexpr int kNumStagingSlots = 2; // Double buffered staging slots
 
     Qwen4ExpPle() = default;
     ~Qwen4ExpPle();
@@ -83,6 +101,14 @@ public:
         int64_t* out_ids,
         int eos_token_id = EOS_TOKEN_ID);
 
+    // Pure n-gram IDs calculation (does NOT mutate state.prev_tokens)
+    void compute_ngram_ids_pure(
+        const Qwen4ExpPleState& state,
+        const int* input_ids,
+        int num_tokens,
+        int64_t* out_ids,
+        std::array<int, 2>& candidate_prev_tokens) const;
+
     // Convenience method using internal tables and updating state.prev_tokens
     void compute_ngram_ids(
         Qwen4ExpPleState& state,
@@ -98,7 +124,32 @@ public:
         int num_tokens,
         sycl::ext::oneapi::bfloat16* out_embed_dev);
 
-    // Forward pass:
+    // P0 Candidate R1 Decoupled Pipeline API:
+    // Pure prepare: kicks off background hash, gather, dequant and H2D DMA to staging slot.
+    PleTicket prepare(
+        Context& ctx,
+        const Qwen4ExpPleState& state,
+        const int* input_ids,
+        int num_tokens,
+        const void* session_ptr = nullptr,
+        uint64_t generation = 0,
+        int start_pos = 0);
+
+    // Consume: waits for ticket ready and executes projection & fusion kernels.
+    void consume(
+        Context& ctx,
+        PleTicket& ticket,
+        Qwen4ExpPleState& state,
+        const sycl::ext::oneapi::bfloat16* hidden_states,
+        sycl::ext::oneapi::bfloat16* out,
+        sycl::ext::oneapi::bfloat16* residual = nullptr);
+
+    // Commit: updates state.prev_tokens only after successful execution.
+    void commit(
+        PleTicket& ticket,
+        Qwen4ExpPleState& state);
+
+    // Forward pass (legacy convenience wrapper calling prepare -> consume -> commit):
     // hidden_states: [num_tokens, 10240] bf16 on device
     // input_ids: [num_tokens] int on host
     // out: [num_tokens, 10240] bf16 on device (residual to be added to hidden_states)
@@ -138,6 +189,10 @@ public:
 
 private:
     void cleanup();
+    void dequant_to_staging(const int64_t* ids, int num_tokens, int slot);
+    void execute_prepare_slot(int slot, int num_tokens, const std::array<int, 2>& prev_tokens);
+    void worker_loop();
+    void wait_task(uint64_t task_id);
 
     Context* ctx_ = nullptr;
     int ple_layer_id_ = 1;
@@ -159,12 +214,38 @@ private:
     Tensor owned_conv1d_w_; // [10240, 4] bf16
     const sycl::ext::oneapi::bfloat16* conv1d_w_ptr_ = nullptr;
 
-    // Pre-allocated pinned host staging buffer for n-gram dequantization
-    void* pinned_staging_embed_ = nullptr;
+    // Double-buffered staging slots (pinned host memory & device tensors)
     size_t staging_embed_bytes_ = 0;
+    void* pinned_staging_embed_ = nullptr; // alias to slot 0 for legacy compatibility
+    std::array<void*, kNumStagingSlots> pinned_staging_embed_slots_{nullptr, nullptr};
+    std::array<Tensor, kNumStagingSlots> dev_embed_slots_;
+    std::array<sycl::event, kNumStagingSlots> slot_h2d_events_;
+    std::array<std::vector<int64_t>, kNumStagingSlots> slot_ngram_ids_;
+    std::array<std::vector<int>, kNumStagingSlots> slot_input_ids_;
+    std::array<std::vector<int>, kNumStagingSlots> slot_history_;
+
+    // Dedicated background worker and copy queue
+    std::unique_ptr<sycl::queue> copy_q_;
+    std::thread worker_thread_;
+    std::mutex worker_mutex_;
+    std::condition_variable worker_cv_;
+    std::mutex done_mutex_;
+    std::condition_variable done_cv_;
+    bool stop_worker_ = false;
+    bool has_task_ = false;
+    uint64_t current_task_id_ = 0;
+    uint64_t completed_task_id_ = 0;
+    mutable int next_staging_slot_ = 0;
+
+    struct WorkerTask {
+        uint64_t task_id = 0;
+        int slot = 0;
+        int num_tokens = 0;
+        std::array<int, 2> prev_tokens_in{};
+    } worker_task_;
 
     // Pre-allocated device tensors for forward execution (zero allocations on hot path)
-    Tensor dev_embed_;    // [max_tokens, 2560] bf16
+    Tensor dev_embed_;    // alias / view to dev_embed_slots_[0] for legacy compatibility
     Tensor key_buf_;      // [max_tokens, 10240] bf16
     Tensor value_buf_;    // [max_tokens, 2560] bf16
     Tensor key_normed_;   // [max_tokens, 10240] bf16

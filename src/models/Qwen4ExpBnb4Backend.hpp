@@ -160,6 +160,8 @@ public:
 
         int CurrentLength() const { return currentLength_; }
         int Capacity() const { return capacity_; }
+        uint64_t generation() const { return generation_; }
+        void bump_generation() { ++generation_; }
 
         const std::unordered_map<int, StateSnapshot>& snapshots_for_testing() const { return snapshots_; }
         std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
@@ -175,6 +177,7 @@ public:
         std::shared_ptr<const SessionOwner> owner_;
         int currentLength_ = 0;
         int capacity_ = 0;
+        uint64_t generation_ = 1;
         bool boundedSnapshots_ = true;
         std::size_t maxSnapshots_ = 4;
 
@@ -256,6 +259,9 @@ private:
                      Tensor& input, Tensor& output, int count, int out_features, int in_features);
     // grouped norm -> low-rank mix -> x = mean_s(mix * N); optionally inject = 2*sigmoid(W N / 4).
     void RunHyperConnection(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject);
+    // P1: Fused residual add + grouped norm across attention -> MLP boundary
+    void RunHyperConnectionCombined(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
+                                    const sycl::ext::oneapi::bfloat16* pending_y, const float* pending_inj);
 
     ModelSpec spec_;
     Qwen4ExpTextConfig cfg_;
@@ -274,6 +280,7 @@ private:
     std::vector<Qwen4ExpLayer> layers_;
     Qwen4ExpHyperConnectionLayer mixer_;
     Qwen4ExpPle ple_;
+    PleTicket ple_ticket_;
     Qwen4ExpExpertCache expert_cache_;
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0

@@ -45,6 +45,22 @@ void hc_inject_add(
     Context& ctx, bf16* H, const bf16* y, const bf16* inj,
     int rows, int group_dim, int groups);
 
+// Fused residual injection add and grouped RMSNorm (P1 intra-layer fusion):
+// Materializes H[r, g * group_dim + d] = bf16(H[r, g * group_dim + d] + inj[r, g] * y[r, d])
+// and immediately computes grouped RMSNorm into out_N using exact same rounded values.
+void hc_inject_add_and_grouped_rms_norm(
+    Context& ctx,
+    bf16* H,
+    const bf16* y,
+    const float* inj,
+    const float* norm_w,
+    float eps,
+    bf16* out_N,
+    int rows,
+    int groups,
+    int group_dim,
+    bool plus_one = true);
+
 // Single-row (decode) hyper-connection, stage A. One work-group per output row:
 //   act[r] = silu(bf16(W_down[r] . N) / groups)          r < lowrank
 //   inj[g] = 2 * sigmoid(bf16(W_inject[g] . N) / groups)  g < groups (skipped if W_inject null)

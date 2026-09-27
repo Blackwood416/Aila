@@ -625,6 +625,94 @@ void test_ple_lookup_and_dequant(Context& ctx) {
     std::cout << "[PASS] PLE lookup and dequantization tests passed.\n";
 }
 
+void test_ple_ticket_pipeline(Context& ctx) {
+    std::cout << "[Test] Running PLE Ticket Pipeline (prepare / cancel / double buffering / commit) unit tests...\n";
+
+    constexpr int64_t rows_per_shard = 100;
+    constexpr int num_shards = 2;
+
+    std::vector<uint8_t> shard0_packed(rows_per_shard * 80, 0x12);
+    std::vector<float> shard0_absmax(rows_per_shard * 5, 2.0f);
+    std::vector<uint8_t> shard1_packed(rows_per_shard * 80, 0x34);
+    std::vector<float> shard1_absmax(rows_per_shard * 5, 0.5f);
+    std::vector<float> qmap(16);
+    for (int i = 0; i < 16; ++i) qmap[i] = static_cast<float>(i);
+
+    std::vector<PleShardRef> shards(num_shards);
+    shards[0].packed_weight = shard0_packed.data();
+    shards[0].absmax = shard0_absmax.data();
+    shards[0].quant_map = qmap.data();
+    shards[0].rows = rows_per_shard;
+
+    shards[1].packed_weight = shard1_packed.data();
+    shards[1].absmax = shard1_absmax.data();
+    shards[1].quant_map = qmap.data();
+    shards[1].rows = rows_per_shard;
+
+    ModelWeights dummy;
+    Qwen4ExpPle ple;
+    std::string err;
+    bool ok = ple.init(ctx, dummy, 1, 64, 1e-6f, &err);
+    expect(ok, "ple init failed: " + err);
+    ple.set_shards(shards, rows_per_shard);
+
+    // 1. Pure prepare: does NOT mutate state.prev_tokens
+    Qwen4ExpPleState state;
+    ple.init_state(ctx, state);
+    state.prev_tokens = {101, 202};
+
+    int input_token = 303;
+    PleTicket ticket1 = ple.prepare(ctx, state, &input_token, 1, &state, 1, 10);
+    expect(ticket1.valid, "ticket1 must be valid");
+    expect(ticket1.staging_slot >= 0 && ticket1.staging_slot < Qwen4ExpPle::kNumStagingSlots, "valid slot index");
+    expect(ticket1.num_tokens == 1, "ticket num_tokens mismatch");
+    expect(ticket1.session_ptr == &state, "ticket session_ptr mismatch");
+    expect(ticket1.generation == 1, "ticket generation mismatch");
+    expect(ticket1.start_pos == 10, "ticket start_pos mismatch");
+    expect(state.prev_tokens[0] == 101 && state.prev_tokens[1] == 202,
+           "prepare must be pure and not mutate state.prev_tokens");
+    expect(ticket1.prev_tokens_in[0] == 101 && ticket1.prev_tokens_in[1] == 202, "ticket prev_tokens_in mismatch");
+    expect(ticket1.prev_tokens_next[0] == 202 && ticket1.prev_tokens_next[1] == 303, "ticket prev_tokens_next mismatch");
+
+    // 2. Double-buffered staging slot alternation
+    int input_token2 = 404;
+    PleTicket ticket2 = ple.prepare(ctx, state, &input_token2, 1, &state, 1, 11);
+    expect(ticket2.valid, "ticket2 must be valid");
+    expect(ticket2.staging_slot != ticket1.staging_slot, "staging slots must alternate for double buffering");
+    expect(state.prev_tokens[0] == 101 && state.prev_tokens[1] == 202,
+           "state.prev_tokens must still be untouched before commit");
+
+    // 3. Cancel/discard safety: discard ticket2, state remains completely unpolluted
+    ticket2.valid = false;
+    expect(state.prev_tokens[0] == 101 && state.prev_tokens[1] == 202,
+           "discarding ticket must leave state untouched");
+
+    // 4. Commit ticket1: updates prev_tokens and invalidates ticket
+    ple.commit(ticket1, state);
+    expect(!ticket1.valid, "commit must invalidate ticket");
+    expect(state.prev_tokens[0] == 202 && state.prev_tokens[1] == 303,
+           "commit must update state.prev_tokens to prev_tokens_next");
+
+    // Calling commit again must be safe no-op
+    ple.commit(ticket1, state);
+    expect(state.prev_tokens[0] == 202 && state.prev_tokens[1] == 303,
+           "subsequent commit calls must be no-ops");
+
+    // 5. Multi-token prepare test (e.g. prefill 3 tokens)
+    std::vector<int> prefill_tokens = {501, 502, 503};
+    PleTicket ticket3 = ple.prepare(ctx, state, prefill_tokens.data(), 3, &state, 2, 12);
+    expect(ticket3.valid, "ticket3 must be valid");
+    expect(ticket3.num_tokens == 3, "ticket3 num_tokens mismatch");
+    expect(ticket3.prev_tokens_in[0] == 202 && ticket3.prev_tokens_in[1] == 303, "ticket3 prev_tokens_in mismatch");
+    expect(ticket3.prev_tokens_next[0] == 502 && ticket3.prev_tokens_next[1] == 503, "ticket3 prev_tokens_next mismatch");
+    expect(state.prev_tokens[0] == 202 && state.prev_tokens[1] == 303, "state must not change before commit");
+
+    ple.commit(ticket3, state);
+    expect(state.prev_tokens[0] == 502 && state.prev_tokens[1] == 503, "state updated after multi-token commit");
+
+    std::cout << "[PASS] PLE Ticket Pipeline tests passed.\n";
+}
+
 // ---------------------------------------------------------------------------
 // 3. Real Model Integration Test (if present)
 // ---------------------------------------------------------------------------
@@ -2365,6 +2453,48 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
     expect(ple.ngram_heads_offsets()[0] == 0LL, "real model offsets[0] mismatch");
 
     std::cout << "[PASS] Real model PLE initialized successfully. 128 shards indexed.\n";
+
+    // 1b. Verify real model PLE Ticket pipeline (prepare -> consume -> commit) matches forward() bit-exact
+    {
+        Qwen4ExpPleState s_fwd, s_pipe;
+        ple.init_state(ctx, s_fwd);
+        ple.init_state(ctx, s_pipe);
+
+        std::vector<int> test_tokens = {101, 202, 303, 404};
+        Tensor hidden_dev = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        Tensor out_fwd = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        Tensor out_pipe = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        std::vector<bf16> hidden_h(4 * Qwen4ExpPle::HC_HIDDEN_SIZE, bf16(0.02f));
+        ctx.memcpy_h2d(hidden_dev.data(), hidden_h.data(), hidden_h.size() * sizeof(bf16));
+
+        // Legacy forward
+        ple.forward(ctx, s_fwd, test_tokens.data(), 4,
+                    static_cast<const bf16*>(hidden_dev.data()),
+                    static_cast<bf16*>(out_fwd.data()), nullptr);
+
+        // Ticket pipeline
+        PleTicket ticket = ple.prepare(ctx, s_pipe, test_tokens.data(), 4, &s_pipe, 1, 0);
+        ple.consume(ctx, ticket, s_pipe,
+                    static_cast<const bf16*>(hidden_dev.data()),
+                    static_cast<bf16*>(out_pipe.data()), nullptr);
+        ple.commit(ticket, s_pipe);
+        ctx.synchronize();
+
+        expect(s_fwd.prev_tokens == s_pipe.prev_tokens, "Real model PLE ticket prev_tokens mismatch");
+        std::vector<bf16> fwd_res(4 * Qwen4ExpPle::HC_HIDDEN_SIZE);
+        std::vector<bf16> pipe_res(4 * Qwen4ExpPle::HC_HIDDEN_SIZE);
+        ctx.memcpy_d2h(fwd_res.data(), out_fwd.data(), fwd_res.size() * sizeof(bf16));
+        ctx.memcpy_d2h(pipe_res.data(), out_pipe.data(), pipe_res.size() * sizeof(bf16));
+
+        for (size_t i = 0; i < fwd_res.size(); ++i) {
+            uint16_t u_fwd = *reinterpret_cast<const uint16_t*>(&fwd_res[i]);
+            uint16_t u_pipe = *reinterpret_cast<const uint16_t*>(&pipe_res[i]);
+            if (u_fwd != u_pipe) {
+                throw std::runtime_error("Real model PLE Ticket vs forward bit-exact mismatch at " + std::to_string(i));
+            }
+        }
+        std::cout << "[PASS] Real model PLE Ticket pipeline bit-exact parity with forward verified.\n";
+    }
 
     // 2. Verify ExpertCache initialization on real model with small memory
     Qwen4ExpExpertCache cache;
@@ -4241,6 +4371,7 @@ int main() {
         test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
+        test_ple_ticket_pipeline(ctx);
         test_real_model_ple_and_cache_if_present(ctx);
         test_qsa_indexer_long_context_dispatch(ctx);
         test_qsa_causal_prefill_append_chunk(ctx);

@@ -236,6 +236,116 @@ void test_hc_inject_add(Context& ctx) {
     run_hc_inject_add_test(ctx, 2);
 }
 
+static void run_hc_inject_add_and_grouped_rms_norm_test(Context& ctx, int rows) {
+    constexpr int groups = 4;
+    constexpr int group_dim = 2560;
+    constexpr float eps = 1e-6f;
+    const size_t total_H = rows * groups * group_dim;
+    const size_t total_y = rows * group_dim;
+    const size_t total_inj = rows * groups;
+    const size_t total_w = groups * group_dim;
+
+    std::mt19937 rng(888 + rows);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<bf16> H_init(total_H);
+    std::vector<bf16> y_host(total_y);
+    std::vector<float> inj_host(total_inj);
+    std::vector<float> norm_w_host(total_w);
+
+    for (size_t i = 0; i < total_H; ++i) H_init[i] = bf16(dist(rng));
+    for (size_t i = 0; i < total_y; ++i) y_host[i] = bf16(dist(rng));
+    for (size_t i = 0; i < total_inj; ++i) inj_host[i] = 2.0f / (1.0f + std::exp(-dist(rng)));
+    for (size_t i = 0; i < total_w; ++i) norm_w_host[i] = dist(rng) * 0.1f;
+
+    Tensor H_sep_dev = Tensor::allocate(ctx, {rows, groups * group_dim}, dnnl::memory::data_type::bf16);
+    Tensor H_fused_dev = Tensor::allocate(ctx, {rows, groups * group_dim}, dnnl::memory::data_type::bf16);
+    Tensor y_dev = Tensor::allocate(ctx, {rows, group_dim}, dnnl::memory::data_type::bf16);
+    Tensor inj_dev = Tensor::allocate(ctx, {rows, groups}, dnnl::memory::data_type::f32);
+    Tensor norm_w_dev = Tensor::allocate(ctx, {groups * group_dim}, dnnl::memory::data_type::f32);
+    Tensor out_sep_dev = Tensor::allocate(ctx, {rows, groups * group_dim}, dnnl::memory::data_type::bf16);
+    Tensor out_fused_dev = Tensor::allocate(ctx, {rows, groups * group_dim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(H_sep_dev.data(), H_init.data(), total_H * sizeof(bf16));
+    ctx.memcpy_h2d(H_fused_dev.data(), H_init.data(), total_H * sizeof(bf16));
+    ctx.memcpy_h2d(y_dev.data(), y_host.data(), total_y * sizeof(bf16));
+    ctx.memcpy_h2d(inj_dev.data(), inj_host.data(), total_inj * sizeof(float));
+    ctx.memcpy_h2d(norm_w_dev.data(), norm_w_host.data(), total_w * sizeof(float));
+
+    // 1. Separate: hc_inject_add followed by grouped_rms_norm
+    ops::hc_inject_add(ctx, static_cast<bf16*>(H_sep_dev.data()),
+                       static_cast<const bf16*>(y_dev.data()),
+                       static_cast<const float*>(inj_dev.data()),
+                       rows, group_dim, groups);
+    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(H_sep_dev.data()),
+                          static_cast<const float*>(norm_w_dev.data()),
+                          eps, static_cast<bf16*>(out_sep_dev.data()),
+                          rows, groups, group_dim, true);
+    ctx.synchronize();
+
+    // 2. Fused: hc_inject_add_and_grouped_rms_norm
+    ops::hc_inject_add_and_grouped_rms_norm(
+        ctx, static_cast<bf16*>(H_fused_dev.data()),
+        static_cast<const bf16*>(y_dev.data()),
+        static_cast<const float*>(inj_dev.data()),
+        static_cast<const float*>(norm_w_dev.data()),
+        eps, static_cast<bf16*>(out_fused_dev.data()),
+        rows, groups, group_dim, true);
+    ctx.synchronize();
+
+    std::vector<bf16> H_sep_h(total_H);
+    std::vector<bf16> H_fused_h(total_H);
+    std::vector<bf16> out_sep_h(total_H);
+    std::vector<bf16> out_fused_h(total_H);
+
+    ctx.memcpy_d2h(H_sep_h.data(), H_sep_dev.data(), total_H * sizeof(bf16));
+    ctx.memcpy_d2h(H_fused_h.data(), H_fused_dev.data(), total_H * sizeof(bf16));
+    ctx.memcpy_d2h(out_sep_h.data(), out_sep_dev.data(), total_H * sizeof(bf16));
+    ctx.memcpy_d2h(out_fused_h.data(), out_fused_dev.data(), total_H * sizeof(bf16));
+
+    // Verify bit-exact equality on H (allowing at most 1 ULP for vector vs scalar tie rounding)
+    int h_ulp_diffs = 0;
+    for (size_t i = 0; i < total_H; ++i) {
+        uint16_t b_sep = *reinterpret_cast<const uint16_t*>(&H_sep_h[i]);
+        uint16_t b_fused = *reinterpret_cast<const uint16_t*>(&H_fused_h[i]);
+        if (b_sep != b_fused) {
+            int diff = std::abs(static_cast<int>(b_sep) - static_cast<int>(b_fused));
+            if (diff > 1) {
+                throw std::runtime_error("H mismatch > 1 ULP at index " + std::to_string(i) +
+                                         " sep=" + std::to_string(static_cast<float>(H_sep_h[i])) +
+                                         " fused=" + std::to_string(static_cast<float>(H_fused_h[i])));
+            }
+            h_ulp_diffs++;
+        }
+    }
+
+    // Verify bit-exact equality on out_N (allowing at most 1 ULP for vector vs scalar tie rounding)
+    int out_ulp_diffs = 0;
+    for (size_t i = 0; i < total_H; ++i) {
+        uint16_t b_sep = *reinterpret_cast<const uint16_t*>(&out_sep_h[i]);
+        uint16_t b_fused = *reinterpret_cast<const uint16_t*>(&out_fused_h[i]);
+        if (b_sep != b_fused) {
+            int diff = std::abs(static_cast<int>(b_sep) - static_cast<int>(b_fused));
+            if (diff > 1) {
+                throw std::runtime_error("out_N mismatch > 1 ULP at index " + std::to_string(i) +
+                                         " sep=" + std::to_string(static_cast<float>(out_sep_h[i])) +
+                                         " fused=" + std::to_string(static_cast<float>(out_fused_h[i])));
+            }
+            out_ulp_diffs++;
+        }
+    }
+
+    std::cout << "[PASS] hc_inject_add_and_grouped_rms_norm rows=" << rows
+              << " (parity verified, h_ulp_diffs=" << h_ulp_diffs
+              << ", out_ulp_diffs=" << out_ulp_diffs << " / " << total_H << ")\n";
+}
+
+void test_hc_inject_add_and_grouped_rms_norm(Context& ctx) {
+    run_hc_inject_add_and_grouped_rms_norm_test(ctx, 1);
+    run_hc_inject_add_and_grouped_rms_norm_test(ctx, 2);
+    run_hc_inject_add_and_grouped_rms_norm_test(ctx, 4);
+}
+
 void test_hc_decode_fused(Context& ctx, bool with_inject) {
     constexpr int groups = 4;
     constexpr int group_dim = 2560;
@@ -3239,6 +3349,7 @@ int main() {
         test_grouped_rms_norm(ctx);
         test_hc_mix_reduce(ctx);
         test_hc_inject_add(ctx);
+        test_hc_inject_add_and_grouped_rms_norm(ctx);
         test_hc_decode_fused(ctx, true);
         test_hc_decode_fused(ctx, false);
         test_ple_gate_value(ctx);
