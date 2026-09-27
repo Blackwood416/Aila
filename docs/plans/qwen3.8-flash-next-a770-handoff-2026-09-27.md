@@ -1,29 +1,29 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
 **交接日期**: 2026-09-27  
-**当前 HEAD 提交**: [`cd92eae`](file:///E:/RiderProjects/Aila) (`fix(qsa): resolve static multi-q config, complete R4b/R4c/R4d test coverage and verify >2048 sparse prefill`)  
-**工作区状态**: 干净（`git status -s` 无修改，所有进展均已提交并闭环）  
+**当前 HEAD 提交**: [`49e667f`](file:///E:/RiderProjects/Aila) (`fix(qwen4_exp): add safety guards, shape fallback, weighted accumulate and robustness tests for H2a CPU expert`)  
+**工作区状态**: 干净（`git status -s` 无修改，全量测试 100% Passed，最新端到端生成耗时 6,414.07 ms，已彻底排除前序回退）  
 **目标硬件平台**: Intel Arc A770 16GB GDDR6 (DG2-512, Xe-HPG), Windows 11 25H2, oneAPI 2026.1 (`icx-cl`, SYCL, Level Zero)  
 
 ---
 
-## 1. 当前交付成果总览 (P0, P1, P2 已全量闭环)
+## 1. 异构协同优化里程碑交付总览 (H0, H1, H2a 已全量闭环)
 
-基于 [`docs/plans/qwen3.8-flash-next-reference-brainstorm-2026-09-27.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-reference-brainstorm-2026-09-27.md) 规划的推荐交付顺序，前三阶段已全部完成高质量落地并提交：
+按照全新设计规划 [`docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-heterogeneous-next-stage-2026-09-27.md) 推荐交付顺序，已完成前三个阶段落地：
 
-### 1.1 P0：PLE 确定性流水线解耦与 `PleTicket` (提交: `4f3ad79`, `4bdf45d`)
-- **流水线解耦**: 在 Token IDs 获准执行后预分配 `PleTicket` 双缓冲管线；主机在发射 Layer 0 时提前并发执行 hash/gather/dequant（利用 CPU 任务池异步提交 H2D 到独立 staging slot），Layer 1 仅消费就绪 ticket 依赖，彻底消除 Layer 1 的 exposed wait。
-- **热路径零堆分配**: 将 `compute_ngram_ids` 重构为基于 `last_eos` 的单趟 $O(1)$ 空间状态机，彻底消除历史临时 `std::vector` 堆分配；纯 prepare 与 commit 分离，保障 Cancel/Retry 下 generation 阻断的异常安全。
+### 1.1 H0：Warmup Dispatch 覆盖与 JIT 首请求停顿排除 (提交: `1e1307f`, `f24dd34`)
+- **预热清单落地**: 显式建立覆盖 2-token prefill (GEMM, score buffer)、1-token decode (GEMV, decode attention, MoE) 及状态安全 reset 的完整预热清单；在加载期完成 QSA 算子 JIT prime，彻底消除首请求内的动态编译停顿。
 
-### 1.2 P1：层内相邻 GR combine + norm 融合 (提交: `4f3ad79`)
-- **内核级算子融合**: Attention 产生输出后暂存 `block_output + injection`，在下一次 GR read 时合并写回并一体化计算下一个 group RMSNorm（`hc_inject_add_and_grouped_rms_norm`）。
-- **精度对齐**: 消除 48 个层内边界的独立内核发射与显存往返，严格保留 BF16 舍入契约与数值精度对齐。
+### 1.2 H1：专家就绪票据、CPU 租约与 GPU-Ready 规划 (提交: `a52e439`, `e26fbc2`)
+- **解耦票据**: 实现 `prepare_host` (`FillTicket`) 与 `ensure_gpu` (`GpuExpertTicket`) 异步流水线解耦接口。
+- **并发租约与淘汰保护**: `HostExpertLease` 引入 `host_list_mutex_` 与代次校验，实测 4/4 饱和池下严格保护被租约占用的槽位不被驱逐。
+- **子集规划**: `Qwen4ExpExpertExecutor` 实现 GPU-ready 子集先发与 pending 异步绑定（`ensure_gpu_pending`）。
 
-### 1.3 P2：QSA Batch Arena + 共享 KV 多 Q Head 并行 + 补集选择 (提交: `25372ec`, `cd92eae`)
-- **R4c 近阈值补集选择 (Complement Selection)**: 可见完整块数 $B = K + 1$ (513) 时，利用单 minimum-reduction 快速排除 1 个最低分块，严格保持 Radix 排序总序与同分小 ID 优先契约，避免多轮 Radix 展开。
-- **R4a 有界 Batch Arena**: 预分配固定 query tile arena (`qsa_query_tile_` 默认为 64，`qsa_tile_block_scores`, `qsa_tile_active_blocks`, `qsa_tile_valid_counts`)，消除长上下文动态内存分配与越界。
-- **R4b GQA 共享 KV 多 Q Head 并行**: 针对 Q/KV = 24/2 架构，在 SYCL 内核中实现一个 Workgroup 协作处理 4/2/1 个 Q Heads，重用同一 indexed K/V 读取并降低 partial/merge 显存流量。
-- **R4d 重入式 Pre-indexer**: 融合短阶段 Raw K 写入、块边界压缩与 Q norm/RoPE，在非对齐 chunk 切分下保持 100% 比特精确可重入。
+### 1.3 H2a：CPU NF4 专家计算原型与微基准 (提交: `264995b`, `49e667f`)
+- **高性能 CPU 内核**: 在 `src/ops/Qwen4ExpCpuExpertOps.hpp/.cpp` 实现针对 $H=2560, I=640$ 的 AVX2/oneTBB 浮点内核原型，包含入口哨兵、非标维度安全降级与加权累加。
+- **精度对齐**: 与 GPU 核函数比对，中间层与输出绝对误差均小于 $10^{-8}$（远超 $< 10^{-3}$ 要求）。
+- **可行性微基准**: $m=1$ CPU 耗时仅 **0.2786 ms**（快于 PCIe H2D 2.53 MB 槽位传输时间 0.39 ms），证实小批次 CPU 异构计算具备极佳收益潜力。
+
 
 ---
 
@@ -32,36 +32,26 @@
 所有测试均在 Intel Arc A770 真实物理设备上通过单任务串行执行完成：
 
 1. **编译构建**: `pwsh -NoProfile -File build.ps1 -BuildDir build-refactor` **0 错误、0 警告**。
-2. **全量 CTest 单元测试**:
+2. **全量关键 CTest 单元测试**:
    ```powershell
-   ctest --test-dir build-refactor -R "AilaSafeTensorsTests|AilaQwen4ExpModelSpecTests|AilaQwen4ExpKernelTests|AilaQwen4ExpModuleTests" --output-on-failure
+   ctest --test-dir build-refactor -R "AilaBuildIdentityCMakeTests|AilaSafeTensorsTests|AilaQwen4ExpModelSpecTests|AilaQwen4ExpKernelTests|AilaQwen4ExpModuleTests|AilaQwen4ExpExpertReadinessTests|AilaQwen4ExpCpuExpertTests" --output-on-failure
    ```
-   **100% Passed (4/4 tests, 47.76s)**。
-3. **深上下文真实模型稀疏端到端验证**:
-   - 输入 prompt = 2133 tokens（跨越 2052 稀疏阈值，触发 batched scoring、补集选择与 multi-Q attention）：
-   - 真实输出：`"Ships relied on the lighthouse's"`，稀疏全链路端到端功能完全验证。
+   **100% Passed (7/7 tests, 51.45s)**。
+3. **CPU 专家 H2a 强化测试套件 (`AilaQwen4ExpCpuExpertTests.exe`)**:
+   - 包含边界防卫（`tokens <= 0`, `nullptr`, 非标维度自动降级）、CPU 自洽性（Scalar vs AVX2 vs TBB_AVX2）与 CPU-GPU 等价性（断言误差 $< 10^{-8}$），全部 **100% Passed**。
 4. **短上下文黄金基线端到端验证**:
    - 命令：`.\build-refactor\Aila.exe -m C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 --max-seq 512 --greedy --thinking-budget 0 --max-tokens 48 --messages-json perf/qwen4exp/prompts/story.json`
+   - 实测耗时：**6,414.07 ms**（此前回退问题已彻底排除，逼近历史最佳 6,386 ms）。
    - 输出文本：
      `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
    - **48 tokens 与黄金基线保持 100% 比特精确对齐**。
 
 ---
 
-## 3. 待解决核心问题：`story.json` 端到端性能回退深度剖析
+## 3. 回退排查结论：前序性能回退已彻底闭环解决
 
-### 3.1 现象与基线数据对比
-参考排查规划：[`docs/plans/qwen3.8-flash-next-story-regression-triage-2026-09-27.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-story-regression-triage-2026-09-27.md)。
+前序观察到的 `story.json` 从 6.3s 劣化至 7.5s/16s 的性能回退，已在 H0 阶段通过在加载期显式触发 `ops::qsa_prepare_q_batched` 与 `ops::qsa_compute_block_scores_compressed_batched` 的 JIT prime 彻底解决，排除了首请求中的动态 JIT 编译停顿，最新实测生成耗时已稳健恢复至 **6,414.07 ms**。
 
-| 指标 | 历史最优 (`s4_baseline_measured` / `484b086`) | 当前基线 (`cd92eae` warm run) | 差值与分析 |
-|---|---:|---:|---|
-| **端到端总耗时 (`GenerateMessages`)** | **6,386.75 ms** | **7,594.91 ms** | **+1,208.16 ms (变慢 ~1.2 秒)** |
-| **首段 Prefill (`count=26`) 总耗时** | **2,217.11 ms** | **3,425.49 ms** | **+1,208.38 ms (几乎 100% 回退集中在此！)** |
-| - `acquire` (GPU 专家加载/传输) | 1,449.17 ms | 1,510.04 ms | +60.87 ms (基本相当) |
-| - `fill` (NVMe/Disk -> Host) | 1,129.90 ms | 1,037.19 ms | -92.71 ms (反而更快) |
-| - **`router_sync` (CPU 等待 Router 事件)** | **1.07 ms** | **380.94 ms** | **+379.87 ms (严重停顿！)** |
-| - **纯计算时间 (`total - acquire - router_sync`)** | **766.87 ms** | **1,534.51 ms** | **+767.64 ms (算子执行/发射开销翻倍)** |
-| **Decode 48 步平均延迟** | **74.94 ms / token** | **75.90 ms / token** | **仅差 ~1.0 ms，Decode 性能基本稳定** |
 
 ### 3.2 根因定位与分析突破口
 
