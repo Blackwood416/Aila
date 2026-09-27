@@ -3110,16 +3110,10 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
     std::cout << "======================================================================\n\n";
 }
 
-void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
-    constexpr int K = 2560;
-    constexpr int N = 2560;
+void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string& desc) {
     constexpr int blocksize = 64;
 
-    std::cout << "\n======================================================================\n";
-    std::cout << "  [Evaluation] W4 C3 Non-MoE Dense Prefill: oneDNN vs XMX Joint Matrix\n";
-    std::cout << "======================================================================\n";
-
-    std::mt19937 rng(777);
+    std::mt19937 rng(777 + K + N);
     std::uniform_int_distribution<int> u8_dist(0, 255);
     std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
     std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
@@ -3152,9 +3146,10 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
     Bnb4BitLinear linear;
     std::string err;
     if (!linear.init(ctx, wref, &err)) {
-        throw std::runtime_error("linear.init failed: " + err);
+        throw std::runtime_error("linear.init failed for " + desc + ": " + err);
     }
 
+    std::cout << "  --- Shape: " << desc << " (K=" << K << ", N=" << N << ") ---\n";
     for (int M : {32, 64}) {
         std::vector<bf16> x_host(static_cast<size_t>(M) * K);
         for (auto& v : x_host) v = bf16(in_dist(rng));
@@ -3167,12 +3162,12 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
         Bnb4BitLinearScratch scratch_fb;
         linear.set_allow_dense_xmx(false);
         // Warmup
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 3; ++i) {
             linear.forward(ctx, scratch_fb, x_dev, out_fallback, M);
         }
         ctx.synchronize();
 
-        constexpr int iters = 30;
+        constexpr int iters = 15;
         auto t0_fb = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < iters; ++i) {
             linear.forward(ctx, scratch_fb, x_dev, out_fallback, M);
@@ -3184,7 +3179,7 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
         Bnb4BitLinearScratch scratch_xmx;
         linear.set_allow_dense_xmx(true);
         // Warmup
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 3; ++i) {
             linear.forward(ctx, scratch_xmx, x_dev, out_xmx, M);
         }
         ctx.synchronize();
@@ -3214,13 +3209,21 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
             if (rdiff > max_rel_diff) max_rel_diff = rdiff;
         }
 
-        std::cout << "  Dense Linear Shape M=" << M << ", K=" << K << ", N=" << N << ":\n";
-        std::cout << "    oneDNN Dequant + GEMM (allow_dense_xmx=false): " << ms_fb << " ms\n";
-        std::cout << "    Dense Fused GEMM      (allow_dense_xmx=true):  " << ms_xmx << " ms\n";
-        std::cout << "    Speedup: " << (ms_fb / ms_xmx) << "x\n";
-        std::cout << "    Numerics: max_abs_diff = " << max_abs_diff
-                  << ", max_rel_diff = " << max_rel_diff << "\n";
+        std::cout << "    M=" << M << ": oneDNN=" << ms_fb << " ms | XMX=" << ms_xmx
+                  << " ms | Speedup: " << (ms_fb / ms_xmx) << "x | max_diff=" << max_abs_diff << "\n";
     }
+}
+
+void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
+    std::cout << "\n======================================================================\n";
+    std::cout << "  [Evaluation] W4 C3 Non-MoE Dense Prefill: oneDNN vs XMX Joint Matrix\n";
+    std::cout << "======================================================================\n";
+
+    evaluate_dense_prefill_shape(ctx, 2560, 2560, "Standard Projection");
+    evaluate_dense_prefill_shape(ctx, 2560, 16480, "Large FFN Gate/Up Projection");
+    evaluate_dense_prefill_shape(ctx, 6144, 2560, "Linear Attention Projection");
+    evaluate_dense_prefill_shape(ctx, 2560, 1280, "Shared Expert Projection");
+
     std::cout << "======================================================================\n\n";
 }
 

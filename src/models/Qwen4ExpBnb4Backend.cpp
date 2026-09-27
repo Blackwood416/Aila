@@ -1996,17 +1996,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                           stage_ms[kStageFullAttn], stage_ms[kStageRouter], stage_ms[kStageExperts],
                           prof_acquire_ms, stage_ms[kStageShared], stage_ms[kStageHead]);
         }
-        static const bool s_log_dispatch = aila::env::read_flag("AILA_Q4E_LOG_DISPATCH", false);
-        if (s_log_dispatch && count > 1) {
-            const auto prefill_stats_t1 = Bnb4BitLinear::get_prefill_dispatch_stats();
-            const uint64_t d_fused = prefill_stats_t1.fused_gemm - prefill_stats_t0.fused_gemm;
-            const uint64_t d_dequant = prefill_stats_t1.on_demand_dequant - prefill_stats_t0.on_demand_dequant;
-            const uint64_t d_sync = prefill_stats_t1.sync_wait - prefill_stats_t0.sync_wait;
-            AILA_LOG_INFO("[Q4E Prefill] dispatch delta: fused_gemm=+%llu, on_demand_dequant=+%llu, sync_wait=+%llu",
-                          static_cast<unsigned long long>(d_fused),
-                          static_cast<unsigned long long>(d_dequant),
-                          static_cast<unsigned long long>(d_sync));
-        }
+    }
+    static const bool s_log_dispatch = aila::env::read_flag("AILA_Q4E_LOG_DISPATCH", false);
+    if (s_log_dispatch && count > 1) {
+        const auto prefill_stats_t1 = Bnb4BitLinear::get_prefill_dispatch_stats();
+        const uint64_t d_fused = prefill_stats_t1.fused_gemm - prefill_stats_t0.fused_gemm;
+        const uint64_t d_dequant = prefill_stats_t1.on_demand_dequant - prefill_stats_t0.on_demand_dequant;
+        const uint64_t d_sync = prefill_stats_t1.sync_wait - prefill_stats_t0.sync_wait;
+        AILA_LOG_INFO("[Q4E Prefill] dispatch delta: fused_gemm=+%llu, on_demand_dequant=+%llu, sync_wait=+%llu",
+                      static_cast<unsigned long long>(d_fused),
+                      static_cast<unsigned long long>(d_dequant),
+                      static_cast<unsigned long long>(d_sync));
     }
     return lastTokenLogits_;
 }

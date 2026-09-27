@@ -1,0 +1,183 @@
+{
+  "generated_at": "2026-09-27T10:46:38.9769314+08:00",
+  "aila_start_head": "69d52c67fd7c694fbf213086a70175e9f8eb3424",
+  "aila_end_head": "69d52c67fd7c694fbf213086a70175e9f8eb3424",
+  "vllm_head": "3137ff07739f0cd19e06119506c6432a4a7e77ad",
+  "llama_cpp_head": "95887577ab5fead779581a7030a83c7752ff3234",
+  "reference_repositories_clean_at_read": true,
+  "scope": "Brainstorm from local source snapshots; not a full acceptance audit of ongoing worker changes",
+  "source_only": true,
+  "new_builds": 0,
+  "new_gpu_tests": 0,
+  "new_model_generations": 0,
+  "worker_messages_sent": 0,
+  "pdf": {
+    "pages": 28,
+    "printed_date": "2026-08-26",
+    "title": "On the Design of Qwen3.8-Next Architecture: Evaluation, Efficiency, and Training Stability",
+    "visually_inspected_pages": [
+      5,
+      6,
+      9,
+      14,
+      15
+    ],
+    "other_relevant_text_pages": [
+      1,
+      2,
+      7,
+      11,
+      12
+    ],
+    "performance_transfer": "No A770 speedup inferred from report or CUDA dispatch tables"
+  },
+  "files": [
+    {
+      "role": "report",
+      "path": "D:/Downloads/Qwen3.8-Flash-Next-tech-report.pdf",
+      "sha256": "04F263446D74A35CB7CEA368574E0C561F3B05C133BE2C777AC884404063655D",
+      "bytes": 2366146,
+      "last_write_time": "2026-09-27T10:32:22.7984263+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/model.py",
+      "sha256": "1EE83AACC7DFD568CE47DAB88DDEDE47BA2F8488967CE97B2CE6AC27BE43AE71",
+      "bytes": 42756,
+      "last_write_time": "2026-09-27T10:33:32.5943250+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/common/ngram_embedding.py",
+      "sha256": "CB3D739D979173FAD2A8F1B7C27A90F0404A0BB6D9BEB0EE333660EE245CA285",
+      "bytes": 20190,
+      "last_write_time": "2026-09-27T10:33:32.5913562+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/hyperconnection.py",
+      "sha256": "E69E86AAEEC6DD7CB7EA29D24ED3A0CDAB84FAE8B56B2D3762C1BC9A97AF4A82",
+      "bytes": 7811,
+      "last_write_time": "2026-09-27T10:33:32.5929950+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/ops/hc.py",
+      "sha256": "B051634FD914FC32F3A4D6021178D79566950CC3F40AF883E549D20591053FC8",
+      "bytes": 14766,
+      "last_write_time": "2026-09-27T10:33:32.5958293+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/common/qsa_cache.py",
+      "sha256": "DAAD5E13BEC8276473D8E6E0BB2743617099455D20AFF565637575AD8588C68B",
+      "bytes": 35051,
+      "last_write_time": "2026-09-27T10:33:32.5913562+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/indexer_qsa.py",
+      "sha256": "12F179046D14962C004353EC37CD86D794FA5111BE471EC20562DABA2F268017",
+      "bytes": 17454,
+      "last_write_time": "2026-09-27T10:33:32.5929950+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py",
+      "sha256": "DDCF4C4CAB8CE074F427B3F931CEA36334D1B23442FA7BB07A259EA190722CBC",
+      "bytes": 23432,
+      "last_write_time": "2026-09-27T10:33:32.5988068+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+      "sha256": "135D56DE655EA3839B82F8278477AB5FB1D2CD72CB72FD05E7FE400CBE4260C7",
+      "bytes": 38996,
+      "last_write_time": "2026-09-27T10:33:32.5974921+08:00"
+    },
+    {
+      "role": "vllm",
+      "path": "tmp/vllm/vllm/models/qwen4_exp/nvidia/qsa.py",
+      "sha256": "A725BAAA69D917D4A3F397126509B54CF37A6506794FFB370A90B8B2640DDDDC",
+      "bytes": 20943,
+      "last_write_time": "2026-09-27T10:33:32.5998064+08:00"
+    },
+    {
+      "role": "llama.cpp",
+      "path": "tmp/llama.cpp/src/models/qwen4exp.cpp",
+      "sha256": "58D4BE69C062DE3A21F569606D8E97CE16E1CB99602451BA954D5AF9705F7BC4",
+      "bytes": 61553,
+      "last_write_time": "2026-09-27T10:33:13.4871480+08:00"
+    },
+    {
+      "role": "llama.cpp",
+      "path": "tmp/llama.cpp/src/llama-memory-hybrid-idx.cpp",
+      "sha256": "48239D69914241ADB3F9D608559EAAB05F6E52FF3786426CFC04CC2E4DE79AF1",
+      "bytes": 24766,
+      "last_write_time": "2026-09-27T10:33:13.3908212+08:00"
+    },
+    {
+      "role": "llama.cpp",
+      "path": "tmp/llama.cpp/ggml/src/ggml-sycl/gated_delta_net.cpp",
+      "sha256": "35BF25E3E071616762DF9C133F8711467E5695A13D19ABE8765D9B8961EBABFD",
+      "bytes": 16788,
+      "last_write_time": "2026-09-27T10:33:12.6037718+08:00"
+    },
+    {
+      "role": "llama.cpp",
+      "path": "tmp/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp",
+      "sha256": "49E1D7DAFDFDCF986B3BD991C4C6ED54105F132F1C7DDDAEF9D0C0E447D4E580",
+      "bytes": 175595,
+      "last_write_time": "2026-09-27T10:33:12.6139488+08:00"
+    },
+    {
+      "role": "llama.cpp",
+      "path": "tmp/llama.cpp/ggml/src/ggml-sycl/mmq.cpp",
+      "sha256": "A1CC91F1AE0ED78972303343B23E13B549993B41F0FED43213792E4143773522",
+      "bytes": 122618,
+      "last_write_time": "2026-09-27T10:33:12.6128569+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "src/models/Qwen4ExpBnb4Backend.cpp",
+      "sha256": "9B400C35BB76B35125BC246FB098E9AA8C26B188443B4B76F6DAB8C70CB4C048",
+      "bytes": 103470,
+      "last_write_time": "2026-09-27T00:35:57.0145750+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "src/models/Qwen4ExpPle.cpp",
+      "sha256": "29CE125237AABD34A5ABB9229ADFAB820C4443C4FA0AF723981E1D8F391E7759",
+      "bytes": 21584,
+      "last_write_time": "2026-09-25T15:19:29.3692509+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "src/ops/QsaIndexerOps.cpp",
+      "sha256": "A20F2A97A510846F641ABDFD50BD3E0FE2BA80FF46308C0AD2A73FBC8D70F1DD",
+      "bytes": 40905,
+      "last_write_time": "2026-09-27T00:34:00.0928747+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "src/ops/GatedDeltaNetOps.cpp",
+      "sha256": "F14C0CD6681FE4FBC519A08836485C4CAAFEF7677C9D3E0FAFC0560CA46E0CA7",
+      "bytes": 36353,
+      "last_write_time": "2026-09-23T18:41:51.7937668+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "tests/models/Qwen4ExpModuleTests.cpp",
+      "sha256": "7B6B2F8CB763A650EFEAC7DE0D879B6884A9141B9F3655DA9AF8069BABC0C467",
+      "bytes": 163988,
+      "last_write_time": "2026-09-27T00:43:05.0786100+08:00"
+    },
+    {
+      "role": "aila",
+      "path": "docs/plans/qwen3.8-flash-next-a770-w0-implementation-484b086.md",
+      "sha256": "D76F313CB0D4D71319301F6CD5A1C9B0FCBDE8D3606C952AB300C33A9B7DB910",
+      "bytes": 6072,
+      "last_write_time": "2026-09-27T00:48:15.5567677+08:00"
+    }
+  ]
+}

@@ -18,7 +18,7 @@
 | B6 需求微批双缓冲流水线 | 在 Prefill S4 实现 `compute(group j)` 与 `fill/copy(group j+1)` 重叠的微批双缓冲流水线（`AILA_Q4E_DEMAND_MICROBATCH`），优先执行 GPU 命中专家；移除小 cache fallback 的保守 CPU 等待，由 slot-level `consumer_fence` 精细保护。 | CTest 4/4 组 100% 通过（含 B6 等价性断言 `max_diff = 0`），端到端真机（`story.json` 48 tokens）100% 比特精确对齐。 |
 | W4 / C1 显式 2-Token 权重复用核心算子 | `MoeExpertOps.cpp` 实现 `launch_moe_expert_major_prefill_gate_up_2token` 与 `launch_moe_expert_major_prefill_down_2token`：单个 subgroup 同时服务同一专家的 2 个 token 行，权重与 scale 只加载 1 次、NF4 dequant 只计算 1 次，削减 50% 显存带宽与反量化开销；累加器与归约完全保持原始浮点运算次序与比特精确性。 | 覆盖单批与批量形状；KernelTests Step 5 断言 0 mismatches；A770 实测加速比最高达 1.85x（+85.4%）。 |
 | W4 / C2 专家激活度动态分解与成对微批排布 | `Qwen4ExpBnb4Backend.cpp` 在单批与 B6 microbatch 中将专家激活度 $m_e$ 自动分解为 $\lfloor m_e / 2 \rfloor$ 个 pairs 和 $m_e \% 2$ 个 singles，热专家自然享受 50% 带宽削减，冷专家无额外开销；Pinned host 数组 `expert_pair_pos_host_` 与 `expert_single_pos_host_` 预分配，热路径零堆分配。 | ModuleTests 验证单体与微批下 W4 权重复用输出与 S4 基线达到 **100% 比特精确一致（max_diff = 0.0）**。 |
-| W4 / C3 & N2 PLE 异步反量化与 Non-MoE Prefill XMX 评估 | `Qwen4ExpPle.cpp` 补齐 `key_proj_` 与 `value_proj_` 的 `set_allow_async_dequant(true)`，彻底消除预填充期间 PLE 触发的 2 次 CPU 同步停顿；在 `Qwen4ExpKernelTests.cpp` 中完成代表形状（M=32/64, K=2560, N=2560）XMX Joint Matrix 评估，实现 1.58x~1.88x 加速且 max_abs_diff=0。 | 端到端真机推理 `sync_wait` 归零，输出 48 tokens 保持 100% 比特精确对齐。 |
+| W4 / C3 & N2 PLE 异步反量化与 Non-MoE Prefill XMX 评估 | `Qwen4ExpPle.cpp` 补齐 `key_proj_` 与 `value_proj_` 的 `set_allow_async_dequant(true)` 与 `set_allow_dense_xmx(true)`，彻底消除预填充期间 PLE 触发的 2 次 CPU 同步停顿；在 `Qwen4ExpKernelTests.cpp` 中完成四大代表形状（Standard 2560x2560, Large FFN 2560x16480, Linear Attention 6144x2560, Shared Expert 2560x1280）XMX Joint Matrix 评估，实现 1.11x~1.90x 加速且高精度吻合；`AILA_Q4E_LOG_DISPATCH` 独立解耦支持每次前向增量计数输出。 | 端到端真机推理 `sync_wait` 归零，输出 48 tokens 保持 100% 比特精确对齐；ModuleTests 5 大分布用例（含极端稀疏 0-pair 与不对称 0-act 专家）全部比特精确通过。 |
 
 代码入口：[backend](../../src/models/Qwen4ExpBnb4Backend.cpp)、[MoE 算子](../../src/ops/MoeExpertOps.cpp)、[PLE 模块](../../src/models/Qwen4ExpPle.cpp)、[QSA 算子](../../src/ops/QsaIndexerOps.cpp)、[专家缓存](../../src/models/Qwen4ExpExpertCache.cpp)。测试：[KernelTests](../../tests/ops/Qwen4ExpKernelTests.cpp)、[ModuleTests](../../tests/models/Qwen4ExpModuleTests.cpp)。
 
@@ -28,16 +28,22 @@
 1. `ctest --test-dir build-refactor -R "AilaSafeTensorsTests|AilaQwen4ExpModelSpecTests|AilaQwen4ExpKernelTests|AilaQwen4ExpModuleTests"`：**4/4 通过，100% PASSED**。
 2. 算子基准测试：`.\build-refactor\AilaQwen4ExpKernelTests.exe`：
    - **W4 C1/C2 2-Token 权重复用基准测试**：
-     * Tokens=16, Acts=160 (73 pairs, 14 singles): S4 1.83 ms -> W4 1.21 ms, **1.50x 加速 (+50.4%)**, 0 bit mismatches。
-     * Tokens=64, Acts=640 (320 pairs, 0 singles): S4 6.93 ms -> W4 3.74 ms, **1.85x 加速 (+85.4%)**, 0 bit mismatches。
-   - **W4 C3 Non-MoE Dense Prefill XMX 评测**：
-     * M=32, K=2560, N=2560: oneDNN 0.728 ms -> Dense Fused 0.460 ms (**1.58x 加速**, max_abs_diff=0)。
-     * M=64, K=2560, N=2560: oneDNN 0.763 ms -> Dense XMX 0.405 ms (**1.88x 加速**, max_abs_diff=0)。
-3. 模块对齐测试：`.\build-refactor\AilaQwen4ExpModuleTests.exe`：
-   - Monolithic S4 vs W4 2-Token Reuse: `max_diff = 0.0`。
-   - Microbatched S4 vs W4 2-Token Reuse: `max_diff = 0.0`。
+     * Tokens=16, Acts=160 (73 pairs, 14 singles): S4 1.83 ms -> W4 1.23 ms, **1.49x 加速 (+48.8%)**, 0 bit mismatches。
+     * Tokens=64, Acts=640 (320 pairs, 0 singles): S4 6.99 ms -> W4 3.73 ms, **1.87x 加速 (+87.0%)**, 0 bit mismatches。
+   - **W4 C3 Non-MoE Dense Prefill XMX 四大代表形状评测**：
+     * Standard Projection (K=2560, N=2560): M=32 oneDNN 0.723ms -> XMX 0.476ms (**1.52x**, max_diff=0); M=64 oneDNN 0.735ms -> XMX 0.433ms (**1.70x**, max_diff=0)。
+     * Large FFN Gate/Up Projection (K=2560, N=16480): M=32 oneDNN 2.138ms -> XMX 1.128ms (**1.90x**, max_diff=0); M=64 oneDNN 2.023ms -> XMX 1.471ms (**1.38x**, max_diff=0)。
+     * Linear Attention Projection (K=6144, N=2560): M=32 oneDNN 1.428ms -> XMX 0.950ms (**1.50x**, max_diff=0.0156); M=64 oneDNN 1.444ms -> XMX 0.820ms (**1.76x**, max_diff=0)。
+     * Shared Expert Projection (K=2560, N=1280): M=32 oneDNN 0.479ms -> XMX 0.433ms (**1.11x**, max_diff=0.0078); M=64 oneDNN 0.499ms -> XMX 0.394ms (**1.27x**, max_diff=0.0039)。
+3. 模块对齐与边界测试：`.\build-refactor\AilaQwen4ExpModuleTests.exe`：
+   - Scenario 1 (Mixed 5,4,3,6 counts -> 8 pairs, 2 singles): Monolithic & Microbatch `max_diff = 0.0`。
+   - Scenario 2 (Pure sparse single 1,1,1,1 counts -> 0 pairs, 4 singles): Monolithic & Microbatch `max_diff = 0.0`。
+   - Scenario 3 (All odd 3,3,3,3 counts -> 4 pairs, 4 singles): Monolithic & Microbatch `max_diff = 0.0`。
+   - Scenario 4 (Pure even 4,4,2,2 counts -> 6 pairs, 0 singles): Monolithic & Microbatch `max_diff = 0.0`。
+   - Scenario 5 (Asymmetric with 0-count expert 0,2,3,1 counts -> 2 pairs, 2 singles): Monolithic & Microbatch `max_diff = 0.0`。
 4. 端到端真机推理：`.\build-refactor\Aila.exe -m C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 --max-seq 512 --greedy --thinking-budget 0 --max-tokens 48 --messages-json perf/qwen4exp/prompts/story.json`：
-   - 输出：`The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
+   - S4+W4 预填充派发增量：`[Q4E Prefill] dispatch delta: fused_gemm=+0, on_demand_dequant=+194, sync_wait=+0`，同步等待完全消除为 0。
+   - 真实模型 48 tokens 生成：`The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
    - **48 tokens 100% 比特精确对齐，无任何回归**。
 5. `git diff --check`：无空白符错误。
 6. 编译构建达到**零错误、零警告**。

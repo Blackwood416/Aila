@@ -3914,49 +3914,32 @@ void test_b6_demand_microbatch_pipeline(Context& ctx) {
     std::cout << "[PASS] B6 demand microbatch double-buffered pipeline tests passed.\n";
 }
 
-void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
-    std::cout << "[Test] Running W4 C1/C2 prefill weight reuse backend alignment test...\n";
-
-    TestCacheHarness harness;
-    Qwen4ExpExpertCache cache;
-    harness.setup_cache(cache, ctx, 8, 16);
-
-    constexpr int tokens = 6;
-    constexpr int top_k = 3;
-    constexpr int total_acts = tokens * top_k; // 18 activations
+void run_prefill_weight_reuse_alignment_scenario(
+    Context& ctx,
+    Qwen4ExpExpertCache& cache,
+    const int* slots,
+    int tokens,
+    int top_k,
+    const std::vector<int>& router_ids,
+    const std::string& desc) {
+    const int total_acts = tokens * top_k;
     constexpr int hidden_size = 256;
     constexpr int intermediate_size = 64;
     constexpr int blocksize = 64;
 
-    // Acquire 4 experts {0, 1, 2, 3}
-    int exp_ids[4] = {0, 1, 2, 3};
-    int slots[4] = {-1, -1, -1, -1};
-    cache.acquire(0, exp_ids, 4, slots).wait();
+    std::vector<float> router_weights(total_acts);
+    for (int t = 0; t < tokens; ++t) {
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            float w = 0.2f + 0.1f * ((t + k) % 5);
+            router_weights[t * top_k + k] = w;
+            sum += w;
+        }
+        for (int k = 0; k < top_k; ++k) {
+            router_weights[t * top_k + k] /= sum;
+        }
+    }
 
-    // 18 routing decisions with uneven counts:
-    // Expert 0: 5 acts (2 pairs, 1 single)
-    // Expert 1: 4 acts (2 pairs, 0 singles)
-    // Expert 2: 3 acts (1 pair, 1 single)
-    // Expert 3: 6 acts (3 pairs, 0 singles)
-    // Total acts: 18 (8 pairs = 16 acts, 2 singles)
-    int router_ids[total_acts] = {
-        0, 1, 3,  // t=0
-        2, 0, 3,  // t=1
-        1, 2, 3,  // t=2
-        0, 1, 0,  // t=3
-        3, 0, 1,  // t=4
-        2, 3, 3   // t=5
-    };
-    float router_weights[total_acts] = {
-        0.5f, 0.3f, 0.2f,
-        0.4f, 0.4f, 0.2f,
-        0.6f, 0.2f, 0.2f,
-        0.5f, 0.3f, 0.2f,
-        0.4f, 0.3f, 0.3f,
-        0.5f, 0.3f, 0.2f
-    };
-
-    // Inputs
     std::vector<bf16> x_host(tokens * hidden_size);
     for (size_t i = 0; i < x_host.size(); ++i) {
         x_host[i] = bf16(0.01f * static_cast<float>((static_cast<int>(i) % 37) - 18));
@@ -3965,9 +3948,8 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
     ctx.memcpy_h2d(x_dev, x_host.data(), x_host.size() * sizeof(bf16));
 
     float* weights_dev = static_cast<float*>(ctx.alloc_device(total_acts * sizeof(float)));
-    ctx.memcpy_h2d(weights_dev, router_weights, total_acts * sizeof(float));
+    ctx.memcpy_h2d(weights_dev, router_weights.data(), total_acts * sizeof(float));
 
-    // Shared out / gate for fusion test
     std::vector<bf16> shared_host(tokens * hidden_size, bf16(0.05f));
     std::vector<bf16> gate_host(tokens, bf16(0.1f));
     bf16* shared_dev = static_cast<bf16*>(ctx.alloc_device(shared_host.size() * sizeof(bf16)));
@@ -4067,8 +4049,6 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
         ctx, dn_acc_w4, weights_dev, y_w4, tokens, top_k, hidden_size, shared_dev, gate_dev, &dn_w4).wait();
 
     // 3. Path C: W4 C1/C2 Microbatched (chunk_size = 2 experts per microbatch)
-    // Chunk 0: experts {0, 1}
-    // Chunk 1: experts {2, 3}
     int c0_pairs = counts[0] / 2 + counts[1] / 2;
     int c0_acts = counts[0] + counts[1];
     int c1_pairs = counts[2] / 2 + counts[3] / 2;
@@ -4114,24 +4094,29 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
     float* dn_acc_mb = static_cast<float*>(ctx.alloc_device(total_acts * hidden_size * sizeof(float)));
     bf16* y_mb = static_cast<bf16*>(ctx.alloc_device(tokens * hidden_size * sizeof(bf16)));
 
-    // Microbatch chunk 0
-    sycl::event gu_mb0 = ops::moe_expert_major_prefill_gate_up(
-        ctx, slot_mb_dev, tok_mb_dev, rnk_mb_dev, nullptr, x_dev, h_mb,
-        c0_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c0_pairs);
-    sycl::event dn_mb0 = ops::moe_expert_major_prefill_down(
-        ctx, slot_mb_dev, tok_mb_dev, rnk_mb_dev, nullptr, h_mb, dn_acc_mb,
-        c0_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb0, cache.uses_nested_codes(), c0_pairs);
+    sycl::event last_mb_dn{};
+    if (c0_acts > 0) {
+        sycl::event gu_mb0 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_mb_dev, tok_mb_dev, rnk_mb_dev, nullptr, x_dev, h_mb,
+            c0_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c0_pairs);
+        sycl::event dn_mb0 = ops::moe_expert_major_prefill_down(
+            ctx, slot_mb_dev, tok_mb_dev, rnk_mb_dev, nullptr, h_mb, dn_acc_mb,
+            c0_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb0, cache.uses_nested_codes(), c0_pairs);
+        last_mb_dn = dn_mb0;
+    }
 
-    // Microbatch chunk 1
-    sycl::event gu_mb1 = ops::moe_expert_major_prefill_gate_up(
-        ctx, slot_mb_dev + c0_acts, tok_mb_dev + c0_acts, rnk_mb_dev + c0_acts, nullptr, x_dev, h_mb,
-        c1_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c1_pairs);
-    sycl::event dn_mb1 = ops::moe_expert_major_prefill_down(
-        ctx, slot_mb_dev + c0_acts, tok_mb_dev + c0_acts, rnk_mb_dev + c0_acts, nullptr, h_mb, dn_acc_mb,
-        c1_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb1, cache.uses_nested_codes(), c1_pairs);
+    if (c1_acts > 0) {
+        sycl::event gu_mb1 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_mb_dev + c0_acts, tok_mb_dev + c0_acts, rnk_mb_dev + c0_acts, nullptr, x_dev, h_mb,
+            c1_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c1_pairs);
+        sycl::event dn_mb1 = ops::moe_expert_major_prefill_down(
+            ctx, slot_mb_dev + c0_acts, tok_mb_dev + c0_acts, rnk_mb_dev + c0_acts, nullptr, h_mb, dn_acc_mb,
+            c1_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb1, cache.uses_nested_codes(), c1_pairs);
+        last_mb_dn = dn_mb1;
+    }
 
     ops::moe_ordered_accumulate_down_rows(
-        ctx, dn_acc_mb, weights_dev, y_mb, tokens, top_k, hidden_size, shared_dev, gate_dev, &dn_mb1).wait();
+        ctx, dn_acc_mb, weights_dev, y_mb, tokens, top_k, hidden_size, shared_dev, gate_dev, &last_mb_dn).wait();
 
     // Verify bit-exact matches
     std::vector<bf16> y_s4_h(tokens * hidden_size);
@@ -4150,11 +4135,12 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
         if (d_mb > max_diff_mb) max_diff_mb = d_mb;
     }
 
-    expect(max_diff_mono == 0.0f, "Monolithic W4 2-token weight reuse must match S4 baseline bit-exact");
-    expect(max_diff_mb == 0.0f, "Microbatched W4 2-token weight reuse must match S4 baseline bit-exact");
+    expect(max_diff_mono == 0.0f, "Monolithic W4 2-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
+    expect(max_diff_mb == 0.0f, "Microbatched W4 2-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
 
-    std::cout << "[PASS] W4 C1/C2 prefill weight reuse backend alignment verified (monolithic max_diff="
-              << max_diff_mono << ", microbatched max_diff=" << max_diff_mb << ").\n";
+    std::cout << "  [PASS] Scenario: " << desc << " (tokens=" << tokens << ", acts=" << total_acts
+              << ", pairs=" << total_pairs << ", max_diff_mono=" << max_diff_mono
+              << ", max_diff_mb=" << max_diff_mb << ")\n";
 
     ctx.free_device(x_dev);
     ctx.free_device(weights_dev);
@@ -4178,6 +4164,53 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
     ctx.free_device(h_mb);
     ctx.free_device(dn_acc_mb);
     ctx.free_device(y_mb);
+}
+
+void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
+    std::cout << "\n======================================================================\n";
+    std::cout << "  [Test] Running W4 C1/C2 prefill weight reuse backend alignment tests\n";
+    std::cout << "======================================================================\n";
+
+    TestCacheHarness harness;
+    Qwen4ExpExpertCache cache;
+    harness.setup_cache(cache, ctx, 8, 16);
+
+    // Acquire 4 experts {0, 1, 2, 3}
+    int exp_ids[4] = {0, 1, 2, 3};
+    int slots[4] = {-1, -1, -1, -1};
+    cache.acquire(0, exp_ids, 4, slots).wait();
+
+    // Scenario 1: Mixed pairs and singles (tokens=6, top_k=3, 18 acts: counts={5, 4, 3, 6})
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 6, 3,
+        {0, 1, 3,  2, 0, 3,  1, 2, 3,  0, 1, 0,  3, 0, 1,  2, 3, 3},
+        "Mixed distribution (5, 4, 3, 6 acts -> 8 pairs, 2 singles)");
+
+    // Scenario 2: Pure sparse distribution (tokens=2, top_k=2, 4 acts: counts={1, 1, 1, 1}, 0 pairs)
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 2, 2,
+        {0, 1,  2, 3},
+        "Pure sparse single activations (1, 1, 1, 1 acts -> 0 pairs, 4 singles)");
+
+    // Scenario 3: All odd activations (tokens=4, top_k=3, 12 acts: counts={3, 3, 3, 3})
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 4, 3,
+        {0, 1, 2,  0, 1, 3,  0, 2, 3,  1, 2, 3},
+        "All odd activation counts (3, 3, 3, 3 acts -> 4 pairs, 4 singles)");
+
+    // Scenario 4: Pure even activations (tokens=4, top_k=3, 12 acts: counts={4, 4, 2, 2}, 0 singles)
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 4, 3,
+        {0, 1, 2,  0, 1, 3,  0, 1, 2,  0, 1, 3},
+        "Pure even activation counts (4, 4, 2, 2 acts -> 6 pairs, 0 singles)");
+
+    // Scenario 5: Asymmetric with zero-count expert in microbatch chunk (tokens=3, top_k=2, 6 acts: counts={0, 2, 3, 1})
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 3, 2,
+        {1, 2,  2, 3,  1, 2},
+        "Asymmetric distribution with 0-count expert (0, 2, 3, 1 acts -> 2 pairs, 2 singles)");
+
+    std::cout << "[PASS] All W4 prefill weight reuse scenarios verified with bit-exact match.\n\n";
 }
 
 } // namespace
