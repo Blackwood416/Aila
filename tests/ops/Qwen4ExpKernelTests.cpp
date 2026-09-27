@@ -2337,6 +2337,343 @@ static void test_qsa_compressed_k_scoring(Context& ctx) {
     }
 }
 
+static void test_qsa_select_topk_blocks(Context& ctx) {
+    std::cout << "[Test] Running QSA Select Top-K Blocks (A3) tests...\n";
+    constexpr int compress_ratio = 4;
+    constexpr int block_topk = 512;
+
+    // 1. Dense phase (num_complete_blocks <= block_topk)
+    {
+        constexpr int num_complete = 10;
+        constexpr int cached_len = 42; // 10 blocks + 2 tail tokens
+        std::vector<float> scores(num_complete, 0.5f);
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete}, dnnl::memory::data_type::f32);
+        Tensor active_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores.data(), num_complete * sizeof(float));
+
+        int gpu_blocks = ops::qsa_select_topk_blocks(
+            ctx, scores_dev, num_complete, block_topk, cached_len, compress_ratio, active_dev);
+        ctx.synchronize();
+
+        std::vector<int> ref_out(block_topk + 4, -1);
+        int ref_blocks = ops::qsa_select_topk_blocks_host(
+            scores.data(), num_complete, block_topk, cached_len, compress_ratio, ref_out.data());
+
+        if (gpu_blocks != ref_blocks || gpu_blocks != num_complete) {
+            throw std::runtime_error("test_qsa_select_topk_blocks: dense phase block count mismatch");
+        }
+        std::vector<int> gpu_out(block_topk + 4);
+        ctx.memcpy_d2h(gpu_out.data(), active_dev.data(), (num_complete + 2) * sizeof(int));
+        for (int i = 0; i < num_complete + 2; ++i) {
+            if (gpu_out[i] != ref_out[i]) {
+                throw std::runtime_error("test_qsa_select_topk_blocks: dense phase index mismatch at " + std::to_string(i));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k blocks dense phase (num_complete=10, 2 tail tokens) verified.\n";
+    }
+
+    // 2. Sparse phase (num_complete_blocks = 600 > 512, cached_len = 2403)
+    {
+        constexpr int num_complete = 600;
+        constexpr int cached_len = 2403; // 600 blocks + 3 tail tokens
+        std::mt19937 rng(777);
+        std::uniform_real_distribution<float> dist(0.01f, 10.0f);
+        std::vector<float> scores(num_complete);
+        for (auto& s : scores) s = dist(rng);
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete}, dnnl::memory::data_type::f32);
+        Tensor active_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores.data(), num_complete * sizeof(float));
+
+        int gpu_blocks = ops::qsa_select_topk_blocks(
+            ctx, scores_dev, num_complete, block_topk, cached_len, compress_ratio, active_dev);
+        ctx.synchronize();
+
+        std::vector<int> ref_out(block_topk + 4, -1);
+        int ref_blocks = ops::qsa_select_topk_blocks_host(
+            scores.data(), num_complete, block_topk, cached_len, compress_ratio, ref_out.data());
+
+        if (gpu_blocks != block_topk || ref_blocks != block_topk) {
+            throw std::runtime_error("test_qsa_select_topk_blocks: sparse phase block count mismatch");
+        }
+        std::vector<int> gpu_out(block_topk + 4);
+        ctx.memcpy_d2h(gpu_out.data(), active_dev.data(), (block_topk + 3) * sizeof(int));
+        for (int i = 0; i < block_topk + 3; ++i) {
+            if (gpu_out[i] != ref_out[i]) {
+                throw std::runtime_error("test_qsa_select_topk_blocks: sparse phase mismatch at " + std::to_string(i) +
+                                         " gpu=" + std::to_string(gpu_out[i]) + " ref=" + std::to_string(ref_out[i]));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k blocks sparse phase (600 blocks -> 512 + 3 tail) verified.\n";
+    }
+
+    // 3. Ties and exact cutoff
+    {
+        constexpr int num_complete = 520;
+        constexpr int cached_len = 520 * compress_ratio;
+        std::vector<float> scores(num_complete, 1.0f);
+        scores[10] = 5.0f;
+        scores[20] = 0.5f;
+
+        Tensor scores_dev = Tensor::allocate(ctx, {num_complete}, dnnl::memory::data_type::f32);
+        Tensor active_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(scores_dev.data(), scores.data(), num_complete * sizeof(float));
+
+        int gpu_blocks = ops::qsa_select_topk_blocks(
+            ctx, scores_dev, num_complete, block_topk, cached_len, compress_ratio, active_dev);
+        ctx.synchronize();
+
+        std::vector<int> ref_out(block_topk + 4, -1);
+        int ref_blocks = ops::qsa_select_topk_blocks_host(
+            scores.data(), num_complete, block_topk, cached_len, compress_ratio, ref_out.data());
+
+        if (gpu_blocks != block_topk || ref_blocks != block_topk) {
+            throw std::runtime_error("test_qsa_select_topk_blocks: ties test block count mismatch");
+        }
+        std::vector<int> gpu_out(block_topk + 4);
+        ctx.memcpy_d2h(gpu_out.data(), active_dev.data(), block_topk * sizeof(int));
+        for (int i = 0; i < block_topk; ++i) {
+            if (gpu_out[i] != ref_out[i]) {
+                throw std::runtime_error("test_qsa_select_topk_blocks: ties mismatch at " + std::to_string(i));
+            }
+        }
+        std::cout << "[PASS] QSA select top-k blocks ties & boundary verified.\n";
+    }
+
+    // 4. Edge cases
+    {
+        Tensor dummy_scores = Tensor::allocate(ctx, {10}, dnnl::memory::data_type::f32);
+        Tensor dummy_blocks = Tensor::allocate(ctx, {10}, dnnl::memory::data_type::s32);
+        int z1 = ops::qsa_select_topk_blocks(ctx, dummy_scores, 10, 5, 0, 4, dummy_blocks);
+        int z2 = ops::qsa_select_topk_blocks(ctx, dummy_scores, 10, -1, 16, 4, dummy_blocks);
+        if (z1 != 0 || z2 != 0) {
+            throw std::runtime_error("test_qsa_select_topk_blocks: edge case guard failed");
+        }
+        std::cout << "[PASS] QSA select top-k blocks edge case guards verified.\n";
+    }
+}
+
+static void test_qsa_prepare_q_batched(Context& ctx) {
+    std::cout << "[Test] Running QSA Batched Query Preparation (A4) tests...\n";
+    constexpr int count = 8;
+    constexpr int start_pos = 100;
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int kOutDim = 640;
+    constexpr float theta = 1000000.0f;
+
+    std::mt19937 rng(888);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> indexer_qk_h(count * kOutDim);
+    std::vector<bf16> qn_w_h(kHeadDim);
+    for (auto& v : indexer_qk_h) v = bf16(dist(rng));
+    for (auto& v : qn_w_h) v = bf16(1.0f + 0.1f * dist(rng));
+
+    Tensor qk_dev = Tensor::allocate(ctx, {count, kOutDim}, dnnl::memory::data_type::bf16);
+    Tensor qn_dev = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor q_dev = Tensor::allocate(ctx, {count, kNumHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(qk_dev.data(), indexer_qk_h.data(), indexer_qk_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(qn_dev.data(), qn_w_h.data(), qn_w_h.size() * sizeof(bf16));
+
+    ops::qsa_prepare_q_batched(ctx, qk_dev, qn_dev, q_dev, start_pos, count, theta);
+    ctx.synchronize();
+
+    std::vector<bf16> ref_out(count * kNumHeads * kHeadDim);
+    ops::qsa_prepare_q_batched_host(indexer_qk_h.data(), qn_w_h.data(), ref_out.data(), start_pos, count, theta);
+
+    std::vector<bf16> gpu_out(count * kNumHeads * kHeadDim);
+    ctx.memcpy_d2h(gpu_out.data(), q_dev.data(), gpu_out.size() * sizeof(bf16));
+
+    std::vector<float> ref_f32(ref_out.size());
+    for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
+
+    check_close(gpu_out, ref_f32, "qsa_prepare_q_batched GPU vs Host", 2e-2f);
+}
+
+static void test_qsa_batched_scoring_and_selection(Context& ctx) {
+    std::cout << "[Test] Running QSA Batched Scoring & Selection (A4) tests...\n";
+    constexpr int query_count = 16;
+    constexpr int max_complete_blocks = 550;
+    constexpr int start_pos = 2040;
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int kHeadDim = 128;
+    constexpr int kNumHeads = 4;
+
+    std::mt19937 rng(999);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<bf16> q_h(query_count * kNumHeads * kHeadDim);
+    std::vector<bf16> comp_k_h(max_complete_blocks * kHeadDim);
+    for (auto& v : q_h) v = bf16(dist(rng));
+    for (auto& v : comp_k_h) v = bf16(dist(rng));
+
+    Tensor q_dev = Tensor::allocate(ctx, {query_count, kNumHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor comp_k_dev = Tensor::allocate(ctx, {max_complete_blocks, kHeadDim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(ctx, {query_count, max_complete_blocks}, dnnl::memory::data_type::f32);
+    Tensor active_dev = Tensor::allocate(ctx, {query_count, block_topk + 4}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(comp_k_dev.data(), comp_k_h.data(), comp_k_h.size() * sizeof(bf16));
+
+    // 1. Batched scoring
+    ops::qsa_compute_block_scores_compressed_batched(
+        ctx, q_dev, comp_k_dev, scores_dev, query_count, max_complete_blocks, compress_ratio, start_pos);
+    ctx.synchronize();
+
+    std::vector<float> ref_scores(query_count * max_complete_blocks);
+    ops::qsa_compute_block_scores_compressed_batched_host(
+        q_h.data(), comp_k_h.data(), ref_scores.data(), query_count, max_complete_blocks, compress_ratio, start_pos);
+
+    std::vector<float> gpu_scores(query_count * max_complete_blocks);
+    ctx.memcpy_d2h(gpu_scores.data(), scores_dev.data(), gpu_scores.size() * sizeof(float));
+
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < gpu_scores.size(); ++i) {
+        if (ref_scores[i] < -1e20f && gpu_scores[i] < -1e20f) continue;
+        float diff = std::abs(gpu_scores[i] - ref_scores[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    if (max_diff > 1e-3f) {
+        throw std::runtime_error("test_qsa_batched_scoring_and_selection: scores mismatch, max_diff=" + std::to_string(max_diff));
+    }
+    std::cout << "[PASS] QSA batched scoring matches host reference (max_diff=" << max_diff << " < 1e-3)\n";
+
+    // 2. Batched selection
+    ops::qsa_select_topk_blocks_batched(
+        ctx, scores_dev, active_dev, query_count, max_complete_blocks, start_pos, block_topk, compress_ratio);
+    ctx.synchronize();
+
+    std::vector<int> ref_active(query_count * (block_topk + 4));
+    ops::qsa_select_topk_blocks_batched_host(
+        ref_scores.data(), ref_active.data(), query_count, max_complete_blocks, start_pos, block_topk, compress_ratio);
+
+    std::vector<int> gpu_active(query_count * (block_topk + 4));
+    ctx.memcpy_d2h(gpu_active.data(), active_dev.data(), gpu_active.size() * sizeof(int));
+
+    for (int q = 0; q < query_count; ++q) {
+        const int pos = start_pos + q;
+        const int visible_len = pos + 1;
+        const int num_complete = visible_len / compress_ratio;
+        const int is_sparse = (num_complete > block_topk);
+        const int active_n = is_sparse ? block_topk : num_complete;
+        const int tail_len = visible_len - num_complete * compress_ratio;
+        const size_t row_stride = block_topk + 4;
+
+        for (int i = 0; i < active_n + tail_len; ++i) {
+            int g_val = gpu_active[static_cast<size_t>(q) * row_stride + i];
+            int r_val = ref_active[static_cast<size_t>(q) * row_stride + i];
+            if (g_val != r_val) {
+                throw std::runtime_error("test_qsa_batched_scoring_and_selection: mismatch at query=" +
+                                         std::to_string(q) + " idx=" + std::to_string(i) +
+                                         " gpu=" + std::to_string(g_val) + " ref=" + std::to_string(r_val));
+            }
+        }
+    }
+    std::cout << "[PASS] QSA batched selection matches host reference for all queries across threshold.\n";
+}
+
+static void test_attention_prefill_qsa_batched(Context& ctx) {
+    std::cout << "[Test] Running Batched QSA Prefill Attention (A4) tests...\n";
+    constexpr int count = 8;
+    constexpr int start_pos = 2050;
+    constexpr int capacity = 2200;
+    constexpr int num_heads = 24;
+    constexpr int num_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+
+    std::vector<bf16> q_h(count * num_heads * head_dim);
+    std::vector<bf16> k_cache_h(num_kv_heads * capacity * head_dim);
+    std::vector<bf16> v_cache_h(num_kv_heads * capacity * head_dim);
+    std::vector<int> active_blocks_h(count * (block_topk + 4));
+    std::vector<bf16> gate_h(count * num_heads * head_dim);
+
+    for (auto& v : q_h) v = bf16(dist(rng));
+    for (auto& v : k_cache_h) v = bf16(dist(rng));
+    for (auto& v : v_cache_h) v = bf16(dist(rng));
+    for (auto& v : gate_h) v = bf16(dist(rng));
+
+    // Setup active_blocks: 512 random blocks in [0, 512] for each query + tail
+    for (int q = 0; q < count; ++q) {
+        const int pos = start_pos + q;
+        const int visible_len = pos + 1;
+        const int num_complete = visible_len / compress_ratio;
+        const int tail_start = num_complete * compress_ratio;
+        const int tail_len = visible_len - tail_start;
+        const size_t stride = block_topk + 4;
+
+        std::vector<int> blocks(num_complete);
+        for (int b = 0; b < num_complete; ++b) blocks[b] = b;
+        std::shuffle(blocks.begin(), blocks.end(), rng);
+        std::sort(blocks.begin(), blocks.begin() + std::min(block_topk, num_complete));
+
+        for (int b = 0; b < std::min(block_topk, num_complete); ++b) {
+            active_blocks_h[static_cast<size_t>(q) * stride + b] = blocks[b];
+        }
+        for (int t = 0; t < tail_len; ++t) {
+            active_blocks_h[static_cast<size_t>(q) * stride + std::min(block_topk, num_complete) + t] = tail_start + t;
+        }
+    }
+
+    Tensor q_dev = Tensor::allocate(ctx, {count, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor active_dev = Tensor::allocate(ctx, {count, block_topk + 4}, dnnl::memory::data_type::s32);
+    Tensor out_dev = Tensor::allocate(ctx, {count, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor gate_dev = Tensor::allocate(ctx, {count, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k_cache_h.data(), k_cache_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), v_cache_h.data(), v_cache_h.size() * sizeof(bf16));
+    ctx.memcpy_h2d(active_dev.data(), active_blocks_h.data(), active_blocks_h.size() * sizeof(int));
+    ctx.memcpy_h2d(gate_dev.data(), gate_h.data(), gate_h.size() * sizeof(bf16));
+
+    // Test 1: Without gate
+    ops::attention_prefill_qsa_batched(
+        ctx, q_dev, k_dev, v_dev, active_dev, out_dev,
+        count, start_pos, num_heads, num_kv_heads, head_dim,
+        block_topk, compress_ratio, nullptr);
+    ctx.synchronize();
+
+    std::vector<bf16> ref_out(count * num_heads * head_dim);
+    ops::attention_prefill_qsa_batched_host(
+        q_h.data(), k_cache_h.data(), v_cache_h.data(), active_blocks_h.data(), ref_out.data(),
+        count, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+        block_topk, compress_ratio, nullptr);
+
+    std::vector<bf16> gpu_out(count * num_heads * head_dim);
+    ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), gpu_out.size() * sizeof(bf16));
+
+    std::vector<float> ref_f32(ref_out.size());
+    for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
+
+    check_close(gpu_out, ref_f32, "attention_prefill_qsa_batched (no gate)", 2e-2f);
+
+    // Test 2: With gate
+    ops::attention_prefill_qsa_batched(
+        ctx, q_dev, k_dev, v_dev, active_dev, out_dev,
+        count, start_pos, num_heads, num_kv_heads, head_dim,
+        block_topk, compress_ratio, &gate_dev);
+    ctx.synchronize();
+
+    ops::attention_prefill_qsa_batched_host(
+        q_h.data(), k_cache_h.data(), v_cache_h.data(), active_blocks_h.data(), ref_out.data(),
+        count, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+        block_topk, compress_ratio, gate_h.data());
+
+    ctx.memcpy_d2h(gpu_out.data(), out_dev.data(), gpu_out.size() * sizeof(bf16));
+    for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
+
+    check_close(gpu_out, ref_f32, "attention_prefill_qsa_batched (with gate)", 2e-2f);
+}
+
 } // namespace
 
 int main() {
@@ -2370,6 +2707,10 @@ int main() {
         test_qsa_select_topk_and_expand_tokens(ctx);
         test_attention_decode_with_qsa_indices(ctx);
         test_qsa_compressed_k_scoring(ctx);
+        test_qsa_select_topk_blocks(ctx);
+        test_qsa_prepare_q_batched(ctx);
+        test_qsa_batched_scoring_and_selection(ctx);
+        test_attention_prefill_qsa_batched(ctx);
 
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;

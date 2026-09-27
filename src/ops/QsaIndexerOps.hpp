@@ -247,4 +247,151 @@ int qsa_prepare_causal_query_and_select_tokens_host(
     bf16* compressed_k = nullptr,
     int* num_compressed_blocks = nullptr);
 
+// Phase A3: Block-native active block selection (device).
+// Writes selected block IDs (ascending) followed by trailing token IDs to active_blocks_out.
+// Returns the number of active blocks selected (<= block_topk).
+int qsa_select_topk_blocks(
+    Context& ctx,
+    const Tensor& scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    Tensor& active_blocks_out);
+
+int qsa_select_topk_blocks_host(
+    const float* scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    int* active_blocks_out);
+
+int qsa_prepare_causal_query_and_select_blocks(
+    Context& ctx,
+    const Tensor& indexer_qk_row,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out_row,
+    Tensor& scores_out,
+    Tensor& active_blocks_out,
+    int pos,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0,
+    Tensor* compressed_k = nullptr,
+    int* num_compressed_blocks = nullptr);
+
+int qsa_prepare_causal_query_and_select_blocks_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    float* scores_out,
+    int* active_blocks_out,
+    int pos,
+    int capacity,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0,
+    bf16* compressed_k = nullptr,
+    int* num_compressed_blocks = nullptr);
+
+// Phase A4: Batched QSA Query Preparation
+void qsa_prepare_q_batched(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& q_out,
+    int start_pos,
+    int count,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+void qsa_prepare_q_batched_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    bf16* q_out,
+    int start_pos,
+    int count,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
+// Phase A4: Batched Scoring of complete blocks using compressed K
+void qsa_compute_block_scores_compressed_batched(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    int query_count,
+    int max_complete_blocks,
+    int compress_ratio,
+    int start_pos);
+
+void qsa_compute_block_scores_compressed_batched_host(
+    const bf16* q,
+    const bf16* compressed_k,
+    float* scores_out,
+    int query_count,
+    int max_complete_blocks,
+    int compress_ratio,
+    int start_pos);
+
+// Phase A4: Batched Radix Top-K block selection
+void qsa_select_topk_blocks_batched(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    int query_count,
+    int max_complete_blocks,
+    int start_pos,
+    int block_topk,
+    int compress_ratio);
+
+void qsa_select_topk_blocks_batched_host(
+    const float* scores,
+    int* active_blocks_out,
+    int query_count,
+    int max_complete_blocks,
+    int start_pos,
+    int block_topk,
+    int compress_ratio);
+
 } // namespace ops
+

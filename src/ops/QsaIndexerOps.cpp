@@ -983,4 +983,658 @@ int qsa_prepare_causal_query_and_select_tokens_host(
         scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_tokens_out);
 }
 
+int qsa_select_topk_blocks(
+    Context& ctx,
+    const Tensor& scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    Tensor& active_blocks_out) {
+    if (cached_len <= 0 || block_topk <= 0) return 0;
+    const int tail_start = num_complete_blocks * compress_ratio;
+    const int tail_len = std::max(0, cached_len - tail_start);
+
+    if (num_complete_blocks <= block_topk) {
+        int* out_ptr = active_blocks_out.data_as<int>();
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::range<1>(std::max(1, num_complete_blocks + tail_len)),
+                [=](sycl::id<1> idx) {
+                    const int i = static_cast<int>(idx[0]);
+                    if (i < num_complete_blocks) {
+                        out_ptr[i] = i;
+                    } else if (i < num_complete_blocks + tail_len) {
+                        out_ptr[i] = tail_start + (i - num_complete_blocks);
+                    }
+                });
+        });
+        return num_complete_blocks;
+    }
+
+    const float* scores_ptr = scores.data_as<float>();
+    int* out_ptr = active_blocks_out.data_as<int>();
+    constexpr int kWgSize = 256;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
+        sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
+        sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int lid = item.get_local_id(0);
+
+                if (lid == 0) {
+                    cutoff_key[0] = 0U;
+                    remaining_rank[0] = block_topk;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                std::uint32_t prefix_mask = 0U;
+                for (int bit = 31; bit >= 0; --bit) {
+                    const std::uint32_t bit_mask = std::uint32_t{1} << bit;
+                    const std::uint32_t prefix = cutoff_key[0];
+                    int count_one = 0;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if ((key & prefix_mask) == prefix && (key & bit_mask) != 0U) {
+                            ++count_one;
+                        }
+                    }
+                    local_cnt_one[lid] = count_one;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) {
+                        if (local_cnt_one[0] >= remaining_rank[0]) {
+                            cutoff_key[0] |= bit_mask;
+                        } else {
+                            remaining_rank[0] -= local_cnt_one[0];
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    prefix_mask |= bit_mask;
+                }
+
+                if (lid == 0) {
+                    const std::uint32_t threshold = cutoff_key[0];
+                    int above_count = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        if (qsa_score_order_key(scores_ptr[b]) > threshold) ++above_count;
+                    }
+                    int ties_needed = block_topk - above_count;
+                    int added = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (key > threshold || (key == threshold && ties_needed > 0)) {
+                            selected_blocks[added++] = b;
+                            if (key == threshold) --ties_needed;
+                        }
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                    out_ptr[idx] = selected_blocks[idx];
+                }
+
+                if (lid < tail_len) {
+                    out_ptr[block_topk + lid] = tail_start + lid;
+                }
+            });
+    });
+
+    return block_topk;
+}
+
+int qsa_select_topk_blocks_host(
+    const float* scores,
+    int num_complete_blocks,
+    int block_topk,
+    int cached_len,
+    int compress_ratio,
+    int* active_blocks_out) {
+    if (cached_len <= 0 || block_topk <= 0) return 0;
+    const int tail_start = num_complete_blocks * compress_ratio;
+    const int tail_len = std::max(0, cached_len - tail_start);
+
+    if (num_complete_blocks <= block_topk) {
+        for (int b = 0; b < num_complete_blocks; ++b) {
+            active_blocks_out[b] = b;
+        }
+        for (int t = 0; t < tail_len; ++t) {
+            active_blocks_out[num_complete_blocks + t] = tail_start + t;
+        }
+        return num_complete_blocks;
+    }
+
+    struct Candidate {
+        std::uint32_t key;
+        int id;
+    };
+    std::vector<Candidate> cands(num_complete_blocks);
+    for (int b = 0; b < num_complete_blocks; ++b) {
+        cands[b] = {qsa_score_order_key(scores[b]), b};
+    }
+    std::nth_element(
+        cands.begin(), cands.begin() + block_topk, cands.end(),
+        [](const Candidate& a, const Candidate& b) {
+            if (a.key != b.key) return a.key > b.key;
+            return a.id < b.id;
+        });
+    std::vector<int> selected(block_topk);
+    for (int i = 0; i < block_topk; ++i) {
+        selected[i] = cands[i].id;
+    }
+    std::sort(selected.begin(), selected.end());
+
+    for (int i = 0; i < block_topk; ++i) {
+        active_blocks_out[i] = selected[i];
+    }
+    for (int t = 0; t < tail_len; ++t) {
+        active_blocks_out[block_topk + t] = tail_start + t;
+    }
+    return block_topk;
+}
+
+int qsa_prepare_causal_query_and_select_blocks(
+    Context& ctx,
+    const Tensor& indexer_qk_row,
+    const Tensor& q_norm_w,
+    const Tensor& k_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out_row,
+    Tensor& scores_out,
+    Tensor& active_blocks_out,
+    int pos,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w,
+    Tensor* compressed_k,
+    int* num_compressed_blocks) {
+    if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
+        throw std::invalid_argument("qsa_prepare_causal_query_and_select_blocks: invalid position or block geometry");
+    }
+    const int visible_len = pos + 1;
+    qsa_prepare_q_and_cache_k(
+        ctx, indexer_qk_row, q_norm_w, k_cache, q_out_row, pos, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+
+    const int num_complete_blocks = visible_len / compress_ratio;
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr && compressed_k->valid()) {
+        if (num_complete_blocks > *num_compressed_blocks) {
+            const int blocks_to_compress = num_complete_blocks - *num_compressed_blocks;
+            qsa_compress_key_blocks(
+                ctx, k_cache, k_norm_w, *compressed_k, *num_compressed_blocks,
+                blocks_to_compress, theta, interleaved, pos_t, pos_h, pos_w,
+                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = num_complete_blocks;
+        }
+    }
+
+    if (num_complete_blocks <= block_topk) {
+        return 0;
+    }
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr && compressed_k->valid()) {
+        qsa_compute_block_scores_compressed(
+            ctx, q_out_row, *compressed_k, scores_out, num_complete_blocks);
+    } else {
+        qsa_compute_block_scores(
+            ctx, q_out_row, k_cache, k_norm_w, scores_out, num_complete_blocks, theta, interleaved,
+            pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+            mrope_section_t, mrope_section_h, mrope_section_w);
+    }
+    return qsa_select_topk_blocks(
+        ctx, scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_blocks_out);
+}
+
+int qsa_prepare_causal_query_and_select_blocks_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    const bf16* k_norm_w,
+    bf16* k_cache,
+    bf16* q_out,
+    float* scores_out,
+    int* active_blocks_out,
+    int pos,
+    int capacity,
+    int block_topk,
+    int compress_ratio,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w,
+    bf16* compressed_k,
+    int* num_compressed_blocks) {
+    if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
+        throw std::invalid_argument("qsa_prepare_causal_query_and_select_blocks_host: invalid position or block geometry");
+    }
+    const int visible_len = pos + 1;
+    qsa_prepare_q_and_cache_k_host(
+        indexer_qk, q_norm_w, k_cache, q_out, pos, capacity, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+
+    const int num_complete_blocks = visible_len / compress_ratio;
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr) {
+        if (num_complete_blocks > *num_compressed_blocks) {
+            const int blocks_to_compress = num_complete_blocks - *num_compressed_blocks;
+            qsa_compress_key_blocks_host(
+                k_cache, k_norm_w, compressed_k, *num_compressed_blocks,
+                blocks_to_compress, theta, interleaved, pos_t, pos_h, pos_w,
+                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+            *num_compressed_blocks = num_complete_blocks;
+        }
+    }
+
+    if (num_complete_blocks <= block_topk) {
+        return 0;
+    }
+
+    if (compressed_k != nullptr && num_compressed_blocks != nullptr) {
+        qsa_compute_block_scores_compressed_host(
+            q_out, compressed_k, scores_out, num_complete_blocks);
+    } else {
+        qsa_compute_block_scores_host(
+            q_out, k_cache, k_norm_w, scores_out, num_complete_blocks, capacity, theta, interleaved,
+            pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+            mrope_section_t, mrope_section_h, mrope_section_w);
+    }
+    return qsa_select_topk_blocks_host(
+        scores_out, num_complete_blocks, block_topk, visible_len, compress_ratio, active_blocks_out);
+}
+
+void qsa_prepare_q_batched(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& q_out,
+    int start_pos,
+    int count,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    (void)mrope_section_t;
+    if (count <= 0) return;
+    const bf16* qk_ptr = indexer_qk.data_as<bf16>();
+    const bf16* qn_ptr = q_norm_w.data_as<bf16>();
+    bf16* q_out_ptr = q_out.data_as<bf16>();
+
+    constexpr int kHeadDim = 128;
+    constexpr int kRotaryDim = 64;
+    constexpr int kHalfDim = 32;
+    constexpr int kWgSize = 128;
+    constexpr int kNumHeads = 4;
+    constexpr int kOutDim = 640;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_sum(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<float, 1> local_q(sycl::range<1>(kHeadDim), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(count) * kNumHeads * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int group = item.get_group(0);
+                const int row = group / kNumHeads;
+                const int head = group % kNumHeads;
+                const int lid = item.get_local_id(0);
+                const int pos = start_pos + row;
+
+                const float pos_scalar = static_cast<float>(pos >= prompt_pos_len ? pos + text_pos_delta : pos);
+                const size_t q_offset = static_cast<size_t>(row) * kOutDim + head * kHeadDim + lid;
+                const size_t out_offset = static_cast<size_t>(row) * (kNumHeads * kHeadDim) + head * kHeadDim;
+
+                const float qv = static_cast<float>(qk_ptr[q_offset]);
+                local_sum[lid] = qv * qv;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        local_sum[lid] += local_sum[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                const float q_rms = sycl::sqrt(local_sum[0] / static_cast<float>(kHeadDim) + 1e-6f);
+                const float q_normed = (qv / q_rms) * static_cast<float>(qn_ptr[lid]);
+                local_q[lid] = q_normed;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                if (lid < kHalfDim) {
+                    const float pos_val = calculate_rotary_position(
+                        pos, lid, pos_scalar, interleaved, pos_t, pos_h, pos_w,
+                        prompt_pos_len, mrope_section_h, mrope_section_w);
+                    const float freq = 1.0f / sycl::pow(theta, (2.0f * lid) / static_cast<float>(kRotaryDim));
+                    const float angle = pos_val * freq;
+                    const float c = sycl::native::cos(angle);
+                    const float s = sycl::native::sin(angle);
+                    const float q0 = local_q[lid];
+                    const float q1 = local_q[lid + kHalfDim];
+                    q_out_ptr[out_offset + lid] = bf16(q0 * c - q1 * s);
+                    q_out_ptr[out_offset + lid + kHalfDim] = bf16(q1 * c + q0 * s);
+                } else if (lid >= kRotaryDim) {
+                    q_out_ptr[out_offset + lid] = bf16(local_q[lid]);
+                }
+            });
+    });
+}
+
+void qsa_prepare_q_batched_host(
+    const bf16* indexer_qk,
+    const bf16* q_norm_w,
+    bf16* q_out,
+    int start_pos,
+    int count,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    (void)mrope_section_t;
+    constexpr int kNumHeads = 4;
+    constexpr int kHeadDim = 128;
+    constexpr int kRotaryDim = 64;
+    constexpr int kHalfDim = 32;
+    constexpr int kOutDim = 640;
+
+    for (int r = 0; r < count; ++r) {
+        const int pos = start_pos + r;
+        const bf16* row_in = indexer_qk + static_cast<size_t>(r) * kOutDim;
+        bf16* row_out = q_out + static_cast<size_t>(r) * (kNumHeads * kHeadDim);
+        const float pos_scalar = static_cast<float>(pos >= prompt_pos_len ? pos + text_pos_delta : pos);
+
+        for (int h = 0; h < kNumHeads; ++h) {
+            float sum_sq = 0.0f;
+            for (int d = 0; d < kHeadDim; ++d) {
+                float v = static_cast<float>(row_in[h * kHeadDim + d]);
+                sum_sq += v * v;
+            }
+            float rms = std::sqrt(sum_sq / static_cast<float>(kHeadDim) + 1e-6f);
+            std::vector<float> normed_q(kHeadDim);
+            for (int d = 0; d < kHeadDim; ++d) {
+                float v = static_cast<float>(row_in[h * kHeadDim + d]);
+                normed_q[d] = (v / rms) * static_cast<float>(q_norm_w[d]);
+            }
+            for (int d = 0; d < kHalfDim; ++d) {
+                float pos_val = calculate_rotary_position(
+                    pos, d, pos_scalar, interleaved, pos_t, pos_h, pos_w,
+                    prompt_pos_len, mrope_section_h, mrope_section_w);
+                float freq = 1.0f / std::pow(theta, (2.0f * d) / static_cast<float>(kRotaryDim));
+                float angle = pos_val * freq;
+                float c = std::cos(angle);
+                float s = std::sin(angle);
+                float q0 = normed_q[d];
+                float q1 = normed_q[d + kHalfDim];
+                row_out[h * kHeadDim + d] = bf16(q0 * c - q1 * s);
+                row_out[h * kHeadDim + d + kHalfDim] = bf16(q1 * c + q0 * s);
+            }
+            for (int d = kRotaryDim; d < kHeadDim; ++d) {
+                row_out[h * kHeadDim + d] = bf16(normed_q[d]);
+            }
+        }
+    }
+}
+
+void qsa_compute_block_scores_compressed_batched(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    int query_count,
+    int max_complete_blocks,
+    int compress_ratio,
+    int start_pos) {
+    if (query_count <= 0 || max_complete_blocks <= 0) return;
+    const bf16* q_ptr = q.data_as<bf16>();
+    const bf16* comp_k_ptr = compressed_k.data_as<bf16>();
+    float* scores_ptr = scores_out.data_as<float>();
+
+    constexpr int kHeadDim = 128;
+    constexpr int kWgSize = 128;
+    constexpr int kNumHeads = 4;
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(query_count) * max_complete_blocks * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int group = item.get_group(0);
+                const int query = group / max_complete_blocks;
+                const int b = group % max_complete_blocks;
+                const int lid = item.get_local_id(0);
+
+                const int pos = start_pos + query;
+                const int visible_len = pos + 1;
+                const int num_complete_blocks = visible_len / compress_ratio;
+
+                if (b >= num_complete_blocks) {
+                    if (lid == 0) {
+                        scores_ptr[static_cast<size_t>(query) * max_complete_blocks + b] = -1e30f;
+                    }
+                    return;
+                }
+
+                const size_t q_base = static_cast<size_t>(query) * (kNumHeads * kHeadDim);
+                const float kl = static_cast<float>(comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid]);
+                const float p0 = static_cast<float>(q_ptr[q_base + 0 * kHeadDim + lid]) * kl;
+                const float p1 = static_cast<float>(q_ptr[q_base + 1 * kHeadDim + lid]) * kl;
+                const float p2 = static_cast<float>(q_ptr[q_base + 2 * kHeadDim + lid]) * kl;
+                const float p3 = static_cast<float>(q_ptr[q_base + 3 * kHeadDim + lid]) * kl;
+
+                const float dot0 = sycl::reduce_over_group(item.get_group(), p0, sycl::plus<float>());
+                const float dot1 = sycl::reduce_over_group(item.get_group(), p1, sycl::plus<float>());
+                const float dot2 = sycl::reduce_over_group(item.get_group(), p2, sycl::plus<float>());
+                const float dot3 = sycl::reduce_over_group(item.get_group(), p3, sycl::plus<float>());
+
+                if (lid == 0) {
+                    const float r0 = sycl::fmax(0.0f, dot0);
+                    const float r1 = sycl::fmax(0.0f, dot1);
+                    const float r2 = sycl::fmax(0.0f, dot2);
+                    const float r3 = sycl::fmax(0.0f, dot3);
+                    scores_ptr[static_cast<size_t>(query) * max_complete_blocks + b] = (r0 + r1 + r2 + r3) * inv_sqrt_d;
+                }
+            });
+    });
+}
+
+void qsa_compute_block_scores_compressed_batched_host(
+    const bf16* q,
+    const bf16* compressed_k,
+    float* scores_out,
+    int query_count,
+    int max_complete_blocks,
+    int compress_ratio,
+    int start_pos) {
+    constexpr int kNumHeads = 4;
+    constexpr int kHeadDim = 128;
+    for (int query = 0; query < query_count; ++query) {
+        const int pos = start_pos + query;
+        const int visible_len = pos + 1;
+        const int num_complete_blocks = visible_len / compress_ratio;
+        const bf16* q_row = q + static_cast<size_t>(query) * (kNumHeads * kHeadDim);
+        float* scores_row = scores_out + static_cast<size_t>(query) * max_complete_blocks;
+
+        for (int b = 0; b < max_complete_blocks; ++b) {
+            if (b >= num_complete_blocks) {
+                scores_row[b] = -1e30f;
+                continue;
+            }
+            float sum_relu = 0.0f;
+            for (int h = 0; h < kNumHeads; ++h) {
+                float dot = 0.0f;
+                for (int d = 0; d < kHeadDim; ++d) {
+                    dot += static_cast<float>(q_row[h * kHeadDim + d]) *
+                           static_cast<float>(compressed_k[static_cast<size_t>(b) * kHeadDim + d]);
+                }
+                sum_relu += std::max(0.0f, dot);
+            }
+            scores_row[b] = sum_relu / std::sqrt(128.0f);
+        }
+    }
+}
+
+void qsa_select_topk_blocks_batched(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    int query_count,
+    int max_complete_blocks,
+    int start_pos,
+    int block_topk,
+    int compress_ratio) {
+    if (query_count <= 0 || block_topk <= 0) return;
+    const float* scores_ptr = scores.data_as<float>();
+    int* out_ptr = active_blocks_out.data_as<int>();
+
+    constexpr int kWgSize = 256;
+    const size_t out_stride = static_cast<size_t>(block_topk + 4);
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
+        sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
+        sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(query_count) * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int query = item.get_group(0);
+                const int lid = item.get_local_id(0);
+
+                const int pos = start_pos + query;
+                const int visible_len = pos + 1;
+                const int num_complete_blocks = visible_len / compress_ratio;
+                const int tail_start = num_complete_blocks * compress_ratio;
+                const int tail_len = std::max(0, visible_len - tail_start);
+                int* my_out = out_ptr + static_cast<size_t>(query) * out_stride;
+                const float* my_scores = scores_ptr + static_cast<size_t>(query) * max_complete_blocks;
+
+                if (num_complete_blocks <= block_topk) {
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        my_out[b] = b;
+                    }
+                    if (lid < tail_len) {
+                        my_out[num_complete_blocks + lid] = tail_start + lid;
+                    }
+                    return;
+                }
+
+                if (lid == 0) {
+                    cutoff_key[0] = 0U;
+                    remaining_rank[0] = block_topk;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                std::uint32_t prefix_mask = 0U;
+                for (int bit = 31; bit >= 0; --bit) {
+                    const std::uint32_t bit_mask = std::uint32_t{1} << bit;
+                    const std::uint32_t prefix = cutoff_key[0];
+                    int count_one = 0;
+                    for (int b = lid; b < num_complete_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(my_scores[b]);
+                        if ((key & prefix_mask) == prefix && (key & bit_mask) != 0U) {
+                            ++count_one;
+                        }
+                    }
+                    local_cnt_one[lid] = count_one;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) {
+                        if (local_cnt_one[0] >= remaining_rank[0]) {
+                            cutoff_key[0] |= bit_mask;
+                        } else {
+                            remaining_rank[0] -= local_cnt_one[0];
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    prefix_mask |= bit_mask;
+                }
+
+                if (lid == 0) {
+                    const std::uint32_t threshold = cutoff_key[0];
+                    int above_count = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        if (qsa_score_order_key(my_scores[b]) > threshold) ++above_count;
+                    }
+                    int ties_needed = block_topk - above_count;
+                    int added = 0;
+                    for (int b = 0; b < num_complete_blocks; ++b) {
+                        const std::uint32_t key = qsa_score_order_key(my_scores[b]);
+                        if (key > threshold || (key == threshold && ties_needed > 0)) {
+                            selected_blocks[added++] = b;
+                            if (key == threshold) --ties_needed;
+                        }
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                    my_out[idx] = selected_blocks[idx];
+                }
+
+                if (lid < tail_len) {
+                    my_out[block_topk + lid] = tail_start + lid;
+                }
+            });
+    });
+}
+
+void qsa_select_topk_blocks_batched_host(
+    const float* scores,
+    int* active_blocks_out,
+    int query_count,
+    int max_complete_blocks,
+    int start_pos,
+    int block_topk,
+    int compress_ratio) {
+    const size_t out_stride = static_cast<size_t>(block_topk + 4);
+    for (int query = 0; query < query_count; ++query) {
+        const int pos = start_pos + query;
+        const int visible_len = pos + 1;
+        const int num_complete_blocks = visible_len / compress_ratio;
+        const float* my_scores = scores + static_cast<size_t>(query) * max_complete_blocks;
+        int* my_out = active_blocks_out + static_cast<size_t>(query) * out_stride;
+        qsa_select_topk_blocks_host(
+            my_scores, num_complete_blocks, block_topk, visible_len, compress_ratio, my_out);
+    }
+}
+
 } // namespace ops
+

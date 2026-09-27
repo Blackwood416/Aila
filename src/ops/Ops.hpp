@@ -352,7 +352,10 @@ namespace ops {
                           Tensor* exact_partials_buf = nullptr,
                           const Tensor* gate_buf = nullptr,
                           const int* active_indices = nullptr,
-                          int num_active_tokens = 0);
+                          int num_active_tokens = 0,
+                          const int* active_blocks = nullptr,
+                          int num_active_blocks = 0);
+
 
     // Per-row decode geometry for the multi-row entry point below. Rows are
     // independent sequences, so each carries its own cache and position.
@@ -427,6 +430,45 @@ namespace ops {
                                   int q_len, int kv_len,
                                   int num_heads, int num_kv_heads,
                                   int head_dim);
+
+    // Phase A4: Batched QSA Prefill Attention (Prompt > 2051)
+    // q: [count, num_heads * head_dim] bf16
+    // k_cache: [num_kv_heads, max_seq_len, head_dim] bf16
+    // v_cache: [num_kv_heads, max_seq_len, head_dim] bf16
+    // active_blocks: [count, block_topk + 4] s32
+    // output: [count, num_heads * head_dim] bf16
+    void attention_prefill_qsa_batched(
+        Context& ctx,
+        const Tensor& q,
+        const Tensor& k_cache,
+        const Tensor& v_cache,
+        const Tensor& active_blocks,
+        Tensor& output,
+        int count,
+        int start_pos,
+        int num_heads,
+        int num_kv_heads,
+        int head_dim,
+        int block_topk,
+        int compress_ratio,
+        const Tensor* gate_buf = nullptr);
+
+    void attention_prefill_qsa_batched_host(
+        const bf16* q,
+        const bf16* k_cache,
+        const bf16* v_cache,
+        const int* active_blocks,
+        bf16* output,
+        int count,
+        int start_pos,
+        int capacity,
+        int num_heads,
+        int num_kv_heads,
+        int head_dim,
+        int block_topk,
+        int compress_ratio,
+        const bf16* gate = nullptr);
+
 
     // SwiGLU: output = silu(gate) * up
     // gate, up, output: [n] (element-wise)

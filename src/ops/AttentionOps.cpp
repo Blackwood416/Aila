@@ -101,9 +101,11 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
                                     Tensor &scores_buf, int num_heads,
                                     int num_kv_heads, int head_dim, int cached_len,
                                     int tail_start, int sink_len, int effective_len,
-                                    int wg_size,
-                                    const bf16 *gate_ptr = nullptr,
-                                    const int *active_indices = nullptr) {
+                                     int wg_size,
+                                     const bf16 *gate_ptr = nullptr,
+                                     const int *active_indices = nullptr,
+                                     const int *active_blocks = nullptr,
+                                     int num_active_blocks = 0) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -136,22 +138,49 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
           item.barrier(sycl::access::fence_space::local_space);
 
           for (int t = lid; t < effective_len; t += wg_size) {
-            int cache_t = active_indices ? active_indices[t] : ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+            int cache_t = 0;
+            if (active_blocks != nullptr && num_active_blocks > 0) {
+              if (t < num_active_blocks * 4) {
+                cache_t = active_blocks[t / 4] * 4 + (t % 4);
+              } else {
+                cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+              }
+            } else if (active_indices) {
+              cache_t = active_indices[t];
+            } else {
+              cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+            }
             float sum = 0.0f;
-            if ((head_dim & 7) == 0) {
+            if constexpr (!Quantized) {
+              using vec8 = sycl::vec<bf16, 8>;
+              const bf16 *k_tok = static_cast<const bf16 *>(k_ptr) + kv_head * max_seq_len * head_dim + cache_t * head_dim;
               for (int d = 0; d < head_dim; d += 8) {
-                sum += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
-                sum += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
-                sum += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
-                sum += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
-                sum += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
-                sum += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
-                sum += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
-                sum += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+                const vec8 k_vec = *reinterpret_cast<const vec8 *>(k_tok + d);
+                sum += q_cache[d + 0] * static_cast<float>(k_vec[0]);
+                sum += q_cache[d + 1] * static_cast<float>(k_vec[1]);
+                sum += q_cache[d + 2] * static_cast<float>(k_vec[2]);
+                sum += q_cache[d + 3] * static_cast<float>(k_vec[3]);
+                sum += q_cache[d + 4] * static_cast<float>(k_vec[4]);
+                sum += q_cache[d + 5] * static_cast<float>(k_vec[5]);
+                sum += q_cache[d + 6] * static_cast<float>(k_vec[6]);
+                sum += q_cache[d + 7] * static_cast<float>(k_vec[7]);
               }
             } else {
-              for (int d = 0; d < head_dim; d++) {
-                sum += q_cache[d] * k_acc.load(kv_head, cache_t, d);
+              if ((head_dim & 7) == 0) {
+                for (int d = 0; d < head_dim; d += 8) {
+                  sum += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+                  sum += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+                  sum += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+                  sum += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+                  sum += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+                  sum += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+                  sum += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+                  sum += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+                }
+              } else {
+                for (int d = 0; d < head_dim; d++) {
+                  sum += q_cache[d] * k_acc.load(kv_head, cache_t, d);
+                }
               }
             }
             shared[t] = sum * scale;
@@ -183,7 +212,18 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
           for (int d = lid; d < head_dim; d += wg_size) {
             float acc = 0.0f;
             for (int t = 0; t < effective_len; t++) {
-              int cache_t = active_indices ? active_indices[t] : ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              int cache_t = 0;
+              if (active_blocks != nullptr && num_active_blocks > 0) {
+                if (t < num_active_blocks * 4) {
+                  cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                } else {
+                  cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                }
+              } else if (active_indices) {
+                cache_t = active_indices[t];
+              } else {
+                cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              }
               acc += shared[t] * v_acc.load(kv_head, cache_t, d);
             }
             float val = static_cast<float>(bf16(acc));
@@ -205,18 +245,23 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                int tail_start, int sink_len, int effective_len,
                                int wg_size,
                                const Tensor *gate_buf = nullptr,
-                               const int *active_indices = nullptr) {
+                               const int *active_indices = nullptr,
+                               const int *active_blocks = nullptr,
+                               int num_active_blocks = 0) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_baseline_impl<true>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices,
+        active_blocks, num_active_blocks);
   } else {
     attention_decode_baseline_impl<false>(
         ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices);
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices,
+        active_blocks, num_active_blocks);
   }
 }
+
 
 template <bool Quantized>
 void attention_decode_exact_head256_partial_merge_impl(
@@ -224,7 +269,9 @@ void attention_decode_exact_head256_partial_merge_impl(
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
     const bf16 *gate_ptr = nullptr,
-    const int *active_indices = nullptr) {
+    const int *active_indices = nullptr,
+    const int *active_blocks = nullptr,
+    int num_active_blocks = 0) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -278,18 +325,44 @@ void attention_decode_exact_head256_partial_merge_impl(
           float score = -1e30f;
           if (lid < tile_len) {
             const int t = tile_start + lid;
-            const int cache_t = active_indices ? active_indices[t] :
-                ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+            int cache_t = 0;
+            if (active_blocks != nullptr && num_active_blocks > 0) {
+              if (t < num_active_blocks * 4) {
+                cache_t = active_blocks[t / 4] * 4 + (t % 4);
+              } else {
+                cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+              }
+            } else if (active_indices) {
+              cache_t = active_indices[t];
+            } else {
+              cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+            }
             score = 0.0f;
-            for (int d = 0; d < head_dim; d += 8) {
-              score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
-              score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
-              score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
-              score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
-              score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
-              score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
-              score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
-              score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+            if constexpr (!Quantized) {
+              using vec8 = sycl::vec<bf16, 8>;
+              const bf16 *k_tok = static_cast<const bf16 *>(k_ptr) + kv_head * max_seq_len * head_dim + cache_t * head_dim;
+              for (int d = 0; d < head_dim; d += 8) {
+                const vec8 k_vec = *reinterpret_cast<const vec8 *>(k_tok + d);
+                score += q_cache[d + 0] * static_cast<float>(k_vec[0]);
+                score += q_cache[d + 1] * static_cast<float>(k_vec[1]);
+                score += q_cache[d + 2] * static_cast<float>(k_vec[2]);
+                score += q_cache[d + 3] * static_cast<float>(k_vec[3]);
+                score += q_cache[d + 4] * static_cast<float>(k_vec[4]);
+                score += q_cache[d + 5] * static_cast<float>(k_vec[5]);
+                score += q_cache[d + 6] * static_cast<float>(k_vec[6]);
+                score += q_cache[d + 7] * static_cast<float>(k_vec[7]);
+              }
+            } else {
+              for (int d = 0; d < head_dim; d += 8) {
+                score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+                score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+                score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+                score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+                score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+                score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+                score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+                score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+              }
             }
             score *= scale;
           }
@@ -321,8 +394,18 @@ void attention_decode_exact_head256_partial_merge_impl(
             float acc = 0.0f;
             for (int i = 0; i < tile_len; ++i) {
               const int t = tile_start + i;
-              const int cache_t = active_indices ? active_indices[t] :
-                  ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              int cache_t = 0;
+              if (active_blocks != nullptr && num_active_blocks > 0) {
+                if (t < num_active_blocks * 4) {
+                  cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                } else {
+                  cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                }
+              } else if (active_indices) {
+                cache_t = active_indices[t];
+              } else {
+                cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              }
               acc += logits[i] * v_acc.load(kv_head, cache_t, d);
             }
             partial[kDecodeExact256PartialAccOffset + d] = acc;
@@ -388,18 +471,23 @@ void attention_decode_exact_head256_partial_merge(
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
     const Tensor *gate_buf = nullptr,
-    const int *active_indices = nullptr) {
+    const int *active_indices = nullptr,
+    const int *active_blocks = nullptr,
+    int num_active_blocks = 0) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
     attention_decode_exact_head256_partial_merge_impl<true>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr, active_indices);
+        tail_start, sink_len, effective_len, gate_ptr, active_indices,
+        active_blocks, num_active_blocks);
   } else {
     attention_decode_exact_head256_partial_merge_impl<false>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr, active_indices);
+        tail_start, sink_len, effective_len, gate_ptr, active_indices,
+        active_blocks, num_active_blocks);
   }
 }
+
 
 template <bool Quantized>
 void attention_decode_exact_head128_partial_merge_impl(
@@ -1284,7 +1372,9 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       Tensor *exact_partials_buf,
                       const Tensor *gate_buf,
                       const int *active_indices,
-                      int num_active_tokens) {
+                      int num_active_tokens,
+                      const int *active_blocks,
+                      int num_active_blocks) {
   static bool jm_log_once = false;
   const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
   bool allow_jm = jm_cfg.allow_jm;
@@ -1301,7 +1391,11 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
   int sink_len = 0;
   bool contiguous_mode = true;
 
-  if (active_indices != nullptr && num_active_tokens > 0) {
+  if (active_blocks != nullptr && num_active_blocks > 0) {
+    const int tail_len = cached_len - (cached_len / 4) * 4;
+    effective_len = num_active_blocks * 4 + tail_len;
+    contiguous_mode = false;
+  } else if (active_indices != nullptr && num_active_tokens > 0) {
     effective_len = num_active_tokens;
     contiguous_mode = false;
   } else {
@@ -1341,14 +1435,14 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     jm_log_once = true;
   }
   if (head_dim == 128 && cached_len > 0 && effective_len >= kDecodeExact128MinLen &&
-      exact_partials_buf && exact_partials_buf->valid() && !active_indices) {
+      exact_partials_buf && exact_partials_buf->valid() && !active_indices && !active_blocks) {
     attention_decode_exact_head128_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
         num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
     return;
   }
 
-  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0 && !active_indices) {
+  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0 && !active_indices && !active_blocks) {
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
                                   attn_start, jm_tile_id, decode_wg, gate_buf);
@@ -1359,15 +1453,18 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
       exact_partials_buf && exact_partials_buf->valid()) {
     attention_decode_exact_head256_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
-        num_kv_heads, tail_start, sink_len, effective_len, gate_buf, active_indices);
+        num_kv_heads, tail_start, sink_len, effective_len, gate_buf, active_indices,
+        active_blocks, num_active_blocks);
     return;
   }
 
   attention_decode_baseline(ctx, q, k_cache, v_cache, output, scores_buf,
                             num_heads, num_kv_heads, head_dim, cached_len,
                             tail_start, sink_len, effective_len,
-                            decode_wg, gate_buf, active_indices);
+                            decode_wg, gate_buf, active_indices,
+                            active_blocks, num_active_blocks);
 }
+
 
 
 void attention_decode_rows(Context &ctx, Tensor &q, int q_row_stride,
@@ -4157,4 +4254,244 @@ void attention_prefill_masked(Context& ctx,
         });
 }
 
+void attention_prefill_qsa_batched(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& k_cache,
+    const Tensor& v_cache,
+    const Tensor& active_blocks,
+    Tensor& output,
+    int count,
+    int start_pos,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_topk,
+    int compress_ratio,
+    const Tensor* gate_buf) {
+  if (count <= 0) return;
+  const bf16* q_ptr = q.data_as<bf16>();
+  const bf16* k_ptr = k_cache.data_as<bf16>();
+  const bf16* v_ptr = v_cache.data_as<bf16>();
+  const int* active_blocks_ptr = active_blocks.data_as<int>();
+  bf16* o_ptr = output.data_as<bf16>();
+  const bf16* gate_ptr = (gate_buf && gate_buf->valid()) ? gate_buf->data_as<bf16>() : nullptr;
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  constexpr int wg_size = 64;
+  const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
+
+  ctx.queue().submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(count) * num_heads * wg_size, wg_size),
+        [=](sycl::nd_item<1> item) {
+          const int group = item.get_group(0);
+          const int row = group / num_heads;
+          const int head = group % num_heads;
+          const int lid = item.get_local_id(0);
+          const int kv_head = head / heads_per_kv;
+          const int pos = start_pos + row;
+          const int visible_len = pos + 1;
+          const int num_complete_blocks = visible_len / compress_ratio;
+          const bool is_sparse = (num_complete_blocks > block_topk);
+          const int num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+          const int tail_start = num_complete_blocks * compress_ratio;
+          const int tail_len = std::max(0, visible_len - tail_start);
+
+          const size_t q_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
+          for (int d = lid; d < head_dim; d += wg_size) {
+            q_cache[d] = static_cast<float>(q_ptr[q_head_offset + d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
+          const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+
+          float running_max = -1e30f;
+          float running_sum = 0.0f;
+          const int d0 = lid;
+          const int d1 = lid + 64;
+          const int d2 = lid + 128;
+          const int d3 = lid + 192;
+          float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+          // Loop over active blocks
+          for (int b = 0; b < num_active_blocks; ++b) {
+            const int blk = is_sparse ? my_blocks[b] : b;
+            const int base_t = blk * compress_ratio;
+
+            for (int c = 0; c < compress_ratio; ++c) {
+              const int cache_t = base_t + c;
+              const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+              const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
+              const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+              const float score = dot * scale;
+
+              const float new_max = sycl::fmax(running_max, score);
+              const float rescale = (running_max <= -1e20f) ? 0.0f : sycl::native::exp(running_max - new_max);
+              const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+              running_sum = running_sum * rescale + exp_score;
+              running_max = new_max;
+
+              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+              acc0 = acc0 * rescale + exp_score * v0;
+              acc1 = acc1 * rescale + exp_score * v1;
+              acc2 = acc2 * rescale + exp_score * v2;
+              acc3 = acc3 * rescale + exp_score * v3;
+            }
+          }
+
+          // Loop over tail tokens
+          for (int t = 0; t < tail_len; ++t) {
+            const int cache_t = tail_start + t;
+            const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
+            const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
+            const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
+            const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
+            const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+            const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
+            const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
+            const float score = dot * scale;
+
+            const float new_max = sycl::fmax(running_max, score);
+            const float rescale = (running_max <= -1e20f) ? 0.0f : sycl::native::exp(running_max - new_max);
+            const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+            running_sum = running_sum * rescale + exp_score;
+            running_max = new_max;
+
+            const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
+            const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
+            const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
+            const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+
+            acc0 = acc0 * rescale + exp_score * v0;
+            acc1 = acc1 * rescale + exp_score * v1;
+            acc2 = acc2 * rescale + exp_score * v2;
+            acc3 = acc3 * rescale + exp_score * v3;
+          }
+
+          const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+          float o0 = acc0 * inv_sum;
+          float o1 = acc1 * inv_sum;
+          float o2 = acc2 * inv_sum;
+          float o3 = acc3 * inv_sum;
+
+          const size_t out_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
+          if (gate_ptr != nullptr) {
+            const float g0 = static_cast<float>(gate_ptr[out_head_offset + d0]);
+            const float g1 = static_cast<float>(gate_ptr[out_head_offset + d1]);
+            const float g2 = static_cast<float>(gate_ptr[out_head_offset + d2]);
+            const float g3 = static_cast<float>(gate_ptr[out_head_offset + d3]);
+            o0 *= 1.0f / (1.0f + sycl::native::exp(-g0));
+            o1 *= 1.0f / (1.0f + sycl::native::exp(-g1));
+            o2 *= 1.0f / (1.0f + sycl::native::exp(-g2));
+            o3 *= 1.0f / (1.0f + sycl::native::exp(-g3));
+          }
+
+          o_ptr[out_head_offset + d0] = bf16(o0);
+          o_ptr[out_head_offset + d1] = bf16(o1);
+          o_ptr[out_head_offset + d2] = bf16(o2);
+          o_ptr[out_head_offset + d3] = bf16(o3);
+        });
+  });
+}
+
+void attention_prefill_qsa_batched_host(
+    const bf16* q,
+    const bf16* k_cache,
+    const bf16* v_cache,
+    const int* active_blocks,
+    bf16* output,
+    int count,
+    int start_pos,
+    int capacity,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_topk,
+    int compress_ratio,
+    const bf16* gate) {
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
+
+  for (int row = 0; row < count; ++row) {
+    const int pos = start_pos + row;
+    const int visible_len = pos + 1;
+    const int num_complete_blocks = visible_len / compress_ratio;
+    const bool is_sparse = (num_complete_blocks > block_topk);
+    const int num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+    const int tail_start = num_complete_blocks * compress_ratio;
+    const int tail_len = std::max(0, visible_len - tail_start);
+    const int* my_blocks = active_blocks + static_cast<size_t>(row) * active_blocks_stride;
+
+    std::vector<int> active_tokens;
+    active_tokens.reserve(num_active_blocks * compress_ratio + tail_len);
+    for (int b = 0; b < num_active_blocks; ++b) {
+      const int blk = is_sparse ? my_blocks[b] : b;
+      for (int c = 0; c < compress_ratio; ++c) {
+        active_tokens.push_back(blk * compress_ratio + c);
+      }
+    }
+    for (int t = 0; t < tail_len; ++t) {
+      active_tokens.push_back(tail_start + t);
+    }
+    const int n_tokens = static_cast<int>(active_tokens.size());
+
+    for (int head = 0; head < num_heads; ++head) {
+      const int kv_head = head / heads_per_kv;
+      const size_t q_off = (static_cast<size_t>(row) * num_heads + head) * head_dim;
+      const size_t kv_head_off = static_cast<size_t>(kv_head) * capacity * head_dim;
+
+      std::vector<float> scores(n_tokens);
+      float max_score = -1e30f;
+      for (int i = 0; i < n_tokens; ++i) {
+        const int tok = active_tokens[i];
+        const size_t k_off = kv_head_off + static_cast<size_t>(tok) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+          dot += static_cast<float>(q[q_off + d]) * static_cast<float>(k_cache[k_off + d]);
+        }
+        scores[i] = dot * scale;
+        if (scores[i] > max_score) max_score = scores[i];
+      }
+
+      float sum_exp = 0.0f;
+      for (int i = 0; i < n_tokens; ++i) {
+        scores[i] = std::exp(scores[i] - max_score);
+        sum_exp += scores[i];
+      }
+      const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_tokens; ++i) {
+          const int tok = active_tokens[i];
+          const size_t v_off = kv_head_off + static_cast<size_t>(tok) * head_dim;
+          acc += scores[i] * static_cast<float>(v_cache[v_off + d]);
+        }
+        float val = acc * inv_sum;
+        if (gate != nullptr) {
+          float g = static_cast<float>(gate[q_off + d]);
+          val *= 1.0f / (1.0f + std::exp(-g));
+        }
+        output[q_off + d] = bf16(val);
+      }
+    }
+  }
+}
+
 } // namespace ops
+

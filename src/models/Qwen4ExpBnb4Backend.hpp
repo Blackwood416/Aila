@@ -113,6 +113,10 @@ struct Qwen4ExpBuffers {
     Tensor indexer_q;            // [max_seq, 512]
     Tensor indexer_block_scores; // [max_blocks] f32
     Tensor indexer_active_tokens;// [2051] s32
+    Tensor indexer_active_blocks;// [516] s32 (Phase A3)
+    Tensor qsa_tile_block_scores;// [kQsaQueryTile, max_blocks] f32 (Phase A4)
+    Tensor qsa_tile_active_blocks;// [kQsaQueryTile, 516] s32 (Phase A4)
+
 
     // Linear Attention
     Tensor linear_all;    // [max_seq, 16480]
