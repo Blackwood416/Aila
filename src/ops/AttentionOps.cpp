@@ -4270,6 +4270,16 @@ void attention_prefill_qsa_batched(
     int compress_ratio,
     const Tensor* gate_buf) {
   if (count <= 0) return;
+  if (head_dim != 256) {
+    throw std::invalid_argument("attention_prefill_qsa_batched requires head_dim == 256");
+  }
+  if (k_cache.dtype() != dnnl::memory::data_type::bf16 ||
+      v_cache.dtype() != dnnl::memory::data_type::bf16) {
+    throw std::invalid_argument("attention_prefill_qsa_batched requires bf16 KV cache");
+  }
+  if (block_topk <= 0 || compress_ratio <= 0) {
+    throw std::invalid_argument("attention_prefill_qsa_batched requires positive block_topk and compress_ratio");
+  }
   const bf16* q_ptr = q.data_as<bf16>();
   const bf16* k_ptr = k_cache.data_as<bf16>();
   const bf16* v_ptr = v_cache.data_as<bf16>();
@@ -4383,10 +4393,10 @@ void attention_prefill_qsa_batched(
           }
 
           const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
-          float o0 = acc0 * inv_sum;
-          float o1 = acc1 * inv_sum;
-          float o2 = acc2 * inv_sum;
-          float o3 = acc3 * inv_sum;
+          float o0 = static_cast<float>(bf16(acc0 * inv_sum));
+          float o1 = static_cast<float>(bf16(acc1 * inv_sum));
+          float o2 = static_cast<float>(bf16(acc2 * inv_sum));
+          float o3 = static_cast<float>(bf16(acc3 * inv_sum));
 
           const size_t out_head_offset = (static_cast<size_t>(row) * num_heads + head) * head_dim;
           if (gate_ptr != nullptr) {
@@ -4394,10 +4404,10 @@ void attention_prefill_qsa_batched(
             const float g1 = static_cast<float>(gate_ptr[out_head_offset + d1]);
             const float g2 = static_cast<float>(gate_ptr[out_head_offset + d2]);
             const float g3 = static_cast<float>(gate_ptr[out_head_offset + d3]);
-            o0 *= 1.0f / (1.0f + sycl::native::exp(-g0));
-            o1 *= 1.0f / (1.0f + sycl::native::exp(-g1));
-            o2 *= 1.0f / (1.0f + sycl::native::exp(-g2));
-            o3 *= 1.0f / (1.0f + sycl::native::exp(-g3));
+            o0 = static_cast<float>(bf16(o0 * (1.0f / (1.0f + sycl::native::exp(-g0)))));
+            o1 = static_cast<float>(bf16(o1 * (1.0f / (1.0f + sycl::native::exp(-g1)))));
+            o2 = static_cast<float>(bf16(o2 * (1.0f / (1.0f + sycl::native::exp(-g2)))));
+            o3 = static_cast<float>(bf16(o3 * (1.0f / (1.0f + sycl::native::exp(-g3)))));
           }
 
           o_ptr[out_head_offset + d0] = bf16(o0);
@@ -4423,6 +4433,13 @@ void attention_prefill_qsa_batched_host(
     int block_topk,
     int compress_ratio,
     const bf16* gate) {
+  if (count <= 0) return;
+  if (head_dim != 256) {
+    throw std::invalid_argument("attention_prefill_qsa_batched_host requires head_dim == 256");
+  }
+  if (block_topk <= 0 || compress_ratio <= 0) {
+    throw std::invalid_argument("attention_prefill_qsa_batched_host requires positive block_topk and compress_ratio");
+  }
   const int heads_per_kv = num_heads / num_kv_heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
@@ -4482,16 +4499,17 @@ void attention_prefill_qsa_batched_host(
           const size_t v_off = kv_head_off + static_cast<size_t>(tok) * head_dim;
           acc += scores[i] * static_cast<float>(v_cache[v_off + d]);
         }
-        float val = acc * inv_sum;
+        float val = static_cast<float>(bf16(acc * inv_sum));
         if (gate != nullptr) {
           float g = static_cast<float>(gate[q_off + d]);
-          val *= 1.0f / (1.0f + std::exp(-g));
+          float s = 1.0f / (1.0f + std::exp(-g));
+          val = static_cast<float>(bf16(val * s));
         }
         output[q_off + d] = bf16(val);
       }
     }
   }
 }
-
 } // namespace ops
+
 

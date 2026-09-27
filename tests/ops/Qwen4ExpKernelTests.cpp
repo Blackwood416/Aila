@@ -2490,6 +2490,39 @@ static void test_qsa_prepare_q_batched(Context& ctx) {
     for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
 
     check_close(gpu_out, ref_f32, "qsa_prepare_q_batched GPU vs Host", 2e-2f);
+
+    // 2. Test with MRoPE positions (interleaved = true)
+    {
+        std::vector<int> pos_t_h(start_pos + count);
+        std::vector<int> pos_h_h(start_pos + count);
+        std::vector<int> pos_w_h(start_pos + count);
+        for (int i = 0; i < start_pos + count; ++i) {
+            pos_t_h[i] = i * 2;
+            pos_h_h[i] = i * 3 + 1;
+            pos_w_h[i] = i * 4 + 2;
+        }
+        Tensor pos_t_dev = Tensor::allocate(ctx, {start_pos + count}, dnnl::memory::data_type::s32);
+        Tensor pos_h_dev = Tensor::allocate(ctx, {start_pos + count}, dnnl::memory::data_type::s32);
+        Tensor pos_w_dev = Tensor::allocate(ctx, {start_pos + count}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(pos_t_dev.data(), pos_t_h.data(), pos_t_h.size() * sizeof(int));
+        ctx.memcpy_h2d(pos_h_dev.data(), pos_h_h.data(), pos_h_h.size() * sizeof(int));
+        ctx.memcpy_h2d(pos_w_dev.data(), pos_w_h.data(), pos_w_h.size() * sizeof(int));
+
+        ops::qsa_prepare_q_batched(
+            ctx, qk_dev, qn_dev, q_dev, start_pos, count, theta, true,
+            pos_t_dev.data_as<int>(), pos_h_dev.data_as<int>(), pos_w_dev.data_as<int>(),
+            start_pos + count, 0, 0, 8, 8);
+        ctx.synchronize();
+
+        ops::qsa_prepare_q_batched_host(
+            indexer_qk_h.data(), qn_w_h.data(), ref_out.data(), start_pos, count, theta, true,
+            pos_t_h.data(), pos_h_h.data(), pos_w_h.data(),
+            start_pos + count, 0, 0, 8, 8);
+
+        ctx.memcpy_d2h(gpu_out.data(), q_dev.data(), gpu_out.size() * sizeof(bf16));
+        for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
+        check_close(gpu_out, ref_f32, "qsa_prepare_q_batched (MRoPE interleaved) GPU vs Host", 2e-2f);
+    }
 }
 
 static void test_qsa_batched_scoring_and_selection(Context& ctx) {
@@ -2672,6 +2705,66 @@ static void test_attention_prefill_qsa_batched(Context& ctx) {
     for (size_t i = 0; i < ref_out.size(); ++i) ref_f32[i] = static_cast<float>(ref_out[i]);
 
     check_close(gpu_out, ref_f32, "attention_prefill_qsa_batched (with gate)", 2e-2f);
+
+    // Test 3: Guard checks (invalid head_dim)
+    try {
+        ops::attention_prefill_qsa_batched(
+            ctx, q_dev, k_dev, v_dev, active_dev, out_dev,
+            count, start_pos, num_heads, num_kv_heads, 128,
+            block_topk, compress_ratio, nullptr);
+        throw std::runtime_error("attention_prefill_qsa_batched failed to throw on invalid head_dim=128");
+    } catch (const std::invalid_argument&) {
+        std::cout << "[PASS] attention_prefill_qsa_batched guarded against invalid head_dim=128.\n";
+    }
+
+    // Test 4: Multi-tile prefill (count = 80)
+    {
+        constexpr int count_large = 80;
+        std::vector<bf16> q_large_h(count_large * num_heads * head_dim);
+        std::vector<int> active_large_h(count_large * (block_topk + 4));
+        for (auto& v : q_large_h) v = bf16(dist(rng));
+        for (int q = 0; q < count_large; ++q) {
+            const int pos = start_pos + q;
+            const int visible_len = pos + 1;
+            const int num_complete = visible_len / compress_ratio;
+            const int tail_start = num_complete * compress_ratio;
+            const int tail_len = visible_len - tail_start;
+            const size_t stride = block_topk + 4;
+            std::vector<int> blocks(num_complete);
+            for (int b = 0; b < num_complete; ++b) blocks[b] = b;
+            std::shuffle(blocks.begin(), blocks.end(), rng);
+            std::sort(blocks.begin(), blocks.begin() + std::min(block_topk, num_complete));
+            for (int b = 0; b < std::min(block_topk, num_complete); ++b) {
+                active_large_h[static_cast<size_t>(q) * stride + b] = blocks[b];
+            }
+            for (int t = 0; t < tail_len; ++t) {
+                active_large_h[static_cast<size_t>(q) * stride + std::min(block_topk, num_complete) + t] = tail_start + t;
+            }
+        }
+        Tensor q_large_dev = Tensor::allocate(ctx, {count_large, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor active_large_dev = Tensor::allocate(ctx, {count_large, block_topk + 4}, dnnl::memory::data_type::s32);
+        Tensor out_large_dev = Tensor::allocate(ctx, {count_large, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(q_large_dev.data(), q_large_h.data(), q_large_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(active_large_dev.data(), active_large_h.data(), active_large_h.size() * sizeof(int));
+
+        ops::attention_prefill_qsa_batched(
+            ctx, q_large_dev, k_dev, v_dev, active_large_dev, out_large_dev,
+            count_large, start_pos, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, nullptr);
+        ctx.synchronize();
+
+        std::vector<bf16> ref_large_out(count_large * num_heads * head_dim);
+        ops::attention_prefill_qsa_batched_host(
+            q_large_h.data(), k_cache_h.data(), v_cache_h.data(), active_large_h.data(), ref_large_out.data(),
+            count_large, start_pos, capacity, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, nullptr);
+
+        std::vector<bf16> gpu_large_out(count_large * num_heads * head_dim);
+        ctx.memcpy_d2h(gpu_large_out.data(), out_large_dev.data(), gpu_large_out.size() * sizeof(bf16));
+        std::vector<float> ref_large_f32(ref_large_out.size());
+        for (size_t i = 0; i < ref_large_out.size(); ++i) ref_large_f32[i] = static_cast<float>(ref_large_out[i]);
+        check_close(gpu_large_out, ref_large_f32, "attention_prefill_qsa_batched multi-tile (count=80)", 2e-2f);
+    }
 }
 
 } // namespace

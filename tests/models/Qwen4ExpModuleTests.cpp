@@ -3133,87 +3133,102 @@ void test_qsa_block_native_decode_alignment(Context& ctx) {
     constexpr int num_heads = 24;
     constexpr int num_kv_heads = 2;
     constexpr int full_head_dim = 256;
-    constexpr int cached_len = 2400; // 600 complete blocks
     constexpr int block_topk = 512;
     constexpr int compress_ratio = 4;
-    constexpr int num_complete_blocks = cached_len / compress_ratio;
 
     std::mt19937 rng(4321);
     std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
 
-    std::vector<float> scores_h(num_complete_blocks);
-    for (auto& s : scores_h) s = dist(rng) + 0.5f;
+    const std::vector<int> test_lens = {2400, 2401, 2403, 1003};
 
-    Tensor scores_dev = Tensor::allocate(ctx, {num_complete_blocks}, dnnl::memory::data_type::f32);
-    Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
-    Tensor active_blocks_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
+    for (int cached_len : test_lens) {
+        const int num_complete_blocks = cached_len / compress_ratio;
+        const int tail_len = cached_len - num_complete_blocks * compress_ratio;
 
-    ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
+        std::vector<float> scores_h(std::max(1, num_complete_blocks));
+        for (auto& s : scores_h) s = dist(rng) + 0.5f;
 
-    int num_tokens = ops::qsa_select_topk_and_expand_tokens(
-        ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
-    int num_blocks = ops::qsa_select_topk_blocks(
-        ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_blocks_dev);
-    ctx.synchronize();
+        Tensor scores_dev = Tensor::allocate(ctx, {std::max(1, num_complete_blocks)}, dnnl::memory::data_type::f32);
+        Tensor active_tokens_dev = Tensor::allocate(ctx, {cached_len}, dnnl::memory::data_type::s32);
+        Tensor active_blocks_dev = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
 
-    expect(num_tokens == 2048, "Block-Native: expanded tokens must be 2048");
-    expect(num_blocks == 512, "Block-Native: active blocks must be 512");
+        ctx.memcpy_h2d(scores_dev.data(), scores_h.data(), scores_h.size() * sizeof(float));
 
-    // Setup Q, K, V
-    Tensor q_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
-    Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
-    Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
-    Tensor out_expanded_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
-    Tensor out_native_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
-    Tensor scores_buf = Tensor::allocate(ctx, {num_heads, cached_len}, dnnl::memory::data_type::f32);
-    constexpr int kDecodeExactTile = 128;
-    const int max_tiles = (cached_len + kDecodeExactTile - 1) / kDecodeExactTile;
-    Tensor partials_dev1 = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, 272}, dnnl::memory::data_type::f32);
-    Tensor partials_dev2 = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, 272}, dnnl::memory::data_type::f32);
+        int num_tokens = ops::qsa_select_topk_and_expand_tokens(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_tokens_dev);
+        int num_blocks = ops::qsa_select_topk_blocks(
+            ctx, scores_dev, num_complete_blocks, block_topk, cached_len, compress_ratio, active_blocks_dev);
+        ctx.synchronize();
 
-    std::vector<bf16> q_h(num_heads * full_head_dim);
-    for (auto& v : q_h) v = bf16(dist(rng));
-    std::vector<bf16> kv_h(num_kv_heads * cached_len * full_head_dim);
-    for (auto& v : kv_h) v = bf16(dist(rng) * 0.1f);
+        const int expected_blocks = std::min(num_complete_blocks, block_topk);
+        const int expected_tokens = expected_blocks * compress_ratio + tail_len;
+        expect(num_tokens == expected_tokens, "Block-Native: expanded tokens mismatch for cached_len=" + std::to_string(cached_len));
+        expect(num_blocks == expected_blocks, "Block-Native: active blocks mismatch for cached_len=" + std::to_string(cached_len));
 
-    ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
-    ctx.memcpy_h2d(k_dev.data(), kv_h.data(), kv_h.size() * sizeof(bf16));
-    ctx.memcpy_h2d(v_dev.data(), kv_h.data(), kv_h.size() * sizeof(bf16));
+        // Setup Q, K, V, Gate
+        Tensor q_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor z_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor k_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v_dev = Tensor::allocate(ctx, {num_kv_heads, cached_len, full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor out_expanded_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor out_native_dev = Tensor::allocate(ctx, {1, num_heads * full_head_dim}, dnnl::memory::data_type::bf16);
+        Tensor scores_buf = Tensor::allocate(ctx, {num_heads, cached_len}, dnnl::memory::data_type::f32);
+        constexpr int kDecodeExactTile = 128;
+        const int max_tiles = (cached_len + kDecodeExactTile - 1) / kDecodeExactTile;
+        Tensor partials_dev1 = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, 272}, dnnl::memory::data_type::f32);
+        Tensor partials_dev2 = Tensor::allocate(ctx, {(int64_t)num_heads, (int64_t)max_tiles, 272}, dnnl::memory::data_type::f32);
 
-    // 1. Attention decode with expanded active tokens
-    ops::attention_decode(
-        ctx, q_dev, k_dev, v_dev, out_expanded_dev, scores_buf,
-        num_heads, num_kv_heads, full_head_dim, cached_len,
-        &partials_dev1, nullptr,
-        active_tokens_dev.data_as<int>(), num_tokens, nullptr, 0);
+        std::vector<bf16> q_h(num_heads * full_head_dim);
+        std::vector<bf16> z_h(num_heads * full_head_dim);
+        for (auto& v : q_h) v = bf16(dist(rng));
+        for (auto& v : z_h) v = bf16(dist(rng));
+        std::vector<bf16> kv_h(num_kv_heads * cached_len * full_head_dim);
+        for (auto& v : kv_h) v = bf16(dist(rng) * 0.1f);
 
-    // 2. Attention decode with block-native active blocks (Phase A3)
-    ops::attention_decode(
-        ctx, q_dev, k_dev, v_dev, out_native_dev, scores_buf,
-        num_heads, num_kv_heads, full_head_dim, cached_len,
-        &partials_dev2, nullptr,
-        nullptr, 0, active_blocks_dev.data_as<int>(), num_blocks);
-    ctx.synchronize();
+        ctx.memcpy_h2d(q_dev.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(z_dev.data(), z_h.data(), z_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k_dev.data(), kv_h.data(), kv_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v_dev.data(), kv_h.data(), kv_h.size() * sizeof(bf16));
 
-    std::vector<bf16> out_exp_h(num_heads * full_head_dim);
-    std::vector<bf16> out_nat_h(num_heads * full_head_dim);
-    ctx.memcpy_d2h(out_exp_h.data(), out_expanded_dev.data(), out_exp_h.size() * sizeof(bf16));
-    ctx.memcpy_d2h(out_nat_h.data(), out_native_dev.data(), out_nat_h.size() * sizeof(bf16));
+        for (bool with_gate : {false, true}) {
+            // 1. Attention decode with expanded active tokens
+            ops::attention_decode(
+                ctx, q_dev, k_dev, v_dev, out_expanded_dev, scores_buf,
+                num_heads, num_kv_heads, full_head_dim, cached_len,
+                &partials_dev1, (with_gate ? &z_dev : nullptr),
+                active_tokens_dev.data_as<int>(), num_tokens, nullptr, 0);
 
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < out_exp_h.size(); ++i) {
-        float d = std::abs(static_cast<float>(out_exp_h[i]) - static_cast<float>(out_nat_h[i]));
-        if (d > max_diff) max_diff = d;
+            // 2. Attention decode with block-native active blocks (Phase A3)
+            ops::attention_decode(
+                ctx, q_dev, k_dev, v_dev, out_native_dev, scores_buf,
+                num_heads, num_kv_heads, full_head_dim, cached_len,
+                &partials_dev2, (with_gate ? &z_dev : nullptr),
+                nullptr, 0, active_blocks_dev.data_as<int>(), num_blocks);
+            ctx.synchronize();
+
+            std::vector<bf16> out_exp_h(num_heads * full_head_dim);
+            std::vector<bf16> out_nat_h(num_heads * full_head_dim);
+            ctx.memcpy_d2h(out_exp_h.data(), out_expanded_dev.data(), out_exp_h.size() * sizeof(bf16));
+            ctx.memcpy_d2h(out_nat_h.data(), out_native_dev.data(), out_nat_h.size() * sizeof(bf16));
+
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < out_exp_h.size(); ++i) {
+                float d = std::abs(static_cast<float>(out_exp_h[i]) - static_cast<float>(out_nat_h[i]));
+                if (d > max_diff) max_diff = d;
+            }
+            expect(max_diff < 1e-4f, "Block-Native Decode: mismatch vs expanded tokens for cached_len=" +
+                   std::to_string(cached_len) + " gate=" + std::to_string(with_gate) + " max_diff=" + std::to_string(max_diff));
+        }
+        std::cout << "[PASS] QSA Block-Native Decode (A3) matches expanded token path for cached_len="
+                  << cached_len << " (tail=" << tail_len << ").\n";
     }
-    expect(max_diff < 1e-4f, "Block-Native Decode: output mismatch vs expanded tokens path, max_diff=" + std::to_string(max_diff));
-    std::cout << "[PASS] QSA Block-Native Decode (A3) matches expanded token path bit-for-bit (max_diff=" << max_diff << ").\n";
 }
 
 void test_qsa_batched_prefill_oracle_alignment(Context& ctx) {
     std::cout << "[Test] Running QSA Batched Prefill vs Oracle Alignment (A4) Test...\n";
     constexpr int start_pos = 2040;
-    constexpr int count = 32; // spans pos 2040..2071 (crosses dense 2050 -> sparse 2051 threshold)
-    constexpr int capacity = 2200;
+    constexpr int count = 80; // spans pos 2040..2119 (crosses dense 2050 -> sparse 2051 threshold, spans 2 tiles: 64 + 16)
+    constexpr int capacity = 2300;
     constexpr int num_heads = 24;
     constexpr int num_kv_heads = 2;
     constexpr int full_head_dim = 256;
@@ -3275,24 +3290,44 @@ void test_qsa_batched_prefill_oracle_alignment(Context& ctx) {
     ctx.memcpy_h2d(k_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
     ctx.memcpy_h2d(v_full_dev.data(), kv_full_h.data(), kv_full_h.size() * sizeof(bf16));
 
-    // Path 1: Phase A4 Batched QSA Prefill
+    // Path 1: Phase A4 Batched QSA Prefill with query tiling (kQsaQueryTile = 64)
     {
         Tensor indexer_q_dev = Tensor::allocate(ctx, {count, indexer_q_dim}, dnnl::memory::data_type::bf16);
         const int max_blocks = total_complete_blocks;
-        Tensor tile_scores = Tensor::allocate(ctx, {64, max_blocks}, dnnl::memory::data_type::f32);
-        Tensor tile_blocks = Tensor::allocate(ctx, {64, block_topk + 4}, dnnl::memory::data_type::s32);
+        constexpr int kQsaQueryTile = 64;
+        Tensor tile_scores = Tensor::allocate(ctx, {kQsaQueryTile, max_blocks}, dnnl::memory::data_type::f32);
+        Tensor tile_blocks = Tensor::allocate(ctx, {kQsaQueryTile, block_topk + 4}, dnnl::memory::data_type::s32);
 
         ops::qsa_prepare_q_batched(ctx, indexer_qk_dev, qn_dev, indexer_q_dev, start_pos, count, rope_theta);
 
-        ops::qsa_compute_block_scores_compressed_batched(
-            ctx, indexer_q_dev, compressed_k_dev, tile_scores, count, max_blocks, compress_ratio, start_pos);
+        for (int tile_offset = 0; tile_offset < count; tile_offset += kQsaQueryTile) {
+            const int tile_count = std::min(kQsaQueryTile, count - tile_offset);
+            const int tile_start_pos = start_pos + tile_offset;
+            const int tile_max_blocks = std::max(1, (tile_start_pos + tile_count) / compress_ratio);
 
-        ops::qsa_select_topk_blocks_batched(
-            ctx, tile_scores, tile_blocks, count, max_blocks, start_pos, block_topk, compress_ratio);
+            Tensor q_tile = Tensor::view(
+                ctx, indexer_q_dev.data_as<bf16>() + static_cast<size_t>(tile_offset) * indexer_q_dim,
+                {tile_count, indexer_q_dim});
+            Tensor q_full_tile = Tensor::view(
+                ctx, q_full_dev.data_as<bf16>() + static_cast<size_t>(tile_offset) * q_dim,
+                {tile_count, q_dim});
+            Tensor z_tile = Tensor::view(
+                ctx, z_dev.data_as<bf16>() + static_cast<size_t>(tile_offset) * q_dim,
+                {tile_count, q_dim});
+            Tensor attn_out_tile = Tensor::view(
+                ctx, attn_out_batched.data_as<bf16>() + static_cast<size_t>(tile_offset) * q_dim,
+                {tile_count, q_dim});
 
-        ops::attention_prefill_qsa_batched(
-            ctx, q_full_dev, k_full_dev, v_full_dev, tile_blocks, attn_out_batched,
-            count, start_pos, num_heads, num_kv_heads, full_head_dim, block_topk, compress_ratio, &z_dev);
+            ops::qsa_compute_block_scores_compressed_batched(
+                ctx, q_tile, compressed_k_dev, tile_scores, tile_count, tile_max_blocks, compress_ratio, tile_start_pos);
+
+            ops::qsa_select_topk_blocks_batched(
+                ctx, tile_scores, tile_blocks, tile_count, tile_max_blocks, tile_start_pos, block_topk, compress_ratio);
+
+            ops::attention_prefill_qsa_batched(
+                ctx, q_full_tile, k_full_dev, v_full_dev, tile_blocks, attn_out_tile,
+                tile_count, tile_start_pos, num_heads, num_kv_heads, full_head_dim, block_topk, compress_ratio, &z_tile);
+        }
         ctx.synchronize();
     }
 
