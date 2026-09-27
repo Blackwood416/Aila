@@ -6,6 +6,28 @@ Last updated: 2026-09-25. Supersedes the M1 handoff (see this file at commit `6c
 Covers performance sessions after M1. **Everything below after `6c99f8f` is
 uncommitted in the working tree** (section 9 lists the files).
 
+## 0. Continuation: H2b Heterogeneous Decode Dispatch & H3 Bounded Credit/Straggler Protection (2026-09-27)
+
+This session implemented **H2b (Heterogeneous Decode Dispatch & Ordered Rank Merge)** and **H3 (Bounded Admission Credit & Straggler Protection)** for Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path, building upon H0, H1, and H2a:
+
+1. **H2b: Heterogeneous Decode Dispatch & Ordered Rank Merge**:
+   - **GPU Slotted Down Kernel (`moe_decode_down_to_rank_f32`)**: Computes active GPU experts' unweighted down projections directly into logical rank slots `[(token * top_k + rank) * out_features + row]` in `down_acc_dev_`. Passes `slot_ptrs`, `rank_ptrs`, and `token_ptrs` by value (`std::array<..., 16>`) for zero device pointer dereferencing on host.
+   - **CPU Concurrent Expert Forwarding (`ops::cpu::cpu_expert_forward`)**: Dispatches GPU-miss, Host-Ready experts to CPU AVX2/TBB forward kernel via thread-safe `HostExpertLease`. Leases are released immediately after reading host weights. Results are streamed asynchronously to their corresponding rank slots in `down_acc_dev_` via pinned host-to-device transfers.
+   - **Strict Ordered Rank Merge (`moe_ordered_accumulate_down_rows`)**: Gathers all `top_k` rank results from `down_acc_dev_` in strict ascending rank order ($k=0 \dots \text{top\_k}-1$), multiplies by route weights, performs BF16 rounding, and fuses shared expert output. Verified numerically equivalent to baseline fused down projection (max diff = 0 in Test 5).
+   - **Zero Dynamic Allocations on Hot Path**: Preallocated pinned host and device buffers in `Qwen4ExpExpertExecutor` (`x_host_`, `cpu_out_host_`, `scratch_h_`, `down_acc_dev_`, `weights_dev_`, `gpu_slots_host_`, `gpu_ranks_host_`, `gpu_tokens_host_`, `slot_seen_`), eliminating all runtime heap allocations during decode.
+   - **Feature Gate**: Controlled by `AILA_Q4E_CPU_EXPERT_DISPATCH` (default-off, safe opt-in). When disabled, 100% of execution follows the existing GPU path.
+
+2. **H3: Bounded Admission Credit & Straggler Protection**:
+   - **Bounded Admission Credit**: Strictly limits concurrent CPU expert dispatch to `max_cpu_credits_` ($1 \le C \le 4$, default 2) and `max_cpu_tokens_` ($m \le 4$, decode only). Excess host-ready misses gracefully fall back to GPU pending DMA without blocking.
+   - **True GPU/CPU Concurrent Overlap**: Reordered heterogeneous decode submission: D2H activation transfer (5 KB) completes first, GPU kernels (`gate_up` and `down_to_rank_f32`) are submitted asynchronously to the device hardware queue, and CPU AVX2 forward kernels run in parallel on host cores while GPU compute and DMA proceed simultaneously.
+   - **Straggler Monitoring & Dynamic Throttling**: Monitors execution timing of CPU work versus GPU completion. If GPU completes before CPU finishes, marks CPU as a straggler. Two consecutive straggles activate `straggler_penalty_active_` which throttles CPU credits by 1. Automatically recovers full credit once CPU execution overlaps within the GPU deadline.
+
+3. **Verification & Benchmark Results**:
+   - `AilaQwen4ExpExpertReadinessTests`: All 7 tests passed (Test 5 down_to_rank_f32 vs fused max diff = 0, Test 6 dispatch & credit bounds passed, Test 7 straggler penalty & recovery passed).
+   - Full CTest suite passed 100% (59/59 passed, 0 failed).
+   - Real-model end-to-end inference with `AILA_Q4E_CPU_EXPERT_DISPATCH=1`: generated 48 tokens successfully (Prompt=30, Generated=48 in 8613.51 ms), zero crashes, clean reasoning/story text.
+   - Baseline golden verification (default path): 6638.13 ms steady-state, 100% bit-exact text match.
+
 ## 0. Continuation: Stage 4 Prefill Pipeline Overlap & Speculative Prefetch (2026-09-25)
 
 This session implemented **Stage 4: Prefill Cross-Layer Asynchronous Pipeline Overlap & Speculative Prefetch** on the Qwen3.8-Flash-Next (`qwen4_exp`) inference hot path:
