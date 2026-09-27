@@ -164,6 +164,11 @@ private:
     float* weights_dev_ = nullptr;
     float* down_acc_dev_ = nullptr;
     std::vector<bool> slot_seen_;
+
+    // Zero-allocation preallocated staging for ensure_gpu_pending
+    std::vector<int> pending_experts_buf_;
+    std::vector<int> assigned_slots_buf_;
+    sycl::event prev_cpu_h2d_ev_{};
 };
 
 } // namespace aila

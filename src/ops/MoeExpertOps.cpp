@@ -514,6 +514,139 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
 }
 
 template <bool UseNested>
+sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int num_active_experts,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_group = wg_size / sub_group_size;
+    const size_t total_rows = static_cast<size_t>(num_active_experts) * intermediate_size;
+    const size_t num_groups = (total_rows + rows_per_group - 1) / rows_per_group;
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int sg_lane = lid % sub_group_size;
+                const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+                if (global_row < total_rows) {
+                    const int expert_idx = static_cast<int>(global_row / intermediate_size);
+                    const int row = static_cast<int>(global_row % intermediate_size);
+                    const auto& slot = slots[expert_idx];
+
+                    const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                    const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
+                    const size_t up_byte_base = static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
+                    const size_t up_block_base = static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+
+                    int byte_offset = sg_lane * 4;
+                    for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+                        const int token = token_ids ? token_ids[expert_idx] : 0;
+                        const bf16* token_x = x + static_cast<size_t>(token) * in_features;
+                        const vec8 in_v = *reinterpret_cast<const vec8*>(token_x + byte_offset * 2);
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        gate_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[gb0 >> 4] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[gb0 & 0xF] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[gb1 >> 4] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[gb1 & 0xF] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[gb2 >> 4] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[gb2 & 0xF] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[gb3 >> 4] * ga, gate_acc);
+                        gate_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[gb3 & 0xF] * ga, gate_acc);
+
+                        up_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[ub0 >> 4] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[ub0 & 0xF] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[ub1 >> 4] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[ub1 & 0xF] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[ub2 >> 4] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[ub2 & 0xF] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[ub3 >> 4] * ua, up_acc);
+                        up_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[ub3 & 0xF] * ua, up_acc);
+                    }
+                }
+
+                float gate_sum = sycl::reduce_over_group(item.get_sub_group(), gate_acc, sycl::plus<>());
+                float up_sum = sycl::reduce_over_group(item.get_sub_group(), up_acc, sycl::plus<>());
+
+                if (sg_lane == 0 && global_row < total_rows) {
+                    const float silu_gate = gate_sum / (1.0f + sycl::native::exp(-gate_sum));
+                    h[global_row] = bf16(silu_gate * up_sum);
+                }
+            });
+    });
+}
+
+template <bool UseNested>
 sycl::event launch_moe_decode_down_weighted_accumulate(
     Context& ctx,
     const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
@@ -1695,24 +1828,42 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int intermediate_size,
     int blocksize,
     const sycl::event* dep_event,
-    const int* token_ids) {
+    const int* token_ids,
+    bool use_nested) {
     if (num_active_experts <= 0) return {};
 
-    std::array<MoeExpertSlotDev, 16> slot_ptrs{};
-    std::array<int, 16> token_ptrs{};
-    const int k_capped = std::min(num_active_experts, 16);
-    for (int i = 0; i < k_capped; ++i) {
-        slot_ptrs[static_cast<size_t>(i)] = slots[i];
-        token_ptrs[static_cast<size_t>(i)] = token_ids ? token_ids[i] : 0;
+    bool is_nested = use_nested;
+    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
+    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    if (!is_nested && slots != nullptr && !is_device) {
+        is_nested = (slots[0].gate_up_nested.codes != nullptr);
     }
 
-    if (slots[0].gate_up_nested.codes != nullptr) {
-        return launch_moe_decode_gate_up_swiglu_grouped<true>(
+    if (!is_device && num_active_experts <= 16) {
+        std::array<MoeExpertSlotDev, 16> slot_ptrs{};
+        std::array<int, 16> token_ptrs{};
+        for (int i = 0; i < num_active_experts; ++i) {
+            slot_ptrs[static_cast<size_t>(i)] = slots[i];
+            token_ptrs[static_cast<size_t>(i)] = token_ids ? token_ids[i] : 0;
+        }
+
+        if (is_nested) {
+            return launch_moe_decode_gate_up_swiglu_grouped<true>(
+                ctx, slot_ptrs, token_ptrs, quant_map, x, h, num_active_experts,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_decode_gate_up_swiglu_grouped<false>(
             ctx, slot_ptrs, token_ptrs, quant_map, x, h, num_active_experts,
             in_features, intermediate_size, blocksize, dep_event);
     }
-    return launch_moe_decode_gate_up_swiglu_grouped<false>(
-        ctx, slot_ptrs, token_ptrs, quant_map, x, h, num_active_experts,
+
+    if (is_nested) {
+        return launch_moe_decode_gate_up_swiglu_grouped_dev<true>(
+            ctx, slots, token_ids, quant_map, x, h, num_active_experts,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    return launch_moe_decode_gate_up_swiglu_grouped_dev<false>(
+        ctx, slots, token_ids, quant_map, x, h, num_active_experts,
         in_features, intermediate_size, blocksize, dep_event);
 }
 
@@ -1769,7 +1920,14 @@ sycl::event moe_decode_down_to_rank_f32(
     bool use_nested) {
     if (num_active_experts <= 0 || out_features <= 0 || in_features <= 0) return {};
 
-    if (num_active_experts <= 16) {
+    bool is_nested = use_nested;
+    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
+    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    if (!is_nested && slots != nullptr && !is_device) {
+        is_nested = (slots[0].down_nested.codes != nullptr);
+    }
+
+    if (!is_device && num_active_experts <= 16) {
         std::array<MoeExpertSlotDev, 16> slot_ptrs{};
         std::array<int, 16> rank_ptrs{};
         std::array<int, 16> token_ptrs{};
@@ -1780,7 +1938,7 @@ sycl::event moe_decode_down_to_rank_f32(
             token_ptrs[static_cast<size_t>(i)] = token_ids ? token_ids[i] : 0;
         }
 
-        if (use_nested || (slots && slots[0].down_nested.codes != nullptr)) {
+        if (is_nested) {
             return launch_moe_decode_down_to_rank_f32<true>(
                 ctx, slot_ptrs, rank_ptrs, token_ptrs, h, down_acc,
                 num_active_experts, top_k, in_features, out_features, blocksize,
@@ -1792,7 +1950,7 @@ sycl::event moe_decode_down_to_rank_f32(
             quant_map, dep_event);
     }
 
-    if (use_nested || (slots && slots[0].down_nested.codes != nullptr)) {
+    if (is_nested) {
         return launch_moe_decode_down_to_rank_f32_dev<true>(
             ctx, slots, ranks, token_ids, h, down_acc,
             num_active_experts, top_k, in_features, out_features, blocksize,

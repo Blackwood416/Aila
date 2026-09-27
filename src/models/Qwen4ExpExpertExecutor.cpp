@@ -75,6 +75,11 @@ void Qwen4ExpExpertExecutor::init(
     const size_t max_down_acc = static_cast<size_t>(max_cpu_tokens_) * top_k_ * hidden_size_;
     down_acc_dev_ = static_cast<float*>(ctx_->alloc_device(max_down_acc * sizeof(float)));
 
+    const size_t max_pending = static_cast<size_t>(max_seq_len_) * top_k_;
+    pending_experts_buf_.assign(max_pending, 0);
+    assigned_slots_buf_.assign(max_pending, -1);
+    prev_cpu_h2d_ev_ = sycl::event{};
+
     stats_.reset();
     slot_seen_.assign(cache_->num_slots(), false);
     straggler_penalty_active_ = false;
@@ -114,7 +119,7 @@ LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(
 
     // H3: Determine effective CPU credits for this layer
     const int effective_credits = straggler_penalty_active_ ? std::max(0, max_cpu_credits_ - 1) : max_cpu_credits_;
-    const bool allow_cpu_dispatch = enable_hetero && (token_count <= max_cpu_tokens_) && (total <= 16) && (effective_credits > 0);
+    const bool allow_cpu_dispatch = enable_hetero && (token_count <= max_cpu_tokens_) && (effective_credits > 0);
 
     for (int t = 0; t < token_count; ++t) {
         for (int r = 0; r < top_k; ++r) {
@@ -179,20 +184,14 @@ void Qwen4ExpExpertExecutor::ensure_gpu_pending(LayerMoePlan& plan) {
         return;
     }
 
-    constexpr int kMaxStackPending = 16;
-    int pending_experts_buf[kMaxStackPending];
-    int assigned_slots_buf[kMaxStackPending];
-    int* pending_experts = pending_experts_buf;
-    int* assigned_slots = assigned_slots_buf;
-    std::vector<int> pending_vec;
-    std::vector<int> assigned_vec;
-
-    if (plan.pending_gpu_indices.size() > kMaxStackPending) {
-        pending_vec.reserve(plan.pending_gpu_indices.size());
-        assigned_vec.resize(plan.pending_gpu_indices.size(), -1);
-        pending_experts = pending_vec.data();
-        assigned_slots = assigned_vec.data();
+    const size_t num_indices = plan.pending_gpu_indices.size();
+    if (num_indices > pending_experts_buf_.size()) {
+        pending_experts_buf_.resize(num_indices);
+        assigned_slots_buf_.resize(num_indices);
     }
+
+    int* pending_experts = pending_experts_buf_.data();
+    int* assigned_slots = assigned_slots_buf_.data();
 
     int num_pending = 0;
     for (int idx : plan.pending_gpu_indices) {
@@ -240,47 +239,75 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
     const bf16* shared_out,
     const bf16* shared_gate,
     bool uses_nested) {
-    if (!initialized_ || token_count <= 0) return {};
+    if (!initialized_ || token_count <= 0 || token_count > max_cpu_tokens_) return {};
+
+    // Drain previous layer's CPU result copy if still in-flight to prevent host buffer reuse race
+    if (prev_cpu_h2d_ev_ != sycl::event{}) {
+        prev_cpu_h2d_ev_.wait();
+        prev_cpu_h2d_ev_ = sycl::event{};
+    }
 
     const size_t total_acts = static_cast<size_t>(token_count) * top_k;
     // Copy router weights to device for ordered rank accumulation
     ctx.queue().memcpy(weights_dev_, router_weights_host, total_acts * sizeof(float));
 
-    // 1. If CPU tasks exist, fetch input activations x_dev to pinned host memory (5 KB for decode)
+    // 1. If CPU tasks exist, initiate async fetch of activations x_dev to pinned host memory
+    sycl::event x_d2h_ev{};
     if (plan.cpu_tasks > 0 && !active_cpu_leases_.empty()) {
-        ctx.queue().memcpy(x_host_, x_dev, static_cast<size_t>(token_count) * hidden_size_ * sizeof(bf16)).wait();
+        x_d2h_ev = ctx.queue().memcpy(x_host_, x_dev, static_cast<size_t>(token_count) * hidden_size_ * sizeof(bf16));
     }
 
     // 2. Launch GPU execution FIRST so GPU hardware runs asynchronously while CPU computes
     sycl::event down_ev{};
     if (plan.gpu_tasks > 0) {
         int g_idx = 0;
+        const int num_slots = cache_->num_slots();
         for (int idx : plan.ready_gpu_indices) {
-            gpu_slots_host_[g_idx] = cache_->get_slot_dev(plan.entries[idx].gpu_slot);
+            const int slot = plan.entries[idx].gpu_slot;
+            if (slot < 0 || slot >= num_slots) {
+                throw std::runtime_error("Qwen4ExpExpertExecutor: invalid ready gpu_slot " + std::to_string(slot));
+            }
+            gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
             gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
             gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
             ++g_idx;
         }
         for (int idx : plan.pending_gpu_indices) {
-            gpu_slots_host_[g_idx] = cache_->get_slot_dev(plan.entries[idx].gpu_slot);
+            const int slot = plan.entries[idx].gpu_slot;
+            if (slot < 0 || slot >= num_slots) {
+                throw std::runtime_error("Qwen4ExpExpertExecutor: invalid pending gpu_slot " + std::to_string(slot));
+            }
+            gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
             gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
             gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
             ++g_idx;
         }
         stats_.gpu_tasks_dispatched += plan.gpu_tasks;
 
-        // Launch GPU gate_up (reading host pointers gpu_slots_host_ and gpu_tokens_host_)
+        const ops::MoeExpertSlotDev* eff_slots = gpu_slots_host_;
+        const int* eff_ranks = gpu_ranks_host_;
+        const int* eff_tokens = gpu_tokens_host_;
+        if (plan.gpu_tasks > 16) {
+            ctx.queue().memcpy(gpu_slots_dev_, gpu_slots_host_, plan.gpu_tasks * sizeof(ops::MoeExpertSlotDev));
+            ctx.queue().memcpy(gpu_ranks_dev_, gpu_ranks_host_, plan.gpu_tasks * sizeof(int));
+            ctx.queue().memcpy(gpu_tokens_dev_, gpu_tokens_host_, plan.gpu_tasks * sizeof(int));
+            eff_slots = gpu_slots_dev_;
+            eff_ranks = gpu_ranks_dev_;
+            eff_tokens = gpu_tokens_dev_;
+        }
+
+        // Launch GPU gate_up
         sycl::event gu_ev = ops::moe_decode_gate_up_swiglu_grouped(
-            ctx, gpu_slots_host_, nullptr, x_dev, moe_h_dev, plan.gpu_tasks,
+            ctx, eff_slots, nullptr, x_dev, moe_h_dev, plan.gpu_tasks,
             hidden_size_, intermediate_size_, 64,
             plan.final_dma_event != sycl::event{} ? &plan.final_dma_event : nullptr,
-            gpu_tokens_host_);
+            eff_tokens, uses_nested);
 
         // Launch GPU down_to_rank_f32 writing directly into rank slots of down_acc_dev_
         down_ev = ops::moe_decode_down_to_rank_f32(
-            ctx, gpu_slots_host_, gpu_ranks_host_, moe_h_dev, down_acc_dev_,
+            ctx, eff_slots, eff_ranks, moe_h_dev, down_acc_dev_,
             plan.gpu_tasks, top_k, intermediate_size_, hidden_size_, 64,
-            gpu_tokens_host_, nullptr, &gu_ev, uses_nested);
+            eff_tokens, nullptr, &gu_ev, uses_nested);
 
         // Record consumer reader fences for the GPU slots used
         for (int idx : plan.ready_gpu_indices) {
@@ -297,6 +324,9 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
     bool cpu_did_work = false;
 
     if (plan.cpu_tasks > 0 && !active_cpu_leases_.empty()) {
+        if (x_d2h_ev != sycl::event{}) {
+            x_d2h_ev.wait();
+        }
         cpu_did_work = true;
 
         for (int c = 0; c < plan.cpu_tasks; ++c) {
@@ -336,26 +366,24 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
         stats_.cpu_tasks_dispatched += plan.cpu_tasks;
         stats_.cpu_tasks_completed += plan.cpu_tasks;
         active_cpu_leases_.clear();
-    }
 
-    // 4. H3: Straggler Monitoring & Protection
-    if (cpu_did_work && plan.gpu_tasks > 0) {
-        if (last_cpu_h2d_ev != sycl::event{}) {
-            last_cpu_h2d_ev.wait();
-        }
-        const auto gpu_status = down_ev.get_info<sycl::info::event::command_execution_status>();
-        if (gpu_status == sycl::info::event_command_status::complete) {
-            // GPU finished before CPU work/copy completed -> CPU was a straggler!
-            stats_.cpu_straggler_count++;
-            consecutive_stragglers_++;
-            if (consecutive_stragglers_ >= 2) {
-                straggler_penalty_active_ = true;
+        // 4. H3: Straggler Monitoring & Protection (sampled at exact CPU compute completion)
+        if (plan.gpu_tasks > 0) {
+            const auto gpu_status = down_ev.get_info<sycl::info::event::command_execution_status>();
+            if (gpu_status == sycl::info::event_command_status::complete) {
+                // GPU finished before CPU compute completed -> CPU was a straggler!
+                stats_.cpu_straggler_count++;
+                consecutive_stragglers_++;
+                stats_.cpu_exposed_tail_ns += cpu_elapsed_ns;
+                if (consecutive_stragglers_ >= 2) {
+                    straggler_penalty_active_ = true;
+                }
+            } else {
+                // GPU is still busy computing -> CPU completed inside GPU execution window (healthy overlap)!
+                stats_.cpu_overlapped_count++;
+                consecutive_stragglers_ = 0;
+                straggler_penalty_active_ = false;
             }
-        } else {
-            // CPU finished while GPU was still executing -> successful pipeline overlap!
-            stats_.cpu_overlapped_count++;
-            consecutive_stragglers_ = 0;
-            straggler_penalty_active_ = false;
         }
     }
 
@@ -365,6 +393,7 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
         hidden_size_, shared_out, shared_gate,
         plan.gpu_tasks > 0 ? &down_ev : (last_cpu_h2d_ev != sycl::event{} ? &last_cpu_h2d_ev : nullptr));
 
+    prev_cpu_h2d_ev_ = last_cpu_h2d_ev;
     stats_.layers_hetero_executed++;
     record_execution_complete(plan, merge_ev);
     return merge_ev;

@@ -683,6 +683,183 @@ void test_h3_straggler_monitoring_and_penalty(Context& ctx) {
     std::cout << "  Passed H3 straggler monitoring and penalty test.\n";
 }
 
+void test_h2b_multi_token_and_large_task_dispatch(Context& ctx) {
+    std::cout << "[Test 8] Testing H2b multi-token (m=2, top_k=10 => 20 tasks, >16 GPU tasks) dispatch...\n";
+    _putenv("AILA_TEST_Q4E_HOST_SLOTS=8");
+    SyntheticExpertWeights synth;
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp * sizeof(uint8_t) +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp * sizeof(uint8_t);
+    const size_t cache_bytes = 20 * slot_bytes;
+
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, synth.num_layers, cache_bytes,
+                         synth.num_experts_per_layer, synth.hidden_size,
+                         synth.intermediate_size, synth.blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
+
+    // Populate GPU slots with expert 0
+    int pre_req[1] = {0};
+    int pre_slots[1] = {-1};
+    sycl::event ev = cache.acquire(0, pre_req, 1, pre_slots);
+    ev.wait_and_throw();
+
+    // Host-ready experts: 1, 2
+    cache.prepare_host(0, 1);
+    cache.prepare_host(0, 2);
+
+    aila::Qwen4ExpExpertExecutor executor;
+    executor.init(ctx, cache, 64, 10, synth.hidden_size, synth.intermediate_size);
+    executor.set_max_cpu_credits(2);
+    executor.set_max_cpu_tokens(4);
+
+    // 2 tokens, top_k = 10 -> total = 20 tasks!
+    // Token 0: [0, 1, 2, 3, 4, 5, 6, 7, 0, 1] (0: GPU, 1: CPU, 2: CPU, others: GPU pending)
+    // Token 1: [0, 3, 4, 5, 6, 7, 0, 1, 2, 3] (0: GPU, others: GPU pending since credits full)
+    std::vector<int> route_ids = {
+        0, 1, 2, 3, 4, 5, 6, 7, 0, 1,
+        0, 3, 4, 5, 6, 7, 0, 1, 2, 3
+    };
+    std::vector<float> route_weights(20, 0.1f);
+
+    try {
+        aila::LayerMoePlan& plan = executor.plan_layer(0, route_ids.data(), route_weights.data(), 2, 10, true);
+        expect(plan.token_count == 2, "token count must be 2");
+        expect(plan.total_tasks == 20, "total tasks must be 20");
+        expect(plan.cpu_tasks == 2, "cpu tasks must be 2 (within effective_credits=2)");
+        expect(plan.gpu_tasks == 18, "gpu tasks must be 18 (> 16, exercising dev pointer kernel dispatch)");
+
+        executor.ensure_gpu_pending(plan);
+        if (plan.final_dma_event != sycl::event{}) {
+            plan.final_dma_event.wait_and_throw();
+        }
+
+        // Allocate device buffers
+        bf16* x_dev = static_cast<bf16*>(ctx.alloc_device(2 * synth.hidden_size * sizeof(bf16)));
+        std::vector<bf16> x_host(2 * synth.hidden_size, bf16(0.25f));
+        ctx.queue().memcpy(x_dev, x_host.data(), 2 * synth.hidden_size * sizeof(bf16)).wait();
+
+        bf16* moe_h_dev = static_cast<bf16*>(ctx.alloc_device(20 * synth.intermediate_size * sizeof(bf16)));
+        bf16* y_dev = static_cast<bf16*>(ctx.alloc_device(2 * synth.hidden_size * sizeof(bf16)));
+
+        sycl::event hetero_ev = executor.execute_hetero_decode(
+            ctx, plan, x_dev, moe_h_dev, route_weights.data(), y_dev, 2, 10,
+            nullptr, nullptr, cache.uses_nested_codes());
+        hetero_ev.wait_and_throw();
+
+        // Verify stats
+        const auto& stats = executor.stats();
+        expect(stats.cpu_tasks_dispatched == 2, "expected 2 cpu tasks dispatched");
+        expect(stats.cpu_tasks_completed == 2, "expected 2 cpu tasks completed");
+        expect(stats.gpu_tasks_dispatched == 18, "expected 18 gpu tasks dispatched (>16)");
+        expect(stats.layers_hetero_executed == 1, "expected 1 layer hetero executed");
+
+        // Check output values are finite
+        std::vector<bf16> y_host(2 * synth.hidden_size);
+        ctx.queue().memcpy(y_host.data(), y_dev, 2 * synth.hidden_size * sizeof(bf16)).wait();
+        for (size_t i = 0; i < y_host.size(); ++i) {
+            float val = static_cast<float>(y_host[i]);
+            expect(!std::isnan(val) && !std::isinf(val), "output values must be finite numbers");
+        }
+
+        ctx.free_device(x_dev);
+        ctx.free_device(moe_h_dev);
+        ctx.free_device(y_dev);
+
+        std::cout << "  Passed H2b multi-token (>16 tasks) dispatch and execution test.\n";
+    } catch (const std::exception& e) {
+        std::cout << "  [Test 8 Exception caught]: " << e.what() << "\n";
+        throw;
+    }
+}
+
+void test_active_gpu_experts_greater_than_16(Context& ctx) {
+    std::cout << "[Test 9] Testing gate_up and down_to_rank_f32 with >16 active GPU experts...\n";
+    SyntheticExpertWeights synth;
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp * sizeof(uint8_t) +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp * sizeof(uint8_t);
+    const size_t cache_bytes = 24 * slot_bytes;
+
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, synth.num_layers, cache_bytes,
+                         synth.num_experts_per_layer, synth.hidden_size,
+                         synth.intermediate_size, synth.blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
+
+    // Acquire all 8 unique experts into cache slots
+    constexpr int kUniqueExp = 8;
+    std::vector<int> req(kUniqueExp);
+    for (int i = 0; i < kUniqueExp; ++i) req[i] = i;
+    std::vector<int> slots(kUniqueExp, -1);
+    sycl::event ev = cache.acquire(0, req.data(), kUniqueExp, slots.data());
+    ev.wait_and_throw();
+
+    constexpr int kNumExp = 20;
+    std::vector<ops::MoeExpertSlotDev> dev_slots(kNumExp);
+    for (int i = 0; i < kNumExp; ++i) {
+        dev_slots[i] = cache.get_slot_dev(slots[i % kUniqueExp]);
+    }
+
+    ops::MoeExpertSlotDev* dev_slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(kNumExp * sizeof(ops::MoeExpertSlotDev)));
+    ctx.queue().memcpy(dev_slots_dev, dev_slots.data(), kNumExp * sizeof(ops::MoeExpertSlotDev)).wait();
+
+    std::vector<int> token_ids(kNumExp, 0);
+    int* token_ids_dev = static_cast<int*>(ctx.alloc_device(kNumExp * sizeof(int)));
+    ctx.queue().memcpy(token_ids_dev, token_ids.data(), kNumExp * sizeof(int)).wait();
+
+    std::vector<int> ranks(kNumExp);
+    for (int i = 0; i < kNumExp; ++i) ranks[i] = i % 10;
+    int* ranks_dev = static_cast<int*>(ctx.alloc_device(kNumExp * sizeof(int)));
+    ctx.queue().memcpy(ranks_dev, ranks.data(), kNumExp * sizeof(int)).wait();
+
+    bf16* x_dev = static_cast<bf16*>(ctx.alloc_device(synth.hidden_size * sizeof(bf16)));
+    std::vector<bf16> x_host(synth.hidden_size, bf16(0.3f));
+    ctx.queue().memcpy(x_dev, x_host.data(), synth.hidden_size * sizeof(bf16)).wait();
+
+    bf16* moe_h_dev = static_cast<bf16*>(ctx.alloc_device(kNumExp * synth.intermediate_size * sizeof(bf16)));
+    float* down_acc_dev = static_cast<float*>(ctx.alloc_device(kNumExp * synth.hidden_size * sizeof(float)));
+
+    // Launch grouped gate_up with 20 experts (>16)
+    sycl::event gu_ev = ops::moe_decode_gate_up_swiglu_grouped(
+        ctx, dev_slots_dev, nullptr, x_dev, moe_h_dev, kNumExp,
+        synth.hidden_size, synth.intermediate_size, synth.blocksize,
+        nullptr, token_ids_dev, cache.uses_nested_codes());
+
+    // Launch down_to_rank_f32 with 20 experts (>16)
+    sycl::event down_ev = ops::moe_decode_down_to_rank_f32(
+        ctx, dev_slots_dev, ranks_dev, moe_h_dev, down_acc_dev,
+        kNumExp, 10, synth.intermediate_size, synth.hidden_size, synth.blocksize,
+        token_ids_dev, nullptr, &gu_ev, cache.uses_nested_codes());
+    down_ev.wait_and_throw();
+
+    // Verify down_acc_dev has valid non-zero values
+    std::vector<float> acc_host(kNumExp * synth.hidden_size);
+    ctx.queue().memcpy(acc_host.data(), down_acc_dev, acc_host.size() * sizeof(float)).wait();
+    bool has_nonzero = false;
+    for (float f : acc_host) {
+        expect(!std::isnan(f) && !std::isinf(f), "acc values must be finite");
+        if (std::abs(f) > 1e-6f) has_nonzero = true;
+    }
+    expect(has_nonzero, "down_to_rank_f32 for 20 experts must compute non-zero activations");
+
+    ctx.free_device(dev_slots_dev);
+    ctx.free_device(token_ids_dev);
+    ctx.free_device(ranks_dev);
+    ctx.free_device(x_dev);
+    ctx.free_device(moe_h_dev);
+    ctx.free_device(down_acc_dev);
+
+    std::cout << "  Passed >16 active GPU experts gate_up and down_to_rank_f32 test.\n";
+}
+
 } // namespace
 
 int main() {
@@ -703,6 +880,8 @@ int main() {
         test_h2b_down_to_rank_and_ordered_merge(ctx);
         test_h2b_h3_cpu_expert_dispatch_and_credit_bounds(ctx);
         test_h3_straggler_monitoring_and_penalty(ctx);
+        test_h2b_multi_token_and_large_task_dispatch(ctx);
+        test_active_gpu_experts_greater_than_16(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
@@ -710,7 +889,7 @@ int main() {
         std::cout << "All H1/H2b/H3 expert readiness tests PASSED successfully!\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "FATAL ERROR in readiness tests: " << e.what() << "\n";
+        std::cout << "FATAL ERROR in readiness tests: " << e.what() << "\n";
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
         return 1;

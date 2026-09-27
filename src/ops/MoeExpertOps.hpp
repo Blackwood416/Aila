@@ -102,7 +102,8 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int intermediate_size = 640,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    const int* token_ids = nullptr);
+    const int* token_ids = nullptr,
+    bool use_nested = false);
 
 inline sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,

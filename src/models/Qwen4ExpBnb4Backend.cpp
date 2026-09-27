@@ -2081,6 +2081,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                           stage_ms[kStagePle], stage_ms[kStageHc], stage_ms[kStageLinearAttn],
                           stage_ms[kStageFullAttn], stage_ms[kStageRouter], stage_ms[kStageExperts],
                           prof_acquire_ms, stage_ms[kStageShared], stage_ms[kStageHead]);
+            if (expert_executor_.stats().layers_hetero_executed > 0) {
+                const auto& hs = expert_executor_.stats();
+                AILA_LOG_INFO("[Q4E Hetero] layers=%llu cpu_tasks=%llu (overlapped=%llu, stragglers=%llu) gpu_tasks=%llu cpu_compute=%.2f ms exposed_tail=%.2f ms",
+                              static_cast<unsigned long long>(hs.layers_hetero_executed),
+                              static_cast<unsigned long long>(hs.cpu_tasks_dispatched),
+                              static_cast<unsigned long long>(hs.cpu_overlapped_count),
+                              static_cast<unsigned long long>(hs.cpu_straggler_count),
+                              static_cast<unsigned long long>(hs.gpu_tasks_dispatched),
+                              static_cast<double>(hs.cpu_compute_ns) / 1e6,
+                              static_cast<double>(hs.cpu_exposed_tail_ns) / 1e6);
+            }
         }
     }
     static const bool s_log_dispatch = aila::env::read_flag("AILA_Q4E_LOG_DISPATCH", false);
