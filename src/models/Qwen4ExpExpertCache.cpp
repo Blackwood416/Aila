@@ -328,6 +328,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     slot_to_key_ = std::move(other.slot_to_key_);
     slot_reserved_ = std::move(other.slot_reserved_);
     slots_dev_ = std::move(other.slots_dev_);
+    gpu_slot_records_ = std::move(other.gpu_slot_records_);
     stats_ = other.stats_;
     initialized_ = other.initialized_;
     faulted_ = other.faulted_;
@@ -341,6 +342,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     host_slot_ptrs_ = std::move(other.host_slot_ptrs_);
     host_layer_expert_to_slot_ = std::move(other.host_layer_expert_to_slot_);
     host_slot_to_key_ = std::move(other.host_slot_to_key_);
+    host_slot_records_ = std::move(other.host_slot_records_);
     host_empty_slots_ = std::move(other.host_empty_slots_);
     host_probationary_list_ = std::move(other.host_probationary_list_);
     host_protected_list_ = std::move(other.host_protected_list_);
@@ -357,6 +359,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     batch_reserved_slots_scratch_ = std::move(other.batch_reserved_slots_scratch_);
     to_fill_scratch_ = std::move(other.to_fill_scratch_);
     assigned_hslots_scratch_ = std::move(other.assigned_hslots_scratch_);
+    assigned_hslot_gens_scratch_ = std::move(other.assigned_hslot_gens_scratch_);
     parts_left_scratch_ = std::move(other.parts_left_scratch_);
     parts_left_capacity_ = other.parts_left_capacity_;
 
@@ -428,10 +431,12 @@ void Qwen4ExpExpertCache::cleanup() {
     slot_to_key_.clear();
     slot_reserved_.clear();
     slots_dev_.clear();
+    gpu_slot_records_.clear();
     host_pool_chunks_.clear();
     host_slot_ptrs_.clear();
     host_layer_expert_to_slot_.clear();
     host_slot_to_key_.clear();
+    host_slot_records_.clear();
     host_empty_slots_.clear();
     host_probationary_list_.clear();
     host_protected_list_.clear();
@@ -645,6 +650,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
             host_pool_enabled_ = true;
             protected_ratio_ = aila::env::read_float("AILA_Q4E_HOST_PROTECTED_RATIO", 0.75f);
             host_slot_to_key_.assign(num_host_slots_, UINT64_MAX);
+            host_slot_records_.assign(num_host_slots_, HostSlotRecord{});
             host_slot_iters_.resize(num_host_slots_);
             host_slot_is_protected_.assign(num_host_slots_, false);
             host_slot_reserved_.assign(num_host_slots_, false);
@@ -662,7 +668,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
             host_layer_expert_to_slot_.assign(static_cast<size_t>(num_layers_) * num_experts_per_layer_, -1);
             host_slot_state_ = std::make_unique<std::atomic<uint8_t>[]>(num_host_slots_);
             for (int h = 0; h < num_host_slots_; ++h) {
-                host_slot_state_[h].store(0 /* Empty */, std::memory_order_relaxed);
+                host_slot_state_[h].store(static_cast<uint8_t>(ExpertSlotState::Empty), std::memory_order_relaxed);
             }
             AILA_LOG_INFO("[Q4E ExpertCache] Hot Host RAM Pool initialized: slots=%d pool=%.1fMB",
                           num_host_slots_, host_pool_bytes_ / (1024.0 * 1024.0));
@@ -675,6 +681,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     layer_expert_to_slot_.assign(static_cast<size_t>(num_layers_) * num_experts_per_layer_, -1);
     slot_to_key_.assign(num_slots_, UINT64_MAX);
     slot_reserved_.assign(num_slots_, false);
+    gpu_slot_records_.assign(num_slots_, GpuSlotRecord{});
 
     slots_dev_.resize(num_slots_);
 
@@ -949,7 +956,9 @@ void Qwen4ExpExpertCache::ensure_prefetch_item_ready(PrefetchItem& item, int c) 
                 if (item.parts_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     item.ready.store(true, std::memory_order_release);
                     if (item.hslot >= 0) {
-                        host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
+                        if (host_slot_records_[item.hslot].generation == item.expected_generation) {
+                            host_slot_state_[item.hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+                        }
                     }
                 }
             }
@@ -983,12 +992,17 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
                     host_slot_reserved_[h] = false;
                 }
                 if (!item.ready.load(std::memory_order_acquire)) {
+                    const int rem = item.parts_remaining.load(std::memory_order_relaxed);
+                    if (rem > 0 && fill_parts_ > 0) {
+                        stats_.prefetch_cancelled_bytes += (static_cast<uint64_t>(rem) * slot_bytes_) / fill_parts_;
+                    }
                     const int flat = expert_flat_index(item.layer, item.expert_id);
                     if (host_layer_expert_to_slot_[flat] == h) {
                         host_layer_expert_to_slot_[flat] = -1;
                     }
                     host_slot_to_key_[h] = UINT64_MAX;
-                    host_slot_state_[h].store(0 /* Empty */, std::memory_order_release);
+                    host_slot_records_[h].key = UINT64_MAX;
+                    host_slot_state_[h].store(static_cast<uint8_t>(ExpertSlotState::Empty), std::memory_order_release);
                     if (host_slot_is_protected_[h]) {
                         host_protected_list_.erase(host_slot_iters_[h]);
                     } else {
@@ -997,7 +1011,23 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
                     host_slot_is_protected_[h] = false;
                     host_empty_slots_.push_back(h);
                 } else {
-                    host_slot_state_[h].store(2 /* Ready */, std::memory_order_release);
+                    if (host_slot_records_[h].generation == item.expected_generation) {
+                        host_slot_state_[h].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+                    }
+                }
+            } else if (!item.ready.load(std::memory_order_acquire)) {
+                const int rem = item.parts_remaining.load(std::memory_order_relaxed);
+                if (rem > 0 && fill_parts_ > 0) {
+                    stats_.prefetch_cancelled_bytes += (static_cast<uint64_t>(rem) * slot_bytes_) / fill_parts_;
+                }
+            }
+        }
+    } else {
+        for (auto& item : prefetch_items_) {
+            if (!item.ready.load(std::memory_order_acquire)) {
+                const int rem = item.parts_remaining.load(std::memory_order_relaxed);
+                if (rem > 0 && fill_parts_ > 0) {
+                    stats_.prefetch_cancelled_bytes += (static_cast<uint64_t>(rem) * slot_bytes_) / fill_parts_;
                 }
             }
         }
@@ -1042,7 +1072,14 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     // replacement-policy simulation (perf/qwen4exp/q4e_cache_sim.py).
     static FILE* s_trace = [] {
         const std::string path = aila::env::read_string("AILA_DEBUG_Q4E_ROUTE_TRACE", "");
-        return path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
+        if (path.empty()) return static_cast<FILE*>(nullptr);
+        FILE* fp = nullptr;
+#ifdef _WIN32
+        fopen_s(&fp, path.c_str(), "wb");
+#else
+        fp = std::fopen(path.c_str(), "wb");
+#endif
+        return fp;
     }();
     if (s_trace) {
         const int header[2] = {layer, count};
@@ -1081,6 +1118,9 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 }
                 if (bindings_published || dma_submitted) {
                     self->faulted_ = true;
+                    for (int s : self->batch_reserved_slots_scratch_) {
+                        self->gpu_slot_records_[s].state = ExpertSlotState::Faulted;
+                    }
                 }
                 for (int s : self->batch_reserved_slots_scratch_) {
                     self->slot_reserved_[s] = false;
@@ -1109,6 +1149,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 batch_reserved_slots_scratch_.push_back(slot);
                 lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
             }
+            gpu_slot_records_[slot].state = ExpertSlotState::Ready;
             ++stats_.hit_count;
             ++hit_count_in_batch;
         } else {
@@ -1140,13 +1181,47 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             continue;
         }
 
-        // Search for least recently used unreserved slot from back
+        // Search for least recently used unreserved slot from back,
+        // with cost-aware preference (B4): among candidates near the LRU tail,
+        // prefer evicting an expert that is already cached in Host RAM
+        // (lower replacement cost: H2D copy only, vs disk mmap read + CPU repack + H2D).
+        static const bool s_cost_aware_eviction = aila::env::read_flag("AILA_Q4E_COST_AWARE_EVICTION", true);
         int victim_slot = -1;
-        for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend(); ++r_it) {
-            int s = *r_it;
-            if (!slot_reserved_[s]) {
-                victim_slot = s;
-                break;
+        if (s_cost_aware_eviction && host_pool_enabled_) {
+            constexpr int kMaxCandidates = 8;
+            int candidates_checked = 0;
+            int fallback_victim = -1;
+            for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend() && candidates_checked < kMaxCandidates; ++r_it) {
+                int s = *r_it;
+                if (!slot_reserved_[s]) {
+                    if (fallback_victim < 0) fallback_victim = s;
+                    ++candidates_checked;
+                    uint64_t old_k = slot_to_key_[s];
+                    if (old_k == UINT64_MAX) {
+                        victim_slot = s;
+                        break;
+                    }
+                    int old_layer = static_cast<int>(old_k >> 32);
+                    int old_exp = static_cast<int>(old_k & 0xFFFFFFFF);
+                    int h_flat = expert_flat_index(old_layer, old_exp);
+                    int hslot = host_layer_expert_to_slot_[h_flat];
+                    if (hslot >= 0 &&
+                        host_slot_state_[hslot].load(std::memory_order_acquire) == static_cast<uint8_t>(ExpertSlotState::Ready)) {
+                        victim_slot = s;
+                        break;
+                    }
+                }
+            }
+            if (victim_slot < 0) victim_slot = fallback_victim;
+        }
+
+        if (victim_slot < 0) {
+            for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend(); ++r_it) {
+                int s = *r_it;
+                if (!slot_reserved_[s]) {
+                    victim_slot = s;
+                    break;
+                }
             }
         }
 
@@ -1154,6 +1229,14 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             for (int s : batch_reserved_slots_scratch_) slot_reserved_[s] = false;
             for (int h : batch_reserved_hslots_scratch_) host_slot_reserved_[h] = false;
             throw std::runtime_error("Qwen4ExpExpertCache: all slots reserved in batch, count exceeds num_slots");
+        }
+
+        // B1: Consumer reader fence: protect GPU reader kernels from previous token before overwriting
+        if (gpu_slot_records_[victim_slot].consumer_fence != sycl::event{}) {
+            try {
+                gpu_slot_records_[victim_slot].consumer_fence.wait_and_throw();
+            } catch (...) {}
+            gpu_slot_records_[victim_slot].consumer_fence = sycl::event{};
         }
 
         // Validate the descriptor before mutating the cache's LRU and key maps.
@@ -1169,6 +1252,10 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert);
         layer_expert_to_slot_[flat_idx] = victim_slot;
         slot_to_key_[victim_slot] = key;
+        gpu_slot_records_[victim_slot].generation++;
+        gpu_slot_records_[victim_slot].key = key;
+        gpu_slot_records_[victim_slot].state = ExpertSlotState::Copying;
+        gpu_slot_records_[victim_slot].fill_owner = 0; // demand
         guard.bindings_published = true;
 
         // Move victim to MRU (front) and reserve for this batch
@@ -1215,6 +1302,8 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     : (prefetch_staging_ptr_ + static_cast<size_t>(matched_pf) * slot_bytes_);
                 copy_to_slot(miss.slot_id, src);
                 stats_.total_transferred_bytes += slot_bytes_;
+                stats_.prefetch_useful_bytes += slot_bytes_;
+                gpu_slot_records_[miss.slot_id].state = ExpertSlotState::Ready;
                 if (pf_item.hslot >= 0) {
                     touch_host_slot(pf_item.hslot);
                     add_batch_reader_hslot(pf_item.hslot);
@@ -1227,12 +1316,13 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             if (host_pool_enabled_) {
                 int h_flat = expert_flat_index(miss.layer, miss.expert_id);
                 int hslot = host_layer_expert_to_slot_[h_flat];
-                if (hslot >= 0 && host_slot_state_[hslot].load(std::memory_order_acquire) == 2 /* Ready */) {
+                if (hslot >= 0 && host_slot_state_[hslot].load(std::memory_order_acquire) == static_cast<uint8_t>(ExpertSlotState::Ready)) {
                     touch_host_slot(hslot);
                     add_batch_reader_hslot(hslot);
                     const uint8_t* src = host_slot_ptrs_[hslot];
                     copy_to_slot(miss.slot_id, src);
                     stats_.total_transferred_bytes += slot_bytes_;
+                    gpu_slot_records_[miss.slot_id].state = ExpertSlotState::Ready;
                     ++stats_.host_pool_hits;
                     continue;
                 }
@@ -1273,6 +1363,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
 
                 const size_t chunk_size = std::min(std::max<size_t>(1, avail_hslots), to_fill_scratch_.size() - m);
                 assigned_hslots_scratch_.resize(chunk_size);
+                assigned_hslot_gens_scratch_.resize(chunk_size);
 
                 for (size_t c = 0; c < chunk_size; ++c) {
                     const auto& miss = to_fill_scratch_[m + c];
@@ -1283,6 +1374,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                             host_slot_reserved_[h] = false;
                             host_slot_in_batch_readers_[h] = false;
                             host_slot_dma_events_[h] = sycl::event{};
+                            host_slot_records_[h].source_reader_fence = sycl::event{};
                         }
                         batch_reserved_hslots_scratch_.clear();
                         victim_hslot = pick_victim_hslot();
@@ -1300,7 +1392,11 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     const uint64_t key = (static_cast<uint64_t>(miss.layer) << 32) | static_cast<uint32_t>(miss.expert_id);
                     host_layer_expert_to_slot_[expert_flat_index(miss.layer, miss.expert_id)] = victim_hslot;
                     host_slot_to_key_[victim_hslot] = key;
-                    host_slot_state_[victim_hslot].store(1 /* Filling */, std::memory_order_release);
+                    const uint64_t next_gen = host_slot_records_[victim_hslot].generation + 1;
+                    host_slot_records_[victim_hslot].generation = next_gen;
+                    host_slot_records_[victim_hslot].key = key;
+                    host_slot_records_[victim_hslot].fill_owner = 0; // demand
+                    host_slot_state_[victim_hslot].store(static_cast<uint8_t>(ExpertSlotState::Filling), std::memory_order_release);
 
                     if (old_key == UINT64_MAX) {
                         host_slot_is_protected_[victim_hslot] = false;
@@ -1316,6 +1412,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     }
 
                     assigned_hslots_scratch_[c] = victim_hslot;
+                    assigned_hslot_gens_scratch_[c] = next_gen;
                     parts_left_scratch_[c].store(parts, std::memory_order_relaxed);
                     ++stats_.host_pool_misses;
                 }
@@ -1324,11 +1421,14 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     const int c = task / parts;
                     const auto& miss = to_fill_scratch_[m + c];
                     int hslot = assigned_hslots_scratch_[c];
+                    uint64_t exp_gen = assigned_hslot_gens_scratch_[c];
                     uint8_t* host_slot_ptr = host_slot_ptrs_[hslot];
                     load_expert_to_staging(miss.layer, miss.expert_id, host_slot_ptr, task % parts, parts);
                     if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        host_slot_state_[hslot].store(2 /* Ready */, std::memory_order_release);
-                        copy_to_slot(miss.slot_id, host_slot_ptr);
+                        if (host_slot_records_[hslot].generation == exp_gen) {
+                            host_slot_state_[hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+                            copy_to_slot(miss.slot_id, host_slot_ptr);
+                        }
                     }
                 };
                 fill_pool_->run(static_cast<int>(chunk_size) * parts, fill_task);
@@ -1342,12 +1442,15 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                         host_slot_reserved_[h] = false;
                         host_slot_in_batch_readers_[h] = false;
                         host_slot_dma_events_[h] = sycl::event{};
+                        host_slot_records_[h].source_reader_fence = sycl::event{};
                     }
                     batch_reserved_hslots_scratch_.clear();
                 }
             }
-            stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            const auto fill_ns_elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count());
+            stats_.fill_ns += fill_ns_elapsed;
+            stats_.demand_exposed_wait_ns += fill_ns_elapsed;
         } else if (!to_fill_scratch_.empty()) {
             // Double-buffered staging: while one half DMAs, the other half is being filled.
             const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
@@ -1385,8 +1488,10 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 };
                 fill_pool_->run(chunk_size * parts, fill_task);
                 stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
-                stats_.fill_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                const auto fill_ns_elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - t0).count());
+                stats_.fill_ns += fill_ns_elapsed;
+                stats_.demand_exposed_wait_ns += fill_ns_elapsed;
 
                 half_done[half] = copy_q_->ext_oneapi_submit_barrier();
                 half_busy[half] = true;
@@ -1400,8 +1505,12 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         if (copy_q_) {
             dma_done_event = copy_q_->ext_oneapi_submit_barrier();
             last_dma_event_ = dma_done_event;
+            for (const auto& miss : misses_scratch_) {
+                gpu_slot_records_[miss.slot_id].state = ExpertSlotState::Ready;
+            }
             for (int h : batch_reserved_hslots_scratch_) {
                 host_slot_dma_events_[h] = dma_done_event;
+                host_slot_records_[h].source_reader_fence = dma_done_event;
             }
         }
     }
@@ -1423,7 +1532,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     return dma_done_event;
 }
 
-void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int count) {
+void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int count, int quota) {
     if (!initialized_ || count <= 0 || expert_ids == nullptr) {
         return;
     }
@@ -1437,25 +1546,33 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
 
     prefetch_items_.clear();
     const int max_slots = host_pool_enabled_ ? num_host_slots_ : prefetch_staging_slots_;
+    const int effective_quota = (quota > 0) ? quota : count;
+    const int target_quota = std::max(1, std::min(max_slots, effective_quota));
     const int parts = fill_parts_;
-    for (int i = 0; i < count && static_cast<int>(prefetch_items_.size()) < max_slots; ++i) {
+    // B3: Filter GPU resident, host Ready, and duplicate items BEFORE quota truncation!
+    for (int i = 0; i < count && static_cast<int>(prefetch_items_.size()) < target_quota; ++i) {
         const int expert = expert_ids[i];
-        if (expert < 0 || expert >= num_experts_per_layer_ || contains(layer, expert)) continue;
+        if (expert < 0 || expert >= num_experts_per_layer_) continue;
+        if (contains(layer, expert)) continue;
         if (host_pool_enabled_) {
             int hflat = expert_flat_index(layer, expert);
             int cur_hslot = host_layer_expert_to_slot_[hflat];
-            if (cur_hslot >= 0 && host_slot_state_[cur_hslot].load(std::memory_order_acquire) == 2 /* Ready */) continue;
+            if (cur_hslot >= 0 &&
+                host_slot_state_[cur_hslot].load(std::memory_order_acquire) == static_cast<uint8_t>(ExpertSlotState::Ready)) {
+                continue;
+            }
         }
         bool dup = false;
         for (const auto& item : prefetch_items_) {
             if (item.expert_id == expert) { dup = true; break; }
         }
-        if (!dup) prefetch_items_.emplace_back(layer, expert, -1, parts);
+        if (!dup) prefetch_items_.emplace_back(layer, expert, -1, parts, 0);
     }
     if (prefetch_items_.empty()) return;
 
     const int n = static_cast<int>(prefetch_items_.size());
     stats_.prefetch_issued += static_cast<uint64_t>(n);
+    stats_.prefetch_issued_bytes += static_cast<uint64_t>(n) * slot_bytes_;
     prefetch_in_flight_ = true;
 
     if (host_pool_enabled_) {
@@ -1476,7 +1593,11 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
             const uint64_t key = (static_cast<uint64_t>(item.layer) << 32) | static_cast<uint32_t>(item.expert_id);
             host_layer_expert_to_slot_[expert_flat_index(item.layer, item.expert_id)] = victim_hslot;
             host_slot_to_key_[victim_hslot] = key;
-            host_slot_state_[victim_hslot].store(1 /* Filling */, std::memory_order_release);
+            const uint64_t next_gen = host_slot_records_[victim_hslot].generation + 1;
+            host_slot_records_[victim_hslot].generation = next_gen;
+            host_slot_records_[victim_hslot].key = key;
+            host_slot_records_[victim_hslot].fill_owner = 1; // prefetch
+            host_slot_state_[victim_hslot].store(static_cast<uint8_t>(ExpertSlotState::Filling), std::memory_order_release);
 
             if (old_key == UINT64_MAX) {
                 host_slot_is_protected_[victim_hslot] = false;
@@ -1492,6 +1613,7 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
             }
 
             item.hslot = victim_hslot;
+            item.expected_generation = next_gen;
         }
     }
 
@@ -1518,7 +1640,9 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
                 if (item.parts_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     item.ready.store(true, std::memory_order_release);
                     if (item.hslot >= 0) {
-                        host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
+                        if (host_slot_records_[item.hslot].generation == item.expected_generation) {
+                            host_slot_state_[item.hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+                        }
                     }
                 }
             }
@@ -1537,7 +1661,9 @@ void Qwen4ExpExpertCache::wait_prefetch() {
                 }
                 if (item.parts_remaining.load(std::memory_order_acquire) == 0) {
                     item.ready.store(true, std::memory_order_release);
-                    host_slot_state_[item.hslot].store(2 /* Ready */, std::memory_order_release);
+                    if (host_slot_records_[item.hslot].generation == item.expected_generation) {
+                        host_slot_state_[item.hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
+                    }
                 }
             }
         }
@@ -1674,6 +1800,46 @@ void Qwen4ExpExpertCache::log_stats(int layer) const {
         std::cout << "[Q4E MoE] total"
                   << " hit=" << stats_.hit_count << "/" << total
                   << " (" << rate << "%)"
-                  << " bytes=" << stats_.total_transferred_bytes << "\n";
+                  << " bytes=" << stats_.total_transferred_bytes
+                  << " pf_issued_b=" << stats_.prefetch_issued_bytes
+                  << " pf_useful_b=" << stats_.prefetch_useful_bytes
+                  << " pf_cancelled_b=" << stats_.prefetch_cancelled_bytes
+                  << " exposed_wait_ms=" << (stats_.demand_exposed_wait_ns / 1000000.0) << "\n";
+    }
+}
+
+ExpertSlotState Qwen4ExpExpertCache::get_slot_state(int slot_id) const {
+    if (faulted_ || slot_id < 0 || slot_id >= num_slots_) return ExpertSlotState::Faulted;
+    return gpu_slot_records_[slot_id].state;
+}
+
+uint64_t Qwen4ExpExpertCache::get_slot_generation(int slot_id) const {
+    if (slot_id < 0 || slot_id >= num_slots_) return 0;
+    return gpu_slot_records_[slot_id].generation;
+}
+
+ExpertSlotState Qwen4ExpExpertCache::get_host_slot_state(int hslot) const {
+    if (faulted_ || !host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return ExpertSlotState::Faulted;
+    return static_cast<ExpertSlotState>(host_slot_state_[hslot].load(std::memory_order_acquire));
+}
+
+uint64_t Qwen4ExpExpertCache::get_host_slot_generation(int hslot) const {
+    if (!host_pool_enabled_ || hslot < 0 || hslot >= num_host_slots_) return 0;
+    return host_slot_records_[hslot].generation;
+}
+
+void Qwen4ExpExpertCache::record_consumer_reader_fence(int slot_id, sycl::event fence) {
+    if (slot_id >= 0 && slot_id < num_slots_) {
+        gpu_slot_records_[slot_id].consumer_fence = fence;
+    }
+}
+
+void Qwen4ExpExpertCache::record_consumer_reader_fences(const int* slot_ids, int count, sycl::event fence) {
+    if (!slot_ids || count <= 0) return;
+    for (int i = 0; i < count; ++i) {
+        int s = slot_ids[i];
+        if (s >= 0 && s < num_slots_) {
+            gpu_slot_records_[s].consumer_fence = fence;
+        }
     }
 }

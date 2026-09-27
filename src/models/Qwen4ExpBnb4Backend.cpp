@@ -1353,24 +1353,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
                     count, cfg_.num_experts, hidden_size_);
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
-        sycl::event route_event = ops::router_softmax_topk_device(
+        sycl::event actual_route_event = ops::router_softmax_topk_device(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
         const bool predict_next = (count == 1)
             ? ((s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
             : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers));
+        sycl::event prediction_event{};
         if (predict_next) {
             // Route this layer's MoE input through the next layer's router to guess its experts.
             DenseLinear(ctx, layers_[L + 1].router_gate, layers_[L + 1].router_w, buf_.x, pred_scores_,
                         count, cfg_.num_experts, hidden_size_);
             static const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
             if (s_pred_ids_only) {
-                route_event = ops::router_topk_ids_device(
+                prediction_event = ops::router_topk_ids_device(
                     ctx, static_cast<const bf16*>(pred_scores_.data()),
                     pred_host_ids_, count, cfg_.num_experts, top_k);
             } else {
-                route_event = ops::router_softmax_topk_device(
+                prediction_event = ops::router_softmax_topk_device(
                     ctx, static_cast<const bf16*>(pred_scores_.data()), nullptr,
                     pred_host_ids_, pred_host_weights_, count, cfg_.num_experts, top_k, true);
             }
@@ -1396,25 +1397,33 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             layer.shared_down_proj.forward(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
         }
 
-        const auto prof_router_t0 = prof_clock::now();
-        route_event.wait();
-        const auto prof_router_t1 = prof_clock::now();
-        if (predict_next || have_pred) {
-            if (have_pred && s_predict_stats && count == 1) {
-                for (int k = 0; k < top_k; ++k) {
-                    const int e = router_host_ids_[k];
-                    const bool in_pred = std::find(pred_ids.begin(), pred_ids.begin() + top_k, e) != pred_ids.begin() + top_k;
-                    pred_overlap_ += in_pred ? 1 : 0;
-                    if (!expert_cache_.contains(L, e)) {
-                        ++pred_miss_total_;
-                        pred_miss_hit_ += in_pred ? 1 : 0;
-                    }
+        auto ensure_prediction_ready = [&]() {
+            if (prediction_event != sycl::event{}) {
+                prediction_event.wait();
+                prediction_event = sycl::event{};
+                if (count == 1) {
+                    std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
                 }
-                pred_total_ += top_k;
             }
-            have_pred = predict_next && (count == 1);
-            if (predict_next && count == 1) std::copy(pred_host_ids_, pred_host_ids_ + top_k, pred_ids.begin());
+        };
+
+        const auto prof_router_t0 = prof_clock::now();
+        // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
+        actual_route_event.wait();
+        const auto prof_router_t1 = prof_clock::now();
+        if (have_pred && s_predict_stats && count == 1) {
+            for (int k = 0; k < top_k; ++k) {
+                const int e = router_host_ids_[k];
+                const bool in_pred = std::find(pred_ids.begin(), pred_ids.begin() + top_k, e) != pred_ids.begin() + top_k;
+                pred_overlap_ += in_pred ? 1 : 0;
+                if (!expert_cache_.contains(L, e)) {
+                    ++pred_miss_total_;
+                    pred_miss_hit_ += in_pred ? 1 : 0;
+                }
+            }
+            pred_total_ += top_k;
         }
+        have_pred = predict_next && (count == 1);
         prof_router_sync_ms += prof_ms(prof_router_t0, prof_router_t1);
         stage(kStageRouter);
         // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
@@ -1455,6 +1464,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
         }
         if (s_prefetch && predict_next && count > 1 && batch_acquire) {
+            ensure_prediction_ready();
             prefill_pred_unique_.clear();
             std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
             const int total_preds = count * top_k;
@@ -1468,7 +1478,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
                 [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
             const int prefetch_count = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
-            expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(), prefetch_count);
+            expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(),
+                                         static_cast<int>(prefill_pred_unique_.size()), prefetch_count);
         }
         prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
 
@@ -1502,13 +1513,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
 
             ctx.queue().memcpy(expert_map_slot_dev_, expert_map_slot_host_,
-                               static_cast<size_t>(total_acts) * sizeof(ops::MoeExpertSlotDev));
+                                static_cast<size_t>(total_acts) * sizeof(ops::MoeExpertSlotDev));
             ctx.queue().memcpy(expert_map_token_dev_, expert_map_token_host_,
-                               static_cast<size_t>(total_acts) * sizeof(int));
+                                static_cast<size_t>(total_acts) * sizeof(int));
             ctx.queue().memcpy(expert_map_rank_dev_, expert_map_rank_host_,
-                               static_cast<size_t>(total_acts) * sizeof(int));
+                                static_cast<size_t>(total_acts) * sizeof(int));
             ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
-                               static_cast<size_t>(total_acts) * sizeof(float));
+                                static_cast<size_t>(total_acts) * sizeof(float));
 
             const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
             bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
@@ -1532,6 +1543,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
                 &dn_event);
+
+            expert_cache_.record_consumer_reader_fences(
+                prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
         } else if (batch_acquire && s_prefill_moe_rows && count > 1) {
             for (int t = 0; t < count; ++t) {
                 const int* t_ids = router_host_ids_ + t * top_k;
@@ -1541,9 +1555,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
             }
             ctx.queue().memcpy(batch_slots_dev_, batch_slots_host_,
-                               static_cast<size_t>(count) * top_k * sizeof(ops::MoeExpertSlotDev));
+                                static_cast<size_t>(count) * top_k * sizeof(ops::MoeExpertSlotDev));
             ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
-                               static_cast<size_t>(count) * top_k * sizeof(float));
+                                static_cast<size_t>(count) * top_k * sizeof(float));
 
             const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
             bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
@@ -1554,12 +1568,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 count, top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
                 &batch_dma_event, expert_cache_.uses_nested_codes());
 
-            ops::moe_prefill_down_rows(
+            sycl::event dn_event = ops::moe_prefill_down_rows(
                 ctx, batch_slots_dev_, batch_weights_dev_, nullptr, h_ptr, y_ptr,
                 count, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
                 s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
                 nullptr, expert_cache_.uses_nested_codes());
+
+            expert_cache_.record_consumer_reader_fences(
+                prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
         } else {
             for (int t = 0; t < count; ++t) {
                 const int* t_ids = router_host_ids_ + t * top_k;
@@ -1579,7 +1596,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
                     prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
                     if (s_prefetch && predict_next && count == 1) {
-                        expert_cache_.prefetch_async(L + 1, pred_ids.data(), std::min(top_k, s_prefetch_topn));
+                        ensure_prediction_ready();
+                        expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
                     }
                 }
 
@@ -1595,6 +1613,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
                     dma_event);
 
+                sycl::event down_ev{};
                 if (!batch_acquire && count > 1) {
                     fallback_last_down_event = ops::moe_decode_down_weighted_accumulate(
                         ctx, dev_slots, nullptr, t_weights,
@@ -1604,8 +1623,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                         s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
                                             static_cast<size_t>(t) * hidden_size_ : nullptr,
                         s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
+                    down_ev = fallback_last_down_event;
                 } else {
-                    ops::moe_decode_down_weighted_accumulate(
+                    down_ev = ops::moe_decode_down_weighted_accumulate(
                         ctx, dev_slots, nullptr, t_weights,
                         static_cast<const bf16*>(buf_.moe_h.data()),
                         nullptr, y_t,
@@ -1614,12 +1634,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                             static_cast<size_t>(t) * hidden_size_ : nullptr,
                         s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
                 }
+                expert_cache_.record_consumer_reader_fences(slots, top_k, down_ev);
             }
         }
         if (fallback_last_down_event != sycl::event{}) {
             fallback_last_down_event.wait_and_throw();
             fallback_last_down_event = sycl::event{};
         }
+        ensure_prediction_ready();
         stage(kStageExperts);
 
         if (!s_fuse_shared) {

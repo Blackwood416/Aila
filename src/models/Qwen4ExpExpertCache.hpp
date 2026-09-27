@@ -15,6 +15,29 @@
 
 class ExpertFillPool;
 
+enum class ExpertSlotState : uint8_t {
+    Empty = 0,
+    Filling = 1,
+    Copying = 2,
+    Ready = 3,
+    Faulted = 4
+};
+
+struct GpuSlotRecord {
+    uint64_t key = UINT64_MAX;
+    uint64_t generation = 0;
+    ExpertSlotState state = ExpertSlotState::Empty;
+    int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
+    sycl::event consumer_fence{};
+};
+
+struct HostSlotRecord {
+    uint64_t key = UINT64_MAX;
+    uint64_t generation = 0;
+    int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
+    sycl::event source_reader_fence{};
+};
+
 struct ExpertCacheStats {
     uint64_t hit_count = 0;
     uint64_t miss_count = 0;
@@ -27,9 +50,22 @@ struct ExpertCacheStats {
     uint64_t host_pool_hits = 0;   // served directly from hot host RAM pool (zero CPU copy)
     uint64_t host_pool_misses = 0; // required fill into host pool from mmap
 
+    // Phase B metrics (B3)
+    uint64_t prefetch_issued_bytes = 0;
+    uint64_t prefetch_useful_bytes = 0;
+    uint64_t prefetch_cancelled_bytes = 0;
+    uint64_t prefetch_wasted_bytes = 0;
+    uint64_t demand_exposed_wait_ns = 0;
+
     double hit_rate() const {
         uint64_t total = hit_count + miss_count;
         return total > 0 ? static_cast<double>(hit_count) / static_cast<double>(total) : 0.0;
+    }
+
+    double prefetch_utility_ratio() const {
+        return prefetch_issued_bytes > 0
+            ? static_cast<double>(prefetch_useful_bytes) / static_cast<double>(prefetch_issued_bytes)
+            : 0.0;
     }
 };
 
@@ -79,7 +115,8 @@ public:
     // Starts filling predicted non-resident experts into a pinned prefetch staging area on
     // the worker threads and returns immediately. Binds no slot; the next acquire() joins
     // the fill and DMAs staged experts that actually miss instead of filling them again.
-    void prefetch_async(int layer, const int* expert_ids, int count);
+    // quota: maximum number of non-resident experts to stage. If <= 0, defaults to count.
+    void prefetch_async(int layer, const int* expert_ids, int count, int quota = -1);
     void wait_prefetch();
     void wait_copy();
 
@@ -130,6 +167,13 @@ public:
     void set_host_protected_ratio(float ratio) { protected_ratio_ = std::max(0.0f, std::min(1.0f, ratio)); }
     void reset_stats() { stats_ = {}; }
     void log_stats(int layer = -1) const;
+
+    ExpertSlotState get_slot_state(int slot_id) const;
+    uint64_t get_slot_generation(int slot_id) const;
+    ExpertSlotState get_host_slot_state(int hslot) const;
+    uint64_t get_host_slot_generation(int hslot) const;
+    void record_consumer_reader_fence(int slot_id, sycl::event fence);
+    void record_consumer_reader_fences(const int* slot_ids, int count, sycl::event fence);
 
     int num_slots() const { return num_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
@@ -197,17 +241,20 @@ private:
         int layer = -1;
         int expert_id = -1;
         int hslot = -1;
+        uint64_t expected_generation = 0;
         std::atomic<uint64_t> claimed_parts{0};
         std::atomic<int> parts_remaining{0};
         std::atomic<bool> cancelled{false};
         std::atomic<bool> ready{false};
 
         PrefetchItem() = default;
-        PrefetchItem(int l, int e, int h, int parts)
-            : layer(l), expert_id(e), hslot(h), claimed_parts(0), parts_remaining(parts), cancelled(false), ready(false) {}
+        PrefetchItem(int l, int e, int h, int parts, uint64_t gen = 0)
+            : layer(l), expert_id(e), hslot(h), expected_generation(gen),
+              claimed_parts(0), parts_remaining(parts), cancelled(false), ready(false) {}
 
         PrefetchItem(const PrefetchItem& o)
             : layer(o.layer), expert_id(o.expert_id), hslot(o.hslot),
+              expected_generation(o.expected_generation),
               claimed_parts(o.claimed_parts.load(std::memory_order_relaxed)),
               parts_remaining(o.parts_remaining.load(std::memory_order_relaxed)),
               cancelled(o.cancelled.load(std::memory_order_relaxed)),
@@ -218,6 +265,7 @@ private:
                 layer = o.layer;
                 expert_id = o.expert_id;
                 hslot = o.hslot;
+                expected_generation = o.expected_generation;
                 claimed_parts.store(o.claimed_parts.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 parts_remaining.store(o.parts_remaining.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 cancelled.store(o.cancelled.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -254,6 +302,7 @@ private:
     std::vector<uint64_t> slot_to_key_;
     std::vector<bool> slot_reserved_;
     std::vector<ops::MoeExpertSlotDev> slots_dev_;
+    std::vector<GpuSlotRecord> gpu_slot_records_;
 
     ExpertCacheStats stats_{};
     bool initialized_ = false;
@@ -268,6 +317,7 @@ private:
     std::vector<uint8_t*> host_slot_ptrs_;
     std::vector<int> host_layer_expert_to_slot_;
     std::vector<uint64_t> host_slot_to_key_;
+    std::vector<HostSlotRecord> host_slot_records_;
     std::vector<int> host_empty_slots_;
     std::list<int> host_probationary_list_;
     std::list<int> host_protected_list_;
@@ -295,6 +345,7 @@ private:
     std::vector<int> batch_reserved_slots_scratch_;
     std::vector<MissInfo> to_fill_scratch_;
     std::vector<int> assigned_hslots_scratch_;
+    std::vector<uint64_t> assigned_hslot_gens_scratch_;
     std::unique_ptr<std::atomic<int>[]> parts_left_scratch_;
     size_t parts_left_capacity_ = 0;
 
