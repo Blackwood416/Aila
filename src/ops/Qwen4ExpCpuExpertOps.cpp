@@ -110,6 +110,7 @@ void cpu_expert_gate_up_swiglu_scalar(
     int in_features,
     int intermediate_size,
     int blocksize) {
+    if (!slot.gate_up_packed || !x || !h) return;
     if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || blocksize <= 0) return;
 
     const float* qmap = resolve_quant_map(quant_map);
@@ -163,7 +164,13 @@ void cpu_expert_down_scalar(
     int intermediate_size,
     int out_features,
     int blocksize) {
+    if (!slot.down_packed || !h || !out) return;
     if (tokens <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
+    if (accumulate && weight == 0.0f) return;
+    if (!accumulate && weight == 0.0f) {
+        std::memset(out, 0, static_cast<size_t>(tokens) * out_features * sizeof(float));
+        return;
+    }
 
     const float* qmap = resolve_quant_map(quant_map);
     const int num_blocks = intermediate_size / blocksize;
@@ -215,6 +222,10 @@ void cpu_expert_forward_scalar(
     int intermediate_size,
     int out_features,
     int blocksize) {
+    if (!slot.gate_up_packed || !slot.down_packed || !x || !out) return;
+    if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
+    if (accumulate && weight == 0.0f) return;
+
     alignas(64) bf16 local_h_stack[kMaxStackTokens * kIntermediateDim];
     std::vector<bf16> local_h_heap;
     bf16* effective_h = scratch_h;
@@ -442,9 +453,10 @@ void cpu_expert_gate_up_swiglu_avx2(
     int intermediate_size,
     int blocksize) {
 #if defined(__AVX2__)
+    if (!slot.gate_up_packed || !x || !h) return;
     if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || blocksize <= 0) return;
-    if (tokens > kMaxStackTokens) {
-        // Fallback to scalar for large batch sizes beyond stack allocation
+    if (tokens > kMaxStackTokens || in_features != kHiddenDim || intermediate_size != kIntermediateDim || blocksize != kBlockSize) {
+        // Fallback to scalar for large batch sizes beyond stack allocation or non-standard dimensions
         cpu_expert_gate_up_swiglu_scalar(slot, x, h, tokens, quant_map, in_features, intermediate_size, blocksize);
         return;
     }
@@ -471,8 +483,14 @@ void cpu_expert_down_avx2(
     int out_features,
     int blocksize) {
 #if defined(__AVX2__)
+    if (!slot.down_packed || !h || !out) return;
     if (tokens <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
-    if (tokens > kMaxStackTokens) {
+    if (accumulate && weight == 0.0f) return;
+    if (!accumulate && weight == 0.0f) {
+        std::memset(out, 0, static_cast<size_t>(tokens) * out_features * sizeof(float));
+        return;
+    }
+    if (tokens > kMaxStackTokens || intermediate_size != kIntermediateDim || out_features != kHiddenDim || blocksize != kBlockSize) {
         cpu_expert_down_scalar(slot, h, out, tokens, quant_map, weight, accumulate,
                                intermediate_size, out_features, blocksize);
         return;
@@ -502,6 +520,10 @@ void cpu_expert_forward_avx2(
     int intermediate_size,
     int out_features,
     int blocksize) {
+    if (!slot.gate_up_packed || !slot.down_packed || !x || !out) return;
+    if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
+    if (accumulate && weight == 0.0f) return;
+
     alignas(64) bf16 local_h_stack[kMaxStackTokens * kIntermediateDim];
     std::vector<bf16> local_h_heap;
     bf16* effective_h = scratch_h;
@@ -534,8 +556,9 @@ void cpu_expert_gate_up_swiglu_tbb_avx2(
     int intermediate_size,
     int blocksize) {
 #if defined(__AVX2__)
+    if (!slot.gate_up_packed || !x || !h) return;
     if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || blocksize <= 0) return;
-    if (tokens > kMaxStackTokens) {
+    if (tokens > kMaxStackTokens || in_features != kHiddenDim || intermediate_size != kIntermediateDim || blocksize != kBlockSize) {
         cpu_expert_gate_up_swiglu_scalar(slot, x, h, tokens, quant_map, in_features, intermediate_size, blocksize);
         return;
     }
@@ -567,8 +590,14 @@ void cpu_expert_down_tbb_avx2(
     int out_features,
     int blocksize) {
 #if defined(__AVX2__)
+    if (!slot.down_packed || !h || !out) return;
     if (tokens <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
-    if (tokens > kMaxStackTokens) {
+    if (accumulate && weight == 0.0f) return;
+    if (!accumulate && weight == 0.0f) {
+        std::memset(out, 0, static_cast<size_t>(tokens) * out_features * sizeof(float));
+        return;
+    }
+    if (tokens > kMaxStackTokens || intermediate_size != kIntermediateDim || out_features != kHiddenDim || blocksize != kBlockSize) {
         cpu_expert_down_scalar(slot, h, out, tokens, quant_map, weight, accumulate,
                                intermediate_size, out_features, blocksize);
         return;
@@ -603,6 +632,10 @@ void cpu_expert_forward_tbb_avx2(
     int intermediate_size,
     int out_features,
     int blocksize) {
+    if (!slot.gate_up_packed || !slot.down_packed || !x || !out) return;
+    if (tokens <= 0 || in_features <= 0 || intermediate_size <= 0 || out_features <= 0 || blocksize <= 0) return;
+    if (accumulate && weight == 0.0f) return;
+
     alignas(64) bf16 local_h_stack[kMaxStackTokens * kIntermediateDim];
     std::vector<bf16> local_h_heap;
     bf16* effective_h = scratch_h;

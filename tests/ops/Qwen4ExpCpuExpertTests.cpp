@@ -127,7 +127,7 @@ void test_cpu_self_consistency() {
         std::vector<bf16> x(tokens * synth.in_features);
         for (auto& v : x) v = bf16(in_dist(rng));
 
-        // 1. Nested scale testing
+        // 1. Nested scale testing: standard forward (weight=1.0, accumulate=false)
         std::vector<bf16> h_scalar(tokens * synth.intermediate_size);
         std::vector<bf16> h_avx2(tokens * synth.intermediate_size);
         std::vector<bf16> h_tbb(tokens * synth.intermediate_size);
@@ -183,7 +183,46 @@ void test_cpu_self_consistency() {
         expect(max_diff_out_avx2 < 5e-4f, "AVX2 out diff exceeded threshold");
         expect(max_diff_out_tbb < 5e-4f, "TBB out diff exceeded threshold");
 
-        // 2. Unnested scale testing
+        // 2. Nested scale testing: weighted accumulate (weight=0.42, accumulate=true)
+        std::vector<float> acc_scalar(tokens * synth.out_features, 1.25f);
+        std::vector<float> acc_avx2(tokens * synth.out_features, 1.25f);
+        std::vector<float> acc_tbb(tokens * synth.out_features, 1.25f);
+        ops::cpu::cpu_expert_down_scalar(
+            synth.host_slot_nested, h_scalar.data(), acc_scalar.data(), tokens, synth.qmap.data(),
+            0.42f, true);
+        ops::cpu::cpu_expert_down_avx2(
+            synth.host_slot_nested, h_avx2.data(), acc_avx2.data(), tokens, synth.qmap.data(),
+            0.42f, true);
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_nested, h_tbb.data(), acc_tbb.data(), tokens, synth.qmap.data(),
+            0.42f, true);
+
+        float max_diff_acc_avx2 = 0.0f;
+        float max_diff_acc_tbb = 0.0f;
+        for (size_t i = 0; i < acc_scalar.size(); ++i) {
+            max_diff_acc_avx2 = std::max(max_diff_acc_avx2, std::abs(acc_scalar[i] - acc_avx2[i]));
+            max_diff_acc_tbb = std::max(max_diff_acc_tbb, std::abs(acc_scalar[i] - acc_tbb[i]));
+        }
+        std::cout << "  [Nested m=" << tokens << "] Accumulate(0.42) out max_diff: AVX2="
+                  << max_diff_acc_avx2 << ", TBB=" << max_diff_acc_tbb << "\n";
+        expect(max_diff_acc_avx2 < 5e-4f, "AVX2 accumulate out diff exceeded threshold");
+        expect(max_diff_acc_tbb < 5e-4f, "TBB accumulate out diff exceeded threshold");
+
+        // 3. Zero weight testing
+        std::vector<float> zero_scalar(tokens * synth.out_features, 9.9f);
+        std::vector<float> zero_tbb(tokens * synth.out_features, 9.9f);
+        ops::cpu::cpu_expert_down_scalar(
+            synth.host_slot_nested, h_scalar.data(), zero_scalar.data(), tokens, synth.qmap.data(),
+            0.0f, false);
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_nested, h_tbb.data(), zero_tbb.data(), tokens, synth.qmap.data(),
+            0.0f, false);
+        for (size_t i = 0; i < zero_scalar.size(); ++i) {
+            expect(zero_scalar[i] == 0.0f, "Scalar weight=0 should zero output");
+            expect(zero_tbb[i] == 0.0f, "TBB weight=0 should zero output");
+        }
+
+        // 4. Unnested scale testing
         std::vector<bf16> h_un_scalar(tokens * synth.intermediate_size);
         std::vector<bf16> h_un_tbb(tokens * synth.intermediate_size);
         std::vector<float> out_un_scalar(tokens * synth.out_features);
@@ -235,11 +274,13 @@ void test_cpu_gpu_equivalence(Context& ctx) {
     Tensor gu_codes_dev = Tensor::allocate(ctx, {synth.gu_absmax_count}, dnnl::memory::data_type::u8);
     Tensor gu_nested_absmax_dev = Tensor::allocate(ctx, {synth.gu_nested_absmax.size()}, dnnl::memory::data_type::f32);
     Tensor gu_nested_qmap_dev = Tensor::allocate(ctx, {synth.gu_nested_qmap.size()}, dnnl::memory::data_type::f32);
+    Tensor gu_absmax_unnested_dev = Tensor::allocate(ctx, {synth.gu_absmax_unnested.size()}, dnnl::memory::data_type::f32);
 
     Tensor dn_packed_dev = Tensor::allocate(ctx, {synth.down_packed_bytes}, dnnl::memory::data_type::u8);
     Tensor dn_codes_dev = Tensor::allocate(ctx, {synth.dn_codes.size()}, dnnl::memory::data_type::u8);
     Tensor dn_nested_absmax_dev = Tensor::allocate(ctx, {synth.dn_nested_absmax.size()}, dnnl::memory::data_type::f32);
     Tensor dn_nested_qmap_dev = Tensor::allocate(ctx, {synth.dn_nested_qmap.size()}, dnnl::memory::data_type::f32);
+    Tensor dn_absmax_unnested_dev = Tensor::allocate(ctx, {synth.dn_absmax_unnested.size()}, dnnl::memory::data_type::f32);
 
     Tensor qmap_dev = Tensor::allocate(ctx, {synth.qmap.size()}, dnnl::memory::data_type::f32);
 
@@ -247,11 +288,13 @@ void test_cpu_gpu_equivalence(Context& ctx) {
     ctx.memcpy_h2d(gu_codes_dev.data(), synth.gu_codes.data(), synth.gu_absmax_count);
     ctx.memcpy_h2d(gu_nested_absmax_dev.data(), synth.gu_nested_absmax.data(), synth.gu_nested_absmax.size() * sizeof(float));
     ctx.memcpy_h2d(gu_nested_qmap_dev.data(), synth.gu_nested_qmap.data(), synth.gu_nested_qmap.size() * sizeof(float));
+    ctx.memcpy_h2d(gu_absmax_unnested_dev.data(), synth.gu_absmax_unnested.data(), synth.gu_absmax_unnested.size() * sizeof(float));
 
     ctx.memcpy_h2d(dn_packed_dev.data(), synth.dn_packed.data(), synth.down_packed_bytes);
     ctx.memcpy_h2d(dn_codes_dev.data(), synth.dn_codes.data(), synth.dn_codes.size());
     ctx.memcpy_h2d(dn_nested_absmax_dev.data(), synth.dn_nested_absmax.data(), synth.dn_nested_absmax.size() * sizeof(float));
     ctx.memcpy_h2d(dn_nested_qmap_dev.data(), synth.dn_nested_qmap.data(), synth.dn_nested_qmap.size() * sizeof(float));
+    ctx.memcpy_h2d(dn_absmax_unnested_dev.data(), synth.dn_absmax_unnested.data(), synth.dn_absmax_unnested.size() * sizeof(float));
 
     ctx.memcpy_h2d(qmap_dev.data(), synth.qmap.data(), synth.qmap.size() * sizeof(float));
 
@@ -271,6 +314,12 @@ void test_cpu_gpu_equivalence(Context& ctx) {
     dev_slot.down_nested.offset = 0.01f;
     dev_slot.down_nested.blocksize = synth.nested_blocksize;
 
+    ops::MoeExpertSlotDev dev_slot_unnested{};
+    dev_slot_unnested.gate_up_packed = static_cast<const uint8_t*>(gu_packed_dev.data());
+    dev_slot_unnested.down_packed = static_cast<const uint8_t*>(dn_packed_dev.data());
+    dev_slot_unnested.gate_up_absmax = static_cast<const float*>(gu_absmax_unnested_dev.data());
+    dev_slot_unnested.down_absmax = static_cast<const float*>(dn_absmax_unnested_dev.data());
+
     const std::vector<int> test_batches = {1, 2, 3, 4};
     std::mt19937 rng(999);
     // Typical normalized LLM hidden state distribution
@@ -285,7 +334,7 @@ void test_cpu_gpu_equivalence(Context& ctx) {
         Tensor out_dev = Tensor::allocate(ctx, {m, synth.out_features}, dnnl::memory::data_type::f32);
         ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
 
-        // 1. GPU Computation
+        // 1. GPU Computation (nested, unweighted)
         std::vector<float> gpu_out_host(m * synth.out_features);
         std::vector<bf16> gpu_h_host(m * synth.intermediate_size);
 
@@ -338,15 +387,181 @@ void test_cpu_gpu_equivalence(Context& ctx) {
             max_diff_out = std::max(max_diff_out, std::abs(g - c));
         }
 
-        std::cout << "  [Batch m=" << m << "] Intermediate h max_diff: "
+        std::cout << "  [Nested m=" << m << "] Intermediate h max_diff: "
                   << max_diff_h << " (target < 1e-3)\n";
-        std::cout << "  [Batch m=" << m << "] Output out max_diff: "
+        std::cout << "  [Nested m=" << m << "] Output out max_diff: "
                   << max_diff_out << " (target < 1e-3)\n";
 
         expect(max_diff_h < 1e-3f, "m=" + std::to_string(m) + " intermediate h max_diff >= 1e-3");
         expect(max_diff_out < 1e-3f, "m=" + std::to_string(m) + " output out max_diff >= 1e-3");
+
+        // 4. Test GPU vs CPU with fractional weight & accumulate=true
+        const float test_weight = 0.35f;
+        std::vector<float> gpu_acc_host(m * synth.out_features);
+        std::vector<float> cpu_acc_host(m * synth.out_features);
+        for (int i = 0; i < m * synth.out_features; ++i) {
+            float init_v = 0.5f * static_cast<float>((i * 13) % 17) / 17.0f;
+            gpu_acc_host[i] = init_v;
+            cpu_acc_host[i] = init_v;
+        }
+        ctx.memcpy_h2d(out_dev.data(), gpu_acc_host.data(), gpu_acc_host.size() * sizeof(float));
+        for (int t = 0; t < m; ++t) {
+            auto* h_t = static_cast<bf16*>(h_dev.data()) + t * synth.intermediate_size;
+            auto* out_f32_t = static_cast<float*>(out_dev.data()) + t * synth.out_features;
+            ops::moe_decode_down_weighted_accumulate(
+                ctx, &dev_slot, static_cast<const float*>(qmap_dev.data()),
+                &test_weight, h_t, out_f32_t, nullptr, 1, synth.intermediate_size, synth.out_features, synth.blocksize);
+        }
+        ctx.synchronize();
+        ctx.memcpy_d2h(gpu_acc_host.data(), out_dev.data(), gpu_acc_host.size() * sizeof(float));
+
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_nested, cpu_h_host.data(), cpu_acc_host.data(), m, synth.qmap.data(),
+            test_weight, true, synth.intermediate_size, synth.out_features, synth.blocksize);
+
+        float max_diff_acc = 0.0f;
+        for (size_t i = 0; i < cpu_acc_host.size(); ++i) {
+            max_diff_acc = std::max(max_diff_acc, std::abs(gpu_acc_host[i] - cpu_acc_host[i]));
+        }
+        std::cout << "  [Nested m=" << m << "] Accumulate(0.35) out max_diff: "
+                  << max_diff_acc << " (target < 1e-3)\n";
+        expect(max_diff_acc < 1e-3f, "Accumulate GPU vs CPU max_diff >= 1e-3");
     }
+
+    // 5. Unnested scale GPU vs CPU equivalence (m=1, 2)
+    for (int m : {1, 2}) {
+        std::vector<bf16> x_host(m * synth.in_features);
+        for (auto& v : x_host) v = bf16(in_dist(rng));
+
+        Tensor x_dev = Tensor::allocate(ctx, {m, synth.in_features}, dnnl::memory::data_type::bf16);
+        Tensor h_dev = Tensor::allocate(ctx, {m, synth.intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor out_dev = Tensor::allocate(ctx, {m, synth.out_features}, dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+        std::vector<float> gpu_out_host(m * synth.out_features);
+        std::vector<bf16> gpu_h_host(m * synth.intermediate_size);
+
+        for (int t = 0; t < m; ++t) {
+            const auto* x_t = static_cast<const bf16*>(x_dev.data()) + t * synth.in_features;
+            auto* h_t = static_cast<bf16*>(h_dev.data()) + t * synth.intermediate_size;
+            auto* out_f32_t = static_cast<float*>(out_dev.data()) + t * synth.out_features;
+
+            std::vector<float> zero_buf(synth.out_features, 0.0f);
+            ctx.memcpy_h2d(out_f32_t, zero_buf.data(), synth.out_features * sizeof(float));
+
+            ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, &dev_slot_unnested, static_cast<const float*>(qmap_dev.data()),
+                x_t, h_t, 1, synth.in_features, synth.intermediate_size, synth.blocksize);
+
+            const float weight = 1.0f;
+            ops::moe_decode_down_weighted_accumulate(
+                ctx, &dev_slot_unnested, static_cast<const float*>(qmap_dev.data()),
+                &weight, h_t, out_f32_t, nullptr, 1, synth.intermediate_size, synth.out_features, synth.blocksize);
+        }
+        ctx.synchronize();
+
+        ctx.memcpy_d2h(gpu_h_host.data(), h_dev.data(), gpu_h_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(gpu_out_host.data(), out_dev.data(), gpu_out_host.size() * sizeof(float));
+
+        std::vector<bf16> cpu_h_host(m * synth.intermediate_size);
+        std::vector<float> cpu_out_host(m * synth.out_features);
+
+        ops::cpu::cpu_expert_gate_up_swiglu_tbb_avx2(
+            synth.host_slot_unnested, x_host.data(), cpu_h_host.data(), m, synth.qmap.data(),
+            synth.in_features, synth.intermediate_size, synth.blocksize);
+        ops::cpu::cpu_expert_down_tbb_avx2(
+            synth.host_slot_unnested, cpu_h_host.data(), cpu_out_host.data(), m, synth.qmap.data(),
+            1.0f, false, synth.intermediate_size, synth.out_features, synth.blocksize);
+
+        float max_diff_h = 0.0f;
+        for (size_t i = 0; i < cpu_h_host.size(); ++i) {
+            max_diff_h = std::max(max_diff_h, std::abs(static_cast<float>(gpu_h_host[i]) - static_cast<float>(cpu_h_host[i])));
+        }
+        float max_diff_out = 0.0f;
+        for (size_t i = 0; i < cpu_out_host.size(); ++i) {
+            max_diff_out = std::max(max_diff_out, std::abs(gpu_out_host[i] - cpu_out_host[i]));
+        }
+
+        std::cout << "  [Unnested m=" << m << "] Intermediate h max_diff: "
+                  << max_diff_h << " (target < 1e-3)\n";
+        std::cout << "  [Unnested m=" << m << "] Output out max_diff: "
+                  << max_diff_out << " (target < 1e-3)\n";
+
+        expect(max_diff_h < 1e-3f, "Unnested GPU vs CPU h diff >= 1e-3");
+        expect(max_diff_out < 1e-3f, "Unnested GPU vs CPU out diff >= 1e-3");
+    }
+
     std::cout << "  => PASSED: CPU vs GPU Equivalence tests (max_diff < 1e-3 confirmed).\n";
+}
+
+void test_edge_cases_and_robustness() {
+    std::cout << "\n=== [Test 3] Edge Cases and Robustness Verification ===\n";
+    SyntheticExpertData synth;
+
+    // 1. Boundary: tokens <= 0 (must not crash, no-op)
+    bf16 dummy_x[16]{};
+    bf16 dummy_h[16]{};
+    float dummy_out[16]{};
+    ops::cpu::cpu_expert_gate_up_swiglu(synth.host_slot_nested, dummy_x, dummy_h, 0);
+    ops::cpu::cpu_expert_down(synth.host_slot_nested, dummy_h, dummy_out, 0);
+    ops::cpu::cpu_expert_forward(synth.host_slot_nested, dummy_x, dummy_out, 0);
+    ops::cpu::cpu_expert_gate_up_swiglu_avx2(synth.host_slot_nested, dummy_x, dummy_h, -1);
+    ops::cpu::cpu_expert_down_avx2(synth.host_slot_nested, dummy_h, dummy_out, -1);
+    std::cout << "  [Passed] tokens <= 0 no-op verification\n";
+
+    // 2. Boundary: nullptr checks (must safely no-op instead of segfaulting)
+    ops::MoeExpertSlotHost null_slot{};
+    ops::cpu::cpu_expert_gate_up_swiglu(null_slot, dummy_x, dummy_h, 1);
+    ops::cpu::cpu_expert_down(null_slot, dummy_h, dummy_out, 1);
+    ops::cpu::cpu_expert_forward(null_slot, dummy_x, dummy_out, 1);
+    ops::cpu::cpu_expert_gate_up_swiglu(synth.host_slot_nested, nullptr, dummy_h, 1);
+    ops::cpu::cpu_expert_gate_up_swiglu(synth.host_slot_nested, dummy_x, nullptr, 1);
+    ops::cpu::cpu_expert_down(synth.host_slot_nested, nullptr, dummy_out, 1);
+    ops::cpu::cpu_expert_down(synth.host_slot_nested, dummy_h, nullptr, 1);
+    std::cout << "  [Passed] nullptr safely handled without crash\n";
+
+    // 3. Robustness: Non-standard dimensions fallback to scalar
+    // e.g., in_features=128, intermediate_size=64, blocksize=64
+    const int custom_H = 128;
+    const int custom_I = 64;
+    const int custom_bs = 64;
+    const size_t c_gu_bytes = static_cast<size_t>(2 * custom_I) * (custom_H / 2);
+    const size_t c_gu_blocks = static_cast<size_t>(2 * custom_I) * (custom_H / custom_bs);
+    const size_t c_dn_bytes = static_cast<size_t>(custom_H) * (custom_I / 2);
+    const size_t c_dn_blocks = static_cast<size_t>(custom_H) * (custom_I / custom_bs);
+
+    std::vector<uint8_t> c_gu_packed(c_gu_bytes, 0x12);
+    std::vector<float> c_gu_absmax(c_gu_blocks, 0.05f);
+    std::vector<uint8_t> c_dn_packed(c_dn_bytes, 0x34);
+    std::vector<float> c_dn_absmax(c_dn_blocks, 0.04f);
+
+    ops::MoeExpertSlotHost custom_slot{};
+    custom_slot.gate_up_packed = c_gu_packed.data();
+    custom_slot.down_packed = c_dn_packed.data();
+    custom_slot.gate_up_absmax = c_gu_absmax.data();
+    custom_slot.down_absmax = c_dn_absmax.data();
+
+    std::vector<bf16> c_x(custom_H, bf16(0.01f));
+    std::vector<bf16> c_h_scalar(custom_I);
+    std::vector<bf16> c_h_avx2(custom_I);
+    std::vector<bf16> c_h_tbb(custom_I);
+    std::vector<float> c_out_scalar(custom_H);
+    std::vector<float> c_out_avx2(custom_H);
+    std::vector<float> c_out_tbb(custom_H);
+
+    ops::cpu::cpu_expert_forward_scalar(custom_slot, c_x.data(), c_out_scalar.data(), 1, c_h_scalar.data(),
+                                        synth.qmap.data(), 1.0f, false, custom_H, custom_I, custom_H, custom_bs);
+    ops::cpu::cpu_expert_forward_avx2(custom_slot, c_x.data(), c_out_avx2.data(), 1, c_h_avx2.data(),
+                                      synth.qmap.data(), 1.0f, false, custom_H, custom_I, custom_H, custom_bs);
+    ops::cpu::cpu_expert_forward_tbb_avx2(custom_slot, c_x.data(), c_out_tbb.data(), 1, c_h_tbb.data(),
+                                          synth.qmap.data(), 1.0f, false, custom_H, custom_I, custom_H, custom_bs);
+
+    for (int i = 0; i < custom_H; ++i) {
+        expect(c_out_scalar[i] == c_out_avx2[i], "Custom shape AVX2 fallback did not match scalar");
+        expect(c_out_scalar[i] == c_out_tbb[i], "Custom shape TBB fallback did not match scalar");
+    }
+    std::cout << "  [Passed] Non-standard dimension fallback gracefully executes scalar and matches bitwise\n";
+    std::cout << "  => PASSED: Edge Cases and Robustness tests.\n";
 }
 
 void run_microbenchmark() {
@@ -418,6 +633,7 @@ void run_microbenchmark() {
 int main() {
     std::cout << "Starting Qwen4Exp CPU Expert H2a Verification Suite...\n";
     try {
+        test_edge_cases_and_robustness();
         test_cpu_self_consistency();
 
         Context ctx;
