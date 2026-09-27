@@ -702,8 +702,8 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     router_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     pred_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
     pred_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
+    embed_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * sizeof(int)));
     if (embed_host_.valid()) {
-        embed_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * sizeof(int)));
         embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
     }
     const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
@@ -879,11 +879,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
     // P0: Early PLE prepare pipeline (pure prepare + async DMA to double-buffered staging)
     const int* ple_ids_ptr = embed_host_ids_;
-    std::vector<int> ple_fallback_host_ids;
     if (!embed_host_.valid()) {
-        ple_fallback_host_ids.resize(count);
-        ctx.memcpy_d2h(ple_fallback_host_ids.data(), tokenIdsDevice, count * sizeof(int));
-        ple_ids_ptr = ple_fallback_host_ids.data();
+        ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
     }
     ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
                                &session, session.generation(), start_pos);

@@ -9,6 +9,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -232,7 +233,6 @@ private:
     std::mutex done_mutex_;
     std::condition_variable done_cv_;
     bool stop_worker_ = false;
-    bool has_task_ = false;
     uint64_t current_task_id_ = 0;
     uint64_t completed_task_id_ = 0;
     mutable int next_staging_slot_ = 0;
@@ -242,7 +242,9 @@ private:
         int slot = 0;
         int num_tokens = 0;
         std::array<int, 2> prev_tokens_in{};
-    } worker_task_;
+    };
+    std::deque<WorkerTask> task_queue_;
+    std::array<uint64_t, kNumStagingSlots> slot_task_ids_{0, 0};
 
     // Pre-allocated device tensors for forward execution (zero allocations on hot path)
     Tensor dev_embed_;    // alias / view to dev_embed_slots_[0] for legacy compatibility

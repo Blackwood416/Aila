@@ -65,16 +65,16 @@ void Qwen4ExpPle::cleanup() {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
             stop_worker_ = true;
-            has_task_ = false;
             worker_cv_.notify_all();
         }
         worker_thread_.join();
     }
+    task_queue_.clear();
     stop_worker_ = false;
-    has_task_ = false;
     current_task_id_ = 0;
     completed_task_id_ = 0;
     next_staging_slot_ = 0;
+    slot_task_ids_.fill(0);
 
     if (copy_q_) {
         try { copy_q_->wait_and_throw(); } catch (...) {}
@@ -327,10 +327,11 @@ bool Qwen4ExpPle::init(Context& ctx,
     }
 
     stop_worker_ = false;
-    has_task_ = false;
+    task_queue_.clear();
     current_task_id_ = 0;
     completed_task_id_ = 0;
     next_staging_slot_ = 0;
+    slot_task_ids_.fill(0);
     static const bool s_ple_async = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
     if (s_ple_async) {
         worker_thread_ = std::thread([this] { worker_loop(); });
@@ -366,50 +367,34 @@ void Qwen4ExpPle::compute_ngram_ids(
 
     if (total_tokens <= 0 || num_tokens <= 0) return;
 
-    std::vector<int> shift0(total_tokens);
-    std::vector<int> shift1(total_tokens);
-    std::vector<int> shift2(total_tokens);
+    int last_eos = -1;
+    const int start_t = total_tokens - num_tokens;
 
-    auto compute_shift = [&](int s, std::vector<int>& out_shifted) {
-        int last_eos = -1;
-        for (int i = 0; i < total_tokens; ++i) {
-            int prev_eos = last_eos;
-            if (token_history[i] == eos_token_id) {
-                last_eos = i;
-            }
-            int segment_start = prev_eos + 1;
-            int pos_in_segment = i - segment_start;
-            int src_pos = i - s;
-            if (pos_in_segment >= s && src_pos >= 0) {
-                out_shifted[i] = token_history[src_pos];
-            } else {
-                out_shifted[i] = eos_token_id;
-            }
+    for (int i = 0; i < total_tokens; ++i) {
+        const int prev_eos = last_eos;
+        if (token_history[i] == eos_token_id) {
+            last_eos = i;
         }
-    };
+        if (i < start_t) continue;
 
-    compute_shift(0, shift0);
-    compute_shift(1, shift1);
-    compute_shift(2, shift2);
+        const int t = i - start_t;
+        const int segment_start = prev_eos + 1;
+        const int pos_in_segment = i - segment_start;
 
-    int start_t = total_tokens - num_tokens;
+        const int64_t s0 = token_history[i];
+        const int64_t s1 = (pos_in_segment >= 1 && i >= 1) ? token_history[i - 1] : eos_token_id;
+        const int64_t s2 = (pos_in_segment >= 2 && i >= 2) ? token_history[i - 2] : eos_token_id;
 
-    for (int t = 0; t < num_tokens; ++t) {
-        int pos = start_t + t;
-        int64_t s0 = shift0[pos];
-        int64_t s1 = shift1[pos];
-        int64_t s2 = shift2[pos];
+        const uint64_t m0_u = static_cast<uint64_t>(s0) * static_cast<uint64_t>(layer_multipliers[0]);
+        const uint64_t m1_u = static_cast<uint64_t>(s1) * static_cast<uint64_t>(layer_multipliers[1]);
+        const uint64_t m2_u = static_cast<uint64_t>(s2) * static_cast<uint64_t>(layer_multipliers[2]);
 
-        uint64_t m0_u = static_cast<uint64_t>(s0) * static_cast<uint64_t>(layer_multipliers[0]);
-        uint64_t m1_u = static_cast<uint64_t>(s1) * static_cast<uint64_t>(layer_multipliers[1]);
-        uint64_t m2_u = static_cast<uint64_t>(s2) * static_cast<uint64_t>(layer_multipliers[2]);
+        const int64_t m0 = static_cast<int64_t>(m0_u);
+        const int64_t m1 = static_cast<int64_t>(m1_u);
+        const int64_t m2 = static_cast<int64_t>(m2_u);
 
-        int64_t m0 = static_cast<int64_t>(m0_u);
-        int64_t m1 = static_cast<int64_t>(m1_u);
-        int64_t m2 = static_cast<int64_t>(m2_u);
-
-        int64_t mixed2 = m0 ^ m1;
-        int64_t mixed3 = m0 ^ m1 ^ m2;
+        const int64_t mixed2 = m0 ^ m1;
+        const int64_t mixed3 = m0 ^ m1 ^ m2;
 
         int64_t* row = out_ids + t * NUM_HEADS;
 
@@ -444,16 +429,28 @@ void Qwen4ExpPle::compute_ngram_ids_pure(
         candidate_prev_tokens = state.prev_tokens;
     }
 
-    std::vector<int> history(Qwen4ExpPleState::NGRAM_CONTEXT_LEN + num_tokens);
-    history[0] = state.prev_tokens[0];
-    history[1] = state.prev_tokens[1];
-    for (int i = 0; i < num_tokens; ++i) {
-        history[Qwen4ExpPleState::NGRAM_CONTEXT_LEN + i] = input_ids[i];
+    constexpr int kSmallStack = 16;
+    if (num_tokens + 2 <= kSmallStack) {
+        std::array<int, kSmallStack> stack_history;
+        stack_history[0] = state.prev_tokens[0];
+        stack_history[1] = state.prev_tokens[1];
+        for (int i = 0; i < num_tokens; ++i) {
+            stack_history[2 + i] = input_ids[i];
+        }
+        compute_ngram_ids(stack_history.data(), num_tokens + 2, num_tokens,
+                          layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
+                          ngram_heads_offsets_.data(), out_ids, EOS_TOKEN_ID);
+    } else {
+        std::vector<int> history(num_tokens + 2);
+        history[0] = state.prev_tokens[0];
+        history[1] = state.prev_tokens[1];
+        for (int i = 0; i < num_tokens; ++i) {
+            history[2 + i] = input_ids[i];
+        }
+        compute_ngram_ids(history.data(), static_cast<int>(history.size()), num_tokens,
+                          layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
+                          ngram_heads_offsets_.data(), out_ids, EOS_TOKEN_ID);
     }
-
-    compute_ngram_ids(history.data(), static_cast<int>(history.size()), num_tokens,
-                      layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
-                      ngram_heads_offsets_.data(), out_ids, EOS_TOKEN_ID);
 }
 
 void Qwen4ExpPle::compute_ngram_ids(
@@ -549,17 +546,21 @@ void Qwen4ExpPle::worker_loop() {
         WorkerTask task;
         {
             std::unique_lock<std::mutex> lock(worker_mutex_);
-            worker_cv_.wait(lock, [this] { return stop_worker_ || has_task_; });
-            if (stop_worker_) break;
-            task = worker_task_;
-            has_task_ = false;
+            worker_cv_.wait(lock, [this] { return stop_worker_ || !task_queue_.empty(); });
+            if (stop_worker_ && task_queue_.empty()) break;
+            task = task_queue_.front();
+            task_queue_.pop_front();
         }
 
-        execute_prepare_slot(task.slot, task.num_tokens, task.prev_tokens_in);
+        try {
+            execute_prepare_slot(task.slot, task.num_tokens, task.prev_tokens_in);
+        } catch (...) {
+            // Guard against unhandled exception terminating the worker thread
+        }
 
         {
             std::lock_guard<std::mutex> lock(done_mutex_);
-            completed_task_id_ = task.task_id;
+            completed_task_id_ = std::max(completed_task_id_, task.task_id);
             done_cv_.notify_all();
         }
     }
@@ -612,7 +613,13 @@ PleTicket Qwen4ExpPle::prepare(
         ticket.prev_tokens_next = state.prev_tokens;
     }
 
-    // Retain H2D source-reader completion: ensure any previous transfer from this slot is done
+    // 1. If a prior task targeted this slot, wait for its CPU execution to complete
+    uint64_t prior_slot_task = slot_task_ids_[slot];
+    if (prior_slot_task > 0) {
+        wait_task(prior_slot_task);
+    }
+
+    // 2. Retain H2D source-reader completion: ensure any previous transfer from this slot is done
     if (slot_h2d_events_[slot] != sycl::event{}) {
         try { slot_h2d_events_[slot].wait_and_throw(); } catch (...) {}
         slot_h2d_events_[slot] = sycl::event{};
@@ -629,18 +636,21 @@ PleTicket Qwen4ExpPle::prepare(
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
             tid = ++current_task_id_;
-            worker_task_.task_id = tid;
-            worker_task_.slot = slot;
-            worker_task_.num_tokens = num_tokens;
-            worker_task_.prev_tokens_in = ticket.prev_tokens_in;
-            has_task_ = true;
+            WorkerTask task;
+            task.task_id = tid;
+            task.slot = slot;
+            task.num_tokens = num_tokens;
+            task.prev_tokens_in = ticket.prev_tokens_in;
+            task_queue_.push_back(task);
             worker_cv_.notify_one();
         }
         ticket.task_id = tid;
+        slot_task_ids_[slot] = tid;
     } else {
         execute_prepare_slot(slot, num_tokens, ticket.prev_tokens_in);
         ticket.h2d_event = slot_h2d_events_[slot];
         ticket.task_id = 0;
+        slot_task_ids_[slot] = 0;
     }
 
     ticket.valid = true;

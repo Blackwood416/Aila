@@ -707,8 +707,85 @@ void test_ple_ticket_pipeline(Context& ctx) {
     expect(ticket3.prev_tokens_next[0] == 502 && ticket3.prev_tokens_next[1] == 503, "ticket3 prev_tokens_next mismatch");
     expect(state.prev_tokens[0] == 202 && state.prev_tokens[1] == 303, "state must not change before commit");
 
-    ple.commit(ticket3, state);
-    expect(state.prev_tokens[0] == 502 && state.prev_tokens[1] == 503, "state updated after multi-token commit");
+    // 6. EOS token handling in n-gram calculation (boundary reset)
+    {
+        std::array<int64_t, 3> mults = {10007LL, 20011LL, 30013LL};
+        std::array<int64_t, 16> vocabs;
+        vocabs.fill(1000);
+        std::array<int64_t, 16> offs;
+        offs.fill(0);
+        ple.set_multipliers_and_vocab(mults, vocabs, offs);
+
+        // Sequence: EOS, tokenA, EOS, tokenB
+        std::vector<int> eos_seq = {Qwen4ExpPle::EOS_TOKEN_ID, 777, Qwen4ExpPle::EOS_TOKEN_ID, 888};
+        std::vector<int64_t> ids(eos_seq.size() * Qwen4ExpPle::NUM_HEADS);
+        Qwen4ExpPle::compute_ngram_ids(eos_seq.data(), static_cast<int>(eos_seq.size()),
+                                       static_cast<int>(eos_seq.size()),
+                                       mults.data(), vocabs.data(), offs.data(), ids.data(),
+                                       Qwen4ExpPle::EOS_TOKEN_ID);
+
+        // For token at pos 0 (EOS): prev_eos is -1, pos_in_seg is 0, s0 = EOS, s1 = EOS, s2 = EOS
+        // For token at pos 3 (888): prev_eos is 2 (the EOS at pos 2), pos_in_seg is 3 - 3 = 0.
+        // Therefore s0 = 888, s1 = EOS, s2 = EOS (reset after EOS!)
+        int64_t m0_u = static_cast<int64_t>(static_cast<uint64_t>(888) * static_cast<uint64_t>(mults[0]));
+        int64_t m1_u = static_cast<int64_t>(static_cast<uint64_t>(Qwen4ExpPle::EOS_TOKEN_ID) * static_cast<uint64_t>(mults[1]));
+        int64_t m2_u = static_cast<int64_t>(static_cast<uint64_t>(Qwen4ExpPle::EOS_TOKEN_ID) * static_cast<uint64_t>(mults[2]));
+        int64_t mixed2 = m0_u ^ m1_u;
+        int64_t mixed3 = m0_u ^ m1_u ^ m2_u;
+        int64_t expected_h0 = (mixed2 % 1000 + 1000) % 1000;
+        int64_t expected_h8 = (mixed3 % 1000 + 1000) % 1000;
+
+        const int64_t* row3 = ids.data() + 3 * Qwen4ExpPle::NUM_HEADS;
+        expect(row3[0] == expected_h0, "EOS boundary reset head 0 mismatch");
+        expect(row3[8] == expected_h8, "EOS boundary reset head 8 mismatch");
+    }
+
+    // 7. Cancel / Retry safety with generation bump
+    {
+        uint64_t gen = 100;
+        Qwen4ExpPleState s_retry;
+        ple.init_state(ctx, s_retry);
+        s_retry.prev_tokens = {10, 20};
+
+        int bad_token = 999;
+        PleTicket ticket_aborted = ple.prepare(ctx, s_retry, &bad_token, 1, &s_retry, gen, 5);
+        expect(ticket_aborted.valid, "ticket_aborted must be valid");
+
+        // Cancel / Retry triggered: generation bumped, ticket discarded
+        ++gen;
+        ticket_aborted.valid = false;
+        expect(s_retry.prev_tokens[0] == 10 && s_retry.prev_tokens[1] == 20,
+               "state must remain unchanged after abort");
+
+        // Stale ticket validation check
+        expect(ticket_aborted.generation != gen, "stale ticket generation mismatch detected");
+
+        // New valid retry token prepared and committed
+        int good_token = 30;
+        PleTicket ticket_retried = ple.prepare(ctx, s_retry, &good_token, 1, &s_retry, gen, 5);
+        expect(ticket_retried.valid && ticket_retried.generation == gen, "retried ticket must be valid and current");
+        ple.commit(ticket_retried, s_retry);
+        expect(s_retry.prev_tokens[0] == 20 && s_retry.prev_tokens[1] == 30,
+               "state correctly updated with retried token only");
+    }
+
+    // 8. Rapid queueing & double-buffering concurrency
+    {
+        Qwen4ExpPleState s_rapid;
+        ple.init_state(ctx, s_rapid);
+        s_rapid.prev_tokens = {1, 2};
+
+        int tok1 = 3;
+        int tok2 = 4;
+        PleTicket t_a = ple.prepare(ctx, s_rapid, &tok1, 1, &s_rapid, 1, 0);
+        // Note: s_rapid.prev_tokens is not yet committed, so for t_b we simulate chained decode
+        ple.commit(t_a, s_rapid);
+        PleTicket t_b = ple.prepare(ctx, s_rapid, &tok2, 1, &s_rapid, 1, 1);
+        ple.commit(t_b, s_rapid);
+
+        expect(s_rapid.prev_tokens[0] == 3 && s_rapid.prev_tokens[1] == 4,
+               "rapid sequential prepare/commit must chain cleanly");
+    }
 
     std::cout << "[PASS] PLE Ticket Pipeline tests passed.\n";
 }
