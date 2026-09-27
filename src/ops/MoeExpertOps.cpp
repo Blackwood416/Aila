@@ -1135,6 +1135,336 @@ sycl::event launch_moe_expert_major_prefill_down(
     });
 }
 
+template <bool UseNested>
+sycl::event launch_moe_expert_major_prefill_gate_up_2token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_pairs,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_group = wg_size / sub_group_size;
+    const size_t total_rows = static_cast<size_t>(total_pairs) * intermediate_size;
+    const size_t num_groups = (total_rows + rows_per_group - 1) / rows_per_group;
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int sg_lane = lid % sub_group_size;
+                const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float gate_acc0 = 0.0f;
+                float up_acc0 = 0.0f;
+                float gate_acc1 = 0.0f;
+                float up_acc1 = 0.0f;
+
+                if (global_row < total_rows) {
+                    const int pair_idx = static_cast<int>(global_row / intermediate_size);
+                    const int row = static_cast<int>(global_row % intermediate_size);
+
+                    const auto& slot = slots[pair_idx * 2];
+                    const int token0 = token_ids[pair_idx * 2];
+                    const int token1 = token_ids[pair_idx * 2 + 1];
+                    const bf16* x_token0 = x + static_cast<size_t>(token0) * in_features;
+                    const bf16* x_token1 = x + static_cast<size_t>(token1) * in_features;
+
+                    const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                    const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
+                    const size_t up_byte_base = static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
+                    const size_t up_block_base = static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+
+                    int byte_offset = sg_lane * 4;
+                    for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        const float gw0 = qmap[gb0 >> 4] * ga;
+                        const float gw1 = qmap[gb0 & 0xF] * ga;
+                        const float gw2 = qmap[gb1 >> 4] * ga;
+                        const float gw3 = qmap[gb1 & 0xF] * ga;
+                        const float gw4 = qmap[gb2 >> 4] * ga;
+                        const float gw5 = qmap[gb2 & 0xF] * ga;
+                        const float gw6 = qmap[gb3 >> 4] * ga;
+                        const float gw7 = qmap[gb3 & 0xF] * ga;
+
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[0]), gw0, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[0]), gw0, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[1]), gw1, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[1]), gw1, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[2]), gw2, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[2]), gw2, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[3]), gw3, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[3]), gw3, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[4]), gw4, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[4]), gw4, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[5]), gw5, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[5]), gw5, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[6]), gw6, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[6]), gw6, gate_acc1);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[7]), gw7, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[7]), gw7, gate_acc1);
+
+                        const float uw0 = qmap[ub0 >> 4] * ua;
+                        const float uw1 = qmap[ub0 & 0xF] * ua;
+                        const float uw2 = qmap[ub1 >> 4] * ua;
+                        const float uw3 = qmap[ub1 & 0xF] * ua;
+                        const float uw4 = qmap[ub2 >> 4] * ua;
+                        const float uw5 = qmap[ub2 & 0xF] * ua;
+                        const float uw6 = qmap[ub3 >> 4] * ua;
+                        const float uw7 = qmap[ub3 & 0xF] * ua;
+
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[0]), uw0, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[0]), uw0, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[1]), uw1, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[1]), uw1, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[2]), uw2, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[2]), uw2, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[3]), uw3, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[3]), uw3, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[4]), uw4, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[4]), uw4, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[5]), uw5, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[5]), uw5, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[6]), uw6, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[6]), uw6, up_acc1);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[7]), uw7, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[7]), uw7, up_acc1);
+                    }
+                }
+
+                float gate_sum0 = sycl::reduce_over_group(item.get_sub_group(), gate_acc0, sycl::plus<>());
+                float up_sum0 = sycl::reduce_over_group(item.get_sub_group(), up_acc0, sycl::plus<>());
+                float gate_sum1 = sycl::reduce_over_group(item.get_sub_group(), gate_acc1, sycl::plus<>());
+                float up_sum1 = sycl::reduce_over_group(item.get_sub_group(), up_acc1, sycl::plus<>());
+
+                if (sg_lane == 0 && global_row < total_rows) {
+                    const int pair_idx = static_cast<int>(global_row / intermediate_size);
+                    const int row = static_cast<int>(global_row % intermediate_size);
+
+                    const int token0 = token_ids[pair_idx * 2];
+                    const int rank0 = ranks[pair_idx * 2];
+                    const float silu_gate0 = gate_sum0 / (1.0f + sycl::native::exp(-gate_sum0));
+                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * intermediate_size + row;
+                    h[out_pos0] = bf16(silu_gate0 * up_sum0);
+
+                    const int token1 = token_ids[pair_idx * 2 + 1];
+                    const int rank1 = ranks[pair_idx * 2 + 1];
+                    const float silu_gate1 = gate_sum1 / (1.0f + sycl::native::exp(-gate_sum1));
+                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * intermediate_size + row;
+                    h[out_pos1] = bf16(silu_gate1 * up_sum1);
+                }
+            });
+    });
+}
+
+template <bool UseNested>
+sycl::event launch_moe_expert_major_prefill_down_2token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* h,
+    float* down_acc,
+    int total_pairs,
+    int top_k,
+    int in_features,
+    int out_features,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_group = wg_size / sub_group_size;
+    const size_t total_rows = static_cast<size_t>(total_pairs) * out_features;
+    const size_t num_groups = (total_rows + rows_per_group - 1) / rows_per_group;
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int sg_lane = lid % sub_group_size;
+                const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float expert_acc0 = 0.0f;
+                float expert_acc1 = 0.0f;
+
+                if (global_row < total_rows) {
+                    const int pair_idx = static_cast<int>(global_row / out_features);
+                    const int row = static_cast<int>(global_row % out_features);
+
+                    const auto& slot = slots[pair_idx * 2];
+                    const int token0 = token_ids[pair_idx * 2];
+                    const int rank0 = ranks[pair_idx * 2];
+                    const int token1 = token_ids[pair_idx * 2 + 1];
+                    const int rank1 = ranks[pair_idx * 2 + 1];
+
+                    const bf16* in_expert0 = h + (static_cast<size_t>(token0) * top_k + rank0) * in_features;
+                    const bf16* in_expert1 = h + (static_cast<size_t>(token1) * top_k + rank1) * in_features;
+
+                    const size_t byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                    const size_t block_base = static_cast<size_t>(row) * blocks_per_row;
+
+                    int byte_offset = sg_lane * 4;
+                    for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const uint32_t d4 = *reinterpret_cast<const uint32_t*>(
+                            slot.down_packed + byte_base + byte_offset);
+                        const size_t scale_index = block_base + (byte_offset / (blocksize / 2));
+                        float da;
+                        if (blocksize == 64) {
+                            const float da_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested>(
+                                      slot.down_absmax, slot.down_nested, scale_index)
+                                : 0.0f;
+                            const float da0 = sycl::group_broadcast(
+                                item.get_sub_group(), da_leader, 0);
+                            const float da8 = sycl::group_broadcast(
+                                item.get_sub_group(), da_leader, 8);
+                            da = sg_lane < 8 ? da0 : da8;
+                        } else {
+                            da = load_expert_absmax<UseNested>(
+                                slot.down_absmax, slot.down_nested, scale_index);
+                        }
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(in_expert0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(in_expert1 + byte_offset * 2);
+
+                        const uint8_t db0 = static_cast<uint8_t>(d4);
+                        const uint8_t db1 = static_cast<uint8_t>(d4 >> 8);
+                        const uint8_t db2 = static_cast<uint8_t>(d4 >> 16);
+                        const uint8_t db3 = static_cast<uint8_t>(d4 >> 24);
+
+                        const float dw0 = qmap[db0 >> 4] * da;
+                        const float dw1 = qmap[db0 & 0xF] * da;
+                        const float dw2 = qmap[db1 >> 4] * da;
+                        const float dw3 = qmap[db1 & 0xF] * da;
+                        const float dw4 = qmap[db2 >> 4] * da;
+                        const float dw5 = qmap[db2 & 0xF] * da;
+                        const float dw6 = qmap[db3 >> 4] * da;
+                        const float dw7 = qmap[db3 & 0xF] * da;
+
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[0]), dw0, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[0]), dw0, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[1]), dw1, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[1]), dw1, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[2]), dw2, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[2]), dw2, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[3]), dw3, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[3]), dw3, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[4]), dw4, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[4]), dw4, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[5]), dw5, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[5]), dw5, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[6]), dw6, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[6]), dw6, expert_acc1);
+                        expert_acc0 = sycl::fma(static_cast<float>(in_v0[7]), dw7, expert_acc0);
+                        expert_acc1 = sycl::fma(static_cast<float>(in_v1[7]), dw7, expert_acc1);
+                    }
+                }
+
+                float expert_sum0 = sycl::reduce_over_group(item.get_sub_group(), expert_acc0, sycl::plus<>());
+                float expert_sum1 = sycl::reduce_over_group(item.get_sub_group(), expert_acc1, sycl::plus<>());
+
+                if (sg_lane == 0 && global_row < total_rows) {
+                    const int pair_idx = static_cast<int>(global_row / out_features);
+                    const int row = static_cast<int>(global_row % out_features);
+
+                    const int token0 = token_ids[pair_idx * 2];
+                    const int rank0 = ranks[pair_idx * 2];
+                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * out_features + row;
+                    down_acc[out_pos0] = expert_sum0;
+
+                    const int token1 = token_ids[pair_idx * 2 + 1];
+                    const int rank1 = ranks[pair_idx * 2 + 1];
+                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * out_features + row;
+                    down_acc[out_pos1] = expert_sum1;
+                }
+            });
+    });
+}
+
 } // namespace
 
 sycl::event moe_decode_gate_up_swiglu_grouped(
@@ -1305,6 +1635,58 @@ void moe_silu_gate_up_mul_flat(
     });
 }
 
+sycl::event moe_expert_major_prefill_gate_up_2token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_pairs,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event,
+    bool use_nested) {
+    if (total_pairs <= 0) return {};
+    if (use_nested) {
+        return launch_moe_expert_major_prefill_gate_up_2token<true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_pairs, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    return launch_moe_expert_major_prefill_gate_up_2token<false>(
+        ctx, slots, token_ids, ranks, quant_map, x, h, total_pairs, top_k,
+        in_features, intermediate_size, blocksize, dep_event);
+}
+
+sycl::event moe_expert_major_prefill_down_2token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* h,
+    float* down_acc,
+    int total_pairs,
+    int top_k,
+    int in_features,
+    int out_features,
+    int blocksize,
+    const sycl::event* dep_event,
+    bool use_nested) {
+    if (total_pairs <= 0) return {};
+    if (use_nested) {
+        return launch_moe_expert_major_prefill_down_2token<true>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_pairs, top_k,
+            in_features, out_features, blocksize, dep_event);
+    }
+    return launch_moe_expert_major_prefill_down_2token<false>(
+        ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_pairs, top_k,
+        in_features, out_features, blocksize, dep_event);
+}
+
 sycl::event moe_expert_major_prefill_gate_up(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1319,16 +1701,48 @@ sycl::event moe_expert_major_prefill_gate_up(
     int intermediate_size,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    int num_pairs) {
     if (total_acts <= 0) return {};
-    if (use_nested) {
-        return launch_moe_expert_major_prefill_gate_up<true>(
+    if (num_pairs <= 0) {
+        if (use_nested) {
+            return launch_moe_expert_major_prefill_gate_up<true>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up<false>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
             in_features, intermediate_size, blocksize, dep_event);
     }
+
+    const int clamped_pairs = std::min(num_pairs, total_acts / 2);
+    const int single_acts = total_acts - 2 * clamped_pairs;
+    sycl::event pair_ev{};
+    if (use_nested) {
+        pair_ev = launch_moe_expert_major_prefill_gate_up_2token<true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, clamped_pairs, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    } else {
+        pair_ev = launch_moe_expert_major_prefill_gate_up_2token<false>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, clamped_pairs, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+
+    if (single_acts <= 0) {
+        return pair_ev;
+    }
+
+    const int single_offset = 2 * clamped_pairs;
+    if (use_nested) {
+        return launch_moe_expert_major_prefill_gate_up<true>(
+            ctx, slots + single_offset, token_ids + single_offset, ranks + single_offset,
+            quant_map, x, h, single_acts, top_k,
+            in_features, intermediate_size, blocksize, &pair_ev);
+    }
     return launch_moe_expert_major_prefill_gate_up<false>(
-        ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
-        in_features, intermediate_size, blocksize, dep_event);
+        ctx, slots + single_offset, token_ids + single_offset, ranks + single_offset,
+        quant_map, x, h, single_acts, top_k,
+        in_features, intermediate_size, blocksize, &pair_ev);
 }
 
 sycl::event moe_expert_major_prefill_down(
@@ -1345,16 +1759,48 @@ sycl::event moe_expert_major_prefill_down(
     int out_features,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    int num_pairs) {
     if (total_acts <= 0) return {};
-    if (use_nested) {
-        return launch_moe_expert_major_prefill_down<true>(
+    if (num_pairs <= 0) {
+        if (use_nested) {
+            return launch_moe_expert_major_prefill_down<true>(
+                ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
+                in_features, out_features, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_down<false>(
             ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
             in_features, out_features, blocksize, dep_event);
     }
+
+    const int clamped_pairs = std::min(num_pairs, total_acts / 2);
+    const int single_acts = total_acts - 2 * clamped_pairs;
+    sycl::event pair_ev{};
+    if (use_nested) {
+        pair_ev = launch_moe_expert_major_prefill_down_2token<true>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, clamped_pairs, top_k,
+            in_features, out_features, blocksize, dep_event);
+    } else {
+        pair_ev = launch_moe_expert_major_prefill_down_2token<false>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, clamped_pairs, top_k,
+            in_features, out_features, blocksize, dep_event);
+    }
+
+    if (single_acts <= 0) {
+        return pair_ev;
+    }
+
+    const int single_offset = 2 * clamped_pairs;
+    if (use_nested) {
+        return launch_moe_expert_major_prefill_down<true>(
+            ctx, slots + single_offset, token_ids + single_offset, ranks + single_offset,
+            quant_map, h, down_acc, single_acts, top_k,
+            in_features, out_features, blocksize, &pair_ev);
+    }
     return launch_moe_expert_major_prefill_down<false>(
-        ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
-        in_features, out_features, blocksize, dep_event);
+        ctx, slots + single_offset, token_ids + single_offset, ranks + single_offset,
+        quant_map, h, down_acc, single_acts, top_k,
+        in_features, out_features, blocksize, &pair_ev);
 }
 
 sycl::event moe_ordered_accumulate_down_rows(

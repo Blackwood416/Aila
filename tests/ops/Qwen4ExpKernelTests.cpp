@@ -4,10 +4,12 @@
 #include "ops/MoeExpertOps.hpp"
 #include "ops/GatedDeltaNetOps.hpp"
 #include "ops/QsaIndexerOps.hpp"
+#include "ops/Bnb4BitLinear.hpp"
 #include "ops/Ops.hpp"
 #include "utils/EnvUtils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -1143,10 +1145,118 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
     }
     ctx.free_device(em_slots_dev);
 
+    // 5. Expert-major prefill with explicit 2-token weight reuse (Phase W4 C1/C2)
+    int total_pairs = 0;
+    for (int e = 0; e < num_unique_experts; ++e) {
+        total_pairs += expert_counts[e] / 2;
+    }
+    std::vector<int> wr_pair_pos(num_unique_experts, 0);
+    std::vector<int> wr_single_pos(num_unique_experts, 0);
+    int p_off = 0;
+    int s_off = 2 * total_pairs;
+    for (int e = 0; e < num_unique_experts; ++e) {
+        wr_pair_pos[e] = p_off;
+        wr_single_pos[e] = s_off;
+        p_off += (expert_counts[e] / 2) * 2;
+        s_off += (expert_counts[e] % 2);
+    }
+    std::vector<int> wr_tokens(total_acts);
+    std::vector<int> wr_ranks(total_acts);
+    std::vector<ops::MoeExpertSlotDev> wr_slots(total_acts);
+    std::vector<int> wr_expert_seen(num_unique_experts, 0);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < num_active_experts; ++k) {
+            int e = (t * 7 + k) % num_unique_experts;
+            int seen = wr_expert_seen[e]++;
+            int pairs_limit = (expert_counts[e] / 2) * 2;
+            int pos = (seen < pairs_limit)
+                ? (wr_pair_pos[e] + seen)
+                : (wr_single_pos[e] + (seen - pairs_limit));
+            wr_tokens[pos] = t;
+            wr_ranks[pos] = k;
+            wr_slots[pos] = expert_pool[e];
+        }
+    }
+
+    Tensor wr_tokens_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    Tensor wr_ranks_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    ops::MoeExpertSlotDev* wr_slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+    Tensor wr_h_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor wr_down_acc_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+    Tensor wr_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor wr_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(wr_tokens_dev.data(), wr_tokens.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(wr_ranks_dev.data(), wr_ranks.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(wr_slots_dev, wr_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+    sycl::event wr_gu = ops::moe_expert_major_prefill_gate_up(
+        ctx, wr_slots_dev,
+        static_cast<const int*>(wr_tokens_dev.data()),
+        static_cast<const int*>(wr_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(wr_h_dev.data()),
+        total_acts, num_active_experts, in_features, intermediate_size, blocksize,
+        nullptr, use_nested, total_pairs);
+
+    sycl::event wr_dn = ops::moe_expert_major_prefill_down(
+        ctx, wr_slots_dev,
+        static_cast<const int*>(wr_tokens_dev.data()),
+        static_cast<const int*>(wr_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(wr_h_dev.data()),
+        static_cast<float*>(wr_down_acc_dev.data()),
+        total_acts, num_active_experts, intermediate_size, out_features, blocksize,
+        &wr_gu, use_nested, total_pairs);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(wr_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(wr_y_dev.data()),
+        tokens, num_active_experts, out_features,
+        nullptr, nullptr, &wr_dn);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(wr_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(wr_y_fused_dev.data()),
+        tokens, num_active_experts, out_features,
+        static_cast<const bf16*>(shared_dev.data()),
+        static_cast<const bf16*>(gate_dev.data()),
+        &wr_dn);
+
+    ctx.synchronize();
+
+    std::vector<bf16> wr_h(total_acts * intermediate_size);
+    std::vector<bf16> wr_y(tokens * out_features);
+    std::vector<bf16> wr_y_fused(tokens * out_features);
+    ctx.memcpy_d2h(wr_h.data(), wr_h_dev.data(), wr_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(wr_y.data(), wr_y_dev.data(), wr_y.size() * sizeof(bf16));
+    ctx.memcpy_d2h(wr_y_fused.data(), wr_y_fused_dev.data(), wr_y_fused.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < ref_h.size(); ++i) {
+        if (wr_h[i] != ref_h[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_gate_up (2-token reuse) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y.size(); ++i) {
+        if (wr_y[i] != ref_y[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down (2-token reuse) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y_fused.size(); ++i) {
+        if (wr_y_fused[i] != ref_y_fused[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down (2-token reuse fused) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    ctx.free_device(wr_slots_dev);
+
     std::cout << "[PASS] moe_prefill tokens=" << tokens
               << " k=" << num_active_experts
               << " nested=" << (use_nested ? "true" : "false")
-              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, both S1 and S4)\n";
+              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, all S1, S4, and W4 C1/C2)\n";
 
     ctx.free_device(slots_dev_buf);
     ctx.free_device(weights_dev);
@@ -2767,6 +2877,353 @@ static void test_attention_prefill_qsa_batched(Context& ctx) {
     }
 }
 
+void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
+    constexpr int in_features = 2560;
+    constexpr int intermediate_size = 640;
+    constexpr int out_features = 2560;
+    constexpr int blocksize = 64;
+
+    std::cout << "\n======================================================================\n";
+    std::cout << "  [Benchmark] W4 C1/C2 Expert-Major Prefill 2-Token Weight Reuse\n";
+    std::cout << "======================================================================\n";
+
+    for (int tokens : {16, 64}) {
+        const int num_active_experts = 10;
+        const int num_unique_experts = 32;
+        const int total_acts = tokens * num_active_experts;
+
+        std::mt19937 rng(999 + tokens);
+        std::uniform_int_distribution<int> u8_dist(0, 255);
+        std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
+        std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
+
+        const size_t gu_packed_bytes = static_cast<size_t>(2 * intermediate_size) * (in_features / 2);
+        const size_t gu_absmax_count = static_cast<size_t>(2 * intermediate_size) * (in_features / blocksize);
+        const size_t down_packed_bytes = static_cast<size_t>(out_features) * (intermediate_size / 2);
+        const size_t down_absmax_count = static_cast<size_t>(out_features) * (intermediate_size / blocksize);
+
+        std::vector<Tensor> gu_packed_dev, gu_absmax_dev, down_packed_dev, down_absmax_dev;
+        Tensor qmap_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(qmap_dev.data(), kTestQuantMap, 16 * sizeof(float));
+
+        std::vector<ops::MoeExpertSlotDev> expert_pool(num_unique_experts);
+        for (int e = 0; e < num_unique_experts; ++e) {
+            gu_packed_dev.push_back(Tensor::allocate(ctx, {gu_packed_bytes}, dnnl::memory::data_type::u8));
+            gu_absmax_dev.push_back(Tensor::allocate(ctx, {gu_absmax_count}, dnnl::memory::data_type::f32));
+            down_packed_dev.push_back(Tensor::allocate(ctx, {down_packed_bytes}, dnnl::memory::data_type::u8));
+            down_absmax_dev.push_back(Tensor::allocate(ctx, {down_absmax_count}, dnnl::memory::data_type::f32));
+
+            std::vector<uint8_t> gu_p(gu_packed_bytes), dn_p(down_packed_bytes);
+            std::vector<float> gu_a(gu_absmax_count), dn_a(down_absmax_count);
+            for (auto& v : gu_p) v = static_cast<uint8_t>(u8_dist(rng));
+            for (auto& v : dn_p) v = static_cast<uint8_t>(u8_dist(rng));
+            for (auto& v : gu_a) v = f_dist(rng);
+            for (auto& v : dn_a) v = f_dist(rng);
+
+            ctx.memcpy_h2d(gu_packed_dev[e].data(), gu_p.data(), gu_packed_bytes);
+            ctx.memcpy_h2d(gu_absmax_dev[e].data(), gu_a.data(), gu_absmax_count * sizeof(float));
+            ctx.memcpy_h2d(down_packed_dev[e].data(), dn_p.data(), down_packed_bytes);
+            ctx.memcpy_h2d(down_absmax_dev[e].data(), dn_a.data(), down_absmax_count * sizeof(float));
+
+            expert_pool[e].gate_up_packed = static_cast<const uint8_t*>(gu_packed_dev[e].data());
+            expert_pool[e].gate_up_absmax = static_cast<const float*>(gu_absmax_dev[e].data());
+            expert_pool[e].down_packed = static_cast<const uint8_t*>(down_packed_dev[e].data());
+            expert_pool[e].down_absmax = static_cast<const float*>(down_absmax_dev[e].data());
+        }
+
+        std::vector<bf16> x_host(tokens * in_features);
+        for (auto& v : x_host) v = bf16(in_dist(rng));
+        Tensor x_dev = Tensor::allocate(ctx, {tokens, in_features}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+        std::vector<float> weights_host(total_acts, 1.0f / num_active_experts);
+        float* weights_dev = static_cast<float*>(ctx.alloc_device(total_acts * sizeof(float)));
+        ctx.memcpy_h2d(weights_dev, weights_host.data(), total_acts * sizeof(float));
+
+        std::vector<int> expert_counts(num_unique_experts, 0);
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < num_active_experts; ++k) {
+                int e = (t * 7 + k) % num_unique_experts;
+                expert_counts[e]++;
+            }
+        }
+
+        // Layout 1: S4 baseline (num_pairs = 0)
+        std::vector<int> s4_tokens(total_acts), s4_ranks(total_acts);
+        std::vector<ops::MoeExpertSlotDev> s4_slots(total_acts);
+        std::vector<int> s4_offsets(num_unique_experts + 1, 0);
+        for (int e = 0; e < num_unique_experts; ++e) {
+            s4_offsets[e + 1] = s4_offsets[e] + expert_counts[e];
+        }
+        std::vector<int> s4_pos = s4_offsets;
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < num_active_experts; ++k) {
+                int e = (t * 7 + k) % num_unique_experts;
+                int p = s4_pos[e]++;
+                s4_tokens[p] = t;
+                s4_ranks[p] = k;
+                s4_slots[p] = expert_pool[e];
+            }
+        }
+        Tensor s4_tok_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        Tensor s4_rnk_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        ops::MoeExpertSlotDev* s4_slt_dev = static_cast<ops::MoeExpertSlotDev*>(
+            ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+        ctx.memcpy_h2d(s4_tok_dev.data(), s4_tokens.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(s4_rnk_dev.data(), s4_ranks.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(s4_slt_dev, s4_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+        // Layout 2: W4 C1/C2 (num_pairs = total_pairs)
+        int total_pairs = 0;
+        for (int e = 0; e < num_unique_experts; ++e) total_pairs += expert_counts[e] / 2;
+        std::vector<int> wr_pair_pos(num_unique_experts, 0);
+        std::vector<int> wr_single_pos(num_unique_experts, 0);
+        int p_off = 0, s_off = 2 * total_pairs;
+        for (int e = 0; e < num_unique_experts; ++e) {
+            wr_pair_pos[e] = p_off;
+            wr_single_pos[e] = s_off;
+            p_off += (expert_counts[e] / 2) * 2;
+            s_off += (expert_counts[e] % 2);
+        }
+        std::vector<int> wr_tokens(total_acts), wr_ranks(total_acts);
+        std::vector<ops::MoeExpertSlotDev> wr_slots(total_acts);
+        std::vector<int> wr_seen(num_unique_experts, 0);
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < num_active_experts; ++k) {
+                int e = (t * 7 + k) % num_unique_experts;
+                int seen = wr_seen[e]++;
+                int pairs_limit = (expert_counts[e] / 2) * 2;
+                int p = (seen < pairs_limit) ? (wr_pair_pos[e] + seen) : (wr_single_pos[e] + (seen - pairs_limit));
+                wr_tokens[p] = t;
+                wr_ranks[p] = k;
+                wr_slots[p] = expert_pool[e];
+            }
+        }
+        Tensor wr_tok_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        Tensor wr_rnk_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        ops::MoeExpertSlotDev* wr_slt_dev = static_cast<ops::MoeExpertSlotDev*>(
+            ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+        ctx.memcpy_h2d(wr_tok_dev.data(), wr_tokens.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(wr_rnk_dev.data(), wr_ranks.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(wr_slt_dev, wr_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+        Tensor h_s4_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor down_acc_s4_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+        Tensor y_s4_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+        Tensor h_wr_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor down_acc_wr_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+        Tensor y_wr_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+        // Warmup
+        for (int i = 0; i < 5; ++i) {
+            sycl::event gu = ops::moe_expert_major_prefill_gate_up(
+                ctx, s4_slt_dev, static_cast<const int*>(s4_tok_dev.data()), static_cast<const int*>(s4_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_s4_dev.data()),
+                total_acts, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, 0);
+            sycl::event dn = ops::moe_expert_major_prefill_down(
+                ctx, s4_slt_dev, static_cast<const int*>(s4_tok_dev.data()), static_cast<const int*>(s4_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(h_s4_dev.data()), static_cast<float*>(down_acc_s4_dev.data()),
+                total_acts, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, 0);
+            ops::moe_ordered_accumulate_down_rows(
+                ctx, static_cast<const float*>(down_acc_s4_dev.data()), weights_dev, static_cast<bf16*>(y_s4_dev.data()),
+                tokens, num_active_experts, out_features, nullptr, nullptr, &dn);
+        }
+        ctx.synchronize();
+
+        constexpr int iters = 40;
+        // Benchmark S4 baseline
+        auto t0_s4 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            sycl::event gu = ops::moe_expert_major_prefill_gate_up(
+                ctx, s4_slt_dev, static_cast<const int*>(s4_tok_dev.data()), static_cast<const int*>(s4_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_s4_dev.data()),
+                total_acts, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, 0);
+            sycl::event dn = ops::moe_expert_major_prefill_down(
+                ctx, s4_slt_dev, static_cast<const int*>(s4_tok_dev.data()), static_cast<const int*>(s4_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(h_s4_dev.data()), static_cast<float*>(down_acc_s4_dev.data()),
+                total_acts, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, 0);
+            ops::moe_ordered_accumulate_down_rows(
+                ctx, static_cast<const float*>(down_acc_s4_dev.data()), weights_dev, static_cast<bf16*>(y_s4_dev.data()),
+                tokens, num_active_experts, out_features, nullptr, nullptr, &dn);
+        }
+        ctx.synchronize();
+        auto t1_s4 = std::chrono::high_resolution_clock::now();
+        double ms_s4 = std::chrono::duration<double, std::milli>(t1_s4 - t0_s4).count() / iters;
+
+        // Warmup W4 C1
+        for (int i = 0; i < 5; ++i) {
+            sycl::event gu = ops::moe_expert_major_prefill_gate_up(
+                ctx, wr_slt_dev, static_cast<const int*>(wr_tok_dev.data()), static_cast<const int*>(wr_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_wr_dev.data()),
+                total_acts, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, total_pairs);
+            sycl::event dn = ops::moe_expert_major_prefill_down(
+                ctx, wr_slt_dev, static_cast<const int*>(wr_tok_dev.data()), static_cast<const int*>(wr_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(h_wr_dev.data()), static_cast<float*>(down_acc_wr_dev.data()),
+                total_acts, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, total_pairs);
+            ops::moe_ordered_accumulate_down_rows(
+                ctx, static_cast<const float*>(down_acc_wr_dev.data()), weights_dev, static_cast<bf16*>(y_wr_dev.data()),
+                tokens, num_active_experts, out_features, nullptr, nullptr, &dn);
+        }
+        ctx.synchronize();
+
+        // Benchmark W4 C1
+        auto t0_w4 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            sycl::event gu = ops::moe_expert_major_prefill_gate_up(
+                ctx, wr_slt_dev, static_cast<const int*>(wr_tok_dev.data()), static_cast<const int*>(wr_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_wr_dev.data()),
+                total_acts, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, total_pairs);
+            sycl::event dn = ops::moe_expert_major_prefill_down(
+                ctx, wr_slt_dev, static_cast<const int*>(wr_tok_dev.data()), static_cast<const int*>(wr_rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(h_wr_dev.data()), static_cast<float*>(down_acc_wr_dev.data()),
+                total_acts, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, total_pairs);
+            ops::moe_ordered_accumulate_down_rows(
+                ctx, static_cast<const float*>(down_acc_wr_dev.data()), weights_dev, static_cast<bf16*>(y_wr_dev.data()),
+                tokens, num_active_experts, out_features, nullptr, nullptr, &dn);
+        }
+        ctx.synchronize();
+        auto t1_w4 = std::chrono::high_resolution_clock::now();
+        double ms_w4 = std::chrono::duration<double, std::milli>(t1_w4 - t0_w4).count() / iters;
+
+        // Verify bit-exact equality between S4 baseline and W4 C1 reuse
+        std::vector<bf16> y_s4_h(tokens * out_features), y_wr_h(tokens * out_features);
+        ctx.memcpy_d2h(y_s4_h.data(), y_s4_dev.data(), y_s4_h.size() * sizeof(bf16));
+        ctx.memcpy_d2h(y_wr_h.data(), y_wr_dev.data(), y_wr_h.size() * sizeof(bf16));
+        for (size_t i = 0; i < y_s4_h.size(); ++i) {
+            if (y_s4_h[i] != y_wr_h[i]) {
+                throw std::runtime_error("Benchmark verification failed: bit mismatch between S4 and W4 C1 at " + std::to_string(i));
+            }
+        }
+
+        double speedup = ms_s4 / ms_w4;
+        std::cout << "  Tokens=" << tokens << ", Acts=" << total_acts << " (" << total_pairs << " pairs, "
+                  << (total_acts - 2 * total_pairs) << " singles across " << num_unique_experts << " experts)\n";
+        std::cout << "    S4 Baseline (num_pairs=0):       " << ms_s4 << " ms\n";
+        std::cout << "    W4 C1 2-Token Reuse (num_pairs=" << total_pairs << "): " << ms_w4 << " ms\n";
+        std::cout << "    Speedup: " << speedup << "x (" << ((speedup - 1.0) * 100.0) << "% faster, 0 bit mismatches)\n";
+
+        ctx.free_device(s4_slt_dev);
+        ctx.free_device(wr_slt_dev);
+        ctx.free_device(weights_dev);
+    }
+    std::cout << "======================================================================\n\n";
+}
+
+void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
+    constexpr int K = 2560;
+    constexpr int N = 2560;
+    constexpr int blocksize = 64;
+
+    std::cout << "\n======================================================================\n";
+    std::cout << "  [Evaluation] W4 C3 Non-MoE Dense Prefill: oneDNN vs XMX Joint Matrix\n";
+    std::cout << "======================================================================\n";
+
+    std::mt19937 rng(777);
+    std::uniform_int_distribution<int> u8_dist(0, 255);
+    std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
+    std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
+
+    const size_t packed_bytes = static_cast<size_t>(N) * (K / 2);
+    const size_t absmax_count = static_cast<size_t>(N) * (K / blocksize);
+
+    std::vector<uint8_t> packed_host(packed_bytes);
+    std::vector<float> absmax_host(absmax_count);
+    for (auto& v : packed_host) v = static_cast<uint8_t>(u8_dist(rng));
+    for (auto& v : absmax_host) v = f_dist(rng);
+
+    Tensor packed_dev = Tensor::allocate(ctx, {static_cast<int64_t>(packed_bytes)}, dnnl::memory::data_type::u8);
+    Tensor absmax_dev = Tensor::allocate(ctx, {static_cast<int64_t>(absmax_count)}, dnnl::memory::data_type::f32);
+    Tensor qmap_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
+
+    ctx.memcpy_h2d(packed_dev.data(), packed_host.data(), packed_bytes);
+    ctx.memcpy_h2d(absmax_dev.data(), absmax_host.data(), absmax_count * sizeof(float));
+    ctx.memcpy_h2d(qmap_dev.data(), kTestQuantMap, 16 * sizeof(float));
+
+    Bnb4BitWeightRef wref;
+    wref.name = "test_dense_weight";
+    wref.packed_weight = &packed_dev;
+    wref.absmax = &absmax_dev;
+    wref.quant_map = &qmap_dev;
+    wref.quant_state.shape = {N, K};
+    wref.quant_state.blocksize = blocksize;
+    wref.quant_state.quant_type = "nf4";
+
+    Bnb4BitLinear linear;
+    std::string err;
+    if (!linear.init(ctx, wref, &err)) {
+        throw std::runtime_error("linear.init failed: " + err);
+    }
+
+    for (int M : {32, 64}) {
+        std::vector<bf16> x_host(static_cast<size_t>(M) * K);
+        for (auto& v : x_host) v = bf16(in_dist(rng));
+        Tensor x_dev = Tensor::allocate(ctx, {M, K}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+        Tensor out_fallback = Tensor::allocate(ctx, {M, N}, dnnl::memory::data_type::bf16);
+        Tensor out_xmx = Tensor::allocate(ctx, {M, N}, dnnl::memory::data_type::bf16);
+
+        Bnb4BitLinearScratch scratch_fb;
+        linear.set_allow_dense_xmx(false);
+        // Warmup
+        for (int i = 0; i < 5; ++i) {
+            linear.forward(ctx, scratch_fb, x_dev, out_fallback, M);
+        }
+        ctx.synchronize();
+
+        constexpr int iters = 30;
+        auto t0_fb = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            linear.forward(ctx, scratch_fb, x_dev, out_fallback, M);
+        }
+        ctx.synchronize();
+        auto t1_fb = std::chrono::high_resolution_clock::now();
+        double ms_fb = std::chrono::duration<double, std::milli>(t1_fb - t0_fb).count() / iters;
+
+        Bnb4BitLinearScratch scratch_xmx;
+        linear.set_allow_dense_xmx(true);
+        // Warmup
+        for (int i = 0; i < 5; ++i) {
+            linear.forward(ctx, scratch_xmx, x_dev, out_xmx, M);
+        }
+        ctx.synchronize();
+
+        auto t0_xmx = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            linear.forward(ctx, scratch_xmx, x_dev, out_xmx, M);
+        }
+        ctx.synchronize();
+        auto t1_xmx = std::chrono::high_resolution_clock::now();
+        double ms_xmx = std::chrono::duration<double, std::milli>(t1_xmx - t0_xmx).count() / iters;
+
+        std::vector<bf16> y_fb_host(static_cast<size_t>(M) * N);
+        std::vector<bf16> y_xmx_host(static_cast<size_t>(M) * N);
+        ctx.memcpy_d2h(y_fb_host.data(), out_fallback.data(), y_fb_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(y_xmx_host.data(), out_xmx.data(), y_xmx_host.size() * sizeof(bf16));
+
+        float max_abs_diff = 0.0f;
+        float max_rel_diff = 0.0f;
+        for (size_t i = 0; i < y_fb_host.size(); ++i) {
+            float v_fb = static_cast<float>(y_fb_host[i]);
+            float v_xmx = static_cast<float>(y_xmx_host[i]);
+            float diff = std::abs(v_fb - v_xmx);
+            if (diff > max_abs_diff) max_abs_diff = diff;
+            float denom = std::max(std::abs(v_fb), 1e-4f);
+            float rdiff = diff / denom;
+            if (rdiff > max_rel_diff) max_rel_diff = rdiff;
+        }
+
+        std::cout << "  Dense Linear Shape M=" << M << ", K=" << K << ", N=" << N << ":\n";
+        std::cout << "    oneDNN Dequant + GEMM (allow_dense_xmx=false): " << ms_fb << " ms\n";
+        std::cout << "    Dense Fused GEMM      (allow_dense_xmx=true):  " << ms_xmx << " ms\n";
+        std::cout << "    Speedup: " << (ms_fb / ms_xmx) << "x\n";
+        std::cout << "    Numerics: max_abs_diff = " << max_abs_diff
+                  << ", max_rel_diff = " << max_rel_diff << "\n";
+    }
+    std::cout << "======================================================================\n\n";
+}
+
 } // namespace
 
 int main() {
@@ -2787,6 +3244,8 @@ int main() {
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
         test_moe_prefill_gate_up_and_down(ctx);
+        test_moe_prefill_weight_reuse_benchmark(ctx);
+        test_non_moe_prefill_dense_xmx_evaluation(ctx);
         test_gated_delta_net_sigmoid(ctx);
         test_attention_decode_gate_fusion(ctx);
         test_attention_prefill_gate_fusion(ctx);
