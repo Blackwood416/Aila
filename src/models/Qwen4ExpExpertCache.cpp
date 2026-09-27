@@ -1097,6 +1097,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     if (unique_experts > num_slots_) {
         throw std::runtime_error("Qwen4ExpExpertCache: unique expert demand exceeds GPU slot capacity");
     }
+    ++stats_.demand_microbatches;
     // AILA_DEBUG_Q4E_ROUTE_TRACE: append int32 {layer, count, ids[count]} per call, for offline
     // replacement-policy simulation (perf/qwen4exp/q4e_cache_sim.py).
     static FILE* s_trace = [] {

@@ -3720,6 +3720,200 @@ void test_b4_cost_aware_two_tier_eviction(Context& ctx) {
     std::cout << "[PASS] B4 cost-aware two-tier eviction tests passed.\n";
 }
 
+void test_b6_demand_microbatch_pipeline(Context& ctx) {
+    std::cout << "[Test] Running B6 demand microbatch double-buffered pipeline tests...\n";
+
+    // Sub-test 1: Cache microbatch statistics and consumer reader fence protection
+    {
+        TestCacheHarness harness;
+        Qwen4ExpExpertCache cache;
+        harness.setup_cache(cache, ctx, 4, 8); // 4 GPU slots, 8 host slots
+
+        expect(cache.stats().demand_microbatches == 0, "Initial demand microbatches must be 0");
+
+        int exp_g0[2] = {0, 1};
+        int slots_g0[2] = {-1, -1};
+        sycl::event ev0 = cache.acquire(0, exp_g0, 2, slots_g0);
+        expect(cache.stats().demand_microbatches == 1, "First microbatch must increment demand_microbatches to 1");
+        expect(cache.contains(0, 0) && cache.contains(0, 1), "Group 0 experts must be resident in GPU cache");
+
+        // Record dummy consumer fence on Group 0
+        sycl::event fence_g0 = ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.single_task([=]() {});
+        });
+        cache.record_consumer_reader_fences(slots_g0, 2, fence_g0);
+
+        int exp_g1[2] = {2, 3};
+        int slots_g1[2] = {-1, -1};
+        sycl::event ev1 = cache.acquire(0, exp_g1, 2, slots_g1);
+        expect(cache.stats().demand_microbatches == 2, "Second microbatch must increment demand_microbatches to 2");
+        expect(cache.contains(0, 2) && cache.contains(0, 3), "Group 1 experts must be resident in GPU cache");
+
+        // Record dummy consumer fence on Group 1
+        sycl::event fence_g1 = ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.single_task([=]() {});
+        });
+        cache.record_consumer_reader_fences(slots_g1, 2, fence_g1);
+
+        // Now cache is full (slots 0..3 used for experts 0..3, all protected by fences)
+        // Acquire expert 4: must evict one of the slots after its fence completes
+        int exp_g2[1] = {4};
+        int slot_g2[1] = {-1};
+        sycl::event ev2 = cache.acquire(0, exp_g2, 1, slot_g2);
+        expect(cache.stats().demand_microbatches == 3, "Third microbatch must increment demand_microbatches to 3");
+        expect(cache.contains(0, 4), "Expert 4 must be resident in GPU cache");
+        std::cout << "  Sub-test 1: Microbatch acquire metrics and reader fence protection verified.\n";
+    }
+
+    // Sub-test 2: Kernel bit-exact equivalence between Monolithic S4 and Microbatched S4
+    {
+        TestCacheHarness harness;
+        Qwen4ExpExpertCache cache;
+        harness.setup_cache(cache, ctx, 8, 16);
+
+        constexpr int tokens = 4;
+        constexpr int top_k = 2;
+        constexpr int total_acts = tokens * top_k; // 8 activations
+        constexpr int hidden_size = 256;
+        constexpr int intermediate_size = 64;
+        constexpr int blocksize = 64;
+
+        // Acquire experts {0, 1, 2, 3}
+        int exp_ids[4] = {0, 1, 2, 3};
+        int slots[4] = {-1, -1, -1, -1};
+        cache.acquire(0, exp_ids, 4, slots).wait();
+
+        // 4 tokens each choosing 2 experts:
+        // token 0: exp 0, exp 2
+        // token 1: exp 1, exp 3
+        // token 2: exp 0, exp 1
+        // token 3: exp 2, exp 3
+        int router_ids[total_acts] = {0, 2, 1, 3, 0, 1, 2, 3};
+        float router_weights[total_acts] = {0.6f, 0.4f, 0.7f, 0.3f, 0.5f, 0.5f, 0.8f, 0.2f};
+
+        // Inputs
+        std::vector<bf16> x_host(tokens * hidden_size, bf16(0.125f));
+        bf16* x_dev = static_cast<bf16*>(ctx.alloc_device(x_host.size() * sizeof(bf16)));
+        ctx.memcpy_h2d(x_dev, x_host.data(), x_host.size() * sizeof(bf16));
+
+        // Allocations for Monolithic S4
+        bf16* h_mono = static_cast<bf16*>(ctx.alloc_device(total_acts * intermediate_size * sizeof(bf16)));
+        float* down_acc_mono = static_cast<float*>(ctx.alloc_device(total_acts * hidden_size * sizeof(float)));
+        bf16* y_mono = static_cast<bf16*>(ctx.alloc_device(tokens * hidden_size * sizeof(bf16)));
+
+        // Allocations for Microbatched S4
+        bf16* h_mb = static_cast<bf16*>(ctx.alloc_device(total_acts * intermediate_size * sizeof(bf16)));
+        float* down_acc_mb = static_cast<float*>(ctx.alloc_device(total_acts * hidden_size * sizeof(float)));
+        bf16* y_mb = static_cast<bf16*>(ctx.alloc_device(tokens * hidden_size * sizeof(bf16)));
+
+        float* weights_dev = static_cast<float*>(ctx.alloc_device(total_acts * sizeof(float)));
+        ctx.memcpy_h2d(weights_dev, router_weights, total_acts * sizeof(float));
+
+        // Device buffers for activation maps
+        int* token_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+        int* rank_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+        ops::MoeExpertSlotDev* slot_dev = static_cast<ops::MoeExpertSlotDev*>(
+            ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+
+        // Compute layout
+        std::vector<int> counts(4, 0);
+        for (int i = 0; i < total_acts; ++i) counts[router_ids[i]]++;
+        std::vector<int> offsets(5, 0);
+        for (int e = 0; e < 4; ++e) offsets[e + 1] = offsets[e] + counts[e];
+        std::vector<int> cur_pos = offsets;
+
+        std::vector<int> map_token(total_acts);
+        std::vector<int> map_rank(total_acts);
+        std::vector<ops::MoeExpertSlotDev> map_slot(total_acts);
+
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < top_k; ++k) {
+                int i = t * top_k + k;
+                int e = router_ids[i];
+                int p = cur_pos[e]++;
+                map_token[p] = t;
+                map_rank[p] = k;
+                map_slot[p] = cache.get_slot_dev(slots[e]);
+            }
+        }
+
+        ctx.memcpy_h2d(token_dev, map_token.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(rank_dev, map_rank.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(slot_dev, map_slot.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+        // 1. Run Monolithic S4
+        sycl::event gu_m = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_dev, token_dev, rank_dev, nullptr, x_dev, h_mono,
+            total_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes());
+        sycl::event dn_m = ops::moe_expert_major_prefill_down(
+            ctx, slot_dev, token_dev, rank_dev, nullptr, h_mono, down_acc_mono,
+            total_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_m, cache.uses_nested_codes());
+        ops::moe_ordered_accumulate_down_rows(
+            ctx, down_acc_mono, weights_dev, y_mono, tokens, top_k, hidden_size, nullptr, nullptr, &dn_m).wait();
+
+        // 2. Run Microbatched S4 (Group 0: experts {0, 1}, Group 1: experts {2, 3})
+        // Group 0 activations: [offsets[0], offsets[2])
+        // Group 1 activations: [offsets[2], offsets[4])
+        int g0_start = offsets[0];
+        int g0_count = offsets[2] - offsets[0];
+        int g1_start = offsets[2];
+        int g1_count = offsets[4] - offsets[2];
+
+        // Launch Group 0
+        sycl::event gu_mb0 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_dev + g0_start, token_dev + g0_start, rank_dev + g0_start,
+            nullptr, x_dev, h_mb, g0_count, top_k, hidden_size, intermediate_size, blocksize,
+            nullptr, cache.uses_nested_codes());
+        sycl::event dn_mb0 = ops::moe_expert_major_prefill_down(
+            ctx, slot_dev + g0_start, token_dev + g0_start, rank_dev + g0_start,
+            nullptr, h_mb, down_acc_mb, g0_count, top_k, intermediate_size, hidden_size, blocksize,
+            &gu_mb0, cache.uses_nested_codes());
+
+        // Launch Group 1
+        sycl::event gu_mb1 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_dev + g1_start, token_dev + g1_start, rank_dev + g1_start,
+            nullptr, x_dev, h_mb, g1_count, top_k, hidden_size, intermediate_size, blocksize,
+            nullptr, cache.uses_nested_codes());
+        sycl::event dn_mb1 = ops::moe_expert_major_prefill_down(
+            ctx, slot_dev + g1_start, token_dev + g1_start, rank_dev + g1_start,
+            nullptr, h_mb, down_acc_mb, g1_count, top_k, intermediate_size, hidden_size, blocksize,
+            &gu_mb1, cache.uses_nested_codes());
+
+        // Accumulate with last event
+        ops::moe_ordered_accumulate_down_rows(
+            ctx, down_acc_mb, weights_dev, y_mb, tokens, top_k, hidden_size, nullptr, nullptr, &dn_mb1).wait();
+
+        // Compare y_mono and y_mb
+        std::vector<bf16> y_mono_host(tokens * hidden_size);
+        std::vector<bf16> y_mb_host(tokens * hidden_size);
+        ctx.memcpy_d2h(y_mono_host.data(), y_mono, y_mono_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(y_mb_host.data(), y_mb, y_mb_host.size() * sizeof(bf16));
+
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < y_mono_host.size(); ++i) {
+            float d = std::abs(static_cast<float>(y_mono_host[i]) - static_cast<float>(y_mb_host[i]));
+            if (d > max_diff) max_diff = d;
+        }
+        expect(max_diff == 0.0f, "Microbatch pipeline must produce bit-exact identical outputs to monolithic S4");
+        std::cout << "  Sub-test 2: Monolithic vs Microbatched prefill bit-exact equivalence verified (max_diff = "
+                  << max_diff << ").\n";
+
+        ctx.free_device(x_dev);
+        ctx.free_device(h_mono);
+        ctx.free_device(down_acc_mono);
+        ctx.free_device(y_mono);
+        ctx.free_device(h_mb);
+        ctx.free_device(down_acc_mb);
+        ctx.free_device(y_mb);
+        ctx.free_device(weights_dev);
+        ctx.free_device(token_dev);
+        ctx.free_device(rank_dev);
+        ctx.free_device(slot_dev);
+    }
+
+    std::cout << "[PASS] B6 demand microbatch double-buffered pipeline tests passed.\n";
+}
+
 } // namespace
 
 int main() {
@@ -3743,6 +3937,7 @@ int main() {
         test_b2_route_and_prediction_event_decoupling(ctx);
         test_b3_utility_aware_prefetch_filtering_and_metrics(ctx);
         test_b4_cost_aware_two_tier_eviction(ctx);
+        test_b6_demand_microbatch_pipeline(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);

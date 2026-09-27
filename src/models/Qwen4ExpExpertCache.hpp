@@ -77,12 +77,13 @@ struct ExpertCacheStats {
     uint64_t host_pool_hits = 0;   // served directly from hot host RAM pool (zero CPU copy)
     uint64_t host_pool_misses = 0; // required fill into host pool from mmap
 
-    // Phase B metrics (B3)
+    // Phase B metrics (B3, B6)
     uint64_t prefetch_issued_bytes = 0;
     uint64_t prefetch_useful_bytes = 0;
     uint64_t prefetch_cancelled_bytes = 0;
     uint64_t prefetch_wasted_bytes = 0;
     uint64_t demand_exposed_wait_ns = 0;
+    uint64_t demand_microbatches = 0;
 
     double hit_rate() const {
         uint64_t total = hit_count + miss_count;
