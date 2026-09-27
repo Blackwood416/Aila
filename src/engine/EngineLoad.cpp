@@ -605,11 +605,19 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
             int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
             ctx_->synchronize();
+
+            // H0: exercise count=1 decode step while session has cached tokens,
+            // compiling decode GEMV, decode attention / JM, decode MoE, and LM head.
+            Tensor& warmup_decode_logits = backend_->forward(*ctx_, warmup_token_ids, 1);
+            ops::argmax(*ctx_, warmup_decode_logits, config_.vocab_size, warmup_argmax);
+            ctx_->synchronize();
             t_warmup_end = std::chrono::high_resolution_clock::now();
 
             ctx_->free_device(warmup_argmax);
             ctx_->free_device(warmup_token_ids);
             backend_->reset();
+
+            AILA_LOG_INFO("[Warmup Manifest] reached: 2-token prefill (gemm, score buf), 1-token decode (gemv, decode attn, moe), state reset");
             }
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();
