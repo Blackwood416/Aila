@@ -62,3 +62,9 @@
    - 实现了显式 2-token 权重复用预填充内核，在 A770 上实现 MoE Prefill 内核加速达 **1.85x (+85.4%)**，同时保持 **100% 比特精确对齐**。
    - 专家激活度动态分解机制（$m_e = 2P + S$）支持任意批量与稀疏激活形状，无缝嵌入单批与双缓冲微批调度管线。
    - 消除 PLE 残留的 2 次 CPU 同步停顿，并在 Non-MoE dense linear 评测中验证了 1.58x~1.88x 的加速收益与精确一致性。
+9. **P0（PLE 确定性流水线解耦与 PleTicket）** 与 **P1（层内相邻 GR combine + norm 融合）**：
+   - **P0 落地**：落地 `PleTicket` 双缓冲管线，在 Token IDs 获准执行后提前并发执行 hash/gather/dequant（利用 CPU 任务池并异步提交 H2D 到独立 staging slot），Layer 1 仅需等待 ticket 就绪并消费投影，消除 Layer 1 的 exposed wait；纯 prepare 与 commit 分离，重构 `compute_ngram_ids` 为 O(1) 空间状态机，彻底消除热路径堆动态分配，保障 Cancel/Retry 下的 generation 阻断安全。
+   - **P1 落地**：在 Attention 产生输出后暂存 `block_output + injection`，在下一次 GR read 时合并写回并一体化计算下一个 group RMSNorm（`hc_inject_add_and_grouped_rms_norm`），消除 48 个层内边界的独立内核发射与显存往返；严格保留 BF16 舍入契约与数值精度对齐。
+   - **全量验证闭环**：编译 0 错误 0 警告；全量 CTest (ModelSpec, Kernel, Module, SafeTensors) 100% 通过；真机 48 tokens 生成 7429.47 ms，与黄金基线保持 **100% 比特精确对齐**。
+   - 关联提交：`4f3ad79` 与 `4bdf45d`。
+
