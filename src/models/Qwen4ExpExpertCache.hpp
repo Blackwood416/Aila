@@ -154,12 +154,14 @@ struct DmaTimingStats {
     uint64_t total_copy_ns = 0;
     uint64_t total_consumer_gap_ns = 0;
     uint64_t batches_measured = 0;
+    uint64_t batches_profiled = 0;
+    uint64_t batches_unprofiled = 0;
 
     uint64_t last_batch_bytes = 0;
     uint32_t last_memcpy_count = 0;
     uint64_t last_submit_ns = 0;
-    uint64_t last_copy_ns = 0;
-    uint64_t last_consumer_gap_ns = 0;
+    uint64_t last_copy_ns = 0; // first copy start to last copy end, including gaps
+    uint64_t last_consumer_gap_ns = 0; // host submit-to-consumer-hook, not GPU idle
     double last_effective_gbps = 0.0;
 };
 
@@ -331,6 +333,11 @@ public:
         return host_slot_records_[hslot].cpu_readers.load(std::memory_order_relaxed);
     }
     FillTicket prepare_host(int layer, int expert_id, int priority = 0);
+    static constexpr int kMaxHostPrepareTasks = 40;
+    // Coordinator-only. Pins ready inputs, fills distinct cold experts on the
+    // demand pool, then returns leases. Unavailable slots yield empty leases.
+    int prepare_host_batch(int layer, const int* expert_ids, int count, HostExpertLease* leases,
+                           bool wait_for_prefetch = false);
     GpuExpertTicket ensure_gpu(int layer, int expert_id, int priority = 0);
     GpuExpertTicket ensure_gpu(const HostExpertLease& lease, int priority = 0);
 
@@ -346,6 +353,8 @@ public:
 
 private:
     void cleanup();
+    FillTicket reserve_host_preparation(int layer, int expert_id, bool& needs_fill);
+    void invalidate_host_preparation(const FillTicket& ticket);
     void configure_layer_nested_metadata(int layer);
     void bind_slot_nested_metadata(int slot, int layer, int expert_id);
     // Fills part [part, nparts) of every slot segment for one expert.
@@ -512,7 +521,7 @@ private:
     DmaTimingStats dma_timing_stats_{};
     std::chrono::high_resolution_clock::time_point last_batch_submit_end_time_{};
     sycl::event last_batch_dma_event_{};
-    sycl::event first_batch_dma_event_{};
+    std::vector<sycl::event> batch_dma_events_;
     bool new_dma_batch_pending_ = false;
 };
 

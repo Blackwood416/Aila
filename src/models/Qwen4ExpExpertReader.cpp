@@ -17,9 +17,53 @@ namespace aila {
 
 namespace {
 
+struct AtomicExpertReaderStats {
+    std::atomic<uint64_t> read_count{0}, read_bytes{0}, read_ns{0};
+    std::atomic<uint64_t> prefetch_calls{0}, cancel_calls{0}, fallback_mmap_reads{0};
+
+    ExpertReaderStats snapshot() const {
+        return {read_count.load(std::memory_order_relaxed),
+                read_bytes.load(std::memory_order_relaxed),
+                read_ns.load(std::memory_order_relaxed),
+                prefetch_calls.load(std::memory_order_relaxed),
+                cancel_calls.load(std::memory_order_relaxed),
+                fallback_mmap_reads.load(std::memory_order_relaxed)};
+    }
+
+    void reset() {
+        read_count.store(0, std::memory_order_relaxed);
+        read_bytes.store(0, std::memory_order_relaxed);
+        read_ns.store(0, std::memory_order_relaxed);
+        prefetch_calls.store(0, std::memory_order_relaxed);
+        cancel_calls.store(0, std::memory_order_relaxed);
+        fallback_mmap_reads.store(0, std::memory_order_relaxed);
+    }
+
+    void record_read(size_t bytes, uint64_t ns) {
+        read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        read_ns.fetch_add(ns, std::memory_order_relaxed);
+        read_count.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
 inline void part_range(size_t len, int part, int nparts, size_t& begin, size_t& end) {
     begin = len * static_cast<size_t>(part) / static_cast<size_t>(nparts);
     end = len * static_cast<size_t>(part + 1) / static_cast<size_t>(nparts);
+}
+
+size_t staged_part_bytes(const ExpertSlotGeometry& geom, int part, int nparts) {
+    size_t total = 0;
+    for (size_t bytes : {geom.gu_packed_bytes, geom.dn_packed_bytes}) {
+        size_t begin = 0, end = 0;
+        part_range(bytes, part, nparts, begin, end);
+        total += end - begin;
+    }
+    for (size_t count : {geom.gu_absmax_count, geom.dn_absmax_count}) {
+        size_t begin = 0, end = 0;
+        part_range(count, part, nparts, begin, end);
+        total += (end - begin) * (geom.compact_nested ? 1 : sizeof(float));
+    }
+    return total;
 }
 
 void mmap_fill_matrix(const Bnb4BitHostWeightRef& ref, int expert_id,
@@ -130,13 +174,12 @@ public:
                          part, nparts);
 
         const auto t1 = std::chrono::high_resolution_clock::now();
-        stats_.read_count++;
-        stats_.read_bytes += geom_.slot_bytes / static_cast<size_t>(std::max(1, nparts));
-        stats_.read_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        stats_.record_read(staged_part_bytes(geom_, part, nparts),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
 
     void cancel() override {
-        stats_.cancel_calls++;
+        stats_.cancel_calls.fetch_add(1, std::memory_order_relaxed);
         cancelled_.store(true, std::memory_order_release);
     }
 
@@ -181,7 +224,7 @@ public:
             }
             if (n_ranges > 0) {
                 PrefetchVirtualMemory(GetCurrentProcess(), n_ranges, ranges, 0);
-                stats_.prefetch_calls++;
+                stats_.prefetch_calls.fetch_add(1, std::memory_order_relaxed);
             }
         }
 #endif
@@ -194,15 +237,15 @@ public:
         layers_[layer] = src;
     }
 
-    ExpertReaderStats stats() const override { return stats_; }
-    void reset_stats() override { stats_ = {}; }
+    ExpertReaderStats stats() const override { return stats_.snapshot(); }
+    void reset_stats() override { stats_.reset(); }
 
 private:
     ExpertSlotGeometry geom_{};
     std::vector<ExpertLayerSource> layers_;
     bool enable_virtual_prefetch_ = false;
     std::atomic<bool> cancelled_{false};
-    ExpertReaderStats stats_{};
+    AtomicExpertReaderStats stats_{};
 };
 
 // ============================================================
@@ -283,11 +326,10 @@ public:
                              staging_slot + geom_.dn_packed_offset, geom_.dn_packed_bytes,
                              staging_slot + geom_.dn_absmax_offset, geom_.dn_absmax_count, geom_.compact_nested,
                              part, nparts);
-            stats_.fallback_mmap_reads++;
+            stats_.fallback_mmap_reads.fetch_add(1, std::memory_order_relaxed);
             const auto t1 = std::chrono::high_resolution_clock::now();
-            stats_.read_count++;
-            stats_.read_bytes += geom_.slot_bytes / static_cast<size_t>(std::max(1, nparts));
-            stats_.read_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            stats_.record_read(staged_part_bytes(geom_, part, nparts),
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
             return;
         }
 
@@ -419,14 +461,13 @@ public:
         }
 
         const auto t1 = std::chrono::high_resolution_clock::now();
-        stats_.read_count++;
-        stats_.read_bytes += geom_.slot_bytes / static_cast<size_t>(std::max(1, nparts));
-        stats_.read_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        stats_.record_read(staged_part_bytes(geom_, part, nparts),
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
 
     void cancel() override {
 #ifdef _WIN32
-        stats_.cancel_calls++;
+        stats_.cancel_calls.fetch_add(1, std::memory_order_relaxed);
         cancelled_.store(true, std::memory_order_release);
         for (HANDLE h : shard_handles_) {
             if (h != INVALID_HANDLE_VALUE) {
@@ -451,8 +492,8 @@ public:
         layers_[layer] = src;
     }
 
-    ExpertReaderStats stats() const override { return stats_; }
-    void reset_stats() override { stats_ = {}; }
+    ExpertReaderStats stats() const override { return stats_.snapshot(); }
+    void reset_stats() override { stats_.reset(); }
 
 private:
     bool has_valid_handle(int shard_id) const {
@@ -521,7 +562,7 @@ private:
 #endif
     std::vector<ExpertLayerSource> layers_;
     std::atomic<bool> cancelled_{false};
-    ExpertReaderStats stats_{};
+    AtomicExpertReaderStats stats_{};
 };
 
 // ============================================================

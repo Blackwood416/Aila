@@ -6,8 +6,10 @@
 #include "ops/Qwen4ExpCpuExpertOps.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
+#include <memory>
 
 namespace aila {
 
@@ -18,6 +20,7 @@ struct RouteRankEntry {
     float route_weight = 0.0f;
     bool is_gpu = true;
     int gpu_slot = -1;
+    uint64_t gpu_generation = 0;
     int result_idx = -1;
     sycl::event dma_event{};
 };
@@ -64,18 +67,45 @@ struct HeteroExecutionStats {
     uint64_t cpu_straggler_count = 0;
     uint64_t cpu_overlapped_count = 0;
     uint64_t cpu_compute_ns = 0;
-    uint64_t cpu_exposed_tail_ns = 0;
+    uint64_t cpu_activation_wait_ns = 0;
+    uint64_t cpu_straggler_interval_ns = 0; // observed host interval, not exposed GPU tail
     uint64_t gpu_tasks_dispatched = 0;
     uint64_t layers_hetero_executed = 0;
+    uint64_t ready_first_layers = 0;
+    uint64_t gpu_acquire_ns = 0;
+    uint64_t cpu_async_layers = 0;
+    uint64_t cpu_join_wait_ns = 0;
+    uint64_t cpu_acquire_overlap_ns = 0; // intersection of host compute and acquire intervals
+    uint64_t cpu_max_batch_tasks = 0;
+    uint64_t cpu_host_prepare_ns = 0;
+    uint64_t cpu_host_prepare_batches = 0;
+    uint64_t cpu_host_prepared_experts = 0;
+    uint64_t cpu_result_copies = 0;
+    uint64_t cpu_result_bytes = 0;
+    uint64_t cpu_result_submit_ns = 0;
 
     void reset() {
         *this = HeteroExecutionStats{};
     }
 };
 
+struct ExpertPrefetchRequest {
+    int layer = -1;
+    const int* expert_ids = nullptr;
+    int count = 0;
+    int quota = 0;
+};
+
 class Qwen4ExpExpertExecutor {
 public:
-    Qwen4ExpExpertExecutor() = default;
+    // Synchronous test hook while the host lease is held. Disabled in normal execution.
+    using CpuObserver = void (*)(void*, Context&, int, const RouteRankEntry&,
+                                 const ops::MoeExpertSlotHost&, const bf16*, const bf16*, const float*);
+    void set_cpu_observer_for_testing(CpuObserver observer, void* state) {
+        cpu_observer_ = observer;
+        cpu_observer_state_ = state;
+    }
+    Qwen4ExpExpertExecutor();
     ~Qwen4ExpExpertExecutor();
 
     Qwen4ExpExpertExecutor(const Qwen4ExpExpertExecutor&) = delete;
@@ -94,7 +124,7 @@ public:
         int top_k,
         bool enable_hetero = false);
 
-    // Ensure all pending GPU tasks are acquired/staged into GPU slots and record final_dma_event
+    // Acquire the entire GPU subset together, protecting ready entries from eviction.
     void ensure_gpu_pending(LayerMoePlan& plan);
 
     // Execute heterogeneous decode with ordered rank merge:
@@ -112,26 +142,37 @@ public:
         int top_k,
         const bf16* shared_out = nullptr,
         const bf16* shared_gate = nullptr,
-        bool uses_nested = false);
+        bool uses_nested = false,
+        bool defer_gpu_acquire = false,
+        const ExpertPrefetchRequest* next_prefetch = nullptr);
 
     // Record execution completion
     void record_execution_complete(LayerMoePlan& plan, sycl::event finish_event);
 
     bool is_initialized() const { return initialized_; }
+    bool cpu_overlap_enabled() const { return cpu_worker_ != nullptr; }
+    bool cpu_work_complete_for_testing() const;
     const HeteroExecutionStats& stats() const { return stats_; }
     void reset_stats() { stats_.reset(); }
 
     int max_cpu_credits() const { return max_cpu_credits_; }
-    void set_max_cpu_credits(int credits) { max_cpu_credits_ = std::max(0, std::min(4, credits)); }
+    void set_max_cpu_credits(int credits) { max_cpu_credits_ = std::clamp(credits, 0, ops::cpu::kMaxExpertBatchTasks); }
     int max_cpu_tokens() const { return max_cpu_tokens_; }
-    void set_max_cpu_tokens(int tokens) { max_cpu_tokens_ = std::max(1, tokens); }
+    void set_max_cpu_tokens(int tokens) { max_cpu_tokens_ = std::clamp(tokens, 1, 4); }
 
     // Check if straggler protection penalty is currently active
     bool is_straggler_penalty_active() const { return straggler_penalty_active_; }
-    void set_straggler_penalty(bool active) { straggler_penalty_active_ = active; }
+    void set_straggler_penalty(bool active) {
+        straggler_penalty_active_ = active;
+        cpu_retry_countdown_ = active ? 8 : 0;
+    }
 
 private:
+    struct CpuWorker;
+    std::unique_ptr<CpuWorker> cpu_worker_;
     void cleanup();
+    uint64_t acquire_begin_ns_ = 0;
+    uint64_t acquire_end_ns_ = 0;
 
     Context* ctx_ = nullptr;
     Qwen4ExpExpertCache* cache_ = nullptr;
@@ -142,11 +183,19 @@ private:
     bool initialized_ = false;
 
     // H3: Bounded admission credit & Straggler parameters
-    int max_cpu_credits_ = 2; // bounded in [1, 4]
+    int max_cpu_credits_ = 2; // maximum expert/token tasks per plan, up to 40
+    int cpu_placement_ = 0; // 0: host-ready GPU misses, 1: any host-ready, 2: prepare host on demand
+    bool cpu_fixed_credits_ = false;
+    bool cpu_batch_prepare_ = false;
+    bool cpu_wait_prefetch_ = false;
+    bool cpu_coalesce_results_ = false;
     int max_cpu_tokens_ = 4;   // strictly m <= 4
     bool straggler_penalty_active_ = false;
     int consecutive_stragglers_ = 0;
+    int cpu_retry_countdown_ = 0;
     HeteroExecutionStats stats_{};
+    CpuObserver cpu_observer_ = nullptr;
+    void* cpu_observer_state_ = nullptr;
 
     LayerMoePlan active_plan_;
     std::vector<HostExpertLease> active_cpu_leases_;

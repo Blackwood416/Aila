@@ -5,6 +5,7 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include "Qwen4ExpCpuDiagnostic.hpp"
 
 struct Qwen4ExpGenerationTestAccess {
     static void InitFixture(InferenceEngine& engine) {
@@ -316,13 +317,37 @@ void test_real_model(const std::string& directory) {
            "Reusable generation after one-shot must rebuild correctly");
     std::cout << "[PASS] Snapshot-policy transitions preserve generation\n";
 }
+
+void diagnose_real_cpu(const std::string& directory) {
+    InferenceEngine engine;
+    expect(engine.init(directory, 512), "Real Q4E model initialization failed");
+    auto& executor = Access::Backend(engine).expert_executor();
+    q4e_cpu_diagnostic::State state;
+    executor.set_cpu_observer_for_testing(q4e_cpu_diagnostic::observe, &state);
+    struct Detach { aila::Qwen4ExpExpertExecutor& executor;
+        ~Detach() { executor.set_cpu_observer_for_testing(nullptr, nullptr); } } detach{executor};
+    GenerationConfig config;
+    config.do_sample = false;
+    config.thinking_budget_tokens = 0;
+    config.max_new_tokens = 48;
+    aila::chat::ChatRequest request;
+    std::string error;
+    expect(aila::chat::parse_chat_request_json(
+        R"([{"role":"user","content":"Write a short paragraph (about 80 words) describing a sunrise over the ocean."}])",
+        config, request, &error), "Cannot parse diagnostic fixture");
+    try { engine.generate_chat_request_text(request); }
+    catch (const q4e_cpu_diagnostic::Complete&) {}
+    expect(state.samples == state.limit, "Diagnostic did not observe enough CPU tasks; enable CPU dispatch");
+    std::cout << "[DIAGNOSTIC COMPLETE] samples=" << state.samples << "; not a numerical acceptance or timing run\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         test_prefill_slices();
         if (argc == 3 && std::string(argv[1]) == "--model") test_real_model(argv[2]);
-        else if (argc != 1) throw std::invalid_argument("Usage: AilaQwen4ExpGenerationTests [--model directory]");
+        else if (argc == 3 && std::string(argv[1]) == "--diagnose-cpu") diagnose_real_cpu(argv[2]);
+        else if (argc != 1) throw std::invalid_argument("Usage: AilaQwen4ExpGenerationTests [--model|--diagnose-cpu directory]");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[FAIL] " << error.what() << '\n';

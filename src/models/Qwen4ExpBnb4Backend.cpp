@@ -362,6 +362,8 @@ bool Qwen4ExpBnb4Backend::load(
         if (s_q4e_async_dequant) {
             linear.set_allow_async_dequant(true);
         }
+        static const bool s_direct_prefill_io = aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", false);
+        linear.set_direct_prefill_io(s_direct_prefill_io);
         static const bool s_q4e_fused_prefill = aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
         if (s_q4e_fused_prefill) {
             linear.set_allow_dense_xmx(true);
@@ -1528,7 +1530,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
         // instead of a blocking round trip per token), then map slots back per token.
         const auto prof_acq_batch_t0 = prof_clock::now();
-        const bool can_batch = count > 1 && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        static const bool s_cpu_expert_dispatch = aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false);
+        static const bool s_cpu_small_m = aila::env::read_flag("AILA_Q4E_CPU_SMALL_M", false);
+        const bool cpu_small_m = s_cpu_expert_dispatch && s_cpu_small_m && count > 1 && count <= 4;
+        const bool can_batch = count > 1 && !cpu_small_m && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
         bool batch_acquire = false;
         sycl::event batch_dma_event{};
         static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
@@ -1925,15 +1930,20 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             expert_cache_.record_consumer_reader_fences(
                 prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
         } else {
-            static const bool s_cpu_expert_dispatch = aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false);
+            static const bool s_ready_first = aila::env::read_flag("AILA_Q4E_READY_FIRST", false);
             bool hetero_executed = false;
-            if (s_cpu_expert_dispatch && count <= 4 && !batch_acquire) {
-                auto& plan = expert_executor_.plan_layer(L, router_host_ids_, router_host_weights_, count, top_k, true);
-                if (plan.cpu_tasks > 0) {
-                    expert_executor_.ensure_gpu_pending(plan);
+            if ((s_cpu_expert_dispatch || s_ready_first) && count <= 4 && !batch_acquire) {
+                auto& plan = expert_executor_.plan_layer(L, router_host_ids_, router_host_weights_, count, top_k, s_cpu_expert_dispatch);
+                const bool mixed_gpu = plan.ready_gpu_tasks > 0 && plan.pending_gpu_tasks > 0;
+                if (plan.cpu_tasks > 0 || (s_ready_first && mixed_gpu)) {
+                    const auto acquire_ns_before = expert_executor_.stats().gpu_acquire_ns;
+                    const bool defer_acquire = s_ready_first || expert_executor_.cpu_overlap_enabled();
+                    if (!defer_acquire) expert_executor_.ensure_gpu_pending(plan);
+                    aila::ExpertPrefetchRequest next_prefetch;
                     if (s_prefetch && predict_next && count == 1) {
                         ensure_prediction_ready();
-                        expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
+                        if (defer_acquire) next_prefetch = {L + 1, pred_ids.data(), top_k, s_prefetch_topn};
+                        else expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
                     }
                     const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
                     bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
@@ -1943,9 +1953,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
                     sycl::event hetero_ev = expert_executor_.execute_hetero_decode(
                         ctx, plan, x_ptr, h_ptr, router_host_weights_,
-                        y_ptr, count, top_k, sh_out, sh_gate, expert_cache_.uses_nested_codes());
+                        y_ptr, count, top_k, sh_out, sh_gate, expert_cache_.uses_nested_codes(), defer_acquire,
+                        next_prefetch.expert_ids ? &next_prefetch : nullptr);
+                    prof_acquire_ms += (expert_executor_.stats().gpu_acquire_ns - acquire_ns_before) * 1e-6;
 
-                    fallback_last_down_event = hetero_ev;
+                    // The in-order queue carries merge -> residual -> next route.
+                    // Slot readers already have fences; ready-first needs no host drain here.
+                    if (!defer_acquire) fallback_last_down_event = hetero_ev;
                     hetero_executed = true;
                 }
             }
@@ -2107,11 +2121,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                       options.need_logits ? 1 : 0);
         if (count > 1) {
             auto dstats = Bnb4BitLinear::get_prefill_dispatch_stats();
-            AILA_LOG_INFO("[Q4E Prefill Dispatch] linear calls: fused_gemm=%llu cached=%llu on_demand=%llu sync_waits=%llu",
+            AILA_LOG_INFO("[Q4E Prefill Dispatch] linear calls: fused_gemm=%llu cached=%llu on_demand=%llu sync_waits=%llu direct_io=%llu",
                           static_cast<unsigned long long>(dstats.fused_gemm),
                           static_cast<unsigned long long>(dstats.cached_weight),
                           static_cast<unsigned long long>(dstats.on_demand_dequant),
-                          static_cast<unsigned long long>(dstats.sync_wait));
+                          static_cast<unsigned long long>(dstats.sync_wait),
+                          static_cast<unsigned long long>(dstats.direct_io));
         }
         if (s_predict_stats && pred_total_ > 0) {
             AILA_LOG_INFO("[Q4E Predict] next-layer overlap=%.1f%% misses_predicted=%llu/%llu (%.1f%%)",
@@ -2128,15 +2143,34 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                           prof_acquire_ms, stage_ms[kStageShared], stage_ms[kStageHead]);
             if (expert_executor_.stats().layers_hetero_executed > 0) {
                 const auto& hs = expert_executor_.stats();
-                AILA_LOG_INFO("[Q4E Hetero] layers=%llu cpu_tasks=%llu (overlapped=%llu, stragglers=%llu) gpu_tasks=%llu cpu_compute=%.2f ms exposed_tail=%.2f ms",
+                AILA_LOG_INFO("[Q4E Hetero] layers=%llu cpu_tasks=%llu (overlapped=%llu, stragglers=%llu) gpu_tasks=%llu cpu_compute=%.2f ms straggler_interval=%.2f ms",
                               static_cast<unsigned long long>(hs.layers_hetero_executed),
                               static_cast<unsigned long long>(hs.cpu_tasks_dispatched),
                               static_cast<unsigned long long>(hs.cpu_overlapped_count),
                               static_cast<unsigned long long>(hs.cpu_straggler_count),
                               static_cast<unsigned long long>(hs.gpu_tasks_dispatched),
                               static_cast<double>(hs.cpu_compute_ns) / 1e6,
-                              static_cast<double>(hs.cpu_exposed_tail_ns) / 1e6);
+                              static_cast<double>(hs.cpu_straggler_interval_ns) / 1e6);
             }
+        }
+        if (expert_executor_.stats().ready_first_layers > 0 || expert_executor_.stats().cpu_tasks_dispatched > 0) {
+            AILA_LOG_INFO("[Q4E ReadyFirst] layers=%llu cpu_tasks=%llu cpu_compute=%.2fms cpu_activation_wait=%.2fms",
+                          static_cast<unsigned long long>(expert_executor_.stats().ready_first_layers),
+                          static_cast<unsigned long long>(expert_executor_.stats().cpu_tasks_dispatched),
+                          expert_executor_.stats().cpu_compute_ns * 1e-6,
+                          expert_executor_.stats().cpu_activation_wait_ns * 1e-6);
+        }
+        if (expert_executor_.stats().cpu_async_layers > 0) {
+            const auto& hs = expert_executor_.stats();
+            AILA_LOG_INFO("[Q4E CPU Overlap] layers=%llu join_wait=%.2fms acquire_overlap=%.2fms max_tasks=%llu host_prepare=%.2fms",
+                          static_cast<unsigned long long>(hs.cpu_async_layers),
+                          hs.cpu_join_wait_ns * 1e-6, hs.cpu_acquire_overlap_ns * 1e-6,
+                          static_cast<unsigned long long>(hs.cpu_max_batch_tasks), hs.cpu_host_prepare_ns * 1e-6);
+            AILA_LOG_INFO("[Q4E CPU Dataflow] prepare_batches=%llu prepared_experts=%llu result_copies=%llu result_bytes=%llu result_submit=%.2fms",
+                          static_cast<unsigned long long>(hs.cpu_host_prepare_batches),
+                          static_cast<unsigned long long>(hs.cpu_host_prepared_experts),
+                          static_cast<unsigned long long>(hs.cpu_result_copies),
+                          static_cast<unsigned long long>(hs.cpu_result_bytes), hs.cpu_result_submit_ns * 1e-6);
         }
     }
     static const bool s_log_dispatch = aila::env::read_flag("AILA_Q4E_LOG_DISPATCH", false);

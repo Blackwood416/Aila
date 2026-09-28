@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
 #include <immintrin.h>
@@ -35,8 +36,9 @@ inline float load_host_absmax(const float* absmax_f32,
                               size_t index) {
     if (nested.codes != nullptr) {
         const size_t bs = nested.blocksize > 0 ? static_cast<size_t>(nested.blocksize) : 256;
-        const float product = nested.nested_quant_map[nested.codes[index]] *
-                              nested.nested_absmax[index / bs];
+        // Match GPU/fill two-step f32 rounding; contraction changes real scales.
+        volatile float product = nested.nested_quant_map[nested.codes[index]] *
+                                 nested.nested_absmax[index / bs];
         return product + nested.offset;
     }
     return absmax_f32 ? absmax_f32[index] : 1.0f;
@@ -249,6 +251,125 @@ void cpu_expert_forward_scalar(
 // =========================================================================
 
 #if defined(__AVX2__)
+
+static float gpu_order_dot(const uint8_t* packed, const float* absmax,
+                           const MoeNestedScaleHost& nested, size_t row,
+                           const float* x, int columns, const float* qmap) {
+    const __m256i byte_offsets = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    const __m256i input_offsets = _mm256_setr_epi32(0, 8, 16, 24, 32, 40, 48, 56);
+    __m256 acc[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int column = 0; column < columns; column += 128) {
+        for (int half = 0; half < 2; ++half) {
+            const int start = column + half * 64;
+            const float scale = load_host_absmax(absmax, nested, row * (columns / 64) + start / 64);
+            const auto raw = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(packed + row * (columns / 2) + start / 2), byte_offsets, 1);
+            for (int j = 0; j < 8; ++j) {
+                const int shift = (j / 2) * 8 + ((j & 1) ? 0 : 4);
+                const auto codes = _mm256_and_si256(_mm256_srlv_epi32(raw, _mm256_set1_epi32(shift)), _mm256_set1_epi32(15));
+                const auto w = _mm256_mul_ps(_mm256_i32gather_ps(qmap, codes, 4), _mm256_set1_ps(scale));
+                const auto values = _mm256_i32gather_ps(x + start + j, input_offsets, 4);
+                acc[half] = _mm256_fmadd_ps(values, w, acc[half]);
+            }
+        }
+    }
+    alignas(32) float parts[16];
+    _mm256_store_ps(parts, acc[0]);
+    _mm256_store_ps(parts + 8, acc[1]);
+    volatile float sums[16];
+    for (int i = 0; i < 16; ++i) sums[i] = parts[i];
+    for (int stride = 8; stride; stride /= 2)
+        for (int i = 0; i < stride; ++i) sums[i] = sums[i] + sums[i + stride];
+    return sums[0];
+}
+
+static int lane_input_index(int column) {
+    return (column / 64) * 64 + (column % 8) * 8 + (column % 64) / 8;
+}
+
+static float gpu_order_dot_prepared(const uint8_t* packed, const float* absmax,
+                                   const MoeNestedScaleHost& nested, size_t row,
+                                   const float* x, int columns, const float* qmap) {
+    const auto qlo = _mm256_loadu_ps(qmap);
+    const auto qhi = _mm256_loadu_ps(qmap + 8);
+    __m256 acc[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int column = 0; column < columns; column += 128) {
+        for (int half = 0; half < 2; ++half) {
+            const int start = column + half * 64;
+            const auto scale = _mm256_set1_ps(load_host_absmax(absmax, nested, row * (columns / 64) + start / 64));
+            const auto raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * (columns / 2) + start / 2));
+            for (int j = 0; j < 8; ++j) {
+                const int shift = (j / 2) * 8 + ((j & 1) ? 0 : 4);
+                const auto codes = _mm256_and_si256(_mm256_srlv_epi32(raw, _mm256_set1_epi32(shift)), _mm256_set1_epi32(15));
+                const auto low = _mm256_permutevar8x32_ps(qlo, codes);
+                const auto high = _mm256_permutevar8x32_ps(qhi, codes);
+                const auto values = _mm256_blendv_ps(low, high, _mm256_castsi256_ps(_mm256_slli_epi32(codes, 28)));
+                const auto w = _mm256_mul_ps(values, scale);
+                acc[half] = _mm256_fmadd_ps(_mm256_loadu_ps(x + start + j * 8), w, acc[half]);
+            }
+        }
+    }
+    // Same 16-lane reduction and rounding as the unprepared reference.
+    alignas(32) float parts[16];
+    _mm256_store_ps(parts, acc[0]);
+    _mm256_store_ps(parts + 8, acc[1]);
+    volatile float sums[16];
+    for (int i = 0; i < 16; ++i) sums[i] = parts[i];
+    for (int stride = 8; stride; stride /= 2)
+        for (int i = 0; i < stride; ++i) sums[i] = sums[i] + sums[i + stride];
+    return sums[0];
+}
+
+static void gpu_order_gate_up(const MoeExpertSlotHost& slot, const bf16* x, bf16* h,
+                              int tokens, const float* quant_map, int in_features, int intermediate_size, int blocksize) {
+    if (!slot.gate_up_packed || !x || !h || tokens <= 0) return;
+    if (tokens < 1 || tokens > 4 || in_features != kHiddenDim || intermediate_size != kIntermediateDim || blocksize != 64)
+        throw std::invalid_argument("GpuOrderAvx2 supports only H=2560 I=640 block=64 m=1..4");
+    alignas(64) float input[4 * kHiddenDim];
+    convert_bf16_to_f32(x, input, tokens * in_features);
+    const auto* qmap = resolve_quant_map(quant_map);
+    tbb::parallel_for(tbb::blocked_range<int>(0, intermediate_size, 16), [&](const tbb::blocked_range<int>& range) {
+        for (int row = range.begin(); row < range.end(); ++row) {
+            for (int t = 0; t < tokens; ++t) {
+                const float* values = input + t * in_features;
+                const float gate = gpu_order_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
+                                                 row, values, in_features, qmap);
+                const float up = gpu_order_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
+                                               row + intermediate_size, values, in_features, qmap);
+                // Explicit division avoids host fast-math reciprocal reassociation.
+                const float denominator = 1.0f + std::exp(-gate);
+                const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+                h[t * intermediate_size + row] = bf16(silu * up);
+            }
+        }
+    });
+}
+
+static void gpu_order_down(const MoeExpertSlotHost& slot, const bf16* h, float* out, int tokens,
+                           const float* quant_map, float weight, bool accumulate,
+                           int intermediate_size, int out_features, int blocksize) {
+    if (!slot.down_packed || !h || !out || tokens <= 0) return;
+    if (tokens < 1 || tokens > 4 || out_features != kHiddenDim || intermediate_size != kIntermediateDim || blocksize != 64)
+        throw std::invalid_argument("GpuOrderAvx2 supports only H=2560 I=640 block=64 m=1..4");
+    if (weight == 0.0f) {
+        if (!accumulate) std::memset(out, 0, static_cast<size_t>(tokens) * out_features * sizeof(float));
+        return;
+    }
+    alignas(64) float input[4 * kIntermediateDim];
+    convert_bf16_to_f32(h, input, tokens * intermediate_size);
+    const auto* qmap = resolve_quant_map(quant_map);
+    tbb::parallel_for(tbb::blocked_range<int>(0, out_features, 32), [&](const tbb::blocked_range<int>& range) {
+        for (int row = range.begin(); row < range.end(); ++row) {
+            for (int t = 0; t < tokens; ++t) {
+                const float sum = gpu_order_dot(slot.down_packed, slot.down_absmax, slot.down_nested,
+                                                row, input + t * intermediate_size, intermediate_size, qmap);
+                const int idx = t * out_features + row;
+                if (accumulate) out[idx] += weight * sum;
+                else out[idx] = weight * sum;
+            }
+        }
+    });
+}
 
 static void cpu_expert_gate_up_swiglu_avx2_impl(
     const MoeExpertSlotHost& slot,
@@ -658,6 +779,77 @@ void cpu_expert_forward_tbb_avx2(
 // General Dispatch Entry Points
 // =========================================================================
 
+void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
+    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map, CpuKernelBackend backend) {
+    if (count < 0 || count > kMaxExpertBatchTasks || tokens < 1 || tokens > 4)
+        throw std::invalid_argument("CPU expert batch exceeds m=4/tasks=40 capacity");
+    if (count == 0) return;
+    if (!tasks || !x || !h || !out) throw std::invalid_argument("Null CPU expert batch buffer");
+    for (int c = 0; c < count; ++c)
+        if (tasks[c].token < 0 || tasks[c].token >= tokens || !tasks[c].slot.gate_up_packed || !tasks[c].slot.down_packed)
+            throw std::invalid_argument("Invalid CPU expert batch task");
+#if defined(__AVX2__)
+    alignas(64) float input[4 * kHiddenDim];
+    alignas(64) float inter[kMaxExpertBatchTasks * kIntermediateDim];
+    const bool prepared = backend == CpuKernelBackend::GpuOrderPreparedAvx2;
+    if (prepared) {
+        for (int t = 0; t < tokens; ++t)
+            for (int col = 0; col < kHiddenDim; ++col)
+                input[t * kHiddenDim + lane_input_index(col)] = static_cast<float>(x[t * kHiddenDim + col]);
+    } else convert_bf16_to_f32(x, input, tokens * kHiddenDim);
+    const float* qmap = resolve_quant_map(quant_map);
+    const bool ordered = prepared || backend == CpuKernelBackend::GpuOrderAvx2;
+    if (!ordered && backend != CpuKernelBackend::Avx2 && backend != CpuKernelBackend::TbbAvx2 && backend != CpuKernelBackend::Auto)
+        throw std::invalid_argument("CPU batch supports AVX2 or GPU-order arithmetic");
+    constexpr int gate_tile = 16, down_tile = 32;
+    tbb::parallel_for(tbb::blocked_range<int>(0, count * (kIntermediateDim / gate_tile), 1),
+        [&](const tbb::blocked_range<int>& range) {
+            for (int tile = range.begin(); tile < range.end(); ++tile) {
+                const int c = tile / (kIntermediateDim / gate_tile);
+                const int begin = tile % (kIntermediateDim / gate_tile) * gate_tile;
+                const auto& slot = tasks[c].slot;
+                const auto* values = input + tasks[c].token * kHiddenDim;
+                auto* result = h + c * kIntermediateDim;
+                if (!ordered) {
+                    cpu_expert_gate_up_swiglu_avx2_impl(slot, values, result, begin, begin + gate_tile, 1, qmap, kHiddenDim, kIntermediateDim, 64);
+                } else for (int row = begin; row < begin + gate_tile; ++row) {
+                    const float gate = prepared
+                        ? gpu_order_dot_prepared(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested, row, values, kHiddenDim, qmap)
+                        : gpu_order_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested, row, values, kHiddenDim, qmap);
+                    const float up = prepared
+                        ? gpu_order_dot_prepared(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested, row + kIntermediateDim, values, kHiddenDim, qmap)
+                        : gpu_order_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested, row + kIntermediateDim, values, kHiddenDim, qmap);
+                    const float denominator = 1.0f + std::exp(-gate);
+                    const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+                    result[row] = bf16(silu * up);
+                }
+                if (prepared) {
+                    for (int row = begin; row < begin + gate_tile; ++row)
+                        inter[c * kIntermediateDim + lane_input_index(row)] = static_cast<float>(result[row]);
+                } else convert_bf16_to_f32(result + begin, inter + c * kIntermediateDim + begin, gate_tile);
+            }
+        });
+    tbb::parallel_for(tbb::blocked_range<int>(0, count * (kHiddenDim / down_tile), 1),
+        [&](const tbb::blocked_range<int>& range) {
+            for (int tile = range.begin(); tile < range.end(); ++tile) {
+                const int c = tile / (kHiddenDim / down_tile);
+                const int begin = tile % (kHiddenDim / down_tile) * down_tile;
+                const auto& slot = tasks[c].slot;
+                const auto* values = inter + c * kIntermediateDim;
+                auto* result = out + c * kHiddenDim;
+                if (!ordered) {
+                    cpu_expert_down_avx2_impl(slot, values, result, begin, begin + down_tile, 1, qmap, 1.0f, false, kIntermediateDim, kHiddenDim, 64);
+                } else for (int row = begin; row < begin + down_tile; ++row)
+                    result[row] = prepared
+                        ? gpu_order_dot_prepared(slot.down_packed, slot.down_absmax, slot.down_nested, row, values, kIntermediateDim, qmap)
+                        : gpu_order_dot(slot.down_packed, slot.down_absmax, slot.down_nested, row, values, kIntermediateDim, qmap);
+            }
+        });
+#else
+    throw std::runtime_error("CPU expert batch requires AVX2/FMA");
+#endif
+}
+
 void cpu_expert_gate_up_swiglu(
     const MoeExpertSlotHost& slot,
     const bf16* x,
@@ -669,6 +861,15 @@ void cpu_expert_gate_up_swiglu(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::GpuOrderPreparedAvx2:
+            throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");
+        case CpuKernelBackend::GpuOrderAvx2:
+#if defined(__AVX2__)
+            gpu_order_gate_up(slot, x, h, tokens, quant_map, in_features, intermediate_size, blocksize);
+            break;
+#else
+            throw std::runtime_error("GpuOrderAvx2 requires AVX2/FMA");
+#endif
         case CpuKernelBackend::Scalar:
             cpu_expert_gate_up_swiglu_scalar(slot, x, h, tokens, quant_map, in_features, intermediate_size, blocksize);
             break;
@@ -696,6 +897,15 @@ void cpu_expert_down(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::GpuOrderPreparedAvx2:
+            throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");
+        case CpuKernelBackend::GpuOrderAvx2:
+#if defined(__AVX2__)
+            gpu_order_down(slot, h, out, tokens, quant_map, weight, accumulate, intermediate_size, out_features, blocksize);
+            break;
+#else
+            throw std::runtime_error("GpuOrderAvx2 requires AVX2/FMA");
+#endif
         case CpuKernelBackend::Scalar:
             cpu_expert_down_scalar(slot, h, out, tokens, quant_map, weight, accumulate,
                                    intermediate_size, out_features, blocksize);
@@ -728,6 +938,16 @@ void cpu_expert_forward(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::GpuOrderPreparedAvx2:
+            throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");
+        case CpuKernelBackend::GpuOrderAvx2: {
+            if (!slot.gate_up_packed || !slot.down_packed || !x || !out || tokens <= 0) return;
+            alignas(64) bf16 local_h[4 * kIntermediateDim];
+            bf16* effective_h = scratch_h ? scratch_h : local_h;
+            cpu_expert_gate_up_swiglu(slot, x, effective_h, tokens, quant_map, in_features, intermediate_size, blocksize, backend);
+            cpu_expert_down(slot, effective_h, out, tokens, quant_map, weight, accumulate, intermediate_size, out_features, blocksize, backend);
+            break;
+        }
         case CpuKernelBackend::Scalar:
             cpu_expert_forward_scalar(slot, x, out, tokens, scratch_h, quant_map, weight, accumulate,
                                       in_features, intermediate_size, out_features, blocksize);

@@ -87,12 +87,15 @@ public:
 
     void set_allow_async_dequant(bool value) { allow_async_dequant_ = value; }
     bool allow_async_dequant() const { return allow_async_dequant_; }
+    // Keep the same oneDNN arithmetic, bypassing staging only for disjoint, non-LoRA prefill.
+    void set_direct_prefill_io(bool value) { direct_prefill_io_ = value; }
 
     struct PrefillDispatchStats {
         uint64_t fused_gemm = 0;
         uint64_t cached_weight = 0;
         uint64_t on_demand_dequant = 0;
         uint64_t sync_wait = 0;
+        uint64_t direct_io = 0;
     };
     static PrefillDispatchStats get_prefill_dispatch_stats();
     static void reset_prefill_dispatch_stats();
@@ -122,6 +125,7 @@ private:
     bool cached_weight_ready_ = false;
     bool allow_dense_xmx_ = false;
     bool allow_async_dequant_ = false;
+    bool direct_prefill_io_ = false;
     dnnl::matmul decode_prim_;
     dnnl::memory::desc decode_src_md_;
     dnnl::memory::desc decode_weight_md_;

@@ -10,13 +10,23 @@ namespace cpu {
 constexpr int kHiddenDim = 2560;
 constexpr int kIntermediateDim = 640;
 constexpr int kBlockSize = 64;
+constexpr int kMaxExpertBatchTasks = 40;
+struct CpuExpertTask { MoeExpertSlotHost slot; int token = 0; };
 
 enum class CpuKernelBackend {
     Auto = 0,
     Scalar = 1,
     Avx2 = 2,
-    TbbAvx2 = 3
+    TbbAvx2 = 3,
+    GpuOrderAvx2 = 4, // experimental DG2 lane order, not a cross-device exactness guarantee
+    GpuOrderPreparedAvx2 = 5 // batch-only, shared lane-major inputs and register NF4 lookup
 };
+
+// Two flat parallel stages over all expert rows. Caller supplies [tasks,I] h,
+// [tasks,H] out; no nested per-expert parallel_for or repeated x conversion.
+void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
+    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map = nullptr,
+    CpuKernelBackend backend = CpuKernelBackend::GpuOrderAvx2);
 
 // Gate/Up SwiGLU:
 // Inputs:

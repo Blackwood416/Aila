@@ -6,12 +6,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <tbb/task_arena.h>
 
 namespace {
 
@@ -52,7 +55,7 @@ struct SyntheticExpertData {
     ops::MoeExpertSlotHost host_slot_nested{};
     ops::MoeExpertSlotHost host_slot_unnested{};
 
-    SyntheticExpertData() {
+    explicit SyntheticExpertData(unsigned seed = 1337) {
         gu_packed.resize(gu_packed_bytes);
         gu_codes.resize(gu_absmax_count);
         gu_nested_absmax.assign((gu_absmax_count + nested_blocksize - 1) / nested_blocksize, 0.05f);
@@ -77,7 +80,7 @@ struct SyntheticExpertData {
             dn_nested_qmap[i] = static_cast<float>(i - 128) / 128.0f;
         }
 
-        std::mt19937 rng(1337);
+        std::mt19937 rng(seed);
         for (auto& v : gu_packed) v = static_cast<uint8_t>(rng() & 0xFF);
         for (auto& v : gu_codes) v = static_cast<uint8_t>(rng() & 0xFF);
         for (auto& v : dn_packed) v = static_cast<uint8_t>(rng() & 0xFF);
@@ -114,6 +117,146 @@ struct SyntheticExpertData {
         host_slot_unnested.down_absmax = dn_absmax_unnested.data();
     }
 };
+
+void test_batch_scale(bool benchmark) {
+    constexpr int H = ops::cpu::kHiddenDim, I = ops::cpu::kIntermediateDim;
+    std::vector<std::unique_ptr<SyntheticExpertData>> experts;
+    for (int c = 0; c < 40; ++c) experts.push_back(std::make_unique<SyntheticExpertData>(1337 + c));
+    std::vector<bf16> x(4 * H), expected_h(40 * I), actual_h(40 * I);
+    std::vector<float> expected(40 * H), actual(40 * H);
+    std::mt19937 rng(20260928);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& value : x) value = bf16(dist(rng));
+    ops::cpu::CpuExpertTask tasks[40];
+    for (auto backend : {ops::cpu::CpuKernelBackend::TbbAvx2, ops::cpu::CpuKernelBackend::GpuOrderAvx2,
+                         ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2}) {
+        const auto reference = backend == ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2
+            ? ops::cpu::CpuKernelBackend::GpuOrderAvx2 : backend;
+        for (int count : {1, 4, 10, 40}) {
+            const int tokens = count == 40 ? 4 : 1;
+            for (int c = 0; c < count; ++c)
+                tasks[c] = {c % 2 ? experts[c]->host_slot_nested : experts[c]->host_slot_unnested, c % tokens};
+            auto sequential = [&] {
+                for (int c = 0; c < count; ++c)
+                    ops::cpu::cpu_expert_forward(tasks[c].slot, x.data() + tasks[c].token * H,
+                        expected.data() + c * H, 1, expected_h.data() + c * I, nullptr,
+                        1.0f, false, H, I, H, 64, reference);
+            };
+            auto batch = [&] { ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), tokens,
+                actual_h.data(), actual.data(), nullptr, backend); };
+            for (int threads : {4, 12}) {
+                tbb::task_arena arena(threads);
+                arena.execute([&] { sequential(); batch(); });
+                expect(std::memcmp(expected_h.data(), actual_h.data(), count * I * sizeof(bf16)) == 0,
+                    "batch intermediate differs from per-expert reference");
+                expect(std::memcmp(expected.data(), actual.data(), count * H * sizeof(float)) == 0,
+                    "batch output differs from per-expert reference");
+                if (!benchmark) continue;
+                for (int warm = 0; warm < 3; ++warm) arena.execute([&] { sequential(); batch(); });
+                for (int rep = 0; rep < 3; ++rep) {
+                    std::vector<double> timings[2];
+                    for (int sample = 0; sample < 20; ++sample) {
+                        for (int step = 0; step < 2; ++step) {
+                            const int mode = (sample + step + rep) % 2;
+                            const auto begin = std::chrono::steady_clock::now();
+                            arena.execute([&] { if (mode) batch(); else sequential(); });
+                            timings[mode].push_back(std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - begin).count());
+                        }
+                    }
+                    for (int mode = 0; mode < 2; ++mode) {
+                        auto& times = timings[mode];
+                        std::sort(times.begin(), times.end());
+                        const double median = (times[9] + times[10]) * 0.5;
+                        std::cout << std::fixed << std::setprecision(4)
+                            << "[CPU scale] backend=" << static_cast<int>(backend) << " tasks=" << count
+                            << " tokens=" << tokens << " threads=" << threads << " batch=" << mode
+                            << " rep=" << rep << " samples=20 median_ms=" << median
+                            << " p10_ms=" << times[1] << " p90_ms=" << times[17]
+                            << " per_task_ms=" << median / count << '\n';
+                    }
+                }
+            }
+        }
+    }
+    auto reject = [&](const ops::cpu::CpuExpertTask* list, int count, int tokens) {
+        bool caught = false;
+        try { ops::cpu::cpu_expert_batch_forward(list, count, x.data(), tokens, actual_h.data(), actual.data()); }
+        catch (const std::invalid_argument&) { caught = true; }
+        expect(caught, "invalid CPU batch must be rejected before reading/writing buffers");
+    };
+    reject(tasks, 41, 4); reject(tasks, -1, 4); reject(tasks, 1, 5); reject(nullptr, 1, 1);
+    tasks[0].token = 4; reject(tasks, 1, 4);
+    ops::cpu::cpu_expert_batch_forward(nullptr, 0, nullptr, 1, nullptr, nullptr);
+    std::cout << "[PASS] CPU batch 1/4/10/40 distinct experts, nested/expanded, 4/12 threads, bit-exact\n";
+}
+
+void test_nested_rounding_contract() {
+    SyntheticExpertData synth;
+    std::mt19937 rng(20260928);
+    auto vary = [&](std::vector<float>& values, float lo, float hi) {
+        std::uniform_real_distribution<float> dist(lo, hi);
+        for (auto& value : values) value = dist(rng);
+    };
+    vary(synth.gu_nested_absmax, 0.013f, 0.087f);
+    vary(synth.dn_nested_absmax, 0.017f, 0.093f);
+    vary(synth.gu_nested_qmap, -1.0f, 1.0f);
+    vary(synth.dn_nested_qmap, -1.0f, 1.0f);
+    size_t contraction_differences = 0;
+    auto expand = [&](const ops::MoeNestedScaleHost& nested, std::vector<float>& out) {
+        for (size_t i = 0; i < out.size(); ++i) {
+            const float a = nested.nested_quant_map[nested.codes[i]];
+            const float b = nested.nested_absmax[i / nested.blocksize];
+            volatile float product = a * b;
+            out[i] = product + nested.offset;
+            if (out[i] != std::fma(a, b, nested.offset)) ++contraction_differences;
+        }
+    };
+    expand(synth.host_slot_nested.gate_up_nested, synth.gu_absmax_unnested);
+    expand(synth.host_slot_nested.down_nested, synth.dn_absmax_unnested);
+    expect(contraction_differences > 0, "fixture must distinguish FMA from two-step scales");
+    for (int tokens : {1, 4}) {
+        std::vector<bf16> x(tokens * synth.in_features), h(tokens * synth.intermediate_size);
+        std::vector<bf16> nested_h(h.size()), expanded_h(h.size());
+        std::vector<float> nested_out(tokens * synth.out_features), expanded_out(nested_out.size());
+        std::uniform_real_distribution<float> dist(-1.5f, 1.5f);
+        for (auto& value : x) value = bf16(dist(rng));
+        for (auto& value : h) value = bf16(dist(rng));
+        for (auto backend : {ops::cpu::CpuKernelBackend::Scalar, ops::cpu::CpuKernelBackend::Avx2,
+                             ops::cpu::CpuKernelBackend::TbbAvx2, ops::cpu::CpuKernelBackend::GpuOrderAvx2}) {
+            ops::cpu::cpu_expert_gate_up_swiglu(synth.host_slot_nested, x.data(), nested_h.data(), tokens,
+                synth.qmap.data(), synth.in_features, synth.intermediate_size, synth.blocksize, backend);
+            ops::cpu::cpu_expert_gate_up_swiglu(synth.host_slot_unnested, x.data(), expanded_h.data(), tokens,
+                synth.qmap.data(), synth.in_features, synth.intermediate_size, synth.blocksize, backend);
+            expect(std::memcmp(nested_h.data(), expanded_h.data(), h.size() * sizeof(bf16)) == 0,
+                   "nested gate/up must equal explicitly expanded two-step scales bitwise");
+            ops::cpu::cpu_expert_down(synth.host_slot_nested, h.data(), nested_out.data(), tokens, synth.qmap.data(),
+                1.0f, false, synth.intermediate_size, synth.out_features, synth.blocksize, backend);
+            ops::cpu::cpu_expert_down(synth.host_slot_unnested, h.data(), expanded_out.data(), tokens, synth.qmap.data(),
+                1.0f, false, synth.intermediate_size, synth.out_features, synth.blocksize, backend);
+            expect(std::memcmp(nested_out.data(), expanded_out.data(), nested_out.size() * sizeof(float)) == 0,
+                   "nested down must equal explicitly expanded two-step scales bitwise");
+        }
+    }
+    const auto gpu_order = ops::cpu::CpuKernelBackend::GpuOrderAvx2;
+    std::vector<bf16> x(synth.in_features, bf16(0.0f)), h(synth.intermediate_size);
+    std::vector<float> out(synth.out_features, 3.0f);
+    ops::cpu::cpu_expert_down(synth.host_slot_nested, h.data(), out.data(), 1, nullptr, 0.0f, true,
+        synth.intermediate_size, synth.out_features, synth.blocksize, gpu_order);
+    expect(out.front() == 3.0f && out.back() == 3.0f, "zero-weight accumulate must be a no-op");
+    ops::cpu::cpu_expert_down(synth.host_slot_nested, h.data(), out.data(), 1, nullptr, 0.0f, false,
+        synth.intermediate_size, synth.out_features, synth.blocksize, gpu_order);
+    expect(std::all_of(out.begin(), out.end(), [](float value) { return value == 0.0f; }), "zero weight must clear output");
+    ops::cpu::cpu_expert_forward({}, nullptr, nullptr, 1, nullptr, nullptr, 1.0f, false,
+        synth.in_features, synth.intermediate_size, synth.out_features, synth.blocksize, gpu_order);
+    bool rejected = false;
+    try {
+        ops::cpu::cpu_expert_forward(synth.host_slot_nested, x.data(), out.data(), 5, h.data(), nullptr, 1.0f, false,
+            synth.in_features, synth.intermediate_size, synth.out_features, synth.blocksize, gpu_order);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "GPU-order path must reject unsupported token capacity before reading buffers");
+    std::cout << "[PASS] Two-step nested scales, scalar/AVX2/TBB/GPU-order, m=1/4: bit-exact\n";
+}
 
 void test_cpu_self_consistency() {
     std::cout << "\n=== [Test 1] CPU Self-Consistency: Scalar vs AVX2 vs TBB_AVX2 ===\n";
@@ -395,6 +538,13 @@ void test_cpu_gpu_equivalence(Context& ctx) {
         expect(max_diff_h < 1e-3f, "m=" + std::to_string(m) + " intermediate h max_diff >= 1e-3");
         expect(max_diff_out < 1e-3f, "m=" + std::to_string(m) + " output out max_diff >= 1e-3");
 
+        std::vector<float> ordered_out(gpu_out_host.size());
+        ops::cpu::cpu_expert_down(synth.host_slot_nested, gpu_h_host.data(), ordered_out.data(), m,
+            synth.qmap.data(), 1.0f, false, synth.intermediate_size, synth.out_features, synth.blocksize,
+            ops::cpu::CpuKernelBackend::GpuOrderAvx2);
+        expect(std::memcmp(gpu_out_host.data(), ordered_out.data(), ordered_out.size() * sizeof(float)) == 0,
+               "GPU-order down must match GPU bitwise on the same BF16 intermediate");
+
         // 4. Test GPU vs CPU with fractional weight & accumulate=true
         const float test_weight = 0.35f;
         std::vector<float> gpu_acc_host(m * synth.out_features);
@@ -616,6 +766,7 @@ void run_microbenchmark() {
     benchmark_run(1, ops::cpu::CpuKernelBackend::Scalar, "Scalar");
     benchmark_run(1, ops::cpu::CpuKernelBackend::Avx2, "AVX2 (1T)");
     benchmark_run(1, ops::cpu::CpuKernelBackend::TbbAvx2, "TBB+AVX2");
+    benchmark_run(1, ops::cpu::CpuKernelBackend::GpuOrderAvx2, "GPU-order");
 
     benchmark_run(2, ops::cpu::CpuKernelBackend::Avx2, "AVX2 (1T)");
     benchmark_run(2, ops::cpu::CpuKernelBackend::TbbAvx2, "TBB+AVX2");
@@ -630,10 +781,16 @@ void run_microbenchmark() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "Starting Qwen4Exp CPU Expert H2a Verification Suite...\n";
     try {
+        if (argc == 2 && std::string(argv[1]) == "--batch-scale") {
+            test_batch_scale(true);
+            return 0;
+        }
+        test_batch_scale(false);
         test_edge_cases_and_robustness();
+        test_nested_rounding_contract();
         test_cpu_self_consistency();
 
         Context ctx;

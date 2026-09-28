@@ -8,6 +8,12 @@
 
 ## 1. 先纠正基线，再决定优化对象
 
+**2026-09-28 CPU 数据通路续验：** 批量准备、合并回传和等待所选专家预取完成的组合已完成三组实模配对：旧 CPU 配置总时延中位数 9258.08 ms，候选 8733.11 ms（降低 5.67%），六次黄金 token 均一致；候选三次均执行 26400 个 CPU 任务（含预热），并通过完整 logits、多轮复用和实际回滚验收。同期 GPU-only 为 5695.54 ms，强制 CPU 放置仍明显更慢。未等待预取的动态混合配置复测出现 token 偏差，不能计为有效加速；三个实验开关均保持默认关闭。详见 [CPU 数据通路实验](qwen3.8-flash-next-cpu-dataflow-2026-09-28.md)。
+
+**2026-09-28 大规模 CPU 实验更新：** 按用户要求，不再限制于单专家/4 线程：CPU arena 放宽到 12 线程，执行槽支持 40 个 expert/token 任务，并增加固定配额、主动放置和 2..4-token prefill 实验入口。跨专家批量计算及输入预排布/寄存器 NF4 查表已实现；12 线程下 40 任务微基准由 20.45 降到 4.13 ms，保持原 CPU GPU-order 算术逐位一致。真实 40 任务放置也已跑通，但不能把 CPU 算子收益视为超越 GPU-only。完整矩阵、数值限制与最终复测见 [12 线程与大批专家实验](qwen3.8-flash-next-cpu-scale12-2026-09-28.md)。以下“暂停扩大”及少量分流建议保留为此前阶段记录，不再作为实验规模限制。
+
+**2026-09-28 后续实施更新：** H1/H4/H5 的并发统计、DMA 计时和 ready-slot 生命周期已补强；GPU ready-first 已独立接入但默认关闭。修正 CPU 单配额永久停用后，真实 CPU 分流在 story 第 26 步出现 token 偏差，暂停扩大 CPU 份额，先做算子级数值对齐。direct prefill I/O 已完成实现与正确性验收：三组 story 对照总时延中位数改善约 0.49%，但与 MoE rows 组合未显示稳定叠加收益，保持默认关闭。最终 11 项聚焦测试、独立及组合真实模型验收通过，13 次短故事测试均与黄金 token 一致。详见 [异构后续进展](qwen3.8-flash-next-heterogeneous-progress-2026-09-28.md)。以下仍保留原始设计分析，不代表所有 H 阶段均已完成。
+
 `[RECORDED + CODE]` 此前约 1.2 秒回退已定位为 QSA 首次编译未被 warmup 覆盖。A2 K-only 使 2-token warmup 不再走原 QSA cache kernel，也未组成完整 4-token block；首个真实 prefill 才触达相关编译工作。`f24dd34` 在 load 末尾用 dummy block 调用 `qsa_compress_key_blocks` 并完成同步。提交记录报告首段 prefill 3376→2217 ms、GenerateMessages 7403→6241 ms、打印的 48-token 回复不变。数字来自既有记录，本轮没有复现。
 
 因此：
@@ -92,6 +98,8 @@ LayerMoePlan PlanExperts(RouteBatch, ResidencyView, ResourceBudget);
 
 ## 5. H2：CPU NF4 原型与有序汇合
 
+**2026-09-28 数值对齐更新：** 已修复 CPU nested scale 的融合乘加舍入差异，并新增默认关闭的 `AILA_Q4E_CPU_GPU_ORDER=1` 候选，以 GPU lane 顺序计算并显式执行非线性除法。16 个真实专家样本的中间值/down 对照、三次黄金 48-token 生成及多轮回滚验收通过；但端到端负性能筛选仍慢约 6%，不升默认、不扩大 CPU 配额。原 Auto CPU 路径仅修 scale 后仍有 token 偏差。详见 [CPU 对齐记录](qwen3.8-flash-next-cpu-alignment-2026-09-28.md)。
+
 ### 先实现小而专用的 CPU kernel
 
 `[DESIGN]` 首个实现只支持本模型固定 H/I、BF16 activation、NF4 block=64 和当前 nested scale 格式；scalar 路径作 reference，AVX2/FMA 路径按输出行并行。
@@ -121,6 +129,8 @@ LayerMoePlan PlanExperts(RouteBatch, ResidencyView, ResourceBudget);
 这种汇合避免额外的跨设备乱序相加，但**不保证 CPU/GPU bitwise 相同**：AVX2 与 SYCL subgroup reduction、FMA 次序和 native exp 仍可能不同。先对同一权重/x 比较 gate、h、down、merge，再看一次完整生成。若项目坚持完全相同 token 输出，未满足时保持 hetero opt-in；不得以“NF4 格式没变”宣称数值无损。
 
 ## 6. H3：以整层完成时间为目标的调度
+
+**2026-09-28 异步重叠更新：** 已增加默认关闭的 `AILA_Q4E_CPU_OVERLAP`、单任务槽常驻 worker 和 1–4 线程局部预算，实现 CPU 与 acquire/fill 重叠。修正异步汇合后的节流误判后，三组黄金 story 对照通过，但总时延中位数仍比 GPU-only 慢 3.21%，不升默认。初版大量 CPU 分流再次出现 token 偏差，通用数值一致性仍未解决。详见 [CPU 重叠记录](qwen3.8-flash-next-cpu-overlap-2026-09-28.md)。
 
 `[DESIGN]` 初版只按真实 residency、m、CPU 队列长度和传输 backlog 作确定性选择，不训练 predictor、不依赖上一步 Top-K 猜测计算。
 

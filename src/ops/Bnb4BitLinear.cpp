@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <exception>
@@ -24,6 +25,7 @@ struct AtomicPrefillDispatchStats {
     std::atomic<uint64_t> cached_weight{0};
     std::atomic<uint64_t> on_demand_dequant{0};
     std::atomic<uint64_t> sync_wait{0};
+    std::atomic<uint64_t> direct_io{0};
 };
 static AtomicPrefillDispatchStats g_prefill_dispatch_stats;
 
@@ -1813,6 +1815,7 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
         out_features_ = static_cast<int>(total_out_features);
         allow_dense_xmx_ = first->allow_dense_xmx_;
         allow_async_dequant_ = first->allow_async_dequant_;
+        direct_prefill_io_ = first->direct_prefill_io_;
 
         finish_init(ctx);
         ctx.synchronize();
@@ -2236,10 +2239,19 @@ void Bnb4BitLinear::forward(Context& ctx,
     const bool need_scratch_weight = !cache_dequantized_weight_;
 
     scratch.ensure(ctx, seq_len, in_features_, out_features_, need_scratch_weight);
-    Tensor input_bf16 = Tensor::view(ctx, scratch.input_bf16.data(),
+    const size_t input_bytes = static_cast<size_t>(seq_len) * in_features_ * sizeof(bf16);
+    const size_t output_bytes = static_cast<size_t>(seq_len) * out_features_ * sizeof(bf16);
+    const auto input_address = reinterpret_cast<std::uintptr_t>(input.data());
+    const auto output_address = reinterpret_cast<std::uintptr_t>(output.data());
+    const bool disjoint = input_address <= output_address
+        ? input_bytes <= output_address - input_address
+        : output_bytes <= input_address - output_address;
+    const bool direct_io = direct_prefill_io_ && seq_len > 1 && lora_attachments_.empty() && disjoint;
+    if (direct_io) g_prefill_dispatch_stats.direct_io.fetch_add(1, std::memory_order_relaxed);
+    Tensor input_bf16 = Tensor::view(ctx, direct_io ? input.data() : scratch.input_bf16.data(),
                                     {seq_len, (int64_t)in_features_},
                                     dnnl::memory::data_type::bf16);
-    Tensor output_bf16 = Tensor::view(ctx, scratch.output_bf16.data(),
+    Tensor output_bf16 = Tensor::view(ctx, direct_io ? output.data() : scratch.output_bf16.data(),
                                      {seq_len, (int64_t)out_features_},
                                      dnnl::memory::data_type::bf16);
     Tensor scratch_weight_bf16;
@@ -2254,8 +2266,7 @@ void Bnb4BitLinear::forward(Context& ctx,
         weight_bf16 = &scratch_weight_bf16;
     }
 
-    ctx.queue().memcpy(input_bf16.data(), input.data(),
-                       static_cast<size_t>(seq_len) * static_cast<size_t>(in_features_) * sizeof(bf16));
+    if (!direct_io) ctx.queue().memcpy(input_bf16.data(), input.data(), input_bytes);
 
     if (!cache_dequantized_weight_ || !cached_weight_ready_) {
         g_prefill_dispatch_stats.on_demand_dequant.fetch_add(1, std::memory_order_relaxed);
@@ -2352,8 +2363,7 @@ void Bnb4BitLinear::forward(Context& ctx,
         apply_lora_prefill(ctx, input_bf16, output_bf16, seq_len);
     }
 
-    ctx.queue().memcpy(output.data(), output_bf16.data(),
-                       static_cast<size_t>(seq_len) * static_cast<size_t>(out_features_) * sizeof(bf16));
+    if (!direct_io) ctx.queue().memcpy(output.data(), output_bf16.data(), output_bytes);
 }
 
 // ============================================================
@@ -3589,6 +3599,7 @@ Bnb4BitLinear::PrefillDispatchStats Bnb4BitLinear::get_prefill_dispatch_stats() 
     s.cached_weight = g_prefill_dispatch_stats.cached_weight.load(std::memory_order_relaxed);
     s.on_demand_dequant = g_prefill_dispatch_stats.on_demand_dequant.load(std::memory_order_relaxed);
     s.sync_wait = g_prefill_dispatch_stats.sync_wait.load(std::memory_order_relaxed);
+    s.direct_io = g_prefill_dispatch_stats.direct_io.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -3597,5 +3608,6 @@ void Bnb4BitLinear::reset_prefill_dispatch_stats() {
     g_prefill_dispatch_stats.cached_weight.store(0, std::memory_order_relaxed);
     g_prefill_dispatch_stats.on_demand_dequant.store(0, std::memory_order_relaxed);
     g_prefill_dispatch_stats.sync_wait.store(0, std::memory_order_relaxed);
+    g_prefill_dispatch_stats.direct_io.store(0, std::memory_order_relaxed);
 }
 

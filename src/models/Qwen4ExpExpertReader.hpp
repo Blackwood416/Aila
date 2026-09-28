@@ -38,6 +38,7 @@ struct ExpertLayerSource {
 
 struct ExpertReaderStats {
     uint64_t read_count = 0;
+    // Completed staging payload, not physical file I/O (nested scales may expand).
     uint64_t read_bytes = 0;
     uint64_t read_ns = 0;
     uint64_t prefetch_calls = 0;
@@ -72,6 +73,8 @@ public:
     // Update layer source bindings
     virtual void set_layer_source(int layer, const ExpertLayerSource& src) = 0;
 
+    // Race-free approximate snapshot while reading; exact after readers join.
+    // Reset only at a quiescent measurement boundary.
     virtual ExpertReaderStats stats() const = 0;
     virtual void reset_stats() = 0;
 };

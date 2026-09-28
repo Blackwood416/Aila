@@ -364,7 +364,7 @@ void test_expert_executor_planning_and_ready_subset(Context& ctx) {
 
     const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp * sizeof(uint8_t) +
                               synth.dn_packed_per_exp + synth.dn_absmax_per_exp * sizeof(uint8_t);
-    const size_t cache_bytes = 4 * slot_bytes;
+    const size_t cache_bytes = 6 * slot_bytes;
 
     std::string err;
     bool ok = cache.init(ctx, dummy_weights, synth.num_layers, cache_bytes,
@@ -379,6 +379,12 @@ void test_expert_executor_planning_and_ready_subset(Context& ctx) {
     int pre_slots[2] = {-1, -1};
     sycl::event ev = cache.acquire(0, pre_req, 2, pre_slots);
     ev.wait_and_throw();
+    // Fill the cache completely, leaving the two needed ready experts at the LRU tail.
+    int filler_ids[4] = {0, 1, 2, 3};
+    int filler_slots[4];
+    cache.acquire(1, filler_ids, 4, filler_slots).wait_and_throw();
+    const auto ready0 = cache.query_residency(0, 0);
+    const auto ready1 = cache.query_residency(0, 1);
 
     // Initialize executor
     aila::Qwen4ExpExpertExecutor executor;
@@ -416,10 +422,24 @@ void test_expert_executor_planning_and_ready_subset(Context& ctx) {
     // Now all entries should have valid gpu_slot
     for (const auto& entry : plan.entries) {
         expect(entry.gpu_slot >= 0, "all entries must have valid gpu_slot after ensure_gpu_pending");
+        const auto res = cache.query_residency(plan.layer, entry.expert_id);
+        expect(res.gpu_slot == entry.gpu_slot && res.gpu_generation == entry.gpu_generation,
+               "plan must still reference the correct expert generation");
     }
+    expect(cache.query_residency(0, 0).gpu_generation == ready0.gpu_generation &&
+           cache.query_residency(0, 0).gpu_slot == ready0.gpu_slot, "ready expert 0 was evicted");
+    expect(cache.query_residency(0, 1).gpu_generation == ready1.gpu_generation &&
+           cache.query_residency(0, 1).gpu_slot == ready1.gpu_slot, "ready expert 1 was evicted");
 
     // Record execution completion
     executor.record_execution_complete(plan, sycl::event{});
+    int overflow_ids[8] = {0, 1, 2, 3, 4, 5, 6, 0};
+    auto& overflow = executor.plan_layer(0, overflow_ids, route_weights, 2, 4, false);
+    bool rejected = false;
+    try { executor.ensure_gpu_pending(overflow); } catch (const std::runtime_error&) { rejected = true; }
+    expect(rejected && !cache.is_faulted(), "over-capacity GPU union must reject without poisoning");
+    expect(cache.query_residency(0, 0).gpu_generation == ready0.gpu_generation,
+           "over-capacity plan must preserve ready bindings");
 
     // Test edge cases: token_count == 0, null router_ids
     aila::LayerMoePlan& p_empty = executor.plan_layer(0, nullptr, nullptr, 0, 4);
@@ -679,6 +699,20 @@ void test_h3_straggler_monitoring_and_penalty(Context& ctx) {
     std::vector<float> large_weights(5 * 4, 0.25f);
     aila::LayerMoePlan& p_large = executor.plan_layer(0, large_route.data(), large_weights.data(), 5, 4, true);
     expect(p_large.cpu_tasks == 0, "CPU dispatch must be disabled for token count > max_cpu_tokens (m <= 4)");
+
+    executor.set_max_cpu_credits(1);
+    executor.set_straggler_penalty(true);
+    for (int layer = 0; layer < 8; ++layer) {
+        auto& cooling = executor.plan_layer(0, route_ids, route_weights, 1, 4, true);
+        expect(cooling.cpu_tasks == 0, "single-credit straggler policy must cool down");
+    }
+    auto& retry = executor.plan_layer(0, route_ids, route_weights, 1, 4, true);
+    expect(retry.cpu_tasks == 1, "single-credit policy must eventually retry after warmup");
+    executor.set_max_cpu_credits(0);
+    for (int layer = 0; layer < 10; ++layer) {
+        auto& disabled = executor.plan_layer(0, route_ids, route_weights, 1, 4, true);
+        expect(disabled.cpu_tasks == 0, "explicit zero credits must remain disabled");
+    }
 
     std::cout << "  Passed H3 straggler monitoring and penalty test.\n";
 }

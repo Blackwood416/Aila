@@ -11,6 +11,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -167,7 +168,7 @@ void test_mmap_vs_overlapped_readfile_exact_match() {
 }
 
 void test_sliced_multipart_reads() {
-    std::cout << "[Test 3] Testing sliced multi-part parallel reads (nparts=8)...\n";
+    std::cout << "[Test 3] Testing concurrent sliced reads and exact statistics...\n";
     SyntheticSafetensorsShard fixture;
 
     ModelWeights weights = LoadModelWeightsLazy(fixture.temp_dir.string());
@@ -200,17 +201,32 @@ void test_sliced_multipart_reads() {
     std::vector<uint8_t> full_slot(geom.slot_bytes, 0);
     std::vector<uint8_t> sliced_slot(geom.slot_bytes, 0);
 
-    // Full read (nparts=1)
-    readfile_reader->read_expert_slice(0, 1, full_slot.data(), 0, 1);
-
-    // Sliced read (nparts=8)
-    constexpr int nparts = 8;
-    for (int p = 0; p < nparts; ++p) {
-        readfile_reader->read_expert_slice(0, 1, sliced_slot.data(), p, nparts);
+    readfile_reader->read_expert_slice(0, 3, full_slot.data(), 0, 1);
+    auto mmap_reader = aila::CreateMmapExpertReader(geom, layers, false);
+    constexpr int nparts = 7; // segment sizes are deliberately not divisible by 7
+    constexpr int repeats = 32;
+    for (auto* reader : {readfile_reader.get(), mmap_reader.get()}) {
+        reader->reset_stats();
+        std::vector<std::thread> threads;
+        for (int p = 0; p < nparts; ++p) {
+            threads.emplace_back([&, p] {
+                for (int i = 0; i < repeats; ++i) {
+                    reader->read_expert_slice(0, i % 4, sliced_slot.data(), p, nparts);
+                }
+            });
+        }
+        for (int i = 0; i < repeats; ++i) (void)reader->stats();
+        for (auto& thread : threads) thread.join();
+        expect(std::memcmp(full_slot.data(), sliced_slot.data(), geom.slot_bytes) == 0,
+               "Concurrent sliced read mismatch vs full read");
+        const auto stats = reader->stats();
+        expect(stats.read_count == nparts * repeats, "concurrent read count lost updates");
+        expect(stats.read_bytes == geom.slot_bytes * repeats, "concurrent byte count must be exact");
+        expect(stats.read_ns > 0, "read duration must be positive");
+        reader->reset_stats();
+        expect(reader->stats().read_count == 0 && reader->stats().read_bytes == 0,
+               "quiescent reset must clear statistics");
     }
-
-    int diff = std::memcmp(full_slot.data(), sliced_slot.data(), geom.slot_bytes);
-    expect(diff == 0, "Sliced read mismatch vs full read");
 
     std::cout << "  Multi-part sliced reads assembled 100% bitwise identical! [PASSED]\n";
 }

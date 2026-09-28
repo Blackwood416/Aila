@@ -731,6 +731,11 @@ target_include_directories(AilaQwen4ExpGenerationTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaQwen4ExpGenerationTests PRIVATE AilaLib)
+if(MSVC)
+    target_compile_options(AilaQwen4ExpGenerationTests PRIVATE /arch:AVX2)
+else()
+    target_compile_options(AilaQwen4ExpGenerationTests PRIVATE -mavx2 -mfma)
+endif()
 add_test(NAME AilaQwen4ExpGenerationTests COMMAND AilaQwen4ExpGenerationTests)
 set_tests_properties(AilaQwen4ExpGenerationTests PROPERTIES LABELS "gpu;models;qwen4_exp;h6" TIMEOUT 60)
 
