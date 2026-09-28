@@ -29,9 +29,10 @@ bool is_event_complete(const sycl::event& ev) {
     }
 }
 
-struct SyntheticExpertWeights {
-    static constexpr int num_layers = 2;
-    static constexpr int num_experts_per_layer = 8;
+template <int NumLayers = 2, int NumExperts = 8>
+struct SyntheticExpertWeightsT {
+    static constexpr int num_layers = NumLayers;
+    static constexpr int num_experts_per_layer = NumExperts;
     static constexpr int hidden_size = 256;
     static constexpr int intermediate_size = 64;
     static constexpr int blocksize = 64;
@@ -57,7 +58,7 @@ struct SyntheticExpertWeights {
     Bnb4BitHostWeightRef gu_ref;
     Bnb4BitHostWeightRef dn_ref;
 
-    SyntheticExpertWeights() {
+    SyntheticExpertWeightsT() {
         const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
         const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
         const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
@@ -141,6 +142,8 @@ struct SyntheticExpertWeights {
         dn_ref.quant_state.nested_offset = 0.03f;
     }
 };
+
+using SyntheticExpertWeights = SyntheticExpertWeightsT<2, 8>;
 
 void test_dma_timing_stats(Context& ctx) {
     std::cout << "[Test 1] Testing DmaTimingStats tracking and record_first_consumer_start...\n";
@@ -379,6 +382,111 @@ void test_host_slot_dma_event_fencing(Context& ctx) {
     std::cout << "  Host slot per-expert DMA fencing and lease release verified! [PASSED]\n";
 }
 
+void test_multi_token_decoupled_execution_and_hit_protection(Context& ctx) {
+    std::cout << "[Test 5] Testing multi-token (>16 tasks) decoupled execution & hit protection...\n";
+    SyntheticExpertWeightsT<1, 24> synth;
+    ModelWeights dummy_weights;
+    Qwen4ExpExpertCache cache;
+
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp * sizeof(uint8_t) +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp * sizeof(uint8_t);
+    const size_t cache_bytes = 24 * slot_bytes; // 24 GPU slots
+
+    std::string err;
+    bool ok = cache.init(ctx, dummy_weights, synth.num_layers, cache_bytes,
+                         synth.num_experts_per_layer, synth.hidden_size,
+                         synth.intermediate_size, synth.blocksize, &err, true);
+    expect(ok, "cache init failed: " + err);
+    cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
+
+    // 1. Warm up 10 experts (0..9) on GPU so they are resident and Ready
+    std::vector<int> warm_req(10);
+    std::vector<int> warm_slots(10, -1);
+    for (int i = 0; i < 10; ++i) warm_req[i] = i;
+    sycl::event warm_ev = cache.acquire(0, warm_req.data(), 10, warm_slots.data());
+    if (warm_ev != sycl::event{}) warm_ev.wait_and_throw();
+
+    // Setup executor with token_count = 2, top_k = 10 -> total 20 tasks (> 16 tasks!)
+    aila::Qwen4ExpExpertExecutor executor;
+    executor.init(ctx, cache, 2, 10, synth.hidden_size, synth.intermediate_size);
+
+    // Token 0 uses experts 0..9 (hits, ready = 10)
+    // Token 1 uses experts 10..19 (misses, pending = 10)
+    std::vector<int> router_ids(20);
+    std::vector<float> router_weights(20);
+    for (int i = 0; i < 10; ++i) {
+        router_ids[i] = i;
+        router_weights[i] = 0.1f;
+    }
+    for (int i = 10; i < 20; ++i) {
+        router_ids[i] = i;
+        router_weights[i] = 0.1f;
+    }
+
+    aila::LayerMoePlan& plan = executor.plan_layer(0, router_ids.data(), router_weights.data(), 2, 10, false);
+    expect(plan.gpu_tasks == 20, "expected 20 total GPU tasks (> 16 tasks)");
+    expect(plan.ready_gpu_tasks == 10, "expected 10 ready GPU tasks");
+    expect(plan.pending_gpu_tasks == 10, "expected 10 pending GPU tasks");
+
+    executor.ensure_gpu_pending(plan);
+    plan.final_dma_event.wait_and_throw();
+    expect(is_event_complete(plan.final_dma_event), "final_dma_event must complete");
+
+    // Allocate test buffers for m=2 tokens
+    bf16* x_dev = static_cast<bf16*>(ctx.alloc_device(2 * synth.hidden_size * sizeof(bf16)));
+    bf16* moe_h_dev = static_cast<bf16*>(ctx.alloc_device(20 * synth.intermediate_size * sizeof(bf16)));
+    bf16* y_dev = static_cast<bf16*>(ctx.alloc_device(2 * synth.hidden_size * sizeof(bf16)));
+
+    std::vector<bf16> x_host(2 * synth.hidden_size, bf16(0.125f));
+    ctx.queue().memcpy(x_dev, x_host.data(), x_host.size() * sizeof(bf16)).wait();
+    ctx.queue().memset(y_dev, 0, 2 * synth.hidden_size * sizeof(bf16)).wait();
+
+    // Execute multi-token decoupled execution (> 16 tasks path)
+    sycl::event finish_ev = executor.execute_hetero_decode(
+        ctx, plan, x_dev, moe_h_dev, router_weights.data(), y_dev, 2, 10,
+        nullptr, nullptr, cache.uses_nested_codes());
+    finish_ev.wait_and_throw();
+
+    // Verify output in y_dev
+    std::vector<bf16> y_host(2 * synth.hidden_size);
+    ctx.queue().memcpy(y_host.data(), y_dev, y_host.size() * sizeof(bf16)).wait();
+    for (size_t i = 0; i < y_host.size(); ++i) {
+        float f = static_cast<float>(y_host[i]);
+        expect(!std::isnan(f) && !std::isinf(f), "multi-token output activations must be finite");
+    }
+
+    // 2. Timing and Hit Protection Verification
+    const auto stats_after_first = cache.dma_timing_stats();
+    expect(stats_after_first.batches_measured >= 1, "batches_measured should be >= 1 after first acquire with misses");
+    uint64_t measured_batches_prev = stats_after_first.batches_measured;
+    uint64_t gap_prev = stats_after_first.total_consumer_gap_ns;
+
+    // Execute a second pass with the exact same 20 experts (now 100% hits in cache!)
+    aila::LayerMoePlan& plan_hits = executor.plan_layer(0, router_ids.data(), router_weights.data(), 2, 10, false);
+    expect(plan_hits.ready_gpu_tasks == 20, "all 20 tasks should be hits");
+    expect(plan_hits.pending_gpu_tasks == 0, "0 pending tasks on hit");
+
+    executor.ensure_gpu_pending(plan_hits);
+    sycl::event hit_finish_ev = executor.execute_hetero_decode(
+        ctx, plan_hits, x_dev, moe_h_dev, router_weights.data(), y_dev, 2, 10,
+        nullptr, nullptr, cache.uses_nested_codes());
+    hit_finish_ev.wait_and_throw();
+
+    // Call record_first_consumer_start() again: should be a NO-OP since no new DMA was issued!
+    cache.record_first_consumer_start();
+    const auto stats_after_hit = cache.dma_timing_stats();
+    expect(stats_after_hit.batches_measured == measured_batches_prev,
+           "batches_measured must NOT increment on 100% hit batch");
+    expect(stats_after_hit.total_consumer_gap_ns == gap_prev,
+           "total_consumer_gap_ns must NOT accumulate on 100% hit batch");
+
+    ctx.free_device(x_dev);
+    ctx.free_device(moe_h_dev);
+    ctx.free_device(y_dev);
+
+    std::cout << "  Multi-token decoupled execution and hit protection verified! [PASSED]\n";
+}
+
 } // namespace
 
 int main() {
@@ -395,6 +503,7 @@ int main() {
         test_slot_dma_event_tracking(ctx);
         test_decoupled_ready_pending_gpu_execution(ctx);
         test_host_slot_dma_event_fencing(ctx);
+        test_multi_token_decoupled_execution_and_hit_protection(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

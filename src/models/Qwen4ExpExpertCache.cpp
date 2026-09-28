@@ -1033,7 +1033,7 @@ void Qwen4ExpExpertCache::ensure_prefetch_item_ready(PrefetchItem& item, int c) 
         if (!(item.claimed_parts.load(std::memory_order_relaxed) & bit)) {
             const uint64_t old = item.claimed_parts.fetch_or(bit, std::memory_order_acq_rel);
             if (!(old & bit)) {
-                load_expert_to_staging(item.layer, item.expert_id, dst, p, parts);
+                load_expert_to_staging(item.layer, item.expert_id, dst, p, parts, item.expected_generation);
                 if (item.parts_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     item.ready.store(true, std::memory_order_release);
                     if (item.hslot >= 0) {
@@ -1146,6 +1146,9 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
 
     prefetch_items_.clear();
     prefetch_in_flight_ = false;
+    if (reader_) {
+        reader_->reset_cancelled();
+    }
 }
 
 sycl::event Qwen4ExpExpertCache::acquire(int layer,
@@ -1546,7 +1549,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     int hslot = assigned_hslots_scratch_[c];
                     uint64_t exp_gen = assigned_hslot_gens_scratch_[c];
                     uint8_t* host_slot_ptr = host_slot_ptrs_[hslot];
-                    load_expert_to_staging(miss.layer, miss.expert_id, host_slot_ptr, task % parts, parts);
+                    load_expert_to_staging(miss.layer, miss.expert_id, host_slot_ptr, task % parts, parts, exp_gen);
                     if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         if (host_slot_records_[hslot].generation.load(std::memory_order_acquire) == exp_gen) {
                             host_slot_state_[hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
@@ -1604,7 +1607,8 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     const int c = task / parts;
                     const auto& miss = to_fill_scratch_[m + c];
                     uint8_t* staging_slot = chunk_base + static_cast<size_t>(c) * slot_bytes_;
-                    load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts);
+                    const uint64_t exp_gen = gpu_slot_records_[miss.slot_id].generation;
+                    load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts, exp_gen);
                     if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         copy_to_slot(miss.slot_id, staging_slot, -1);
                     }
@@ -1646,6 +1650,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             last_batch_submit_end_time_ = t_submit_end;
             last_batch_dma_event_ = dma_done_event;
             first_batch_dma_event_ = first_memcpy_ev;
+            new_dma_batch_pending_ = true;
         }
     }
 
@@ -1773,7 +1778,7 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
             if (!(old & bit)) {
                 uint8_t* dst = (item.hslot >= 0) ? host_slot_ptrs_[item.hslot]
                                                  : prefetch_staging_ptr_ + static_cast<size_t>(c) * slot_bytes_;
-                load_expert_to_staging(item.layer, item.expert_id, dst, p, parts);
+                load_expert_to_staging(item.layer, item.expert_id, dst, p, parts, item.expected_generation);
                 if (item.parts_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     item.ready.store(true, std::memory_order_release);
                     if (item.hslot >= 0) {
@@ -1907,9 +1912,9 @@ void fill_expert_matrix(const Bnb4BitHostWeightRef& ref, int expert_id,
 } // namespace
 
 void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
-                                                 int part, int nparts) {
+                                                 int part, int nparts, uint64_t slot_gen) {
     if (reader_) {
-        reader_->read_expert_slice(layer, expert_id, staging_slot, part, nparts);
+        reader_->read_expert_slice(layer, expert_id, staging_slot, part, nparts, slot_gen);
         return;
     }
     if (layer < 0 || layer >= static_cast<int>(layer_weights_.size()) || !layer_weights_[layer].valid) {
@@ -2193,7 +2198,7 @@ FillTicket Qwen4ExpExpertCache::prepare_host(int layer, int expert_id, int /*pri
     }
 
     uint8_t* host_slot_ptr = host_slot_ptrs_[victim_hslot];
-    load_expert_to_staging(layer, expert_id, host_slot_ptr, 0, 1);
+    load_expert_to_staging(layer, expert_id, host_slot_ptr, 0, 1, next_gen);
     host_slot_state_[victim_hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
     ++stats_.host_pool_misses;
 
@@ -2244,27 +2249,40 @@ sycl::event Qwen4ExpExpertCache::get_slot_dma_event(int slot_id) const {
     return gpu_slot_records_[slot_id].dma_event;
 }
 
+const DmaTimingStats& Qwen4ExpExpertCache::dma_timing_stats() {
+    update_dma_profiling();
+    return dma_timing_stats_;
+}
+
+void Qwen4ExpExpertCache::update_dma_profiling() {
+    if (dma_timing_stats_.last_memcpy_count > 0 && dma_timing_stats_.last_copy_ns == 0) {
+        try {
+            if (is_event_complete(last_batch_dma_event_)) {
+                uint64_t start = first_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_start>();
+                uint64_t end = last_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_end>();
+                if (end > start) {
+                    dma_timing_stats_.last_copy_ns = end - start;
+                    dma_timing_stats_.total_copy_ns += (end - start);
+                    dma_timing_stats_.last_effective_gbps =
+                        (static_cast<double>(dma_timing_stats_.last_batch_bytes) / static_cast<double>(end - start));
+                }
+            }
+        } catch (...) {
+        }
+    }
+}
+
 void Qwen4ExpExpertCache::record_first_consumer_start() {
-    if (dma_timing_stats_.last_batch_bytes == 0) return;
+    if (!new_dma_batch_pending_ || dma_timing_stats_.last_batch_bytes == 0) return;
+    new_dma_batch_pending_ = false;
+
     const auto now = std::chrono::high_resolution_clock::now();
     uint64_t gap_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         now - last_batch_submit_end_time_).count());
     dma_timing_stats_.last_consumer_gap_ns = gap_ns;
     dma_timing_stats_.total_consumer_gap_ns += gap_ns;
 
-    if (dma_timing_stats_.last_memcpy_count > 0) {
-        try {
-            uint64_t start = first_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_start>();
-            uint64_t end = last_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_end>();
-            if (end > start) {
-                dma_timing_stats_.last_copy_ns = end - start;
-                dma_timing_stats_.total_copy_ns += (end - start);
-                dma_timing_stats_.last_effective_gbps =
-                    (static_cast<double>(dma_timing_stats_.last_batch_bytes) / static_cast<double>(end - start));
-            }
-        } catch (...) {
-        }
-    }
+    update_dma_profiling();
 
     static const bool s_prof = aila::env::read_flag("AILA_Q4E_DMA_PROF", false);
     if (s_prof) {
@@ -2275,4 +2293,3 @@ void Qwen4ExpExpertCache::record_first_consumer_start() {
                   << " rate=" << dma_timing_stats_.last_effective_gbps << " GB/s\n";
     }
 }
-

@@ -284,7 +284,57 @@ void test_first_vs_second_read_latency_comparison() {
                       << " Mmap=" << mmap_ms << " ms [PASSED]\n";
         }
     } else {
-        std::cout << "  (Real model directory not found, skipping real model benchmark)\n";
+        std::cout << "  (Real model directory not found, benchmarking on synthetic fixture)\n";
+        SyntheticSafetensorsShard synth_fixture;
+        ModelWeights synth_weights = LoadModelWeightsLazy(synth_fixture.temp_dir.string());
+        aila::ExpertSlotGeometry s_geom;
+        s_geom.gu_packed_bytes = synth_fixture.gu_packed_bytes;
+        s_geom.gu_absmax_count = synth_fixture.gu_absmax_bytes;
+        s_geom.gu_absmax_bytes = synth_fixture.gu_absmax_bytes;
+        s_geom.dn_packed_bytes = synth_fixture.dn_packed_bytes;
+        s_geom.dn_absmax_count = synth_fixture.dn_absmax_bytes;
+        s_geom.dn_absmax_bytes = synth_fixture.dn_absmax_bytes;
+        s_geom.gu_packed_offset = 0;
+        s_geom.gu_absmax_offset = s_geom.gu_packed_bytes;
+        s_geom.dn_packed_offset = s_geom.gu_absmax_offset + s_geom.gu_absmax_bytes;
+        s_geom.dn_absmax_offset = s_geom.dn_packed_offset + s_geom.dn_packed_bytes;
+        s_geom.slot_bytes = synth_fixture.slot_bytes;
+        s_geom.compact_nested = true;
+
+        std::vector<aila::ExpertLayerSource> s_layers(1);
+        s_layers[0].gate_up.packed_weight = synth_weights.host_view("model.layers.0.mlp.experts.gate_up_proj.weight");
+        s_layers[0].gate_up.absmax = synth_weights.host_view("model.layers.0.mlp.experts.gate_up_proj.weight.absmax");
+        s_layers[0].down.packed_weight = synth_weights.host_view("model.layers.0.mlp.experts.down_proj.weight");
+        s_layers[0].down.absmax = synth_weights.host_view("model.layers.0.mlp.experts.down_proj.weight.absmax");
+        s_layers[0].valid = true;
+
+        auto s_mmap = aila::CreateMmapExpertReader(s_geom, s_layers, false);
+        auto s_rf = aila::CreateOverlappedReadFileExpertReader(s_geom, synth_weights.shard_paths(), s_layers);
+
+        std::vector<uint8_t> b1(s_geom.slot_bytes, 0);
+        std::vector<uint8_t> b2(s_geom.slot_bytes, 0);
+        std::vector<uint8_t> b_mmap(s_geom.slot_bytes, 0);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        s_rf->read_expert_slice(0, 0, b1.data(), 0, 1);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double rf1_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        t0 = std::chrono::high_resolution_clock::now();
+        s_rf->read_expert_slice(0, 0, b2.data(), 0, 1);
+        t1 = std::chrono::high_resolution_clock::now();
+        double rf2_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        t0 = std::chrono::high_resolution_clock::now();
+        s_mmap->read_expert_slice(0, 0, b_mmap.data(), 0, 1);
+        t1 = std::chrono::high_resolution_clock::now();
+        double mmap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        expect(std::memcmp(b1.data(), b_mmap.data(), s_geom.slot_bytes) == 0, "Synthetic mmap vs readfile byte match failed");
+        std::cout << "  Synthetic expert (25 KB):"
+                  << " ReadFile 1st=" << rf1_ms << " ms,"
+                  << " ReadFile 2nd=" << rf2_ms << " ms,"
+                  << " Mmap=" << mmap_ms << " ms [PASSED]\n";
     }
 }
 
@@ -312,8 +362,103 @@ void test_cancellation_and_boundaries() {
     // Cancel calls
     reader->cancel();
     expect(reader->stats().cancel_calls == 1, "cancel_calls count mismatch");
+    expect(reader->is_cancelled(), "reader must report is_cancelled == true");
+
+    // After cancel, reads should short-circuit and not write data
+    std::fill(buf.begin(), buf.end(), 0xEE);
+    reader->read_expert_slice(0, 0, buf.data(), 0, 1);
+    expect(buf[0] == 0xEE, "Cancelled reader should return immediately without writing");
+
+    reader->reset_cancelled();
+    expect(!reader->is_cancelled(), "reader must report is_cancelled == false after reset");
 
     std::cout << "  Boundary handling and cancellation safe! [PASSED]\n";
+}
+
+void test_non_compact_unnested_float_absmax() {
+    std::cout << "[Test 6] Testing non-compact unnested float32 absmax (Issue 1 defense)...\n";
+    fs::path temp_dir = fs::temp_directory_path() / ("aila_unnested_test_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
+    fs::create_directories(temp_dir);
+    fs::path shard_path = temp_dir / "model.safetensors";
+
+    const int num_experts = 2;
+    const size_t gu_packed_bytes = 8192;
+    const size_t gu_absmax_count = 128;
+    const size_t gu_absmax_bytes = gu_absmax_count * sizeof(float);
+    const size_t dn_packed_bytes = 4096;
+    const size_t dn_absmax_count = 64;
+    const size_t dn_absmax_bytes = dn_absmax_count * sizeof(float);
+    const size_t slot_bytes = gu_packed_bytes + gu_absmax_bytes + dn_packed_bytes + dn_absmax_bytes;
+
+    std::vector<uint8_t> gu_packed(num_experts * gu_packed_bytes, 0x33);
+    std::vector<float> gu_absmax(num_experts * gu_absmax_count, 1.5f);
+    std::vector<uint8_t> dn_packed(num_experts * dn_packed_bytes, 0x55);
+    std::vector<float> dn_absmax(num_experts * dn_absmax_count, 2.5f);
+
+    size_t o0 = 0;
+    size_t o1 = o0 + gu_packed.size();
+    size_t o2 = o1 + gu_absmax.size() * sizeof(float);
+    size_t o3 = o2 + dn_packed.size();
+    size_t o4 = o3 + dn_absmax.size() * sizeof(float);
+
+    std::string json = "{"
+        "\"model.layers.0.mlp.experts.gate_up_proj.weight\":{\"dtype\":\"U8\",\"shape\":[" + std::to_string(num_experts * 64) + ",128],\"data_offsets\":[" + std::to_string(o0) + "," + std::to_string(o1) + "]},"
+        "\"model.layers.0.mlp.experts.gate_up_proj.weight.absmax\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(gu_absmax.size()) + "],\"data_offsets\":[" + std::to_string(o1) + "," + std::to_string(o2) + "]},"
+        "\"model.layers.0.mlp.experts.down_proj.weight\":{\"dtype\":\"U8\",\"shape\":[" + std::to_string(num_experts * 128) + ",32],\"data_offsets\":[" + std::to_string(o2) + "," + std::to_string(o3) + "]},"
+        "\"model.layers.0.mlp.experts.down_proj.weight.absmax\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(dn_absmax.size()) + "],\"data_offsets\":[" + std::to_string(o3) + "," + std::to_string(o4) + "]}"
+        "}";
+
+    uint64_t header_len = json.size();
+    std::ofstream out(shard_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&header_len), 8);
+    out.write(json.data(), json.size());
+    out.write(reinterpret_cast<const char*>(gu_packed.data()), gu_packed.size());
+    out.write(reinterpret_cast<const char*>(gu_absmax.data()), gu_absmax.size() * sizeof(float));
+    out.write(reinterpret_cast<const char*>(dn_packed.data()), dn_packed.size());
+    out.write(reinterpret_cast<const char*>(dn_absmax.data()), dn_absmax.size() * sizeof(float));
+    out.close();
+
+    ModelWeights weights = LoadModelWeightsLazy(temp_dir.string());
+
+    aila::ExpertSlotGeometry geom;
+    geom.gu_packed_bytes = gu_packed_bytes;
+    geom.gu_absmax_count = gu_absmax_count;
+    geom.gu_absmax_bytes = gu_absmax_bytes;
+    geom.dn_packed_bytes = dn_packed_bytes;
+    geom.dn_absmax_count = dn_absmax_count;
+    geom.dn_absmax_bytes = dn_absmax_bytes;
+    geom.gu_packed_offset = 0;
+    geom.gu_absmax_offset = geom.gu_packed_bytes;
+    geom.dn_packed_offset = geom.gu_absmax_offset + geom.gu_absmax_bytes;
+    geom.dn_absmax_offset = geom.dn_packed_offset + geom.dn_packed_bytes;
+    geom.slot_bytes = slot_bytes;
+    geom.compact_nested = false;
+
+    aila::ExpertLayerSource layer_src;
+    layer_src.gate_up.packed_weight = weights.host_view("model.layers.0.mlp.experts.gate_up_proj.weight");
+    layer_src.gate_up.absmax = weights.host_view("model.layers.0.mlp.experts.gate_up_proj.weight.absmax");
+    layer_src.gate_up.quant_state.nested = false;
+    layer_src.down.packed_weight = weights.host_view("model.layers.0.mlp.experts.down_proj.weight");
+    layer_src.down.absmax = weights.host_view("model.layers.0.mlp.experts.down_proj.weight.absmax");
+    layer_src.down.quant_state.nested = false;
+    layer_src.valid = true;
+
+    std::vector<aila::ExpertLayerSource> layers = { layer_src };
+    auto mmap_reader = aila::CreateMmapExpertReader(geom, layers, false);
+    auto rf_reader = aila::CreateOverlappedReadFileExpertReader(geom, weights.shard_paths(), layers);
+
+    std::vector<uint8_t> mmap_buf(slot_bytes, 0);
+    std::vector<uint8_t> rf_buf(slot_bytes, 0);
+
+    for (int e = 0; e < num_experts; ++e) {
+        mmap_reader->read_expert_slice(0, e, mmap_buf.data(), 0, 1);
+        rf_reader->read_expert_slice(0, e, rf_buf.data(), 0, 1);
+        expect(std::memcmp(mmap_buf.data(), rf_buf.data(), slot_bytes) == 0,
+               "Unnested float absmax byte mismatch for expert " + std::to_string(e));
+    }
+
+    try { fs::remove_all(temp_dir); } catch (...) {}
+    std::cout << "  Non-compact unnested float32 absmax reader verified! [PASSED]\n";
 }
 
 } // namespace
@@ -329,6 +474,7 @@ int main() {
         test_sliced_multipart_reads();
         test_first_vs_second_read_latency_comparison();
         test_cancellation_and_boundaries();
+        test_non_compact_unnested_float_absmax();
 
         std::cout << "========================================\n";
         std::cout << "  All H4 ExpertReader Tests PASSED!     \n";

@@ -339,7 +339,8 @@ public:
     void set_reader(std::unique_ptr<aila::IExpertReader> reader) { reader_ = std::move(reader); }
     void set_reader_type(aila::ExpertReaderType type);
 
-    const DmaTimingStats& dma_timing_stats() const { return dma_timing_stats_; }
+    const DmaTimingStats& dma_timing_stats();
+    void update_dma_profiling();
     void record_first_consumer_start();
     sycl::event get_slot_dma_event(int slot_id) const;
 
@@ -349,7 +350,7 @@ private:
     void bind_slot_nested_metadata(int slot, int layer, int expert_id);
     // Fills part [part, nparts) of every slot segment for one expert.
     void load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
-                                int part = 0, int nparts = 1);
+                                int part = 0, int nparts = 1, uint64_t slot_gen = 0);
 
     Context* ctx_ = nullptr;
     const ModelWeights* weights_ = nullptr;
@@ -512,6 +513,7 @@ private:
     std::chrono::high_resolution_clock::time_point last_batch_submit_end_time_{};
     sycl::event last_batch_dma_event_{};
     sycl::event first_batch_dma_event_{};
+    bool new_dma_batch_pending_ = false;
 };
 
 inline void HostExpertLease::release() {

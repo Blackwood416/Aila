@@ -66,6 +66,8 @@ public:
 
     // Cancel in-flight I/O operations
     virtual void cancel() {}
+    virtual void reset_cancelled() {}
+    virtual bool is_cancelled() const { return false; }
 
     // Update layer source bindings
     virtual void set_layer_source(int layer, const ExpertLayerSource& src) = 0;

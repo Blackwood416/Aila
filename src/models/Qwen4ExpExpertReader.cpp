@@ -110,6 +110,7 @@ public:
 
     void read_expert_slice(int layer, int expert_id, uint8_t* staging_slot,
                            int part, int nparts, uint64_t /*slot_gen*/) override {
+        if (cancelled_.load(std::memory_order_acquire)) return;
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (layer < 0 || layer >= static_cast<int>(layers_.size()) || !layers_[layer].valid) {
             size_t b0 = 0, b1 = 0;
@@ -122,6 +123,7 @@ public:
                          staging_slot + geom_.gu_packed_offset, geom_.gu_packed_bytes,
                          staging_slot + geom_.gu_absmax_offset, geom_.gu_absmax_count, geom_.compact_nested,
                          part, nparts);
+        if (cancelled_.load(std::memory_order_acquire)) return;
         mmap_fill_matrix(lw.down, expert_id,
                          staging_slot + geom_.dn_packed_offset, geom_.dn_packed_bytes,
                          staging_slot + geom_.dn_absmax_offset, geom_.dn_absmax_count, geom_.compact_nested,
@@ -131,6 +133,19 @@ public:
         stats_.read_count++;
         stats_.read_bytes += geom_.slot_bytes / static_cast<size_t>(std::max(1, nparts));
         stats_.read_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    }
+
+    void cancel() override {
+        stats_.cancel_calls++;
+        cancelled_.store(true, std::memory_order_release);
+    }
+
+    void reset_cancelled() override {
+        cancelled_.store(false, std::memory_order_release);
+    }
+
+    bool is_cancelled() const override {
+        return cancelled_.load(std::memory_order_acquire);
     }
 
     void prefetch_expert(int layer, int expert_id) override {
@@ -186,6 +201,7 @@ private:
     ExpertSlotGeometry geom_{};
     std::vector<ExpertLayerSource> layers_;
     bool enable_virtual_prefetch_ = false;
+    std::atomic<bool> cancelled_{false};
     ExpertReaderStats stats_{};
 };
 
@@ -234,6 +250,7 @@ public:
 
     void read_expert_slice(int layer, int expert_id, uint8_t* staging_slot,
                            int part, int nparts, uint64_t /*slot_gen*/) override {
+        if (cancelled_.load(std::memory_order_acquire)) return;
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (layer < 0 || layer >= static_cast<int>(layers_.size()) || !layers_[layer].valid) {
             size_t b0 = 0, b1 = 0;
@@ -261,6 +278,7 @@ public:
                              staging_slot + geom_.gu_packed_offset, geom_.gu_packed_bytes,
                              staging_slot + geom_.gu_absmax_offset, geom_.gu_absmax_count, geom_.compact_nested,
                              part, nparts);
+            if (cancelled_.load(std::memory_order_acquire)) return;
             mmap_fill_matrix(lw.down, expert_id,
                              staging_slot + geom_.dn_packed_offset, geom_.dn_packed_bytes,
                              staging_slot + geom_.dn_absmax_offset, geom_.dn_absmax_count, geom_.compact_nested,
@@ -279,8 +297,11 @@ public:
             part_range(geom_.gu_packed_bytes, part, nparts, b0, b1);
             const uint64_t offset = gu_p_span.absolute_offset +
                 static_cast<uint64_t>(expert_id) * geom_.gu_packed_bytes + b0;
-            read_segment(gu_p_span.shard_id, offset, staging_slot + geom_.gu_packed_offset + b0, b1 - b0);
+            if (!read_segment(gu_p_span.shard_id, offset, staging_slot + geom_.gu_packed_offset + b0, b1 - b0)) {
+                return;
+            }
         }
+        if (cancelled_.load(std::memory_order_acquire)) return;
 
         // 2. Gate/Up absmax
         {
@@ -289,18 +310,23 @@ public:
             if (geom_.compact_nested) {
                 const uint64_t offset = gu_a_span.absolute_offset +
                     static_cast<uint64_t>(expert_id) * geom_.gu_absmax_count + a0;
-                read_segment(gu_a_span.shard_id, offset, staging_slot + geom_.gu_absmax_offset + a0, a1 - a0);
-            } else {
+                if (!read_segment(gu_a_span.shard_id, offset, staging_slot + geom_.gu_absmax_offset + a0, a1 - a0)) {
+                    return;
+                }
+            } else if (lw.gate_up.quant_state.nested) {
                 // Non-compact nested: read u8 codes into local buffer and expand to float absmax
                 uint8_t temp_codes[512];
                 const size_t count = a1 - a0;
                 const size_t chunk_limit = sizeof(temp_codes);
                 size_t done = 0;
                 while (done < count) {
+                    if (cancelled_.load(std::memory_order_acquire)) return;
                     const size_t cur_chunk = std::min(count - done, chunk_limit);
                     const uint64_t offset = gu_a_span.absolute_offset +
                         static_cast<uint64_t>(expert_id) * geom_.gu_absmax_count + a0 + done;
-                    read_segment(gu_a_span.shard_id, offset, temp_codes, cur_chunk);
+                    if (!read_segment(gu_a_span.shard_id, offset, temp_codes, cur_chunk)) {
+                        return;
+                    }
 
                     float* absmax_f32 = reinterpret_cast<float*>(staging_slot + geom_.gu_absmax_offset);
                     const float* nested_absmax = lw.gate_up.nested_absmax_ptr();
@@ -317,8 +343,18 @@ public:
                     }
                     done += cur_chunk;
                 }
+            } else {
+                // Non-nested: absmax is already float32
+                float* absmax_f32 = reinterpret_cast<float*>(staging_slot + geom_.gu_absmax_offset);
+                const size_t float_bytes = (a1 - a0) * sizeof(float);
+                const uint64_t offset = gu_a_span.absolute_offset +
+                    (static_cast<uint64_t>(expert_id) * geom_.gu_absmax_count + a0) * sizeof(float);
+                if (!read_segment(gu_a_span.shard_id, offset, reinterpret_cast<uint8_t*>(absmax_f32 + a0), float_bytes)) {
+                    return;
+                }
             }
         }
+        if (cancelled_.load(std::memory_order_acquire)) return;
 
         // 3. Down packed
         {
@@ -326,8 +362,11 @@ public:
             part_range(geom_.dn_packed_bytes, part, nparts, b0, b1);
             const uint64_t offset = dn_p_span.absolute_offset +
                 static_cast<uint64_t>(expert_id) * geom_.dn_packed_bytes + b0;
-            read_segment(dn_p_span.shard_id, offset, staging_slot + geom_.dn_packed_offset + b0, b1 - b0);
+            if (!read_segment(dn_p_span.shard_id, offset, staging_slot + geom_.dn_packed_offset + b0, b1 - b0)) {
+                return;
+            }
         }
+        if (cancelled_.load(std::memory_order_acquire)) return;
 
         // 4. Down absmax
         {
@@ -336,17 +375,22 @@ public:
             if (geom_.compact_nested) {
                 const uint64_t offset = dn_a_span.absolute_offset +
                     static_cast<uint64_t>(expert_id) * geom_.dn_absmax_count + a0;
-                read_segment(dn_a_span.shard_id, offset, staging_slot + geom_.dn_absmax_offset + a0, a1 - a0);
-            } else {
+                if (!read_segment(dn_a_span.shard_id, offset, staging_slot + geom_.dn_absmax_offset + a0, a1 - a0)) {
+                    return;
+                }
+            } else if (lw.down.quant_state.nested) {
                 uint8_t temp_codes[512];
                 const size_t count = a1 - a0;
                 const size_t chunk_limit = sizeof(temp_codes);
                 size_t done = 0;
                 while (done < count) {
+                    if (cancelled_.load(std::memory_order_acquire)) return;
                     const size_t cur_chunk = std::min(count - done, chunk_limit);
                     const uint64_t offset = dn_a_span.absolute_offset +
                         static_cast<uint64_t>(expert_id) * geom_.dn_absmax_count + a0 + done;
-                    read_segment(dn_a_span.shard_id, offset, temp_codes, cur_chunk);
+                    if (!read_segment(dn_a_span.shard_id, offset, temp_codes, cur_chunk)) {
+                        return;
+                    }
 
                     float* absmax_f32 = reinterpret_cast<float*>(staging_slot + geom_.dn_absmax_offset);
                     const float* nested_absmax = lw.down.nested_absmax_ptr();
@@ -363,6 +407,14 @@ public:
                     }
                     done += cur_chunk;
                 }
+            } else {
+                float* absmax_f32 = reinterpret_cast<float*>(staging_slot + geom_.dn_absmax_offset);
+                const size_t float_bytes = (a1 - a0) * sizeof(float);
+                const uint64_t offset = dn_a_span.absolute_offset +
+                    (static_cast<uint64_t>(expert_id) * geom_.dn_absmax_count + a0) * sizeof(float);
+                if (!read_segment(dn_a_span.shard_id, offset, reinterpret_cast<uint8_t*>(absmax_f32 + a0), float_bytes)) {
+                    return;
+                }
             }
         }
 
@@ -375,12 +427,21 @@ public:
     void cancel() override {
 #ifdef _WIN32
         stats_.cancel_calls++;
+        cancelled_.store(true, std::memory_order_release);
         for (HANDLE h : shard_handles_) {
             if (h != INVALID_HANDLE_VALUE) {
                 CancelIoEx(h, NULL);
             }
         }
 #endif
+    }
+
+    void reset_cancelled() override {
+        cancelled_.store(false, std::memory_order_release);
+    }
+
+    bool is_cancelled() const override {
+        return cancelled_.load(std::memory_order_acquire);
     }
 
     void set_layer_source(int layer, const ExpertLayerSource& src) override {
@@ -403,8 +464,9 @@ private:
 #endif
     }
 
-    void read_segment(int shard_id, uint64_t file_offset, uint8_t* dst, size_t bytes_to_read) {
-        if (bytes_to_read == 0) return;
+    bool read_segment(int shard_id, uint64_t file_offset, uint8_t* dst, size_t bytes_to_read) {
+        if (bytes_to_read == 0) return true;
+        if (cancelled_.load(std::memory_order_acquire)) return false;
 #ifdef _WIN32
         HANDLE h = shard_handles_[shard_id];
         auto& io_ctx = t_io_ctx;
@@ -413,6 +475,7 @@ private:
         size_t remaining = bytes_to_read;
 
         while (remaining > 0) {
+            if (cancelled_.load(std::memory_order_acquire)) return false;
             io_ctx.ov.Offset = static_cast<DWORD>(cur_offset & 0xFFFFFFFF);
             io_ctx.ov.OffsetHigh = static_cast<DWORD>((cur_offset >> 32) & 0xFFFFFFFF);
             ResetEvent(io_ctx.hEvent);
@@ -423,20 +486,20 @@ private:
             if (!ok) {
                 DWORD err = GetLastError();
                 if (err == ERROR_IO_PENDING) {
-                    DWORD wait_res = WaitForSingleObject(io_ctx.hEvent, INFINITE);
-                    if (wait_res == WAIT_OBJECT_0) {
-                        if (!GetOverlappedResult(h, &io_ctx.ov, &bytes_read, FALSE)) {
-                            DWORD res_err = GetLastError();
-                            if (res_err == ERROR_OPERATION_ABORTED) return;
-                            throw std::runtime_error("GetOverlappedResult failed: " + std::to_string(res_err));
-                        }
-                    } else {
-                        throw std::runtime_error("WaitForSingleObject failed on overlapped read event");
+                    if (!GetOverlappedResult(h, &io_ctx.ov, &bytes_read, TRUE)) {
+                        DWORD res_err = GetLastError();
+                        if (res_err == ERROR_OPERATION_ABORTED) return false;
+                        throw std::runtime_error("GetOverlappedResult failed: " + std::to_string(res_err));
                     }
                 } else if (err == ERROR_OPERATION_ABORTED) {
-                    return;
+                    return false;
                 } else {
                     throw std::runtime_error("ReadFile failed with error: " + std::to_string(err));
+                }
+            } else {
+                if (!GetOverlappedResult(h, &io_ctx.ov, &bytes_read, FALSE)) {
+                    DWORD res_err = GetLastError();
+                    if (res_err == ERROR_OPERATION_ABORTED) return false;
                 }
             }
             if (bytes_read == 0) break; // EOF
@@ -444,8 +507,10 @@ private:
             cur_dst += bytes_read;
             remaining -= bytes_read;
         }
+        return true;
 #else
         std::memset(dst, 0, bytes_to_read);
+        return true;
 #endif
     }
 
@@ -455,6 +520,7 @@ private:
     std::vector<HANDLE> shard_handles_;
 #endif
     std::vector<ExpertLayerSource> layers_;
+    std::atomic<bool> cancelled_{false};
     ExpertReaderStats stats_{};
 };
 
