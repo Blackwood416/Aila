@@ -253,7 +253,7 @@ void moe_silu_gate_up_mul_flat(
     int total_tokens,
     int intermediate_size);
 
-// Phase S4 & W4 (C1/C2): Expert-Major Prefill Gate/Up and Down
+// Phase S4, W4 & G3: Expert-Major Prefill Gate/Up and Down
 sycl::event moe_expert_major_prefill_gate_up(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -269,7 +269,8 @@ sycl::event moe_expert_major_prefill_gate_up(
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
     bool use_nested = false,
-    int num_pairs = 0);
+    int num_pairs = 0,
+    int num_quads = 0);
 
 sycl::event moe_expert_major_prefill_down(
     Context& ctx,
@@ -286,7 +287,8 @@ sycl::event moe_expert_major_prefill_down(
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
     bool use_nested = false,
-    int num_pairs = 0);
+    int num_pairs = 0,
+    int num_quads = 0);
 
 // Phase W4 (C1): Explicit 2-token weight reuse prefill kernels
 sycl::event moe_expert_major_prefill_gate_up_2token(
@@ -314,6 +316,39 @@ sycl::event moe_expert_major_prefill_down_2token(
     const bf16* h,
     float* down_acc,
     int total_pairs,
+    int top_k,
+    int in_features = 640,
+    int out_features = 2560,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+// Phase G3: Explicit 4-token weight reuse prefill kernels
+sycl::event moe_expert_major_prefill_gate_up_4token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false);
+
+sycl::event moe_expert_major_prefill_down_4token(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* h,
+    float* down_acc,
+    int total_quads,
     int top_k,
     int in_features = 640,
     int out_features = 2560,

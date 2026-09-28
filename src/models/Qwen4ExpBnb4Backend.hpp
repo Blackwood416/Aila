@@ -323,10 +323,11 @@ private:
     ops::MoeExpertSlotDev* batch_slots_dev_ = nullptr;
     float* batch_weights_dev_ = nullptr;
 
-    // Phase S4 & W4 (C1/C2): Expert-major prefill bucket sort and mapping tables (host pinned and device mirrors).
+    // Phase S4, W4 & G3: Expert-major prefill bucket sort and mapping tables (host pinned and device mirrors).
     int* expert_offsets_host_ = nullptr;
     int* expert_counts_host_ = nullptr;
     int* expert_curr_pos_host_ = nullptr;
+    int* expert_quad_pos_host_ = nullptr;
     int* expert_pair_pos_host_ = nullptr;
     int* expert_single_pos_host_ = nullptr;
     int* expert_map_token_host_ = nullptr;

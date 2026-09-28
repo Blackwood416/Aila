@@ -278,6 +278,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (expert_offsets_host_) context_->free_host(expert_offsets_host_);
     if (expert_counts_host_) context_->free_host(expert_counts_host_);
     if (expert_curr_pos_host_) context_->free_host(expert_curr_pos_host_);
+    if (expert_quad_pos_host_) context_->free_host(expert_quad_pos_host_);
     if (expert_pair_pos_host_) context_->free_host(expert_pair_pos_host_);
     if (expert_single_pos_host_) context_->free_host(expert_single_pos_host_);
     if (expert_map_token_host_) context_->free_host(expert_map_token_host_);
@@ -289,6 +290,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     expert_offsets_host_ = nullptr;
     expert_counts_host_ = nullptr;
     expert_curr_pos_host_ = nullptr;
+    expert_quad_pos_host_ = nullptr;
     expert_pair_pos_host_ = nullptr;
     expert_single_pos_host_ = nullptr;
     expert_map_token_host_ = nullptr;
@@ -643,10 +645,10 @@ bool Qwen4ExpBnb4Backend::load(
         ctx.synchronize();
         break;
     }
-    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
+    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
     const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
-    const char* prefill_mode = s_expert_major ? "S4 (expert-major)" : (s_moe_rows ? "S1 (batched-rows)" : "baseline (token-by-token)");
+    const char* prefill_mode = s_expert_major ? "S4 (expert-major W4/G3)" : (s_moe_rows ? "S1 (batched-rows)" : "baseline (token-by-token)");
     AILA_LOG_INFO("[Qwen4Exp] Prefill MoE mode: %s, Router pred: %s",
                   prefill_mode, s_pred_ids_only ? "ids-only" : "full-softmax");
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
@@ -733,7 +735,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     if (embed_host_.valid()) {
         embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
     }
-    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
+    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
 
     if (s_expert_major || s_moe_rows) {
@@ -758,6 +760,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         expert_offsets_host_ = static_cast<int*>(ctx.alloc_host((cfg_.num_experts + 1) * sizeof(int)));
         expert_counts_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_curr_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
+        expert_quad_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_pair_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_single_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_map_token_host_ = static_cast<int*>(
@@ -1536,7 +1539,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const bool can_batch = count > 1 && !cpu_small_m && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
         bool batch_acquire = false;
         sycl::event batch_dma_event{};
-        static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", false);
+        static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
         static const bool s_prefill_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
         static const int s_demand_microbatch = aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0);
         const bool use_microbatch_pipeline = can_batch && s_expert_major_prefill && count > 1 && (s_demand_microbatch > 0);
@@ -1610,28 +1613,47 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     }
                 }
                 static const bool s_q4e_weight_reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
+                static const bool s_q4e_4token = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
                 if (s_q4e_weight_reuse) {
                     int cur_chunk_start = 0;
                     size_t scan_u = 0;
                     while (scan_u < prefill_unique_.size()) {
                         const size_t c_u = std::min<size_t>(static_cast<size_t>(s_demand_microbatch),
                                                             prefill_unique_.size() - scan_u);
+                        int c_quads = 0;
                         int c_pairs = 0;
                         int c_acts = 0;
                         for (size_t g = 0; g < c_u; ++g) {
                             const int e = prefill_unique_[scan_u + g];
-                            c_pairs += expert_counts_host_[e] / 2;
-                            c_acts += expert_counts_host_[e];
+                            const int cnt = expert_counts_host_[e];
+                            if (s_q4e_4token) {
+                                c_quads += cnt / 4;
+                                c_pairs += (cnt % 4) / 2;
+                            } else {
+                                c_pairs += cnt / 2;
+                            }
+                            c_acts += cnt;
                         }
                         expert_offsets_host_[prefill_unique_[scan_u]] = cur_chunk_start;
-                        int pair_off = cur_chunk_start;
-                        int single_off = cur_chunk_start + 2 * c_pairs;
+                        int quad_off = cur_chunk_start;
+                        int pair_off = cur_chunk_start + 4 * c_quads;
+                        int single_off = cur_chunk_start + 4 * c_quads + 2 * c_pairs;
                         for (size_t g = 0; g < c_u; ++g) {
                             const int e = prefill_unique_[scan_u + g];
-                            expert_pair_pos_host_[e] = pair_off;
-                            expert_single_pos_host_[e] = single_off;
-                            pair_off += (expert_counts_host_[e] / 2) * 2;
-                            single_off += (expert_counts_host_[e] % 2);
+                            const int cnt = expert_counts_host_[e];
+                            if (s_q4e_4token) {
+                                expert_quad_pos_host_[e] = quad_off;
+                                expert_pair_pos_host_[e] = pair_off;
+                                expert_single_pos_host_[e] = single_off;
+                                quad_off += (cnt / 4) * 4;
+                                pair_off += ((cnt % 4) / 2) * 2;
+                                single_off += (cnt % 2);
+                            } else {
+                                expert_pair_pos_host_[e] = pair_off;
+                                expert_single_pos_host_[e] = single_off;
+                                pair_off += (cnt / 2) * 2;
+                                single_off += (cnt % 2);
+                            }
                         }
                         cur_chunk_start += c_acts;
                         scan_u += c_u;
@@ -1643,12 +1665,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             const int e = router_host_ids_[i];
                             if (e >= 0 && e < cfg_.num_experts) {
                                 const int seen = expert_curr_pos_host_[e]++;
-                                const int pairs_limit = (expert_counts_host_[e] / 2) * 2;
+                                const int cnt = expert_counts_host_[e];
                                 int pos;
-                                if (seen < pairs_limit) {
-                                    pos = expert_pair_pos_host_[e] + seen;
+                                if (s_q4e_4token) {
+                                    const int quads_limit = (cnt / 4) * 4;
+                                    const int pairs_limit = quads_limit + ((cnt % 4) / 2) * 2;
+                                    if (seen < quads_limit) {
+                                        pos = expert_quad_pos_host_[e] + seen;
+                                    } else if (seen < pairs_limit) {
+                                        pos = expert_pair_pos_host_[e] + (seen - quads_limit);
+                                    } else {
+                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                                    }
                                 } else {
-                                    pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                                    const int pairs_limit = (cnt / 2) * 2;
+                                    if (seen < pairs_limit) {
+                                        pos = expert_pair_pos_host_[e] + seen;
+                                    } else {
+                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                                    }
                                 }
                                 expert_map_token_host_[pos] = t;
                                 expert_map_rank_host_[pos] = k;
@@ -1694,12 +1729,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                                             prefill_unique_.size() - u);
                     const int act_start = expert_offsets_host_[prefill_unique_[u]];
                     int act_count = 0;
+                    int chunk_quads = 0;
                     int chunk_pairs = 0;
                     for (size_t g = 0; g < chunk_u; ++g) {
                         const int e = prefill_unique_[u + g];
-                        act_count += expert_counts_host_[e];
+                        const int cnt = expert_counts_host_[e];
+                        act_count += cnt;
                         if (s_q4e_weight_reuse) {
-                            chunk_pairs += expert_counts_host_[e] / 2;
+                            if (s_q4e_4token) {
+                                chunk_quads += cnt / 4;
+                                chunk_pairs += (cnt % 4) / 2;
+                            } else {
+                                chunk_pairs += cnt / 2;
+                            }
                         }
                     }
 
@@ -1715,13 +1757,29 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                         prefill_expert_slot_[e] = slot;
                         const ops::MoeExpertSlotDev dev_s = expert_cache_.get_slot_dev(slot);
                         if (s_q4e_weight_reuse) {
-                            const int p_start = expert_pair_pos_host_[e];
-                            const int p_cnt = (expert_counts_host_[e] / 2) * 2;
-                            for (int p = p_start; p < p_start + p_cnt; ++p) {
-                                expert_map_slot_host_[p] = dev_s;
-                            }
-                            if (expert_counts_host_[e] % 2 != 0) {
-                                expert_map_slot_host_[expert_single_pos_host_[e]] = dev_s;
+                            if (s_q4e_4token) {
+                                const int q_start = expert_quad_pos_host_[e];
+                                const int q_cnt = (expert_counts_host_[e] / 4) * 4;
+                                for (int p = q_start; p < q_start + q_cnt; ++p) {
+                                    expert_map_slot_host_[p] = dev_s;
+                                }
+                                const int p_start = expert_pair_pos_host_[e];
+                                const int p_cnt = ((expert_counts_host_[e] % 4) / 2) * 2;
+                                for (int p = p_start; p < p_start + p_cnt; ++p) {
+                                    expert_map_slot_host_[p] = dev_s;
+                                }
+                                if (expert_counts_host_[e] % 2 != 0) {
+                                    expert_map_slot_host_[expert_single_pos_host_[e]] = dev_s;
+                                }
+                            } else {
+                                const int p_start = expert_pair_pos_host_[e];
+                                const int p_cnt = (expert_counts_host_[e] / 2) * 2;
+                                for (int p = p_start; p < p_start + p_cnt; ++p) {
+                                    expert_map_slot_host_[p] = dev_s;
+                                }
+                                if (expert_counts_host_[e] % 2 != 0) {
+                                    expert_map_slot_host_[expert_single_pos_host_[e]] = dev_s;
+                                }
                             }
                         } else {
                             const int e_start = expert_offsets_host_[e];
@@ -1744,7 +1802,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             nullptr, x_ptr, h_ptr, act_count, top_k,
                             hidden_size_, cfg_.moe_intermediate_size, 64,
                             &group_dma_event, expert_cache_.uses_nested_codes(),
-                            s_q4e_weight_reuse ? chunk_pairs : 0);
+                            s_q4e_weight_reuse ? chunk_pairs : 0,
+                            (s_q4e_weight_reuse && s_q4e_4token) ? chunk_quads : 0);
 
                         sycl::event dn_event = ops::moe_expert_major_prefill_down(
                             ctx, expert_map_slot_dev_ + act_start,
@@ -1753,7 +1812,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             nullptr, h_ptr, static_cast<float*>(buf_.moe_down_acc.data()),
                             act_count, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
                             &gu_event, expert_cache_.uses_nested_codes(),
-                            s_q4e_weight_reuse ? chunk_pairs : 0);
+                            s_q4e_weight_reuse ? chunk_pairs : 0,
+                            (s_q4e_weight_reuse && s_q4e_4token) ? chunk_quads : 0);
 
                         expert_cache_.record_consumer_reader_fences(
                             prefill_unique_slots_.data() + u, static_cast<int>(chunk_u), dn_event);
@@ -1806,38 +1866,86 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     }
                 }
                 static const bool s_q4e_weight_reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
+                static const bool s_q4e_4token = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
+                int total_quads = 0;
                 int total_pairs = 0;
                 if (s_q4e_weight_reuse) {
-                    for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                        const int e = prefill_unique_[u];
-                        total_pairs += expert_counts_host_[e] / 2;
-                    }
-                    int pair_off = 0;
-                    int single_off = 2 * total_pairs;
-                    for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                        const int e = prefill_unique_[u];
-                        expert_pair_pos_host_[e] = pair_off;
-                        expert_single_pos_host_[e] = single_off;
-                        pair_off += (expert_counts_host_[e] / 2) * 2;
-                        single_off += (expert_counts_host_[e] % 2);
-                    }
-                    std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
-                    for (int t = 0; t < count; ++t) {
-                        for (int k = 0; k < top_k; ++k) {
-                            const int i = t * top_k + k;
-                            const int e = router_host_ids_[i];
-                            if (e >= 0 && e < cfg_.num_experts) {
-                                const int seen = expert_curr_pos_host_[e]++;
-                                const int pairs_limit = (expert_counts_host_[e] / 2) * 2;
-                                int pos;
-                                if (seen < pairs_limit) {
-                                    pos = expert_pair_pos_host_[e] + seen;
-                                } else {
-                                    pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                    if (s_q4e_4token) {
+                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                            const int e = prefill_unique_[u];
+                            const int cnt = expert_counts_host_[e];
+                            total_quads += cnt / 4;
+                            total_pairs += (cnt % 4) / 2;
+                        }
+                        int quad_off = 0;
+                        int pair_off = 4 * total_quads;
+                        int single_off = 4 * total_quads + 2 * total_pairs;
+                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                            const int e = prefill_unique_[u];
+                            const int cnt = expert_counts_host_[e];
+                            expert_quad_pos_host_[e] = quad_off;
+                            expert_pair_pos_host_[e] = pair_off;
+                            expert_single_pos_host_[e] = single_off;
+                            quad_off += (cnt / 4) * 4;
+                            pair_off += ((cnt % 4) / 2) * 2;
+                            single_off += (cnt % 2);
+                        }
+                        std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
+                        for (int t = 0; t < count; ++t) {
+                            for (int k = 0; k < top_k; ++k) {
+                                const int i = t * top_k + k;
+                                const int e = router_host_ids_[i];
+                                if (e >= 0 && e < cfg_.num_experts) {
+                                    const int seen = expert_curr_pos_host_[e]++;
+                                    const int cnt = expert_counts_host_[e];
+                                    const int quads_limit = (cnt / 4) * 4;
+                                    const int pairs_limit = quads_limit + ((cnt % 4) / 2) * 2;
+                                    int pos;
+                                    if (seen < quads_limit) {
+                                        pos = expert_quad_pos_host_[e] + seen;
+                                    } else if (seen < pairs_limit) {
+                                        pos = expert_pair_pos_host_[e] + (seen - quads_limit);
+                                    } else {
+                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                                    }
+                                    expert_map_token_host_[pos] = t;
+                                    expert_map_rank_host_[pos] = k;
+                                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
                                 }
-                                expert_map_token_host_[pos] = t;
-                                expert_map_rank_host_[pos] = k;
-                                expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+                            }
+                        }
+                    } else {
+                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                            const int e = prefill_unique_[u];
+                            total_pairs += expert_counts_host_[e] / 2;
+                        }
+                        int pair_off = 0;
+                        int single_off = 2 * total_pairs;
+                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
+                            const int e = prefill_unique_[u];
+                            expert_pair_pos_host_[e] = pair_off;
+                            expert_single_pos_host_[e] = single_off;
+                            pair_off += (expert_counts_host_[e] / 2) * 2;
+                            single_off += (expert_counts_host_[e] % 2);
+                        }
+                        std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
+                        for (int t = 0; t < count; ++t) {
+                            for (int k = 0; k < top_k; ++k) {
+                                const int i = t * top_k + k;
+                                const int e = router_host_ids_[i];
+                                if (e >= 0 && e < cfg_.num_experts) {
+                                    const int seen = expert_curr_pos_host_[e]++;
+                                    const int pairs_limit = (expert_counts_host_[e] / 2) * 2;
+                                    int pos;
+                                    if (seen < pairs_limit) {
+                                        pos = expert_pair_pos_host_[e] + seen;
+                                    } else {
+                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
+                                    }
+                                    expert_map_token_host_[pos] = t;
+                                    expert_map_rank_host_[pos] = k;
+                                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+                                }
                             }
                         }
                     }
@@ -1879,14 +1987,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     nullptr, x_ptr, h_ptr, total_acts, top_k,
                     hidden_size_, cfg_.moe_intermediate_size, 64,
                     &batch_dma_event, expert_cache_.uses_nested_codes(),
-                    s_q4e_weight_reuse ? total_pairs : 0);
+                    s_q4e_weight_reuse ? total_pairs : 0,
+                    (s_q4e_weight_reuse && s_q4e_4token) ? total_quads : 0);
 
                 sycl::event dn_event = ops::moe_expert_major_prefill_down(
                     ctx, expert_map_slot_dev_, expert_map_token_dev_, expert_map_rank_dev_,
                     nullptr, h_ptr, static_cast<float*>(buf_.moe_down_acc.data()),
                     total_acts, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
                     &gu_event, expert_cache_.uses_nested_codes(),
-                    s_q4e_weight_reuse ? total_pairs : 0);
+                    s_q4e_weight_reuse ? total_pairs : 0,
+                    (s_q4e_weight_reuse && s_q4e_4token) ? total_quads : 0);
 
                 ops::moe_ordered_accumulate_down_rows(
                     ctx, static_cast<const float*>(buf_.moe_down_acc.data()), batch_weights_dev_,

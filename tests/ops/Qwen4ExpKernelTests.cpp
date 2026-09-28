@@ -1372,10 +1372,183 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
     }
     ctx.free_device(wr_slots_dev);
 
+    // 6. Expert-major prefill with 4-token weight reuse (Phase G3)
+    int total_quads = 0;
+    int total_pairs_g3 = 0;
+    for (int e = 0; e < num_unique_experts; ++e) {
+        int cnt = expert_counts[e];
+        total_quads += cnt / 4;
+        total_pairs_g3 += (cnt % 4) / 2;
+    }
+    std::vector<int> g3_quad_pos(num_unique_experts, 0);
+    std::vector<int> g3_pair_pos(num_unique_experts, 0);
+    std::vector<int> g3_single_pos(num_unique_experts, 0);
+    int q_off = 0;
+    int p_off_g3 = 4 * total_quads;
+    int s_off_g3 = 4 * total_quads + 2 * total_pairs_g3;
+    for (int e = 0; e < num_unique_experts; ++e) {
+        int cnt = expert_counts[e];
+        g3_quad_pos[e] = q_off;
+        g3_pair_pos[e] = p_off_g3;
+        g3_single_pos[e] = s_off_g3;
+        q_off += (cnt / 4) * 4;
+        p_off_g3 += ((cnt % 4) / 2) * 2;
+        s_off_g3 += (cnt % 2);
+    }
+    std::vector<int> g3_tokens(total_acts);
+    std::vector<int> g3_ranks(total_acts);
+    std::vector<ops::MoeExpertSlotDev> g3_slots(total_acts);
+    std::vector<int> g3_expert_seen(num_unique_experts, 0);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < num_active_experts; ++k) {
+            int e = (t * 7 + k) % num_unique_experts;
+            int seen = g3_expert_seen[e]++;
+            int cnt = expert_counts[e];
+            int q_limit = (cnt / 4) * 4;
+            int p_limit = q_limit + ((cnt % 4) / 2) * 2;
+            int pos;
+            if (seen < q_limit) {
+                pos = g3_quad_pos[e] + seen;
+            } else if (seen < p_limit) {
+                pos = g3_pair_pos[e] + (seen - q_limit);
+            } else {
+                pos = g3_single_pos[e] + (seen - p_limit);
+            }
+            g3_tokens[pos] = t;
+            g3_ranks[pos] = k;
+            g3_slots[pos] = expert_pool[e];
+        }
+    }
+
+    Tensor g3_tokens_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    Tensor g3_ranks_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+    ops::MoeExpertSlotDev* g3_slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+    Tensor g3_h_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+    Tensor g3_down_acc_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+    Tensor g3_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+    Tensor g3_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(g3_tokens_dev.data(), g3_tokens.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(g3_ranks_dev.data(), g3_ranks.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(g3_slots_dev, g3_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+    sycl::event g3_gu = ops::moe_expert_major_prefill_gate_up(
+        ctx, g3_slots_dev,
+        static_cast<const int*>(g3_tokens_dev.data()),
+        static_cast<const int*>(g3_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(x_dev.data()),
+        static_cast<bf16*>(g3_h_dev.data()),
+        total_acts, num_active_experts, in_features, intermediate_size, blocksize,
+        nullptr, use_nested, total_pairs_g3, total_quads);
+
+    sycl::event g3_dn = ops::moe_expert_major_prefill_down(
+        ctx, g3_slots_dev,
+        static_cast<const int*>(g3_tokens_dev.data()),
+        static_cast<const int*>(g3_ranks_dev.data()),
+        nullptr,
+        static_cast<const bf16*>(g3_h_dev.data()),
+        static_cast<float*>(g3_down_acc_dev.data()),
+        total_acts, num_active_experts, intermediate_size, out_features, blocksize,
+        &g3_gu, use_nested, total_pairs_g3, total_quads);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(g3_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(g3_y_dev.data()),
+        tokens, num_active_experts, out_features,
+        nullptr, nullptr, &g3_dn);
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, static_cast<const float*>(g3_down_acc_dev.data()),
+        weights_dev,
+        static_cast<bf16*>(g3_y_fused_dev.data()),
+        tokens, num_active_experts, out_features,
+        static_cast<const bf16*>(shared_dev.data()),
+        static_cast<const bf16*>(gate_dev.data()),
+        &g3_dn);
+
+    ctx.synchronize();
+
+    std::vector<bf16> g3_h(total_acts * intermediate_size);
+    std::vector<bf16> g3_y(tokens * out_features);
+    std::vector<bf16> g3_y_fused(tokens * out_features);
+    ctx.memcpy_d2h(g3_h.data(), g3_h_dev.data(), g3_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(g3_y.data(), g3_y_dev.data(), g3_y.size() * sizeof(bf16));
+    ctx.memcpy_d2h(g3_y_fused.data(), g3_y_fused_dev.data(), g3_y_fused.size() * sizeof(bf16));
+
+    for (size_t i = 0; i < ref_h.size(); ++i) {
+        if (g3_h[i] != ref_h[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_gate_up (4-token reuse) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y.size(); ++i) {
+        if (g3_y[i] != ref_y[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down (4-token reuse) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+    for (size_t i = 0; i < ref_y_fused.size(); ++i) {
+        if (g3_y_fused[i] != ref_y_fused[i]) {
+            throw std::runtime_error("moe_expert_major_prefill_down (4-token reuse fused) bit-exact mismatch at index " + std::to_string(i));
+        }
+    }
+
+    if (total_quads > 0) {
+        Tensor direct_quad_h = Tensor::allocate(ctx, {tokens * num_active_experts * intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor direct_quad_dn = Tensor::allocate(ctx, {tokens * num_active_experts * out_features}, dnnl::memory::data_type::f32);
+        sycl::event quad_gu = ops::moe_expert_major_prefill_gate_up_4token(
+            ctx, g3_slots_dev,
+            static_cast<const int*>(g3_tokens_dev.data()),
+            static_cast<const int*>(g3_ranks_dev.data()),
+            nullptr,
+            static_cast<const bf16*>(x_dev.data()),
+            static_cast<bf16*>(direct_quad_h.data()),
+            total_quads, num_active_experts, in_features, intermediate_size, blocksize,
+            nullptr, use_nested);
+
+        sycl::event quad_dn = ops::moe_expert_major_prefill_down_4token(
+            ctx, g3_slots_dev,
+            static_cast<const int*>(g3_tokens_dev.data()),
+            static_cast<const int*>(g3_ranks_dev.data()),
+            nullptr,
+            static_cast<const bf16*>(direct_quad_h.data()),
+            static_cast<float*>(direct_quad_dn.data()),
+            total_quads, num_active_experts, intermediate_size, out_features, blocksize,
+            &quad_gu, use_nested);
+        quad_dn.wait();
+
+        std::vector<bf16> quad_h_host(tokens * num_active_experts * intermediate_size);
+        std::vector<float> quad_dn_host(tokens * num_active_experts * out_features);
+        ctx.memcpy_d2h(quad_h_host.data(), direct_quad_h.data(), quad_h_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(quad_dn_host.data(), direct_quad_dn.data(), quad_dn_host.size() * sizeof(float));
+
+        std::vector<float> g3_dn_acc_host(total_acts * out_features);
+        ctx.memcpy_d2h(g3_dn_acc_host.data(), g3_down_acc_dev.data(), g3_dn_acc_host.size() * sizeof(float));
+
+        for (int q = 0; q < total_quads * 4; ++q) {
+            int t = g3_tokens[q];
+            int r = g3_ranks[q];
+            size_t base_h = (static_cast<size_t>(t) * num_active_experts + r) * intermediate_size;
+            for (int d = 0; d < intermediate_size; ++d) {
+                if (quad_h_host[base_h + d] != ref_h[base_h + d]) {
+                    throw std::runtime_error("moe_expert_major_prefill_gate_up_4token direct bit-exact mismatch");
+                }
+            }
+            size_t base_dn = (static_cast<size_t>(t) * num_active_experts + r) * out_features;
+            for (int d = 0; d < out_features; ++d) {
+                if (quad_dn_host[base_dn + d] != g3_dn_acc_host[base_dn + d]) {
+                    throw std::runtime_error("moe_expert_major_prefill_down_4token direct bit-exact mismatch");
+                }
+            }
+        }
+    }
+    ctx.free_device(g3_slots_dev);
+
     std::cout << "[PASS] moe_prefill tokens=" << tokens
               << " k=" << num_active_experts
               << " nested=" << (use_nested ? "true" : "false")
-              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, all S1, S4, and W4 C1/C2)\n";
+              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, all S1, S4, W4 C1/C2, and G3 4-token)\n";
 
     ctx.free_device(slots_dev_buf);
     ctx.free_device(weights_dev);

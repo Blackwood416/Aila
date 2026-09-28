@@ -4850,29 +4850,181 @@ void run_prefill_weight_reuse_alignment_scenario(
     ops::moe_ordered_accumulate_down_rows(
         ctx, dn_acc_mb, weights_dev, y_mb, tokens, top_k, hidden_size, shared_dev, gate_dev, &last_mb_dn).wait();
 
+    // 4. Path D: G3 Monolithic 4-Token (quads + pairs + singles)
+    int g3_quads = 0;
+    int g3_pairs = 0;
+    for (int e = 0; e < 4; ++e) {
+        g3_quads += counts[e] / 4;
+        g3_pairs += (counts[e] % 4) / 2;
+    }
+    std::vector<int> g3_quad_pos(4, 0);
+    std::vector<int> g3_pair_pos(4, 0);
+    std::vector<int> g3_single_pos(4, 0);
+    int g3_q_off = 0;
+    int g3_p_off = 4 * g3_quads;
+    int g3_s_off = 4 * g3_quads + 2 * g3_pairs;
+    for (int e = 0; e < 4; ++e) {
+        g3_quad_pos[e] = g3_q_off;
+        g3_pair_pos[e] = g3_p_off;
+        g3_single_pos[e] = g3_s_off;
+        g3_q_off += (counts[e] / 4) * 4;
+        g3_p_off += ((counts[e] % 4) / 2) * 2;
+        g3_s_off += (counts[e] % 2);
+    }
+    std::vector<int> g3_seen(4, 0);
+    std::vector<int> map_token_g3(total_acts), map_rank_g3(total_acts);
+    std::vector<ops::MoeExpertSlotDev> map_slot_g3(total_acts);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            int i = t * top_k + k;
+            int e = router_ids[i];
+            int s = g3_seen[e]++;
+            int qlimit = (counts[e] / 4) * 4;
+            int plimit = qlimit + ((counts[e] % 4) / 2) * 2;
+            int p = (s < qlimit) ? (g3_quad_pos[e] + s)
+                : (s < plimit) ? (g3_pair_pos[e] + (s - qlimit))
+                : (g3_single_pos[e] + (s - plimit));
+            map_token_g3[p] = t;
+            map_rank_g3[p] = k;
+            map_slot_g3[p] = cache.get_slot_dev(slots[e]);
+        }
+    }
+
+    int* tok_g3_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+    int* rnk_g3_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+    ops::MoeExpertSlotDev* slot_g3_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+    ctx.memcpy_h2d(tok_g3_dev, map_token_g3.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(rnk_g3_dev, map_rank_g3.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(slot_g3_dev, map_slot_g3.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+    bf16* h_g3 = static_cast<bf16*>(ctx.alloc_device(total_acts * intermediate_size * sizeof(bf16)));
+    float* dn_acc_g3 = static_cast<float*>(ctx.alloc_device(total_acts * hidden_size * sizeof(float)));
+    bf16* y_g3 = static_cast<bf16*>(ctx.alloc_device(tokens * hidden_size * sizeof(bf16)));
+
+    sycl::event gu_g3 = ops::moe_expert_major_prefill_gate_up(
+        ctx, slot_g3_dev, tok_g3_dev, rnk_g3_dev, nullptr, x_dev, h_g3,
+        total_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), g3_pairs, g3_quads);
+    sycl::event dn_g3 = ops::moe_expert_major_prefill_down(
+        ctx, slot_g3_dev, tok_g3_dev, rnk_g3_dev, nullptr, h_g3, dn_acc_g3,
+        total_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_g3, cache.uses_nested_codes(), g3_pairs, g3_quads);
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, dn_acc_g3, weights_dev, y_g3, tokens, top_k, hidden_size, shared_dev, gate_dev, &dn_g3).wait();
+
+    // 5. Path E: G3 Microbatched 4-Token (chunk_size = 2 experts per microbatch)
+    int c0_quads_g3 = counts[0] / 4 + counts[1] / 4;
+    int c0_pairs_g3 = (counts[0] % 4) / 2 + (counts[1] % 4) / 2;
+    int c1_quads_g3 = counts[2] / 4 + counts[3] / 4;
+    int c1_pairs_g3 = (counts[2] % 4) / 2 + (counts[3] % 4) / 2;
+
+    std::vector<int> mb_g3_quad_pos(4, 0);
+    std::vector<int> mb_g3_pair_pos(4, 0);
+    std::vector<int> mb_g3_single_pos(4, 0);
+    mb_g3_quad_pos[0] = 0;
+    mb_g3_pair_pos[0] = 4 * c0_quads_g3;
+    mb_g3_single_pos[0] = 4 * c0_quads_g3 + 2 * c0_pairs_g3;
+    mb_g3_quad_pos[1] = mb_g3_quad_pos[0] + (counts[0] / 4) * 4;
+    mb_g3_pair_pos[1] = mb_g3_pair_pos[0] + ((counts[0] % 4) / 2) * 2;
+    mb_g3_single_pos[1] = mb_g3_single_pos[0] + (counts[0] % 2);
+
+    mb_g3_quad_pos[2] = c0_acts;
+    mb_g3_pair_pos[2] = c0_acts + 4 * c1_quads_g3;
+    mb_g3_single_pos[2] = c0_acts + 4 * c1_quads_g3 + 2 * c1_pairs_g3;
+    mb_g3_quad_pos[3] = mb_g3_quad_pos[2] + (counts[2] / 4) * 4;
+    mb_g3_pair_pos[3] = mb_g3_pair_pos[2] + ((counts[2] % 4) / 2) * 2;
+    mb_g3_single_pos[3] = mb_g3_single_pos[2] + (counts[2] % 2);
+
+    std::vector<int> mb_g3_seen(4, 0);
+    std::vector<int> map_token_mb_g3(total_acts), map_rank_mb_g3(total_acts);
+    std::vector<ops::MoeExpertSlotDev> map_slot_mb_g3(total_acts);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < top_k; ++k) {
+            int i = t * top_k + k;
+            int e = router_ids[i];
+            int s = mb_g3_seen[e]++;
+            int qlimit = (counts[e] / 4) * 4;
+            int plimit = qlimit + ((counts[e] % 4) / 2) * 2;
+            int p = (s < qlimit) ? (mb_g3_quad_pos[e] + s)
+                : (s < plimit) ? (mb_g3_pair_pos[e] + (s - qlimit))
+                : (mb_g3_single_pos[e] + (s - plimit));
+            map_token_mb_g3[p] = t;
+            map_rank_mb_g3[p] = k;
+            map_slot_mb_g3[p] = cache.get_slot_dev(slots[e]);
+        }
+    }
+
+    int* tok_mb_g3_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+    int* rnk_mb_g3_dev = static_cast<int*>(ctx.alloc_device(total_acts * sizeof(int)));
+    ops::MoeExpertSlotDev* slot_mb_g3_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+    ctx.memcpy_h2d(tok_mb_g3_dev, map_token_mb_g3.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(rnk_mb_g3_dev, map_rank_mb_g3.data(), total_acts * sizeof(int));
+    ctx.memcpy_h2d(slot_mb_g3_dev, map_slot_mb_g3.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+    bf16* h_mb_g3 = static_cast<bf16*>(ctx.alloc_device(total_acts * intermediate_size * sizeof(bf16)));
+    float* dn_acc_mb_g3 = static_cast<float*>(ctx.alloc_device(total_acts * hidden_size * sizeof(float)));
+    bf16* y_mb_g3 = static_cast<bf16*>(ctx.alloc_device(tokens * hidden_size * sizeof(bf16)));
+
+    sycl::event last_mb_dn_g3{};
+    if (c0_acts > 0) {
+        sycl::event gu_mb0 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_mb_g3_dev, tok_mb_g3_dev, rnk_mb_g3_dev, nullptr, x_dev, h_mb_g3,
+            c0_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c0_pairs_g3, c0_quads_g3);
+        sycl::event dn_mb0 = ops::moe_expert_major_prefill_down(
+            ctx, slot_mb_g3_dev, tok_mb_g3_dev, rnk_mb_g3_dev, nullptr, h_mb_g3, dn_acc_mb_g3,
+            c0_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb0, cache.uses_nested_codes(), c0_pairs_g3, c0_quads_g3);
+        last_mb_dn_g3 = dn_mb0;
+    }
+
+    if (c1_acts > 0) {
+        sycl::event gu_mb1 = ops::moe_expert_major_prefill_gate_up(
+            ctx, slot_mb_g3_dev + c0_acts, tok_mb_g3_dev + c0_acts, rnk_mb_g3_dev + c0_acts, nullptr, x_dev, h_mb_g3,
+            c1_acts, top_k, hidden_size, intermediate_size, blocksize, nullptr, cache.uses_nested_codes(), c1_pairs_g3, c1_quads_g3);
+        sycl::event dn_mb1 = ops::moe_expert_major_prefill_down(
+            ctx, slot_mb_g3_dev + c0_acts, tok_mb_g3_dev + c0_acts, rnk_mb_g3_dev + c0_acts, nullptr, h_mb_g3, dn_acc_mb_g3,
+            c1_acts, top_k, intermediate_size, hidden_size, blocksize, &gu_mb1, cache.uses_nested_codes(), c1_pairs_g3, c1_quads_g3);
+        last_mb_dn_g3 = dn_mb1;
+    }
+
+    ops::moe_ordered_accumulate_down_rows(
+        ctx, dn_acc_mb_g3, weights_dev, y_mb_g3, tokens, top_k, hidden_size, shared_dev, gate_dev, &last_mb_dn_g3).wait();
+
     // Verify bit-exact matches
     std::vector<bf16> y_s4_h(tokens * hidden_size);
     std::vector<bf16> y_w4_h(tokens * hidden_size);
     std::vector<bf16> y_mb_h(tokens * hidden_size);
+    std::vector<bf16> y_g3_h(tokens * hidden_size);
+    std::vector<bf16> y_mb_g3_h(tokens * hidden_size);
     ctx.memcpy_d2h(y_s4_h.data(), y_s4, y_s4_h.size() * sizeof(bf16));
     ctx.memcpy_d2h(y_w4_h.data(), y_w4, y_w4_h.size() * sizeof(bf16));
     ctx.memcpy_d2h(y_mb_h.data(), y_mb, y_mb_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(y_g3_h.data(), y_g3, y_g3_h.size() * sizeof(bf16));
+    ctx.memcpy_d2h(y_mb_g3_h.data(), y_mb_g3, y_mb_g3_h.size() * sizeof(bf16));
 
     float max_diff_mono = 0.0f;
     float max_diff_mb = 0.0f;
+    float max_diff_g3_mono = 0.0f;
+    float max_diff_g3_mb = 0.0f;
     for (size_t i = 0; i < y_s4_h.size(); ++i) {
         float d_mono = std::abs(static_cast<float>(y_s4_h[i]) - static_cast<float>(y_w4_h[i]));
         if (d_mono > max_diff_mono) max_diff_mono = d_mono;
         float d_mb = std::abs(static_cast<float>(y_s4_h[i]) - static_cast<float>(y_mb_h[i]));
         if (d_mb > max_diff_mb) max_diff_mb = d_mb;
+        float d_g3_mono = std::abs(static_cast<float>(y_s4_h[i]) - static_cast<float>(y_g3_h[i]));
+        if (d_g3_mono > max_diff_g3_mono) max_diff_g3_mono = d_g3_mono;
+        float d_g3_mb = std::abs(static_cast<float>(y_s4_h[i]) - static_cast<float>(y_mb_g3_h[i]));
+        if (d_g3_mb > max_diff_g3_mb) max_diff_g3_mb = d_g3_mb;
     }
 
     expect(max_diff_mono == 0.0f, "Monolithic W4 2-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
     expect(max_diff_mb == 0.0f, "Microbatched W4 2-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
+    expect(max_diff_g3_mono == 0.0f, "Monolithic G3 4-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
+    expect(max_diff_g3_mb == 0.0f, "Microbatched G3 4-token weight reuse must match S4 baseline bit-exact (" + desc + ")");
 
     std::cout << "  [PASS] Scenario: " << desc << " (tokens=" << tokens << ", acts=" << total_acts
-              << ", pairs=" << total_pairs << ", max_diff_mono=" << max_diff_mono
-              << ", max_diff_mb=" << max_diff_mb << ")\n";
+              << ", pairs=" << total_pairs << ", quads=" << g3_quads
+              << ", max_diff_w4=" << std::max(max_diff_mono, max_diff_mb)
+              << ", max_diff_g3=" << std::max(max_diff_g3_mono, max_diff_g3_mb) << ")\n";
 
     ctx.free_device(x_dev);
     ctx.free_device(weights_dev);
@@ -4896,6 +5048,18 @@ void run_prefill_weight_reuse_alignment_scenario(
     ctx.free_device(h_mb);
     ctx.free_device(dn_acc_mb);
     ctx.free_device(y_mb);
+    ctx.free_device(tok_g3_dev);
+    ctx.free_device(rnk_g3_dev);
+    ctx.free_device(slot_g3_dev);
+    ctx.free_device(h_g3);
+    ctx.free_device(dn_acc_g3);
+    ctx.free_device(y_g3);
+    ctx.free_device(tok_mb_g3_dev);
+    ctx.free_device(rnk_mb_g3_dev);
+    ctx.free_device(slot_mb_g3_dev);
+    ctx.free_device(h_mb_g3);
+    ctx.free_device(dn_acc_mb_g3);
+    ctx.free_device(y_mb_g3);
 }
 
 void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
@@ -4942,7 +5106,14 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
         {1, 2,  2, 3,  1, 2},
         "Asymmetric distribution with 0-count expert (0, 2, 3, 1 acts -> 2 pairs, 2 singles)");
 
-    std::cout << "[PASS] All W4 prefill weight reuse scenarios verified with bit-exact match.\n\n";
+    // Scenario 6: Quad-heavy distribution (tokens=8, top_k=4, 32 acts: counts={9, 8, 7, 8} -> 6 quads, 2 pairs, 4 singles)
+    run_prefill_weight_reuse_alignment_scenario(
+        ctx, cache, slots, 8, 4,
+        {0, 1, 2, 3,  0, 1, 2, 3,  0, 1, 2, 3,  0, 1, 2, 3,
+         0, 1, 2, 3,  0, 1, 2, 3,  0, 1, 2, 3,  0, 1, 0, 3},
+        "Quad-heavy distribution (9, 8, 7, 8 acts -> 6 quads, 2 pairs, 4 singles)");
+
+    std::cout << "[PASS] All W4 & G3 prefill weight reuse scenarios verified with bit-exact match.\n\n";
 }
 
 } // namespace
