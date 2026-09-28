@@ -18,12 +18,11 @@
 
 namespace {
 bool is_event_complete(const sycl::event& ev) {
-    if (ev == sycl::event{}) return true;
     try {
         return ev.get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete;
     } catch (...) {
-        return false;
+        return true;
     }
 }
 }
@@ -611,10 +610,18 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
         }
 
         try {
-            copy_q_ = std::make_unique<sycl::queue>(
-                ctx_->queue().get_context(), ctx_->queue().get_device(),
-                sycl::property_list{sycl::property::queue::in_order(),
-                                    sycl::ext::intel::property::queue::immediate_command_list()});
+            try {
+                copy_q_ = std::make_unique<sycl::queue>(
+                    ctx_->queue().get_context(), ctx_->queue().get_device(),
+                    sycl::property_list{sycl::property::queue::in_order(),
+                                        sycl::ext::intel::property::queue::immediate_command_list(),
+                                        sycl::property::queue::enable_profiling()});
+            } catch (...) {
+                copy_q_ = std::make_unique<sycl::queue>(
+                    ctx_->queue().get_context(), ctx_->queue().get_device(),
+                    sycl::property_list{sycl::property::queue::in_order(),
+                                        sycl::ext::intel::property::queue::immediate_command_list()});
+            }
         } catch (const std::exception& e) {
             if (error_message) *error_message = std::string("copy_q creation failed: ") + e.what();
             cleanup();
@@ -735,6 +742,37 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
 
     fill_pool_ = std::make_unique<ExpertFillPool>(fill_threads);
 
+    const std::string reader_env = aila::env::read_string("AILA_Q4E_EXPERT_READER", "mmap");
+    aila::ExpertReaderType reader_type = aila::ExpertReaderType::Mmap;
+    if (reader_env == "readfile" || reader_env == "overlapped" || reader_env == "buffered_readfile") {
+        reader_type = aila::ExpertReaderType::OverlappedReadFile;
+    }
+
+    aila::ExpertSlotGeometry geom;
+    geom.gu_packed_bytes = gu_packed_bytes_;
+    geom.gu_absmax_count = gu_absmax_count_;
+    geom.gu_absmax_bytes = gu_absmax_bytes_;
+    geom.dn_packed_bytes = dn_packed_bytes_;
+    geom.dn_absmax_count = dn_absmax_count_;
+    geom.dn_absmax_bytes = dn_absmax_bytes_;
+    geom.gu_packed_offset = gu_packed_offset_;
+    geom.gu_absmax_offset = gu_absmax_offset_;
+    geom.dn_packed_offset = dn_packed_offset_;
+    geom.dn_absmax_offset = dn_absmax_offset_;
+    geom.slot_bytes = slot_bytes_;
+    geom.compact_nested = compact_nested_;
+
+    std::vector<aila::ExpertLayerSource> sources(num_layers_);
+    for (int L = 0; L < num_layers_; ++L) {
+        if (L < static_cast<int>(layer_weights_.size()) && layer_weights_[L].valid) {
+            sources[L].gate_up = layer_weights_[L].gate_up;
+            sources[L].down = layer_weights_[L].down;
+            sources[L].valid = true;
+        }
+    }
+
+    reader_ = aila::CreateExpertReader(reader_type, geom, weights.shard_paths(), sources);
+
     misses_scratch_.clear();
     misses_scratch_.reserve(num_experts_per_layer_);
     batch_reserved_slots_scratch_.clear();
@@ -765,6 +803,42 @@ void Qwen4ExpExpertCache::set_layer_expert_ref(int layer,
     layer_weights_[layer].down = down;
     layer_weights_[layer].valid = true;
     if (compact_nested_) configure_layer_nested_metadata(layer);
+    if (reader_) {
+        aila::ExpertLayerSource src;
+        src.gate_up = gate_up;
+        src.down = down;
+        src.valid = true;
+        reader_->set_layer_source(layer, src);
+    }
+}
+
+void Qwen4ExpExpertCache::set_reader_type(aila::ExpertReaderType type) {
+    if (!initialized_) return;
+    aila::ExpertSlotGeometry geom;
+    geom.gu_packed_bytes = gu_packed_bytes_;
+    geom.gu_absmax_count = gu_absmax_count_;
+    geom.gu_absmax_bytes = gu_absmax_bytes_;
+    geom.dn_packed_bytes = dn_packed_bytes_;
+    geom.dn_absmax_count = dn_absmax_count_;
+    geom.dn_absmax_bytes = dn_absmax_bytes_;
+    geom.gu_packed_offset = gu_packed_offset_;
+    geom.gu_absmax_offset = gu_absmax_offset_;
+    geom.dn_packed_offset = dn_packed_offset_;
+    geom.dn_absmax_offset = dn_absmax_offset_;
+    geom.slot_bytes = slot_bytes_;
+    geom.compact_nested = compact_nested_;
+
+    std::vector<aila::ExpertLayerSource> sources(num_layers_);
+    for (int L = 0; L < num_layers_; ++L) {
+        if (L < static_cast<int>(layer_weights_.size()) && layer_weights_[L].valid) {
+            sources[L].gate_up = layer_weights_[L].gate_up;
+            sources[L].down = layer_weights_[L].down;
+            sources[L].valid = true;
+        }
+    }
+    std::vector<std::string> paths;
+    if (weights_) paths = weights_->shard_paths();
+    reader_ = aila::CreateExpertReader(type, geom, paths, sources);
 }
 
 void Qwen4ExpExpertCache::configure_layer_nested_metadata(int layer) {
@@ -908,13 +982,7 @@ bool Qwen4ExpExpertCache::host_has_dma_in_flight(int layer, int expert_id) const
     if (!initialized_ || !host_pool_enabled_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
     int hslot = host_layer_expert_to_slot_[expert_flat_index(layer, expert_id)];
     if (hslot < 0 || hslot >= num_host_slots_) return false;
-    if (host_slot_dma_events_[hslot] == sycl::event{}) return false;
-    try {
-        return host_slot_dma_events_[hslot].get_info<sycl::info::event::command_execution_status>() !=
-               sycl::info::event_command_status::complete;
-    } catch (...) {
-        return false;
-    }
+    return !is_event_complete(host_slot_dma_events_[hslot]);
 }
 
 void Qwen4ExpExpertCache::touch_host_slot(int hslot) {
@@ -996,6 +1064,9 @@ void Qwen4ExpExpertCache::cancel_prefetch() {
 
     if (prefetch_in_flight_ && fill_pool_) {
         fill_pool_->cancel();
+    }
+    if (reader_) {
+        reader_->cancel();
     }
 
     if (host_pool_enabled_) {
@@ -1314,11 +1385,26 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
 
     sycl::event dma_done_event{};
     if (!misses_scratch_.empty()) {
-        auto copy_to_slot = [&](int slot_id, const uint8_t* src) {
-            copy_q_->submit([&](sycl::handler& cgh) {
-                cgh.memcpy(slot_dev_base_[slot_id], src, slot_bytes_);
-            });
+        const auto t_submit_start = std::chrono::high_resolution_clock::now();
+        uint32_t batch_memcpy_count = 0;
+        uint64_t batch_bytes = 0;
+
+        sycl::event first_memcpy_ev{};
+        auto copy_to_slot = [&](int slot_id, const uint8_t* src, int hslot = -1) -> sycl::event {
+            sycl::event ev = copy_q_->memcpy(slot_dev_base_[slot_id], src, slot_bytes_);
             guard.dma_submitted = true;
+            gpu_slot_records_[slot_id].dma_event = ev;
+            gpu_slot_records_[slot_id].state = ExpertSlotState::Copying;
+            if (hslot >= 0 && hslot < num_host_slots_) {
+                host_slot_dma_events_[hslot] = ev;
+                host_slot_records_[hslot].source_reader_fence = ev;
+            }
+            if (batch_memcpy_count == 0) {
+                first_memcpy_ev = ev;
+            }
+            ++batch_memcpy_count;
+            batch_bytes += slot_bytes_;
+            return ev;
         };
         to_fill_scratch_.clear();
 
@@ -1338,7 +1424,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                 const uint8_t* src = (pf_item.hslot >= 0)
                     ? host_slot_ptrs_[pf_item.hslot]
                     : (prefetch_staging_ptr_ + static_cast<size_t>(matched_pf) * slot_bytes_);
-                copy_to_slot(miss.slot_id, src);
+                copy_to_slot(miss.slot_id, src, pf_item.hslot);
                 stats_.total_transferred_bytes += slot_bytes_;
                 stats_.prefetch_useful_bytes += slot_bytes_;
                 pf_item.used = true;
@@ -1358,7 +1444,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     touch_host_slot(hslot);
                     add_batch_reader_hslot(hslot);
                     const uint8_t* src = host_slot_ptrs_[hslot];
-                    copy_to_slot(miss.slot_id, src);
+                    copy_to_slot(miss.slot_id, src, hslot);
                     stats_.total_transferred_bytes += slot_bytes_;
                     ++stats_.host_pool_hits;
                     continue;
@@ -1464,7 +1550,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         if (host_slot_records_[hslot].generation.load(std::memory_order_acquire) == exp_gen) {
                             host_slot_state_[hslot].store(static_cast<uint8_t>(ExpertSlotState::Ready), std::memory_order_release);
-                            copy_to_slot(miss.slot_id, host_slot_ptr);
+                            copy_to_slot(miss.slot_id, host_slot_ptr, hslot);
                         }
                     }
                 };
@@ -1520,7 +1606,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     uint8_t* staging_slot = chunk_base + static_cast<size_t>(c) * slot_bytes_;
                     load_expert_to_staging(miss.layer, miss.expert_id, staging_slot, task % parts, parts);
                     if (parts_left_scratch_[c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        copy_to_slot(miss.slot_id, staging_slot);
+                        copy_to_slot(miss.slot_id, staging_slot, -1);
                     }
                 };
                 fill_pool_->run(chunk_size * parts, fill_task);
@@ -1537,20 +1623,29 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         } // end of else if (!to_fill.empty())
 
         // Capture completion of all DMA operations on copy_q_ with a SYCL hardware barrier.
-        // The GPU compute queue establishes a hardware dependency on this event (cgh.depends_on),
-        // completely eliminating CPU thread blocking and idle GPU wait.
-        if (copy_q_) {
+        // Decouple per-expert events on individual slot records from the whole-batch barrier.
+        if (copy_q_ && batch_memcpy_count > 0) {
             dma_done_event = copy_q_->ext_oneapi_submit_barrier();
             last_dma_event_ = dma_done_event;
             for (const auto& miss : misses_scratch_) {
-                gpu_slot_records_[miss.slot_id].dma_event = dma_done_event;
-                gpu_slot_records_[miss.slot_id].state = is_event_complete(dma_done_event)
-                    ? ExpertSlotState::Ready : ExpertSlotState::Copying;
+                if (is_event_complete(gpu_slot_records_[miss.slot_id].dma_event)) {
+                    gpu_slot_records_[miss.slot_id].state = ExpertSlotState::Ready;
+                }
             }
-            for (int h : batch_reserved_hslots_scratch_) {
-                host_slot_dma_events_[h] = dma_done_event;
-                host_slot_records_[h].source_reader_fence = dma_done_event;
-            }
+
+            const auto t_submit_end = std::chrono::high_resolution_clock::now();
+            const uint64_t submit_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_submit_end - t_submit_start).count());
+
+            dma_timing_stats_.last_batch_bytes = batch_bytes;
+            dma_timing_stats_.last_memcpy_count = batch_memcpy_count;
+            dma_timing_stats_.last_submit_ns = submit_ns;
+            dma_timing_stats_.total_submit_ns += submit_ns;
+            dma_timing_stats_.total_dma_bytes += batch_bytes;
+            dma_timing_stats_.batches_measured++;
+            last_batch_submit_end_time_ = t_submit_end;
+            last_batch_dma_event_ = dma_done_event;
+            first_batch_dma_event_ = first_memcpy_ev;
         }
     }
 
@@ -1605,7 +1700,10 @@ void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int c
         for (const auto& item : prefetch_items_) {
             if (item.expert_id == expert) { dup = true; break; }
         }
-        if (!dup) prefetch_items_.emplace_back(layer, expert, -1, parts, 0);
+        if (!dup) {
+            prefetch_items_.emplace_back(layer, expert, -1, parts, 0);
+            if (reader_) reader_->prefetch_expert(layer, expert);
+        }
     }
     if (prefetch_items_.empty()) return;
 
@@ -1810,6 +1908,10 @@ void fill_expert_matrix(const Bnb4BitHostWeightRef& ref, int expert_id,
 
 void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
                                                  int part, int nparts) {
+    if (reader_) {
+        reader_->read_expert_slice(layer, expert_id, staging_slot, part, nparts);
+        return;
+    }
     if (layer < 0 || layer >= static_cast<int>(layer_weights_.size()) || !layer_weights_[layer].valid) {
         size_t b0 = 0, b1 = 0;
         part_range(slot_bytes_, part, nparts, b0, b1);
@@ -2136,3 +2238,41 @@ GpuExpertTicket Qwen4ExpExpertCache::ensure_gpu(const HostExpertLease& lease, in
     if (!lease.is_valid()) return {};
     return ensure_gpu(lease.layer(), lease.expert_id(), priority);
 }
+
+sycl::event Qwen4ExpExpertCache::get_slot_dma_event(int slot_id) const {
+    if (slot_id < 0 || slot_id >= num_slots_) return {};
+    return gpu_slot_records_[slot_id].dma_event;
+}
+
+void Qwen4ExpExpertCache::record_first_consumer_start() {
+    if (dma_timing_stats_.last_batch_bytes == 0) return;
+    const auto now = std::chrono::high_resolution_clock::now();
+    uint64_t gap_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now - last_batch_submit_end_time_).count());
+    dma_timing_stats_.last_consumer_gap_ns = gap_ns;
+    dma_timing_stats_.total_consumer_gap_ns += gap_ns;
+
+    if (dma_timing_stats_.last_memcpy_count > 0) {
+        try {
+            uint64_t start = first_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_start>();
+            uint64_t end = last_batch_dma_event_.get_profiling_info<sycl::info::event_profiling::command_end>();
+            if (end > start) {
+                dma_timing_stats_.last_copy_ns = end - start;
+                dma_timing_stats_.total_copy_ns += (end - start);
+                dma_timing_stats_.last_effective_gbps =
+                    (static_cast<double>(dma_timing_stats_.last_batch_bytes) / static_cast<double>(end - start));
+            }
+        } catch (...) {
+        }
+    }
+
+    static const bool s_prof = aila::env::read_flag("AILA_Q4E_DMA_PROF", false);
+    if (s_prof) {
+        std::cout << "[Q4E DMA Prof] bytes=" << dma_timing_stats_.last_batch_bytes
+                  << " count=" << dma_timing_stats_.last_memcpy_count
+                  << " submit_ms=" << (dma_timing_stats_.last_submit_ns / 1e6)
+                  << " consumer_gap_ms=" << (dma_timing_stats_.last_consumer_gap_ns / 1e6)
+                  << " rate=" << dma_timing_stats_.last_effective_gbps << " GB/s\n";
+    }
+}
+

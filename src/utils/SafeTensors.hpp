@@ -53,11 +53,19 @@ struct Bnb4BitQuantState {
     float nested_offset = 0.0f;
 };
 
+struct FileSpan {
+    int32_t shard_id = -1;
+    uint64_t absolute_offset = 0;
+    size_t bytes = 0;
+    bool valid() const { return shard_id >= 0 && bytes > 0; }
+};
+
 struct HostTensorView {
     const uint8_t* ptr = nullptr;
     std::vector<int64_t> shape;
     DataType dtype = DT_UNKNOWN;
     size_t bytes = 0;
+    FileSpan file_span{};
     const uint8_t* data() const { return ptr; }
     bool valid() const { return ptr != nullptr; }
     int64_t numel() const {
@@ -73,6 +81,7 @@ struct HostTensorEntry {
     TensorMeta meta{};
     const uint8_t* tensor_data_start = nullptr;
     const uint8_t* data_ptr = nullptr;
+    FileSpan file_span{};
 };
 
 struct Bnb4BitHostWeightRef {
@@ -197,6 +206,7 @@ public:
 
     const std::vector<std::unique_ptr<MemoryMappedFile>>& mmaps() const { return mmaps_; }
     const std::unordered_map<std::string, HostTensorEntry>& host_index() const { return host_index_; }
+    const std::vector<std::string>& shard_paths() const { return shard_paths_; }
 
 private:
     std::unordered_map<std::string, Tensor> tensors_;
@@ -204,6 +214,7 @@ private:
     // 保持 mmap 文件存活 (权重数据来自 mmap, GPU 拷贝后可释放)
     friend ModelWeights LoadSafetensors(const std::string& path, Context& ctx);
     std::vector<std::unique_ptr<MemoryMappedFile>> mmaps_;
+    std::vector<std::string> shard_paths_;
     std::unordered_map<std::string, HostTensorEntry> host_index_;
     Context* ctx_ = nullptr;
 

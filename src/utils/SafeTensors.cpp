@@ -91,6 +91,7 @@ HostTensorView ModelWeights::host_view(const std::string& name) const {
     view.shape.assign(entry.meta.shape.dims, entry.meta.shape.dims + entry.meta.shape.ndims);
     view.dtype = entry.meta.dtype;
     view.bytes = entry.meta.byte_offset_end - entry.meta.byte_offset_start;
+    view.file_span = entry.file_span;
     return view;
 }
 
@@ -264,6 +265,7 @@ ModelWeights LoadSafetensors(const std::string& path, Context& ctx) {
     try {
         // 打开 mmap 文件
         weights.mmap_file_ = std::make_unique<MemoryMappedFile>(path);
+        weights.shard_paths_.push_back(path);
         const uint8_t* raw_ptr = weights.mmap_file_->data();
 
         // 解析 header
@@ -904,6 +906,7 @@ ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx) {
         }
         std::string json_str(reinterpret_cast<const char*>(raw_ptr + 8), header_size);
         const uint8_t* tensor_data_start = raw_ptr + 8 + header_size;
+        const uint64_t tensor_data_offset = 8 + header_size;
 
         std::unordered_map<std::string, TensorMeta> metadata;
         auto layer_names = ParseHeader(json_str, metadata);
@@ -915,10 +918,14 @@ ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx) {
             entry.meta = meta;
             entry.tensor_data_start = tensor_data_start;
             entry.data_ptr = tensor_data_start + meta.byte_offset_start;
+            entry.file_span.shard_id = static_cast<int32_t>(shard_idx);
+            entry.file_span.absolute_offset = tensor_data_offset + meta.byte_offset_start;
+            entry.file_span.bytes = meta.byte_offset_end - meta.byte_offset_start;
             weights.host_index_[name] = entry;
         }
 
         weights.mmaps_.push_back(std::move(mmap));
+        weights.shard_paths_.push_back(shard_path.string());
     };
 
     if (fs::exists(single)) {

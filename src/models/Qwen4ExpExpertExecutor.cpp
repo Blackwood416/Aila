@@ -215,12 +215,13 @@ void Qwen4ExpExpertExecutor::ensure_gpu_pending(LayerMoePlan& plan) {
                                          assigned_slots);
     plan.final_dma_event = dma_ev;
 
-    // Update entries with assigned slots
+    // Update entries with assigned slots and per-expert DMA event
     for (int idx : plan.pending_gpu_indices) {
         int eid = plan.entries[idx].expert_id;
         for (int i = 0; i < num_pending; ++i) {
             if (pending_experts[i] == eid) {
                 plan.entries[idx].gpu_slot = assigned_slots[i];
+                plan.entries[idx].dma_event = cache_->get_slot_dma_event(assigned_slots[i]);
                 break;
             }
         }
@@ -260,61 +261,124 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
     // 2. Launch GPU execution FIRST so GPU hardware runs asynchronously while CPU computes
     sycl::event down_ev{};
     if (plan.gpu_tasks > 0) {
-        int g_idx = 0;
-        const int num_slots = cache_->num_slots();
-        for (int idx : plan.ready_gpu_indices) {
-            const int slot = plan.entries[idx].gpu_slot;
-            if (slot < 0 || slot >= num_slots) {
-                throw std::runtime_error("Qwen4ExpExpertExecutor: invalid ready gpu_slot " + std::to_string(slot));
-            }
-            gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
-            gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
-            gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
-            ++g_idx;
-        }
-        for (int idx : plan.pending_gpu_indices) {
-            const int slot = plan.entries[idx].gpu_slot;
-            if (slot < 0 || slot >= num_slots) {
-                throw std::runtime_error("Qwen4ExpExpertExecutor: invalid pending gpu_slot " + std::to_string(slot));
-            }
-            gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
-            gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
-            gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
-            ++g_idx;
-        }
+        cache_->record_first_consumer_start();
         stats_.gpu_tasks_dispatched += plan.gpu_tasks;
+        const int num_slots = cache_->num_slots();
 
-        const ops::MoeExpertSlotDev* eff_slots = gpu_slots_host_;
-        const int* eff_ranks = gpu_ranks_host_;
-        const int* eff_tokens = gpu_tokens_host_;
-        if (plan.gpu_tasks > 16) {
-            ctx.queue().memcpy(gpu_slots_dev_, gpu_slots_host_, plan.gpu_tasks * sizeof(ops::MoeExpertSlotDev));
-            ctx.queue().memcpy(gpu_ranks_dev_, gpu_ranks_host_, plan.gpu_tasks * sizeof(int));
-            ctx.queue().memcpy(gpu_tokens_dev_, gpu_tokens_host_, plan.gpu_tasks * sizeof(int));
-            eff_slots = gpu_slots_dev_;
-            eff_ranks = gpu_ranks_dev_;
-            eff_tokens = gpu_tokens_dev_;
-        }
+        if (plan.ready_gpu_tasks > 0 && plan.pending_gpu_tasks > 0) {
+            const int ready_count = plan.ready_gpu_tasks;
+            const int pending_count = plan.pending_gpu_tasks;
 
-        // Launch GPU gate_up
-        sycl::event gu_ev = ops::moe_decode_gate_up_swiglu_grouped(
-            ctx, eff_slots, nullptr, x_dev, moe_h_dev, plan.gpu_tasks,
-            hidden_size_, intermediate_size_, 64,
-            plan.final_dma_event != sycl::event{} ? &plan.final_dma_event : nullptr,
-            eff_tokens, uses_nested);
+            // 1. Ready subset: launch immediately without waiting for pending DMA!
+            for (int r = 0; r < ready_count; ++r) {
+                int idx = plan.ready_gpu_indices[r];
+                const int slot = plan.entries[idx].gpu_slot;
+                if (slot < 0 || slot >= num_slots) {
+                    throw std::runtime_error("Qwen4ExpExpertExecutor: invalid ready gpu_slot " + std::to_string(slot));
+                }
+                gpu_slots_host_[r] = cache_->get_slot_dev(slot);
+                gpu_ranks_host_[r] = plan.entries[idx].rank;
+                gpu_tokens_host_[r] = plan.entries[idx].token_idx;
+            }
 
-        // Launch GPU down_to_rank_f32 writing directly into rank slots of down_acc_dev_
-        down_ev = ops::moe_decode_down_to_rank_f32(
-            ctx, eff_slots, eff_ranks, moe_h_dev, down_acc_dev_,
-            plan.gpu_tasks, top_k, intermediate_size_, hidden_size_, 64,
-            eff_tokens, nullptr, &gu_ev, uses_nested);
+            sycl::event gu_ev_ready = ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, gpu_slots_host_, nullptr, x_dev, moe_h_dev, ready_count,
+                hidden_size_, intermediate_size_, 64,
+                nullptr, gpu_tokens_host_, uses_nested);
 
-        // Record consumer reader fences for the GPU slots used
-        for (int idx : plan.ready_gpu_indices) {
-            cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev);
-        }
-        for (int idx : plan.pending_gpu_indices) {
-            cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev);
+            sycl::event down_ev_ready = ops::moe_decode_down_to_rank_f32(
+                ctx, gpu_slots_host_, gpu_ranks_host_, moe_h_dev, down_acc_dev_,
+                ready_count, top_k, intermediate_size_, hidden_size_, 64,
+                gpu_tokens_host_, nullptr, &gu_ev_ready, uses_nested);
+
+            for (int idx : plan.ready_gpu_indices) {
+                cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev_ready);
+            }
+
+            // 2. Pending subset: launch with pending DMA dependency
+            for (int p = 0; p < pending_count; ++p) {
+                int idx = plan.pending_gpu_indices[p];
+                const int slot = plan.entries[idx].gpu_slot;
+                if (slot < 0 || slot >= num_slots) {
+                    throw std::runtime_error("Qwen4ExpExpertExecutor: invalid pending gpu_slot " + std::to_string(slot));
+                }
+                gpu_slots_host_[ready_count + p] = cache_->get_slot_dev(slot);
+                gpu_ranks_host_[ready_count + p] = plan.entries[idx].rank;
+                gpu_tokens_host_[ready_count + p] = plan.entries[idx].token_idx;
+            }
+
+            sycl::event gu_ev_pending = ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, gpu_slots_host_ + ready_count, nullptr, x_dev,
+                moe_h_dev + static_cast<size_t>(ready_count) * intermediate_size_,
+                pending_count, hidden_size_, intermediate_size_, 64,
+                plan.final_dma_event != sycl::event{} ? &plan.final_dma_event : nullptr,
+                gpu_tokens_host_ + ready_count, uses_nested);
+
+            sycl::event down_ev_pending = ops::moe_decode_down_to_rank_f32(
+                ctx, gpu_slots_host_ + ready_count, gpu_ranks_host_ + ready_count,
+                moe_h_dev + static_cast<size_t>(ready_count) * intermediate_size_,
+                down_acc_dev_, pending_count, top_k, intermediate_size_, hidden_size_, 64,
+                gpu_tokens_host_ + ready_count, nullptr, &gu_ev_pending, uses_nested);
+
+            for (int idx : plan.pending_gpu_indices) {
+                cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev_pending);
+            }
+
+            down_ev = down_ev_pending;
+        } else {
+            int g_idx = 0;
+            for (int idx : plan.ready_gpu_indices) {
+                const int slot = plan.entries[idx].gpu_slot;
+                if (slot < 0 || slot >= num_slots) {
+                    throw std::runtime_error("Qwen4ExpExpertExecutor: invalid ready gpu_slot " + std::to_string(slot));
+                }
+                gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
+                gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
+                gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
+                ++g_idx;
+            }
+            for (int idx : plan.pending_gpu_indices) {
+                const int slot = plan.entries[idx].gpu_slot;
+                if (slot < 0 || slot >= num_slots) {
+                    throw std::runtime_error("Qwen4ExpExpertExecutor: invalid pending gpu_slot " + std::to_string(slot));
+                }
+                gpu_slots_host_[g_idx] = cache_->get_slot_dev(slot);
+                gpu_ranks_host_[g_idx] = plan.entries[idx].rank;
+                gpu_tokens_host_[g_idx] = plan.entries[idx].token_idx;
+                ++g_idx;
+            }
+
+            const ops::MoeExpertSlotDev* eff_slots = gpu_slots_host_;
+            const int* eff_ranks = gpu_ranks_host_;
+            const int* eff_tokens = gpu_tokens_host_;
+            if (plan.gpu_tasks > 16) {
+                ctx.queue().memcpy(gpu_slots_dev_, gpu_slots_host_, plan.gpu_tasks * sizeof(ops::MoeExpertSlotDev));
+                ctx.queue().memcpy(gpu_ranks_dev_, gpu_ranks_host_, plan.gpu_tasks * sizeof(int));
+                ctx.queue().memcpy(gpu_tokens_dev_, gpu_tokens_host_, plan.gpu_tasks * sizeof(int));
+                eff_slots = gpu_slots_dev_;
+                eff_ranks = gpu_ranks_dev_;
+                eff_tokens = gpu_tokens_dev_;
+            }
+
+            const sycl::event* dep = (plan.pending_gpu_tasks > 0 && plan.final_dma_event != sycl::event{})
+                ? &plan.final_dma_event : nullptr;
+
+            sycl::event gu_ev = ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, eff_slots, nullptr, x_dev, moe_h_dev, plan.gpu_tasks,
+                hidden_size_, intermediate_size_, 64,
+                dep, eff_tokens, uses_nested);
+
+            down_ev = ops::moe_decode_down_to_rank_f32(
+                ctx, eff_slots, eff_ranks, moe_h_dev, down_acc_dev_,
+                plan.gpu_tasks, top_k, intermediate_size_, hidden_size_, 64,
+                eff_tokens, nullptr, &gu_ev, uses_nested);
+
+            for (int idx : plan.ready_gpu_indices) {
+                cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev);
+            }
+            for (int idx : plan.pending_gpu_indices) {
+                cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev);
+            }
         }
     }
 

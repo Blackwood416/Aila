@@ -2,6 +2,7 @@
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
+#include "models/Qwen4ExpExpertReader.hpp"
 #include "ops/MoeExpertOps.hpp"
 #include "utils/SafeTensors.hpp"
 
@@ -145,6 +146,21 @@ private:
     int hslot_ = -1;
     uint64_t generation_ = 0;
     ops::MoeExpertSlotHost slot_host_{};
+};
+
+struct DmaTimingStats {
+    uint64_t total_dma_bytes = 0;
+    uint64_t total_submit_ns = 0;
+    uint64_t total_copy_ns = 0;
+    uint64_t total_consumer_gap_ns = 0;
+    uint64_t batches_measured = 0;
+
+    uint64_t last_batch_bytes = 0;
+    uint32_t last_memcpy_count = 0;
+    uint64_t last_submit_ns = 0;
+    uint64_t last_copy_ns = 0;
+    uint64_t last_consumer_gap_ns = 0;
+    double last_effective_gbps = 0.0;
 };
 
 struct ExpertCacheStats {
@@ -318,6 +334,15 @@ public:
     GpuExpertTicket ensure_gpu(int layer, int expert_id, int priority = 0);
     GpuExpertTicket ensure_gpu(const HostExpertLease& lease, int priority = 0);
 
+    aila::IExpertReader* reader() { return reader_.get(); }
+    const aila::IExpertReader* reader() const { return reader_.get(); }
+    void set_reader(std::unique_ptr<aila::IExpertReader> reader) { reader_ = std::move(reader); }
+    void set_reader_type(aila::ExpertReaderType type);
+
+    const DmaTimingStats& dma_timing_stats() const { return dma_timing_stats_; }
+    void record_first_consumer_start();
+    sycl::event get_slot_dma_event(int slot_id) const;
+
 private:
     void cleanup();
     void configure_layer_nested_metadata(int layer);
@@ -481,6 +506,12 @@ private:
 
     std::unique_ptr<ExpertFillPool> fill_pool_;
     int fill_parts_ = 8;
+
+    std::unique_ptr<aila::IExpertReader> reader_;
+    DmaTimingStats dma_timing_stats_{};
+    std::chrono::high_resolution_clock::time_point last_batch_submit_end_time_{};
+    sycl::event last_batch_dma_event_{};
+    sycl::event first_batch_dma_event_{};
 };
 
 inline void HostExpertLease::release() {

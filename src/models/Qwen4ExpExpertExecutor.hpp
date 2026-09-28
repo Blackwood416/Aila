@@ -19,6 +19,7 @@ struct RouteRankEntry {
     bool is_gpu = true;
     int gpu_slot = -1;
     int result_idx = -1;
+    sycl::event dma_event{};
 };
 
 struct LayerMoePlan {

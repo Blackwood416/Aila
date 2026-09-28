@@ -1949,6 +1949,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 const bf16* x_t = static_cast<const bf16*>(buf_.x.data()) + t * hidden_size_;
                 bf16* y_t = static_cast<bf16*>(buf_.y.data()) + t * hidden_size_;
 
+                expert_cache_.record_first_consumer_start();
                 ops::moe_decode_gate_up_swiglu_grouped(
                     ctx, dev_slots, nullptr, x_t,
                     static_cast<bf16*>(buf_.moe_h.data()),

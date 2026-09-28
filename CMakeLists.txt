@@ -196,6 +196,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
     src/models/Qwen4ExpExpertExecutor.cpp
+    src/models/Qwen4ExpExpertReader.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -754,6 +755,32 @@ else()
 endif()
 add_test(NAME AilaQwen4ExpCpuExpertTests COMMAND AilaQwen4ExpCpuExpertTests)
 set_tests_properties(AilaQwen4ExpCpuExpertTests PROPERTIES LABELS "gpu;ops;qwen4exp;h2a" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpExpertReaderTests
+    tests/models/Qwen4ExpExpertReaderTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpExpertReaderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpExpertReaderTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpExpertReaderTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpExpertReaderTests COMMAND AilaQwen4ExpExpertReaderTests)
+set_tests_properties(AilaQwen4ExpExpertReaderTests PROPERTIES LABELS "cpu;models;qwen4_exp;h4" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpDmaTimingTests
+    tests/models/Qwen4ExpDmaTimingTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpDmaTimingTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpDmaTimingTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpDmaTimingTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpDmaTimingTests COMMAND AilaQwen4ExpDmaTimingTests)
+set_tests_properties(AilaQwen4ExpDmaTimingTests PROPERTIES LABELS "gpu;models;qwen4_exp;h5" TIMEOUT 120)
 
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp
