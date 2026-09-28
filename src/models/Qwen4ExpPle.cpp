@@ -753,9 +753,11 @@ void Qwen4ExpPle::init_state(Context& ctx, Qwen4ExpPleState& state) const {
 }
 
 void Qwen4ExpPle::capture_snapshot(Context& ctx, const Qwen4ExpPleState& state, Qwen4ExpPleSnapshot& snapshot) const {
+    if (snapshot.conv_state.size() != CONV_STATE_LEN * HC_HIDDEN_SIZE) {
+        throw std::invalid_argument("Qwen4ExpPle: snapshot storage is not initialized");
+    }
     snapshot.prev_tokens = state.prev_tokens;
     snapshot.conv_head = state.conv_head;
-    snapshot.conv_state.resize(CONV_STATE_LEN * HC_HIDDEN_SIZE);
     if (state.conv_state.valid()) {
         ctx.memcpy_d2h(snapshot.conv_state.data(), state.conv_state.data(), snapshot.conv_state.size() * sizeof(float));
     } else {

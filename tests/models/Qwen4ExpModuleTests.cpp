@@ -2420,6 +2420,20 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
 
     auto& caches = session->layer_caches_for_testing();
     expect(caches.size() == 48, "expected 48 layer caches allocated in session");
+    const auto storage_addresses = [&]() {
+        std::vector<const void*> addresses;
+        addresses.push_back(session->snapshot_slots_for_testing().data());
+        for (const auto& slot : session->snapshot_slots_for_testing()) {
+            addresses.push_back(slot.layers.data());
+            addresses.push_back(slot.ple_snapshot.conv_state.data());
+            for (const auto& layer : slot.layers) {
+                addresses.push_back(layer.linear_state_host.data());
+                addresses.push_back(layer.linear_conv_state_host.data());
+            }
+        }
+        return addresses;
+    };
+    const auto initial_storage = storage_addresses();
 
     // Initialize test patterns in Layer 0 and Layer 1 linear states
     const size_t state_size = 48 * 128 * 128;
@@ -2443,7 +2457,7 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     backend.capture_snapshot_for_testing(ctx, *session, 10, 10);
     expect(!caches[0].device_state_dirty, "device_state_dirty must be cleared after snapshot");
     expect(!caches[1].device_state_dirty, "device_state_dirty must be cleared after snapshot");
-    expect(session->snapshots_for_testing().count(10) == 1, "snapshot 10 must exist");
+    expect(session->snapshot_for_testing(10) != nullptr, "snapshot 10 must exist");
 
     // 2. Mutate device state to all zeros
     ctx.queue().memset(caches[0].linear_state.data(), 0, state_size * sizeof(float)).wait_and_throw();
@@ -2490,10 +2504,10 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     caches[1].device_state_dirty = true;
     backend.capture_snapshot_for_testing(ctx, *session, 40, 10);
 
-    expect(session->snapshots_for_testing().count(10) == 0, "snapshot 10 must be evicted when maxSnapshots exceeded");
-    expect(session->snapshots_for_testing().count(20) == 1, "snapshot 20 must be retained");
-    expect(session->snapshots_for_testing().count(30) == 1, "snapshot 30 must be retained");
-    expect(session->snapshots_for_testing().count(40) == 1, "snapshot 40 must be retained");
+    expect(session->snapshot_for_testing(10) == nullptr, "snapshot 10 must be evicted when maxSnapshots exceeded");
+    expect(session->snapshot_for_testing(20) != nullptr, "snapshot 20 must be retained");
+    expect(session->snapshot_for_testing(30) != nullptr, "snapshot 30 must be retained");
+    expect(session->snapshot_for_testing(40) != nullptr, "snapshot 40 must be retained");
 
     // Truncate to 35 -> nearest checkpoint <= 35 is 30
     restored = backend.Truncate(*session, 35);
@@ -2503,6 +2517,21 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     restored = backend.Truncate(*session, 15);
     expect(restored == 0, "Truncate to 15 must reset to 0");
     expect(session->CurrentLength() == 0, "CurrentLength must be 0 after reset");
+    expect(initial_storage == storage_addresses(), "Capture, eviction and reset must reuse snapshot storage");
+
+    backend.capture_snapshot_for_testing(ctx, *session, 13, 1, true);
+    expect(session->snapshot_for_testing(13) != nullptr, "Explicit single-token anchor must be captured");
+    expect(backend.Truncate(*session, 13) == 13, "Single-token anchor must be restorable");
+    backend.Reset(*session);
+    expect(initial_storage == storage_addresses(), "Anchor restore must preserve storage");
+    for (const auto& slot : session->snapshot_slots_for_testing()) {
+        expect(slot.length == -1, "Reset must invalidate every snapshot");
+    }
+    session.reset();
+    auto no_snapshots = backend.CreateSession(ctx, 0);
+    backend.capture_snapshot_for_testing(ctx, *no_snapshots, 13, 1, true);
+    expect(no_snapshots->snapshot_slots_for_testing().empty(), "Zero snapshot budget must remain empty");
+    expect(backend.Truncate(*no_snapshots, 12) == 0, "Missing snapshot must fall back to reset");
 
     std::cout << "[PASS] Phase S5 batched async snapshot capture & truncate verified successfully.\n";
 }
@@ -3180,9 +3209,9 @@ void test_qsa_session_compressed_k_lifecycle(Context& ctx) {
     backend.capture_snapshot_for_testing(ctx, *session, 2050, 2050);
 
     // Verify snapshot captured num_compressed_blocks == 512
-    const auto& snaps = session->snapshots_for_testing();
-    expect(snaps.count(2050) == 1, "Snapshot at 2050 must exist");
-    expect(snaps.at(2050).layers[3].num_compressed_blocks == 512, "Snapshot layer 3 num_compressed_blocks must be 512");
+    const auto* snapshot = session->snapshot_for_testing(2050);
+    expect(snapshot != nullptr, "Snapshot at 2050 must exist");
+    expect(snapshot->layers[3].num_compressed_blocks == 512, "Snapshot layer 3 num_compressed_blocks must be 512");
 
     // Simulate decode steps advancing to 2054 (crossing to 513 complete blocks)
     caches[3].num_compressed_blocks = 513;
@@ -3198,7 +3227,9 @@ void test_qsa_session_compressed_k_lifecycle(Context& ctx) {
     backend.Reset(*session);
     expect(session->CurrentLength() == 0, "CurrentLength after reset must be 0");
     expect(caches[3].num_compressed_blocks == 0, "num_compressed_blocks after reset must be 0");
-    expect(session->snapshots_for_testing().empty(), "Snapshots must be cleared on Reset");
+    for (const auto& slot : session->snapshot_slots_for_testing()) {
+        expect(slot.length == -1, "Snapshots must be invalidated on Reset");
+    }
 
     std::cout << "[PASS] QSA Session compressed K state lifecycle, snapshot capture, rollback & reset verified.\n";
 }

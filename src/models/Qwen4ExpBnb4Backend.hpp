@@ -17,7 +17,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <unordered_map>
 
 struct Qwen4ExpHyperConnectionLayer {
     Tensor* hc_norm_weight = nullptr; // f32, preprocessed for grouped_rms_norm (1+w)
@@ -147,6 +146,7 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         int num_compressed_blocks = 0;
     };
     struct StateSnapshot {
+        int length = -1;
         std::vector<LayerStateSnapshot> layers;
         Qwen4ExpPleSnapshot ple_snapshot;
     };
@@ -165,7 +165,13 @@ public:
         uint64_t generation() const { return generation_; }
         void bump_generation() { ++generation_; }
 
-        const std::unordered_map<int, StateSnapshot>& snapshots_for_testing() const { return snapshots_; }
+        const std::vector<StateSnapshot>& snapshot_slots_for_testing() const { return snapshots_; }
+        const StateSnapshot* snapshot_for_testing(int length) const {
+            for (const auto& snapshot : snapshots_) {
+                if (snapshot.length == length) return &snapshot;
+            }
+            return nullptr;
+        }
         std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
         int& current_length_for_testing() { return currentLength_; }
 
@@ -173,19 +179,17 @@ public:
         friend class Qwen4ExpBnb4Backend;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
-                bool boundedSnapshots, std::size_t maxSnapshots);
+                std::size_t maxSnapshots);
 
         Context* context_ = nullptr;
         std::shared_ptr<const SessionOwner> owner_;
         int currentLength_ = 0;
         int capacity_ = 0;
         uint64_t generation_ = 1;
-        bool boundedSnapshots_ = true;
-        std::size_t maxSnapshots_ = 4;
 
         std::vector<Qwen4ExpLayerCache> layerCaches_;
         Qwen4ExpPleState ple_state_;
-        std::unordered_map<int, StateSnapshot> snapshots_;
+        std::vector<StateSnapshot> snapshots_;
 
         Tensor mropePosT_, mropePosH_, mropePosW_;
         int mropePromptLength_ = 0;
@@ -229,8 +233,9 @@ public:
             layers_[i].is_linear = ((i + 1) % 4 != 0);
         }
     }
-    void capture_snapshot_for_testing(Context& ctx, Session& session, int nextLength, int count = 1) {
-        CaptureSnapshot(ctx, session, nextLength, count);
+    void capture_snapshot_for_testing(Context& ctx, Session& session, int nextLength, int count = 1,
+                                      bool force = false) {
+        CaptureSnapshot(ctx, session, nextLength, count, force);
         session.currentLength_ = nextLength;
     }
     void ensure_runtime_buffers_for_testing(Context& ctx, int seq_len) {
@@ -259,7 +264,8 @@ private:
                         const ForwardOptions& options);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
-    void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount);
+    void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
+    friend struct Qwen4ExpGenerationTestAccess;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void free_pinned_host_buffers();
     // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
@@ -304,6 +310,7 @@ private:
     Tensor lm_head_weight_transposed_;
     Linear lm_head_;
     Tensor lastTokenLogits_;
+    Tensor unusedLogits_; // Invalid output for forwards that only advance cached state.
 
     Qwen4ExpBuffers buf_;
     // Pinned host [runtime_seq_capacity_, top_k] router outputs written directly by the top-k kernel.

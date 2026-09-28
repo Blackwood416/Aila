@@ -12,6 +12,7 @@
 struct ForwardOptions {
     SnapshotPolicy snapshot_policy = SnapshotPolicy::ReusablePrefix;
     bool need_logits = true;
+    bool capture_snapshot = false; // Force a checkpoint at an explicit prefix boundary.
 };
 
 class IModelBackend {

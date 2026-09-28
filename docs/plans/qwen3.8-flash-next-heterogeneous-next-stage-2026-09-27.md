@@ -194,6 +194,8 @@ AOT 不会消除 oneDNN 运行期 primitive 准备、host 文件访问、专家 
 
 ## 10. H6：26+4 的来源与三档优化
 
+**2026-09-28 实施更新：H6a/b 已完成并验证。** H6a 提交为 `ac5e7df`；H6b 保留 anchor、跳过非末段 logits，并预分配 token staging 和快照槽位。真实模型完整 logits 位模式、两轮复用、修改历史后的实际回滚及 48-token 黄金基线均通过。详见 [H6 验收记录](qwen3.8-flash-next-h6-results-2026-09-28.md)。下述来源分析描述实施前状态；H6c 仍为后续候选。
+
 `[CODE]` 路径已确认：
 
 1. `EngineGeneration.cpp:536–555` 重新渲染不带 generation prompt 的稳定聊天前缀，并可能加上 assistant header，形成 `recurrent_prefill_anchor`。

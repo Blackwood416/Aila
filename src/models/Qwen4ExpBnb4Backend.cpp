@@ -208,10 +208,9 @@ void dump_hidden_row(Context& ctx, const std::string& path, const Tensor& hidden
 Qwen4ExpBnb4Backend::Session::Session(
     Context& ctx, int capacity,
     std::shared_ptr<const SessionOwner> owner,
-    bool boundedSnapshots, std::size_t maxSnapshots)
+    std::size_t maxSnapshots)
     : context_(&ctx), owner_(std::move(owner)),
-      capacity_(capacity), boundedSnapshots_(boundedSnapshots),
-      maxSnapshots_(maxSnapshots) {
+      capacity_(capacity), snapshots_(maxSnapshots) {
     layerCaches_.resize(48);
     for (int i = 0; i < 48; ++i) {
         bool is_linear = ((i + 1) % 4 != 0);
@@ -2012,38 +2011,40 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         fallback_last_down_event = sycl::event{};
     }
 
-    // 3. Final Hyper-Connection Mixer
-    RunHyperConnection(ctx, mixer_, count, false);
+    if (options.need_logits) {
+        // 3. Final Hyper-Connection Mixer
+        RunHyperConnection(ctx, mixer_, count, false);
 
-    if (!s_dump_dir.empty()) {
-        std::string mixer_path = s_dump_dir + "/mixer.bin";
-        dump_hidden_row(ctx, mixer_path, buf_.x, count - 1, 2560);
-    }
-
-    // 4. LM Head (Compute for last token)
-    if (lastTokenOnly) {
-        const bf16* last_x = static_cast<const bf16*>(buf_.x.data()) + static_cast<size_t>(count - 1) * hidden_size_;
-        Tensor x_last_view = Tensor::view(ctx, const_cast<bf16*>(last_x), {1, hidden_size_});
-        lm_head_.forward(ctx, x_last_view, buf_.logits, 1);
-        lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {1, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
-    } else {
-        if (buf_.logits.shape(0) < count) {
-            buf_.logits = Tensor::allocate(ctx, {count, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
+        if (!s_dump_dir.empty()) {
+            std::string mixer_path = s_dump_dir + "/mixer.bin";
+            dump_hidden_row(ctx, mixer_path, buf_.x, count - 1, 2560);
         }
-        lm_head_.forward(ctx, buf_.x, buf_.logits, count);
-        lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
-    }
 
-    stage(kStageHead);
+        // 4. LM Head (Compute for last token)
+        if (lastTokenOnly) {
+            const bf16* last_x = static_cast<const bf16*>(buf_.x.data()) + static_cast<size_t>(count - 1) * hidden_size_;
+            Tensor x_last_view = Tensor::view(ctx, const_cast<bf16*>(last_x), {1, hidden_size_});
+            lm_head_.forward(ctx, x_last_view, buf_.logits, 1);
+            lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {1, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
+        } else {
+            if (buf_.logits.shape(0) < count) {
+                buf_.logits = Tensor::allocate(ctx, {count, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
+            }
+            lm_head_.forward(ctx, buf_.x, buf_.logits, count);
+            lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
+        }
 
-    if (!s_dump_dir.empty()) {
-        std::string logits_path = s_dump_dir + "/logits.bin";
-        dump_hidden_row(ctx, logits_path, buf_.logits, 0, cfg_.vocab_size);
+        stage(kStageHead);
+
+        if (!s_dump_dir.empty()) {
+            std::string logits_path = s_dump_dir + "/logits.bin";
+            dump_hidden_row(ctx, logits_path, buf_.logits, 0, cfg_.vocab_size);
+        }
     }
 
     expert_cache_.wait_prefetch();
     if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
-        CaptureSnapshot(ctx, session, cached_len, count);
+        CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
     }
     session.currentLength_ = cached_len;
 
@@ -2053,7 +2054,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const uint64_t hits = s1.hit_count - prof_stats0.hit_count;
         const uint64_t misses = s1.miss_count - prof_stats0.miss_count;
         AILA_LOG_INFO("[Q4E Profile] pos=%d count=%d total=%.2fms router_sync=%.2fms acquire=%.2fms "
-                      "(fill=%.2fms dma_wait=%.2fms pf_wait=%.2fms pf=%llu/%llu) hit=%llu/%llu xfer=%.1fMB",
+                      "(fill=%.2fms dma_wait=%.2fms pf_wait=%.2fms pf=%llu/%llu) hit=%llu/%llu xfer=%.1fMB logits=%d",
                       start_pos, count, prof_ms(prof_t0, prof_clock::now()),
                       prof_router_sync_ms, prof_acquire_ms,
                       (s1.fill_ns - prof_stats0.fill_ns) * 1e-6,
@@ -2063,7 +2064,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                       static_cast<unsigned long long>(s1.prefetch_issued - prof_stats0.prefetch_issued),
                       static_cast<unsigned long long>(hits),
                       static_cast<unsigned long long>(hits + misses),
-                      (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0));
+                      (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0),
+                      options.need_logits ? 1 : 0);
         if (count > 1) {
             auto dstats = Bnb4BitLinear::get_prefill_dispatch_stats();
             AILA_LOG_INFO("[Q4E Prefill Dispatch] linear calls: fused_gemm=%llu cached=%llu on_demand=%llu sync_waits=%llu",
@@ -2109,7 +2111,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                       static_cast<unsigned long long>(d_dequant),
                       static_cast<unsigned long long>(d_sync));
     }
-    return lastTokenLogits_;
+    return options.need_logits ? lastTokenLogits_ : unusedLogits_;
 }
 
 // ============================================================================
@@ -2117,24 +2119,23 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 // ============================================================================
 
 void Qwen4ExpBnb4Backend::CaptureSnapshot(
-    Context& ctx, Session& session, int nextLength, int tokenCount) {
-    if (session.boundedSnapshots_ && session.maxSnapshots_ == 0) return;
+    Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
+    if (session.snapshots_.empty()) return;
     int step = aila::env::read_int("AILA_Q4E_PREFILL_STEP", 64);
     if (step <= 0) step = 64;
-    if (tokenCount <= 1 && nextLength % step != 0) return;
+    if (!force && tokenCount <= 1 && nextLength % step != 0) return;
 
     ctx.synchronize();
     auto& snapshots = session.snapshots_;
-    if (session.boundedSnapshots_ && snapshots.find(nextLength) == snapshots.end() &&
-        snapshots.size() >= session.maxSnapshots_) {
-        const auto oldest = std::min_element(
-            snapshots.begin(), snapshots.end(),
-            [](const auto& left, const auto& right) { return left.first < right.first; });
-        snapshots.erase(oldest);
+    auto slot = std::find_if(snapshots.begin(), snapshots.end(),
+        [nextLength](const auto& snapshot) { return snapshot.length == nextLength; });
+    if (slot == snapshots.end()) {
+        slot = std::min_element(snapshots.begin(), snapshots.end(),
+            [](const auto& left, const auto& right) { return left.length < right.length; });
     }
-    auto& snapshot = snapshots[nextLength];
+    auto& snapshot = *slot;
+    snapshot.length = -1;
     try {
-        snapshot.layers.resize(session.layerCaches_.size());
         sycl::event last_d2h_event{};
         for (size_t i = 0; i < layers_.size(); ++i) {
             if (!layers_[i].is_linear) continue;
@@ -2148,7 +2149,6 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
                     last_d2h_event = ctx.memcpy_d2h_async(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
                                                           cache.host_linear_conv_state.size() * sizeof(float));
                 }
-                cache.device_state_dirty = false;
             }
         }
         if (last_d2h_event != sycl::event{}) {
@@ -2157,16 +2157,20 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
         for (size_t i = 0; i < layers_.size(); ++i) {
             auto& cache = session.layerCaches_[i];
             if (layers_[i].is_linear) {
-                snapshot.layers[i].linear_state_host = cache.host_linear_state;
-                snapshot.layers[i].linear_conv_state_host = cache.host_linear_conv_state;
+                std::copy(cache.host_linear_state.begin(), cache.host_linear_state.end(),
+                          snapshot.layers[i].linear_state_host.begin());
+                std::copy(cache.host_linear_conv_state.begin(), cache.host_linear_conv_state.end(),
+                          snapshot.layers[i].linear_conv_state_host.begin());
+                cache.device_state_dirty = false;
                 snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
             } else {
                 snapshot.layers[i].num_compressed_blocks = cache.num_compressed_blocks;
             }
         }
         ple_.capture_snapshot(ctx, session.ple_state_, snapshot.ple_snapshot);
+        snapshot.length = nextLength;
     } catch (...) {
-        snapshots.erase(nextLength);
+        ctx.synchronize();
         throw;
     }
 }
@@ -2182,23 +2186,27 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         return 0;
     }
     int target = -1;
-    for (const auto& kv : session.snapshots_) {
-        if (kv.first <= newLength && kv.first > target) {
-            target = kv.first;
+    const StateSnapshot* selected = nullptr;
+    for (const auto& snapshot : session.snapshots_) {
+        if (snapshot.length <= newLength && snapshot.length > target) {
+            target = snapshot.length;
+            selected = &snapshot;
         }
     }
     if (target < 0) {
         Reset(session);
         return 0;
     }
-    const auto& snapshot = session.snapshots_.at(target);
+    const auto& snapshot = *selected;
     sycl::event last_h2d_event{};
     for (size_t i = 0; i < layers_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
         const auto& snap_layer = snapshot.layers[i];
         if (layers_[i].is_linear) {
-            cache.host_linear_state = snap_layer.linear_state_host;
-            cache.host_linear_conv_state = snap_layer.linear_conv_state_host;
+            std::copy(snap_layer.linear_state_host.begin(), snap_layer.linear_state_host.end(),
+                      cache.host_linear_state.begin());
+            std::copy(snap_layer.linear_conv_state_host.begin(), snap_layer.linear_conv_state_host.end(),
+                      cache.host_linear_conv_state.begin());
             cache.linear_conv_head = snap_layer.linear_conv_head;
             if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
                 last_h2d_event = session.context_->memcpy_h2d_async(cache.linear_state.data(), cache.host_linear_state.data(),
@@ -2220,9 +2228,8 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
     session.bump_generation();
     ple_ticket_.valid = false;
 
-    for (auto it = session.snapshots_.begin(); it != session.snapshots_.end(); ) {
-        if (it->first > target) it = session.snapshots_.erase(it);
-        else ++it;
+    for (auto& entry : session.snapshots_) {
+        if (entry.length > target) entry.length = -1;
     }
     session.currentLength_ = target;
     return target;
@@ -2231,7 +2238,7 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
 void Qwen4ExpBnb4Backend::Reset(Session& session) {
     ValidateSession(session);
     session.context_->synchronize();
-    session.snapshots_.clear();
+    for (auto& snapshot : session.snapshots_) snapshot.length = -1;
     for (size_t i = 0; i < layers_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
         if (layers_[i].is_linear) {
@@ -2273,8 +2280,17 @@ void Qwen4ExpBnb4Backend::reset() {
 
 std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession(
     Context& ctx, std::size_t maxSnapshots) {
-    auto session = std::unique_ptr<Session>(new Session(ctx, max_seq_len_, sessionOwner_, true, maxSnapshots));
+    auto session = std::unique_ptr<Session>(new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots));
     ple_.init_state(ctx, session->ple_state_);
+    for (auto& snapshot : session->snapshots_) {
+        snapshot.layers.resize(layers_.size());
+        for (size_t i = 0; i < layers_.size(); ++i) {
+            if (!layers_[i].is_linear) continue;
+            const auto& cache = session->layerCaches_[i];
+            snapshot.layers[i].linear_state_host.resize(cache.host_linear_state.size());
+            snapshot.layers[i].linear_conv_state_host.resize(cache.host_linear_conv_state.size());
+        }
+    }
     return session;
 }
 

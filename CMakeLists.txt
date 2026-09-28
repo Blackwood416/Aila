@@ -723,6 +723,17 @@ target_link_libraries(AilaQwen4ExpModuleTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpModuleTests COMMAND AilaQwen4ExpModuleTests)
 set_tests_properties(AilaQwen4ExpModuleTests PROPERTIES LABELS "gpu;models;qwen4_exp" TIMEOUT 120)
 
+add_executable(AilaQwen4ExpGenerationTests tests/models/Qwen4ExpGenerationTests.cpp)
+target_compile_definitions(AilaQwen4ExpGenerationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpGenerationTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpGenerationTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpGenerationTests COMMAND AilaQwen4ExpGenerationTests)
+set_tests_properties(AilaQwen4ExpGenerationTests PROPERTIES LABELS "gpu;models;qwen4_exp;h6" TIMEOUT 60)
+
 add_executable(AilaQwen4ExpExpertReadinessTests
     tests/models/Qwen4ExpExpertReadinessTests.cpp
 )

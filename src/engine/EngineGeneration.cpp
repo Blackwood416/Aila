@@ -12,7 +12,9 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
 
         auto replay_range = [&](const std::vector<int>& ids, int start, int len) {
             if (len <= 0) return;
-            Tensor* ignored_logits = forward_prompt_tokens(ids, start, len);
+            ForwardOptions replay_options;
+            replay_options.need_logits = false;
+            Tensor* ignored_logits = forward_prompt_tokens(ids, start, len, 0, false, replay_options);
             (void)ignored_logits;
         };
 
@@ -61,6 +63,10 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                                   bool async_h2d,
                                   const ForwardOptions& options) {
         if (!backend_ || !ctx_ || len <= 0) return nullptr;
+        if (start < 0 || start > static_cast<int>(token_ids.size()) ||
+            len > static_cast<int>(token_ids.size()) - start || !token_input_staging_.valid()) {
+            throw std::invalid_argument("Invalid prompt range or uninitialized token staging");
+        }
 
         int chunk_size = len;
         if (model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) {
@@ -70,6 +76,8 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
             }
         }
 
+        chunk_size = std::min(chunk_size, static_cast<int>(token_input_staging_.numel()));
+        int* token_ids_device = token_input_staging_.data_as<int>();
         Tensor* logits_ptr = nullptr;
         const int end = start + len;
         int pos = start;
@@ -80,20 +88,27 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                 next = snapshot_after_len;
             }
             const int slice_len = next - pos;
-            int* token_ids_device = static_cast<int*>(
-                ctx_->alloc_device(static_cast<size_t>(slice_len) * sizeof(int)));
-            if (async_h2d) {
-                ctx_->memcpy_h2d_async(token_ids_device,
-                                       token_ids.data() + pos,
-                                       static_cast<size_t>(slice_len) * sizeof(int));
-            } else {
-                ctx_->memcpy_h2d(token_ids_device,
-                                 token_ids.data() + pos,
-                                 static_cast<size_t>(slice_len) * sizeof(int));
+            ForwardOptions slice_options = options;
+            slice_options.need_logits = options.need_logits && next == end;
+            slice_options.capture_snapshot = options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
+                (options.capture_snapshot || (snapshot_after_len > 0 && next == snapshot_after_len));
+            try {
+                if (async_h2d) {
+                    ctx_->memcpy_h2d_async(token_ids_device,
+                                           token_ids.data() + pos,
+                                           static_cast<size_t>(slice_len) * sizeof(int));
+                } else {
+                    ctx_->memcpy_h2d(token_ids_device,
+                                     token_ids.data() + pos,
+                                     static_cast<size_t>(slice_len) * sizeof(int));
+                }
+                Tensor& output = backend_->forward(*ctx_, token_ids_device, slice_len, slice_options);
+                logits_ptr = slice_options.need_logits ? &output : nullptr;
+                ctx_->synchronize();
+            } catch (...) {
+                ctx_->synchronize();
+                throw;
             }
-            logits_ptr = &backend_->forward(*ctx_, token_ids_device, slice_len, options);
-            ctx_->synchronize();
-            ctx_->free_device(token_ids_device);
 
             pos = next;
         }
@@ -875,13 +890,21 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                                                snapshot_after_len, false, forward_options);
         } else {
             AILA_LOG_INFO("[Qwen3.5] Tokenwise prefill enabled for debug");
-            int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-            for (int i = 0; i < new_tokens_to_prefill; ++i) {
-                int tok = full_ids[static_cast<size_t>(prefill_start + i)];
-                ctx_->memcpy_h2d(one_token_device, &tok, sizeof(int));
-                logits_ptr = &backend_->forward(*ctx_, one_token_device, 1, forward_options);
+            int* one_token_device = token_input_staging_.data_as<int>();
+            try {
+                for (int i = 0; i < new_tokens_to_prefill; ++i) {
+                    int tok = full_ids[static_cast<size_t>(prefill_start + i)];
+                    ctx_->memcpy_h2d(one_token_device, &tok, sizeof(int));
+                    ForwardOptions step_options = forward_options;
+                    step_options.need_logits = i + 1 == new_tokens_to_prefill;
+                    step_options.capture_snapshot = prefill_start + i + 1 == recurrent_prefill_anchor;
+                    logits_ptr = &backend_->forward(*ctx_, one_token_device, 1, step_options);
+                }
+                ctx_->synchronize();
+            } catch (...) {
+                ctx_->synchronize();
+                throw;
             }
-            ctx_->free_device(one_token_device);
         }
         Tensor& logits = *logits_ptr;
 

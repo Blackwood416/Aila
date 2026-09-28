@@ -439,6 +439,8 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
         bool is_exact_q35_0p8b_spec =
             (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
             is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
+        token_input_staging_ = Tensor::allocate(*ctx_, {backend_->max_seq_len()},
+                                               dnnl::memory::data_type::s32);
         int init_warmup_mode = aila::env::read_int_raw("AILA_INIT_WARMUP", -1);
         bool run_init_warmup = true;
         if (init_warmup_mode == 0) {

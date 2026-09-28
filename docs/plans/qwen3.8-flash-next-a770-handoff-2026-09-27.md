@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
+> **2026-09-28 H6 更新：** H6a/b 已完成，H6a 提交 `ac5e7df`。默认聊天保留 26+4，非末段跳过 logits，token staging 与快照目标预分配；显式 one-shot 维持 30-token 单段。完整 logits 位模式、真实两轮复用/回滚及两种策略的 48-token ID 对照通过。最新代码和验收以 [H6 记录](qwen3.8-flash-next-h6-results-2026-09-28.md) 为准，本文下方 H0–H5 数据及原 H6 待办是接手时记录。H6c 尚未实施。
+
 **交接日期**: 2026-09-28  
 **当前 HEAD 提交**: [`d39c164`](file:///E:/RiderProjects/Aila) (`fix(qwen4_exp): resolve unnested float absmax reader crash, add >16 decoupled task dispatch and accurate DMA timing`)  
 **工作区状态**: 干净（`git status -s` 无修改，全量测试 100% Passed，最新 Overlapped ReadFile 模式端到端生成耗时 **5,829.39 ms**，大幅刷新历史最快纪录）  

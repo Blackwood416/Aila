@@ -31,7 +31,8 @@ struct Qwen4ExpPleState {
 struct Qwen4ExpPleSnapshot {
     std::array<int, 2> prev_tokens = {248044, 248044};
     int conv_head = 0;
-    std::vector<float> conv_state; // [9 * 10240] f32 on host
+    std::vector<float> conv_state = std::vector<float>(
+        Qwen4ExpPleState::CONV_STATE_LEN * Qwen4ExpPleState::CONV_CHANNELS);
 };
 
 struct PleShardRef {

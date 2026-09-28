@@ -427,6 +427,8 @@ private:
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
+    Tensor token_input_staging_;
+    friend struct Qwen4ExpGenerationTestAccess;
     std::unique_ptr<aila::vision::Yolo26Detector> detector_;
     std::unique_ptr<aila::vision::IVisionEncoder> vision_encoder_;
     std::unique_ptr<aila::audio::Qwen3ASRAudioEncoder> audio_encoder_;
