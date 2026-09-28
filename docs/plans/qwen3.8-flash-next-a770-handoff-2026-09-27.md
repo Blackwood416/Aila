@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
+> **H6c 后续更新：** 默认关闭的短文本内部快照原型已验证 story 中位计时约降低 4.33%，并通过黄金 token、多轮复用和实际回滚对照。通用锚点数值一致性仍未解决，不能默认启用；详见 [H6c 实验与下一步](qwen3.8-flash-next-h6c-results-2026-09-28.md)。以下“H6c 尚未实施”是前一轮 H6b 交接时的历史状态。
+
 > **2026-09-28 H6 更新：** H6a/b 已完成，H6a 提交 `ac5e7df`。默认聊天保留 26+4，非末段跳过 logits，token staging 与快照目标预分配；显式 one-shot 维持 30-token 单段。完整 logits 位模式、真实两轮复用/回滚及两种策略的 48-token ID 对照通过。最新代码和验收以 [H6 记录](qwen3.8-flash-next-h6-results-2026-09-28.md) 为准，本文下方 H0–H5 数据及原 H6 待办是接手时记录。H6c 尚未实施。
 
 **交接日期**: 2026-09-28  

@@ -895,6 +895,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     ensure_runtime_buffers(ctx, count);
+    const int checkpoint_after = options.snapshot_policy == SnapshotPolicy::ReusablePrefix
+        ? options.checkpoint_after : 0;
+    if (checkpoint_after < 0 || (checkpoint_after > 0 &&
+        (checkpoint_after < 2 || count - checkpoint_after < 2 || count > 64 ||
+         cached_len > 2052 || session.snapshots_.size() < 2))) {
+        throw std::invalid_argument("Qwen4ExpBnb4Backend: interior checkpoint requires short dense prefill, two multi-token sides and two slots");
+    }
+    StateSnapshot* interior = checkpoint_after > 0
+        ? &ReserveSnapshot(session, start_pos + checkpoint_after) : nullptr;
     Bnb4BitLinear::PrefillDispatchStats prefill_stats_t0{};
     if (count > 1) {
         prefill_stats_t0 = Bnb4BitLinear::get_prefill_dispatch_stats();
@@ -1039,7 +1048,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                            &session, session.generation(), start_pos);
             }
             ple_.consume(ctx, ple_ticket_, session.ple_state_,
-                         hidden4_ptr, nullptr, hidden4_ptr);
+                         hidden4_ptr, nullptr, hidden4_ptr, checkpoint_after,
+                         interior ? &interior->ple_snapshot : nullptr);
             ple_.commit(ple_ticket_, session.ple_state_);
         }
 
@@ -1078,9 +1088,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 layer.linear_o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.y, 1);
             } else {
                 layer.linear_all_proj.forward(ctx, linear_scratch_, buf_.x, buf_.linear_all, count);
-                ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
-                                                         static_cast<const bf16*>(buf_.linear_all.data()),
-                                                         static_cast<bf16*>(buf_.attn_out.data()), count);
+                const auto run_range = [&](int offset, int length) {
+                    const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
+                    bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
+                    ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
+                                                             input, output, length);
+                };
+                if (interior) {
+                    run_range(0, checkpoint_after);
+                    auto& snapshot = interior->layers[L];
+                    snapshot.linear_conv_head = d_state.conv_head;
+                    // In-order D2H completes before the suffix may overwrite the recurrent state.
+                    ctx.memcpy_d2h_async(snapshot.linear_state_host.data(), cache.linear_state.data(),
+                                         cache.linear_state.size_bytes());
+                    ctx.memcpy_d2h_async(snapshot.linear_conv_state_host.data(), cache.linear_conv_state.data(),
+                                         cache.linear_conv_state.size_bytes());
+                    run_range(checkpoint_after, count - checkpoint_after);
+                } else {
+                    run_range(0, count);
+                }
                 layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
             }
             cache.linear_conv_head = d_state.conv_head;
@@ -2043,6 +2069,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     expert_cache_.wait_prefetch();
+    if (interior) {
+        const int position = start_pos + checkpoint_after;
+        const int ratio = std::max(1, cfg_.indexer_compress_ratio);
+        for (size_t i = 0; i < layers_.size(); ++i) {
+            if (!layers_[i].is_linear) {
+                // Raw K and KV retain the entire prefix; only valid block counts need rollback.
+                interior->layers[i].num_compressed_blocks =
+                    std::min(session.layerCaches_[i].num_compressed_blocks, position / ratio);
+            }
+        }
+        ctx.synchronize();
+        interior->length = position;
+    }
     if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
         CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
     }
@@ -2118,14 +2157,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 // Snapshot & Rollback
 // ============================================================================
 
-void Qwen4ExpBnb4Backend::CaptureSnapshot(
-    Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
-    if (session.snapshots_.empty()) return;
-    int step = aila::env::read_int("AILA_Q4E_PREFILL_STEP", 64);
-    if (step <= 0) step = 64;
-    if (!force && tokenCount <= 1 && nextLength % step != 0) return;
-
-    ctx.synchronize();
+Qwen4ExpBnb4Backend::StateSnapshot& Qwen4ExpBnb4Backend::ReserveSnapshot(Session& session, int nextLength) {
     auto& snapshots = session.snapshots_;
     auto slot = std::find_if(snapshots.begin(), snapshots.end(),
         [nextLength](const auto& snapshot) { return snapshot.length == nextLength; });
@@ -2135,6 +2167,18 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
     }
     auto& snapshot = *slot;
     snapshot.length = -1;
+    return snapshot;
+}
+
+void Qwen4ExpBnb4Backend::CaptureSnapshot(
+    Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
+    if (session.snapshots_.empty()) return;
+    int step = aila::env::read_int("AILA_Q4E_PREFILL_STEP", 64);
+    if (step <= 0) step = 64;
+    if (!force && tokenCount <= 1 && nextLength % step != 0) return;
+
+    ctx.synchronize();
+    auto& snapshot = ReserveSnapshot(session, nextLength);
     try {
         sycl::event last_d2h_event{};
         for (size_t i = 0; i < layers_.size(); ++i) {
@@ -2308,6 +2352,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLegacyLogits(
 Tensor& Qwen4ExpBnb4Backend::forward(
     Context& ctx, const int* token_ids_device, int seq_len) {
     return Forward(ctx, DefaultSession(ctx), token_ids_device, seq_len);
+}
+
+bool Qwen4ExpBnb4Backend::supports_interior_checkpoint(int count, int checkpoint_after) const {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_INLINE_CHECKPOINT", false);
+    return enabled && defaultSession_ && defaultSession_->snapshots_.size() >= 2 &&
+        count <= 64 && checkpoint_after >= 2 && count - checkpoint_after >= 2 &&
+        defaultSession_->CurrentLength() + count <= 2052 &&
+        defaultSession_->embeddingOverridePositions_.empty() && !defaultSession_->mropePosT_.valid();
 }
 
 Tensor& Qwen4ExpBnb4Backend::forward(

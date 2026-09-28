@@ -144,7 +144,9 @@ public:
         Qwen4ExpPleState& state,
         const sycl::ext::oneapi::bfloat16* hidden_states,
         sycl::ext::oneapi::bfloat16* out,
-        sycl::ext::oneapi::bfloat16* residual = nullptr);
+        sycl::ext::oneapi::bfloat16* residual = nullptr,
+        int checkpoint_after = 0,
+        Qwen4ExpPleSnapshot* checkpoint = nullptr);
 
     // Commit: updates state.prev_tokens only after successful execution.
     void commit(

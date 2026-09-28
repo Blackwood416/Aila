@@ -13,6 +13,7 @@ struct ForwardOptions {
     SnapshotPolicy snapshot_policy = SnapshotPolicy::ReusablePrefix;
     bool need_logits = true;
     bool capture_snapshot = false; // Force a checkpoint at an explicit prefix boundary.
+    int checkpoint_after = 0; // Tokens within this forward; zero disables the interior checkpoint.
 };
 
 class IModelBackend {
@@ -34,6 +35,7 @@ public:
     }
 
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) = 0;
+    virtual bool supports_interior_checkpoint(int, int) const { return false; }
     // Backends may skip the output head when logits are not consumed.
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len,
                             const ForwardOptions&) {

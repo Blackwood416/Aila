@@ -663,8 +663,14 @@ void Qwen4ExpPle::consume(
     Qwen4ExpPleState& state,
     const bf16* hidden_states,
     bf16* out,
-    bf16* residual) {
+    bf16* residual,
+    int checkpoint_after,
+    Qwen4ExpPleSnapshot* checkpoint) {
     if (!ticket.valid || ticket.num_tokens <= 0) return;
+    if (checkpoint_after < 0 || checkpoint_after >= ticket.num_tokens ||
+        (checkpoint_after > 0 && !checkpoint)) {
+        throw std::invalid_argument("Qwen4ExpPle: invalid interior checkpoint");
+    }
 
     if (ticket.task_id > 0) {
         wait_task(ticket.task_id);
@@ -712,6 +718,22 @@ void Qwen4ExpPle::consume(
                           num_tokens, HC_COUNT, EMBED_DIM, true);
 
     // 7. Dilated Conv1D + SiLU + Residual Add
+    if (checkpoint_after > 0) {
+        ops::ple_dilated_conv_silu_add(ctx, gv_normed_.data_as<bf16>(), gv_buf_.data_as<bf16>(),
+                                      state.conv_state.data_as<float>(), state.conv_head, conv1d_w_ptr_, out,
+                                      checkpoint_after, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION, residual);
+        capture_snapshot(ctx, state, *checkpoint);
+        const auto& ids = slot_input_ids_[ticket.staging_slot];
+        checkpoint->prev_tokens = {checkpoint_after == 1 ? ticket.prev_tokens_in[1] : ids[checkpoint_after - 2],
+                                   ids[checkpoint_after - 1]};
+        const size_t offset = static_cast<size_t>(checkpoint_after) * HC_HIDDEN_SIZE;
+        ops::ple_dilated_conv_silu_add(ctx, gv_normed_.data_as<bf16>() + offset, gv_buf_.data_as<bf16>() + offset,
+                                      state.conv_state.data_as<float>(), state.conv_head, conv1d_w_ptr_,
+                                      out ? out + offset : nullptr, num_tokens - checkpoint_after,
+                                      HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION,
+                                      residual ? residual + offset : nullptr);
+        return;
+    }
     ops::ple_dilated_conv_silu_add(ctx, static_cast<const bf16*>(gv_normed_.data()),
                                   static_cast<const bf16*>(gv_buf_.data()),
                                   static_cast<float*>(state.conv_state.data()),

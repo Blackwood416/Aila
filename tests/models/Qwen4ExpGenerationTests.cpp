@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -43,9 +44,13 @@ public:
     };
     std::vector<Call> calls;
     bool throw_next = false;
+    bool interior_enabled = false;
     explicit RecordingBackend(Context& ctx)
         : output_(Tensor::allocate(ctx, {1, 4}, dnnl::memory::data_type::f32)) {}
     bool load(Context&, ModelWeights&, const ModelSpec&, int, std::string*) override { return true; }
+    bool supports_interior_checkpoint(int count, int anchor) const override {
+        return interior_enabled && count <= 64 && anchor >= 2 && count - anchor >= 2;
+    }
     Tensor& forward(Context& ctx, const int* ids, int count) override { return forward(ctx, ids, count, {}); }
     Tensor& forward(Context& ctx, const int* ids, int count, const ForwardOptions& options) override {
         Call call{count, options, ids, ctx.device_allocation_count()};
@@ -114,6 +119,32 @@ void test_prefill_slices() {
     expect(!recording.calls[0].options.need_logits && !recording.calls[1].options.need_logits &&
            recording.calls[2].options.need_logits, "Capacity splitting must compute only final logits");
 
+    recording.calls.clear();
+    recording.interior_enabled = true;
+    engine.forward_prompt_tokens(ids, 0, 30, 26);
+    expect(recording.calls.size() == 1 && recording.calls[0].count == 30 &&
+           recording.calls[0].options.checkpoint_after == 26 && recording.calls[0].options.need_logits,
+           "Interior checkpoint must preserve one full-length prefill");
+    recording.calls.clear();
+    engine.forward_prompt_tokens(ids, 25, 5, 26);
+    expect(recording.calls.size() == 2 && recording.calls[0].count == 1 &&
+           recording.calls[0].options.checkpoint_after == 0,
+           "Single-token interior boundary must fall back to split prefill");
+    recording.calls.clear();
+    engine.forward_prompt_tokens(ids, 0, 30, 29);
+    expect(recording.calls.size() == 2 && recording.calls[1].count == 1,
+           "Single-token suffix must fall back to split prefill");
+    recording.calls.clear();
+    engine.forward_prompt_tokens(ids, 0, 130, 80);
+    expect(recording.calls.size() == 3 && recording.calls[0].options.checkpoint_after == 0 &&
+           recording.calls[1].options.checkpoint_after == 16 && recording.calls[2].options.checkpoint_after == 0,
+           "Only the chunk containing the anchor may capture it");
+    recording.calls.clear();
+    engine.forward_prompt_tokens(ids, 0, 30, 26, false, {SnapshotPolicy::None, true});
+    expect(recording.calls.size() == 1 && recording.calls[0].options.checkpoint_after == 0,
+           "One-shot must not request an interior checkpoint");
+    recording.interior_enabled = false;
+
     recording.throw_next = true;
     bool failed = false;
     try { engine.forward_prompt_tokens(ids, 0, 30, 26, true); }
@@ -172,6 +203,68 @@ void test_real_model(const std::string& directory) {
     const auto restored_final = read_logits(ctx, backend.forward(ctx, Access::Staging(engine) + 26, 4));
     expect(reference_final == restored_final, "Rollback must preserve every final logit bit");
     std::cout << "[PASS] Real 26+4 skip-logits and rollback: " << reference_final.size() << " BF16 logits identical\n";
+
+    backend.reset();
+    const auto full_final = read_logits(ctx, backend.forward(ctx, Access::Staging(engine), 30));
+    for (const int anchor : {2, 16, 26, 28}) {
+        backend.reset();
+        backend.forward(ctx, Access::Staging(engine), anchor, {SnapshotPolicy::ReusablePrefix, false, true});
+        const auto expected_snapshot = *session.snapshot_for_testing(anchor);
+        const auto split_final = read_logits(ctx, backend.forward(ctx, Access::Staging(engine) + anchor, 30 - anchor));
+        backend.reset();
+        const auto inline_final = read_logits(ctx, backend.forward(ctx, Access::Staging(engine), 30,
+            {SnapshotPolicy::ReusablePrefix, true, false, anchor}));
+        expect(inline_final == full_final, "Interior checkpoint must preserve full-prefill logits");
+        const auto* actual_snapshot = session.snapshot_for_testing(anchor);
+        expect(actual_snapshot && session.snapshot_for_testing(30), "Interior and final checkpoints must both be retained");
+        expect(actual_snapshot->ple_snapshot.prev_tokens == expected_snapshot.ple_snapshot.prev_tokens &&
+               actual_snapshot->ple_snapshot.conv_head == expected_snapshot.ple_snapshot.conv_head,
+               "Interior PLE token history must match the split prefix");
+        for (size_t i = 0; i < actual_snapshot->layers.size(); ++i) {
+            expect(actual_snapshot->layers[i].linear_conv_head == expected_snapshot.layers[i].linear_conv_head &&
+                   actual_snapshot->layers[i].num_compressed_blocks == expected_snapshot.layers[i].num_compressed_blocks,
+                   "Interior layer metadata must match the split prefix");
+        }
+        expect(backend.Truncate(session, anchor) == anchor, "Interior checkpoint must be restorable");
+        for (size_t i = 0; i < actual_snapshot->layers.size(); ++i) {
+            const auto& layer = actual_snapshot->layers[i];
+            if (layer.linear_state_host.empty()) continue;
+            const auto& cache = session.layer_caches_for_testing()[i];
+            std::vector<float> restored(layer.linear_state_host.size());
+            ctx.memcpy_d2h(restored.data(), cache.linear_state.data(), restored.size() * sizeof(float));
+            expect(restored == layer.linear_state_host, "Interior recurrent state must restore exactly");
+            restored.resize(layer.linear_conv_state_host.size());
+            ctx.memcpy_d2h(restored.data(), cache.linear_conv_state.data(), restored.size() * sizeof(float));
+            expect(restored == layer.linear_conv_state_host, "Interior convolution state must restore exactly");
+        }
+        const auto replay_final = read_logits(ctx, backend.forward(ctx, Access::Staging(engine) + anchor, 30 - anchor));
+        size_t mismatches = 0;
+        float max_abs_diff = 0.0f;
+        for (size_t i = 0; i < replay_final.size(); ++i) {
+            if (replay_final[i] != split_final[i]) ++mismatches;
+            uint32_t left_bits = static_cast<uint32_t>(replay_final[i]) << 16;
+            uint32_t right_bits = static_cast<uint32_t>(split_final[i]) << 16;
+            float left, right;
+            std::memcpy(&left, &left_bits, sizeof(float));
+            std::memcpy(&right, &right_bits, sizeof(float));
+            max_abs_diff = std::max(max_abs_diff, std::abs(left - right));
+        }
+        std::cout << "[DIAGNOSTIC] Interior anchor=" << anchor << " split-reference mismatches="
+                  << mismatches << " max_abs_diff=" << max_abs_diff << '\n';
+        if (anchor == 26 || anchor == 28) {
+            expect(mismatches == 0, "Golden story anchor rollback must match split logits exactly");
+        }
+        std::cout << "[PASS] Interior checkpoint anchor=" << anchor << " full-prefill logits and state restore identical\n";
+    }
+    backend.reset();
+    for (const int rejected_anchor : {1, 29}) {
+        bool invalid_checkpoint = false;
+        try { backend.forward(ctx, Access::Staging(engine), 30,
+                               {SnapshotPolicy::ReusablePrefix, true, false, rejected_anchor}); }
+        catch (const std::invalid_argument&) { invalid_checkpoint = true; }
+        expect(invalid_checkpoint && session.CurrentLength() == 0,
+               "Unsupported interior checkpoint must be rejected before advancing state");
+    }
 
     engine.reset_context();
     const std::string first = engine.generate_chat_request_text(request);

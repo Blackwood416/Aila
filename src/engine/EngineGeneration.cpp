@@ -83,12 +83,18 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
         int pos = start;
         while (pos < end) {
             int next = std::min(end, pos + chunk_size);
+            int checkpoint_after = 0;
             if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
                 snapshot_after_len > pos && snapshot_after_len < next) {
-                next = snapshot_after_len;
+                if (backend_->supports_interior_checkpoint(next - pos, snapshot_after_len - pos)) {
+                    checkpoint_after = snapshot_after_len - pos;
+                } else {
+                    next = snapshot_after_len;
+                }
             }
             const int slice_len = next - pos;
             ForwardOptions slice_options = options;
+            slice_options.checkpoint_after = checkpoint_after;
             slice_options.need_logits = options.need_logits && next == end;
             slice_options.capture_snapshot = options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
                 (options.capture_snapshot || (snapshot_after_len > 0 && next == snapshot_after_len));

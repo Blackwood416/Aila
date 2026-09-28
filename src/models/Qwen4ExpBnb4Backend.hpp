@@ -205,6 +205,7 @@ public:
     bool load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
               int max_seq_len, std::string* error_message) override;
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
+    bool supports_interior_checkpoint(int count, int checkpoint_after) const override;
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len,
                     const ForwardOptions& options) override;
     void reset() override;
@@ -265,6 +266,7 @@ private:
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
+    StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
     friend struct Qwen4ExpGenerationTestAccess;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void free_pinned_host_buffers();
