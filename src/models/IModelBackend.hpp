@@ -9,6 +9,11 @@
 #include <vector>
 #include <sycl/sycl.hpp>
 
+struct ForwardOptions {
+    SnapshotPolicy snapshot_policy = SnapshotPolicy::ReusablePrefix;
+    bool need_logits = true;
+};
+
 class IModelBackend {
 public:
     virtual ~IModelBackend() = default;
@@ -28,6 +33,11 @@ public:
     }
 
     virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) = 0;
+    // Backends may skip the output head when logits are not consumed.
+    virtual Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len,
+                            const ForwardOptions&) {
+        return forward(ctx, token_ids_device, seq_len);
+    }
     virtual void reset() = 0;
     // Truncate cached state to new_len positions.  Returns true if the
     // truncation was clean (state is consistent at new_len so incremental

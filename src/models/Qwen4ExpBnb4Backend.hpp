@@ -201,6 +201,8 @@ public:
     bool load(Context& ctx, ModelWeights& weights, const ModelSpec& spec,
               int max_seq_len, std::string* error_message) override;
     Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len) override;
+    Tensor& forward(Context& ctx, const int* token_ids_device, int seq_len,
+                    const ForwardOptions& options) override;
     void reset() override;
     bool truncate_kv_cache(int new_len) override;
     int get_current_context_len() const override {
@@ -212,7 +214,8 @@ public:
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
     Tensor& Forward(Context& ctx, Session& session,
-                    const int* tokenIdsDevice, int count);
+                    const int* tokenIdsDevice, int count,
+                    const ForwardOptions& options = {});
     Tensor& ForwardLegacyLogits(Context& ctx, Session& session,
                                 const int* tokenIdsDevice, int count);
     void Reset(Session& session);
@@ -252,7 +255,8 @@ public:
 
 private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
-                        const int* tokenIdsDevice, int count, bool lastTokenOnly);
+                        const int* tokenIdsDevice, int count, bool lastTokenOnly,
+                        const ForwardOptions& options);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount);

@@ -111,12 +111,27 @@ void run_chat_json_tests() {
     ChatRequest array_req;
     GenerationConfig defaults;
     defaults.max_new_tokens = 7;
+    defaults.snapshot_policy = SnapshotPolicy::None;
     AILA_CHAT_EXPECT_TRUE(parse_chat_request_json(
         R"([{"role":"assistant","tool_calls":[{"function":{"name":"calc","arguments":{"x":2}}}]}])",
         defaults,
         array_req,
         &error));
     AILA_CHAT_EXPECT_EQ(array_req.generation_config.max_new_tokens, 7);
+    AILA_CHAT_EXPECT_TRUE(array_req.generation_config.snapshot_policy == SnapshotPolicy::None);
+    for (const std::string policy : {"none", "reusable_prefix"}) {
+        AILA_CHAT_EXPECT_TRUE(parse_chat_request_json(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"snapshot_policy\":\"" + policy + "\"}",
+            defaults, req, &error));
+        AILA_CHAT_EXPECT_TRUE(req.generation_config.snapshot_policy ==
+            (policy == "none" ? SnapshotPolicy::None : SnapshotPolicy::ReusablePrefix));
+    }
+    for (const std::string value : {"\"auto\"", "null", "42", "true"}) {
+        AILA_CHAT_EXPECT_TRUE(!parse_chat_request_json(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"snapshot_policy\":" + value + "}",
+            defaults, req, &error));
+        AILA_CHAT_EXPECT_TRUE(error.find("snapshot_policy") != std::string::npos);
+    }
     AILA_CHAT_EXPECT_EQ(array_req.messages.size(), static_cast<size_t>(1));
     AILA_CHAT_EXPECT_EQ(array_req.messages[0].tool_calls[0].type, std::string("function"));
     AILA_CHAT_EXPECT_EQ(array_req.messages[0].tool_calls[0].function.arguments_json, std::string(R"({"x":2})"));

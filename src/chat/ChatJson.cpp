@@ -563,6 +563,17 @@ bool parse_chat_request_json(const std::string& request_json,
         }
 
         if (has_root_obj) {
+            simdjson::dom::element snapshot_policy;
+            if (root_obj.at_key("snapshot_policy").get(snapshot_policy) == simdjson::SUCCESS) {
+                std::string_view policy;
+                if (snapshot_policy.get_string().get(policy) != simdjson::SUCCESS ||
+                    (policy != "none" && policy != "reusable_prefix")) {
+                    set_error(error_message, "snapshot_policy must be none or reusable_prefix");
+                    return false;
+                }
+                out.generation_config.snapshot_policy = policy == "none"
+                    ? SnapshotPolicy::None : SnapshotPolicy::ReusablePrefix;
+            }
             parse_generation_options(root_obj, out);
             parse_template_kwargs(root_obj, out);
             if (!parse_tool_choice(root_obj, out, error_message)) {

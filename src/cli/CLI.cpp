@@ -210,6 +210,7 @@ Options:
   --no-stream              Force non-streaming output
   --max-tokens <N>         Maximum new tokens (default: 1024)
   --thinking-budget <N>    Thinking token budget: -1=off, 0=no-think, >0 cap
+  --snapshot-policy <P>    none or reusable_prefix (default: reusable_prefix)
   --decode-chunk <N>       Decode chunk size (default: 12)
   --stream-chunk <N>       Stream chunk size (default: 4)
   --rep-penalty <F>        Repetition penalty (default: 1.0, >1.0 to penalize)
@@ -378,6 +379,16 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--max-tokens" && i + 1 < argc) {
             opts.max_new_tokens = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--snapshot-policy" && i + 1 < argc) {
+            const std::string policy = argv[++i];
+            if (policy == "none") opts.snapshot_policy = SnapshotPolicy::None;
+            else if (policy == "reusable_prefix") opts.snapshot_policy = SnapshotPolicy::ReusablePrefix;
+            else {
+                std::cerr << "Error: --snapshot-policy must be none or reusable_prefix" << std::endl;
+                return false;
+            }
             continue;
         }
         if (arg == "--thinking-budget" && i + 1 < argc) {

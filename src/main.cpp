@@ -275,6 +275,7 @@ int main(int argc, char** argv) {
     gen_config.decode_chunk_size = opts.decode_chunk_size;
     gen_config.stream_chunk_size = opts.stream_chunk_size;
     gen_config.thinking_budget_tokens = opts.thinking_budget_tokens;
+    gen_config.snapshot_policy = opts.snapshot_policy;
     gen_config.repetition_penalty = opts.repetition_penalty;
     gen_config.presence_penalty   = opts.presence_penalty;
     gen_config.frequency_penalty  = opts.frequency_penalty;

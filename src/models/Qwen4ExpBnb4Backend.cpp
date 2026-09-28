@@ -882,7 +882,8 @@ void Qwen4ExpBnb4Backend::RunHyperConnection(
 
 Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     Context& ctx, Session& session,
-    const int* tokenIdsDevice, int count, bool lastTokenOnly) {
+    const int* tokenIdsDevice, int count, bool lastTokenOnly,
+    const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
 
@@ -2041,7 +2042,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     expert_cache_.wait_prefetch();
-    CaptureSnapshot(ctx, session, cached_len, count);
+    if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
+        CaptureSnapshot(ctx, session, cached_len, count);
+    }
     session.currentLength_ = cached_len;
 
     if (s_profile) {
@@ -2276,18 +2279,24 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
 }
 
 Tensor& Qwen4ExpBnb4Backend::Forward(
-    Context& ctx, Session& session, const int* tokenIdsDevice, int count) {
-    return ForwardImpl(ctx, session, tokenIdsDevice, count, true);
+    Context& ctx, Session& session, const int* tokenIdsDevice, int count,
+    const ForwardOptions& options) {
+    return ForwardImpl(ctx, session, tokenIdsDevice, count, true, options);
 }
 
 Tensor& Qwen4ExpBnb4Backend::ForwardLegacyLogits(
     Context& ctx, Session& session, const int* tokenIdsDevice, int count) {
-    return ForwardImpl(ctx, session, tokenIdsDevice, count, false);
+    return ForwardImpl(ctx, session, tokenIdsDevice, count, false, {});
 }
 
 Tensor& Qwen4ExpBnb4Backend::forward(
     Context& ctx, const int* token_ids_device, int seq_len) {
     return Forward(ctx, DefaultSession(ctx), token_ids_device, seq_len);
+}
+
+Tensor& Qwen4ExpBnb4Backend::forward(
+    Context& ctx, const int* token_ids_device, int seq_len, const ForwardOptions& options) {
+    return Forward(ctx, DefaultSession(ctx), token_ids_device, seq_len, options);
 }
 
 Qwen4ExpBnb4Backend::Session& Qwen4ExpBnb4Backend::DefaultSession(Context& ctx) {

@@ -525,6 +525,8 @@ enum class EngineErrorCode {
 // ============================================================
 // Generation Parameters
 // ============================================================
+enum class SnapshotPolicy { None, ReusablePrefix };
+
 struct GenerationConfig {
     int max_new_tokens      = 512;
     float temperature       = 0.6f;
@@ -536,6 +538,7 @@ struct GenerationConfig {
     int decode_chunk_size   = 12;   // greedy + non-streaming: tokens per host sync chunk
     int stream_chunk_size   = 4;    // greedy + streaming: tokens per flush chunk
     int thinking_budget_tokens = -1; // -1=disabled, 0=no-think, >0=max tokens inside <think>
+    SnapshotPolicy snapshot_policy = SnapshotPolicy::ReusablePrefix;
 
     // Penalty parameters
     float repetition_penalty = 1.0f;   // > 1.0 penalizes repeated tokens multiplicatively

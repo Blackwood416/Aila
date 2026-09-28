@@ -58,7 +58,8 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                                   int start,
                                   int len,
                                   int snapshot_after_len,
-                                  bool async_h2d) {
+                                  bool async_h2d,
+                                  const ForwardOptions& options) {
         if (!backend_ || !ctx_ || len <= 0) return nullptr;
 
         int chunk_size = len;
@@ -74,7 +75,8 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
         int pos = start;
         while (pos < end) {
             int next = std::min(end, pos + chunk_size);
-            if (snapshot_after_len > pos && snapshot_after_len < next) {
+            if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
+                snapshot_after_len > pos && snapshot_after_len < next) {
                 next = snapshot_after_len;
             }
             const int slice_len = next - pos;
@@ -89,7 +91,7 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                                  token_ids.data() + pos,
                                  static_cast<size_t>(slice_len) * sizeof(int));
             }
-            logits_ptr = &backend_->forward(*ctx_, token_ids_device, slice_len);
+            logits_ptr = &backend_->forward(*ctx_, token_ids_device, slice_len, options);
             ctx_->synchronize();
             ctx_->free_device(token_ids_device);
 
@@ -535,6 +537,7 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
              rendered_ends_with(rendered.text, "<think>"));
         int recurrent_prefill_anchor = 0;
         if ((model_spec_.family == ModelFamily::Qwen35Hybrid || model_spec_.family == ModelFamily::Qwen4Exp) &&
+            gen_config.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
             total_vision_tokens == 0 && total_audio_tokens == 0) {
             std::string stable_err;
             aila::chat::ChatFormatTextResult stable_rendered;
@@ -806,7 +809,10 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
         }
 
         int reusable_prefix = 0;
-        bool allow_incremental_prefill = (total_vision_tokens == 0 && total_audio_tokens == 0);
+        const bool retain_prefix = gen_config.snapshot_policy == SnapshotPolicy::ReusablePrefix;
+        const ForwardOptions forward_options{gen_config.snapshot_policy, true};
+        bool allow_incremental_prefill = retain_prefix &&
+                                        (total_vision_tokens == 0 && total_audio_tokens == 0);
         if (allow_incremental_prefill) {
             int max_possible_match = std::min(static_cast<int>(cached_ids_.size()),
                                               static_cast<int>(full_ids.size()));
@@ -866,14 +872,14 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                     : 0;
             logits_ptr = forward_prompt_tokens(full_ids, prefill_start,
                                                new_tokens_to_prefill,
-                                               snapshot_after_len);
+                                               snapshot_after_len, false, forward_options);
         } else {
             AILA_LOG_INFO("[Qwen3.5] Tokenwise prefill enabled for debug");
             int* one_token_device = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
             for (int i = 0; i < new_tokens_to_prefill; ++i) {
                 int tok = full_ids[static_cast<size_t>(prefill_start + i)];
                 ctx_->memcpy_h2d(one_token_device, &tok, sizeof(int));
-                logits_ptr = &backend_->forward(*ctx_, one_token_device, 1);
+                logits_ptr = &backend_->forward(*ctx_, one_token_device, 1, forward_options);
             }
             ctx_->free_device(one_token_device);
         }
@@ -979,7 +985,7 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
 
                 while (available_tokens < chunk_end) {
                     int current_index = available_tokens - 1;
-                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device + current_index, 1);
+                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device + current_index, 1, forward_options);
                     if (tuned_cfg.do_sample) {
                         ops::sample_with_config_device(*ctx_, logits_next, config_.vocab_size,
                                                        tuned_cfg, ops::next_sampling_uniform(),
@@ -1108,7 +1114,7 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                         break;
                     }
 
-                    Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1);
+                    Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1, forward_options);
                     if (has_forced_token()) {
                         next_token = pop_forced_token();
                     } else {
@@ -1137,15 +1143,22 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
             output_text.compare(0, 7, "<think>") != 0) {
             output_text.insert(0, "<think>\n");
         }
-        align_backend_context_to_sequence(full_ids, generated_token_ids,
-                                          total_prompt_len, "[GenerateMessages]");
+        if (retain_prefix) {
+            align_backend_context_to_sequence(full_ids, generated_token_ids,
+                                              total_prompt_len, "[GenerateMessages]");
+        }
 
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         AILA_LOG_INFO("[GenerateMessages] Prompt=%d Generated=%zu in %.2f ms",
                       total_prompt_len, generated_token_ids.size(), ms);
 
-        cached_ids_ = full_ids;
-        cached_ids_.insert(cached_ids_.end(), generated_token_ids.begin(), generated_token_ids.end());
+        if (retain_prefix) {
+            cached_ids_ = full_ids;
+            cached_ids_.insert(cached_ids_.end(), generated_token_ids.begin(), generated_token_ids.end());
+        } else {
+            backend_->reset();
+            cached_ids_.clear();
+        }
         return output_text;
     }
 
