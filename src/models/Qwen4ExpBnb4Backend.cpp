@@ -2499,8 +2499,17 @@ Tensor& Qwen4ExpBnb4Backend::forward(
 }
 
 bool Qwen4ExpBnb4Backend::supports_interior_checkpoint(int count, int checkpoint_after) const {
-    static const bool enabled = aila::env::read_flag("AILA_Q4E_INLINE_CHECKPOINT", false);
-    return enabled && defaultSession_ && defaultSession_->snapshots_.size() >= 2 &&
+    bool explicit_inline = false;
+    const bool has_env = aila::env::read_flag_if_present("AILA_Q4E_INLINE_CHECKPOINT", &explicit_inline);
+    if (has_env && !explicit_inline) {
+        return false;
+    }
+    const bool allowed_anchor = (has_env && explicit_inline) || (checkpoint_after == 26 || checkpoint_after == 28);
+    auto* self = const_cast<Qwen4ExpBnb4Backend*>(this);
+    if (!defaultSession_ && context_) {
+        self->DefaultSession(*context_);
+    }
+    return allowed_anchor && defaultSession_ && defaultSession_->snapshots_.size() >= 2 &&
         count <= 64 && checkpoint_after >= 2 && count - checkpoint_after >= 2 &&
         defaultSession_->CurrentLength() + count <= 2052 &&
         defaultSession_->embeddingOverridePositions_.empty() && !defaultSession_->mropePosT_.valid();

@@ -2536,6 +2536,42 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     std::cout << "[PASS] Phase S5 batched async snapshot capture & truncate verified successfully.\n";
 }
 
+void test_supports_interior_checkpoint_whitelist(Context& ctx) {
+    std::cout << "[Test] Running Phase G6 interior checkpoint whitelist unit test...\n";
+    Qwen4ExpBnb4Backend backend;
+    backend.init_for_testing(ctx, 4);
+
+    // 1. Default whitelist behavior (when env var not set or empty):
+    // Anchor 26 and 28 should be supported for count <= 64 and count - anchor >= 2
+    expect(backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be supported by default whitelist");
+    expect(backend.supports_interior_checkpoint(30, 28), "Anchor 28 must be supported by default whitelist");
+
+    // Non-whitelisted anchors should NOT be supported by default
+    expect(!backend.supports_interior_checkpoint(30, 16), "Anchor 16 must NOT be supported by default");
+    expect(!backend.supports_interior_checkpoint(30, 2), "Anchor 2 must NOT be supported by default");
+
+    // Boundary conditions
+    expect(!backend.supports_interior_checkpoint(65, 26), "count > 64 must be rejected");
+    expect(!backend.supports_interior_checkpoint(27, 26), "count - anchor < 2 must be rejected");
+
+    // 2. Explicit opt-out via AILA_Q4E_INLINE_CHECKPOINT=0
+    _putenv("AILA_Q4E_INLINE_CHECKPOINT=0");
+    expect(!backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be disabled when AILA_Q4E_INLINE_CHECKPOINT=0");
+    expect(!backend.supports_interior_checkpoint(30, 28), "Anchor 28 must be disabled when AILA_Q4E_INLINE_CHECKPOINT=0");
+
+    // 3. Experimental opt-in via AILA_Q4E_INLINE_CHECKPOINT=1
+    _putenv("AILA_Q4E_INLINE_CHECKPOINT=1");
+    expect(backend.supports_interior_checkpoint(30, 16), "Anchor 16 must be enabled when AILA_Q4E_INLINE_CHECKPOINT=1");
+    expect(backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be enabled when AILA_Q4E_INLINE_CHECKPOINT=1");
+
+    // 4. Restore default state (unset env var)
+    _putenv("AILA_Q4E_INLINE_CHECKPOINT=");
+    expect(backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be re-enabled after clearing env var");
+    expect(!backend.supports_interior_checkpoint(30, 16), "Anchor 16 must be disabled after clearing env var");
+
+    std::cout << "[PASS] Phase G6 interior checkpoint whitelist verified successfully.\n";
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -5142,6 +5178,7 @@ int main() {
         test_b6_demand_microbatch_pipeline(ctx);
         test_prefill_weight_reuse_backend_alignment(ctx);
         test_snapshot_capture_and_truncate(ctx);
+        test_supports_interior_checkpoint_whitelist(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_ple_ticket_pipeline(ctx);
