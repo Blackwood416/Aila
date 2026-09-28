@@ -346,15 +346,12 @@ void test_hc_inject_add_and_grouped_rms_norm(Context& ctx) {
     run_hc_inject_add_and_grouped_rms_norm_test(ctx, 4);
 }
 
-void test_hc_decode_fused(Context& ctx, bool with_inject) {
-    constexpr int groups = 4;
-    constexpr int group_dim = 2560;
-    constexpr int lowrank = 320;
-    constexpr int k_dim = groups * group_dim;
+void run_hc_decode_fused_case(Context& ctx, int groups, int group_dim, int lowrank, bool with_inject) {
+    const int k_dim = groups * group_dim;
     auto round_bf16 = [](float v) { return static_cast<float>(bf16(v)); };
     auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
 
-    std::mt19937 rng(with_inject ? 789 : 790);
+    std::mt19937 rng(with_inject ? (789 + groups + lowrank) : (790 + groups + lowrank));
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<bf16> N_host(k_dim), w_down(static_cast<size_t>(lowrank) * k_dim),
         w_inject(static_cast<size_t>(groups) * k_dim), w_up(static_cast<size_t>(k_dim) * lowrank);
@@ -420,10 +417,22 @@ void test_hc_decode_fused(Context& ctx, bool with_inject) {
     ctx.memcpy_d2h(act.data(), act_dev.data(), act.size() * sizeof(bf16));
     ctx.memcpy_d2h(x.data(), x_dev.data(), x.size() * sizeof(bf16));
     ctx.memcpy_d2h(inj.data(), inj_dev.data(), inj.size() * sizeof(float));
-    const std::string tag = with_inject ? " (inject)" : " (mixer)";
+    const std::string tag = (with_inject ? " (inject" : " (mixer") +
+                            std::string(" g=") + std::to_string(groups) +
+                            " d=" + std::to_string(group_dim) +
+                            " lr=" + std::to_string(lowrank) + ")";
     check_close(act, ref_act, "hc_decode_down_inject act" + tag, 1e-2f);
     check_close(x, ref_x, "hc_decode_up_mix x" + tag, 1e-2f);
     check_close_f32(inj, with_inject ? ref_inj : inj_sentinel, "hc_decode_down_inject inj" + tag, 1e-2f);
+}
+
+void test_hc_decode_fused(Context& ctx, bool with_inject) {
+    run_hc_decode_fused_case(ctx, 4, 2560, 320, with_inject);
+    if (with_inject) {
+        // Non-standard & odd shapes testing subgroup tail loop and scalar unaligned fallback
+        run_hc_decode_fused_case(ctx, 2, 256, 45, true);
+        run_hc_decode_fused_case(ctx, 3, 31, 35, true);
+    }
 }
 
 void test_ple_gate_value(Context& ctx) {
@@ -1398,6 +1407,162 @@ void test_gated_delta_net_sigmoid(Context& ctx) {
         throw std::runtime_error("DeltaNetGeometry dimension calculation unexpected");
     }
     std::cout << "[PASS] DeltaNetGeometry dimension calculations validated\n";
+
+    // -------------------------------------------------------------------------
+    // Phase G2 Parity Check: Verify GDN Single-Write Pass vs CPU Reference
+    // -------------------------------------------------------------------------
+    const int qkv_dim = geom_silu.qkv_dim;
+    const int z_dim = geom_silu.z_dim;
+    const int state_elements = v_heads * head_k * head_v;
+
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> dist_s(-0.05f, 0.05f);
+    std::uniform_real_distribution<float> dist_x(-0.2f, 0.2f);
+    std::uniform_real_distribution<float> dist_ab(-0.5f, 0.5f);
+
+    std::vector<float> S_init(state_elements);
+    for (auto& s : S_init) s = dist_s(rng);
+
+    std::vector<bf16> conv_w(static_cast<size_t>(qkv_dim) * kernel, bf16(0.0f));
+    for (int c = 0; c < qkv_dim; ++c) {
+        conv_w[static_cast<size_t>(c) * kernel + 3] = bf16(1.0f); // Identity tap
+    }
+
+    std::vector<float> norm_w(head_v, 1.0f);
+    std::vector<float> a_log(v_heads, -1.0f);
+    std::vector<bf16> dt_bias(v_heads, bf16(0.0f));
+    std::vector<float> conv_state(static_cast<size_t>(geom_silu.conv_rows) * qkv_dim, 0.0f);
+
+    std::vector<bf16> qkv(qkv_dim), z(z_dim), a(v_heads), b(v_heads);
+    for (auto& x : qkv) x = bf16(dist_x(rng));
+    for (auto& x : z) x = bf16(dist_x(rng));
+    for (auto& x : a) x = bf16(dist_ab(rng));
+    for (auto& x : b) x = bf16(dist_ab(rng));
+
+    // Allocate GPU tensors
+    Tensor conv_w_dev = Tensor::allocate(ctx, {qkv_dim, kernel}, dnnl::memory::data_type::bf16);
+    Tensor norm_w_dev = Tensor::allocate(ctx, {head_v}, dnnl::memory::data_type::f32);
+    Tensor a_log_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::f32);
+    Tensor dt_bias_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::bf16);
+
+    Tensor state_dev = Tensor::allocate(ctx, {v_heads, head_k, head_v}, dnnl::memory::data_type::f32);
+    Tensor conv_state_dev = Tensor::allocate(ctx, {geom_silu.conv_rows, qkv_dim}, dnnl::memory::data_type::f32);
+
+    Tensor qkv_dev = Tensor::allocate(ctx, {qkv_dim}, dnnl::memory::data_type::bf16);
+    Tensor z_dev = Tensor::allocate(ctx, {z_dim}, dnnl::memory::data_type::bf16);
+    Tensor a_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::bf16);
+    Tensor b_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::bf16);
+    Tensor out_dev = Tensor::allocate(ctx, {v_heads * head_v}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(conv_w_dev.data(), conv_w.data(), conv_w.size() * sizeof(bf16));
+    ctx.memcpy_h2d(norm_w_dev.data(), norm_w.data(), norm_w.size() * sizeof(float));
+    ctx.memcpy_h2d(a_log_dev.data(), a_log.data(), a_log.size() * sizeof(float));
+    ctx.memcpy_h2d(dt_bias_dev.data(), dt_bias.data(), dt_bias.size() * sizeof(bf16));
+
+    ctx.memcpy_h2d(state_dev.data(), S_init.data(), S_init.size() * sizeof(float));
+    ctx.memcpy_h2d(conv_state_dev.data(), conv_state.data(), conv_state.size() * sizeof(float));
+
+    ctx.memcpy_h2d(qkv_dev.data(), qkv.data(), qkv.size() * sizeof(bf16));
+    ctx.memcpy_h2d(z_dev.data(), z.data(), z.size() * sizeof(bf16));
+    ctx.memcpy_h2d(a_dev.data(), a.data(), a.size() * sizeof(bf16));
+    ctx.memcpy_h2d(b_dev.data(), b.data(), b.size() * sizeof(bf16));
+
+    ops::DeltaNetWeights weights{
+        conv_w_dev.data_as<bf16>(),
+        norm_w_dev.data_as<float>(),
+        a_log_dev.data_as<float>(),
+        dt_bias_dev.data_as<bf16>()
+    };
+
+    ops::DeltaNetState state{
+        state_dev.data_as<float>(),
+        conv_state_dev.data_as<float>(),
+        0,
+        false
+    };
+
+    // CPU Reference Calculation for Decode Step
+    auto silu_fn = [](float v) { return v / (1.0f + std::exp(-v)); };
+    auto softplus_fn = [](float v) {
+        if (v > 20.0f) return v;
+        if (v < -20.0f) return std::exp(v);
+        return std::log1p(std::exp(v));
+    };
+
+    std::vector<float> q_conv(q_heads * head_k), k_conv(q_heads * head_k), v_conv(v_heads * head_v);
+    for (int h = 0; h < q_heads; ++h) {
+        float q_sq = 0.0f, k_sq = 0.0f;
+        for (int d = 0; d < head_k; ++d) {
+            float q_val = silu_fn(static_cast<float>(qkv[h * head_k + d]));
+            float k_val = silu_fn(static_cast<float>(qkv[geom_silu.q_dim + h * head_k + d]));
+            q_conv[h * head_k + d] = q_val;
+            k_conv[h * head_k + d] = k_val;
+            q_sq += q_val * q_val;
+            k_sq += k_val * k_val;
+        }
+        float q_sc = 1.0f / std::sqrt(q_sq + eps);
+        float k_sc = 1.0f / std::sqrt(k_sq + eps);
+        for (int d = 0; d < head_k; ++d) {
+            q_conv[h * head_k + d] *= q_sc;
+            k_conv[h * head_k + d] *= k_sc;
+        }
+    }
+    for (int i = 0; i < v_heads * head_v; ++i) {
+        v_conv[i] = silu_fn(static_cast<float>(qkv[2 * geom_silu.q_dim + i]));
+    }
+
+    std::vector<float> S_ref = S_init;
+    std::vector<bf16> out_ref(v_heads * head_v);
+
+    for (int hv = 0; hv < v_heads; ++hv) {
+        int hk = ops::linear_delta_key_head_for_value_head(hv, q_heads, v_heads);
+        float beta = 1.0f / (1.0f + std::exp(-static_cast<float>(b[hv])));
+        float alpha = static_cast<float>(a[hv]);
+        float g_pre = softplus_fn(alpha + static_cast<float>(dt_bias[hv])) * (-std::exp(a_log[hv]));
+        float decay = std::exp(g_pre);
+
+        float* S_head = S_ref.data() + static_cast<size_t>(hv) * head_k * head_v;
+        std::vector<float> out_h(head_v, 0.0f);
+
+        for (int dv = 0; dv < head_v; ++dv) {
+            float acc = 0.0f;
+            for (int j = 0; j < head_k; ++j) {
+                acc += S_head[j * head_v + dv] * decay * k_conv[hk * head_k + j];
+            }
+            float dval = (v_conv[hv * head_v + dv] - acc) * beta;
+            for (int j = 0; j < head_k; ++j) {
+                float sv = S_head[j * head_v + dv] * decay + k_conv[hk * head_k + j] * dval;
+                S_head[j * head_v + dv] = sv;
+                out_h[dv] += sv * q_conv[hk * head_k + j];
+            }
+            out_h[dv] *= geom_silu.scale;
+        }
+
+        float out_sq = 0.0f;
+        for (int dv = 0; dv < head_v; ++dv) out_sq += out_h[dv] * out_h[dv];
+        float out_scale = 1.0f / std::sqrt(out_sq / static_cast<float>(head_v) + eps);
+        for (int dv = 0; dv < head_v; ++dv) {
+            float n = out_h[dv] * out_scale * norm_w[dv];
+            float gate = silu_fn(static_cast<float>(z[hv * head_v + dv]));
+            out_ref[hv * head_v + dv] = bf16(n * gate);
+        }
+    }
+
+    // Run GPU kernel
+    ops::run_linear_delta_decode_gpu(
+        ctx, geom_silu, weights, state,
+        qkv_dev.data_as<bf16>(), z_dev.data_as<bf16>(),
+        a_dev.data_as<bf16>(), b_dev.data_as<bf16>(),
+        out_dev.data_as<bf16>());
+    ctx.synchronize();
+
+    std::vector<float> S_gpu(state_elements);
+    std::vector<bf16> out_gpu(v_heads * head_v);
+    ctx.memcpy_d2h(S_gpu.data(), state_dev.data(), S_gpu.size() * sizeof(float));
+    ctx.memcpy_d2h(out_gpu.data(), out_dev.data(), out_gpu.size() * sizeof(bf16));
+
+    check_close_f32(S_gpu, S_ref, "GDN single-write state parity (decode)", 2e-4f);
+    check_close(out_gpu, std::vector<float>(out_ref.begin(), out_ref.end()), "GDN single-write out parity (decode)", 2e-2f);
 }
 
 static void run_attention_decode_gate_fusion_case(
