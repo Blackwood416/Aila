@@ -373,7 +373,14 @@ const func_builtins & global_builtins() {
             // get current time
             // TODO: make sure this is the same behavior as Python's strftime
             char buf[100];
-            if (std::strftime(buf, sizeof(buf), format.c_str(), std::localtime(&args.ctx.current_time))) {
+            std::tm tm_buf{};
+#if defined(_WIN32)
+            if (localtime_s(&tm_buf, &args.ctx.current_time) == 0 &&
+                std::strftime(buf, sizeof(buf), format.c_str(), &tm_buf)) {
+#else
+            if (localtime_r(&args.ctx.current_time, &tm_buf) &&
+                std::strftime(buf, sizeof(buf), format.c_str(), &tm_buf)) {
+#endif
                 return mk_val<value_string>(std::string(buf));
             } else {
                 throw raised_exception("strftime_now: failed to format time");

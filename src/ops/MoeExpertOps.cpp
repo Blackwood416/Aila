@@ -2626,24 +2626,24 @@ sycl::event moe_expert_major_prefill_gate_up(
 
     int remaining_acts = total_acts;
     int cur_offset = 0;
-    const sycl::event* cur_dep = dep_event;
-    sycl::event last_ev{};
+    sycl::event quad_ev{};
+    sycl::event pair_ev{};
+    sycl::event single_ev{};
 
     if (num_quads > 0) {
         const int clamped_quads = std::min(num_quads, remaining_acts / 4);
         if (clamped_quads > 0) {
             if (use_nested) {
-                last_ev = launch_moe_expert_major_prefill_gate_up_4token<true>(
+                quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_quads, top_k,
-                    in_features, intermediate_size, blocksize, cur_dep);
+                    in_features, intermediate_size, blocksize, dep_event);
             } else {
-                last_ev = launch_moe_expert_major_prefill_gate_up_4token<false>(
+                quad_ev = launch_moe_expert_major_prefill_gate_up_4token<false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_quads, top_k,
-                    in_features, intermediate_size, blocksize, cur_dep);
+                    in_features, intermediate_size, blocksize, dep_event);
             }
-            cur_dep = &last_ev;
             const int quad_acts = 4 * clamped_quads;
             cur_offset += quad_acts;
             remaining_acts -= quad_acts;
@@ -2654,17 +2654,16 @@ sycl::event moe_expert_major_prefill_gate_up(
         const int clamped_pairs = std::min(num_pairs, remaining_acts / 2);
         if (clamped_pairs > 0) {
             if (use_nested) {
-                last_ev = launch_moe_expert_major_prefill_gate_up_2token<true>(
+                pair_ev = launch_moe_expert_major_prefill_gate_up_2token<true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_pairs, top_k,
-                    in_features, intermediate_size, blocksize, cur_dep);
+                    in_features, intermediate_size, blocksize, dep_event);
             } else {
-                last_ev = launch_moe_expert_major_prefill_gate_up_2token<false>(
+                pair_ev = launch_moe_expert_major_prefill_gate_up_2token<false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_pairs, top_k,
-                    in_features, intermediate_size, blocksize, cur_dep);
+                    in_features, intermediate_size, blocksize, dep_event);
             }
-            cur_dep = &last_ev;
             const int pair_acts = 2 * clamped_pairs;
             cur_offset += pair_acts;
             remaining_acts -= pair_acts;
@@ -2673,19 +2672,21 @@ sycl::event moe_expert_major_prefill_gate_up(
 
     if (remaining_acts > 0) {
         if (use_nested) {
-            last_ev = launch_moe_expert_major_prefill_gate_up<true>(
+            single_ev = launch_moe_expert_major_prefill_gate_up<true>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, x, h, remaining_acts, top_k,
-                in_features, intermediate_size, blocksize, cur_dep);
+                in_features, intermediate_size, blocksize, dep_event);
         } else {
-            last_ev = launch_moe_expert_major_prefill_gate_up<false>(
+            single_ev = launch_moe_expert_major_prefill_gate_up<false>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, x, h, remaining_acts, top_k,
-                in_features, intermediate_size, blocksize, cur_dep);
+                in_features, intermediate_size, blocksize, dep_event);
         }
     }
 
-    return last_ev;
+    if (single_ev != sycl::event{}) return single_ev;
+    if (pair_ev != sycl::event{}) return pair_ev;
+    return quad_ev;
 }
 
 sycl::event moe_expert_major_prefill_down(
@@ -2719,24 +2720,24 @@ sycl::event moe_expert_major_prefill_down(
 
     int remaining_acts = total_acts;
     int cur_offset = 0;
-    const sycl::event* cur_dep = dep_event;
-    sycl::event last_ev{};
+    sycl::event quad_ev{};
+    sycl::event pair_ev{};
+    sycl::event single_ev{};
 
     if (num_quads > 0) {
         const int clamped_quads = std::min(num_quads, remaining_acts / 4);
         if (clamped_quads > 0) {
             if (use_nested) {
-                last_ev = launch_moe_expert_major_prefill_down_4token<true>(
+                quad_ev = launch_moe_expert_major_prefill_down_4token<true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc, clamped_quads, top_k,
-                    in_features, out_features, blocksize, cur_dep);
+                    in_features, out_features, blocksize, dep_event);
             } else {
-                last_ev = launch_moe_expert_major_prefill_down_4token<false>(
+                quad_ev = launch_moe_expert_major_prefill_down_4token<false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc, clamped_quads, top_k,
-                    in_features, out_features, blocksize, cur_dep);
+                    in_features, out_features, blocksize, dep_event);
             }
-            cur_dep = &last_ev;
             const int quad_acts = 4 * clamped_quads;
             cur_offset += quad_acts;
             remaining_acts -= quad_acts;
@@ -2747,17 +2748,16 @@ sycl::event moe_expert_major_prefill_down(
         const int clamped_pairs = std::min(num_pairs, remaining_acts / 2);
         if (clamped_pairs > 0) {
             if (use_nested) {
-                last_ev = launch_moe_expert_major_prefill_down_2token<true>(
+                pair_ev = launch_moe_expert_major_prefill_down_2token<true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc, clamped_pairs, top_k,
-                    in_features, out_features, blocksize, cur_dep);
+                    in_features, out_features, blocksize, dep_event);
             } else {
-                last_ev = launch_moe_expert_major_prefill_down_2token<false>(
+                pair_ev = launch_moe_expert_major_prefill_down_2token<false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc, clamped_pairs, top_k,
-                    in_features, out_features, blocksize, cur_dep);
+                    in_features, out_features, blocksize, dep_event);
             }
-            cur_dep = &last_ev;
             const int pair_acts = 2 * clamped_pairs;
             cur_offset += pair_acts;
             remaining_acts -= pair_acts;
@@ -2766,19 +2766,21 @@ sycl::event moe_expert_major_prefill_down(
 
     if (remaining_acts > 0) {
         if (use_nested) {
-            last_ev = launch_moe_expert_major_prefill_down<true>(
+            single_ev = launch_moe_expert_major_prefill_down<true>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, h, down_acc, remaining_acts, top_k,
-                in_features, out_features, blocksize, cur_dep);
+                in_features, out_features, blocksize, dep_event);
         } else {
-            last_ev = launch_moe_expert_major_prefill_down<false>(
+            single_ev = launch_moe_expert_major_prefill_down<false>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, h, down_acc, remaining_acts, top_k,
-                in_features, out_features, blocksize, cur_dep);
+                in_features, out_features, blocksize, dep_event);
         }
     }
 
-    return last_ev;
+    if (single_ev != sycl::event{}) return single_ev;
+    if (pair_ev != sycl::event{}) return pair_ev;
+    return quad_ev;
 }
 
 sycl::event moe_ordered_accumulate_down_rows(
