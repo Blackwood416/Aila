@@ -353,6 +353,8 @@ private:
     int* pred_host_ids_ = nullptr;
     float* pred_host_weights_ = nullptr;
     uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
+    // Phase G4: MoE Router predictive GEMV gating tracking
+    int consecutive_no_miss_layers_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
 };

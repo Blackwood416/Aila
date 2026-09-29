@@ -611,6 +611,7 @@ bool Qwen4ExpBnb4Backend::load(
                             cfg_.num_experts, hidden_size_, cfg_.moe_intermediate_size, 64, error_message)) {
         return false;
     }
+    // Phase G5: expert_cache_.init_pinned_experts();
 
     ensure_runtime_buffers(ctx, 1);
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
@@ -914,6 +915,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         prefill_stats_t0 = Bnb4BitLinear::get_prefill_dispatch_stats();
     }
 
+    if (start_pos == 0) {
+        consecutive_no_miss_layers_ = 0;
+    }
+
     // 1. Embedding lookup + optional vision embedding override
     EmbedTokens(ctx, tokenIdsDevice, count);
 
@@ -1023,7 +1028,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // Decode-time speculative prefetch of layer L+1 experts (predicted from layer L's MoE input)
     // overlapping host fill + PCIe DMA with GPU compute of layer L+1's attention.
     static const bool s_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH", true);
-    static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
+    static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", true);
+    static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", true);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
     static const int s_prefetch_topn = std::max(1, aila::env::read_int("AILA_Q4E_PREFETCH_TOPN", 10));
     static const int s_prefill_prefetch_max = aila::env::read_int("AILA_Q4E_PREFILL_PREFETCH_MAX", 48);
@@ -1461,7 +1467,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
-        const bool predict_next = (count == 1)
+        const auto cur_cache_stats = expert_cache_.stats();
+        const bool high_hit_rate = (cur_cache_stats.hit_count + cur_cache_stats.miss_count > 100) &&
+                                   (cur_cache_stats.hit_rate() >= 0.90);
+        const bool gate_prediction = s_predict_gating && (count == 1) &&
+            (consecutive_no_miss_layers_ >= 2 || (high_hit_rate && consecutive_no_miss_layers_ > 0));
+
+        const bool predict_next = !gate_prediction && (count == 1)
             ? ((s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
             : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers));
         sycl::event prediction_event{};
@@ -2138,6 +2150,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         ensure_prediction_ready();
         stage(kStageExperts);
 
+        const uint64_t misses_after_moe = expert_cache_.stats().miss_count;
+        if (misses_after_moe > cur_cache_stats.miss_count) {
+            consecutive_no_miss_layers_ = 0;
+        } else {
+            consecutive_no_miss_layers_++;
+        }
+
         if (!s_fuse_shared) {
             add_shared_expert_to_y(ctx, buf_.y, buf_.shared_out_buf, buf_.shared_gate_buf,
                                    count, hidden_size_);
@@ -2420,12 +2439,14 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         if (entry.length > target) entry.length = -1;
     }
     session.currentLength_ = target;
+    consecutive_no_miss_layers_ = 0;
     return target;
 }
 
 void Qwen4ExpBnb4Backend::Reset(Session& session) {
     ValidateSession(session);
     session.context_->synchronize();
+    consecutive_no_miss_layers_ = 0;
     for (auto& snapshot : session.snapshots_) snapshot.length = -1;
     for (size_t i = 0; i < layers_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
