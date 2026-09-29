@@ -84,6 +84,8 @@ public:
     // weight format. The process-wide AILA_BNB4_GEMM_XMX override still wins.
     void set_allow_dense_xmx(bool value) { allow_dense_xmx_ = value; }
     bool allow_dense_xmx() const { return allow_dense_xmx_; }
+    void set_force_dense_xmx(bool value) { force_dense_xmx_ = value; }
+    bool force_dense_xmx() const { return force_dense_xmx_; }
 
     void set_allow_async_dequant(bool value) { allow_async_dequant_ = value; }
     bool allow_async_dequant() const { return allow_async_dequant_; }
@@ -124,6 +126,7 @@ private:
     bool cache_dequantized_weight_ = false;
     bool cached_weight_ready_ = false;
     bool allow_dense_xmx_ = false;
+    bool force_dense_xmx_ = false;
     bool allow_async_dequant_ = false;
     bool direct_prefill_io_ = false;
     dnnl::matmul decode_prim_;

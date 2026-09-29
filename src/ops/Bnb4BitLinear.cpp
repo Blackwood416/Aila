@@ -1068,6 +1068,7 @@ void packed_nf4_gemm_bf16(Context& ctx,
                           int M, int N, int K,
                           int blocksize,
                           bool allow_dense_xmx = false) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
     static const bool use_a770_bm64 = [&ctx]() {
         const std::string device_name =
             ctx.queue().get_device().get_info<sycl::info::device::name>();
@@ -1083,7 +1084,7 @@ void packed_nf4_gemm_bf16(Context& ctx,
         static bool xmx_override = false;
         static const bool xmx_explicit = aila::env::read_flag_if_present(
             "AILA_BNB4_GEMM_XMX", &xmx_override);
-        const bool use_xmx = xmx_explicit ? xmx_override : allow_dense_xmx;
+        const bool use_xmx = (M > 1) && (xmx_explicit ? xmx_override : allow_dense_xmx);
         if (use_xmx && (K % 16 == 0) && (N <= 32768) && (K <= 16384) && (blocksize <= 64 || blocksize == 128)) {
             if (M >= 64 && N >= 64) {
                 static const int xmx_bk =
@@ -2230,8 +2231,11 @@ void Bnb4BitLinear::forward(Context& ctx,
         aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", -1);
     static const int fused_min_m =
         aila::env::read_int_raw("AILA_BNB4_FUSED_MIN_M", 2);
+    const bool shape_prefers_onednn = (out_features_ <= 1280) ||
+                                      (seq_len >= 64 && out_features_ > 8192);
     const bool use_fused_prefill = ((fused_prefill_mode == 1) ||
-                                    (fused_prefill_mode == -1 && allow_dense_xmx_)) &&
+                                    (force_dense_xmx_) ||
+                                    (fused_prefill_mode == -1 && allow_dense_xmx_ && !shape_prefers_onednn)) &&
                                    (seq_len >= fused_min_m);
     if (use_fused_prefill && seq_len > 1 &&
         (blocksize % 2) == 0 &&

@@ -3692,6 +3692,7 @@ void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string&
 
         Bnb4BitLinearScratch scratch_fb;
         linear.set_allow_dense_xmx(false);
+        linear.set_force_dense_xmx(false);
         // Warmup
         for (int i = 0; i < 3; ++i) {
             linear.forward(ctx, scratch_fb, x_dev, out_fallback, M);
@@ -3709,6 +3710,7 @@ void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string&
 
         Bnb4BitLinearScratch scratch_xmx;
         linear.set_allow_dense_xmx(true);
+        linear.set_force_dense_xmx(true);
         // Warmup
         for (int i = 0; i < 3; ++i) {
             linear.forward(ctx, scratch_xmx, x_dev, out_xmx, M);
@@ -3770,7 +3772,8 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
     evaluate_dense_prefill_shape(ctx, 2560, 2560, "Standard Projection");
     evaluate_dense_prefill_shape(ctx, 2560, 16480, "Large FFN Gate/Up Projection");
     evaluate_dense_prefill_shape(ctx, 6144, 2560, "Linear Attention Projection");
-    evaluate_dense_prefill_shape(ctx, 2560, 1280, "Shared Expert Projection");
+    evaluate_dense_prefill_shape(ctx, 2560, 1280, "Shared Expert Gate/Up (Unfused, N=1280)");
+    evaluate_dense_prefill_shape(ctx, 1280, 2560, "Shared Expert Down Projection (K=1280, N=2560)");
 
     std::cout << "======================================================================\n\n";
 }

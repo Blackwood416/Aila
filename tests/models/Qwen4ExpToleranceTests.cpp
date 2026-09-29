@@ -192,7 +192,27 @@ void test_mock_prefill_tolerance(Context& ctx) {
         ctx.memcpy_d2h(ref_host.data(), out_ref.data(), ref_host.size() * sizeof(bf16));
         ctx.memcpy_d2h(cand_host.data(), out_cand.data(), cand_host.size() * sizeof(bf16));
 
-        // Evaluate tolerance on the last row
+        // 1. Evaluate full tensor tolerance across all M * N elements
+        double sum_sq_diff = 0.0, sum_sq_ref = 0.0, sum_sq_cand = 0.0, dot_prod = 0.0;
+        float tensor_max_diff = 0.0f;
+        const size_t total_elems = ref_host.size();
+        for (size_t i = 0; i < total_elems; ++i) {
+            float r = static_cast<float>(ref_host[i]);
+            float c = static_cast<float>(cand_host[i]);
+            float d = std::abs(r - c);
+            if (d > tensor_max_diff) tensor_max_diff = d;
+            sum_sq_diff += d * d;
+            sum_sq_ref += r * r;
+            sum_sq_cand += c * c;
+            dot_prod += r * c;
+        }
+        double tensor_rms_ref = std::sqrt(sum_sq_ref / total_elems);
+        double tensor_nrmse = std::sqrt(sum_sq_diff / total_elems) / std::max(tensor_rms_ref, 1e-6);
+        double tensor_cos_sim = dot_prod / std::max(std::sqrt(sum_sq_ref * sum_sq_cand), 1e-12);
+        expect(tensor_nrmse <= 0.015, "Full tensor NRMSE must meet tolerance (<= 1.5%)");
+        expect(tensor_cos_sim >= 0.999, "Full tensor Cosine Similarity must meet tolerance (>= 0.999)");
+
+        // 2. Evaluate tolerance on the last row
         std::vector<float> row_ref(N), row_cand(N);
         const size_t row_offset = static_cast<size_t>(M - 1) * N;
         for (int i = 0; i < N; ++i) {
@@ -266,7 +286,17 @@ void test_real_model_tolerance(const std::string& model_dir) {
     ctx.memcpy_h2d(token_buf.data(), ids.data(), num_prompt_tokens * sizeof(int));
     const int* dev_ids = token_buf.data_as<int>();
 
-    // 1.1 Prefix M=26 Logits (Baseline oneDNN)
+    // 1.0 Warmup pass on prompt: warms JIT compilation and populates active expert weights
+    std::cout << "\n[Warmup] Warming expert cache on prompt (M=26)...\n";
+    q4e_backend.reset();
+    auto cold_t0 = std::chrono::high_resolution_clock::now();
+    q4e_backend.forward(ctx, dev_ids, 26, {SnapshotPolicy::None, true});
+    ctx.synchronize();
+    auto cold_t1 = std::chrono::high_resolution_clock::now();
+    double ms_cold = std::chrono::duration<double, std::milli>(cold_t1 - cold_t0).count();
+    std::cout << "[Warmup] Cold-start prefill complete in " << ms_cold << " ms\n";
+
+    // 1.1 Prefix M=26 Logits (Baseline oneDNN, warm cache)
     q4e_backend.set_prefill_xmx(false);
     q4e_backend.set_direct_prefill_io(true);
     q4e_backend.reset();
@@ -277,7 +307,7 @@ void test_real_model_tolerance(const std::string& model_dir) {
     double ms_ref_26 = std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::vector<float> ref_logits_26 = extract_bf16_to_f32(ctx, ref_26_tensor);
 
-    // 1.2 Prefix M=26 Logits (XMX Joint Matrix)
+    // 1.2 Prefix M=26 Logits (XMX Joint Matrix, warm cache)
     q4e_backend.set_prefill_xmx(true);
     q4e_backend.set_direct_prefill_io(true);
     q4e_backend.reset();
@@ -334,12 +364,24 @@ void test_real_model_tolerance(const std::string& model_dir) {
     // ------------------------------------------------------------------------
     std::cout << "\n--- Measuring End-to-End Text Generation & Coherence ---\n";
 
+    // 2.0 Warmup generation to ensure generation JIT and expert caching are stable
+    engine.reset_context();
+    engine.generate_chat_request_text(request);
+
     // 2.1 Baseline Generation
     q4e_backend.set_prefill_xmx(false);
     q4e_backend.set_direct_prefill_io(true);
     engine.reset_context();
+    double ttft_ms_ref = 0.0;
+    bool first_ref = true;
     auto gen_t0 = std::chrono::high_resolution_clock::now();
-    const std::string text_ref = engine.generate_chat_request_text(request);
+    const std::string text_ref = engine.generate_chat_request_text(request, [&](const std::string&) {
+        if (first_ref) {
+            ttft_ms_ref = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - gen_t0).count();
+            first_ref = false;
+        }
+    });
     auto gen_t1 = std::chrono::high_resolution_clock::now();
     double gen_ms_ref = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
     expect(!text_ref.empty(), "Baseline generation returned empty text");
@@ -348,14 +390,26 @@ void test_real_model_tolerance(const std::string& model_dir) {
     q4e_backend.set_prefill_xmx(true);
     q4e_backend.set_direct_prefill_io(true);
     engine.reset_context();
+    double ttft_ms_cand = 0.0;
+    bool first_cand = true;
     gen_t0 = std::chrono::high_resolution_clock::now();
-    const std::string text_cand = engine.generate_chat_request_text(request);
+    const std::string text_cand = engine.generate_chat_request_text(request, [&](const std::string&) {
+        if (first_cand) {
+            ttft_ms_cand = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - gen_t0).count();
+            first_cand = false;
+        }
+    });
     gen_t1 = std::chrono::high_resolution_clock::now();
     double gen_ms_cand = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
     expect(!text_cand.empty(), "XMX generation returned empty text");
 
-    std::cout << "\n[Baseline Output (" << gen_ms_ref << " ms)]:\n" << text_ref << "\n";
-    std::cout << "\n[XMX Output (" << gen_ms_cand << " ms)]:\n" << text_cand << "\n";
+    std::cout << "\n[Baseline Output (Total " << gen_ms_ref << " ms, TTFT " << ttft_ms_ref << " ms)]:\n" << text_ref << "\n";
+    std::cout << "\n[XMX Output (Total " << gen_ms_cand << " ms, TTFT " << ttft_ms_cand << " ms)]:\n" << text_cand << "\n";
+    if (ttft_ms_cand > 0.0 && ttft_ms_ref > 0.0) {
+        std::cout << "TTFT Speedup: " << std::fixed << std::setprecision(2)
+                  << (ttft_ms_ref / ttft_ms_cand) << "x (TTFT " << ttft_ms_ref << " ms -> " << ttft_ms_cand << " ms)\n";
+    }
 
     // Analyze token overlap in generated text
     const auto gen_ids_ref = tokenizer.encode(text_ref);
