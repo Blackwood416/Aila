@@ -21,6 +21,13 @@
 namespace fs = std::filesystem;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+struct Qwen4ExpGenerationTestAccess {
+    static bool CanCapture(const Qwen4ExpBnb4Backend& backend,
+                           const Qwen4ExpBnb4Backend::Session& session, int count, int anchor) {
+        return backend.CanCaptureInteriorCheckpoint(session, count, anchor);
+    }
+};
+
 namespace {
 
 void expect(bool cond, const std::string& msg) {
@@ -2537,42 +2544,46 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
 }
 
 void test_supports_interior_checkpoint_whitelist(Context& ctx) {
-    std::cout << "[Test] Running Phase G6 interior checkpoint whitelist unit test...\n";
+    std::cout << "[Test] X2 interior checkpoint eligibility and opt-out...\n";
     Qwen4ExpBnb4Backend backend;
     backend.init_for_testing(ctx, 4);
-
-    // 1. Default safe baseline behavior (when env var not set or empty):
-    // Interior checkpoints must default to false to protect golden baseline alignment
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=");
-    expect(!backend.supports_interior_checkpoint(30, 26), "Anchor 26 must default to false to preserve golden baseline");
-    expect(!backend.supports_interior_checkpoint(30, 28), "Anchor 28 must default to false to preserve golden baseline");
-    expect(!backend.supports_interior_checkpoint(30, 16), "Anchor 16 must NOT be supported");
-
-    // 2. Controlled opt-in via AILA_Q4E_INLINE_CHECKPOINT=1
-    // Strictly whitelist Anchor 26 and Anchor 28
+    expect(backend.supports_interior_checkpoint(30, 26), "Measured story shape must default on");
+    expect(!backend.supports_interior_checkpoint(30, 28), "Unmeasured defaults stay opt-in");
+    expect(!backend.supports_interior_checkpoint(30, 16), "General anchors stay opt-in");
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=1");
-    expect(backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be supported under whitelist with INLINE_CHECKPOINT=1");
-    expect(backend.supports_interior_checkpoint(30, 28), "Anchor 28 must be supported under whitelist with INLINE_CHECKPOINT=1");
-
-    // Non-whitelisted anchors must NOT be supported even when INLINE_CHECKPOINT=1
-    expect(!backend.supports_interior_checkpoint(30, 16), "Anchor 16 must NOT be supported even with INLINE_CHECKPOINT=1");
-    expect(!backend.supports_interior_checkpoint(30, 2), "Anchor 2 must NOT be supported even with INLINE_CHECKPOINT=1");
-
-    // Boundary conditions
+    for (int anchor : {2, 16, 26, 28})
+        expect(backend.supports_interior_checkpoint(30, anchor), "Valid text anchors must support opt-in");
+    expect(backend.supports_interior_checkpoint(64, 32), "Largest dense chunk must support opt-in");
+    for (int anchor : {-1, 0, 1, 29, 30, 31})
+        expect(!backend.supports_interior_checkpoint(30, anchor), "Invalid sides must be rejected");
     expect(!backend.supports_interior_checkpoint(65, 26), "count > 64 must be rejected");
-    expect(!backend.supports_interior_checkpoint(27, 26), "count - anchor < 2 must be rejected");
-
-    // 3. Explicit opt-out via AILA_Q4E_INLINE_CHECKPOINT=0
+    backend.set_embedding_overrides({0}, {bf16(0)}, 1);
+    expect(!backend.supports_interior_checkpoint(30, 26), "Vision override must fall back");
+    backend.clear_embedding_overrides();
+    backend.set_mrope_positions(ctx, {0}, {0}, {0}, 0);
+    expect(!backend.supports_interior_checkpoint(30, 26), "Mrope override must fall back");
+    backend.clear_mrope_positions();
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=0");
-    expect(!backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be disabled when AILA_Q4E_INLINE_CHECKPOINT=0");
-    expect(!backend.supports_interior_checkpoint(30, 28), "Anchor 28 must be disabled when AILA_Q4E_INLINE_CHECKPOINT=0");
-
-    // 4. Restore default state (unset env var)
+    expect(!backend.supports_interior_checkpoint(30, 26), "Explicit opt-out must retain split prefill");
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=");
-    expect(!backend.supports_interior_checkpoint(30, 26), "Anchor 26 must be disabled after clearing env var");
-    expect(!backend.supports_interior_checkpoint(30, 16), "Anchor 16 must be disabled after clearing env var");
-
-    std::cout << "[PASS] Phase G6 interior checkpoint whitelist verified successfully.\n";
+    expect(backend.supports_interior_checkpoint(30, 26), "Clearing override restores measured default");
+    Qwen4ExpBnb4Backend large;
+    large.init_for_testing(ctx, 4, 4096);
+    auto session = large.CreateSession(ctx, 2);
+    session->current_length_for_testing() = 2021;
+    expect(Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2051 must remain dense");
+    session->current_length_for_testing() = 2022;
+    expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2052 is sparse and must be rejected");
+    bool rejected = false;
+    try { large.Forward(ctx, *session, nullptr, 30, {SnapshotPolicy::ReusablePrefix, true, false, 26}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected && session->CurrentLength() == 2022, "Direct forward must reject sparse capture before advancing");
+    auto single_slot = large.CreateSession(ctx, 1);
+    expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *single_slot, 30, 26), "Capture needs two slots");
+    session->current_length_for_testing() = 4090;
+    expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "Capture must fit session capacity");
+    std::cout << "[PASS] X2 interior checkpoint eligibility\n";
 }
 
 void test_real_model_ple_and_cache_if_present(Context& ctx) {

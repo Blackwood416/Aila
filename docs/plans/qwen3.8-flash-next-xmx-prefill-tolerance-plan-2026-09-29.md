@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：以容差为契约的 XMX Prefill 优化方案
 
+实施进度（2026-09-29 更新）：X0/X1 已完成；X2 已完成有界验收并默认启用初始文本 `30/26` 形状，通用锚点保留 opt-in。快照、KV、非零起点和 256-token 回退检查见 [X2 结果](qwen3.8-flash-next-x2-results-2026-09-29.md)。长文 RAM 问题已将 Windows 专家 reader 默认改为 ReadFile。X3 已完成 histogram、grouped XMX 首版及短/256-token/B6 验证；首版性能和长文数值未满足默认准入，所有桶保留 ALU 默认，详见 [X3 结果](qwen3.8-flash-next-x3-results-2026-09-29.md)。X4 已完成 T16 chunked GDN 数学原型、DG2 FP32/XMX 映射和状态验收；GPU FP32 候选算子快约 28%–31%、模型 prefill 快约 1.2%，因长文 logits 差异较大仍保留 opt-in，详见 [X4 结果](qwen3.8-flash-next-x4-results-2026-09-29.md)。以下为原始设计依据，旧默认值描述应结合最新结果阅读。
+
 日期：2026-09-29。勘察基线：`6091a42976c0863b96200314e92b0ffd5034d47d`，开始勘察时工作区干净。
 
 本轮按用户要求以代码和已有日志为主，没有运行构建、GPU benchmark 或全量测试。本文件给出下一阶段设计，不宣称候选方案已经获得端到端收益。用户本轮已明确允许合理容差内的数值差异；历史文档中的“48 个生成 token 必须完全一致”不再作为新计算路径的准入条件。

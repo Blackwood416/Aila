@@ -1,0 +1,216 @@
+{
+  "mmap": {
+    "identity": {
+      "timestamp": "2026-09-29T17:07:51.7511400+08:00",
+      "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+      "dirty": [
+        " M src/models/Qwen4ExpBnb4Backend.cpp",
+        " M src/models/Qwen4ExpBnb4Backend.hpp",
+        " M tests/models/Qwen4ExpModuleTests.cpp",
+        " M tests/models/Qwen4ExpToleranceTests.cpp",
+        "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+        "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+        "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+        "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp"
+      ],
+      "exe_sha256": "EEC8CABED129734545CAEAF93EA7295E6BF0EAADB7609EC6C82DB3A8CBD200F6",
+      "harness_sha256": "E4E8E1EA9E16D14A561586E6D27EFCB0AD2FFEB7196F44042D438A375C2E6FC3",
+      "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+      "stack": {
+        "name": "oneapi-2026.1",
+        "role": "candidate",
+        "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "compilerVersion": "2026.1.0",
+        "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+        "dnnlVersion": "3.11.2",
+        "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+        "tbbVersion": "2023.1",
+        "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+        "expectedSyclDll": "sycl9.dll",
+        "allowLegacyCompiler": false
+      },
+      "mode": "memory",
+      "reader_override": "mmap",
+      "gpu": [
+        {
+          "Name": "GameViewer Virtual Display Adapter",
+          "DriverVersion": "15.6.5.199"
+        },
+        {
+          "Name": "Intel(R) Arc(TM) A770 Graphics",
+          "DriverVersion": "32.0.101.8860"
+        }
+      ],
+      "env_overrides": {
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_CPU_OVERLAP": "0",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+        "AILA_Q4E_EXPERT_READER": "mmap",
+        "AILA_Q4E_INLINE_CHECKPOINT": "0"
+      },
+      "inherited_experiment_overrides_cleared": true,
+      "prompt_tokens": [
+        256,
+        256
+      ],
+      "teacher_forced_targets": 0,
+      "max_seq": 512,
+      "cache": "Both paths warmed; host cache warm, GPU cache capacity limited",
+      "timing": "3 alternating pairs; prefill and prefill+47 fixed-token forwards; no logits download in timed runs",
+      "memory_pressure_stop": true
+    },
+    "peak_working_set_bytes": 50246025216,
+    "peak_private_commit_bytes": 33681924096,
+    "minimum_system_free_mb": 7897.6015625,
+    "records": [
+      "[X2 MEMORY] stage=warmup device_bytes=14082476694 peak_device_bytes=14082476706 pinned_host_bytes=17359604996 host_pool_bytes=17178163200 reader=mmap mmap_fallbacks=0"
+    ]
+  },
+  "readfile": {
+    "identity": {
+      "timestamp": "2026-09-29T17:05:58.5244069+08:00",
+      "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+      "dirty": [
+        " M src/models/Qwen4ExpBnb4Backend.cpp",
+        " M src/models/Qwen4ExpBnb4Backend.hpp",
+        " M tests/models/Qwen4ExpModuleTests.cpp",
+        " M tests/models/Qwen4ExpToleranceTests.cpp",
+        "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+        "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+        "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp"
+      ],
+      "exe_sha256": "EEC8CABED129734545CAEAF93EA7295E6BF0EAADB7609EC6C82DB3A8CBD200F6",
+      "harness_sha256": "E4E8E1EA9E16D14A561586E6D27EFCB0AD2FFEB7196F44042D438A375C2E6FC3",
+      "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+      "stack": {
+        "name": "oneapi-2026.1",
+        "role": "candidate",
+        "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "compilerVersion": "2026.1.0",
+        "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+        "dnnlVersion": "3.11.2",
+        "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+        "tbbVersion": "2023.1",
+        "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+        "expectedSyclDll": "sycl9.dll",
+        "allowLegacyCompiler": false
+      },
+      "mode": "memory",
+      "reader_override": "readfile",
+      "gpu": [
+        {
+          "Name": "GameViewer Virtual Display Adapter",
+          "DriverVersion": "15.6.5.199"
+        },
+        {
+          "Name": "Intel(R) Arc(TM) A770 Graphics",
+          "DriverVersion": "32.0.101.8860"
+        }
+      ],
+      "env_overrides": {
+        "AILA_Q4E_INLINE_CHECKPOINT": "0",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+        "AILA_Q4E_CPU_OVERLAP": "0",
+        "AILA_Q4E_PREFILL_XMX": "1"
+      },
+      "inherited_experiment_overrides_cleared": true,
+      "prompt_tokens": [
+        256,
+        256
+      ],
+      "teacher_forced_targets": 0,
+      "max_seq": 512,
+      "cache": "Both paths warmed; host cache warm, GPU cache capacity limited",
+      "timing": "3 alternating pairs; prefill and prefill+47 fixed-token forwards; no logits download in timed runs"
+    },
+    "peak_working_set_bytes": 22758178816,
+    "peak_private_commit_bytes": 33690349568,
+    "minimum_system_free_mb": 29796.9609375,
+    "records": [
+      "[X2 MEMORY] stage=warmup device_bytes=14082476694 peak_device_bytes=14082476706 pinned_host_bytes=17359604996 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0",
+      "[X2 MEMORY FORWARD] tokens=256 ms=7511.26 logits_fnv64=1271920800156241593",
+      "[X2 MEMORY] stage=256 device_bytes=14295005206 peak_device_bytes=14295005206 pinned_host_bytes=17360819204 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0",
+      "[X2 MEMORY FORWARD] tokens=256 ms=3905.31 logits_fnv64=1271920800156241593",
+      "[X2 MEMORY] stage=256 device_bytes=14295005206 peak_device_bytes=14295005206 pinned_host_bytes=17360819204 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0"
+    ],
+    "runner_note": "Post-run metadata aggregation failed on OrderedDictionary samples; sample JSON and complete stdout retained. Default confirmation run fixes aggregation and exits 0."
+  },
+  "default": {
+    "identity": {
+      "timestamp": "2026-09-29T17:10:56.1041209+08:00",
+      "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+      "dirty": [
+        " M src/models/Qwen4ExpBnb4Backend.cpp",
+        " M src/models/Qwen4ExpBnb4Backend.hpp",
+        " M src/models/Qwen4ExpExpertCache.cpp",
+        " M tests/models/Qwen4ExpModuleTests.cpp",
+        " M tests/models/Qwen4ExpToleranceTests.cpp",
+        "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+        "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+        "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+        "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp"
+      ],
+      "exe_sha256": "ABF0C76A5A9CD1169256A970194ACE1D25D5F379FC0E989757C16460BEAC5D3A",
+      "harness_sha256": "E4E8E1EA9E16D14A561586E6D27EFCB0AD2FFEB7196F44042D438A375C2E6FC3",
+      "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+      "stack": {
+        "name": "oneapi-2026.1",
+        "role": "candidate",
+        "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "compilerVersion": "2026.1.0",
+        "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+        "dnnlVersion": "3.11.2",
+        "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+        "tbbVersion": "2023.1",
+        "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+        "expectedSyclDll": "sycl9.dll",
+        "allowLegacyCompiler": false
+      },
+      "mode": "memory",
+      "reader_override": "default",
+      "gpu": [
+        {
+          "Name": "GameViewer Virtual Display Adapter",
+          "DriverVersion": "15.6.5.199"
+        },
+        {
+          "Name": "Intel(R) Arc(TM) A770 Graphics",
+          "DriverVersion": "32.0.101.8860"
+        }
+      ],
+      "env_overrides": {
+        "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+        "AILA_Q4E_INLINE_CHECKPOINT": "0",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_CPU_OVERLAP": "0",
+        "AILA_Q4E_STATIC_PINNING": "0"
+      },
+      "inherited_experiment_overrides_cleared": true,
+      "prompt_tokens": [
+        256,
+        256
+      ],
+      "teacher_forced_targets": 0,
+      "max_seq": 512,
+      "cache": "Init warmup; GPU cache capacity limited. Checkpoint mode also warms both paths; memory mode retains cold first long shape.",
+      "timing": "Two 256-token forwards; includes logits download/hash; diagnostic timing, no speedup claim",
+      "peak_working_set_bytes": 22741151744.0,
+      "peak_private_commit_bytes": 33674285056.0,
+      "minimum_system_free_mb": 29627.9375,
+      "exit_code": 0
+    },
+    "peak_working_set_bytes": 22741151744,
+    "peak_private_commit_bytes": 33674285056,
+    "minimum_system_free_mb": 29627.9375,
+    "records": [
+      "[X2 MEMORY] stage=warmup device_bytes=14082476694 peak_device_bytes=14082476706 pinned_host_bytes=17359604996 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0",
+      "[X2 MEMORY FORWARD] tokens=256 ms=4204.14 logits_fnv64=1271920800156241593",
+      "[X2 MEMORY] stage=256 device_bytes=14295005206 peak_device_bytes=14295005206 pinned_host_bytes=17360819204 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0",
+      "[X2 MEMORY FORWARD] tokens=256 ms=3898.1 logits_fnv64=1271920800156241593",
+      "[X2 MEMORY] stage=256 device_bytes=14295005206 peak_device_bytes=14295005206 pinned_host_bytes=17360819204 host_pool_bytes=17178163200 reader=readfile_overlapped mmap_fallbacks=0"
+    ]
+  }
+}

@@ -1,0 +1,3353 @@
+{
+  "phase": "X4",
+  "date": "2026-09-29",
+  "status": "prototype and bounded acceptance completed; recurrence remains default",
+  "modes": {
+    "0": "unchanged recurrence (default)",
+    "1": "T16 FP32 chunked solve and matrix products, GPU only",
+    "2": "same FP32 solve, BF16 joint_matrix final products"
+  },
+  "timing_protocol": "3 series x 20 interleaved operator wall samples after 3 warmups; GPU event span includes queue gaps; 3 interleaved model samples after warming each mode; state upload and logits downloads excluded from timed paths",
+  "primary_operator_run": "x4-ops-unrolled",
+  "primary_model_run": "x4-model",
+  "runs": [
+    {
+      "tag": "x4-math-baseline",
+      "identity": {
+        "timestamp": "2026-09-29T18:24:09.9289090+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "kernel",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "2E34B24F9682CA0054E5A12C7B19506A4C1CC842336D2C2D28306C52817FB432",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1"
+        },
+        "kernel_test_sha256": "0981438B452DFDF15AB69FCC6530A9ED9282173E1A62F007CFD9B58C4550F315",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "peak_working_set_bytes": 236531712.0,
+        "peak_private_commit_bytes": 234659840.0,
+        "minimum_system_free_mb": 54240.26953125,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "MATH",
+          "chunk": 16.0,
+          "state_nrmse": 3.71483e-16,
+          "raw_nrmse": 4.11511e-16
+        },
+        {
+          "type": "MATH",
+          "chunk": 32.0,
+          "state_nrmse": 3.8764e-16,
+          "raw_nrmse": 4.21179e-16
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.03411e-07,
+          "state_max_abs": 3.8629e-08,
+          "output_nrmse": 5.1672e-05,
+          "output_max_abs": 0.00195312
+        }
+      ],
+      "summary": []
+    },
+    {
+      "tag": "x4-baseline",
+      "identity": {
+        "timestamp": "2026-09-29T18:29:12.7476250+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "baseline",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "2E34B24F9682CA0054E5A12C7B19506A4C1CC842336D2C2D28306C52817FB432",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "kernel_test_sha256": "0981438B452DFDF15AB69FCC6530A9ED9282173E1A62F007CFD9B58C4550F315",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "peak_working_set_bytes": 242327552.0,
+        "peak_private_commit_bytes": 258482176.0,
+        "minimum_system_free_mb": 54090.65625,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 0.0,
+          "wall_ms": 0.766,
+          "p10": 0.7615,
+          "p90": 0.7869,
+          "device_span_ms": 0.620208
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 1.0,
+          "wall_ms": 0.7912,
+          "p10": 0.7664,
+          "p90": 0.8044,
+          "device_span_ms": 0.621875
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 2.0,
+          "wall_ms": 0.7802,
+          "p10": 0.7632,
+          "p90": 0.7971,
+          "device_span_ms": 0.621354
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 0.0,
+          "wall_ms": 4.929,
+          "p10": 4.8989,
+          "p90": 5.0568,
+          "device_span_ms": 4.74167
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 1.0,
+          "wall_ms": 4.9161,
+          "p10": 4.9033,
+          "p90": 5.0324,
+          "device_span_ms": 4.74261
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 2.0,
+          "wall_ms": 4.9175,
+          "p10": 4.9017,
+          "p90": 5.006,
+          "device_span_ms": 4.74156
+        }
+      ],
+      "summary": [
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "mode": 0,
+          "wall_ms": {
+            "median": 0.7802,
+            "mad": 0.01100000000000001,
+            "samples": [
+              0.766,
+              0.7912,
+              0.7802
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.621354,
+            "mad": 0.0005209999999999937,
+            "samples": [
+              0.620208,
+              0.621875,
+              0.621354
+            ]
+          }
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "mode": 0,
+          "wall_ms": {
+            "median": 4.9175,
+            "mad": 0.00140000000000029,
+            "samples": [
+              4.929,
+              4.9161,
+              4.9175
+            ]
+          },
+          "device_span_ms": {
+            "median": 4.74167,
+            "mad": 0.00011000000000027654,
+            "samples": [
+              4.74167,
+              4.74261,
+              4.74156
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-kernel",
+      "identity": {
+        "timestamp": "2026-09-29T18:42:11.5252152+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "kernel",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "CCB34E220C72279E0F6926743AF9FCC6B4BE00430D4E08AE3685DE6F901BBCBE",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0"
+        },
+        "kernel_test_sha256": "0F70F2645CA6FFB1D2471EECB04604E804BBCF6A8980A9664A8449B525748DB2",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "84E70787B8F840F0FE1A69E9FC353FC0C1B4F0957658BCEE6C49F884AF3394FF",
+        "peak_working_set_bytes": 236806144.0,
+        "peak_private_commit_bytes": 235708416.0,
+        "minimum_system_free_mb": 55245.24609375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "MATH",
+          "chunk": 16.0,
+          "state_nrmse": 3.71483e-16,
+          "raw_nrmse": 4.11511e-16
+        },
+        {
+          "type": "MATH",
+          "chunk": 32.0,
+          "state_nrmse": 3.8764e-16,
+          "raw_nrmse": 4.21179e-16
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.03411e-07,
+          "state_max_abs": 3.8629e-08,
+          "output_nrmse": 5.1672e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CHUNK",
+          "xmx": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.35315e-07,
+          "state_max_abs": 3.88706e-08,
+          "output_nrmse": 5.19458e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.71823e-07,
+          "state_max_abs": 4.98049e-08,
+          "output_nrmse": 3.10317e-05,
+          "output_max_abs": 0.000976562
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 0.0,
+          "cut": 1.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.94752e-07,
+          "state_max_abs": 3.88706e-08,
+          "output_nrmse": 5.19298e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 0.0,
+          "cut": 15.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.35315e-07,
+          "state_max_abs": 3.88706e-08,
+          "output_nrmse": 5.19458e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 0.0,
+          "cut": 16.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.12878e-07,
+          "state_max_abs": 4.60796e-08,
+          "output_nrmse": 5.19458e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 0.0,
+          "cut": 17.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 8.35315e-07,
+          "state_max_abs": 3.88706e-08,
+          "output_nrmse": 5.19458e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 0.0,
+          "cut": 32.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHUNK",
+          "xmx": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00220367,
+          "state_max_abs": 0.000121969,
+          "output_nrmse": 0.00232127,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.0022056,
+          "state_max_abs": 0.000155549,
+          "output_nrmse": 0.00234403,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 1.0,
+          "cut": 1.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00220247,
+          "state_max_abs": 0.000176047,
+          "output_nrmse": 0.00233937,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 1.0,
+          "cut": 15.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00220367,
+          "state_max_abs": 0.000121969,
+          "output_nrmse": 0.00232127,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 1.0,
+          "cut": 16.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00220743,
+          "state_max_abs": 0.000161015,
+          "output_nrmse": 0.00230706,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 1.0,
+          "cut": 17.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00220367,
+          "state_max_abs": 0.000121969,
+          "output_nrmse": 0.00232127,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "CONTINUATION",
+          "xmx": 1.0,
+          "cut": 32.0,
+          "restore_replay": "bitwise",
+          "guards": "pass"
+        }
+      ],
+      "summary": []
+    },
+    {
+      "tag": "x4-ops",
+      "identity": {
+        "timestamp": "2026-09-29T18:43:54.3490586+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "bench",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "CCB34E220C72279E0F6926743AF9FCC6B4BE00430D4E08AE3685DE6F901BBCBE",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0"
+        },
+        "kernel_test_sha256": "0F70F2645CA6FFB1D2471EECB04604E804BBCF6A8980A9664A8449B525748DB2",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "84E70787B8F840F0FE1A69E9FC353FC0C1B4F0957658BCEE6C49F884AF3394FF",
+        "peak_working_set_bytes": 293404672.0,
+        "peak_private_commit_bytes": 364855296.0,
+        "minimum_system_free_mb": 55210.93359375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.69637e-07,
+          "state_max_abs": 3.88274e-08,
+          "output_nrmse": 3.82003e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.80076e-07,
+          "state_max_abs": 3.93973e-08,
+          "output_nrmse": 5.18326e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00213045,
+          "state_max_abs": 0.000139273,
+          "output_nrmse": 0.0022878,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 0.7868,
+          "p10": 0.7593,
+          "p90": 0.9123,
+          "device_span_ms": 0.639896,
+          "cv": 0.073621,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 3.1083,
+          "p10": 3.013,
+          "p90": 3.2772,
+          "device_span_ms": 2.96208,
+          "cv": 0.0911261,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 3.2277,
+          "p10": 3.1278,
+          "p90": 3.4746,
+          "device_span_ms": 3.06385,
+          "cv": 0.0409432,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 0.7802,
+          "p10": 0.7583,
+          "p90": 0.8086,
+          "device_span_ms": 0.639375,
+          "cv": 0.0434301,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 3.0989,
+          "p10": 3.0083,
+          "p90": 3.3344,
+          "device_span_ms": 2.94823,
+          "cv": 0.0355635,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 3.2163,
+          "p10": 3.1128,
+          "p90": 3.3117,
+          "device_span_ms": 3.06302,
+          "cv": 0.0263208,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 0.7806,
+          "p10": 0.762,
+          "p90": 0.8697,
+          "device_span_ms": 0.639583,
+          "cv": 0.064979,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 3.0937,
+          "p10": 3.0106,
+          "p90": 3.1538,
+          "device_span_ms": 2.9499,
+          "cv": 0.0172284,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 3.2559,
+          "p10": 3.1731,
+          "p90": 3.3571,
+          "device_span_ms": 3.11344,
+          "cv": 0.100132,
+          "noisy": 1.0
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.04547e-07,
+          "state_max_abs": 5.8719e-08,
+          "output_nrmse": 5.46265e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.04452e-07,
+          "state_max_abs": 5.49937e-08,
+          "output_nrmse": 5.58378e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.0024307,
+          "state_max_abs": 0.00015264,
+          "output_nrmse": 0.00306881,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 4.9905,
+          "p10": 4.9751,
+          "p90": 5.2172,
+          "device_span_ms": 4.885,
+          "cv": 0.0192441,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 28.1886,
+          "p10": 27.9503,
+          "p90": 28.662,
+          "device_span_ms": 28.0629,
+          "cv": 0.0082765,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 29.7076,
+          "p10": 29.3943,
+          "p90": 30.1337,
+          "device_span_ms": 29.5811,
+          "cv": 0.00948759,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 4.9815,
+          "p10": 4.9673,
+          "p90": 5.1199,
+          "device_span_ms": 4.87385,
+          "cv": 0.0205548,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 28.2379,
+          "p10": 27.8535,
+          "p90": 28.4529,
+          "device_span_ms": 28.1137,
+          "cv": 0.012476,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 29.5212,
+          "p10": 29.0174,
+          "p90": 29.9092,
+          "device_span_ms": 29.3818,
+          "cv": 0.0152605,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 5.0014,
+          "p10": 4.9678,
+          "p90": 5.1769,
+          "device_span_ms": 4.88719,
+          "cv": 0.0201785,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 28.1019,
+          "p10": 27.789,
+          "p90": 28.3723,
+          "device_span_ms": 27.9784,
+          "cv": 0.00931613,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 29.6985,
+          "p10": 29.3991,
+          "p90": 30.1811,
+          "device_span_ms": 29.5804,
+          "cv": 0.00965531,
+          "noisy": 0.0
+        }
+      ],
+      "summary": [
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 0.7806,
+            "mad": 0.00039999999999995595,
+            "samples": [
+              0.7868,
+              0.7802,
+              0.7806
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.639583,
+            "mad": 0.00020799999999998597,
+            "samples": [
+              0.639896,
+              0.639375,
+              0.639583
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 3.0989,
+            "mad": 0.005199999999999871,
+            "samples": [
+              3.1083,
+              3.0989,
+              3.0937
+            ]
+          },
+          "device_span_ms": {
+            "median": 2.9499,
+            "mad": 0.0016699999999998383,
+            "samples": [
+              2.96208,
+              2.94823,
+              2.9499
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 3.2277,
+            "mad": 0.011400000000000077,
+            "samples": [
+              3.2277,
+              3.2163,
+              3.2559
+            ]
+          },
+          "device_span_ms": {
+            "median": 3.06385,
+            "mad": 0.0008300000000001084,
+            "samples": [
+              3.06385,
+              3.06302,
+              3.11344
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 4.9905,
+            "mad": 0.009000000000000341,
+            "samples": [
+              4.9905,
+              4.9815,
+              5.0014
+            ]
+          },
+          "device_span_ms": {
+            "median": 4.885,
+            "mad": 0.0021900000000005804,
+            "samples": [
+              4.885,
+              4.87385,
+              4.88719
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 28.1886,
+            "mad": 0.04929999999999879,
+            "samples": [
+              28.1886,
+              28.2379,
+              28.1019
+            ]
+          },
+          "device_span_ms": {
+            "median": 28.0629,
+            "mad": 0.0508000000000024,
+            "samples": [
+              28.0629,
+              28.1137,
+              27.9784
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 29.6985,
+            "mad": 0.009100000000000108,
+            "samples": [
+              29.7076,
+              29.5212,
+              29.6985
+            ]
+          },
+          "device_span_ms": {
+            "median": 29.5804,
+            "mad": 0.0006999999999983686,
+            "samples": [
+              29.5811,
+              29.3818,
+              29.5804
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-ops-padded",
+      "identity": {
+        "timestamp": "2026-09-29T18:55:38.8006099+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/experiments/",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "bench",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "33618311D6F47909484A43E67CC14978217073A7DE8F1F44CFB2FF822CDEEBDB",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "kernel_test_sha256": "21AD8DB877A78C17DED6FDE7C8F3144ECF229F44BA2C26481B6487C6E921EBC3",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "9FE5527F1BBC82CC3B6994B8D36EE511646090ED4AC33557AEA48DAD9704C71D",
+        "peak_working_set_bytes": 294129664.0,
+        "peak_private_commit_bytes": 360824832.0,
+        "minimum_system_free_mb": 55280.3671875,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.69637e-07,
+          "state_max_abs": 3.88274e-08,
+          "output_nrmse": 3.82003e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.80076e-07,
+          "state_max_abs": 3.93973e-08,
+          "output_nrmse": 5.18326e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00213045,
+          "state_max_abs": 0.000139273,
+          "output_nrmse": 0.0022878,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 0.7816,
+          "p10": 0.7639,
+          "p90": 0.8934,
+          "device_span_ms": 0.639375,
+          "cv": 0.0990109,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 3.0989,
+          "p10": 2.9779,
+          "p90": 3.1543,
+          "device_span_ms": 2.96115,
+          "cv": 0.0940538,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 3.2348,
+          "p10": 3.1356,
+          "p90": 3.4176,
+          "device_span_ms": 3.07979,
+          "cv": 0.0390503,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 0.7798,
+          "p10": 0.7616,
+          "p90": 0.7854,
+          "device_span_ms": 0.638541,
+          "cv": 0.0151501,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 3.1371,
+          "p10": 3.0325,
+          "p90": 3.262,
+          "device_span_ms": 2.99344,
+          "cv": 0.0379248,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 3.245,
+          "p10": 3.1526,
+          "p90": 3.3327,
+          "device_span_ms": 3.10344,
+          "cv": 0.02411,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 0.7793,
+          "p10": 0.7566,
+          "p90": 0.8031,
+          "device_span_ms": 0.639687,
+          "cv": 0.0322575,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 3.1165,
+          "p10": 2.977,
+          "p90": 3.2683,
+          "device_span_ms": 2.96958,
+          "cv": 0.0343826,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 3.2562,
+          "p10": 3.1237,
+          "p90": 3.4445,
+          "device_span_ms": 3.10719,
+          "cv": 0.0356516,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.04547e-07,
+          "state_max_abs": 5.8719e-08,
+          "output_nrmse": 5.46265e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.04452e-07,
+          "state_max_abs": 5.49937e-08,
+          "output_nrmse": 5.58378e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.0024307,
+          "state_max_abs": 0.00015264,
+          "output_nrmse": 0.00306881,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 5.0249,
+          "p10": 4.9716,
+          "p90": 5.1366,
+          "device_span_ms": 4.90719,
+          "cv": 0.0155996,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 28.2446,
+          "p10": 27.9159,
+          "p90": 28.4827,
+          "device_span_ms": 28.1181,
+          "cv": 0.00696185,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 29.6673,
+          "p10": 29.0982,
+          "p90": 30.0576,
+          "device_span_ms": 29.5486,
+          "cv": 0.0155201,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 4.9753,
+          "p10": 4.9673,
+          "p90": 5.0692,
+          "device_span_ms": 4.87229,
+          "cv": 0.011741,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 27.9487,
+          "p10": 27.6562,
+          "p90": 28.1576,
+          "device_span_ms": 27.8197,
+          "cv": 0.00754777,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 29.4381,
+          "p10": 29.1502,
+          "p90": 29.6734,
+          "device_span_ms": 29.3168,
+          "cv": 0.00750234,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 4.9941,
+          "p10": 4.9696,
+          "p90": 5.1014,
+          "device_span_ms": 4.87479,
+          "cv": 0.010536,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 28.0147,
+          "p10": 27.6846,
+          "p90": 28.7162,
+          "device_span_ms": 27.8949,
+          "cv": 0.0196921,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 29.4462,
+          "p10": 29.2502,
+          "p90": 29.8298,
+          "device_span_ms": 29.3216,
+          "cv": 0.00711145,
+          "noisy": 0.0
+        }
+      ],
+      "summary": [
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 0.7798,
+            "mad": 0.000500000000000056,
+            "samples": [
+              0.7816,
+              0.7798,
+              0.7793
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.639375,
+            "mad": 0.00031199999999997896,
+            "samples": [
+              0.639375,
+              0.638541,
+              0.639687
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 3.1165,
+            "mad": 0.017599999999999838,
+            "samples": [
+              3.0989,
+              3.1371,
+              3.1165
+            ]
+          },
+          "device_span_ms": {
+            "median": 2.96958,
+            "mad": 0.00843000000000016,
+            "samples": [
+              2.96115,
+              2.99344,
+              2.96958
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 3.245,
+            "mad": 0.010200000000000209,
+            "samples": [
+              3.2348,
+              3.245,
+              3.2562
+            ]
+          },
+          "device_span_ms": {
+            "median": 3.10344,
+            "mad": 0.003750000000000142,
+            "samples": [
+              3.07979,
+              3.10344,
+              3.10719
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 4.9941,
+            "mad": 0.018800000000000594,
+            "samples": [
+              5.0249,
+              4.9753,
+              4.9941
+            ]
+          },
+          "device_span_ms": {
+            "median": 4.87479,
+            "mad": 0.002500000000000391,
+            "samples": [
+              4.90719,
+              4.87229,
+              4.87479
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 28.0147,
+            "mad": 0.0660000000000025,
+            "samples": [
+              28.2446,
+              27.9487,
+              28.0147
+            ]
+          },
+          "device_span_ms": {
+            "median": 27.8949,
+            "mad": 0.07519999999999882,
+            "samples": [
+              28.1181,
+              27.8197,
+              27.8949
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 29.4462,
+            "mad": 0.008100000000002439,
+            "samples": [
+              29.6673,
+              29.4381,
+              29.4462
+            ]
+          },
+          "device_span_ms": {
+            "median": 29.3216,
+            "mad": 0.004799999999999471,
+            "samples": [
+              29.5486,
+              29.3168,
+              29.3216
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-ops-unrolled",
+      "identity": {
+        "timestamp": "2026-09-29T19:02:27.1594939+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/experiments/",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "bench",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "5211A0508F8CCA1169EEF32607B6D451F2451C778DC4D1C6E3C26C14B72B43C8",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "kernel_test_sha256": "21AD8DB877A78C17DED6FDE7C8F3144ECF229F44BA2C26481B6487C6E921EBC3",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "2F9391D63C058CBBA41B22D04C6DD0A6E132A91F63BBA5DA5B27ED9ADB055BCA",
+        "peak_working_set_bytes": 297009152.0,
+        "peak_private_commit_bytes": 348708864.0,
+        "minimum_system_free_mb": 55313.80859375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.69637e-07,
+          "state_max_abs": 3.88274e-08,
+          "output_nrmse": 3.82003e-05,
+          "output_max_abs": 0.00195312
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 6.76927e-07,
+          "state_max_abs": 3.93973e-08,
+          "output_nrmse": 5.29136e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 30.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00213045,
+          "state_max_abs": 0.000139273,
+          "output_nrmse": 0.0022878,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 0.7796,
+          "p10": 0.7605,
+          "p90": 0.8005,
+          "device_span_ms": 0.638542,
+          "cv": 0.035213,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 0.5629,
+          "p10": 0.5402,
+          "p90": 0.6234,
+          "device_span_ms": 0.414375,
+          "cv": 0.0961185,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 0.6759,
+          "p10": 0.6649,
+          "p90": 0.6989,
+          "device_span_ms": 0.528646,
+          "cv": 0.0585187,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 0.7784,
+          "p10": 0.7555,
+          "p90": 0.7951,
+          "device_span_ms": 0.638646,
+          "cv": 0.0376645,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 0.557,
+          "p10": 0.54,
+          "p90": 0.5696,
+          "device_span_ms": 0.41375,
+          "cv": 0.0515542,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 0.6744,
+          "p10": 0.6694,
+          "p90": 0.6971,
+          "device_span_ms": 0.528229,
+          "cv": 0.038221,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 0.7821,
+          "p10": 0.7554,
+          "p90": 0.7945,
+          "device_span_ms": 0.63875,
+          "cv": 0.0261308,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 0.5593,
+          "p10": 0.5433,
+          "p90": 0.5735,
+          "device_span_ms": 0.413333,
+          "cv": 0.0446942,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 0.6772,
+          "p10": 0.6707,
+          "p90": 0.7331,
+          "device_span_ms": 0.532604,
+          "cv": 0.0428817,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 0.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.04547e-07,
+          "state_max_abs": 5.8719e-08,
+          "output_nrmse": 5.46265e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 1.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 7.00172e-07,
+          "state_max_abs": 5.8719e-08,
+          "output_nrmse": 5.62578e-05,
+          "output_max_abs": 0.00390625
+        },
+        {
+          "type": "BENCH CHECK",
+          "count": 256.0,
+          "mode": 2.0
+        },
+        {
+          "type": "CHECK",
+          "state_nrmse": 0.00243072,
+          "state_max_abs": 0.00015264,
+          "output_nrmse": 0.00306885,
+          "output_max_abs": 0.0078125
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 0.0,
+          "wall_ms": 5.0234,
+          "p10": 4.8931,
+          "p90": 5.0675,
+          "device_span_ms": 4.84833,
+          "cv": 0.013743,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 0.0,
+          "wall_ms": 3.3863,
+          "p10": 3.3618,
+          "p90": 3.5988,
+          "device_span_ms": 3.19812,
+          "cv": 0.0324357,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 0.0,
+          "wall_ms": 4.7224,
+          "p10": 4.5839,
+          "p90": 4.9161,
+          "device_span_ms": 4.53021,
+          "cv": 0.0302702,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 1.0,
+          "wall_ms": 4.9306,
+          "p10": 4.8931,
+          "p90": 5.0473,
+          "device_span_ms": 4.7651,
+          "cv": 0.0131389,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 1.0,
+          "wall_ms": 3.3775,
+          "p10": 3.3604,
+          "p90": 3.6331,
+          "device_span_ms": 3.20177,
+          "cv": 0.0355326,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 1.0,
+          "wall_ms": 4.6831,
+          "p10": 4.6241,
+          "p90": 5.0412,
+          "device_span_ms": 4.49885,
+          "cv": 0.0345541,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "series": 2.0,
+          "wall_ms": 4.9274,
+          "p10": 4.8963,
+          "p90": 5.0574,
+          "device_span_ms": 4.76687,
+          "cv": 0.012591,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "series": 2.0,
+          "wall_ms": 3.3789,
+          "p10": 3.3599,
+          "p90": 3.5534,
+          "device_span_ms": 3.19667,
+          "cv": 0.0330715,
+          "noisy": 0.0
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "series": 2.0,
+          "wall_ms": 4.6801,
+          "p10": 4.6138,
+          "p90": 5.0291,
+          "device_span_ms": 4.49969,
+          "cv": 0.0354453,
+          "noisy": 0.0
+        }
+      ],
+      "summary": [
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 0.7796,
+            "mad": 0.0011999999999999789,
+            "samples": [
+              0.7796,
+              0.7784,
+              0.7821
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.638646,
+            "mad": 0.00010399999999999299,
+            "samples": [
+              0.638542,
+              0.638646,
+              0.63875
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 0.5593,
+            "mad": 0.0022999999999999687,
+            "samples": [
+              0.5629,
+              0.557,
+              0.5593
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.41375,
+            "mad": 0.0004170000000000007,
+            "samples": [
+              0.414375,
+              0.41375,
+              0.413333
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 30.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 0.6759,
+            "mad": 0.0013000000000000789,
+            "samples": [
+              0.6759,
+              0.6744,
+              0.6772
+            ]
+          },
+          "device_span_ms": {
+            "median": 0.528646,
+            "mad": 0.0004170000000000007,
+            "samples": [
+              0.528646,
+              0.528229,
+              0.532604
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 0.0,
+          "wall_ms": {
+            "median": 4.9306,
+            "mad": 0.0032000000000005357,
+            "samples": [
+              5.0234,
+              4.9306,
+              4.9274
+            ]
+          },
+          "device_span_ms": {
+            "median": 4.76687,
+            "mad": 0.0017699999999996052,
+            "samples": [
+              4.84833,
+              4.7651,
+              4.76687
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 1.0,
+          "wall_ms": {
+            "median": 3.3789,
+            "mad": 0.0013999999999998458,
+            "samples": [
+              3.3863,
+              3.3775,
+              3.3789
+            ]
+          },
+          "device_span_ms": {
+            "median": 3.19812,
+            "mad": 0.0014499999999997293,
+            "samples": [
+              3.19812,
+              3.20177,
+              3.19667
+            ]
+          }
+        },
+        {
+          "type": "BENCH",
+          "count": 256.0,
+          "mode": 2.0,
+          "wall_ms": {
+            "median": 4.6831,
+            "mad": 0.0029999999999992255,
+            "samples": [
+              4.7224,
+              4.6831,
+              4.6801
+            ]
+          },
+          "device_span_ms": {
+            "median": 4.49969,
+            "mad": 0.0008400000000001739,
+            "samples": [
+              4.53021,
+              4.49885,
+              4.49969
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-model",
+      "identity": {
+        "timestamp": "2026-09-29T19:06:55.3478536+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/experiments/",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "model",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "E46F6E11D05715DDEDE6F585A25F344097691442FD10CD03A0226AC3F58F86F2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1"
+        },
+        "kernel_test_sha256": "89B64814EB3A5849AB35AAA9FBCD641E2625B18C771B10A106A88AC73E655CDA",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "2F9391D63C058CBBA41B22D04C6DD0A6E132A91F63BBA5DA5B27ED9ADB055BCA",
+        "peak_working_set_bytes": 22899449856.0,
+        "peak_private_commit_bytes": 33873420288.0,
+        "minimum_system_free_mb": 28597.8046875,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "WARM",
+          "count": 30.0,
+          "mode": 0.0
+        },
+        {
+          "type": "WARM",
+          "count": 30.0,
+          "mode": 1.0
+        },
+        {
+          "type": "WARM",
+          "count": 30.0,
+          "mode": 2.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 30.0,
+          "mode": 1.0,
+          "rows": 48.0,
+          "mean_kl": 0.00196356,
+          "mean_nll_delta": -0.0125693,
+          "max_logits_nrmse": 0.0557405,
+          "warning": 0.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 30.0,
+          "mode": 2.0,
+          "rows": 48.0,
+          "mean_kl": 0.0022403,
+          "mean_nll_delta": -0.0150282,
+          "max_logits_nrmse": 0.0716237,
+          "warning": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 0.0,
+          "pair": 0.0,
+          "prefill_ms": 1373.21,
+          "total_ms": 4840.21,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 1.0,
+          "pair": 0.0,
+          "prefill_ms": 1354.31,
+          "total_ms": 4831.36,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 2.0,
+          "pair": 0.0,
+          "prefill_ms": 1351.34,
+          "total_ms": 4842.66,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 1.0,
+          "pair": 1.0,
+          "prefill_ms": 1356.59,
+          "total_ms": 4823.98,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 2.0,
+          "pair": 1.0,
+          "prefill_ms": 1350.99,
+          "total_ms": 4809.58,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 0.0,
+          "pair": 1.0,
+          "prefill_ms": 1370.18,
+          "total_ms": 4836.77,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 2.0,
+          "pair": 2.0,
+          "prefill_ms": 1352.78,
+          "total_ms": 4824.73,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 0.0,
+          "pair": 2.0,
+          "prefill_ms": 1368.74,
+          "total_ms": 4838.36,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 1.0,
+          "pair": 2.0,
+          "prefill_ms": 1351.3,
+          "total_ms": 4816.43,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 30.0,
+          "device_bytes": 14090028886.0,
+          "host_bytes": 17359610116.0,
+          "cache_slots": 3714.0
+        },
+        {
+          "type": "WARM",
+          "count": 256.0,
+          "mode": 0.0
+        },
+        {
+          "type": "WARM",
+          "count": 256.0,
+          "mode": 1.0
+        },
+        {
+          "type": "WARM",
+          "count": 256.0,
+          "mode": 2.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 256.0,
+          "mode": 1.0,
+          "rows": 8.0,
+          "mean_kl": 0.0158226,
+          "mean_nll_delta": -0.0376396,
+          "max_logits_nrmse": 0.235081,
+          "warning": 0.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 256.0,
+          "mode": 2.0,
+          "rows": 8.0,
+          "mean_kl": 0.0410126,
+          "mean_nll_delta": -0.0961328,
+          "max_logits_nrmse": 0.288142,
+          "warning": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 0.0,
+          "pair": 0.0,
+          "prefill_ms": 3623.67,
+          "total_ms": 4305.62,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 1.0,
+          "pair": 0.0,
+          "prefill_ms": 3585.45,
+          "total_ms": 4265.65,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 2.0,
+          "pair": 0.0,
+          "prefill_ms": 3623.82,
+          "total_ms": 4303.36,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 1.0,
+          "pair": 1.0,
+          "prefill_ms": 3589.79,
+          "total_ms": 4264.02,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 2.0,
+          "pair": 1.0,
+          "prefill_ms": 3619.06,
+          "total_ms": 4288.52,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 0.0,
+          "pair": 1.0,
+          "prefill_ms": 3628.03,
+          "total_ms": 4301.89,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 2.0,
+          "pair": 2.0,
+          "prefill_ms": 3618.98,
+          "total_ms": 4294.84,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 0.0,
+          "pair": 2.0,
+          "prefill_ms": 3627.87,
+          "total_ms": 4304.26,
+          "chunk_calls": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 1.0,
+          "pair": 2.0,
+          "prefill_ms": 3580.84,
+          "total_ms": 4257.67,
+          "chunk_calls": 36.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 256.0,
+          "device_bytes": 14321520854.0,
+          "host_bytes": 17360839684.0,
+          "cache_slots": 3714.0
+        },
+        {
+          "type": "STATE",
+          "mode": 1.0,
+          "start": 4.0,
+          "anchor": 21.0,
+          "restore": "bitwise",
+          "replay": "bitwise",
+          "suffix_independent": 1.0
+        },
+        {
+          "type": "STATE",
+          "mode": 2.0,
+          "start": 4.0,
+          "anchor": 21.0,
+          "restore": "bitwise",
+          "replay": "bitwise",
+          "suffix_independent": 1.0
+        }
+      ],
+      "summary": [
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 0.0,
+          "prefill_ms": {
+            "median": 1370.18,
+            "mad": 1.4400000000000546,
+            "samples": [
+              1373.21,
+              1370.18,
+              1368.74
+            ]
+          },
+          "total_ms": {
+            "median": 4838.36,
+            "mad": 1.589999999999236,
+            "samples": [
+              4840.21,
+              4836.77,
+              4838.36
+            ]
+          }
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 1.0,
+          "prefill_ms": {
+            "median": 1354.31,
+            "mad": 2.2799999999999727,
+            "samples": [
+              1354.31,
+              1356.59,
+              1351.3
+            ]
+          },
+          "total_ms": {
+            "median": 4823.98,
+            "mad": 7.380000000000109,
+            "samples": [
+              4831.36,
+              4823.98,
+              4816.43
+            ]
+          }
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "mode": 2.0,
+          "prefill_ms": {
+            "median": 1351.34,
+            "mad": 0.34999999999990905,
+            "samples": [
+              1351.34,
+              1350.99,
+              1352.78
+            ]
+          },
+          "total_ms": {
+            "median": 4824.73,
+            "mad": 15.149999999999636,
+            "samples": [
+              4842.66,
+              4809.58,
+              4824.73
+            ]
+          }
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 0.0,
+          "prefill_ms": {
+            "median": 3627.87,
+            "mad": 0.16000000000030923,
+            "samples": [
+              3623.67,
+              3628.03,
+              3627.87
+            ]
+          },
+          "total_ms": {
+            "median": 4304.26,
+            "mad": 1.3599999999996726,
+            "samples": [
+              4305.62,
+              4301.89,
+              4304.26
+            ]
+          }
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 1.0,
+          "prefill_ms": {
+            "median": 3585.45,
+            "mad": 4.3400000000001455,
+            "samples": [
+              3585.45,
+              3589.79,
+              3580.84
+            ]
+          },
+          "total_ms": {
+            "median": 4264.02,
+            "mad": 1.6299999999991996,
+            "samples": [
+              4265.65,
+              4264.02,
+              4257.67
+            ]
+          }
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "mode": 2.0,
+          "prefill_ms": {
+            "median": 3619.06,
+            "mad": 0.07999999999992724,
+            "samples": [
+              3623.82,
+              3619.06,
+              3618.98
+            ]
+          },
+          "total_ms": {
+            "median": 4294.84,
+            "mad": 6.319999999999709,
+            "samples": [
+              4303.36,
+              4288.52,
+              4294.84
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-baseline-profile",
+      "identity": {
+        "timestamp": "2026-09-29T18:26:23.2340854+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "profile",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "2E34B24F9682CA0054E5A12C7B19506A4C1CC842336D2C2D28306C52817FB432",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0"
+        },
+        "kernel_test_sha256": "0981438B452DFDF15AB69FCC6530A9ED9282173E1A62F007CFD9B58C4550F315",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "peak_working_set_bytes": 316997632.0,
+        "peak_private_commit_bytes": 294977536.0,
+        "minimum_system_free_mb": 53769.83984375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 0.0,
+          "wall_ms": 93.6433,
+          "p10": 89.4614,
+          "p90": 108.026,
+          "device_span_ms": 19.5687
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 1.0,
+          "wall_ms": 94.2742,
+          "p10": 90.9807,
+          "p90": 102.296,
+          "device_span_ms": 19.5766
+        },
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "series": 2.0,
+          "wall_ms": 92.7069,
+          "p10": 90.0134,
+          "p90": 101.539,
+          "device_span_ms": 19.4608
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 0.0,
+          "wall_ms": 121.887,
+          "p10": 117.136,
+          "p90": 126.63,
+          "device_span_ms": 45.8853
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 1.0,
+          "wall_ms": 123.187,
+          "p10": 116.631,
+          "p90": 128.758,
+          "device_span_ms": 45.9964
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "series": 2.0,
+          "wall_ms": 120.757,
+          "p10": 116.082,
+          "p90": 126.68,
+          "device_span_ms": 45.6701
+        }
+      ],
+      "summary": [
+        {
+          "type": "BASELINE",
+          "count": 30.0,
+          "mode": 0,
+          "wall_ms": {
+            "median": 93.6433,
+            "mad": 0.6308999999999969,
+            "samples": [
+              93.6433,
+              94.2742,
+              92.7069
+            ]
+          },
+          "device_span_ms": {
+            "median": 19.5687,
+            "mad": 0.007899999999999352,
+            "samples": [
+              19.5687,
+              19.5766,
+              19.4608
+            ]
+          }
+        },
+        {
+          "type": "BASELINE",
+          "count": 256.0,
+          "mode": 0,
+          "wall_ms": {
+            "median": 121.887,
+            "mad": 1.1299999999999955,
+            "samples": [
+              121.887,
+              123.187,
+              120.757
+            ]
+          },
+          "device_span_ms": {
+            "median": 45.8853,
+            "mad": 0.11110000000000042,
+            "samples": [
+              45.8853,
+              45.9964,
+              45.6701
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x4-chunk-profile",
+      "identity": {
+        "timestamp": "2026-09-29T18:50:11.2792060+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "profile",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "A83177F125513F4A9441E4C5659522BD710E04DC3C1FBDC4990C152C17E46D16",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0"
+        },
+        "kernel_test_sha256": "21AD8DB877A78C17DED6FDE7C8F3144ECF229F44BA2C26481B6487C6E921EBC3",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "84E70787B8F840F0FE1A69E9FC353FC0C1B4F0957658BCEE6C49F884AF3394FF",
+        "peak_working_set_bytes": 296935424.0,
+        "peak_private_commit_bytes": 275709952.0,
+        "minimum_system_free_mb": 55051.68359375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        }
+      ],
+      "summary": []
+    },
+    {
+      "tag": "x4-unrolled-profile",
+      "identity": {
+        "timestamp": "2026-09-29T19:12:39.2331574+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x3-results-2026-09-29.md",
+          "?? perf/qwen4exp/experiments/",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_gdn_chunk_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/GdnChunkOps.cpp",
+          "?? src/ops/GdnChunkOps.hpp",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGdnChunkAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp",
+          "?? tests/ops/GdnChunkTests.cpp"
+        ],
+        "mode": "profile",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "exe_sha256": "66EAC122A95C8B3F45EB9AAAA868CDD890F18B664C07898F51F43E6A02323312",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_PREFILL_XMX": "1"
+        },
+        "kernel_test_sha256": "89B64814EB3A5849AB35AAA9FBCD641E2625B18C771B10A106A88AC73E655CDA",
+        "timer": "Host wall; optional GPU event span includes queue gaps; reset/copies excluded; model timing excludes logits download",
+        "kernel_sha256": "2F9391D63C058CBBA41B22D04C6DD0A6E132A91F63BBA5DA5B27ED9ADB055BCA",
+        "peak_working_set_bytes": 332988416.0,
+        "peak_private_commit_bytes": 313012224.0,
+        "minimum_system_free_mb": 55022.01953125,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "DEVICE"
+        }
+      ],
+      "summary": []
+    }
+  ],
+  "vtune_profiles": {
+    "x4-baseline-profile": [
+      {
+        "Computing Task": "ops::run_linear_delta_prefill_gpu_batched_impl<(ops::GateActivation)1>(void, Context&, ops::DeltaNetGeometry const&, ops::DeltaNetWeights const&, ops::DeltaNetState&, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16*, int)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "6144",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "2.320453",
+        "Computing Task:Average Time": "0.016815",
+        "Computing Task:Instance Count": "138",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "25086253824",
+        "GPU Instructions Executed:Control Flow": "1404612576",
+        "GPU Instructions Executed:Send": "4005897120",
+        "GPU Instructions Executed:Synchronization": "964858464",
+        "GPU Instructions Executed:Int16 & HP Float": "68412672",
+        "GPU Instructions Executed:Int32 & SP Float": "14604144768",
+        "GPU Instructions Executed:Other": "4038328224",
+        "SIMD Utilization(%)": "99.2"
+      },
+      {
+        "Computing Task": "ops::commit_linear_conv_history(Context&, sycl::_V1::ext::oneapi::bfloat16 const*, int, float*, int, int, int, int)::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "30720",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.004965",
+        "Computing Task:Average Time": "0.000036",
+        "Computing Task:Instance Count": "138",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "45043200",
+        "GPU Instructions Executed:Control Flow": "3179520",
+        "GPU Instructions Executed:Send": "794880",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "28085760",
+        "GPU Instructions Executed:Other": "12983040",
+        "SIMD Utilization(%)": "98.7"
+      },
+      {
+        "Computing Task": "zeCommandListAppendBarrier",
+        "Work Size:Global": "",
+        "Work Size:Local": "",
+        "Computing Task:Total Time": "0.000443",
+        "Computing Task:Average Time": "0.000002",
+        "Computing Task:Instance Count": "276",
+        "Computing Task:SIMD Width": "",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "",
+        "GPU Instructions Executed:Control Flow": "",
+        "GPU Instructions Executed:Send": "",
+        "GPU Instructions Executed:Synchronization": "",
+        "GPU Instructions Executed:Int16 & HP Float": "",
+        "GPU Instructions Executed:Int32 & SP Float": "",
+        "GPU Instructions Executed:Other": "",
+        "SIMD Utilization(%)": ""
+      },
+      {
+        "Computing Task": "zeCommandListAppendMemoryCopy",
+        "Work Size:Global": "",
+        "Work Size:Local": "",
+        "Computing Task:Total Time": "0.074528",
+        "Computing Task:Average Time": "0.000176",
+        "Computing Task:Instance Count": "424",
+        "Computing Task:SIMD Width": "",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "703155712",
+        "Transfer Size:Host-to-Device": "703155712",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "",
+        "GPU Instructions Executed:Control Flow": "",
+        "GPU Instructions Executed:Send": "",
+        "GPU Instructions Executed:Synchronization": "",
+        "GPU Instructions Executed:Int16 & HP Float": "",
+        "GPU Instructions Executed:Int32 & SP Float": "",
+        "GPU Instructions Executed:Other": "",
+        "SIMD Utilization(%)": ""
+      }
+    ],
+    "x4-chunk-profile": [
+      {
+        "Computing Task": "ops::(anonymous namespace)::product_f32(Context&, float const*, float const*, float const*, float const*, float*, float*, int, int, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "884736",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.004401",
+        "Computing Task:Average Time": "0.000138",
+        "Computing Task:Instance Count": "32",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "181075968",
+        "GPU Instructions Executed:Control Flow": "5505024",
+        "GPU Instructions Executed:Send": "38731776",
+        "GPU Instructions Executed:Synchronization": "1572864",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "91029504",
+        "GPU Instructions Executed:Other": "44236800",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::solve_chunk(Context&, float const*, float*, float*, float*, float*, float*, int, int, int)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "6144",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.424727",
+        "Computing Task:Average Time": "0.006636",
+        "Computing Task:Instance Count": "64",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "2367415296",
+        "GPU Instructions Executed:Control Flow": "133668864",
+        "GPU Instructions Executed:Send": "339551232",
+        "GPU Instructions Executed:Synchronization": "120870912",
+        "GPU Instructions Executed:Int16 & HP Float": "172032",
+        "GPU Instructions Executed:Int32 & SP Float": "1060549632",
+        "GPU Instructions Executed:Other": "712602624",
+        "SIMD Utilization(%)": "82.6"
+      },
+      {
+        "Computing Task": "ops::commit_linear_conv_history(Context&, sycl::_V1::ext::oneapi::bfloat16 const*, int, float*, int, int, int, int)::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "30720",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.000134",
+        "Computing Task:Average Time": "0.000034",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "1305600",
+        "GPU Instructions Executed:Control Flow": "92160",
+        "GPU Instructions Executed:Send": "23040",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "814080",
+        "GPU Instructions Executed:Other": "376320",
+        "SIMD Utilization(%)": "98.7"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::finish(Context&, ops::DeltaNetGeometry, ops::DeltaNetWeights, sycl::_V1::ext::oneapi::bfloat16 const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "1572864",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.001342",
+        "Computing Task:Average Time": "0.000335",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "67239936",
+        "GPU Instructions Executed:Control Flow": "5898240",
+        "GPU Instructions Executed:Send": "4325376",
+        "GPU Instructions Executed:Synchronization": "1966080",
+        "GPU Instructions Executed:Int16 & HP Float": "786432",
+        "GPU Instructions Executed:Int32 & SP Float": "33030144",
+        "GPU Instructions Executed:Other": "21233664",
+        "SIMD Utilization(%)": "95.2"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::prepare_inputs(Context&, ops::DeltaNetGeometry, ops::DeltaNetWeights, float const*, int, sycl::_V1::ext::oneapi::bfloat16 const*, float*, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "1572864",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.008095",
+        "Computing Task:Average Time": "0.002024",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "241569792",
+        "GPU Instructions Executed:Control Flow": "23212032",
+        "GPU Instructions Executed:Send": "14843904",
+        "GPU Instructions Executed:Synchronization": "5111808",
+        "GPU Instructions Executed:Int16 & HP Float": "1179648",
+        "GPU Instructions Executed:Int32 & SP Float": "130085376",
+        "GPU Instructions Executed:Other": "67137024",
+        "SIMD Utilization(%)": "97.5"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::product_xmx(Context&, float const*, float const*, float const*, float const*, float*, float*, int, int, int)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "110592",
+        "Work Size:Local": "64",
+        "Computing Task:Total Time": "0.013127",
+        "Computing Task:Average Time": "0.000410",
+        "Computing Task:Instance Count": "32",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "267386880",
+        "GPU Instructions Executed:Control Flow": "32243712",
+        "GPU Instructions Executed:Send": "34996224",
+        "GPU Instructions Executed:Synchronization": "5799936",
+        "GPU Instructions Executed:Int16 & HP Float": "5308416",
+        "GPU Instructions Executed:Int32 & SP Float": "107593728",
+        "GPU Instructions Executed:Other": "81444864",
+        "SIMD Utilization(%)": "99.2"
+      },
+      {
+        "Computing Task": "zeCommandListAppendMemoryCopy",
+        "Work Size:Global": "",
+        "Work Size:Local": "",
+        "Computing Task:Total Time": "0.003573",
+        "Computing Task:Average Time": "0.000210",
+        "Computing Task:Instance Count": "17",
+        "Computing Task:SIMD Width": "",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "34177952",
+        "Transfer Size:Host-to-Device": "34177952",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "",
+        "GPU Instructions Executed:Control Flow": "",
+        "GPU Instructions Executed:Send": "",
+        "GPU Instructions Executed:Synchronization": "",
+        "GPU Instructions Executed:Int16 & HP Float": "",
+        "GPU Instructions Executed:Int32 & SP Float": "",
+        "GPU Instructions Executed:Other": "",
+        "SIMD Utilization(%)": ""
+      }
+    ],
+    "x4-unrolled-profile": [
+      {
+        "Computing Task": "ops::(anonymous namespace)::product_f32(Context&, float const*, float const*, float const*, float const*, float*, float*, int, int, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "884736",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.003674",
+        "Computing Task:Average Time": "0.000115",
+        "Computing Task:Instance Count": "32",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "181075968",
+        "GPU Instructions Executed:Control Flow": "5505024",
+        "GPU Instructions Executed:Send": "38731776",
+        "GPU Instructions Executed:Synchronization": "1572864",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "91029504",
+        "GPU Instructions Executed:Other": "44236800",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::solve_chunk(Context&, float const*, float*, float*, float*, float*, float*, int, int, int)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "6144",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.063509",
+        "Computing Task:Average Time": "0.000992",
+        "Computing Task:Instance Count": "64",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "690935808",
+        "GPU Instructions Executed:Control Flow": "28483584",
+        "GPU Instructions Executed:Send": "131490816",
+        "GPU Instructions Executed:Synchronization": "19196928",
+        "GPU Instructions Executed:Int16 & HP Float": "147456",
+        "GPU Instructions Executed:Int32 & SP Float": "370873344",
+        "GPU Instructions Executed:Other": "140743680",
+        "SIMD Utilization(%)": "87.3"
+      },
+      {
+        "Computing Task": "ops::commit_linear_conv_history(Context&, sycl::_V1::ext::oneapi::bfloat16 const*, int, float*, int, int, int, int)::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "30720",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.000133",
+        "Computing Task:Average Time": "0.000033",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "1305600",
+        "GPU Instructions Executed:Control Flow": "92160",
+        "GPU Instructions Executed:Send": "23040",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "814080",
+        "GPU Instructions Executed:Other": "376320",
+        "SIMD Utilization(%)": "98.7"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::finish(Context&, ops::DeltaNetGeometry, ops::DeltaNetWeights, sycl::_V1::ext::oneapi::bfloat16 const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "1572864",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.001350",
+        "Computing Task:Average Time": "0.000337",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "67239936",
+        "GPU Instructions Executed:Control Flow": "5898240",
+        "GPU Instructions Executed:Send": "4325376",
+        "GPU Instructions Executed:Synchronization": "1966080",
+        "GPU Instructions Executed:Int16 & HP Float": "786432",
+        "GPU Instructions Executed:Int32 & SP Float": "33030144",
+        "GPU Instructions Executed:Other": "21233664",
+        "SIMD Utilization(%)": "95.2"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::prepare_inputs(Context&, ops::DeltaNetGeometry, ops::DeltaNetWeights, float const*, int, sycl::_V1::ext::oneapi::bfloat16 const*, float*, int)::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "1572864",
+        "Work Size:Local": "128",
+        "Computing Task:Total Time": "0.008483",
+        "Computing Task:Average Time": "0.002121",
+        "Computing Task:Instance Count": "4",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "241569792",
+        "GPU Instructions Executed:Control Flow": "23212032",
+        "GPU Instructions Executed:Send": "14843904",
+        "GPU Instructions Executed:Synchronization": "5111808",
+        "GPU Instructions Executed:Int16 & HP Float": "1179648",
+        "GPU Instructions Executed:Int32 & SP Float": "130085376",
+        "GPU Instructions Executed:Other": "67137024",
+        "SIMD Utilization(%)": "97.5"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::product_xmx(Context&, float const*, float const*, float const*, float const*, float*, float*, int, int, int)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "110592",
+        "Work Size:Local": "64",
+        "Computing Task:Total Time": "0.011284",
+        "Computing Task:Average Time": "0.000353",
+        "Computing Task:Instance Count": "32",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "267386880",
+        "GPU Instructions Executed:Control Flow": "32243712",
+        "GPU Instructions Executed:Send": "34996224",
+        "GPU Instructions Executed:Synchronization": "5799936",
+        "GPU Instructions Executed:Int16 & HP Float": "5308416",
+        "GPU Instructions Executed:Int32 & SP Float": "107593728",
+        "GPU Instructions Executed:Other": "81444864",
+        "SIMD Utilization(%)": "99.2"
+      },
+      {
+        "Computing Task": "zeCommandListAppendMemoryCopy",
+        "Work Size:Global": "",
+        "Work Size:Local": "",
+        "Computing Task:Total Time": "0.003686",
+        "Computing Task:Average Time": "0.000217",
+        "Computing Task:Instance Count": "17",
+        "Computing Task:SIMD Width": "",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "34177952",
+        "Transfer Size:Host-to-Device": "34177952",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "",
+        "GPU Instructions Executed:Control Flow": "",
+        "GPU Instructions Executed:Send": "",
+        "GPU Instructions Executed:Synchronization": "",
+        "GPU Instructions Executed:Int16 & HP Float": "",
+        "GPU Instructions Executed:Int32 & SP Float": "",
+        "GPU Instructions Executed:Other": "",
+        "SIMD Utilization(%)": ""
+      }
+    ]
+  },
+  "verification": {
+    "ctest_passed": 6,
+    "ctest_failed": 0,
+    "wall_seconds": 34.76,
+    "ctest_log": "tmp/x4-ctest.log",
+    "detail_log": "tmp/x4-ctest-detail.log",
+    "x4_results": [
+      "[X4 DEVICE] Intel(R) Arc(TM) A770 Graphics",
+      "[X4 MATH] chunk=16 state_nrmse=3.71483e-16 raw_nrmse=4.11511e-16",
+      "[X4 MATH] chunk=32 state_nrmse=3.8764e-16 raw_nrmse=4.21179e-16",
+      "[X4 CHECK] state_nrmse=8.03411e-07 state_max_abs=3.8629e-08 output_nrmse=5.1672e-05 output_max_abs=0.00195312",
+      "[X4 CHUNK] xmx=0",
+      "[X4 CHECK] state_nrmse=8.33244e-07 state_max_abs=3.88706e-08 output_nrmse=5.06445e-05 output_max_abs=0.00195312",
+      "[X4 CHECK] state_nrmse=7.68287e-07 state_max_abs=4.60796e-08 output_nrmse=3.10313e-05 output_max_abs=0.000976562",
+      "[X4 CONTINUATION] xmx=0 cut=1 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=7.92412e-07 state_max_abs=3.88706e-08 output_nrmse=5.16721e-05 output_max_abs=0.00195312",
+      "[X4 CONTINUATION] xmx=0 cut=15 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=8.33244e-07 state_max_abs=3.88706e-08 output_nrmse=5.06445e-05 output_max_abs=0.00195312",
+      "[X4 CONTINUATION] xmx=0 cut=16 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=8.10041e-07 state_max_abs=4.60796e-08 output_nrmse=5.16882e-05 output_max_abs=0.00195312",
+      "[X4 CONTINUATION] xmx=0 cut=17 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=8.33244e-07 state_max_abs=3.88706e-08 output_nrmse=5.06445e-05 output_max_abs=0.00195312",
+      "[X4 CONTINUATION] xmx=0 cut=32 restore_replay=bitwise guards=pass",
+      "[X4 CHUNK] xmx=1",
+      "[X4 CHECK] state_nrmse=0.00220367 state_max_abs=0.000121969 output_nrmse=0.00232127 output_max_abs=0.0078125",
+      "[X4 CHECK] state_nrmse=0.0022056 state_max_abs=0.000155549 output_nrmse=0.00234403 output_max_abs=0.0078125",
+      "[X4 CONTINUATION] xmx=1 cut=1 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=0.00220247 state_max_abs=0.000176047 output_nrmse=0.00233937 output_max_abs=0.0078125",
+      "[X4 CONTINUATION] xmx=1 cut=15 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=0.00220367 state_max_abs=0.000121969 output_nrmse=0.00232127 output_max_abs=0.0078125",
+      "[X4 CONTINUATION] xmx=1 cut=16 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=0.00220743 state_max_abs=0.000161015 output_nrmse=0.00230706 output_max_abs=0.0078125",
+      "[X4 CONTINUATION] xmx=1 cut=17 restore_replay=bitwise guards=pass",
+      "[X4 CHECK] state_nrmse=0.00220367 state_max_abs=0.000121969 output_nrmse=0.00232127 output_max_abs=0.0078125",
+      "[X4 CONTINUATION] xmx=1 cut=32 restore_replay=bitwise guards=pass",
+      "[X4 DECAY] a_log=10 xmx=0",
+      "[X4 CHECK] state_nrmse=1.07266e-07 state_max_abs=3.76701e-09 output_nrmse=0 output_max_abs=0",
+      "[X4 DECAY] a_log=10 xmx=1",
+      "[X4 CHECK] state_nrmse=0.00254247 state_max_abs=8.76028e-05 output_nrmse=0.00343295 output_max_abs=0.000488281",
+      "[X4 DECAY] a_log=-20 xmx=0",
+      "[X4 CHECK] state_nrmse=5.09622e-08 state_max_abs=4.51291e-09 output_nrmse=5.50252e-05 output_max_abs=0.00012207",
+      "[X4 DECAY] a_log=-20 xmx=1",
+      "[X4 CHECK] state_nrmse=0.000747217 state_max_abs=8.94715e-05 output_nrmse=0.00123232 output_max_abs=0.000976562"
+    ],
+    "detail_sha256": "d51eebe8433a99905e4cc95722b616fff29f65b4337e5360f60f381a08a32158"
+  },
+  "final_files": {
+    "src/ops/GdnChunkOps.cpp": "2f9391d63c058cbba41b22d04c6dd0a6e132a91f63bba5da5b27ed9adb055bca",
+    "src/ops/GdnChunkOps.hpp": "fac75ac7d432cbbca0a2dfe17c52909ac2edefcd272aa7c90337428fbf67ddeb",
+    "tests/ops/GdnChunkTests.cpp": "89b64814eb3a5849ab35aaa9fbcd641e2625b18c771b10a106a88ac73e655cda",
+    "tests/models/Qwen4ExpGdnChunkAcceptance.hpp": "d0fee9bf43586bb7efa92336e6e23a4fe5b2645f00afe3efc04c4ab04ac78719",
+    "src/models/Qwen4ExpBnb4Backend.cpp": "f99ca93f37046d713fadf3a5f6ed257eb093133bbd0f4d7c8fa855470b53bdd1",
+    "perf/qwen4exp/experiments/gdn_chunk_t16_unpadded.cpp": "84e70787b8f840f0fe1a69e9fc353fc0c1b4f0957658bcee6c49f884af3394ff",
+    "perf/qwen4exp/experiments/gdn_chunk_t16_padded.cpp": "9fe5527f1bbc82cc3b6994b8d36ee511646090ed4ac33557aea48dad9704c71d",
+    "build-refactor/Aila.exe": "8e836643c5ee22706bb865872d77770cbe527b4df7d5a3e38c3dd921e4c12e77",
+    "build-refactor/AilaGdnChunkTests.exe": "66eac122a95c8b3f45eb9aaaa868cdd890f18b664c07898f51f43e6a02323312",
+    "build-refactor/AilaQwen4ExpToleranceTests.exe": "e46f6e11d05715ddede6f585a25f344097691442fd10cd03a0226ac3f58f86f2"
+  }
+}

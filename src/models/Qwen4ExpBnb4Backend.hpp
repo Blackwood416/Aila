@@ -3,6 +3,7 @@
 #include "IModelBackend.hpp"
 #include "../ops/Bnb4BitLinear.hpp"
 #include "../ops/GatedDeltaNetOps.hpp"
+#include "../ops/GdnChunkOps.hpp"
 #include "../ops/HyperConnectionOps.hpp"
 #include "../ops/MoeExpertOps.hpp"
 #include "../ops/Ops.hpp"
@@ -13,6 +14,7 @@
 #include "engine/Types.hpp"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -301,9 +303,13 @@ private:
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
     StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
+    bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void free_pinned_host_buffers();
+    sycl::event RunGroupedExperts(Context& ctx, int layer, int count,
+        int firstUnique, int numUnique, int& actStart, int& tileStart,
+        int minRows, const sycl::event& ready);
     // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
     void EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count);
     // bf16 Linear with raw [out, in] weight: native GEMV for one row, oneDNN otherwise.
@@ -349,6 +355,9 @@ private:
     Tensor unusedLogits_; // Invalid output for forwards that only advance cached state.
 
     Qwen4ExpBuffers buf_;
+    ops::GdnChunkScratch gdn_chunk_scratch_;
+    int gdn_chunk_mode_ = 0; // 0 recurrence, 1 FP32 chunk control, 2 BF16 XMX products
+    uint64_t gdn_chunk_calls_ = 0;
     // Pinned host [runtime_seq_capacity_, top_k] router outputs written directly by the top-k kernel.
     int* router_host_ids_ = nullptr;
     float* router_host_weights_ = nullptr;
@@ -370,6 +379,17 @@ private:
     int* expert_map_token_dev_ = nullptr;
     int* expert_map_rank_dev_ = nullptr;
     ops::MoeExpertSlotDev* expert_map_slot_dev_ = nullptr;
+    ops::MoeExpertTile* expert_tiles_host_ = nullptr;
+    Tensor expert_tiles_dev_;
+    bool grouped_xmx_supported_ = false;
+    int grouped_xmx_min_rows_override_ = -1; // test harness only; -1 uses cached environment
+    bool expert_histogram_enabled_ = false;
+    // Buckets 1,2,3-4,5-8,9-16,>16: requests, activations, resident hits, misses.
+    std::array<std::array<uint64_t, 4>, 6> expert_histogram_{};
+    uint64_t grouped_xmx_tiles_ = 0, grouped_xmx_acts_ = 0;
+    // Optional bounded real-input acceptance hook; null in normal inference.
+    void (*grouped_expert_probe_)(Qwen4ExpBnb4Backend&, int, int, int, int, int,
+                                  const sycl::event&) = nullptr;
 
     // Prefill batched expert acquire scratch (expert -> slot / token uses for the current layer).
     std::vector<int> prefill_expert_slot_;

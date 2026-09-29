@@ -765,7 +765,16 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
 
     fill_pool_ = std::make_unique<ExpertFillPool>(fill_threads);
 
-    const std::string reader_env = aila::env::read_string("AILA_Q4E_EXPERT_READER", "mmap");
+    // Read directly into the bounded host pool instead of also faulting the expert
+    // payload into this process's mmap working set. Long prompts can otherwise touch
+    // most of the model on top of the 16 GiB pinned pool. Preserve explicit mmap opt-in
+    // and the reader's existing fallback for sources without valid file spans.
+#ifdef _WIN32
+    constexpr const char* default_reader = "readfile";
+#else
+    constexpr const char* default_reader = "mmap";
+#endif
+    const std::string reader_env = aila::env::read_string("AILA_Q4E_EXPERT_READER", default_reader);
     aila::ExpertReaderType reader_type = aila::ExpertReaderType::Mmap;
     if (reader_env == "readfile" || reader_env == "overlapped" || reader_env == "buffered_readfile") {
         reader_type = aila::ExpertReaderType::OverlappedReadFile;
@@ -812,9 +821,9 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     parts_left_scratch_ = std::make_unique<std::atomic<int>[]>(parts_left_capacity_);
     prefetch_items_.reserve(std::max(prefetch_staging_slots_, num_host_slots_));
 
-    AILA_LOG_INFO("[Q4E ExpertCache] slots=%d slot_bytes=%zu pool=%.1fMB nested_codes=%d fill_threads=%d fill_parts=%d",
+    AILA_LOG_INFO("[Q4E ExpertCache] slots=%d slot_bytes=%zu pool=%.1fMB nested_codes=%d fill_threads=%d fill_parts=%d reader=%s",
                   num_slots_, slot_bytes_, dev_pool_bytes_ / (1024.0 * 1024.0),
-                  compact_nested_ ? 1 : 0, fill_threads, fill_parts_);
+                  compact_nested_ ? 1 : 0, fill_threads, fill_parts_, reader_->name());
 
     initialized_ = true;
     return true;

@@ -30,6 +30,29 @@ struct MoeExpertSlotDev {
     MoeNestedScaleDev down_nested{};
 };
 
+// One expert's contiguous slice of the existing token/rank map. Each tile
+// consumes at most 8 rows; padding never reads a token or writes a rank slot.
+struct MoeExpertTile {
+    int first = 0;
+    int rows = 0;
+};
+static_assert(sizeof(MoeExpertTile) == 2 * sizeof(int), "Expert tile mirror uses two s32 values");
+
+// Experimental DG2 grouped NF4 -> BF16 XMX, FP32 accumulation. A is gathered
+// from x[token,H] (gate/up) or h[token,rank,I] (down), W is [N,K] NF4.
+// No expanded weights or new activation arena; caller owns maps/tiles/slots
+// until the returned final consumer event completes. K must be divisible by 64.
+sycl::event moe_grouped_xmx_gate_up(
+    Context& ctx, const MoeExpertSlotDev* slots, const MoeExpertTile* tiles,
+    int num_tiles, const int* token_ids, const int* ranks, const float* quant_map,
+    const bf16* x, bf16* h, int top_k, int hidden, int intermediate,
+    bool use_nested, const sycl::event* ready = nullptr);
+sycl::event moe_grouped_xmx_down(
+    Context& ctx, const MoeExpertSlotDev* slots, const MoeExpertTile* tiles,
+    int num_tiles, const int* token_ids, const int* ranks, const float* quant_map,
+    const bf16* h, float* down, int top_k, int hidden, int intermediate,
+    bool use_nested, const sycl::event* ready = nullptr);
+
 struct MoeNestedScaleHost {
     const uint8_t* codes = nullptr;
     const float* nested_absmax = nullptr;

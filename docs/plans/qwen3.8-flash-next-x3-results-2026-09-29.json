@@ -1,0 +1,2482 @@
+{
+  "phase": "X3",
+  "date": "2026-09-29",
+  "decision": "Keep ALU as default for all buckets. Grouped M8/N32/K32 prototype is opt-in, not admitted for default use.",
+  "primary_run": "x3-final",
+  "operator_reference": "same real NF4 expert, input and routes; existing 4/2/1-row ALU",
+  "operator_timing": "3 series of 20 interleaved wall samples after 5 warmup pairs; includes gather, tile decode, SwiGLU and rank writes; no per-call host upload or ordered merge",
+  "model_timing": "3 interleaved wall pairs after warming both paths; recompute routing, prefill then 47/7 teacher-forced forwards, no logits download in timing",
+  "negative_evidence": "Two live-probe allocation-churn runs exited 0xC0000005; diagnostic localized second to ze_intel_gpu64.dll+0x308b4e. Preallocated reusable test-only buffers passed the final run. Driver root cause not established.",
+  "runs": [
+    {
+      "tag": "x3-final",
+      "identity": {
+        "timestamp": "2026-09-29T17:57:38.8304915+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "67F5FF3DD9F16CB5CA9C66A799CF64ED8EF8483AC695A8D0BB7EB05D85540125",
+        "harness_sha256": "65E85B203511BE1BAA8A7E589F23193C4DD1D8405C7FB4D6038EC5BA2DDE9158",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "model",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_TEST_X3_DIAGNOSTIC": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_TEST_X3_PROBE_ONLY": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 22861107200.0,
+        "peak_private_commit_bytes": 33748398080.0,
+        "minimum_system_free_mb": 28761.90625,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "h_nrmse": 0.00243143,
+          "down_nrmse": 0.00258166,
+          "down_rms": 0.0297797,
+          "max_abs": 0.000530571,
+          "p99_abs": 0.000217727,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.3421,
+          "p10": 0.3126,
+          "p90": 0.3627,
+          "cv": 0.134351,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.4198,
+          "p10": 1.3904,
+          "p90": 1.4754,
+          "cv": 0.0428502,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.3717,
+          "p10": 0.3405,
+          "p90": 0.4417,
+          "cv": 0.132831,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.4441,
+          "p10": 1.4193,
+          "p90": 1.4921,
+          "cv": 0.0269597,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.3422,
+          "p10": 0.3031,
+          "p90": 0.3666,
+          "cv": 0.116744,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.4222,
+          "p10": 1.3883,
+          "p90": 1.612,
+          "cv": 0.0528386,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "h_nrmse": 0.00230442,
+          "down_nrmse": 0.00263101,
+          "down_rms": 0.0204661,
+          "max_abs": 0.000279233,
+          "p99_abs": 0.000148345,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0624,
+          "p10": 0.0533,
+          "p90": 0.0688,
+          "cv": 0.151832,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5587,
+          "p10": 1.5147,
+          "p90": 1.7825,
+          "cv": 0.0864694,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0625,
+          "p10": 0.0521,
+          "p90": 0.0696,
+          "cv": 0.143215,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.733,
+          "p10": 1.5131,
+          "p90": 1.7708,
+          "cv": 0.0827774,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0621,
+          "p10": 0.052,
+          "p90": 0.0674,
+          "cv": 0.141686,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.7258,
+          "p10": 1.5145,
+          "p90": 1.7676,
+          "cv": 0.0703139,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "h_nrmse": 0.00332197,
+          "down_nrmse": 0.003462,
+          "down_rms": 0.0198993,
+          "max_abs": 0.000420045,
+          "p99_abs": 0.000208646,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0512,
+          "p10": 0.0162,
+          "p90": 0.0572,
+          "cv": 0.536796,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.4768,
+          "p10": 1.4013,
+          "p90": 1.6281,
+          "cv": 0.0782511,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0437,
+          "p10": 0.0158,
+          "p90": 0.0504,
+          "cv": 0.483558,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.4987,
+          "p10": 1.383,
+          "p90": 1.6026,
+          "cv": 0.0875199,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0407,
+          "p10": 0.0161,
+          "p90": 0.0672,
+          "cv": 0.809636,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.562,
+          "p10": 1.3992,
+          "p90": 1.6404,
+          "cv": 0.0697579,
+          "noisy": 0.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 30.0,
+          "rows": 48.0,
+          "mean_kl": 0.00161066,
+          "mean_nll_delta": -0.00930087,
+          "max_logits_nrmse": 0.0890673,
+          "warning": 0.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 0.0,
+          "requests": 2207.0,
+          "acts": 2207.0,
+          "hits": 462.0,
+          "misses": 1745.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 1.0,
+          "requests": 944.0,
+          "acts": 1888.0,
+          "hits": 229.0,
+          "misses": 715.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 2.0,
+          "requests": 873.0,
+          "acts": 2913.0,
+          "hits": 203.0,
+          "misses": 670.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 3.0,
+          "requests": 530.0,
+          "acts": 3217.0,
+          "hits": 121.0,
+          "misses": 409.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 4.0,
+          "requests": 243.0,
+          "acts": 2792.0,
+          "hits": 48.0,
+          "misses": 195.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 5.0,
+          "requests": 72.0,
+          "acts": 1383.0,
+          "hits": 10.0,
+          "misses": 62.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 0.0,
+          "prefill_ms": 1382.07,
+          "total_ms": 4846.62,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 1.0,
+          "prefill_ms": 1423.32,
+          "total_ms": 4892.2,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 1.0,
+          "xmx": 1.0,
+          "prefill_ms": 1420.0,
+          "total_ms": 4882.24,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 1.0,
+          "xmx": 0.0,
+          "prefill_ms": 1378.67,
+          "total_ms": 4841.34,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 2.0,
+          "xmx": 0.0,
+          "prefill_ms": 1381.94,
+          "total_ms": 4854.81,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 2.0,
+          "xmx": 1.0,
+          "prefill_ms": 1427.18,
+          "total_ms": 4899.09,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 30.0,
+          "device_bytes": 14112261782.0,
+          "host_bytes": 17359610116.0,
+          "cache_slots": 3714.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "h_nrmse": 0.00240847,
+          "down_nrmse": 0.00235056,
+          "down_rms": 0.0270474,
+          "max_abs": 0.000609532,
+          "p99_abs": 0.000171643,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.6422,
+          "p10": 0.589,
+          "p90": 0.7023,
+          "cv": 0.0879634,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5988,
+          "p10": 1.5738,
+          "p90": 1.7504,
+          "cv": 0.038712,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.6398,
+          "p10": 0.5795,
+          "p90": 0.6643,
+          "cv": 0.101805,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.5986,
+          "p10": 1.5696,
+          "p90": 1.726,
+          "cv": 0.0440778,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.6326,
+          "p10": 0.5792,
+          "p90": 0.6596,
+          "cv": 0.0752594,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.6109,
+          "p10": 1.5871,
+          "p90": 1.7894,
+          "cv": 0.0544177,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "h_nrmse": 0.00118562,
+          "down_nrmse": 0.00194959,
+          "down_rms": 0.0411504,
+          "max_abs": 0.000555918,
+          "p99_abs": 0.000246003,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0532,
+          "p10": 0.0168,
+          "p90": 0.0559,
+          "cv": 0.569584,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5535,
+          "p10": 1.4836,
+          "p90": 1.6385,
+          "cv": 0.0544151,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0492,
+          "p10": 0.0165,
+          "p90": 0.0539,
+          "cv": 0.502261,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.6081,
+          "p10": 1.4601,
+          "p90": 1.8023,
+          "cv": 0.0769912,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0502,
+          "p10": 0.0171,
+          "p90": 0.0679,
+          "cv": 0.563755,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.6325,
+          "p10": 1.4848,
+          "p90": 1.675,
+          "cv": 0.0548052,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "h_nrmse": 0.00301413,
+          "down_nrmse": 0.00368858,
+          "down_rms": 0.0318137,
+          "max_abs": 0.00428914,
+          "p99_abs": 0.000299629,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0483,
+          "p10": 0.016,
+          "p90": 0.0546,
+          "cv": 0.50169,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5727,
+          "p10": 1.3926,
+          "p90": 1.6179,
+          "cv": 0.0783986,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0506,
+          "p10": 0.0162,
+          "p90": 0.0563,
+          "cv": 0.471549,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.5673,
+          "p10": 1.3994,
+          "p90": 1.606,
+          "cv": 0.0656721,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0501,
+          "p10": 0.0165,
+          "p90": 0.0623,
+          "cv": 0.596472,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.5619,
+          "p10": 1.3948,
+          "p90": 1.6811,
+          "cv": 0.0785379,
+          "noisy": 0.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 256.0,
+          "rows": 8.0,
+          "mean_kl": 0.0192468,
+          "mean_nll_delta": 0.184535,
+          "max_logits_nrmse": 0.129893,
+          "warning": 1.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 0.0,
+          "requests": 2096.0,
+          "acts": 2096.0,
+          "hits": 123.0,
+          "misses": 1973.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 1.0,
+          "requests": 1232.0,
+          "acts": 2464.0,
+          "hits": 99.0,
+          "misses": 1133.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 2.0,
+          "requests": 1486.0,
+          "acts": 5124.0,
+          "hits": 150.0,
+          "misses": 1336.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 3.0,
+          "requests": 1637.0,
+          "acts": 10291.0,
+          "hits": 160.0,
+          "misses": 1477.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 4.0,
+          "requests": 1713.0,
+          "acts": 20468.0,
+          "hits": 230.0,
+          "misses": 1483.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 5.0,
+          "requests": 2177.0,
+          "acts": 82437.0,
+          "hits": 503.0,
+          "misses": 1674.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 0.0,
+          "xmx": 0.0,
+          "prefill_ms": 3636.69,
+          "total_ms": 4320.32,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 0.0,
+          "xmx": 1.0,
+          "prefill_ms": 4165.0,
+          "total_ms": 4844.57,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 1.0,
+          "xmx": 1.0,
+          "prefill_ms": 4183.09,
+          "total_ms": 4871.85,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 1.0,
+          "xmx": 0.0,
+          "prefill_ms": 3630.97,
+          "total_ms": 4315.94,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 2.0,
+          "xmx": 0.0,
+          "prefill_ms": 3633.54,
+          "total_ms": 4309.35,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 2.0,
+          "xmx": 1.0,
+          "prefill_ms": 4165.57,
+          "total_ms": 4843.19,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 256.0,
+          "device_bytes": 14324805654.0,
+          "host_bytes": 17360839684.0,
+          "cache_slots": 3714.0
+        }
+      ],
+      "summaries": [
+        {
+          "count": 30.0,
+          "xmx": 0,
+          "prefill_ms": {
+            "median": 1381.94,
+            "mad": 0.12999999999988177,
+            "samples": [
+              1382.07,
+              1378.67,
+              1381.94
+            ]
+          },
+          "total_ms": {
+            "median": 4846.62,
+            "mad": 5.279999999999745,
+            "samples": [
+              4846.62,
+              4841.34,
+              4854.81
+            ]
+          }
+        },
+        {
+          "count": 30.0,
+          "xmx": 1,
+          "prefill_ms": {
+            "median": 1423.32,
+            "mad": 3.3199999999999363,
+            "samples": [
+              1423.32,
+              1420.0,
+              1427.18
+            ]
+          },
+          "total_ms": {
+            "median": 4892.2,
+            "mad": 6.890000000000327,
+            "samples": [
+              4892.2,
+              4882.24,
+              4899.09
+            ]
+          }
+        },
+        {
+          "count": 256.0,
+          "xmx": 0,
+          "prefill_ms": {
+            "median": 3633.54,
+            "mad": 2.5700000000001637,
+            "samples": [
+              3636.69,
+              3630.97,
+              3633.54
+            ]
+          },
+          "total_ms": {
+            "median": 4315.94,
+            "mad": 4.380000000000109,
+            "samples": [
+              4320.32,
+              4315.94,
+              4309.35
+            ]
+          }
+        },
+        {
+          "count": 256.0,
+          "xmx": 1,
+          "prefill_ms": {
+            "median": 4165.57,
+            "mad": 0.569999999999709,
+            "samples": [
+              4165.0,
+              4183.09,
+              4165.57
+            ]
+          },
+          "total_ms": {
+            "median": 4844.57,
+            "mad": 1.3800000000001091,
+            "samples": [
+              4844.57,
+              4871.85,
+              4843.19
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x3-microbatch",
+      "identity": {
+        "timestamp": "2026-09-29T18:01:08.8628347+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "67F5FF3DD9F16CB5CA9C66A799CF64ED8EF8483AC695A8D0BB7EB05D85540125",
+        "harness_sha256": "65E85B203511BE1BAA8A7E589F23193C4DD1D8405C7FB4D6038EC5BA2DDE9158",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "model",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_TEST_X3_PROBE_ONLY": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_TEST_X3_DIAGNOSTIC": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "16",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 22763601920.0,
+        "peak_private_commit_bytes": 33499779072.0,
+        "minimum_system_free_mb": 29830.27734375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "QUALITY",
+          "count": 30.0,
+          "rows": 4.0,
+          "mean_kl": 0.000421444,
+          "mean_nll_delta": 0.00333884,
+          "max_logits_nrmse": 0.042694,
+          "warning": 0.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 0.0,
+          "requests": 2207.0,
+          "acts": 2207.0,
+          "hits": 207.0,
+          "misses": 2000.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 1.0,
+          "requests": 944.0,
+          "acts": 1888.0,
+          "hits": 116.0,
+          "misses": 828.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 2.0,
+          "requests": 873.0,
+          "acts": 2913.0,
+          "hits": 128.0,
+          "misses": 745.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 3.0,
+          "requests": 530.0,
+          "acts": 3217.0,
+          "hits": 116.0,
+          "misses": 414.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 4.0,
+          "requests": 243.0,
+          "acts": 2792.0,
+          "hits": 49.0,
+          "misses": 194.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 5.0,
+          "requests": 72.0,
+          "acts": 1383.0,
+          "hits": 13.0,
+          "misses": 59.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 0.0,
+          "prefill_ms": 1402.0,
+          "total_ms": 1670.94,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 1.0,
+          "prefill_ms": 1551.15,
+          "total_ms": 1824.48,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 30.0,
+          "device_bytes": 14082483862.0,
+          "host_bytes": 17359610116.0,
+          "cache_slots": 3714.0
+        }
+      ],
+      "summaries": [
+        {
+          "count": 30.0,
+          "xmx": 0,
+          "prefill_ms": {
+            "median": 1402.0,
+            "mad": 0.0,
+            "samples": [
+              1402.0
+            ]
+          },
+          "total_ms": {
+            "median": 1670.94,
+            "mad": 0.0,
+            "samples": [
+              1670.94
+            ]
+          }
+        },
+        {
+          "count": 30.0,
+          "xmx": 1,
+          "prefill_ms": {
+            "median": 1551.15,
+            "mad": 0.0,
+            "samples": [
+              1551.15
+            ]
+          },
+          "total_ms": {
+            "median": 1824.48,
+            "mad": 0.0,
+            "samples": [
+              1824.48
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x3-long-diagnostic",
+      "identity": {
+        "timestamp": "2026-09-29T17:48:14.5889754+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "9537F3DD36DBE491D4FDA8024175B4B39BD502CB385C1D4CA09FEE39721386AA",
+        "harness_sha256": "E002B117657C48177B52A124D343A45BD6D202956D61CD4898FA2B70CCD7129E",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "model",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "0",
+          "AILA_TEST_X3_DIAGNOSTIC": "1"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 22776893440.0,
+        "peak_private_commit_bytes": 33717911552.0,
+        "minimum_system_free_mb": 28932.4375,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "QUALITY",
+          "count": 256.0,
+          "rows": 8.0,
+          "mean_kl": 0.0192468,
+          "mean_nll_delta": 0.184535,
+          "max_logits_nrmse": 0.129893,
+          "warning": 1.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 0.0,
+          "requests": 2096.0,
+          "acts": 2096.0,
+          "hits": 129.0,
+          "misses": 1967.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 1.0,
+          "requests": 1232.0,
+          "acts": 2464.0,
+          "hits": 99.0,
+          "misses": 1133.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 2.0,
+          "requests": 1486.0,
+          "acts": 5124.0,
+          "hits": 150.0,
+          "misses": 1336.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 3.0,
+          "requests": 1637.0,
+          "acts": 10291.0,
+          "hits": 160.0,
+          "misses": 1477.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 4.0,
+          "requests": 1713.0,
+          "acts": 20468.0,
+          "hits": 222.0,
+          "misses": 1491.0
+        },
+        {
+          "type": "HIST",
+          "count": 256.0,
+          "bin": 5.0,
+          "requests": 2177.0,
+          "acts": 82437.0,
+          "hits": 496.0,
+          "misses": 1681.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 0.0,
+          "xmx": 0.0,
+          "prefill_ms": 3633.39,
+          "total_ms": 4309.59,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 0.0,
+          "xmx": 1.0,
+          "prefill_ms": 4181.07,
+          "total_ms": 4850.98,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 1.0,
+          "xmx": 1.0,
+          "prefill_ms": 4186.49,
+          "total_ms": 4859.47,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 1.0,
+          "xmx": 0.0,
+          "prefill_ms": 3630.73,
+          "total_ms": 4309.85,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 2.0,
+          "xmx": 0.0,
+          "prefill_ms": 3630.19,
+          "total_ms": 4308.18,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 256.0,
+          "pair": 2.0,
+          "xmx": 1.0,
+          "prefill_ms": 4187.27,
+          "total_ms": 4862.45,
+          "xmx_acts": 105564.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 256.0,
+          "device_bytes": 14295027734.0,
+          "host_bytes": 17360839684.0,
+          "cache_slots": 3714.0
+        }
+      ],
+      "summaries": [
+        {
+          "count": 256.0,
+          "xmx": 0,
+          "prefill_ms": {
+            "median": 3630.73,
+            "mad": 0.5399999999999636,
+            "samples": [
+              3633.39,
+              3630.73,
+              3630.19
+            ]
+          },
+          "total_ms": {
+            "median": 4309.59,
+            "mad": 0.2600000000002183,
+            "samples": [
+              4309.59,
+              4309.85,
+              4308.18
+            ]
+          }
+        },
+        {
+          "count": 256.0,
+          "xmx": 1,
+          "prefill_ms": {
+            "median": 4186.49,
+            "mad": 0.7800000000006548,
+            "samples": [
+              4181.07,
+              4186.49,
+              4187.27
+            ]
+          },
+          "total_ms": {
+            "median": 4859.47,
+            "mad": 2.9799999999995634,
+            "samples": [
+              4850.98,
+              4859.47,
+              4862.45
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x3-model",
+      "identity": {
+        "timestamp": "2026-09-29T17:38:56.2552931+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "0FE6D01DE11EAADBF878342E6C91E44DA524A1C32937523E3ED50896C0409E2C",
+        "harness_sha256": "8EEADF0736EFB3530B5DF6202372D4357D8C5AA55B5347862F79F07BD469F130",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "model",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_DEMAND_MICROBATCH": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 22863073280.0,
+        "peak_private_commit_bytes": 33735356416.0,
+        "minimum_system_free_mb": 29023.125,
+        "exit_code": -1073741819
+      },
+      "observations": [
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "h_nrmse": 0.00243143,
+          "down_nrmse": 0.00258166,
+          "down_rms": 0.0297797,
+          "max_abs": 0.000530571,
+          "p99_abs": 0.000217727,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.3362,
+          "p10": 0.3136,
+          "p90": 0.3623,
+          "cv": 0.059422,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.4211,
+          "p10": 1.4012,
+          "p90": 1.5858,
+          "cv": 0.045976,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.3348,
+          "p10": 0.3105,
+          "p90": 0.3618,
+          "cv": 0.0681746,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.4166,
+          "p10": 1.3903,
+          "p90": 1.5393,
+          "cv": 0.0417651,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.3399,
+          "p10": 0.3133,
+          "p90": 0.3652,
+          "cv": 0.0681308,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 0.0,
+          "m": 9.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.4215,
+          "p10": 1.3965,
+          "p90": 1.4441,
+          "cv": 0.0349241,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "h_nrmse": 0.00230442,
+          "down_nrmse": 0.00263101,
+          "down_rms": 0.0204661,
+          "max_abs": 0.000279233,
+          "p99_abs": 0.000148345,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0637,
+          "p10": 0.0543,
+          "p90": 0.0766,
+          "cv": 0.16278,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5926,
+          "p10": 1.5287,
+          "p90": 1.8148,
+          "cv": 0.0859697,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0615,
+          "p10": 0.0533,
+          "p90": 0.065,
+          "cv": 0.143281,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.7315,
+          "p10": 1.5157,
+          "p90": 1.7748,
+          "cv": 0.07255,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0607,
+          "p10": 0.0528,
+          "p90": 0.0645,
+          "cv": 0.124626,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 26.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.7488,
+          "p10": 1.5138,
+          "p90": 1.7834,
+          "cv": 0.0711484,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "h_nrmse": 0.00332197,
+          "down_nrmse": 0.003462,
+          "down_rms": 0.0198993,
+          "max_abs": 0.000420045,
+          "p99_abs": 0.000208646,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0472,
+          "p10": 0.0168,
+          "p90": 0.0538,
+          "cv": 0.523024,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.4825,
+          "p10": 1.4001,
+          "p90": 1.603,
+          "cv": 0.0643859,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0413,
+          "p10": 0.0164,
+          "p90": 0.0529,
+          "cv": 0.486633,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.4411,
+          "p10": 1.3912,
+          "p90": 1.5979,
+          "cv": 0.0968412,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0403,
+          "p10": 0.0162,
+          "p90": 0.0501,
+          "cv": 0.450442,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 30.0,
+          "layer": 1.0,
+          "m": 8.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.573,
+          "p10": 1.3902,
+          "p90": 1.5879,
+          "cv": 0.0658846,
+          "noisy": 0.0
+        },
+        {
+          "type": "QUALITY",
+          "count": 30.0,
+          "rows": 48.0,
+          "mean_kl": 0.00161066,
+          "mean_nll_delta": -0.00930087,
+          "max_logits_nrmse": 0.0890673,
+          "warning": 0.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 0.0,
+          "requests": 2207.0,
+          "acts": 2207.0,
+          "hits": 462.0,
+          "misses": 1745.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 1.0,
+          "requests": 944.0,
+          "acts": 1888.0,
+          "hits": 229.0,
+          "misses": 715.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 2.0,
+          "requests": 873.0,
+          "acts": 2913.0,
+          "hits": 203.0,
+          "misses": 670.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 3.0,
+          "requests": 530.0,
+          "acts": 3217.0,
+          "hits": 121.0,
+          "misses": 409.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 4.0,
+          "requests": 243.0,
+          "acts": 2792.0,
+          "hits": 48.0,
+          "misses": 195.0
+        },
+        {
+          "type": "HIST",
+          "count": 30.0,
+          "bin": 5.0,
+          "requests": 72.0,
+          "acts": 1383.0,
+          "hits": 10.0,
+          "misses": 62.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 0.0,
+          "prefill_ms": 1371.57,
+          "total_ms": 4839.51,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 0.0,
+          "xmx": 1.0,
+          "prefill_ms": 1418.04,
+          "total_ms": 4885.72,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 1.0,
+          "xmx": 1.0,
+          "prefill_ms": 1421.51,
+          "total_ms": 4887.18,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 1.0,
+          "xmx": 0.0,
+          "prefill_ms": 1375.74,
+          "total_ms": 4882.61,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 2.0,
+          "xmx": 0.0,
+          "prefill_ms": 1370.13,
+          "total_ms": 4845.41,
+          "xmx_acts": 0.0
+        },
+        {
+          "type": "TIME",
+          "count": 30.0,
+          "pair": 2.0,
+          "xmx": 1.0,
+          "prefill_ms": 1417.91,
+          "total_ms": 4888.25,
+          "xmx_acts": 4752.0
+        },
+        {
+          "type": "MEMORY",
+          "count": 30.0,
+          "device_bytes": 14082483862.0,
+          "host_bytes": 17359610116.0,
+          "cache_slots": 3714.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "h_nrmse": 0.00240847,
+          "down_nrmse": 0.00235056,
+          "down_rms": 0.0270474,
+          "max_abs": 0.000609532,
+          "p99_abs": 0.000171643,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.617,
+          "p10": 0.5763,
+          "p90": 0.6532,
+          "cv": 0.0632024,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.5951,
+          "p10": 1.5661,
+          "p90": 1.7662,
+          "cv": 0.04559,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.6369,
+          "p10": 0.5817,
+          "p90": 0.746,
+          "cv": 0.0918018,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.5935,
+          "p10": 1.554,
+          "p90": 1.6408,
+          "cv": 0.031584,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.6345,
+          "p10": 0.5943,
+          "p90": 0.6533,
+          "cv": 0.0900352,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.595,
+          "p10": 1.5767,
+          "p90": 1.6105,
+          "cv": 0.0167356,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "h_nrmse": 0.00118562,
+          "down_nrmse": 0.00194959,
+          "down_rms": 0.0411504,
+          "max_abs": 0.000555918,
+          "p99_abs": 0.000246003,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0523,
+          "p10": 0.0177,
+          "p90": 0.0819,
+          "cv": 0.600591,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.6121,
+          "p10": 1.4792,
+          "p90": 1.6884,
+          "cv": 0.0590121,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0461,
+          "p10": 0.0168,
+          "p90": 0.0489,
+          "cv": 0.464345,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.5476,
+          "p10": 1.4572,
+          "p90": 1.6439,
+          "cv": 0.0543187,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0483,
+          "p10": 0.0171,
+          "p90": 0.0603,
+          "cv": 0.509128,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.4857,
+          "p10": 1.4594,
+          "p90": 1.7128,
+          "cv": 0.0738242,
+          "noisy": 0.0
+        }
+      ],
+      "summaries": [
+        {
+          "count": 30.0,
+          "xmx": 0,
+          "prefill_ms": {
+            "median": 1371.57,
+            "mad": 1.4399999999998272,
+            "samples": [
+              1371.57,
+              1375.74,
+              1370.13
+            ]
+          },
+          "total_ms": {
+            "median": 4845.41,
+            "mad": 5.899999999999636,
+            "samples": [
+              4839.51,
+              4882.61,
+              4845.41
+            ]
+          }
+        },
+        {
+          "count": 30.0,
+          "xmx": 1,
+          "prefill_ms": {
+            "median": 1418.04,
+            "mad": 0.12999999999988177,
+            "samples": [
+              1418.04,
+              1421.51,
+              1417.91
+            ]
+          },
+          "total_ms": {
+            "median": 4887.18,
+            "mad": 1.069999999999709,
+            "samples": [
+              4885.72,
+              4887.18,
+              4888.25
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "tag": "x3-probe-diagnostic",
+      "identity": {
+        "timestamp": "2026-09-29T17:52:04.7279704+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "52FF9F41B0291F84B2B6A6D1D076188CFDB1C43A914B85EB6A6A0101121C64E7",
+        "harness_sha256": "09D710DF834DFC590AA7F34A3A2D04D130436F3F798388DB213DE19C666CCD38",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "model",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_TEST_X3_PROBE_ONLY": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_TEST_X3_DIAGNOSTIC": "1"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 22763696128.0,
+        "peak_private_commit_bytes": 33757491200.0,
+        "minimum_system_free_mb": 28943.3203125,
+        "exit_code": -1073741819
+      },
+      "observations": [
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "h_nrmse": 0.00240847,
+          "down_nrmse": 0.00235056,
+          "down_rms": 0.0270474,
+          "max_abs": 0.000609532,
+          "p99_abs": 0.000171643,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.6614,
+          "p10": 0.6017,
+          "p90": 0.7405,
+          "cv": 0.0863767,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.6422,
+          "p10": 1.5877,
+          "p90": 1.7991,
+          "cv": 0.0418677,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.619,
+          "p10": 0.5818,
+          "p90": 0.6845,
+          "cv": 0.0865389,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.6165,
+          "p10": 1.5807,
+          "p90": 1.784,
+          "cv": 0.0680979,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.6393,
+          "p10": 0.5786,
+          "p90": 0.6614,
+          "cv": 0.131081,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 59.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.6103,
+          "p10": 1.5767,
+          "p90": 1.8078,
+          "cv": 0.0533953,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPQUALITY",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "h_nrmse": 0.00118562,
+          "down_nrmse": 0.00194959,
+          "down_rms": 0.0411504,
+          "max_abs": 0.000555918,
+          "p99_abs": 0.000246003,
+          "warning": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 0.0,
+          "median_ms": 0.0485,
+          "p10": 0.0171,
+          "p90": 0.0509,
+          "cv": 0.463254,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 0.0,
+          "xmx": 1.0,
+          "median_ms": 1.4934,
+          "p10": 1.4557,
+          "p90": 1.6261,
+          "cv": 0.0667616,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 0.0,
+          "median_ms": 0.0406,
+          "p10": 0.017,
+          "p90": 0.0536,
+          "cv": 0.511966,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 1.0,
+          "xmx": 1.0,
+          "median_ms": 1.6008,
+          "p10": 1.4538,
+          "p90": 1.643,
+          "cv": 0.0697657,
+          "noisy": 0.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 0.0,
+          "median_ms": 0.0479,
+          "p10": 0.0171,
+          "p90": 0.0534,
+          "cv": 0.496975,
+          "noisy": 1.0
+        },
+        {
+          "type": "OPTIME",
+          "count": 256.0,
+          "layer": 0.0,
+          "m": 16.0,
+          "series": 2.0,
+          "xmx": 1.0,
+          "median_ms": 1.5142,
+          "p10": 1.455,
+          "p90": 1.6356,
+          "cv": 0.0699234,
+          "noisy": 0.0
+        }
+      ],
+      "summaries": []
+    },
+    {
+      "tag": "x3-kernel",
+      "identity": {
+        "timestamp": "2026-09-29T17:30:50.5199636+08:00",
+        "commit": "42b52181643ab3af054f01eb3b1777ba4fb797ed",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/ops/MoeExpertOps.hpp",
+          " M tests/models/Qwen4ExpModuleTests.cpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-x2-memory-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-x2-results-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_checkpoint_acceptance.ps1",
+          "?? perf/qwen4exp/q4e_grouped_xmx_acceptance.ps1",
+          "?? src/ops/MoeGroupedXmx.cpp",
+          "?? tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? tests/models/Qwen4ExpGroupedXmxAcceptance.hpp"
+        ],
+        "exe_sha256": "586E78848D520C562E808B3200FE2725797D165AB1BCDD34A28332E986F838BA",
+        "harness_sha256": "B66FFF2F0FC4F90A8444E10BAE142BE4488F2C2D2BAEE751130A92836D5F68D7",
+        "kernel_sha256": "F4B7AA07E9B483D7C2BBD5ACD640EF128B54B604C6E88F5935EB6E6ED8F814D7",
+        "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "mode": "kernel",
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0",
+          "AILA_Q4E_DIRECT_PREFILL_IO": "1",
+          "AILA_Q4E_CPU_OVERLAP": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_STATIC_PINNING": "0"
+        },
+        "max_seq": 512,
+        "prompt_tokens": [
+          30,
+          256
+        ],
+        "timing": "Host wall: 3 interleaved pairs after warmup; real operator probes 3 x 20 pairs after 5 warmups",
+        "peak_working_set_bytes": 248934400.0,
+        "peak_private_commit_bytes": 245317632.0,
+        "minimum_system_free_mb": 55821.12890625,
+        "exit_code": 0
+      },
+      "observations": [
+        {
+          "type": "KERNEL",
+          "nested": 0.0,
+          "h_nrmse": 2.04051e-07,
+          "down_nrmse": 2.25569e-07,
+          "max_abs": 4.62705e-10,
+          "ready_consumer_reuse": "pass",
+          "guards": "pass"
+        },
+        {
+          "type": "KERNEL",
+          "nested": 1.0,
+          "h_nrmse": 2.04051e-07,
+          "down_nrmse": 2.25569e-07,
+          "max_abs": 4.62705e-10,
+          "ready_consumer_reuse": "pass",
+          "guards": "pass"
+        }
+      ],
+      "summaries": []
+    }
+  ],
+  "verification": {
+    "build_targets": [
+      "Aila",
+      "AilaQwen4ExpToleranceTests",
+      "AilaQwen4ExpDmaTimingTests",
+      "AilaQwen4ExpModuleTests",
+      "AilaQwen4ExpGenerationTests"
+    ],
+    "ctest_passed": 5,
+    "ctest_failed": 0,
+    "ctest_wall_seconds": 31.6,
+    "ctest_log": "tmp/x3-ctest.log",
+    "ctest_detail_log": "tmp/x3-ctest-detail.log",
+    "kernel_results": [
+      "[X3 KERNEL] nested=0 h_nrmse=0 down_nrmse=6.52515e-08 max_abs=1.37845e-10 ready_consumer_reuse=pass guards=pass",
+      "[X3 KERNEL] nested=1 h_nrmse=0 down_nrmse=6.52515e-08 max_abs=1.37845e-10 ready_consumer_reuse=pass guards=pass"
+    ],
+    "ctest_log_sha256": "6f1ffcdbf0c3fe28acde1975c7172462da1f7d41575f852f35cf48433bd60923"
+  }
+}

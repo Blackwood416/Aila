@@ -277,6 +277,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
 
     if (expert_offsets_host_) context_->free_host(expert_offsets_host_);
     if (expert_counts_host_) context_->free_host(expert_counts_host_);
+    if (expert_tiles_host_) context_->free_host(expert_tiles_host_);
     if (expert_curr_pos_host_) context_->free_host(expert_curr_pos_host_);
     if (expert_quad_pos_host_) context_->free_host(expert_quad_pos_host_);
     if (expert_pair_pos_host_) context_->free_host(expert_pair_pos_host_);
@@ -289,6 +290,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (expert_map_slot_dev_) context_->free_device(expert_map_slot_dev_);
     expert_offsets_host_ = nullptr;
     expert_counts_host_ = nullptr;
+    expert_tiles_host_ = nullptr;
     expert_curr_pos_host_ = nullptr;
     expert_quad_pos_host_ = nullptr;
     expert_pair_pos_host_ = nullptr;
@@ -309,6 +311,9 @@ bool Qwen4ExpBnb4Backend::load(
     Context& ctx, ModelWeights& weights, const ModelSpec& spec,
     int max_seq_len, std::string* error_message) {
     context_ = &ctx;
+    grouped_xmx_supported_ = ctx.queue().get_device().get_info<sycl::info::device::name>().find("Arc(TM) A770") != std::string::npos;
+    expert_histogram_enabled_ = aila::env::read_flag("AILA_Q4E_EXPERT_HISTOGRAM", false);
+    gdn_chunk_mode_ = std::clamp(aila::env::read_int("AILA_Q4E_GDN_CHUNK_MODE", 0), 0, 2);
     spec_ = spec;
     cfg_ = spec.qwen4exp_text;
     hidden_size_ = cfg_.hidden_size;
@@ -735,6 +740,8 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 
     // Linear Attention buffers
     buf_.linear_all = Tensor::allocate(ctx, {cap, linear_all_dim_}, dnnl::memory::data_type::bf16);
+    if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
+        gdn_chunk_scratch_.Reserve(ctx, cap, linear_kv_heads_);
 
     // MoE buffers
     buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
@@ -772,6 +779,10 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 
         expert_offsets_host_ = static_cast<int*>(ctx.alloc_host((cfg_.num_experts + 1) * sizeof(int)));
         expert_counts_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
+        // At most one descriptor per activation, including every padded expert tail.
+        expert_tiles_host_ = static_cast<ops::MoeExpertTile*>(ctx.alloc_host(
+            static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertTile)));
+        expert_tiles_dev_ = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, 2}, dnnl::memory::data_type::s32);
         expert_curr_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_quad_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_pair_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
@@ -802,6 +813,97 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // ============================================================================
 // Forward Implementation
 // ============================================================================
+
+sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
+    Context& ctx, int layer, int count, int firstUnique, int numUnique,
+    int& actStart, int& tileStart, int minRows, const sycl::event& ready) {
+    const int top_k = cfg_.num_experts_per_tok;
+    static const bool reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
+    static const bool quads = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
+    int nq = 0, np = 0, ns = 0, nx = 0;
+    for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
+        const int n = prefill_expert_uses_[prefill_unique_[u]];
+        if (n >= minRows) nx += n;
+        else {
+            nq += reuse && quads ? n / 4 : 0;
+            const int rem = reuse && quads ? n % 4 : n;
+            np += reuse ? rem / 2 : 0;
+            ns += reuse ? rem % 2 : rem;
+        }
+    }
+    const int alu = nq * 4 + np * 2 + ns;
+    int qo = actStart, po = qo + nq * 4, so = po + np * 2, xo = actStart + alu;
+    const int tileBegin = tileStart;
+    std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
+    for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
+        const int e = prefill_unique_[u], n = prefill_expert_uses_[e];
+        expert_curr_pos_host_[e] = 0;
+        expert_offsets_host_[e] = n >= minRows ? xo : -2;
+        if (n >= minRows) {
+            for (int row = 0; row < n; row += 8)
+                expert_tiles_host_[tileStart++] = {xo + row, std::min(8, n - row)};
+            xo += n;
+        } else {
+            const int q = reuse && quads ? n / 4 : 0;
+            const int rem = n - q * 4, p = reuse ? rem / 2 : 0;
+            expert_quad_pos_host_[e] = qo; qo += q * 4;
+            expert_pair_pos_host_[e] = po; po += p * 2;
+            expert_single_pos_host_[e] = so; so += rem - p * 2;
+        }
+    }
+    for (int i = 0; i < count * top_k; ++i) {
+        const int e = router_host_ids_[i], base = expert_offsets_host_[e];
+        if (base == -1) continue; // another ready/miss microbatch
+        const int seen = expert_curr_pos_host_[e]++, n = prefill_expert_uses_[e];
+        int pos;
+        if (base >= 0) pos = base + seen;
+        else {
+            const int q = reuse && quads ? (n / 4) * 4 : 0;
+            const int p = reuse ? ((n - q) / 2) * 2 : 0;
+            pos = seen < q ? expert_quad_pos_host_[e] + seen :
+                seen < q + p ? expert_pair_pos_host_[e] + seen - q :
+                expert_single_pos_host_[e] + seen - q - p;
+        }
+        expert_map_token_host_[pos] = i / top_k;
+        expert_map_rank_host_[pos] = i % top_k;
+        expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+    }
+    const int acts = alu + nx, tiles = tileStart - tileBegin;
+    // Microbatches use disjoint slices: host descriptors remain immutable until
+    // their DMA is done. The next layer's router wait drains these consumers.
+    ctx.queue().memcpy(expert_map_token_dev_ + actStart, expert_map_token_host_ + actStart, size_t(acts) * sizeof(int));
+    ctx.queue().memcpy(expert_map_rank_dev_ + actStart, expert_map_rank_host_ + actStart, size_t(acts) * sizeof(int));
+    ctx.queue().memcpy(expert_map_slot_dev_ + actStart, expert_map_slot_host_ + actStart, size_t(acts) * sizeof(ops::MoeExpertSlotDev));
+    auto* tilesDev = reinterpret_cast<ops::MoeExpertTile*>(expert_tiles_dev_.data());
+    if (tiles) ctx.queue().memcpy(tilesDev + tileBegin, expert_tiles_host_ + tileBegin, size_t(tiles) * sizeof(ops::MoeExpertTile));
+    sycl::event last = ready;
+    const bool nested = expert_cache_.uses_nested_codes();
+    if (alu) {
+        last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
+            expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
+            buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), alu, top_k,
+            hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq);
+        last = ops::moe_expert_major_prefill_down(ctx, expert_map_slot_dev_ + actStart,
+            expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
+            buf_.moe_h.data_as<bf16>(), buf_.moe_down_acc.data_as<float>(), alu, top_k,
+            cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq);
+    }
+    if (tiles) {
+        last = ops::moe_grouped_xmx_gate_up(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,
+            expert_map_token_dev_, expert_map_rank_dev_, nullptr, buf_.x.data_as<bf16>(),
+            buf_.moe_h.data_as<bf16>(), top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
+        last = ops::moe_grouped_xmx_down(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,
+            expert_map_token_dev_, expert_map_rank_dev_, nullptr, buf_.moe_h.data_as<bf16>(),
+            buf_.moe_down_acc.data_as<float>(), top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
+        grouped_xmx_tiles_ += tiles;
+        grouped_xmx_acts_ += nx;
+        if (grouped_expert_probe_) grouped_expert_probe_(*this, layer, count, actStart + alu, tileBegin, tiles, last);
+    }
+    // This event covers both ALU and XMX readers on the in-order compute queue.
+    expert_cache_.record_consumer_reader_fences(prefill_unique_slots_.data() + firstUnique, numUnique, last);
+    actStart += acts;
+    return last;
+}
 
 void Qwen4ExpBnb4Backend::EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count) {
     if (!embed_host_.valid()) {
@@ -912,14 +1014,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                  std::to_string(max_seq_len_));
     }
 
-    ensure_runtime_buffers(ctx, count);
     const int checkpoint_after = options.snapshot_policy == SnapshotPolicy::ReusablePrefix
         ? options.checkpoint_after : 0;
     if (checkpoint_after < 0 || (checkpoint_after > 0 &&
-        (checkpoint_after < 2 || count - checkpoint_after < 2 || count > 64 ||
-         cached_len > 2052 || session.snapshots_.size() < 2))) {
+        !CanCaptureInteriorCheckpoint(session, count, checkpoint_after))) {
         throw std::invalid_argument("Qwen4ExpBnb4Backend: interior checkpoint requires short dense prefill, two multi-token sides and two slots");
     }
+    ensure_runtime_buffers(ctx, count);
     StateSnapshot* interior = checkpoint_after > 0
         ? &ReserveSnapshot(session, start_pos + checkpoint_after) : nullptr;
     Bnb4BitLinear::PrefillDispatchStats prefill_stats_t0{};
@@ -1114,8 +1215,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 const auto run_range = [&](int offset, int length) {
                     const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
                     bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
-                    ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
-                                                             input, output, length);
+                    if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_ &&
+                        ops::try_linear_delta_prefill_chunked(ctx, layer.geom, d_weights, d_state,
+                            gdn_chunk_scratch_, input, output, length, gdn_chunk_mode_ == 2)) {
+                        ++gdn_chunk_calls_;
+                    } else {
+                        ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
+                                                                 input, output, length);
+                    }
                 };
                 if (interior) {
                     run_range(0, checkpoint_after);
@@ -1577,6 +1684,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     prefill_unique_.push_back(e);
                 }
             }
+            if (expert_histogram_enabled_) {
+                for (int e : prefill_unique_) {
+                    const int n = prefill_expert_uses_[e];
+                    const int bucket = n <= 2 ? n - 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : 5;
+                    auto& bin = expert_histogram_[bucket];
+                    ++bin[0]; bin[1] += n;
+                    ++bin[expert_cache_.contains(L, e) ? 2 : 3];
+                }
+            }
             if (prefill_unique_.size() <= static_cast<size_t>(expert_cache_.num_slots())) {
                 batch_acquire = true;
                 prefill_unique_slots_.resize(prefill_unique_.size());
@@ -1621,7 +1737,60 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
 
-        if (batch_acquire && s_expert_major_prefill && count > 1) {
+        static const int s_grouped_min = aila::env::read_int("AILA_Q4E_GROUPED_XMX_MIN_ROWS", 0);
+        const int grouped_min = grouped_xmx_min_rows_override_ >= 0 ? grouped_xmx_min_rows_override_ : s_grouped_min;
+        const bool grouped = grouped_min > 0 && grouped_xmx_supported_ &&
+            hidden_size_ % 64 == 0 && cfg_.moe_intermediate_size % 64 == 0;
+        if (batch_acquire && s_expert_major_prefill && count > 1 && grouped) {
+            if (use_microbatch_pipeline) {
+                std::stable_partition(prefill_unique_.begin(), prefill_unique_.end(),
+                    [&](int e) { return expert_cache_.contains(L, e); });
+            }
+            ctx.queue().memcpy(batch_weights_dev_, router_host_weights_, size_t(count) * top_k * sizeof(float));
+            int actStart = 0, tileStart = 0;
+            sycl::event last = batch_dma_event;
+            const int total = static_cast<int>(prefill_unique_.size());
+            const int step = use_microbatch_pipeline ? s_demand_microbatch : total;
+            for (int u = 0; u < total; u += step) {
+                const int n = std::min(step, total - u);
+                sycl::event ready = batch_dma_event;
+                if (use_microbatch_pipeline) {
+                    const auto begin = prof_clock::now();
+                    ready = expert_cache_.acquire(L, prefill_unique_.data() + u, n, prefill_unique_slots_.data() + u);
+                    prof_acquire_ms += prof_ms(begin, prof_clock::now());
+                    for (int j = u; j < u + n; ++j)
+                        prefill_expert_slot_[prefill_unique_[j]] = prefill_unique_slots_[j];
+                }
+                last = RunGroupedExperts(ctx, L, count, u, n, actStart, tileStart, grouped_min, ready);
+            }
+            ops::moe_ordered_accumulate_down_rows(ctx, buf_.moe_down_acc.data_as<float>(), batch_weights_dev_,
+                buf_.y.data_as<bf16>(), count, top_k, hidden_size_,
+                s_fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
+                s_fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last);
+            if (use_microbatch_pipeline) {
+                static const bool demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
+                const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
+                if (demote && prefill_unique_.size() > keep) {
+                    stable_sort_with_scratch(prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
+                        [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
+                    expert_cache_.demote(L, prefill_unique_.data() + keep, static_cast<int>(prefill_unique_.size() - keep));
+                }
+            }
+            if (use_microbatch_pipeline && s_prefetch && predict_next) {
+                ensure_prediction_ready();
+                prefill_pred_unique_.clear();
+                std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
+                for (int i = 0; i < count * top_k; ++i) {
+                    const int e = pred_host_ids_[i];
+                    if (e >= 0 && e < cfg_.num_experts && prefill_pred_uses_[e]++ == 0)
+                        prefill_pred_unique_.push_back(e);
+                }
+                stable_sort_with_scratch(prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
+                    [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
+                const int n = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
+                expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(), static_cast<int>(prefill_pred_unique_.size()), n);
+            }
+        } else if (batch_acquire && s_expert_major_prefill && count > 1) {
             if (use_microbatch_pipeline) {
                 // Phase B6: Demand microbatch double-buffered pipeline
                 // Partition unique experts: ready (GPU resident hits) first, then misses
@@ -2242,6 +2411,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
     session.currentLength_ = cached_len;
 
+    if (expert_histogram_enabled_ && count > 1) {
+        for (int b = 0; b < 6; ++b) {
+            const auto& bin = expert_histogram_[b];
+            AILA_LOG_INFO("[Q4E ExpertHistogram] cumulative bucket=%d requests=%llu acts=%llu hits=%llu misses=%llu",
+                b, static_cast<unsigned long long>(bin[0]), static_cast<unsigned long long>(bin[1]),
+                static_cast<unsigned long long>(bin[2]), static_cast<unsigned long long>(bin[3]));
+        }
+        AILA_LOG_INFO("[Q4E GroupedXMX] cumulative tiles=%llu acts=%llu",
+            static_cast<unsigned long long>(grouped_xmx_tiles_), static_cast<unsigned long long>(grouped_xmx_acts_));
+    }
     if (s_profile) {
         ctx.synchronize();
         const ExpertCacheStats& s1 = expert_cache_.stats();
@@ -2531,21 +2710,30 @@ Tensor& Qwen4ExpBnb4Backend::forward(
     return Forward(ctx, DefaultSession(ctx), token_ids_device, seq_len);
 }
 
+bool Qwen4ExpBnb4Backend::CanCaptureInteriorCheckpoint(
+    const Session& session, int count, int checkpointAfter) const {
+    if (count < 4 || count > 64 || checkpointAfter < 2 || checkpointAfter > count - 2 ||
+        session.snapshots_.size() < 2 || count > session.Capacity() - session.CurrentLength() ||
+        !session.embeddingOverridePositions_.empty() || session.mropePosT_.valid()) return false;
+    // Match ForwardImpl's sparse-prefill predicate exactly. At the default ratio/budget,
+    // 2052 is already sparse (513 complete blocks); the final dense position is 2051.
+    const int ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+    const int blockTopK = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / ratio;
+    return (session.CurrentLength() + count) / ratio <= blockTopK;
+}
+
 bool Qwen4ExpBnb4Backend::supports_interior_checkpoint(int count, int checkpoint_after) const {
     bool explicit_inline = false;
     const bool has_env = aila::env::read_flag_if_present("AILA_Q4E_INLINE_CHECKPOINT", &explicit_inline);
-    if (!has_env || !explicit_inline) {
-        return false;
-    }
-    const bool allowed_anchor = (checkpoint_after == 26 || checkpoint_after == 28);
+    if (has_env && !explicit_inline) return false;
     auto* self = const_cast<Qwen4ExpBnb4Backend*>(this);
     if (!defaultSession_ && context_) {
         self->DefaultSession(*context_);
     }
-    return allowed_anchor && defaultSession_ && defaultSession_->snapshots_.size() >= 2 &&
-        count <= 64 && checkpoint_after >= 2 && count - checkpoint_after >= 2 &&
-        defaultSession_->CurrentLength() + count <= 2052 &&
-        defaultSession_->embeddingOverridePositions_.empty() && !defaultSession_->mropePosT_.valid();
+    if (!defaultSession_ || !CanCaptureInteriorCheckpoint(*defaultSession_, count, checkpoint_after)) return false;
+    // X2 measured default: initial 30-token text prefill with a 26-token reusable prefix.
+    // Explicit opt-in enables other structurally valid anchors, without a bitwise whitelist.
+    return has_env || (defaultSession_->CurrentLength() == 0 && count == 30 && checkpoint_after == 26);
 }
 
 Tensor& Qwen4ExpBnb4Backend::forward(

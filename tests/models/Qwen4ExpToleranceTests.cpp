@@ -12,6 +12,9 @@
 #include <set>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static constexpr float kTestQuantMap[16] = {
     -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
@@ -24,6 +27,33 @@ struct Qwen4ExpGenerationTestAccess {
     static Context& Ctx(InferenceEngine& engine) { return *engine.ctx_; }
     static Qwen4ExpBnb4Backend& Backend(InferenceEngine& engine) {
         return dynamic_cast<Qwen4ExpBnb4Backend&>(*engine.backend_);
+    }
+    static Qwen4ExpBnb4Backend::Session& Session(InferenceEngine& engine) {
+        return *Backend(engine).defaultSession_;
+    }
+    static Qwen4ExpExpertCache& Cache(InferenceEngine& engine) { return Backend(engine).expert_cache_; }
+    static void Grouped(Qwen4ExpBnb4Backend& b, int minRows) { b.grouped_xmx_min_rows_override_ = minRows; }
+    static void Histogram(Qwen4ExpBnb4Backend& b) { b.expert_histogram_enabled_ = true; b.expert_histogram_ = {}; }
+    static const auto& Histogram(const Qwen4ExpBnb4Backend& b) { return b.expert_histogram_; }
+    static uint64_t GroupedActs(const Qwen4ExpBnb4Backend& b) { return b.grouped_xmx_acts_; }
+    static void GdnMode(Qwen4ExpBnb4Backend& b, int mode) {
+        b.gdn_chunk_mode_ = mode;
+        if (mode) b.gdn_chunk_scratch_.Reserve(*b.context_, b.runtime_seq_capacity_, b.linear_kv_heads_);
+    }
+    static uint64_t GdnCalls(const Qwen4ExpBnb4Backend& b) { return b.gdn_chunk_calls_; }
+    static void Probe(Qwen4ExpBnb4Backend& b, decltype(b.grouped_expert_probe_) hook) { b.grouped_expert_probe_ = hook; }
+    struct ExpertView {
+        Context& ctx;
+        const bf16* x;
+        const int* tokens;
+        const int* ranks;
+        const ops::MoeExpertSlotDev* slots;
+        const ops::MoeExpertTile* tiles;
+        bool nested;
+    };
+    static ExpertView Experts(Qwen4ExpBnb4Backend& b) {
+        return {*b.context_, b.buf_.x.data_as<bf16>(), b.expert_map_token_host_, b.expert_map_rank_host_,
+            b.expert_map_slot_host_, b.expert_tiles_host_, b.expert_cache_.uses_nested_codes()};
     }
 };
 using Access = Qwen4ExpGenerationTestAccess;
@@ -468,11 +498,49 @@ void test_real_model_tolerance(const std::string& model_dir) {
     std::cout << "======================================================================\n\n";
 }
 
+#include "Qwen4ExpCheckpointAcceptance.hpp"
+#include "Qwen4ExpGroupedXmxAcceptance.hpp"
+#include "Qwen4ExpGdnChunkAcceptance.hpp"
+
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Keep fatal driver/host failures attributable in isolated GPU canaries.
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* p) -> LONG {
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = {};
+        const auto address = p->ExceptionRecord->ExceptionAddress;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(address), &module);
+        if (module) GetModuleFileNameA(module, path, MAX_PATH);
+        std::cerr << "[GPU CANARY CRASH] code=" << std::hex << p->ExceptionRecord->ExceptionCode
+                  << " module=" << path << " offset=" << (reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)) << '\n';
+        return EXCEPTION_EXECUTE_HANDLER;
+    });
+#endif
     aila::env::enable_l0_copy_engine();
     try {
+        if (argc == 2 && std::string(argv[1]) == "--grouped-kernel") {
+            test_grouped_xmx_kernel();
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--grouped-model") {
+            test_grouped_xmx_model(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--gdn-chunk-model") {
+            test_gdn_chunk_model(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--checkpoint-model") {
+            test_checkpoint_acceptance(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--memory-model") {
+            test_prefill_memory(argv[2]);
+            return 0;
+        }
         Context ctx;
         test_mock_prefill_tolerance(ctx);
 

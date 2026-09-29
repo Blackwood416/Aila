@@ -172,8 +172,10 @@ set(LIB_SOURCES
     src/ops/Transpose.cpp
     src/ops/ConvOps.cpp
     src/ops/GatedDeltaNetOps.cpp
+    src/ops/GdnChunkOps.cpp
     src/ops/HyperConnectionOps.cpp
     src/ops/MoeExpertOps.cpp
+    src/ops/MoeGroupedXmx.cpp
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
     src/memory/KVCache.cpp
@@ -696,6 +698,12 @@ target_include_directories(AilaQwen4ExpKernelTests PRIVATE
 target_link_libraries(AilaQwen4ExpKernelTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpKernelTests COMMAND AilaQwen4ExpKernelTests)
 set_tests_properties(AilaQwen4ExpKernelTests PROPERTIES LABELS "gpu;ops;qwen4exp" TIMEOUT 60)
+add_executable(AilaGdnChunkTests tests/ops/GdnChunkTests.cpp)
+target_compile_definitions(AilaGdnChunkTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaGdnChunkTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaGdnChunkTests PRIVATE AilaLib)
+add_test(NAME AilaGdnChunkTests COMMAND AilaGdnChunkTests)
+set_tests_properties(AilaGdnChunkTests PROPERTIES LABELS "gpu;ops;qwen4_exp" TIMEOUT 90)
 
 add_executable(AilaQwen4ExpMoeBench
     perf/qwen4exp/q4e_moe_bench.cpp
@@ -754,6 +762,8 @@ else()
 endif()
 add_test(NAME AilaQwen4ExpToleranceTests COMMAND AilaQwen4ExpToleranceTests)
 set_tests_properties(AilaQwen4ExpToleranceTests PROPERTIES LABELS "gpu;models;qwen4_exp;tolerance" TIMEOUT 60)
+add_test(NAME AilaQwen4ExpGroupedXmxTests COMMAND AilaQwen4ExpToleranceTests --grouped-kernel)
+set_tests_properties(AilaQwen4ExpGroupedXmxTests PROPERTIES LABELS "gpu;ops;qwen4_exp" TIMEOUT 60)
 
 add_executable(AilaQwen4ExpExpertReadinessTests
     tests/models/Qwen4ExpExpertReadinessTests.cpp
