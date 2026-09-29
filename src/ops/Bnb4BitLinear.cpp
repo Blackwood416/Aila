@@ -1157,6 +1157,10 @@ void packed_nf4_gemm_bf16(Context& ctx,
                 packed_nf4_gemm_bf16_joint_matrix_wide<16, 64, 32, 8, 8, 16, 8>(
                     ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
                     output_ptr, M, N, K, blocksize);
+            } else if (M < 8 && (K % 32 == 0)) {
+                packed_nf4_gemm_bf16_joint_matrix_wide<16, 32, 32, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
             } else {
                 packed_nf4_gemm_bf16_joint_matrix<32, 32, 16, 8, 8, 16, 8>(
                     ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
@@ -1834,6 +1838,7 @@ bool Bnb4BitLinear::init_fused_rows_impl(Context& ctx,
         in_features_ = in_features;
         out_features_ = static_cast<int>(total_out_features);
         allow_dense_xmx_ = first->allow_dense_xmx_;
+        force_dense_xmx_ = first->force_dense_xmx_;
         allow_async_dequant_ = first->allow_async_dequant_;
         direct_prefill_io_ = first->direct_prefill_io_;
 
@@ -2231,11 +2236,25 @@ void Bnb4BitLinear::forward(Context& ctx,
         aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", -1);
     static const int fused_min_m =
         aila::env::read_int_raw("AILA_BNB4_FUSED_MIN_M", 2);
-    const bool shape_prefers_onednn = (out_features_ <= 1280) ||
-                                      (seq_len >= 64 && out_features_ > 8192);
-    const bool use_fused_prefill = ((fused_prefill_mode == 1) ||
+    static bool s_xmx_override = false;
+    static const bool s_xmx_explicit = aila::env::read_flag_if_present(
+        "AILA_BNB4_GEMM_XMX", &s_xmx_override);
+    static const bool s_is_a770 = [&ctx]() {
+        const std::string device_name =
+            ctx.queue().get_device().get_info<sycl::info::device::name>();
+        return device_name.find("Arc(TM) A770") != std::string::npos ||
+               device_name.find("Arc A770") != std::string::npos;
+    }();
+
+    const bool xmx_allowed = force_dense_xmx_ ||
+                             (s_xmx_explicit ? s_xmx_override : allow_dense_xmx_);
+    const bool shape_prefers_onednn = !force_dense_xmx_ &&
+                                      ((out_features_ <= 1280) ||
+                                       (seq_len >= 64 && out_features_ > 8192));
+    const bool use_fused_prefill = s_is_a770 &&
+                                   ((fused_prefill_mode == 1) ||
                                     (force_dense_xmx_) ||
-                                    (fused_prefill_mode == -1 && allow_dense_xmx_ && !shape_prefers_onednn)) &&
+                                    (fused_prefill_mode == -1 && xmx_allowed && !shape_prefers_onednn)) &&
                                    (seq_len >= fused_min_m);
     if (use_fused_prefill && seq_len > 1 &&
         (blocksize % 2) == 0 &&
@@ -2253,7 +2272,7 @@ void Bnb4BitLinear::forward(Context& ctx,
                                  static_cast<const bf16*>(input.data()),
                                  static_cast<bf16*>(output.data()),
                                  seq_len, out_features_, in_features_,
-                                 blocksize, allow_dense_xmx_);
+                                 blocksize, xmx_allowed);
             return;
         }
 
@@ -2272,7 +2291,7 @@ void Bnb4BitLinear::forward(Context& ctx,
                              static_cast<const bf16*>(fused_input.data()),
                              static_cast<bf16*>(fused_output.data()),
                              seq_len, out_features_, in_features_,
-                             blocksize, allow_dense_xmx_);
+                             blocksize, xmx_allowed);
         ctx.queue().memcpy(output.data(), fused_output.data(), output_bytes);
         if (!lora_attachments_.empty()) {
             apply_lora_prefill(ctx, input, output, seq_len);

@@ -124,16 +124,11 @@ void print_tolerance_card(const std::string& title, const ToleranceScoreCard& ca
     std::cout << "------------------------------------------------------------\n";
 }
 
-void test_mock_prefill_tolerance(Context& ctx) {
-    std::cout << "\n======================================================================\n";
-    std::cout << "  [Phase X0 Unit] Synthetic Prefill Tolerance & Operator Parity\n";
-    std::cout << "======================================================================\n";
-
+void evaluate_mock_shape_tolerance(Context& ctx, int K, int N, const std::string& desc,
+                                   const std::vector<int>& m_values,
+                                   bool force_xmx_for_eval = false) {
     constexpr int blocksize = 64;
-    constexpr int K = 2560;
-    constexpr int N = 2560;
-
-    std::mt19937 rng(42);
+    std::mt19937 rng(42 + K * 17 + N * 31);
     std::uniform_int_distribution<int> u8_dist(0, 255);
     std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
     std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
@@ -155,7 +150,7 @@ void test_mock_prefill_tolerance(Context& ctx) {
     ctx.memcpy_h2d(qmap_dev.data(), kTestQuantMap, 16 * sizeof(float));
 
     Bnb4BitWeightRef wref;
-    wref.name = "mock_tolerance_weight";
+    wref.name = "mock_" + desc;
     wref.packed_weight = &packed_dev;
     wref.absmax = &absmax_dev;
     wref.quant_map = &qmap_dev;
@@ -171,7 +166,7 @@ void test_mock_prefill_tolerance(Context& ctx) {
 
     Bnb4BitLinearScratch scratch_ref, scratch_cand;
 
-    for (int M : {4, 26, 30}) {
+    for (int M : m_values) {
         std::vector<bf16> x_host(static_cast<size_t>(M) * K);
         for (auto& v : x_host) v = bf16(in_dist(rng));
         Tensor x_dev = Tensor::allocate(ctx, {M, K}, dnnl::memory::data_type::bf16);
@@ -181,9 +176,13 @@ void test_mock_prefill_tolerance(Context& ctx) {
         Tensor out_cand = Tensor::allocate(ctx, {M, N}, dnnl::memory::data_type::bf16);
 
         linear.set_allow_dense_xmx(false);
+        linear.set_force_dense_xmx(false);
         linear.forward(ctx, scratch_ref, x_dev, out_ref, M);
 
         linear.set_allow_dense_xmx(true);
+        if (force_xmx_for_eval) {
+            linear.set_force_dense_xmx(true);
+        }
         linear.forward(ctx, scratch_cand, x_dev, out_cand, M);
         ctx.synchronize();
 
@@ -221,12 +220,34 @@ void test_mock_prefill_tolerance(Context& ctx) {
         }
 
         auto card = evaluate_logits_tolerance(row_ref, row_cand, M, N);
-        print_tolerance_card("Synthetic Dense Projection", card);
+        print_tolerance_card(desc, card);
 
         expect(card.cosine_similarity >= 0.999, "Cosine similarity must meet tolerance (>= 0.999)");
         expect(card.nrmse <= 0.015, "NRMSE must meet tolerance (<= 1.5%)");
     }
-    std::cout << "[PASS] Synthetic Prefill Tolerance Suite passed\n";
+}
+
+void test_mock_prefill_tolerance(Context& ctx) {
+    std::cout << "\n======================================================================\n";
+    std::cout << "  [Phase X0 Unit] Synthetic Prefill Tolerance & Operator Parity\n";
+    std::cout << "======================================================================\n";
+
+    // 1. Standard projection (K=2560, N=2560), testing small odd & even M: {3, 4, 7, 26, 30}
+    evaluate_mock_shape_tolerance(ctx, 2560, 2560, "Standard Projection (2560x2560)", {3, 4, 7, 26, 30});
+
+    // 2. Linear Attention projection (K=6144, N=2560): M in {4, 26, 30}
+    evaluate_mock_shape_tolerance(ctx, 6144, 2560, "Linear Attention Projection (6144x2560)", {4, 26, 30});
+
+    // 3. Shared Expert Down projection (K=1280, N=2560): M in {4, 26, 30}
+    evaluate_mock_shape_tolerance(ctx, 1280, 2560, "Shared Expert Down (1280x2560)", {4, 26, 30});
+
+    // 4. Shared Expert Gate/Up (K=2560, N=1280): verify shape heuristic fallback (oneDNN is faster)
+    evaluate_mock_shape_tolerance(ctx, 2560, 1280, "Shared Expert Gate/Up Heuristic Fallback (2560x1280)", {4, 26, 30}, false);
+
+    // 5. Shared Expert Gate/Up with forced XMX: verify numerical parity even when forced
+    evaluate_mock_shape_tolerance(ctx, 2560, 1280, "Shared Expert Gate/Up Forced XMX (2560x1280)", {4, 26, 30}, true);
+
+    std::cout << "[PASS] Synthetic Prefill Tolerance Suite passed across all shapes and M boundaries\n";
 }
 
 std::vector<float> extract_bf16_to_f32(Context& ctx, const Tensor& tensor) {
