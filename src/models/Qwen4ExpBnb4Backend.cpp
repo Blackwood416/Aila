@@ -364,10 +364,13 @@ bool Qwen4ExpBnb4Backend::load(
         if (s_q4e_async_dequant) {
             linear.set_allow_async_dequant(true);
         }
-        static const bool s_direct_prefill_io = aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", false);
+        static const bool s_q4e_prefill_xmx =
+            aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+            aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
+        static const bool s_direct_prefill_io =
+            aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
         linear.set_direct_prefill_io(s_direct_prefill_io);
-        static const bool s_q4e_fused_prefill = aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
-        if (s_q4e_fused_prefill) {
+        if (s_q4e_prefill_xmx) {
             linear.set_allow_dense_xmx(true);
         }
         return true;
@@ -652,9 +655,15 @@ bool Qwen4ExpBnb4Backend::load(
     const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
     const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
+    const bool s_dense_xmx = aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+                             aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
+    const bool s_direct_io = aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
     const char* prefill_mode = s_expert_major ? "S4 (expert-major W4/G3)" : (s_moe_rows ? "S1 (batched-rows)" : "baseline (token-by-token)");
     AILA_LOG_INFO("[Qwen4Exp] Prefill MoE mode: %s, Router pred: %s",
                   prefill_mode, s_pred_ids_only ? "ids-only" : "full-softmax");
+    AILA_LOG_INFO("[Qwen4Exp] Prefill Dense Linear: %s (direct_io=%s)",
+                  s_dense_xmx ? "XMX Joint Matrix" : "oneDNN on-demand",
+                  s_direct_io ? "enabled" : "disabled");
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
     return true;
 }

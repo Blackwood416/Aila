@@ -3585,55 +3585,58 @@ void test_direct_prefill_io(Context& ctx) {
     if (!linear.init(ctx, ref, &error)) throw std::runtime_error(error);
     linear.set_allow_async_dequant(true);
     Bnb4BitLinearScratch scratch;
-    for (int rows : {1, 2, 4, 26, 64}) {
-        const size_t elements = static_cast<size_t>(rows) * dim;
-        const size_t bytes = elements * sizeof(bf16);
-        std::vector<bf16> input(elements), expected(elements), actual(elements);
-        for (auto& value : input) value = bf16((static_cast<int>(rng() % 101) - 50) * 0.01f);
-        Tensor x = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
-        Tensor x2 = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
-        Tensor y = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
-        Tensor y2 = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
-        ctx.memcpy_h2d(x.data(), input.data(), bytes);
-        ctx.memcpy_h2d(x2.data(), input.data(), bytes);
-        linear.set_direct_prefill_io(false);
-        linear.forward(ctx, scratch, x, y, rows);
-        ctx.memcpy_d2h(expected.data(), y.data(), bytes);
-        linear.set_direct_prefill_io(true);
-        const auto before = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
-        linear.forward(ctx, scratch, x, y2, rows);
-        ctx.memcpy_d2h(actual.data(), y2.data(), bytes);
-        if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
-            throw std::runtime_error("direct prefill output differs from staged oneDNN output");
-        }
-        const auto after = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
-        if (after - before != static_cast<uint64_t>(rows > 1)) {
-            throw std::runtime_error("direct I/O must bypass only multi-row prefill staging");
-        }
-        linear.forward(ctx, scratch, x2, y, rows);
-        ctx.memcpy_d2h(actual.data(), y.data(), bytes);
-        if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
-            throw std::runtime_error("direct prefill cached bindings were not refreshed");
-        }
-        if (rows > 1) {
-            Tensor arena = Tensor::allocate(ctx, {static_cast<int64_t>(elements + 1)}, dnnl::memory::data_type::bf16);
-            auto source = Tensor::view(ctx, arena.data(), {rows, dim}, dnnl::memory::data_type::bf16);
-            const auto before_alias = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
-            for (int offset : {0, 1}) {
-                auto target = Tensor::view(ctx, arena.data_as<bf16>() + offset, {rows, dim}, dnnl::memory::data_type::bf16);
-                ctx.memcpy_h2d(source.data(), input.data(), bytes);
-                linear.forward(ctx, scratch, source, target, rows);
-                ctx.memcpy_d2h(actual.data(), target.data(), bytes);
-                if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
-                    throw std::runtime_error("overlapping prefill buffers must retain staged semantics");
-                }
+    for (bool allow_xmx : {false, true}) {
+        linear.set_allow_dense_xmx(allow_xmx);
+        for (int rows : {1, 2, 4, 26, 64}) {
+            const size_t elements = static_cast<size_t>(rows) * dim;
+            const size_t bytes = elements * sizeof(bf16);
+            std::vector<bf16> input(elements), expected(elements), actual(elements);
+            for (auto& value : input) value = bf16((static_cast<int>(rng() % 101) - 50) * 0.01f);
+            Tensor x = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
+            Tensor x2 = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
+            Tensor y = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
+            Tensor y2 = Tensor::allocate(ctx, {rows + 1, dim}, dnnl::memory::data_type::bf16);
+            ctx.memcpy_h2d(x.data(), input.data(), bytes);
+            ctx.memcpy_h2d(x2.data(), input.data(), bytes);
+            linear.set_direct_prefill_io(false);
+            linear.forward(ctx, scratch, x, y, rows);
+            ctx.memcpy_d2h(expected.data(), y.data(), bytes);
+            linear.set_direct_prefill_io(true);
+            const auto before = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
+            linear.forward(ctx, scratch, x, y2, rows);
+            ctx.memcpy_d2h(actual.data(), y2.data(), bytes);
+            if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
+                throw std::runtime_error(std::string("direct prefill output differs from staged output (xmx=") + (allow_xmx ? "1" : "0") + ")");
             }
-            if (Bnb4BitLinear::get_prefill_dispatch_stats().direct_io != before_alias) {
-                throw std::runtime_error("overlapping prefill must not take direct I/O path");
+            const auto after = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
+            if (after - before != static_cast<uint64_t>(rows > 1)) {
+                throw std::runtime_error("direct I/O must bypass only multi-row prefill staging");
+            }
+            linear.forward(ctx, scratch, x2, y, rows);
+            ctx.memcpy_d2h(actual.data(), y.data(), bytes);
+            if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
+                throw std::runtime_error("direct prefill cached bindings were not refreshed");
+            }
+            if (rows > 1) {
+                Tensor arena = Tensor::allocate(ctx, {static_cast<int64_t>(elements + 1)}, dnnl::memory::data_type::bf16);
+                auto source = Tensor::view(ctx, arena.data(), {rows, dim}, dnnl::memory::data_type::bf16);
+                const auto before_alias = Bnb4BitLinear::get_prefill_dispatch_stats().direct_io;
+                for (int offset : {0, 1}) {
+                    auto target = Tensor::view(ctx, arena.data_as<bf16>() + offset, {rows, dim}, dnnl::memory::data_type::bf16);
+                    ctx.memcpy_h2d(source.data(), input.data(), bytes);
+                    linear.forward(ctx, scratch, source, target, rows);
+                    ctx.memcpy_d2h(actual.data(), target.data(), bytes);
+                    if (std::memcmp(expected.data(), actual.data(), bytes) != 0) {
+                        throw std::runtime_error("overlapping prefill buffers must retain staged semantics");
+                    }
+                }
+                if (Bnb4BitLinear::get_prefill_dispatch_stats().direct_io != before_alias) {
+                    throw std::runtime_error("overlapping prefill must not take direct I/O path");
+                }
             }
         }
     }
-    std::cout << "[PASS] Direct/staged prefill, pointer rebinding and alias fallback: bit-exact\n";
+    std::cout << "[PASS] Direct/staged prefill (oneDNN + XMX), pointer rebinding and alias fallback: bit-exact\n";
 }
 
 void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string& desc) {
@@ -3674,9 +3677,11 @@ void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string&
     if (!linear.init(ctx, wref, &err)) {
         throw std::runtime_error("linear.init failed for " + desc + ": " + err);
     }
+    linear.set_allow_async_dequant(true);
+    linear.set_direct_prefill_io(true);
 
     std::cout << "  --- Shape: " << desc << " (K=" << K << ", N=" << N << ") ---\n";
-    for (int M : {32, 64}) {
+    for (int M : {4, 26, 30, 64}) {
         std::vector<bf16> x_host(static_cast<size_t>(M) * K);
         for (auto& v : x_host) v = bf16(in_dist(rng));
         Tensor x_dev = Tensor::allocate(ctx, {M, K}, dnnl::memory::data_type::bf16);
@@ -3724,19 +3729,36 @@ void evaluate_dense_prefill_shape(Context& ctx, int K, int N, const std::string&
         ctx.memcpy_d2h(y_xmx_host.data(), out_xmx.data(), y_xmx_host.size() * sizeof(bf16));
 
         float max_abs_diff = 0.0f;
-        float max_rel_diff = 0.0f;
+        double sum_sq_diff = 0.0;
+        double sum_sq_fb = 0.0;
+        double sum_sq_xmx = 0.0;
+        double dot_prod = 0.0;
         for (size_t i = 0; i < y_fb_host.size(); ++i) {
             float v_fb = static_cast<float>(y_fb_host[i]);
             float v_xmx = static_cast<float>(y_xmx_host[i]);
             float diff = std::abs(v_fb - v_xmx);
             if (diff > max_abs_diff) max_abs_diff = diff;
-            float denom = std::max(std::abs(v_fb), 1e-4f);
-            float rdiff = diff / denom;
-            if (rdiff > max_rel_diff) max_rel_diff = rdiff;
+            sum_sq_diff += diff * diff;
+            sum_sq_fb += v_fb * v_fb;
+            sum_sq_xmx += v_xmx * v_xmx;
+            dot_prod += v_fb * v_xmx;
         }
+        const size_t total_elems = y_fb_host.size();
+        double rms_fb = std::sqrt(sum_sq_fb / total_elems);
+        double rms_diff = std::sqrt(sum_sq_diff / total_elems);
+        double nrmse = rms_diff / std::max(rms_fb, 1e-6);
+        double cos_sim = dot_prod / std::max(std::sqrt(sum_sq_fb * sum_sq_xmx), 1e-12);
 
         std::cout << "    M=" << M << ": oneDNN=" << ms_fb << " ms | XMX=" << ms_xmx
-                  << " ms | Speedup: " << (ms_fb / ms_xmx) << "x | max_diff=" << max_abs_diff << "\n";
+                  << " ms | Speedup: " << (ms_fb / ms_xmx) << "x | max_diff=" << max_abs_diff
+                  << " | NRMSE=" << (nrmse * 100.0) << "% | CosSim=" << cos_sim << "\n";
+
+        if (nrmse > 0.015) {
+            throw std::runtime_error("NRMSE exceeded tolerance threshold (1.5%) for " + desc + " M=" + std::to_string(M));
+        }
+        if (cos_sim < 0.998) {
+            throw std::runtime_error("Cosine similarity dropped below tolerance (0.998) for " + desc + " M=" + std::to_string(M));
+        }
     }
 }
 

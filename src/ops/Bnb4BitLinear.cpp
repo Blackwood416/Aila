@@ -1088,17 +1088,17 @@ void packed_nf4_gemm_bf16(Context& ctx,
             if (M >= 64 && N >= 64) {
                 static const int xmx_bk =
                     aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_BK", 0);
+                static const int xmx_tile =
+                    aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_TILE", 0);
                 if (xmx_bk >= 64 && (K % 64) == 0) {
                     packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 64, 8, 8, 16, 8>(
                         ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
                         output_ptr, M, N, K, blocksize);
-                } else if (xmx_bk >= 32 && (K % 32) == 0) {
+                } else if ((xmx_bk >= 32 || (xmx_bk == 0 && xmx_tile == 0)) && (K % 32) == 0) {
                     packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 32, 8, 8, 16, 8>(
                         ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
                         output_ptr, M, N, K, blocksize);
                 } else {
-                    static const int xmx_tile =
-                        aila::env::read_int_raw("AILA_BNB4_GEMM_XMX_TILE", 0);
                     switch (xmx_tile) {
                         case 1:
                             packed_nf4_gemm_bf16_joint_matrix<64, 32, 16, 8, 8, 16, 8>(
@@ -1137,6 +1137,25 @@ void packed_nf4_gemm_bf16(Context& ctx,
                             break;
                     }
                 }
+            } else if (M >= 8 && N >= 64 && (K % 32 == 0)) {
+                // [DISPATCH] M in [8, 63], N >= 64, K % 32 == 0:
+                // BM=32, BN=64, BK=32 cuts barriers in half vs BK=16, matches M=26/30 with minimal padding
+                packed_nf4_gemm_bf16_joint_matrix_wide<32, 64, 32, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            } else if (M >= 8 && (K % 32 == 0)) {
+                packed_nf4_gemm_bf16_joint_matrix_wide<32, 32, 32, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            } else if (M >= 8 && N >= 64) {
+                packed_nf4_gemm_bf16_joint_matrix<32, 64, 16, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
+            } else if (M < 8 && N >= 64 && (K % 32 == 0)) {
+                // Small M tail boundary (e.g. M=4): BM=16, BN=64, BK=32 reduces padding overhead
+                packed_nf4_gemm_bf16_joint_matrix_wide<16, 64, 32, 8, 8, 16, 8>(
+                    ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
+                    output_ptr, M, N, K, blocksize);
             } else {
                 packed_nf4_gemm_bf16_joint_matrix<32, 32, 16, 8, 8, 16, 8>(
                     ctx, packed_ptr, quant_map_ptr, absmax_ptr, input_ptr,
@@ -2197,11 +2216,23 @@ void Bnb4BitLinear::forward(Context& ctx,
         return;
     }
 
+    const size_t input_bytes = static_cast<size_t>(seq_len) * static_cast<size_t>(in_features_) * sizeof(bf16);
+    const size_t output_bytes = static_cast<size_t>(seq_len) * static_cast<size_t>(out_features_) * sizeof(bf16);
+    const auto input_address = reinterpret_cast<std::uintptr_t>(input.data());
+    const auto output_address = reinterpret_cast<std::uintptr_t>(output.data());
+    const bool disjoint = input_address <= output_address
+        ? input_bytes <= output_address - input_address
+        : output_bytes <= input_address - output_address;
+    const bool direct_io = direct_prefill_io_ && seq_len > 1 && lora_attachments_.empty() && disjoint;
+
     const int blocksize = weight_.quant_state.blocksize;
     static const int fused_prefill_mode =
         aila::env::read_int_raw("AILA_BNB4_FUSED_PREFILL", -1);
-    const bool use_fused_prefill = (fused_prefill_mode == 1) ||
-                                   (fused_prefill_mode == -1 && allow_dense_xmx_);
+    static const int fused_min_m =
+        aila::env::read_int_raw("AILA_BNB4_FUSED_MIN_M", 2);
+    const bool use_fused_prefill = ((fused_prefill_mode == 1) ||
+                                    (fused_prefill_mode == -1 && allow_dense_xmx_)) &&
+                                   (seq_len >= fused_min_m);
     if (use_fused_prefill && seq_len > 1 &&
         (blocksize % 2) == 0 &&
         (128 % blocksize) == 0 &&
@@ -2209,6 +2240,19 @@ void Bnb4BitLinear::forward(Context& ctx,
         weight_.packed_weight && weight_.packed_weight->valid() &&
         weight_.quant_map && weight_.quant_map->valid()) {
         g_prefill_dispatch_stats.fused_gemm.fetch_add(1, std::memory_order_relaxed);
+        if (direct_io) {
+            g_prefill_dispatch_stats.direct_io.fetch_add(1, std::memory_order_relaxed);
+            packed_nf4_gemm_bf16(ctx,
+                                 static_cast<const uint8_t*>(weight_.packed_weight->data()),
+                                 static_cast<const float*>(weight_.quant_map->data()),
+                                 static_cast<const float*>(absmax_f32_.data()),
+                                 static_cast<const bf16*>(input.data()),
+                                 static_cast<bf16*>(output.data()),
+                                 seq_len, out_features_, in_features_,
+                                 blocksize, allow_dense_xmx_);
+            return;
+        }
+
         scratch.ensure(ctx, seq_len, in_features_, out_features_, false);
         Tensor fused_input = Tensor::view(
             ctx, scratch.input_bf16.data(), {seq_len, (int64_t)in_features_},
@@ -2216,10 +2260,6 @@ void Bnb4BitLinear::forward(Context& ctx,
         Tensor fused_output = Tensor::view(
             ctx, scratch.output_bf16.data(), {seq_len, (int64_t)out_features_},
             dnnl::memory::data_type::bf16);
-        const size_t input_bytes = static_cast<size_t>(seq_len) *
-                                   static_cast<size_t>(in_features_) * sizeof(bf16);
-        const size_t output_bytes = static_cast<size_t>(seq_len) *
-                                    static_cast<size_t>(out_features_) * sizeof(bf16);
         ctx.queue().memcpy(fused_input.data(), input.data(), input_bytes);
         packed_nf4_gemm_bf16(ctx,
                              static_cast<const uint8_t*>(weight_.packed_weight->data()),
@@ -2239,14 +2279,6 @@ void Bnb4BitLinear::forward(Context& ctx,
     const bool need_scratch_weight = !cache_dequantized_weight_;
 
     scratch.ensure(ctx, seq_len, in_features_, out_features_, need_scratch_weight);
-    const size_t input_bytes = static_cast<size_t>(seq_len) * in_features_ * sizeof(bf16);
-    const size_t output_bytes = static_cast<size_t>(seq_len) * out_features_ * sizeof(bf16);
-    const auto input_address = reinterpret_cast<std::uintptr_t>(input.data());
-    const auto output_address = reinterpret_cast<std::uintptr_t>(output.data());
-    const bool disjoint = input_address <= output_address
-        ? input_bytes <= output_address - input_address
-        : output_bytes <= input_address - output_address;
-    const bool direct_io = direct_prefill_io_ && seq_len > 1 && lora_attachments_.empty() && disjoint;
     if (direct_io) g_prefill_dispatch_stats.direct_io.fetch_add(1, std::memory_order_relaxed);
     Tensor input_bf16 = Tensor::view(ctx, direct_io ? input.data() : scratch.input_bf16.data(),
                                     {seq_len, (int64_t)in_features_},

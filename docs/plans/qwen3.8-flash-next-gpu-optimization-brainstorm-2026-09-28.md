@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Intel Arc A770：纯 GPU 深度优化 Brainstorm 路线与方案报告
 
+> 后续评审（2026-09-29）：本文保留为 G1–G6 的历史设想，不代表所有预测收益已实现。关于“MoE XMX 不划算”的一概排除、SLM 层级、收益相加和 bitwise 准入，已在 [新一轮 XMX Prefill 与容差方案](/E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md) 中纠正；后续实现以新方案为准。
+
 **日期**: 2026-09-28  
 **目标硬件与环境**: Intel Arc A770 16GB GDDR6 (DG2-512, Xe-HPG, 560 GB/s 带宽, 512 XMX, 16MB L2), Windows 11 25H2, oneAPI 2026.1 (`icx-cl`, SYCL, Level Zero), PowerShell  
 **核心参考文档**:

@@ -236,7 +236,11 @@ bool Qwen4ExpPle::init(Context& ctx,
 
     // 5. Linear projections key_proj & value_proj
     static const bool s_q4e_async_dequant = aila::env::read_flag("AILA_Q4E_ASYNC_DEQUANT", true);
-    static const bool s_q4e_fused_prefill = aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
+    static const bool s_q4e_prefill_xmx =
+        aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+        aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
+    static const bool s_direct_prefill_io =
+        aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
     std::string key_name = prefix + "key_proj.weight";
     std::string val_name = prefix + "value_proj.weight";
     if (weights.has_host(key_name) || weights.has(key_name)) {
@@ -250,7 +254,8 @@ bool Qwen4ExpPle::init(Context& ctx,
         if (s_q4e_async_dequant) {
             key_proj_.set_allow_async_dequant(true);
         }
-        if (s_q4e_fused_prefill) {
+        key_proj_.set_direct_prefill_io(s_direct_prefill_io);
+        if (s_q4e_prefill_xmx) {
             key_proj_.set_allow_dense_xmx(true);
         }
     }
@@ -265,7 +270,8 @@ bool Qwen4ExpPle::init(Context& ctx,
         if (s_q4e_async_dequant) {
             value_proj_.set_allow_async_dequant(true);
         }
-        if (s_q4e_fused_prefill) {
+        value_proj_.set_direct_prefill_io(s_direct_prefill_io);
+        if (s_q4e_prefill_xmx) {
             value_proj_.set_allow_dense_xmx(true);
         }
     }

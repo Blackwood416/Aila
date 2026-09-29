@@ -258,6 +258,38 @@ public:
                              int text_pos_delta) override;
     void clear_mrope_positions() override;
 
+    void set_prefill_xmx(bool enabled) {
+        for (auto& layer : layers_) {
+            if (layer.is_linear) {
+                layer.linear_o_proj.set_allow_dense_xmx(enabled);
+                layer.linear_all_proj.set_allow_dense_xmx(enabled);
+            } else {
+                layer.o_proj.set_allow_dense_xmx(enabled);
+                layer.qkv_proj.set_allow_dense_xmx(enabled);
+            }
+            layer.shared_gate_up_proj.set_allow_dense_xmx(enabled);
+            layer.shared_down_proj.set_allow_dense_xmx(enabled);
+        }
+        ple_.key_proj().set_allow_dense_xmx(enabled);
+        ple_.value_proj().set_allow_dense_xmx(enabled);
+    }
+
+    void set_direct_prefill_io(bool enabled) {
+        for (auto& layer : layers_) {
+            if (layer.is_linear) {
+                layer.linear_o_proj.set_direct_prefill_io(enabled);
+                layer.linear_all_proj.set_direct_prefill_io(enabled);
+            } else {
+                layer.o_proj.set_direct_prefill_io(enabled);
+                layer.qkv_proj.set_direct_prefill_io(enabled);
+            }
+            layer.shared_gate_up_proj.set_direct_prefill_io(enabled);
+            layer.shared_down_proj.set_direct_prefill_io(enabled);
+        }
+        ple_.key_proj().set_direct_prefill_io(enabled);
+        ple_.value_proj().set_direct_prefill_io(enabled);
+    }
+
     const aila::HeteroExecutionStats& hetero_stats() const { return expert_executor_.stats(); }
     aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
 

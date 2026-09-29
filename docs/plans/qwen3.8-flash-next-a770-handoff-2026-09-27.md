@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
+> 2026-09-29 后续设计更新：用户已明确允许合理容差内的数值差异，新的计算路径不再要求与历史 48-token 黄金轨迹完全一致。后续 GPU/XMX 工作以 [XMX Prefill 与容差方案](/E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md) 为准。下文性能和测试数字保留为历史交付记录；G6 当前仍需显式 opt-in，G4/G5 默认关闭。
+
 **交接日期**: 2026-09-29  
 **当前状态**: Phase G1–G6 优化里程碑全量闭环，CTest 62/62 100% Passed，端到端 48 tokens 与黄金基线比特精确对齐。  
 **目标硬件平台**: Intel Arc A770 16GB GDDR6 (DG2-512, Xe-HPG), Windows 11 25H2, oneAPI 2026.1 (`icx-cl`, SYCL, Level Zero)  
@@ -89,5 +91,5 @@
 
 1. **单任务串行队列执行**: Windows WDDM 驱动对 Arc A770 并发显存占用极其敏感。**严禁并发运行多个构建、测试或推理进程**，必须等前一个进程彻底退出并释放显存后再启动下一个。
 2. **热路径零堆分配 (Zero Allocations on Hot Path)**: 禁止在 `ForwardImpl`、算子调度或 decode 循环中调用 `new`、`malloc`、`std::vector::resize` 等动态堆操作。
-3. **比特精确对齐黄金基线**: 任何改动后必须运行真实模型验证，默认生产模式下生成的 48 个 tokens 必须与黄金基线 **100% 比特精确对齐**。
+3. **容差与语义正确性（2026-09-29 更新）**: 新计算路径允许 BF16 舍入与归约顺序导致的差异，以同一 NF4 模型的算子误差和固定 token 条件下的 logits/质量观察验收；不以历史 48 个生成 token 完全一致为通用准入条件。布局、mask、路由索引、快照与内存生命周期仍必须正确。按改动范围做定向验证，具体见上方新方案。
 4. **规范 Git 提交**: 分阶段推进，每个独立优化点通过 CTest 与端到端验证后方可提交。

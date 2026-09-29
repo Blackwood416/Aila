@@ -739,6 +739,22 @@ endif()
 add_test(NAME AilaQwen4ExpGenerationTests COMMAND AilaQwen4ExpGenerationTests)
 set_tests_properties(AilaQwen4ExpGenerationTests PROPERTIES LABELS "gpu;models;qwen4_exp;h6" TIMEOUT 60)
 
+add_executable(AilaQwen4ExpToleranceTests tests/models/Qwen4ExpToleranceTests.cpp)
+target_compile_definitions(AilaQwen4ExpToleranceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpToleranceTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpToleranceTests PRIVATE AilaLib)
+if(MSVC)
+    target_compile_options(AilaQwen4ExpToleranceTests PRIVATE /arch:AVX2)
+else()
+    target_compile_options(AilaQwen4ExpToleranceTests PRIVATE -mavx2 -mfma)
+endif()
+add_test(NAME AilaQwen4ExpToleranceTests COMMAND AilaQwen4ExpToleranceTests)
+set_tests_properties(AilaQwen4ExpToleranceTests PROPERTIES LABELS "gpu;models;qwen4_exp;tolerance" TIMEOUT 60)
+
 add_executable(AilaQwen4ExpExpertReadinessTests
     tests/models/Qwen4ExpExpertReadinessTests.cpp
 )
