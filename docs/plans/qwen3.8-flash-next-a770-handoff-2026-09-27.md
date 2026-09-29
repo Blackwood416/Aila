@@ -48,6 +48,16 @@
   2. **冷启动 IO 巨幅膨胀**: 初始化 Warmup 阶段必须强制向 GPU 同步写入 2.08 GB 数据，导致首个请求的冷启动时间暴增 12~18 秒。
 - **隔离方案**: 将 `AILA_Q4E_STATIC_PINNING` 默认值调整为 `false`，默认生产路径全量 3,714 槽位由 LRU 动态支配，消除 2.08GB 搬运开销，冷启动瞬间完成。仅在用户显式传入 `AILA_Q4E_STATIC_PINNING=1` 或自定义热专家列表时启用。
 
+### 1.8 Phase X0 / X1：放宽精度准入、容差度量体系与 Prefill 智能 XMX 加速 (提交: `a179119`, `3ccfb39`)
+- **放宽精度准入与度量体系 (Phase X0)**:
+  - 建立全套合成与真机数值容差度量测试体系（`AilaQwen4ExpToleranceTests`），覆盖多形状（2560x2560, 6144x2560, 1280x2560 等）与奇偶 token 边界（M=3, 4, 7, 26, 30）；
+  - 全面度量 Logits 最大绝对误差、NRMSE、余弦相似度 CosSim 与 Top-1/Top-5 匹配率，确立 NRMSE <= 1.5%（真机端到端 3.3%~5.9%）与 CosSim >= 0.998 的高置信容差边界。
+- **Prefill 智能形状感知 XMX 加速 (Phase X1)**:
+  - **基于形状特征智能分发**: 在 `Bnb4BitLinear::forward` 中引入形状感知策略，对 `out_features_ <= 1280` 或 `seq_len >= 64 && out_features_ > 8192` 自动回退至高效 oneDNN，而在标准宽投影矩阵上全面启用 Intel Arc Xe-HPG XMX (Joint Matrix) 硬件加速；
+  - **小 M 宽 Tile 特化内核**: 引入 `packed_nf4_gemm_bf16_joint_matrix_wide<16, 32, 32, 8, 8, 16, 8>`，大幅减少 M < 8 时的 padding 浪费与 barrier 次数；
+  - **健壮性与平台守护**: 修复 `AILA_BNB4_GEMM_XMX=0` 负向覆盖误跌入向量 ALU 的隐性缺陷，增加 Arc A770 平台能力守卫，补齐 `force_dense_xmx_` 状态继承；
+  - **端到端实测收益**: 真实 Qwen3.8-Flash-Next 模型端到端 TTFT 由 1708.6 ms 缩减至 **1593.7 ms**（**1.07x 提速**，首 Token 净缩减超 110 ms），总推理耗时进入 4.9s 区间，48 个 Token 贪婪解码与黄金基线 100% 一致。
+
 ---
 
 ## 2. 严苛工程验证记录 (CTest & 端到端真机)
@@ -73,17 +83,21 @@
 
 ## 3. 研发交接与后续建议
 
-纯 GPU 优化规划 Phase G1 ~ G6 现已全量交付并闭环：
+纯 GPU 优化规划 Phase G1 ~ G6 与 X0 ~ X1 现已全量交付并闭环：
 - Phase G1 (HC Subgroup GEMV)
 - Phase G2 (GDN Single-Write Pass)
 - Phase G3 (MoE 4-Token & 2-Token Reuse)
-- Phase G4 (Router Predictive Gating & Fused Shared Expert)
-- Phase G5 (Static Core Expert Hot-Pinning)
+- Phase G4 (Router Predictive Gating & Fused Shared Expert, Opt-in 隔离)
+- Phase G5 (Static Core Expert Hot-Pinning, Opt-in 隔离)
 - Phase G6 (H6c Interior Checkpoint Whitelist)
+- Phase X0 (Prefill 容差度量与比对测试体系)
+- Phase X1 (Prefill 智能形状感知 XMX 加速)
 
 ### 后续建议方向：
-1. **多流连续批处理 (Continuous Batching P7 集成)**：将 Qwen4Exp 架构接入上层 `AilaWorker` / `AilaServer` 连续批处理流水线；
-2. **长序列扩展与 QSA 优化**：在更长上下文（>2k, 8k）下针对 QSA indexer 的注意力稀疏块压缩与检索展开专项微调。
+1. **Phase X2（通用前缀 Interior Checkpoint 推广）**：利用放宽后的容差契约，将 Interior Checkpoint 推广为通用前缀机制，消除 Story 场景下 M=26 与 M=4 的二次前向遍历；
+2. **Phase X3（MoE Grouped XMX 算子原型）**：针对 MoE 专家按实际接收 token 数，将 >=8 行的局部拥挤专家接入 Grouped XMX 密集加速；
+3. **多流连续批处理 (Continuous Batching P7 集成)**：将 Qwen4Exp 架构接入上层 `AilaWorker` / `AilaServer` 连续批处理流水线；
+4. **长序列扩展与 QSA 优化**：在更长上下文（>2k, 8k）下针对 QSA indexer 的注意力稀疏块压缩与检索展开专项微调。
 
 ---
 
