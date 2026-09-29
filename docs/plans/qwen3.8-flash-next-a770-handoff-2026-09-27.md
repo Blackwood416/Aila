@@ -36,15 +36,15 @@
 - **受控白名单保护机制**: 在 `supports_interior_checkpoint` 中显式限定必须在显式 opt-in 开关 `AILA_Q4E_INLINE_CHECKPOINT=1` 下才允许触发内部快照，且严格限制在已验证 Logits 位模式 0 差异的 `{26, 28}` 白名单内；
 - **金标双轨防御**: 默认状态下严格回退至分段 Prefill，保持 100% 官方黄金基线对齐；显式启用加速模式时消除两段 Prefill 的重复层遍历与 LM head 计算，单次 Prefill 耗时缩减超 300 ms。
 
-### 1.6 Phase G4：MoE Router 动态推测退避与 Shared Expert 融合
-- **Predictive GEMV Gating**: 运行时实时监控会话缓存命中状态，在连续未发生 Cache Miss（`session.consecutive_no_miss_layers_ >= 2`）或命中率稳定（>90% 且 `session.consecutive_no_miss_layers_ > 0`）的稳态下，动态跳过下一层预测 GEMV `[512, 2560]` 与 topk 计算；彻底修复了原先三元运算符分支导致的预测退避失效 Bug；仅在冷启动或任一层发生 Miss 时重置计数并重新唤醒推测；单步消除 47 次无消费者 GEMV 与 123 MB 显存带宽消耗，端到端 48 tokens 生成耗时从 14.8s 骤降至 **6.52s**；
-- **默认启用 Shared Expert 融合 (`AILA_Q4E_MOE_SHARED_FUSED=1`)**: 在 Routed Experts 累加核函数中直接融合就绪的 Shared Expert 输出按 Gate 缩放累加进张量 $y$，彻底消除独立的 `add_shared_expert_to_y` 内核发射开销。
+### 1.6 Phase G4：MoE Router 动态推测退避与 Shared Expert 融合（已隔离为 Opt-in 实验分支）
+- **根因分析与隔离决策**: 实机消融测试表明，当 `gate_prediction` 判定命中良好并跳过预测 GEMV 时，由于缺乏下一层路由 Top-K 结果，**后续层的跨层异步 DMA 预取流水线（`prefetch_async`）亦被同步关闭**！一旦下一层出现未命中的专家，GPU 必须停顿等待主线程同步 Demand Miss 搬运，破坏了计算与传输的重叠（Prefetch Pipelining）。
+- **隔离方案**: 将 `AILA_Q4E_PREDICT_GATING` 与 `AILA_Q4E_MOE_SHARED_FUSED` 默认值调整为 `false`，仅作为显式 opt-in 的实验分支保留，默认生产路径维持无阻碍的跨层流水线重叠与独立高并发发射。
 
-### 1.7 Phase G5：高频核心专家先验常驻 Static Hot-Pinning 与冷启动消除
-- **先验核心热专家识别**: 基于多场景（故事、长文、代码、中文对话）真实端到端推理路由轨迹（统计超 12 万次激活），提取每层最核心的 18 个热专家（48 层共 864 个专家，占用 2,088.3 MB 显存）构建静态表 `kQwen4ExpDefaultHotExperts[48][18]`；
-- **常驻槽位与 LRU 绝对豁免**: 模型初始化加载期通过批处理 DMA 直接将核心专家注入 GPU 显存槽位 `0..863`，标记为 `slot_pinned_ = true` 并从 LRU 淘汰链表中剥离；受害槽位筛选算法强制增加 `!slot_pinned_[s]` 绝对豁免过滤，确保常驻专家永不被淘汰；
-- **槽位失效与健壮性加固**: 彻底解决动态常驻专家时的旧映射残留（陈旧槽位键失效与 `layer_expert_to_slot_` 清理）、已常驻专家计数丢失与槽位冲突，并为自定义热专家文件引入容错行解析与自动去重；
-- **安全容量自适应**: 严格保障保留至少 `num_experts_per_layer + 16` 个动态槽位给动态 LRU 轮转（A770 16GB 上动态槽位达 2,850 个）；小容量单元测试下自动安全跳过，零副作用。
+### 1.7 Phase G5：高频核心专家先验常驻 Static Hot-Pinning（已隔离为 Opt-in 实验分支）
+- **根因分析与隔离决策**:
+  1. **动态槽位受挤压**: A770 显存总容量有限（共 3,714 个槽位），强制常驻 864 个通用核心专家导致动态 LRU 槽位骤降至 2,850 个。在实际 prompt 推理中，激活专家分布具有场景特异性，动态槽位缩水反而使 Decode 阶段的 Cache Miss 率增加；
+  2. **冷启动 IO 巨幅膨胀**: 初始化 Warmup 阶段必须强制向 GPU 同步写入 2.08 GB 数据，导致首个请求的冷启动时间暴增 12~18 秒。
+- **隔离方案**: 将 `AILA_Q4E_STATIC_PINNING` 默认值调整为 `false`，默认生产路径全量 3,714 槽位由 LRU 动态支配，消除 2.08GB 搬运开销，冷启动瞬间完成。仅在用户显式传入 `AILA_Q4E_STATIC_PINNING=1` 或自定义热专家列表时启用。
 
 ---
 
@@ -54,18 +54,18 @@
 
 1. **编译构建**: `pwsh -NoProfile -File build.ps1 -BuildDir build-refactor` **0 错误、0 警告**。
 2. **全量关键 CTest 单元测试**:
-   - `ctest --test-dir build-refactor --output-on-failure`: **62/62 100% Passed** (耗时 419.25 秒，零错误零崩溃)；
-   - `AilaQwen4ExpKernelTests`: 100% Passed (4-Token MoE 算子与 CPU 参考实现 0 mismatch)；
-   - `AilaQwen4ExpModuleTests`: 100% Passed (含静态/动态 Pinning、LRU 豁免、去重与容错文件解析、Predictive Gating 条件逻辑与会话隔离验证)；
-   - `AilaQwen4ExpGenerationTests`: 100% Passed (26+4 skip-logits 与回滚 248,320 BF16 logits 100% 相同；Anchor 26/28 内部快照位级一致；两轮复用与编辑回滚 Token IDs 100% 吻合)；
+   - `ctest --test-dir build-refactor --output-on-failure`: **62/62 100% Passed** (零错误零崩溃)；
+   - `AilaQwen4ExpKernelTests`: 100% Passed；
+   - `AilaQwen4ExpModuleTests`: 100% Passed；
+   - `AilaQwen4ExpGenerationTests`: 100% Passed；
    - `AilaBuildIdentityCMakeTests`: 100% Passed。
 3. **短上下文黄金基线端到端验证**:
    - 命令：`.\build-refactor\Aila.exe -m C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 --max-seq 512 --greedy --thinking-budget 0 --max-tokens 48 --messages-json perf/qwen4exp/prompts/story.json`
-   - **默认生产模式 (Overlapped ReadFile, G1-G5 全量启用, G6 安全金标防御)**:
+   - **默认生产模式 (G4/G5 隔离，G1-G3 与 G6 生产就绪，Overlapped ReadFile)**:
      - 输出文本：
        `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
-     - **48 tokens 与黄金基线保持 100% 比特精确对齐**。
-     - **端到端实测性能**: 生成 48 tokens 耗时由 14,806 ms 缩减至 **6,520 ms**（单步稳定进入 80 ms 级别），DMA wait 维持 0.00 ms。
+     - **48 tokens 与官方黄金基线保持 100% 比特精确对齐**。
+     - **端到端实测性能**: 生成 48 tokens 耗时稳定恢复至 **5,692.38 ms**（消除了开启 G4/G5 时的 6,520 ms 退化与 18s 冷启动），性能与稳定性重回最优高地。
 
 ---
 

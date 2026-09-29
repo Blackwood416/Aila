@@ -2046,8 +2046,8 @@ bool Qwen4ExpExpertCache::is_pinned(int layer, int expert_id) const {
 
 int Qwen4ExpExpertCache::init_pinned_experts(int experts_per_layer, const std::string& custom_file) {
     if (!initialized_ || faulted_) return 0;
-    static const bool s_static_pinning = aila::env::read_flag("AILA_Q4E_STATIC_PINNING", true);
-    if (!s_static_pinning) return 0;
+    static const bool s_static_pinning = aila::env::read_flag("AILA_Q4E_STATIC_PINNING", false);
+    if (!s_static_pinning && custom_file.empty()) return 0;
 
     int pin_per_layer = aila::env::read_int("AILA_Q4E_HOT_PIN_PER_LAYER", experts_per_layer);
     if (pin_per_layer <= 0) return 0;

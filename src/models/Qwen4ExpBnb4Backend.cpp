@@ -611,7 +611,10 @@ bool Qwen4ExpBnb4Backend::load(
                             cfg_.num_experts, hidden_size_, cfg_.moe_intermediate_size, 64, error_message)) {
         return false;
     }
-    expert_cache_.init_pinned_experts();
+    static const bool s_static_pinning = aila::env::read_flag("AILA_Q4E_STATIC_PINNING", false);
+    if (s_static_pinning) {
+        expert_cache_.init_pinned_experts();
+    }
 
     ensure_runtime_buffers(ctx, 1);
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
@@ -1028,8 +1031,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // Decode-time speculative prefetch of layer L+1 experts (predicted from layer L's MoE input)
     // overlapping host fill + PCIe DMA with GPU compute of layer L+1's attention.
     static const bool s_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH", true);
-    static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", true);
-    static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", true);
+    static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
+    static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
     static const int s_prefetch_topn = std::max(1, aila::env::read_int("AILA_Q4E_PREFETCH_TOPN", 10));
     static const int s_prefill_prefetch_max = aila::env::read_int("AILA_Q4E_PREFILL_PREFETCH_MAX", 48);
