@@ -1,4 +1,5 @@
 #include "Qwen4ExpExpertCache.hpp"
+#include "models/Qwen4ExpHotExperts.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <functional>
 #include <exception>
@@ -339,6 +341,9 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     layer_expert_to_slot_ = std::move(other.layer_expert_to_slot_);
     slot_to_key_ = std::move(other.slot_to_key_);
     slot_reserved_ = std::move(other.slot_reserved_);
+    slot_pinned_ = std::move(other.slot_pinned_);
+    num_pinned_slots_ = other.num_pinned_slots_;
+    other.num_pinned_slots_ = 0;
     slots_dev_ = std::move(other.slots_dev_);
     gpu_slot_records_ = std::move(other.gpu_slot_records_);
     stats_ = other.stats_;
@@ -452,6 +457,8 @@ void Qwen4ExpExpertCache::cleanup() {
     layer_expert_to_slot_.clear();
     slot_to_key_.clear();
     slot_reserved_.clear();
+    slot_pinned_.clear();
+    num_pinned_slots_ = 0;
     slots_dev_.clear();
     gpu_slot_records_.clear();
     host_pool_chunks_.clear();
@@ -715,6 +722,8 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     layer_expert_to_slot_.assign(static_cast<size_t>(num_layers_) * num_experts_per_layer_, -1);
     slot_to_key_.assign(num_slots_, UINT64_MAX);
     slot_reserved_.assign(num_slots_, false);
+    slot_pinned_.assign(num_slots_, false);
+    num_pinned_slots_ = 0;
     gpu_slot_records_.assign(num_slots_, GpuSlotRecord{});
 
     slots_dev_.resize(num_slots_);
@@ -1280,7 +1289,9 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             if (!slot_reserved_[slot]) {
                 slot_reserved_[slot] = true;
                 batch_reserved_slots_scratch_.push_back(slot);
-                lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
+                if (!slot_pinned_[slot]) {
+                    lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
+                }
             }
             auto& record = gpu_slot_records_[slot];
             if (record.state == ExpertSlotState::Copying) {
@@ -1329,7 +1340,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             int fallback_victim = -1;
             for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend() && candidates_checked < kMaxCandidates; ++r_it) {
                 int s = *r_it;
-                if (!slot_reserved_[s]) {
+                if (!slot_reserved_[s] && !slot_pinned_[s]) {
                     if (fallback_victim < 0) fallback_victim = s;
                     ++candidates_checked;
                     uint64_t old_k = slot_to_key_[s];
@@ -1354,7 +1365,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         if (victim_slot < 0) {
             for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend(); ++r_it) {
                 int s = *r_it;
-                if (!slot_reserved_[s]) {
+                if (!slot_reserved_[s] && !slot_pinned_[s]) {
                     victim_slot = s;
                     break;
                 }
@@ -1854,7 +1865,7 @@ void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
         int e = expert_ids[i];
         if (e < 0 || e >= num_experts_per_layer_) continue;
         int slot = layer_expert_to_slot_[expert_flat_index(layer, e)];
-        if (slot >= 0) {
+        if (slot >= 0 && !slot_pinned_[slot]) {
             lru_list_.splice(lru_list_.end(), lru_list_, slot_iters_[slot]);
         }
         if (host_pool_enabled_) {
@@ -1956,6 +1967,147 @@ void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8
                        staging_slot + dn_packed_offset_, dn_packed_bytes_,
                        staging_slot + dn_absmax_offset_, dn_absmax_count_, compact_nested_,
                        part, nparts);
+}
+
+bool Qwen4ExpExpertCache::pin_expert(int layer, int expert_id) {
+    if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+    const int flat = expert_flat_index(layer, expert_id);
+    if (layer_expert_to_slot_[flat] >= 0) {
+        int existing_slot = layer_expert_to_slot_[flat];
+        if (slot_pinned_[existing_slot]) return true;
+        slot_pinned_[existing_slot] = true;
+        if (slot_iters_[existing_slot] != lru_list_.end()) {
+            lru_list_.erase(slot_iters_[existing_slot]);
+            slot_iters_[existing_slot] = lru_list_.end();
+        }
+        return true;
+    }
+    if (num_pinned_slots_ >= num_slots_) return false;
+    const int slot = num_pinned_slots_++;
+    load_expert_to_staging(layer, expert_id, pinned_staging_ptr_, 0, 1, 1);
+    if (copy_q_) {
+        copy_q_->memcpy(slot_dev_base_[slot], pinned_staging_ptr_, slot_bytes_).wait_and_throw();
+    } else {
+        ctx_->memcpy_h2d(slot_dev_base_[slot], pinned_staging_ptr_, slot_bytes_);
+    }
+    bind_slot_nested_metadata(slot, layer, expert_id);
+    const uint64_t key = (static_cast<uint64_t>(layer) << 32) | static_cast<uint32_t>(expert_id);
+    slot_to_key_[slot] = key;
+    layer_expert_to_slot_[flat] = slot;
+    slot_pinned_[slot] = true;
+    gpu_slot_records_[slot].key = key;
+    gpu_slot_records_[slot].generation = 1;
+    gpu_slot_records_[slot].state = ExpertSlotState::Ready;
+    gpu_slot_records_[slot].fill_owner = -1;
+    if (slot_iters_[slot] != lru_list_.end()) {
+        lru_list_.erase(slot_iters_[slot]);
+        slot_iters_[slot] = lru_list_.end();
+    }
+    return true;
+}
+
+bool Qwen4ExpExpertCache::is_pinned(int layer, int expert_id) const {
+    if (!initialized_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
+    int slot = layer_expert_to_slot_[expert_flat_index(layer, expert_id)];
+    return slot >= 0 && slot < num_slots_ && slot < static_cast<int>(slot_pinned_.size()) && slot_pinned_[slot];
+}
+
+int Qwen4ExpExpertCache::init_pinned_experts(int experts_per_layer, const std::string& custom_file) {
+    if (!initialized_ || faulted_) return 0;
+    static const bool s_static_pinning = aila::env::read_flag("AILA_Q4E_STATIC_PINNING", true);
+    if (!s_static_pinning) return 0;
+
+    int pin_per_layer = aila::env::read_int("AILA_Q4E_HOT_PIN_PER_LAYER", experts_per_layer);
+    if (pin_per_layer <= 0) return 0;
+    pin_per_layer = std::min(pin_per_layer, 18);
+
+    // Safety headroom: ensure at least num_experts_per_layer_ + 16 dynamic slots remain for LRU
+    const int min_dynamic_slots = std::min(num_experts_per_layer_ + 16, num_slots_ / 2);
+    const int max_pinnable = std::max(0, num_slots_ - min_dynamic_slots);
+    const int max_per_layer = max_pinnable / std::max(1, num_layers_);
+    pin_per_layer = std::min(pin_per_layer, max_per_layer);
+    if (pin_per_layer <= 0) return 0;
+
+    std::string file_path = aila::env::read_string("AILA_Q4E_HOT_PIN_FILE", custom_file);
+    std::vector<std::pair<int, int>> experts_to_pin;
+    experts_to_pin.reserve(static_cast<size_t>(num_layers_) * pin_per_layer);
+
+    if (!file_path.empty()) {
+        std::ifstream ifs(file_path);
+        if (ifs.is_open()) {
+            int l, e;
+            while (ifs >> l >> e) {
+                if (l >= 0 && l < num_layers_ && e >= 0 && e < num_experts_per_layer_) {
+                    experts_to_pin.emplace_back(l, e);
+                }
+            }
+        }
+    }
+    if (experts_to_pin.empty()) {
+        for (int L = 0; L < std::min(num_layers_, aila::kMaxHotPinLayers); ++L) {
+            for (int p = 0; p < pin_per_layer; ++p) {
+                int e = aila::kQwen4ExpDefaultHotExperts[L][p];
+                if (e >= 0 && e < num_experts_per_layer_) {
+                    experts_to_pin.emplace_back(L, e);
+                }
+            }
+        }
+    }
+
+    const size_t staging_slots = staging_buffer_bytes_ / slot_bytes_;
+    const int chunk_size = std::max(1, static_cast<int>(std::min<size_t>(16, staging_slots)));
+
+    int total_pinned = 0;
+    size_t idx = 0;
+    while (idx < experts_to_pin.size() && num_pinned_slots_ < max_pinnable) {
+        size_t cur_chunk = std::min<size_t>(chunk_size, experts_to_pin.size() - idx);
+        cur_chunk = std::min<size_t>(cur_chunk, static_cast<size_t>(max_pinnable - num_pinned_slots_));
+        for (size_t c = 0; c < cur_chunk; ++c) {
+            const int L = experts_to_pin[idx + c].first;
+            const int e = experts_to_pin[idx + c].second;
+            const int slot = num_pinned_slots_ + static_cast<int>(c);
+            uint8_t* staging = pinned_staging_ptr_ + c * slot_bytes_;
+            load_expert_to_staging(L, e, staging, 0, 1, 1);
+            if (copy_q_) {
+                copy_q_->memcpy(slot_dev_base_[slot], staging, slot_bytes_);
+            } else {
+                ctx_->memcpy_h2d(slot_dev_base_[slot], staging, slot_bytes_);
+            }
+        }
+        if (copy_q_) {
+            copy_q_->wait_and_throw();
+        }
+
+        for (size_t c = 0; c < cur_chunk; ++c) {
+            const int L = experts_to_pin[idx + c].first;
+            const int e = experts_to_pin[idx + c].second;
+            const int slot = num_pinned_slots_ + static_cast<int>(c);
+
+            bind_slot_nested_metadata(slot, L, e);
+            const uint64_t key = (static_cast<uint64_t>(L) << 32) | static_cast<uint32_t>(e);
+            slot_to_key_[slot] = key;
+            layer_expert_to_slot_[expert_flat_index(L, e)] = slot;
+            slot_pinned_[slot] = true;
+            gpu_slot_records_[slot].key = key;
+            gpu_slot_records_[slot].generation = 1;
+            gpu_slot_records_[slot].state = ExpertSlotState::Ready;
+            gpu_slot_records_[slot].fill_owner = -1;
+
+            if (slot_iters_[slot] != lru_list_.end()) {
+                lru_list_.erase(slot_iters_[slot]);
+                slot_iters_[slot] = lru_list_.end();
+            }
+            ++total_pinned;
+        }
+        num_pinned_slots_ += static_cast<int>(cur_chunk);
+        idx += cur_chunk;
+    }
+
+    AILA_LOG_INFO("[Q4E ExpertCache] Static hot-pinning complete: %d experts pinned in slots 0..%d (%.1f MB, %zu LRU slots remain)",
+                  num_pinned_slots_, num_pinned_slots_ - 1,
+                  (static_cast<double>(num_pinned_slots_) * slot_bytes_) / (1024.0 * 1024.0),
+                  lru_list_.size());
+    return total_pinned;
 }
 
 void Qwen4ExpExpertCache::log_stats(int layer) const {

@@ -305,6 +305,15 @@ public:
     void set_cost_aware_eviction(bool enable) { cost_aware_eviction_ = enable; }
     bool cost_aware_eviction() const { return cost_aware_eviction_; }
 
+    // Phase G5: Static Hot-Pinning API
+    bool pin_expert(int layer, int expert_id);
+    int init_pinned_experts(int experts_per_layer = 18, const std::string& custom_file = "");
+    bool is_pinned(int layer, int expert_id) const;
+    bool is_slot_pinned(int slot) const {
+        return slot >= 0 && slot < num_slots_ && slot < static_cast<int>(slot_pinned_.size()) && slot_pinned_[slot];
+    }
+    int num_pinned_slots() const { return num_pinned_slots_; }
+
     int num_slots() const { return num_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
     bool uses_nested_codes() const { return compact_nested_; }
@@ -464,6 +473,8 @@ private:
     std::vector<int> layer_expert_to_slot_;
     std::vector<uint64_t> slot_to_key_;
     std::vector<bool> slot_reserved_;
+    std::vector<bool> slot_pinned_;
+    int num_pinned_slots_ = 0;
     std::vector<ops::MoeExpertSlotDev> slots_dev_;
     std::vector<GpuSlotRecord> gpu_slot_records_;
 

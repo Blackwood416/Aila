@@ -611,7 +611,7 @@ bool Qwen4ExpBnb4Backend::load(
                             cfg_.num_experts, hidden_size_, cfg_.moe_intermediate_size, 64, error_message)) {
         return false;
     }
-    // Phase G5: expert_cache_.init_pinned_experts();
+    expert_cache_.init_pinned_experts();
 
     ensure_runtime_buffers(ctx, 1);
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);

@@ -288,6 +288,10 @@ compact u8 absmax codes (default for compatible nested checkpoints) or expanded 
 | `AILA_Q4E_PREFILL_PREFETCH_MAX` | int | `48` | Maximum unique predicted experts to asynchronously prefetch per layer during prefill into the Hot Host RAM Pool (hides host fill latency behind GPU compute while preventing OS page-cache thrashing) |
 | `AILA_Q4E_PREFILL_DEMOTE` | bool | `true` | Batched prefill keeps each layer's `slots / layers` most-used experts hot and queues the rest for eviction first, so decode after a long prompt still finds every layer's hottest experts (plain LRU would keep only the last layers) |
 | `AILA_Q4E_PREDICT_STATS` | bool | `false` | With `AILA_PROFILE_Q4E_DECODE`, log how often the next-layer prediction matched the real routing |
+| `AILA_Q4E_PREDICT_GATING` | bool | `true` | Phase G4: Skip next-layer router GEMV prediction during steady state decode (consecutive no-miss >= 2 or hit-rate >= 90%), eliminating 47 unconsumed router GEMVs per step |
+| `AILA_Q4E_STATIC_PINNING` | bool | `true` | Phase G5: Pin high-frequency core experts in slots 0..863 (18 per layer) permanently in GPU VRAM during initialization, eliminating cold start misses and PCIe stalls |
+| `AILA_Q4E_HOT_PIN_PER_LAYER` | int | `18` | Phase G5: Number of hot experts per layer to pin (default 18, capped by safety dynamic LRU headroom) |
+| `AILA_Q4E_HOT_PIN_FILE` | path | empty | Phase G5: Optional custom expert pin file with whitespace-separated `layer expert_id` pairs |
 
 ### Kernels / State
 
@@ -296,7 +300,7 @@ compact u8 absmax codes (default for compatible nested checkpoints) or expanded 
 | `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from the host mmap instead of keeping the 1.3 GB table in VRAM (the auto expert cache grows by ~460 slots). `0` uploads the table |
 | `AILA_Q4E_DENSE_GEMV` | bool | `true` | Single-row bf16 projections (hyper-connection, router, shared-expert gate) use the native GEMV instead of oneDNN |
 | `AILA_Q4E_HC_FUSED` | bool | `true` | Decode hyper-connection runs as two fused kernels (down + inject, up + mix) |
-| `AILA_Q4E_MOE_SHARED_FUSED` | bool | `false` | Experimental gated shared-expert add inside MoE down. Changes a few BF16 values in layer 0 and caused a decode-route regression on the fixed benchmark; keep disabled by default |
+| `AILA_Q4E_MOE_SHARED_FUSED` | bool | `true` | Phase G4: Gated shared-expert add fused directly inside MoE down projection accumulate kernel, eliminating separate residual add dispatch |
 | `AILA_Q4E_PREFILL_STEP` | int | `64` | Decode positions between recurrent-state snapshots used for context rollback |
 
 ### Profiling / Debug

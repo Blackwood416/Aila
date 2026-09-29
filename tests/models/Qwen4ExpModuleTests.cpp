@@ -5155,6 +5155,67 @@ void test_prefill_weight_reuse_backend_alignment(Context& ctx) {
     std::cout << "[PASS] All W4 & G3 prefill weight reuse scenarios verified with bit-exact match.\n\n";
 }
 
+void test_static_expert_pinning_and_lru_immunity(Context& ctx) {
+    std::cout << "[Test] Running Phase G5 static hot expert pinning and LRU immunity tests...\n";
+    TestCacheHarness harness;
+    Qwen4ExpExpertCache cache;
+    // 4 layers, 16 experts per layer, 6 GPU slots, 12 host slots
+    harness.setup_cache(cache, ctx, 6, 12);
+
+    expect(cache.num_pinned_slots() == 0, "initial pinned count must be 0");
+
+    // 1. Explicitly pin expert (layer 0, expert 1)
+    bool pin_ok = cache.pin_expert(0, 1);
+    expect(pin_ok, "pin_expert(0, 1) should succeed");
+    expect(cache.is_pinned(0, 1), "expert (0, 1) must be marked pinned");
+    expect(cache.num_pinned_slots() == 1, "num_pinned_slots must be 1");
+    expect(cache.contains(0, 1), "expert (0, 1) must be resident in cache");
+
+    // Pin a second expert (layer 1, expert 2)
+    pin_ok = cache.pin_expert(1, 2);
+    expect(pin_ok, "pin_expert(1, 2) should succeed");
+    expect(cache.is_pinned(1, 2), "expert (1, 2) must be marked pinned");
+    expect(cache.num_pinned_slots() == 2, "num_pinned_slots must be 2");
+
+    // 2. Re-pinning already pinned expert should be a no-op returning true
+    expect(cache.pin_expert(0, 1), "re-pinning (0, 1) must return true");
+    expect(cache.num_pinned_slots() == 2, "pinned slot count must not change on re-pin");
+
+    // 3. Acquire pinned expert: should be a direct hit
+    int pinned_req = 1;
+    int slot = -1;
+    cache.acquire(0, &pinned_req, 1, &slot);
+    expect(slot >= 0, "acquire pinned expert must succeed");
+    expect(cache.is_slot_pinned(slot), "returned slot must be pinned");
+
+    // 4. Heavy LRU pressure: acquire experts 3, 4, 5, 6, 7 on layer 0
+    // Capacity is 6 slots; 2 are pinned, leaving 4 dynamic slots.
+    for (int exp = 3; exp <= 7; ++exp) {
+        int req = exp;
+        int out_slot = -1;
+        cache.acquire(0, &req, 1, &out_slot).wait();
+        expect(out_slot >= 0, "dynamic acquire must succeed");
+        expect(!cache.is_slot_pinned(out_slot), "dynamic slot must not be marked pinned");
+    }
+
+    // Pinned experts (0, 1) and (1, 2) MUST STILL BE RESIDENT!
+    expect(cache.contains(0, 1), "pinned expert (0, 1) must never be evicted");
+    expect(cache.is_pinned(0, 1), "pinned expert (0, 1) must still be pinned");
+    expect(cache.contains(1, 2), "pinned expert (1, 2) must never be evicted");
+    expect(cache.is_pinned(1, 2), "pinned expert (1, 2) must still be pinned");
+
+    // 5. Demote on pinned expert must be safely ignored without modifying LRU or crashing
+    int demote_id = 1;
+    cache.demote(0, &demote_id, 1);
+    expect(cache.contains(0, 1), "pinned expert (0, 1) must remain resident after demote");
+
+    // 6. Test init_pinned_experts safety headroom on small test cache (returns 0 due to safety limit)
+    int auto_pinned = cache.init_pinned_experts(2);
+    expect(auto_pinned == 0, "init_pinned_experts on small test cache must safely return 0 without exceeding headroom");
+
+    std::cout << "[PASS] Static hot expert pinning and LRU immunity verified.\n\n";
+}
+
 } // namespace
 
 int main() {
@@ -5178,6 +5239,7 @@ int main() {
         test_b2_route_and_prediction_event_decoupling(ctx);
         test_b3_utility_aware_prefetch_filtering_and_metrics(ctx);
         test_b4_cost_aware_two_tier_eviction(ctx);
+        test_static_expert_pinning_and_lru_immunity(ctx);
         test_b6_demand_microbatch_pipeline(ctx);
         test_prefill_weight_reuse_backend_alignment(ctx);
         test_snapshot_capture_and_truncate(ctx);

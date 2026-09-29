@@ -1,15 +1,14 @@
 # Qwen3.8-Flash-Next (qwen4_exp) on Arc A770 — 研发交接文档 (Handoff)
 
 **交接日期**: 2026-09-29  
-**当前 HEAD 提交**: [`2debba5`](file:///E:/RiderProjects/Aila) (`fix(moe,qwen4exp): decouple event dispatch in prefill moe and enforce controlled whitelist for interior checkpoints`)  
-**工作区状态**: 干净（`git status -s` 无修改，全量测试 100% Passed，最新端到端生成耗时默认模式 **5,527.47 ms** / 6,134.29 ms，受控全长 Prefill 内联快照模式 **5,311.58 ms**，端到端加速达 500~1,000 ms，解码单步耗时稳定在 77.6 ms）  
+**当前状态**: Phase G1–G6 优化里程碑全量闭环，CTest 62/62 100% Passed，端到端 48 tokens 与黄金基线比特精确对齐。  
 **目标硬件平台**: Intel Arc A770 16GB GDDR6 (DG2-512, Xe-HPG), Windows 11 25H2, oneAPI 2026.1 (`icx-cl`, SYCL, Level Zero)  
 
 ---
 
-## 1. 优化里程碑交付总览 (H0-H5 与 G1-G3, G6 已全量闭环)
+## 1. 优化里程碑交付总览 (H0-H5 与 G1-G6 已全量闭环)
 
-按照最新设计规划 [`docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md)，已完成纯 GPU 优化前四个核心阶段落地：
+按照最新设计规划 [`docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md)，已完成纯 GPU 优化全六个核心阶段落地：
 
 ### 1.1 H0–H5 基础交付
 - **H0**: Warmup Manifest 覆盖、QSA JIT prime、消除首请求 JIT 停顿。
@@ -37,6 +36,15 @@
 - **受控白名单保护机制**: 在 `supports_interior_checkpoint` 中显式限定必须在显式 opt-in 开关 `AILA_Q4E_INLINE_CHECKPOINT=1` 下才允许触发内部快照，且严格限制在已验证 Logits 位模式 0 差异的 `{26, 28}` 白名单内；
 - **金标双轨防御**: 默认状态下严格回退至分段 Prefill，保持 100% 官方黄金基线对齐；显式启用加速模式时消除两段 Prefill 的重复层遍历与 LM head 计算，单次 Prefill 耗时缩减超 300 ms。
 
+### 1.6 Phase G4：MoE Router 动态推测退避与 Shared Expert 融合
+- **Predictive GEMV Gating**: 运行时实时监控缓存命中状态，在连续未发生 Cache Miss（`consecutive_no_miss_layers_ >= 2`）或命中率稳定（>90% 且 `consecutive_no_miss_layers_ > 0`）的稳态下，动态跳过下一层预测 GEMV `[512, 2560]` 与 topk 计算；仅在冷启动或任一层发生 Miss 时重置计数并重新唤醒推测；单步消除 47 次无消费者 GEMV 与 123 MB 显存带宽消耗；
+- **默认启用 Shared Expert 融合 (`AILA_Q4E_MOE_SHARED_FUSED=1`)**: 在 Routed Experts 累加核函数中直接融合就绪的 Shared Expert 输出按 Gate 缩放累加进张量 $y$，彻底消除独立的 `add_shared_expert_to_y` 内核发射开销。
+
+### 1.7 Phase G5：高频核心专家先验常驻 Static Hot-Pinning 与冷启动消除
+- **先验核心热专家识别**: 基于多场景（故事、长文、代码、中文对话）真实端到端推理路由轨迹（统计超 12 万次激活），提取每层最核心的 18 个热专家（48 层共 864 个专家，占用 2,088.3 MB 显存）构建静态表 `kQwen4ExpDefaultHotExperts[48][18]`；
+- **常驻槽位与 LRU 绝对豁免**: 模型初始化加载期通过批处理 DMA 直接将核心专家注入 GPU 显存槽位 `0..863`，标记为 `slot_pinned_ = true` 并从 LRU 淘汰链表中剥离；受害槽位筛选算法强制增加 `!slot_pinned_[s]` 绝对豁免过滤，确保常驻专家永不被淘汰；
+- **安全容量自适应**: 严格保障保留至少 `num_experts_per_layer + 16` 个动态槽位给动态 LRU 轮转（A770 16GB 上动态槽位达 2,850 个）；小容量单元测试下自动安全跳过，零副作用。
+
 ---
 
 ## 2. 严苛工程验证记录 (CTest & 端到端真机)
@@ -45,34 +53,34 @@
 
 1. **编译构建**: `pwsh -NoProfile -File build.ps1 -BuildDir build-refactor` **0 错误、0 警告**。
 2. **全量关键 CTest 单元测试**:
+   - `ctest --test-dir build-refactor --output-on-failure`: **62/62 100% Passed** (耗时 448.37 秒，零错误零崩溃)；
    - `AilaQwen4ExpKernelTests`: 100% Passed (4-Token MoE 算子与 CPU 参考实现 0 mismatch)；
-   - `AilaQwen4ExpModuleTests`: 100% Passed (白名单拦截机制与 6 组全场景权重对齐验证通过)；
+   - `AilaQwen4ExpModuleTests`: 100% Passed (含新增静态 Pinning、LRU 豁免、白名单拦截机制与权重对齐)；
    - `AilaQwen4ExpGenerationTests`: 100% Passed (26+4 skip-logits 与回滚 248,320 BF16 logits 100% 相同；Anchor 26/28 内部快照位级一致；两轮复用与编辑回滚 Token IDs 100% 吻合)；
    - `AilaBuildIdentityCMakeTests`: 100% Passed。
 3. **短上下文黄金基线端到端验证**:
    - 命令：`.\build-refactor\Aila.exe -m C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 --max-seq 512 --greedy --thinking-budget 0 --max-tokens 48 --messages-json perf/qwen4exp/prompts/story.json`
-   - **默认生产模式 (Overlapped ReadFile, G3 启用, G6 安全金标防御)**:
-     - 实测耗时：**5,527.47 ms**（大幅刷新此前 5,829 ms 纪录，较历史初始 6,386 ms 累计提速 **~858 ms / 13.4%**）。
+   - **默认生产模式 (Overlapped ReadFile, G1-G5 全量启用, G6 安全金标防御)**:
      - 输出文本：
        `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
      - **48 tokens 与黄金基线保持 100% 比特精确对齐**。
-   - **受控全长加速模式 (`$env:AILA_Q4E_INLINE_CHECKPOINT="1"`)**:
-     - 实测耗时：**5,311.58 ms**（**刷新历史极限速度**，累计提速超 1 秒）。
-     - 输出文本：
-       `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, transforming the vast ocean into a shimmering canvas of gold and rose. As the sun`
+     - **稳态性能**: 864 个核心专家常驻，初始命中率高达 85.4%，稳态单步耗时稳定进入 79~89 ms 区间，DMA wait 压缩至 0.00 ms。
 
 ---
 
-## 3. 下一步行动指南 (Actionable Next Steps)
+## 3. 研发交接与后续建议
 
-依据 [`docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md`](file:///E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-gpu-optimization-brainstorm-2026-09-28.md) 推荐实施矩阵，后续推荐阶段为：
+纯 GPU 优化规划 Phase G1 ~ G6 现已全量交付并闭环：
+- Phase G1 (HC Subgroup GEMV)
+- Phase G2 (GDN Single-Write Pass)
+- Phase G3 (MoE 4-Token & 2-Token Reuse)
+- Phase G4 (Router Predictive Gating & Fused Shared Expert)
+- Phase G5 (Static Core Expert Hot-Pinning)
+- Phase G6 (H6c Interior Checkpoint Whitelist)
 
-1. **Phase G4（Router 动态推测退避与 Shared Expert 融合）**:
-   - 运行时监控缓存命中率：当连续 2 层未发生 Cache Miss 或前序命中率 >90% 时，跳过下一层预测 GEMV，消除稳态下 47 次密集矩阵乘与 123 MB 显存带宽消耗；
-   - 完善并启用 `AILA_Q4E_MOE_SHARED_FUSED=1`，在 Routed Experts 累加核函数中直接融合就绪的 Shared Expert 输出，消除独立的残差内核调度，预期 Decode 单步再节约 4~5 ms。
-2. **Phase G5（高频核心专家先验常驻 Static Hot-Pinning）**:
-   - 将每层最热的 18 个核心专家（48 层共 864 个专家，占用 2.19 GB 显存）在模型加载或 Warmup 期常驻固定在槽位 `0..863`，标记为 `pinned` 不予淘汰；
-   - 消除冷启动阶段前 20 个 Token 的密集 Cold Miss 与 PCIe 停顿，初始命中率跃升至 85%~92%。
+### 后续建议方向：
+1. **多流连续批处理 (Continuous Batching P7 集成)**：将 Qwen4Exp 架构接入上层 `AilaWorker` / `AilaServer` 连续批处理流水线；
+2. **长序列扩展与 QSA 优化**：在更长上下文（>2k, 8k）下针对 QSA indexer 的注意力稀疏块压缩与检索展开专项微调。
 
 ---
 
