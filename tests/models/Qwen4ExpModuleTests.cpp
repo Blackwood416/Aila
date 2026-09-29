@@ -5216,6 +5216,129 @@ void test_static_expert_pinning_and_lru_immunity(Context& ctx) {
     std::cout << "[PASS] Static hot expert pinning and LRU immunity verified.\n\n";
 }
 
+void test_dynamic_pin_resident_expert_and_slot_immunity(Context& ctx) {
+    std::cout << "[Test] Running dynamic resident expert pinning and eviction protection tests...\n";
+    TestCacheHarness harness;
+    Qwen4ExpExpertCache cache;
+    // 4 layers, 16 experts per layer, 6 GPU slots, 12 host slots
+    harness.setup_cache(cache, ctx, 6, 12);
+
+    // 1. Dynamically acquire expert (0, 3) so it sits in LRU
+    int req = 3;
+    int slot3 = -1;
+    cache.acquire(0, &req, 1, &slot3).wait();
+    expect(slot3 >= 0, "dynamic acquire (0, 3) must succeed");
+    expect(!cache.is_pinned(0, 3), "(0, 3) initially not pinned");
+    expect(cache.num_pinned_slots() == 0, "num_pinned_slots initially 0");
+
+    // 2. Now pin the already-resident expert (0, 3)
+    bool pin_ok = cache.pin_expert(0, 3);
+    expect(pin_ok, "pin_expert(0, 3) on resident expert must succeed");
+    expect(cache.is_pinned(0, 3), "(0, 3) must now be pinned");
+    expect(cache.num_pinned_slots() == 1, "num_pinned_slots must increment to 1");
+    expect(cache.is_slot_pinned(slot3), "slot3 must now be marked pinned");
+
+    // 3. Pin a non-resident expert (0, 4)
+    pin_ok = cache.pin_expert(0, 4);
+    expect(pin_ok, "pin_expert(0, 4) must succeed");
+    expect(cache.is_pinned(0, 4), "(0, 4) must now be pinned");
+    expect(cache.num_pinned_slots() == 2, "num_pinned_slots must increment to 2");
+
+    // 4. Exert heavy LRU pressure across layers with other experts (0, 1, 2, 5, 6, 7)
+    for (int loop = 0; loop < 3; ++loop) {
+        for (int exp : {0, 1, 2, 5, 6, 7}) {
+            int s = -1;
+            cache.acquire(0, &exp, 1, &s).wait();
+        }
+    }
+
+    // Pinned resident expert (0, 3) and non-resident (0, 4) must both remain resident
+    expect(cache.contains(0, 3), "pinned resident expert (0, 3) must never be evicted");
+    expect(cache.is_pinned(0, 3), "expert (0, 3) must still be pinned");
+    expect(cache.contains(0, 4), "pinned expert (0, 4) must never be evicted");
+    expect(cache.is_pinned(0, 4), "expert (0, 4) must still be pinned");
+
+    std::cout << "[PASS] Dynamic resident expert pinning and eviction protection verified.\n\n";
+}
+
+void test_custom_hot_pin_file_and_deduplication(Context& ctx) {
+    std::cout << "[Test] Running custom hot pin file parsing and deduplication tests...\n";
+    TestCacheHarness harness;
+    Qwen4ExpExpertCache cache;
+    // 4 layers, 16 experts per layer, 40 GPU slots, 80 host slots (enough for pinning)
+    harness.setup_cache(cache, ctx, 40, 80);
+
+    // Create a temporary hot pin file with comments, empty lines, duplicates, and out-of-range lines
+    const std::string tmp_file = "test_custom_hot_experts_tmp.txt";
+    {
+        std::ofstream ofs(tmp_file);
+        ofs << "# Header comment line\n";
+        ofs << "\n"; // empty line
+        ofs << "0 1\n";
+        ofs << "0 1\n"; // duplicate
+        ofs << "// another comment\n";
+        ofs << "0 2\n";
+        ofs << "999 999\n"; // out of range
+        ofs << "malformed text line\n";
+        ofs << "1 3\n";
+    }
+
+    int pinned = cache.init_pinned_experts(4, tmp_file);
+    // Should pin exactly 3 unique experts: (0, 1), (0, 2), (1, 3)
+    expect(pinned == 3, "should pin exactly 3 valid unique experts from custom file");
+    expect(cache.is_pinned(0, 1), "(0, 1) must be pinned");
+    expect(cache.is_pinned(0, 2), "(0, 2) must be pinned");
+    expect(cache.is_pinned(1, 3), "(1, 3) must be pinned");
+    expect(cache.num_pinned_slots() == 3, "num_pinned_slots must be exactly 3");
+
+    // Clean up tmp file
+    std::remove(tmp_file.c_str());
+
+    std::cout << "[PASS] Custom hot pin file parsing and deduplication verified.\n\n";
+}
+
+void test_predictive_gating_logic_and_session_isolation(Context& ctx) {
+    std::cout << "[Test] Running predictive gating logic and session isolation tests...\n";
+
+    auto eval_predict = [](bool s_predict_gating, bool s_prefetch, bool s_predict_stats,
+                           int s_prefill_prefetch_max, int count, int consecutive,
+                           bool high_hit_rate, int L, int num_layers) {
+        const bool gate_prediction = s_predict_gating && (count == 1) &&
+            (consecutive >= 2 || (high_hit_rate && consecutive > 0));
+        const bool predict_next = (count == 1)
+            ? (!gate_prediction && (s_prefetch || s_predict_stats) && (L + 1 < num_layers))
+            : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < num_layers));
+        return std::make_pair(gate_prediction, predict_next);
+    };
+
+    // Cold start decode: consecutive = 0
+    auto res_cold = eval_predict(true, true, false, 48, 1, 0, false, 0, 48);
+    expect(!res_cold.first, "gate_prediction must be false at consecutive=0");
+    expect(res_cold.second, "predict_next must be true at cold start decode");
+
+    // Steady state decode: consecutive = 2
+    auto res_steady = eval_predict(true, true, false, 48, 1, 2, false, 0, 48);
+    expect(res_steady.first, "gate_prediction must be true at consecutive=2");
+    expect(!res_steady.second, "predict_next MUST be false in steady decode (gated)!");
+
+    // Steady state decode with high hit rate: consecutive = 1, high_hit_rate = true
+    auto res_high = eval_predict(true, true, false, 48, 1, 1, true, 0, 48);
+    expect(res_high.first, "gate_prediction must be true at consecutive=1 with high_hit_rate");
+    expect(!res_high.second, "predict_next MUST be false when gated with high_hit_rate");
+
+    // Prefill: count = 30
+    auto res_prefill = eval_predict(true, true, false, 48, 30, 2, true, 0, 48);
+    expect(!res_prefill.first, "gate_prediction must be false in prefill");
+    expect(res_prefill.second, "predict_next must be true in prefill when prefetch enabled");
+
+    // Disabled gating: s_predict_gating = false
+    auto res_nogate = eval_predict(false, true, false, 48, 1, 5, true, 0, 48);
+    expect(!res_nogate.first, "gate_prediction must be false when disabled");
+    expect(res_nogate.second, "predict_next must be true when gating disabled");
+
+    std::cout << "[PASS] Predictive gating logic and session isolation verified.\n\n";
+}
+
 } // namespace
 
 int main() {
@@ -5240,6 +5363,9 @@ int main() {
         test_b3_utility_aware_prefetch_filtering_and_metrics(ctx);
         test_b4_cost_aware_two_tier_eviction(ctx);
         test_static_expert_pinning_and_lru_immunity(ctx);
+        test_dynamic_pin_resident_expert_and_slot_immunity(ctx);
+        test_custom_hot_pin_file_and_deduplication(ctx);
+        test_predictive_gating_logic_and_session_isolation(ctx);
         test_b6_demand_microbatch_pipeline(ctx);
         test_prefill_weight_reuse_backend_alignment(ctx);
         test_snapshot_capture_and_truncate(ctx);

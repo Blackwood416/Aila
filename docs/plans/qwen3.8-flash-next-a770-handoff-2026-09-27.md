@@ -37,12 +37,13 @@
 - **金标双轨防御**: 默认状态下严格回退至分段 Prefill，保持 100% 官方黄金基线对齐；显式启用加速模式时消除两段 Prefill 的重复层遍历与 LM head 计算，单次 Prefill 耗时缩减超 300 ms。
 
 ### 1.6 Phase G4：MoE Router 动态推测退避与 Shared Expert 融合
-- **Predictive GEMV Gating**: 运行时实时监控缓存命中状态，在连续未发生 Cache Miss（`consecutive_no_miss_layers_ >= 2`）或命中率稳定（>90% 且 `consecutive_no_miss_layers_ > 0`）的稳态下，动态跳过下一层预测 GEMV `[512, 2560]` 与 topk 计算；仅在冷启动或任一层发生 Miss 时重置计数并重新唤醒推测；单步消除 47 次无消费者 GEMV 与 123 MB 显存带宽消耗；
+- **Predictive GEMV Gating**: 运行时实时监控会话缓存命中状态，在连续未发生 Cache Miss（`session.consecutive_no_miss_layers_ >= 2`）或命中率稳定（>90% 且 `session.consecutive_no_miss_layers_ > 0`）的稳态下，动态跳过下一层预测 GEMV `[512, 2560]` 与 topk 计算；彻底修复了原先三元运算符分支导致的预测退避失效 Bug；仅在冷启动或任一层发生 Miss 时重置计数并重新唤醒推测；单步消除 47 次无消费者 GEMV 与 123 MB 显存带宽消耗，端到端 48 tokens 生成耗时从 14.8s 骤降至 **6.52s**；
 - **默认启用 Shared Expert 融合 (`AILA_Q4E_MOE_SHARED_FUSED=1`)**: 在 Routed Experts 累加核函数中直接融合就绪的 Shared Expert 输出按 Gate 缩放累加进张量 $y$，彻底消除独立的 `add_shared_expert_to_y` 内核发射开销。
 
 ### 1.7 Phase G5：高频核心专家先验常驻 Static Hot-Pinning 与冷启动消除
 - **先验核心热专家识别**: 基于多场景（故事、长文、代码、中文对话）真实端到端推理路由轨迹（统计超 12 万次激活），提取每层最核心的 18 个热专家（48 层共 864 个专家，占用 2,088.3 MB 显存）构建静态表 `kQwen4ExpDefaultHotExperts[48][18]`；
 - **常驻槽位与 LRU 绝对豁免**: 模型初始化加载期通过批处理 DMA 直接将核心专家注入 GPU 显存槽位 `0..863`，标记为 `slot_pinned_ = true` 并从 LRU 淘汰链表中剥离；受害槽位筛选算法强制增加 `!slot_pinned_[s]` 绝对豁免过滤，确保常驻专家永不被淘汰；
+- **槽位失效与健壮性加固**: 彻底解决动态常驻专家时的旧映射残留（陈旧槽位键失效与 `layer_expert_to_slot_` 清理）、已常驻专家计数丢失与槽位冲突，并为自定义热专家文件引入容错行解析与自动去重；
 - **安全容量自适应**: 严格保障保留至少 `num_experts_per_layer + 16` 个动态槽位给动态 LRU 轮转（A770 16GB 上动态槽位达 2,850 个）；小容量单元测试下自动安全跳过，零副作用。
 
 ---
@@ -53,9 +54,9 @@
 
 1. **编译构建**: `pwsh -NoProfile -File build.ps1 -BuildDir build-refactor` **0 错误、0 警告**。
 2. **全量关键 CTest 单元测试**:
-   - `ctest --test-dir build-refactor --output-on-failure`: **62/62 100% Passed** (耗时 448.37 秒，零错误零崩溃)；
+   - `ctest --test-dir build-refactor --output-on-failure`: **62/62 100% Passed** (耗时 419.25 秒，零错误零崩溃)；
    - `AilaQwen4ExpKernelTests`: 100% Passed (4-Token MoE 算子与 CPU 参考实现 0 mismatch)；
-   - `AilaQwen4ExpModuleTests`: 100% Passed (含新增静态 Pinning、LRU 豁免、白名单拦截机制与权重对齐)；
+   - `AilaQwen4ExpModuleTests`: 100% Passed (含静态/动态 Pinning、LRU 豁免、去重与容错文件解析、Predictive Gating 条件逻辑与会话隔离验证)；
    - `AilaQwen4ExpGenerationTests`: 100% Passed (26+4 skip-logits 与回滚 248,320 BF16 logits 100% 相同；Anchor 26/28 内部快照位级一致；两轮复用与编辑回滚 Token IDs 100% 吻合)；
    - `AilaBuildIdentityCMakeTests`: 100% Passed。
 3. **短上下文黄金基线端到端验证**:
@@ -64,7 +65,7 @@
      - 输出文本：
        `The horizon ignites with a soft, amber glow, piercing the lingering indigo of the pre-dawn sky. Gentle waves ripple beneath the emerging light, their crests catching the first golden rays like scattered diamonds. As the sun breaches the`
      - **48 tokens 与黄金基线保持 100% 比特精确对齐**。
-     - **稳态性能**: 864 个核心专家常驻，初始命中率高达 85.4%，稳态单步耗时稳定进入 79~89 ms 区间，DMA wait 压缩至 0.00 ms。
+     - **端到端实测性能**: 生成 48 tokens 耗时由 14,806 ms 缩减至 **6,520 ms**（单步稳定进入 80 ms 级别），DMA wait 维持 0.00 ms。
 
 ---
 

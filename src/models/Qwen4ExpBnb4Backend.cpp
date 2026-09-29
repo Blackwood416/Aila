@@ -915,8 +915,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         prefill_stats_t0 = Bnb4BitLinear::get_prefill_dispatch_stats();
     }
 
-    if (start_pos == 0) {
-        consecutive_no_miss_layers_ = 0;
+    if (count > 1 || start_pos == 0) {
+        session.consecutive_no_miss_layers_ = 0;
     }
 
     // 1. Embedding lookup + optional vision embedding override
@@ -1471,10 +1471,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const bool high_hit_rate = (cur_cache_stats.hit_count + cur_cache_stats.miss_count > 100) &&
                                    (cur_cache_stats.hit_rate() >= 0.90);
         const bool gate_prediction = s_predict_gating && (count == 1) &&
-            (consecutive_no_miss_layers_ >= 2 || (high_hit_rate && consecutive_no_miss_layers_ > 0));
+            (session.consecutive_no_miss_layers_ >= 2 || (high_hit_rate && session.consecutive_no_miss_layers_ > 0));
 
-        const bool predict_next = !gate_prediction && (count == 1)
-            ? ((s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
+        const bool predict_next = (count == 1)
+            ? (!gate_prediction && (s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
             : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers));
         sycl::event prediction_event{};
         if (predict_next) {
@@ -2152,9 +2152,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         const uint64_t misses_after_moe = expert_cache_.stats().miss_count;
         if (misses_after_moe > cur_cache_stats.miss_count) {
-            consecutive_no_miss_layers_ = 0;
+            session.consecutive_no_miss_layers_ = 0;
         } else {
-            consecutive_no_miss_layers_++;
+            session.consecutive_no_miss_layers_++;
         }
 
         if (!s_fuse_shared) {
@@ -2439,14 +2439,14 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
         if (entry.length > target) entry.length = -1;
     }
     session.currentLength_ = target;
-    consecutive_no_miss_layers_ = 0;
+    session.consecutive_no_miss_layers_ = 0;
     return target;
 }
 
 void Qwen4ExpBnb4Backend::Reset(Session& session) {
     ValidateSession(session);
     session.context_->synchronize();
-    consecutive_no_miss_layers_ = 0;
+    session.consecutive_no_miss_layers_ = 0;
     for (auto& snapshot : session.snapshots_) snapshot.length = -1;
     for (size_t i = 0; i < layers_.size(); ++i) {
         auto& cache = session.layerCaches_[i];

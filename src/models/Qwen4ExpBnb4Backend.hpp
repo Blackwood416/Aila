@@ -174,6 +174,7 @@ public:
         }
         std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
         int& current_length_for_testing() { return currentLength_; }
+        int consecutive_no_miss_layers() const { return consecutive_no_miss_layers_; }
 
     private:
         friend class Qwen4ExpBnb4Backend;
@@ -186,6 +187,7 @@ public:
         int currentLength_ = 0;
         int capacity_ = 0;
         uint64_t generation_ = 1;
+        int consecutive_no_miss_layers_ = 0;
 
         std::vector<Qwen4ExpLayerCache> layerCaches_;
         Qwen4ExpPleState ple_state_;
@@ -353,8 +355,6 @@ private:
     int* pred_host_ids_ = nullptr;
     float* pred_host_weights_ = nullptr;
     uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
-    // Phase G4: MoE Router predictive GEMV gating tracking
-    int consecutive_no_miss_layers_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
 };
