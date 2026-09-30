@@ -3,6 +3,7 @@
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
 #include "models/Qwen4ExpExpertReader.hpp"
+#include "models/Qwen4ExpCacheTrace.hpp"
 #include "ops/MoeExpertOps.hpp"
 #include "utils/SafeTensors.hpp"
 
@@ -252,6 +253,11 @@ public:
     // one listed is evicted first. Non-resident experts are ignored.
     void demote(int layer, const int* expert_ids, int count);
 
+    // Explicit forward boundaries: acquire count is not a Prefill/decode marker.
+    void trace_forward(int position, int tokens, bool begin, bool need_logits);
+    void trace_host_interval(const char* name, int layer, int64_t begin_ns, int64_t end_ns);
+    bool tracing() const { return static_cast<bool>(cache_trace_); }
+
     // Device slot descriptors for kernel launches
     ops::MoeExpertSlotDev get_slot_dev(int slot_id) const {
         if (faulted_) throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned; reinitialize before use");
@@ -482,6 +488,10 @@ private:
     bool initialized_ = false;
     bool faulted_ = false;
     bool cost_aware_eviction_ = true;
+    std::unique_ptr<Qwen4ExpCacheTrace> cache_trace_;
+    uint64_t trace_forward_id_ = 0;
+    uint64_t trace_acquire_id_ = 0;
+    void trace_acquire_end(const ExpertCacheStats& before, int64_t begin_ns);
 
     // Host fill parallelism (AILA_Q4E_FILL_THREADS / AILA_Q4E_FILL_PARTS)
     // Hot Host RAM Pool (pinned USM host memory allocated in 1 GB chunks)

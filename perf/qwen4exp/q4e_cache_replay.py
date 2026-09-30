@@ -1,0 +1,266 @@
+"""Validate schema-1 cache traces, then compare GPU-only admission hypotheses.
+
+The observed replay checks the *actual* eight-candidate host-ready decisions,
+batch reservations and demotes. Counterfactual policies deliberately make no
+host-cache/I/O/time predictions: different GPU misses change prefetch and host
+replacement. Their byte counts are hypotheses for a subsequent real canary.
+Legacy binary traces cannot supply this evidence; use q4e_execution_probe.ps1.
+"""
+import argparse
+from collections import OrderedDict, defaultdict
+from collections import deque
+import heapq
+import hashlib
+import json
+from pathlib import Path
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def read_trace(path):
+    rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    require(rows and rows[0].get("schema") == 1, "Missing schema-1 config")
+    require(sum(r["type"] == "config" for r in rows) == 1, "Multiple cache instances")
+    return rows
+
+
+def validate(rows):
+    cfg = rows[0]
+    cap, experts = cfg["slots"], cfg["experts"]
+    # Oldest first. Runtime starts with slots [0..cap-1], MRU first.
+    lru = OrderedDict((s, None) for s in reversed(range(cap)))
+    resident, slots = {}, [-1] * cap
+    forward, acquire, reserved = None, None, set()
+    totals = []
+    for r in rows[1:]:
+        kind = r["type"]
+        if kind == "forward_begin":
+            require(forward is None and acquire is None, "Unclosed forward")
+            forward = dict(r, hits=0, misses=0, bytes=0, host_hits=0, file_fills=0,
+                           acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={})
+        elif kind == "acquire_begin":
+            require(forward is not None and acquire is None, "Acquire outside forward")
+            require(not r["pinned"], "Pinned traces require a pin event schema")
+            require(r["forward"] == forward["forward"], "Wrong forward id")
+            acquire = r
+            keys = [r["layer"] * experts + e for e in r["ids"]]
+            require(len(keys) == len(r["initial_slots"]) == len(r["host_states"]), "Invalid arrays")
+            require(all(0 <= e < experts for e in r["ids"]), "Invalid expert")
+            require([resident.get(k, -1) for k in keys] == r["initial_slots"], "Resident map mismatch")
+            acquire["expected_hits"] = sum(s >= 0 for s in r["initial_slots"])
+            acquire["expected_misses"] = len({k for k in keys if k not in resident})
+            acquire["victims"] = 0
+            reserved = set()
+            # All hits are touched/reserved before any miss gets a slot.
+            for s in r["initial_slots"]:
+                if s >= 0 and s not in reserved:
+                    reserved.add(s)
+                    lru.move_to_end(s)
+        elif kind == "victim":
+            require(acquire and r["acquire"] == acquire["acquire"], "Orphan victim")
+            eligible = [s for s in lru if s not in reserved]
+            c, backed = r["candidates"], r["backed"]
+            require(c == eligible[:len(c)] and len(c) <= 8 and len(c) == len(backed), "LRU candidate window mismatch")
+            if cfg["cost_aware"] and cfg["host_slots"]:
+                require(bool(c), "Missing cost-aware observations")
+                chosen = c[0]
+                for i, s in enumerate(c):
+                    if slots[s] < 0 or backed[i]:
+                        chosen = s
+                        require(i == len(c) - 1, "Observed search continued after match")
+                        break
+                else:
+                    require(len(c) == min(8, len(eligible)), "Short candidate window")
+            else:
+                require(not c, "Unexpected cost-aware candidates")
+                chosen = eligible[0]
+            require(r["slot"] == chosen and r["old_key"] == slots[chosen], "Victim mismatch")
+            require(r["key"] in {acquire["layer"] * experts + e for e in acquire["ids"]}, "Unrequested binding")
+            require(r["key"] not in resident, "Duplicate binding")
+            if slots[chosen] >= 0:
+                del resident[slots[chosen]]
+            slots[chosen] = r["key"]
+            resident[r["key"]] = chosen
+            reserved.add(chosen)
+            lru.move_to_end(chosen)
+            acquire["victims"] += 1
+        elif kind == "acquire_end":
+            require(acquire and r["acquire"] == acquire["acquire"], "Orphan end")
+            require(r["hits"] == acquire["expected_hits"], "Hit mismatch")
+            require(r["misses"] == acquire["expected_misses"] == acquire["victims"], "Miss mismatch")
+            require(r["bytes"] == r["misses"] * cfg["slot_bytes"], "Payload mismatch")
+            layer = forward["layers"].setdefault(acquire["layer"], defaultdict(int))
+            for field in ("hits", "misses", "bytes", "host_hits", "file_fills", "fill_ns", "prefetch_wait_ns"):
+                forward[field] += r[field]
+                layer[field] += r[field]
+            forward["acquire_ns"] += r["ns"] - r["begin_ns"]
+            layer["acquire_ns"] += r["ns"] - r["begin_ns"]
+            acquire, reserved = None, set()
+        elif kind == "demote":
+            require(acquire is None, "Demote inside acquire")
+            for e in r["ids"]:
+                s = resident.get(r["layer"] * experts + e)
+                if s is not None:
+                    lru.move_to_end(s, last=False)
+        elif kind == "forward_end":
+            require(forward and r["forward"] == forward["forward"] and acquire is None, "Wrong forward end")
+            forward["host_span_ns"] = r["ns"] - forward["ns"]
+            totals.append(forward)
+            forward = None
+        elif kind == "host":
+            require(forward and r["forward"] == forward["forward"], "Orphan host interval")
+        else:
+            raise ValueError(f"Unknown event {kind}")
+    require(forward is None and acquire is None and totals, "Truncated trace")
+    return totals
+
+
+def simulate(rows, protected_fraction=0):
+    """SLRU: resident re-use promotes, demote cannot eject a protected key.
+
+    Capacity stays fixed, no static per-layer allotment, all hits are reserved
+    before misses. A large batch may overflow the probationary area and safely
+    evict the oldest unreserved protected entry. No host cost preference.
+    """
+    cap, experts = rows[0]["slots"], rows[0]["experts"]
+    protected_cap = int(cap * protected_fraction)
+    lru = OrderedDict((s, None) for s in reversed(range(cap)))
+    protected, resident = OrderedDict(), {}
+    slots = [-1] * cap
+    output = []
+    current = None
+    for r in rows[1:]:
+        if r["type"] == "forward_begin":
+            current = dict(forward=r["forward"], position=r["position"], tokens=r["tokens"], hits=0, misses=0)
+        elif r["type"] == "acquire_begin":
+            keys = [r["layer"] * experts + e for e in r["ids"]]
+            batch = set(keys)
+            require(len(batch) <= cap, "Batch exceeds capacity")
+            # Match runtime hit accounting for duplicates; miss accounting is unique.
+            current["hits"] += sum(k in resident for k in keys)
+            reserved = {resident[k] for k in keys if k in resident}
+            for k in dict.fromkeys(keys):
+                if k in resident:
+                    s = resident[k]
+                    lru.move_to_end(s)
+                    if protected_cap:
+                        protected[s] = None
+                        protected.move_to_end(s)
+                        if len(protected) > protected_cap:
+                            protected.popitem(last=False)
+            for k in dict.fromkeys(keys):
+                if k in resident:
+                    continue
+                victim = next((v for v in lru if v not in reserved and v not in protected), None)
+                if victim is None:
+                    victim = next(v for v in lru if v not in reserved)
+                if slots[victim] >= 0:
+                    del resident[slots[victim]]
+                protected.pop(victim, None)
+                slots[victim] = k
+                resident[k] = victim
+                reserved.add(victim)
+                lru.move_to_end(victim)
+                current["misses"] += 1
+        elif r["type"] == "demote":
+            for e in r["ids"]:
+                k = r["layer"] * experts + e
+                s = resident.get(k)
+                if s is not None and s not in protected:
+                    lru.move_to_end(s, last=False)
+        elif r["type"] == "forward_end":
+            current["bytes"] = current["misses"] * rows[0]["slot_bytes"]
+            output.append(current)
+    return output
+
+
+def report(path):
+    rows = read_trace(path)
+    observed = validate(rows)
+    return {
+        "schema": 1, "trace": str(path), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        "config": rows[0], "validation": "all observed hits, victims, demotes and bytes matched",
+        "observed": observed,
+        "counterfactual_scope": "GPU byte counts only; no host cache, prefetch, DMA fence or timing prediction",
+        "lru_demote_no_cost": simulate(rows),
+        "slru75_demote_no_cost": simulate(rows, .75),
+        "offline_farthest_next_use": offline_reference(rows),
+    }
+
+
+def offline_reference(rows):
+    """Uniform-slot farthest-next-use reference with whole-batch reservations.
+
+    Uses future route knowledge. This is a GPU transfer lower-bound reference,
+    not an online policy or a prediction of feasible host I/O latency.
+    """
+    cap, experts = rows[0]["slots"], rows[0]["experts"]
+    future = defaultdict(deque)
+    batches = []
+    for r in rows:
+        if r["type"] == "acquire_begin":
+            batch = [r["layer"] * experts + e for e in r["ids"]]
+            for key in set(batch):
+                future[key].append(len(batches))
+            batches.append(batch)
+    resident, heap, output = {}, [], []
+    pos = 0
+    current = None
+    for r in rows[1:]:
+        if r["type"] == "forward_begin":
+            current = dict(forward=r["forward"], position=r["position"], tokens=r["tokens"], hits=0, misses=0)
+        elif r["type"] == "acquire_begin":
+            batch = batches[pos]
+            reserved = set(batch)
+            require(len(reserved) <= cap, "Batch exceeds capacity")
+            current["hits"] += sum(k in resident for k in batch)
+            for k in dict.fromkeys(batch):
+                require(future[k].popleft() == pos, "Future-use indexing error")
+                if k in resident:
+                    resident[k] = future[k][0] if future[k] else len(batches)
+                    heapq.heappush(heap, (-resident[k], k))
+            for k in dict.fromkeys(batch):
+                if k in resident:
+                    continue
+                if len(resident) == cap:
+                    skipped = []
+                    while heap:
+                        nxt, victim = heapq.heappop(heap)
+                        if resident.get(victim) != -nxt:
+                            continue
+                        if victim in reserved:
+                            skipped.append((nxt, victim))
+                            continue
+                        del resident[victim]
+                        break
+                    else:
+                        raise ValueError("No offline reference victim")
+                    for item in skipped:
+                        heapq.heappush(heap, item)
+                resident[k] = future[k][0] if future[k] else len(batches)
+                heapq.heappush(heap, (-resident[k], k))
+                current["misses"] += 1
+            pos += 1
+        elif r["type"] == "forward_end":
+            current["bytes"] = current["misses"] * rows[0]["slot_bytes"]
+            output.append(current)
+    return output
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("trace")
+    ap.add_argument("--output", required=True)
+    args = ap.parse_args()
+    result = report(args.trace)
+    Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
+    for label in ("observed", "lru_demote_no_cost", "slru75_demote_no_cost", "offline_farthest_next_use"):
+        groups = defaultdict(lambda: [0, 0, 0])
+        for row in result[label]:
+            key = f"prefill{row['tokens']}" if row["tokens"] > 1 else "decode"
+            for i, field in enumerate(("hits", "misses", "bytes")):
+                groups[key][i] += row[field]
+        print(label, dict(groups))

@@ -1,4 +1,8 @@
-"""Replays Qwen3.8-Flash-Next expert-acquire traces under several eviction policies.
+"""Legacy binary-trace exploration; not a replay of the current runtime.
+
+For explicit forward phases, demote, eight-candidate cost-aware decisions and
+observed hit/byte validation, use q4e_cache_replay.py with AILA_Q4E_CACHE_TRACE.
+The legacy format cannot model current asynchronous host readiness or fences.
 
 Record a trace with AILA_DEBUG_Q4E_ROUTE_TRACE=<file.bin> (int32 records
 {layer, count, ids[count]}, one per Qwen4ExpExpertCache::acquire call), then:
@@ -6,8 +10,8 @@ Record a trace with AILA_DEBUG_Q4E_ROUTE_TRACE=<file.bin> (int32 records
     python perf/qwen4exp/q4e_cache_sim.py tmp/route_essay.bin tmp/route_code.bin --cap 3463
 
 Every call's experts must be resident at once (they may not evict each other), as in
-acquire(). Hit rates are reported over decode calls (count == top_k) only. LRU matches the
-production cache (validated: 72.7% simulated vs 72.9% measured on a 400-token essay).
+acquire(). Here count == top_k is only a legacy decode heuristic. An old 400-token
+essay matched LRU at 72.7% vs 72.9%; that is not current-policy validation.
 """
 import argparse
 import heapq

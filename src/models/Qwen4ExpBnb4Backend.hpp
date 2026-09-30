@@ -180,6 +180,7 @@ public:
 
     private:
         friend class Qwen4ExpBnb4Backend;
+        friend struct Qwen4ExpMtpProbe;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
                 std::size_t maxSnapshots);
@@ -305,6 +306,7 @@ private:
     StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
+    friend struct Qwen4ExpMtpProbe;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void free_pinned_host_buffers();
     sycl::event RunGroupedExperts(Context& ctx, int layer, int count,

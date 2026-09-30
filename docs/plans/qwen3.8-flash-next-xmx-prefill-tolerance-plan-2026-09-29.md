@@ -1,5 +1,17 @@
 # Qwen3.8-Flash-Next：以容差为契约的 XMX Prefill 优化方案
 
+最新 [Strata 源码设计对照](qwen3.8-flash-next-strata-design-review-2026-09-30.md) 给出新的 GPU-only 候选：MTP 历史补齐仅计算 K/V、保存 GDN 输入后只提交接受前缀的递推状态、复用 Prefill 临时区并统一 chunk/cache 预算。先做 KV-only 的有界实验，再依据小窗口成本与代表性接受率决定后续；Strata 的 CUDA/CPU 混合吞吐不能外推到 A770/NF4。本次仅完成源码审阅和预算计算，未实施这些候选。
+
+此前 [P4 MTP 探索](qwen3.8-flash-next-p4-mtp-results-2026-09-30.md) 已完成真实 GPU draft、512/64 专家槽取舍和有界 device checkpoint 恢复重放检查。短样本连续命中不足，重复长样本验证成本过高；乐观条件成本模型约 11–13 tok/s，尚不支持生产 MTP 接入。CPU 数值参考的 softmax 敏感性与未通过门槛已保留，接受前缀提交未实现，默认不变。
+
+此前 [P4 HC 融合结果](qwen3.8-flash-next-p4-hc-results-2026-09-30.md)：新增默认关闭的 2–4 行 HC 融合，512 输入四行验证由相邻控制的 199.95 ms/块降至 189.19 ms，独立复测 189.64 ms。算子与默认单行回归通过；仍有整模型数值差异，未默认启用。后续 MTP 探索见上文；20 tok/s 生成尚未实现。
+
+X2–X4 之后，面向 Prefill 100+ tok/s / decode 20 tok/s 的执行模型审计、冷暖缓存诊断和下一阶段优先级见 [执行模型审计](qwen3.8-flash-next-execution-model-audit-2026-09-29.md)。候选的实际实施状态以随后各阶段结果为准，decode 目标尚未达到。
+
+顺序推进记录见 [P0–P2 首轮结果](qwen3.8-flash-next-p0-p2-results-2026-09-29.md)：已补 trace/时间线，拒绝首版保护区候选；现有 B6 在固定长输入上缩短约 7.5%，默认仍不变。
+
+后续 [P2/P3 结果](qwen3.8-flash-next-p2-supply-p3-front-results-2026-09-29.md) 已在 512/1024 暖输入验证 100+ tok/s 并拒绝固定 front graph。[P3/P4 继续结果](qwen3.8-flash-next-p3-decode-p4-verify-results-2026-09-29.md) 补齐 128 步固定续写与 2/4 行验证，新增默认关闭的小批量 NF4 投影；四行验证约 184 ms（短输入）/200 ms（512 输入），尚未计入 MTP draft/回滚，decode 20 tok/s 仍未达到。
+
 实施进度（2026-09-29 更新）：X0/X1 已完成；X2 已完成有界验收并默认启用初始文本 `30/26` 形状，通用锚点保留 opt-in。快照、KV、非零起点和 256-token 回退检查见 [X2 结果](qwen3.8-flash-next-x2-results-2026-09-29.md)。长文 RAM 问题已将 Windows 专家 reader 默认改为 ReadFile。X3 已完成 histogram、grouped XMX 首版及短/256-token/B6 验证；首版性能和长文数值未满足默认准入，所有桶保留 ALU 默认，详见 [X3 结果](qwen3.8-flash-next-x3-results-2026-09-29.md)。X4 已完成 T16 chunked GDN 数学原型、DG2 FP32/XMX 映射和状态验收；GPU FP32 候选算子快约 28%–31%、模型 prefill 快约 1.2%，因长文 logits 差异较大仍保留 opt-in，详见 [X4 结果](qwen3.8-flash-next-x4-results-2026-09-29.md)。以下为原始设计依据，旧默认值描述应结合最新结果阅读。
 
 日期：2026-09-29。勘察基线：`6091a42976c0863b96200314e92b0ffd5034d47d`，开始勘察时工作区干净。

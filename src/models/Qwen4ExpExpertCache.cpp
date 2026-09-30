@@ -348,6 +348,10 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     slots_dev_ = std::move(other.slots_dev_);
     gpu_slot_records_ = std::move(other.gpu_slot_records_);
     stats_ = other.stats_;
+    cost_aware_eviction_ = other.cost_aware_eviction_;
+    cache_trace_ = std::move(other.cache_trace_);
+    trace_forward_id_ = other.trace_forward_id_;
+    trace_acquire_id_ = other.trace_acquire_id_;
     initialized_ = other.initialized_;
     faulted_ = other.faulted_;
     fill_pool_ = std::move(other.fill_pool_);
@@ -411,6 +415,8 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
 }
 
 void Qwen4ExpExpertCache::cleanup() {
+    cache_trace_.reset();
+    trace_forward_id_ = trace_acquire_id_ = 0;
     try {
         cancel_prefetch();
     } catch (...) {}
@@ -826,7 +832,55 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
                   compact_nested_ ? 1 : 0, fill_threads, fill_parts_, reader_->name());
 
     initialized_ = true;
+    const auto trace_path = aila::env::read_string("AILA_Q4E_CACHE_TRACE", "");
+    if (!trace_path.empty()) {
+        cache_trace_ = std::make_unique<Qwen4ExpCacheTrace>(trace_path);
+        cache_trace_->Row("config") << ",\"schema\":1,\"slots\":" << num_slots_
+            << ",\"slot_bytes\":" << slot_bytes_ << ",\"layers\":" << num_layers_
+            << ",\"experts\":" << num_experts_per_layer_ << ",\"host_slots\":" << num_host_slots_
+            << ",\"cost_aware\":" << cost_aware_eviction_;
+        cache_trace_->End();
+        cache_trace_->Flush();
+    }
     return true;
+}
+
+void Qwen4ExpExpertCache::trace_forward(int position, int tokens, bool begin, bool need_logits) {
+    if (!cache_trace_) return;
+    if (begin) ++trace_forward_id_;
+    cache_trace_->Row(begin ? "forward_begin" : "forward_end")
+        << ",\"forward\":" << trace_forward_id_ << ",\"position\":" << position
+        << ",\"tokens\":" << tokens << ",\"logits\":" << need_logits
+        << ",\"prefetch_issued_bytes\":" << stats_.prefetch_issued_bytes
+        << ",\"prefetch_useful_bytes\":" << stats_.prefetch_useful_bytes
+        << ",\"prefetch_cancelled_bytes\":" << stats_.prefetch_cancelled_bytes
+        << ",\"prefetch_wasted_bytes\":" << stats_.prefetch_wasted_bytes;
+    cache_trace_->End();
+    if (!begin) cache_trace_->Flush();
+}
+
+void Qwen4ExpExpertCache::trace_host_interval(const char* name, int layer, int64_t begin_ns, int64_t end_ns) {
+    if (!cache_trace_) return;
+    cache_trace_->Row("host") << ",\"forward\":" << trace_forward_id_
+        << ",\"name\":\"" << name << "\",\"layer\":" << layer
+        << ",\"begin_ns\":" << begin_ns << ",\"end_ns\":" << end_ns;
+    cache_trace_->End();
+}
+
+void Qwen4ExpExpertCache::trace_acquire_end(const ExpertCacheStats& before, int64_t begin_ns) {
+    if (!cache_trace_) return;
+    cache_trace_->Row("acquire_end") << ",\"acquire\":" << trace_acquire_id_
+        << ",\"begin_ns\":" << begin_ns
+        << ",\"hits\":" << stats_.hit_count - before.hit_count
+        << ",\"misses\":" << stats_.miss_count - before.miss_count
+        << ",\"bytes\":" << stats_.total_transferred_bytes - before.total_transferred_bytes
+        << ",\"host_hits\":" << stats_.host_pool_hits - before.host_pool_hits
+        << ",\"file_fills\":" << stats_.host_pool_misses - before.host_pool_misses
+        << ",\"fill_ns\":" << stats_.fill_ns - before.fill_ns
+        << ",\"prefetch_wait_ns\":" << stats_.prefetch_wait_ns - before.prefetch_wait_ns
+        << ",\"prefetch_used\":" << stats_.prefetch_used - before.prefetch_used
+        << ",\"prefetch_cancelled_bytes\":" << stats_.prefetch_cancelled_bytes - before.prefetch_cancelled_bytes;
+    cache_trace_->End();
 }
 
 void Qwen4ExpExpertCache::set_layer_expert_ref(int layer,
@@ -1219,6 +1273,34 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         throw std::runtime_error("Qwen4ExpExpertCache: unique expert demand exceeds GPU slot capacity");
     }
     ++stats_.demand_microbatches;
+    const int64_t trace_begin_ns = cache_trace_ ? Qwen4ExpCacheTrace::NowNs() : 0;
+    const ExpertCacheStats trace_stats0 = cache_trace_ ? stats_ : ExpertCacheStats{};
+    if (cache_trace_) {
+        auto& out = cache_trace_->Row("acquire_begin");
+        out << ",\"acquire\":" << ++trace_acquire_id_ << ",\"forward\":" << trace_forward_id_
+            << ",\"layer\":" << layer << ",\"ids\":";
+        Qwen4ExpCacheTrace::Ints(out, expert_ids, count);
+        out << ",\"initial_slots\":[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out << ',';
+            out << layer_expert_to_slot_[expert_flat_index(layer, expert_ids[i])];
+        }
+        out << "],\"host_states\":[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out << ',';
+            const int h = host_pool_enabled_ ? host_layer_expert_to_slot_[expert_flat_index(layer, expert_ids[i])] : -1;
+            out << (h < 0 ? 0 : static_cast<int>(host_slot_state_[h].load(std::memory_order_acquire)));
+        }
+        out << "],\"gpu_states\":[";
+        for (int i = 0; i < count; ++i) {
+            if (i) out << ',';
+            const int s = layer_expert_to_slot_[expert_flat_index(layer, expert_ids[i])];
+            // Copying is the recorded state, not a claim that DMA is still active.
+            out << (s < 0 ? 0 : static_cast<int>(gpu_slot_records_[s].state));
+        }
+        out << "],\"pinned\":" << num_pinned_slots_;
+        cache_trace_->End();
+    }
     // AILA_DEBUG_Q4E_ROUTE_TRACE: append int32 {layer, count, ids[count]} per call, for offline
     // replacement-policy simulation (perf/qwen4exp/q4e_cache_sim.py).
     static FILE* s_trace = [] {
@@ -1323,6 +1405,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             slot_reserved_[s] = false;
         }
         batch_reserved_slots_scratch_.clear();
+        trace_acquire_end(trace_stats0, trace_begin_ns);
         return hit_dma_pending ? copy_q_->ext_oneapi_submit_barrier() : sycl::event{};
     }
 
@@ -1344,6 +1427,9 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
         // prefer evicting an expert that is already cached in Host RAM
         // (lower replacement cost: H2D copy only, vs disk mmap read + CPU repack + H2D).
         int victim_slot = -1;
+        int trace_candidates[8] = {};
+        int trace_backed[8] = {};
+        int trace_candidates_count = 0;
         if (cost_aware_eviction_ && host_pool_enabled_) {
             constexpr int kMaxCandidates = 8;
             int candidates_checked = 0;
@@ -1354,6 +1440,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     if (fallback_victim < 0) fallback_victim = s;
                     ++candidates_checked;
                     uint64_t old_k = slot_to_key_[s];
+                    if (cache_trace_) trace_candidates[trace_candidates_count++] = s;
                     if (old_k == UINT64_MAX) {
                         victim_slot = s;
                         break;
@@ -1364,6 +1451,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                     int hslot = host_layer_expert_to_slot_[h_flat];
                     if (hslot >= 0 &&
                         host_slot_state_[hslot].load(std::memory_order_acquire) == static_cast<uint8_t>(ExpertSlotState::Ready)) {
+                        if (cache_trace_) trace_backed[trace_candidates_count - 1] = 1;
                         victim_slot = s;
                         break;
                     }
@@ -1388,6 +1476,18 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
             throw std::runtime_error("Qwen4ExpExpertCache: all slots reserved in batch, count exceeds num_slots");
         }
 
+        if (cache_trace_) {
+            const uint64_t old = slot_to_key_[victim_slot];
+            auto& out = cache_trace_->Row("victim");
+            out << ",\"acquire\":" << trace_acquire_id_ << ",\"slot\":" << victim_slot
+                << ",\"key\":" << flat_idx << ",\"old_key\":"
+                << (old == UINT64_MAX ? -1 : expert_flat_index(static_cast<int>(old >> 32), static_cast<int>(old & 0xffffffff)))
+                << ",\"candidates\":";
+            Qwen4ExpCacheTrace::Ints(out, trace_candidates, trace_candidates_count);
+            out << ",\"backed\":";
+            Qwen4ExpCacheTrace::Ints(out, trace_backed, trace_candidates_count);
+            cache_trace_->End();
+        }
         // B1: Consumer reader fence: protect GPU reader kernels from previous token before overwriting
         if (gpu_slot_records_[victim_slot].consumer_fence != sycl::event{}) {
             gpu_slot_records_[victim_slot].consumer_fence.wait_and_throw();
@@ -1713,6 +1813,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
     batch_reserved_slots_scratch_.clear();
     batch_reserved_hslots_scratch_.clear();
 
+    trace_acquire_end(trace_stats0, trace_begin_ns);
     return dma_done_event;
 }
 
@@ -1868,6 +1969,12 @@ void Qwen4ExpExpertCache::wait_copy() {
 
 void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
     if (!initialized_ || expert_ids == nullptr) return;
+    if (cache_trace_) {
+        auto& out = cache_trace_->Row("demote");
+        out << ",\"forward\":" << trace_forward_id_ << ",\"layer\":" << layer << ",\"ids\":";
+        Qwen4ExpCacheTrace::Ints(out, expert_ids, count);
+        cache_trace_->End();
+    }
     if (faulted_) {
         throw std::logic_error("Qwen4ExpExpertCache: cache is poisoned after a failed acquire; reinitialize before use");
     }

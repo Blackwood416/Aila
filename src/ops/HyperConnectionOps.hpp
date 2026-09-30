@@ -76,6 +76,16 @@ void hc_decode_up_mix(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
     bf16* x, int lowrank, int group_dim, int groups);
 
+// Contiguous batches of 1..4 rows, with shared raw row-major BF16 weights.
+// Each subgroup still computes one output; rows use independent work-groups.
+// Same intermediate BF16 rounding and FP32 reductions as the single-row path.
+void hc_decode_down_inject_rows(
+    Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows);
+void hc_decode_up_mix_rows(
+    Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
+    bf16* x, int lowrank, int group_dim, int groups, int rows);
+
 // PLE Gate-Value computation:
 // g[s] = sum_d (K[s, d] * Q[s, d]) / sqrt(hidden_size)
 // g = sign(g) * sqrt(max(|g|, 1e-6))

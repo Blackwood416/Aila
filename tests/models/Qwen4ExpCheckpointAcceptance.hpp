@@ -252,8 +252,10 @@ void test_checkpoint_acceptance(const std::string& directory) {
 
 void test_prefill_memory(const std::string& directory) {
     std::cout << std::unitbuf;
+    const int count = aila::env::read_int("AILA_Q4E_MEMORY_CANARY_TOKENS", 256);
+    expect(count == 256 || count == 512 || count == 1024, "Unsupported memory canary token count");
     InferenceEngine engine;
-    expect(engine.init(directory, 512), "Memory canary initialization failed");
+    expect(engine.init(directory, std::max(512, count)), "Memory canary initialization failed");
     auto& ctx = Access::Ctx(engine);
     auto& backend = Access::Backend(engine);
     auto& cache = Access::Cache(engine);
@@ -269,10 +271,14 @@ void test_prefill_memory(const std::string& directory) {
     };
     report("warmup");
     std::string text;
-    while (tokenizer.encode(text).size() < 256)
+    while (tokenizer.encode(text).size() < size_t(count))
         text += "The lighthouse overlooks the ocean. At sunrise the keeper watches the waves and writes in the logbook. ";
     const auto all = tokenizer.encode(text);
-    for (int count : {256, 256}) {
+    // Extra identical passes let the profiling harness retain a complete warm
+    // interval even when the collector loses trailing events at process exit.
+    const int repeats = std::clamp(aila::env::read_int("AILA_Q4E_MEMORY_CANARY_REPEATS", 2), 2, 8);
+    uint64_t expected_hash = 0;
+    for (int pass = 0; pass < repeats; ++pass) {
         engine.reset_context();
         const std::vector<int> ids(all.begin(), all.begin() + count);
         const auto start = std::chrono::steady_clock::now();
@@ -285,6 +291,8 @@ void test_prefill_memory(const std::string& directory) {
             const auto* bytes = reinterpret_cast<const uint8_t*>(&logits[i]);
             for (size_t b = 0; b < sizeof(float); ++b) { hash ^= bytes[b]; hash *= 1099511628211ULL; }
         }
+        if (pass == 0) expected_hash = hash;
+        else expect(hash == expected_hash, "Identical memory canary replay changed logits bits");
         std::cout << "[X2 MEMORY FORWARD] tokens=" << count << " ms="
                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()
                   << " logits_fnv64=" << hash << '\n';

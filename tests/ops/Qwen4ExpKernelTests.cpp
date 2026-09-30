@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -32,6 +33,7 @@ void check_close(const std::vector<bf16>& actual, const std::vector<float>& expe
     for (size_t i = 0; i < actual.size(); ++i) {
         float act = static_cast<float>(actual[i]);
         float exp = expected[i];
+        if (!std::isfinite(act) || !std::isfinite(exp)) throw std::runtime_error(name + " nonfinite");
         float diff = std::abs(act - exp);
         if (diff > max_diff) {
             max_diff = diff;
@@ -54,6 +56,7 @@ void check_close_f32(const std::vector<float>& actual, const std::vector<float>&
     }
     float max_diff = 0.0f;
     for (size_t i = 0; i < actual.size(); ++i) {
+        if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) throw std::runtime_error(name + " nonfinite");
         float diff = std::abs(actual[i] - expected[i]);
         if (diff > max_diff) {
             max_diff = diff;
@@ -434,6 +437,8 @@ void test_hc_decode_fused(Context& ctx, bool with_inject) {
         run_hc_decode_fused_case(ctx, 3, 31, 35, true);
     }
 }
+
+#include "Qwen4ExpHcRowsTests.hpp"
 
 void test_ple_gate_value(Context& ctx) {
     constexpr int rows = 2;
@@ -3780,19 +3785,29 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     aila::env::enable_l0_copy_engine();
     try {
         Context ctx;
         std::cout << "Starting Qwen4Exp Kernel Tests on device: "
                   << ctx.queue().get_device().get_info<sycl::info::device::name>() << "\n";
 
+        if (argc == 2 && std::string(argv[1]) == "--hc-only") {
+            test_hc_decode_fused(ctx,true); test_hc_decode_fused(ctx,false);
+            test_hc_rows_suite(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("HC test teardown USM leak");
+            std::cout << "HC-only tests PASSED; teardown USM zero\n";
+            return 0;
+        }
         test_grouped_rms_norm(ctx);
         test_hc_mix_reduce(ctx);
         test_hc_inject_add(ctx);
         test_hc_inject_add_and_grouped_rms_norm(ctx);
         test_hc_decode_fused(ctx, true);
         test_hc_decode_fused(ctx, false);
+        test_hc_rows_suite(ctx);
         test_ple_gate_value(ctx);
         test_ple_dilated_conv_silu_add(ctx);
         test_ple_dilated_conv_silu_add_residual(ctx);

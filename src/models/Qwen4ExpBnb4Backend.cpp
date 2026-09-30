@@ -959,6 +959,17 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     const int lowrank = cfg_.hc_lowrank;
 
     static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
+    static const bool s_small_rows_hc = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_HC", false);
+    if (s_small_rows_hc && s_fused_hc && count >= 2 && count <= 4 &&
+        hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
+        ops::hc_decode_down_inject_rows(ctx, buf_.hc_N.data_as<bf16>(),
+            hc.mix_down_w->data_as<bf16>(), with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
+            buf_.hc_mix_down.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(),
+            lowrank, hidden_size_, 4, count);
+        ops::hc_decode_up_mix_rows(ctx, buf_.hc_mix_down.data_as<bf16>(), hc.mix_up_w->data_as<bf16>(),
+            buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(), lowrank, hidden_size_, 4, count);
+        return;
+    }
     if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
         ops::hc_decode_down_inject(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
                                    hc.mix_down_w->data_as<bf16>(),
@@ -1120,6 +1131,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (top_k > kMaxTopK) {
         throw std::runtime_error("Qwen4ExpBnb4Backend: num_experts_per_tok exceeds 16");
     }
+    // Experimental tiny-prefill/verification route. Keep it opt-in until full
+    // model numerics and state semantics are accepted for each supported shape.
+    static const bool s_small_rows_decode = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_DECODE", false);
+    const bool small_rows_decode = s_small_rows_decode && count >= 2 && count <= 4;
+    auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& input, Tensor& output) {
+        if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, input, output, count);
+        else projection.forward(ctx, linear_scratch_, input, output, count);
+    };
     static const std::string s_dump_dir = aila::env::read_string("AILA_DEBUG_Q4E_DUMP_DIR", "");
     static const bool s_profile = aila::env::read_flag("AILA_PROFILE_Q4E_DECODE", false);
     using prof_clock = std::chrono::steady_clock;
@@ -1127,6 +1146,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
     const auto prof_t0 = prof_clock::now();
+    expert_cache_.trace_forward(start_pos, count, true, options.need_logits);
+    static const bool s_trace_markers = aila::env::read_flag("AILA_Q4E_TRACE_MARKERS", false);
+    if (expert_cache_.tracing() && s_trace_markers)
+        ctx.queue().single_task<class Q4ETraceForwardBegin>([] {});
     double prof_router_sync_ms = 0.0;
     double prof_acquire_ms = 0.0;
     const ExpertCacheStats prof_stats0 = expert_cache_.stats();
@@ -1211,7 +1234,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
                 layer.linear_o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, buf_.y, 1);
             } else {
-                layer.linear_all_proj.forward(ctx, linear_scratch_, buf_.x, buf_.linear_all, count);
+                project_prefill(layer.linear_all_proj, buf_.x, buf_.linear_all);
                 const auto run_range = [&](int offset, int length) {
                     const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
                     bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
@@ -1237,7 +1260,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 } else {
                     run_range(0, count);
                 }
-                layer.linear_o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                project_prefill(layer.linear_o_proj, buf_.attn_out, buf_.y);
             }
             cache.linear_conv_head = d_state.conv_head;
             cache.device_state_dirty = d_state.device_state_dirty;
@@ -1380,7 +1403,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     }
                 }
 
-                layer.qkv_proj.forward(ctx, linear_scratch_, buf_.x, buf_.full_qkv, count);
+                project_prefill(layer.qkv_proj, buf_.x, buf_.full_qkv);
                 ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
                                 full_q_heads_, full_kv_heads_, full_head_dim_);
 
@@ -1526,7 +1549,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                 buf_.indexer_active_tokens.data_as<int>(), attention_active_tokens);
                         }
                     }
-                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                    project_prefill(layer.o_proj, buf_.attn_out, buf_.y);
                 } else {
                     if (has_qsa_indexer) {
                         // Short chunks stay on the existing batched dense prefill path;
@@ -1556,7 +1579,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     } else {
                         ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
                     }
-                    layer.o_proj.forward(ctx, linear_scratch_, buf_.attn_out, buf_.y, count);
+                    project_prefill(layer.o_proj, buf_.attn_out, buf_.y);
                 }
             }
         }
@@ -1626,10 +1649,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
             layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, 1);
         } else {
-            layer.shared_gate_up_proj.forward(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, count);
+            project_prefill(layer.shared_gate_up_proj, buf_.x, buf_.shared_gate_up_buf);
             ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
                                            static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
-            layer.shared_down_proj.forward(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
+            project_prefill(layer.shared_down_proj, buf_.shared_inter_buf, buf_.shared_out_buf);
         }
 
         auto ensure_prediction_ready = [&]() {
@@ -1646,6 +1669,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
         actual_route_event.wait_and_throw();
         const auto prof_router_t1 = prof_clock::now();
+        if (expert_cache_.tracing()) {
+            expert_cache_.trace_host_interval("router_wait", L,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_router_t0.time_since_epoch()).count(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_router_t1.time_since_epoch()).count());
+        }
         if (have_pred && s_predict_stats && count == 1) {
             for (int k = 0; k < top_k; ++k) {
                 const int e = router_host_ids_[k];
@@ -2330,6 +2358,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         ensure_prediction_ready();
         stage(kStageExperts);
+        if (expert_cache_.tracing()) {
+            expert_cache_.trace_host_interval("expert_acquire_submit", L,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_acq_batch_t0.time_since_epoch()).count(),
+                Qwen4ExpCacheTrace::NowNs());
+        }
 
         const uint64_t misses_after_moe = expert_cache_.stats().miss_count;
         if (misses_after_moe > cur_cache_stats.miss_count) {
@@ -2410,6 +2443,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
     }
     session.currentLength_ = cached_len;
+    if (expert_cache_.tracing() && s_trace_markers)
+        ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
+    expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
 
     if (expert_histogram_enabled_ && count > 1) {
         for (int b = 0; b < 6; ++b) {

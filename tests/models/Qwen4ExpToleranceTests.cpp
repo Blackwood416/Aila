@@ -1,9 +1,12 @@
 #include "engine/Engine.hpp"
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -24,6 +27,45 @@ static constexpr float kTestQuantMap[16] = {
 };
 
 struct Qwen4ExpGenerationTestAccess {
+    static Tensor& MtpTargetPrompt(InferenceEngine& e,const int* ids,int count) {
+        return Backend(e).ForwardImpl(Ctx(e),Session(e),ids,count,true,{SnapshotPolicy::None,true});
+    }
+    static Tensor& Logits(Qwen4ExpBnb4Backend& b) { return b.buf_.logits; }
+    static ModelWeights& Weights(InferenceEngine& e) { return *e.weights_; }
+    static Tensor& VerifyRows(InferenceEngine& e, const int* ids, int count) {
+        auto& b = Backend(e);
+        return b.ForwardImpl(Ctx(e), Session(e), ids, count, false, {SnapshotPolicy::None, true});
+    }
+    static void ReserveVerifyLogits(InferenceEngine& e, int rows) {
+        auto& b = Backend(e);
+        if (b.buf_.logits.shape(0) < rows)
+            b.buf_.logits = Tensor::allocate(Ctx(e), {rows, b.cfg_.vocab_size}, dnnl::memory::data_type::bf16);
+    }
+    static const ops::DeltaNetGeometry& FrontGeometry(Qwen4ExpBnb4Backend& b) { return b.layers_.at(0).geom; }
+    static Tensor& FrontHidden(Qwen4ExpBnb4Backend& b) { return b.buf_.hidden4; }
+    static Tensor& FrontX(Qwen4ExpBnb4Backend& b) { return b.buf_.x; }
+    static Tensor& FrontScores(Qwen4ExpBnb4Backend& b) { return b.buf_.router_scores; }
+    static Tensor& FrontInject(Qwen4ExpBnb4Backend& b) { return b.buf_.hc_inject_f32; }
+    static const int* FrontIds(Qwen4ExpBnb4Backend& b) { return b.router_host_ids_; }
+    static const float* FrontWeights(Qwen4ExpBnb4Backend& b) { return b.router_host_weights_; }
+    // Exact fixed-address layer-0 decode front, excluding PLE, expert acquire and MoE.
+    // The recurrent state belongs to the test, leaving session state untouched.
+    static void Front(Qwen4ExpBnb4Backend& b, ops::DeltaNetState& state) {
+        auto& ctx=*b.context_; auto& layer=b.layers_.at(0);
+        if (!layer.is_linear) throw std::runtime_error("Graph probe requires a linear layer 0");
+        b.RunHyperConnection(ctx,layer.attn_hc,1,true);
+        layer.linear_all_proj.ForwardDecodeRows(ctx,b.linear_scratch_,b.buf_.x,b.buf_.linear_all,1);
+        const auto* p=b.buf_.linear_all.data_as<bf16>();
+        ops::DeltaNetWeights weights{layer.linear_conv1d_weight->data_as<bf16>(),
+            layer.linear_norm_weight->data_as<float>(),layer.linear_A_log->data_as<float>(),layer.linear_dt_bias->data_as<bf16>()};
+        ops::run_linear_delta_decode_gpu(ctx,layer.geom,weights,state,p,p+b.linear_qkv_dim_,
+            p+b.linear_qkv_dim_+b.linear_z_dim_,p+b.linear_qkv_dim_+b.linear_z_dim_+b.linear_kv_heads_,b.buf_.attn_out.data_as<bf16>());
+        layer.linear_o_proj.ForwardDecodeRows(ctx,b.linear_scratch_,b.buf_.attn_out,b.buf_.y,1);
+        b.RunHyperConnectionCombined(ctx,layer.mlp_hc,1,true,b.buf_.y.data_as<bf16>(),b.buf_.hc_inject_f32.data_as<float>());
+        b.DenseLinear(ctx,layer.router_gate,layer.router_w,b.buf_.x,b.buf_.router_scores,1,b.cfg_.num_experts,b.hidden_size_);
+        ops::router_softmax_topk_device(ctx,b.buf_.router_scores.data_as<bf16>(),nullptr,
+            b.router_host_ids_,b.router_host_weights_,1,b.cfg_.num_experts,b.cfg_.num_experts_per_tok,true);
+    }
     static Context& Ctx(InferenceEngine& engine) { return *engine.ctx_; }
     static Qwen4ExpBnb4Backend& Backend(InferenceEngine& engine) {
         return dynamic_cast<Qwen4ExpBnb4Backend&>(*engine.backend_);
@@ -57,6 +99,8 @@ struct Qwen4ExpGenerationTestAccess {
     }
 };
 using Access = Qwen4ExpGenerationTestAccess;
+
+#include "Qwen4ExpMtpProbe.hpp"
 
 namespace {
 
@@ -501,6 +545,9 @@ void test_real_model_tolerance(const std::string& model_dir) {
 #include "Qwen4ExpCheckpointAcceptance.hpp"
 #include "Qwen4ExpGroupedXmxAcceptance.hpp"
 #include "Qwen4ExpGdnChunkAcceptance.hpp"
+#include "Qwen4ExpFrontGraphProbe.hpp"
+#include "Qwen4ExpDecodeProbe.hpp"
+#include "Qwen4ExpMtpAcceptance.hpp"
 
 } // namespace
 
@@ -539,6 +586,18 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--memory-model") {
             test_prefill_memory(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--front-graph-model") {
+            test_front_graph(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--decode-model") {
+            test_decode_probe(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--mtp-model") {
+            test_mtp_probe(argv[2]);
             return 0;
         }
         Context ctx;
