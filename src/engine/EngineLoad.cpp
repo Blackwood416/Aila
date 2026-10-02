@@ -12,7 +12,7 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
 
         // 1. Create context
         AILA_LOG_INFO("[1/3] Initializing GPU context...");
-        ctx_ = std::make_unique<Context>();
+        ctx_ = std::make_unique<Context>(nullptr,aila::env::read_flag("AILA_PROFILE_Q4E_COLD_DEVICE",false));
 
         // Detection models are self-contained and intentionally do not initialize
         // tokenizer, generation backend, KV cache, or token warmup state.
@@ -436,6 +436,8 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                       to_mb(ctx_->peak_allocated_bytes()));
 
         // 5. Warmup to amortize first-run JIT/primitive costs
+        auto* q4e_warmup_backend=dynamic_cast<Qwen4ExpBnb4Backend*>(backend_.get());
+        if(q4e_warmup_backend)q4e_warmup_backend->SetColdEpochEnabled(false);
         bool is_exact_q35_0p8b_spec =
             (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
             is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
@@ -667,6 +669,7 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
         }
 
         AILA_LOG_INFO("========================================");
+        if(q4e_warmup_backend)q4e_warmup_backend->SetColdEpochEnabled(true);
         AILA_LOG_INFO("  Engine ready!");
         AILA_LOG_INFO("========================================");
 

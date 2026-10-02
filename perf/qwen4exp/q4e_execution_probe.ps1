@@ -4,6 +4,19 @@ param(
     [switch]$RuntimeDefaults,
     [switch]$IntegerDeviceProfile,
     [ValidateSet(0,1,2)][int]$ResidentDecode=0,
+    [ValidateSet(0,1,2)][int]$ColdMode=0,
+    [switch]$ResidentPrefill,
+    [switch]$ColdBench,
+    [switch]$ColdQuality,
+    [switch]$ColdDiagnostic,
+    [switch]$ColdPipelineDiagnostic,
+    [switch]$ColdLowRank,
+    [switch]$ColdDeviceProfile,
+    [switch]$ReverseCold,
+    [ValidateSet(-1,0,1)][int]$ColdQualityH3=-1,
+    [ValidateRange(1,12)][int]$ColdThreads=4,
+    [ValidateRange(1,10)][int]$ColdCredits=2,
+    [ValidateRange(100,10000)][int]$ColdBudgetUs=1000,
     [string]$Executable="",
     [ValidateSet("causal","checkpoint")][string]$IntegerStatePart="causal",
     [ValidateSet(0,256,512,1024)][int]$CompactMoe=0,
@@ -57,6 +70,7 @@ $stack=Get-AilaOneApiStack -Config $cfg -Name "oneapi-2026.1"
 Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $stack)
 Get-ChildItem Env: | Where-Object { $_.Name -match "^(AILA_|ONEDNN_|DNNL_)" } | Remove-Item
 $prefix=Join-Path $repo "tmp/$Tag"
+if($ColdDeviceProfile) {$Trace=$true}
 $overrides=@{
     AILA_Q4E_CPU_EXPERT_DISPATCH="0"; AILA_Q4E_PREFILL_XMX="1"
     AILA_Q4E_EXPERT_READER="readfile"; AILA_PROFILE_Q4E_DECODE=$(if($Profile){"1"}else{"0"})
@@ -71,6 +85,17 @@ if($RuntimeDefaults) {
 if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$InlineCheckpoint}
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
 if($PSBoundParameters.ContainsKey('ResidentDecode')) {$overrides.AILA_Q4E_RESIDENT_DECODE=[string]$ResidentDecode}
+if($ColdMode -or $ColdBench -or $ColdQuality) {
+    $overrides.AILA_Q4E_COLD_MODE=[string]$(if($ColdMode){$ColdMode}else{1})
+    $overrides.AILA_Q4E_CPU_THREADS=[string]$ColdThreads
+    $overrides.AILA_Q4E_CPU_MAX_EXPERTS=[string]$ColdCredits
+    $overrides.AILA_Q4E_COLD_BUDGET_US=[string]$ColdBudgetUs
+}
+if($ResidentPrefill) {$overrides.AILA_Q4E_RESIDENT_PREFILL="1"}
+if($ColdLowRank) {$overrides.AILA_Q4E_COLD_LOW_RANK="1"}
+if($ColdDiagnostic) {$overrides.AILA_Q4E_COLD_DIAGNOSTIC="1"}
+if($ColdPipelineDiagnostic) {$overrides.AILA_Q4E_COLD_PIPELINE_DIAGNOSTIC="1"}
+if($ColdDeviceProfile) {$overrides.AILA_PROFILE_Q4E_COLD_DEVICE="1"}
 if($AttentionTile) {$overrides.AILA_Q4E_PREFILL_ATTN_TILE=[string]$AttentionTile}
 if($CompactMoe) {$overrides.AILA_Q4E_MOE_COMPACT_ACTS=[string]$CompactMoe}
 if($Trace) {$overrides.AILA_Q4E_CACHE_TRACE="$prefix.cache.jsonl"}
@@ -125,6 +150,16 @@ if($Workload -eq "resident") {
     $overrides.AILA_Q4E_RESIDENT_PROMPT_FILE=$residentPrompt
     $overrides.AILA_Q4E_RESIDENT_DECODE="2"
     $inputIdentity=@{kind="resident_nf4_state_quality";prompt_sha256=(Get-FileHash $residentPrompt).Hash;source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpResidentAcceptance.hpp")).Hash}
+}
+if($ColdBench -or $ColdQuality) {
+    $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
+    $arguments=@($(if($ColdBench){"--cold-bench"}else{"--cold-model"}),$ModelDir)
+    $coldPrompt=if($GenerationPromptFile){(Resolve-Path -LiteralPath $GenerationPromptFile).Path}else{Join-Path $PSScriptRoot "prompts/story.json"}
+    $overrides.AILA_Q4E_RESIDENT_PROMPT_FILE=$coldPrompt
+    $overrides.AILA_Q4E_COLD_BENCH_H3=[string][int][bool]$ResidentPrefill
+    $overrides.AILA_Q4E_COLD_BENCH_REVERSE=[string][int][bool]$ReverseCold
+    $overrides.AILA_Q4E_COLD_TEST_H3=[string]$ColdQualityH3
+    $inputIdentity=@{kind=$(if($ColdBench){"frozen_cold_generation"}else{"frozen_cold_quality"});prompt_sha256=(Get-FileHash $coldPrompt).Hash;source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpColdAcceptance.hpp")).Hash}
 }
 if($Workload -eq "window") {
     $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
@@ -251,7 +286,7 @@ if($SmallRowsDecode) {$overrides.AILA_Q4E_SMALL_ROWS_DECODE="1"}
 if($SmallRowsHc) {$overrides.AILA_Q4E_SMALL_ROWS_HC="1"}
 if($Stages) {$overrides.AILA_PROFILE_Q4E_DECODE="1"; $overrides.AILA_PROFILE_Q4E_STAGES="1"}
 foreach($key in $overrides.Keys) {Set-Item "env:$key" $overrides[$key]}
-if($PerformancePreset) {
+if($PerformancePreset -and !$ColdBench -and !$ColdQuality) {
     if($Workload -notin @("story","generation")) {throw "CLI preset requires story or generation"}
     $arguments+=@("--performance-preset",$PerformancePreset)
 }
@@ -266,6 +301,8 @@ $meta=[ordered]@{
     diagnostic_only=[bool]($Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
 }
 $launcher=$exe
+if($ColdQuality) {$meta.diagnostic_only=$true;$meta.workload="cold_quality"}
+if($ColdBench) {$meta.workload="cold_bench"}
 if($Vtune -or $VtuneInstructions) {
     $launcher="C:/Program Files (x86)/Intel/oneAPI/vtune/latest/bin64/vtune.exe"
     $collection=if($VtuneInstructions){@("-collect","gpu-hotspots","-knob","characterization-mode=instruction-count")}else{@("-collect","xpu-offload")}
@@ -308,5 +345,6 @@ $meta | ConvertTo-Json -Depth 8 | Set-Content "$prefix.meta.json"
 $samples | ConvertTo-Json -Depth 3 | Set-Content "$prefix.memory.json"
 Get-Content "$prefix.log" | Select-Object -Last 6
 Get-Content "$prefix.err.log" | Select-Object -Last 4
+if($meta.Contains('memory_pressure') -and $meta.memory_pressure) {throw "Execution probe stopped the process below the 8 GiB available RAM floor"}
 if($meta.watchdog_stop) {throw "Execution probe watchdog stopped the process"}
 exit $proc.ExitCode

@@ -37,9 +37,30 @@ def validate(rows):
     totals = []
     routed, acquired = {}, {}
     direct, leased = None, set()
+    frozen = set()
     for r in rows[1:]:
         kind = r["type"]
-        if kind == "forward_begin":
+        if kind == "freeze":
+            require(acquire is None and direct is None and not frozen, "Invalid freeze boundary")
+            require(len(set(r['slots'])) == len(r['slots']) and all(0 <= s < cap and slots[s] >= 0 for s in r['slots']), "Invalid frozen slots")
+            frozen = set(r['slots'])
+        elif kind == "thaw":
+            require(acquire is None and direct is None, "Thaw with active readers")
+            frozen.clear()
+        elif kind == "discard":
+            s = r['slot']
+            require(acquire is None and 0 <= s < cap and s not in frozen and s not in leased and slots[s] >= 0, "Invalid transient discard")
+            del resident[slots[s]]
+            slots[s] = -1
+        elif kind == "cold_cpu":
+            require(direct and acquire is None and direct['layer'] == r['layer'], "Orphan CPU cold batch")
+            require(len(r['ids']) == len(r['ranks']) and len(set(r['ranks'])) == len(r['ranks']), "Invalid CPU cold ranks")
+            for e,rank in zip(r['ids'],r['ranks']):
+                require(0 <= rank < len(direct['ids']) and direct['ids'][rank] == e and direct['direct_slots'][rank] < 0 and e in direct['cold_ids'], "CPU stole a hot/duplicate contribution")
+                direct['cold_ids'].remove(e)
+            acquired.setdefault(r['layer'], set()).update(r['ids'])
+            forward['cpu_tasks'] = forward.get('cpu_tasks',0) + len(r['ids'])
+        elif kind == "forward_begin":
             require(forward is None and acquire is None and direct is None, "Unclosed forward")
             forward = dict(r, hits=0, misses=0, bytes=0, host_hits=0, file_fills=0,
                            acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={},
@@ -62,7 +83,7 @@ def validate(rows):
             require(all(d == -1 or d == s >= 0 for d,s in zip(r["direct_slots"],r["initial_slots"])), "Invalid direct binding")
             cold = [e for e,d in zip(r["ids"],r["direct_slots"]) if d < 0]
             require(cold == r["cold_ids"], "Direct/cold partition mismatch")
-            direct = dict(r, cold_acquired=False)
+            direct = dict(r, cold_ids=list(r['cold_ids']), cold_acquired=False)
             leased = {s for s in r["direct_slots"] if s >= 0}
             for s in dict.fromkeys(r["initial_slots"]):
                 if s >= 0: lru.move_to_end(s)
@@ -102,7 +123,7 @@ def validate(rows):
                     if r.get("touch_hits",1): lru.move_to_end(s)
         elif kind == "victim":
             require(acquire and r["acquire"] == acquire["acquire"], "Orphan victim")
-            eligible = [s for s in lru if s not in reserved]
+            eligible = [s for s in lru if s not in reserved and s not in frozen]
             c, backed = r["candidates"], r["backed"]
             require(c == eligible[:len(c)] and len(c) <= 8 and len(c) == len(backed), "LRU candidate window mismatch")
             if cfg["cost_aware"] and cfg["host_slots"]:
@@ -155,6 +176,8 @@ def validate(rows):
             forward = None
         elif kind == "host":
             require(forward and r["forward"] == forward["forward"], "Orphan host interval")
+        elif kind == "device":
+            require(forward and r['forward']==forward['forward'] and r['clock']=='sycl_event' and r['end']>=r['start'], "Invalid device interval")
         else:
             raise ValueError(f"Unknown event {kind}")
     require(forward is None and acquire is None and direct is None and totals, "Truncated trace")

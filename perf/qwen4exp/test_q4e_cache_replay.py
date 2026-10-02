@@ -32,6 +32,23 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_frozen_cpu_and_transient_ownership(self):
+        rows=fixture()[:6]+[
+            dict(type="freeze",slots=[1]),
+            dict(type="direct_bind",forward=1,layer=0,ids=[0,2,3],initial_slots=[1,-1,-1],direct_slots=[1,-1,-1],cold_ids=[2,3]),
+            dict(type="cold_cpu",layer=0,ids=[2],ranks=[1]),
+            dict(type="acquire_begin",forward=1,acquire=2,layer=0,ids=[3],initial_slots=[-1],host_states=[0],pinned=0,touch_hits=0),
+            dict(type="victim",acquire=2,slot=0,key=3,old_key=1,candidates=[],backed=[]),
+            end(2,0,1),dict(type="discard",slot=0),
+            dict(type="direct_release",forward=1,layer=0),
+            dict(type="forward_end",forward=1,ns=100)]
+        actual=validate(copy.deepcopy(rows))[0]
+        self.assertEqual((actual['cpu_tasks'],actual['direct_entries'],actual['misses']),(1,1,3))
+        bad=copy.deepcopy(rows);bad[8].update(ids=[0],ranks=[0])
+        with self.assertRaisesRegex(ValueError,'CPU stole'):validate(bad)
+        bad=copy.deepcopy(rows);bad[12]['slot']=1
+        with self.assertRaisesRegex(ValueError,'Invalid transient discard'):validate(bad)
+
     def test_direct_binding_and_cold_only_acquire(self):
         rows=fixture()
         # Replace the second full acquire by a lease for ID 0 and cold ID 2.

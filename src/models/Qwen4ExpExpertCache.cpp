@@ -368,6 +368,11 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     other.num_pinned_slots_ = 0;
     slots_dev_ = std::move(other.slots_dev_);
     gpu_slot_records_ = std::move(other.gpu_slot_records_);
+    frozen_ = other.frozen_; other.frozen_ = false;
+    frozen_count_ = other.frozen_count_; other.frozen_count_ = 0;
+    frozen_slots_ = std::move(other.frozen_slots_);
+    frozen_descriptors_published_ = other.frozen_descriptors_published_;
+    frozen_indices_published_ = std::move(other.frozen_indices_published_);
     resident_descriptors_dev_ = std::move(other.resident_descriptors_dev_);
     resident_indices_dev_ = std::move(other.resident_indices_dev_);
     resident_descriptors_host_ = std::move(other.resident_descriptors_host_);
@@ -500,6 +505,8 @@ void Qwen4ExpExpertCache::cleanup() {
     slot_to_key_.clear();
     slot_reserved_.clear();
     slot_pinned_.clear();
+    frozen_slots_.clear(); frozen_ = false; frozen_count_ = 0;
+    frozen_indices_published_.clear(); frozen_descriptors_published_=false;
     num_pinned_slots_ = 0;
     slots_dev_.clear();
     gpu_slot_records_.clear();
@@ -766,6 +773,8 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     slot_to_key_.assign(num_slots_, UINT64_MAX);
     slot_reserved_.assign(num_slots_, false);
     slot_pinned_.assign(num_slots_, false);
+    frozen_slots_.assign(num_slots_, false);
+    frozen_indices_published_.assign(num_layers_,false);
     num_pinned_slots_ = 0;
     gpu_slot_records_.assign(num_slots_, GpuSlotRecord{});
 
@@ -1322,6 +1331,98 @@ GpuReadyLease Qwen4ExpExpertCache::BindReady(int layer, const int* ids, int coun
     return BindReadyImpl(layer, ids, count, nullptr);
 }
 
+bool Qwen4ExpExpertCache::IsDirectReady(int layer, int expert) const {
+    if (!is_initialized() || layer < 0 || layer >= num_layers_ || expert < 0 || expert >= num_experts_per_layer_) return false;
+    const int slot = layer_expert_to_slot_[expert_flat_index(layer, expert)];
+    return slot >= 0 && (!frozen_ || frozen_slots_[slot]) &&
+        ValidateReadyBinding(layer, expert, slot, gpu_slot_records_[slot].generation);
+}
+
+uint64_t Qwen4ExpExpertCache::FrozenIdentity() const {
+    uint64_t hash = 1469598103934665603ULL;
+    // Hash sorted logical keys, independent of physical slot placement.
+    for (int l = 0; l < num_layers_; ++l) for (int e = 0; e < num_experts_per_layer_; ++e) {
+        const int s = layer_expert_to_slot_[expert_flat_index(l,e)];
+        if (s >= 0 && frozen_slots_[s]) { hash ^= uint64_t(l) * num_experts_per_layer_ + e; hash *= 1099511628211ULL; }
+    }
+    return hash;
+}
+
+void Qwen4ExpExpertCache::FreezeReady(int staging_slots) {
+    if (!is_initialized() || staging_slots < 1 || staging_slots >= num_slots_ || num_pinned_slots_)
+        throw std::invalid_argument("Frozen residency requires transient capacity and no legacy pinning");
+    if (frozen_) return;
+    for (const auto& r : gpu_slot_records_) if (r.direct_leases)
+        throw std::logic_error("Cannot freeze with active direct readers");
+    ctx_->synchronize();
+    copy_q_->wait_and_throw();
+    frozen_count_ = 0;
+    // The original MRU order contains only previously observed demand.
+    for (int s : lru_list_) {
+        if (frozen_count_ >= num_slots_ - staging_slots) break;
+        if (slot_to_key_[s] != UINT64_MAX && get_slot_state(s) == ExpertSlotState::Ready) {
+            frozen_slots_[s] = true; ++frozen_count_;
+        }
+    }
+    frozen_ = true;
+    if(cache_trace_) {
+        auto& out=cache_trace_->Row("freeze");out<<",\"slots\":[";
+        bool first=true;for(int s=0;s<num_slots_;++s)if(frozen_slots_[s]){if(!first)out<<',';out<<s;first=false;}
+        out<<']';cache_trace_->End();
+    }
+    frozen_descriptors_published_=false;
+    std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
+    for (int s = 0; s < num_slots_; ++s) if (!frozen_slots_[s]) DiscardTransient(&s,1);
+    AILA_LOG_INFO("[Q4E Frozen] slots=%d staging=%d identity=%llu", frozen_count_, num_slots_-frozen_count_,
+        static_cast<unsigned long long>(FrozenIdentity()));
+}
+
+void Qwen4ExpExpertCache::ThawReady() {
+    if (!frozen_) return;
+    for (const auto& r : gpu_slot_records_) if (r.direct_leases)
+        throw std::logic_error("Cannot thaw with active direct readers");
+    ctx_->synchronize(); copy_q_->wait_and_throw();
+    std::fill(frozen_slots_.begin(), frozen_slots_.end(), false);
+    frozen_ = false; frozen_count_ = 0;
+    if(cache_trace_){cache_trace_->Row("thaw");cache_trace_->End();}
+}
+
+void Qwen4ExpExpertCache::DiscardTransient(const int* slots, int count) {
+    if (!frozen_) return;
+    for (int i=0;i<count;++i) {
+        const int s=slots[i];
+        if (s<0 || s>=num_slots_) throw std::invalid_argument("Invalid transient slot");
+        if (frozen_slots_[s]) continue;
+        auto& record=gpu_slot_records_[s];
+        if (record.direct_leases) throw std::logic_error("Cannot discard a leased slot");
+        const auto key=slot_to_key_[s];
+        if(cache_trace_ && key!=UINT64_MAX) {
+            cache_trace_->Row("discard")<<",\"slot\":"<<s;cache_trace_->End();
+        }
+        if (key!=UINT64_MAX) layer_expert_to_slot_[expert_flat_index(int(key>>32),int(uint32_t(key)))]=-1;
+        slot_to_key_[s]=UINT64_MAX; record.key=UINT64_MAX; ++record.generation;
+        // Keep DMA and consumer fences: next reuse still waits for submitted readers.
+        record.state=ExpertSlotState::Empty;
+    }
+}
+
+void Qwen4ExpExpertCache::TraceColdCpu(int layer,const int* ids,const int* ranks,int count) {
+    stats_.cpu_cold_entries+=count;
+    if(!cache_trace_ || !count)return;
+    auto& out=cache_trace_->Row("cold_cpu");out<<",\"layer\":"<<layer<<",\"ids\":";
+    Qwen4ExpCacheTrace::Ints(out,ids,count);out<<",\"ranks\":";Qwen4ExpCacheTrace::Ints(out,ranks,count);cache_trace_->End();
+}
+
+void Qwen4ExpExpertCache::TraceDeviceEvent(const char* label,int layer,sycl::event event) {
+    if(!cache_trace_ || event==sycl::event{} || !ctx_->queue().has_property<sycl::property::queue::enable_profiling>())return;
+    event.wait_and_throw();
+    const auto start=event.get_profiling_info<sycl::info::event_profiling::command_start>();
+    const auto end=event.get_profiling_info<sycl::info::event_profiling::command_end>();
+    cache_trace_->Row("device")<<",\"forward\":"<<trace_forward_id_<<",\"layer\":"<<layer
+        <<",\"label\":\""<<label<<"\",\"clock\":\"sycl_event\",\"start\":"<<start<<",\"end\":"<<end;
+    cache_trace_->End();
+}
+
 GpuReadyLease Qwen4ExpExpertCache::BindReadyImpl(int layer, const int* ids, int count, const int* selected_slots) {
     if (!is_initialized() || !ids || count < 1 || count > GpuReadyLease::kMaxEntries ||
         layer < 0 || layer >= num_layers_)
@@ -1349,7 +1450,7 @@ GpuReadyLease Qwen4ExpExpertCache::BindReadyImpl(int layer, const int* ids, int 
             auto& record = gpu_slot_records_[slot];
             if (selected_slots && selected_slots[i] >= 0 && selected_slots[i] != slot)
                 throw std::logic_error("Device resident route changed identity");
-            if ((!selected_slots || selected_slots[i] == slot) &&
+            if ((!frozen_ || frozen_slots_[slot]) && (!selected_slots || selected_slots[i] == slot) &&
                 ValidateReadyBinding(layer, ids[i], slot, record.generation)) {
                 record.state = ExpertSlotState::Ready; // cache the completed-DMA observation, as acquire does
                 const int r = lease.ready_count++;
@@ -1415,6 +1516,7 @@ void Qwen4ExpExpertCache::EnableResidentDeviceTables() {
 void Qwen4ExpExpertCache::BeginResidentDeviceEpoch() {
     if (!resident_descriptors_dev_.valid() || !is_initialized())
         throw std::logic_error("Resident device tables not initialized");
+    if(frozen_ && frozen_descriptors_published_)return;
     // The previous forward's route waits already cover this upload. Retain the
     // explicit source-lifetime check for callers outside the normal backend.
     if (resident_descriptor_upload_ != sycl::event{}) resident_descriptor_upload_.wait_and_throw();
@@ -1423,6 +1525,7 @@ void Qwen4ExpExpertCache::BeginResidentDeviceEpoch() {
     const size_t bytes = size_t(num_slots_) * sizeof(ops::MoeExpertSlotDev);
     resident_descriptor_upload_ = ctx_->queue().memcpy(resident_descriptors_dev_.data(), resident_descriptors_host_.data(), bytes);
     stats_.resident_metadata_bytes += bytes;
+    if(frozen_)frozen_descriptors_published_=true;
 }
 
 GpuResidentLayerLease Qwen4ExpExpertCache::BeginResidentLayer(int layer) {
@@ -1435,7 +1538,7 @@ GpuResidentLayerLease Qwen4ExpExpertCache::BeginResidentLayer(int layer) {
     std::fill_n(indices, num_experts_per_layer_, -1);
     for (int e = 0; e < num_experts_per_layer_; ++e) {
         const int slot = layer_expert_to_slot_[expert_flat_index(layer, e)];
-        if (slot < 0 || !ValidateReadyBinding(layer, e, slot, resident_descriptor_generations_[slot])) continue;
+        if (slot < 0 || (frozen_ && !frozen_slots_[slot]) || !ValidateReadyBinding(layer, e, slot, resident_descriptor_generations_[slot])) continue;
         gpu_slot_records_[slot].state = ExpertSlotState::Ready;
         indices[e] = slot;
         lease.slots_[lease.count_] = slot;
@@ -1443,8 +1546,11 @@ GpuResidentLayerLease Qwen4ExpExpertCache::BeginResidentLayer(int layer) {
         ++gpu_slot_records_[slot].direct_leases;
     }
     const size_t bytes = size_t(num_experts_per_layer_) * sizeof(int);
-    resident_index_uploads_[layer] = ctx_->queue().memcpy(resident_indices_dev_.data_as<int>() + layer * num_experts_per_layer_, indices, bytes);
-    stats_.resident_metadata_bytes += bytes;
+    if(!frozen_ || !frozen_indices_published_[layer]) {
+        resident_index_uploads_[layer] = ctx_->queue().memcpy(resident_indices_dev_.data_as<int>() + layer * num_experts_per_layer_, indices, bytes);
+        stats_.resident_metadata_bytes += bytes;
+        if(frozen_)frozen_indices_published_[layer]=true;
+    }
     return lease;
 }
 
@@ -1522,6 +1628,15 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
     }
     if (unique_experts > num_slots_) {
         throw std::runtime_error("Qwen4ExpExpertCache: unique expert demand exceeds GPU slot capacity");
+    }
+    if(frozen_) {
+        int cold_unique=0;
+        for(int i=0;i<count;++i) {
+            if(std::find(expert_ids,expert_ids+i,expert_ids[i])!=expert_ids+i)continue;
+            const int s=layer_expert_to_slot_[expert_flat_index(layer,expert_ids[i])];
+            if(s<0 || !frozen_slots_[s])++cold_unique;
+        }
+        if(cold_unique>num_slots_-frozen_count_)throw std::runtime_error("Cold batch exceeds frozen staging capacity");
     }
     ++stats_.demand_microbatches;
     ++stats_.acquire_calls;
@@ -1670,7 +1785,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
             int fallback_victim = -1;
             for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend() && candidates_checked < kMaxCandidates; ++r_it) {
                 int s = *r_it;
-                if (!slot_reserved_[s] && !slot_pinned_[s] && !gpu_slot_records_[s].direct_leases) {
+                if (!slot_reserved_[s] && !slot_pinned_[s] && !frozen_slots_[s] && !gpu_slot_records_[s].direct_leases) {
                     if (fallback_victim < 0) fallback_victim = s;
                     ++candidates_checked;
                     uint64_t old_k = slot_to_key_[s];
@@ -1697,7 +1812,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         if (victim_slot < 0) {
             for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend(); ++r_it) {
                 int s = *r_it;
-                if (!slot_reserved_[s] && !slot_pinned_[s] && !gpu_slot_records_[s].direct_leases) {
+                if (!slot_reserved_[s] && !slot_pinned_[s] && !frozen_slots_[s] && !gpu_slot_records_[s].direct_leases) {
                     victim_slot = s;
                     break;
                 }
@@ -2321,6 +2436,7 @@ void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8
 }
 
 bool Qwen4ExpExpertCache::pin_expert(int layer, int expert_id) {
+    if (frozen_) throw std::logic_error("Legacy pinning cannot change a frozen epoch");
     if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ || expert_id < 0 || expert_id >= num_experts_per_layer_) return false;
     const int flat = expert_flat_index(layer, expert_id);
     if (layer_expert_to_slot_[flat] >= 0) {
@@ -2544,7 +2660,7 @@ int Qwen4ExpExpertCache::init_pinned_experts(int experts_per_layer, const std::s
 }
 
 void Qwen4ExpExpertCache::log_stats(int layer) const {
-    uint64_t total = stats_.hit_count + stats_.miss_count;
+    uint64_t total = stats_.hit_count + stats_.miss_count + stats_.cpu_cold_entries;
     double rate = total > 0 ? 100.0 * static_cast<double>(stats_.hit_count) / static_cast<double>(total) : 0.0;
     if (layer >= 0) {
         std::cout << "[Q4E MoE] layer=" << layer

@@ -300,6 +300,7 @@ public:
 
     const aila::HeteroExecutionStats& hetero_stats() const { return expert_executor_.stats(); }
     aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
+    void SetColdEpochEnabled(bool enabled) { cold_epoch_enabled_=enabled; }
 
 private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
@@ -357,8 +358,14 @@ private:
     Qwen4ExpExpertCache expert_cache_;
     aila::Qwen4ExpExpertExecutor expert_executor_;
     int resident_decode_mode_ = 0; // 0 legacy, 1 host Ready binding, 2 GPU resident selection
+    int cold_mode_ = 0; // 0 dynamic, 1 frozen + GPU cold, 2 frozen + bounded CPU cold
+    bool resident_prefill_ = false;
+    bool cold_epoch_enabled_ = true; // disabled explicitly during synthetic engine warmup
     Tensor resident_down_, resident_weights_, resident_route_ids_, resident_selected_;
     int* resident_selected_host_ = nullptr;
+    sycl::event resident_hot_reader_{};
+    void* resident_probe_data_ = nullptr;
+    void (*resident_probe_)(void*,Qwen4ExpBnb4Backend&,int) = nullptr;
     sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease = nullptr);
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0

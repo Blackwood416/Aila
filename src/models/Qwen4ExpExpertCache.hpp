@@ -124,7 +124,7 @@ class Qwen4ExpExpertCache;
 // The cache must outlive the lease and cannot be moved while it is leased.
 class GpuReadyLease {
 public:
-    static constexpr int kMaxEntries = 40;
+    static constexpr int kMaxEntries = 512; // full prefill unique-expert batch
     GpuReadyLease() = default;
     ~GpuReadyLease();
     GpuReadyLease(const GpuReadyLease&) = delete;
@@ -235,9 +235,10 @@ struct ExpertCacheStats {
     uint64_t direct_route_entries = 0;
     uint64_t direct_cold_acquire_ns = 0;
     uint64_t resident_metadata_bytes = 0;
+    uint64_t cpu_cold_entries = 0;
 
     double hit_rate() const {
-        uint64_t total = hit_count + miss_count;
+        uint64_t total = hit_count + miss_count + cpu_cold_entries;
         return total > 0 ? static_cast<double>(hit_count) / static_cast<double>(total) : 0.0;
     }
 
@@ -296,6 +297,17 @@ public:
     // supply only the cold subset. Preserves legacy hit accounting and LRU order.
     GpuReadyLease BindReady(int layer, const int* expert_ids, int count);
     sycl::event AcquireCold(const GpuReadyLease& lease, int* out_slots);
+    // C1: freeze only existing Ready weights; leave a bounded transient region.
+    // Boundaries drain readers, never change session/checkpoint state.
+    void FreezeReady(int staging_slots);
+    void ThawReady();
+    bool frozen() const { return frozen_; }
+    bool IsDirectReady(int layer, int expert) const;
+    uint64_t FrozenIdentity() const;
+    int frozen_slots() const { return frozen_count_; }
+    void DiscardTransient(const int* slots, int count);
+    void TraceColdCpu(int layer,const int* ids,const int* ranks,int count);
+    void TraceDeviceEvent(const char* label,int layer,sycl::event event);
     bool ValidateReadyBinding(int layer, int expert, int slot, uint64_t generation) const;
     // H2 forward-scoped descriptor snapshot, refreshed only at serialized
     // forward boundaries. Each layer publishes its still-valid Ready indices.
@@ -557,6 +569,11 @@ private:
     std::vector<ops::MoeExpertSlotDev> slots_dev_;
     std::vector<GpuSlotRecord> gpu_slot_records_;
     Tensor resident_descriptors_dev_, resident_indices_dev_;
+    bool frozen_ = false;
+    int frozen_count_ = 0;
+    std::vector<bool> frozen_slots_;
+    bool frozen_descriptors_published_ = false;
+    std::vector<bool> frozen_indices_published_;
     std::vector<ops::MoeExpertSlotDev> resident_descriptors_host_;
     std::vector<uint64_t> resident_descriptor_generations_;
     std::vector<int> resident_indices_host_;

@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：优先实现驻留专家直接执行与 hot expert set
 
+最新实施（2026-10-02）：已完成 [C1/H3 首轮实现与对照](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同冻结集合下，CPU cold 的短/长 decode 中位数为7.57→7.86、7.45→7.63 tok/s；但原动态路径为13.90/8.75，固定集合仍损害 decode 命中。H3 减少 acquire，却没有稳定净收益。代表性短/长48步质量、checkpoint/取消恢复、6项CTest、7项Python测试和普通trace回放通过；GPU profiling 因系统RAM突增触发保护，设备时间未取得。所有候选继续默认关闭，32 GiB预算不变。**下一步 H4/C2：热集来源、跨域覆盖和有界 epoch/admission；R2b继续暂停。** 下文保留各阶段历史记录。
+
 实施更新（2026-10-02）：已保存此前工作为5ea0171，并完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。Ready租约与cold-only acquire分离、GPU device route/descriptor查表及提前热提交已实现；短/长输入48步logits、checkpoint回放逐位一致，6项CTest及真实trace回放通过。但当前短decode为原路径14.0、H1 12.6、H2 13.1 tok/s，长decode为8.95、8.4、8.75 tok/s，尚无稳定端到端净收益，默认仍为0。此版本没有固定热名单或CPU冷计算。**下一步继续C1的同热集、冻结admission对照，R2b继续暂停。** 以下保留原始规划与勘察记录。
 
 日期：2026-10-02。基线为 `66e21e9` 加当前未提交工作；R0、R1b、R2b 的最新结果以各自报告为准。本轮只做源码勘察、既有 trace 计数和热表静态覆盖分析，没有构建或运行 GPU 测试，没有修改运行时代码。

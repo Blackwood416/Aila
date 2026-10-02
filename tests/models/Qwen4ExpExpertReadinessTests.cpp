@@ -1075,6 +1075,41 @@ void test_direct_ready_lease(Context& ctx) {
     std::cout << "[Hotset H2 PASS] device_select=1 mailbox_exact=1 masked_hot=1 cold_merge=1 epoch_generation=1 rank_exact=1 cancellation_drain=1\n";
 }
 
+void test_frozen_transient(Context& ctx) {
+    SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    expect(cache.init(ctx,weights,2,4*bytes,8,256,64,64,&error,true),error);
+    for(int l=0;l<2;++l)cache.set_layer_expert_ref(l,synth.gu_ref,synth.dn_ref);
+    int initial[2]={0,1},slots[4];cache.acquire(0,initial,2,slots).wait_and_throw();
+    cache.FreezeReady(2);const auto identity=cache.FrozenIdentity();
+    expect(cache.frozen_slots()==2,"Frozen resident count");
+    cache.EnableResidentDeviceTables();cache.BeginResidentDeviceEpoch();
+    {auto epoch=cache.BeginResidentLayer(0);}
+    const auto metadata=cache.stats().resident_metadata_bytes;
+    cache.BeginResidentDeviceEpoch();{auto epoch=cache.BeginResidentLayer(0);}
+    expect(cache.stats().resident_metadata_bytes==metadata,"Immutable frozen tables were republished");
+    for(int repeat=0;repeat<3;++repeat) {
+        int route[3]={0,2,3};auto binding=cache.BindReady(0,route,3);
+        expect(binding.ready_count==1 && binding.cold_count==2,"Cold staging became a direct hit");
+        cache.AcquireCold(binding,slots).wait_and_throw();
+        const auto generation=cache.get_slot_generation(slots[0]);
+        // A pending real payload reader must survive immediate logical invalidation.
+        auto scratch=Tensor::allocate(ctx,{32},dnnl::memory::data_type::u8);
+        auto source=cache.get_slot_dev(slots[0]).gate_up_packed;
+        auto reader=ctx.queue().memcpy(scratch.data(),source,32);
+        cache.record_consumer_reader_fences(slots,2,reader);cache.DiscardTransient(slots,2);
+        expect(!cache.contains(0,2) && !cache.ValidateReadyBinding(0,2,slots[0],generation),"Transient remained admitted");
+        binding.Finish(reader);reader.wait_and_throw();
+        expect(cache.FrozenIdentity()==identity && cache.IsDirectReady(0,1),"Cold fill evicted frozen hot weights");
+    }
+    int too_many[3]={4,5,6};bool rejected=false;
+    try{cache.acquire(0,too_many,3,slots);}catch(const std::runtime_error&){rejected=true;}
+    expect(rejected && !cache.is_faulted() && cache.FrozenIdentity()==identity,"Oversized staging mutated frozen cache");
+    cache.ThawReady();cache.acquire(1,too_many,3,slots).wait_and_throw();
+    expect(!cache.frozen(),"Thaw failed");
+    std::cout<<"[C1 CACHE PASS] frozen_identity=1 transient_no_admission=1 reader_fence=1 capacity_reject=1 thaw=1\n";
+}
+
 } // namespace
 
 int main() {
@@ -1098,6 +1133,7 @@ int main() {
         test_h2b_multi_token_and_large_task_dispatch(ctx);
         test_active_gpu_experts_greater_than_16(ctx);
         test_direct_ready_lease(ctx);
+        test_frozen_transient(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

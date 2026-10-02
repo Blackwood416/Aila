@@ -83,6 +83,7 @@ struct HeteroExecutionStats {
     uint64_t cpu_result_copies = 0;
     uint64_t cpu_result_bytes = 0;
     uint64_t cpu_result_submit_ns = 0;
+    uint64_t cold_eligible = 0, cold_budget_rejected = 0, cold_queue_ns = 0;
 
     void reset() {
         *this = HeteroExecutionStats{};
@@ -154,6 +155,12 @@ public:
     bool cpu_work_complete_for_testing() const;
     const HeteroExecutionStats& stats() const { return stats_; }
     void reset_stats() { stats_.reset(); }
+    // C1 single-row cold service. Start removes only successfully leased CPU
+    // entries from the cold subset; caller submits remaining GPU work before Join.
+    int StartResidentCold(GpuReadyLease& route, const bf16* x_dev);
+    void StageResidentInput(const bf16* x_dev);
+    sycl::event JoinResidentCold(float* rank_output);
+    void AbortResidentCold() noexcept;
 
     int max_cpu_credits() const { return max_cpu_credits_; }
     void set_max_cpu_credits(int credits) { max_cpu_credits_ = std::clamp(credits, 0, ops::cpu::kMaxExpertBatchTasks); }
@@ -219,6 +226,12 @@ private:
     std::vector<int> pending_experts_buf_;
     std::vector<int> assigned_slots_buf_;
     sycl::event prev_cpu_h2d_ev_{};
+    sycl::event resident_input_event_{};
+    std::array<int, 16> cold_ranks_{}, cold_ids_{};
+    std::array<double, 17> cold_cost_ns_{};
+    int cold_count_ = 0, cold_layer_ = -1;
+    uint64_t cold_submit_ns_ = 0;
+    double cold_budget_ns_ = 1000000.0;
 };
 
 } // namespace aila

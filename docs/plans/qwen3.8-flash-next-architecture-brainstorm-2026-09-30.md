@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：执行架构、量化计算与数据供给的下一轮设计
 
+2026-10-02 最新进展：[C1/H3 首轮完成](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同热集 CPU cold 有小幅 decode 收益，固定集合却明显损害 decode 命中；H3 的 acquire 减少尚无稳定净收益。短/长质量、状态和回归通过，保留额外续写的NLL预警、吞吐异常及profiling内存失败。候选默认关闭，下一步 H4/C2 的 profile/epoch/admission，R2b继续暂停。
+
 2026-10-02 按 [hotset新优先级规划](qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md) 暂停R2b后续实施，先完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。正确性与状态检查通过；当前GPU-only候选短decode由14.0降至12.6/13.1 tok/s，长decode由8.95降至8.4/8.75 tok/s，未默认开启。下一步是新架构下C1冷专家CPU/GPU分工的同热集对照；不再沿用本文件早期对该方向的低优先级安排。
 
 **2026-10-02 优先级修订：先完成 [驻留专家直接执行、hot expert set 与 CPU 冷专家新分工](qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md)。** Strata 的关键设计包含 profile 预装、设备 residency table 和绕过主机供给的命中计算；旧 G5 pinning/SLRU 负例不足以否定它。先拆分 resident binding 与 cold acquire，再做 GPU hit selection，并重启同一热集下的 CPU/GPU 冷计算对照。保留 R2b 已有成果，其进一步生产集成与数值细化后移。附带 Strata 热表在既有 Aila 路由上覆盖不足，不能直接照搬名单。本文件下面保留各阶段历史结果，后续实施顺序以新计划为准；第 11 节关于 CPU 路线的旧排序也由新计划替代。
