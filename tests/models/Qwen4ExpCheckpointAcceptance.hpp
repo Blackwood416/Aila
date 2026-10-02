@@ -253,9 +253,11 @@ void test_checkpoint_acceptance(const std::string& directory) {
 void test_prefill_memory(const std::string& directory) {
     std::cout << std::unitbuf;
     const int count = aila::env::read_int("AILA_Q4E_MEMORY_CANARY_TOKENS", 256);
-    expect(count == 256 || count == 512 || count == 1024, "Unsupported memory canary token count");
+    const int tailCount = aila::env::read_int_raw("AILA_Q4E_MEMORY_CANARY_TAIL", 0);
+    expect(count == 256 || count == 512 || count == 1024 || count == 2052, "Unsupported memory canary token count");
+    expect(tailCount == 0 || tailCount == 8, "Unsupported memory canary tail");
     InferenceEngine engine;
-    expect(engine.init(directory, std::max(512, count)), "Memory canary initialization failed");
+    expect(engine.init(directory, std::max(512, count + tailCount)), "Memory canary initialization failed");
     auto& ctx = Access::Ctx(engine);
     auto& backend = Access::Backend(engine);
     auto& cache = Access::Cache(engine);
@@ -274,10 +276,16 @@ void test_prefill_memory(const std::string& directory) {
     while (tokenizer.encode(text).size() < size_t(count))
         text += "The lighthouse overlooks the ocean. At sunrise the keeper watches the waves and writes in the logbook. ";
     const auto all = tokenizer.encode(text);
+    Tensor tailIds;
+    if(tailCount) {
+        tailIds=Tensor::allocate(ctx,{tailCount},dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(tailIds.data(),all.data(),tailCount*sizeof(int));
+    }
     // Extra identical passes let the profiling harness retain a complete warm
     // interval even when the collector loses trailing events at process exit.
     const int repeats = std::clamp(aila::env::read_int("AILA_Q4E_MEMORY_CANARY_REPEATS", 2), 2, 8);
     uint64_t expected_hash = 0;
+    std::vector<uint64_t> expectedTail;
     for (int pass = 0; pass < repeats; ++pass) {
         engine.reset_context();
         const std::vector<int> ids(all.begin(), all.begin() + count);
@@ -297,5 +305,27 @@ void test_prefill_memory(const std::string& directory) {
                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()
                   << " logits_fnv64=" << hash << '\n';
         report(std::to_string(count).c_str());
+        if(tailCount) {
+            const auto live=ctx.device_allocation_count(),pinned=ctx.pinned_host_allocation_count();
+            std::vector<uint64_t> hashes;std::vector<double> ms;
+            for(int t=0;t<tailCount;++t) {
+                auto begin=std::chrono::steady_clock::now();
+                auto& next=Access::VerifyRows(engine,tailIds.data_as<int>()+t,1);ctx.synchronize();
+                ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
+                const auto values=extract_bf16_to_f32(ctx,next);uint64_t h=14695981039346656037ULL;
+                for(float v:values) {
+                    expect(std::isfinite(v),"Nonfinite memory canary tail");
+                    const auto* bytes=reinterpret_cast<const uint8_t*>(&v);
+                    for(size_t b=0;b<sizeof(float);++b){h^=bytes[b];h*=1099511628211ULL;}
+                }
+                hashes.push_back(h);
+            }
+            if(pass==0)expectedTail=hashes;else expect(hashes==expectedTail,"Memory canary tail changed bits");
+            expect(ctx.device_allocation_count()==live && ctx.pinned_host_allocation_count()==pinned,"Memory canary decode grew live USM");
+            auto print=[](const auto& v){std::cout<<'[';for(size_t i=0;i<v.size();++i){if(i)std::cout<<',';std::cout<<v[i];}std::cout<<']';};
+            std::cout<<"[S4 TAIL] {\"pass\":"<<pass<<",\"hashes\":";print(hashes);
+            std::cout<<",\"ms\":";print(ms);std::cout<<",\"live_usm_delta\":0}\n";
+            report("tail");
+        }
     }
 }

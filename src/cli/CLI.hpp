@@ -17,6 +17,7 @@ class InferenceEngine;
 struct CLIOptions {
     std::string model_dir;         // -m, --model
     std::string lora_dir;          // --lora
+    std::string performance_preset; // --performance-preset (explicit opt-in)
     int max_seq_len = 4096;        // -s, --max-seq
     int max_new_tokens = 1024;     // --max-tokens
     float temperature = 0.7f;      // -t, --temperature

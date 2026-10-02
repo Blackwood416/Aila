@@ -3783,6 +3783,8 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
     std::cout << "======================================================================\n\n";
 }
 
+#include "Qwen4ExpQsaProbe.hpp"
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3799,6 +3801,32 @@ int main(int argc, char** argv) {
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("HC test teardown USM leak");
             std::cout << "HC-only tests PASSED; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-probe") {
+            test_qsa_decode_cost_curve(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA probe teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-tests") {
+            test_qsa_selector_adversarial(ctx);
+            test_qsa_select_topk_blocks(ctx);
+            test_qsa_batched_scoring_and_selection(ctx);
+            test_attention_prefill_qsa_batched(ctx);
+            test_attention_decode_with_qsa_indices(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA tests teardown USM leak");
+            std::cout << "QSA tests PASSED; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string(argv[1]) == "--qsa-batches" || std::string(argv[1]) == "--qsa-profile")) {
+            test_qsa_selector_batches(ctx, std::string(argv[1]) == "--qsa-profile");
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA batches teardown USM leak");
             return 0;
         }
         test_grouped_rms_norm(ctx);
@@ -3831,6 +3859,7 @@ int main(int argc, char** argv) {
         test_attention_decode_with_qsa_indices(ctx);
         test_qsa_compressed_k_scoring(ctx);
         test_qsa_select_topk_blocks(ctx);
+        test_qsa_selector_adversarial(ctx);
         test_qsa_prepare_q_batched(ctx);
         test_qsa_batched_scoring_and_selection(ctx);
         test_attention_prefill_qsa_batched(ctx);

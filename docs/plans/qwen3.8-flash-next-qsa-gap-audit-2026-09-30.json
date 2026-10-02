@@ -1,0 +1,2461 @@
+{
+  "qsa": {
+    "prefix": "tmp/qsa-cost-curve-20260930",
+    "metadata": {
+      "timestamp": "2026-09-30T19:54:14.2338355+08:00",
+      "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+      "dirty": [
+        " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+        " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+        " M perf/qwen4exp/q4e_cache_replay.py",
+        " M perf/qwen4exp/q4e_execution_probe.ps1",
+        " M perf/qwen4exp/test_q4e_cache_replay.py",
+        " M src/models/Qwen4ExpBnb4Backend.cpp",
+        " M src/models/Qwen4ExpBnb4Backend.hpp",
+        " M src/models/Qwen4ExpExpertCache.cpp",
+        " M src/models/Qwen4ExpExpertCache.hpp",
+        " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+        " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+        " M tests/models/Qwen4ExpMtpProbe.hpp",
+        " M tests/models/Qwen4ExpToleranceTests.cpp",
+        " M tests/ops/Qwen4ExpKernelTests.cpp",
+        "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+        "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+        "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+        "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+        "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+        "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+        "?? perf/qwen4exp/prompts/mtp-code.json",
+        "?? perf/qwen4exp/prompts/mtp-en.json",
+        "?? perf/qwen4exp/prompts/mtp-prose.json",
+        "?? perf/qwen4exp/prompts/mtp-zh.json",
+        "?? perf/qwen4exp/prompts/ram-long.json",
+        "?? perf/qwen4exp/q4e_ram_summary.py",
+        "?? perf/qwen4exp/q4e_resident_summary.py",
+        "?? perf/qwen4exp/q4e_route_wait_summary.py",
+        "?? perf/qwen4exp/q4e_scratch_summary.py",
+        "?? perf/qwen4exp/q4e_strata_summary.py",
+        "?? perf/qwen4exp/q4e_stream_coverage.py",
+        "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+      ],
+      "workload": "qsa",
+      "input": {
+        "source_sha256": "F2D72647BD23037EEA1B38C2202AD18BC5726C88EA0AB3385EFA5AD0535113D1",
+        "kind": "fixed_bf16_qsa_decode_curve"
+      },
+      "arguments": [
+        "--qsa-probe"
+      ],
+      "env_overrides": {
+        "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_PROFILE_Q4E_DECODE": "0",
+        "AILA_Q4E_HOT_RAM_MB": "32768",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_GDN_CHUNK_MODE": "0"
+      },
+      "exe_sha256": "231375992A54E664A088D6D3C9E2B0D361C8C9F728F54E05CFC66D690325ECF1",
+      "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+      "stack": {
+        "name": "oneapi-2026.1",
+        "role": "candidate",
+        "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "compilerVersion": "2026.1.0",
+        "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+        "dnnlVersion": "3.11.2",
+        "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+        "tbbVersion": "2023.1",
+        "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+        "expectedSyclDll": "sycl9.dll",
+        "allowLegacyCompiler": false
+      },
+      "gpu": [
+        {
+          "Name": "GameViewer Virtual Display Adapter",
+          "DriverVersion": "15.6.5.199"
+        },
+        {
+          "Name": "Intel(R) Arc(TM) A770 Graphics",
+          "DriverVersion": "32.0.101.8860"
+        }
+      ],
+      "diagnostic_only": true,
+      "watchdog_stop": false,
+      "exit_code": 0,
+      "peak_working_set_bytes": 349470720.0,
+      "peak_child_working_set_bytes": 10543104.0,
+      "minimum_system_free_mb": 53067.0390625,
+      "log_sha256": "1CBFE3278E28B1B98A1DFEB596D902132868574D8D40D44F90F0BCC6DD76D479",
+      "err_log_sha256": "C5C9624D57AD93ABBC96AD5A8E4ECEED0B40F6ED8863358E4F527F90545CE35F"
+    },
+    "curve": [
+      {
+        "length": 512,
+        "dense_attention": {
+          "median_wall_us": 359.8,
+          "median_queued_wall_us": 263.12,
+          "rounds": [
+            {
+              "length": 512,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 381.5,
+              "p10_us": 369,
+              "p90_us": 484.2,
+              "queued_wall_us": 266.705
+            },
+            {
+              "length": 512,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 359.8,
+              "p10_us": 350.6,
+              "p90_us": 389.2,
+              "queued_wall_us": 263.12
+            },
+            {
+              "length": 512,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 358.8,
+              "p10_us": 352.6,
+              "p90_us": 365.8,
+              "queued_wall_us": 262.005
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 357.25,
+          "median_queued_wall_us": 261.825,
+          "rounds": [
+            {
+              "length": 512,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 357.25,
+              "p10_us": 353.4,
+              "p90_us": 362.9,
+              "queued_wall_us": 270.41
+            },
+            {
+              "length": 512,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 357.55,
+              "p10_us": 338.3,
+              "p90_us": 362.7,
+              "queued_wall_us": 261.825
+            },
+            {
+              "length": 512,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 356.85,
+              "p10_us": 336.8,
+              "p90_us": 361.7,
+              "queued_wall_us": 261.775
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 79.6,
+          "median_queued_wall_us": 17.795,
+          "rounds": [
+            {
+              "length": 512,
+              "stage": "score",
+              "round": 0,
+              "median_us": 79.6,
+              "p10_us": 77.6,
+              "p90_us": 92.1,
+              "queued_wall_us": 109.02
+            },
+            {
+              "length": 512,
+              "stage": "score",
+              "round": 1,
+              "median_us": 81.1,
+              "p10_us": 79.3,
+              "p90_us": 122.9,
+              "queued_wall_us": 17.795
+            },
+            {
+              "length": 512,
+              "stage": "score",
+              "round": 2,
+              "median_us": 79.3,
+              "p10_us": 78.5,
+              "p90_us": 102.8,
+              "queued_wall_us": 15.485
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 86.9,
+          "median_queued_wall_us": 21.525,
+          "rounds": [
+            {
+              "length": 512,
+              "stage": "select",
+              "round": 0,
+              "median_us": 81.3,
+              "p10_us": 80.9,
+              "p90_us": 92.3,
+              "queued_wall_us": 20.58
+            },
+            {
+              "length": 512,
+              "stage": "select",
+              "round": 1,
+              "median_us": 86.9,
+              "p10_us": 84.6,
+              "p90_us": 122.3,
+              "queued_wall_us": 21.525
+            },
+            {
+              "length": 512,
+              "stage": "select",
+              "round": 2,
+              "median_us": 120.5,
+              "p10_us": 112,
+              "p90_us": 169.6,
+              "queued_wall_us": 34.345
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 373.95,
+          "median_queued_wall_us": 277.08,
+          "rounds": [
+            {
+              "length": 512,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 400.15,
+              "p10_us": 388,
+              "p90_us": 578.4,
+              "queued_wall_us": 277.08
+            },
+            {
+              "length": 512,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 373.95,
+              "p10_us": 354.3,
+              "p90_us": 382.5,
+              "queued_wall_us": 281.71
+            },
+            {
+              "length": 512,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 371.8,
+              "p10_us": 369.6,
+              "p90_us": 377.8,
+              "queued_wall_us": 276
+            }
+          ]
+        }
+      },
+      {
+        "length": 2048,
+        "dense_attention": {
+          "median_wall_us": 256.45,
+          "median_queued_wall_us": 179.44,
+          "rounds": [
+            {
+              "length": 2048,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 257.3,
+              "p10_us": 253.8,
+              "p90_us": 308.1,
+              "queued_wall_us": 179.44
+            },
+            {
+              "length": 2048,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 255.45,
+              "p10_us": 253.6,
+              "p90_us": 306.6,
+              "queued_wall_us": 180.075
+            },
+            {
+              "length": 2048,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 256.45,
+              "p10_us": 252.5,
+              "p90_us": 273.5,
+              "queued_wall_us": 179.25
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 256.4,
+          "median_queued_wall_us": 178.51,
+          "rounds": [
+            {
+              "length": 2048,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 256.4,
+              "p10_us": 252.7,
+              "p90_us": 308.7,
+              "queued_wall_us": 177.965
+            },
+            {
+              "length": 2048,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 256.45,
+              "p10_us": 254.3,
+              "p90_us": 275.6,
+              "queued_wall_us": 178.51
+            },
+            {
+              "length": 2048,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 255.9,
+              "p10_us": 253,
+              "p90_us": 259,
+              "queued_wall_us": 181.73
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 78.7,
+          "median_queued_wall_us": 15.335,
+          "rounds": [
+            {
+              "length": 2048,
+              "stage": "score",
+              "round": 0,
+              "median_us": 78.7,
+              "p10_us": 77.3,
+              "p90_us": 81.1,
+              "queued_wall_us": 13.445
+            },
+            {
+              "length": 2048,
+              "stage": "score",
+              "round": 1,
+              "median_us": 79.05,
+              "p10_us": 77.8,
+              "p90_us": 86.1,
+              "queued_wall_us": 16.965
+            },
+            {
+              "length": 2048,
+              "stage": "score",
+              "round": 2,
+              "median_us": 77.5,
+              "p10_us": 77.1,
+              "p90_us": 94.1,
+              "queued_wall_us": 15.335
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 82.5,
+          "median_queued_wall_us": 20.34,
+          "rounds": [
+            {
+              "length": 2048,
+              "stage": "select",
+              "round": 0,
+              "median_us": 82.2,
+              "p10_us": 81.1,
+              "p90_us": 86.7,
+              "queued_wall_us": 21.685
+            },
+            {
+              "length": 2048,
+              "stage": "select",
+              "round": 1,
+              "median_us": 82.65,
+              "p10_us": 82.1,
+              "p90_us": 89,
+              "queued_wall_us": 20.34
+            },
+            {
+              "length": 2048,
+              "stage": "select",
+              "round": 2,
+              "median_us": 82.5,
+              "p10_us": 81.6,
+              "p90_us": 95.4,
+              "queued_wall_us": 20.195
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 316.05,
+          "median_queued_wall_us": 195.285,
+          "rounds": [
+            {
+              "length": 2048,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 316.05,
+              "p10_us": 309,
+              "p90_us": 324.4,
+              "queued_wall_us": 195.045
+            },
+            {
+              "length": 2048,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 318.4,
+              "p10_us": 315.6,
+              "p90_us": 329.2,
+              "queued_wall_us": 195.285
+            },
+            {
+              "length": 2048,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 267,
+              "p10_us": 264,
+              "p90_us": 310.4,
+              "queued_wall_us": 213.045
+            }
+          ]
+        }
+      },
+      {
+        "length": 2051,
+        "dense_attention": {
+          "median_wall_us": 268.65,
+          "median_queued_wall_us": 182.72,
+          "rounds": [
+            {
+              "length": 2051,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 267.6,
+              "p10_us": 266.2,
+              "p90_us": 276.6,
+              "queued_wall_us": 182.685
+            },
+            {
+              "length": 2051,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 272.5,
+              "p10_us": 266.4,
+              "p90_us": 326.6,
+              "queued_wall_us": 182.72
+            },
+            {
+              "length": 2051,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 268.65,
+              "p10_us": 266.4,
+              "p90_us": 276.4,
+              "queued_wall_us": 182.895
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 268.5,
+          "median_queued_wall_us": 182.815,
+          "rounds": [
+            {
+              "length": 2051,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 268.65,
+              "p10_us": 266.6,
+              "p90_us": 286.7,
+              "queued_wall_us": 182.755
+            },
+            {
+              "length": 2051,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 268.4,
+              "p10_us": 266.5,
+              "p90_us": 271.5,
+              "queued_wall_us": 182.815
+            },
+            {
+              "length": 2051,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 268.5,
+              "p10_us": 267.2,
+              "p90_us": 275.5,
+              "queued_wall_us": 183.165
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 80.55,
+          "median_queued_wall_us": 13.58,
+          "rounds": [
+            {
+              "length": 2051,
+              "stage": "score",
+              "round": 0,
+              "median_us": 78.2,
+              "p10_us": 77.4,
+              "p90_us": 80.1,
+              "queued_wall_us": 13.93
+            },
+            {
+              "length": 2051,
+              "stage": "score",
+              "round": 1,
+              "median_us": 80.55,
+              "p10_us": 77.6,
+              "p90_us": 100.7,
+              "queued_wall_us": 13.58
+            },
+            {
+              "length": 2051,
+              "stage": "score",
+              "round": 2,
+              "median_us": 80.75,
+              "p10_us": 78.6,
+              "p90_us": 130.5,
+              "queued_wall_us": 13.27
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 82.25,
+          "median_queued_wall_us": 20.795,
+          "rounds": [
+            {
+              "length": 2051,
+              "stage": "select",
+              "round": 0,
+              "median_us": 82.65,
+              "p10_us": 81.2,
+              "p90_us": 95.7,
+              "queued_wall_us": 20.415
+            },
+            {
+              "length": 2051,
+              "stage": "select",
+              "round": 1,
+              "median_us": 80.3,
+              "p10_us": 79.7,
+              "p90_us": 97.3,
+              "queued_wall_us": 22.11
+            },
+            {
+              "length": 2051,
+              "stage": "select",
+              "round": 2,
+              "median_us": 82.25,
+              "p10_us": 80.9,
+              "p90_us": 86.6,
+              "queued_wall_us": 20.795
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 300.85,
+          "median_queued_wall_us": 192.27,
+          "rounds": [
+            {
+              "length": 2051,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 300.85,
+              "p10_us": 284.1,
+              "p90_us": 310.6,
+              "queued_wall_us": 192.27
+            },
+            {
+              "length": 2051,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 330.05,
+              "p10_us": 326.8,
+              "p90_us": 405.1,
+              "queued_wall_us": 194.625
+            },
+            {
+              "length": 2051,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 279.8,
+              "p10_us": 276.9,
+              "p90_us": 312.4,
+              "queued_wall_us": 192.26
+            }
+          ]
+        }
+      },
+      {
+        "length": 2052,
+        "dense_attention": {
+          "median_wall_us": 268.95,
+          "median_queued_wall_us": 182.845,
+          "rounds": [
+            {
+              "length": 2052,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 268.95,
+              "p10_us": 266.1,
+              "p90_us": 277.3,
+              "queued_wall_us": 182.845
+            },
+            {
+              "length": 2052,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 286.3,
+              "p10_us": 271.8,
+              "p90_us": 331.2,
+              "queued_wall_us": 190.275
+            },
+            {
+              "length": 2052,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 268.55,
+              "p10_us": 266.9,
+              "p90_us": 273.1,
+              "queued_wall_us": 182.745
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 324.4,
+          "median_queued_wall_us": 218.59,
+          "rounds": [
+            {
+              "length": 2052,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 328.65,
+              "p10_us": 320.2,
+              "p90_us": 360.8,
+              "queued_wall_us": 221.38
+            },
+            {
+              "length": 2052,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 324.4,
+              "p10_us": 315.8,
+              "p90_us": 361.5,
+              "queued_wall_us": 218.59
+            },
+            {
+              "length": 2052,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 322.9,
+              "p10_us": 316.5,
+              "p90_us": 345.7,
+              "queued_wall_us": 218.265
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 81.85,
+          "median_queued_wall_us": 14.715,
+          "rounds": [
+            {
+              "length": 2052,
+              "stage": "score",
+              "round": 0,
+              "median_us": 81.85,
+              "p10_us": 80.1,
+              "p90_us": 114.4,
+              "queued_wall_us": 14.595
+            },
+            {
+              "length": 2052,
+              "stage": "score",
+              "round": 1,
+              "median_us": 82.4,
+              "p10_us": 80.7,
+              "p90_us": 106.6,
+              "queued_wall_us": 14.715
+            },
+            {
+              "length": 2052,
+              "stage": "score",
+              "round": 2,
+              "median_us": 80.75,
+              "p10_us": 79.9,
+              "p90_us": 101.4,
+              "queued_wall_us": 14.715
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 79.4,
+          "median_queued_wall_us": 16.215,
+          "rounds": [
+            {
+              "length": 2052,
+              "stage": "select",
+              "round": 0,
+              "median_us": 78.4,
+              "p10_us": 77.7,
+              "p90_us": 85.3,
+              "queued_wall_us": 16.165
+            },
+            {
+              "length": 2052,
+              "stage": "select",
+              "round": 1,
+              "median_us": 79.4,
+              "p10_us": 78.9,
+              "p90_us": 97.3,
+              "queued_wall_us": 16.215
+            },
+            {
+              "length": 2052,
+              "stage": "select",
+              "round": 2,
+              "median_us": 79.5,
+              "p10_us": 78.7,
+              "p90_us": 95.7,
+              "queued_wall_us": 16.25
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 268.95,
+          "median_queued_wall_us": 193.015,
+          "rounds": [
+            {
+              "length": 2052,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 268.95,
+              "p10_us": 264.3,
+              "p90_us": 367.6,
+              "queued_wall_us": 192.485
+            },
+            {
+              "length": 2052,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 268.8,
+              "p10_us": 264.8,
+              "p90_us": 285.6,
+              "queued_wall_us": 193.015
+            },
+            {
+              "length": 2052,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 324.8,
+              "p10_us": 311.3,
+              "p90_us": 350.4,
+              "queued_wall_us": 201.245
+            }
+          ]
+        }
+      },
+      {
+        "length": 2056,
+        "dense_attention": {
+          "median_wall_us": 269.9,
+          "median_queued_wall_us": 185.915,
+          "rounds": [
+            {
+              "length": 2056,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 270.1,
+              "p10_us": 267.3,
+              "p90_us": 325.6,
+              "queued_wall_us": 185.29
+            },
+            {
+              "length": 2056,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 269.9,
+              "p10_us": 267.1,
+              "p90_us": 316.3,
+              "queued_wall_us": 185.915
+            },
+            {
+              "length": 2056,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 268.6,
+              "p10_us": 265,
+              "p90_us": 280.9,
+              "queued_wall_us": 190.235
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 471.4,
+          "median_queued_wall_us": 361.62,
+          "rounds": [
+            {
+              "length": 2056,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 496.4,
+              "p10_us": 483.1,
+              "p90_us": 525.2,
+              "queued_wall_us": 362.465
+            },
+            {
+              "length": 2056,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 471.4,
+              "p10_us": 463.3,
+              "p90_us": 520.5,
+              "queued_wall_us": 360.14
+            },
+            {
+              "length": 2056,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 471.1,
+              "p10_us": 464.7,
+              "p90_us": 506,
+              "queued_wall_us": 361.62
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 81.15,
+          "median_queued_wall_us": 15.545,
+          "rounds": [
+            {
+              "length": 2056,
+              "stage": "score",
+              "round": 0,
+              "median_us": 80.4,
+              "p10_us": 79.1,
+              "p90_us": 83.2,
+              "queued_wall_us": 14.455
+            },
+            {
+              "length": 2056,
+              "stage": "score",
+              "round": 1,
+              "median_us": 82.15,
+              "p10_us": 81.1,
+              "p90_us": 104.2,
+              "queued_wall_us": 15.655
+            },
+            {
+              "length": 2056,
+              "stage": "score",
+              "round": 2,
+              "median_us": 81.15,
+              "p10_us": 80.6,
+              "p90_us": 88.5,
+              "queued_wall_us": 15.545
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 225.85,
+          "median_queued_wall_us": 151.385,
+          "rounds": [
+            {
+              "length": 2056,
+              "stage": "select",
+              "round": 0,
+              "median_us": 224.05,
+              "p10_us": 222.3,
+              "p90_us": 254.5,
+              "queued_wall_us": 153.265
+            },
+            {
+              "length": 2056,
+              "stage": "select",
+              "round": 1,
+              "median_us": 240.05,
+              "p10_us": 224.5,
+              "p90_us": 324.9,
+              "queued_wall_us": 151.385
+            },
+            {
+              "length": 2056,
+              "stage": "select",
+              "round": 2,
+              "median_us": 225.85,
+              "p10_us": 223.2,
+              "p90_us": 247.2,
+              "queued_wall_us": 150.725
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 266.1,
+          "median_queued_wall_us": 193.41,
+          "rounds": [
+            {
+              "length": 2056,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 266.1,
+              "p10_us": 264.8,
+              "p90_us": 295.1,
+              "queued_wall_us": 191.945
+            },
+            {
+              "length": 2056,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 265.15,
+              "p10_us": 263.4,
+              "p90_us": 290.3,
+              "queued_wall_us": 193.53
+            },
+            {
+              "length": 2056,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 267.8,
+              "p10_us": 265,
+              "p90_us": 275.9,
+              "queued_wall_us": 193.41
+            }
+          ]
+        }
+      },
+      {
+        "length": 2146,
+        "dense_attention": {
+          "median_wall_us": 270.7,
+          "median_queued_wall_us": 196.635,
+          "rounds": [
+            {
+              "length": 2146,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 270.7,
+              "p10_us": 268.8,
+              "p90_us": 294.9,
+              "queued_wall_us": 197.24
+            },
+            {
+              "length": 2146,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 270.65,
+              "p10_us": 268.7,
+              "p90_us": 276.6,
+              "queued_wall_us": 187.53
+            },
+            {
+              "length": 2146,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 278.25,
+              "p10_us": 271.2,
+              "p90_us": 360.6,
+              "queued_wall_us": 196.635
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 468.8,
+          "median_queued_wall_us": 357.83,
+          "rounds": [
+            {
+              "length": 2146,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 486.7,
+              "p10_us": 479.2,
+              "p90_us": 543.3,
+              "queued_wall_us": 361.05
+            },
+            {
+              "length": 2146,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 468.8,
+              "p10_us": 462,
+              "p90_us": 574.7,
+              "queued_wall_us": 357.735
+            },
+            {
+              "length": 2146,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 460.75,
+              "p10_us": 457.7,
+              "p90_us": 572.6,
+              "queued_wall_us": 357.83
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 80.75,
+          "median_queued_wall_us": 14.825,
+          "rounds": [
+            {
+              "length": 2146,
+              "stage": "score",
+              "round": 0,
+              "median_us": 80.65,
+              "p10_us": 79.4,
+              "p90_us": 81.8,
+              "queued_wall_us": 14.825
+            },
+            {
+              "length": 2146,
+              "stage": "score",
+              "round": 1,
+              "median_us": 80.75,
+              "p10_us": 79.9,
+              "p90_us": 96,
+              "queued_wall_us": 14.43
+            },
+            {
+              "length": 2146,
+              "stage": "score",
+              "round": 2,
+              "median_us": 107.55,
+              "p10_us": 83.3,
+              "p90_us": 119.3,
+              "queued_wall_us": 17.885
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 269.6,
+          "median_queued_wall_us": 160.29,
+          "rounds": [
+            {
+              "length": 2146,
+              "stage": "select",
+              "round": 0,
+              "median_us": 273.9,
+              "p10_us": 236,
+              "p90_us": 318.1,
+              "queued_wall_us": 173.865
+            },
+            {
+              "length": 2146,
+              "stage": "select",
+              "round": 1,
+              "median_us": 269.6,
+              "p10_us": 231.4,
+              "p90_us": 284.9,
+              "queued_wall_us": 159.1
+            },
+            {
+              "length": 2146,
+              "stage": "select",
+              "round": 2,
+              "median_us": 232.25,
+              "p10_us": 227.6,
+              "p90_us": 332,
+              "queued_wall_us": 160.29
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 281.2,
+          "median_queued_wall_us": 190.625,
+          "rounds": [
+            {
+              "length": 2146,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 327.7,
+              "p10_us": 309.4,
+              "p90_us": 407.1,
+              "queued_wall_us": 197.67
+            },
+            {
+              "length": 2146,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 281.2,
+              "p10_us": 275,
+              "p90_us": 330.9,
+              "queued_wall_us": 190.625
+            },
+            {
+              "length": 2146,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 279.9,
+              "p10_us": 275.2,
+              "p90_us": 385.8,
+              "queued_wall_us": 189.27
+            }
+          ]
+        }
+      },
+      {
+        "length": 4096,
+        "dense_attention": {
+          "median_wall_us": 370.6,
+          "median_queued_wall_us": 271.93,
+          "rounds": [
+            {
+              "length": 4096,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 399.55,
+              "p10_us": 384.7,
+              "p90_us": 437.4,
+              "queued_wall_us": 271.93
+            },
+            {
+              "length": 4096,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 370.5,
+              "p10_us": 354.8,
+              "p90_us": 427.6,
+              "queued_wall_us": 270.48
+            },
+            {
+              "length": 4096,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 370.6,
+              "p10_us": 352.5,
+              "p90_us": 405,
+              "queued_wall_us": 288.225
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 581.1,
+          "median_queued_wall_us": 472.11,
+          "rounds": [
+            {
+              "length": 4096,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 580.25,
+              "p10_us": 575,
+              "p90_us": 666.9,
+              "queued_wall_us": 472.11
+            },
+            {
+              "length": 4096,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 581.1,
+              "p10_us": 567.6,
+              "p90_us": 688.7,
+              "queued_wall_us": 470.34
+            },
+            {
+              "length": 4096,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 581.45,
+              "p10_us": 575.2,
+              "p90_us": 644.9,
+              "queued_wall_us": 484.24
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 82.15,
+          "median_queued_wall_us": 15.055,
+          "rounds": [
+            {
+              "length": 4096,
+              "stage": "score",
+              "round": 0,
+              "median_us": 80.8,
+              "p10_us": 79.2,
+              "p90_us": 84.5,
+              "queued_wall_us": 14.845
+            },
+            {
+              "length": 4096,
+              "stage": "score",
+              "round": 1,
+              "median_us": 82.15,
+              "p10_us": 80.9,
+              "p90_us": 101.3,
+              "queued_wall_us": 15.065
+            },
+            {
+              "length": 4096,
+              "stage": "score",
+              "round": 2,
+              "median_us": 82.25,
+              "p10_us": 81.4,
+              "p90_us": 114.1,
+              "queued_wall_us": 15.055
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 385.1,
+          "median_queued_wall_us": 264.09,
+          "rounds": [
+            {
+              "length": 4096,
+              "stage": "select",
+              "round": 0,
+              "median_us": 360.65,
+              "p10_us": 340.2,
+              "p90_us": 390.4,
+              "queued_wall_us": 263.56
+            },
+            {
+              "length": 4096,
+              "stage": "select",
+              "round": 1,
+              "median_us": 386.95,
+              "p10_us": 353.5,
+              "p90_us": 415.4,
+              "queued_wall_us": 265.785
+            },
+            {
+              "length": 4096,
+              "stage": "select",
+              "round": 2,
+              "median_us": 385.1,
+              "p10_us": 364.6,
+              "p90_us": 411.4,
+              "queued_wall_us": 264.09
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 264.15,
+          "median_queued_wall_us": 193.92,
+          "rounds": [
+            {
+              "length": 4096,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 264,
+              "p10_us": 261.3,
+              "p90_us": 277.3,
+              "queued_wall_us": 193.825
+            },
+            {
+              "length": 4096,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 264.15,
+              "p10_us": 261.7,
+              "p90_us": 275.9,
+              "queued_wall_us": 193.92
+            },
+            {
+              "length": 4096,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 319.55,
+              "p10_us": 302.5,
+              "p90_us": 460.8,
+              "queued_wall_us": 196.815
+            }
+          ]
+        }
+      },
+      {
+        "length": 8192,
+        "dense_attention": {
+          "median_wall_us": 558.15,
+          "median_queued_wall_us": 464.365,
+          "rounds": [
+            {
+              "length": 8192,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 558.15,
+              "p10_us": 540.8,
+              "p90_us": 585.8,
+              "queued_wall_us": 464.365
+            },
+            {
+              "length": 8192,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 556.85,
+              "p10_us": 542.2,
+              "p90_us": 565.4,
+              "queued_wall_us": 468.95
+            },
+            {
+              "length": 8192,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 587,
+              "p10_us": 572.6,
+              "p90_us": 753.3,
+              "queued_wall_us": 454.79
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 812.3,
+          "median_queued_wall_us": 711.93,
+          "rounds": [
+            {
+              "length": 8192,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 812.3,
+              "p10_us": 803.3,
+              "p90_us": 839.3,
+              "queued_wall_us": 711.83
+            },
+            {
+              "length": 8192,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 835.7,
+              "p10_us": 821.7,
+              "p90_us": 948.6,
+              "queued_wall_us": 712.935
+            },
+            {
+              "length": 8192,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 812.25,
+              "p10_us": 800.1,
+              "p90_us": 866.3,
+              "queued_wall_us": 711.93
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 85.4,
+          "median_queued_wall_us": 18,
+          "rounds": [
+            {
+              "length": 8192,
+              "stage": "score",
+              "round": 0,
+              "median_us": 85,
+              "p10_us": 84,
+              "p90_us": 87.2,
+              "queued_wall_us": 18
+            },
+            {
+              "length": 8192,
+              "stage": "score",
+              "round": 1,
+              "median_us": 85.85,
+              "p10_us": 85.1,
+              "p90_us": 109.1,
+              "queued_wall_us": 19.975
+            },
+            {
+              "length": 8192,
+              "stage": "score",
+              "round": 2,
+              "median_us": 85.4,
+              "p10_us": 84.5,
+              "p90_us": 158.7,
+              "queued_wall_us": 17.945
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 589.4,
+          "median_queued_wall_us": 500.815,
+          "rounds": [
+            {
+              "length": 8192,
+              "stage": "select",
+              "round": 0,
+              "median_us": 589.4,
+              "p10_us": 582.3,
+              "p90_us": 593.6,
+              "queued_wall_us": 511.26
+            },
+            {
+              "length": 8192,
+              "stage": "select",
+              "round": 1,
+              "median_us": 588.45,
+              "p10_us": 576.2,
+              "p90_us": 671.8,
+              "queued_wall_us": 500.815
+            },
+            {
+              "length": 8192,
+              "stage": "select",
+              "round": 2,
+              "median_us": 590.4,
+              "p10_us": 574.2,
+              "p90_us": 679.9,
+              "queued_wall_us": 493.925
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 267.8,
+          "median_queued_wall_us": 194.31,
+          "rounds": [
+            {
+              "length": 8192,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 267.8,
+              "p10_us": 263.4,
+              "p90_us": 322.7,
+              "queued_wall_us": 194.31
+            },
+            {
+              "length": 8192,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 275.85,
+              "p10_us": 262.9,
+              "p90_us": 362,
+              "queued_wall_us": 195.155
+            },
+            {
+              "length": 8192,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 263.8,
+              "p10_us": 260.1,
+              "p90_us": 288.3,
+              "queued_wall_us": 193.985
+            }
+          ]
+        }
+      },
+      {
+        "length": 32768,
+        "dense_attention": {
+          "median_wall_us": 2243.3,
+          "median_queued_wall_us": 2144.18,
+          "rounds": [
+            {
+              "length": 32768,
+              "stage": "dense_attention",
+              "round": 0,
+              "median_us": 2239.85,
+              "p10_us": 2231.4,
+              "p90_us": 2259,
+              "queued_wall_us": 2149.68
+            },
+            {
+              "length": 32768,
+              "stage": "dense_attention",
+              "round": 1,
+              "median_us": 2243.4,
+              "p10_us": 2235.5,
+              "p90_us": 2473.2,
+              "queued_wall_us": 2144.18
+            },
+            {
+              "length": 32768,
+              "stage": "dense_attention",
+              "round": 2,
+              "median_us": 2243.3,
+              "p10_us": 2235.8,
+              "p90_us": 2333.8,
+              "queued_wall_us": 2125.85
+            }
+          ]
+        },
+        "routed_post_projection": {
+          "median_wall_us": 2194.25,
+          "median_queued_wall_us": 2095.84,
+          "rounds": [
+            {
+              "length": 32768,
+              "stage": "routed_post_projection",
+              "round": 0,
+              "median_us": 2195.2,
+              "p10_us": 2188.3,
+              "p90_us": 2302.4,
+              "queued_wall_us": 2094.99
+            },
+            {
+              "length": 32768,
+              "stage": "routed_post_projection",
+              "round": 1,
+              "median_us": 2194.25,
+              "p10_us": 2185.9,
+              "p90_us": 2218.7,
+              "queued_wall_us": 2095.84
+            },
+            {
+              "length": 32768,
+              "stage": "routed_post_projection",
+              "round": 2,
+              "median_us": 2191.25,
+              "p10_us": 2178,
+              "p90_us": 2271.1,
+              "queued_wall_us": 2108.62
+            }
+          ]
+        },
+        "score": {
+          "median_wall_us": 106.65,
+          "median_queued_wall_us": 38.735,
+          "rounds": [
+            {
+              "length": 32768,
+              "stage": "score",
+              "round": 0,
+              "median_us": 107.1,
+              "p10_us": 106.1,
+              "p90_us": 111,
+              "queued_wall_us": 38.655
+            },
+            {
+              "length": 32768,
+              "stage": "score",
+              "round": 1,
+              "median_us": 106.35,
+              "p10_us": 105.5,
+              "p90_us": 144.3,
+              "queued_wall_us": 39.43
+            },
+            {
+              "length": 32768,
+              "stage": "score",
+              "round": 2,
+              "median_us": 106.65,
+              "p10_us": 104.7,
+              "p90_us": 112.9,
+              "queued_wall_us": 38.735
+            }
+          ]
+        },
+        "select": {
+          "median_wall_us": 1954.6,
+          "median_queued_wall_us": 1857.02,
+          "rounds": [
+            {
+              "length": 32768,
+              "stage": "select",
+              "round": 0,
+              "median_us": 1952.95,
+              "p10_us": 1938.2,
+              "p90_us": 1963.4,
+              "queued_wall_us": 1856.5
+            },
+            {
+              "length": 32768,
+              "stage": "select",
+              "round": 1,
+              "median_us": 1954.6,
+              "p10_us": 1944.2,
+              "p90_us": 2075.4,
+              "queued_wall_us": 1863.86
+            },
+            {
+              "length": 32768,
+              "stage": "select",
+              "round": 2,
+              "median_us": 1954.8,
+              "p10_us": 1942.8,
+              "p90_us": 2092.9,
+              "queued_wall_us": 1857.02
+            }
+          ]
+        },
+        "selected_attention": {
+          "median_wall_us": 264.85,
+          "median_queued_wall_us": 193.53,
+          "rounds": [
+            {
+              "length": 32768,
+              "stage": "selected_attention",
+              "round": 0,
+              "median_us": 263.65,
+              "p10_us": 261.5,
+              "p90_us": 273.4,
+              "queued_wall_us": 192.955
+            },
+            {
+              "length": 32768,
+              "stage": "selected_attention",
+              "round": 1,
+              "median_us": 264.85,
+              "p10_us": 261.7,
+              "p90_us": 280.8,
+              "queued_wall_us": 193.53
+            },
+            {
+              "length": 32768,
+              "stage": "selected_attention",
+              "round": 2,
+              "median_us": 269.8,
+              "p10_us": 264.5,
+              "p90_us": 292.1,
+              "queued_wall_us": 194.685
+            }
+          ]
+        }
+      }
+    ],
+    "checks": [
+      "[QSA CHECK] length=512 indexed=0 selected=128 max_abs=5.45087e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=512 indexed=1 selected=128 max_abs=5.45087e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2048 indexed=0 selected=512 max_abs=1.73627e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2048 indexed=1 selected=512 max_abs=1.73627e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2051 indexed=0 selected=512 max_abs=2.04048e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2051 indexed=1 selected=512 max_abs=2.04048e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2052 indexed=0 selected=512 max_abs=2.49631e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2052 indexed=1 selected=512 max_abs=1.65216e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2056 indexed=0 selected=512 max_abs=1.75625e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2056 indexed=1 selected=512 max_abs=1.62022e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2146 indexed=0 selected=512 max_abs=1.59635e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=2146 indexed=1 selected=512 max_abs=1.91459e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=4096 indexed=0 selected=512 max_abs=1.52549e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=4096 indexed=1 selected=512 max_abs=2.84267e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=8192 indexed=0 selected=512 max_abs=7.55146e-06 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=8192 indexed=1 selected=512 max_abs=2.95825e-05 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=32768 indexed=0 selected=512 max_abs=6.6626e-06 reference_heads=2 finite_heads=24",
+      "[QSA CHECK] length=32768 indexed=1 selected=512 max_abs=2.99135e-05 reference_heads=2 finite_heads=24"
+    ]
+  },
+  "model_stages": [
+    {
+      "prefix": "tmp/qsa-short-fixed-cap-stages-20260930",
+      "metadata": {
+        "timestamp": "2026-09-30T20:03:19.9436433+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "repeats": 2,
+          "max_tokens": 16,
+          "max_seq": 2560,
+          "kind": "cli_stream_generation",
+          "source_sha256": "C1083B8926EA92BC3B36E738111D723D2189A81116D7E545890BF695EFA440B6",
+          "stdin_sha256": "E5A4ACD4A9638E82E3590E0559AE6298D593F5E25AAC133158DD2537E06E7DBB",
+          "sha256": "500BF2884E64C028599E182D907A22F5EF1CE968E0C609CFD4909F13B7C9F452"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1"
+        ],
+        "env_overrides": {
+          "AILA_PROFILE_Q4E_DECODE": "1",
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_DEMAND_MICROBATCH": "32",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_PHASE_SCRATCH": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_PROFILE_Q4E_STAGES": "1",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "A2CC5A7EC48F64915D87ED4BAC1FB4129A4FCF2F4F98A7EDF8A1F1D4DEE4030F",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 39904649216.0,
+        "peak_child_working_set_bytes": 10530816.0,
+        "minimum_system_free_mb": 11280.05078125,
+        "log_sha256": "46144F7DB7459703FBEFDD312B6A4BA6CD2690DFB1F7A150433F709A6C33B32C",
+        "err_log_sha256": "3CBEB0EA9036D3E6D4DBF3788D1103AD92A5E71431E87941FD27FA84712E892B"
+      },
+      "prompt": 41,
+      "last_request_rows": [
+        {
+          "pos": 41.0,
+          "count": 1.0,
+          "total": 116.36,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 348.0,
+          "ple": 1.21,
+          "hc": 18.14,
+          "linear_attn": 11.49,
+          "full_attn": 3.85,
+          "router": 13.23,
+          "experts": 58.59,
+          "acquire": 6.58,
+          "shared": 6.39,
+          "head": 3.4
+        },
+        {
+          "pos": 42.0,
+          "count": 1.0,
+          "total": 143.24,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 553.5,
+          "ple": 1.28,
+          "hc": 19.04,
+          "linear_attn": 11.89,
+          "full_attn": 3.97,
+          "router": 13.92,
+          "experts": 82.88,
+          "acquire": 11.91,
+          "shared": 6.8,
+          "head": 3.44
+        },
+        {
+          "pos": 43.0,
+          "count": 1.0,
+          "total": 137.65,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 539.0,
+          "ple": 1.25,
+          "hc": 18.1,
+          "linear_attn": 11.64,
+          "full_attn": 4.28,
+          "router": 13.49,
+          "experts": 78.92,
+          "acquire": 9.07,
+          "shared": 6.58,
+          "head": 3.37
+        },
+        {
+          "pos": 44.0,
+          "count": 1.0,
+          "total": 100.27,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 171.6,
+          "ple": 1.26,
+          "hc": 18.89,
+          "linear_attn": 11.68,
+          "full_attn": 3.9,
+          "router": 13.41,
+          "experts": 40.67,
+          "acquire": 8.55,
+          "shared": 6.98,
+          "head": 3.42
+        },
+        {
+          "pos": 45.0,
+          "count": 1.0,
+          "total": 115.75,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 350.5,
+          "ple": 1.23,
+          "hc": 18.19,
+          "linear_attn": 11.74,
+          "full_attn": 3.82,
+          "router": 13.17,
+          "experts": 57.74,
+          "acquire": 7.5,
+          "shared": 6.41,
+          "head": 3.44
+        },
+        {
+          "pos": 46.0,
+          "count": 1.0,
+          "total": 103.46,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 229.6,
+          "ple": 1.19,
+          "hc": 18.22,
+          "linear_attn": 11.47,
+          "full_attn": 3.86,
+          "router": 13.09,
+          "experts": 45.76,
+          "acquire": 7.19,
+          "shared": 6.46,
+          "head": 3.38
+        },
+        {
+          "pos": 47.0,
+          "count": 1.0,
+          "total": 110.98,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 278.0,
+          "ple": 1.29,
+          "hc": 18.64,
+          "linear_attn": 11.72,
+          "full_attn": 4.49,
+          "router": 13.47,
+          "experts": 51.32,
+          "acquire": 6.47,
+          "shared": 6.58,
+          "head": 3.43
+        },
+        {
+          "pos": 48.0,
+          "count": 1.0,
+          "total": 122.47,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 357.7,
+          "ple": 1.26,
+          "hc": 18.32,
+          "linear_attn": 11.7,
+          "full_attn": 3.88,
+          "router": 13.16,
+          "experts": 63.95,
+          "acquire": 17.32,
+          "shared": 6.51,
+          "head": 3.67
+        },
+        {
+          "pos": 49.0,
+          "count": 1.0,
+          "total": 113.52,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 263.5,
+          "ple": 1.23,
+          "hc": 18.7,
+          "linear_attn": 11.62,
+          "full_attn": 4.22,
+          "router": 13.61,
+          "experts": 53.73,
+          "acquire": 11.7,
+          "shared": 6.8,
+          "head": 3.55
+        },
+        {
+          "pos": 50.0,
+          "count": 1.0,
+          "total": 106.95,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 241.7,
+          "ple": 1.26,
+          "hc": 18.39,
+          "linear_attn": 11.51,
+          "full_attn": 3.92,
+          "router": 13.44,
+          "experts": 48.4,
+          "acquire": 7.48,
+          "shared": 6.59,
+          "head": 3.39
+        },
+        {
+          "pos": 51.0,
+          "count": 1.0,
+          "total": 115.28,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 299.7,
+          "ple": 1.22,
+          "hc": 18.01,
+          "linear_attn": 11.63,
+          "full_attn": 4.38,
+          "router": 13.35,
+          "experts": 56.93,
+          "acquire": 13.45,
+          "shared": 6.34,
+          "head": 3.4
+        },
+        {
+          "pos": 52.0,
+          "count": 1.0,
+          "total": 104.41,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 246.5,
+          "ple": 1.18,
+          "hc": 17.98,
+          "linear_attn": 11.58,
+          "full_attn": 3.91,
+          "router": 13.04,
+          "experts": 47.0,
+          "acquire": 6.28,
+          "shared": 6.29,
+          "head": 3.38
+        },
+        {
+          "pos": 53.0,
+          "count": 1.0,
+          "total": 101.87,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 154.7,
+          "ple": 1.32,
+          "hc": 20.0,
+          "linear_attn": 12.13,
+          "full_attn": 4.07,
+          "router": 14.13,
+          "experts": 39.49,
+          "acquire": 6.98,
+          "shared": 7.21,
+          "head": 3.47
+        },
+        {
+          "pos": 54.0,
+          "count": 1.0,
+          "total": 99.0,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 190.9,
+          "ple": 1.2,
+          "hc": 17.75,
+          "linear_attn": 11.35,
+          "full_attn": 3.87,
+          "router": 13.41,
+          "experts": 41.61,
+          "acquire": 6.43,
+          "shared": 6.39,
+          "head": 3.4
+        },
+        {
+          "pos": 55.0,
+          "count": 1.0,
+          "total": 106.23,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 181.3,
+          "ple": 1.25,
+          "hc": 18.66,
+          "linear_attn": 11.83,
+          "full_attn": 4.34,
+          "router": 13.44,
+          "experts": 46.56,
+          "acquire": 10.38,
+          "shared": 6.67,
+          "head": 3.46
+        },
+        {
+          "pos": 56.0,
+          "count": 1.0,
+          "total": 79.69,
+          "fill": 0.0,
+          "pf_wait": 0.0,
+          "xfer": 65.3,
+          "ple": 1.18,
+          "hc": 17.75,
+          "linear_attn": 11.51,
+          "full_attn": 3.92,
+          "router": 12.94,
+          "experts": 26.19,
+          "acquire": 3.52,
+          "shared": 6.18,
+          "head": 0.0
+        }
+      ],
+      "means": {
+        "total": 111.070625,
+        "fill": 0.0,
+        "pf_wait": 0.0,
+        "xfer": 279.46875,
+        "ple": 1.238125,
+        "hc": 18.423750000000002,
+        "linear_attn": 11.655625,
+        "full_attn": 4.0425,
+        "router": 13.39375,
+        "experts": 52.48375,
+        "acquire": 8.800625,
+        "shared": 6.5737499999999995,
+        "head": 3.225
+      },
+      "interpretation": "Stage synchronization changes scheduling. Means are diagnostic milliseconds; xfer is demand MiB. Includes final alignment. Different prompt/output trajectories, not a causal context-only comparison."
+    },
+    {
+      "prefix": "tmp/qsa-long-stages-20260930",
+      "metadata": {
+        "timestamp": "2026-09-30T19:57:21.6754469+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "repeats": 2,
+          "kind": "cli_stream_generation",
+          "sha256": "E911EB7A45627FCFAA4B4BAD1C964BD07F2D0EC9A01F2A7AFC8D771A1A3F5972",
+          "source_sha256": "C1083B8926EA92BC3B36E738111D723D2189A81116D7E545890BF695EFA440B6",
+          "stdin_sha256": "37DDA9705300A3905698C357A4208847E278E73E3068DF2F54053A3909597B1B",
+          "max_tokens": 16,
+          "max_seq": 2560
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1"
+        ],
+        "env_overrides": {
+          "AILA_PROFILE_Q4E_STAGES": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PHASE_SCRATCH": "1",
+          "AILA_PROFILE_Q4E_DECODE": "1",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "32",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "A2CC5A7EC48F64915D87ED4BAC1FB4129A4FCF2F4F98A7EDF8A1F1D4DEE4030F",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 39965347840.0,
+        "peak_child_working_set_bytes": 10526720.0,
+        "minimum_system_free_mb": 10641.984375,
+        "log_sha256": "1207955C34C1F678C99F58C38E7CF8969CA0562B7E76B8B3D7B4D21292B24CCF",
+        "err_log_sha256": "810746D0A083E612F444FCFC98D12FE0A694F4CCCE463DBB7E5E48F413D3B973"
+      },
+      "prompt": 2146,
+      "last_request_rows": [
+        {
+          "pos": 2146.0,
+          "count": 1.0,
+          "total": 207.48,
+          "fill": 35.18,
+          "pf_wait": 42.65,
+          "xfer": 459.2,
+          "ple": 1.35,
+          "hc": 19.19,
+          "linear_attn": 11.67,
+          "full_attn": 8.34,
+          "router": 13.98,
+          "experts": 143.23,
+          "acquire": 100.37,
+          "shared": 6.27,
+          "head": 3.42
+        },
+        {
+          "pos": 2147.0,
+          "count": 1.0,
+          "total": 214.89,
+          "fill": 36.56,
+          "pf_wait": 37.31,
+          "xfer": 568.0,
+          "ple": 1.32,
+          "hc": 19.29,
+          "linear_attn": 11.76,
+          "full_attn": 9.33,
+          "router": 14.37,
+          "experts": 148.59,
+          "acquire": 100.01,
+          "shared": 6.72,
+          "head": 3.44
+        },
+        {
+          "pos": 2148.0,
+          "count": 1.0,
+          "total": 170.44,
+          "fill": 29.15,
+          "pf_wait": 16.68,
+          "xfer": 365.0,
+          "ple": 1.27,
+          "hc": 18.9,
+          "linear_attn": 11.57,
+          "full_attn": 7.98,
+          "router": 14.06,
+          "experts": 106.82,
+          "acquire": 63.63,
+          "shared": 6.44,
+          "head": 3.37
+        },
+        {
+          "pos": 2149.0,
+          "count": 1.0,
+          "total": 210.4,
+          "fill": 57.47,
+          "pf_wait": 33.82,
+          "xfer": 369.8,
+          "ple": 1.32,
+          "hc": 19.42,
+          "linear_attn": 11.9,
+          "full_attn": 8.46,
+          "router": 14.25,
+          "experts": 144.72,
+          "acquire": 112.5,
+          "shared": 6.59,
+          "head": 3.7
+        },
+        {
+          "pos": 2150.0,
+          "count": 1.0,
+          "total": 172.74,
+          "fill": 26.73,
+          "pf_wait": 29.49,
+          "xfer": 297.3,
+          "ple": 1.28,
+          "hc": 18.85,
+          "linear_attn": 11.55,
+          "full_attn": 8.12,
+          "router": 13.99,
+          "experts": 109.25,
+          "acquire": 74.89,
+          "shared": 6.24,
+          "head": 3.41
+        },
+        {
+          "pos": 2151.0,
+          "count": 1.0,
+          "total": 219.02,
+          "fill": 46.57,
+          "pf_wait": 42.19,
+          "xfer": 476.1,
+          "ple": 1.29,
+          "hc": 19.39,
+          "linear_attn": 11.75,
+          "full_attn": 8.61,
+          "router": 13.89,
+          "experts": 154.04,
+          "acquire": 113.87,
+          "shared": 6.64,
+          "head": 3.38
+        },
+        {
+          "pos": 2152.0,
+          "count": 1.0,
+          "total": 157.65,
+          "fill": 22.07,
+          "pf_wait": 23.68,
+          "xfer": 219.9,
+          "ple": 1.26,
+          "hc": 18.98,
+          "linear_attn": 11.64,
+          "full_attn": 7.99,
+          "router": 14.15,
+          "experts": 92.98,
+          "acquire": 60.15,
+          "shared": 6.79,
+          "head": 3.84
+        },
+        {
+          "pos": 2153.0,
+          "count": 1.0,
+          "total": 141.55,
+          "fill": 16.72,
+          "pf_wait": 11.05,
+          "xfer": 287.6,
+          "ple": 1.35,
+          "hc": 18.74,
+          "linear_attn": 11.54,
+          "full_attn": 8.16,
+          "router": 13.85,
+          "experts": 77.94,
+          "acquire": 37.63,
+          "shared": 6.4,
+          "head": 3.53
+        },
+        {
+          "pos": 2154.0,
+          "count": 1.0,
+          "total": 160.48,
+          "fill": 34.29,
+          "pf_wait": 14.84,
+          "xfer": 251.4,
+          "ple": 1.3,
+          "hc": 19.66,
+          "linear_attn": 11.78,
+          "full_attn": 8.32,
+          "router": 14.54,
+          "experts": 94.72,
+          "acquire": 64.49,
+          "shared": 6.72,
+          "head": 3.41
+        },
+        {
+          "pos": 2155.0,
+          "count": 1.0,
+          "total": 160.26,
+          "fill": 35.2,
+          "pf_wait": 3.6,
+          "xfer": 336.0,
+          "ple": 1.26,
+          "hc": 19.2,
+          "linear_attn": 11.7,
+          "full_attn": 8.57,
+          "router": 13.81,
+          "experts": 95.74,
+          "acquire": 55.74,
+          "shared": 6.58,
+          "head": 3.37
+        },
+        {
+          "pos": 2156.0,
+          "count": 1.0,
+          "total": 147.13,
+          "fill": 21.07,
+          "pf_wait": 19.4,
+          "xfer": 263.5,
+          "ple": 1.25,
+          "hc": 18.45,
+          "linear_attn": 11.87,
+          "full_attn": 8.24,
+          "router": 13.67,
+          "experts": 83.91,
+          "acquire": 51.1,
+          "shared": 6.31,
+          "head": 3.4
+        },
+        {
+          "pos": 2157.0,
+          "count": 1.0,
+          "total": 129.61,
+          "fill": 28.61,
+          "pf_wait": 1.64,
+          "xfer": 125.7,
+          "ple": 1.33,
+          "hc": 18.77,
+          "linear_attn": 11.65,
+          "full_attn": 7.93,
+          "router": 14.29,
+          "experts": 65.29,
+          "acquire": 35.42,
+          "shared": 6.49,
+          "head": 3.84
+        },
+        {
+          "pos": 2158.0,
+          "count": 1.0,
+          "total": 140.17,
+          "fill": 27.75,
+          "pf_wait": 9.55,
+          "xfer": 203.0,
+          "ple": 1.28,
+          "hc": 18.73,
+          "linear_attn": 11.5,
+          "full_attn": 7.91,
+          "router": 13.79,
+          "experts": 77.35,
+          "acquire": 47.73,
+          "shared": 6.17,
+          "head": 3.4
+        },
+        {
+          "pos": 2159.0,
+          "count": 1.0,
+          "total": 214.52,
+          "fill": 64.16,
+          "pf_wait": 32.18,
+          "xfer": 367.4,
+          "ple": 1.28,
+          "hc": 19.64,
+          "linear_attn": 11.97,
+          "full_attn": 8.74,
+          "router": 14.18,
+          "experts": 148.64,
+          "acquire": 112.45,
+          "shared": 6.59,
+          "head": 3.43
+        },
+        {
+          "pos": 2160.0,
+          "count": 1.0,
+          "total": 215.56,
+          "fill": 62.35,
+          "pf_wait": 36.64,
+          "xfer": 323.9,
+          "ple": 1.34,
+          "hc": 19.23,
+          "linear_attn": 11.89,
+          "full_attn": 8.24,
+          "router": 14.1,
+          "experts": 150.71,
+          "acquire": 117.04,
+          "shared": 6.6,
+          "head": 3.4
+        },
+        {
+          "pos": 2161.0,
+          "count": 1.0,
+          "total": 183.48,
+          "fill": 30.12,
+          "pf_wait": 36.94,
+          "xfer": 321.5,
+          "ple": 1.28,
+          "hc": 18.62,
+          "linear_attn": 11.52,
+          "full_attn": 8.17,
+          "router": 13.99,
+          "experts": 123.48,
+          "acquire": 89.79,
+          "shared": 6.39,
+          "head": 0.0
+        }
+      ],
+      "means": {
+        "total": 177.83625,
+        "fill": 35.875,
+        "pf_wait": 24.478749999999998,
+        "xfer": 327.20625,
+        "ple": 1.2975,
+        "hc": 19.06625,
+        "linear_attn": 11.70375,
+        "full_attn": 8.319375,
+        "router": 14.056875,
+        "experts": 113.58812499999999,
+        "acquire": 77.300625,
+        "shared": 6.49625,
+        "head": 3.27125
+      },
+      "interpretation": "Stage synchronization changes scheduling. Means are diagnostic milliseconds; xfer is demand MiB. Includes final alignment. Different prompt/output trajectories, not a causal context-only comparison."
+    }
+  ],
+  "limitations": [
+    "QSA uses fixed synthetic prepared BF16 data and wall timings, not hardware event times or production throughput.",
+    "Selected block IDs checked against host oracle; attention checked against CPU f64 for two heads, finite values for all 24. Indexer scoring numerics not newly certified here.",
+    "Post-projection path excludes Q/K/V projections, indexer projection, norm/RoPE, compression, gating and output projection.",
+    "Model stages serialize execution; different prompts and generated tokens can change expert demand. No direct WDDM residency measurement."
+  ]
+}

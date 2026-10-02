@@ -1,5 +1,9 @@
 #include "engine/Engine.hpp"
+#include "utils/Qwen38A770Preset.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <sycl/ext/oneapi/dot_product.hpp>
+#include <sycl/ext/intel/math.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include <algorithm>
 #include <array>
@@ -27,6 +31,28 @@ static constexpr float kTestQuantMap[16] = {
 };
 
 struct Qwen4ExpGenerationTestAccess {
+    static void ExpertQualityProbe(Qwen4ExpBnb4Backend& b,void* data,decltype(b.expert_quality_probe_) hook) {
+        b.expert_quality_probe_data_=data;b.expert_quality_probe_=hook;
+    }
+    static Tensor& ExpertIntermediate(Qwen4ExpBnb4Backend& b) {return b.buf_.moe_h;}
+    static Tensor& ExpertDown(Qwen4ExpBnb4Backend& b) {return b.buf_.moe_down_acc;}
+    static void CompactMoe(Qwen4ExpBnb4Backend& b, int tile) {
+        b.context_->synchronize(); b.moe_compact_tile_=tile;b.runtime_seq_capacity_=0;
+        b.ensure_runtime_buffers(*b.context_,64);
+    }
+    static void AttentionTile(Qwen4ExpBnb4Backend& b, int tile, int reserve = 0) {
+        b.context_->synchronize();
+        b.prefill_attention_tile_ = tile;
+        if (reserve) b.ensure_runtime_buffers(*b.context_, reserve);
+    }
+    static Tensor& AttentionOnly(Qwen4ExpBnb4Backend& b, int layer, int count, int position) {
+        b.RunAttentionWindow(*b.context_, *b.defaultSession_, layer, count, position, nullptr, 0);
+        return b.buf_.y;
+    }
+    static int FullLayer(Qwen4ExpBnb4Backend& b) {
+        for (int i=0;i<int(b.layers_.size());++i) if (!b.layers_[i].is_linear) return i;
+        throw std::runtime_error("Missing full attention layer");
+    }
     static Tensor& MtpTargetPrompt(InferenceEngine& e,const int* ids,int count) {
         return Backend(e).ForwardImpl(Ctx(e),Session(e),ids,count,true,{SnapshotPolicy::None,true});
     }
@@ -76,6 +102,7 @@ struct Qwen4ExpGenerationTestAccess {
     static Qwen4ExpExpertCache& Cache(InferenceEngine& engine) { return Backend(engine).expert_cache_; }
     static void Grouped(Qwen4ExpBnb4Backend& b, int minRows) { b.grouped_xmx_min_rows_override_ = minRows; }
     static void Histogram(Qwen4ExpBnb4Backend& b) { b.expert_histogram_enabled_ = true; b.expert_histogram_ = {}; }
+    static void ResidentSplit(Qwen4ExpBnb4Backend& b, bool enabled) { b.small_rows_resident_split_override_ = enabled ? 1 : 0; }
     static const auto& Histogram(const Qwen4ExpBnb4Backend& b) { return b.expert_histogram_; }
     static uint64_t GroupedActs(const Qwen4ExpBnb4Backend& b) { return b.grouped_xmx_acts_; }
     static void GdnMode(Qwen4ExpBnb4Backend& b, int mode) {
@@ -543,6 +570,12 @@ void test_real_model_tolerance(const std::string& model_dir) {
 }
 
 #include "Qwen4ExpCheckpointAcceptance.hpp"
+#include "Qwen4ExpPresetAcceptance.hpp"
+#include "Qwen4ExpAttentionTileAcceptance.hpp"
+#include "Qwen4ExpMatureGemmProbe.hpp"
+#include "Qwen4ExpCompactMoeProbe.hpp"
+#include "Qwen4ExpIntegerMoeProbe.hpp"
+#include "Qwen4ExpIntegerQualityAcceptance.hpp"
 #include "Qwen4ExpGroupedXmxAcceptance.hpp"
 #include "Qwen4ExpGdnChunkAcceptance.hpp"
 #include "Qwen4ExpFrontGraphProbe.hpp"
@@ -582,6 +615,40 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--checkpoint-model") {
             test_checkpoint_acceptance(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--preset-model") {
+            test_qwen38_preset_checkpoint(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--window-model") {
+            test_qwen38_window_quality(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--compact-model") {
+            test_compact_moe(argv[2]); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--integer-model") {
+            test_integer_moe(argv[2]); return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--dpas-smoke") {
+            test_integer_dpas_smoke(); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--dpas-model") {
+            test_integer_moe(argv[2],true); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--integer-state") {
+            test_integer_quality(argv[2],true); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--integer-quality") {
+            test_integer_quality(argv[2]); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--tile-model") {
+            test_attention_tile_acceptance(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--mature-moe-model") {
+            test_mature_moe_gemm(argv[2]);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--memory-model") {

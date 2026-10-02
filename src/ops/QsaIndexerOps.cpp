@@ -1,4 +1,5 @@
 #include "ops/QsaIndexerOps.hpp"
+#include "utils/EnvUtils.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -6,6 +7,27 @@
 namespace ops {
 
 namespace {
+
+// 0: legacy; 1: native one-bit reduction; 2/3: parallel 4/8-bit radix; 4: vec4 loads.
+struct QsaSelectorPolicy {
+    int mode = 0;
+    explicit QsaSelectorPolicy(Context& ctx) {
+        const auto device = ctx.queue().get_device();
+        const auto name = device.get_info<sycl::info::device::name>();
+        if (ctx.queue().get_backend() == sycl::backend::ext_oneapi_level_zero &&
+            device.get_info<sycl::info::device::vendor_id>() == 0x8086 &&
+            name.find("A770") != std::string::npos) mode = 4;
+    }
+};
+
+int qsa_selector_mode(Context& ctx, int topk, int ratio, int blocks) {
+    static const int mode = aila::env::read_int_raw("AILA_QSA_SELECTOR", -1);
+    if (mode >= 0) return mode;
+    // A770/Level Zero, Qwen's 512-block budget, through 128K visible tokens.
+    // Cache device identification per Context, never in a process-global device flag.
+    if (topk != 512 || ratio != 4 || blocks > 32768) return 0;
+    return ctx.workspace<QsaSelectorPolicy>().mode;
+}
 
 // Map IEEE-754 values to an unsigned key with the same order as numeric comparison.
 // QSA scores are non-negative, but keeping the helper well-defined for the public
@@ -27,6 +49,97 @@ inline std::uint32_t qsa_score_order_key(float score) {
 inline bool qsa_candidate_is_worse(std::uint32_t a_key, int a_id, std::uint32_t b_key, int b_id) {
     if (a_key != b_key) return a_key < b_key;
     return a_id > b_id;
+}
+
+// Exact integer-key selection. Each subgroup owns a histogram to bound local
+// atomic contention; all lanes participate in digit scans and stable compaction.
+// Output remains ascending by block ID, including ties at the cutoff.
+template <int Bits, int LoadWidth = 1>
+void qsa_radix_select_blocks(Context& ctx, const float* scores, int* output,
+    int queries, int score_stride, int start_pos, int topk, int ratio,
+    size_t output_stride, int* valid_counts) {
+    constexpr int wg = 256, bins = 1 << Bits, subgroups = wg / 16;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> hist(sycl::range<1>(subgroups * bins), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(queries) * wg, wg),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int lid = item.get_local_id(0), row = item.get_group(0);
+                const int length = start_pos + row + 1, blocks = length / ratio;
+                const int tail = length % ratio, selected = sycl::min(blocks, topk);
+                const float* sc = scores + size_t(row) * score_stride;
+                int* out = output + size_t(row) * output_stride;
+                const auto group = item.get_group();
+                if (valid_counts && lid == 0) {
+                    valid_counts[2 * row] = selected;
+                    valid_counts[2 * row + 1] = tail;
+                }
+                if (lid < tail) out[selected + lid] = blocks * ratio + lid;
+                if (blocks <= topk) {
+                    for (int b = lid; b < blocks; b += wg) out[b] = b;
+                    return;
+                }
+                std::uint32_t prefix = 0, mask = 0;
+                int rank = topk;
+                for (int shift = 32 - Bits; shift >= 0; shift -= Bits) {
+                    for (int i = lid; i < subgroups * bins; i += wg) hist[i] = 0;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int b = lid * LoadWidth; b < blocks; b += wg * LoadWidth) {
+                        sycl::vec<float, LoadWidth> values;
+                        if (b + LoadWidth <= blocks) {
+                            values.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                sycl::access::decorated::no>(sc + b));
+                        } else {
+                            for (int j = 0; j < LoadWidth; ++j)
+                                values[j] = b + j < blocks ? sc[b + j] : 0.0f;
+                        }
+                        for (int j = 0; j < LoadWidth; ++j) {
+                            const auto key = qsa_score_order_key(values[j]);
+                            if (b + j < blocks && (key & mask) == prefix) {
+                                const int bin = (key >> shift) & (bins - 1);
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                                    sycl::memory_scope::work_group,
+                                    sycl::access::address_space::local_space> count(
+                                        hist[(lid / 16) * bins + bin]);
+                                count.fetch_add(1);
+                            }
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    int count = 0;
+                    if (lid < bins) {
+                        for (int sg = 0; sg < subgroups; ++sg)
+                            count += hist[sg * bins + (bins - 1 - lid)];
+                    }
+                    const int inclusive = sycl::inclusive_scan_over_group(group, count, sycl::plus<int>());
+                    const int before = inclusive - count;
+                    const bool cutoff = lid < bins && before < rank && inclusive >= rank;
+                    const int digit = sycl::reduce_over_group(group, cutoff ? bins - 1 - lid : 0, sycl::maximum<int>());
+                    const int above = sycl::reduce_over_group(group, cutoff ? before : 0, sycl::plus<int>());
+                    prefix |= std::uint32_t(digit) << shift;
+                    mask |= std::uint32_t(bins - 1) << shift;
+                    rank -= above;
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                // Contiguous per-lane intervals make global compaction stable.
+                const int per = (blocks + wg - 1) / wg;
+                const int begin = lid * per, end = sycl::min(begin + per, blocks);
+                int greater = 0, equal = 0;
+                for (int b = begin; b < end; ++b) {
+                    const auto key = qsa_score_order_key(sc[b]);
+                    greater += key > prefix; equal += key == prefix;
+                }
+                const int eq_before = sycl::exclusive_scan_over_group(group, equal, sycl::plus<int>());
+                int ties = sycl::min(equal, sycl::max(0, rank - eq_before));
+                int offset = sycl::exclusive_scan_over_group(group, greater + ties, sycl::plus<int>());
+                for (int b = begin; b < end; ++b) {
+                    const auto key = qsa_score_order_key(sc[b]);
+                    if (key > prefix || (key == prefix && ties > 0)) {
+                        out[offset++] = b;
+                        if (key == prefix) --ties;
+                    }
+                }
+            });
+    });
 }
 
 inline float calculate_rotary_position(
@@ -1092,6 +1205,20 @@ int qsa_select_topk_blocks(
     if (cached_len <= 0 || block_topk <= 0) return 0;
     const int tail_start = num_complete_blocks * compress_ratio;
     const int tail_len = std::max(0, cached_len - tail_start);
+    const int selector = qsa_selector_mode(ctx, block_topk, compress_ratio, num_complete_blocks);
+    if (selector >= 2 && selector <= 4 && num_complete_blocks > block_topk + 1 &&
+        compress_ratio > 0 && num_complete_blocks == cached_len / compress_ratio) {
+        if (selector == 2)
+            qsa_radix_select_blocks<4>(ctx, scores.data_as<float>(), active_blocks_out.data_as<int>(),
+                1, num_complete_blocks, cached_len - 1, block_topk, compress_ratio, 0, nullptr);
+        else if (selector == 3)
+            qsa_radix_select_blocks<8>(ctx, scores.data_as<float>(), active_blocks_out.data_as<int>(),
+                1, num_complete_blocks, cached_len - 1, block_topk, compress_ratio, 0, nullptr);
+        else
+            qsa_radix_select_blocks<8, 4>(ctx, scores.data_as<float>(), active_blocks_out.data_as<int>(),
+                1, num_complete_blocks, cached_len - 1, block_topk, compress_ratio, 0, nullptr);
+        return block_topk;
+    }
 
     if (num_complete_blocks <= block_topk) {
         int* out_ptr = active_blocks_out.data_as<int>();
@@ -1198,11 +1325,16 @@ int qsa_select_topk_blocks(
                             ++count_one;
                         }
                     }
-                    local_cnt_one[lid] = count_one;
-                    item.barrier(sycl::access::fence_space::local_space);
-                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
-                        if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                    if (selector == 1) {
+                        const int count = sycl::reduce_over_group(item.get_group(), count_one, sycl::plus<int>());
+                        if (lid == 0) local_cnt_one[0] = count;
+                    } else {
+                        local_cnt_one[lid] = count_one;
                         item.barrier(sycl::access::fence_space::local_space);
+                        for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                            if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                            item.barrier(sycl::access::fence_space::local_space);
+                        }
                     }
                     if (lid == 0) {
                         if (local_cnt_one[0] >= remaining_rank[0]) {
@@ -1700,6 +1832,19 @@ void qsa_select_topk_blocks_batched(
 
     constexpr int kWgSize = 256;
     const size_t out_stride = static_cast<size_t>(block_topk + 4);
+    const int selector = qsa_selector_mode(ctx, block_topk, compress_ratio, (start_pos + query_count) / compress_ratio);
+    if (selector >= 2 && selector <= 4) {
+        if (selector == 2)
+            qsa_radix_select_blocks<4>(ctx, scores_ptr, out_ptr, query_count, max_complete_blocks,
+                start_pos, block_topk, compress_ratio, out_stride, valid_counts_ptr);
+        else if (selector == 3)
+            qsa_radix_select_blocks<8>(ctx, scores_ptr, out_ptr, query_count, max_complete_blocks,
+                start_pos, block_topk, compress_ratio, out_stride, valid_counts_ptr);
+        else
+            qsa_radix_select_blocks<8, 4>(ctx, scores_ptr, out_ptr, query_count, max_complete_blocks,
+                start_pos, block_topk, compress_ratio, out_stride, valid_counts_ptr);
+        return;
+    }
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);

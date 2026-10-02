@@ -199,6 +199,7 @@ Usage: aila [options]
 
 Options:
   -m, --model <path>       Model directory (required, or set AILA_MODEL_DIR)
+  --performance-preset qwen38-a770  Qwen3.8 NF4 on A770; 32 GiB host pool, GPU experts
   -s, --max-seq <N>        Maximum sequence length (default: 4096, or AILA_MAX_SEQ_LEN)
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
@@ -323,6 +324,14 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             opts.model_dir = argv[++i];
+            continue;
+        }
+        if (arg == "--performance-preset") {
+            if (i + 1 >= argc || std::string(argv[i + 1]) != "qwen38-a770") {
+                std::cerr << "Error: --performance-preset requires qwen38-a770" << std::endl;
+                return false;
+            }
+            opts.performance_preset = argv[++i];
             continue;
         }
         if ((arg == "-s" || arg == "--max-seq") && i + 1 < argc) {

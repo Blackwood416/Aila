@@ -221,7 +221,8 @@ public:
               int intermediate_size = 640,
               int blocksize = 64,
               std::string* error_message = nullptr,
-              bool force_nested_codes = false);
+              bool force_nested_codes = false,
+              const std::string& trace_suffix = "");
 
     // Override or set layer expert references (useful for testing or manual binding)
     void set_layer_expert_ref(int layer,
@@ -256,6 +257,7 @@ public:
     // Explicit forward boundaries: acquire count is not a Prefill/decode marker.
     void trace_forward(int position, int tokens, bool begin, bool need_logits);
     void trace_host_interval(const char* name, int layer, int64_t begin_ns, int64_t end_ns);
+    void trace_router(int layer, const int* ids, int rows, int top_k);
     bool tracing() const { return static_cast<bool>(cache_trace_); }
 
     // Device slot descriptors for kernel launches

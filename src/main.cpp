@@ -7,6 +7,8 @@
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
+#include "utils/Qwen38A770Preset.hpp"
+#include "utils/ModelSpec.hpp"
 #include "vision/DetectionRenderer.hpp"
 #include <algorithm>
 #include <chrono>
@@ -147,6 +149,25 @@ int main(int argc, char** argv) {
     aila::set_log_level(opts.log_level);
 
     // Check GPU device
+    if (!opts.performance_preset.empty()) {
+        try {
+            ModelSpec spec;
+            std::string error;
+            if (!aila::modelspec::load_from_dir(opts.model_dir, spec, &error) ||
+                spec.family != ModelFamily::Qwen4Exp || !spec.is_bitsandbytes_4bit() ||
+                spec.quantization.bnb_4bit_quant_type != "nf4")
+                throw std::runtime_error("qwen38-a770 requires a Qwen3.8-Flash-Next NF4 model: " + error);
+            const sycl::device device(sycl::default_selector_v);
+            if (device.get_backend() != sycl::backend::ext_oneapi_level_zero ||
+                device.get_info<sycl::info::device::vendor_id>() != 0x8086 ||
+                device.get_info<sycl::info::device::name>().find("A770") == std::string::npos)
+                throw std::runtime_error("qwen38-a770 requires an Intel Arc A770 with Level Zero");
+            aila::ApplyQwen38A770Preset();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            return 1;
+        }
+    }
     CheckDevice();
     AILA_LOG_INFO("[Config] log_level=%s max_seq_len=%d",
                   aila::log_level_name(opts.log_level), opts.max_seq_len);

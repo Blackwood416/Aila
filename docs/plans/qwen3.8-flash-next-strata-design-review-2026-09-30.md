@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：Strata 执行设计对照与可迁移方案
 
+后续执行状态：[S1/S2 与 S3 条件判断](qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md)、[S4 实现与 S5 筛选](qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md)。以下保留源码审阅时的设计与假设，实施结果以这些后续报告为准。
+
 2026-09-30。审阅本地 `tmp/Strata`，commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`（0.1.27），其工作区干净。Aila 为 `0293b3b` 加当前 P0–P4/HC/MTP 未提交改动。本轮只阅读源码、核对既有结果和计算预算，没有运行 Strata、GPU benchmark 或改变推理默认值。源码身份与计算输入见同名 JSON。
 
 **Strata 值得借鉴，最有价值的是把“小窗口验证”作为独立执行路径，并分别优化 draft 历史补齐、接受前缀状态提交和 Prefill 内存生命周期。它使 MTP 出现了新的具体实验方向，但并未推翻 Aila 现有验证成本不足以达到 20 tok/s 的测量结论。**

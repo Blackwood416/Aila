@@ -110,7 +110,9 @@ struct Qwen4ExpMtpProbe {
         constexpr size_t slotBytes=2534400;
         const int mtpSlots=aila::env::read_int("AILA_Q4E_MTP_SLOTS",512);
         Require(mtpSlots==64 || mtpSlots==512,"Unsupported MTP cache probe size");
-        Require(experts.init(ctx,weights,1,mtpSlots*slotBytes,512,2560,640,64,&error,true),error);
+        // A separate trace prevents the draft cache from truncating the target
+        // cache's file when both caches live in the same diagnostic process.
+        Require(experts.init(ctx,weights,1,mtpSlots*slotBytes,512,2560,640,64,&error,true,".mtp"),error);
         Bnb4BitHostWeightRef gu,dn;
         Require(LoadBnb4BitHostRef(weights,"mtp.layers.0.mlp.experts.gate_up_proj",gu,&error,2560),error);
         Require(LoadBnb4BitHostRef(weights,"mtp.layers.0.mlp.experts.down_proj",dn,&error,640),error);
@@ -134,6 +136,8 @@ struct Qwen4ExpMtpProbe {
     void Reset() {
         ctx.queue().memset(state.k.data(),0,state.k.size_bytes());
         ctx.queue().memset(state.v.data(),0,state.v.size_bytes());
+        ctx.queue().memset(state.indexer_k.data(),0,state.indexer_k.size_bytes());
+        ctx.queue().memset(state.indexer_compressed_k.data(),0,state.indexer_compressed_k.size_bytes());
         state.num_compressed_blocks=0;
     }
     // Input hidden is [4,H] from target/prior draft BEFORE its final mixer.
@@ -146,7 +150,10 @@ struct Qwen4ExpMtpProbe {
         std::ofstream out(prefix+name,std::ios::binary);out.write(reinterpret_cast<const char*>(host.data()),host.size()*sizeof(bf16));
         Require(bool(out),"MTP stage dump failed");
     }
-    void Step(const bf16* hidden,int token,int position,bool head=true,const std::string& debug="") {
+    void AppendTargetKv(const bf16* hidden,int token,int position) {
+        Step(hidden,token,position,false,"",true);
+    }
+    void Step(const bf16* hidden,int token,int position,bool head=true,const std::string& debug="",bool kvOnly=false) {
         Require(position>=0 && position<capacity,"MTP position outside probe capacity");
         auto& b=target.buf_; auto& scratch=target.linear_scratch_;
         Require(token>=0 && token<target.cfg_.vocab_size,"MTP token out of range");
@@ -178,6 +185,10 @@ struct Qwen4ExpMtpProbe {
             ops::qsa_compress_key_blocks(ctx,state.indexer_k,*layer.index_k_norm_weight,state.indexer_compressed_k,
                 position/4,1,10000000.0f,true,nullptr,nullptr,nullptr,0,0,11,11,10);
         }
+        // Keep the original fused QKV and indexer arithmetic. Catch-up only
+        // needs these persistent rows; neither attention nor MoE feeds them.
+        // Scratch hidden4/x are intentionally not a completed draft output.
+        if (kvOnly) return;
         ops::attention_decode(ctx,b.q,state.k,state.v,b.attn_out,b.decode_scores,24,2,256,position+1,&b.decode_attn_partials,&b.z);
         Dump(debug,".attn_out.bf16",b.attn_out,6144);
         layer.o_proj.ForwardDecodeRows(ctx,scratch,b.attn_out,b.y,1);
@@ -205,6 +216,37 @@ struct Qwen4ExpMtpProbe {
             target.RunHyperConnection(ctx,mixer,1,false);
             target.lm_head_.forward(ctx,b.x,b.logits,1);
         }
+    }
+
+    void CheckTargetKv(const bf16* hidden,const std::vector<int>& tokens,int rows) {
+        Require(rows>0 && rows+1<capacity && int(tokens.size())>rows+1,"Invalid KV equivalence range");
+        auto copy=[&](const Tensor& t) {
+            std::vector<uint8_t> out(t.size_bytes());ctx.memcpy_d2h(out.data(),t.data(),out.size());return out;
+        };
+        const std::array<Tensor*,4> caches{&state.k,&state.v,&state.indexer_k,&state.indexer_compressed_k};
+        std::array<std::vector<uint8_t>,4> reference;
+        const auto live=ctx.device_allocation_count(),pinned=ctx.pinned_host_allocation_count();
+        Reset();
+        for(int p=0;p<rows;++p)Step(hidden+size_t(p)*10240,tokens[p+1],p,false);
+        for(size_t i=0;i<caches.size();++i)reference[i]=copy(*caches[i]);
+        Step(hidden+size_t(rows)*10240,tokens[rows+1],rows);ctx.synchronize();
+        // Only one output row is written; do not copy unused scratch tails.
+        std::vector<bf16> refHidden(10240),actualHidden(10240);
+        ctx.memcpy_d2h(refHidden.data(),target.buf_.hidden4.data(),refHidden.size()*sizeof(bf16));
+        std::vector<bf16> refLogits(target.vocab_size()),actual(refLogits.size());
+        ctx.memcpy_d2h(refLogits.data(),target.buf_.logits.data(),refLogits.size()*sizeof(bf16));
+        Reset();const auto stats=experts.stats();
+        for(int p=0;p<rows;++p)AppendTargetKv(hidden+size_t(p)*10240,tokens[p+1],p);
+        for(size_t i=0;i<caches.size();++i)Require(copy(*caches[i])==reference[i],"KV-only changed persistent cache");
+        Require(experts.stats().miss_count==stats.miss_count && experts.stats().hit_count==stats.hit_count &&
+            experts.stats().total_transferred_bytes==stats.total_transferred_bytes,"KV-only accessed experts");
+        Step(hidden+size_t(rows)*10240,tokens[rows+1],rows);ctx.synchronize();
+        ctx.memcpy_d2h(actual.data(),target.buf_.logits.data(),actual.size()*sizeof(bf16));
+        ctx.memcpy_d2h(actualHidden.data(),target.buf_.hidden4.data(),actualHidden.size()*sizeof(bf16));
+        Require(std::memcmp(refHidden.data(),actualHidden.data(),10240*sizeof(bf16))==0 &&
+            std::memcmp(refLogits.data(),actual.data(),actual.size()*sizeof(bf16))==0,"KV-only changed subsequent full draft");
+        Require(ctx.device_allocation_count()==live && ctx.pinned_host_allocation_count()==pinned,"KV-only grew live USM");
+        std::cout<<"[MTP KV EQUIVALENCE] {\"rows\":"<<rows<<",\"cache_bitwise\":true,\"continuation_bitwise\":true,\"expert_accesses\":0,\"live_usm_delta\":0}\n";
     }
 
     // One bounded device checkpoint, text-only SnapshotPolicy::None. KV and

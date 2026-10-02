@@ -21,7 +21,7 @@ def require(ok, message):
 
 
 def read_trace(path):
-    rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
     require(rows and rows[0].get("schema") == 1, "Missing schema-1 config")
     require(sum(r["type"] == "config" for r in rows) == 1, "Multiple cache instances")
     return rows
@@ -35,17 +35,27 @@ def validate(rows):
     resident, slots = {}, [-1] * cap
     forward, acquire, reserved = None, None, set()
     totals = []
+    routed, acquired = {}, {}
     for r in rows[1:]:
         kind = r["type"]
         if kind == "forward_begin":
             require(forward is None and acquire is None, "Unclosed forward")
             forward = dict(r, hits=0, misses=0, bytes=0, host_hits=0, file_fills=0,
                            acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={})
+            routed, acquired = {}, {}
+        elif kind == "route":
+            require(forward is not None and acquire is None and r["forward"] == forward["forward"], "Orphan route")
+            require(r["rows"] == forward["tokens"] and 0 < r["top_k"] <= experts, "Invalid route shape")
+            require(len(r["ids"]) == r["rows"]*r["top_k"] and all(0 <= e < experts for e in r["ids"]), "Invalid route IDs")
+            require(0 <= r["layer"] < cfg["layers"] and r["layer"] not in routed, "Duplicate/invalid route layer")
+            require(all(len(set(r["ids"][i:i+r["top_k"]])) == r["top_k"] for i in range(0,len(r["ids"]),r["top_k"])), "Duplicate expert within a token")
+            routed[r["layer"]] = set(r["ids"])
         elif kind == "acquire_begin":
             require(forward is not None and acquire is None, "Acquire outside forward")
             require(not r["pinned"], "Pinned traces require a pin event schema")
             require(r["forward"] == forward["forward"], "Wrong forward id")
             acquire = r
+            acquired.setdefault(r["layer"], set()).update(r["ids"])
             keys = [r["layer"] * experts + e for e in r["ids"]]
             require(len(keys) == len(r["initial_slots"]) == len(r["host_states"]), "Invalid arrays")
             require(all(0 <= e < experts for e in r["ids"]), "Invalid expert")
@@ -107,6 +117,8 @@ def validate(rows):
                     lru.move_to_end(s, last=False)
         elif kind == "forward_end":
             require(forward and r["forward"] == forward["forward"] and acquire is None, "Wrong forward end")
+            if routed:
+                require(set(routed) == set(range(cfg["layers"])) and routed == acquired, "Route/demand coverage mismatch")
             forward["host_span_ns"] = r["ns"] - forward["ns"]
             totals.append(forward)
             forward = None

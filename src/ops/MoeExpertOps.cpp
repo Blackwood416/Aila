@@ -1377,7 +1377,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool Compact = false>
 sycl::event launch_moe_expert_major_prefill_down(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1478,7 +1478,7 @@ sycl::event launch_moe_expert_major_prefill_down(
                     const int row = static_cast<int>(global_row % out_features);
                     const int token = token_ids[act_idx];
                     const int rank = ranks[act_idx];
-                    const size_t out_pos = (static_cast<size_t>(token) * top_k + rank) * out_features + row;
+                    const size_t out_pos = (Compact ? size_t(act_idx) : size_t(token) * top_k + rank) * out_features + row;
                     down_acc[out_pos] = expert_sum;
                 }
             });
@@ -1675,7 +1675,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up_2token(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool Compact = false>
 sycl::event launch_moe_expert_major_prefill_down_2token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1803,12 +1803,12 @@ sycl::event launch_moe_expert_major_prefill_down_2token(
 
                     const int token0 = token_ids[pair_idx * 2];
                     const int rank0 = ranks[pair_idx * 2];
-                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * out_features + row;
+                    const size_t out_pos0 = (Compact ? size_t(pair_idx * 2 + 0) : size_t(token0) * top_k + rank0) * out_features + row;
                     down_acc[out_pos0] = expert_sum0;
 
                     const int token1 = token_ids[pair_idx * 2 + 1];
                     const int rank1 = ranks[pair_idx * 2 + 1];
-                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * out_features + row;
+                    const size_t out_pos1 = (Compact ? size_t(pair_idx * 2 + 1) : size_t(token1) * top_k + rank1) * out_features + row;
                     down_acc[out_pos1] = expert_sum1;
                 }
             });
@@ -2063,7 +2063,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool Compact = false>
 sycl::event launch_moe_expert_major_prefill_down_4token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2219,22 +2219,22 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
 
                     const int token0 = token_ids[quad_idx * 4];
                     const int rank0 = ranks[quad_idx * 4];
-                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * out_features + row;
+                    const size_t out_pos0 = (Compact ? size_t(quad_idx * 4 + 0) : size_t(token0) * top_k + rank0) * out_features + row;
                     down_acc[out_pos0] = expert_sum0;
 
                     const int token1 = token_ids[quad_idx * 4 + 1];
                     const int rank1 = ranks[quad_idx * 4 + 1];
-                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * out_features + row;
+                    const size_t out_pos1 = (Compact ? size_t(quad_idx * 4 + 1) : size_t(token1) * top_k + rank1) * out_features + row;
                     down_acc[out_pos1] = expert_sum1;
 
                     const int token2 = token_ids[quad_idx * 4 + 2];
                     const int rank2 = ranks[quad_idx * 4 + 2];
-                    const size_t out_pos2 = (static_cast<size_t>(token2) * top_k + rank2) * out_features + row;
+                    const size_t out_pos2 = (Compact ? size_t(quad_idx * 4 + 2) : size_t(token2) * top_k + rank2) * out_features + row;
                     down_acc[out_pos2] = expert_sum2;
 
                     const int token3 = token_ids[quad_idx * 4 + 3];
                     const int rank3 = ranks[quad_idx * 4 + 3];
-                    const size_t out_pos3 = (static_cast<size_t>(token3) * top_k + rank3) * out_features + row;
+                    const size_t out_pos3 = (Compact ? size_t(quad_idx * 4 + 3) : size_t(token3) * top_k + rank3) * out_features + row;
                     down_acc[out_pos3] = expert_sum3;
                 }
             });
@@ -2689,7 +2689,8 @@ sycl::event moe_expert_major_prefill_gate_up(
     return quad_ev;
 }
 
-sycl::event moe_expert_major_prefill_down(
+template <bool Compact>
+static sycl::event dispatch_moe_expert_major_prefill_down(
     Context& ctx,
     const MoeExpertSlotDev* slots,
     const int* token_ids,
@@ -2709,11 +2710,11 @@ sycl::event moe_expert_major_prefill_down(
     if (total_acts <= 0) return {};
     if (num_quads <= 0 && num_pairs <= 0) {
         if (use_nested) {
-            return launch_moe_expert_major_prefill_down<true>(
+            return launch_moe_expert_major_prefill_down<true, Compact>(
                 ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
         }
-        return launch_moe_expert_major_prefill_down<false>(
+        return launch_moe_expert_major_prefill_down<false, Compact>(
             ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
             in_features, out_features, blocksize, dep_event);
     }
@@ -2728,14 +2729,14 @@ sycl::event moe_expert_major_prefill_down(
         const int clamped_quads = std::min(num_quads, remaining_acts / 4);
         if (clamped_quads > 0) {
             if (use_nested) {
-                quad_ev = launch_moe_expert_major_prefill_down_4token<true>(
+                quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                    quant_map, h, down_acc, clamped_quads, top_k,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
                     in_features, out_features, blocksize, dep_event);
             } else {
-                quad_ev = launch_moe_expert_major_prefill_down_4token<false>(
+                quad_ev = launch_moe_expert_major_prefill_down_4token<false, Compact>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                    quant_map, h, down_acc, clamped_quads, top_k,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
                     in_features, out_features, blocksize, dep_event);
             }
             const int quad_acts = 4 * clamped_quads;
@@ -2748,14 +2749,14 @@ sycl::event moe_expert_major_prefill_down(
         const int clamped_pairs = std::min(num_pairs, remaining_acts / 2);
         if (clamped_pairs > 0) {
             if (use_nested) {
-                pair_ev = launch_moe_expert_major_prefill_down_2token<true>(
+                pair_ev = launch_moe_expert_major_prefill_down_2token<true, Compact>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                    quant_map, h, down_acc, clamped_pairs, top_k,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_pairs, top_k,
                     in_features, out_features, blocksize, dep_event);
             } else {
-                pair_ev = launch_moe_expert_major_prefill_down_2token<false>(
+                pair_ev = launch_moe_expert_major_prefill_down_2token<false, Compact>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                    quant_map, h, down_acc, clamped_pairs, top_k,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_pairs, top_k,
                     in_features, out_features, blocksize, dep_event);
             }
             const int pair_acts = 2 * clamped_pairs;
@@ -2766,14 +2767,14 @@ sycl::event moe_expert_major_prefill_down(
 
     if (remaining_acts > 0) {
         if (use_nested) {
-            single_ev = launch_moe_expert_major_prefill_down<true>(
+            single_ev = launch_moe_expert_major_prefill_down<true, Compact>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                quant_map, h, down_acc, remaining_acts, top_k,
+                quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
         } else {
-            single_ev = launch_moe_expert_major_prefill_down<false>(
+            single_ev = launch_moe_expert_major_prefill_down<false, Compact>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
-                quant_map, h, down_acc, remaining_acts, top_k,
+                quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
         }
     }
@@ -2781,6 +2782,80 @@ sycl::event moe_expert_major_prefill_down(
     if (single_ev != sycl::event{}) return single_ev;
     if (pair_ev != sycl::event{}) return pair_ev;
     return quad_ev;
+}
+
+sycl::event moe_expert_major_prefill_down(
+    Context& ctx, const MoeExpertSlotDev* slots, const int* tokens, const int* ranks,
+    const float* qmap, const bf16* h, float* down, int acts, int top_k,
+    int in_features, int out_features, int blocksize, const sycl::event* dep,
+    bool nested, int pairs, int quads, bool compact) {
+    if (compact) return dispatch_moe_expert_major_prefill_down<true>(ctx,slots,tokens,ranks,
+        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads);
+    return dispatch_moe_expert_major_prefill_down<false>(ctx,slots,tokens,ranks,
+        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads);
+}
+
+void moe_build_inverse_map(Context& ctx, const int* tokens, const int* ranks,
+                           int* inverse, int acts, int top_k) {
+    if(acts<=0)return;
+    if(top_k<1 || top_k>16)throw std::invalid_argument("Compact MoE top_k must be 1..16");
+    ctx.queue().parallel_for(sycl::range<1>(acts),[=](sycl::id<1> i) [[sycl::reqd_sub_group_size(16)]] {
+        inverse[tokens[i]*top_k+ranks[i]]=int(i[0]);
+    });
+}
+
+sycl::event moe_merge_compact_down(Context& ctx, const float* down, const int* tokens,
+    const int* inverse, const float* weights, int64_t* sum, int* invalid, int first, int acts,
+    int top_k, int H, const sycl::event* dep) {
+    if(acts<=0)return {};
+    if(first<0 || H<=0 || H%4 || top_k<1 || top_k>16)
+        throw std::invalid_argument("Invalid compact MoE merge shape");
+    // Each token is owned by its first activation in this tile. No float atomics
+    // or races when several experts in the tile contribute to the same token.
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if(dep && *dep!=sycl::event{})cgh.depends_on(*dep);
+        cgh.parallel_for(sycl::nd_range<2>({size_t(acts),128},{1,128}),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                int a=int(item.get_group(0)), t=tokens[first+a], owner=first+acts;
+                for(int k=0;k<top_k;++k){int p=inverse[t*top_k+k];if(p>=first && p<first+acts)owner=sycl::min(owner,p);}
+                if(first+a!=owner)return;
+                using V=sycl::vec<float,4>;
+                using S=sycl::vec<int64_t,4>;
+                for(int j=int(item.get_local_id(1))*4;j<H;j+=128*4){
+                    S acc=*reinterpret_cast<S*>(sum+size_t(t)*H+j);
+                    for(int k=0;k<top_k;++k){
+                        int p=inverse[t*top_k+k];
+                        if(p>=first && p<first+acts) {
+                            const V v=weights[t*top_k+k] * *reinterpret_cast<const V*>(down+size_t(p-first)*H+j);
+                            for(int lane=0;lane<4;++lane) {
+                                // Q36: <=2^-37 absolute rounding per contribution.
+                                // |term|<=2^20 and top_k<=16 keep |sum|<=2^60.
+                                // Inspect bits: -ffast-math may remove isfinite checks.
+                                const uint32_t magnitude=sycl::bit_cast<uint32_t>(float(v[lane]))&0x7fffffffU;
+                                if(magnitude>0x49800000U) {
+                                    sycl::atomic_ref<int,sycl::memory_order::relaxed,sycl::memory_scope::device,
+                                        sycl::access::address_space::global_space>(*invalid).store(1);
+                                } else acc[lane]+=int64_t(sycl::rint(v[lane]*68719476736.f));
+                            }
+                        }
+                    }
+                    *reinterpret_cast<S*>(sum+size_t(t)*H+j)=acc;
+                }
+            });
+    });
+}
+
+sycl::event moe_finish_compact_down(Context& ctx, const int64_t* sum, bf16* y,
+    int tokens, int H, const bf16* shared_out, const bf16* shared_gate) {
+    return ctx.queue().parallel_for(sycl::range<1>(size_t(tokens)*H),
+        [=](sycl::id<1> id) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t i=id[0];const bf16 routed=bf16(float(sum[i])*(1.f/68719476736.f));
+            if(shared_out && shared_gate){
+                const float g=float(shared_gate[i/H]);
+                const float gate=1.f/(1.f+sycl::native::exp(-g));
+                y[i]=bf16(float(routed)+gate*float(shared_out[i]));
+            } else y[i]=routed;
+        });
 }
 
 sycl::event moe_ordered_accumulate_down_rows(

@@ -63,6 +63,7 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                                   bool async_h2d,
                                   const ForwardOptions& options) {
         if (!backend_ || !ctx_ || len <= 0) return nullptr;
+        static const bool log_q4e_preset = !aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "").empty();
         if (start < 0 || start > static_cast<int>(token_ids.size()) ||
             len > static_cast<int>(token_ids.size()) - start || !token_input_staging_.valid()) {
             throw std::invalid_argument("Invalid prompt range or uninitialized token staging");
@@ -93,6 +94,9 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                 }
             }
             const int slice_len = next - pos;
+            if (model_spec_.family == ModelFamily::Qwen4Exp && log_q4e_preset) {
+                AILA_LOG_INFO("[Q4E PrefillSlice] start=%d count=%d checkpoint_after=%d", pos, slice_len, checkpoint_after);
+            }
             ForwardOptions slice_options = options;
             slice_options.checkpoint_after = checkpoint_after;
             slice_options.need_logits = options.need_logits && next == end;

@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：CPU 异构路线是否继续投入
 
+**2026-10-02 决策更新：撤销本报告“CPU routed expert 继续退出优先主线”的后续安排。** 用户指出 Strata 的稳定热集与 GPU 直接命中执行改变了异构分工的架构前提；现按 [热集与 CPU 冷专家新计划](/E:/RiderProjects/Aila/docs/plans/qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md) 重启研究。下文保留旧实现的实测及当时判断；它们不能证明新架构下的 CPU/GPU 分工无价值，也尚未被新的性能实验推翻。数值标准采用用户后来允许的容差与模型质量指标，不再要求生成 token 逐个相同。
+
 日期：2026-09-28。勘察基线为 `f78732da1775f169b616f5bb8adbc0e191e16ba4` 加当前未提交工作树；不能把实验结果仅绑定到该 commit。当前 `Aila.exe` SHA256 为 `5CA0BAE474C8249C59A94EA84A9FD3C2AC1139F47BB86FFF0F14EBC352A8AB0A`，与最新 dataflow 配对一致。Windows / oneAPI 2026.1 / A770 16GB / Xeon E5-2696 v3 AVX2，目标为单请求 story 的延迟。
 
 本轮只读代码、既有实验报告、原始日志与 sidecar，新增本判断和证据摘录。没有构建、运行模型、重跑测试、修改实现、停止 worker 或改变默认开关。

@@ -197,6 +197,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertCache.cpp
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
+    src/models/Qwen4ExpPrefill.cpp
     src/models/Qwen4ExpExpertExecutor.cpp
     src/models/Qwen4ExpExpertReader.cpp
     src/generation/DiffusionGemmaGenerator.cpp
@@ -767,6 +768,8 @@ else()
 endif()
 add_test(NAME AilaQwen4ExpToleranceTests COMMAND AilaQwen4ExpToleranceTests)
 set_tests_properties(AilaQwen4ExpToleranceTests PROPERTIES LABELS "gpu;models;qwen4_exp;tolerance" TIMEOUT 60)
+add_test(NAME AilaQwen4ExpDpasSmoke COMMAND AilaQwen4ExpToleranceTests --dpas-smoke)
+set_tests_properties(AilaQwen4ExpDpasSmoke PROPERTIES LABELS "gpu;models;qwen4_exp;dpas" TIMEOUT 30)
 add_test(NAME AilaQwen4ExpGroupedXmxTests COMMAND AilaQwen4ExpToleranceTests --grouped-kernel)
 set_tests_properties(AilaQwen4ExpGroupedXmxTests PROPERTIES LABELS "gpu;ops;qwen4_exp" TIMEOUT 60)
 

@@ -1,0 +1,1320 @@
+{
+  "date": "2026-10-01",
+  "stage": "R2b bounded DP4A prototype; not full R2b completion",
+  "production_enabled": false,
+  "driver": "32.0.101.9033",
+  "semantics": "two real resident layer-0 experts 7 and 113; BF16 synthetic activations; NF4 integer LUT x per-64 Q8; SwiGLU then Q8 down and ordered BF16 merge",
+  "shape": {
+    "H": 2560,
+    "I": 640,
+    "experts": 2,
+    "rows_per_expert": [
+      1,
+      32
+    ],
+    "top_k_storage": 10
+  },
+  "modes": {
+    "0": "current NF4; decode grouped at M1 and G3 four-token at M32",
+    "1": "DP4A single-token + fdiv_rn quantization",
+    "2": "DP4A four-token + fdiv_rn quantization (M32 only)",
+    "3": "DP4A + corrected reciprocal Q8; single-token M1/four-token M32"
+  },
+  "protocol": {
+    "warmup_per_mode": 8,
+    "interleaved_samples_per_round_per_mode": 20,
+    "rounds": 3,
+    "wall_includes": "two Q8 quantizations, both projections, SwiGLU, ordered merge, submit and completion wait",
+    "h2d_included": false,
+    "event_profile_separate": true,
+    "vtune_wall_time_used": false,
+    "fixture_host_pool_mb": 0,
+    "research_host_pool_mb_unchanged": 32768
+  },
+  "summary": [
+    {
+      "M": 1,
+      "wall_median_of_three_round_medians_us": {
+        "0": 195.75,
+        "1": 250,
+        "3": 236.55
+      },
+      "candidate3_latency_change_percent": 20.84291187739464
+    },
+    {
+      "M": 32,
+      "wall_median_of_three_round_medians_us": {
+        "0": 522.35,
+        "1": 952.95,
+        "2": 593.9,
+        "3": 554.55
+      },
+      "candidate3_latency_change_percent": 6.164449124150462
+    }
+  ],
+  "source_sha256": {
+    "tests/models/Qwen4ExpIntegerMoeProbe.hpp": "a51062521087aa75e3d363d6422d5d3a706f30d2f3604d1f6aad7570577e4b57",
+    "tests/models/Qwen4ExpToleranceTests.cpp": "92d42fdaaa6b61895e273fdc4a3277da9ad4e0b17a6371673e7f466711d4b456",
+    "perf/qwen4exp/q4e_execution_probe.ps1": "d79cb9e371da740d2d9dcea6a1cd1634bb9fd9063090eed6a09790fb3ce52b0a",
+    "perf/qwen4exp/q4e_integer_isa.py": "98116ac1ee1aa3e50d424f83eeaff0f328d391e0186063519939c66a6f02e361"
+  },
+  "runs": {
+    "r2b-integer-corrected-20261001": {
+      "meta_path": "tmp\\r2b-integer-corrected-20261001.meta.json",
+      "log_path": "tmp\\r2b-integer-corrected-20261001.log",
+      "meta_sha256": "812d6ccf7bc827bfe388d7266c960c7c7ee710af05dca60fe15e74ceb0f25d14",
+      "metadata": {
+        "timestamp": "2026-10-01T19:31:37.0809801+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "input": {
+          "kind": "real_nf4_integer_lut_q8_block64",
+          "host_pool_disabled": true,
+          "source_sha256": "A51062521087AA75E3D363D6422D5D3A706F30D2F3604D1F6AAD7570577E4B57"
+        },
+        "exe_sha256": "D7A6AC0374BD5293697049C2E26483DC182B1721C65DC719CE36856E9A328286",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "exit_code": 0,
+        "log_sha256": "2AD4E59E325BB43BB7868474A20933506495120DEF8C039DFACBC246DBCD1383",
+        "err_log_sha256": "1C9E877A633CD97D8B408DD99BD7B06D03D80A0FF7F0F727F2FDF2176375A380",
+        "peak_working_set_bytes": 194752512.0,
+        "peak_child_working_set_bytes": 10477568.0,
+        "minimum_system_free_mb": 53638.109375,
+        "watchdog_stop": false
+      },
+      "entries": [
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 1,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 1,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 3,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 3,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 0,
+          "mode": 0,
+          "median_us": 194.85,
+          "p10_us": 194,
+          "p90_us": 213.4
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 0,
+          "mode": 1,
+          "median_us": 248.2,
+          "p10_us": 246.1,
+          "p90_us": 289
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 0,
+          "mode": 3,
+          "median_us": 236.85,
+          "p10_us": 231,
+          "p90_us": 275.9
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 1,
+          "mode": 0,
+          "median_us": 195.75,
+          "p10_us": 194.4,
+          "p90_us": 199.7
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 1,
+          "mode": 1,
+          "median_us": 250,
+          "p10_us": 248.1,
+          "p90_us": 301.6
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 1,
+          "mode": 3,
+          "median_us": 233.3,
+          "p10_us": 232.6,
+          "p90_us": 286.1
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 2,
+          "mode": 0,
+          "median_us": 198.35,
+          "p10_us": 196.6,
+          "p90_us": 209.8
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 2,
+          "mode": 1,
+          "median_us": 252.55,
+          "p10_us": 251.2,
+          "p90_us": 257.1
+        },
+        {
+          "kind": "TIME",
+          "M": 1,
+          "round": 2,
+          "mode": 3,
+          "median_us": 236.55,
+          "p10_us": 234,
+          "p90_us": 252.3
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 1,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 1,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 2,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 2,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 3,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 3,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 0,
+          "mode": 0,
+          "median_us": 523.7,
+          "p10_us": 515.7,
+          "p90_us": 546.4
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 0,
+          "mode": 1,
+          "median_us": 954.05,
+          "p10_us": 951.5,
+          "p90_us": 964.7
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 0,
+          "mode": 2,
+          "median_us": 595.65,
+          "p10_us": 581.1,
+          "p90_us": 733.1
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 0,
+          "mode": 3,
+          "median_us": 556.5,
+          "p10_us": 551.8,
+          "p90_us": 599
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 1,
+          "mode": 0,
+          "median_us": 522.35,
+          "p10_us": 519.8,
+          "p90_us": 631.7
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 1,
+          "mode": 1,
+          "median_us": 952.95,
+          "p10_us": 950.2,
+          "p90_us": 1073.7
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 1,
+          "mode": 2,
+          "median_us": 593.9,
+          "p10_us": 587.9,
+          "p90_us": 603.3
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 1,
+          "mode": 3,
+          "median_us": 554.55,
+          "p10_us": 550.4,
+          "p90_us": 585.3
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 2,
+          "mode": 0,
+          "median_us": 518.85,
+          "p10_us": 510,
+          "p90_us": 558.8
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 2,
+          "mode": 1,
+          "median_us": 942.8,
+          "p10_us": 932.4,
+          "p90_us": 958.5
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 2,
+          "mode": 2,
+          "median_us": 586.25,
+          "p10_us": 569.6,
+          "p90_us": 656.6
+        },
+        {
+          "kind": "TIME",
+          "M": 32,
+          "round": 2,
+          "mode": 3,
+          "median_us": 552.45,
+          "p10_us": 537.7,
+          "p90_us": 622.9
+        }
+      ]
+    },
+    "r2b-integer-device-final-20261001": {
+      "meta_path": "tmp\\r2b-integer-device-final-20261001.meta.json",
+      "log_path": "tmp\\r2b-integer-device-final-20261001.log",
+      "meta_sha256": "25f9e1eef9acb776a69b0c99135ae769d8a51e10f4f0fc29dca09f8e716befea",
+      "metadata": {
+        "timestamp": "2026-10-01T19:32:43.3419638+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "input": {
+          "source_sha256": "A51062521087AA75E3D363D6422D5D3A706F30D2F3604D1F6AAD7570577E4B57",
+          "host_pool_disabled": true,
+          "kind": "real_nf4_integer_lut_q8_block64"
+        },
+        "exe_sha256": "D7A6AC0374BD5293697049C2E26483DC182B1721C65DC719CE36856E9A328286",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "exit_code": 0,
+        "log_sha256": "2A08F315424E177A98EEBF44F546EAC5F117D2C91B1E08DC8B61D4F780E009DE",
+        "err_log_sha256": "1C9E877A633CD97D8B408DD99BD7B06D03D80A0FF7F0F727F2FDF2176375A380",
+        "peak_working_set_bytes": 195862528.0,
+        "peak_child_working_set_bytes": 10481664.0,
+        "minimum_system_free_mb": 53726.49609375,
+        "watchdog_stop": false
+      },
+      "entries": [
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 1,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 1,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 3,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 3,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 0,
+          "stage": 1,
+          "median_us": 73.438,
+          "p10_us": 73.125,
+          "p90_us": 74.27
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 0,
+          "stage": 3,
+          "median_us": 24.896,
+          "p10_us": 24.583,
+          "p90_us": 25.729
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 0,
+          "stage": 4,
+          "median_us": 8.2295,
+          "p10_us": 8.229,
+          "p90_us": 8.646
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 1,
+          "stage": 0,
+          "median_us": 31.4065,
+          "p10_us": 31.354,
+          "p90_us": 32.083
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 1,
+          "stage": 1,
+          "median_us": 60.834,
+          "p10_us": 59.688,
+          "p90_us": 61.979
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 1,
+          "stage": 2,
+          "median_us": 34.375,
+          "p10_us": 34.166,
+          "p90_us": 35.208
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 1,
+          "stage": 3,
+          "median_us": 19.74,
+          "p10_us": 19.48,
+          "p90_us": 20.417
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 1,
+          "stage": 4,
+          "median_us": 8.541,
+          "p10_us": 8.438,
+          "p90_us": 8.542
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 3,
+          "stage": 0,
+          "median_us": 8.438,
+          "p10_us": 8.437,
+          "p90_us": 8.645
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 3,
+          "stage": 1,
+          "median_us": 69.062,
+          "p10_us": 68.333,
+          "p90_us": 70.417
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 3,
+          "stage": 2,
+          "median_us": 6.458,
+          "p10_us": 6.458,
+          "p90_us": 6.563
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 3,
+          "stage": 3,
+          "median_us": 19.8435,
+          "p10_us": 19.48,
+          "p90_us": 20.417
+        },
+        {
+          "kind": "DEVICE",
+          "M": 1,
+          "mode": 3,
+          "stage": 4,
+          "median_us": 8.542,
+          "p10_us": 8.541,
+          "p90_us": 8.646
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 1,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 1,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 2,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 2,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 3,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 3,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 0,
+          "stage": 1,
+          "median_us": 251.094,
+          "p10_us": 248.229,
+          "p90_us": 253.646
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 0,
+          "stage": 3,
+          "median_us": 140.9375,
+          "p10_us": 140.521,
+          "p90_us": 141.979
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 0,
+          "stage": 4,
+          "median_us": 21.146,
+          "p10_us": 20.625,
+          "p90_us": 21.98
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 1,
+          "stage": 0,
+          "median_us": 35.937,
+          "p10_us": 35.833,
+          "p90_us": 36.041
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 1,
+          "stage": 1,
+          "median_us": 479.375,
+          "p10_us": 478.437,
+          "p90_us": 480.937
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 1,
+          "stage": 2,
+          "median_us": 29.792,
+          "p10_us": 29.688,
+          "p90_us": 30.312
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 1,
+          "stage": 3,
+          "median_us": 275.469,
+          "p10_us": 275.104,
+          "p90_us": 292.812
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 1,
+          "stage": 4,
+          "median_us": 21.146,
+          "p10_us": 20.521,
+          "p90_us": 21.563
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 2,
+          "stage": 0,
+          "median_us": 35.8855,
+          "p10_us": 35.833,
+          "p90_us": 36.042
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 2,
+          "stage": 1,
+          "median_us": 243.4895,
+          "p10_us": 242.396,
+          "p90_us": 249.688
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 2,
+          "stage": 2,
+          "median_us": 29.688,
+          "p10_us": 29.583,
+          "p90_us": 29.896
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 2,
+          "stage": 3,
+          "median_us": 148.802,
+          "p10_us": 148.229,
+          "p90_us": 149.479
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 2,
+          "stage": 4,
+          "median_us": 21.25,
+          "p10_us": 20.417,
+          "p90_us": 21.771
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 3,
+          "stage": 0,
+          "median_us": 8.959,
+          "p10_us": 8.542,
+          "p90_us": 9.167
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 3,
+          "stage": 1,
+          "median_us": 244.7915,
+          "p10_us": 242.395,
+          "p90_us": 252.5
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 3,
+          "stage": 2,
+          "median_us": 6.667,
+          "p10_us": 6.666,
+          "p90_us": 6.979
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 3,
+          "stage": 3,
+          "median_us": 148.906,
+          "p10_us": 148.333,
+          "p90_us": 149.271
+        },
+        {
+          "kind": "DEVICE",
+          "M": 32,
+          "mode": 3,
+          "stage": 4,
+          "median_us": 21.562,
+          "p10_us": 20.833,
+          "p90_us": 21.771
+        }
+      ]
+    },
+    "r2b-integer-vtune-final-20261001": {
+      "meta_path": "tmp\\r2b-integer-vtune-final-20261001.meta.json",
+      "log_path": "tmp\\r2b-integer-vtune-final-20261001.log",
+      "meta_sha256": "abf5ad53a21d736c58f30af3ed41feb7cc60b1ce4449e6539d5f4c3f95cfbaa9",
+      "metadata": {
+        "timestamp": "2026-10-01T19:39:53.8846538+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "input": {
+          "host_pool_disabled": true,
+          "source_sha256": "A51062521087AA75E3D363D6422D5D3A706F30D2F3604D1F6AAD7570577E4B57",
+          "kind": "real_nf4_integer_lut_q8_block64"
+        },
+        "exe_sha256": "D7A6AC0374BD5293697049C2E26483DC182B1721C65DC719CE36856E9A328286",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "exit_code": 0,
+        "log_sha256": "80812CF9EA88BAD49AB084BA32455A6DE57A6A51CC72F3D30C1390F363D7A381",
+        "err_log_sha256": "C8EC7147AA0F8799D894D7C6B824DF321D8EB272DC0FFB080A840A85844B435F",
+        "peak_working_set_bytes": 324231168.0,
+        "peak_child_working_set_bytes": 63148032.0,
+        "minimum_system_free_mb": 52420.20703125,
+        "watchdog_stop": false
+      },
+      "entries": [
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 1,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 1,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 1,
+          "mode": 3,
+          "checked": 7680,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.0614045e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 1,
+          "mode": 3,
+          "nrmse": 0.01795813467,
+          "max_abs": 0.0002746582031,
+          "pointwise_errors": 3,
+          "elements": 2560,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 1,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 1,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 2,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 2,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        },
+        {
+          "kind": "CPU",
+          "M": 32,
+          "mode": 3,
+          "checked": 15360,
+          "errors": 0,
+          "quantizer_errors": 0,
+          "edge_errors": 0,
+          "activation_errors": 0,
+          "merge_errors": 0,
+          "nrmse": 1.04576754e-07,
+          "max_abs": 7.902708443e-08,
+          "abs_tol": 1e-06,
+          "rel_tol": 0.0001
+        },
+        {
+          "kind": "APPROX",
+          "M": 32,
+          "mode": 3,
+          "nrmse": 0.01653179463,
+          "max_abs": 0.0005035400391,
+          "pointwise_errors": 29,
+          "elements": 81920,
+          "abs_tol": 0.0002,
+          "rel_tol": 0.02,
+          "model_quality_validated": 0
+        }
+      ]
+    }
+  },
+  "native_isa": [
+    {
+      "symbol": ".text._ZTSZZN12_GLOBAL__N_118integer_projectionILb1ELi1EEEN4sycl3_V15eventER7ContextPKN3ops16MoeExpertSlotDevEPKiSB_PKaPKfPNS2_3ext6oneapi8bfloat16EPfiiiiSK_ENKUlRNS2_7handlerEE_clESM_EUlNS2_7nd_itemILi1EEEE_",
+      "source": "tmp\\r2b-integer-vtune-final-20261001-vtune\\data.0\\1df68b2fce7afcde.zebin",
+      "source_sha256": "a37f1e52c850d01b4bf2470d8dfe17c5312395d2531ed6198080c87ec842973e",
+      "machine_code_sha256": "107147ae8a2906778c1de9ac2aaa753888bcc93671e52d7f21f299d37e4cf814",
+      "machine_code_unchanged": true,
+      "assembly": "tmp\\r2b-integer-vtune-final-20261001-isa\\1df68b2fce7afcde\\.text.k3.asm",
+      "assembly_sha256": "d517239c47a7220a7777edffaa588fced5f7578e336f6257524c682e0288ac80",
+      "native_dp4a_static_sites": 4
+    },
+    {
+      "symbol": ".text._ZTSZZN12_GLOBAL__N_118integer_projectionILb1ELi4EEEN4sycl3_V15eventER7ContextPKN3ops16MoeExpertSlotDevEPKiSB_PKaPKfPNS2_3ext6oneapi8bfloat16EPfiiiiSK_ENKUlRNS2_7handlerEE_clESM_EUlNS2_7nd_itemILi1EEEE_",
+      "source": "tmp\\r2b-integer-vtune-final-20261001-vtune\\data.0\\1df68b2fce7afcde.zebin",
+      "source_sha256": "a37f1e52c850d01b4bf2470d8dfe17c5312395d2531ed6198080c87ec842973e",
+      "machine_code_sha256": "689e0b0be6fbad17edcaecffd1f63f34ff956f20bed81c14e9d4d4f60ff81244",
+      "machine_code_unchanged": true,
+      "assembly": "tmp\\r2b-integer-vtune-final-20261001-isa\\1df68b2fce7afcde\\.text.k4.asm",
+      "assembly_sha256": "562bb446e2339e3040d184a035fda799cb5f0bbb9139bf94fba998a5fbef592d",
+      "native_dp4a_static_sites": 16
+    },
+    {
+      "symbol": ".text._ZTSZZN12_GLOBAL__N_118integer_projectionILb0ELi4EEEN4sycl3_V15eventER7ContextPKN3ops16MoeExpertSlotDevEPKiSB_PKaPKfPNS2_3ext6oneapi8bfloat16EPfiiiiSK_ENKUlRNS2_7handlerEE_clESM_EUlNS2_7nd_itemILi1EEEE_",
+      "source": "tmp\\r2b-integer-vtune-final-20261001-vtune\\data.0\\1df68b2fce7afcde.zebin",
+      "source_sha256": "a37f1e52c850d01b4bf2470d8dfe17c5312395d2531ed6198080c87ec842973e",
+      "machine_code_sha256": "1070b16465827de0a2ad1d82321a337bb21ced6fe91ee3c0c2a47c8ad9544432",
+      "machine_code_unchanged": true,
+      "assembly": "tmp\\r2b-integer-vtune-final-20261001-isa\\1df68b2fce7afcde\\.text.k5.asm",
+      "assembly_sha256": "8e7fec9a6c8cd91a334711ddf6a48612bd8743e50c923f81039ad735010d4888",
+      "native_dp4a_static_sites": 8
+    },
+    {
+      "symbol": ".text._ZTSZZN12_GLOBAL__N_118integer_projectionILb0ELi1EEEN4sycl3_V15eventER7ContextPKN3ops16MoeExpertSlotDevEPKiSB_PKaPKfPNS2_3ext6oneapi8bfloat16EPfiiiiSK_ENKUlRNS2_7handlerEE_clESM_EUlNS2_7nd_itemILi1EEEE_",
+      "source": "tmp\\r2b-integer-vtune-final-20261001-vtune\\data.0\\1df68b2fce7afcde.zebin",
+      "source_sha256": "a37f1e52c850d01b4bf2470d8dfe17c5312395d2531ed6198080c87ec842973e",
+      "machine_code_sha256": "a1c52787e8db9e30c05a6a11b12dd6edf98daeb36354f73151985cafade73228",
+      "machine_code_unchanged": true,
+      "assembly": "tmp\\r2b-integer-vtune-final-20261001-isa\\1df68b2fce7afcde\\.text.k13.asm",
+      "assembly_sha256": "cd2b9c6719244ddd81c7cc487adb5bf57404921614fa9677c9ef2007d33f11b1",
+      "native_dp4a_static_sites": 2
+    }
+  ],
+  "vtune_rows": [
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)0, (int)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "81920",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.000274",
+      "Computing Task:Average Time": "0.000137",
+      "Computing Task:Instance Count": "2",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "13103360",
+      "GPU Instructions Executed:Control Flow": "706560",
+      "GPU Instructions Executed:Send": "821760",
+      "GPU Instructions Executed:Synchronization": "10240",
+      "GPU Instructions Executed:Int16 & HP Float": "163840",
+      "GPU Instructions Executed:Int32 & SP Float": "6691840",
+      "GPU Instructions Executed:Other": "4709120",
+      "SIMD Utilization(%)": "68.2"
+    },
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)0, (int)4>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "655360",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.001263",
+      "Computing Task:Average Time": "0.000632",
+      "Computing Task:Instance Count": "2",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "172410880",
+      "GPU Instructions Executed:Control Flow": "6144000",
+      "GPU Instructions Executed:Send": "9359360",
+      "GPU Instructions Executed:Synchronization": "81920",
+      "GPU Instructions Executed:Int16 & HP Float": "4997120",
+      "GPU Instructions Executed:Int32 & SP Float": "88104960",
+      "GPU Instructions Executed:Other": "63723520",
+      "SIMD Utilization(%)": "79.9"
+    },
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)1, (int)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "655360",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.003276",
+      "Computing Task:Average Time": "0.003276",
+      "Computing Task:Instance Count": "1",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "298050560",
+      "GPU Instructions Executed:Control Flow": "18432000",
+      "GPU Instructions Executed:Send": "21800960",
+      "GPU Instructions Executed:Synchronization": "40960",
+      "GPU Instructions Executed:Int16 & HP Float": "2498560",
+      "GPU Instructions Executed:Int32 & SP Float": "144363520",
+      "GPU Instructions Executed:Other": "110914560",
+      "SIMD Utilization(%)": "32.8"
+    },
+    {
+      "Computing Task": "ops::(anonymous namespace)::launch_moe_expert_major_prefill_down_4token<(bool)1, (bool)0>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, float*, int, int, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "655360",
+      "Work Size:Local": "256",
+      "Computing Task:Total Time": "0.001472",
+      "Computing Task:Average Time": "0.001472",
+      "Computing Task:Instance Count": "1",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "102126080",
+      "GPU Instructions Executed:Control Flow": "4341760",
+      "GPU Instructions Executed:Send": "4838400",
+      "GPU Instructions Executed:Synchronization": "40960",
+      "GPU Instructions Executed:Int16 & HP Float": "81920",
+      "GPU Instructions Executed:Int32 & SP Float": "69132800",
+      "GPU Instructions Executed:Other": "23690240",
+      "SIMD Utilization(%)": "75.3"
+    },
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)0, (int)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "2621440",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.002398",
+      "Computing Task:Average Time": "0.002398",
+      "Computing Task:Instance Count": "1",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "209653760",
+      "GPU Instructions Executed:Control Flow": "11304960",
+      "GPU Instructions Executed:Send": "13148160",
+      "GPU Instructions Executed:Synchronization": "163840",
+      "GPU Instructions Executed:Int16 & HP Float": "2621440",
+      "GPU Instructions Executed:Int32 & SP Float": "107069440",
+      "GPU Instructions Executed:Other": "75345920",
+      "SIMD Utilization(%)": "68.2"
+    },
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)1, (int)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "20480",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.000625",
+      "Computing Task:Average Time": "0.000312",
+      "Computing Task:Instance Count": "2",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "0",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "18628160",
+      "GPU Instructions Executed:Control Flow": "1152000",
+      "GPU Instructions Executed:Send": "1362560",
+      "GPU Instructions Executed:Synchronization": "2560",
+      "GPU Instructions Executed:Int16 & HP Float": "156160",
+      "GPU Instructions Executed:Int32 & SP Float": "9022720",
+      "GPU Instructions Executed:Other": "6932160",
+      "SIMD Utilization(%)": "32.8"
+    },
+    {
+      "Computing Task": "(anonymous namespace)::integer_projection<(bool)1, (int)4>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, signed char const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, int, float*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "163840",
+      "Work Size:Local": "128",
+      "Computing Task:Total Time": "0.000502",
+      "Computing Task:Average Time": "0.000251",
+      "Computing Task:Instance Count": "2",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "1024",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "",
+      "GPU Instructions Executed:Control Flow": "",
+      "GPU Instructions Executed:Send": "",
+      "GPU Instructions Executed:Synchronization": "",
+      "GPU Instructions Executed:Int16 & HP Float": "",
+      "GPU Instructions Executed:Int32 & SP Float": "",
+      "GPU Instructions Executed:Other": "",
+      "SIMD Utilization(%)": ""
+    },
+    {
+      "Computing Task": "ops::(anonymous namespace)::launch_moe_expert_major_prefill_gate_up_4token<(bool)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16*, int, int, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+      "Work Size:Global": "163840",
+      "Work Size:Local": "256",
+      "Computing Task:Total Time": "0.001988",
+      "Computing Task:Average Time": "0.001988",
+      "Computing Task:Instance Count": "1",
+      "Computing Task:SIMD Width": "16",
+      "Computing Task:SVM Usage Type": "",
+      "Computing Task:Spill Memory Size": "1216",
+      "Transfer Size": "0",
+      "Transfer Size:Host-to-Device": "0",
+      "Transfer Size:Device-to-Host": "0",
+      "GPU Instructions Executed": "116995840",
+      "GPU Instructions Executed:Control Flow": "4925440",
+      "GPU Instructions Executed:Send": "9565440",
+      "GPU Instructions Executed:Synchronization": "634880",
+      "GPU Instructions Executed:Int16 & HP Float": "20480",
+      "GPU Instructions Executed:Int32 & SP Float": "70193280",
+      "GPU Instructions Executed:Other": "31656320",
+      "SIMD Utilization(%)": "69.0"
+    }
+  ],
+  "verification": {
+    "ctest": {
+      "tests": [
+        "AilaQwen4ExpKernelTests",
+        "AilaQwen4ExpToleranceTests"
+      ],
+      "passed": 2,
+      "failed": 0
+    },
+    "integer_semantics_pass": true,
+    "pointwise_nf4_approximation_pass": false,
+    "full_model_quality_tested": false,
+    "hot_usm_growth": false
+  },
+  "limitations": [
+    "Synthetic BF16 input, only two real resident experts; not model TPS or representative hidden-state quality.",
+    "M1 candidate has noticeable p90 outliers; decision uses all three interleaved round medians, all lose.",
+    "INT8 DPAS and RMSNorm/activation fusion not implemented.",
+    "No driver before/after comparison this turn; no inference driver-regression attribution."
+  ]
+}

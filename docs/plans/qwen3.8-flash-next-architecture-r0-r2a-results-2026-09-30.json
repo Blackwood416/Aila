@@ -1,0 +1,2919 @@
+{
+  "runs": [
+    {
+      "prefix": "tmp/r0-cli-baseline-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:30:10.8445893+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "max_tokens": 16,
+          "sha256": "500BF2884E64C028599E182D907A22F5EF1CE968E0C609CFD4909F13B7C9F452",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "stdin_sha256": "2D9AD9D3CF5464FDF14DDD7479DAD3E05A2E48DD2AF48D318A73A4F9E75BF8BA",
+          "repeats": 3,
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "512",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_INLINE_CHECKPOINT": "0"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 39882649600.0,
+        "peak_child_working_set_bytes": 10551296.0,
+        "minimum_system_free_mb": 11421.53515625,
+        "log_sha256": "E664503722F58F388DB3004E87068094678F6EC9D3BC6B2F6FB8CC1D156A4864",
+        "err_log_sha256": "4DDF28B4588DD506E110DD33A497A61EBF522FA0DEF0751C00E8624FE68A4A28"
+      },
+      "effective_config": {
+        "preset": "none",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3714",
+        "dense_xmx": "0",
+        "direct_io": "1",
+        "phase_scratch": "0",
+        "demand_microbatch": "0",
+        "checkpoint": "0"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 15962.33,
+          "device_bytes": 14346374874,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 13891046400,
+              "host_misses": 3183,
+              "host_hits": 2298,
+              "shapes": [
+                37,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4891392000,
+              "host_misses": 594,
+              "host_hits": 1336,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 11933.0,
+          "decode_tok_s": 3.6,
+          "text": "The horizon ignites with a soft, amber glow, piercing the lingering indigo",
+          "text_sha256": "df4840eaafc1eb5698f7d3cc44825be32ecc619ed9713ac8ee691d5801a2a5e1",
+          "input_tok_s_to_first_token": 3.4358501634123857
+        },
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 3158.59,
+          "device_bytes": 14346374874,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 11792563200,
+              "host_misses": 0,
+              "host_hits": 4653,
+              "shapes": [
+                37,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4924339200,
+              "host_misses": 0,
+              "host_hits": 1943,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 1917.0,
+          "decode_tok_s": 11.5,
+          "text": "The horizon ignites with a soft, amber glow, piercing the lingering indigo",
+          "text_sha256": "df4840eaafc1eb5698f7d3cc44825be32ecc619ed9713ac8ee691d5801a2a5e1",
+          "input_tok_s_to_first_token": 21.387584767866457
+        },
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 3104.38,
+          "device_bytes": 14346374874,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 11792563200,
+              "host_misses": 0,
+              "host_hits": 4653,
+              "shapes": [
+                37,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4924339200,
+              "host_misses": 0,
+              "host_hits": 1943,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 1905.0,
+          "decode_tok_s": 12.0,
+          "text": "The horizon ignites with a soft, amber glow, piercing the lingering indigo",
+          "text_sha256": "df4840eaafc1eb5698f7d3cc44825be32ecc619ed9713ac8ee691d5801a2a5e1",
+          "input_tok_s_to_first_token": 21.522309711286088
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 1911.0,
+        "decode_tok_s": 11.75,
+        "request_ms": 3131.485,
+        "input_tok_s_to_first_token": 21.45494723957627,
+        "prefill_demand_bytes": 11792563200.0,
+        "decode_demand_bytes": 4924339200.0,
+        "peak_device_gib": 13.361102784052491,
+        "peak_working_set_gib": 37.143611907958984,
+        "minimum_available_ram_gib": 11.15384292602539
+      }
+    },
+    {
+      "prefix": "tmp/r0-cli-preset-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:31:23.8214271+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "max_tokens": 16,
+          "sha256": "500BF2884E64C028599E182D907A22F5EF1CE968E0C609CFD4909F13B7C9F452",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "stdin_sha256": "2D9AD9D3CF5464FDF14DDD7479DAD3E05A2E48DD2AF48D318A73A4F9E75BF8BA",
+          "repeats": 3,
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "512",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_HOT_RAM_MB": "32768"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 39882432512.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 11463.84375,
+        "log_sha256": "4E5DB519D64E31DCD4D9F74C5250408561B9DCA8DE7D9CE6E8B6200242BDC474",
+        "err_log_sha256": "1D04CBFF9842553F73993DD7DDB593DA76291CD008500817AEF653846C6B7234"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3714",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 14786.52,
+          "device_bytes": 14075129562,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 13526092800,
+              "host_misses": 3686,
+              "host_hits": 1651,
+              "shapes": [
+                41
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4876185600,
+              "host_misses": 593,
+              "host_hits": 1331,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 10680.0,
+          "decode_tok_s": 3.5,
+          "text": "The horizon ignites with a soft, golden glow, piercing the lingering darkness of",
+          "text_sha256": "56a819b7fb1f0da4c9633c4f25abe8efb9368c40e32d89590a95bf7fb1388c98",
+          "input_tok_s_to_first_token": 3.838951310861423
+        },
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 2771.57,
+          "device_bytes": 14075129562,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 11653171200,
+              "host_misses": 0,
+              "host_hits": 4598,
+              "shapes": [
+                41
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4483353600,
+              "host_misses": 0,
+              "host_hits": 1769,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 1587.0,
+          "decode_tok_s": 11.9,
+          "text": "The horizon ignites with a soft, golden glow, piercing the lingering darkness of",
+          "text_sha256": "56a819b7fb1f0da4c9633c4f25abe8efb9368c40e32d89590a95bf7fb1388c98",
+          "input_tok_s_to_first_token": 25.8349086326402
+        },
+        {
+          "prompt_tokens": 41,
+          "generated": 16,
+          "request_ms": 2706.05,
+          "device_bytes": 14075129562,
+          "phases": {
+            "prefill": {
+              "count": 41,
+              "demand_bytes": 11653171200,
+              "host_misses": 0,
+              "host_hits": 4598,
+              "shapes": [
+                41
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 4483353600,
+              "host_misses": 0,
+              "host_hits": 1769,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 1572.0,
+          "decode_tok_s": 12.4,
+          "text": "The horizon ignites with a soft, golden glow, piercing the lingering darkness of",
+          "text_sha256": "56a819b7fb1f0da4c9633c4f25abe8efb9368c40e32d89590a95bf7fb1388c98",
+          "input_tok_s_to_first_token": 26.081424936386767
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 1579.5,
+        "decode_tok_s": 12.15,
+        "request_ms": 2738.8100000000004,
+        "input_tok_s_to_first_token": 25.958166784513484,
+        "prefill_demand_bytes": 11653171200.0,
+        "decode_demand_bytes": 4483353600.0,
+        "peak_device_gib": 13.108485901728272,
+        "peak_working_set_gib": 37.143409729003906,
+        "minimum_available_ram_gib": 11.195159912109375
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-512-first-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:32:37.0970373+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "max_tokens": 16,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_seq": 2560,
+          "repeats": 2,
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40150171648.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10532.41015625,
+        "log_sha256": "E7D6A05B44A7D8D5F396EC5BA674CB9C90E352C1AA20F0469725D15DD713443B",
+        "err_log_sha256": "648322F1C73DB5D8E44F0D00C7090A6B09AF2CD64D744F6A886445DB927DAE73"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 62804.17,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 126955699200,
+              "host_misses": 17229,
+              "host_hits": 32864,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 182,
+              "host_hits": 2097,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 60847.0,
+          "decode_tok_s": 7.1,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 30.124739099709107
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 24289.6,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 121641062400,
+              "host_misses": 5719,
+              "host_hits": 42277,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 205,
+              "host_hits": 2074,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 22381.0,
+          "decode_tok_s": 7.3,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 81.8998257450516
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 22381.0,
+        "decode_tok_s": 7.3,
+        "request_ms": 24289.6,
+        "input_tok_s_to_first_token": 81.8998257450516,
+        "prefill_demand_bytes": 121641062400,
+        "decode_demand_bytes": 5775897600,
+        "peak_device_gib": 13.396085331216455,
+        "peak_working_set_gib": 37.39276123046875,
+        "minimum_available_ram_gib": 10.28555679321289
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-2048-large-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:34:57.7170214+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "repeats": 2,
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_tokens": 16,
+          "max_seq": 2560,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40148570112.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10719.50390625,
+        "log_sha256": "6BF8C085609EECC4C1315BDA93C06BE1E4307679568868911B46AAFD8BC1788F",
+        "err_log_sha256": "A7DDF4775F9BDC5BD4597B5164A9B6C636443F890B240B046E3F561FEFA72FE3"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 44083.17,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 15060,
+              "host_hits": 2176,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 42482.0,
+          "decode_tok_s": 8.7,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 43.14768607880985
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 19408.69,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38315059200,
+              "host_misses": 3401,
+              "host_hits": 11717,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6034406400,
+              "host_misses": 371,
+              "host_hits": 2010,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16689.0,
+          "decode_tok_s": 5.2,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 109.8328240158188
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16689.0,
+        "decode_tok_s": 5.2,
+        "request_ms": 19408.69,
+        "input_tok_s_to_first_token": 109.8328240158188,
+        "prefill_demand_bytes": 38315059200,
+        "decode_demand_bytes": 6034406400,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.39126968383789,
+        "minimum_available_ram_gib": 10.468265533447266
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-512-return-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:36:54.8074487+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "kind": "cli_stream_generation",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_seq": 2560,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "max_tokens": 16,
+          "repeats": 2
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40151388160.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10851.6953125,
+        "log_sha256": "CC861245743984151F6B2FCD8903F6B1B4A7CF3E055642D2840983F2DB459D08",
+        "err_log_sha256": "A5A76734CE96575596439FDDE6C8E42197A19350BB35A1F8CE6F9342703D3EC7"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 63762.87,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 126955699200,
+              "host_misses": 17330,
+              "host_hits": 32763,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 180,
+              "host_hits": 2099,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 61755.0,
+          "decode_tok_s": 6.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 29.681807141122178
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 24703.34,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 121628390400,
+              "host_misses": 5831,
+              "host_hits": 42160,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 198,
+              "host_hits": 2081,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 22833.0,
+          "decode_tok_s": 7.4,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 80.27854421232426
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 22833.0,
+        "decode_tok_s": 7.4,
+        "request_ms": 24703.34,
+        "input_tok_s_to_first_token": 80.27854421232426,
+        "prefill_demand_bytes": 121628390400,
+        "decode_demand_bytes": 5775897600,
+        "peak_device_gib": 13.396085331216455,
+        "peak_working_set_gib": 37.39389419555664,
+        "minimum_available_ram_gib": 10.597358703613281
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-2048-repeat-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T23:01:40.7272252+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "repeats": 2,
+          "kind": "cli_stream_generation",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "max_tokens": 16,
+          "max_seq": 2560
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40146329600.0,
+        "peak_child_working_set_bytes": 10547200.0,
+        "minimum_system_free_mb": 11020.42578125,
+        "log_sha256": "8ABE5417CF819E456F4D5DEBA315089806FF9C5DA5AABCA361E20FBBBD9724CD",
+        "err_log_sha256": "3C4D2061F0D5B6EF7403648B0C44A8BF4E53BDE56F1074E02BE73FC0F799E605"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 40490.8,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 14981,
+              "host_hits": 2255,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 38933.0,
+          "decode_tok_s": 8.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 47.08088254180258
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 18775.1,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38315059200,
+              "host_misses": 3387,
+              "host_hits": 11731,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6034406400,
+              "host_misses": 373,
+              "host_hits": 2008,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16135.0,
+          "decode_tok_s": 5.3,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 113.60396653238301
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16135.0,
+        "decode_tok_s": 5.3,
+        "request_ms": 18775.1,
+        "input_tok_s_to_first_token": 113.60396653238301,
+        "prefill_demand_bytes": 38315059200,
+        "decode_demand_bytes": 6034406400,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.389183044433594,
+        "minimum_available_ram_gib": 10.762134552001953
+      }
+    }
+  ],
+  "groups": [
+    {
+      "prompt_tokens": 41,
+      "preset": "none",
+      "chunk": 512,
+      "processes": 1,
+      "warm_ttft_ms": [
+        1917.0,
+        1905.0
+      ],
+      "median_ttft_ms": 1911.0,
+      "warm_decode_tok_s": [
+        11.5,
+        12.0
+      ],
+      "median_decode_tok_s": 11.75,
+      "median_request_ms": 3131.485,
+      "median_prefill_demand_gb": 11.7925632,
+      "median_decode_demand_gb": 4.9243392,
+      "input_tok_s_to_first_token": 21.454735740450026
+    },
+    {
+      "prompt_tokens": 41,
+      "preset": "qwen38-a770",
+      "chunk": 512,
+      "processes": 1,
+      "warm_ttft_ms": [
+        1587.0,
+        1572.0
+      ],
+      "median_ttft_ms": 1579.5,
+      "warm_decode_tok_s": [
+        11.9,
+        12.4
+      ],
+      "median_decode_tok_s": 12.15,
+      "median_request_ms": 2738.8100000000004,
+      "median_prefill_demand_gb": 11.6531712,
+      "median_decode_demand_gb": 4.4833536,
+      "input_tok_s_to_first_token": 25.957581513137068
+    },
+    {
+      "prompt_tokens": 1833,
+      "preset": "qwen38-a770",
+      "chunk": 2048,
+      "processes": 2,
+      "warm_ttft_ms": [
+        16689.0,
+        16135.0
+      ],
+      "median_ttft_ms": 16412.0,
+      "warm_decode_tok_s": [
+        5.2,
+        5.3
+      ],
+      "median_decode_tok_s": 5.25,
+      "median_request_ms": 19091.894999999997,
+      "median_prefill_demand_gb": 38.3150592,
+      "median_decode_demand_gb": 6.0344064,
+      "input_tok_s_to_first_token": 111.6865708018523
+    },
+    {
+      "prompt_tokens": 1833,
+      "preset": "qwen38-a770",
+      "chunk": 512,
+      "processes": 2,
+      "warm_ttft_ms": [
+        22381.0,
+        22833.0
+      ],
+      "median_ttft_ms": 22607.0,
+      "warm_decode_tok_s": [
+        7.3,
+        7.4
+      ],
+      "median_decode_tok_s": 7.35,
+      "median_request_ms": 24496.47,
+      "median_prefill_demand_gb": 121.6347264,
+      "median_decode_demand_gb": 5.7758976,
+      "input_tok_s_to_first_token": 81.08108108108108
+    }
+  ],
+  "canaries": [
+    {
+      "prefix": "tmp/r0-cli41-checkpoint48-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T22:22:29.0305876+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "preset",
+        "input": {
+          "source_sha256": "8429EF142E1F470A5C5E0EA91CE4DC67260016AFF964800DF185F7BC2329B8A1",
+          "kind": "cli41_checkpoint_teacher_forcing"
+        },
+        "arguments": [
+          "--preset-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0"
+        },
+        "exe_sha256": "0EEA504D089D6933C5BA1BE1932FBD9D083F7A0D962978787F430187B0DF3952",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40139313152.0,
+        "peak_child_working_set_bytes": 10547200.0,
+        "minimum_system_free_mb": 10921.96484375,
+        "log_sha256": "28E3D505FC94BBAC774D97D3C6578A450F8E56C298B3BB60573C2A00FE250418",
+        "err_log_sha256": "BE0F567B5CC75FA279DDCE271623421D609DE26F6BB0BFEDB3EE3AB714B7DEEC"
+      },
+      "observations": [
+        "[X2 QUALITY] R0_cli41_first16 rows=16 mean_kl=0.001952661031 mean_nll_delta=0.01370954391 max_logits_nrmse=0.05568358564 nll_warning=1",
+        "[X2 QUALITY] R0_cli41_inline37 rows=48 mean_kl=0.00159666463 mean_nll_delta=0.005597585351 max_logits_nrmse=0.06540588346 nll_warning=0",
+        "[R0 TIME] pair=0 inline=0 prefill_ms=1759.8452",
+        "[R0 TIME] pair=0 inline=1 prefill_ms=1557.3534",
+        "[R0 TIME] pair=1 inline=1 prefill_ms=1194.5027",
+        "[R0 TIME] pair=1 inline=0 prefill_ms=1357.0173",
+        "[R0 TIME] pair=2 inline=0 prefill_ms=1755.2695",
+        "[R0 TIME] pair=2 inline=1 prefill_ms=1559.1587",
+        "[R0 STATE PASS] prompt=41 anchor=37 teacher_rows=48 future_independent=1 restore_exact=1 replay_exact=1",
+        "[R0 PASS] state_and_quality=1"
+      ]
+    },
+    {
+      "prefix": "tmp/r1-natural-quality-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T22:59:29.3514506+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "window",
+        "input": {
+          "source_sha256": "155954C6D1D167AD7B7D5CF812F66FCD2621DDFED4E8552CFFB80331194577AE",
+          "prompt_sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "kind": "natural_window_teacher_forcing"
+        },
+        "arguments": [
+          "--window-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_WINDOW_PROMPT_FILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\archive-natural.json",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0"
+        },
+        "exe_sha256": "D763D1E9E0501F64C92BC51785BE60E8C914FBD838011630E45DEFC6FA1367E8",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40329957376.0,
+        "peak_child_working_set_bytes": 10518528.0,
+        "minimum_system_free_mb": 10633.80859375,
+        "log_sha256": "E2CE304443EB83F329FE5BB31AE79C02CC95EC6A97547A3C8DC04D9903E13910",
+        "err_log_sha256": "0E4F5E02B508E61DCC0E7D1BCC39A2B7B0B840B244BF57470BE93E89B39D8A03"
+      },
+      "observations": [
+        "[X2 QUALITY] R1_natural1833_chunk512_vs2048 rows=48 mean_kl=0.006162748783 mean_nll_delta=-0.02170013326 max_logits_nrmse=0.08175736765 nll_warning=0",
+        "[R1 QUALITY] prompt=1833 rows=48 finite=1 nll_warning=0"
+      ]
+    },
+    {
+      "prefix": "tmp/r2a-m32-baseline-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T22:57:39.1776499+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "mature",
+        "input": {
+          "source_sha256": "AF45396BECAA74E3CA2131B86D5FCF76240ADA7F800826BA2C35EFDBFF46785C",
+          "host_pool_disabled": true,
+          "kind": "two_real_experts_m32_bounded_bf16_staging"
+        },
+        "arguments": [
+          "--mature-moe-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_MATURE_PROFILE": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_HOT_RAM_MB": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_STATIC_PINNING": "0"
+        },
+        "exe_sha256": "D763D1E9E0501F64C92BC51785BE60E8C914FBD838011630E45DEFC6FA1367E8",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 322142208.0,
+        "peak_child_working_set_bytes": 10539008.0,
+        "minimum_system_free_mb": 53447.85546875,
+        "log_sha256": "E73ABC13E0E74AF94C9CEA2DDC9DA5FE1C6477E4CD7C1E256564E0DEBA9A8FAA",
+        "err_log_sha256": "1C9E877A633CD97D8B408DD99BD7B06D03D80A0FF7F0F727F2FDF2176375A380"
+      },
+      "observations": [
+        "[R2 CONFIG] experts=2 ids=7,113 layer=0 rows_per_expert=32 H=2560 I=640 top_k=10 bf16_weight_bytes=19660800 scratch_bytes=0 device_bytes=30760833 input=synthetic_bf16 weights=real_nf4 h2d_excluded=1",
+        "[R2 LIBRARY] gate_up=jit:gemm:any down=jit:gemm:any src=bf16 weight=bf16 dst=f32 weights_strided=1 fpmath=strict",
+        "[R2 CHECK] mode=0 nrmse_vs_nf4=0 max_abs=0 bound_nrmse=0.02",
+        "[R2 CHECK] mode=1 nrmse_vs_nf4=0.003806011829 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CHECK] mode=2 nrmse_vs_nf4=0.003805701317 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CPU] reference=f64_from_bf16_staging rows=4 nrmse=1.828571296e-07 max_abs=8.429196896e-09 bound_nrmse=0.01",
+        "[R2 TIME] round=0 mode=0 median_us=518.3 p10_us=501.6 p90_us=530.9",
+        "[R2 TIME] round=0 mode=1 median_us=1595.55 p10_us=1582.6 p90_us=1613.7",
+        "[R2 TIME] round=0 mode=2 median_us=619.6 p10_us=572.7 p90_us=662.6",
+        "[R2 TIME] round=1 mode=0 median_us=509.15 p10_us=499.8 p90_us=526.3",
+        "[R2 TIME] round=1 mode=1 median_us=1597.85 p10_us=1577.6 p90_us=1722.9",
+        "[R2 TIME] round=1 mode=2 median_us=610.05 p10_us=562.7 p90_us=645",
+        "[R2 TIME] round=2 mode=0 median_us=525.85 p10_us=505.7 p90_us=531.7",
+        "[R2 TIME] round=2 mode=1 median_us=1606.25 p10_us=1590 p90_us=1675.7",
+        "[R2 TIME] round=2 mode=2 median_us=621.35 p10_us=575.1 p90_us=648.1",
+        "[R2 PASS] dequant_gather_gemm_swiglu_scatter_merge_included=1 no_hot_usm_growth=1"
+      ],
+      "timings": [
+        {
+          "round": 0.0,
+          "mode": 0.0,
+          "median_us": 518.3,
+          "_us": 530.9
+        },
+        {
+          "round": 0.0,
+          "mode": 1.0,
+          "median_us": 1595.55,
+          "_us": 1613.7
+        },
+        {
+          "round": 0.0,
+          "mode": 2.0,
+          "median_us": 619.6,
+          "_us": 662.6
+        },
+        {
+          "round": 1.0,
+          "mode": 0.0,
+          "median_us": 509.15,
+          "_us": 526.3
+        },
+        {
+          "round": 1.0,
+          "mode": 1.0,
+          "median_us": 1597.85,
+          "_us": 1722.9
+        },
+        {
+          "round": 1.0,
+          "mode": 2.0,
+          "median_us": 610.05,
+          "_us": 645.0
+        },
+        {
+          "round": 2.0,
+          "mode": 0.0,
+          "median_us": 525.85,
+          "_us": 531.7
+        },
+        {
+          "round": 2.0,
+          "mode": 1.0,
+          "median_us": 1606.25,
+          "_us": 1675.7
+        },
+        {
+          "round": 2.0,
+          "mode": 2.0,
+          "median_us": 621.35,
+          "_us": 648.1
+        }
+      ],
+      "median_us_by_mode": {
+        "0": 518.3,
+        "1": 1597.85,
+        "2": 619.6
+      }
+    },
+    {
+      "prefix": "tmp/r2a-m32-final-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T23:14:05.5336462+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-r0-r1a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "mature",
+        "input": {
+          "source_sha256": "40A374CB73A0B3E4FC827C3C4005E0949D2D887E4BF270054DF2DF754FA9FCE3",
+          "kind": "two_real_experts_m32_bounded_bf16_staging",
+          "host_pool_disabled": true
+        },
+        "arguments": [
+          "--mature-moe-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_HOT_RAM_MB": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_MATURE_PROFILE": "0"
+        },
+        "exe_sha256": "4F1E601BAC1F73AA6C85961CE6E23B0F359A0F1606494D27F46680077329B997",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 322027520.0,
+        "peak_child_working_set_bytes": 10539008.0,
+        "minimum_system_free_mb": 53452.828125,
+        "log_sha256": "70812EA4C62A19232CEE3E5D1093B4586C17BDCDB537278831462DE237BFBAA5",
+        "err_log_sha256": "1C9E877A633CD97D8B408DD99BD7B06D03D80A0FF7F0F727F2FDF2176375A380"
+      },
+      "observations": [
+        "[R2 CONFIG] experts=2 ids=7,113 layer=0 rows_per_expert=32 H=2560 I=640 top_k=10 bf16_weight_bytes=19660800 scratch_bytes=0 device_bytes=30760833 input=synthetic_bf16 weights=real_nf4 h2d_excluded=1",
+        "[R2 LIBRARY] gate_up=jit:gemm:any down=jit:gemm:any src=bf16 weight=bf16 dst=f32 weights_strided=1 fpmath=strict",
+        "[R2 CHECK] mode=0 nrmse_vs_nf4=0 max_abs=0 bound_nrmse=0.02",
+        "[R2 CHECK] mode=1 nrmse_vs_nf4=0.003806011829 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CHECK] mode=2 nrmse_vs_nf4=0.003805701317 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CPU] reference=f64_from_bf16_staging rows=4 nrmse=1.828571296e-07 max_abs=8.429196896e-09 bound_nrmse=0.01",
+        "[R2 TIME] round=0 mode=0 median_us=516 p10_us=501.8 p90_us=548.3",
+        "[R2 TIME] round=0 mode=1 median_us=1598.6 p10_us=1587.8 p90_us=1616",
+        "[R2 TIME] round=0 mode=2 median_us=618.05 p10_us=570.7 p90_us=629.2",
+        "[R2 TIME] round=1 mode=0 median_us=518.85 p10_us=502.4 p90_us=545.5",
+        "[R2 TIME] round=1 mode=1 median_us=1598.5 p10_us=1585.3 p90_us=1788.3",
+        "[R2 TIME] round=1 mode=2 median_us=616.05 p10_us=574.7 p90_us=626.6",
+        "[R2 TIME] round=2 mode=0 median_us=519.3 p10_us=487.5 p90_us=529.1",
+        "[R2 TIME] round=2 mode=1 median_us=1594.3 p10_us=1586.5 p90_us=1641.7",
+        "[R2 TIME] round=2 mode=2 median_us=621.2 p10_us=575.5 p90_us=640.1",
+        "[R2 PASS] dequant_gather_gemm_swiglu_scatter_merge_included=1 no_hot_usm_growth=1"
+      ],
+      "timings": [
+        {
+          "round": 0.0,
+          "mode": 0.0,
+          "median_us": 516.0,
+          "_us": 548.3
+        },
+        {
+          "round": 0.0,
+          "mode": 1.0,
+          "median_us": 1598.6,
+          "_us": 1616.0
+        },
+        {
+          "round": 0.0,
+          "mode": 2.0,
+          "median_us": 618.05,
+          "_us": 629.2
+        },
+        {
+          "round": 1.0,
+          "mode": 0.0,
+          "median_us": 518.85,
+          "_us": 545.5
+        },
+        {
+          "round": 1.0,
+          "mode": 1.0,
+          "median_us": 1598.5,
+          "_us": 1788.3
+        },
+        {
+          "round": 1.0,
+          "mode": 2.0,
+          "median_us": 616.05,
+          "_us": 626.6
+        },
+        {
+          "round": 2.0,
+          "mode": 0.0,
+          "median_us": 519.3,
+          "_us": 529.1
+        },
+        {
+          "round": 2.0,
+          "mode": 1.0,
+          "median_us": 1594.3,
+          "_us": 1641.7
+        },
+        {
+          "round": 2.0,
+          "mode": 2.0,
+          "median_us": 621.2,
+          "_us": 640.1
+        }
+      ],
+      "median_us_by_mode": {
+        "0": 518.85,
+        "1": 1598.5,
+        "2": 618.05
+      }
+    },
+    {
+      "prefix": "tmp/r2a-m32-vtune-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T23:14:19.7513553+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-r0-r1a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "mature",
+        "input": {
+          "source_sha256": "40A374CB73A0B3E4FC827C3C4005E0949D2D887E4BF270054DF2DF754FA9FCE3",
+          "kind": "two_real_experts_m32_bounded_bf16_staging",
+          "host_pool_disabled": true
+        },
+        "arguments": [
+          "--mature-moe-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CACHE_TRACE": "E:\\RiderProjects\\Aila\\tmp\\r2a-m32-vtune-20260930.cache.jsonl",
+          "AILA_Q4E_TRACE_MARKERS": "1",
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_MATURE_PROFILE": "1",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_HOT_RAM_MB": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0"
+        },
+        "exe_sha256": "4F1E601BAC1F73AA6C85961CE6E23B0F359A0F1606494D27F46680077329B997",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 331460608.0,
+        "peak_child_working_set_bytes": 63168512.0,
+        "minimum_system_free_mb": 53287.375,
+        "log_sha256": "A5198E5720C221A6C2796478177F34C4197B44CB4401AE1F693775A59B1F09BA",
+        "err_log_sha256": "50668392171E0FA31C52D345AC7B674CE39D0D919371B72E157396F3A59706A9",
+        "trace_sha256": "85EFA1F07C21B0655E427D2133851971445D6E27CD896E47FEBB5F73C4B1FDE5"
+      },
+      "observations": [
+        "[R2 CONFIG] experts=2 ids=7,113 layer=0 rows_per_expert=32 H=2560 I=640 top_k=10 bf16_weight_bytes=19660800 scratch_bytes=0 device_bytes=30760833 input=synthetic_bf16 weights=real_nf4 h2d_excluded=1",
+        "[R2 LIBRARY] gate_up=jit:gemm:any down=jit:gemm:any src=bf16 weight=bf16 dst=f32 weights_strided=1 fpmath=strict",
+        "[R2 CHECK] mode=0 nrmse_vs_nf4=0 max_abs=0 bound_nrmse=0.02",
+        "[R2 CHECK] mode=1 nrmse_vs_nf4=0.003806011829 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CHECK] mode=2 nrmse_vs_nf4=0.003805701317 max_abs=0.0001220703125 bound_nrmse=0.02",
+        "[R2 CPU] reference=f64_from_bf16_staging rows=4 nrmse=1.828571296e-07 max_abs=8.429196896e-09 bound_nrmse=0.01",
+        "[R2 PROFILE PASS] correctness_checked=1 timing_skipped=1"
+      ]
+    },
+    {
+      "prefix": "tmp/r2a-m32-contract-20260930",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-09-30T23:29:01.1427850+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-r0-r1a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "mature",
+        "input": {
+          "host_pool_disabled": true,
+          "kind": "two_real_experts_m32_bounded_bf16_staging",
+          "source_sha256": "1FD5A62E52BE71B0A6DF78297B494FC9B7FC59F0A45D659EC0C91A323F31E8AE"
+        },
+        "arguments": [
+          "--mature-moe-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_MATURE_PROFILE": "0",
+          "AILA_Q4E_HOT_RAM_MB": "0",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "124CAEA6263D3938BA0656B8BEF3933417DDB1720F8A5AAEF321561A3469F0AC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 318619648.0,
+        "peak_child_working_set_bytes": 10543104.0,
+        "minimum_system_free_mb": 53426.578125,
+        "log_sha256": "D6441E74BDF2FB23BF27387315D49581CE079F5AA2CA55ADE633E3EA641304B4",
+        "err_log_sha256": "1C9E877A633CD97D8B408DD99BD7B06D03D80A0FF7F0F727F2FDF2176375A380"
+      },
+      "observations": [
+        "[R2 CONFIG] experts=2 ids=7,113 layer=0 rows_per_expert=32 H=2560 I=640 top_k=10 bf16_weight_bytes=19660800 scratch_bytes=0 device_bytes=30760833 input=synthetic_bf16 weights=real_nf4 h2d_excluded=1",
+        "[R2 LIBRARY] gate_up=jit:gemm:any down=jit:gemm:any src=bf16 weight=bf16 dst=f32 weights_strided=1 fpmath=strict",
+        "[R2 CHECK] mode=0 nrmse_vs_nf4=0 max_abs=0 max_rel_err=0 rel_tol=0.02 abs_tol=0.0002 errors=0 bound_nrmse=0.02 reference=original_nf4_alu semantics_id=two_expert_gate_swiglu_down_merge accuracy_mode=bf16_staging",
+        "[R2 CHECK] mode=1 nrmse_vs_nf4=0.003806011829 max_abs=0.0001220703125 max_rel_err=151.9350649 rel_tol=0.02 abs_tol=0.0002 errors=0 bound_nrmse=0.02 reference=original_nf4_alu semantics_id=two_expert_gate_swiglu_down_merge accuracy_mode=bf16_staging",
+        "[R2 CHECK] mode=2 nrmse_vs_nf4=0.003805701317 max_abs=0.0001220703125 max_rel_err=151.9350649 rel_tol=0.02 abs_tol=0.0002 errors=0 bound_nrmse=0.02 reference=original_nf4_alu semantics_id=two_expert_gate_swiglu_down_merge accuracy_mode=bf16_staging",
+        "[R2 CPU] reference=f64_from_bf16_staging rows=4 nrmse=1.828571296e-07 max_abs=8.429196896e-09 max_rel_err=0.0007920890727 rel_tol=0.0001 abs_tol=0.000001 errors=0 bound_nrmse=0.01",
+        "[R2 CONTRACT] accuracy_class=relaxed_matched comparable_for_speedup=true semantics_id=two_expert_gate_swiglu_down_merge accuracy_mode=bf16_staging reference=original_nf4_and_cpu_f64",
+        "[R2 TIME] round=0 mode=0 median_us=517.1 p10_us=497.1 p90_us=527.6",
+        "[R2 TIME] round=0 mode=1 median_us=1603.1 p10_us=1585.1 p90_us=1632",
+        "[R2 TIME] round=0 mode=2 median_us=616.9 p10_us=571.4 p90_us=715.2",
+        "[R2 TIME] round=1 mode=0 median_us=516.7 p10_us=508.1 p90_us=547.4",
+        "[R2 TIME] round=1 mode=1 median_us=1593.2 p10_us=1585.2 p90_us=1633.7",
+        "[R2 TIME] round=1 mode=2 median_us=614.9 p10_us=562.2 p90_us=700.4",
+        "[R2 TIME] round=2 mode=0 median_us=511.15 p10_us=483.1 p90_us=529.1",
+        "[R2 TIME] round=2 mode=1 median_us=1588.3 p10_us=1574.1 p90_us=1623.3",
+        "[R2 TIME] round=2 mode=2 median_us=626.75 p10_us=564.5 p90_us=663.5",
+        "[R2 PASS] dequant_gather_gemm_swiglu_scatter_merge_included=1 no_hot_usm_growth=1"
+      ],
+      "timings": [
+        {
+          "round": 0.0,
+          "mode": 0.0,
+          "median_us": 517.1,
+          "_us": 527.6
+        },
+        {
+          "round": 0.0,
+          "mode": 1.0,
+          "median_us": 1603.1,
+          "_us": 1632.0
+        },
+        {
+          "round": 0.0,
+          "mode": 2.0,
+          "median_us": 616.9,
+          "_us": 715.2
+        },
+        {
+          "round": 1.0,
+          "mode": 0.0,
+          "median_us": 516.7,
+          "_us": 547.4
+        },
+        {
+          "round": 1.0,
+          "mode": 1.0,
+          "median_us": 1593.2,
+          "_us": 1633.7
+        },
+        {
+          "round": 1.0,
+          "mode": 2.0,
+          "median_us": 614.9,
+          "_us": 700.4
+        },
+        {
+          "round": 2.0,
+          "mode": 0.0,
+          "median_us": 511.15,
+          "_us": 529.1
+        },
+        {
+          "round": 2.0,
+          "mode": 1.0,
+          "median_us": 1588.3,
+          "_us": 1623.3
+        },
+        {
+          "round": 2.0,
+          "mode": 2.0,
+          "median_us": 626.75,
+          "_us": 663.5
+        }
+      ],
+      "median_us_by_mode": {
+        "0": 516.7,
+        "1": 1593.2,
+        "2": 616.9
+      }
+    }
+  ],
+  "vtune": {
+    "path": "tmp/r2a-m32-vtune-report.csv",
+    "sha256": "53b0d9a0432d56a52d588a88f10e0be0e836e07a1af7d30045d6666433450a84",
+    "instructions": [
+      {
+        "Computing Task": "(anonymous namespace)::test_mature_moe_gemm(std::string const&)::{lambda()#1}::operator()(void) const::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "9830400",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.001144",
+        "Computing Task:Average Time": "0.001144",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "151756800",
+        "GPU Instructions Executed:Control Flow": "3686400",
+        "GPU Instructions Executed:Send": "9216000",
+        "GPU Instructions Executed:Synchronization": "614400",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "68812800",
+        "GPU Instructions Executed:Other": "69427200",
+        "SIMD Utilization(%)": "93.8"
+      },
+      {
+        "Computing Task": "ops::moe_ordered_accumulate_down_rows(Context&, float const*, float const*, sycl::_V1::ext::oneapi::bfloat16*, int, int, int, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "81920",
+        "Work Size:Local": "256",
+        "Computing Task:Total Time": "0.000275",
+        "Computing Task:Average Time": "0.000092",
+        "Computing Task:Instance Count": "3",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "4469760",
+        "GPU Instructions Executed:Control Flow": "353280",
+        "GPU Instructions Executed:Send": "337920",
+        "GPU Instructions Executed:Synchronization": "153600",
+        "GPU Instructions Executed:Int16 & HP Float": "15360",
+        "GPU Instructions Executed:Int32 & SP Float": "2703360",
+        "GPU Instructions Executed:Other": "906240",
+        "SIMD Utilization(%)": "99.3"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::launch_moe_expert_major_prefill_down_4token<(bool)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, float*, int, int, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "655360",
+        "Work Size:Local": "256",
+        "Computing Task:Total Time": "0.000948",
+        "Computing Task:Average Time": "0.000948",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "86028800",
+        "GPU Instructions Executed:Control Flow": "4341760",
+        "GPU Instructions Executed:Send": "4838400",
+        "GPU Instructions Executed:Synchronization": "40960",
+        "GPU Instructions Executed:Int16 & HP Float": "81920",
+        "GPU Instructions Executed:Int32 & SP Float": "58319360",
+        "GPU Instructions Executed:Other": "18406400",
+        "SIMD Utilization(%)": "72.3"
+      },
+      {
+        "Computing Task": "gemm_kernel",
+        "Work Size:Global": "640 x 4 x 4",
+        "Work Size:Local": "32 x 4 x 2",
+        "Computing Task:Total Time": "0.000126",
+        "Computing Task:Average Time": "0.000126",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "2424320",
+        "GPU Instructions Executed:Control Flow": "52480",
+        "GPU Instructions Executed:Send": "779520",
+        "GPU Instructions Executed:Synchronization": "109440",
+        "GPU Instructions Executed:Int16 & HP Float": "219520",
+        "GPU Instructions Executed:Int32 & SP Float": "866560",
+        "GPU Instructions Executed:Other": "396800",
+        "SIMD Utilization(%)": "99.3"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::launch_grouped_xmx<(bool)1, (bool)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, ops::MoeExpertTile const*, int, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "5120",
+        "Work Size:Local": "32",
+        "Computing Task:Total Time": "0.051681",
+        "Computing Task:Average Time": "0.051681",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "864",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "91176640",
+        "GPU Instructions Executed:Control Flow": "8986240",
+        "GPU Instructions Executed:Send": "13363200",
+        "GPU Instructions Executed:Synchronization": "838400",
+        "GPU Instructions Executed:Int16 & HP Float": "876800",
+        "GPU Instructions Executed:Int32 & SP Float": "39382080",
+        "GPU Instructions Executed:Other": "27729920",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "(anonymous namespace)::test_mature_moe_gemm(std::string const&)::{lambda()#3}::operator()(void) const::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "40960",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.000007",
+        "Computing Task:Average Time": "0.000007",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "92160",
+        "GPU Instructions Executed:Control Flow": "0",
+        "GPU Instructions Executed:Send": "10240",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "61440",
+        "GPU Instructions Executed:Other": "20480",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "gemm_kernel",
+        "Work Size:Global": "2560 x 4 x 2",
+        "Work Size:Local": "64 x 4 x 1",
+        "Computing Task:Total Time": "0.000104",
+        "Computing Task:Average Time": "0.000104",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "1937920",
+        "GPU Instructions Executed:Control Flow": "117760",
+        "GPU Instructions Executed:Send": "458240",
+        "GPU Instructions Executed:Synchronization": "53760",
+        "GPU Instructions Executed:Int16 & HP Float": "151040",
+        "GPU Instructions Executed:Int32 & SP Float": "798720",
+        "GPU Instructions Executed:Other": "358400",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::launch_grouped_xmx<(bool)0, (bool)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, ops::MoeExpertTile const*, int, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16*, float*, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "20480",
+        "Work Size:Local": "32",
+        "Computing Task:Total Time": "0.001891",
+        "Computing Task:Average Time": "0.001891",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "8",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "54570240",
+        "GPU Instructions Executed:Control Flow": "6095360",
+        "GPU Instructions Executed:Send": "7690240",
+        "GPU Instructions Executed:Synchronization": "798720",
+        "GPU Instructions Executed:Int16 & HP Float": "642560",
+        "GPU Instructions Executed:Int32 & SP Float": "23184640",
+        "GPU Instructions Executed:Other": "16158720",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "(anonymous namespace)::test_mature_moe_gemm(std::string const&)::{lambda()#2}::operator()(void) const::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "163840",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.000016",
+        "Computing Task:Average Time": "0.000016",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "276480",
+        "GPU Instructions Executed:Control Flow": "0",
+        "GPU Instructions Executed:Send": "40960",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "163840",
+        "GPU Instructions Executed:Other": "71680",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "(anonymous namespace)::test_mature_moe_gemm(std::string const&)::{lambda()#4}::operator()(void) const::{lambda(sycl::_V1::id<(int)1>)#1}",
+        "Work Size:Global": "163840",
+        "Work Size:Local": "512",
+        "Computing Task:Total Time": "0.000018",
+        "Computing Task:Average Time": "0.000018",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "0",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "296960",
+        "GPU Instructions Executed:Control Flow": "0",
+        "GPU Instructions Executed:Send": "51200",
+        "GPU Instructions Executed:Synchronization": "0",
+        "GPU Instructions Executed:Int16 & HP Float": "0",
+        "GPU Instructions Executed:Int32 & SP Float": "163840",
+        "GPU Instructions Executed:Other": "81920",
+        "SIMD Utilization(%)": "100.0"
+      },
+      {
+        "Computing Task": "ops::(anonymous namespace)::launch_moe_expert_major_prefill_gate_up_4token<(bool)1>(sycl::_V1::event, Context&, ops::MoeExpertSlotDev const*, int const*, int const*, float const*, sycl::_V1::ext::oneapi::bfloat16 const*, sycl::_V1::ext::oneapi::bfloat16*, int, int, int, int, int, sycl::_V1::event const*)::{lambda(sycl::_V1::handler&)#1}::operator()(sycl::_V1::handler&) const::{lambda(sycl::_V1::nd_item<(int)1>)#1}",
+        "Work Size:Global": "163840",
+        "Work Size:Local": "256",
+        "Computing Task:Total Time": "0.004087",
+        "Computing Task:Average Time": "0.004087",
+        "Computing Task:Instance Count": "1",
+        "Computing Task:SIMD Width": "16",
+        "Computing Task:SVM Usage Type": "",
+        "Computing Task:Spill Memory Size": "576",
+        "Transfer Size": "0",
+        "Transfer Size:Host-to-Device": "0",
+        "Transfer Size:Device-to-Host": "0",
+        "GPU Instructions Executed": "104553600",
+        "GPU Instructions Executed:Control Flow": "4925440",
+        "GPU Instructions Executed:Send": "7988480",
+        "GPU Instructions Executed:Synchronization": "256000",
+        "GPU Instructions Executed:Int16 & HP Float": "20480",
+        "GPU Instructions Executed:Int32 & SP Float": "65984640",
+        "GPU Instructions Executed:Other": "25378560",
+        "SIMD Utilization(%)": "66.8"
+      }
+    ]
+  },
+  "limitations": [
+    "Input tokens / TTFT is effective prompt-to-first-token throughput, not an isolated GPU prefill timer.",
+    "Work summaries use existing demand counters without new queue waits; byte counts are logical scheduled demand, not measured bus bandwidth.",
+    "Different prefill arithmetic can change routing and generated text. Quality uses separate fixed-token canaries.",
+    "USM ledger bytes are not DXGI residency or measured WDDM paging. CPU working set and available RAM are sampled.",
+    "R0 combines several existing features; its generated TPS difference cannot be attributed only to checkpointing."
+  ]
+}

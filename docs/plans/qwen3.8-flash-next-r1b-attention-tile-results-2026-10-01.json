@@ -1,0 +1,2976 @@
+{
+  "runs": [
+    {
+      "prefix": "tmp/r1-natural-512-first-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:32:37.0970373+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "max_tokens": 16,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_seq": 2560,
+          "repeats": 2,
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40150171648.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10532.41015625,
+        "log_sha256": "E7D6A05B44A7D8D5F396EC5BA674CB9C90E352C1AA20F0469725D15DD713443B",
+        "err_log_sha256": "648322F1C73DB5D8E44F0D00C7090A6B09AF2CD64D744F6A886445DB927DAE73"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 62804.17,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 126955699200,
+              "host_misses": 17229,
+              "host_hits": 32864,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 182,
+              "host_hits": 2097,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 60847.0,
+          "decode_tok_s": 7.1,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 30.124739099709107
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 24289.6,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 121641062400,
+              "host_misses": 5719,
+              "host_hits": 42277,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 205,
+              "host_hits": 2074,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 22381.0,
+          "decode_tok_s": 7.3,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 81.8998257450516
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 22381.0,
+        "decode_tok_s": 7.3,
+        "request_ms": 24289.6,
+        "input_tok_s_to_first_token": 81.8998257450516,
+        "prefill_demand_bytes": 121641062400,
+        "decode_demand_bytes": 5775897600,
+        "peak_device_gib": 13.396085331216455,
+        "peak_working_set_gib": 37.39276123046875,
+        "minimum_available_ram_gib": 10.28555679321289
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-512-return-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:36:54.8074487+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "kind": "cli_stream_generation",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_seq": 2560,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "max_tokens": 16,
+          "repeats": 2
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40151388160.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10851.6953125,
+        "log_sha256": "CC861245743984151F6B2FCD8903F6B1B4A7CF3E055642D2840983F2DB459D08",
+        "err_log_sha256": "A5A76734CE96575596439FDDE6C8E42197A19350BB35A1F8CE6F9342703D3EC7"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 63762.87,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 126955699200,
+              "host_misses": 17330,
+              "host_hits": 32763,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 180,
+              "host_hits": 2099,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 61755.0,
+          "decode_tok_s": 6.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 29.681807141122178
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 24703.34,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 121628390400,
+              "host_misses": 5831,
+              "host_hits": 42160,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 198,
+              "host_hits": 2081,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 22833.0,
+          "decode_tok_s": 7.4,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 80.27854421232426
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 22833.0,
+        "decode_tok_s": 7.4,
+        "request_ms": 24703.34,
+        "input_tok_s_to_first_token": 80.27854421232426,
+        "prefill_demand_bytes": 121628390400,
+        "decode_demand_bytes": 5775897600,
+        "peak_device_gib": 13.396085331216455,
+        "peak_working_set_gib": 37.39389419555664,
+        "minimum_available_ram_gib": 10.597358703613281
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-2048-large-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T22:34:57.7170214+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "repeats": 2,
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_tokens": 16,
+          "max_seq": 2560,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "kind": "cli_stream_generation"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40148570112.0,
+        "peak_child_working_set_bytes": 10522624.0,
+        "minimum_system_free_mb": 10719.50390625,
+        "log_sha256": "6BF8C085609EECC4C1315BDA93C06BE1E4307679568868911B46AAFD8BC1788F",
+        "err_log_sha256": "A7DDF4775F9BDC5BD4597B5164A9B6C636443F890B240B046E3F561FEFA72FE3"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 44083.17,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 15060,
+              "host_hits": 2176,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 42482.0,
+          "decode_tok_s": 8.7,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 43.14768607880985
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 19408.69,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38315059200,
+              "host_misses": 3401,
+              "host_hits": 11717,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6034406400,
+              "host_misses": 371,
+              "host_hits": 2010,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16689.0,
+          "decode_tok_s": 5.2,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 109.8328240158188
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16689.0,
+        "decode_tok_s": 5.2,
+        "request_ms": 19408.69,
+        "input_tok_s_to_first_token": 109.8328240158188,
+        "prefill_demand_bytes": 38315059200,
+        "decode_demand_bytes": 6034406400,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.39126968383789,
+        "minimum_available_ram_gib": 10.468265533447266
+      }
+    },
+    {
+      "prefix": "tmp/r1-natural-2048-repeat-20260930",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-09-30T23:01:40.7272252+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "repeats": 2,
+          "kind": "cli_stream_generation",
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "max_tokens": 16,
+          "max_seq": 2560
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40146329600.0,
+        "peak_child_working_set_bytes": 10547200.0,
+        "minimum_system_free_mb": 11020.42578125,
+        "log_sha256": "8ABE5417CF819E456F4D5DEBA315089806FF9C5DA5AABCA361E20FBBBD9724CD",
+        "err_log_sha256": "3C4D2061F0D5B6EF7403648B0C44A8BF4E53BDE56F1074E02BE73FC0F799E605"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 40490.8,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 14981,
+              "host_hits": 2255,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 38933.0,
+          "decode_tok_s": 8.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 47.08088254180258
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 18775.1,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38315059200,
+              "host_misses": 3387,
+              "host_hits": 11731,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6034406400,
+              "host_misses": 373,
+              "host_hits": 2008,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16135.0,
+          "decode_tok_s": 5.3,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 113.60396653238301
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16135.0,
+        "decode_tok_s": 5.3,
+        "request_ms": 18775.1,
+        "input_tok_s_to_first_token": 113.60396653238301,
+        "prefill_demand_bytes": 38315059200,
+        "decode_demand_bytes": 6034406400,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.389183044433594,
+        "minimum_available_ram_gib": 10.762134552001953
+      }
+    },
+    {
+      "prefix": "tmp/r1b-driver9033-512-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T13:33:11.5108148+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "kind": "cli_stream_generation",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "max_seq": 2560,
+          "repeats": 2,
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_tokens": 16,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "512",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40022835200.0,
+        "peak_child_working_set_bytes": 9928704.0,
+        "minimum_system_free_mb": 12110.3359375,
+        "log_sha256": "71B18D377EC17D791E6D78A89554123BD494D04572EB48EE87FA72428589EC31",
+        "err_log_sha256": "7A8DE9E1C1B47EC84653CA9C4DA646D08B5753E41A10AF29FAB66B210B4A7485"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "512",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 66349.16,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 126960768000,
+              "host_misses": 17042,
+              "host_hits": 33053,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5773363200,
+              "host_misses": 182,
+              "host_hits": 2096,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 64388.0,
+          "decode_tok_s": 7.1,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 28.468037522519722
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 25041.21,
+          "device_bytes": 14383937098,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 121643596800,
+              "host_misses": 5375,
+              "host_hits": 42622,
+              "shapes": [
+                512,
+                512,
+                512,
+                293,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 5775897600,
+              "host_misses": 197,
+              "host_hits": 2082,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 23198.0,
+          "decode_tok_s": 7.5,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 79.01543236485904
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 23198.0,
+        "decode_tok_s": 7.5,
+        "request_ms": 25041.21,
+        "input_tok_s_to_first_token": 79.01543236485904,
+        "prefill_demand_bytes": 121643596800,
+        "decode_demand_bytes": 5775897600,
+        "peak_device_gib": 13.396085331216455,
+        "peak_working_set_gib": 37.274169921875,
+        "minimum_available_ram_gib": 11.826499938964844
+      }
+    },
+    {
+      "prefix": "tmp/r1b-driver9033-2048-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T13:36:58.5367788+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "kind": "cli_stream_generation",
+          "max_tokens": 16,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "max_seq": 2560,
+          "repeats": 2,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_HOT_RAM_MB": "32768"
+        },
+        "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40113147904.0,
+        "peak_child_working_set_bytes": 9957376.0,
+        "minimum_system_free_mb": 12142.98828125,
+        "log_sha256": "98072E043F575CAB6C6202C94B7766E062F2CBC18D624A7CE157F411E41EA560",
+        "err_log_sha256": "7E378D2EB1422448B3786B77FB3AC69621EE619A909418413CD662F8F909FAC4"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 44721.4,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 14804,
+              "host_hits": 2432,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 43171.0,
+          "decode_tok_s": 9.0,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 42.45905816404531
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 19591.14,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38317593600,
+              "host_misses": 3290,
+              "host_hits": 11829,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6036940800,
+              "host_misses": 375,
+              "host_hits": 2007,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16877.0,
+          "decode_tok_s": 5.2,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 108.60935000296261
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16877.0,
+        "decode_tok_s": 5.2,
+        "request_ms": 19591.14,
+        "input_tok_s_to_first_token": 108.60935000296261,
+        "prefill_demand_bytes": 38317593600,
+        "decode_demand_bytes": 6036940800,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.358280181884766,
+        "minimum_available_ram_gib": 11.858386993408203
+      }
+    },
+    {
+      "prefix": "tmp/r1b-2048-tile256-first-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T14:04:03.0670883+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "kind": "cli_stream_generation",
+          "max_tokens": 16,
+          "max_seq": 2560,
+          "repeats": 2,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_PREFILL_ATTN_TILE": "256",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q35_PREFILL_CHUNK": "2048"
+        },
+        "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40032632832.0,
+        "peak_child_working_set_bytes": 9961472.0,
+        "minimum_system_free_mb": 12205.82421875,
+        "log_sha256": "FF99911A8AC97FB64710DC37965662B759D65A51DEFECBFBBE1E223DD5167132",
+        "err_log_sha256": "9473C6769344EE355384E2373AB03571645759BE9EB035179D2813EEFEAFBCCB"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1",
+        "attn_tile": "256"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 51718.87,
+          "device_bytes": 14701937076,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43677849600,
+              "host_misses": 14445,
+              "host_hits": 2789,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6054681600,
+              "host_misses": 138,
+              "host_hits": 2251,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 50172.0,
+          "decode_tok_s": 9.0,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 36.53432193255202
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 19295.17,
+          "device_bytes": 14701937076,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38330265600,
+              "host_misses": 3169,
+              "host_hits": 11955,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6057216000,
+              "host_misses": 373,
+              "host_hits": 2017,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16713.0,
+          "decode_tok_s": 5.5,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 109.67510321306767
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16713.0,
+        "decode_tok_s": 5.5,
+        "request_ms": 19295.17,
+        "input_tok_s_to_first_token": 109.67510321306767,
+        "prefill_demand_bytes": 38330265600,
+        "decode_demand_bytes": 6057216000,
+        "peak_device_gib": 13.69224588945508,
+        "peak_working_set_gib": 37.283294677734375,
+        "minimum_available_ram_gib": 11.919750213623047
+      }
+    },
+    {
+      "prefix": "tmp/r1b-2048-control-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T14:06:21.9677597+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_prefill_tile_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "max_seq": 2560,
+          "kind": "cli_stream_generation",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_tokens": 16,
+          "repeats": 2,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40014610432.0,
+        "peak_child_working_set_bytes": 9953280.0,
+        "minimum_system_free_mb": 12254.02734375,
+        "log_sha256": "608413C731C90F9D994A2051A82A0C7342FD51448AE05DB6378A1B50AC7C9919",
+        "err_log_sha256": "C9EA805542307CBD62BD406F4AACEB0E93B5CDD977063222B921B627E934CF5A"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1",
+        "attn_tile": "0"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 42134.76,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 14811,
+              "host_hits": 2425,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 40582.0,
+          "decode_tok_s": 9.0,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 45.167808387955255
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 18701.21,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38317593600,
+              "host_misses": 3271,
+              "host_hits": 11848,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6036940800,
+              "host_misses": 373,
+              "host_hits": 2009,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16107.0,
+          "decode_tok_s": 5.4,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 113.80145278450364
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16107.0,
+        "decode_tok_s": 5.4,
+        "request_ms": 18701.21,
+        "input_tok_s_to_first_token": 113.80145278450364,
+        "prefill_demand_bytes": 38317593600,
+        "decode_demand_bytes": 6036940800,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.266510009765625,
+        "minimum_available_ram_gib": 11.96682357788086
+      }
+    },
+    {
+      "prefix": "tmp/r1b-2048-tile256-repeat-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T14:09:54.7622640+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_prefill_tile_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "max_tokens": 16,
+          "kind": "cli_stream_generation",
+          "repeats": 2,
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "max_seq": 2560,
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9"
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_WORK_SUMMARY": "1",
+          "AILA_Q4E_PREFILL_ATTN_TILE": "256",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0"
+        },
+        "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40020787200.0,
+        "peak_child_working_set_bytes": 9961472.0,
+        "minimum_system_free_mb": 12446.17578125,
+        "log_sha256": "EF6DFF97E8CC7B6EA4D685FD8ABED31FC6FEEFED67B6705D1D57B1B6335597D7",
+        "err_log_sha256": "4E9E163C4921E00DA6F984A77A3AB3E6CA167B3D56691D8B132D514451984144"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1",
+        "attn_tile": "256"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 41953.42,
+          "device_bytes": 14701937076,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43677849600,
+              "host_misses": 14493,
+              "host_hits": 2741,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6054681600,
+              "host_misses": 138,
+              "host_hits": 2251,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 40395.0,
+          "decode_tok_s": 8.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 45.376903082064615
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 18987.04,
+          "device_bytes": 14701937076,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38330265600,
+              "host_misses": 3174,
+              "host_hits": 11950,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6057216000,
+              "host_misses": 377,
+              "host_hits": 2013,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16466.0,
+          "decode_tok_s": 5.6,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 111.32029636827401
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16466.0,
+        "decode_tok_s": 5.6,
+        "request_ms": 18987.04,
+        "input_tok_s_to_first_token": 111.32029636827401,
+        "prefill_demand_bytes": 38330265600,
+        "decode_demand_bytes": 6057216000,
+        "peak_device_gib": 13.69224588945508,
+        "peak_working_set_gib": 37.27226257324219,
+        "minimum_available_ram_gib": 12.154468536376953
+      }
+    },
+    {
+      "prefix": "tmp/r1b-2048-control-repeat-20261001",
+      "metadata": {
+        "performance_preset": "qwen38-a770",
+        "runtime_defaults": true,
+        "timestamp": "2026-10-01T14:13:25.9762634+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_prefill_tile_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "generation",
+        "input": {
+          "sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9",
+          "source_sha256": "0768CD3B874049CD61D9E61649B52F24ADB1B04B0574C011B34032ADF925DB3E",
+          "kind": "cli_stream_generation",
+          "stdin_sha256": "91F9F3B5B730B8F81F6BFD05438811941B2DCD22B19F9A4ED18BACA141814D14",
+          "max_tokens": 16,
+          "repeats": 2,
+          "max_seq": 2560
+        },
+        "arguments": [
+          "-m",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+          "--max-seq",
+          "2560",
+          "--greedy",
+          "--thinking-budget",
+          "0",
+          "--max-tokens",
+          "16",
+          "--stream",
+          "--stream-chunk",
+          "1",
+          "--decode-chunk",
+          "1",
+          "--performance-preset",
+          "qwen38-a770"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_WORK_SUMMARY": "1"
+        },
+        "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": false,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40037576704.0,
+        "peak_child_working_set_bytes": 9957376.0,
+        "minimum_system_free_mb": 12533.65234375,
+        "log_sha256": "BB35E42D8311748112C68D1CF76B4F89739ADC47B7645F085B461D2E86E0BFE2",
+        "err_log_sha256": "312E8F6B93458506D639154B0361CE55C1F9A332A868B956F9C619DD4E8C835B"
+      },
+      "effective_config": {
+        "preset": "qwen38-a770",
+        "chunk": "2048",
+        "host_ram_mb": "32768",
+        "slots": "3567",
+        "dense_xmx": "1",
+        "direct_io": "1",
+        "phase_scratch": "1",
+        "demand_microbatch": "32",
+        "checkpoint": "1",
+        "attn_tile": "0"
+      },
+      "requests": [
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 41621.42,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 43682918400,
+              "host_misses": 14800,
+              "host_hits": 2436,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6031872000,
+              "host_misses": 144,
+              "host_hits": 2236,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 40058.0,
+          "decode_tok_s": 8.9,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 45.75864995756154
+        },
+        {
+          "prompt_tokens": 1833,
+          "generated": 16,
+          "request_ms": 19497.04,
+          "device_bytes": 14972751412,
+          "phases": {
+            "prefill": {
+              "count": 1833,
+              "demand_bytes": 38317593600,
+              "host_misses": 3279,
+              "host_hits": 11840,
+              "shapes": [
+                1829,
+                4
+              ]
+            },
+            "decode": {
+              "count": 16,
+              "demand_bytes": 6036940800,
+              "host_misses": 374,
+              "host_hits": 2008,
+              "shapes": [
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          "ttft_ms": 16525.0,
+          "decode_tok_s": 4.8,
+          "text": "Based on the project brief, the team\u2019s primary goal is not to build a",
+          "text_sha256": "cecd644332024ce79b8559e19aa858a82fd4c1518c4b2eea156e0fb42958bceb",
+          "input_tok_s_to_first_token": 110.92284417549168
+        }
+      ],
+      "warm_summary": {
+        "ttft_ms": 16525.0,
+        "decode_tok_s": 4.8,
+        "request_ms": 19497.04,
+        "input_tok_s_to_first_token": 110.92284417549168,
+        "prefill_demand_bytes": 38317593600,
+        "decode_demand_bytes": 6036940800,
+        "peak_device_gib": 13.944461394101381,
+        "peak_working_set_gib": 37.287899017333984,
+        "minimum_available_ram_gib": 12.23989486694336
+      }
+    }
+  ],
+  "groups": [
+    {
+      "driver": "32.0.101.8860",
+      "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+      "chunk": 512,
+      "attention_tile": 0,
+      "prefixes": [
+        "tmp/r1-natural-512-first-20260930",
+        "tmp/r1-natural-512-return-20260930"
+      ],
+      "warm_ttft_ms": [
+        22381.0,
+        22833.0
+      ],
+      "warm_decode_tok_s": [
+        7.3,
+        7.4
+      ],
+      "median_ttft_ms": 22607.0,
+      "median_decode_tok_s": 7.35,
+      "median_request_ms": 24496.47,
+      "input_tok_s": 81.08108108108108,
+      "median_prefill_demand_gb": 121.6347264,
+      "median_decode_host_misses": 201.5,
+      "peak_device_gib": 13.396085331216455,
+      "minimum_free_ram_gib": 10.28555679321289
+    },
+    {
+      "driver": "32.0.101.8860",
+      "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+      "chunk": 2048,
+      "attention_tile": 0,
+      "prefixes": [
+        "tmp/r1-natural-2048-large-20260930",
+        "tmp/r1-natural-2048-repeat-20260930"
+      ],
+      "warm_ttft_ms": [
+        16689.0,
+        16135.0
+      ],
+      "warm_decode_tok_s": [
+        5.2,
+        5.3
+      ],
+      "median_ttft_ms": 16412.0,
+      "median_decode_tok_s": 5.25,
+      "median_request_ms": 19091.894999999997,
+      "input_tok_s": 111.6865708018523,
+      "median_prefill_demand_gb": 38.3150592,
+      "median_decode_host_misses": 372.0,
+      "peak_device_gib": 13.944461394101381,
+      "minimum_free_ram_gib": 10.468265533447266
+    },
+    {
+      "driver": "32.0.101.9033",
+      "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+      "chunk": 512,
+      "attention_tile": 0,
+      "prefixes": [
+        "tmp/r1b-driver9033-512-20261001"
+      ],
+      "warm_ttft_ms": [
+        23198.0
+      ],
+      "warm_decode_tok_s": [
+        7.5
+      ],
+      "median_ttft_ms": 23198.0,
+      "median_decode_tok_s": 7.5,
+      "median_request_ms": 25041.21,
+      "input_tok_s": 79.01543236485904,
+      "median_prefill_demand_gb": 121.6435968,
+      "median_decode_host_misses": 197,
+      "peak_device_gib": 13.396085331216455,
+      "minimum_free_ram_gib": 11.826499938964844
+    },
+    {
+      "driver": "32.0.101.9033",
+      "exe_sha256": "0BFB43F26E2F64CAA0F229CCAB76ED709006ABD63F2416001C33E6587B77FDDC",
+      "chunk": 2048,
+      "attention_tile": 0,
+      "prefixes": [
+        "tmp/r1b-driver9033-2048-20261001"
+      ],
+      "warm_ttft_ms": [
+        16877.0
+      ],
+      "warm_decode_tok_s": [
+        5.2
+      ],
+      "median_ttft_ms": 16877.0,
+      "median_decode_tok_s": 5.2,
+      "median_request_ms": 19591.14,
+      "input_tok_s": 108.60935000296261,
+      "median_prefill_demand_gb": 38.3175936,
+      "median_decode_host_misses": 375,
+      "peak_device_gib": 13.944461394101381,
+      "minimum_free_ram_gib": 11.858386993408203
+    },
+    {
+      "driver": "32.0.101.9033",
+      "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+      "chunk": 2048,
+      "attention_tile": 256,
+      "prefixes": [
+        "tmp/r1b-2048-tile256-first-20261001",
+        "tmp/r1b-2048-tile256-repeat-20261001"
+      ],
+      "warm_ttft_ms": [
+        16713.0,
+        16466.0
+      ],
+      "warm_decode_tok_s": [
+        5.5,
+        5.6
+      ],
+      "median_ttft_ms": 16589.5,
+      "median_decode_tok_s": 5.55,
+      "median_request_ms": 19141.105,
+      "input_tok_s": 110.49157599686549,
+      "median_prefill_demand_gb": 38.3302656,
+      "median_decode_host_misses": 375.0,
+      "peak_device_gib": 13.69224588945508,
+      "minimum_free_ram_gib": 11.919750213623047
+    },
+    {
+      "driver": "32.0.101.9033",
+      "exe_sha256": "9AA568AFCCD6CCA0C1CA813CD6D594A11FE9A0CDB13CC06DC6BEADA6E1194DD7",
+      "chunk": 2048,
+      "attention_tile": 0,
+      "prefixes": [
+        "tmp/r1b-2048-control-20261001",
+        "tmp/r1b-2048-control-repeat-20261001"
+      ],
+      "warm_ttft_ms": [
+        16107.0,
+        16525.0
+      ],
+      "warm_decode_tok_s": [
+        5.4,
+        4.8
+      ],
+      "median_ttft_ms": 16316.0,
+      "median_decode_tok_s": 5.1,
+      "median_request_ms": 19099.125,
+      "input_tok_s": 112.34371169404265,
+      "median_prefill_demand_gb": 38.3175936,
+      "median_decode_host_misses": 373.5,
+      "peak_device_gib": 13.944461394101381,
+      "minimum_free_ram_gib": 11.96682357788086
+    }
+  ],
+  "canaries": [
+    {
+      "prefix": "tmp/r1b-tile-state-v2-20261001",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-10-01T13:58:39.0738069+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "tile",
+        "input": {
+          "source_sha256": "AA137E8D92FF7F8430B101E72E49024FA53F877F8D496EDF808A13863EF7B307",
+          "kind": "attention_tile_state_and_quality"
+        },
+        "arguments": [
+          "--tile-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_WINDOW_PROMPT_FILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\archive-natural.json",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "390DC5810F415B91DCD8ED4B9622257610943B0FDA56CF1AA5085457079DCBE4",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40077111296.0,
+        "peak_child_working_set_bytes": 9936896.0,
+        "minimum_system_free_mb": 12377.953125,
+        "log_sha256": "1E19F38A1942362906E65D6237FDCC1BE33E9C4B51A200F73E698BE24DFD0E89",
+        "err_log_sha256": "140DF830E7FDE0177D9C4E212498BE0F5C311B65D227F05246E14F7337E82CA5"
+      },
+      "observations": [
+        "[X2 QUALITY] R1b_257_tile128_teacher8 rows=8 mean_kl=1.762989556e-16 mean_nll_delta=0 max_logits_nrmse=0 nll_warning=0",
+        "[R1b STATE] rows=257 tile=128 anchor=129 future_independent=1 replay_exact=1 tail_one_avoided=1",
+        "[R1b ATTENTION] layer=3 start=1796 count=257 nrmse=0.0001717918811 max_abs=0.00390625 bound_nrmse=0.05 future_independent=1",
+        "[R1b PASS] attention_tiling_state_and_bounded_quality=1"
+      ]
+    },
+    {
+      "prefix": "tmp/r1b-natural-quality256-20261001",
+      "metadata": {
+        "performance_preset": "",
+        "runtime_defaults": false,
+        "timestamp": "2026-10-01T14:19:34.9865701+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M CMakeLists.txt",
+          " M docs/plans/qwen3.8-flash-next-strata-design-review-2026-09-30.md",
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_replay.py",
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M perf/qwen4exp/test_q4e_cache_replay.py",
+          " M src/cli/CLI.cpp",
+          " M src/cli/CLI.hpp",
+          " M src/engine/EngineGeneration.cpp",
+          " M src/main.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M src/ops/QsaIndexerOps.cpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          " M tests/models/Qwen4ExpToleranceTests.cpp",
+          " M tests/ops/Qwen4ExpKernelTests.cpp",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-architecture-brainstorm-evidence-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-qsa-selector-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram-budget-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-ram32-decode-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s5-coverage-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md",
+          "?? perf/qwen4exp/prompts/archive-natural.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/prompts/ram-long.json",
+          "?? perf/qwen4exp/q4e_architecture_summary.py",
+          "?? perf/qwen4exp/q4e_prefill_tile_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_audit_summary.py",
+          "?? perf/qwen4exp/q4e_qsa_selector_summary.py",
+          "?? perf/qwen4exp/q4e_ram_summary.py",
+          "?? perf/qwen4exp/q4e_resident_summary.py",
+          "?? perf/qwen4exp/q4e_route_wait_summary.py",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py",
+          "?? src/models/Qwen4ExpPrefill.cpp",
+          "?? src/utils/Qwen38A770Preset.hpp",
+          "?? tests/models/Qwen4ExpAttentionTileAcceptance.hpp",
+          "?? tests/models/Qwen4ExpMatureGemmProbe.hpp",
+          "?? tests/models/Qwen4ExpPresetAcceptance.hpp",
+          "?? tests/ops/Qwen4ExpQsaProbe.hpp"
+        ],
+        "workload": "window",
+        "input": {
+          "source_sha256": "B4C160F2D87B01D2AF2C378CB2967907FBCDD022EEEBB64CB4EFB89C1F8B3D90",
+          "kind": "natural_window_teacher_forcing",
+          "prompt_sha256": "15A9D1318A8718D77DF40F7A61DCA2F6C2901B035E28AE7FAC5D238148193BF9"
+        },
+        "arguments": [
+          "--window-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_WINDOW_PROMPT_FILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\archive-natural.json",
+          "AILA_PROFILE_Q4E_DECODE": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_HOT_RAM_MB": "32768",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_PREFILL_ATTN_TILE": "256",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0"
+        },
+        "exe_sha256": "F3D237BF64B7261D1C7C4FB4A8D79B328B9F24373E9D861EF9FDC3111043270F",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.9033"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 40195321856.0,
+        "peak_child_working_set_bytes": 9949184.0,
+        "minimum_system_free_mb": 12167.1328125,
+        "log_sha256": "F54830C83AC99F089C5A9B8C0FEBF52C7C651B508A43A1A8F8FF28DCAAC69D94",
+        "err_log_sha256": "DB9108A5EE1225F9132EA6A7B96C0E544B83CF8A7BF79CC2C6804E24D1A04F96"
+      },
+      "observations": [
+        "[X2 QUALITY] R1b_natural1833_untiled_vs_tiled rows=48 mean_kl=0.005898649491 mean_nll_delta=-0.01321464724 max_logits_nrmse=0.0787916743 nll_warning=0",
+        "[R1b QUALITY] prompt=1833 rows=48 tile=256 finite=1 nll_warning=0"
+      ]
+    }
+  ],
+  "limitations": [
+    "Historical driver comparisons are not same-day driver A/B experiments; no automatic driver attribution.",
+    "Only same-driver same-binary groups isolate attention tiling.",
+    "Input tokens/TTFT is warm effective throughput; demand counters are logical payload, not bus bytes.",
+    "USM ledger is not WDDM residency; the tiled candidate still retains the full MoE rank output buffer."
+  ]
+}

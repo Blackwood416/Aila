@@ -311,7 +311,19 @@ sycl::event moe_expert_major_prefill_down(
     const sycl::event* dep_event = nullptr,
     bool use_nested = false,
     int num_pairs = 0,
-    int num_quads = 0);
+    int num_quads = 0,
+    bool compact_output = false);
+
+// Compact output is [acts,H]; input h still uses [token,rank,I]. H must be divisible by 4.
+void moe_build_inverse_map(Context& ctx, const int* tokens, const int* ranks,
+    int* inverse, int acts, int top_k);
+sycl::event moe_merge_compact_down(Context& ctx, const float* down, const int* tokens,
+    const int* inverse, const float* weights, int64_t* sum, int* invalid, int first, int acts,
+    int top_k, int H, const sycl::event* dep = nullptr);
+sycl::event moe_finish_compact_down(Context& ctx, const int64_t* sum,
+    sycl::ext::oneapi::bfloat16* y, int tokens, int H,
+    const sycl::ext::oneapi::bfloat16* shared_out = nullptr,
+    const sycl::ext::oneapi::bfloat16* shared_gate = nullptr);
 
 // Phase W4 (C1): Explicit 2-token weight reuse prefill kernels
 sycl::event moe_expert_major_prefill_gate_up_2token(

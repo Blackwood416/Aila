@@ -1,6 +1,30 @@
 # Qwen3.8-Flash-Next：以容差为契约的 XMX Prefill 优化方案
 
-最新 [Strata 源码设计对照](qwen3.8-flash-next-strata-design-review-2026-09-30.md) 给出新的 GPU-only 候选：MTP 历史补齐仅计算 K/V、保存 GDN 输入后只提交接受前缀的递推状态、复用 Prefill 临时区并统一 chunk/cache 预算。先做 KV-only 的有界实验，再依据小窗口成本与代表性接受率决定后续；Strata 的 CUDA/CPU 混合吞吐不能外推到 A770/NF4。本次仅完成源码审阅和预算计算，未实施这些候选。
+2026-10-01 补齐 [R2b 真实隐藏态、单输入模型质量与状态检查](qwen3.8-flash-next-r2b-real-quality-results-2026-10-01.md)：六组真实专家通过整数 CPU/RTE 参考及连续 graph 参数表/scatter 检查；1833-token 输入的 48 步 teacher forcing 平均 KL=0.00701、NLL 差=−0.00115，42/48 首选 token 一致，通过预设模型 canary 门槛。257-token 前缀因果、65-token 快照/恢复回放及 3 项 CTest 通过。但原 NF4 逐点门槛在真实样本中有 18.9%–46.9% 超限，不能称全面质量认证。所有 count>1 prefill 专家统一整数格式，decode 仍 NF4，禁止热度决定数值格式；诊断重复计算 NF4，未产生生产 TPS 收益。32 GiB host pool 下最终最低可用 RAM 10.99 GiB。下一步先用真实语料验证 down per32 激活尺度及小桶一致算术，再去除重复计算接入；R2b 生产集成、decode 20 tok/s 尚未完成。
+
+2026-10-01 继续完成 [R2b INT8 DPAS 热桶与静态 graph 实验](qwen3.8-flash-next-r2b-dpas-results-2026-10-01.md)：原生 dpas.8x8 已由实际 ISA 确认；两次独立运行中，含转码、两次 Q8、pack/merge 的完整链对同 graph NF4 基线，M32 延迟下降约 26%，M48 约 24%–26%，M64 约 47%。M8/M24 落后、M16 余量不足，WG32/stride padding 没有一致收益，不写泛化阈值。CPU 算子参考、修改输入/路由/专家描述符后的 graph 逐位检查、3 项 CTest 通过。新算术仍有少量逐点超限，未做模型 NLL/生成验收，保持测试入口；下一步真实隐藏态质量与可复用热桶 graph 集成，未宣称整机 TPS 提升。
+
+2026-10-01 完成 [R2b NF4 integer-LUT × Q8 的有界 DP4A 实验](qwen3.8-flash-next-r2b-integer-results-2026-10-01.md)：真实专家整数参考、Q8 RTE/非有限保护、SwiGLU 和 merge 检查通过，实际 GPU ISA 确认原生 dp4a；四行权重复用及精确修正倒数量化把 M32 整数完整路径从约 953 降至 555 µs，但原 NF4 为 522 µs（仍慢 6.2%），M1 仍慢 20.8%。近似 NRMSE 1.65%–1.80%，少量元素超出原逐点门槛，未做模型质量认证，保持测试入口。R2b 的 INT8 DPAS/真实隐藏态验收尚未实现，未宣称整阶段完成；可继续 DPAS 热桶或原计划 R3-head，9033/32 GiB/GPU-only 不变。
+
+2026-10-01 继续完成 [R1b 有界 MoE scratch / Q36 window merge](qwen3.8-flash-next-r1b-compact-moe-results-2026-10-01.md)：原 NF4 专家算术不变，以顺序无关整数累加保证缓存/分组重排后的前缀一致性，相关算子、因果、checkpoint 和质量检查通过。相对 attention tile256 再节省 94.73 MiB GPU USM，完整请求基本持平、decode 未改善，候选默认关闭。R1b 的预算窗口与服务公平性尚未实现；下一步 R2b / R3-head，GPU-only、32 GiB、9033 基线不变。
+
+2026-10-01 完成 [R1b attention/GDN tile 第一部分](qwen3.8-flash-next-r1b-attention-tile-results-2026-10-01.md)：9033 驱动上，大路由窗口内分 tile 执行 attention，回收 258.27 MiB GPU USM；状态、跨稀疏阈值因果和自然文本 48 步质量检查通过。暖 TTFT 小幅增加、完整请求未加速，候选默认关闭；下一步是有界 MoE down scratch / window merge，R1b 尚未全部完成。驱动升级的同旧二进制复测显示约 3% TTFT 变慢信号，证据不足以归因于驱动；decode 20 tok/s 仍未达到。
+
+根据架构 brainstorm 完成 [R0 / R1a / R2a 首轮](qwen3.8-flash-next-architecture-r0-r2a-results-2026-09-30.md)：新增显式 qwen38-a770 CLI preset，41-token checkpoint 状态与 48 步质量 canary 通过（保留前 16 步 NLL 预警）；自然 1833-token 大窗口暖态 TTFT 22.607→16.412 s、prefill demand 字节减少 68.5%，但 decode 7.35→5.25 tok/s，未将 2048 设为默认。成熟 GEMM M32 完整路径仍比 ALU 慢约 19%，仅保留测试原型。下一项进入 R1b 的大路由窗口/小 tile 解耦，随后 R2b/R3-head；32 GiB、GPU-only 不变，实际 decode 20 tok/s 尚未达到。
+
+已完成 [精确 QSA selector 与提交方式实验](qwen3.8-flash-next-qsa-selector-results-2026-09-30.md)：A770/Level Zero 的 K=512、ratio=4、完整块数≤32768 默认使用 8-bit radix＋vec4＋并行稳定输出。32K Top-K 1.956→0.118 ms，组合 QSA 后半段 2.198→0.381 ms；1428 组精确检查及相关 attention 回归通过。2146-token 真实 ABBA 的暖态 decode 仍为 6.15 tok/s，未宣称整机提速。Immediate 的连续提交路径出现回退，未全局开启；OOO 留作有显式事件和独立 scratch 的分支候选。下一项优先专家供给等待，保持 32 GiB、GPU-only。
+
+新增 [QSA 与长上下文执行差距审计](qwen3.8-flash-next-qsa-gap-audit-2026-09-30.md)：固定 Q/K/V 实测确认 selected attention 约 0.27 ms/层封顶，但通用 Top-K 从 4K 的约 0.39 ms 增至 32K 的约 1.95 ms，吞掉稀疏收益。同显存容量的模型分段诊断也显示，慢请求主要新增等待在专家 acquire（约 8.8 → 77.3 ms/forward），Full Attention 约 4.0 → 8.3 ms。下一步优先精确 radix/并行 compaction、长 Prefill 后供给与容量协调，再做 GQA 复用和 MTP 重估。保持 32 GiB、GPU-only；本轮增加诊断，未更换生产 kernel。
+
+本机后续性能实验采用 **32 GiB host pool、MTP 64 个 draft 槽**。新增 [32 GiB decode 结果](qwen3.8-flash-next-ram32-decode-results-2026-09-30.md)：三个上下文的 24/32 GiB 正反向对照全部完成。2146-token 输入后实际 decode 中位数 5.45 → 6.7 tok/s；计入一次 3.8 tok/s 回落后，合并解码速度估算改善约 3.9%，完整请求中位数缩短 11.0%。短输入没有进一步收益，32 GiB 为实验基线而非全域最优；最低可用 RAM 10.775 GiB。probe 默认预算已切换，长上下文波动和 20 tok/s 目标仍待解决。
+
+新增 [16/24 GiB RAM 预算对照](qwen3.8-flash-next-ram-budget-results-2026-09-30.md)：固定 GPU 容量、AB/BA 复测，短样本实际 decode 中位数 13.15 → 14.8 tok/s（约 +12.5%），主机池暖态填充归零；长 Prefill 未获得稳定收益。24 GiB 正式进程峰值工作集约 29.23 GiB，最低可用 RAM 18.09 GiB。保留全局 16 GiB 默认，24 GiB 作为本机 decode 性能候选，未达到 20 tok/s。
+
+继续推进 [S6 驻留/缺失专家拆批](qwen3.8-flash-next-strata-s6-resident-results-2026-09-30.md)：修复同进程 MTP/target trace 文件冲突，补逐 token 路由和覆盖校验；默认关闭的小窗口拆批候选在中文/代码四行验证中分别降低约 3.2%/2.7%，所有对照 logits 位级一致。计算/拷贝重叠增大，但 kernel 区间也变长，尚未达到 20 generated tok/s；未更改生产 MTP 默认值。
+
+最新进度（2026-09-30）：此前累计改动已提交为 66e21e9。[S1/S2 结果](qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md) 完成 KV-only 补齐（draft+catch-up 降约 9%/20%）及四类文本 1–4 行窗口测量；20 tok/s 的成本余量仍不足，按条件暂缓 S3 的前缀提交工程。[S4/S5 结果](qwen3.8-flash-next-strata-s4-s5-results-2026-09-30.md) 完成默认关闭的 scratch arena 候选，测试形状回收 77–700 MiB GPU USM；2052 边界和后续八步 logits 位级一致。S5 大块 trace 不支持直接移植 stream-all，未新增该供给路径。动态借槽和生产 MTP 均未实施，decode 20 tok/s 仍未达到。
+
+设计起点 [Strata 源码对照](qwen3.8-flash-next-strata-design-review-2026-09-30.md) 给出 GPU-only 候选：MTP 历史补齐仅计算 K/V、保存 GDN 输入后只提交接受前缀的递推状态、复用 Prefill 临时区并统一 chunk/cache 预算。Strata 的 CUDA/CPU 混合吞吐不能外推到 A770/NF4；具体实施与未通过的门槛以上述后续结果为准。
 
 此前 [P4 MTP 探索](qwen3.8-flash-next-p4-mtp-results-2026-09-30.md) 已完成真实 GPU draft、512/64 专家槽取舍和有界 device checkpoint 恢复重放检查。短样本连续命中不足，重复长样本验证成本过高；乐观条件成本模型约 11–13 tok/s，尚不支持生产 MTP 接入。CPU 数值参考的 softmax 敏感性与未通过门槛已保留，接受前缀提交未实现，默认不变。
 

@@ -89,6 +89,8 @@ struct Qwen4ExpLayerCache {
 };
 
 struct Qwen4ExpBuffers {
+    // Owns the opt-in phase scratch. Declared before views so it dies last.
+    Tensor phase_scratch;
     Tensor hidden4;       // [max_seq, 10240]
     Tensor hc_N;          // [max_seq, 10240]
     Tensor hc_mix_down;   // [max_seq, 320]
@@ -132,6 +134,9 @@ struct Qwen4ExpBuffers {
     Tensor shared_gate_up_buf; // [max_seq, 1280]
     Tensor shared_inter_buf;   // [max_seq, 640]
     Tensor shared_out_buf;     // [max_seq, 2560]
+    Tensor moe_window_sum; // compact path [window,H] int64 Q36, independent of expert submission order
+    Tensor moe_compact_invalid; // fail closed on nonfinite/out-of-range contributions
+    Tensor moe_inverse_map; // [window,top_k] -> global activation index
     Tensor moe_down_acc;       // [max_seq, top_k, 2560] f32 (Phase S4 expert-major down accumulation)
 
     // Output
@@ -300,6 +305,13 @@ private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly,
                         const ForwardOptions& options);
+    sycl::event RunCompactExpertDown(Context& ctx, int first, int acts,
+        int pairs, int quads, const sycl::event& ready);
+    void RunAttentionLayerTile(Context& ctx, Session& session, int layer,
+        Tensor& input, Tensor& output, int count, int startPos,
+        StateSnapshot* interior, int checkpointAfter);
+    void RunAttentionWindow(Context& ctx, Session& session, int layer, int count,
+        int startPos, StateSnapshot* interior, int checkpointAfter);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
@@ -385,6 +397,8 @@ private:
     Tensor expert_tiles_dev_;
     bool grouped_xmx_supported_ = false;
     int grouped_xmx_min_rows_override_ = -1; // test harness only; -1 uses cached environment
+    // Test-only override permits paired scheduling trials in one loaded model.
+    int small_rows_resident_split_override_ = -1;
     bool expert_histogram_enabled_ = false;
     // Buckets 1,2,3-4,5-8,9-16,>16: requests, activations, resident hits, misses.
     std::array<std::array<uint64_t, 4>, 6> expert_histogram_{};
@@ -392,6 +406,11 @@ private:
     // Optional bounded real-input acceptance hook; null in normal inference.
     void (*grouped_expert_probe_)(Qwen4ExpBnb4Backend&, int, int, int, int, int,
                                   const sycl::event&) = nullptr;
+    // Test-only real-input/replacement seam. The returned event must cover all
+    // extra slot readers before cache eviction; null for normal inference.
+    void* expert_quality_probe_data_ = nullptr;
+    sycl::event (*expert_quality_probe_)(void*, Qwen4ExpBnb4Backend&, int, int,
+                                        int, int, const sycl::event&) = nullptr;
 
     // Prefill batched expert acquire scratch (expert -> slot / token uses for the current layer).
     std::vector<int> prefill_expert_slot_;
@@ -411,4 +430,6 @@ private:
     uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
+    int moe_compact_tile_ = 0; // bounded activation rows, separate from router window
+    int prefill_attention_tile_ = 0; // opt-in; independent of the routing window
 };

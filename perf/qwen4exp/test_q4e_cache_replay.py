@@ -32,6 +32,21 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_router_rows_match_acquired_experts(self):
+        rows = fixture()
+        rows.insert(2, dict(type="route", forward=1, layer=0, rows=2, top_k=2, ids=[0,1,2,3]))
+        self.assertEqual(validate(copy.deepcopy(rows))[0]["bytes"], 256)
+        rows[2]["ids"] = [0,1,2,4]
+        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            validate(copy.deepcopy(rows))
+        rows[2]["ids"] = [0,0,2,3]
+        with self.assertRaisesRegex(ValueError, "Duplicate expert"):
+            validate(copy.deepcopy(rows))
+        rows[2]["ids"] = [0,1,2,3]
+        rows[0]["layers"] = 2
+        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            validate(copy.deepcopy(rows))
+
     def test_batch_reservation_and_demote(self):
         observed = validate(fixture())[0]
         predicted = simulate(fixture())[0]

@@ -1,0 +1,396 @@
+{
+  "runs": [
+    {
+      "path": "tmp/p2-mb32-profile-20260929.cache.jsonl",
+      "sha256": "16162b0a0f623ae35da6265c5df49adf745cdbfe0316d509716c4ca15d810d47",
+      "config": {
+        "type": "config",
+        "ns": 40123300965600,
+        "schema": 1,
+        "slots": 3714,
+        "slot_bytes": 2534400,
+        "layers": 48,
+        "experts": 512,
+        "host_slots": 6778,
+        "cost_aware": 1
+      },
+      "forwards": [
+        {
+          "position": 0,
+          "tokens": 256,
+          "unique_layer_experts": 10341,
+          "coverage": 0.4207763671875,
+          "demand_bytes": 25052544000,
+          "demand_file_fills": 7796,
+          "minimum_stream_all_bytes": 52872652800,
+          "minimum_stream_all_vs_observed_demand": 2.1104704097116844,
+          "full_catalog_bytes": 62285414400
+        },
+        {
+          "position": 0,
+          "tokens": 256,
+          "unique_layer_experts": 10341,
+          "coverage": 0.4207763671875,
+          "demand_bytes": 25855948800,
+          "demand_file_fills": 3072,
+          "minimum_stream_all_bytes": 52872652800,
+          "minimum_stream_all_vs_observed_demand": 2.0448931582042738,
+          "full_catalog_bytes": 62285414400
+        },
+        {
+          "position": 0,
+          "tokens": 256,
+          "unique_layer_experts": 10341,
+          "coverage": 0.4207763671875,
+          "demand_bytes": 25855948800,
+          "demand_file_fills": 3331,
+          "minimum_stream_all_bytes": 52872652800,
+          "minimum_stream_all_vs_observed_demand": 2.0448931582042738,
+          "full_catalog_bytes": 62285414400
+        }
+      ],
+      "caveat": "Traffic lower bound assumes every initial GPU slot avoids one transfer and no extra evictions. Not a stream-all runtime simulation. Existing demand bytes include actual expert H2D, not speculative host reads. Coverage is per real chunk; do not extrapolate its threshold to other prompts.",
+      "metadata": {
+        "timestamp": "2026-09-29T21:22:29.9300231+08:00",
+        "commit": "0293b3b7306db27390c4c79db3316a6a7eda9ee7",
+        "dirty": [
+          " M docs/plans/qwen3.8-flash-next-xmx-prefill-tolerance-plan-2026-09-29.md",
+          " M perf/qwen4exp/q4e_cache_sim.py",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpExpertCache.cpp",
+          " M src/models/Qwen4ExpExpertCache.hpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          "?? docs/plans/qwen3.8-flash-next-execution-model-audit-2026-09-29.json",
+          "?? docs/plans/qwen3.8-flash-next-execution-model-audit-2026-09-29.md",
+          "?? perf/qwen4exp/q4e_cache_replay.py",
+          "?? perf/qwen4exp/q4e_execution_probe.ps1",
+          "?? perf/qwen4exp/q4e_export_timeline.ps1",
+          "?? perf/qwen4exp/q4e_timeline_summary.py",
+          "?? perf/qwen4exp/test_q4e_cache_replay.py",
+          "?? src/models/Qwen4ExpCacheTrace.hpp"
+        ],
+        "workload": "memory",
+        "input": {
+          "kind": "generated_lighthouse256",
+          "source_sha256": "6C54855202D9F0F55B3C381E5AC242B54AD26631CA7B1B491CD458001C971344",
+          "repeats": 3
+        },
+        "arguments": [
+          "--memory-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_FILL_PARTS": "8",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q4E_CACHE_TRACE": "E:\\RiderProjects\\Aila\\tmp\\p2-mb32-profile-20260929.cache.jsonl",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_MEMORY_CANARY_REPEATS": "3",
+          "AILA_Q4E_TRACE_MARKERS": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_PROFILE_Q4E_DECODE": "1",
+          "AILA_Q4E_DEMAND_MICROBATCH": "32",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "B1B2F3D146960975097AA22ABAD0E71C7B257A7DB857503E06642D7A2A2F04D1",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 398589952.0,
+        "peak_child_working_set_bytes": 64180224.0,
+        "minimum_system_free_mb": 28831.67578125,
+        "log_sha256": "A030CDDCFF1EE7242C2B2C6D304476B61673F6A17C0AA0AA5E20C1D6B7D48416",
+        "err_log_sha256": "62D2CF640D4AF2D2F559F7F81718B6D70F7CAFE6BCD94DC24B5232F64C4A5A2A",
+        "trace_sha256": "16162B0A0F623AE35DA6265C5DF49ADF745CDBFE0316D509716C4CA15D810D47"
+      }
+    },
+    {
+      "path": "tmp/s5-coverage1024-20260930.cache.jsonl",
+      "sha256": "43a573f650563024313e8f020b99735e91126a674169094c9a1f25e8834759c6",
+      "config": {
+        "type": "config",
+        "ns": 13749302052200,
+        "schema": 1,
+        "slots": 3676,
+        "slot_bytes": 2534400,
+        "layers": 48,
+        "experts": 512,
+        "host_slots": 6778,
+        "cost_aware": 1
+      },
+      "forwards": [
+        {
+          "position": 0,
+          "tokens": 1024,
+          "unique_layer_experts": 13826,
+          "coverage": 0.5625813802083334,
+          "demand_bytes": 33634022400,
+          "demand_file_fills": 11863,
+          "minimum_stream_all_bytes": 52968960000,
+          "minimum_stream_all_vs_observed_demand": 1.5748624821038355,
+          "full_catalog_bytes": 62285414400
+        },
+        {
+          "position": 0,
+          "tokens": 1024,
+          "unique_layer_experts": 13826,
+          "coverage": 0.5625813802083334,
+          "demand_bytes": 30861388800,
+          "demand_file_fills": 6104,
+          "minimum_stream_all_bytes": 52968960000,
+          "minimum_stream_all_vs_observed_demand": 1.7163504968383017,
+          "full_catalog_bytes": 62285414400
+        }
+      ],
+      "caveat": "Traffic lower bound assumes every initial GPU slot avoids one transfer and no extra evictions. Not a stream-all runtime simulation. Existing demand bytes include actual expert H2D, not speculative host reads. Coverage is per real chunk; do not extrapolate its threshold to other prompts.",
+      "metadata": {
+        "timestamp": "2026-09-30T15:30:56.2543271+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py"
+        ],
+        "workload": "memory",
+        "input": {
+          "kind": "generated_lighthouse",
+          "max_seq": 1032,
+          "source_sha256": "DBF312F29731F93B9F3623062D74A6BF0F1AF5F2133C46D9834914998CFC71A4",
+          "tokens": 1024,
+          "repeats": 2,
+          "tail": 8
+        },
+        "arguments": [
+          "--memory-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_EXPERT_READER": "readfile",
+          "AILA_Q4E_CACHE_TRACE": "E:\\RiderProjects\\Aila\\tmp\\s5-coverage1024-20260930.cache.jsonl",
+          "AILA_PROFILE_Q4E_DECODE": "1",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_PHASE_SCRATCH": "1",
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_MEMORY_CANARY_REPEATS": "2",
+          "AILA_Q4E_DEMAND_MICROBATCH": "32",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_Q35_PREFILL_CHUNK": "1024",
+          "AILA_Q4E_MEMORY_CANARY_TAIL": "8",
+          "AILA_Q4E_MEMORY_CANARY_TOKENS": "1024"
+        },
+        "exe_sha256": "5E4375186191F593DB15DFB351C4FCAEF3A122366DF6174AECC6661A01769C29",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 22751174656.0,
+        "peak_child_working_set_bytes": 10448896.0,
+        "minimum_system_free_mb": 26886.51953125,
+        "log_sha256": "C0F7926D0296A35DD1E4F3464AA40EF62D2F53C72A15EA7E44FB517CF0931A74",
+        "err_log_sha256": "B2A2E2097417A5AEF1419C8AA62D04452CD565AD91ABD372968EBBD0A4B08D52",
+        "trace_sha256": "43A573F650563024313E8F020B99735E91126A674169094C9A1F25E8834759C6"
+      }
+    },
+    {
+      "path": "tmp/s5-coverage2048-20260930.cache.jsonl",
+      "sha256": "0d669d6489acf2ae8114a1fe521a029c0b0dbf6b7949cb57eb3b2e69bd80d15e",
+      "config": {
+        "type": "config",
+        "ns": 13843830091500,
+        "schema": 1,
+        "slots": 3602,
+        "slot_bytes": 2534400,
+        "layers": 48,
+        "experts": 512,
+        "host_slots": 6778,
+        "cost_aware": 1
+      },
+      "forwards": [
+        {
+          "position": 0,
+          "tokens": 2048,
+          "unique_layer_experts": 15717,
+          "coverage": 0.6395263671875,
+          "demand_bytes": 38368281600,
+          "demand_file_fills": 13435,
+          "minimum_stream_all_bytes": 53156505600,
+          "minimum_stream_all_vs_observed_demand": 1.3854283638285223,
+          "full_catalog_bytes": 62285414400
+        },
+        {
+          "position": 0,
+          "tokens": 2048,
+          "unique_layer_experts": 15717,
+          "coverage": 0.6395263671875,
+          "demand_bytes": 34989926400,
+          "demand_file_fills": 8126,
+          "minimum_stream_all_bytes": 53156505600,
+          "minimum_stream_all_vs_observed_demand": 1.5191945530928581,
+          "full_catalog_bytes": 62285414400
+        }
+      ],
+      "caveat": "Traffic lower bound assumes every initial GPU slot avoids one transfer and no extra evictions. Not a stream-all runtime simulation. Existing demand bytes include actual expert H2D, not speculative host reads. Coverage is per real chunk; do not extrapolate its threshold to other prompts.",
+      "metadata": {
+        "timestamp": "2026-09-30T15:32:30.8397501+08:00",
+        "commit": "66e21e926a4a8a5d8ac274b94e88de03188f53fc",
+        "dirty": [
+          " M perf/qwen4exp/q4e_execution_probe.ps1",
+          " M src/models/Qwen4ExpBnb4Backend.cpp",
+          " M src/models/Qwen4ExpBnb4Backend.hpp",
+          " M tests/models/Qwen4ExpCheckpointAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpAcceptance.hpp",
+          " M tests/models/Qwen4ExpMtpProbe.hpp",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.json",
+          "?? docs/plans/qwen3.8-flash-next-strata-s1-s2-results-2026-09-30.md",
+          "?? docs/plans/qwen3.8-flash-next-strata-s4-results-2026-09-30.json",
+          "?? perf/qwen4exp/prompts/mtp-code.json",
+          "?? perf/qwen4exp/prompts/mtp-en.json",
+          "?? perf/qwen4exp/prompts/mtp-prose.json",
+          "?? perf/qwen4exp/prompts/mtp-zh.json",
+          "?? perf/qwen4exp/q4e_scratch_summary.py",
+          "?? perf/qwen4exp/q4e_strata_summary.py",
+          "?? perf/qwen4exp/q4e_stream_coverage.py"
+        ],
+        "workload": "memory",
+        "input": {
+          "max_seq": 2060,
+          "tokens": 2052,
+          "kind": "generated_lighthouse",
+          "source_sha256": "DBF312F29731F93B9F3623062D74A6BF0F1AF5F2133C46D9834914998CFC71A4",
+          "tail": 8,
+          "repeats": 2
+        },
+        "arguments": [
+          "--memory-model",
+          "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
+        ],
+        "env_overrides": {
+          "AILA_Q4E_STATIC_PINNING": "0",
+          "AILA_Q4E_MEMORY_CANARY_TOKENS": "2052",
+          "AILA_Q4E_CACHE_TRACE": "E:\\RiderProjects\\Aila\\tmp\\s5-coverage2048-20260930.cache.jsonl",
+          "AILA_Q4E_GDN_CHUNK_MODE": "0",
+          "AILA_Q4E_PREFILL_XMX": "1",
+          "AILA_PROFILE_Q4E_DECODE": "1",
+          "AILA_Q4E_PHASE_SCRATCH": "1",
+          "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+          "AILA_Q4E_MEMORY_CANARY_TAIL": "8",
+          "AILA_Q4E_MEMORY_CANARY_REPEATS": "2",
+          "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+          "AILA_Q4E_DEMAND_MICROBATCH": "32",
+          "AILA_Q35_PREFILL_CHUNK": "2048",
+          "AILA_Q4E_EXPERT_READER": "readfile"
+        },
+        "exe_sha256": "5E4375186191F593DB15DFB351C4FCAEF3A122366DF6174AECC6661A01769C29",
+        "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+        "stack": {
+          "name": "oneapi-2026.1",
+          "role": "candidate",
+          "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+          "compilerVersion": "2026.1.0",
+          "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+          "dnnlVersion": "3.11.2",
+          "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+          "tbbVersion": "2023.1",
+          "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+          "expectedSyclDll": "sycl9.dll",
+          "allowLegacyCompiler": false
+        },
+        "gpu": [
+          {
+            "Name": "GameViewer Virtual Display Adapter",
+            "DriverVersion": "15.6.5.199"
+          },
+          {
+            "Name": "Intel(R) Arc(TM) A770 Graphics",
+            "DriverVersion": "32.0.101.8860"
+          }
+        ],
+        "diagnostic_only": true,
+        "watchdog_stop": false,
+        "exit_code": 0,
+        "peak_working_set_bytes": 22777004032.0,
+        "peak_child_working_set_bytes": 10444800.0,
+        "minimum_system_free_mb": 27147.7734375,
+        "log_sha256": "805290CE1B0690B938933855AA234094651765340BA80F3688D26942F379DB7C",
+        "err_log_sha256": "7D4465980F3BE5D37CE4268342623FF3006619C8C57616C5F5F97D7A0A82E6A6",
+        "trace_sha256": "0D669D6489ACF2AE8114A1FE521A029C0B0DBF6B7949CB57EB3B2E69BD80D15E"
+      }
+    }
+  ],
+  "decision": "No stream-all implementation: even2048 chunk has64% coverage; minimum H2D1.39..1.52x observed demand. This rejects copying the threshold, not every bounded issuer design.",
+  "alternatives": {
+    "subset_head": "Not prioritized: target head~1% of serialized diagnostic and free entire draft still cannot close the observed20tps budget.",
+    "grouped_xmx": "Do not rerun unchanged failed kernel. Need new target expert cost/codegen hypothesis first.",
+    "kv_compression": "Not the principal memory at640..2060 context; separately validate if pursuing long contexts.",
+    "bounded_issuer": "Requires measured unhidden host-submit/readiness gaps and byte-budget neutral candidate; existing B6 demand pipeline is already present."
+  },
+  "ring": {
+    "nf4_slot_bytes": 2534400,
+    "slots384_bytes": 973209600,
+    "enabled": false
+  },
+  "scope": "Trace-based byte/coverage analysis. No speculative all-expert copy or CPU expert arithmetic added."
+}

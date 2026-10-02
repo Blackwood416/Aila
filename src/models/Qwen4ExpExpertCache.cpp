@@ -517,7 +517,8 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
                               int intermediate_size,
                               int blocksize,
                               std::string* error_message,
-                              bool force_nested_codes) {
+                              bool force_nested_codes,
+                              const std::string& trace_suffix) {
     cleanup();
 
     ctx_ = &ctx;
@@ -834,7 +835,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     initialized_ = true;
     const auto trace_path = aila::env::read_string("AILA_Q4E_CACHE_TRACE", "");
     if (!trace_path.empty()) {
-        cache_trace_ = std::make_unique<Qwen4ExpCacheTrace>(trace_path);
+        cache_trace_ = std::make_unique<Qwen4ExpCacheTrace>(trace_path + trace_suffix);
         cache_trace_->Row("config") << ",\"schema\":1,\"slots\":" << num_slots_
             << ",\"slot_bytes\":" << slot_bytes_ << ",\"layers\":" << num_layers_
             << ",\"experts\":" << num_experts_per_layer_ << ",\"host_slots\":" << num_host_slots_
@@ -864,6 +865,15 @@ void Qwen4ExpExpertCache::trace_host_interval(const char* name, int layer, int64
     cache_trace_->Row("host") << ",\"forward\":" << trace_forward_id_
         << ",\"name\":\"" << name << "\",\"layer\":" << layer
         << ",\"begin_ns\":" << begin_ns << ",\"end_ns\":" << end_ns;
+    cache_trace_->End();
+}
+
+void Qwen4ExpExpertCache::trace_router(int layer, const int* ids, int rows, int top_k) {
+    if (!cache_trace_) return;
+    auto& out = cache_trace_->Row("route");
+    out << ",\"forward\":" << trace_forward_id_ << ",\"layer\":" << layer
+        << ",\"rows\":" << rows << ",\"top_k\":" << top_k << ",\"ids\":";
+    Qwen4ExpCacheTrace::Ints(out, ids, rows * top_k);
     cache_trace_->End();
 }
 
