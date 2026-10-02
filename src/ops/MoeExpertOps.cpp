@@ -513,7 +513,7 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool Resident = false>
 sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -525,7 +525,7 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
     int in_features,
     int intermediate_size,
     int blocksize,
-    const sycl::event* dep_event = nullptr) {
+    const sycl::event* dep_event = nullptr, const int* resident_slots = nullptr) {
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     constexpr size_t wg_size = 256;
@@ -560,7 +560,11 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
                 if (global_row < total_rows) {
                     const int expert_idx = static_cast<int>(global_row / intermediate_size);
                     const int row = static_cast<int>(global_row % intermediate_size);
-                    const auto& slot = slots[expert_idx];
+                    const int slot_index = Resident ? resident_slots[expert_idx] : expert_idx;
+                    // All lanes of this subgroup share the rank. The only
+                    // work-group barrier is above this uniform subgroup exit.
+                    if constexpr (Resident) { if (slot_index < 0) return; }
+                    const auto& slot = slots[slot_index];
 
                     const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
                     const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
@@ -867,7 +871,7 @@ sycl::event launch_moe_decode_down_to_rank_f32(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool Resident = false>
 sycl::event launch_moe_decode_down_to_rank_f32_dev(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -881,7 +885,7 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
     int out_features,
     int blocksize,
     const float* quant_map,
-    const sycl::event* dep_event) {
+    const sycl::event* dep_event, const int* resident_slots = nullptr) {
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     constexpr size_t wg_size = 256;
@@ -915,9 +919,13 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
                 if (global_row < total_rows) {
                     const int expert_idx = static_cast<int>(global_row / out_features);
                     const int row = static_cast<int>(global_row % out_features);
-                    const auto& slot = slots[expert_idx];
+                    const int slot_index = Resident ? resident_slots[expert_idx] : expert_idx;
+                    // All lanes of this subgroup share the rank. The only
+                    // work-group barrier is above this uniform subgroup exit.
+                    if constexpr (Resident) { if (slot_index < 0) return; }
+                    const auto& slot = slots[slot_index];
                     const int token = token_ids ? token_ids[expert_idx] : 0;
-                    const int rank = ranks[expert_idx];
+                    const int rank = Resident ? expert_idx : ranks[expert_idx];
                     const bf16* in_expert = h + static_cast<size_t>(expert_idx) * in_features;
 
                     const size_t byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
@@ -966,7 +974,7 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
                     const int expert_idx = static_cast<int>(global_row / out_features);
                     const int row = static_cast<int>(global_row % out_features);
                     const int token = token_ids ? token_ids[expert_idx] : 0;
-                    const int rank = ranks[expert_idx];
+                    const int rank = Resident ? expert_idx : ranks[expert_idx];
                     const size_t out_pos = (static_cast<size_t>(token) * top_k + rank) * out_features + row;
                     down_acc[out_pos] = expert_sum;
                 }
@@ -2242,6 +2250,37 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
 }
 
 } // namespace
+
+sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* weights,
+    const int* table, int* selected, int* host_ids, float* host_weights, int* host_selected,
+    int top_k, int experts) {
+    if (top_k < 1 || top_k > 16) throw std::invalid_argument("Resident top-k bound");
+    return ctx.queue().parallel_for(sycl::range<1>(16), [=](sycl::id<1> index) [[sycl::reqd_sub_group_size(16)]] {
+        const int rank = index[0];
+        if (rank < top_k) {
+            const int expert = ids[rank];
+            const int slot = expert >= 0 && expert < experts ? table[expert] : -1;
+            selected[rank] = slot; host_selected[rank] = slot;
+            host_ids[rank] = expert; host_weights[rank] = weights[rank];
+        }
+    });
+}
+
+sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested) {
+    if (top_k < 1 || top_k > 16 || hidden % 64 || intermediate % 16)
+        throw std::invalid_argument("Resident gate/up shape");
+    if (nested) return launch_moe_decode_gate_up_swiglu_grouped_dev<true,true>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected);
+    return launch_moe_decode_gate_up_swiglu_grouped_dev<false,true>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected);
+}
+
+sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested) {
+    if (top_k < 1 || top_k > 16 || hidden % 16 || intermediate % 64)
+        throw std::invalid_argument("Resident down shape");
+    if (nested) return launch_moe_decode_down_to_rank_f32_dev<true,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
+    return launch_moe_decode_down_to_rank_f32_dev<false,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
+}
 
 sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,

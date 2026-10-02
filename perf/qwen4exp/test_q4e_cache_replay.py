@@ -32,6 +32,25 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_direct_binding_and_cold_only_acquire(self):
+        rows=fixture()
+        # Replace the second full acquire by a lease for ID 0 and cold ID 2.
+        rows[6:7]=[
+            dict(type="direct_bind",forward=1,layer=0,ids=[2,0],initial_slots=[-1,1],direct_slots=[-1,1],cold_ids=[2]),
+            dict(type="acquire_begin",forward=1,acquire=2,layer=0,ids=[2],initial_slots=[-1],host_states=[0],pinned=0,touch_hits=0)]
+        rows[9]=end(2,0,1)
+        rows.insert(10,dict(type="direct_release",forward=1,layer=0))
+        actual=validate(copy.deepcopy(rows))[0]
+        self.assertEqual((actual["hits"],actual["misses"],actual["direct_entries"]),(1,4,1))
+        self.assertEqual(simulate(rows),simulate(fixture()))
+        self.assertEqual(offline_reference(rows),offline_reference(fixture()))
+        bad=copy.deepcopy(rows);bad[7]["ids"]=[0]
+        with self.assertRaisesRegex(ValueError,"Wrong cold transaction"): validate(bad)
+        bad=copy.deepcopy(rows);bad[8]["slot"]=1
+        with self.assertRaisesRegex(ValueError,"Victim mismatch"): validate(bad)
+        bad=copy.deepcopy(rows);del bad[10]
+        with self.assertRaises(ValueError): validate(bad)
+
     def test_router_rows_match_acquired_experts(self):
         rows = fixture()
         rows.insert(2, dict(type="route", forward=1, layer=0, rows=2, top_k=2, ids=[0,1,2,3]))

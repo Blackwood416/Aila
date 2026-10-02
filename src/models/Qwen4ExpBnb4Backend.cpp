@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
@@ -251,6 +252,7 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     free_pinned_host_buffers();
+    if (resident_selected_host_) context_->free_host(resident_selected_host_);
 }
 
 void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
@@ -637,6 +639,24 @@ bool Qwen4ExpBnb4Backend::load(
     }
 
     ensure_runtime_buffers(ctx, 1);
+    static const int s_resident_decode = aila::env::read_int("AILA_Q4E_RESIDENT_DECODE", 0);
+    resident_decode_mode_ = s_resident_decode;
+    if (resident_decode_mode_ < 0 || resident_decode_mode_ > 2 ||
+        (resident_decode_mode_ && aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false))) {
+        if (error_message) *error_message = "Resident decode currently supports GPU-only mode 0/1/2";
+        return false;
+    }
+    if (resident_decode_mode_) {
+        resident_down_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, hidden_size_}, dnnl::memory::data_type::f32);
+        resident_weights_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::f32);
+        if (resident_decode_mode_ == 2) {
+            expert_cache_.EnableResidentDeviceTables();
+            resident_route_ids_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::s32);
+            resident_selected_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::s32);
+            resident_selected_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts_per_tok * sizeof(int)));
+        }
+        AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d dynamic_ready=1 fixed_hot_slots=0", resident_decode_mode_);
+    }
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
     // Batched prefill acquire needs every unique expert of a layer resident at once.
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
@@ -863,6 +883,49 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // ============================================================================
 // Forward Implementation
 // ============================================================================
+
+sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease) {
+    constexpr int kMaxTopK = 16;
+    const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
+    const bool nested = expert_cache_.uses_nested_codes();
+    auto lease = device_lease ? std::move(*device_lease) : expert_cache_.BindReady(layer, router_host_ids_, top_k);
+    const int64_t ready_begin = expert_cache_.tracing() ? Qwen4ExpCacheTrace::NowNs() : 0;
+    std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{}, cold{};
+    auto* h = buf_.moe_h.data_as<bf16>();
+    auto* down = resident_down_.data_as<float>();
+    sycl::event last{};
+    // Every original rank is written exactly once by one of these subsets.
+    // No atomics, new quantization, or route-weight multiplication in the dots.
+    if (!device_lease && lease.ready_count) {
+        expert_cache_.get_slots_dev(lease.ready_slots.data(), lease.ready_count, hot.data());
+        last = ops::moe_decode_gate_up_swiglu_grouped(ctx, hot.data(), nullptr,
+            buf_.x.data_as<bf16>(), h, lease.ready_count, hidden_size_, intermediate, 64,
+            nullptr, nullptr, nested);
+        last = ops::moe_decode_down_to_rank_f32(ctx, hot.data(), lease.ready_ranks.data(), h,
+            down, lease.ready_count, top_k, intermediate, hidden_size_, 64, nullptr, nullptr, &last, nested);
+        if (expert_cache_.tracing()) expert_cache_.trace_host_interval("resident_submit", layer, ready_begin, Qwen4ExpCacheTrace::NowNs());
+    }
+    std::array<int, kMaxTopK> cold_slots{};
+    if (lease.cold_count) {
+        const auto dma = expert_cache_.AcquireCold(lease, cold_slots.data());
+        expert_cache_.get_slots_dev(cold_slots.data(), lease.cold_count, cold.data());
+        auto* cold_h = h + size_t(lease.ready_count) * intermediate;
+        expert_cache_.record_first_consumer_start();
+        last = ops::moe_decode_gate_up_swiglu_grouped(ctx, cold.data(), nullptr,
+            buf_.x.data_as<bf16>(), cold_h, lease.cold_count, hidden_size_, intermediate, 64,
+            &dma, nullptr, nested);
+        last = ops::moe_decode_down_to_rank_f32(ctx, cold.data(), lease.cold_ranks.data(), cold_h,
+            down, lease.cold_count, top_k, intermediate, hidden_size_, 64, nullptr, nullptr, &last, nested);
+        expert_cache_.record_consumer_reader_fences(cold_slots.data(), lease.cold_count, last);
+    }
+    if (!device_lease) ctx.queue().memcpy(resident_weights_.data(), router_host_weights_, top_k * sizeof(float));
+    auto merge = ops::moe_ordered_accumulate_down_rows(ctx, down, resident_weights_.data_as<float>(),
+        buf_.y.data_as<bf16>(), 1, top_k, hidden_size_,
+        fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
+        fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last);
+    lease.Finish(merge); // in-order merge covers both reader subsets and metadata uploads
+    return merge;
+}
 
 sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     Context& ctx, int layer, int count, int firstUnique, int numUnique,
@@ -1206,6 +1269,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     double prof_router_sync_ms = 0.0;
     double prof_acquire_ms = 0.0;
     const ExpertCacheStats prof_stats0 = expert_cache_.stats();
+    if (resident_decode_mode_ == 2 && count == 1) expert_cache_.BeginResidentDeviceEpoch();
 
     // AILA_PROFILE_Q4E_STAGES serializes after every stage; use for relative cost only.
     static const bool s_stages = aila::env::read_flag("AILA_PROFILE_Q4E_STAGES", false);
@@ -1280,13 +1344,29 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStageHc);
 
         // 2.5. MoE Computation
+        std::optional<GpuResidentLayerLease> resident_epoch;
+        std::optional<GpuReadyLease> resident_binding;
+        if (resident_decode_mode_ == 2 && count == 1)
+            resident_epoch.emplace(expert_cache_.BeginResidentLayer(L));
         DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
                     count, cfg_.num_experts, hidden_size_);
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
         sycl::event actual_route_event = ops::router_softmax_topk_device(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
-            router_host_ids_, router_host_weights_,
+            resident_epoch ? resident_route_ids_.data_as<int>() : router_host_ids_,
+            resident_epoch ? resident_weights_.data_as<float>() : router_host_weights_,
             count, cfg_.num_experts, top_k, true);
+        if (resident_epoch) {
+            actual_route_event = ops::moe_resident_classify(ctx, resident_route_ids_.data_as<int>(), resident_weights_.data_as<float>(),
+                expert_cache_.resident_layer_table(L), resident_selected_.data_as<int>(), router_host_ids_, router_host_weights_,
+                resident_selected_host_, top_k, cfg_.num_experts);
+            const int64_t submit_begin = expert_cache_.tracing() ? Qwen4ExpCacheTrace::NowNs() : 0;
+            ops::moe_resident_gate_up(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+            ops::moe_resident_down(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                buf_.moe_h.data_as<bf16>(), resident_down_.data_as<float>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+            if (expert_cache_.tracing()) expert_cache_.trace_host_interval("resident_gpu_submit", L, submit_begin, Qwen4ExpCacheTrace::NowNs());
+        }
         const auto cur_cache_stats = expert_cache_.stats();
         const bool high_hit_rate = (cur_cache_stats.hit_count + cur_cache_stats.miss_count > 100) &&
                                    (cur_cache_stats.hit_rate() >= 0.90);
@@ -1346,6 +1426,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const auto prof_router_t0 = prof_clock::now();
         // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
         actual_route_event.wait_and_throw();
+        if (resident_epoch) resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
         const auto prof_router_t1 = prof_clock::now();
         if (expert_cache_.tracing()) {
             expert_cache_.trace_host_interval("router_wait", L,
@@ -1966,7 +2047,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         } else {
             static const bool s_ready_first = aila::env::read_flag("AILA_Q4E_READY_FIRST", false);
             bool hetero_executed = false;
-            if ((s_cpu_expert_dispatch || s_ready_first) && count <= 4 && !batch_acquire) {
+            if (resident_decode_mode_ && count == 1 && !batch_acquire) {
+                const auto acq_before = expert_cache_.stats().direct_cold_acquire_ns;
+                RunResidentDecode(ctx, L, s_fuse_shared, resident_binding ? &*resident_binding : nullptr);
+                prof_acquire_ms += (expert_cache_.stats().direct_cold_acquire_ns - acq_before) * 1e-6;
+                if (s_prefetch && predict_next) {
+                    ensure_prediction_ready();
+                    expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
+                }
+                hetero_executed = true;
+            }
+            if (!hetero_executed && (s_cpu_expert_dispatch || s_ready_first) && count <= 4 && !batch_acquire) {
                 auto& plan = expert_executor_.plan_layer(L, router_host_ids_, router_host_weights_, count, top_k, s_cpu_expert_dispatch);
                 const bool mixed_gpu = plan.ready_gpu_tasks > 0 && plan.pending_gpu_tasks > 0;
                 if (plan.cpu_tasks > 0 || (s_ready_first && mixed_gpu)) {
@@ -2167,6 +2258,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
     if (s_work_summary) {
         const auto& after = expert_cache_.stats();
+        if (resident_decode_mode_ && count == 1) {
+            AILA_LOG_INFO("[Q4E Resident] pos=%d mode=%d route=%llu resident=%llu direct=%llu cold=%llu acquire_calls=%llu demand_bytes=%llu metadata_bytes=%llu",
+                start_pos, resident_decode_mode_,
+                static_cast<unsigned long long>(after.direct_route_entries - prof_stats0.direct_route_entries),
+                static_cast<unsigned long long>(after.resident_route_entries - prof_stats0.resident_route_entries),
+                static_cast<unsigned long long>(after.direct_entries - prof_stats0.direct_entries),
+                static_cast<unsigned long long>(after.cold_request_entries - prof_stats0.cold_request_entries),
+                static_cast<unsigned long long>(after.acquire_calls - prof_stats0.acquire_calls),
+                static_cast<unsigned long long>(after.total_transferred_bytes - prof_stats0.total_transferred_bytes),
+                static_cast<unsigned long long>(after.resident_metadata_bytes - prof_stats0.resident_metadata_bytes));
+        }
         AILA_LOG_INFO("[Q4E Work] pos=%d count=%d demand_bytes=%llu host_misses=%llu host_hits=%llu device_bytes=%zu",
             start_pos, count,
             static_cast<unsigned long long>(after.total_transferred_bytes - prof_stats0.total_transferred_bytes),

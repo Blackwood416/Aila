@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：执行架构、量化计算与数据供给的下一轮设计
 
+2026-10-02 按 [hotset新优先级规划](qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md) 暂停R2b后续实施，先完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。正确性与状态检查通过；当前GPU-only候选短decode由14.0降至12.6/13.1 tok/s，长decode由8.95降至8.4/8.75 tok/s，未默认开启。下一步是新架构下C1冷专家CPU/GPU分工的同热集对照；不再沿用本文件早期对该方向的低优先级安排。
+
 **2026-10-02 优先级修订：先完成 [驻留专家直接执行、hot expert set 与 CPU 冷专家新分工](qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md)。** Strata 的关键设计包含 profile 预装、设备 residency table 和绕过主机供给的命中计算；旧 G5 pinning/SLRU 负例不足以否定它。先拆分 resident binding 与 cold acquire，再做 GPU hit selection，并重启同一热集下的 CPU/GPU 冷计算对照。保留 R2b 已有成果，其进一步生产集成与数值细化后移。附带 Strata 热表在既有 Aila 路由上覆盖不足，不能直接照搬名单。本文件下面保留各阶段历史结果，后续实施顺序以新计划为准；第 11 节关于 CPU 路线的旧排序也由新计划替代。
 
 2026-10-01 补齐 [R2b 真实隐藏态、单输入模型质量与状态检查](qwen3.8-flash-next-r2b-real-quality-results-2026-10-01.md)：六组真实专家通过整数 CPU/RTE 参考及连续 graph 参数表/scatter 检查；1833-token 输入的 48 步 teacher forcing 平均 KL=0.00701、NLL 差=−0.00115，42/48 首选 token 一致，通过预设模型 canary 门槛。257-token 前缀因果、65-token 快照/恢复回放及 3 项 CTest 通过。但原 NF4 逐点门槛在真实样本中有 18.9%–46.9% 超限，不能称全面质量认证。所有 count>1 prefill 专家统一整数格式，decode 仍 NF4，禁止热度决定数值格式；诊断重复计算 NF4，未产生生产 TPS 收益。32 GiB host pool 下最终最低可用 RAM 10.99 GiB。下一步先用真实语料验证 down per32 激活尺度及小桶一致算术，再去除重复计算接入；R2b 生产集成、decode 20 tok/s 尚未完成。

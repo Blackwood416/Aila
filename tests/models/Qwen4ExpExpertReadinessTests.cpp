@@ -9,6 +9,18 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <future>
+#include <cstring>
+#include <thread>
+
+struct Qwen4ExpResidentTestAccess {
+    static void HoldCopy(Qwen4ExpExpertCache& cache, int slot, std::shared_future<void> signal) {
+        cache.gpu_slot_records_[slot].state = ExpertSlotState::Copying;
+        cache.gpu_slot_records_[slot].dma_event = cache.copy_q_->submit([&](sycl::handler& cgh) {
+            cgh.host_task([signal] { signal.wait_for(std::chrono::seconds(10)); });
+        });
+    }
+};
 
 namespace {
 
@@ -894,6 +906,175 @@ void test_active_gpu_experts_greater_than_16(Context& ctx) {
     std::cout << "  Passed >16 active GPU experts gate_up and down_to_rank_f32 test.\n";
 }
 
+void test_direct_ready_lease(Context& ctx) {
+    std::cout << "[Hotset H1] Ready leases, cold-only supply, original rank ownership...\n";
+    SyntheticExpertWeights synth;
+    ModelWeights weights;
+    constexpr int H = SyntheticExpertWeights::hidden_size, I = SyntheticExpertWeights::intermediate_size;
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp;
+    auto init = [&](Qwen4ExpExpertCache& cache) {
+        std::string error;
+        expect(cache.init(ctx, weights, 2, 4 * slot_bytes, 8, H, I, 64, &error, true), error);
+        cache.set_layer_expert_ref(0, synth.gu_ref, synth.dn_ref);
+        cache.set_layer_expert_ref(1, synth.gu_ref, synth.dn_ref);
+    };
+    auto x = Tensor::allocate(ctx, {2, H}, dnnl::memory::data_type::bf16);
+    auto h = Tensor::allocate(ctx, {4, I}, dnnl::memory::data_type::bf16);
+    auto down = Tensor::allocate(ctx, {4, H}, dnnl::memory::data_type::f32);
+    auto out = Tensor::allocate(ctx, {2, H}, dnnl::memory::data_type::bf16);
+    auto route_weights = Tensor::allocate(ctx, {4}, dnnl::memory::data_type::f32);
+    std::vector<bf16> input(2 * H), reference(2 * H), result(2 * H);
+    for (int j=0;j<2*H;++j) input[j]=bf16(float((j*37)%97-48)*.003f);
+    const int ids[4] = {0,1,0,3}, tokens[4] = {0,0,1,1}, ranks[4] = {0,1,0,1};
+    const float ws[4] = {.75f,.25f,.125f,.875f};
+    ctx.memcpy_h2d(x.data(),input.data(),input.size()*2);
+    ctx.memcpy_h2d(route_weights.data(),ws,sizeof(ws));
+    {
+        Qwen4ExpExpertCache ref; init(ref);
+        int slots[4]; ref.acquire(0,ids,4,slots).wait_and_throw();
+        ops::MoeExpertSlotDev desc[4]; ref.get_slots_dev(slots,4,desc);
+        auto gu = ops::moe_decode_gate_up_swiglu_grouped(ctx,desc,nullptr,x.data_as<bf16>(),h.data_as<bf16>(),4,H,I,64,nullptr,tokens,true);
+        auto dn = ops::moe_decode_down_to_rank_f32(ctx,desc,ranks,h.data_as<bf16>(),down.data_as<float>(),4,2,I,H,64,tokens,nullptr,&gu,true);
+        auto ev = ops::moe_ordered_accumulate_down_rows(ctx,down.data_as<float>(),route_weights.data_as<float>(),out.data_as<bf16>(),2,2,H,nullptr,nullptr,&dn);
+        ref.record_consumer_reader_fences(slots,4,ev);
+        ctx.memcpy_d2h(reference.data(),out.data(),reference.size()*2);
+    }
+    for (int kind=0;kind<3;++kind) { // all cold / mixed / all Ready
+        Qwen4ExpExpertCache cache; init(cache);
+        int slots[4];
+        if(kind==1) cache.acquire(0,ids,1,slots).wait_and_throw();
+        if(kind==2) cache.acquire(0,ids,4,slots).wait_and_throw();
+        cache.reset_stats();
+        auto lease=cache.BindReady(0,ids,4);
+        expect(lease.ready_count==(kind==0?0:kind==1?2:4),"Ready route coverage");
+        expect(lease.cold_count==4-lease.ready_count,"Cold route coverage");
+        ctx.queue().memset(down.data(),0xff,4*H*sizeof(float)); // stale/unwritten ranks must fail
+        auto launch=[&](bool ready,const sycl::event& dma) {
+            const int n=ready?lease.ready_count:lease.cold_count;
+            if(!n)return sycl::event{};
+            ops::MoeExpertSlotDev desc[4];int ts[4],rs[4];
+            for(int j=0;j<n;++j){int flat=ready?lease.ready_ranks[j]:lease.cold_ranks[j];
+                ts[j]=flat/2;rs[j]=flat%2;desc[j]=cache.get_slot_dev(ready?lease.ready_slots[j]:slots[j]);}
+            auto gu=ops::moe_decode_gate_up_swiglu_grouped(ctx,desc,nullptr,x.data_as<bf16>(),h.data_as<bf16>(),n,H,I,64,&dma,ts,true);
+            return ops::moe_decode_down_to_rank_f32(ctx,desc,rs,h.data_as<bf16>(),down.data_as<float>(),n,2,I,H,64,ts,nullptr,&gu,true);
+        };
+        auto ev=launch(true,{});
+        // Force the leased Ready slot to the eviction end while cold supply runs.
+        if(kind==1)cache.demote(0,ids,1);
+        auto dma=cache.AcquireCold(lease,slots);
+        if(lease.cold_count)ev=launch(false,dma);
+        for(int j=0;j<lease.ready_count;++j)
+            expect(cache.ValidateReadyBinding(0,lease.ready_ids[j],lease.ready_slots[j],lease.ready_generations[j]),"Cold acquire evicted a leased Ready slot");
+        auto merged=ops::moe_ordered_accumulate_down_rows(ctx,down.data_as<float>(),route_weights.data_as<float>(),out.data_as<bf16>(),2,2,H,nullptr,nullptr,&ev);
+        cache.record_consumer_reader_fences(slots,lease.cold_count,merged);
+        lease.Finish(merged);
+        ctx.memcpy_d2h(result.data(),out.data(),result.size()*2);
+        expect(std::memcmp(reference.data(),result.data(),result.size()*2)==0,"Split route duplicated or lost a rank/weight");
+        expect(cache.stats().hit_count==uint64_t(lease.ready_count),"Bypass hit accounting");
+        expect(cache.stats().acquire_calls==uint64_t(kind!=2),"All-ready called acquire");
+        expect(cache.stats().direct_entries+cache.stats().cold_request_entries==4,"Accounting route partition");
+    }
+    auto ids_dev=Tensor::allocate(ctx,{2},dnnl::memory::data_type::s32);
+    auto selected_dev=Tensor::allocate(ctx,{2},dnnl::memory::data_type::s32);
+    int* mailbox=static_cast<int*>(ctx.alloc_host(4*sizeof(int)));
+    float* mailbox_weights=static_cast<float*>(ctx.alloc_host(2*sizeof(float)));
+    struct MailboxDrain {Context& ctx;int* ids;float* weights;~MailboxDrain(){ctx.synchronize();ctx.free_host(ids);ctx.free_host(weights);}} mailbox_drain{ctx,mailbox,mailbox_weights};
+    for(int kind=0;kind<3;++kind){
+        Qwen4ExpExpertCache cache;init(cache);cache.EnableResidentDeviceTables();
+        int slots[4];
+        if(kind==1)cache.acquire(0,ids,1,slots).wait_and_throw();
+        if(kind==2)cache.acquire(0,ids,4,slots).wait_and_throw();
+        ctx.queue().memset(down.data(),0xff,4*H*sizeof(float));
+        for(int token=0;token<2;++token){
+            cache.BeginResidentDeviceEpoch();auto epoch=cache.BeginResidentLayer(0);
+            ctx.memcpy_h2d(ids_dev.data(),ids+token*2,2*sizeof(int));
+            auto route=ops::moe_resident_classify(ctx,ids_dev.data_as<int>(),route_weights.data_as<float>()+token*2,
+                cache.resident_layer_table(0),selected_dev.data_as<int>(),mailbox,mailbox_weights,mailbox+2,2,8);
+            ops::moe_resident_gate_up(ctx,cache.resident_descriptors(),selected_dev.data_as<int>(),x.data_as<bf16>()+token*H,h.data_as<bf16>(),2,H,I,true);
+            auto last=ops::moe_resident_down(ctx,cache.resident_descriptors(),selected_dev.data_as<int>(),h.data_as<bf16>(),down.data_as<float>()+token*2*H,2,H,I,true);
+            route.wait_and_throw();
+            expect(mailbox[0]==ids[token*2] && mailbox[1]==ids[token*2+1] && mailbox_weights[0]==ws[token*2] && mailbox_weights[1]==ws[token*2+1],"GPU mailbox changed router IDs/weights");
+            auto lease=epoch.BindRoute(mailbox,mailbox+2,2);
+            if(token==0)expect(lease.ready_count==(kind==0?0:kind==1?1:2),"GPU resident mask wrong");
+            if(lease.cold_count){
+                const auto dma=cache.AcquireCold(lease,slots);ops::MoeExpertSlotDev desc[2];
+                cache.get_slots_dev(slots,lease.cold_count,desc);
+                last=ops::moe_decode_gate_up_swiglu_grouped(ctx,desc,nullptr,x.data_as<bf16>()+token*H,h.data_as<bf16>(),lease.cold_count,H,I,64,&dma,nullptr,true);
+                last=ops::moe_decode_down_to_rank_f32(ctx,desc,lease.cold_ranks.data(),h.data_as<bf16>(),down.data_as<float>()+token*2*H,lease.cold_count,2,I,H,64,nullptr,nullptr,&last,true);
+                cache.record_consumer_reader_fences(slots,lease.cold_count,last);
+            }
+            auto merge=ops::moe_ordered_accumulate_down_rows(ctx,down.data_as<float>()+token*2*H,route_weights.data_as<float>()+token*2,out.data_as<bf16>()+token*H,1,2,H,nullptr,nullptr,&last);
+            lease.Finish(merge);
+        }
+        ctx.memcpy_d2h(result.data(),out.data(),result.size()*2);
+        expect(std::memcmp(reference.data(),result.data(),result.size()*2)==0,"Device resident hot/cold rank mismatch");
+    }
+    {
+        Qwen4ExpExpertCache cache;init(cache);cache.EnableResidentDeviceTables();
+        int slots[4];cache.acquire(0,ids,4,slots).wait_and_throw();
+        ctx.memcpy_h2d(ids_dev.data(),ids,2*sizeof(int));
+        struct Cancelled {};
+        sycl::event reader;
+        for(int mode=1;mode<=2;++mode){
+            try{
+                cache.BeginResidentDeviceEpoch();
+                // Hold the in-order queue briefly so cancellation happens with
+                // real weight readers submitted, not after they already retired.
+                ctx.queue().submit([](sycl::handler& cgh){cgh.host_task([]{std::this_thread::sleep_for(std::chrono::milliseconds(25));});});
+                if(mode==1){
+                    auto lease=cache.BindReady(0,ids,2);ops::MoeExpertSlotDev desc[2];cache.get_slots_dev(lease.ready_slots.data(),2,desc);
+                    reader=ops::moe_decode_gate_up_swiglu_grouped(ctx,desc,nullptr,x.data_as<bf16>(),h.data_as<bf16>(),2,H,I,64,nullptr,nullptr,true);
+                    throw Cancelled{};
+                }else{
+                    auto epoch=cache.BeginResidentLayer(0);
+                    ops::moe_resident_classify(ctx,ids_dev.data_as<int>(),route_weights.data_as<float>(),cache.resident_layer_table(0),selected_dev.data_as<int>(),mailbox,mailbox_weights,mailbox+2,2,8);
+                    reader=ops::moe_resident_gate_up(ctx,cache.resident_descriptors(),selected_dev.data_as<int>(),x.data_as<bf16>(),h.data_as<bf16>(),2,H,I,true);
+                    throw Cancelled{};
+                }
+            }catch(const Cancelled&){}
+            expect(reader.get_info<sycl::info::event::command_execution_status>()==sycl::info::event_command_status::complete,"Cancelled resident lease released before GPU readers drained");
+            expect(!cache.is_faulted(),"Cancellation poisoned a healthy cache");
+        }
+        int replacement[4]={4,5,6,7};cache.acquire(0,replacement,4,slots).wait_and_throw();
+        expect(cache.contains(0,7),"Cancelled epoch leaked slot reservations");
+    }
+    {
+        Qwen4ExpExpertCache cache;init(cache);
+        int hot_ids[4]={0,1,2,3},hot_slots[4];cache.acquire(0,hot_ids,4,hot_slots).wait_and_throw();
+        const auto old_gen=cache.get_slot_generation(hot_slots[0]);
+        {
+            auto lease=cache.BindReady(0,hot_ids,4);
+            int cold_id=7,slot;
+            bool rejected=false;try{cache.acquire(0,&cold_id,1,&slot);}catch(const std::runtime_error&){rejected=true;}
+            expect(rejected && !cache.is_faulted(),"Full lease capacity must reject before mutation");
+            expect(cache.ValidateReadyBinding(0,0,hot_slots[0],old_gen),"Lease identity changed");
+        } // exceptional/no-submit release drains, then frees reservations
+        int replacement[4]={4,5,6,7};cache.acquire(0,replacement,4,hot_slots).wait_and_throw();
+        expect(!cache.ValidateReadyBinding(0,0,hot_slots[0],old_gen),"Stale generation accepted");
+        int id=4;auto snapshot=cache.query_residency(0,id);
+        expect(cache.ValidateReadyBinding(0,id,snapshot.gpu_slot,snapshot.gpu_generation),"Current generation rejected");
+        expect(!cache.ValidateReadyBinding(0,id,snapshot.gpu_slot,old_gen),"Old generation accepted for a rebound slot");
+        std::promise<void> release;auto signal=release.get_future().share();
+        Qwen4ExpResidentTestAccess::HoldCopy(cache,snapshot.gpu_slot,signal);
+        auto lease=cache.BindReady(0,&id,1);
+        const bool copying_rejected=lease.ready_count==0 && lease.cold_count==1;
+        release.set_value();
+        expect(copying_rejected,"Copying was treated as Ready");
+        cache.AcquireCold(lease,hot_slots).wait_and_throw();lease.Finish({});
+        cache.EnableResidentDeviceTables();cache.BeginResidentDeviceEpoch();
+        cache.acquire(1,replacement,4,hot_slots).wait_and_throw(); // changes every descriptor generation after the snapshot
+        auto epoch=cache.BeginResidentLayer(1);
+        int mapped[8];ctx.memcpy_d2h(mapped,cache.resident_layer_table(1),sizeof(mapped));
+        for(int e:replacement)expect(mapped[e]==-1,"Stale descriptor generation published to device");
+        int missing[4]={-1,-1,-1,-1};auto fresh=epoch.BindRoute(replacement,missing,4);
+        expect(fresh.ready_count==0 && fresh.cold_count==4,"Old epoch silently rebound to new payload");
+        cache.AcquireCold(fresh,hot_slots).wait_and_throw();fresh.Finish({});
+    }
+    std::cout << "[Hotset H1 PASS] all_hot=1 mixed=1 all_cold=1 copying=1 repeat_expert=1 stale_generation=1 lease_release=1 rank_exact=1\n";
+    std::cout << "[Hotset H2 PASS] device_select=1 mailbox_exact=1 masked_hot=1 cold_merge=1 epoch_generation=1 rank_exact=1 cancellation_drain=1\n";
+}
+
 } // namespace
 
 int main() {
@@ -916,6 +1097,7 @@ int main() {
         test_h3_straggler_monitoring_and_penalty(ctx);
         test_h2b_multi_token_and_large_task_dispatch(ctx);
         test_active_gpu_experts_greater_than_16(ctx);
+        test_direct_ready_lease(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

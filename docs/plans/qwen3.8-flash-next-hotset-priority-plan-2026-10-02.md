@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：优先实现驻留专家直接执行与 hot expert set
 
+实施更新（2026-10-02）：已保存此前工作为5ea0171，并完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。Ready租约与cold-only acquire分离、GPU device route/descriptor查表及提前热提交已实现；短/长输入48步logits、checkpoint回放逐位一致，6项CTest及真实trace回放通过。但当前短decode为原路径14.0、H1 12.6、H2 13.1 tok/s，长decode为8.95、8.4、8.75 tok/s，尚无稳定端到端净收益，默认仍为0。此版本没有固定热名单或CPU冷计算。**下一步继续C1的同热集、冻结admission对照，R2b继续暂停。** 以下保留原始规划与勘察记录。
+
 日期：2026-10-02。基线为 `66e21e9` 加当前未提交工作；R0、R1b、R2b 的最新结果以各自报告为准。本轮只做源码勘察、既有 trace 计数和热表静态覆盖分析，没有构建或运行 GPU 测试，没有修改运行时代码。
 
 **优先级修订：先做 hot/resident expert 的直接执行路径，并重新评估 CPU 只算冷专家的异构分工，再继续 R2b 的生产集成与数值细化。** 保留已有 R2b 原型和质量结果。这里调整的是计划，不代表已停止或更改其他 worker 的运行。

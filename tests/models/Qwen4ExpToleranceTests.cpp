@@ -31,6 +31,7 @@ static constexpr float kTestQuantMap[16] = {
 };
 
 struct Qwen4ExpGenerationTestAccess {
+    static void ResidentMode(Qwen4ExpBnb4Backend& b,int mode) {b.context_->synchronize();b.resident_decode_mode_=mode;}
     static void ExpertQualityProbe(Qwen4ExpBnb4Backend& b,void* data,decltype(b.expert_quality_probe_) hook) {
         b.expert_quality_probe_data_=data;b.expert_quality_probe_=hook;
     }
@@ -576,6 +577,7 @@ void test_real_model_tolerance(const std::string& model_dir) {
 #include "Qwen4ExpCompactMoeProbe.hpp"
 #include "Qwen4ExpIntegerMoeProbe.hpp"
 #include "Qwen4ExpIntegerQualityAcceptance.hpp"
+#include "Qwen4ExpResidentAcceptance.hpp"
 #include "Qwen4ExpGroupedXmxAcceptance.hpp"
 #include "Qwen4ExpGdnChunkAcceptance.hpp"
 #include "Qwen4ExpFrontGraphProbe.hpp"
@@ -639,6 +641,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--integer-state") {
             test_integer_quality(argv[2],true); return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--resident-model") {
+            test_resident_model(argv[2]); return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--integer-quality") {
             test_integer_quality(argv[2]); return 0;

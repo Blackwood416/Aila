@@ -113,6 +113,16 @@ void router_topk_ids_host(
     int top_k = 10);
 
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
+// H2: GPU classification plus fixed-rank, masked resident NF4 projections.
+sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* weights,
+    const int* table, int* selected, int* host_ids, float* host_weights, int* host_selected,
+    int top_k, int experts);
+sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested);
+sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested);
+
+// Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
 sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,

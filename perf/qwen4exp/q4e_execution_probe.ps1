@@ -1,8 +1,10 @@
 param(
-    [ValidateSet("story","generation","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","memory","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp")][string]$Workload="story",
+    [ValidateSet("story","generation","resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","memory","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp")][string]$Workload="story",
     [ValidateSet("","qwen38-a770")][string]$PerformancePreset="",
     [switch]$RuntimeDefaults,
     [switch]$IntegerDeviceProfile,
+    [ValidateSet(0,1,2)][int]$ResidentDecode=0,
+    [string]$Executable="",
     [ValidateSet("causal","checkpoint")][string]$IntegerStatePart="causal",
     [ValidateSet(0,256,512,1024)][int]$CompactMoe=0,
     [ValidateSet(0,128,256,512)][int]$AttentionTile=0,
@@ -68,6 +70,7 @@ if($RuntimeDefaults) {
 }
 if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$InlineCheckpoint}
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
+if($PSBoundParameters.ContainsKey('ResidentDecode')) {$overrides.AILA_Q4E_RESIDENT_DECODE=[string]$ResidentDecode}
 if($AttentionTile) {$overrides.AILA_Q4E_PREFILL_ATTN_TILE=[string]$AttentionTile}
 if($CompactMoe) {$overrides.AILA_Q4E_MOE_COMPACT_ACTS=[string]$CompactMoe}
 if($Trace) {$overrides.AILA_Q4E_CACHE_TRACE="$prefix.cache.jsonl"}
@@ -114,6 +117,14 @@ if($Workload -eq "preset") {
     $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
     $arguments=@("--preset-model",$ModelDir)
     $inputIdentity=@{kind="cli41_checkpoint_teacher_forcing";source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpPresetAcceptance.hpp")).Hash}
+}
+if($Workload -eq "resident") {
+    $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
+    $arguments=@("--resident-model",$ModelDir)
+    $residentPrompt=if($GenerationPromptFile){(Resolve-Path -LiteralPath $GenerationPromptFile).Path}else{Join-Path $PSScriptRoot "prompts/story.json"}
+    $overrides.AILA_Q4E_RESIDENT_PROMPT_FILE=$residentPrompt
+    $overrides.AILA_Q4E_RESIDENT_DECODE="2"
+    $inputIdentity=@{kind="resident_nf4_state_quality";prompt_sha256=(Get-FileHash $residentPrompt).Hash;source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpResidentAcceptance.hpp")).Hash}
 }
 if($Workload -eq "window") {
     $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
@@ -244,6 +255,7 @@ if($PerformancePreset) {
     if($Workload -notin @("story","generation")) {throw "CLI preset requires story or generation"}
     $arguments+=@("--performance-preset",$PerformancePreset)
 }
+if($Executable) {$exe=(Resolve-Path -LiteralPath $Executable).Path}
 $meta=[ordered]@{
     performance_preset=$PerformancePreset;runtime_defaults=[bool]$RuntimeDefaults
     timestamp=(Get-Date -Format o);commit=(& git -C $repo rev-parse HEAD);dirty=@(& git -C $repo status --short)
@@ -251,7 +263,7 @@ $meta=[ordered]@{
     exe_sha256=(Get-FileHash $exe).Hash;model_config_sha256=(Get-FileHash "$ModelDir/config.json").Hash
     stack=(Get-AilaOneApiStackMetadata -Stack $stack)
     gpu=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion)
-    diagnostic_only=[bool]($Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
+    diagnostic_only=[bool]($Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
 }
 $launcher=$exe
 if($Vtune -or $VtuneInstructions) {

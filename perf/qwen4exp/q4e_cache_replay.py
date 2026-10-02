@@ -36,12 +36,14 @@ def validate(rows):
     forward, acquire, reserved = None, None, set()
     totals = []
     routed, acquired = {}, {}
+    direct, leased = None, set()
     for r in rows[1:]:
         kind = r["type"]
         if kind == "forward_begin":
-            require(forward is None and acquire is None, "Unclosed forward")
+            require(forward is None and acquire is None and direct is None, "Unclosed forward")
             forward = dict(r, hits=0, misses=0, bytes=0, host_hits=0, file_fills=0,
-                           acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={})
+                           acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={},
+                           direct_entries=0, resident_route_entries=0, cold_request_entries=0, acquire_calls=0)
             routed, acquired = {}, {}
         elif kind == "route":
             require(forward is not None and acquire is None and r["forward"] == forward["forward"], "Orphan route")
@@ -50,11 +52,40 @@ def validate(rows):
             require(0 <= r["layer"] < cfg["layers"] and r["layer"] not in routed, "Duplicate/invalid route layer")
             require(all(len(set(r["ids"][i:i+r["top_k"]])) == r["top_k"] for i in range(0,len(r["ids"]),r["top_k"])), "Duplicate expert within a token")
             routed[r["layer"]] = set(r["ids"])
+        elif kind == "direct_bind":
+            require(forward is not None and acquire is None and direct is None, "Overlapping direct lease")
+            require(r["forward"] == forward["forward"] and 0 <= r["layer"] < cfg["layers"], "Invalid direct identity")
+            keys = [r["layer"] * experts + e for e in r["ids"]]
+            require(all(0 <= e < experts for e in r["ids"]), "Invalid direct expert")
+            require(len(keys) == len(r["initial_slots"]) == len(r["direct_slots"]), "Invalid direct arrays")
+            require([resident.get(k, -1) for k in keys] == r["initial_slots"], "Direct resident map mismatch")
+            require(all(d == -1 or d == s >= 0 for d,s in zip(r["direct_slots"],r["initial_slots"])), "Invalid direct binding")
+            cold = [e for e,d in zip(r["ids"],r["direct_slots"]) if d < 0]
+            require(cold == r["cold_ids"], "Direct/cold partition mismatch")
+            direct = dict(r, cold_acquired=False)
+            leased = {s for s in r["direct_slots"] if s >= 0}
+            for s in dict.fromkeys(r["initial_slots"]):
+                if s >= 0: lru.move_to_end(s)
+            ready = [e for e,d in zip(r["ids"],r["direct_slots"]) if d >= 0]
+            acquired.setdefault(r["layer"], set()).update(ready)
+            layer = forward["layers"].setdefault(r["layer"], defaultdict(int))
+            for name,value in (("hits",len(ready)), ("direct_entries",len(ready)),
+                               ("resident_route_entries",sum(s >= 0 for s in r["initial_slots"])),
+                               ("cold_request_entries",len(cold))):
+                forward[name] += value; layer[name] += value
+        elif kind == "direct_release":
+            require(direct and acquire is None and r["forward"] == forward["forward"] and r["layer"] == direct["layer"], "Orphan direct release")
+            require(not direct["cold_ids"] or direct["cold_acquired"], "Missing cold transaction")
+            direct, leased = None, set()
         elif kind == "acquire_begin":
             require(forward is not None and acquire is None, "Acquire outside forward")
             require(not r["pinned"], "Pinned traces require a pin event schema")
             require(r["forward"] == forward["forward"], "Wrong forward id")
             acquire = r
+            if not r.get("touch_hits",1):
+                require(direct and not direct["cold_acquired"] and r["layer"] == direct["layer"] and r["ids"] == direct["cold_ids"], "Wrong cold transaction")
+                direct["cold_acquired"] = True
+            forward["acquire_calls"] += 1
             acquired.setdefault(r["layer"], set()).update(r["ids"])
             keys = [r["layer"] * experts + e for e in r["ids"]]
             require(len(keys) == len(r["initial_slots"]) == len(r["host_states"]), "Invalid arrays")
@@ -63,12 +94,12 @@ def validate(rows):
             acquire["expected_hits"] = sum(s >= 0 for s in r["initial_slots"])
             acquire["expected_misses"] = len({k for k in keys if k not in resident})
             acquire["victims"] = 0
-            reserved = set()
+            reserved = set(leased)
             # All hits are touched/reserved before any miss gets a slot.
             for s in r["initial_slots"]:
                 if s >= 0 and s not in reserved:
                     reserved.add(s)
-                    lru.move_to_end(s)
+                    if r.get("touch_hits",1): lru.move_to_end(s)
         elif kind == "victim":
             require(acquire and r["acquire"] == acquire["acquire"], "Orphan victim")
             eligible = [s for s in lru if s not in reserved]
@@ -116,7 +147,7 @@ def validate(rows):
                 if s is not None:
                     lru.move_to_end(s, last=False)
         elif kind == "forward_end":
-            require(forward and r["forward"] == forward["forward"] and acquire is None, "Wrong forward end")
+            require(forward and r["forward"] == forward["forward"] and acquire is None and direct is None, "Wrong forward end")
             if routed:
                 require(set(routed) == set(range(cfg["layers"])) and routed == acquired, "Route/demand coverage mismatch")
             forward["host_span_ns"] = r["ns"] - forward["ns"]
@@ -126,8 +157,23 @@ def validate(rows):
             require(forward and r["forward"] == forward["forward"], "Orphan host interval")
         else:
             raise ValueError(f"Unknown event {kind}")
-    require(forward is None and acquire is None and totals, "Truncated trace")
+    require(forward is None and acquire is None and direct is None and totals, "Truncated trace")
     return totals
+
+
+def admission_rows(rows):
+    """Counterfactuals consume full routes, never only the observed cold subset."""
+    direct = False
+    for row in rows[1:]:
+        if row["type"] == "direct_bind":
+            direct = True
+            yield dict(row, type="acquire_begin")
+        elif row["type"] == "direct_release":
+            direct = False
+        elif row["type"] == "acquire_begin" and direct:
+            continue
+        else:
+            yield row
 
 
 def simulate(rows, protected_fraction=0):
@@ -144,7 +190,7 @@ def simulate(rows, protected_fraction=0):
     slots = [-1] * cap
     output = []
     current = None
-    for r in rows[1:]:
+    for r in admission_rows(rows):
         if r["type"] == "forward_begin":
             current = dict(forward=r["forward"], position=r["position"], tokens=r["tokens"], hits=0, misses=0)
         elif r["type"] == "acquire_begin":
@@ -212,7 +258,7 @@ def offline_reference(rows):
     cap, experts = rows[0]["slots"], rows[0]["experts"]
     future = defaultdict(deque)
     batches = []
-    for r in rows:
+    for r in admission_rows(rows):
         if r["type"] == "acquire_begin":
             batch = [r["layer"] * experts + e for e in r["ids"]]
             for key in set(batch):
@@ -221,7 +267,7 @@ def offline_reference(rows):
     resident, heap, output = {}, [], []
     pos = 0
     current = None
-    for r in rows[1:]:
+    for r in admission_rows(rows):
         if r["type"] == "forward_begin":
             current = dict(forward=r["forward"], position=r["position"], tokens=r["tokens"], hits=0, misses=0)
         elif r["type"] == "acquire_begin":

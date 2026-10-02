@@ -8,6 +8,7 @@
 #include "utils/SafeTensors.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -33,6 +34,7 @@ struct GpuSlotRecord {
     int fill_owner = -1; // -1: none, 0: demand, 1: prefetch
     sycl::event consumer_fence{};
     sycl::event dma_event{};
+    uint32_t direct_leases = 0; // coordinator-owned; independent of acquire's reservations
 };
 
 struct HostSlotRecord {
@@ -117,6 +119,47 @@ struct GpuExpertTicket {
 
 class Qwen4ExpExpertCache;
 
+// A route-scoped lease. Finish transfers protection to an in-order compute
+// reader fence. Exceptional destruction drains submitted work before release.
+// The cache must outlive the lease and cannot be moved while it is leased.
+class GpuReadyLease {
+public:
+    static constexpr int kMaxEntries = 40;
+    GpuReadyLease() = default;
+    ~GpuReadyLease();
+    GpuReadyLease(const GpuReadyLease&) = delete;
+    GpuReadyLease& operator=(const GpuReadyLease&) = delete;
+    GpuReadyLease(GpuReadyLease&& other) noexcept;
+    GpuReadyLease& operator=(GpuReadyLease&&) = delete;
+    void Finish(const sycl::event& last_reader);
+    int layer = -1, ready_count = 0, cold_count = 0;
+    std::array<int, kMaxEntries> ready_slots{}, ready_ranks{}, ready_ids{};
+    std::array<uint64_t, kMaxEntries> ready_generations{};
+    std::array<int, kMaxEntries> cold_ids{}, cold_ranks{};
+private:
+    friend class Qwen4ExpExpertCache;
+    Qwen4ExpExpertCache* cache_ = nullptr;
+};
+
+// Holds all eligible slots of one layer until the device route is visible.
+// BindRoute transfers selected readers to a route lease and releases unused slots.
+class GpuResidentLayerLease {
+public:
+    GpuResidentLayerLease() = default;
+    ~GpuResidentLayerLease();
+    GpuResidentLayerLease(const GpuResidentLayerLease&) = delete;
+    GpuResidentLayerLease& operator=(const GpuResidentLayerLease&) = delete;
+    GpuResidentLayerLease(GpuResidentLayerLease&& other) noexcept;
+    GpuResidentLayerLease& operator=(GpuResidentLayerLease&&) = delete;
+    GpuReadyLease BindRoute(const int* ids, const int* device_selected_slots, int count);
+private:
+    friend class Qwen4ExpExpertCache;
+    Qwen4ExpExpertCache* cache_ = nullptr;
+    int layer_ = -1, count_ = 0;
+    std::array<int, 512> slots_{};
+    std::array<uint64_t, 512> generations_{};
+};
+
 class HostExpertLease {
 public:
     HostExpertLease() = default;
@@ -185,6 +228,13 @@ struct ExpertCacheStats {
     uint64_t prefetch_wasted_bytes = 0;
     uint64_t demand_exposed_wait_ns = 0;
     uint64_t demand_microbatches = 0;
+    uint64_t acquire_calls = 0;
+    uint64_t resident_route_entries = 0; // includes Copying, unlike direct_entries
+    uint64_t direct_entries = 0;
+    uint64_t cold_request_entries = 0;
+    uint64_t direct_route_entries = 0;
+    uint64_t direct_cold_acquire_ns = 0;
+    uint64_t resident_metadata_bytes = 0;
 
     double hit_rate() const {
         uint64_t total = hit_count + miss_count;
@@ -241,6 +291,19 @@ public:
                         const int* expert_ids,
                         int count,
                         int* out_slots);
+
+    // H1: classify/touch a full route once, lease only GPU Ready entries, then
+    // supply only the cold subset. Preserves legacy hit accounting and LRU order.
+    GpuReadyLease BindReady(int layer, const int* expert_ids, int count);
+    sycl::event AcquireCold(const GpuReadyLease& lease, int* out_slots);
+    bool ValidateReadyBinding(int layer, int expert, int slot, uint64_t generation) const;
+    // H2 forward-scoped descriptor snapshot, refreshed only at serialized
+    // forward boundaries. Each layer publishes its still-valid Ready indices.
+    void EnableResidentDeviceTables();
+    void BeginResidentDeviceEpoch();
+    GpuResidentLayerLease BeginResidentLayer(int layer);
+    const ops::MoeExpertSlotDev* resident_descriptors() const { return resident_descriptors_dev_.data_as<ops::MoeExpertSlotDev>(); }
+    const int* resident_layer_table(int layer) const { return resident_indices_dev_.data_as<int>() + layer * num_experts_per_layer_; }
 
     // Starts filling predicted non-resident experts into a pinned prefetch staging area on
     // the worker threads and returns immediately. Binds no slot; the next acquire() joins
@@ -369,6 +432,14 @@ public:
     sycl::event get_slot_dma_event(int slot_id) const;
 
 private:
+    friend class GpuReadyLease;
+    friend class GpuResidentLayerLease;
+    friend struct Qwen4ExpResidentTestAccess;
+    void ReleaseReady(GpuReadyLease& lease, const sycl::event& last_reader, bool drain);
+    void ReleaseResidentLayer(GpuResidentLayerLease& lease, bool drain);
+    GpuReadyLease BindReadyImpl(int layer, const int* ids, int count, const int* selected_slots);
+    sycl::event acquire_impl(int layer, const int* expert_ids, int count,
+                             int* out_slots, bool touch_hits);
     void cleanup();
     FillTicket reserve_host_preparation(int layer, int expert_id, bool& needs_fill);
     void invalidate_host_preparation(const FillTicket& ticket);
@@ -485,6 +556,12 @@ private:
     int num_pinned_slots_ = 0;
     std::vector<ops::MoeExpertSlotDev> slots_dev_;
     std::vector<GpuSlotRecord> gpu_slot_records_;
+    Tensor resident_descriptors_dev_, resident_indices_dev_;
+    std::vector<ops::MoeExpertSlotDev> resident_descriptors_host_;
+    std::vector<uint64_t> resident_descriptor_generations_;
+    std::vector<int> resident_indices_host_;
+    sycl::event resident_descriptor_upload_{};
+    std::vector<sycl::event> resident_index_uploads_;
 
     ExpertCacheStats stats_{};
     bool initialized_ = false;

@@ -356,6 +356,10 @@ private:
     PleTicket ple_ticket_;
     Qwen4ExpExpertCache expert_cache_;
     aila::Qwen4ExpExpertExecutor expert_executor_;
+    int resident_decode_mode_ = 0; // 0 legacy, 1 host Ready binding, 2 GPU resident selection
+    Tensor resident_down_, resident_weights_, resident_route_ids_, resident_selected_;
+    int* resident_selected_host_ = nullptr;
+    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease = nullptr);
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0
     // Otherwise rows are gathered from the mmap per forward: decode needs one 5 KB row, and the
