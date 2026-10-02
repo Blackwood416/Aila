@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：优先实现驻留专家直接执行与 hot expert set
 
+最新实施（H4/C2，2026-10-02）：已完成[Strata策略迁移与首轮验收](qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md)：Aila profile预装、4-forward/96-swap衰减自适应、异步retire/publish、3551热槽与prefill借槽、12线程CPU冷计算及PCIe比例分流、独立冷区LRU。19个性能进程保留全部61个请求；长文暖decode中位数8.8→11.3 tok/s，整请求29.69→24.08秒，有效输入/TTFT约91.7 tok/s。短输入后续达到15.6，但仍有适应成本；不宣称达到100+/20或冷启动普适收益。短/长质量、checkpoint/取消恢复、6项CTest及10项Python测试通过。32 GiB host pool不变，候选未写入默认preset，R2b尚未恢复。下一步补profile跨域覆盖，并将稳定descriptor用于GPU提交优化/R2b；下文的“下一步C1/H4”等保留为历史记录。
+
 最新实施（2026-10-02）：已完成 [C1/H3 首轮实现与对照](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同冻结集合下，CPU cold 的短/长 decode 中位数为7.57→7.86、7.45→7.63 tok/s；但原动态路径为13.90/8.75，固定集合仍损害 decode 命中。H3 减少 acquire，却没有稳定净收益。代表性短/长48步质量、checkpoint/取消恢复、6项CTest、7项Python测试和普通trace回放通过；GPU profiling 因系统RAM突增触发保护，设备时间未取得。所有候选继续默认关闭，32 GiB预算不变。**下一步 H4/C2：热集来源、跨域覆盖和有界 epoch/admission；R2b继续暂停。** 下文保留各阶段历史记录。
 
 实施更新（2026-10-02）：已保存此前工作为5ea0171，并完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。Ready租约与cold-only acquire分离、GPU device route/descriptor查表及提前热提交已实现；短/长输入48步logits、checkpoint回放逐位一致，6项CTest及真实trace回放通过。但当前短decode为原路径14.0、H1 12.6、H2 13.1 tok/s，长decode为8.95、8.4、8.75 tok/s，尚无稳定端到端净收益，默认仍为0。此版本没有固定热名单或CPU冷计算。**下一步继续C1的同热集、冻结admission对照，R2b继续暂停。** 以下保留原始规划与勘察记录。

@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：执行架构、量化计算与数据供给的下一轮设计
 
+2026-10-02 最新进展：[H4/C2策略迁移与验收完成](qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md)。已实现profile预装、衰减热集自适应、异步换入、prefill借槽和独立冷区LRU，实际测试12线程CPU冷计算与Strata PCIe比例分流。长文暖decode 8.8→11.3 tok/s、整请求29.69→24.08秒；短后续请求达到15.6，但保留适应期和异常样本。质量/状态/回归通过，候选仍显式开启、32 GiB预算不变，R2b尚未恢复。以下为此前阶段记录。
+
 2026-10-02 最新进展：[C1/H3 首轮完成](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同热集 CPU cold 有小幅 decode 收益，固定集合却明显损害 decode 命中；H3 的 acquire 减少尚无稳定净收益。短/长质量、状态和回归通过，保留额外续写的NLL预警、吞吐异常及profiling内存失败。候选默认关闭，下一步 H4/C2 的 profile/epoch/admission，R2b继续暂停。
 
 2026-10-02 按 [hotset新优先级规划](qwen3.8-flash-next-hotset-priority-plan-2026-10-02.md) 暂停R2b后续实施，先完成 [H1/H2动态驻留直接执行首轮](qwen3.8-flash-next-hotset-h1-h2-results-2026-10-02.md)。正确性与状态检查通过；当前GPU-only候选短decode由14.0降至12.6/13.1 tok/s，长decode由8.95降至8.4/8.75 tok/s，未默认开启。下一步是新架构下C1冷专家CPU/GPU分工的同热集对照；不再沿用本文件早期对该方向的低优先级安排。

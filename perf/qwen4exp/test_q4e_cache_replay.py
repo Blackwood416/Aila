@@ -32,6 +32,21 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_epoch_retirement_publication_and_borrow(self):
+        rows=fixture()+[
+            dict(type='freeze',slots=[1]),
+            dict(type='epoch_retire',slot=1,old_key=0,key=5),
+            dict(type='epoch_publish',slot=1,key=5),
+            dict(type='epoch_borrow',slots=[1]),
+            dict(type='thaw')]
+        self.assertEqual(len(validate(copy.deepcopy(rows))),1)
+        bad=copy.deepcopy(rows);bad[-3]['key']=6
+        with self.assertRaisesRegex(ValueError,'Invalid epoch publication'): validate(bad)
+        bad=copy.deepcopy(rows);bad[-4]['old_key']=2
+        with self.assertRaisesRegex(ValueError,'Invalid epoch retirement'): validate(bad)
+        bad=copy.deepcopy(rows);bad[-2]['slots']=[0]
+        with self.assertRaisesRegex(ValueError,'Unsafe prefill borrowing'): validate(bad)
+
     def test_frozen_cpu_and_transient_ownership(self):
         rows=fixture()[:6]+[
             dict(type="freeze",slots=[1]),

@@ -309,6 +309,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     if (this == &other) return *this;
 
     try {
+        other.PublishHotsetPending(true);
         other.cancel_prefetch();
         if (other.copy_q_) {
             other.copy_q_->wait_and_throw();
@@ -373,6 +374,15 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     frozen_slots_ = std::move(other.frozen_slots_);
     frozen_descriptors_published_ = other.frozen_descriptors_published_;
     frozen_indices_published_ = std::move(other.frozen_indices_published_);
+    hotset_policy_=std::move(other.hotset_policy_);
+    adaptive_hotset_=other.adaptive_hotset_; other.adaptive_hotset_=false;
+    hotset_borrow_=other.hotset_borrow_; hotset_borrowed_=other.hotset_borrowed_;
+    hotset_interval_=other.hotset_interval_; hotset_swaps_=other.hotset_swaps_; hotset_tokens_=other.hotset_tokens_;
+    hotset_identity_=std::move(other.hotset_identity_); hotset_export_=std::move(other.hotset_export_);
+    other.hotset_export_.clear(); hotset_keys_=std::move(other.hotset_keys_);
+    hotset_cold_slots_=std::move(other.hotset_cold_slots_);hotset_cold_cursor_=other.hotset_cold_cursor_;hotset_ring_=other.hotset_ring_;
+    hotset_cold_policy_=other.hotset_cold_policy_;hotset_cold_lru_=std::move(other.hotset_cold_lru_);
+    hotset_cold_iters_=std::move(other.hotset_cold_iters_);hotset_cold_member_=std::move(other.hotset_cold_member_);
     resident_descriptors_dev_ = std::move(other.resident_descriptors_dev_);
     resident_indices_dev_ = std::move(other.resident_indices_dev_);
     resident_descriptors_host_ = std::move(other.resident_descriptors_host_);
@@ -448,6 +458,18 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
 }
 
 void Qwen4ExpExpertCache::cleanup() {
+    try { PublishHotsetPending(true); } catch (...) {
+        if(copy_q_)try {copy_q_->wait();} catch (...) {}
+    }
+    hotset_pending_.clear();
+    if(!hotset_export_.empty()) {
+        try { hotset_policy_.Save(hotset_export_,hotset_identity_); }
+        catch(const std::exception& e) { AILA_LOG_ERROR("[Q4E Hotset] export failed: %s",e.what()); }
+        hotset_export_.clear();
+    }
+    adaptive_hotset_=false; hotset_borrowed_=false; hotset_keys_.clear();
+    hotset_cold_slots_.clear();hotset_cold_cursor_=0;
+    hotset_cold_lru_.clear();hotset_cold_iters_.clear();hotset_cold_member_.clear();
     cache_trace_.reset();
     trace_forward_id_ = trace_acquire_id_ = 0;
     try {
@@ -1331,6 +1353,179 @@ GpuReadyLease Qwen4ExpExpertCache::BindReady(int layer, const int* ids, int coun
     return BindReadyImpl(layer, ids, count, nullptr);
 }
 
+void Qwen4ExpExpertCache::ConfigureHotset() {
+    const auto profile=aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","");
+    hotset_export_=aila::env::read_string("AILA_Q4E_HOTSET_EXPORT","");
+    if(profile.empty() && hotset_export_.empty())return;
+    hotset_policy_.Init(num_layers_,num_experts_per_layer_);
+    // Layout/quantization plus sampled source bytes, computed once at load. This
+    // is an expert-identity guard, not a cryptographic hash of the entire model.
+    uint64_t hash=1469598103934665603ULL;
+    auto bytes=[&](const uint8_t* p,size_t n){for(size_t i=0;i<n;++i){hash^=p[i];hash*=1099511628211ULL;}};
+    for(const auto& lw:layer_weights_) for(const auto* w:{&lw.gate_up,&lw.down}) {
+        for(const auto* view:{&w->packed_weight,&w->absmax,&w->quant_map,&w->nested_absmax,&w->nested_quant_map}) {
+            const uint64_t n=view->bytes;bytes(reinterpret_cast<const uint8_t*>(&n),sizeof(n));
+            if(view->valid()) {const size_t sample=std::min<size_t>(4096,n);
+                bytes(view->ptr,sample); if(n>sample)bytes(view->ptr+n-sample,sample);}
+        }
+        bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_offset),sizeof(w->quant_state.nested_offset));
+        bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_blocksize),sizeof(w->quant_state.nested_blocksize));
+    }
+    hotset_identity_="nf4-original-expert-order-"+std::to_string(num_layers_)+"x"+std::to_string(num_experts_per_layer_)+
+        "-"+std::to_string(hidden_size_)+"x"+std::to_string(intermediate_size_)+"-b"+std::to_string(blocksize_)+
+        "-nested"+std::to_string(int(compact_nested_))+"-sample-fnv64-"+std::to_string(hash);
+    if(profile.empty())return;
+    hotset_policy_.Load(profile,hotset_identity_); // Fail explicit experiments on a wrong profile.
+    hotset_interval_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_INTERVAL",4),0,1024);
+    hotset_swaps_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS",96),0,512);
+    hotset_borrow_=aila::env::read_flag("AILA_Q4E_HOTSET_BORROW",false);
+    hotset_ring_=aila::env::read_flag("AILA_Q4E_HOTSET_RING",true);
+    hotset_cold_policy_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_COLD_QUEUE",hotset_ring_?2:0),0,2);
+    const int staging=std::min(hotset_borrow_?16:num_experts_per_layer_,num_slots_-1);
+    const int capacity=std::clamp(aila::env::read_int("AILA_Q4E_HOTSET_SLOTS",num_slots_-staging),1,num_slots_-staging);
+    hotset_keys_.assign(hotset_policy_.ranking.begin(),hotset_policy_.ranking.begin()+capacity);
+    hotset_pending_.reserve(hotset_swaps_); adaptive_hotset_=true;
+    InstallHotset(hotset_keys_);
+    AILA_LOG_INFO("[Q4E Hotset] profile=%s identity=%s slots=%d interval=%d swaps=%d decay=0.7 min_usage=2 gain=1.5 borrow=%d",
+        profile.c_str(),hotset_identity_.c_str(),capacity,hotset_interval_,hotset_swaps_,int(hotset_borrow_));
+}
+
+void Qwen4ExpExpertCache::InstallHotset(const std::vector<int>& keys) {
+    // Validate before any mutation. Acquire can never evict an already installed
+    // member, even if loading a later layer wraps the dynamic LRU.
+    std::vector<bool> seen(size_t(num_layers_)*num_experts_per_layer_,false);
+    if(num_pinned_slots_)throw std::invalid_argument("Profile hotset cannot mix with legacy pinning");
+    if(keys.empty() || keys.size()>=size_t(num_slots_))throw std::invalid_argument("Hotset leaves no staging");
+    for(int k:keys) {if(k<0 || k>=int(seen.size()) || seen[k])throw std::invalid_argument("Invalid hotset key");seen[k]=true;}
+    PublishHotsetPending(true);ThawReady();ctx_->synchronize();copy_q_->wait_and_throw();
+    const auto start=std::chrono::steady_clock::now();const auto bytes0=stats_.total_transferred_bytes;
+    const auto hits0=stats_.hit_count, misses0=stats_.miss_count, calls0=stats_.acquire_calls, batches0=stats_.demand_microbatches;
+    if(cache_trace_){cache_trace_->Row("epoch_load_begin")<<",\"forward\":"<<trace_forward_id_;cache_trace_->End();}
+    frozen_=true; frozen_count_=0;
+    // Preserve target weights that survived the borrowed prefill region. Protect
+    // all of them before filling any layer, so refill cannot evict later targets.
+    std::vector<int> preserved;
+    for(int k:keys) {const int s=layer_expert_to_slot_[k];if(s>=0) {
+        frozen_slots_[s]=true;++frozen_count_;preserved.push_back(s);gpu_slot_records_[s].state=ExpertSlotState::Ready;}}
+    if(cache_trace_ && !preserved.empty()){auto& out=cache_trace_->Row("epoch_protect");out<<",\"slots\":";Qwen4ExpCacheTrace::Ints(out,preserved.data(),int(preserved.size()));cache_trace_->End();}
+    for(int l=0;l<num_layers_;++l) {
+        std::vector<int> ids,slots;for(int k:keys)if(k/num_experts_per_layer_==l && layer_expert_to_slot_[k]<0)ids.push_back(k%num_experts_per_layer_);
+        // Chunk by available staging while progressively protecting the target set.
+        for(size_t offset=0;offset<ids.size();) {
+            const int n=std::min<int>(int(ids.size()-offset),num_slots_-frozen_count_);slots.resize(n);
+            acquire_impl(l,ids.data()+offset,n,slots.data(),false).wait_and_throw();
+            std::vector<int> added;
+            for(int s:slots){if(!frozen_slots_[s]){frozen_slots_[s]=true;++frozen_count_;added.push_back(s);}gpu_slot_records_[s].state=ExpertSlotState::Ready;}
+            if(cache_trace_ && !added.empty()){auto& out=cache_trace_->Row("epoch_protect");out<<",\"slots\":";Qwen4ExpCacheTrace::Ints(out,added.data(),int(added.size()));cache_trace_->End();}
+            offset+=n;
+        }
+    }
+    for(int s=0;s<num_slots_;++s)if(!frozen_slots_[s])DiscardTransient(&s,1);
+    frozen_descriptors_published_=false;std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
+    stats_.epoch_refill_bytes+=stats_.total_transferred_bytes-bytes0;
+    stats_.total_transferred_bytes=bytes0; // Epoch traffic is reported separately from demand.
+    // Maintenance is not a routed demand. In particular, profile loading must
+    // not depress the hit-rate that controls speculative prefetch gating.
+    stats_.hit_count=hits0;stats_.miss_count=misses0;stats_.acquire_calls=calls0;stats_.demand_microbatches=batches0;
+    stats_.epoch_refill_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+    ++stats_.epoch_publishes;
+    RefreshHotsetColdSlots();
+    if(cache_trace_){cache_trace_->Row("epoch_load_end");cache_trace_->End();}
+}
+
+void Qwen4ExpExpertCache::RefreshHotsetColdSlots() {
+    hotset_cold_slots_.clear();hotset_cold_cursor_=0;
+    hotset_cold_lru_.clear();hotset_cold_iters_.resize(num_slots_);hotset_cold_member_.assign(num_slots_,false);
+    if(adaptive_hotset_ && frozen_ && hotset_cold_policy_==1)
+        for(int s=0;s<num_slots_;++s)if(!frozen_slots_[s])hotset_cold_slots_.push_back(s);
+    if(adaptive_hotset_ && frozen_ && hotset_cold_policy_==2)
+        for(int s:lru_list_)if(!frozen_slots_[s]) {
+            hotset_cold_lru_.push_back(s);hotset_cold_iters_[s]=std::prev(hotset_cold_lru_.end());hotset_cold_member_[s]=true;
+        }
+}
+void Qwen4ExpExpertCache::TouchHotsetColdSlot(int slot,bool front) {
+    if(!hotset_cold_lru_.empty() && hotset_cold_member_[slot])
+        hotset_cold_lru_.splice(front?hotset_cold_lru_.begin():hotset_cold_lru_.end(),hotset_cold_lru_,hotset_cold_iters_[slot]);
+}
+
+void Qwen4ExpExpertCache::PublishHotsetPending(bool wait) {
+    if(hotset_pending_.empty())return;
+    for(const auto& p:hotset_pending_)if(!wait && !is_event_complete(p.ready))return;
+    for(auto& p:hotset_pending_) {
+        p.ready.wait_and_throw();
+        const int l=p.key/num_experts_per_layer_,e=p.key%num_experts_per_layer_;
+        const int transient=layer_expert_to_slot_[p.key];
+        if(transient>=0 && transient!=p.slot)DiscardTransient(&transient,1);
+        bind_slot_nested_metadata(p.slot,l,e);
+        const uint64_t key=(uint64_t(l)<<32)|uint32_t(e);
+        layer_expert_to_slot_[p.key]=p.slot;slot_to_key_[p.slot]=key;
+        auto& r=gpu_slot_records_[p.slot];r.key=key;r.state=ExpertSlotState::Ready;
+        if(cache_trace_){cache_trace_->Row("epoch_publish")<<",\"slot\":"<<p.slot<<",\"key\":"<<p.key;cache_trace_->End();}
+    }
+    hotset_pending_.clear();frozen_descriptors_published_=false;
+    std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);++stats_.epoch_publishes;
+}
+
+void Qwen4ExpExpertCache::RebalanceHotset() {
+    if(!frozen_ || !hotset_pending_.empty() || hotset_swaps_==0)return;
+    std::vector<int> resident(layer_expert_to_slot_.size(),-1);
+    for(size_t k=0;k<resident.size();++k) {const int s=layer_expert_to_slot_[k];if(s>=0 && frozen_slots_[s])resident[k]=s;}
+    const auto swaps=hotset_policy_.Select(resident,hotset_swaps_);hotset_policy_.Decay();
+    if(swaps.empty())return;
+    for(const auto& r:gpu_slot_records_)if(r.direct_leases)throw std::logic_error("Epoch switch with active readers");
+    // Slot-specific consumer fences protect payloads; no global compute queue
+    // drain is needed. Retire before DMA, publish only at a later forward boundary.
+    const auto begin=std::chrono::steady_clock::now();
+    cancel_prefetch();
+    frozen_descriptors_published_=false;std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
+    try {
+    for(const auto& sw:swaps) {
+        const int l=sw.incoming/num_experts_per_layer_,e=sw.incoming%num_experts_per_layer_,s=resident[sw.outgoing];
+        prepare_host(l,e);auto lease=acquire_host_lease(l,e);
+        if(!lease.is_valid())continue;
+        auto& r=gpu_slot_records_[s];
+        if(r.consumer_fence!=sycl::event{})r.consumer_fence.wait_and_throw();
+        if(r.dma_event!=sycl::event{})r.dma_event.wait_and_throw();
+        layer_expert_to_slot_[sw.outgoing]=-1;slot_to_key_[s]=UINT64_MAX;r.key=UINT64_MAX;++r.generation;
+        const auto ready=copy_q_->memcpy(slot_dev_base_[s],host_slot_ptrs_[lease.hslot()],slot_bytes_);
+        r.dma_event=ready;r.state=ExpertSlotState::Copying;
+        hotset_pending_.push_back({sw.incoming,s,std::move(lease),ready});
+        auto old=std::find(hotset_keys_.begin(),hotset_keys_.end(),sw.outgoing);if(old!=hotset_keys_.end())*old=sw.incoming;
+        stats_.epoch_refill_bytes+=slot_bytes_;++stats_.epoch_swaps;
+        if(cache_trace_){cache_trace_->Row("epoch_retire")<<",\"slot\":"<<s<<",\"key\":"<<sw.incoming<<",\"old_key\":"<<sw.outgoing;cache_trace_->End();}
+    }
+    } catch(...) {
+        faulted_=true;
+        try {copy_q_->wait();} catch(...) {}
+        hotset_pending_.clear();
+        throw;
+    }
+    stats_.epoch_refill_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
+}
+
+void Qwen4ExpExpertCache::BeginHotsetForward(int position,int rows) {
+    if(!adaptive_hotset_)return;
+    PublishHotsetPending(false);
+    if(hotset_borrow_ && rows>1 && !hotset_borrowed_) {
+        PublishHotsetPending(true);ctx_->synchronize();
+        const int retain=std::min<int>(int(hotset_keys_.size()),std::max(0,num_slots_-num_experts_per_layer_));
+        std::vector<int> lent;
+        for(size_t i=retain;i<hotset_keys_.size();++i) {const int s=layer_expert_to_slot_[hotset_keys_[i]];
+            if(s>=0 && frozen_slots_[s]){frozen_slots_[s]=false;--frozen_count_;lent.push_back(s);}}
+        if(cache_trace_){auto& out=cache_trace_->Row("epoch_borrow");out<<",\"slots\":";Qwen4ExpCacheTrace::Ints(out,lent.data(),int(lent.size()));cache_trace_->End();}
+        frozen_descriptors_published_=false;std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
+        hotset_borrowed_=true;
+        RefreshHotsetColdSlots();
+    } else if(rows==1 && hotset_borrowed_) {InstallHotset(hotset_keys_);hotset_borrowed_=false;}
+    if(position==0)hotset_tokens_=0;
+}
+void Qwen4ExpExpertCache::ObserveHotsetRoute(int layer,const int* ids,int rows,int topk) {
+    if(hotset_policy_.layers)hotset_policy_.Observe(layer,ids,rows,topk);
+}
+void Qwen4ExpExpertCache::EndHotsetForward(int rows) {
+    if(adaptive_hotset_ && rows==1 && hotset_interval_ && ++hotset_tokens_%hotset_interval_==0)RebalanceHotset();
+}
+
 bool Qwen4ExpExpertCache::IsDirectReady(int layer, int expert) const {
     if (!is_initialized() || layer < 0 || layer >= num_layers_ || expert < 0 || expert >= num_experts_per_layer_) return false;
     const int slot = layer_expert_to_slot_[expert_flat_index(layer, expert)];
@@ -1378,6 +1573,8 @@ void Qwen4ExpExpertCache::FreezeReady(int staging_slots) {
 }
 
 void Qwen4ExpExpertCache::ThawReady() {
+    hotset_cold_slots_.clear();hotset_cold_cursor_=0;
+    hotset_cold_lru_.clear();
     if (!frozen_) return;
     for (const auto& r : gpu_slot_records_) if (r.direct_leases)
         throw std::logic_error("Cannot thaw with active direct readers");
@@ -1447,6 +1644,7 @@ GpuReadyLease Qwen4ExpExpertCache::BindReadyImpl(int layer, const int* ids, int 
             for (int j = 0; j < i; ++j) if (ids[j] == ids[i]) first = false;
             if (first && !slot_pinned_[slot])
                 lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
+                TouchHotsetColdSlot(slot,true);
             auto& record = gpu_slot_records_[slot];
             if (selected_slots && selected_slots[i] >= 0 && selected_slots[i] != slot)
                 throw std::logic_error("Device resident route changed identity");
@@ -1732,6 +1930,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
                 batch_reserved_slots_scratch_.push_back(slot);
                 if (touch_hits && !slot_pinned_[slot]) {
                     lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[slot]);
+                    TouchHotsetColdSlot(slot,true);
                 }
             }
             auto& record = gpu_slot_records_[slot];
@@ -1779,11 +1978,22 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         int trace_candidates[8] = {};
         int trace_backed[8] = {};
         int trace_candidates_count = 0;
-        if (cost_aware_eviction_ && host_pool_enabled_) {
+        const bool transient_ring=adaptive_hotset_ && frozen_ && !hotset_cold_slots_.empty();
+        auto& victim_lru=hotset_cold_lru_.empty()?lru_list_:hotset_cold_lru_;
+        if(transient_ring) {
+            // This region never admits demand into the stable tier. Select only
+            // its bounded slots, without walking thousands of protected LRU nodes.
+            for(size_t n=0;n<hotset_cold_slots_.size();++n) {
+                const int s=hotset_cold_slots_[hotset_cold_cursor_];
+                hotset_cold_cursor_=(hotset_cold_cursor_+1)%hotset_cold_slots_.size();
+                if(!slot_reserved_[s] && !slot_pinned_[s] && !gpu_slot_records_[s].direct_leases) {victim_slot=s;break;}
+            }
+        }
+        if (!transient_ring && cost_aware_eviction_ && host_pool_enabled_) {
             constexpr int kMaxCandidates = 8;
             int candidates_checked = 0;
             int fallback_victim = -1;
-            for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend() && candidates_checked < kMaxCandidates; ++r_it) {
+            for (auto r_it = victim_lru.rbegin(); r_it != victim_lru.rend() && candidates_checked < kMaxCandidates; ++r_it) {
                 int s = *r_it;
                 if (!slot_reserved_[s] && !slot_pinned_[s] && !frozen_slots_[s] && !gpu_slot_records_[s].direct_leases) {
                     if (fallback_victim < 0) fallback_victim = s;
@@ -1809,8 +2019,8 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
             if (victim_slot < 0) victim_slot = fallback_victim;
         }
 
-        if (victim_slot < 0) {
-            for (auto r_it = lru_list_.rbegin(); r_it != lru_list_.rend(); ++r_it) {
+        if (victim_slot < 0 && !transient_ring) {
+            for (auto r_it = victim_lru.rbegin(); r_it != victim_lru.rend(); ++r_it) {
                 int s = *r_it;
                 if (!slot_reserved_[s] && !slot_pinned_[s] && !frozen_slots_[s] && !gpu_slot_records_[s].direct_leases) {
                     victim_slot = s;
@@ -1828,6 +2038,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         if (cache_trace_) {
             const uint64_t old = slot_to_key_[victim_slot];
             auto& out = cache_trace_->Row("victim");
+            out<<",\"transient_ring\":"<<int(transient_ring);
             out << ",\"acquire\":" << trace_acquire_id_ << ",\"slot\":" << victim_slot
                 << ",\"key\":" << flat_idx << ",\"old_key\":"
                 << (old == UINT64_MAX ? -1 : expert_flat_index(static_cast<int>(old >> 32), static_cast<int>(old & 0xffffffff)))
@@ -1864,6 +2075,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
 
         // Move victim to MRU (front) and reserve for this batch
         lru_list_.splice(lru_list_.begin(), lru_list_, slot_iters_[victim_slot]);
+        TouchHotsetColdSlot(victim_slot,true);
 
         slot_reserved_[victim_slot] = true;
         batch_reserved_slots_scratch_.push_back(victim_slot);
@@ -2333,6 +2545,7 @@ void Qwen4ExpExpertCache::demote(int layer, const int* expert_ids, int count) {
         int slot = layer_expert_to_slot_[expert_flat_index(layer, e)];
         if (slot >= 0 && !slot_pinned_[slot]) {
             lru_list_.splice(lru_list_.end(), lru_list_, slot_iters_[slot]);
+            TouchHotsetColdSlot(slot,false);
         }
         if (host_pool_enabled_) {
             int hslot = host_layer_expert_to_slot_[expert_flat_index(layer, e)];

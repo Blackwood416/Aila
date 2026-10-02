@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "profile": "qwen38-nf4-h4-v1.profile",
+  "profile_sha256": "3F0994BC4356675EE23D6C8E3557BDAA9AFFF618C98B484F3DDE993C1EE9A77C",
+  "source_run": "tmp/hotset-h4-training-20261002",
+  "source_exe_sha256": "98778D21B405EB5F5469E204236BB02892ED1E93FFDED4F5672EB69FDA84AF2C",
+  "model_config_sha256": "6BEFE9D6096EFC64A1A1B7AACD4D2B46DAA41D0D8049DACDF18A8BD1E25CBBE6",
+  "corpus": [
+    {
+      "sha256": "2F7A766918BC0B0ED42B26EF0555EBEF247D1C2C59ED9B40FBCE1DD1AF5D0583",
+      "path": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\hotset-calibration-code.json"
+    },
+    {
+      "sha256": "04CE30A2AFC2FEFD88D0CD9E68EF733D8D2F28A7AA08D9891109E758DDF41C0D",
+      "path": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\hotset-calibration-reasoning.json"
+    },
+    {
+      "sha256": "02A3038F38A1025D03B546866590CF8DC7E273B130B2B67CB07F9B1784A99CD4",
+      "path": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\prompts\\hotset-calibration-planning.json"
+    }
+  ],
+  "source_trace_sha256": "DE78FD431767D7EECC464F728FC5B30658ADD9C67DC80BEE252D29A2747F4274",
+  "repeats_per_prompt": 2,
+  "generated_tokens_per_request": 48,
+  "ranking": "descending decode token-frequency, then prefill token-frequency, then original expert ID",
+  "identity_guard": "geometry, nested NF4 metadata and sampled FNV64 expert source bytes; not a full checkpoint cryptographic hash",
+  "holdouts": [
+    "story.json",
+    "archive-natural.json"
+  ],
+  "stdin_sha256": "0D0868AE2D41477C0230BA5BE5313EACFD5544C371304B321A766F7C39388F54",
+  "verified_request_count": 6,
+  "metadata_note": "The original collection meta input.sha256 inherited the unused default story path. Actual stdin was checked against the six declared corpus messages; no story/archive holdout was submitted. The probe now omits the unused field for multi-prompt collection."
+}

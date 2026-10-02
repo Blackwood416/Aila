@@ -641,6 +641,8 @@ bool Qwen4ExpBnb4Backend::load(
     ensure_runtime_buffers(ctx, 1);
     static const int s_resident_decode = aila::env::read_int("AILA_Q4E_RESIDENT_DECODE", 0);
     cold_mode_ = aila::env::read_int("AILA_Q4E_COLD_MODE",0);
+    const bool profile_hotset=!aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","").empty();
+    if(profile_hotset && !cold_mode_)cold_mode_=1;
     resident_prefill_ = aila::env::read_flag("AILA_Q4E_RESIDENT_PREFILL",false);
     if(cold_mode_<0 || cold_mode_>2)throw std::invalid_argument("Cold mode must be 0/1/2");
     resident_decode_mode_ = cold_mode_ ? 2 : s_resident_decode;
@@ -661,6 +663,7 @@ bool Qwen4ExpBnb4Backend::load(
         AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d dynamic_ready=1 fixed_hot_slots=0", resident_decode_mode_);
     }
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
+    expert_cache_.ConfigureHotset();
     // Batched prefill acquire needs every unique expert of a layer resident at once.
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
         prefill_expert_slot_.assign(cfg_.num_experts, -1);
@@ -1149,6 +1152,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (count <= 0) return buf_.logits;
 
     int start_pos = session.currentLength_;
+    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count);
     int cached_len = start_pos + count;
     if (cached_len > max_seq_len_) {
         throw std::runtime_error("Qwen4ExpBnb4Backend: context length " +
@@ -1285,7 +1289,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     double prof_acquire_ms = 0.0;
     const ExpertCacheStats prof_stats0 = expert_cache_.stats();
     const auto cold_stats0 = expert_executor_.stats();
-    if(cold_mode_ && cold_epoch_enabled_ && count==1 && start_pos>0 && !expert_cache_.frozen())
+    if(cold_mode_ && cold_epoch_enabled_ && count==1 && start_pos>0 && !expert_cache_.frozen() && !expert_cache_.adaptive_hotset())
         expert_cache_.FreezeReady(std::min(cfg_.num_experts,expert_cache_.num_slots()-1));
     if (resident_decode_mode_ == 2 && count == 1) expert_cache_.BeginResidentDeviceEpoch();
 
@@ -1446,6 +1450,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const auto prof_router_t0 = prof_clock::now();
         // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
         actual_route_event.wait_and_throw();
+        if(cold_epoch_enabled_)expert_cache_.ObserveHotsetRoute(L,router_host_ids_,count,top_k);
         if (resident_epoch) resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
         const auto prof_router_t1 = prof_clock::now();
         if (expert_cache_.tracing()) {
@@ -2283,6 +2288,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (expert_cache_.tracing() && s_trace_markers)
         ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
     expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
+    if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count);
+    if(expert_cache_.adaptive_hotset()) {const auto& hs=expert_cache_.stats();
+        AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu",
+            start_pos,count,expert_cache_.frozen_slots(),(unsigned long long)hs.epoch_swaps,
+            (unsigned long long)hs.epoch_refill_bytes,(unsigned long long)hs.epoch_refill_ns,(unsigned long long)hs.epoch_publishes);
+    }
 
     if (expert_histogram_enabled_ && count > 1) {
         for (int b = 0; b < 6; ++b) {

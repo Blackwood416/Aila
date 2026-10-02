@@ -36,6 +36,7 @@ def read(prefix):
         return result
     assert meta['workload']=='cold_bench' and '[COLD BENCH PASS]' in log
     requests=[fields(line) for line in log.splitlines() if line.startswith('[COLD BENCH]')]
+    assert all(not r.get('adaptive',0) for r in requests), 'Adaptive epochs require the CLI hotset summary, not frozen-set accounting'
     calibration=[fields(line) for line in log.splitlines() if line.startswith('[COLD CALIBRATION]')]
     texts=log.split('[COLD TEXT] ')[1:]
     texts=[t.split('\n[/COLD TEXT]')[0] for t in texts]

@@ -1,0 +1,1 @@
+[{"role":"user","content":"Explain how to implement a bounded producer-consumer queue in C++ using a mutex and condition variables. Describe shutdown, spurious wakeups, ownership and how to avoid dropping queued work. Give a compact example."}]

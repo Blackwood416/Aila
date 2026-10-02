@@ -1,4 +1,5 @@
 #pragma once
+#include "models/Qwen4ExpHotsetPolicy.hpp"
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
@@ -236,6 +237,7 @@ struct ExpertCacheStats {
     uint64_t direct_cold_acquire_ns = 0;
     uint64_t resident_metadata_bytes = 0;
     uint64_t cpu_cold_entries = 0;
+    uint64_t epoch_refill_bytes = 0, epoch_swaps = 0, epoch_refill_ns = 0, epoch_publishes = 0;
 
     double hit_rate() const {
         uint64_t total = hit_count + miss_count + cpu_cold_entries;
@@ -308,6 +310,20 @@ public:
     void DiscardTransient(const int* slots, int count);
     void TraceColdCpu(int layer,const int* ids,const int* ranks,int count);
     void TraceDeviceEvent(const char* label,int layer,sycl::event event);
+    void ConfigureHotset();
+    void BeginHotsetForward(int position, int rows);
+    void ObserveHotsetRoute(int layer,const int* ids,int rows,int topk);
+    void EndHotsetForward(int rows);
+    void PublishHotsetPending(bool wait);
+    void RebalanceHotset();
+    void InstallHotset(const std::vector<int>& keys);
+    const Qwen4ExpHotsetPolicy& hotset_policy() const { return hotset_policy_; }
+    bool adaptive_hotset() const { return adaptive_hotset_; }
+    void RestartHotsetForTesting(bool enabled) {
+        PublishHotsetPending(true);ThawReady();adaptive_hotset_=enabled;hotset_borrowed_=false;hotset_tokens_=0;
+        std::fill(hotset_policy_.usage.begin(),hotset_policy_.usage.end(),0);
+        if(enabled) {hotset_keys_.assign(hotset_policy_.ranking.begin(),hotset_policy_.ranking.begin()+hotset_keys_.size());InstallHotset(hotset_keys_);}
+    }
     bool ValidateReadyBinding(int layer, int expert, int slot, uint64_t generation) const;
     // H2 forward-scoped descriptor snapshot, refreshed only at serialized
     // forward boundaries. Each layer publishes its still-valid Ready indices.
@@ -457,6 +473,8 @@ private:
     void invalidate_host_preparation(const FillTicket& ticket);
     void configure_layer_nested_metadata(int layer);
     void bind_slot_nested_metadata(int slot, int layer, int expert_id);
+    void RefreshHotsetColdSlots();
+    void TouchHotsetColdSlot(int slot, bool front);
     // Fills part [part, nparts) of every slot segment for one expert.
     void load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
                                 int part = 0, int nparts = 1, uint64_t slot_gen = 0);
@@ -574,6 +592,20 @@ private:
     std::vector<bool> frozen_slots_;
     bool frozen_descriptors_published_ = false;
     std::vector<bool> frozen_indices_published_;
+    Qwen4ExpHotsetPolicy hotset_policy_;
+    bool adaptive_hotset_ = false, hotset_borrow_ = false, hotset_borrowed_ = false;
+    int hotset_interval_ = 4, hotset_swaps_ = 96, hotset_tokens_ = 0;
+    std::string hotset_identity_, hotset_export_;
+    std::vector<int> hotset_keys_;
+    std::vector<int> hotset_cold_slots_;
+    size_t hotset_cold_cursor_ = 0;
+    bool hotset_ring_ = true;
+    int hotset_cold_policy_ = 2; // 0 full LRU, 1 FIFO experiment, 2 cold-only LRU
+    std::list<int> hotset_cold_lru_;
+    std::vector<std::list<int>::iterator> hotset_cold_iters_;
+    std::vector<bool> hotset_cold_member_;
+    struct PendingHotset { int key, slot; HostExpertLease source; sycl::event ready; };
+    std::vector<PendingHotset> hotset_pending_;
     std::vector<ops::MoeExpertSlotDev> resident_descriptors_host_;
     std::vector<uint64_t> resident_descriptor_generations_;
     std::vector<int> resident_indices_host_;

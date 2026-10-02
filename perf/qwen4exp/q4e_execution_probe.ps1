@@ -5,6 +5,16 @@ param(
     [switch]$IntegerDeviceProfile,
     [ValidateSet(0,1,2)][int]$ResidentDecode=0,
     [ValidateSet(0,1,2)][int]$ColdMode=0,
+    [string]$HotsetProfile="",
+    [string]$HotsetExport="",
+    [ValidateRange(0,1024)][int]$HotsetInterval=4,
+    [ValidateRange(0,512)][int]$HotsetSwaps=96,
+    [int]$HotsetSlots=0,
+    [switch]$HotsetBorrow,
+    [ValidateSet(-1,0,1)][int]$HotsetRing=-1,
+    [ValidateSet(-1,0,1,2)][int]$HotsetColdQueue=-1,
+    [ValidateSet(0,1,2,3)][int]$ColdPolicy=0,
+    [ValidateRange(0,256)][int]$ColdPcieNum=141,
     [switch]$ResidentPrefill,
     [switch]$ColdBench,
     [switch]$ColdQuality,
@@ -47,6 +57,7 @@ param(
     [int]$MaxTokens=48,
     [ValidateRange(2,8)][int]$GenerationRepeats=4,
     [string]$GenerationPromptFile="",
+    [string[]]$GenerationPromptFiles=@(),
     [ValidateRange(512,4096)][int]$GenerationMaxSeq=512,
     [ValidateRange(2,8)][int]$MemoryRepeats=2,
     [ValidateSet(256,512,1024,2052)][int]$MemoryTokens=256,
@@ -91,6 +102,18 @@ if($ColdMode -or $ColdBench -or $ColdQuality) {
     $overrides.AILA_Q4E_CPU_MAX_EXPERTS=[string]$ColdCredits
     $overrides.AILA_Q4E_COLD_BUDGET_US=[string]$ColdBudgetUs
 }
+if($HotsetProfile) {$overrides.AILA_Q4E_HOTSET_PROFILE=(Resolve-Path -LiteralPath $HotsetProfile).Path}
+if($HotsetExport) {$overrides.AILA_Q4E_HOTSET_EXPORT=$HotsetExport}
+if($HotsetProfile) {
+    $overrides.AILA_Q4E_HOTSET_INTERVAL=[string]$HotsetInterval
+    $overrides.AILA_Q4E_HOTSET_SWAPS=[string]$HotsetSwaps
+    $overrides.AILA_Q4E_HOTSET_BORROW=[string][int][bool]$HotsetBorrow
+    if($HotsetRing -ge 0) {$overrides.AILA_Q4E_HOTSET_RING=[string]$HotsetRing}
+    if($HotsetColdQueue -ge 0) {$overrides.AILA_Q4E_HOTSET_COLD_QUEUE=[string]$HotsetColdQueue}
+    if($HotsetSlots) {$overrides.AILA_Q4E_HOTSET_SLOTS=[string]$HotsetSlots}
+}
+$overrides.AILA_Q4E_COLD_POLICY=[string]$ColdPolicy
+$overrides.AILA_Q4E_COLD_PCIE_NUM=[string]$ColdPcieNum
 if($ResidentPrefill) {$overrides.AILA_Q4E_RESIDENT_PREFILL="1"}
 if($ColdLowRank) {$overrides.AILA_Q4E_COLD_LOW_RANK="1"}
 if($ColdDiagnostic) {$overrides.AILA_Q4E_COLD_DIAGNOSTIC="1"}
@@ -133,10 +156,27 @@ if($Workload -eq "generation") {
         "/clear"
         $text
     }
+    if($GenerationPromptFiles.Count) {
+        $commands=foreach($source in $GenerationPromptFiles) {
+            $trainingMessages=@(Get-Content -Raw -LiteralPath $source | ConvertFrom-Json)
+            if($trainingMessages.Count -ne 1 -or $trainingMessages[0].role -ne 'user') {throw 'Calibration requires single user messages'}
+            for($i=0;$i -lt $GenerationRepeats;$i++) {
+                '/clear'
+                ($trainingMessages[0].content -replace '[\r\n]+',' ')
+            }
+        }
+    }
     @($commands)+@("/quit") | Set-Content -LiteralPath $stdinPath -Encoding utf8NoBOM
     $arguments=@("-m",$ModelDir,"--max-seq",[string]$GenerationMaxSeq,"--greedy","--thinking-budget","0","--max-tokens",[string]$MaxTokens,"--stream","--stream-chunk","1","--decode-chunk","1")
     $inputIdentity=@{kind="cli_stream_generation";sha256=(Get-FileHash $prompt).Hash;stdin_sha256=(Get-FileHash $stdinPath).Hash;repeats=$GenerationRepeats;max_tokens=$MaxTokens;source_sha256=(Get-FileHash (Join-Path $repo "src/cli/CLI.cpp")).Hash}
     if($GenerationMaxSeq -ne 512) {$inputIdentity.max_seq=$GenerationMaxSeq}
+    if($GenerationPromptFiles.Count) {
+        $inputIdentity.Remove('sha256')
+        $inputIdentity.kind='cli_stream_calibration_corpus'
+        $inputIdentity.requests=$GenerationRepeats*$GenerationPromptFiles.Count
+        $inputIdentity.corpus=@($GenerationPromptFiles | ForEach-Object {
+        @{path=(Resolve-Path -LiteralPath $_).Path;sha256=(Get-FileHash -LiteralPath $_).Hash}
+    })}
 }
 if($Workload -eq "preset") {
     $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
@@ -301,6 +341,7 @@ $meta=[ordered]@{
     diagnostic_only=[bool]($Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
 }
 $launcher=$exe
+if($HotsetProfile) {$meta.hotset_profile=@{path=(Resolve-Path -LiteralPath $HotsetProfile).Path;sha256=(Get-FileHash -LiteralPath $HotsetProfile).Hash}}
 if($ColdQuality) {$meta.diagnostic_only=$true;$meta.workload="cold_quality"}
 if($ColdBench) {$meta.workload="cold_bench"}
 if($Vtune -or $VtuneInstructions) {
@@ -330,6 +371,7 @@ try {
     $proc.WaitForExit()
 }
 $meta.exit_code=$proc.ExitCode
+if($HotsetExport -and (Test-Path -LiteralPath $HotsetExport)) {$meta.hotset_export=@{path=$HotsetExport;sha256=(Get-FileHash -LiteralPath $HotsetExport).Hash}}
 if($samples.Count) {
     $meta.peak_working_set_bytes=($samples | Measure-Object working_set_bytes -Maximum).Maximum
     $meta.peak_child_working_set_bytes=($samples | Measure-Object child_working_set_bytes -Maximum).Maximum

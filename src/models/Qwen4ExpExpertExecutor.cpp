@@ -200,6 +200,8 @@ void Qwen4ExpExpertExecutor::init(
     consecutive_stragglers_ = 0;
     cpu_retry_countdown_ = 0;
     cold_budget_ns_ = 1000.0 * std::clamp(aila::env::read_int("AILA_Q4E_COLD_BUDGET_US",1000),100,10000);
+    cold_policy_=std::clamp(aila::env::read_int_raw("AILA_Q4E_COLD_POLICY",0),0,3);
+    cold_pcie_num_=std::clamp(aila::env::read_int_raw("AILA_Q4E_COLD_PCIE_NUM",141),0,256);
     for (int n=0;n<=16;++n) cold_cost_ns_[n]=100000.0+400000.0*n;
     if (aila::env::read_flag("AILA_Q4E_CPU_OVERLAP", false) || aila::env::read_int("AILA_Q4E_COLD_MODE",0)>0) {
         const int threads = std::clamp(aila::env::read_int("AILA_Q4E_CPU_THREADS", 2), 1, 12);
@@ -220,17 +222,22 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
     if (prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
     prev_cpu_h2d_ev_={}; active_cpu_leases_.clear(); cold_layer_=route.layer;
     int gpu_count=0;
+    const bool retry=cold_policy_==2 && (++cold_batches_seen_%32==0);
     try {
         std::array<HostExpertLease,16> chosen;
         int selected=0;
         static const bool low_rank=aila::env::read_flag("AILA_Q4E_COLD_LOW_RANK",false);
         for(int scan=0;scan<route.cold_count;++scan) {
-            const int i=low_rank?route.cold_count-1-scan:scan;
+            const int i=low_rank && cold_policy_!=3?route.cold_count-1-scan:scan;
+            // Strata reserves the last floor(nmiss * fraction) routed misses
+            // for GPU PCIe work. CPU-ineligible host misses also fall back to GPU.
+            if(cold_policy_==3 && i>=route.cold_count-((route.cold_count*cold_pcie_num_)>>8))continue;
             const int e=route.cold_ids[i];
             const auto residency=cache_->query_residency(route.layer,e);
             if (!residency.gpu_ready && !residency.gpu_copying && residency.host_ready) {
                 ++stats_.cold_eligible;
-                if(selected<std::min(16,max_cpu_credits_) && cold_cost_ns_[selected+1]<=cold_budget_ns_) {
+                if(selected<std::min(16,max_cpu_credits_) &&
+                    (cold_policy_==1 || cold_policy_==3 || retry || cold_cost_ns_[selected+1]<=cold_budget_ns_)) {
                     auto lease=cache_->acquire_host_lease(route.layer,e);
                     if(lease.is_valid()) {
                         chosen[i]=std::move(lease);++selected;
@@ -269,7 +276,14 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     stats_.cpu_compute_ns+=result.end_ns-result.begin_ns;
     const auto completion_ns=result.end_ns-cold_submit_ns_;
     stats_.cold_queue_ns+=(result.begin_ns-cold_submit_ns_)-std::min(result.activation_ns,result.begin_ns-cold_submit_ns_);
-    cold_cost_ns_[cold_count_]=0.8*cold_cost_ns_[cold_count_]+0.2*double(completion_ns);
+    const double measured=cold_policy_==2?double(result.end_ns-result.begin_ns):double(completion_ns);
+    cold_cost_ns_[cold_count_]=0.8*cold_cost_ns_[cold_count_]+0.2*measured;
+    if(cold_policy_==2) {
+        // A fresh completed batch also informs larger, stale buckets. Retries
+        // remain bounded by max_cpu_credits_, with only one batch outstanding.
+        for(int n=cold_count_+1;n<=16;++n)
+            cold_cost_ns_[n]=0.95*cold_cost_ns_[n]+0.05*measured*n/cold_count_;
+    }
     if(cache_->tracing()) {
         cache_->trace_host_interval("cold_cpu_compute",cold_layer_,result.begin_ns,result.end_ns);
         cache_->trace_host_interval("cold_cpu_join",cold_layer_,join,steady_ns());

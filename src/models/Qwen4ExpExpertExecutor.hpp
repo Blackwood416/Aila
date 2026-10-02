@@ -232,6 +232,9 @@ private:
     int cold_count_ = 0, cold_layer_ = -1;
     uint64_t cold_submit_ns_ = 0;
     double cold_budget_ns_ = 1000000.0;
+    int cold_policy_ = 0; // 0 C1 budget, 1 all host-Ready cold, 2 recoverable budget, 3 Strata PCIe fraction
+    int cold_pcie_num_ = 141; // 0.55 rounded to 256ths, explicitly selected candidate
+    uint64_t cold_batches_seen_ = 0;
 };
 
 } // namespace aila

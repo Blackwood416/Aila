@@ -38,15 +38,48 @@ def validate(rows):
     routed, acquired = {}, {}
     direct, leased = None, set()
     frozen = set()
+    epoch_loading = False
+    pending = {}
+    cold_ring, cold_cursor = [], 0
     for r in rows[1:]:
         kind = r["type"]
-        if kind == "freeze":
+        if kind == 'epoch_load_begin':
+            require(forward is None and acquire is None and direct is None and not frozen and not pending, 'Unsafe profile refill boundary')
+            epoch_loading = True
+            forward = dict(r, hits=0, misses=0, bytes=0, host_hits=0, file_fills=0,
+                acquire_ns=0, fill_ns=0, prefetch_wait_ns=0, layers={}, acquire_calls=0)
+        elif kind == 'epoch_protect':
+            require(epoch_loading and acquire is None and all(slots[s]>=0 and s not in frozen for s in r['slots']), 'Invalid profile protection')
+            frozen.update(r['slots'])
+        elif kind == 'epoch_load_end':
+            require(epoch_loading and acquire is None and direct is None, 'Unfinished profile refill')
+            epoch_loading, forward = False, None
+            cold_ring, cold_cursor = [s for s in range(cap) if s not in frozen], 0
+        elif kind == 'epoch_retire':
+            s = r['slot']
+            require(forward is None and s in frozen and s not in pending and slots[s]==r['old_key'], 'Invalid epoch retirement')
+            require(r['key']//experts==r['old_key']//experts, 'Cross-layer swap')
+            del resident[slots[s]]
+            slots[s] = -1
+            pending[s] = r['key']
+        elif kind == 'epoch_borrow':
+            require(forward is None and not pending and set(r['slots']) <= frozen, 'Unsafe prefill borrowing')
+            frozen.difference_update(r['slots'])
+            cold_ring, cold_cursor = [s for s in range(cap) if s not in frozen], 0
+        elif kind == 'epoch_publish':
+            s = r['slot']
+            require(forward is None and s in frozen and pending.get(s)==r['key'] and r['key'] not in resident, 'Invalid epoch publication')
+            slots[s] = r['key']
+            resident[r['key']] = s
+            del pending[s]
+        elif kind == "freeze":
             require(acquire is None and direct is None and not frozen, "Invalid freeze boundary")
             require(len(set(r['slots'])) == len(r['slots']) and all(0 <= s < cap and slots[s] >= 0 for s in r['slots']), "Invalid frozen slots")
             frozen = set(r['slots'])
         elif kind == "thaw":
             require(acquire is None and direct is None, "Thaw with active readers")
             frozen.clear()
+            cold_ring, cold_cursor = [], 0
         elif kind == "discard":
             s = r['slot']
             require(acquire is None and 0 <= s < cap and s not in frozen and s not in leased and slots[s] >= 0, "Invalid transient discard")
@@ -103,7 +136,7 @@ def validate(rows):
             require(not r["pinned"], "Pinned traces require a pin event schema")
             require(r["forward"] == forward["forward"], "Wrong forward id")
             acquire = r
-            if not r.get("touch_hits",1):
+            if not r.get("touch_hits",1) and not epoch_loading:
                 require(direct and not direct["cold_acquired"] and r["layer"] == direct["layer"] and r["ids"] == direct["cold_ids"], "Wrong cold transaction")
                 direct["cold_acquired"] = True
             forward["acquire_calls"] += 1
@@ -125,8 +158,19 @@ def validate(rows):
             require(acquire and r["acquire"] == acquire["acquire"], "Orphan victim")
             eligible = [s for s in lru if s not in reserved and s not in frozen]
             c, backed = r["candidates"], r["backed"]
-            require(c == eligible[:len(c)] and len(c) <= 8 and len(c) == len(backed), "LRU candidate window mismatch")
-            if cfg["cost_aware"] and cfg["host_slots"]:
+            require(len(c)==len(backed) and len(c)<=8, 'Invalid candidate observations')
+            if r.get('transient_ring'):
+                require(cold_ring and not c and not backed, 'Invalid transient ring')
+                chosen = None
+                for _ in cold_ring:
+                    candidate = cold_ring[cold_cursor]
+                    cold_cursor = (cold_cursor+1)%len(cold_ring)
+                    if candidate not in reserved:
+                        chosen = candidate
+                        break
+                require(chosen is not None and chosen not in frozen, 'Transient ring exhausted')
+            elif cfg["cost_aware"] and cfg["host_slots"]:
+                require(c == eligible[:len(c)] and len(c) <= 8 and len(c) == len(backed), "LRU candidate window mismatch")
                 require(bool(c), "Missing cost-aware observations")
                 chosen = c[0]
                 for i, s in enumerate(c):
@@ -180,7 +224,7 @@ def validate(rows):
             require(forward and r['forward']==forward['forward'] and r['clock']=='sycl_event' and r['end']>=r['start'], "Invalid device interval")
         else:
             raise ValueError(f"Unknown event {kind}")
-    require(forward is None and acquire is None and direct is None and totals, "Truncated trace")
+    require(forward is None and acquire is None and direct is None and not pending and not epoch_loading and totals, "Truncated trace")
     return totals
 
 

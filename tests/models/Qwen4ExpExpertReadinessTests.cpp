@@ -14,6 +14,10 @@
 #include <thread>
 
 struct Qwen4ExpResidentTestAccess {
+    static void Adaptive(Qwen4ExpExpertCache& cache,const std::vector<int>& keys) {
+        cache.hotset_policy_.Init(2,8);cache.hotset_keys_=keys;cache.hotset_swaps_=1;
+        cache.adaptive_hotset_=true;cache.hotset_borrow_=true;cache.InstallHotset(keys);
+    }
     static void HoldCopy(Qwen4ExpExpertCache& cache, int slot, std::shared_future<void> signal) {
         cache.gpu_slot_records_[slot].state = ExpertSlotState::Copying;
         cache.gpu_slot_records_[slot].dma_event = cache.copy_q_->submit([&](sycl::handler& cgh) {
@@ -1110,6 +1114,37 @@ void test_frozen_transient(Context& ctx) {
     std::cout<<"[C1 CACHE PASS] frozen_identity=1 transient_no_admission=1 reader_fence=1 capacity_reject=1 thaw=1\n";
 }
 
+void test_adaptive_hotset(Context& ctx) {
+    SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    const size_t slot_bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    expect(cache.init(ctx,weights,2,4*slot_bytes,8,256,64,64,&error,true),error);
+    cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);cache.set_layer_expert_ref(1,synth.gu_ref,synth.dn_ref);
+    Qwen4ExpResidentTestAccess::Adaptive(cache,{0,8});
+    expect(cache.stats().hit_count==0 && cache.stats().miss_count==0 && cache.stats().acquire_calls==0,
+        "Profile maintenance polluted routed demand/prefetch hit rate");
+    cache.EnableResidentDeviceTables();cache.BeginResidentDeviceEpoch();
+    const int incoming=2;const auto old=cache.query_residency(0,0);
+    cache.ObserveHotsetRoute(0,&incoming,1,1);cache.ObserveHotsetRoute(0,&incoming,1,1);
+    {auto lease=cache.BindReady(0,&incoming,1);expect(!lease.ready_count,"Incoming must start cold");}
+    cache.RebalanceHotset();
+    expect(!cache.IsDirectReady(0,0) && !cache.IsDirectReady(0,2),"Pending refill exposed old/new identity");
+    expect(!cache.ValidateReadyBinding(0,0,old.gpu_slot,old.gpu_generation),"Retired generation remained valid");
+    cache.PublishHotsetPending(true);cache.BeginResidentDeviceEpoch();
+    expect(cache.IsDirectReady(0,2) && cache.IsDirectReady(1,0),"Wrong layer or missing adaptive admission");
+    std::array<uint8_t,32> payload{};auto slot=cache.query_residency(0,2).gpu_slot;
+    ctx.memcpy_d2h(payload.data(),cache.get_slot_dev(slot).gate_up_packed,payload.size());
+    expect(!std::memcmp(payload.data(),synth.gu_packed_host.data()+2*synth.gu_packed_per_exp,payload.size()),"Published payload mismatches incoming expert");
+    const auto identity=cache.FrozenIdentity();
+    cache.BeginHotsetForward(0,12);expect(cache.frozen_slots()==0,"Prefill did not borrow tier");
+    int ids[4]={3,4,5,6},slots[4];cache.acquire(1,ids,4,slots).wait_and_throw();
+    cache.BeginHotsetForward(12,1);
+    expect(cache.FrozenIdentity()==identity && cache.IsDirectReady(0,2),"Prefill handoff failed to restore evolved tier");
+    const auto& policy=cache.hotset_policy();
+    expect(policy.decode[2]==2 && policy.prefill[2]==0 && policy.unique[2]==2,"Frequency accounting changed with placement");
+    expect(cache.stats().epoch_swaps==1 && cache.stats().epoch_refill_bytes>0,"Refill costs omitted");
+    std::cout<<"[H4 CACHE PASS] retired_generation=1 publish_after_dma=1 payload=1 same_layer=1 borrow_restore=1\n";
+}
+
 } // namespace
 
 int main() {
@@ -1134,6 +1169,7 @@ int main() {
         test_active_gpu_experts_greater_than_16(ctx);
         test_direct_ready_lease(ctx);
         test_frozen_transient(ctx);
+        test_adaptive_hotset(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");
