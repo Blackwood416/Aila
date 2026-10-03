@@ -1303,7 +1303,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // Decode-time speculative prefetch of layer L+1 experts (predicted from layer L's MoE input)
     // overlapping host fill + PCIe DMA with GPU compute of layer L+1's attention.
     static const bool configured_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH", true);
-    const bool s_prefetch = configured_prefetch;
+    // Prediction is a supply policy, independent of the real router. Allow
+    // decoding to stop speculative file fills while retaining prefill overlap.
+    static const bool decode_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_DECODE", true);
+    static const bool prefill_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_PREFILL", true);
+    const bool is_prefill = options.prefill_remaining >= 0 || count > 1;
+    const bool s_prefetch = configured_prefetch && (is_prefill ? prefill_prefetch : decode_prefetch);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.

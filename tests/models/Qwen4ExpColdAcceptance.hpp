@@ -131,7 +131,9 @@ void test_cold_model(const std::string& directory,bool benchmark) {
         expect(ctx.device_allocation_count()==device_count && ctx.pinned_host_allocation_count()==host_count,"Cold decode allocated USM");
         expect(after.direct_entries-before.direct_entries+after.cold_request_entries-before.cold_request_entries==48ULL*48*10,"Cold route coverage");
         if(!adaptive)expect(cache.FrozenIdentity()==identity,"Frozen set drift");
-        else expect(after.epoch_swaps>before.epoch_swaps,"H4 did not adapt during decode");
+        else if(aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS",96)>0)
+            expect(after.epoch_swaps>before.epoch_swaps,"H4 did not adapt during decode");
+        else expect(after.epoch_swaps==before.epoch_swaps,"Disabled online admission changed the hotset");
         expect(session.snapshot_for_testing(anchor),"Cold checkpoint missing");auto snapshot=*session.snapshot_for_testing(anchor);
         const auto original=extract_bf16_to_f32(ctx,Access::Logits(backend));
         for(int pass=0;pass<2;++pass) {

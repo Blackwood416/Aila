@@ -52,6 +52,8 @@ param(
     [switch]$MtpCompareResident,
     [string]$MtpPromptFile="",
     [switch]$NoPrefetch,
+    [ValidateSet(-1,0,1)][int]$DecodePrefetch=-1,
+    [ValidateSet(-1,0,1)][int]$PrefillPrefetch=-1,
     [switch]$Profile,
     [switch]$Stages,
     [switch]$SmallRowsDecode,
@@ -100,6 +102,8 @@ if($RuntimeDefaults) {
 }
 if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$InlineCheckpoint}
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
+if($DecodePrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_DECODE=[string]$DecodePrefetch}
+if($PrefillPrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_PREFILL=[string]$PrefillPrefetch}
 if($PSBoundParameters.ContainsKey('ResidentDecode')) {$overrides.AILA_Q4E_RESIDENT_DECODE=[string]$ResidentDecode}
 if($ColdMode -or $ColdBench -or $ColdQuality) {
     $overrides.AILA_Q4E_COLD_MODE=[string]$(if($ColdMode){$ColdMode}else{1})
