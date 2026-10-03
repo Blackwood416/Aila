@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：以容差为契约的 XMX Prefill 优化方案
 
+2026-10-03 最新进展：[H6 Ready物理槽接管与供给复核](qwen3.8-flash-next-hotset-h6-ready-results-2026-10-03.md)。接管无需额外H2D，短/长GPU teacher48逐位一致，CPU平均KL约0.00185/0.00225，checkpoint/取消恢复通过。三组同二进制跨域对照未获稳定端到端净收益；长文需求/epoch流量下降，GPU冷供给和prefetch等待仍需治理。候选默认关闭、32 GiB预算与原preset不变，R2b仍暂停，100+/20目标尚未完成。下文保留历史结果。
+
 2026-10-02 最新进展：[H4/C2首轮迁移与验收完成](qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md)。GPU teacher forcing逐位一致，CPU短/长平均KL约0.00188/0.00232，无NLL预警，checkpoint/取消恢复通过。长文暖TTFT约19.99秒、有效输入/TTFT约91.7 tok/s，decode中位数11.3；尚未达到100+/20。profile与自适应需要计入初装/借槽恢复/适应成本，候选显式开启、32 GiB预算不变，R2b尚未恢复。以下保留历史结果。
 
 2026-10-02 最新进展：[C1/H3 首轮完成](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同冻结热集 CPU cold 的短/长 decode 中位数7.86/7.63 tok/s，仍低于原动态13.90/8.75；H3 未取得稳定吞吐收益。冻结集合的同prompt暖长TTFT约20.3秒，但有前置校准成本，不能作为冷启动或跨域100+ prefill的结论。代表性质量与状态检查通过，候选默认关闭；下一步H4/C2，R2b继续暂停，保持32 GiB研究预算。

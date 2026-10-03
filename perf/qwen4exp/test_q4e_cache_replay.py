@@ -32,6 +32,39 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_adoption_keeps_separate_cold_lru_position(self):
+        rows=[dict(type='config',schema=1,slots=3,experts=8,layers=1,host_slots=0,cost_aware=0,slot_bytes=64),
+              dict(type='forward_begin',forward=1,position=0,tokens=4,ns=0),
+              dict(type='acquire_begin',forward=1,acquire=1,layer=0,ids=[0,1,2],initial_slots=[-1]*3,host_states=[0]*3,pinned=0),
+              dict(type='victim',acquire=1,slot=2,key=0,old_key=-1,candidates=[],backed=[]),
+              dict(type='victim',acquire=1,slot=1,key=1,old_key=-1,candidates=[],backed=[]),
+              dict(type='victim',acquire=1,slot=0,key=2,old_key=-1,candidates=[],backed=[]),end(1,0,3),
+              dict(type='freeze',slots=[2]),
+              dict(type='acquire_begin',forward=1,acquire=2,layer=0,ids=[2],initial_slots=[0],host_states=[0],pinned=0),end(2,1,0),
+              dict(type='ready_adopt',slot=0,victim=2,key=2,old_key=0,generation=1),
+              dict(type='acquire_begin',forward=1,acquire=3,layer=0,ids=[3],initial_slots=[-1],host_states=[0],pinned=0),
+              dict(type='victim',acquire=3,slot=1,key=3,old_key=1,candidates=[],backed=[]),end(3,0,1),
+              dict(type='forward_end',forward=1,position=0,tokens=4,ns=100)]
+        self.assertEqual(validate(copy.deepcopy(rows),cold_queue=2)[0]['misses'],4)
+        with self.assertRaisesRegex(ValueError,'Victim mismatch'):validate(copy.deepcopy(rows))
+
+    def test_ready_adoption_preserves_payload_and_tier_capacity(self):
+        rows=fixture()[:6]+[
+            dict(type='freeze',slots=[1]),
+            dict(type='ready_adopt',slot=0,victim=1,key=1,old_key=0,generation=1),
+            dict(type='discard',slot=1),
+            dict(type='forward_end',forward=1,position=0,tokens=2,ns=100)]
+        self.assertEqual(validate(copy.deepcopy(rows))[0]['ready_adoptions'],1)
+        for patch,reason in ((dict(slot=1),'Unsafe ready adoption'),
+                             (dict(old_key=7),'identity mismatch'),
+                             (dict(key=9),'identity mismatch')):
+            bad=copy.deepcopy(rows);bad[7].update(patch)
+            with self.assertRaisesRegex(ValueError,reason):validate(bad)
+        bad=copy.deepcopy(rows);bad[8]['slot']=0
+        with self.assertRaisesRegex(ValueError,'Invalid transient discard'):validate(bad)
+        bad=copy.deepcopy(rows);bad.insert(7,dict(type='direct_bind',forward=1,layer=0,ids=[0],initial_slots=[1],direct_slots=[1],cold_ids=[]))
+        with self.assertRaisesRegex(ValueError,'Unsafe ready adoption'):validate(bad)
+
     def test_prompt_target_must_match_published_tier(self):
         for kind in ('prompt_handoff','prefill_handoff'):
             rows=fixture()+[dict(type='freeze',slots=[1]),dict(type=kind,keys=[0])]

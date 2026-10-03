@@ -13,6 +13,8 @@ param(
     [switch]$HotsetBorrow,
     [switch]$HotsetPrompt,
     [switch]$HotsetPromptPrefill,
+    [switch]$HotsetAdoptReady,
+    [ValidateRange(0,4096)][int]$HotsetAdoptLimit=96,
     [ValidateRange(0,4096)][int]$HotsetPromptSwaps=1024,
     [ValidateSet(-1,0,1)][int]$HotsetRing=-1,
     [ValidateSet(-1,0,1,2)][int]$HotsetColdQueue=-1,
@@ -113,6 +115,8 @@ if($HotsetProfile) {
     $overrides.AILA_Q4E_HOTSET_BORROW=[string][int][bool]$HotsetBorrow
     $overrides.AILA_Q4E_HOTSET_PROMPT=[string][int][bool]$HotsetPrompt
     $overrides.AILA_Q4E_HOTSET_PROMPT_PREFILL=[string][int][bool]$HotsetPromptPrefill
+    $overrides.AILA_Q4E_HOTSET_ADOPT_READY=[string][int][bool]$HotsetAdoptReady
+    $overrides.AILA_Q4E_HOTSET_ADOPT_LIMIT=[string]$HotsetAdoptLimit
     $overrides.AILA_Q4E_HOTSET_PROMPT_SWAPS=[string]$HotsetPromptSwaps
     if($HotsetRing -ge 0) {$overrides.AILA_Q4E_HOTSET_RING=[string]$HotsetRing}
     if($HotsetColdQueue -ge 0) {$overrides.AILA_Q4E_HOTSET_COLD_QUEUE=[string]$HotsetColdQueue}

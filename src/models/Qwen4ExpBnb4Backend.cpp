@@ -1592,7 +1592,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 }
                 last = RunGroupedExperts(ctx, L, count, u, n, actStart, tileStart, grouped_min, ready);
                 if(binding)binding->Finish(last);
-                expert_cache_.DiscardTransient(prefill_unique_slots_.data()+u,n);
+                expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data()+u,n);
                 u+=n;
             }
             ops::moe_ordered_accumulate_down_rows(ctx, buf_.moe_down_acc.data_as<float>(), batch_weights_dev_,
@@ -1861,7 +1861,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                             prefill_unique_slots_.data() + u, static_cast<int>(chunk_u), dn_event);
                         last_dn_event = dn_event;
                         if(binding)binding->Finish(dn_event);
-                        expert_cache_.DiscardTransient(prefill_unique_slots_.data()+u,int(chunk_u));
+                        expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data()+u,int(chunk_u));
                     }
                     u += chunk_u;
                 }
@@ -2054,7 +2054,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
                 expert_cache_.record_consumer_reader_fences(
                     prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
-                expert_cache_.DiscardTransient(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
+                expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
             }
         } else if (batch_acquire && s_prefill_moe_rows && count > 1) {
             for (int t = 0; t < count; ++t) {
@@ -2087,7 +2087,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
             expert_cache_.record_consumer_reader_fences(
                 prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
-            expert_cache_.DiscardTransient(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
+            expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
         } else {
             static const bool s_ready_first = aila::env::read_flag("AILA_Q4E_READY_FIRST", false);
             bool hetero_executed = false;
@@ -2290,9 +2290,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
     if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count,options.prefill_remaining);
     if(expert_cache_.adaptive_hotset()) {const auto& hs=expert_cache_.stats();
-        AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu",
+        AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu ready_adoptions=%llu ready_adoption_ns=%llu",
             start_pos,count,expert_cache_.frozen_slots(),(unsigned long long)hs.epoch_swaps,
-            (unsigned long long)hs.epoch_refill_bytes,(unsigned long long)hs.epoch_refill_ns,(unsigned long long)hs.epoch_publishes);
+            (unsigned long long)hs.epoch_refill_bytes,(unsigned long long)hs.epoch_refill_ns,(unsigned long long)hs.epoch_publishes,
+            (unsigned long long)hs.ready_adoptions,(unsigned long long)hs.ready_adoption_ns);
     }
 
     if (expert_histogram_enabled_ && count > 1) {

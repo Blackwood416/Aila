@@ -14,6 +14,8 @@
 #include <thread>
 
 struct Qwen4ExpResidentTestAccess {
+    static void ColdPolicy(Qwen4ExpExpertCache& cache,int policy) {cache.hotset_cold_policy_=policy;cache.RefreshHotsetColdSlots();}
+    static void Adopt(Qwen4ExpExpertCache& cache,int limit) {Prompt(cache);cache.hotset_adopt_ready_=true;cache.hotset_adopt_limit_=limit;cache.hotset_prompt_swaps_=0;}
     static void Prompt(Qwen4ExpExpertCache& cache) {cache.hotset_prompt_=true;cache.hotset_prompt_swaps_=2;}
     static void PromptPrefill(Qwen4ExpExpertCache& cache) {Prompt(cache);cache.hotset_prompt_prefill_=true;}
     static void Adaptive(Qwen4ExpExpertCache& cache,const std::vector<int>& keys) {
@@ -1188,6 +1190,58 @@ void test_prompt_prefill(Context& ctx) {
     std::cout<<"[H5 PREFILL PASS] chunk_admission=1 final_chunk_skip=1 decode_tier_preserved=1\n";
 }
 
+void test_ready_adoption(Context& ctx) {
+    for(int cold_policy=0;cold_policy<=2;++cold_policy) {
+        SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+        const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+        expect(cache.init(ctx,weights,2,12*bytes,8,256,64,64,&error,true),error);
+        for(int l=0;l<2;++l)cache.set_layer_expert_ref(l,synth.gu_ref,synth.dn_ref);
+        Qwen4ExpResidentTestAccess::Adaptive(cache,{0,1,2,3,8,9,10,11});
+        Qwen4ExpResidentTestAccess::Adopt(cache,1);
+        // Exercise all three physical cold-victim structures.
+        Qwen4ExpResidentTestAccess::ColdPolicy(cache,cold_policy);
+        cache.BeginHotsetForward(0,8,128);
+        cache.EnableResidentDeviceTables();cache.BeginResidentDeviceEpoch();
+        const int ids[8]={5,5,5,5,6,6,6,6};cache.ObserveHotsetRoute(0,ids,8,1);
+        int pending_id=6,pending_slot;cache.acquire(0,&pending_id,1,&pending_slot).wait_and_throw();
+        std::promise<void> release;auto signal=release.get_future().share();
+        Qwen4ExpResidentTestAccess::HoldCopy(cache,pending_slot,signal);
+        cache.RetirePrefillSlots(&pending_slot,1);
+        const bool rejected_copy=cache.stats().ready_adoptions==0 && !cache.IsDirectReady(0,6);
+        release.set_value();
+        expect(rejected_copy,"Pending DMA was admitted or waited on");
+        int protected_ids[4]={0,1,2,3};
+        {auto protected_tier=cache.BindReady(0,protected_ids,4);
+            expect(protected_tier.ready_count==4,"Protected fixture tier");
+            int id=5,slot;cache.acquire(0,&id,1,&slot).wait_and_throw();cache.RetirePrefillSlots(&slot,1);
+            expect(cache.stats().ready_adoptions==0 && !cache.contains(0,5),"Admission demoted an active lease");
+        }
+        const auto old=cache.query_residency(0,0);
+        int cold[2]={5,6},slots[2];cache.acquire(0,cold,2,slots).wait_and_throw();
+        const auto incoming=cache.query_residency(0,5);
+        // Demoted payload must remain protected by its outstanding real reader.
+        auto scratch=Tensor::allocate(ctx,{32},dnnl::memory::data_type::u8);
+        auto reader=ctx.queue().memcpy(scratch.data(),cache.get_slot_dev(old.gpu_slot).gate_up_packed,32);
+        cache.record_consumer_reader_fences(&old.gpu_slot,1,reader);
+        const auto before=cache.stats();cache.RetirePrefillSlots(slots,2);
+        expect(cache.stats().ready_adoptions==1 && cache.frozen_slots()==4,"Ready admission exceeded budget/capacity");
+        expect(cache.IsDirectReady(0,5) && !cache.IsDirectReady(0,0) && !cache.contains(0,6),"Ready admission/discard partition");
+        expect(cache.ValidateReadyBinding(0,5,incoming.gpu_slot,incoming.gpu_generation),"Admission moved incoming payload");
+        expect(cache.ValidateReadyBinding(0,0,old.gpu_slot,old.gpu_generation),"Demotion invalidated live payload");
+        expect(cache.stats().total_transferred_bytes==before.total_transferred_bytes && cache.stats().epoch_refill_bytes==before.epoch_refill_bytes,"Admission copied payload");
+        // Descriptor snapshot predating the demand fill cannot publish the new key.
+        {auto epoch=cache.BeginResidentLayer(0);int table[8];ctx.memcpy_d2h(table,cache.resident_layer_table(0),sizeof(table));expect(table[5]==-1,"Stale descriptor exposed promoted payload");}
+        cache.BeginResidentDeviceEpoch();
+        {auto epoch=cache.BeginResidentLayer(0);int table[8];ctx.memcpy_d2h(table,cache.resident_layer_table(0),sizeof(table));expect(table[5]==incoming.gpu_slot && table[0]==-1,"Updated device tier mismatches ownership");}
+        int replace[7]={0,1,2,3,4,6,7},replacement_slots[7];cache.acquire(1,replace,7,replacement_slots).wait_and_throw();
+        reader.wait_and_throw();std::array<uint8_t,32> readback{};ctx.memcpy_d2h(readback.data(),scratch.data(),32);
+        expect(!std::memcmp(readback.data(),synth.gu_packed_host.data(),32),"Demoted reader observed overwritten payload");
+        cache.BeginHotsetForward(8,1);
+        expect(cache.IsDirectReady(0,5) && cache.frozen_slots()==8,"Borrow restore undid ready adoption");
+    }
+    std::cout<<"[H6 READY PASS] no_copy=1 stable_generation=1 bounded_same_layer=1 cold_topology=1 descriptor_generation=1 reader_fence=1 borrow_restore=1\n";
+}
+
 void test_prompt_policy() {
     Qwen4ExpHotsetPolicy full,chunked;full.Init(1,8);chunked.Init(1,8);
     full.BeginPrompt();chunked.BeginPrompt();
@@ -1237,6 +1291,7 @@ int main() {
         test_adaptive_hotset(ctx);
         test_prompt_policy();
         test_prompt_prefill(ctx);
+        test_ready_adoption(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

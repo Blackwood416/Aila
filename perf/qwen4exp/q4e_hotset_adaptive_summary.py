@@ -42,6 +42,9 @@ def read(prefix):
         if '[GenerateMessages] Prompt=' in line:
             if last:
                 active['epoch'] = {k:last[k]-previous[k] for k in ('swaps','refill_bytes','refill_ns','publishes')}
+                for k in ('ready_adoptions','ready_adoption_ns'):
+                    if k in last:
+                        active['epoch'][k] = last[k]-previous.get(k,0)
                 previous = last
             samples.append(active); active = None
     assert len(samples)==len(run['requests'])
@@ -66,6 +69,7 @@ if __name__=='__main__':
             env.get('AILA_Q4E_COLD_POLICY','0'),env.get('AILA_Q4E_CPU_THREADS','0'),
             env.get('AILA_Q4E_COLD_BUDGET_US','0'),env.get('AILA_Q4E_COLD_PCIE_NUM','141'),
             env.get('AILA_Q4E_HOTSET_RING','legacy'),env.get('AILA_Q4E_HOTSET_COLD_QUEUE','legacy'),
+            env.get('AILA_Q4E_HOTSET_ADOPT_READY','0'),env.get('AILA_Q4E_HOTSET_ADOPT_LIMIT','96'),
             run['metadata']['exe_sha256']))
         groups.setdefault(key,[]).extend(run['requests'][1:])
     summary={key:dict(samples=len(rows),decode=[r['decode_tok_s'] for r in rows],

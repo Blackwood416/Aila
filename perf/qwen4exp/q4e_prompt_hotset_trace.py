@@ -7,8 +7,8 @@ from pathlib import Path
 from q4e_cache_replay import read_trace, validate
 
 
-def inspect(path):
-    raw=read_trace(path);forwards=validate(raw)
+def inspect(path, cold_queue=0):
+    raw=read_trace(path);forwards=validate(raw,cold_queue=cold_queue)
     by_id={r['forward']:r for r in forwards}
     timings=defaultdict(lambda:defaultdict(int))
     requests={};request=-1
@@ -40,6 +40,7 @@ def inspect(path):
         forwards=len(forwards),epoch_pairs=sum(r['type']=='epoch_retire' for r in raw),
         prompt_handoffs=sum(r['type']=='prompt_handoff' for r in raw),
         prefill_handoffs=sum(r['type']=='prefill_handoff' for r in raw),
+        ready_adoptions=sum(r['type']=='ready_adopt' for r in raw),cold_queue=cold_queue,
         decode_requests=result,
         limitations=['Host intervals include waits and submission, not pure GPU kernel execution.',
             'CPU compute/join are nested or concurrent with expert_acquire_submit: do not add them together.',
@@ -50,7 +51,9 @@ def inspect(path):
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('traces',nargs='+');ap.add_argument('--output',required=True)
+    ap.add_argument('--cold-queue',type=int,choices=(0,1,2),default=0,
+                    help='Use the queue policy recorded in the probe metadata')
     args=ap.parse_args()
-    result=[inspect(p) for p in args.traces]
+    result=[inspect(p,args.cold_queue) for p in args.traces]
     Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))

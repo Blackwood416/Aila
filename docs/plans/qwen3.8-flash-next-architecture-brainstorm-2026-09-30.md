@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：执行架构、量化计算与数据供给的下一轮设计
 
+2026-10-03 最新进展：[H6 Ready物理槽接管与供给复核](qwen3.8-flash-next-hotset-h6-ready-results-2026-10-03.md)。接管已付费取得的prefill冷槽、保持reader/generation和同层容量，避免接管H2D；补descriptor快照与独立cold LRU回归。三组30请求、长短质量和真实trace确认实现成立，但尚无稳定请求净收益。接管成本低不等于下游复用无等待，下一步结合consumer fence、host/CPU替代成本和prefetch竞争做admission。默认preset、32 GiB host pool不变，R2b仍暂停。以下保留历史记录。
+
 2026-10-02 最新进展：[H4/C2策略迁移与验收完成](qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md)。已实现profile预装、衰减热集自适应、异步换入、prefill借槽和独立冷区LRU，实际测试12线程CPU冷计算与Strata PCIe比例分流。长文暖decode 8.8→11.3 tok/s、整请求29.69→24.08秒；短后续请求达到15.6，但保留适应期和异常样本。质量/状态/回归通过，候选仍显式开启、32 GiB预算不变，R2b尚未恢复。以下为此前阶段记录。
 
 2026-10-02 最新进展：[C1/H3 首轮完成](qwen3.8-flash-next-hotset-c1-h3-results-2026-10-02.md)。同热集 CPU cold 有小幅 decode 收益，固定集合却明显损害 decode 命中；H3 的 acquire 减少尚无稳定净收益。短/长质量、状态和回归通过，保留额外续写的NLL预警、吞吐异常及profiling内存失败。候选默认关闭，下一步 H4/C2 的 profile/epoch/admission，R2b继续暂停。

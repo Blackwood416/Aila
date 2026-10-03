@@ -238,6 +238,7 @@ struct ExpertCacheStats {
     uint64_t resident_metadata_bytes = 0;
     uint64_t cpu_cold_entries = 0;
     uint64_t epoch_refill_bytes = 0, epoch_swaps = 0, epoch_refill_ns = 0, epoch_publishes = 0;
+    uint64_t ready_adoptions = 0, ready_adoption_ns = 0;
 
     double hit_rate() const {
         uint64_t total = hit_count + miss_count + cpu_cold_entries;
@@ -308,6 +309,8 @@ public:
     uint64_t FrozenIdentity() const;
     int frozen_slots() const { return frozen_count_; }
     void DiscardTransient(const int* slots, int count);
+    // H6: promote completed prefill payloads before retiring the cold batch.
+    void RetirePrefillSlots(const int* slots, int count);
     void TraceColdCpu(int layer,const int* ids,const int* ranks,int count);
     void TraceDeviceEvent(const char* label,int layer,sycl::event event);
     void ConfigureHotset();
@@ -603,6 +606,8 @@ private:
     bool hotset_prompt_ = false;
     int hotset_prompt_swaps_ = 1024;
     bool hotset_prompt_prefill_ = false;
+    bool hotset_adopt_ready_ = false;
+    int hotset_adopt_limit_ = 96, hotset_adopt_count_ = 0;
     bool hotset_explicit_prefill_ = false;
     std::vector<int> hotset_prefill_keys_;
     std::string hotset_identity_, hotset_export_;

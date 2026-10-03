@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：优先实现驻留专家直接执行与 hot expert set
 
+最新实施（H6，2026-10-03）：已完成[Ready物理槽接管候选与三组跨域对照](qwen3.8-flash-next-hotset-h6-ready-results-2026-10-03.md)。prefill冷槽可在退休前零额外H2D升入同层热集，保留地址/generation/fence，维护服务槽拓扑与device表；修复旧descriptor快照的layer mask缓存问题。6进程30请求没有稳定端到端净收益，流量下降未同步减少GPU冷供给/等待；候选仍默认关闭。短/长48步质量与状态检查通过，真实trace验证7405次接管；下一步将consumer复用等待、host backing/CPU替代与prefetch竞争纳入同一供给成本预算。保持32 GiB host pool，R2b继续暂停。
+
 最新实施（H5，2026-10-03）：已完成[prompt驱动热集候选与供给瓶颈复查](qwen3.8-flash-next-hotset-h5-results-2026-10-03.md)。当前prefill路由已能初始化在线usage、按相似度交接，并在chunk间更新临时热表；补充明确的prefill/生成尾部阶段边界。9个性能进程保留43个请求（其中2个阶段边界问题进程明确排除最终判断），短/长48步质量、checkpoint/取消恢复、6项CTest及边界复验、13项Python测试和真实trace通过。命中率提升尚未转化为稳定端到端收益：GPU冷供给量没有同步下降，epoch重装抵消了CPU等待节省。**下一步优先做层内Ready临时槽直接接管、按实际供给成本进行admission、需求与prefetch竞争治理，再考虑多prompt历史与GPU提交图/R2b。** 32 GiB预算及默认preset不变，R2b仍暂停；下文保留H4等历史记录。
 
 最新实施（H4/C2，2026-10-02）：已完成[Strata策略迁移与首轮验收](qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md)：Aila profile预装、4-forward/96-swap衰减自适应、异步retire/publish、3551热槽与prefill借槽、12线程CPU冷计算及PCIe比例分流、独立冷区LRU。19个性能进程保留全部61个请求；长文暖decode中位数8.8→11.3 tok/s，整请求29.69→24.08秒，有效输入/TTFT约91.7 tok/s。短输入后续达到15.6，但仍有适应成本；不宣称达到100+/20或冷启动普适收益。短/长质量、checkpoint/取消恢复、6项CTest及10项Python测试通过。32 GiB host pool不变，候选未写入默认preset，R2b尚未恢复。下一步补profile跨域覆盖，并将稳定descriptor用于GPU提交优化/R2b；下文的“下一步C1/H4”等保留为历史记录。

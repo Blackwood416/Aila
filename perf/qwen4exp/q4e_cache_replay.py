@@ -27,7 +27,7 @@ def read_trace(path):
     return rows
 
 
-def validate(rows):
+def validate(rows, cold_queue=0):
     cfg = rows[0]
     cap, experts = cfg["slots"], cfg["experts"]
     # Oldest first. Runtime starts with slots [0..cap-1], MRU first.
@@ -41,6 +41,7 @@ def validate(rows):
     epoch_loading = False
     pending = {}
     cold_ring, cold_cursor = [], 0
+    cold_lru = OrderedDict()
     for r in rows[1:]:
         kind = r["type"]
         if kind == 'epoch_load_begin':
@@ -55,6 +56,7 @@ def validate(rows):
             require(epoch_loading and acquire is None and direct is None, 'Unfinished profile refill')
             epoch_loading, forward = False, None
             cold_ring, cold_cursor = [s for s in range(cap) if s not in frozen], 0
+            cold_lru = OrderedDict((s,None) for s in lru if s not in frozen)
         elif kind == 'epoch_retire':
             s = r['slot']
             require(forward is None and s in frozen and s not in pending and slots[s]==r['old_key'], 'Invalid epoch retirement')
@@ -66,6 +68,7 @@ def validate(rows):
             require(forward is None and not pending and set(r['slots']) <= frozen, 'Unsafe prefill borrowing')
             frozen.difference_update(r['slots'])
             cold_ring, cold_cursor = [s for s in range(cap) if s not in frozen], 0
+            cold_lru = OrderedDict((s,None) for s in lru if s not in frozen)
         elif kind == 'epoch_publish':
             s = r['slot']
             require(forward is None and s in frozen and pending.get(s)==r['key'] and r['key'] not in resident, 'Invalid epoch publication')
@@ -80,10 +83,26 @@ def validate(rows):
             require(acquire is None and direct is None and not frozen, "Invalid freeze boundary")
             require(len(set(r['slots'])) == len(r['slots']) and all(0 <= s < cap and slots[s] >= 0 for s in r['slots']), "Invalid frozen slots")
             frozen = set(r['slots'])
+            cold_lru = OrderedDict((s,None) for s in lru if s not in frozen)
         elif kind == "thaw":
             require(acquire is None and direct is None, "Thaw with active readers")
             frozen.clear()
             cold_ring, cold_cursor = [], 0
+            cold_lru.clear()
+        elif kind == "ready_adopt":
+            s, v = r['slot'], r['victim']
+            require(forward is not None and acquire is None and not pending and
+                    0 <= s < cap and 0 <= v < cap and s not in frozen and v in frozen and
+                    s not in leased and v not in leased, 'Unsafe ready adoption')
+            require(slots[s] == r['key'] and slots[v] == r['old_key'] and
+                    r['key']//experts == r['old_key']//experts, 'Ready adoption identity mismatch')
+            frozen.remove(v)
+            frozen.add(s)
+            cold_ring = [v if slot == s else slot for slot in cold_ring]
+            if cold_queue == 2:
+                require(s in cold_lru and v not in cold_lru, 'Ready adoption cold topology mismatch')
+                cold_lru = OrderedDict((v if slot == s else slot,None) for slot in cold_lru)
+            forward['ready_adoptions'] = forward.get('ready_adoptions', 0) + 1
         elif kind == "discard":
             s = r['slot']
             require(acquire is None and 0 <= s < cap and s not in frozen and s not in leased and slots[s] >= 0, "Invalid transient discard")
@@ -123,7 +142,9 @@ def validate(rows):
             direct = dict(r, cold_ids=list(r['cold_ids']), cold_acquired=False)
             leased = {s for s in r["direct_slots"] if s >= 0}
             for s in dict.fromkeys(r["initial_slots"]):
-                if s >= 0: lru.move_to_end(s)
+                if s >= 0:
+                    lru.move_to_end(s)
+                    if s in cold_lru: cold_lru.move_to_end(s)
             ready = [e for e,d in zip(r["ids"],r["direct_slots"]) if d >= 0]
             acquired.setdefault(r["layer"], set()).update(ready)
             layer = forward["layers"].setdefault(r["layer"], defaultdict(int))
@@ -157,10 +178,13 @@ def validate(rows):
             for s in r["initial_slots"]:
                 if s >= 0 and s not in reserved:
                     reserved.add(s)
-                    if r.get("touch_hits",1): lru.move_to_end(s)
+                    if r.get("touch_hits",1):
+                        lru.move_to_end(s)
+                        if s in cold_lru: cold_lru.move_to_end(s)
         elif kind == "victim":
             require(acquire and r["acquire"] == acquire["acquire"], "Orphan victim")
-            eligible = [s for s in lru if s not in reserved and s not in frozen]
+            victim_lru = cold_lru if cold_queue == 2 and cold_lru else lru
+            eligible = [s for s in victim_lru if s not in reserved and s not in frozen]
             c, backed = r["candidates"], r["backed"]
             require(len(c)==len(backed) and len(c)<=8, 'Invalid candidate observations')
             if r.get('transient_ring'):
@@ -196,6 +220,7 @@ def validate(rows):
             resident[r["key"]] = chosen
             reserved.add(chosen)
             lru.move_to_end(chosen)
+            if chosen in cold_lru: cold_lru.move_to_end(chosen)
             acquire["victims"] += 1
         elif kind == "acquire_end":
             require(acquire and r["acquire"] == acquire["acquire"], "Orphan end")
@@ -215,6 +240,7 @@ def validate(rows):
                 s = resident.get(r["layer"] * experts + e)
                 if s is not None:
                     lru.move_to_end(s, last=False)
+                    if s in cold_lru: cold_lru.move_to_end(s,last=False)
         elif kind == "forward_end":
             require(forward and r["forward"] == forward["forward"] and acquire is None and direct is None, "Wrong forward end")
             if routed:
