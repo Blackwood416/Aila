@@ -19,7 +19,8 @@ enum class CpuKernelBackend {
     Avx2 = 2,
     TbbAvx2 = 3,
     GpuOrderAvx2 = 4, // experimental DG2 lane order, not a cross-device exactness guarantee
-    GpuOrderPreparedAvx2 = 5 // batch-only, shared lane-major inputs and register NF4 lookup
+    GpuOrderPreparedAvx2 = 5, // batch-only, shared lane-major inputs and register NF4 lookup
+    Nf4Q8Avx2 = 6 // experimental batch-only NF4 LUT + Q8 activations; approximate arithmetic
 };
 
 // Two flat parallel stages over all expert rows. Caller supplies [tasks,I] h,

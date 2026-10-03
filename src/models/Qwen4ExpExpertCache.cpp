@@ -397,6 +397,8 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     resident_index_uploads_ = std::move(other.resident_index_uploads_);
     stats_ = other.stats_;
     cost_aware_eviction_ = other.cost_aware_eviction_;
+    host_complement_ = other.host_complement_;
+    host_complement_scan_ = other.host_complement_scan_;
     cache_trace_ = std::move(other.cache_trace_);
     trace_forward_id_ = other.trace_forward_id_;
     trace_acquire_id_ = other.trace_acquire_id_;
@@ -404,6 +406,8 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     faulted_ = other.faulted_;
     fill_pool_ = std::move(other.fill_pool_);
     fill_parts_ = other.fill_parts_;
+    fill_short_parts_ = other.fill_short_parts_;
+    demand_forward_rows_ = other.demand_forward_rows_;
 
     host_pool_enabled_ = other.host_pool_enabled_;
     host_pool_bytes_ = other.host_pool_bytes_;
@@ -555,6 +559,8 @@ void Qwen4ExpExpertCache::cleanup() {
     host_pool_bytes_ = 0;
     num_host_slots_ = 0;
     host_pool_enabled_ = false;
+    host_complement_ = false;
+    host_complement_scan_ = 512;
     protected_ratio_ = 0.75f;
     misses_scratch_.clear();
     batch_reserved_slots_scratch_.clear();
@@ -563,6 +569,7 @@ void Qwen4ExpExpertCache::cleanup() {
     parts_left_scratch_.reset();
     parts_left_capacity_ = 0;
     fill_pool_.reset();
+    fill_short_parts_=0; demand_forward_rows_=0;
     prefetch_items_.clear();
     last_dma_event_ = sycl::event{};
     last_batch_dma_event_ = sycl::event{};
@@ -731,7 +738,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
 
     // Initialize Hot Host RAM Pool (pinned USM host memory allocated in 1 GB chunks).
     // Default 16384 MB (16 GiB). If <= 0, disabled. Only enabled for full model runs (cache_bytes >= 1GB) or unit test flag.
-    const int host_ram_mb = aila::env::read_int("AILA_Q4E_HOT_RAM_MB", 16384);
+    const int host_ram_mb = std::max(0, aila::env::read_int_raw("AILA_Q4E_HOT_RAM_MB", 16384));
     const bool test_host_pool = aila::env::read_flag("AILA_TEST_Q4E_HOST_POOL", false);
     const int test_host_slots = aila::env::read_int("AILA_TEST_Q4E_HOST_SLOTS", 0);
     if ((host_ram_mb > 0 || test_host_slots > 0) && (cache_bytes >= 1024ULL * 1024ULL * 1024ULL || test_host_pool)) {
@@ -839,7 +846,10 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     int fill_threads = aila::env::read_int("AILA_Q4E_FILL_THREADS", std::min(8, hw));
     fill_threads = std::clamp(fill_threads, 1, hw);
     fill_parts_ = std::clamp(aila::env::read_int("AILA_Q4E_FILL_PARTS", 8), 1, 64);
+    fill_short_parts_ = std::clamp(aila::env::read_int_raw("AILA_Q4E_FILL_SHORT_PARTS", 0), 0, 32);
     cost_aware_eviction_ = aila::env::read_flag("AILA_Q4E_COST_AWARE_EVICTION", true);
+    host_complement_ = aila::env::read_flag("AILA_Q4E_HOST_COMPLEMENT", false);
+    host_complement_scan_ = std::clamp(aila::env::read_int("AILA_Q4E_HOST_COMPLEMENT_SCAN", 512), 1, 4096);
 
     fill_pool_ = std::make_unique<ExpertFillPool>(fill_threads);
 
@@ -903,6 +913,7 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
                   num_slots_, slot_bytes_, dev_pool_bytes_ / (1024.0 * 1024.0),
                   compact_nested_ ? 1 : 0, fill_threads, fill_parts_, reader_->name());
 
+    if (host_complement_) AILA_LOG_INFO("[Q4E HostComplement] enabled=1 scan=%d host_slots=%d",host_complement_scan_,num_host_slots_);
     initialized_ = true;
     const auto trace_path = aila::env::read_string("AILA_Q4E_CACHE_TRACE", "");
     if (!trace_path.empty()) {
@@ -957,6 +968,9 @@ void Qwen4ExpExpertCache::trace_acquire_end(const ExpertCacheStats& before, int6
         << ",\"bytes\":" << stats_.total_transferred_bytes - before.total_transferred_bytes
         << ",\"host_hits\":" << stats_.host_pool_hits - before.host_pool_hits
         << ",\"file_fills\":" << stats_.host_pool_misses - before.host_pool_misses
+        << ",\"host_complement_evictions\":" << stats_.host_complement_evictions - before.host_complement_evictions
+        << ",\"host_complement_scans\":" << stats_.host_complement_scans - before.host_complement_scans
+        << ",\"host_complement_searches\":" << stats_.host_complement_searches - before.host_complement_searches
         << ",\"fill_ns\":" << stats_.fill_ns - before.fill_ns
         << ",\"prefetch_wait_ns\":" << stats_.prefetch_wait_ns - before.prefetch_wait_ns
         << ",\"prefetch_used\":" << stats_.prefetch_used - before.prefetch_used
@@ -1110,6 +1124,48 @@ int Qwen4ExpExpertCache::pick_victim_hslot() {
             host_empty_slots_.erase(std::next(it).base());
             return h;
         }
+    }
+    // A bounded approximation to Strata's resident CPU/GPU complement: retain
+    // cold CPU sources before duplicate copies of the frozen GPU tier. During
+    // borrowed prefill only slots remaining in frozen_slots_ are eligible; the
+    // borrowed slots themselves remain cold sources. Selection does not invalidate
+    // keys: the existing caller owns generation/key changes.
+    if (host_complement_ && frozen_) {
+        ++stats_.host_complement_searches;
+        auto duplicate = [&](int h) {
+            ++stats_.host_complement_scans;
+            if (!is_available(h) ||
+                host_slot_state_[h].load(std::memory_order_acquire) != static_cast<uint8_t>(ExpertSlotState::Ready)) return false;
+            const uint64_t key = host_slot_to_key_[h];
+            const uint64_t host_generation = host_slot_records_[h].generation.load(std::memory_order_acquire);
+            const int layer = static_cast<int>(key >> 32), expert = static_cast<int>(key & 0xFFFFFFFF);
+            if (key == UINT64_MAX || layer < 0 || layer >= num_layers_ ||
+                expert < 0 || expert >= num_experts_per_layer_ || host_slot_records_[h].key != key ||
+                host_layer_expert_to_slot_[expert_flat_index(layer, expert)] != h) return false;
+            const int g = layer_expert_to_slot_[expert_flat_index(layer, expert)];
+            if (g < 0 || g >= num_slots_) return false;
+            const uint64_t gpu_generation = gpu_slot_records_[g].generation;
+            return host_generation > 0 && gpu_generation > 0 && frozen_slots_[g] &&
+                slot_to_key_[g] == key && gpu_slot_records_[g].key == key &&
+                gpu_slot_records_[g].state == ExpertSlotState::Ready &&
+                is_event_complete(host_slot_dma_events_[h]) &&
+                is_event_complete(host_slot_records_[h].source_reader_fence) &&
+                is_event_complete(gpu_slot_records_[g].dma_event) &&
+                host_slot_records_[h].generation.load(std::memory_order_acquire) == host_generation &&
+                gpu_slot_records_[g].generation == gpu_generation;
+        };
+        // Reserve half the bound for each tier so a long probationary list does
+        // not hide the protected hot duplicates. No new allocation or wait.
+        auto search = [&](const std::list<int>& tier, int budget) {
+            for (auto it = tier.rbegin(); it != tier.rend() && budget-- > 0; ++it) {
+                if (duplicate(*it)) { ++stats_.host_complement_evictions; return *it; }
+            }
+            return -1;
+        };
+        const int probation_budget = (host_complement_scan_ + 1) / 2;
+        int candidate = search(host_probationary_list_, probation_budget);
+        if (candidate < 0) candidate = search(host_protected_list_, host_complement_scan_ - probation_budget);
+        if (candidate >= 0) return candidate;
     }
     // 2. Try unreserved probationary slots whose DMA is already complete
     for (auto r_it = host_probationary_list_.rbegin(); r_it != host_probationary_list_.rend(); ++r_it) {
@@ -1326,7 +1382,7 @@ sycl::event Qwen4ExpExpertCache::acquire(int layer,
                                          const int* expert_ids,
                                          int count,
                                          int* out_slots) {
-    return acquire_impl(layer, expert_ids, count, out_slots, true);
+    return acquire_impl(layer, expert_ids, count, out_slots, true, true);
 }
 
 GpuReadyLease::~GpuReadyLease() {
@@ -1909,7 +1965,7 @@ sycl::event Qwen4ExpExpertCache::AcquireCold(const GpuReadyLease& lease, int* ou
             throw std::logic_error("Stale resident lease before cold acquire");
     if (!lease.cold_count) return {};
     const auto begin = std::chrono::steady_clock::now();
-    auto result = acquire_impl(lease.layer, lease.cold_ids.data(), lease.cold_count, out_slots, false);
+    auto result = acquire_impl(lease.layer, lease.cold_ids.data(), lease.cold_count, out_slots, false, true);
     stats_.direct_cold_acquire_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - begin).count();
     return result;
@@ -1937,7 +1993,9 @@ void Qwen4ExpExpertCache::ReleaseReady(GpuReadyLease& lease, const sycl::event& 
 }
 
 sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
-                                            int count, int* out_slots, bool touch_hits) {
+                                            int count, int* out_slots, bool touch_hits, bool demand) {
+    const bool short_parts=demand && demand_forward_rows_ > 0 && demand_forward_rows_ <= 64 && fill_short_parts_ > 0;
+    const int demand_parts=short_parts ? fill_short_parts_ : fill_parts_;
     if (!initialized_ || count <= 0 || expert_ids == nullptr || out_slots == nullptr) {
         return {};
     }
@@ -2297,10 +2355,12 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         if (!to_fill_scratch_.empty() && prefetch_in_flight_) {
             cancel_prefetch();
         }
+        if (short_parts && demand_parts != fill_parts_)
+            stats_.demand_short_part_fills += to_fill_scratch_.size();
 
         if (host_pool_enabled_ && !to_fill_scratch_.empty()) {
             const auto t0 = std::chrono::steady_clock::now();
-            const int parts = fill_parts_;
+            const int parts = demand_parts;
             const size_t max_chunk = std::max(1, num_host_slots_);
 
             for (size_t m = 0; m < to_fill_scratch_.size(); ) {
@@ -2432,7 +2492,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
                 uint8_t* chunk_base = pinned_staging_ptr_ + static_cast<size_t>(half) * half_capacity * slot_bytes_;
 
                 const auto t0 = std::chrono::steady_clock::now();
-                const int parts = fill_parts_;
+                const int parts = demand_parts;
                 // The thread finishing an expert's last part submits its h2d copy, so DMA of
                 // early experts overlaps the fill of later ones (SYCL queues are thread-safe).
                 for (size_t c = 0; c < static_cast<size_t>(chunk_size); ++c) {
@@ -3027,6 +3087,9 @@ void Qwen4ExpExpertCache::log_stats(int layer) const {
                   << " pf_useful_b=" << stats_.prefetch_useful_bytes
                   << " pf_wasted_b=" << stats_.prefetch_wasted_bytes
                   << " pf_cancelled_b=" << stats_.prefetch_cancelled_bytes
+                  << " host_complement_evictions=" << stats_.host_complement_evictions
+                  << " host_complement_scans=" << stats_.host_complement_scans
+                  << " host_complement_searches=" << stats_.host_complement_searches
                   << " exposed_wait_ms=" << (stats_.demand_exposed_wait_ns / 1000000.0) << "\n";
     }
 }
@@ -3201,6 +3264,53 @@ ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_slot_host(int hslot) const {
         slot.down_absmax = reinterpret_cast<const float*>(base + dn_absmax_offset_);
     }
     return slot;
+}
+
+ops::MoeExpertSlotHost Qwen4ExpExpertCache::MappedExpertHostSource(int layer, int expert_id) const {
+    if (!initialized_ || faulted_ || layer < 0 || layer >= num_layers_ ||
+        layer >= static_cast<int>(layer_weights_.size()) || expert_id < 0 ||
+        expert_id >= num_experts_per_layer_ || !layer_weights_[layer].valid) return {};
+    const auto& lw=layer_weights_[layer];
+    ops::MoeExpertSlotHost source{};
+    auto matrix=[&](const Bnb4BitHostWeightRef& ref, int rows, int columns, size_t packed_bytes, size_t scales,
+                    const uint8_t*& packed, const float*& absmax, ops::MoeNestedScaleHost& nested) {
+        const size_t count=static_cast<size_t>(expert_id)+1;
+        if (!ref.valid() || ref.packed_weight.dtype != DT_U8 || packed_bytes == 0 || scales == 0 ||
+            count > ref.packed_weight.bytes / packed_bytes || ref.quant_state.blocksize != blocksize_) return false;
+        const auto& shape=ref.quant_state.shape;
+        // Both original [expert,row,column] and flattened [expert*row,column]
+        // metadata must describe the cache's exact expert stride. Byte bounds
+        // alone cannot distinguish tensors with equal numel but different rows.
+        if (shape.size()==3) {
+            if (shape[0]!=num_experts_per_layer_ || shape[1]!=rows || shape[2]!=columns) return false;
+        } else if (shape.size()==2) {
+            if (shape[0]!=static_cast<int64_t>(num_experts_per_layer_)*rows || shape[1]!=columns) return false;
+        } else return false;
+        packed=ref.packed_ptr()+static_cast<size_t>(expert_id)*packed_bytes;
+        if (ref.quant_state.nested) {
+            const int bs=ref.quant_state.nested_blocksize;
+            // The CPU scale view is expert-local, so its first code must also
+            // start a nested block. Never reinterpret original u8 codes as f32
+            // even when the GPU cache expands nested scales during staging.
+            if (bs <= 0 || scales % static_cast<size_t>(bs) || ref.absmax.dtype != DT_U8 ||
+                count > ref.absmax.bytes/scales || !ref.nested_absmax.valid() ||
+                !ref.nested_quant_map.valid() || ref.nested_absmax.dtype != DT_F32 ||
+                ref.nested_quant_map.dtype != DT_F32 || ref.nested_quant_map.bytes < 256*sizeof(float)) return false;
+            const size_t blocks=scales/static_cast<size_t>(bs);
+            if (count > ref.nested_absmax.bytes/(blocks*sizeof(float))) return false;
+            nested.codes=ref.absmax_codes_ptr()+static_cast<size_t>(expert_id)*scales;
+            nested.nested_absmax=ref.nested_absmax_ptr()+static_cast<size_t>(expert_id)*blocks;
+            nested.nested_quant_map=ref.nested_quant_map_ptr();
+            nested.offset=ref.quant_state.nested_offset; nested.blocksize=bs;
+        } else {
+            if (ref.absmax.dtype != DT_F32 || count > ref.absmax.bytes/(scales*sizeof(float))) return false;
+            absmax=ref.absmax_f32_ptr()+static_cast<size_t>(expert_id)*scales;
+        }
+        return true;
+    };
+    if (!matrix(lw.gate_up,2*intermediate_size_,hidden_size_,gu_packed_bytes_,gu_absmax_count_,source.gate_up_packed,source.gate_up_absmax,source.gate_up_nested) ||
+        !matrix(lw.down,hidden_size_,intermediate_size_,dn_packed_bytes_,dn_absmax_count_,source.down_packed,source.down_absmax,source.down_nested)) return {};
+    return source;
 }
 
 ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_expert_slot_host(int layer, int expert_id) const {

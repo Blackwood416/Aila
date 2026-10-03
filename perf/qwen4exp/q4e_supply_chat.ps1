@@ -9,6 +9,8 @@ demand loading remains enabled independently of speculative prefetch.
 pwsh -NoProfile -File perf/qwen4exp/q4e_supply_chat.ps1 -DryRun
 .EXAMPLE
 pwsh -NoProfile -File perf/qwen4exp/q4e_supply_chat.ps1 -PromptFile perf/qwen4exp/prompts/story.json
+.EXAMPLE
+pwsh -NoProfile -File perf/qwen4exp/q4e_supply_chat.ps1 -Heterogeneous -PromptFile perf/qwen4exp/prompts/archive-natural.json
 #>
 [CmdletBinding()]
 param(
@@ -19,9 +21,27 @@ param(
     [ValidateRange(0,512)][int]$HotsetSwaps = 0,
     [ValidateSet(0,1)][int]$DecodePrefetch = 0,
     [ValidateSet(0,1)][int]$PrefillPrefetch = 0,
+    [ValidateSet(0,1)][int]$CpuNf4Q8 = 0,
+    [ValidateSet(0,1)][int]$CpuMmapCold = 0,
+    [ValidateSet(0,1)][int]$CpuMmapPrefetch = 0,
+    [ValidateSet(0,1)][int]$CpuMmapTouch = 0,
+    [ValidateSet(0,1)][int]$HostComplement = 0,
+    [ValidateRange(1,32)][int]$FillParts = 8,
+    [ValidateRange(0,32)][int]$FillShortParts = 0,
+    [ValidateSet(0,8192,16384,24576,32768)][int]$HostRamMB = 32768,
+    [ValidateSet(0,1,2,3)][int]$ColdPolicy = 1,
+    [ValidateRange(0,256)][int]$ColdPcieNum = 141,
+    [switch]$Heterogeneous,
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+# Explicit parameters can override individual knobs for a separate experiment.
+if ($Heterogeneous) {
+    if (-not $PSBoundParameters.ContainsKey('HostRamMB')) { $HostRamMB = 0 }
+    if (-not $PSBoundParameters.ContainsKey('CpuNf4Q8')) { $CpuNf4Q8 = 1 }
+    if (-not $PSBoundParameters.ContainsKey('CpuMmapCold')) { $CpuMmapCold = 1 }
+    if (-not $PSBoundParameters.ContainsKey('FillShortParts')) { $FillShortParts = 1 }
+}
 . (Join-Path $PSScriptRoot '../PerfCommon.ps1')
 $repo = Get-AilaRepoRoot
 $exe = Join-Path $repo 'build-refactor/Aila.exe'
@@ -51,7 +71,7 @@ if (-not [string]::IsNullOrWhiteSpace($PromptFile)) {
 $candidate = @{
     AILA_Q4E_PREFILL_XMX = '1'; AILA_Q4E_DIRECT_PREFILL_IO = '1'
     AILA_Q4E_DEMAND_MICROBATCH = '32'; AILA_Q4E_PHASE_SCRATCH = '1'
-    AILA_Q4E_HOT_RAM_MB = '32768'; AILA_Q4E_EXPERT_READER = 'readfile'
+    AILA_Q4E_HOT_RAM_MB = [string]$HostRamMB; AILA_Q4E_EXPERT_READER = 'readfile'
     AILA_Q35_PREFILL_CHUNK = [string]$PrefillChunk; AILA_Q4E_INLINE_CHECKPOINT = '1'
     AILA_Q4E_STATIC_PINNING = '0'; AILA_Q4E_GROUPED_XMX_MIN_ROWS = '0'
     AILA_Q4E_GDN_CHUNK_MODE = '0'; AILA_Q4E_SMALL_ROWS_DECODE = '0'
@@ -63,9 +83,15 @@ $candidate = @{
     AILA_Q4E_HOTSET_PROMPT_PREFILL = '0'; AILA_Q4E_HOTSET_ADOPT_READY = '1'
     AILA_Q4E_HOTSET_ADOPT_LIMIT = '4096'; AILA_Q4E_RESIDENT_PREFILL = '1'
     AILA_Q4E_RESIDENT_DECODE = '2'; AILA_Q4E_COLD_MODE = '2'
-    AILA_Q4E_COLD_POLICY = '1'; AILA_Q4E_CPU_MAX_EXPERTS = '10'
-    AILA_Q4E_COLD_PCIE_NUM = '141'; AILA_Q4E_COLD_BUDGET_US = '1000'
+    AILA_Q4E_COLD_POLICY = [string]$ColdPolicy; AILA_Q4E_CPU_MAX_EXPERTS = '10'
+    AILA_Q4E_COLD_PCIE_NUM = [string]$ColdPcieNum; AILA_Q4E_COLD_BUDGET_US = '1000'
     AILA_Q4E_CPU_THREADS = '12'; AILA_Q4E_COLD_LOW_RANK = '0'
+    AILA_Q4E_CPU_NF4_Q8 = [string]$CpuNf4Q8; AILA_Q4E_CPU_MMAP_COLD = [string]$CpuMmapCold
+    AILA_Q4E_CPU_MMAP_PREFETCH = [string]$CpuMmapPrefetch
+    AILA_Q4E_CPU_MMAP_TOUCH = [string]$CpuMmapTouch
+    AILA_Q4E_HOST_COMPLEMENT = [string]$HostComplement; AILA_Q4E_HOST_COMPLEMENT_SCAN = '512'
+    AILA_Q4E_FILL_PARTS = [string]$FillParts; AILA_Q4E_FILL_THREADS = '8'
+    AILA_Q4E_FILL_SHORT_PARTS = [string]$FillShortParts
     AILA_Q4E_PREFETCH = '1'; AILA_Q4E_PREFETCH_DECODE = [string]$DecodePrefetch
     AILA_Q4E_PREFETCH_PREFILL = [string]$PrefillPrefetch; AILA_Q4E_PREDICT_STATS = '0'
     AILA_Q4E_PREFILL_ATTN_TILE = '0'; AILA_Q4E_MOE_COMPACT_ACTS = '0'
@@ -98,7 +124,9 @@ try {
     foreach ($entry in $candidate.GetEnumerator()) {
         [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
     }
-    Write-Host "Experimental supply: chunk=$PrefillChunk swaps=$HotsetSwaps prefetch(decode/prefill)=$DecodePrefetch/$PrefillPrefetch Ready-adopt=4096 host-pool=32GiB"
+    Write-Host "Experimental supply: chunk=$PrefillChunk swaps=$HotsetSwaps prefetch(decode/prefill)=$DecodePrefetch/$PrefillPrefetch Ready-adopt=4096 host-pool=${HostRamMB}MiB"
+    Write-Host "CPU NF4-Q8=$CpuNf4Q8 mapped-cold=$CpuMmapCold source-prefetch=$CpuMmapPrefetch source-touch=$CpuMmapTouch complementary-host=$HostComplement fill-parts=$FillParts short-parts=$FillShortParts"
+    Write-Host "Cold policy=$ColdPolicy PCIe fraction=$ColdPcieNum/256"
     Write-Host "Profile: $profile"
     if ($DryRun) {
         $selectedEnvironment = [ordered]@{}

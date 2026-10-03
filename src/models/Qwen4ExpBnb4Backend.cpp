@@ -711,7 +711,7 @@ bool Qwen4ExpBnb4Backend::load(
     AILA_LOG_INFO("[Q4E ExecutionConfig] preset=%s chunk=%d host_ram_mb=%d slots=%d dense_xmx=%d direct_io=%d phase_scratch=%d demand_microbatch=%d checkpoint=%s attn_tile=%d compact_acts=%d",
         aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "none").c_str(),
         aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 512),
-        aila::env::read_int("AILA_Q4E_HOT_RAM_MB", 16384), expert_cache_.num_slots(),
+        std::max(0, aila::env::read_int_raw("AILA_Q4E_HOT_RAM_MB", 16384)), expert_cache_.num_slots(),
         int(s_dense_xmx), int(s_direct_io), int(aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", false)),
         aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0),
         aila::env::read_string("AILA_Q4E_INLINE_CHECKPOINT", "auto-30/26").c_str(), prefill_attention_tile_, moe_compact_tile_);
@@ -1151,6 +1151,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
 
+    expert_cache_.SetDemandForwardRows(count);
     int start_pos = session.currentLength_;
     if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining);
     int cached_len = start_pos + count;
@@ -2316,7 +2317,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const auto& after = expert_cache_.stats();
         if(cold_mode_ || resident_prefill_) {
             const auto& cpu=expert_executor_.stats();
-            AILA_LOG_INFO("[Q4E Cold] pos=%d count=%d mode=%d prefill_direct=%d hot_slots=%d cpu_tasks=%llu eligible=%llu budget_rejected=%llu compute_ns=%llu join_ns=%llu queue_ns=%llu activation_ns=%llu result_bytes=%llu direct=%llu cold=%llu acquire_calls=%llu",
+            AILA_LOG_INFO("[Q4E Cold] pos=%d count=%d mode=%d prefill_direct=%d hot_slots=%d cpu_tasks=%llu eligible=%llu budget_rejected=%llu compute_ns=%llu join_ns=%llu queue_ns=%llu activation_ns=%llu result_bytes=%llu direct=%llu cold=%llu acquire_calls=%llu mapped_tasks=%llu source_prefetch_ns=%llu source_prefetch_calls=%llu source_prefetch_ranges=%llu source_prefetch_bytes=%llu source_prefetch_failures=%llu source_touch_ns=%llu source_touch_pages=%llu",
                 start_pos,count,cold_mode_,int(resident_prefill_),expert_cache_.frozen_slots(),
                 (unsigned long long)(cpu.cpu_tasks_completed-cold_stats0.cpu_tasks_completed),
                 (unsigned long long)(cpu.cold_eligible-cold_stats0.cold_eligible),
@@ -2328,7 +2329,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 (unsigned long long)(cpu.cpu_result_bytes-cold_stats0.cpu_result_bytes),
                 (unsigned long long)(after.direct_entries-prof_stats0.direct_entries),
                 (unsigned long long)(after.cold_request_entries-prof_stats0.cold_request_entries),
-                (unsigned long long)(after.acquire_calls-prof_stats0.acquire_calls));
+                (unsigned long long)(after.acquire_calls-prof_stats0.acquire_calls),
+                (unsigned long long)(cpu.cpu_mapped_tasks_completed-cold_stats0.cpu_mapped_tasks_completed),
+                (unsigned long long)(cpu.cpu_mmap_prefetch_ns-cold_stats0.cpu_mmap_prefetch_ns),
+                (unsigned long long)(cpu.cpu_mmap_prefetch_calls-cold_stats0.cpu_mmap_prefetch_calls),
+                (unsigned long long)(cpu.cpu_mmap_prefetch_ranges-cold_stats0.cpu_mmap_prefetch_ranges),
+                (unsigned long long)(cpu.cpu_mmap_prefetch_bytes-cold_stats0.cpu_mmap_prefetch_bytes),
+                (unsigned long long)(cpu.cpu_mmap_prefetch_failures-cold_stats0.cpu_mmap_prefetch_failures),
+                (unsigned long long)(cpu.cpu_mmap_touch_ns-cold_stats0.cpu_mmap_touch_ns),
+                (unsigned long long)(cpu.cpu_mmap_touch_pages-cold_stats0.cpu_mmap_touch_pages));
         }
         if (resident_decode_mode_ && count == 1) {
             AILA_LOG_INFO("[Q4E Resident] pos=%d mode=%d route=%llu resident=%llu direct=%llu cold=%llu acquire_calls=%llu demand_bytes=%llu metadata_bytes=%llu",
@@ -2341,12 +2350,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 static_cast<unsigned long long>(after.total_transferred_bytes - prof_stats0.total_transferred_bytes),
                 static_cast<unsigned long long>(after.resident_metadata_bytes - prof_stats0.resident_metadata_bytes));
         }
-        AILA_LOG_INFO("[Q4E Work] pos=%d count=%d demand_bytes=%llu host_misses=%llu host_hits=%llu device_bytes=%zu",
+        AILA_LOG_INFO("[Q4E Work] pos=%d count=%d demand_bytes=%llu host_misses=%llu host_hits=%llu device_bytes=%zu complement_evictions=%llu complement_scans=%llu complement_searches=%llu short_part_fills=%llu",
             start_pos, count,
             static_cast<unsigned long long>(after.total_transferred_bytes - prof_stats0.total_transferred_bytes),
             static_cast<unsigned long long>(after.host_pool_misses - prof_stats0.host_pool_misses),
             static_cast<unsigned long long>(after.host_pool_hits - prof_stats0.host_pool_hits),
-            ctx.current_allocated_bytes());
+            ctx.current_allocated_bytes(),
+            static_cast<unsigned long long>(after.host_complement_evictions - prof_stats0.host_complement_evictions),
+            static_cast<unsigned long long>(after.host_complement_scans - prof_stats0.host_complement_scans),
+            static_cast<unsigned long long>(after.host_complement_searches - prof_stats0.host_complement_searches),
+            static_cast<unsigned long long>(after.demand_short_part_fills - prof_stats0.demand_short_part_fills));
     }
     if (s_profile) {
         ctx.synchronize();

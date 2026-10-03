@@ -14,6 +14,28 @@
 #include <thread>
 
 struct Qwen4ExpResidentTestAccess {
+    static sycl::event MaintenanceAcquire(Qwen4ExpExpertCache& cache,int layer,const int* ids,int count,int* slots) {
+        return cache.acquire_impl(layer,ids,count,slots,false);
+    }
+    static void MappedRefs(Qwen4ExpExpertCache& cache, int layer, const Bnb4BitHostWeightRef& gu, const Bnb4BitHostWeightRef& dn) {
+        cache.layer_weights_[layer].gate_up=gu; cache.layer_weights_[layer].down=dn; cache.layer_weights_[layer].valid=true;
+    }
+    static void HostComplement(Qwen4ExpExpertCache& cache, bool enabled, int scan) {
+        cache.host_complement_ = enabled; cache.host_complement_scan_ = scan;
+    }
+    static void ReserveHost(Qwen4ExpExpertCache& cache, int h, bool reserved) {cache.host_slot_reserved_[h] = reserved;}
+    static sycl::event HoldHostSource(Qwen4ExpExpertCache& cache, int h, std::shared_future<void> signal, bool source = true) {
+        auto event = cache.copy_q_->submit([&](sycl::handler& cgh) {
+            cgh.host_task([signal] { signal.wait_for(std::chrono::seconds(10)); });
+        });
+        if (source) cache.host_slot_records_[h].source_reader_fence = event;
+        else cache.host_slot_dma_events_[h] = event;
+        return event;
+    }
+    static uint64_t ChangeGpuKey(Qwen4ExpExpertCache& cache, int g, uint64_t key) {
+        const auto old = cache.gpu_slot_records_[g].key; cache.gpu_slot_records_[g].key = key; return old;
+    }
+    static void BorrowGpuSlot(Qwen4ExpExpertCache& cache, int g) {cache.frozen_slots_[g] = false;}
     static void ColdPolicy(Qwen4ExpExpertCache& cache,int policy) {cache.hotset_cold_policy_=policy;cache.RefreshHotsetColdSlots();}
     static void Adopt(Qwen4ExpExpertCache& cache,int limit) {Prompt(cache);cache.hotset_adopt_ready_=true;cache.hotset_adopt_limit_=limit;cache.hotset_prompt_swaps_=0;}
     static void Prompt(Qwen4ExpExpertCache& cache) {cache.hotset_prompt_=true;cache.hotset_prompt_swaps_=2;}
@@ -1242,6 +1264,401 @@ void test_ready_adoption(Context& ctx) {
     std::cout<<"[H6 READY PASS] no_copy=1 stable_generation=1 bounded_same_layer=1 cold_topology=1 descriptor_generation=1 reader_fence=1 borrow_restore=1\n";
 }
 
+void test_host_ram_zero(Context& ctx) {
+    struct EnvScope {
+        std::array<std::string,3> previous;
+        const std::array<const char*,3> keys={"AILA_Q4E_HOT_RAM_MB","AILA_TEST_Q4E_HOST_POOL","AILA_TEST_Q4E_HOST_SLOTS"};
+        EnvScope() {
+            for(size_t i=0;i<keys.size();++i)if(const char* value=std::getenv(keys[i]))previous[i]=value;
+            _putenv_s(keys[1],"1");_putenv_s(keys[2],"0");
+        }
+        ~EnvScope(){for(size_t i=0;i<keys.size();++i)_putenv_s(keys[i],previous[i].c_str());}
+    } env_scope;
+    SyntheticExpertWeights synth;ModelWeights weights;
+    const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    // The test gate exercises the full-model host-budget branch without a 1 GiB GPU allocation.
+    // Zero test slots prevents the independent test-slot override from enabling the pool.
+    const char* settings[]={"0","-1","1",""};
+    for(int mode=0;mode<4;++mode) {
+        _putenv_s("AILA_Q4E_HOT_RAM_MB",settings[mode]);
+        const bool enabled=mode>=2;
+        Qwen4ExpExpertCache cache;std::string err;
+        expect(cache.init(ctx,weights,2,2*bytes,8,256,64,64,&err,true),"Host RAM fixture init: "+err);
+        cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);
+        cache.set_reader_type(aila::ExpertReaderType::Mmap);
+        expect(cache.host_pool_enabled()==enabled,"Host RAM explicit zero/negative/default enablement");
+        expect(cache.num_host_slots()==(enabled ? 16 : 0),"Host RAM must use budget rather than zero test-slot override");
+        const int id=3;
+        const auto source=cache.MappedExpertHostSource(0,id);
+        expect(source.gate_up_packed==synth.gu_packed_host.data()+id*synth.gu_packed_per_exp &&
+            source.down_packed==synth.dn_packed_host.data()+id*synth.dn_packed_per_exp &&
+            source.gate_up_nested.codes==synth.gu_absmax_codes.data()+id*synth.gu_absmax_per_exp &&
+            source.down_nested.codes==synth.dn_absmax_codes.data()+id*synth.dn_absmax_per_exp,
+            "Host RAM disabled invalidated mapped source");
+        const auto ticket=cache.prepare_host(0,id);
+        expect(ticket.ready==enabled && (ticket.hslot>=0)==enabled,"Host RAM preparation must follow pool enablement");
+        {
+            auto lease=cache.acquire_host_lease(0,id);
+            expect(lease.is_valid()==enabled,"Host RAM lease must follow pool enablement");
+            if(enabled) {
+                expect(!std::memcmp(lease.slot_host().gate_up_packed,source.gate_up_packed,synth.gu_packed_per_exp) &&
+                    !std::memcmp(lease.slot_host().down_packed,source.down_packed,synth.dn_packed_per_exp),
+                    "Positive Host RAM budget changed host payload");
+            }
+        }
+        int slot=-1;cache.acquire(0,&id,1,&slot).wait_and_throw();
+        std::vector<uint8_t> expected(bytes),actual(bytes);size_t offset=0;
+        auto append=[&](const std::vector<uint8_t>& data,size_t per) {
+            std::memcpy(expected.data()+offset,data.data()+size_t(id)*per,per);offset+=per;
+        };
+        append(synth.gu_packed_host,synth.gu_packed_per_exp);append(synth.gu_absmax_codes,synth.gu_absmax_per_exp);
+        append(synth.dn_packed_host,synth.dn_packed_per_exp);append(synth.dn_absmax_codes,synth.dn_absmax_per_exp);
+        ctx.memcpy_d2h(actual.data(),cache.get_slot_dev(slot).gate_up_packed,bytes);
+        expect(actual==expected,"Host RAM enablement changed acquire payload");
+        expect(cache.host_contains(0,id)==enabled,"Disabled Host RAM acquire populated host pool");
+    }
+    std::cout<<"[HOST RAM ZERO PASS] zero_disabled=1 negative_disabled=1 positive_enabled=1 default_enabled=1 mapped_source=1 exact_payload=1\n";
+}
+
+void test_short_demand_parts(Context& ctx) {
+    struct EnvScope {
+        std::array<std::string,3> previous;
+        const std::array<const char*,3> keys={"AILA_Q4E_FILL_PARTS","AILA_Q4E_FILL_SHORT_PARTS","AILA_TEST_Q4E_HOST_POOL"};
+        EnvScope(){for(size_t i=0;i<keys.size();++i)if(const char* value=std::getenv(keys[i]))previous[i]=value;_putenv_s(keys[0],"8");}
+        ~EnvScope(){for(size_t i=0;i<keys.size();++i)_putenv_s(keys[i],previous[i].c_str());}
+    } env_scope;
+    SyntheticExpertWeights synth;ModelWeights weights;
+    const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    for(bool host_pool : {false,true})for(int override_parts : {0,1,3,32}) {
+        _putenv_s("AILA_TEST_Q4E_HOST_POOL",host_pool ? "1" : "0");
+        const auto setting=std::to_string(override_parts);_putenv_s("AILA_Q4E_FILL_SHORT_PARTS",setting.c_str());
+        Qwen4ExpExpertCache cache;std::string err;
+        expect(cache.init(ctx,weights,2,2*bytes,8,256,64,64,&err,true),"Short fill fixture init: "+err);
+        for(int l=0;l<2;++l)cache.set_layer_expert_ref(l,synth.gu_ref,synth.dn_ref);
+        cache.set_reader_type(aila::ExpertReaderType::Mmap);
+        expect(cache.host_pool_enabled() == host_pool,"Short fill fixture host mode");
+        cache.SetDemandForwardRows(41);
+        Qwen4ExpExpertCache moved(std::move(cache));cache=std::move(moved);
+        auto verify=[&](int e,int slot) {
+            std::vector<uint8_t> expected(bytes),actual(bytes);
+            size_t off=0;
+            auto append=[&](const std::vector<uint8_t>& src,size_t per) {std::memcpy(expected.data()+off,src.data()+size_t(e)*per,per);off+=per;};
+            append(synth.gu_packed_host,synth.gu_packed_per_exp);append(synth.gu_absmax_codes,synth.gu_absmax_per_exp);
+            append(synth.dn_packed_host,synth.dn_packed_per_exp);append(synth.dn_absmax_codes,synth.dn_absmax_per_exp);
+            ctx.memcpy_d2h(actual.data(),cache.get_slot_dev(slot).gate_up_packed,bytes);
+            expect(actual == expected,"Short fill changed partition payload");
+        };
+        // The first operation after move must retain the recorded short context.
+        int id=0,slot=-1;auto reads=cache.reader()->stats().read_count;auto short_fills=cache.stats().demand_short_part_fills;
+        cache.acquire(0,&id,1,&slot).wait_and_throw();verify(id,slot);
+        expect(cache.reader()->stats().read_count-reads == uint64_t(override_parts ? override_parts : 8),"Moved short fill context lost");
+        expect(cache.stats().demand_short_part_fills-short_fills == uint64_t(override_parts != 0),"Short fill accounting");
+        const int original_slot=slot;const auto original_generation=cache.get_slot_generation(slot);
+        auto snapshot=Tensor::allocate(ctx,{static_cast<int64_t>(synth.gu_packed_per_exp)},dnnl::memory::data_type::u8);
+        ctx.queue().submit([](sycl::handler& cgh){cgh.host_task([]{std::this_thread::sleep_for(std::chrono::milliseconds(5));});});
+        auto reader=ctx.queue().memcpy(snapshot.data(),cache.get_slot_dev(slot).gate_up_packed,synth.gu_packed_per_exp);
+        cache.record_consumer_reader_fences(&slot,1,reader);
+        const int rows[4]={1,64,65,0};
+        for(int n=0;n<4;++n) {
+            id=n+1;cache.SetDemandForwardRows(rows[n]);reads=cache.reader()->stats().read_count;
+            cache.acquire(0,&id,1,&slot).wait_and_throw();verify(id,slot);
+            const int expected=override_parts && rows[n]>0 && rows[n]<=64 ? override_parts : 8;
+            expect(cache.reader()->stats().read_count-reads == uint64_t(expected),"Short parts threshold/disabled default changed");
+        }
+        reader.wait_and_throw();std::vector<uint8_t> saved(synth.gu_packed_per_exp);ctx.memcpy_d2h(saved.data(),snapshot.data(),saved.size());
+        expect(!std::memcmp(saved.data(),synth.gu_packed_host.data(),saved.size()),"Short fill overwrote live GPU reader");
+        expect(cache.get_slot_generation(original_slot)>original_generation && !cache.contains(0,0),"Short fill reused stale generation");
+        cache.SetDemandForwardRows(41);id=5;reads=cache.reader()->stats().read_count;short_fills=cache.stats().demand_short_part_fills;
+        Qwen4ExpResidentTestAccess::MaintenanceAcquire(cache,0,&id,1,&slot).wait_and_throw();verify(id,slot);
+        expect(cache.reader()->stats().read_count-reads == 8 && cache.stats().demand_short_part_fills == short_fills,"Profile/maintenance used short override");
+        id=6;reads=cache.reader()->stats().read_count;cache.prefetch_async(0,&id,1,1);cache.wait_prefetch();
+        expect(cache.reader()->stats().read_count-reads == 8,"Prefetch changed global partition");
+        cache.acquire(0,&id,1,&slot).wait_and_throw();verify(id,slot);
+    }
+    std::cout<<"[SHORT FILL PARTS PASS] exact_payload=1 odd_partitions=1 threshold=1 disabled_default=1 maintenance_global=1 prefetch_global=1 move=1 generation=1 reader_fence=1 host_and_staging=1\n";
+}
+
+void test_mapped_expert_source(Context& ctx) {
+    SyntheticExpertWeights synth; ModelWeights weights;
+    for (bool compact : {false,true}) {
+        Qwen4ExpExpertCache cache;std::string err;
+        expect(cache.init(ctx,weights,2,4*32768,8,256,64,64,&err,compact),"Mapped fixture init: "+err);
+        cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);
+        const auto before=cache.stats();
+        auto source=cache.MappedExpertHostSource(0,3);
+        expect(source.gate_up_packed == synth.gu_packed_host.data()+3*synth.gu_packed_per_exp &&
+            source.down_packed == synth.dn_packed_host.data()+3*synth.dn_packed_per_exp,"Mapped packed expert offsets");
+        expect(!source.gate_up_absmax && !source.down_absmax &&
+            source.gate_up_nested.codes == synth.gu_absmax_codes.data()+3*synth.gu_absmax_per_exp &&
+            source.down_nested.codes == synth.dn_absmax_codes.data()+3*synth.dn_absmax_per_exp &&
+            source.gate_up_nested.nested_absmax == synth.gu_nested_absmax.data()+3*(synth.gu_absmax_per_exp/256) &&
+            source.down_nested.nested_absmax == synth.dn_nested_absmax.data()+3*(synth.dn_absmax_per_exp/256),"Mapped nested view must use original codes even for expanded cache");
+        expect(!cache.host_contains(0,3) && cache.stats().host_pool_misses == before.host_pool_misses &&
+            cache.stats().total_transferred_bytes == before.total_transferred_bytes,"Mapped view performed host fill/H2D");
+        expect(!cache.MappedExpertHostSource(1,0).gate_up_packed &&
+            !cache.MappedExpertHostSource(-1,0).gate_up_packed && !cache.MappedExpertHostSource(0,8).gate_up_packed,"Mapped invalid refs/id accepted");
+        auto bad=synth.gu_ref;bad.packed_weight.bytes=3*synth.gu_packed_per_exp;
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,bad,synth.dn_ref);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped truncated packed source accepted");
+        bad=synth.gu_ref;bad.nested_absmax.bytes=sizeof(float);
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,bad,synth.dn_ref);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped truncated nested scale source accepted");
+        bad=synth.gu_ref;bad.quant_state.nested_blocksize=257;
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,bad,synth.dn_ref);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped unaligned nested expert boundary accepted");
+        auto gu_flat=synth.gu_ref,dn_flat=synth.dn_ref;
+        gu_flat.quant_state.shape={8*128,256};dn_flat.quant_state.shape={8*256,64};
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,gu_flat,dn_flat);
+        auto flat=cache.MappedExpertHostSource(0,3);
+        expect(flat.gate_up_packed == source.gate_up_packed && flat.down_packed == source.down_packed &&
+            flat.gate_up_nested.codes == source.gate_up_nested.codes,"Mapped valid flattened geometry rejected");
+        // Same numel and byte spans, but a different logical row/column stride.
+        bad=synth.gu_ref;bad.quant_state.shape={8,256,128};
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,bad,synth.dn_ref);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped rank3 wrong expert geometry accepted");
+        bad=gu_flat;bad.quant_state.shape={8*256,128};
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,bad,dn_flat);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped flattened wrong expert geometry accepted");
+        bad=synth.dn_ref;bad.quant_state.shape={4,512,64};
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,synth.gu_ref,bad);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped wrong expert count accepted");
+        std::vector<float> gu_scale(synth.gu_absmax_codes.size(),.5f),dn_scale(synth.dn_absmax_codes.size(),.25f);
+        auto gu=synth.gu_ref,dn=synth.dn_ref;gu.quant_state.nested=false;dn.quant_state.nested=false;
+        gu.absmax.ptr=reinterpret_cast<const uint8_t*>(gu_scale.data());gu.absmax.bytes=gu_scale.size()*sizeof(float);gu.absmax.dtype=DT_F32;
+        dn.absmax.ptr=reinterpret_cast<const uint8_t*>(dn_scale.data());dn.absmax.bytes=dn_scale.size()*sizeof(float);dn.absmax.dtype=DT_F32;
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,gu,dn);
+        source=cache.MappedExpertHostSource(0,3);
+        expect(!source.gate_up_nested.codes && !source.down_nested.codes &&
+            source.gate_up_absmax == gu_scale.data()+3*synth.gu_absmax_per_exp &&
+            source.down_absmax == dn_scale.data()+3*synth.dn_absmax_per_exp,"Mapped unnested f32 offsets");
+        gu.absmax.dtype=DT_U8;Qwen4ExpResidentTestAccess::MappedRefs(cache,0,gu,dn);
+        expect(!cache.MappedExpertHostSource(0,3).gate_up_packed,"Mapped unnested u8 source miscast to float");
+    }
+    std::cout<<"[MAPPED SOURCE PASS] no_staging=1 offsets=1 compact_nested=1 expanded_nested=1 unnested=1 metadata_bounds=1 logical_geometry=1 invalid_refs=1\n";
+}
+
+void test_mapped_resident_cold(Context& ctx) {
+    struct EnvScope {
+        std::array<std::string,6> previous;
+        const std::array<const char*,6> keys={"AILA_Q4E_CPU_MMAP_COLD","AILA_Q4E_COLD_MODE","AILA_Q4E_COLD_POLICY","AILA_Q4E_CPU_MMAP_PREFETCH","AILA_Q4E_CPU_MMAP_TOUCH","AILA_Q4E_CPU_MAX_EXPERTS"};
+        EnvScope() {
+            for(size_t i=0;i<keys.size();++i)if(const char* value=std::getenv(keys[i]))previous[i]=value;
+            _putenv_s(keys[0],"1");_putenv_s(keys[1],"2");_putenv_s(keys[2],"1");
+            _putenv_s(keys[3],"1");
+            _putenv_s(keys[4],"1");
+        }
+        ~EnvScope(){for(size_t i=0;i<keys.size();++i)_putenv_s(keys[i],previous[i].c_str());}
+    } env_scope;
+    constexpr int H=2560,I=640,E=4;
+    constexpr size_t gu_bytes=size_t(2*I)*H/2,dn_bytes=size_t(H)*I/2;
+    constexpr size_t gu_scales=size_t(2*I)*H/64,dn_scales=size_t(H)*I/64;
+    std::vector<uint8_t> gu_packed(E*gu_bytes,0x88),dn_packed(E*dn_bytes,0x88);
+    std::vector<uint8_t> gu_codes(E*gu_scales,128),dn_codes(E*dn_scales,128);
+    std::vector<float> gu_nested(E*gu_scales/256,1.f),dn_nested(E*dn_scales/256,1.f);
+    SyntheticExpertWeights tiny;
+    auto gu=tiny.gu_ref,dn=tiny.dn_ref;
+    gu.packed_weight.ptr=gu_packed.data();gu.packed_weight.bytes=gu_packed.size();gu.quant_state.shape={E,2*I,H};
+    dn.packed_weight.ptr=dn_packed.data();dn.packed_weight.bytes=dn_packed.size();dn.quant_state.shape={E,H,I};
+    gu.absmax.ptr=gu_codes.data();gu.absmax.bytes=gu_codes.size();dn.absmax.ptr=dn_codes.data();dn.absmax.bytes=dn_codes.size();
+    gu.nested_absmax.ptr=reinterpret_cast<const uint8_t*>(gu_nested.data());gu.nested_absmax.bytes=gu_nested.size()*sizeof(float);
+    dn.nested_absmax.ptr=reinterpret_cast<const uint8_t*>(dn_nested.data());dn.nested_absmax.bytes=dn_nested.size()*sizeof(float);
+    ModelWeights weights;Qwen4ExpExpertCache cache;std::string err;
+    expect(cache.init(ctx,weights,1,4*(gu_bytes+dn_bytes+gu_scales+dn_scales),E,H,I,64,&err,true),"Mapped resident fixture init: "+err);
+    cache.set_layer_expert_ref(0,gu,dn);
+    int hot=0,slot=-1;cache.acquire(0,&hot,1,&slot).wait_and_throw();cache.FreezeReady(1);
+    expect(cache.prepare_host(0,1).ready && !cache.host_contains(0,2),"Mapped mixed fixture residency");
+    aila::Qwen4ExpExpertExecutor executor;executor.init(ctx,cache,4,3,H,I);executor.set_max_cpu_credits(2);
+    std::vector<bf16> input(H,bf16(.01f));
+    auto x=Tensor::allocate(ctx,{H},dnnl::memory::data_type::bf16);ctx.memcpy_h2d(x.data(),input.data(),H*sizeof(bf16));
+    auto output=Tensor::allocate(ctx,{3,H},dnnl::memory::data_type::f32);
+    struct Observer {const uint8_t* host=nullptr;const uint8_t* mapped=nullptr;int calls=0;} observer;
+    observer.host=cache.get_expert_slot_host(0,1).gate_up_packed;observer.mapped=gu_packed.data()+2*gu_bytes;
+    executor.set_cpu_observer_for_testing([](void* state,Context&,int,const aila::RouteRankEntry& entry,
+        const ops::MoeExpertSlotHost& source,const bf16*,const bf16*,const float*) {
+        auto& o=*static_cast<Observer*>(state);
+        expect(source.gate_up_packed == (entry.expert_id==1 ? o.host : o.mapped),"CPU observer source confused mixed leases/maps");++o.calls;
+    },&observer);
+    const auto before=cache.stats();
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 2 && route.cold_count == 0,"Mapped resident admission failed");
+        expect(cache.query_residency(0,1).host_cpu_readers == 1 && !cache.host_contains(0,2),"Mapped source consumed fake host lease or released real lease early");
+        executor.JoinResidentCold(output.data_as<float>()).wait_and_throw();route.Finish({});
+    }
+    expect(observer.calls == 2 && executor.stats().cpu_mapped_tasks_dispatched == 1 &&
+        executor.stats().cpu_mapped_tasks_completed == 1 && cache.query_residency(0,1).host_cpu_readers == 0,"Mapped completion/lease accounting");
+#ifdef _WIN32
+    const auto& prefetch_stats=executor.stats();
+    const size_t source_bytes=gu_bytes+dn_bytes+gu_scales+dn_scales+
+        (gu_scales/256+dn_scales/256)*sizeof(float)+2*256*sizeof(float);
+    expect(prefetch_stats.cpu_mmap_prefetch_calls == 1 && prefetch_stats.cpu_mmap_prefetch_ranges == 8 &&
+        prefetch_stats.cpu_mmap_prefetch_bytes == source_bytes,"Mapped prefetch must batch exact original source ranges, excluding host-staged source");
+    expect(prefetch_stats.cpu_mmap_prefetch_failures <= 1,"Mapped advisory prefetch failure accounting");
+    SYSTEM_INFO page_info{};GetSystemInfo(&page_info);
+    const size_t page_size=page_info.dwPageSize;
+    expect(page_size > 0,"Mapped touch fixture requires OS page size");
+    auto span_pages=[&](const void* data,size_t bytes) {
+        const auto start=reinterpret_cast<uintptr_t>(data);
+        return (start+bytes-1)/page_size-start/page_size+1;
+    };
+    const auto mapped_source=cache.MappedExpertHostSource(0,2);
+    const uint64_t expected_pages=span_pages(mapped_source.gate_up_packed,gu_bytes)+span_pages(mapped_source.down_packed,dn_bytes)+
+        span_pages(mapped_source.gate_up_nested.codes,gu_scales)+span_pages(mapped_source.down_nested.codes,dn_scales)+
+        span_pages(mapped_source.gate_up_nested.nested_absmax,(gu_scales/256)*sizeof(float))+
+        span_pages(mapped_source.down_nested.nested_absmax,(dn_scales/256)*sizeof(float))+
+        span_pages(mapped_source.gate_up_nested.nested_quant_map,256*sizeof(float))+
+        span_pages(mapped_source.down_nested.nested_quant_map,256*sizeof(float));
+    expect(prefetch_stats.cpu_mmap_touch_pages == expected_pages,
+        "Mapped touch must cover only each source span's leading and internal pages");
+#endif
+    expect(cache.stats().host_pool_misses == before.host_pool_misses &&
+        cache.stats().total_transferred_bytes == before.total_transferred_bytes && !cache.host_contains(0,2),"Mapped resident performed weight fill/H2D");
+    std::vector<float> rows(3*H);ctx.memcpy_d2h(rows.data(),output.data(),rows.size()*sizeof(float));
+    expect(!std::memcmp(rows.data()+H,rows.data()+2*H,H*sizeof(float)),"Mapped and host-staged identical expert outputs differ");
+    executor.set_cpu_observer_for_testing(nullptr,nullptr);
+    executor.set_max_cpu_credits(1);
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 1 && route.cold_count == 1 && route.cold_ids[0] == 2,"Mapped cold bypassed CPU credits");
+        executor.AbortResidentCold();route.Finish({});
+    }
+    expect(cache.query_residency(0,1).host_cpu_readers == 0,"Mapped mixed cancellation leaked host lease");
+    _putenv_s("AILA_Q4E_CPU_MMAP_PREFETCH","0");
+    _putenv_s("AILA_Q4E_CPU_MMAP_TOUCH","0");
+    executor.init(ctx,cache,4,3,H,I);executor.set_max_cpu_credits(2);
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 2 && route.cold_count == 0,"Disabled prefetch changed mapped CPU admission");
+        executor.JoinResidentCold(output.data_as<float>()).wait_and_throw();route.Finish({});
+    }
+    expect(executor.stats().cpu_mmap_prefetch_calls == 0 && executor.stats().cpu_mmap_prefetch_bytes == 0 &&
+        executor.stats().cpu_mmap_touch_pages == 0,"Disabled mapped preparation must not issue source hints/touches");
+    std::vector<float> without_prefetch(3*H);ctx.memcpy_d2h(without_prefetch.data(),output.data(),without_prefetch.size()*sizeof(float));
+    expect(!std::memcmp(rows.data()+H,without_prefetch.data()+H,2*H*sizeof(float)),"Advisory prefetch changed cold expert arithmetic");
+    _putenv_s("AILA_Q4E_CPU_MMAP_TOUCH","1");
+    executor.init(ctx,cache,4,3,H,I);executor.set_max_cpu_credits(2);
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 2 && route.cold_count == 0,"Touch-only changed mapped CPU admission");
+        executor.JoinResidentCold(output.data_as<float>()).wait_and_throw();route.Finish({});
+    }
+    expect(executor.stats().cpu_mmap_prefetch_calls == 0 && executor.stats().cpu_mmap_prefetch_bytes == 0,
+        "Touch-only must not report advisory PrefetchVirtualMemory hints");
+#ifdef _WIN32
+    expect(executor.stats().cpu_mmap_touch_pages == expected_pages,"Touch-only exact page coverage");
+#endif
+    ctx.memcpy_d2h(without_prefetch.data(),output.data(),without_prefetch.size()*sizeof(float));
+    expect(!std::memcmp(rows.data()+H,without_prefetch.data()+H,2*H*sizeof(float)),"Source touch changed cold expert arithmetic");
+    _putenv_s("AILA_Q4E_CPU_MMAP_PREFETCH","1");
+    _putenv_s("AILA_Q4E_CPU_MMAP_COLD","0");
+    executor.init(ctx,cache,4,3,H,I);executor.set_max_cpu_credits(2);
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 1 && route.cold_count == 1 && route.cold_ids[0] == 2,"Disabled mapped cold changed dispatch");
+        executor.AbortResidentCold();route.Finish({});
+    }
+    expect(executor.stats().cpu_mapped_tasks_dispatched == 0 && executor.stats().cpu_mmap_prefetch_calls == 0 &&
+        executor.stats().cpu_mmap_touch_pages == 0,"Disabled mapped task/prefetch/touch accounting");
+    _putenv_s("AILA_Q4E_CPU_MMAP_COLD","1");executor.init(ctx,cache,4,3,H,I);
+    int gpu_id=3,gpu_slot=-1;cache.acquire(0,&gpu_id,1,&gpu_slot).wait_and_throw();
+    {
+        auto route=cache.BindReady(0,&gpu_id,1);
+        // An already Ready GPU source remains on GPU even if classified cold
+        // because it is outside the immutable resident tier.
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 0 && route.cold_count == 1,"Mapped cold stole GPU Ready work");
+        route.Finish({});
+    }
+    std::promise<void> release;auto signal=release.get_future().share();
+    Qwen4ExpResidentTestAccess::HoldCopy(cache,gpu_slot,signal);
+    {
+        auto route=cache.BindReady(0,&gpu_id,1);
+        const int admitted=executor.StartResidentCold(route,x.data_as<bf16>());
+        release.set_value(); // drain the test source before assertions/cleanup
+        expect(admitted == 0 && route.cold_count == 1,"Mapped cold stole GPU Copying work");route.Finish({});
+    }
+    expect(executor.stats().cpu_mapped_tasks_dispatched == 0,"GPU-ineligible mapped task accounting");
+    _putenv_s("AILA_Q4E_CPU_MAX_EXPERTS","0");
+    executor.init(ctx,cache,4,3,H,I); // Intentionally no setter: exercise env admission.
+    {
+        int ids[3]={0,1,2};auto route=cache.BindReady(0,ids,3);
+        expect(executor.StartResidentCold(route,x.data_as<bf16>()) == 0 && route.cold_count == 2 &&
+            route.cold_ids[0] == 1 && route.cold_ids[1] == 2,"Explicit zero CPU credits must leave every cold rank on GPU");
+        route.Finish({});
+    }
+    expect(executor.stats().cpu_tasks_dispatched == 0 && executor.stats().cpu_mmap_prefetch_calls == 0 &&
+        executor.stats().cpu_mmap_touch_pages == 0 && cache.query_residency(0,1).host_cpu_readers == 0,
+        "Zero CPU credits must not dispatch, warm sources, or acquire host leases");
+    std::cout<<"[MAPPED COLD PASS] host_lease_first=1 mixed_sources=1 rank_output=1 observer=1 no_weight_staging=1 prefetch_ranges=1 prefetch_advisory=1 touch_pages=1 touch_exact=1 credits=1 credits_zero_env=1 cancellation=1 opt_in=1 gpu_ready=1 gpu_copying=1\n";
+}
+
+void test_host_complement(Context& ctx) {
+    struct HostSlotsScope {
+        std::string previous;
+        HostSlotsScope() {
+            if (const char* value=std::getenv("AILA_TEST_Q4E_HOST_SLOTS")) previous=value;
+            if (_putenv_s("AILA_TEST_Q4E_HOST_SLOTS","4") != 0)
+                throw std::runtime_error("Cannot configure complement host fixture");
+        }
+        ~HostSlotsScope() {_putenv_s("AILA_TEST_Q4E_HOST_SLOTS",previous.c_str());}
+    } host_slots_scope;
+    SyntheticExpertWeights synth; ModelWeights weights;
+    const size_t slot_bytes = synth.gu_packed_per_exp + synth.gu_absmax_per_exp +
+                              synth.dn_packed_per_exp + synth.dn_absmax_per_exp;
+    // Modes cover the successful preference and every ownership exclusion. A
+    // non-GPU expert is older than the duplicate, so ordinary LRU picks it.
+    for (int mode = 0; mode <= 9; ++mode) {
+        Qwen4ExpExpertCache cache; std::string err;
+        expect(cache.init(ctx,weights,2,4*slot_bytes,8,256,64,64,&err,true),"Complement fixture init: "+err);
+        expect(cache.num_host_slots() == 4,"Complement fixture requires four host slots");
+        cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);
+        cache.set_layer_expert_ref(1,synth.gu_ref,synth.dn_ref);
+        Qwen4ExpResidentTestAccess::HostComplement(cache,mode != 0,2);
+        const auto old_cold = cache.prepare_host(0,0);
+        int hot_id=1, hot_slot=-1;cache.acquire(0,&hot_id,1,&hot_slot).wait_and_throw();
+        Qwen4ExpResidentTestAccess::Adaptive(cache,{1});
+        const auto duplicate = cache.prepare_host(0,1); // promote to protected host tier
+        expect(cache.prepare_host(0,2).ready && cache.prepare_host(0,3).ready,"Complement pool not full");
+        expect(cache.host_is_protected(0,1),"Duplicate must exercise protected tier");
+        if (mode == 1) {
+            // Cache moves preserve configuration, lists, slot identities and stats.
+            Qwen4ExpExpertCache moved(std::move(cache)); cache = std::move(moved);
+        }
+        HostExpertLease reader;
+        std::promise<void> signal; auto ready=signal.get_future().share();
+        sycl::event held;
+        uint64_t old_gpu_key=0;
+        if (mode == 2) reader=cache.acquire_host_lease(0,1);
+        if (mode == 3) Qwen4ExpResidentTestAccess::ReserveHost(cache,duplicate.hslot,true);
+        if (mode == 4) held=Qwen4ExpResidentTestAccess::HoldHostSource(cache,duplicate.hslot,ready);
+        if (mode == 5) Qwen4ExpResidentTestAccess::HoldCopy(cache,hot_slot,ready);
+        if (mode == 6) old_gpu_key=Qwen4ExpResidentTestAccess::ChangeGpuKey(cache,hot_slot,UINT64_MAX);
+        if (mode == 7) cache.ThawReady();
+        if (mode == 8) held=Qwen4ExpResidentTestAccess::HoldHostSource(cache,duplicate.hslot,ready,false);
+        if (mode == 9) Qwen4ExpResidentTestAccess::BorrowGpuSlot(cache,hot_slot);
+        const auto before=cache.stats();
+        const auto incoming=cache.prepare_host(0,4);
+        // Release the submitted test fence before checking assertions/cleanup.
+        signal.set_value();
+        if (held != sycl::event{}) held.wait_and_throw();
+        if (mode == 3) Qwen4ExpResidentTestAccess::ReserveHost(cache,duplicate.hslot,false);
+        if (mode == 6) Qwen4ExpResidentTestAccess::ChangeGpuKey(cache,hot_slot,old_gpu_key);
+        expect(incoming.ready,"Complement fill failed");
+        const bool selected_duplicate = mode == 1;
+        expect(incoming.hslot == (selected_duplicate ? duplicate.hslot : old_cold.hslot),"Complement violated ownership exclusion mode "+std::to_string(mode));
+        expect(cache.stats().host_complement_evictions-before.host_complement_evictions == uint64_t(selected_duplicate),"Complement eviction accounting");
+        expect(cache.stats().host_complement_scans-before.host_complement_scans <= 2,"Complement exceeded scan bound");
+        expect(cache.stats().host_complement_searches-before.host_complement_searches == uint64_t(mode != 0 && mode != 7),"Disabled/thawed complement searched");
+        const auto stale = selected_duplicate ? duplicate : old_cold;
+        expect(incoming.generation > stale.generation && !cache.host_contains(0,selected_duplicate ? 1 : 0),"Complement reused stale host generation/key");
+        auto lease=cache.acquire_host_lease(0,4);
+        expect(lease.is_valid() && !std::memcmp(lease.slot_host().gate_up_packed,
+            synth.gu_packed_host.data()+4*synth.gu_packed_per_exp,synth.gu_packed_per_exp),"Complement fill payload changed");
+        if (mode == 2) expect(reader.is_valid() && !std::memcmp(reader.slot_host().gate_up_packed,
+            synth.gu_packed_host.data()+synth.gu_packed_per_exp,synth.gu_packed_per_exp),"Complement overwrote active CPU reader");
+    }
+    std::cout<<"[HOST COMPLEMENT PASS] bounded_scan=1 default_compatibility=1 cpu_lease=1 reservation=1 source_fence=1 dma_fence=1 copying=1 key_identity=1 thaw=1 borrowed_slot=1 generation=1 move=1 payload=1\n";
+}
+
 void test_prompt_policy() {
     Qwen4ExpHotsetPolicy full,chunked;full.Init(1,8);chunked.Init(1,8);
     full.BeginPrompt();chunked.BeginPrompt();
@@ -1292,6 +1709,11 @@ int main() {
         test_prompt_policy();
         test_prompt_prefill(ctx);
         test_ready_adoption(ctx);
+        test_host_complement(ctx);
+        test_mapped_expert_source(ctx);
+        test_host_ram_zero(ctx);
+        test_short_demand_parts(ctx);
+        test_mapped_resident_cold(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

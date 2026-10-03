@@ -9,6 +9,10 @@
 #include <mutex>
 #include <thread>
 #include <tbb/task_arena.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <memoryapi.h>
+#endif
 
 namespace aila {
 namespace {
@@ -33,8 +37,15 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         float* out = nullptr;
         sycl::event activation;
         bool resident_prepared = false;
+        std::array<bool, ops::cpu::kMaxExpertBatchTasks> mapped_tasks{};
     };
-    struct Result { uint64_t activation_ns = 0, begin_ns = 0, end_ns = 0; std::exception_ptr error; };
+    struct Result {
+        uint64_t activation_ns = 0, begin_ns = 0, end_ns = 0;
+        uint64_t prefetch_begin_ns = 0, prefetch_ns = 0, prefetch_calls = 0;
+        uint64_t prefetch_ranges = 0, prefetch_bytes = 0, prefetch_failures = 0;
+        uint64_t touch_begin_ns = 0, touch_ns = 0, touch_pages = 0;
+        std::exception_ptr error;
+    };
     std::mutex mutex;
     std::condition_variable cv;
     bool pending = false, busy = false, done = false, stop = false;
@@ -42,9 +53,13 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
     Result result;
     tbb::task_arena arena;
     bool batched;
+    bool mmap_prefetch;
+    bool mmap_touch;
     std::thread thread;
 
-    explicit CpuWorker(int threads) : arena(threads), batched(aila::env::read_flag("AILA_Q4E_CPU_BATCH", false)), thread([this] { run(); }) {}
+    explicit CpuWorker(int threads) : arena(threads), batched(aila::env::read_flag("AILA_Q4E_CPU_BATCH", false)),
+        mmap_prefetch(aila::env::read_flag("AILA_Q4E_CPU_MMAP_PREFETCH", false)),
+        mmap_touch(aila::env::read_flag("AILA_Q4E_CPU_MMAP_TOUCH", false)), thread([this] { run(); }) {}
     ~CpuWorker() {
         drain();
         { std::lock_guard<std::mutex> lock(mutex); stop = true; }
@@ -68,6 +83,79 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         return completed;
     }
     void drain() noexcept { try { finish(); } catch (...) {} }
+    void prepare_mapped_sources(const Job& current, Result& completed) {
+#ifdef _WIN32
+        if ((!mmap_prefetch && !mmap_touch) || !current.resident_prepared || current.count <= 0 ||
+            current.count > ops::cpu::kMaxExpertBatchTasks || current.hidden != ops::cpu::kHiddenDim ||
+            current.intermediate != ops::cpu::kIntermediateDim) return;
+        // Only this layer's admitted immutable sources. The worker can block in
+        // the OS while the coordinator submits GPU work. Neither mode pins pages.
+        WIN32_MEMORY_RANGE_ENTRY ranges[ops::cpu::kMaxExpertBatchTasks * 8];
+        ULONG_PTR range_count = 0;
+        uint64_t bytes = 0;
+        auto append = [&](const void* address, size_t length) {
+            if (!address || !length) return;
+            for (ULONG_PTR i = 0; i < range_count; ++i)
+                if (ranges[i].VirtualAddress == address && ranges[i].NumberOfBytes == length) return;
+            ranges[range_count++] = {const_cast<void*>(address), length};
+            bytes += length;
+        };
+        auto matrix = [&](const uint8_t* packed, const float* absmax,
+                          const ops::MoeNestedScaleHost& nested, int rows, int columns) {
+            append(packed, size_t(rows) * columns / 2);
+            const size_t scales = size_t(rows) * columns / 64;
+            if (nested.codes) {
+                append(nested.codes, scales);
+                const size_t blocksize = nested.blocksize > 0 ? size_t(nested.blocksize) : 256;
+                append(nested.nested_absmax, ((scales + blocksize - 1) / blocksize) * sizeof(float));
+                append(nested.nested_quant_map, 256 * sizeof(float));
+            } else append(absmax, scales * sizeof(float));
+        };
+        for (int c = 0; c < current.count; ++c) {
+            if (!current.mapped_tasks[c]) continue;
+            const auto& source = current.tasks[c].slot;
+            matrix(source.gate_up_packed, source.gate_up_absmax, source.gate_up_nested,
+                2 * current.intermediate, current.hidden);
+            matrix(source.down_packed, source.down_absmax, source.down_nested,
+                current.hidden, current.intermediate);
+        }
+        if (!range_count) return;
+        if (mmap_prefetch) {
+            // Advisory physical-cache hint; failures leave ordinary reads intact.
+            completed.prefetch_begin_ns = steady_ns();
+            const BOOL accepted = PrefetchVirtualMemory(GetCurrentProcess(), range_count, ranges, 0);
+            completed.prefetch_ns = steady_ns() - completed.prefetch_begin_ns;
+            completed.prefetch_calls = 1;
+            completed.prefetch_ranges = range_count;
+            completed.prefetch_bytes = bytes;
+            completed.prefetch_failures = accepted ? 0 : 1;
+        }
+        if (mmap_touch) {
+            completed.touch_begin_ns = steady_ns();
+            static const size_t page_size = [] {
+                SYSTEM_INFO info{};
+                GetSystemInfo(&info);
+                return info.dwPageSize ? size_t(info.dwPageSize) : size_t(4096);
+            }();
+            for (ULONG_PTR i = 0; i < range_count; ++i) {
+                const auto* start = static_cast<const uint8_t*>(ranges[i].VirtualAddress);
+                const size_t length = ranges[i].NumberOfBytes;
+                // Touch the leading page at the actual span start, never at its
+                // rounded-down address (which may be outside short metadata).
+                (void)*static_cast<const volatile uint8_t*>(start);
+                ++completed.touch_pages;
+                const size_t next_page = page_size - (reinterpret_cast<uintptr_t>(start) % page_size);
+                for (size_t offset = next_page; offset < length; offset += page_size) {
+                    (void)*static_cast<const volatile uint8_t*>(start + offset);
+                    ++completed.touch_pages;
+                }
+            }
+            completed.touch_ns = steady_ns() - completed.touch_begin_ns;
+        }
+#else
+        (void)current; (void)completed;
+#endif
+    }
     void run() {
         for (;;) {
             Job current;
@@ -79,6 +167,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
             }
             Result completed;
             try {
+                prepare_mapped_sources(current, completed);
                 const auto begin = steady_ns();
                 current.activation.wait_and_throw();
                 completed.activation_ns = steady_ns() - begin;
@@ -89,8 +178,9 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                             throw std::invalid_argument("CPU batch requires real Q4E geometry");
                         static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
                         static const bool prepared = aila::env::read_flag("AILA_Q4E_CPU_PREPARED_INPUT", false);
+                        static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false);
                         ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
-                            current.resident_prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 :
+                            current.resident_prepared ? (nf4_q8 ? ops::cpu::CpuKernelBackend::Nf4Q8Avx2 : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2) :
                             gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
                                       : ops::cpu::CpuKernelBackend::Avx2);
                     } else for (int c = 0; c < current.count; ++c)
@@ -117,6 +207,7 @@ Qwen4ExpExpertExecutor::~Qwen4ExpExpertExecutor() {
 
 void Qwen4ExpExpertExecutor::cleanup() {
     cpu_worker_.reset();
+    cold_source_slots_={}; cold_count_=0; cold_mapped_count_=0;
     if (ctx_) {
         try { ctx_->synchronize(); } catch (...) {}
     }
@@ -153,12 +244,13 @@ void Qwen4ExpExpertExecutor::init(
     hidden_size_ = hidden_size > 0 ? hidden_size : 2560;
     intermediate_size_ = intermediate_size > 0 ? intermediate_size : 640;
 
-    const int env_max_cpu = aila::env::read_int("AILA_Q4E_CPU_MAX_EXPERTS", 2);
+    const int env_max_cpu = aila::env::read_int_raw("AILA_Q4E_CPU_MAX_EXPERTS", 2);
     max_cpu_credits_ = std::clamp(env_max_cpu, 0, ops::cpu::kMaxExpertBatchTasks);
     cpu_placement_ = std::clamp(aila::env::read_int("AILA_Q4E_CPU_PLACEMENT", 0), 0, 2);
     cpu_fixed_credits_ = aila::env::read_flag("AILA_Q4E_CPU_FIXED_CREDITS", false);
     cpu_batch_prepare_ = aila::env::read_flag("AILA_Q4E_CPU_BATCH_PREPARE", false);
     cpu_wait_prefetch_ = aila::env::read_flag("AILA_Q4E_CPU_WAIT_PREFETCH", false);
+    cpu_mmap_cold_ = aila::env::read_flag("AILA_Q4E_CPU_MMAP_COLD", false);
     cpu_coalesce_results_ = aila::env::read_flag("AILA_Q4E_CPU_COALESCE_RESULTS", false);
     const int env_max_tokens = aila::env::read_int("AILA_Q4E_CPU_MAX_TOKENS", 4);
     max_cpu_tokens_ = std::max(1, std::min(4, env_max_tokens));
@@ -221,10 +313,14 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         throw std::logic_error("Invalid resident CPU cold service");
     if (prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
     prev_cpu_h2d_ev_={}; active_cpu_leases_.clear(); cold_layer_=route.layer;
+    cold_source_slots_={}; cold_mapped_count_=0;
     int gpu_count=0;
+    std::array<bool, ops::cpu::kMaxExpertBatchTasks> mapped_tasks{};
     const bool retry=cold_policy_==2 && (++cold_batches_seen_%32==0);
     try {
         std::array<HostExpertLease,16> chosen;
+        std::array<ops::MoeExpertSlotHost,16> chosen_sources{};
+        std::array<bool,16> mapped{};
         int selected=0;
         static const bool low_rank=aila::env::read_flag("AILA_Q4E_COLD_LOW_RANK",false);
         for(int scan=0;scan<route.cold_count;++scan) {
@@ -234,34 +330,42 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
             if(cold_policy_==3 && i>=route.cold_count-((route.cold_count*cold_pcie_num_)>>8))continue;
             const int e=route.cold_ids[i];
             const auto residency=cache_->query_residency(route.layer,e);
-            if (!residency.gpu_ready && !residency.gpu_copying && residency.host_ready) {
+            if (!residency.gpu_ready && !residency.gpu_copying) {
+                const auto source=!residency.host_ready && cpu_mmap_cold_
+                    ? cache_->MappedExpertHostSource(route.layer,e) : ops::MoeExpertSlotHost{};
+                if (!residency.host_ready && !source.gate_up_packed) continue;
                 ++stats_.cold_eligible;
                 if(selected<std::min(16,max_cpu_credits_) &&
                     (cold_policy_==1 || cold_policy_==3 || retry || cold_cost_ns_[selected+1]<=cold_budget_ns_)) {
-                    auto lease=cache_->acquire_host_lease(route.layer,e);
-                    if(lease.is_valid()) {
-                        chosen[i]=std::move(lease);++selected;
-                    }
+                    if (residency.host_ready) {
+                        auto lease=cache_->acquire_host_lease(route.layer,e);
+                        if (lease.is_valid()) {chosen_sources[i]=lease.slot_host(); chosen[i]=std::move(lease); ++selected;}
+                    } else {chosen_sources[i]=source; mapped[i]=true; ++selected;}
                 } else ++stats_.cold_budget_rejected;
             }
         }
         for(int i=0;i<route.cold_count;++i) {
             const int e=route.cold_ids[i],rank=route.cold_ranks[i];
-            if(chosen[i].is_valid()) {
+            if(chosen_sources[i].gate_up_packed) {
+                mapped_tasks[cold_count_]=mapped[i];
+                cold_source_slots_[cold_count_]=chosen_sources[i];
                 cold_ranks_[cold_count_]=rank;cold_ids_[cold_count_++]=e;
-                active_cpu_leases_.push_back(std::move(chosen[i]));
+                if (chosen[i].is_valid()) active_cpu_leases_.push_back(std::move(chosen[i]));
+                cold_mapped_count_+=mapped[i];
             } else {route.cold_ids[gpu_count]=e;route.cold_ranks[gpu_count++]=rank;}
         }
         route.cold_count=gpu_count;
         if(!cold_count_) return 0;
         CpuWorker::Job job;job.count=cold_count_;job.hidden=hidden_size_;job.intermediate=intermediate_size_;job.tokens=1;
         job.x=x_host_;job.h=scratch_h_;job.out=cpu_out_host_;job.resident_prepared=true;
+        job.mapped_tasks=mapped_tasks;
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
             ctx_->queue().memcpy(x_host_,x_dev,size_t(hidden_size_)*sizeof(bf16));
-        for(int c=0;c<cold_count_;++c)job.tasks[c]={active_cpu_leases_[c].slot_host(),0};
+        for(int c=0;c<cold_count_;++c)job.tasks[c]={cold_source_slots_[c],0};
         cold_submit_ns_=steady_ns();cpu_worker_->submit(job);
         cache_->TraceColdCpu(cold_layer_,cold_ids_.data(),cold_ranks_.data(),cold_count_);
         stats_.cpu_tasks_dispatched+=cold_count_;
+        stats_.cpu_mapped_tasks_dispatched+=cold_mapped_count_;
         if(cache_->tracing())cache_->trace_host_interval("cold_cpu_submit",cold_layer_,cold_submit_ns_,steady_ns());
         return cold_count_;
     } catch(...) {AbortResidentCold();throw;}
@@ -273,10 +377,21 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     const auto result=cpu_worker_->finish();
     stats_.cpu_join_wait_ns+=steady_ns()-join;
     stats_.cpu_activation_wait_ns+=result.activation_ns;
+    stats_.cpu_mmap_prefetch_ns+=result.prefetch_ns;
+    stats_.cpu_mmap_prefetch_calls+=result.prefetch_calls;
+    stats_.cpu_mmap_prefetch_ranges+=result.prefetch_ranges;
+    stats_.cpu_mmap_prefetch_bytes+=result.prefetch_bytes;
+    stats_.cpu_mmap_prefetch_failures+=result.prefetch_failures;
+    stats_.cpu_mmap_touch_ns+=result.touch_ns;
+    stats_.cpu_mmap_touch_pages+=result.touch_pages;
     stats_.cpu_compute_ns+=result.end_ns-result.begin_ns;
     const auto completion_ns=result.end_ns-cold_submit_ns_;
     stats_.cold_queue_ns+=(result.begin_ns-cold_submit_ns_)-std::min(result.activation_ns,result.begin_ns-cold_submit_ns_);
-    const double measured=cold_policy_==2?double(result.end_ns-result.begin_ns):double(completion_ns);
+    // Recoverable policy uses CPU-owned service time, including source warmup.
+    // Activation/host scheduling waits stay separate; flags off preserve its
+    // previous compute-only value.
+    const double measured=cold_policy_==2?
+        double(result.end_ns-result.begin_ns+result.prefetch_ns+result.touch_ns):double(completion_ns);
     cold_cost_ns_[cold_count_]=0.8*cold_cost_ns_[cold_count_]+0.2*measured;
     if(cold_policy_==2) {
         // A fresh completed batch also informs larger, stale buckets. Retries
@@ -285,13 +400,17 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
             cold_cost_ns_[n]=0.95*cold_cost_ns_[n]+0.05*measured*n/cold_count_;
     }
     if(cache_->tracing()) {
+        if (result.prefetch_calls) cache_->trace_host_interval("cold_cpu_mmap_prefetch",cold_layer_,
+            result.prefetch_begin_ns,result.prefetch_begin_ns+result.prefetch_ns);
+        if (result.touch_pages) cache_->trace_host_interval("cold_cpu_mmap_touch",cold_layer_,
+            result.touch_begin_ns,result.touch_begin_ns+result.touch_ns);
         cache_->trace_host_interval("cold_cpu_compute",cold_layer_,result.begin_ns,result.end_ns);
         cache_->trace_host_interval("cold_cpu_join",cold_layer_,join,steady_ns());
         cache_->TraceDeviceEvent("cold_input_copy",cold_layer_,resident_input_event_);
     }
     for(int c=0;c<cold_count_;++c)if(cpu_observer_) {
         RouteRankEntry entry;entry.rank=cold_ranks_[c];entry.expert_id=cold_ids_[c];entry.is_gpu=false;
-        cpu_observer_(cpu_observer_state_,*ctx_,cold_layer_,entry,active_cpu_leases_[c].slot_host(),x_host_,
+        cpu_observer_(cpu_observer_state_,*ctx_,cold_layer_,entry,cold_source_slots_[c],x_host_,
             scratch_h_+size_t(c)*intermediate_size_,cpu_out_host_+size_t(c)*hidden_size_);
     }
     for(int c=0;c<cold_count_;) {
@@ -301,15 +420,16 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
         ++stats_.cpu_result_copies;stats_.cpu_result_bytes+=bytes;c=end;
     }
     stats_.cpu_tasks_completed+=cold_count_;++stats_.cpu_async_layers;
+    stats_.cpu_mapped_tasks_completed+=cold_mapped_count_;
     stats_.cpu_max_batch_tasks=std::max(stats_.cpu_max_batch_tasks,uint64_t(cold_count_));
-    active_cpu_leases_.clear();cold_count_=0;
+    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;
     return prev_cpu_h2d_ev_;
 }
 
 void Qwen4ExpExpertExecutor::AbortResidentCold() noexcept {
     if(cpu_worker_)cpu_worker_->drain();
     try {if(ctx_)ctx_->synchronize();}catch(...){}
-    active_cpu_leases_.clear();cold_count_=0;
+    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;
 }
 
 LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(

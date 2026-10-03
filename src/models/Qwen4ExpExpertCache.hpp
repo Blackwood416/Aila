@@ -221,6 +221,9 @@ struct ExpertCacheStats {
     uint64_t prefetch_wait_ns = 0; // acquire waiting on an unfinished prefetch fill
     uint64_t host_pool_hits = 0;   // served directly from hot host RAM pool (zero CPU copy)
     uint64_t host_pool_misses = 0; // required fill into host pool from mmap
+    uint64_t host_complement_evictions = 0; // Ready frozen GPU duplicates selected for host reuse
+    uint64_t host_complement_scans = 0;     // bounded LRU candidates inspected
+    uint64_t host_complement_searches = 0;
 
     // Phase B metrics (B3, B6)
     uint64_t prefetch_issued_bytes = 0;
@@ -229,6 +232,7 @@ struct ExpertCacheStats {
     uint64_t prefetch_wasted_bytes = 0;
     uint64_t demand_exposed_wait_ns = 0;
     uint64_t demand_microbatches = 0;
+    uint64_t demand_short_part_fills = 0;
     uint64_t acquire_calls = 0;
     uint64_t resident_route_entries = 0; // includes Copying, unlike direct_entries
     uint64_t direct_entries = 0;
@@ -295,6 +299,9 @@ public:
                         const int* expert_ids,
                         int count,
                         int* out_slots);
+    // Coordinator sets once per forward. Zero means no active demand context;
+    // maintenance/profile fills and speculative prefetch retain global parts.
+    void SetDemandForwardRows(int rows) { demand_forward_rows_=rows > 0 ? rows : 0; }
 
     // H1: classify/touch a full route once, lease only GPU Ready entries, then
     // supply only the cold subset. Preserves legacy hit accounting and LRU order.
@@ -449,6 +456,10 @@ public:
         return host_slot_records_[hslot].cpu_readers.load(std::memory_order_relaxed);
     }
     FillTicket prepare_host(int layer, int expert_id, int priority = 0);
+    // Borrow immutable original model storage without staging. ModelWeights (or
+    // synthetic refs) must outlive the cache and every CPU executor using it.
+    // Returns an empty view for invalid geometry, dtype or metadata bounds.
+    ops::MoeExpertSlotHost MappedExpertHostSource(int layer, int expert_id) const;
     static constexpr int kMaxHostPrepareTasks = 40;
     // Coordinator-only. Pins ready inputs, fills distinct cold experts on the
     // demand pool, then returns leases. Unavailable slots yield empty leases.
@@ -475,7 +486,7 @@ private:
     void ReleaseResidentLayer(GpuResidentLayerLease& lease, bool drain);
     GpuReadyLease BindReadyImpl(int layer, const int* ids, int count, const int* selected_slots);
     sycl::event acquire_impl(int layer, const int* expert_ids, int count,
-                             int* out_slots, bool touch_hits);
+                             int* out_slots, bool touch_hits, bool demand = false);
     void cleanup();
     FillTicket reserve_host_preparation(int layer, int expert_id, bool& needs_fill);
     void invalidate_host_preparation(const FillTicket& ticket);
@@ -631,6 +642,8 @@ private:
     bool initialized_ = false;
     bool faulted_ = false;
     bool cost_aware_eviction_ = true;
+    bool host_complement_ = false;
+    int host_complement_scan_ = 512;
     std::unique_ptr<Qwen4ExpCacheTrace> cache_trace_;
     uint64_t trace_forward_id_ = 0;
     uint64_t trace_acquire_id_ = 0;
@@ -680,6 +693,8 @@ private:
 
     std::unique_ptr<ExpertFillPool> fill_pool_;
     int fill_parts_ = 8;
+    int fill_short_parts_ = 0;
+    int demand_forward_rows_ = 0;
 
     std::unique_ptr<aila::IExpertReader> reader_;
     DmaTimingStats dma_timing_stats_{};

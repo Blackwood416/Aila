@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next：以容差为契约的 XMX Prefill 优化方案
 
+2026-10-03 最新进展：[H8原始NF4异构供给与缓存预算](qwen3.8-flash-next-heterogeneous-h8-results-2026-10-03.md)。Q8 CPU、mmap冷来源、短forward分片及HostRam0落地，三轮同EXE完整序列 117.88→51.49秒（减少56.3%），仅pool/short1控制为84.44秒。长文有效输入/TTFT 145.6/150.2、decode 11.1/13.5，20 decode未完成。质量/状态、所有权、回归和launcher通过；保留mmap32内存保护停止、touch/预取回退及伪零预算排除。默认preset与H7 launcher保持，H8用`-Heterogeneous`开启；后续优先CPU来源/内存服务成本与cold admission，再看router同步，R2b仍待独立验收。以下保留历史结果。
+
 2026-10-03 最新进展：[H7供给治理与窗口实测](qwen3.8-flash-next-supply-h7-results-2026-10-03.md)。三轮对照首次/返回长文请求减少16.2%/34.1%，完整跨域序列减少18.3%；chunk2048把长文需求流量约98–100 GB降至37 GB。GPU teacher48逐位一致，CPU短/长平均KL0.001599/0.002672、最大NRMSE0.05633/0.05963，无NLL预警，checkpoint/取消/USM和回归通过。候选返回长文有效输入/TTFT85.49 tok/s、decode8.6，100+/20尚未完成；默认preset、32 GiB预算不变，R2b继续暂停。以下保留历史结果。
 
 2026-10-03 最新进展：[H6 Ready物理槽接管与供给复核](qwen3.8-flash-next-hotset-h6-ready-results-2026-10-03.md)。接管无需额外H2D，短/长GPU teacher48逐位一致，CPU平均KL约0.00185/0.00225，checkpoint/取消恢复通过。三组同二进制跨域对照未获稳定端到端净收益；长文需求/epoch流量下降，GPU冷供给和prefetch等待仍需治理。候选默认关闭、32 GiB预算与原preset不变，R2b仍暂停，100+/20目标尚未完成。下文保留历史结果。

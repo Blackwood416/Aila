@@ -32,6 +32,13 @@ param(
     [ValidateRange(1,12)][int]$ColdThreads=4,
     [ValidateRange(1,10)][int]$ColdCredits=2,
     [ValidateRange(100,10000)][int]$ColdBudgetUs=1000,
+    [ValidateSet(-1,0,1)][int]$CpuNf4Q8=-1,
+    [ValidateSet(-1,0,1)][int]$CpuMmapCold=-1,
+    [ValidateSet(-1,0,1)][int]$CpuMmapPrefetch=-1,
+    [ValidateSet(-1,0,1)][int]$CpuMmapTouch=-1,
+    [ValidateRange(-1,32)][int]$FillShortParts=-1,
+    [ValidateSet(-1,0,1)][int]$HostComplement=-1,
+    [ValidateRange(0,4096)][int]$HostComplementScan=0,
     [string]$Executable="",
     [ValidateSet("causal","checkpoint")][string]$IntegerStatePart="causal",
     [ValidateSet(0,256,512,1024)][int]$CompactMoe=0,
@@ -71,8 +78,9 @@ param(
     [ValidateSet(0,8)][int]$MemoryDecodeTail=0,
     [ValidateSet(0,256,512,1024,2048)][int]$PrefillChunk=0,
     [switch]$PhaseScratch,
-    [ValidateSet(16384,24576,32768)][int]$HostRamMB=32768,
+    [ValidateSet(0,8192,16384,24576,32768)][int]$HostRamMB=32768,
     [ValidateRange(0,64)][int]$FillParts=0,
+    [ValidateRange(0,32)][int]$FillThreads=0,
     [ValidateRange(0,512)][int]$DemandMicrobatch=0,
     [switch]$Trace,
     [switch]$Vtune,
@@ -104,6 +112,13 @@ if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$Inli
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
 if($DecodePrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_DECODE=[string]$DecodePrefetch}
 if($PrefillPrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_PREFILL=[string]$PrefillPrefetch}
+if($CpuNf4Q8 -ge 0) {$overrides.AILA_Q4E_CPU_NF4_Q8=[string]$CpuNf4Q8}
+if($CpuMmapCold -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_COLD=[string]$CpuMmapCold}
+if($CpuMmapPrefetch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_PREFETCH=[string]$CpuMmapPrefetch}
+if($CpuMmapTouch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_TOUCH=[string]$CpuMmapTouch}
+if($FillShortParts -ge 0) {$overrides.AILA_Q4E_FILL_SHORT_PARTS=[string]$FillShortParts}
+if($HostComplement -ge 0) {$overrides.AILA_Q4E_HOST_COMPLEMENT=[string]$HostComplement}
+if($HostComplementScan) {$overrides.AILA_Q4E_HOST_COMPLEMENT_SCAN=[string]$HostComplementScan}
 if($PSBoundParameters.ContainsKey('ResidentDecode')) {$overrides.AILA_Q4E_RESIDENT_DECODE=[string]$ResidentDecode}
 if($ColdMode -or $ColdBench -or $ColdQuality) {
     $overrides.AILA_Q4E_COLD_MODE=[string]$(if($ColdMode){$ColdMode}else{1})
@@ -146,6 +161,7 @@ if($Vtune -or $VtuneInstructions) {
     $overrides.AILA_Q4E_TRACE_MARKERS="1"
 }
 if($FillParts) {$overrides.AILA_Q4E_FILL_PARTS=[string]$FillParts}
+if($FillThreads) {$overrides.AILA_Q4E_FILL_THREADS=[string]$FillThreads}
 if($DemandMicrobatch) {$overrides.AILA_Q4E_DEMAND_MICROBATCH=[string]$DemandMicrobatch}
 if($PrefillChunk) {$overrides.AILA_Q35_PREFILL_CHUNK=[string]$PrefillChunk}
 if($PhaseScratch) {$overrides.AILA_Q4E_PHASE_SCRATCH="1"}

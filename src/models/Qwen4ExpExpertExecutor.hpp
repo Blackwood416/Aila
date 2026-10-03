@@ -64,10 +64,16 @@ struct LayerMoePlan {
 struct HeteroExecutionStats {
     uint64_t cpu_tasks_dispatched = 0;
     uint64_t cpu_tasks_completed = 0;
+    uint64_t cpu_mapped_tasks_dispatched = 0, cpu_mapped_tasks_completed = 0;
     uint64_t cpu_straggler_count = 0;
     uint64_t cpu_overlapped_count = 0;
     uint64_t cpu_compute_ns = 0;
     uint64_t cpu_activation_wait_ns = 0;
+    // Advisory call duration and requested ranges/bytes, not physical I/O or residency.
+    uint64_t cpu_mmap_prefetch_ns = 0, cpu_mmap_prefetch_calls = 0;
+    uint64_t cpu_mmap_prefetch_ranges = 0, cpu_mmap_prefetch_bytes = 0, cpu_mmap_prefetch_failures = 0;
+    // Single-thread in-span page visits; not unique resident pages or OS faults.
+    uint64_t cpu_mmap_touch_ns = 0, cpu_mmap_touch_pages = 0;
     uint64_t cpu_straggler_interval_ns = 0; // observed host interval, not exposed GPU tail
     uint64_t gpu_tasks_dispatched = 0;
     uint64_t layers_hetero_executed = 0;
@@ -83,6 +89,7 @@ struct HeteroExecutionStats {
     uint64_t cpu_result_copies = 0;
     uint64_t cpu_result_bytes = 0;
     uint64_t cpu_result_submit_ns = 0;
+    // Submit-to-compute interval minus activation wait; includes source prefetch/touch.
     uint64_t cold_eligible = 0, cold_budget_rejected = 0, cold_queue_ns = 0;
 
     void reset() {
@@ -99,7 +106,8 @@ struct ExpertPrefetchRequest {
 
 class Qwen4ExpExpertExecutor {
 public:
-    // Synchronous test hook while the host lease is held. Disabled in normal execution.
+    // Synchronous test hook while the host lease or immutable mapped source is
+    // still valid. Disabled in normal execution.
     using CpuObserver = void (*)(void*, Context&, int, const RouteRankEntry&,
                                  const ops::MoeExpertSlotHost&, const bf16*, const bf16*, const float*);
     void set_cpu_observer_for_testing(CpuObserver observer, void* state) {
@@ -156,7 +164,8 @@ public:
     const HeteroExecutionStats& stats() const { return stats_; }
     void reset_stats() { stats_.reset(); }
     // C1 single-row cold service. Start removes only successfully leased CPU
-    // entries from the cold subset; caller submits remaining GPU work before Join.
+    // entries (or opt-in immutable mapped sources) from the cold subset; caller
+    // submits remaining GPU work before Join. ModelWeights must outlive executor.
     int StartResidentCold(GpuReadyLease& route, const bf16* x_dev);
     void StageResidentInput(const bf16* x_dev);
     sycl::event JoinResidentCold(float* rank_output);
@@ -196,6 +205,7 @@ private:
     bool cpu_batch_prepare_ = false;
     bool cpu_wait_prefetch_ = false;
     bool cpu_coalesce_results_ = false;
+    bool cpu_mmap_cold_ = false; // opt-in immutable source for resident host misses
     int max_cpu_tokens_ = 4;   // strictly m <= 4
     bool straggler_penalty_active_ = false;
     int consecutive_stragglers_ = 0;
@@ -228,8 +238,10 @@ private:
     sycl::event prev_cpu_h2d_ev_{};
     sycl::event resident_input_event_{};
     std::array<int, 16> cold_ranks_{}, cold_ids_{};
+    std::array<ops::MoeExpertSlotHost, 16> cold_source_slots_{};
     std::array<double, 17> cold_cost_ns_{};
     int cold_count_ = 0, cold_layer_ = -1;
+    int cold_mapped_count_ = 0;
     uint64_t cold_submit_ns_ = 0;
     double cold_budget_ns_ = 1000000.0;
     int cold_policy_ = 0; // 0 C1 budget, 1 all host-Ready cold, 2 recoverable budget, 3 Strata PCIe fraction
