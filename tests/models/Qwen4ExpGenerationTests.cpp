@@ -46,6 +46,7 @@ public:
     std::vector<Call> calls;
     bool throw_next = false;
     bool interior_enabled = false;
+    int context_len = 0;
     explicit RecordingBackend(Context& ctx)
         : output_(Tensor::allocate(ctx, {1, 4}, dnnl::memory::data_type::f32)) {}
     bool load(Context&, ModelWeights&, const ModelSpec&, int, std::string*) override { return true; }
@@ -62,12 +63,14 @@ public:
             ctx.queue().memset(output_.data(), 0, output_.size_bytes());
             throw std::runtime_error("injected forward failure");
         }
+        context_len+=count;
         return options.need_logits ? output_ : unused_;
     }
     void reset() override {}
     bool truncate_kv_cache(int) override { return true; }
     int max_seq_len() const override { return 64; }
     int vocab_size() const override { return 4; }
+    int get_current_context_len() const override { return context_len; }
     ModelFamily family() const override { return ModelFamily::Qwen4Exp; }
 private:
     Tensor output_, unused_;
@@ -89,6 +92,8 @@ void test_prefill_slices() {
            recording.calls[1].count == 4, "Reusable prefix must retain the 26+4 split");
     expect(!recording.calls[0].options.need_logits && recording.calls[1].options.need_logits,
            "Only final slice may request logits");
+    expect(recording.calls[0].options.prefill_remaining==4 && recording.calls[1].options.prefill_remaining==0,
+           "Prompt remaining length must cover the checkpoint tail");
     expect(recording.calls[0].options.capture_snapshot, "Anchor must request a snapshot");
     expect(recording.calls[0].ids[25] == ids[25] && recording.calls[1].ids[0] == ids[26],
            "Staged token slices must preserve offsets");
@@ -145,6 +150,16 @@ void test_prefill_slices() {
     expect(recording.calls.size() == 1 && recording.calls[0].options.checkpoint_after == 0,
            "One-shot must not request an interior checkpoint");
     recording.interior_enabled = false;
+
+    recording.calls.clear();
+    engine.forward_prompt_tokens(ids,0,1,0,false,{SnapshotPolicy::None,false},false);
+    expect(recording.calls.size()==1 && recording.calls[0].options.prefill_remaining==-1,
+           "Generated-token alignment must not borrow/reseed a new prompt tier");
+    recording.calls.clear();recording.context_len=29;
+    engine.align_backend_context_to_sequence(ids,{77},30,"[Phase test]");
+    expect(recording.calls.size()==2 && recording.calls[0].options.prefill_remaining==0 &&
+           recording.calls[1].options.prefill_remaining==-1 && recording.context_len==31,
+           "Alignment must distinguish missing prompt from missing generated token");
 
     recording.throw_next = true;
     bool failed = false;

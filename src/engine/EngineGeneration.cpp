@@ -10,11 +10,11 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
         int actual_len = backend_->get_current_context_len();
         if (actual_len == accepted_len) return;
 
-        auto replay_range = [&](const std::vector<int>& ids, int start, int len) {
+        auto replay_range = [&](const std::vector<int>& ids, int start, int len,bool prompt_phase) {
             if (len <= 0) return;
             ForwardOptions replay_options;
             replay_options.need_logits = false;
-            Tensor* ignored_logits = forward_prompt_tokens(ids, start, len, 0, false, replay_options);
+            Tensor* ignored_logits = forward_prompt_tokens(ids, start, len, 0, false, replay_options,prompt_phase);
             (void)ignored_logits;
         };
 
@@ -35,7 +35,7 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
             actual_len = 0;
         }
         if (actual_len < prompt_len) {
-            replay_range(prompt_ids, actual_len, prompt_len - actual_len);
+            replay_range(prompt_ids, actual_len, prompt_len - actual_len,true);
             actual_len = backend_->get_current_context_len();
         }
 
@@ -45,7 +45,7 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
         if (generated_start < static_cast<int>(generated_ids.size())) {
             replay_range(generated_ids,
                          generated_start,
-                         static_cast<int>(generated_ids.size()) - generated_start);
+                         static_cast<int>(generated_ids.size()) - generated_start,false);
         }
         ctx_->synchronize();
 
@@ -61,7 +61,7 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                                   int len,
                                   int snapshot_after_len,
                                   bool async_h2d,
-                                  const ForwardOptions& options) {
+                                  const ForwardOptions& options,bool prompt_phase) {
         if (!backend_ || !ctx_ || len <= 0) return nullptr;
         static const bool log_q4e_preset = !aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "").empty();
         if (start < 0 || start > static_cast<int>(token_ids.size()) ||
@@ -100,6 +100,7 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
             ForwardOptions slice_options = options;
             slice_options.checkpoint_after = checkpoint_after;
             slice_options.need_logits = options.need_logits && next == end;
+            slice_options.prefill_remaining = prompt_phase ? end - next : -1;
             slice_options.capture_snapshot = options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
                 (options.capture_snapshot || (snapshot_after_len > 0 && next == snapshot_after_len));
             try {

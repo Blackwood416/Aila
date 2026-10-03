@@ -14,6 +14,8 @@
 #include <thread>
 
 struct Qwen4ExpResidentTestAccess {
+    static void Prompt(Qwen4ExpExpertCache& cache) {cache.hotset_prompt_=true;cache.hotset_prompt_swaps_=2;}
+    static void PromptPrefill(Qwen4ExpExpertCache& cache) {Prompt(cache);cache.hotset_prompt_prefill_=true;}
     static void Adaptive(Qwen4ExpExpertCache& cache,const std::vector<int>& keys) {
         cache.hotset_policy_.Init(2,8);cache.hotset_keys_=keys;cache.hotset_swaps_=1;
         cache.adaptive_hotset_=true;cache.hotset_borrow_=true;cache.InstallHotset(keys);
@@ -1142,7 +1144,70 @@ void test_adaptive_hotset(Context& ctx) {
     const auto& policy=cache.hotset_policy();
     expect(policy.decode[2]==2 && policy.prefill[2]==0 && policy.unique[2]==2,"Frequency accounting changed with placement");
     expect(cache.stats().epoch_swaps==1 && cache.stats().epoch_refill_bytes>0,"Refill costs omitted");
+    Qwen4ExpResidentTestAccess::Prompt(cache);
+    cache.BeginHotsetForward(0,4);
+    int prompt_ids[4]={5,5,5,5};
+    cache.ObserveHotsetRoute(0,prompt_ids,4,1);cache.ObserveHotsetRoute(1,prompt_ids,4,1);
+    int preserved_slot;cache.acquire(1,prompt_ids,1,&preserved_slot).wait_and_throw();
+    const auto preserved_generation=cache.query_residency(1,5).gpu_generation;
+    cache.BeginHotsetForward(4,1);
+    expect(cache.IsDirectReady(0,5) && cache.IsDirectReady(1,5),"Prompt handoff restored stale profile");
+    expect(cache.ValidateReadyBinding(1,5,preserved_slot,preserved_generation),"Prompt handoff reloaded surviving target");
+    expect(!cache.IsDirectReady(0,2) && cache.frozen_slots()==2,"Prompt handoff changed tier capacity");
+    cache.BeginResidentDeviceEpoch();
+    slot=cache.query_residency(0,5).gpu_slot;
+    ctx.memcpy_d2h(payload.data(),cache.get_slot_dev(slot).gate_up_packed,payload.size());
+    expect(!std::memcmp(payload.data(),synth.gu_packed_host.data()+5*synth.gu_packed_per_exp,payload.size()),"Prompt payload mismatches key");
     std::cout<<"[H4 CACHE PASS] retired_generation=1 publish_after_dma=1 payload=1 same_layer=1 borrow_restore=1\n";
+}
+
+void test_prompt_prefill(Context& ctx) {
+    SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    const size_t slot_bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    expect(cache.init(ctx,weights,2,12*slot_bytes,8,256,64,64,&error,true),error);
+    cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);cache.set_layer_expert_ref(1,synth.gu_ref,synth.dn_ref);
+    Qwen4ExpResidentTestAccess::Adaptive(cache,{0,1,2,3,8,9,10,11});
+    Qwen4ExpResidentTestAccess::PromptPrefill(cache);
+    cache.BeginHotsetForward(0,4);
+    int prompt_ids[4]={5,6,5,6};
+    cache.ObserveHotsetRoute(0,prompt_ids,4,1);cache.ObserveHotsetRoute(1,prompt_ids,4,1);
+    cache.EndHotsetForward(4,128);
+    expect(cache.frozen_slots()==4 && cache.IsDirectReady(0,6),"Prefill did not adapt borrowed tier");
+    const auto refill=cache.stats().epoch_refill_bytes;
+    cache.EndHotsetForward(4,4);
+    expect(cache.stats().epoch_refill_bytes==refill,"Final prefill performed unused refresh");
+    cache.BeginHotsetForward(4,1,0);
+    cache.ObserveHotsetRoute(0,prompt_ids,1,1);cache.ObserveHotsetRoute(1,prompt_ids,1,1);
+    cache.EndHotsetForward(1,0);
+    expect(cache.frozen_slots()==4 && cache.hotset_policy().decode[5]==0 && cache.hotset_policy().prompt_rows==5,
+        "Single-row prefill tail was misclassified as decode");
+    cache.BeginHotsetForward(5,1);
+    // Expert 0 is a valid victim in both layers; expert 1 is outside this
+    // two-swap budget and must survive the temporary prefill tier.
+    expect(cache.frozen_slots()==8 && cache.IsDirectReady(1,1),"Prefill overwrote logical decode tier");
+    std::cout<<"[H5 PREFILL PASS] chunk_admission=1 final_chunk_skip=1 decode_tier_preserved=1\n";
+}
+
+void test_prompt_policy() {
+    Qwen4ExpHotsetPolicy full,chunked;full.Init(1,8);chunked.Init(1,8);
+    full.BeginPrompt();chunked.BeginPrompt();
+    const int ids[]={0,1,0,2,2,3,4,5,4,6,4,7};
+    full.ObservePrompt(0,ids,6,2);chunked.ObservePrompt(0,ids,2,2);chunked.ObservePrompt(0,ids+4,4,2);
+    full.SeedFromPrompt();chunked.SeedFromPrompt();
+    for(int i=0;i<8;++i)expect(std::abs(full.usage[i]-chunked.usage[i])<1e-5f,"Prompt depends on chunk geometry");
+    full.usage[7]=20;const auto learned=full.usage;
+    full.BeginPrompt();full.ObservePrompt(0,ids,6,2);const auto similarity=full.SeedFromPrompt();
+    expect(similarity>.99999f && std::abs(full.usage[7]-learned[7])<1e-4f,"Repeated prompt erased decode learning");
+    Qwen4ExpHotsetPolicy switched;switched.Init(1,8);switched.BeginPrompt();
+    const int a[]={0,0,0},b[]={7,7,7};
+    switched.ObservePrompt(0,a,3,1);switched.SeedFromPrompt();
+    switched.BeginPrompt();switched.ObservePrompt(0,b,3,1);
+    expect(switched.SeedFromPrompt()==0 && switched.usage[0]==0 && switched.usage[7]>13,"Domain switch retained stale usage");
+    std::vector<int> resident(8,-1);resident[0]=0;
+    const auto swaps=switched.Select(resident,1,true);
+    expect(swaps.size()==1 && swaps[0].incoming==7 && swaps[0].outgoing==0,"Prompt selection violated budget or direction");
+    expect(switched.Select(resident,0,true).empty(),"Zero prompt budget admitted weights");
+    std::cout<<"[H5 POLICY PASS] chunk_invariance=1 repeat_learning=1 domain_switch=1 bounded_admission=1\n";
 }
 
 } // namespace
@@ -1170,6 +1235,8 @@ int main() {
         test_direct_ready_lease(ctx);
         test_frozen_transient(ctx);
         test_adaptive_hotset(ctx);
+        test_prompt_policy();
+        test_prompt_prefill(ctx);
 
         _putenv("AILA_TEST_Q4E_HOST_POOL=");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=");

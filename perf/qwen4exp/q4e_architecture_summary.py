@@ -45,15 +45,15 @@ def read(prefix):
             requests.append(dict(prompt_tokens=prompt, generated=generated, request_ms=float(match[3]),
                 device_bytes=max(r['device_bytes'] for r in active), phases=phases))
             active = None
-    assert active is None and len(requests) == len(records) == len(texts) == meta['input']['repeats']
+    assert active is None and len(requests) == len(records) == len(texts) == meta['input'].get('requests', meta['input']['repeats'])
     for request, (ttft, callbacks, tps), text in zip(requests, records, texts):
         assert int(callbacks) == request['generated']
         request.update(ttft_ms=float(ttft), decode_tok_s=float(tps), text=text,
             text_sha256=hashlib.sha256(text.encode()).hexdigest(), input_tok_s_to_first_token=request['prompt_tokens']*1000/float(ttft))
     warm = requests[1:]
-    summary = {k: st.median(r[k] for r in warm) for k in ('ttft_ms', 'decode_tok_s', 'request_ms', 'input_tok_s_to_first_token')}
-    summary['prefill_demand_bytes'] = st.median(r['phases']['prefill']['demand_bytes'] for r in warm)
-    summary['decode_demand_bytes'] = st.median(r['phases']['decode']['demand_bytes'] for r in warm)
+    summary = {k: st.median(r[k] for r in warm) if warm else None for k in ('ttft_ms', 'decode_tok_s', 'request_ms', 'input_tok_s_to_first_token')}
+    summary['prefill_demand_bytes'] = st.median(r['phases']['prefill']['demand_bytes'] for r in warm) if warm else None
+    summary['decode_demand_bytes'] = st.median(r['phases']['decode']['demand_bytes'] for r in warm) if warm else None
     summary['peak_device_gib'] = max(r['device_bytes'] for r in requests) / 2**30
     summary['peak_working_set_gib'] = meta['peak_working_set_bytes'] / 2**30
     summary['minimum_available_ram_gib'] = meta['minimum_system_free_mb'] / 1024

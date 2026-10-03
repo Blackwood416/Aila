@@ -311,17 +311,22 @@ public:
     void TraceColdCpu(int layer,const int* ids,const int* ranks,int count);
     void TraceDeviceEvent(const char* label,int layer,sycl::event event);
     void ConfigureHotset();
-    void BeginHotsetForward(int position, int rows);
+    void BeginHotsetForward(int position, int rows,int prefill_remaining=-1);
     void ObserveHotsetRoute(int layer,const int* ids,int rows,int topk);
-    void EndHotsetForward(int rows);
+    void EndHotsetForward(int rows,int prefill_remaining=-1);
     void PublishHotsetPending(bool wait);
     void RebalanceHotset();
     void InstallHotset(const std::vector<int>& keys);
+    void HandoffPromptHotset();
+    void RebalancePromptPrefill();
     const Qwen4ExpHotsetPolicy& hotset_policy() const { return hotset_policy_; }
     bool adaptive_hotset() const { return adaptive_hotset_; }
     void RestartHotsetForTesting(bool enabled) {
         PublishHotsetPending(true);ThawReady();adaptive_hotset_=enabled;hotset_borrowed_=false;hotset_tokens_=0;
         std::fill(hotset_policy_.usage.begin(),hotset_policy_.usage.end(),0);
+        std::fill(hotset_policy_.previous_prompt.begin(),hotset_policy_.previous_prompt.end(),0);
+        hotset_policy_.collecting_prompt=false;
+        hotset_prefill_keys_.clear();
         if(enabled) {hotset_keys_.assign(hotset_policy_.ranking.begin(),hotset_policy_.ranking.begin()+hotset_keys_.size());InstallHotset(hotset_keys_);}
     }
     bool ValidateReadyBinding(int layer, int expert, int slot, uint64_t generation) const;
@@ -595,6 +600,11 @@ private:
     Qwen4ExpHotsetPolicy hotset_policy_;
     bool adaptive_hotset_ = false, hotset_borrow_ = false, hotset_borrowed_ = false;
     int hotset_interval_ = 4, hotset_swaps_ = 96, hotset_tokens_ = 0;
+    bool hotset_prompt_ = false;
+    int hotset_prompt_swaps_ = 1024;
+    bool hotset_prompt_prefill_ = false;
+    bool hotset_explicit_prefill_ = false;
+    std::vector<int> hotset_prefill_keys_;
     std::string hotset_identity_, hotset_export_;
     std::vector<int> hotset_keys_;
     std::vector<int> hotset_cold_slots_;

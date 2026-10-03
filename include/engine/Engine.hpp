@@ -97,7 +97,8 @@ public:
                                   int len,
                                   int snapshot_after_len = 0,
                                   bool async_h2d = false,
-                                  const ForwardOptions& options = {});
+                                  const ForwardOptions& options = {},
+                                  bool prompt_phase = true);
 
     std::string decode_with_special_tokens(const std::vector<int>& ids) const;
 

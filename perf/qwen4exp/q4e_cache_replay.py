@@ -72,6 +72,10 @@ def validate(rows):
             slots[s] = r['key']
             resident[r['key']] = s
             del pending[s]
+        elif kind in ('prompt_handoff', 'prefill_handoff'):
+            require(forward is None and acquire is None and not pending and not epoch_loading, 'Unsafe prompt handoff')
+            require(len(set(r['keys'])) == len(r['keys']) == len(frozen), 'Prompt tier capacity/uniqueness')
+            require(set(r['keys']) == {slots[s] for s in frozen}, 'Prompt target differs from published residency')
         elif kind == "freeze":
             require(acquire is None and direct is None and not frozen, "Invalid freeze boundary")
             require(len(set(r['slots'])) == len(r['slots']) and all(0 <= s < cap and slots[s] >= 0 for s in r['slots']), "Invalid frozen slots")

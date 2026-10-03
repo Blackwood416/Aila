@@ -11,6 +11,9 @@ param(
     [ValidateRange(0,512)][int]$HotsetSwaps=96,
     [int]$HotsetSlots=0,
     [switch]$HotsetBorrow,
+    [switch]$HotsetPrompt,
+    [switch]$HotsetPromptPrefill,
+    [ValidateRange(0,4096)][int]$HotsetPromptSwaps=1024,
     [ValidateSet(-1,0,1)][int]$HotsetRing=-1,
     [ValidateSet(-1,0,1,2)][int]$HotsetColdQueue=-1,
     [ValidateSet(0,1,2,3)][int]$ColdPolicy=0,
@@ -55,7 +58,7 @@ param(
     [switch]$Sliced,
     [string]$Tag="p0-story",
     [int]$MaxTokens=48,
-    [ValidateRange(2,8)][int]$GenerationRepeats=4,
+    [ValidateRange(1,8)][int]$GenerationRepeats=4,
     [string]$GenerationPromptFile="",
     [string[]]$GenerationPromptFiles=@(),
     [ValidateRange(512,4096)][int]$GenerationMaxSeq=512,
@@ -108,6 +111,9 @@ if($HotsetProfile) {
     $overrides.AILA_Q4E_HOTSET_INTERVAL=[string]$HotsetInterval
     $overrides.AILA_Q4E_HOTSET_SWAPS=[string]$HotsetSwaps
     $overrides.AILA_Q4E_HOTSET_BORROW=[string][int][bool]$HotsetBorrow
+    $overrides.AILA_Q4E_HOTSET_PROMPT=[string][int][bool]$HotsetPrompt
+    $overrides.AILA_Q4E_HOTSET_PROMPT_PREFILL=[string][int][bool]$HotsetPromptPrefill
+    $overrides.AILA_Q4E_HOTSET_PROMPT_SWAPS=[string]$HotsetPromptSwaps
     if($HotsetRing -ge 0) {$overrides.AILA_Q4E_HOTSET_RING=[string]$HotsetRing}
     if($HotsetColdQueue -ge 0) {$overrides.AILA_Q4E_HOTSET_COLD_QUEUE=[string]$HotsetColdQueue}
     if($HotsetSlots) {$overrides.AILA_Q4E_HOTSET_SLOTS=[string]$HotsetSlots}

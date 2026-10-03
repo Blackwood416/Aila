@@ -378,6 +378,9 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     adaptive_hotset_=other.adaptive_hotset_; other.adaptive_hotset_=false;
     hotset_borrow_=other.hotset_borrow_; hotset_borrowed_=other.hotset_borrowed_;
     hotset_interval_=other.hotset_interval_; hotset_swaps_=other.hotset_swaps_; hotset_tokens_=other.hotset_tokens_;
+    hotset_prompt_=other.hotset_prompt_;hotset_prompt_swaps_=other.hotset_prompt_swaps_;
+    hotset_prompt_prefill_=other.hotset_prompt_prefill_;hotset_prefill_keys_=std::move(other.hotset_prefill_keys_);
+    hotset_explicit_prefill_=other.hotset_explicit_prefill_;
     hotset_identity_=std::move(other.hotset_identity_); hotset_export_=std::move(other.hotset_export_);
     other.hotset_export_.clear(); hotset_keys_=std::move(other.hotset_keys_);
     hotset_cold_slots_=std::move(other.hotset_cold_slots_);hotset_cold_cursor_=other.hotset_cold_cursor_;hotset_ring_=other.hotset_ring_;
@@ -1379,6 +1382,10 @@ void Qwen4ExpExpertCache::ConfigureHotset() {
     hotset_interval_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_INTERVAL",4),0,1024);
     hotset_swaps_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS",96),0,512);
     hotset_borrow_=aila::env::read_flag("AILA_Q4E_HOTSET_BORROW",false);
+    hotset_prompt_=aila::env::read_flag("AILA_Q4E_HOTSET_PROMPT",false);
+    hotset_prompt_prefill_=aila::env::read_flag("AILA_Q4E_HOTSET_PROMPT_PREFILL",false);
+    hotset_prompt_=hotset_prompt_ || hotset_prompt_prefill_;
+    hotset_prompt_swaps_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_PROMPT_SWAPS",1024),0,num_slots_-1);
     hotset_ring_=aila::env::read_flag("AILA_Q4E_HOTSET_RING",true);
     hotset_cold_policy_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_COLD_QUEUE",hotset_ring_?2:0),0,2);
     const int staging=std::min(hotset_borrow_?16:num_experts_per_layer_,num_slots_-1);
@@ -1503,10 +1510,17 @@ void Qwen4ExpExpertCache::RebalanceHotset() {
     stats_.epoch_refill_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
 }
 
-void Qwen4ExpExpertCache::BeginHotsetForward(int position,int rows) {
+void Qwen4ExpExpertCache::BeginHotsetForward(int position,int rows,int prefill_remaining) {
+    hotset_explicit_prefill_=prefill_remaining>=0;
     if(!adaptive_hotset_)return;
     PublishHotsetPending(false);
-    if(hotset_borrow_ && rows>1 && !hotset_borrowed_) {
+    if(hotset_prompt_ && (position==0 || ((rows>1 || hotset_explicit_prefill_) && !hotset_policy_.collecting_prompt))) {
+        hotset_policy_.BeginPrompt();hotset_tokens_=0;
+        hotset_prefill_keys_=hotset_keys_;
+    }
+    if(hotset_prompt_ && rows==1 && position>0 && !hotset_explicit_prefill_ && hotset_policy_.collecting_prompt)
+        HandoffPromptHotset();
+    if(hotset_borrow_ && (rows>1 || hotset_explicit_prefill_) && !hotset_borrowed_) {
         PublishHotsetPending(true);ctx_->synchronize();
         const int retain=std::min<int>(int(hotset_keys_.size()),std::max(0,num_slots_-num_experts_per_layer_));
         std::vector<int> lent;
@@ -1516,14 +1530,74 @@ void Qwen4ExpExpertCache::BeginHotsetForward(int position,int rows) {
         frozen_descriptors_published_=false;std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
         hotset_borrowed_=true;
         RefreshHotsetColdSlots();
-    } else if(rows==1 && hotset_borrowed_) {InstallHotset(hotset_keys_);hotset_borrowed_=false;}
+    } else if(rows==1 && !hotset_explicit_prefill_ && hotset_borrowed_) {InstallHotset(hotset_keys_);hotset_borrowed_=false;}
     if(position==0)hotset_tokens_=0;
 }
 void Qwen4ExpExpertCache::ObserveHotsetRoute(int layer,const int* ids,int rows,int topk) {
-    if(hotset_policy_.layers)hotset_policy_.Observe(layer,ids,rows,topk);
+    if(hotset_policy_.layers)hotset_policy_.Observe(layer,ids,rows,topk,hotset_explicit_prefill_);
+    if(hotset_prompt_ && hotset_policy_.collecting_prompt)hotset_policy_.ObservePrompt(layer,ids,rows,topk);
 }
-void Qwen4ExpExpertCache::EndHotsetForward(int rows) {
-    if(adaptive_hotset_ && rows==1 && hotset_interval_ && ++hotset_tokens_%hotset_interval_==0)RebalanceHotset();
+
+void Qwen4ExpExpertCache::HandoffPromptHotset() {
+    PublishHotsetPending(true);
+    const float similarity=hotset_policy_.SeedFromPrompt();
+    std::vector<int> target(hotset_policy_.usage.size(),-1);
+    // Logical tier includes lent/missing slots. Select before restore so old
+    // targets that lose the prompt election are never needlessly reloaded.
+    for(int k:hotset_keys_)target[k]=0;
+    // A repeated prompt already has decode evidence. Do not churn low-score
+    // tail entries merely because a no-hysteresis handoff can rank them again.
+    const int budget=int(hotset_prompt_swaps_*std::clamp(1.0f-similarity,0.0f,1.0f));
+    const auto swaps=hotset_policy_.Select(target,budget,true);
+    for(const auto& sw:swaps) {
+        auto old=std::find(hotset_keys_.begin(),hotset_keys_.end(),sw.outgoing);
+        *old=sw.incoming;
+    }
+    // Borrow the least valuable tail on the next prefill, rather than retaining
+    // inherited positions from the original offline profile indefinitely.
+    std::stable_sort(hotset_keys_.begin(),hotset_keys_.end(),[&](int a,int b){
+        return hotset_policy_.usage[a]>hotset_policy_.usage[b];
+    });
+    const auto bytes0=stats_.epoch_refill_bytes,ns0=stats_.epoch_refill_ns;
+    if(hotset_borrowed_ || !swaps.empty())InstallHotset(hotset_keys_);
+    hotset_borrowed_=false;
+    AILA_LOG_INFO("[Q4E PromptHotset] rows=%d similarity=%.6f budget=%d swaps=%d refill_bytes=%llu refill_ns=%llu",
+        hotset_policy_.prompt_rows,similarity,budget,int(swaps.size()),
+        (unsigned long long)(stats_.epoch_refill_bytes-bytes0),(unsigned long long)(stats_.epoch_refill_ns-ns0));
+    if(cache_trace_) {auto& out=cache_trace_->Row("prompt_handoff");
+        out<<",\"rows\":"<<hotset_policy_.prompt_rows<<",\"swaps\":"<<swaps.size()<<",\"keys\":";
+        Qwen4ExpCacheTrace::Ints(out,hotset_keys_.data(),int(hotset_keys_.size()));cache_trace_->End();}
+}
+void Qwen4ExpExpertCache::RebalancePromptPrefill() {
+    const int retain=hotset_borrow_?std::min<int>(int(hotset_keys_.size()),num_slots_-num_experts_per_layer_):int(hotset_keys_.size());
+    if(retain<=0 || hotset_policy_.prompt_rows==0 || hotset_prompt_swaps_==0)return;
+    // Separate temporary prefill residency from the learned decode tier. A long
+    // prompt may need different experts in different chunks, without destroying
+    // the decode prior we want to reuse for a repeated request.
+    std::vector<float> scores(hotset_policy_.usage.size(),0);
+    for(int l=0;l<num_layers_;++l)if(hotset_policy_.prompt_mass[l]>0)
+        for(int e=0;e<num_experts_per_layer_;++e) {const int k=l*num_experts_per_layer_+e;
+            scores[k]=hotset_policy_.prompt_usage[k]/hotset_policy_.prompt_mass[l];}
+    std::vector<int> target(scores.size(),-1);for(int k:hotset_prefill_keys_)target[k]=0;
+    const auto swaps=hotset_policy_.Select(target,hotset_prompt_swaps_,true,&scores);
+    for(const auto& sw:swaps)*std::find(hotset_prefill_keys_.begin(),hotset_prefill_keys_.end(),sw.outgoing)=sw.incoming;
+    std::stable_sort(hotset_prefill_keys_.begin(),hotset_prefill_keys_.end(),[&](int a,int b){return scores[a]>scores[b];});
+    std::vector<int> keys(hotset_prefill_keys_.begin(),hotset_prefill_keys_.begin()+retain);
+    const auto bytes0=stats_.epoch_refill_bytes,ns0=stats_.epoch_refill_ns;
+    InstallHotset(keys);hotset_borrowed_=true;
+    AILA_LOG_INFO("[Q4E PrefillHotset] rows=%d swaps=%d slots=%d refill_bytes=%llu refill_ns=%llu",
+        hotset_policy_.prompt_rows,int(swaps.size()),retain,
+        (unsigned long long)(stats_.epoch_refill_bytes-bytes0),(unsigned long long)(stats_.epoch_refill_ns-ns0));
+    if(cache_trace_) {auto& out=cache_trace_->Row("prefill_handoff");
+        out<<",\"rows\":"<<hotset_policy_.prompt_rows<<",\"swaps\":"<<swaps.size()<<",\"keys\":";
+        Qwen4ExpCacheTrace::Ints(out,keys.data(),int(keys.size()));cache_trace_->End();}
+}
+void Qwen4ExpExpertCache::EndHotsetForward(int rows,int prefill_remaining) {
+    // Avoid rebuilding a multi-GB tier for the small checkpoint/logits tail.
+    // 32 remaining rows is an experimental amortization guard, not a kernel dispatch rule.
+    if(adaptive_hotset_ && hotset_prompt_prefill_ && hotset_policy_.collecting_prompt && rows>1 && prefill_remaining>=32)
+        RebalancePromptPrefill();
+    if(adaptive_hotset_ && rows==1 && prefill_remaining<0 && hotset_interval_ && ++hotset_tokens_%hotset_interval_==0)RebalanceHotset();
 }
 
 bool Qwen4ExpExpertCache::IsDirectReady(int layer, int expert) const {

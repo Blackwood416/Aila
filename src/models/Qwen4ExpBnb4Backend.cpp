@@ -1152,7 +1152,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (count <= 0) return buf_.logits;
 
     int start_pos = session.currentLength_;
-    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count);
+    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining);
     int cached_len = start_pos + count;
     if (cached_len > max_seq_len_) {
         throw std::runtime_error("Qwen4ExpBnb4Backend: context length " +
@@ -2288,7 +2288,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (expert_cache_.tracing() && s_trace_markers)
         ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
     expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
-    if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count);
+    if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count,options.prefill_remaining);
     if(expert_cache_.adaptive_hotset()) {const auto& hs=expert_cache_.stats();
         AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu",
             start_pos,count,expert_cache_.frozen_slots(),(unsigned long long)hs.epoch_swaps,

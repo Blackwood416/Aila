@@ -14,6 +14,7 @@ struct ForwardOptions {
     bool need_logits = true;
     bool capture_snapshot = false; // Force a checkpoint at an explicit prefix boundary.
     int checkpoint_after = 0; // Tokens within this forward; zero disables the interior checkpoint.
+    int prefill_remaining = -1; // Known prompt tokens after this slice; -1 for decode/unspecified.
 };
 
 class IModelBackend {

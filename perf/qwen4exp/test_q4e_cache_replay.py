@@ -32,6 +32,15 @@ def end(acquire, hits, misses):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_prompt_target_must_match_published_tier(self):
+        for kind in ('prompt_handoff','prefill_handoff'):
+            rows=fixture()+[dict(type='freeze',slots=[1]),dict(type=kind,keys=[0])]
+            self.assertEqual(len(validate(copy.deepcopy(rows))),1)
+            bad=copy.deepcopy(rows);bad[-1]['keys']=[3]
+            with self.assertRaisesRegex(ValueError,'differs from published'):validate(bad)
+            bad=copy.deepcopy(rows);bad[-1]['keys']=[0,0]
+            with self.assertRaisesRegex(ValueError,'capacity/uniqueness'):validate(bad)
+
     def test_epoch_retirement_publication_and_borrow(self):
         rows=fixture()+[
             dict(type='freeze',slots=[1]),
