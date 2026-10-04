@@ -11,6 +11,11 @@ from q4e_cold_summary import read as read_canary
 from q4e_prompt_hotset_trace import inspect
 
 VARIABLES = {
+    'AILA_Q4E_HC_DECODE_DOWN_WG': '256', 'AILA_Q4E_HC_DECODE_UP_STREAMS': '0',
+    'AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL': '0',
+    'AILA_Q4E_CPU_NF4_Q8_ROW4': '0', 'AILA_Q4E_CPU_Q8_CHUNKS': '0',
+    'AILA_Q4E_ROUTER_RESIDENT_FUSED': '0',
+    'AILA_Q4E_CPU_NF4_Q8_BLOCK64': '0',
     'AILA_Q4E_CPU_NF4_Q8': '0', 'AILA_Q4E_HOST_COMPLEMENT': '0',
     'AILA_Q4E_CPU_MMAP_COLD': '0',
     'AILA_Q4E_CPU_MMAP_PREFETCH': '0',
@@ -51,6 +56,8 @@ def read_extra(run):
 
 
 def case_name(settings):
+    if settings['AILA_Q4E_CPU_NF4_Q8_ROW4'] == '1' and settings['AILA_Q4E_CPU_NF4_Q8_BLOCK64'] == '1':
+        raise ValueError('row4 and block64 cannot both be enabled')
     q8, hc = settings['AILA_Q4E_CPU_NF4_Q8'], settings['AILA_Q4E_HOST_COMPLEMENT']
     name = 'q8-complement' if q8 == '1' and hc == '1' else 'q8' if q8 == '1' else 'complement' if hc == '1' else 'baseline'
     if settings['AILA_Q4E_CPU_MMAP_COLD'] == '1':
@@ -69,6 +76,23 @@ def case_name(settings):
             name += '-' + label + settings[key]
     if settings['AILA_Q4E_COLD_POLICY'] != '1' or settings['AILA_Q4E_COLD_PCIE_NUM'] != '141':
         name += '-policy' + settings['AILA_Q4E_COLD_POLICY'] + '-pcie' + settings['AILA_Q4E_COLD_PCIE_NUM']
+    if settings['AILA_Q4E_CPU_NF4_Q8_ROW4'] != '0':
+        value = settings['AILA_Q4E_CPU_NF4_Q8_ROW4']
+        name += '-row4' if value == '1' else '-row4' + value
+    if settings['AILA_Q4E_CPU_NF4_Q8_BLOCK64'] != '0':
+        value = settings['AILA_Q4E_CPU_NF4_Q8_BLOCK64']
+        name += '-block64' if value == '1' else '-block64' + value
+    if settings['AILA_Q4E_CPU_Q8_CHUNKS'] != '0':
+        name += '-chunks' + settings['AILA_Q4E_CPU_Q8_CHUNKS']
+    if settings['AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL'] != '0':
+        name += '-pending-mlp' + settings['AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL']
+    if settings['AILA_Q4E_HC_DECODE_DOWN_WG'] != '256':
+        name += '-hc' + settings['AILA_Q4E_HC_DECODE_DOWN_WG']
+    if settings['AILA_Q4E_HC_DECODE_UP_STREAMS'] != '0':
+        name += '-hc-up' + settings['AILA_Q4E_HC_DECODE_UP_STREAMS']
+    if settings['AILA_Q4E_ROUTER_RESIDENT_FUSED'] != '0':
+        value = settings['AILA_Q4E_ROUTER_RESIDENT_FUSED']
+        name += '-routerfused' if value == '1' else '-routerfused' + value
     return name
 
 

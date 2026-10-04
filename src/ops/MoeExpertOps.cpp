@@ -83,7 +83,8 @@ void router_topk_ids_host(
     }
 }
 
-sycl::event router_softmax_topk_device(
+template <bool Resident>
+static sycl::event launch_router_softmax_topk(
     Context& ctx,
     const bf16* router_scores_ptr,
     const bf16* per_expert_scale_ptr,
@@ -92,7 +93,12 @@ sycl::event router_softmax_topk_device(
     int tokens,
     int num_experts,
     int top_k,
-    bool norm_topk_prob) {
+    bool norm_topk_prob,
+    const int* resident_table,
+    int* resident_selected,
+    int* host_ids,
+    float* host_weights,
+    int* host_selected) {
     if (num_experts != 512) {
         std::vector<bf16> scores_host(static_cast<size_t>(tokens) * num_experts);
         std::vector<bf16> scale_host(per_expert_scale_ptr ? num_experts : 0);
@@ -250,10 +256,44 @@ sycl::event router_softmax_topk_device(
                             w *= static_cast<float>(per_expert_scale_ptr[chosen_exp]);
                         }
                         expert_weights_dev[token * top_k + k] = w;
+                        if constexpr (Resident) {
+                            // The complete top-k arithmetic above is shared with
+                            // the original route. Classification only consumes
+                            // its final ID/weight, without a second kernel.
+                            const int slot = resident_table[chosen_exp];
+                            resident_selected[k] = slot;
+                            host_selected[k] = slot;
+                            host_ids[k] = chosen_exp;
+                            host_weights[k] = w;
+                        }
                     }
                 }
             });
     });
+}
+
+sycl::event router_softmax_topk_device(
+    Context& ctx, const bf16* router_scores_ptr, const bf16* per_expert_scale_ptr,
+    int* expert_ids_dev, float* expert_weights_dev, int tokens, int num_experts,
+    int top_k, bool norm_topk_prob) {
+    return launch_router_softmax_topk<false>(ctx, router_scores_ptr, per_expert_scale_ptr,
+        expert_ids_dev, expert_weights_dev, tokens, num_experts, top_k, norm_topk_prob,
+        nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+sycl::event router_softmax_topk_resident(
+    Context& ctx, const bf16* router_scores_ptr, const bf16* per_expert_scale_ptr,
+    int* expert_ids_dev, float* expert_weights_dev, const int* resident_table,
+    int* resident_selected, int* host_ids, float* host_weights, int* host_selected,
+    int num_experts, int top_k, bool norm_topk_prob) {
+    if (num_experts != 512 || top_k < 1 || top_k > 16)
+        throw std::invalid_argument("Resident router requires one token, 512 experts and top-k 1..16");
+    if (!router_scores_ptr || !expert_ids_dev || !expert_weights_dev || !resident_table ||
+        !resident_selected || !host_ids || !host_weights || !host_selected)
+        throw std::invalid_argument("Resident router requires all route/classification outputs");
+    return launch_router_softmax_topk<true>(ctx, router_scores_ptr, per_expert_scale_ptr,
+        expert_ids_dev, expert_weights_dev, 1, num_experts, top_k, norm_topk_prob,
+        resident_table, resident_selected, host_ids, host_weights, host_selected);
 }
 
 sycl::event router_topk_ids_device(

@@ -74,6 +74,13 @@ struct HeteroExecutionStats {
     uint64_t cpu_mmap_prefetch_ranges = 0, cpu_mmap_prefetch_bytes = 0, cpu_mmap_prefetch_failures = 0;
     // Single-thread in-span page visits; not unique resident pages or OS faults.
     uint64_t cpu_mmap_touch_ns = 0, cpu_mmap_touch_pages = 0;
+    // Opt-in process-wide diagnostic counters sampled around CPU compute.
+    // Faults include soft and hard faults from all process threads.
+    uint64_t cpu_diagnostic_batches = 0, cpu_diagnostic_failures = 0;
+    uint64_t cpu_verify_batches = 0; // diagnostic H8 shadow comparisons, mismatch throws
+    uint64_t cpu_process_faults = 0, cpu_process_user_ns = 0, cpu_process_kernel_ns = 0;
+    uint64_t cpu_gate_up_ns = 0, cpu_quantize_ns = 0, cpu_down_ns = 0;
+    uint64_t cpu_gate_chunks = 0, cpu_down_chunks = 0;
     uint64_t cpu_straggler_interval_ns = 0; // observed host interval, not exposed GPU tail
     uint64_t gpu_tasks_dispatched = 0;
     uint64_t layers_hetero_executed = 0;

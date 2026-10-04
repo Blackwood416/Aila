@@ -33,6 +33,17 @@ param(
     [ValidateRange(1,10)][int]$ColdCredits=2,
     [ValidateRange(100,10000)][int]$ColdBudgetUs=1000,
     [ValidateSet(-1,0,1)][int]$CpuNf4Q8=-1,
+    [ValidateSet(-1,0,1)][int]$CpuNf4Q8Row4=-1,
+    [ValidateSet(-1,0,1)][int]$CpuNf4Q8Block64=-1,
+    [ValidateRange(-1,8)][int]$CpuQ8Chunks=-1,
+    [switch]$CpuDiagnostic,
+    [switch]$CpuVerify,
+    [switch]$GpuMemoryDiagnostic,
+    [ValidateSet(-1,0,1)][int]$RouterResidentFused=-1,
+    [ValidateSet(-1,0,1)][int]$DecodePendingMlpResidual=-1,
+    [ValidateSet(-1,64,128,256)][int]$HcDownWorkGroup=-1,
+    [ValidateSet(-1,0,1)][int]$HcUpParallelStreams=-1,
+    [switch]$HcReferenceCanary,
     [ValidateSet(-1,0,1)][int]$CpuMmapCold=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapPrefetch=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapTouch=-1,
@@ -79,6 +90,7 @@ param(
     [ValidateSet(0,256,512,1024,2048)][int]$PrefillChunk=0,
     [switch]$PhaseScratch,
     [ValidateSet(0,8192,16384,24576,32768)][int]$HostRamMB=32768,
+    [ValidateRange(0,16384)][int]$ExpertCacheMB=0,
     [ValidateRange(0,64)][int]$FillParts=0,
     [ValidateRange(0,32)][int]$FillThreads=0,
     [ValidateRange(0,512)][int]$DemandMicrobatch=0,
@@ -89,6 +101,10 @@ param(
     [string]$ModelDir="C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
 )
 $ErrorActionPreference="Stop"
+if ($GpuMemoryDiagnostic -and ($Vtune -or $VtuneInstructions)) {
+    throw 'GpuMemoryDiagnostic requires a direct Aila launch; VTune launches have a different process ID.'
+}
+if($HcReferenceCanary -and !$ColdQuality){throw 'HcReferenceCanary requires ColdQuality; it changes the test reference arm.'}
 . (Join-Path $PSScriptRoot "../PerfCommon.ps1")
 $repo=Get-AilaRepoRoot
 $cfg=Get-AilaOneApiStackConfig -RepoRoot $repo -Path "perf/oneapi-stacks.json"
@@ -108,11 +124,22 @@ if($RuntimeDefaults) {
     $overrides=@{AILA_Q4E_CPU_EXPERT_DISPATCH="0"}
     if($PSBoundParameters.ContainsKey('HostRamMB')) {$overrides.AILA_Q4E_HOT_RAM_MB=[string]$HostRamMB}
 }
+if($ExpertCacheMB -gt 0) {$overrides.AILA_Q4E_EXPERT_CACHE_MB=[string]$ExpertCacheMB}
 if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$InlineCheckpoint}
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
 if($DecodePrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_DECODE=[string]$DecodePrefetch}
 if($PrefillPrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_PREFILL=[string]$PrefillPrefetch}
 if($CpuNf4Q8 -ge 0) {$overrides.AILA_Q4E_CPU_NF4_Q8=[string]$CpuNf4Q8}
+if($CpuNf4Q8Block64 -ge 0) {$overrides.AILA_Q4E_CPU_NF4_Q8_BLOCK64=[string]$CpuNf4Q8Block64}
+if($CpuNf4Q8Row4 -ge 0) {$overrides.AILA_Q4E_CPU_NF4_Q8_ROW4=[string]$CpuNf4Q8Row4}
+if($CpuQ8Chunks -ge 0) {$overrides.AILA_Q4E_CPU_Q8_CHUNKS=[string]$CpuQ8Chunks}
+if($CpuDiagnostic) {$overrides.AILA_Q4E_CPU_DIAGNOSTIC='1'}
+if($CpuVerify) {$overrides.AILA_Q4E_CPU_Q8_VERIFY='1'}
+if($RouterResidentFused -ge 0) {$overrides.AILA_Q4E_ROUTER_RESIDENT_FUSED=[string]$RouterResidentFused}
+if($DecodePendingMlpResidual -ge 0) {$overrides.AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL=[string]$DecodePendingMlpResidual}
+if($HcDownWorkGroup -ge 0) {$overrides.AILA_Q4E_HC_DECODE_DOWN_WG=[string]$HcDownWorkGroup}
+if($HcUpParallelStreams -ge 0) {$overrides.AILA_Q4E_HC_DECODE_UP_STREAMS=[string]$HcUpParallelStreams}
+if($HcReferenceCanary) {$overrides.AILA_Q4E_COLD_TEST_HC_REFERENCE='1'}
 if($CpuMmapCold -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_COLD=[string]$CpuMmapCold}
 if($CpuMmapPrefetch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_PREFETCH=[string]$CpuMmapPrefetch}
 if($CpuMmapTouch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_TOUCH=[string]$CpuMmapTouch}
@@ -368,7 +395,7 @@ $meta=[ordered]@{
     exe_sha256=(Get-FileHash $exe).Hash;model_config_sha256=(Get-FileHash "$ModelDir/config.json").Hash
     stack=(Get-AilaOneApiStackMetadata -Stack $stack)
     gpu=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion)
-    diagnostic_only=[bool]($Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
+    diagnostic_only=[bool]($GpuMemoryDiagnostic -or $CpuVerify -or $CpuDiagnostic -or $Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
 }
 $launcher=$exe
 if($HotsetProfile) {$meta.hotset_profile=@{path=(Resolve-Path -LiteralPath $HotsetProfile).Path;sha256=(Get-FileHash -LiteralPath $HotsetProfile).Hash}}
@@ -385,6 +412,12 @@ $quoted=@($arguments | ForEach-Object { '"' + ([string]$_).Replace('"','\"') + '
 $launchOptions=@{}
 if($stdinPath) {$launchOptions.RedirectStandardInput=$stdinPath}
 $proc=Start-Process -FilePath $launcher -ArgumentList $quoted -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput "$prefix.log" -RedirectStandardError "$prefix.err.log" @launchOptions
+$meta.process_id=$proc.Id
+$gpuSamples=[System.Collections.Generic.List[object]]::new()
+$gpuCounterPaths=@('\GPU Process Memory(*)\Dedicated Usage','\GPU Process Memory(*)\Shared Usage',
+    '\GPU Process Memory(*)\Total Committed','\GPU Process Memory(*)\Local Usage',
+    '\GPU Process Memory(*)\Non Local Usage','\GPU Adapter Memory(*)\Dedicated Usage',
+    '\GPU Adapter Memory(*)\Shared Usage','\GPU Adapter Memory(*)\Total Committed')
 $samples=[System.Collections.Generic.List[object]]::new()
 $timer=[System.Diagnostics.Stopwatch]::StartNew()
 try {
@@ -394,6 +427,23 @@ try {
         $children=@(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" | ForEach-Object {Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue})
         $childWs=0;foreach($child in $children){$childWs+=$child.WorkingSet64}
         $samples.Add([pscustomobject]@{ms=$timer.ElapsedMilliseconds;working_set_bytes=$proc.WorkingSet64;child_working_set_bytes=$childWs;system_free_mb=$free})
+        if($GpuMemoryDiagnostic) {
+            try {
+                $counter=Get-Counter -Counter $gpuCounterPaths -MaxSamples 1 -ErrorAction Stop
+                $gpuRows=@($counter.CounterSamples | Where-Object {
+                    $_.Path -match '\\gpu adapter memory\(' -or $_.InstanceName -match ('^pid_'+$proc.Id+'_')
+                } | ForEach-Object {
+                    [pscustomobject]@{timestamp=$_.Timestamp;path=$_.Path;instance=$_.InstanceName;
+                        # PDH VALID_DATA=0 and NEW_DATA=1 both carry valid values.
+                        status=$_.Status;bytes=$(if($_.Status -in @(0,1)){[uint64]$_.CookedValue}else{$null})}
+                })
+                $gpuSamples.Add([pscustomobject]@{ms=$timer.ElapsedMilliseconds;pid=$proc.Id;rows=$gpuRows;
+                    process_available=[bool](@($gpuRows | Where-Object {$_.instance -match ('^pid_'+$proc.Id+'_') -and $_.status -in @(0,1)}).Count)})
+            } catch {
+                $gpuSamples.Add([pscustomobject]@{ms=$timer.ElapsedMilliseconds;pid=$proc.Id;
+                    process_available=$false;unavailable_reason=$_.Exception.Message})
+            }
+        }
         if($free -lt 8192) {$meta.memory_pressure=$true;break}
     }
 } finally {
@@ -415,6 +465,11 @@ if(($Trace -or $Vtune -or $VtuneInstructions) -and (Test-Path "$prefix.cache.jso
 if(($Trace -or $Vtune -or $VtuneInstructions) -and (Test-Path "$prefix.cache.jsonl.mtp")) {$meta.mtp_trace_sha256=(Get-FileHash "$prefix.cache.jsonl.mtp").Hash}
 $meta | ConvertTo-Json -Depth 8 | Set-Content "$prefix.meta.json"
 $samples | ConvertTo-Json -Depth 3 | Set-Content "$prefix.memory.json"
+if($GpuMemoryDiagnostic) {
+    $gpuSamples | ConvertTo-Json -Depth 6 | Set-Content "$prefix.gpu-memory.json"
+    $meta.gpu_memory_sha256=(Get-FileHash "$prefix.gpu-memory.json").Hash
+    $meta | ConvertTo-Json -Depth 8 | Set-Content "$prefix.meta.json"
+}
 Get-Content "$prefix.log" | Select-Object -Last 6
 Get-Content "$prefix.err.log" | Select-Object -Last 4
 if($meta.Contains('memory_pressure') -and $meta.memory_pressure) {throw "Execution probe stopped the process below the 8 GiB available RAM floor"}

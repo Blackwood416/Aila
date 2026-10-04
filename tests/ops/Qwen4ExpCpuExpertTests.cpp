@@ -118,14 +118,19 @@ struct SyntheticExpertData {
     }
 };
 
-void test_nf4_q8_batch() {
+void test_nf4_q8_batch(bool row4 = false, unsigned case_seed = 20261003, bool block64 = false) {
     constexpr int H = ops::cpu::kHiddenDim, I = ops::cpu::kIntermediateDim;
     constexpr int count = ops::cpu::kMaxExpertBatchTasks;
-    const auto approximate = ops::cpu::CpuKernelBackend::Nf4Q8Avx2;
+    const bool candidate = row4 || block64;
+    const auto approximate = block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2
+                            : row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2
+                                   : ops::cpu::CpuKernelBackend::Nf4Q8Avx2;
     std::vector<std::unique_ptr<SyntheticExpertData>> experts;
-    for (int c = 0; c < 4; ++c) experts.push_back(std::make_unique<SyntheticExpertData>(1337 + c));
+    const int expert_count = candidate ? 10 : 4;
+    for (int c = 0; c < expert_count; ++c)
+        experts.push_back(std::make_unique<SyntheticExpertData>(1337 + c + (case_seed - 20261003) * 17));
     // Include values where nested scale contraction differs from two-step FP32.
-    std::mt19937 rng(20261003);
+    std::mt19937 rng(case_seed);
     std::uniform_real_distribution<float> scale_dist(0.013f, 0.087f);
     for (auto& expert : experts) {
         for (auto& value : expert->gu_nested_absmax) value = scale_dist(rng);
@@ -142,11 +147,19 @@ void test_nf4_q8_batch() {
     }
     std::vector<bf16> x(4 * H), h(count * I), expected_h(count * I), flat_h(count * I);
     std::vector<float> output(count * H), expected(count * H), flat_output(count * H), reference(count * H);
+    std::vector<bf16> h8_h(count * I), h8_flat_h(count * I);
+    std::vector<float> h8_output(count * H), h8_flat_output(count * H);
     std::normal_distribution<float> input_dist(0.0f, 1.0f);
-    for (auto& value : x) value = bf16(input_dist(rng));
+    for (int t = 0; t < 4; ++t) {
+        // Include small SwiGLU outputs near BF16 boundaries as well as wider
+        // gates. A vector exp substitution can be invisible at ordinary scales.
+        constexpr float amplitudes[4] = {0.03125f, 0.125f, 1.0f, 4.0f};
+        const float amplitude = candidate ? amplitudes[t] : 1.0f;
+        for (int col = 0; col < H; ++col) x[t * H + col] = bf16(amplitude * input_dist(rng));
+    }
     ops::cpu::CpuExpertTask tasks[count], flat_tasks[count];
     for (int c = 0; c < count; ++c) {
-        const int expert = c % 4, token = (c / 4) % 4;
+        const int expert = c % expert_count, token = (c / expert_count) % 4;
         tasks[c] = {experts[expert]->host_slot_nested, token};
         flat_tasks[c] = {experts[expert]->host_slot_unnested, token};
     }
@@ -162,6 +175,12 @@ void test_nf4_q8_batch() {
             }
             ops::cpu::cpu_expert_batch_forward(flat_tasks, count, x.data(), 4,
                 flat_h.data(), flat_output.data(), nullptr, approximate);
+            if (candidate) {
+                ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4,
+                    h8_h.data(), h8_output.data(), nullptr, ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
+                ops::cpu::cpu_expert_batch_forward(flat_tasks, count, x.data(), 4,
+                    h8_flat_h.data(), h8_flat_output.data(), nullptr, ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
+            }
         });
         expect(std::memcmp(h.data(), expected_h.data(), h.size() * sizeof(bf16)) == 0,
             "NF4Q8 mixed-token batch intermediate differs from single-task execution");
@@ -170,6 +189,27 @@ void test_nf4_q8_batch() {
         expect(std::memcmp(h.data(), flat_h.data(), h.size() * sizeof(bf16)) == 0 &&
                std::memcmp(output.data(), flat_output.data(), output.size() * sizeof(float)) == 0,
             "NF4Q8 nested scales differ from expanded two-step scales");
+        if (candidate) {
+            expect(std::memcmp(h.data(), h8_h.data(), h.size() * sizeof(bf16)) == 0 &&
+                   std::memcmp(output.data(), h8_output.data(), output.size() * sizeof(float)) == 0,
+                "NF4Q8 candidate nested h/out differs bitwise from H8");
+            expect(std::memcmp(flat_h.data(), h8_flat_h.data(), flat_h.size() * sizeof(bf16)) == 0 &&
+                   std::memcmp(flat_output.data(), h8_flat_output.data(), flat_output.size() * sizeof(float)) == 0,
+                "NF4Q8 candidate flat h/out differs bitwise from H8");
+            ops::cpu::CpuExpertPhaseTimings phases;
+            arena.execute([&] {
+                ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4,
+                    expected_h.data(), expected.data(), nullptr, approximate, &phases);
+            });
+            expect(std::memcmp(h.data(), expected_h.data(), h.size() * sizeof(bf16)) == 0 &&
+                   std::memcmp(output.data(), expected.data(), output.size() * sizeof(float)) == 0,
+                "NF4Q8 candidate phase instrumentation changes h/out bits");
+            expect(phases.gate_up_ns > 0 && phases.quantize_ns > 0 && phases.down_ns > 0,
+                "NF4Q8 candidate requested phase instrumentation is empty");
+            expect(phases.gate_chunks >= 0 && phases.gate_chunks <= count * (I / 16) &&
+                   phases.down_chunks >= 0 && phases.down_chunks <= count * (H / 32),
+                "NF4Q8 candidate coarse chunks exceed available tiles");
+        }
     }
     // Compare complete nonlinear expert outputs with the existing unquantized
     // activation / FP32-dot backend. A 3% NRMSE budget catches nibble ordering,
@@ -191,14 +231,32 @@ void test_nf4_q8_batch() {
     expect(nrmse < 0.03, "NF4Q8 full-expert NRMSE exceeds 3% synthetic error budget");
     // Exact zero must hold even with non-zero weight scales and prior outputs.
     std::fill(x.begin(), x.end(), bf16(0.0f));
-    std::fill(output.begin(), output.end(), 123.0f);
-    arena.execute([&] {
-        ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4, h.data(), output.data(), nullptr, approximate);
-    });
-    for (auto value : h) expect(static_cast<float>(value) == 0.0f, "NF4Q8 zero activation intermediate is non-zero");
-    for (auto value : output) expect(value == 0.0f, "NF4Q8 zero activation output is non-zero");
-    std::cout << "[PASS] NF4Q8 zero, mixed 4-token/max40-task batch, nested scales, 1/4/12 threads, NRMSE="
-              << nrmse << " (<0.03; full-model teacher KL gate remains separate)\n";
+    for (int threads : {1, 4, 12}) {
+        std::fill(h.begin(), h.end(), bf16(123.0f));
+        std::fill(output.begin(), output.end(), 123.0f);
+        tbb::task_arena zero_arena(threads);
+        zero_arena.execute([&] {
+            ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4, h.data(), output.data(), nullptr, approximate);
+            if (candidate) {
+                ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4,
+                    h8_h.data(), h8_output.data(), nullptr, ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
+                ops::cpu::cpu_expert_batch_forward(flat_tasks, count, x.data(), 4,
+                    flat_h.data(), flat_output.data(), nullptr, approximate);
+            }
+        });
+        for (auto value : h) expect(static_cast<float>(value) == 0.0f, "NF4Q8 zero activation intermediate is non-zero");
+        for (auto value : output) expect(value == 0.0f, "NF4Q8 zero activation output is non-zero");
+        if (candidate) {
+            expect(std::memcmp(h.data(), h8_h.data(), h.size() * sizeof(bf16)) == 0 &&
+                   std::memcmp(output.data(), h8_output.data(), output.size() * sizeof(float)) == 0 &&
+                   std::memcmp(h.data(), flat_h.data(), h.size() * sizeof(bf16)) == 0 &&
+                   std::memcmp(output.data(), flat_output.data(), output.size() * sizeof(float)) == 0,
+                "NF4Q8 candidate zero h/out differs bitwise from H8 or flat scales");
+        }
+    }
+    std::cout << "[PASS] NF4Q8" << (block64 ? " block64 H8-bitwise," : row4 ? " row4 H8-bitwise," : "")
+              << " zero, mixed 4-token/max40-task batch, nested/flat scales, 1/4/12 threads, batch/single partition parity, NRMSE="
+              << nrmse << " seed=" << case_seed << " (<0.03; full-model teacher KL gate remains separate)\n";
 }
 
 void test_batch_scale(bool benchmark) {
@@ -871,12 +929,22 @@ int main(int argc, char** argv) {
             test_nf4_q8_batch();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--nf4-q8-row4") {
+            for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(true, seed);
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--nf4-q8-block64") {
+            for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(false, seed, true);
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--batch-scale") {
             test_batch_scale(true);
             return 0;
         }
         test_batch_scale(false);
         test_nf4_q8_batch();
+        for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(true, seed);
+        for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(false, seed, true);
         test_edge_cases_and_robustness();
         test_nested_rounding_contract();
         test_cpu_self_consistency();

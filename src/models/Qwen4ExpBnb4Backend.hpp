@@ -301,8 +301,35 @@ public:
     const aila::HeteroExecutionStats& hetero_stats() const { return expert_executor_.stats(); }
     aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
     void SetColdEpochEnabled(bool enabled) { cold_epoch_enabled_=enabled; }
+    // Cold acceptance reference only. Drain GPU/CPU work and stop forwards
+    // before changing this hook; it is false throughout normal runtime use.
+    void SetDecodeHcReferenceForTest(bool enabled) { decodeHcReferenceForTest_ = enabled; }
 
 private:
+    bool decodeHcReferenceForTest_ = false;
+    // One forward owns this ticket. y/inject remain in their existing buffers
+    // until the next HC norm consumes them on the in-order compute queue.
+    struct DecodePendingMlpResidual {
+        Context& ctx;
+        sycl::ext::oneapi::bfloat16* hidden;
+        const sycl::ext::oneapi::bfloat16* y;
+        const float* inject;
+        int hiddenSize;
+        bool pending = false;
+        uint64_t deferred = 0;
+        uint64_t consumedNorm = 0;
+        uint64_t materialized = 0;
+        DecodePendingMlpResidual(Context& context, sycl::ext::oneapi::bfloat16* hiddenPtr,
+            const sycl::ext::oneapi::bfloat16* yPtr, const float* injectPtr, int dim)
+            : ctx(context), hidden(hiddenPtr), y(yPtr), inject(injectPtr), hiddenSize(dim) {}
+        DecodePendingMlpResidual(const DecodePendingMlpResidual&) = delete;
+        DecodePendingMlpResidual& operator=(const DecodePendingMlpResidual&) = delete;
+        ~DecodePendingMlpResidual() noexcept;
+        void Defer();
+        void Materialize();
+        void ConsumeNorm(const float* normWeight, float eps,
+            sycl::ext::oneapi::bfloat16* normalized);
+    };
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly,
                         const ForwardOptions& options);
@@ -334,7 +361,8 @@ private:
     void RunHyperConnection(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject);
     // P1: Fused residual add + grouped norm across attention -> MLP boundary
     void RunHyperConnectionCombined(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
-                                    const sycl::ext::oneapi::bfloat16* pending_y, const float* pending_inj);
+                                    const sycl::ext::oneapi::bfloat16* pending_y, const float* pending_inj,
+                                    DecodePendingMlpResidual* pending_mlp = nullptr);
 
     ModelSpec spec_;
     Qwen4ExpTextConfig cfg_;

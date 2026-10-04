@@ -8,6 +8,10 @@ void test_cold_model(const std::string& directory,bool benchmark) {
     InferenceEngine engine;expect(engine.init(directory,2560),"Cold model init");
     auto& ctx=Access::Ctx(engine);auto& backend=Access::Backend(engine);auto& cache=Access::Cache(engine);
     auto& session=Access::Session(engine);
+    const bool hc_reference=aila::env::read_flag("AILA_Q4E_COLD_TEST_HC_REFERENCE",false);
+    // Switching the test hook requires every submitted forward to be drained.
+    auto set_hc_reference=[&](bool enabled){ctx.synchronize();backend.SetDecodeHcReferenceForTest(enabled);};
+    struct RestoreHcReference{Context& ctx;Qwen4ExpBnb4Backend& backend;~RestoreHcReference(){try{ctx.synchronize();backend.SetDecodeHcReferenceForTest(false);}catch(...){}}}restore_hc{ctx,backend};
     const bool adaptive=cache.adaptive_hotset();
     if(adaptive)cache.RestartHotsetForTesting(false);
     Access::ColdMode(backend,0,false);
@@ -33,9 +37,11 @@ void test_cold_model(const std::string& directory,bool benchmark) {
     auto prefill=[&]{backend.reset();expect(engine.forward_prompt_tokens(prompt,0,int(prompt.size()),int(prompt.size())-4)!=nullptr,"Cold prefill");ctx.synchronize();};
     std::vector<std::vector<float>> reference;
     if(!benchmark) {
+        set_hc_reference(hc_reference);
         prefill();
         for(int step=0;step<48;++step) {reference.push_back(extract_bf16_to_f32(ctx,Access::Logits(backend)));backend.forward(ctx,ids.data_as<int>()+step,1,{SnapshotPolicy::None,true});}
     }
+    set_hc_reference(false);
     // Rebuild from prompt demand before freezing. Calibration time is reported.
     const auto calibration_begin=std::chrono::steady_clock::now();
     if(adaptive)cache.RestartHotsetForTesting(true);
@@ -128,6 +134,7 @@ void test_cold_model(const std::string& directory,bool benchmark) {
         // not a calibrated universal pass threshold. Keep the alert visible.
         nll_warning=nll_warning || metrics.nll_delta/metrics.rows>.01;
         expect(metrics.kl/metrics.rows<=.01 && metrics.max_nrmse<=.15,"Cold KL/NRMSE gate");
+        if(hc_reference && mode==1)expect(exact==48,"HC candidate differs from original GPU teacher logits");
         expect(ctx.device_allocation_count()==device_count && ctx.pinned_host_allocation_count()==host_count,"Cold decode allocated USM");
         expect(after.direct_entries-before.direct_entries+after.cold_request_entries-before.cold_request_entries==48ULL*48*10,"Cold route coverage");
         if(!adaptive)expect(cache.FrozenIdentity()==identity,"Frozen set drift");
@@ -145,6 +152,7 @@ void test_cold_model(const std::string& directory,bool benchmark) {
             expect_same_checkpoint(snapshot,*session.snapshot_for_testing(anchor));
         }
         std::cout<<"[COLD MODEL] mode="<<mode<<" h3="<<h3<<" exact_rows="<<exact<<" cpu_tasks="<<cpu.cpu_tasks_completed-cpu0.cpu_tasks_completed
+            <<" hc_original_reference="<<hc_reference
             <<" identity="<<identity<<" replay=1 checkpoint=1 live_usm_delta=0\n";
     }
     expect(cpu_total>0,"C1 ran no CPU tasks");if(h3_filter!=0)expect(h3_direct>0,"H3 ran no direct batches");

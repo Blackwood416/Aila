@@ -61,30 +61,42 @@ void hc_inject_add_and_grouped_rms_norm(
     int group_dim,
     bool plus_one = true);
 
-// Single-row (decode) hyper-connection, stage A. One work-group per output row:
+// Pending single-row residual: preserve the standalone vec8 BF16 store, then
+// reload H after a work-group global fence and use grouped_rms_norm's reduction.
+// Returns false without submitting anything for non-vec8 shapes/alignment;
+// the owner must materialize with hc_inject_add before submitting the old norm.
+bool try_hc_decode_inject_add_and_grouped_rms_norm(
+    Context& ctx, bf16* H, const bf16* y, const float* inj,
+    const float* norm_w, float eps, bf16* out_N, int group_dim,
+    bool plus_one = true);
+
+// Single-row (decode) hyper-connection, stage A. One SG16 per output row:
 //   act[r] = silu(bf16(W_down[r] . N) / groups)          r < lowrank
 //   inj[g] = 2 * sigmoid(bf16(W_inject[g] . N) / groups)  g < groups (skipped if W_inject null)
 // N: [groups * group_dim] bf16; W_down: [lowrank, groups * group_dim]; W_inject: [groups, groups * group_dim]
 void hc_decode_down_inject(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
-    bf16* act, float* inj, int lowrank, int group_dim, int groups);
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int down_work_group = 256);
 
 // Single-row (decode) hyper-connection, stage B. One sub-group per output dim d:
 //   x[d] = mean_g( sigmoid(bf16(W_up[g * group_dim + d] . act)) * N[g * group_dim + d] )
 // W_up: [groups * group_dim, lowrank]; act: [lowrank]; x: [group_dim]
 void hc_decode_up_mix(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
-    bf16* x, int lowrank, int group_dim, int groups);
+    bf16* x, int lowrank, int group_dim, int groups, bool parallel_streams = false);
 
 // Contiguous batches of 1..4 rows, with shared raw row-major BF16 weights.
 // Each subgroup still computes one output; rows use independent work-groups.
 // Same intermediate BF16 rounding and FP32 reductions as the single-row path.
+// Explicit experimental dispatch: down WG is 64/128/256; parallel_streams
+// assigns four SG16s per dimension when groups=4, otherwise uses the old path.
+// Its SLM holds only rounded BF16 gates; input activations remain global loads.
 void hc_decode_down_inject_rows(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
-    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows);
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows, int down_work_group = 256);
 void hc_decode_up_mix_rows(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
-    bf16* x, int lowrank, int group_dim, int groups, int rows);
+    bf16* x, int lowrank, int group_dim, int groups, int rows, bool parallel_streams = false);
 
 // PLE Gate-Value computation:
 // g[s] = sum_d (K[s, d] * Q[s, d]) / sqrt(hidden_size)

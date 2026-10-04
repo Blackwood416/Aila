@@ -5,6 +5,8 @@ Run the experimental Qwen3.8 A770 supply candidate in a single-session CLI.
 Screening scope: representative 41/47/1833-token inputs and 48 output tokens.
 This is an opt-in experiment, not a validated production dispatch. Real expert
 demand loading remains enabled independently of speculative prefetch.
+Heterogeneous enables mapped NF4-Q8 CPU supply, the zero host pool, short fills
+and the measured decode residual fusion. Explicit parameters override each knob.
 .EXAMPLE
 pwsh -NoProfile -File perf/qwen4exp/q4e_supply_chat.ps1 -DryRun
 .EXAMPLE
@@ -22,6 +24,14 @@ param(
     [ValidateSet(0,1)][int]$DecodePrefetch = 0,
     [ValidateSet(0,1)][int]$PrefillPrefetch = 0,
     [ValidateSet(0,1)][int]$CpuNf4Q8 = 0,
+    [ValidateSet(0,1)][int]$CpuNf4Q8Row4 = 0,
+    [ValidateSet(0,1)][int]$CpuNf4Q8Block64 = 0,
+    [ValidateRange(0,8)][int]$CpuQ8Chunks = 0,
+    [ValidateSet(0,1)][int]$RouterResidentFused = 0,
+    [ValidateSet(0,1)][int]$DecodePendingMlpResidual = 0,
+    [ValidateSet(64,128,256)][int]$HcDownWorkGroup = 256,
+    [ValidateSet(0,1)][int]$HcUpParallelStreams = 0,
+    [ValidateRange(0,16384)][int]$ExpertCacheMB = 0,
     [ValidateSet(0,1)][int]$CpuMmapCold = 0,
     [ValidateSet(0,1)][int]$CpuMmapPrefetch = 0,
     [ValidateSet(0,1)][int]$CpuMmapTouch = 0,
@@ -35,12 +45,14 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+if ($CpuNf4Q8Row4 -and $CpuNf4Q8Block64) { throw 'Choose row4 or block64 CPU decoding.' }
 # Explicit parameters can override individual knobs for a separate experiment.
 if ($Heterogeneous) {
     if (-not $PSBoundParameters.ContainsKey('HostRamMB')) { $HostRamMB = 0 }
     if (-not $PSBoundParameters.ContainsKey('CpuNf4Q8')) { $CpuNf4Q8 = 1 }
     if (-not $PSBoundParameters.ContainsKey('CpuMmapCold')) { $CpuMmapCold = 1 }
     if (-not $PSBoundParameters.ContainsKey('FillShortParts')) { $FillShortParts = 1 }
+    if (-not $PSBoundParameters.ContainsKey('DecodePendingMlpResidual')) { $DecodePendingMlpResidual = 1 }
 }
 . (Join-Path $PSScriptRoot '../PerfCommon.ps1')
 $repo = Get-AilaRepoRoot
@@ -87,6 +99,16 @@ $candidate = @{
     AILA_Q4E_COLD_PCIE_NUM = [string]$ColdPcieNum; AILA_Q4E_COLD_BUDGET_US = '1000'
     AILA_Q4E_CPU_THREADS = '12'; AILA_Q4E_COLD_LOW_RANK = '0'
     AILA_Q4E_CPU_NF4_Q8 = [string]$CpuNf4Q8; AILA_Q4E_CPU_MMAP_COLD = [string]$CpuMmapCold
+    AILA_Q4E_CPU_NF4_Q8_ROW4 = [string]$CpuNf4Q8Row4
+    AILA_Q4E_CPU_NF4_Q8_BLOCK64 = [string]$CpuNf4Q8Block64
+    AILA_Q4E_CPU_Q8_CHUNKS = [string]$CpuQ8Chunks
+    AILA_Q4E_ROUTER_RESIDENT_FUSED = [string]$RouterResidentFused
+    AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL = [string]$DecodePendingMlpResidual
+    AILA_Q4E_HC_DECODE_DOWN_WG = [string]$HcDownWorkGroup
+    AILA_Q4E_HC_DECODE_UP_STREAMS = [string]$HcUpParallelStreams
+    AILA_Q4E_COLD_TEST_HC_REFERENCE = '0'
+    AILA_Q4E_EXPERT_CACHE_MB = [string]$ExpertCacheMB
+    AILA_Q4E_CPU_DIAGNOSTIC = '0'; AILA_Q4E_CPU_Q8_VERIFY = '0'
     AILA_Q4E_CPU_MMAP_PREFETCH = [string]$CpuMmapPrefetch
     AILA_Q4E_CPU_MMAP_TOUCH = [string]$CpuMmapTouch
     AILA_Q4E_HOST_COMPLEMENT = [string]$HostComplement; AILA_Q4E_HOST_COMPLEMENT_SCAN = '512'
@@ -126,6 +148,10 @@ try {
     }
     Write-Host "Experimental supply: chunk=$PrefillChunk swaps=$HotsetSwaps prefetch(decode/prefill)=$DecodePrefetch/$PrefillPrefetch Ready-adopt=4096 host-pool=${HostRamMB}MiB"
     Write-Host "CPU NF4-Q8=$CpuNf4Q8 mapped-cold=$CpuMmapCold source-prefetch=$CpuMmapPrefetch source-touch=$CpuMmapTouch complementary-host=$HostComplement fill-parts=$FillParts short-parts=$FillShortParts"
+    Write-Host "CPU row4=$CpuNf4Q8Row4 block64=$CpuNf4Q8Block64 chunks=$CpuQ8Chunks resident-router-fused=$RouterResidentFused"
+    Write-Host "GPU expert-cache=${ExpertCacheMB}MiB (0=automatic)"
+    Write-Host "Decode pending MLP residual=$DecodePendingMlpResidual"
+    Write-Host "HC down work group=$HcDownWorkGroup up parallel streams=$HcUpParallelStreams"
     Write-Host "Cold policy=$ColdPolicy PCIe fraction=$ColdPcieNum/256"
     Write-Host "Profile: $profile"
     if ($DryRun) {

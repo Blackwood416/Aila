@@ -8,8 +8,10 @@
 #include "utils/EnvUtils.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -22,9 +24,28 @@ namespace fs = std::filesystem;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
 struct Qwen4ExpGenerationTestAccess {
+    using PendingMlpResidual = Qwen4ExpBnb4Backend::DecodePendingMlpResidual;
     static bool CanCapture(const Qwen4ExpBnb4Backend& backend,
                            const Qwen4ExpBnb4Backend::Session& session, int count, int anchor) {
         return backend.CanCaptureInteriorCheckpoint(session, count, anchor);
+    }
+    static Qwen4ExpBuffers& HcFixture(Qwen4ExpBnb4Backend& backend, Context& ctx, int dim, int lowrank) {
+        backend.context_ = &ctx;
+        backend.hidden_size_ = dim;
+        backend.cfg_.hc_lowrank = lowrank;
+        backend.cfg_.rms_norm_eps = 1e-6f;
+        auto& b = backend.buf_;
+        b.hidden4 = Tensor::allocate(ctx, {1, 4 * dim}, dnnl::memory::data_type::bf16);
+        b.y = Tensor::allocate(ctx, {1, dim}, dnnl::memory::data_type::bf16);
+        b.hc_N = Tensor::allocate(ctx, {1, 4 * dim}, dnnl::memory::data_type::bf16);
+        b.hc_mix_down = Tensor::allocate(ctx, {1, lowrank}, dnnl::memory::data_type::bf16);
+        b.hc_inject_f32 = Tensor::allocate(ctx, {1, 4}, dnnl::memory::data_type::f32);
+        b.x = Tensor::allocate(ctx, {1, dim}, dnnl::memory::data_type::bf16);
+        return b;
+    }
+    static void RunHc(Qwen4ExpBnb4Backend& backend, Context& ctx,
+        Qwen4ExpHyperConnectionLayer& hc, PendingMlpResidual* pending = nullptr) {
+        backend.RunHyperConnectionCombined(ctx, hc, 1, false, nullptr, nullptr, pending);
     }
 };
 
@@ -34,6 +55,331 @@ void expect(bool cond, const std::string& msg) {
     if (!cond) {
         throw std::runtime_error("Test failure: " + msg);
     }
+}
+
+void test_decode_pending_mlp_residual(Context& ctx) {
+    std::cout << "[Test] Decode pending MLP residual bitwise/state alignment...\n";
+    using Pending = Qwen4ExpGenerationTestAccess::PendingMlpResidual;
+    auto expect_bits = [&](const bf16* ref, const bf16* got, size_t count, const std::string& label) {
+        if (std::memcmp(ref, got, count * sizeof(bf16)) == 0) return;
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t old_bits = 0, new_bits = 0;
+            std::memcpy(&old_bits, ref + i, sizeof(old_bits));
+            std::memcpy(&new_bits, got + i, sizeof(new_bits));
+            if (old_bits != new_bits) {
+                std::cerr << "[Bitwise diff] " << label << " index=" << i
+                    << " old_bits=0x" << std::hex << old_bits << " new_bits=0x" << new_bits
+                    << std::dec << " old=" << static_cast<float>(ref[i])
+                    << " new=" << static_cast<float>(got[i]) << '\n';
+                break;
+            }
+        }
+        expect(false, label + " differs bitwise");
+    };
+    for (const int dim : {257, 2560}) {
+        const size_t n = static_cast<size_t>(4 * dim);
+        Tensor old_h = Tensor::allocate(ctx, {4, dim}, dnnl::memory::data_type::bf16);
+        Tensor new_h = Tensor::allocate(ctx, {4, dim}, dnnl::memory::data_type::bf16);
+        Tensor y = Tensor::allocate(ctx, {dim}, dnnl::memory::data_type::bf16);
+        Tensor inj = Tensor::allocate(ctx, {4}, dnnl::memory::data_type::f32);
+        Tensor weight = Tensor::allocate(ctx, {4, dim}, dnnl::memory::data_type::f32);
+        Tensor old_n = Tensor::allocate(ctx, {4, dim}, dnnl::memory::data_type::bf16);
+        Tensor new_n = Tensor::allocate(ctx, {4, dim}, dnnl::memory::data_type::bf16);
+        std::vector<bf16> h_host(n), y_host(dim), ref_h(n), got_h(n), ref_n(n), got_n(n);
+        std::vector<float> w_host(n);
+        const std::array<float, 4> inject = {0.00390625f, -1.0000001192092896f, 0.3333333432674408f, 1.9999998807907104f};
+        for (int d = 0; d < dim; ++d) {
+            y_host[d] = bf16((d % 4 == 0) ? 1.0f : std::ldexp(float((d % 31) - 15), (d % 11) - 5));
+            for (int g = 0; g < 4; ++g) {
+                const size_t i = size_t(g) * dim + d;
+                // Group 0 has exact BF16 half-ULP additions; group 1 has
+                // near-cancellation. Other values span exponents and signs.
+                h_host[i] = bf16((g == 0 && d % 4 == 0) ? 1.0f :
+                    g == 1 ? static_cast<float>(y_host[d]) :
+                    std::ldexp(float(((d * 13 + g * 7) % 47) - 23), (d % 9) - 4));
+                w_host[i] = float(int(i % 19) - 9) / 32.0f;
+            }
+        }
+        ctx.memcpy_h2d(y.data(), y_host.data(), dim * sizeof(bf16));
+        ctx.memcpy_h2d(inj.data(), inject.data(), sizeof(inject));
+        ctx.memcpy_h2d(weight.data(), w_host.data(), n * sizeof(float));
+        auto reset = [&] {
+            ctx.memcpy_h2d(old_h.data(), h_host.data(), n * sizeof(bf16));
+            ctx.memcpy_h2d(new_h.data(), h_host.data(), n * sizeof(bf16));
+        };
+        auto compare_h = [&] {
+            ctx.memcpy_d2h(ref_h.data(), old_h.data(), n * sizeof(bf16));
+            ctx.memcpy_d2h(got_h.data(), new_h.data(), n * sizeof(bf16));
+            expect_bits(ref_h.data(), got_h.data(), n,
+                "pending residual H dim=" + std::to_string(dim));
+        };
+        reset();
+        // Eight successive layers overwrite the same y/inject buffers only
+        // after each submitted norm has consumed them. No wait is inserted
+        // between the norm and that next producer on the compute queue.
+        for (int layer = 0; layer < 8; ++layer) {
+            ops::hc_inject_add(ctx, old_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), 1, dim, 4);
+            ops::grouped_rms_norm(ctx, old_h.data_as<bf16>(), weight.data_as<float>(), 1e-6f,
+                old_n.data_as<bf16>(), 1, 4, dim, true);
+            {
+                Pending pending(ctx, new_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), dim);
+                pending.Defer();
+                pending.ConsumeNorm(weight.data_as<float>(), 1e-6f, new_n.data_as<bf16>());
+                expect(!pending.pending, "norm did not consume residual ownership");
+                expect(pending.deferred == 1 && pending.consumedNorm == uint64_t(dim % 8 == 0) &&
+                    pending.materialized == uint64_t(dim % 8 != 0), "pending norm dispatch counters");
+            }
+            const auto y_ptr = y.data_as<bf16>();
+            const auto inj_ptr = inj.data_as<float>();
+            ctx.queue().parallel_for(sycl::range<1>(dim), [=](sycl::id<1> id) {
+                y_ptr[id[0]] = bf16(-static_cast<float>(y_ptr[id[0]]));
+                if (id[0] < 4) inj_ptr[id[0]] = -inj_ptr[id[0]];
+            });
+            compare_h();
+            ctx.memcpy_d2h(ref_n.data(), old_n.data(), n * sizeof(bf16));
+            ctx.memcpy_d2h(got_n.data(), new_n.data(), n * sizeof(bf16));
+            expect_bits(ref_n.data(), got_n.data(), n,
+                "pending residual N dim=" + std::to_string(dim) + " layer=" + std::to_string(layer));
+        }
+        // Explicit materialization (PLE/no-logits/observer) is idempotent.
+        reset();
+        ops::hc_inject_add(ctx, old_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), 1, dim, 4);
+        {
+            Pending pending(ctx, new_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), dim);
+            pending.Defer(); pending.Materialize(); pending.Materialize();
+            expect(!pending.pending, "boundary flush left a pending residual");
+            expect(pending.deferred == 1 && pending.materialized == 1 && pending.consumedNorm == 0,
+                "idempotent materialization counters");
+        }
+        compare_h();
+        // A host exception before the next norm must materialize exactly once.
+        reset();
+        ops::hc_inject_add(ctx, old_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), 1, dim, 4);
+        try {
+            Pending pending(ctx, new_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), dim);
+            pending.Defer();
+            throw std::runtime_error("test unwind before norm");
+        } catch (const std::runtime_error&) {}
+        compare_h();
+        reset();
+        ops::hc_inject_add(ctx, old_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), 1, dim, 4);
+        try {
+            Pending pending(ctx, new_h.data_as<bf16>(), y.data_as<bf16>(), inj.data_as<float>(), dim);
+            pending.Defer(); pending.ConsumeNorm(weight.data_as<float>(), 1e-6f, new_n.data_as<bf16>());
+            throw std::runtime_error("test unwind after norm");
+        } catch (const std::runtime_error&) {}
+        compare_h();
+    }
+
+    // Exercise the actual backend final-mixer path: with_inject=false must
+    // consume the previous layer's injection before submitting its own dots.
+    constexpr int dim = 32, lowrank = 16;
+    Qwen4ExpBnb4Backend baseline, candidate;
+    auto& old_b = Qwen4ExpGenerationTestAccess::HcFixture(baseline, ctx, dim, lowrank);
+    auto& new_b = Qwen4ExpGenerationTestAccess::HcFixture(candidate, ctx, dim, lowrank);
+    Tensor norm = Tensor::allocate(ctx, {4 * dim}, dnnl::memory::data_type::f32);
+    Tensor down = Tensor::allocate(ctx, {lowrank, 4 * dim}, dnnl::memory::data_type::bf16);
+    Tensor up = Tensor::allocate(ctx, {4 * dim, lowrank}, dnnl::memory::data_type::bf16);
+    std::vector<bf16> h(4 * dim), y(dim), wd(lowrank * 4 * dim), wu(4 * dim * lowrank);
+    std::vector<float> wn(4 * dim);
+    const std::array<float, 4> inject = {0.25f, 0.5f, 1.0f, 1.75f};
+    for (size_t i = 0; i < h.size(); ++i) {h[i] = bf16(float(int(i % 17) - 8) / 4); wn[i] = float(int(i % 7) - 3) / 16;}
+    for (int i = 0; i < dim; ++i) y[i] = bf16(float(i - 16) / 8);
+    for (size_t i = 0; i < wd.size(); ++i) wd[i] = bf16(float(int(i % 13) - 6) / 32);
+    for (size_t i = 0; i < wu.size(); ++i) wu[i] = bf16(float(int(i % 11) - 5) / 32);
+    for (auto* b : {&old_b, &new_b}) {
+        ctx.memcpy_h2d(b->hidden4.data(), h.data(), h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(b->y.data(), y.data(), y.size() * sizeof(bf16));
+        ctx.memcpy_h2d(b->hc_inject_f32.data(), inject.data(), sizeof(inject));
+    }
+    ctx.memcpy_h2d(norm.data(), wn.data(), wn.size() * sizeof(float));
+    ctx.memcpy_h2d(down.data(), wd.data(), wd.size() * sizeof(bf16));
+    ctx.memcpy_h2d(up.data(), wu.data(), wu.size() * sizeof(bf16));
+    Qwen4ExpHyperConnectionLayer hc;
+    hc.hc_norm_weight = &norm; hc.mix_down_w = &down; hc.mix_up_w = &up;
+    ops::hc_inject_add(ctx, old_b.hidden4.data_as<bf16>(), old_b.y.data_as<bf16>(), old_b.hc_inject_f32.data_as<float>(), 1, dim, 4);
+    Qwen4ExpGenerationTestAccess::RunHc(baseline, ctx, hc);
+    {
+        Pending pending(ctx, new_b.hidden4.data_as<bf16>(), new_b.y.data_as<bf16>(), new_b.hc_inject_f32.data_as<float>(), dim);
+        pending.Defer(); Qwen4ExpGenerationTestAccess::RunHc(candidate, ctx, hc, &pending);
+        expect(!pending.pending, "final mixer did not consume residual");
+    }
+    auto bitwise = [&](const Tensor& a, const Tensor& b, const char* label) {
+        std::vector<bf16> x(a.size_bytes() / sizeof(bf16)), z(b.size_bytes() / sizeof(bf16));
+        ctx.memcpy_d2h(x.data(), a.data(), a.size_bytes()); ctx.memcpy_d2h(z.data(), b.data(), b.size_bytes());
+        expect_bits(x.data(), z.data(), x.size(), std::string("final mixer ") + label);
+    };
+    bitwise(old_b.hidden4, new_b.hidden4, "H"); bitwise(old_b.hc_N, new_b.hc_N, "N"); bitwise(old_b.x, new_b.x, "x");
+    std::array<float, 4> got_inject{};
+    ctx.memcpy_d2h(got_inject.data(), new_b.hc_inject_f32.data(), sizeof(got_inject));
+    expect(std::memcmp(got_inject.data(), inject.data(), sizeof(inject)) == 0,
+        "final mixer overwrote the preceding layer's injection");
+    std::cout << "[PASS] Decode pending MLP residual numerical and ownership checks.\n";
+}
+
+void test_hc_decode_scheduling_bitwise(Context& ctx) {
+    std::cout << "[Test] HC down WG64/128 and parallel-stream up strict bitwise alignment...\n";
+    constexpr int guard = 16;
+    auto run_case = [&](int dim, int lowrank, int groups, int rows, uint32_t seed) {
+        const int k = groups * dim;
+        std::mt19937 rng(seed);
+        std::uniform_int_distribution<int> values(-32, 32);
+        std::vector<bf16> n(size_t(rows) * k), wd(size_t(lowrank) * k),
+            wu(size_t(k) * lowrank), wi(size_t(groups) * k);
+        for (auto& v : n) v = bf16(float(values(rng)) / 16.0f);
+        for (auto& v : wd) v = bf16(float(values(rng)) / 256.0f);
+        for (auto& v : wu) v = bf16(float(values(rng)) / 128.0f);
+        for (auto& v : wi) v = bf16(float(values(rng)) / 256.0f);
+        // Dot 0 is exactly halfway between two BF16 values before the HC
+        // nonlinear epilogue. Dot 1 cancels, leaving a small representable term.
+        for (int r = 0; r < rows; ++r) {
+            n[size_t(r) * k] = bf16(1); n[size_t(r) * k + 1] = bf16(1); n[size_t(r) * k + 2] = bf16(1);
+        }
+        std::fill(wd.begin(), wd.begin() + 2 * k, bf16(0));
+        wd[0] = bf16(1); wd[1] = bf16(0.00390625f);
+        wd[k] = bf16(1); wd[k + 1] = bf16(-1); wd[k + 2] = bf16(0.000030517578125f);
+        for (int g = 0; g < groups; ++g) {
+            // Mixed output includes cancellation across streams and exponents.
+            const std::array<float, 4> cancellation = {1.0f, 0.00390625f, -1.0f, -0.00390625f};
+            for (int r = 0; r < rows; ++r) {
+                n[size_t(r) * k + size_t(g) * dim + dim - 1] =
+                    bf16(cancellation[g]);
+            }
+            // Zero projection makes the last dimension's gates exactly 0.5,
+            // exposing the ordered stream accumulation without sigmoid noise.
+            const size_t off = (size_t(g) * dim + dim - 1) * lowrank;
+            std::fill(wu.begin() + off, wu.begin() + off + lowrank, bf16(0));
+        }
+        Tensor tn = Tensor::allocate(ctx, {rows, k}, dnnl::memory::data_type::bf16);
+        Tensor td = Tensor::allocate(ctx, {lowrank, k}, dnnl::memory::data_type::bf16);
+        Tensor tu = Tensor::allocate(ctx, {k, lowrank}, dnnl::memory::data_type::bf16);
+        Tensor ti = Tensor::allocate(ctx, {groups, k}, dnnl::memory::data_type::bf16);
+        ctx.memcpy_h2d(tn.data(), n.data(), n.size() * sizeof(bf16));
+        ctx.memcpy_h2d(td.data(), wd.data(), wd.size() * sizeof(bf16));
+        ctx.memcpy_h2d(tu.data(), wu.data(), wu.size() * sizeof(bf16));
+        ctx.memcpy_h2d(ti.data(), wi.data(), wi.size() * sizeof(bf16));
+        const size_t act_count = size_t(rows) * lowrank, inj_count = size_t(rows) * groups, x_count = size_t(rows) * dim;
+        Tensor ref_a = Tensor::allocate(ctx, {int64_t(act_count + 2 * guard)}, dnnl::memory::data_type::bf16);
+        Tensor got_a = Tensor::allocate(ctx, {int64_t(act_count + 2 * guard)}, dnnl::memory::data_type::bf16);
+        Tensor ref_i = Tensor::allocate(ctx, {int64_t(inj_count + 2 * guard)}, dnnl::memory::data_type::f32);
+        Tensor got_i = Tensor::allocate(ctx, {int64_t(inj_count + 2 * guard)}, dnnl::memory::data_type::f32);
+        Tensor ref_x = Tensor::allocate(ctx, {int64_t(x_count + 2 * guard)}, dnnl::memory::data_type::bf16);
+        Tensor got_x = Tensor::allocate(ctx, {int64_t(x_count + 2 * guard)}, dnnl::memory::data_type::bf16);
+        const bf16 sentinel = bf16(-713.0f);
+        const float inject_sentinel = -919.25f;
+        int case_wg = 256;
+        bool case_parallel = false, case_inject = false;
+        auto initialize = [&](Tensor& a, Tensor& i, Tensor& x) {
+            std::vector<bf16> ah(act_count + 2 * guard, sentinel), xh(x_count + 2 * guard, sentinel);
+            std::vector<float> ih(inj_count + 2 * guard, inject_sentinel);
+            ctx.memcpy_h2d(a.data(), ah.data(), a.size_bytes());
+            ctx.memcpy_h2d(i.data(), ih.data(), i.size_bytes());
+            ctx.memcpy_h2d(x.data(), xh.data(), x.size_bytes());
+        };
+        auto compare = [&](const Tensor& ref, const Tensor& got, const std::string& label) {
+            std::vector<uint8_t> a(ref.size_bytes()), b(got.size_bytes());
+            ctx.memcpy_d2h(a.data(), ref.data(), a.size()); ctx.memcpy_d2h(b.data(), got.data(), b.size());
+            if (a != b) {
+                for (size_t offset = 0; offset < a.size(); offset += sizeof(uint16_t)) {
+                    uint16_t old_bits = 0, new_bits = 0;
+                    std::memcpy(&old_bits, a.data() + offset, sizeof(old_bits));
+                    std::memcpy(&new_bits, b.data() + offset, sizeof(new_bits));
+                    if (old_bits != new_bits) {
+                        std::cerr << "[HC bitwise diff] " << label << " dim=" << dim << " lr=" << lowrank
+                            << " rows=" << rows << " groups=" << groups << " seed=" << seed << " word=" << offset / 2
+                            << " wg=" << case_wg << " parallel=" << case_parallel << " inject=" << case_inject
+                            << " old=0x" << std::hex << old_bits << " new=0x" << new_bits << std::dec << '\n';
+                        break;
+                    }
+                }
+                expect(false, "HC scheduling differs bitwise: " + label);
+            }
+            const bool is_float = label == "inject";
+            const size_t element_bytes = is_float ? sizeof(float) : sizeof(bf16);
+            const void* expected = is_float ? static_cast<const void*>(&inject_sentinel) : static_cast<const void*>(&sentinel);
+            for (size_t j = 0; j < guard; ++j) {
+                expect(std::memcmp(b.data() + j * element_bytes, expected, element_bytes) == 0 &&
+                    std::memcmp(b.data() + b.size() - (j + 1) * element_bytes, expected, element_bytes) == 0,
+                    "HC scheduling wrote output guard: " + label);
+            }
+        };
+        auto down = [&](Tensor& a, Tensor& i, bool inject, int wg, bool defaults) {
+            const bf16* weight_inject = inject ? ti.data_as<bf16>() : nullptr;
+            if (rows == 1) {
+                if (defaults) ops::hc_decode_down_inject(ctx, tn.data_as<bf16>(), td.data_as<bf16>(), weight_inject,
+                    a.data_as<bf16>() + guard, i.data_as<float>() + guard, lowrank, dim, groups);
+                else ops::hc_decode_down_inject(ctx, tn.data_as<bf16>(), td.data_as<bf16>(), weight_inject,
+                    a.data_as<bf16>() + guard, i.data_as<float>() + guard, lowrank, dim, groups, wg);
+            } else {
+                if (defaults) ops::hc_decode_down_inject_rows(ctx, tn.data_as<bf16>(), td.data_as<bf16>(), weight_inject,
+                    a.data_as<bf16>() + guard, i.data_as<float>() + guard, lowrank, dim, groups, rows);
+                else ops::hc_decode_down_inject_rows(ctx, tn.data_as<bf16>(), td.data_as<bf16>(), weight_inject,
+                    a.data_as<bf16>() + guard, i.data_as<float>() + guard, lowrank, dim, groups, rows, wg);
+            }
+        };
+        auto up = [&](const Tensor& a, Tensor& x, bool parallel, bool defaults) {
+            if (rows == 1) {
+                if (defaults) ops::hc_decode_up_mix(ctx, a.data_as<bf16>() + guard, tu.data_as<bf16>(), tn.data_as<bf16>(),
+                    x.data_as<bf16>() + guard, lowrank, dim, groups);
+                else ops::hc_decode_up_mix(ctx, a.data_as<bf16>() + guard, tu.data_as<bf16>(), tn.data_as<bf16>(),
+                    x.data_as<bf16>() + guard, lowrank, dim, groups, parallel);
+            } else {
+                if (defaults) ops::hc_decode_up_mix_rows(ctx, a.data_as<bf16>() + guard, tu.data_as<bf16>(), tn.data_as<bf16>(),
+                    x.data_as<bf16>() + guard, lowrank, dim, groups, rows);
+                else ops::hc_decode_up_mix_rows(ctx, a.data_as<bf16>() + guard, tu.data_as<bf16>(), tn.data_as<bf16>(),
+                    x.data_as<bf16>() + guard, lowrank, dim, groups, rows, parallel);
+            }
+        };
+        for (const bool inject : {false, true}) {
+            case_inject = inject;
+            initialize(ref_a, ref_i, ref_x);
+            down(ref_a, ref_i, inject, 256, true); up(ref_a, ref_x, false, true);
+            for (const int wg : {256, 128, 64}) {
+                case_wg = wg; case_parallel = false;
+                initialize(got_a, got_i, got_x);
+                down(got_a, got_i, inject, wg, false);
+                compare(ref_a, got_a, "act"); compare(ref_i, got_i, "inject");
+                for (const bool parallel : {false, true}) {
+                    case_parallel = parallel;
+                    up(got_a, got_x, parallel, false);
+                    compare(ref_x, got_x, "x");
+                }
+                if (!inject) {
+                    std::vector<float> observed(inj_count + 2 * guard);
+                    ctx.memcpy_d2h(observed.data(), got_i.data(), got_i.size_bytes());
+                    for (float value : observed) expect(value == inject_sentinel, "null injection wrote its output");
+                }
+            }
+        }
+        // Give up its own controlled activation: exact half-ULP dots and
+        // near-cancellation cannot rely on the preceding SiLU values occurring.
+        std::vector<bf16> controlled(act_count + 2 * guard, sentinel);
+        for (int r = 0; r < rows; ++r) {
+            for (int j = 0; j < lowrank; ++j) controlled[guard + size_t(r) * lowrank + j] = bf16(0);
+            controlled[guard + size_t(r) * lowrank] = bf16(1);
+            controlled[guard + size_t(r) * lowrank + 1] = bf16(1);
+            controlled[guard + size_t(r) * lowrank + 2] = bf16(1);
+        }
+        for (int g = 0; g < groups; ++g) {
+            const size_t off = size_t(g) * dim * lowrank;
+            std::fill(wu.begin() + off, wu.begin() + off + 2 * lowrank, bf16(0));
+            wu[off] = bf16(1); wu[off + 1] = bf16(0.00390625f);
+            wu[off + lowrank] = bf16(1); wu[off + lowrank + 1] = bf16(-1);
+            wu[off + lowrank + 2] = bf16(0.000030517578125f);
+        }
+        ctx.memcpy_h2d(tu.data(), wu.data(), wu.size() * sizeof(bf16));
+        ctx.memcpy_h2d(ref_a.data(), controlled.data(), ref_a.size_bytes());
+        case_wg = 256; case_parallel = true;
+        up(ref_a, ref_x, false, true); up(ref_a, got_x, true, false); compare(ref_x, got_x, "x controlled");
+        bool rejected = false;
+        try { down(got_a, got_i, true, 32, false); } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "unsupported explicit HC down work-group accepted");
+    };
+    for (const uint32_t seed : {17u, 113u, 709u})
+        for (const int rows : {1, 2, 4}) run_case(2560, 320, 4, rows, seed);
+    run_case(17, 23, 4, 2, 919u); // partial dimension tile and vec8/scalar tails
+    run_case(17, 23, 3, 2, 920u); // parallel flag must preserve the old non-four-stream path
+    std::cout << "[PASS] HC scheduling defaults, bitwise outputs, null inject and guards.\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -4333,6 +4679,126 @@ void test_b1_slot_state_machine_and_generation(Context& ctx) {
     std::cout << "[PASS] B1 slot state machine, generation, and reader fence tests passed.\n";
 }
 
+void test_fused_resident_router_bitwise(Context& ctx) {
+    std::cout << "[Test] Running fused resident routing bitwise alignment...\n";
+    constexpr int experts = 512, capacity = 17;
+    Tensor scores = Tensor::allocate(ctx, {experts}, dnnl::memory::data_type::bf16);
+    Tensor scales = Tensor::allocate(ctx, {experts}, dnnl::memory::data_type::bf16);
+    Tensor table = Tensor::allocate(ctx, {experts}, dnnl::memory::data_type::s32);
+    Tensor old_ids = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::s32);
+    Tensor old_weights = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::f32);
+    Tensor old_selected = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::s32);
+    Tensor fused_ids = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::s32);
+    Tensor fused_weights = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::f32);
+    Tensor fused_selected = Tensor::allocate(ctx, {capacity}, dnnl::memory::data_type::s32);
+    struct HostOutputs {
+        Context& ctx;
+        void* block;
+        explicit HostOutputs(Context& context) : ctx(context),
+            block(context.alloc_host(6 * capacity * sizeof(uint32_t))) {}
+        ~HostOutputs() {
+            try { ctx.synchronize(); } catch (...) {}
+            ctx.free_host(block);
+        }
+    } outputs(ctx);
+    auto* old_host_ids = static_cast<int*>(outputs.block);
+    auto* old_host_weights = reinterpret_cast<float*>(old_host_ids + capacity);
+    auto* old_host_selected = reinterpret_cast<int*>(old_host_weights + capacity);
+    auto* fused_host_ids = old_host_selected + capacity;
+    auto* fused_host_weights = reinterpret_cast<float*>(fused_host_ids + capacity);
+    auto* fused_host_selected = reinterpret_cast<int*>(fused_host_weights + capacity);
+    std::memset(outputs.block, 0xA5, 6 * capacity * sizeof(uint32_t));
+    for (Tensor* output : {&old_ids, &old_weights, &old_selected,
+                           &fused_ids, &fused_weights, &fused_selected})
+        ctx.queue().memset(output->data(), 0xA5, output->size_bytes());
+    ctx.synchronize();
+
+    // Invalid shape/pointer rejection must happen before GPU submission.
+    auto expect_invalid = [&](int num_experts, int top_k, const int* resident_table) {
+        bool rejected = false;
+        try {
+            ops::router_softmax_topk_resident(ctx, scores.data_as<bf16>(), nullptr,
+                fused_ids.data_as<int>(), fused_weights.data_as<float>(), resident_table,
+                fused_selected.data_as<int>(), fused_host_ids, fused_host_weights,
+                fused_host_selected, num_experts, top_k, true);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "Fused resident router must reject invalid input bounds");
+    };
+    expect_invalid(511, 10, table.data_as<int>());
+    expect_invalid(512, 0, table.data_as<int>());
+    expect_invalid(512, 17, table.data_as<int>());
+    expect_invalid(512, 10, nullptr);
+
+    std::array<bf16, experts> scores_host{}, scales_host{};
+    std::array<int, experts> table_host{};
+    std::array<int, capacity> old_ids_read{}, old_selected_read{}, fused_ids_read{}, fused_selected_read{};
+    std::array<float, capacity> old_weights_read{}, fused_weights_read{};
+    int comparisons = 0;
+    // 48 independent seeds plus explicit all-tie, repeated-tie, extreme finite,
+    // and softmax-underflow inputs. Keep all arithmetic in the original kernel.
+    for (int sample = 0; sample < 52; ++sample) {
+        std::mt19937 rng(0x19A770u + static_cast<unsigned>(sample));
+        std::uniform_real_distribution<float> distribution(-12.0f, 12.0f);
+        for (int expert = 0; expert < experts; ++expert) {
+            float score = distribution(rng);
+            if (sample == 48) score = 0.0f;
+            if (sample == 49) score = static_cast<float>(expert % 8) - 4.0f;
+            if (sample == 50) score = expert % 2 ? 1.0e30f : -1.0e30f;
+            if (sample == 51) score = expert == 511 ? 0.0f : -160.0f;
+            scores_host[expert] = bf16(score);
+            scales_host[expert] = bf16(static_cast<float>((expert + sample) % 33) / 8.0f);
+            table_host[expert] = (expert + sample) % 3 == 0 ? -1 : (expert * 17 + sample) % 3551;
+            expect(std::isfinite(static_cast<float>(scores_host[expert])), "Router test inputs must be finite");
+        }
+        ctx.memcpy_h2d(scores.data(), scores_host.data(), sizeof(scores_host));
+        ctx.memcpy_h2d(scales.data(), scales_host.data(), sizeof(scales_host));
+        ctx.memcpy_h2d(table.data(), table_host.data(), sizeof(table_host));
+        for (int top_k : {1, 10, 16}) for (bool normalize : {false, true}) for (bool scale : {false, true}) {
+            const bf16* scale_ptr = scale ? scales.data_as<bf16>() : nullptr;
+            ops::router_softmax_topk_device(ctx, scores.data_as<bf16>(), scale_ptr,
+                old_ids.data_as<int>(), old_weights.data_as<float>(), 1, experts, top_k, normalize);
+            auto original = ops::moe_resident_classify(ctx, old_ids.data_as<int>(), old_weights.data_as<float>(),
+                table.data_as<int>(), old_selected.data_as<int>(), old_host_ids, old_host_weights,
+                old_host_selected, top_k, experts);
+            auto fused = ops::router_softmax_topk_resident(ctx, scores.data_as<bf16>(), scale_ptr,
+                fused_ids.data_as<int>(), fused_weights.data_as<float>(), table.data_as<int>(),
+                fused_selected.data_as<int>(), fused_host_ids, fused_host_weights,
+                fused_host_selected, experts, top_k, normalize);
+            // Both events provide the public pinned-host output lifetime contract.
+            original.wait_and_throw();
+            fused.wait_and_throw();
+            const std::string tag = " sample=" + std::to_string(sample) + " top_k=" + std::to_string(top_k) +
+                " normalize=" + std::to_string(normalize) + " scale=" + std::to_string(scale);
+            expect(std::memcmp(old_host_ids, fused_host_ids, capacity * sizeof(int)) == 0, "Host IDs differ" + tag);
+            expect(std::memcmp(old_host_weights, fused_host_weights, capacity * sizeof(float)) == 0, "Host weights differ bitwise" + tag);
+            expect(std::memcmp(old_host_selected, fused_host_selected, capacity * sizeof(int)) == 0, "Host selections differ" + tag);
+            ctx.memcpy_d2h(old_ids_read.data(), old_ids.data(), sizeof(old_ids_read));
+            ctx.memcpy_d2h(old_weights_read.data(), old_weights.data(), sizeof(old_weights_read));
+            ctx.memcpy_d2h(old_selected_read.data(), old_selected.data(), sizeof(old_selected_read));
+            ctx.memcpy_d2h(fused_ids_read.data(), fused_ids.data(), sizeof(fused_ids_read));
+            ctx.memcpy_d2h(fused_weights_read.data(), fused_weights.data(), sizeof(fused_weights_read));
+            ctx.memcpy_d2h(fused_selected_read.data(), fused_selected.data(), sizeof(fused_selected_read));
+            expect(std::memcmp(old_ids_read.data(), fused_ids_read.data(), sizeof(old_ids_read)) == 0, "Device IDs differ" + tag);
+            expect(std::memcmp(old_weights_read.data(), fused_weights_read.data(), sizeof(old_weights_read)) == 0, "Device weights differ bitwise" + tag);
+            expect(std::memcmp(old_selected_read.data(), fused_selected_read.data(), sizeof(old_selected_read)) == 0, "Device selections differ" + tag);
+            expect(std::memcmp(fused_ids_read.data(), fused_host_ids, sizeof(fused_ids_read)) == 0, "Fused host/device ID mirrors differ" + tag);
+            expect(std::memcmp(fused_weights_read.data(), fused_host_weights, sizeof(fused_weights_read)) == 0, "Fused host/device weight mirrors differ" + tag);
+            expect(std::memcmp(fused_selected_read.data(), fused_host_selected, sizeof(fused_selected_read)) == 0, "Fused host/device selection mirrors differ" + tag);
+            uint32_t guard = 0;
+            std::memcpy(&guard, fused_host_ids + 16, sizeof(guard));
+            expect(guard == 0xA5A5A5A5u, "Fused output overran top-k capacity" + tag);
+            for (int rank = 0; rank < top_k; ++rank) {
+                expect(fused_host_ids[rank] >= 0 && fused_host_ids[rank] < experts, "Expert ID out of range" + tag);
+                expect(fused_host_selected[rank] == table_host[fused_host_ids[rank]], "Resident classification wrong" + tag);
+                expect(std::isfinite(fused_host_weights[rank]), "Router weight is nonfinite" + tag);
+                if (sample == 48) expect(fused_host_ids[rank] == rank, "All-tie ID ordering changed" + tag);
+            }
+            ++comparisons;
+        }
+    }
+    std::cout << "[PASS] Fused resident router " << comparisons << " bitwise cases, host/device mirrors and bounds.\n\n";
+}
+
 void test_b2_route_and_prediction_event_decoupling(Context& ctx) {
     std::cout << "[Test] Running B2 route and prediction event decoupling tests...\n";
 
@@ -5356,6 +5822,8 @@ int main() {
     aila::env::enable_l0_copy_engine();
     try {
         Context ctx;
+        test_decode_pending_mlp_residual(ctx);
+        test_hc_decode_scheduling_bitwise(ctx);
         test_expert_cache_lru_and_dequant(ctx, false);
         test_expert_cache_lru_and_dequant(ctx, true);
         test_hot_host_ram_pool_and_prefetch(ctx);
@@ -5370,6 +5838,7 @@ int main() {
         test_small_gpu_cache_token_fallback_reader_protection(ctx);
         test_fill_pool_handoff_and_stale_prefetch_cleanup(ctx);
         test_b1_slot_state_machine_and_generation(ctx);
+        test_fused_resident_router_bitwise(ctx);
         test_b2_route_and_prediction_event_decoupling(ctx);
         test_b3_utility_aware_prefetch_filtering_and_metrics(ctx);
         test_b4_cost_aware_two_tier_eviction(ctx);

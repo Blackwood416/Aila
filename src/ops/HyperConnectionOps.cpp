@@ -298,12 +298,76 @@ void hc_inject_add_and_grouped_rms_norm(
     });
 }
 
+bool try_hc_decode_inject_add_and_grouped_rms_norm(
+    Context& ctx, bf16* H, const bf16* y, const float* inj,
+    const float* norm_w, float eps, bf16* out_N, int group_dim, bool plus_one) {
+    using vec8 = sycl::vec<bf16, 8>;
+    if (group_dim <= 0 || group_dim % 8 != 0 || !H || !y || !inj || !out_N ||
+        reinterpret_cast<uintptr_t>(H) % alignof(vec8) != 0 ||
+        reinterpret_cast<uintptr_t>(y) % alignof(vec8) != 0) return false;
+
+    constexpr int wg = 256;
+    constexpr int groups = 4;
+    const int dim8 = group_dim / 8;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(groups * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int group_idx = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const size_t stream_base = static_cast<size_t>(group_idx) * group_dim;
+                const size_t w_base = static_cast<size_t>(group_idx) * group_dim;
+                const float inj_val = static_cast<float>(inj[group_idx]);
+                // Keep the original standalone vec8 arithmetic and BF16 store.
+                // Each stream has one WG, so its entire update precedes its norm.
+                for (int i = lid; i < dim8; i += wg) {
+                    const size_t g_offset = stream_base + static_cast<size_t>(i) * 8;
+                    const size_t y_offset = static_cast<size_t>(i) * 8;
+                    vec8 vh = *reinterpret_cast<const vec8*>(H + g_offset);
+                    const vec8 vy = *reinterpret_cast<const vec8*>(y + y_offset);
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        vh[v] = bf16(static_cast<float>(vh[v]) + inj_val * static_cast<float>(vy[v]));
+                    }
+                    *reinterpret_cast<vec8*>(H + g_offset) = vh;
+                }
+                item.barrier(sycl::access::fence_space::global_and_local);
+
+                // These loads and the lid+256 accumulation/reduction/output
+                // order intentionally match the original grouped_rms_norm.
+                float sum_sq = 0.0f;
+                for (int i = lid; i < group_dim; i += wg) {
+                    float v = static_cast<float>(H[stream_base + i]);
+                    sum_sq += v * v;
+                }
+                red_slm[lid] = sum_sq;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = wg / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) red_slm[lid] += red_slm[lid + stride];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
+                for (int i = lid; i < group_dim; i += wg) {
+                    float v = static_cast<float>(H[stream_base + i]);
+                    float scale = inv_rms;
+                    if (norm_w) {
+                        float w_val = norm_w[w_base + i];
+                        scale *= (plus_one ? (1.0f + w_val) : w_val);
+                    }
+                    out_N[stream_base + i] = bf16(v * scale);
+                }
+            });
+    });
+    return true;
+}
+
 namespace {
-template<bool Batched>
+template<bool Batched, int WorkGroup = 256>
 void hc_decode_down_inject_impl(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
     bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows) {
-    constexpr int wg = 256;
+    constexpr int wg = WorkGroup;
     constexpr int sg_size = 16;
     constexpr int rows_per_wg = wg / sg_size;
     using vec8 = sycl::vec<bf16, 8>;
@@ -366,6 +430,18 @@ void hc_decode_down_inject_impl(
                 }
             });
     });
+}
+
+template<bool Batched>
+void hc_decode_down_inject_dispatch(
+    Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows, int work_group) {
+    switch (work_group) {
+    case 64: hc_decode_down_inject_impl<Batched, 64>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows); break;
+    case 128: hc_decode_down_inject_impl<Batched, 128>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows); break;
+    case 256: hc_decode_down_inject_impl<Batched, 256>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows); break;
+    default: throw std::invalid_argument("hc_decode_down_inject: work-group must be 64, 128 or 256");
+    }
 }
 
 template<bool Batched>
@@ -432,34 +508,107 @@ void hc_decode_up_mix_impl(
     });
 }
 
+template<bool Batched>
+void hc_decode_up_mix_streams_impl(
+    Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
+    bf16* x, int lowrank, int group_dim, int rows) {
+    constexpr int wg = 256, sg_size = 16, groups = 4;
+    constexpr int dims_per_wg = wg / (sg_size * groups);
+    using vec8 = sycl::vec<bf16, 8>;
+    const int k8 = lowrank / 8;
+    const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
+    const float inv_groups = 1.0f / static_cast<float>(groups);
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> gates(sycl::range<1>(dims_per_wg * groups), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const int lane = static_cast<int>(sg.get_local_linear_id());
+                const int sg_id = static_cast<int>(sg.get_group_linear_id());
+                const int local_d = sg_id / groups;
+                const int g = sg_id % groups;
+                const size_t batch = Batched ? item.get_group(0) / num_wgs : 0;
+                const size_t group = Batched ? item.get_group(0) % num_wgs : item.get_group(0);
+                const int d = static_cast<int>(group) * dims_per_wg + local_d;
+                const bf16* a_row = act + batch * lowrank;
+                const bf16* n_row = N + batch * groups * group_dim;
+                // Tail subgroups must reach the WG barrier, even without a row.
+                if (d < group_dim) {
+                    const size_t row = static_cast<size_t>(g) * group_dim + d;
+                    const bf16* w_row = w_up + row * lowrank;
+                    float acc = 0.0f;
+                    const bool is_aligned = (reinterpret_cast<uintptr_t>(w_row) % 16 == 0) &&
+                                            (reinterpret_cast<uintptr_t>(a_row) % 16 == 0);
+                    if (is_aligned) {
+                        for (int i = lane; i < k8; i += sg_size) {
+                            const vec8 w = *reinterpret_cast<const vec8*>(w_row + i * 8);
+                            const vec8 a = *reinterpret_cast<const vec8*>(a_row + i * 8);
+#pragma unroll
+                            for (int v = 0; v < 8; ++v) {
+                                acc = sycl::fma(static_cast<float>(w[v]), static_cast<float>(a[v]), acc);
+                            }
+                        }
+                        const int tail_start = k8 * 8;
+                        for (int i = tail_start + lane; i < lowrank; i += sg_size) {
+                            acc = sycl::fma(static_cast<float>(w_row[i]), static_cast<float>(a_row[i]), acc);
+                        }
+                    } else {
+                        for (int i = lane; i < lowrank; i += sg_size) {
+                            acc = sycl::fma(static_cast<float>(w_row[i]), static_cast<float>(a_row[i]), acc);
+                        }
+                    }
+                    const float dot = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                    const float u = static_cast<float>(bf16(dot));
+                    const bf16 m = bf16(1.0f / (1.0f + sycl::native::exp(-u)));
+                    if (lane == 0) gates[local_d * groups + g] = m;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (g == 0 && d < group_dim) {
+                    float mixed = 0.0f;
+                    // Store only the BF16 gate, not its product. Preserve the
+                    // original ordered multiply-add and final BF16 conversion.
+                    for (int stream = 0; stream < groups; ++stream) {
+                        const size_t row = static_cast<size_t>(stream) * group_dim + d;
+                        const float m = static_cast<float>(gates[local_d * groups + stream]);
+                        mixed += m * static_cast<float>(n_row[row]);
+                    }
+                    if (lane == 0) x[batch * group_dim + d] = bf16(mixed * inv_groups);
+                }
+            });
+    });
+}
+
 } // namespace
 
 void hc_decode_down_inject(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
-    bf16* act, float* inj, int lowrank, int group_dim, int groups) {
-    hc_decode_down_inject_impl<false>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, 1);
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int down_work_group) {
+    hc_decode_down_inject_dispatch<false>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, 1, down_work_group);
 }
 
 void hc_decode_up_mix(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
-    bf16* x, int lowrank, int group_dim, int groups) {
-    hc_decode_up_mix_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, groups, 1);
+    bf16* x, int lowrank, int group_dim, int groups, bool parallel_streams) {
+    if (parallel_streams && groups == 4) hc_decode_up_mix_streams_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, 1);
+    else hc_decode_up_mix_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, groups, 1);
 }
 
 void hc_decode_down_inject_rows(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
-    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows) {
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows, int down_work_group) {
     if (rows < 1 || rows > 4 || groups < 1 || groups > 8 || lowrank < 1 || group_dim < 1)
         throw std::invalid_argument("hc_decode_down_inject_rows: unsupported shape");
-    hc_decode_down_inject_impl<true>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows);
+    hc_decode_down_inject_dispatch<true>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows, down_work_group);
 }
 
 void hc_decode_up_mix_rows(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
-    bf16* x, int lowrank, int group_dim, int groups, int rows) {
+    bf16* x, int lowrank, int group_dim, int groups, int rows, bool parallel_streams) {
     if (rows < 1 || rows > 4 || groups < 1 || groups > 8 || lowrank < 1 || group_dim < 1)
         throw std::invalid_argument("hc_decode_up_mix_rows: unsupported shape");
-    hc_decode_up_mix_impl<true>(ctx, act, w_up, N, x, lowrank, group_dim, groups, rows);
+    if (parallel_streams && groups == 4) hc_decode_up_mix_streams_impl<true>(ctx, act, w_up, N, x, lowrank, group_dim, rows);
+    else hc_decode_up_mix_impl<true>(ctx, act, w_up, N, x, lowrank, group_dim, groups, rows);
 }
 
 void ple_gate_value(

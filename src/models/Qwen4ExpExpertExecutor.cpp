@@ -8,10 +8,13 @@
 #include <exception>
 #include <mutex>
 #include <thread>
+#include <vector>
+#include <cstring>
 #include <tbb/task_arena.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <memoryapi.h>
+#include <psapi.h>
 #endif
 
 namespace aila {
@@ -19,6 +22,27 @@ namespace {
 uint64_t steady_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct CpuProcessSample {
+    uint32_t faults = 0;
+    uint64_t user_ns = 0, kernel_ns = 0;
+    bool valid = false;
+};
+CpuProcessSample sample_cpu_process() {
+    CpuProcessSample sample;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)) &&
+        GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        const auto ns = [](const FILETIME& value) {
+            return ((uint64_t(value.dwHighDateTime) << 32) | value.dwLowDateTime) * 100;
+        };
+        sample.faults = counters.PageFaultCount;
+        sample.user_ns = ns(user); sample.kernel_ns = ns(kernel); sample.valid = true;
+    }
+#endif
+    return sample;
 }
 void compute_expert(const ops::MoeExpertSlotHost& slot, const bf16* x, bf16* h, float* out, int hidden, int intermediate) {
     static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
@@ -44,6 +68,10 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         uint64_t prefetch_begin_ns = 0, prefetch_ns = 0, prefetch_calls = 0;
         uint64_t prefetch_ranges = 0, prefetch_bytes = 0, prefetch_failures = 0;
         uint64_t touch_begin_ns = 0, touch_ns = 0, touch_pages = 0;
+        uint64_t diagnostic_batches = 0, diagnostic_failures = 0;
+        uint64_t verify_batches = 0;
+        uint64_t process_faults = 0, process_user_ns = 0, process_kernel_ns = 0;
+        ops::cpu::CpuExpertPhaseTimings phases{};
         std::exception_ptr error;
     };
     std::mutex mutex;
@@ -55,11 +83,21 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
     bool batched;
     bool mmap_prefetch;
     bool mmap_touch;
+    bool diagnostic;
+    bool verify_q8;
+    // Diagnostic shadow buffers are allocated once, before the worker starts.
+    std::vector<bf16> verify_h;
+    std::vector<float> verify_out;
     std::thread thread;
 
     explicit CpuWorker(int threads) : arena(threads), batched(aila::env::read_flag("AILA_Q4E_CPU_BATCH", false)),
         mmap_prefetch(aila::env::read_flag("AILA_Q4E_CPU_MMAP_PREFETCH", false)),
-        mmap_touch(aila::env::read_flag("AILA_Q4E_CPU_MMAP_TOUCH", false)), thread([this] { run(); }) {}
+        mmap_touch(aila::env::read_flag("AILA_Q4E_CPU_MMAP_TOUCH", false)),
+        diagnostic(aila::env::read_flag("AILA_Q4E_CPU_DIAGNOSTIC", false)),
+        verify_q8(aila::env::read_flag("AILA_Q4E_CPU_Q8_VERIFY", false)),
+        verify_h(verify_q8 ? ops::cpu::kMaxExpertBatchTasks * ops::cpu::kIntermediateDim : 0),
+        verify_out(verify_q8 ? ops::cpu::kMaxExpertBatchTasks * ops::cpu::kHiddenDim : 0),
+        thread([this] { run(); }) {}
     ~CpuWorker() {
         drain();
         { std::lock_guard<std::mutex> lock(mutex); stop = true; }
@@ -171,6 +209,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                 const auto begin = steady_ns();
                 current.activation.wait_and_throw();
                 completed.activation_ns = steady_ns() - begin;
+                const auto before = diagnostic ? sample_cpu_process() : CpuProcessSample{};
                 completed.begin_ns = steady_ns();
                 arena.execute([&] {
                     if (batched || current.resident_prepared) {
@@ -179,16 +218,37 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                         static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
                         static const bool prepared = aila::env::read_flag("AILA_Q4E_CPU_PREPARED_INPUT", false);
                         static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false);
+                        static const bool nf4_q8_block64 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_BLOCK64", false);
+                        static const bool nf4_q8_row4 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_ROW4", false);
                         ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
-                            current.resident_prepared ? (nf4_q8 ? ops::cpu::CpuKernelBackend::Nf4Q8Avx2 : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2) :
+                            current.resident_prepared ? (nf4_q8 ? (nf4_q8_block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2 : nf4_q8_row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2 : ops::cpu::CpuKernelBackend::Nf4Q8Avx2) : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2) :
                             gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
-                                      : ops::cpu::CpuKernelBackend::Avx2);
+                                      : ops::cpu::CpuKernelBackend::Avx2,
+                            diagnostic ? &completed.phases : nullptr);
+                        if (verify_q8 && current.resident_prepared && nf4_q8) {
+                            ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count,
+                                current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
+                                ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
+                            if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)) ||
+                                std::memcmp(current.out, verify_out.data(), current.count * current.hidden * sizeof(float)))
+                                throw std::runtime_error("CPU Q8 candidate differs bitwise from H8 on actual model activation");
+                            completed.verify_batches = 1;
+                        }
                     } else for (int c = 0; c < current.count; ++c)
                         compute_expert(current.tasks[c].slot, current.x + current.tasks[c].token * current.hidden,
                             current.h + c * current.intermediate, current.out + c * current.hidden,
                             current.hidden, current.intermediate);
                 });
                 completed.end_ns = steady_ns();
+                if (diagnostic) {
+                    const auto after = sample_cpu_process();
+                    completed.diagnostic_batches = 1;
+                    if (before.valid && after.valid && after.user_ns >= before.user_ns && after.kernel_ns >= before.kernel_ns) {
+                        completed.process_faults = uint32_t(after.faults - before.faults);
+                        completed.process_user_ns = after.user_ns - before.user_ns;
+                        completed.process_kernel_ns = after.kernel_ns - before.kernel_ns;
+                    } else completed.diagnostic_failures = 1;
+                }
             } catch (...) { completed.error = std::current_exception(); }
             { std::lock_guard<std::mutex> lock(mutex); result = completed; done = true; }
             cv.notify_one();
@@ -384,6 +444,17 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     stats_.cpu_mmap_prefetch_failures+=result.prefetch_failures;
     stats_.cpu_mmap_touch_ns+=result.touch_ns;
     stats_.cpu_mmap_touch_pages+=result.touch_pages;
+    stats_.cpu_diagnostic_batches+=result.diagnostic_batches;
+    stats_.cpu_verify_batches+=result.verify_batches;
+    stats_.cpu_diagnostic_failures+=result.diagnostic_failures;
+    stats_.cpu_process_faults+=result.process_faults;
+    stats_.cpu_process_user_ns+=result.process_user_ns;
+    stats_.cpu_process_kernel_ns+=result.process_kernel_ns;
+    stats_.cpu_gate_up_ns+=result.phases.gate_up_ns;
+    stats_.cpu_quantize_ns+=result.phases.quantize_ns;
+    stats_.cpu_down_ns+=result.phases.down_ns;
+    stats_.cpu_gate_chunks+=result.phases.gate_chunks;
+    stats_.cpu_down_chunks+=result.phases.down_chunks;
     stats_.cpu_compute_ns+=result.end_ns-result.begin_ns;
     const auto completion_ns=result.end_ns-cold_submit_ns_;
     stats_.cold_queue_ns+=(result.begin_ns-cold_submit_ns_)-std::min(result.activation_ns,result.begin_ns-cold_submit_ns_);

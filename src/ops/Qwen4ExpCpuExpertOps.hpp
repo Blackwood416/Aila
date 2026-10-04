@@ -20,14 +20,24 @@ enum class CpuKernelBackend {
     TbbAvx2 = 3,
     GpuOrderAvx2 = 4, // experimental DG2 lane order, not a cross-device exactness guarantee
     GpuOrderPreparedAvx2 = 5, // batch-only, shared lane-major inputs and register NF4 lookup
-    Nf4Q8Avx2 = 6 // experimental batch-only NF4 LUT + Q8 activations; approximate arithmetic
+    Nf4Q8Avx2 = 6, // experimental batch-only NF4 LUT + Q8 activations; approximate arithmetic
+    Nf4Q8Row4Avx2 = 7, // batch-only four independent dots; preserves the Nf4Q8Avx2 row arithmetic
+    Nf4Q8Block64Avx2 = 8 // batch-only 256-bit NF4 block decode; preserves Nf4Q8Avx2 half order
+};
+
+struct CpuExpertPhaseTimings {
+    uint64_t gate_up_ns = 0, quantize_ns = 0, down_ns = 0;
+    // Zero denotes TBB's original automatic partitioning; otherwise these are
+    // logical coarse chunks, not observed scheduler task counts.
+    int gate_chunks = 0, down_chunks = 0;
 };
 
 // Two flat parallel stages over all expert rows. Caller supplies [tasks,I] h,
 // [tasks,H] out; no nested per-expert parallel_for or repeated x conversion.
 void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
     const bf16* x, int tokens, bf16* h, float* out, const float* quant_map = nullptr,
-    CpuKernelBackend backend = CpuKernelBackend::GpuOrderAvx2);
+    CpuKernelBackend backend = CpuKernelBackend::GpuOrderAvx2,
+    CpuExpertPhaseTimings* timings = nullptr);
 
 // Gate/Up SwiGLU:
 // Inputs:

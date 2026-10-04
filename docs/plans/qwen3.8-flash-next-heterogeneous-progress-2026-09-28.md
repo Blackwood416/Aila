@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next: H1-H5 Hardening and Direct Prefill I/O
 
+Latest follow-up (2026-10-04): [H9 measurements and acceptance](qwen3.8-flash-next-heterogeneous-h9-results-2026-10-04.md) continue the validated H8 mapped NF4-Q8/zero-host-pool path. This document retains the earlier H1-H5 baseline and decisions; they do not describe current experimental dispatch or throughput.
+
 Date: 2026-09-28. Working-tree implementation over `f78732d`.
 Target: Intel Arc A770, driver 32.0.101.8860, Windows, oneAPI 2026.1.
 Model: `C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2`.

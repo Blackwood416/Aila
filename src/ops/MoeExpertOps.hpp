@@ -83,6 +83,24 @@ sycl::event router_softmax_topk_device(
     int top_k = 10,
     bool norm_topk_prob = true);
 
+// Single-token resident router: identical top-k arithmetic, then device-table
+// classification and pinned-host mirrors in the same kernel's final writer.
+// Wait for the returned event before reading/reusing any host output.
+sycl::event router_softmax_topk_resident(
+    Context& ctx,
+    const bf16* router_scores_ptr,
+    const bf16* per_expert_scale_ptr,
+    int* expert_ids_dev,
+    float* expert_weights_dev,
+    const int* resident_table,
+    int* resident_selected,
+    int* host_ids,
+    float* host_weights,
+    int* host_selected,
+    int num_experts = 512,
+    int top_k = 10,
+    bool norm_topk_prob = true);
+
 // 512-expert Top-K Router (Host CPU Reference)
 void router_softmax_topk_host(
     const bf16* router_scores_ptr,

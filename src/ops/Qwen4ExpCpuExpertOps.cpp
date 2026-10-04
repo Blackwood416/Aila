@@ -1,7 +1,9 @@
 #include "Qwen4ExpCpuExpertOps.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <vector>
 #include <stdexcept>
@@ -14,6 +16,7 @@
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 
 namespace ops {
 namespace cpu {
@@ -383,8 +386,125 @@ static float nf4_q8_dot(const uint8_t* packed, const float* absmax,
     return hsum256_ps(accumulator);
 }
 
+// One 32-byte read decodes all 64 NF4 weights. AVX2 byte unpack/shuffle work
+// independently within 128-bit lanes, so the two decoded vectors initially
+// contain [0..15,32..47] and [16..31,48..63]. Recombine those lanes into the
+// original activation halves before performing H8's half0 then half1 FMA.
+template <int Columns>
+#if defined(_MSC_VER)
+static __forceinline float nf4_q8_dot_block64(const uint8_t* packed, const float* absmax,
+#else
+static inline __attribute__((always_inline)) float nf4_q8_dot_block64(const uint8_t* packed, const float* absmax,
+#endif
+    const MoeNestedScaleHost& nested, size_t row, const int8_t* input,
+    const float* input_scales, __m128i lut, float lut_scale) {
+    static_assert(Columns > 0 && Columns % 64 == 0, "NF4Q8 block64 requires complete 64-weight blocks");
+    const auto mask = _mm256_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    const auto table = _mm256_broadcastsi128_si256(lut);
+    auto accumulator = _mm256_setzero_ps();
+    for (int b = 0; b < Columns / 64; ++b) {
+        const float scale = load_host_absmax(absmax, nested, row * (Columns / 64) + b);
+        const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * (Columns / 2) + b * 32));
+        const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+        const auto low = _mm256_and_si256(bytes, mask);
+        const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+        const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
+        const auto weights0 = _mm256_permute2x128_si256(wlo, whi, 0x20);
+        const auto weights1 = _mm256_permute2x128_si256(wlo, whi, 0x31);
+        const auto activation0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64));
+        const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
+        const auto dot0 = _mm256_madd_epi16(pairs0, ones);
+        accumulator = _mm256_fmadd_ps(_mm256_set1_ps(scale * input_scales[b * 2] * lut_scale),
+            _mm256_cvtepi32_ps(dot0), accumulator);
+        const auto activation1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + 32));
+        const auto pairs1 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights1), _mm256_sign_epi8(activation1, weights1));
+        const auto dot1 = _mm256_madd_epi16(pairs1, ones);
+        accumulator = _mm256_fmadd_ps(_mm256_set1_ps(scale * input_scales[b * 2 + 1] * lut_scale),
+            _mm256_cvtepi32_ps(dot1), accumulator);
+    }
+    return hsum256_ps(accumulator);
+}
+
+// Keep the single-row reference above intact. Four independent accumulators
+// share activation loads, but each row sees exactly its original block/half
+// FMA order, scale expression and final horizontal reduction.
+template <int Columns>
+#if defined(_MSC_VER)
+static __forceinline void nf4_q8_dot_rows4(const uint8_t* packed, const float* absmax,
+#else
+static inline __attribute__((always_inline)) void nf4_q8_dot_rows4(const uint8_t* packed, const float* absmax,
+#endif
+    const MoeNestedScaleHost& nested, size_t row0, size_t row1, size_t row2, size_t row3,
+    const int8_t* input, const float* input_scales,
+    __m128i lut, float lut_scale, float* result) {
+    static_assert(Columns > 0 && Columns % 64 == 0, "NF4Q8 row4 requires complete 64-weight blocks");
+    const auto mask = _mm_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    auto acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    auto acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    constexpr size_t stride = Columns / 2;
+    for (int b = 0; b < Columns / 64; ++b) {
+        const float scale0 = load_host_absmax(absmax, nested, row0 * (Columns / 64) + b);
+        const float scale1 = load_host_absmax(absmax, nested, row1 * (Columns / 64) + b);
+        const float scale2 = load_host_absmax(absmax, nested, row2 * (Columns / 64) + b);
+        const float scale3 = load_host_absmax(absmax, nested, row3 * (Columns / 64) + b);
+        for (int half = 0; half < 2; ++half) {
+            const auto activation = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + half * 32));
+            const float input_scale = input_scales[b * 2 + half];
+            const size_t offset = b * 32 + half * 16;
+            auto update = [&](size_t row, float scale, __m256 accumulator) {
+                const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + row * stride + offset));
+                const auto high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+                const auto low = _mm_and_si128(bytes, mask);
+                const auto w0 = _mm_shuffle_epi8(lut, _mm_unpacklo_epi8(high, low));
+                const auto w1 = _mm_shuffle_epi8(lut, _mm_unpackhi_epi8(high, low));
+                const auto weights = _mm256_set_m128i(w1, w0);
+                const auto pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(weights), _mm256_sign_epi8(activation, weights));
+                const auto dot = _mm256_madd_epi16(pairs, ones);
+                return _mm256_fmadd_ps(_mm256_set1_ps(scale * input_scale * lut_scale),
+                    _mm256_cvtepi32_ps(dot), accumulator);
+            };
+            acc0 = update(row0, scale0, acc0);
+            acc1 = update(row1, scale1, acc1);
+            acc2 = update(row2, scale2, acc2);
+            acc3 = update(row3, scale3, acc3);
+        }
+    }
+    result[0] = hsum256_ps(acc0); result[1] = hsum256_ps(acc1);
+    result[2] = hsum256_ps(acc2); result[3] = hsum256_ps(acc3);
+}
+
+int nf4_q8_chunk_factor() {
+    static const int factor = std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_Q8_CHUNKS", 0), 0, 8);
+    return factor;
+}
+
+template <class Body>
+int nf4_q8_parallel_tiles(int tile_count, const Body& body) {
+    const int factor = nf4_q8_chunk_factor();
+    if (!factor) {
+        tbb::parallel_for(tbb::blocked_range<int>(0, tile_count, 1), body);
+        return 0;
+    }
+    const int chunks = std::min(tile_count, factor * std::max(1, tbb::this_task_arena::max_concurrency()));
+    tbb::parallel_for(tbb::blocked_range<int>(0, chunks, 1), [&](const tbb::blocked_range<int>& range) {
+        for (int chunk = range.begin(); chunk < range.end(); ++chunk) {
+            // Integral floor boundaries cover every complete original tile once.
+            body(tbb::blocked_range<int>(chunk * tile_count / chunks, (chunk + 1) * tile_count / chunks, 1));
+        }
+    });
+    return chunks;
+}
+
+uint64_t nf4_q8_phase_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
-    const bf16* x, int tokens, bf16* h, float* out, const float* qmap) {
+    const bf16* x, int tokens, bf16* h, float* out, const float* qmap, bool row4,
+    bool block64, CpuExpertPhaseTimings* timings) {
     alignas(64) int8_t input[4 * kHiddenDim];
     alignas(64) float input_scales[4 * kHiddenDim / 32];
     alignas(64) int8_t intermediate[kMaxExpertBatchTasks * kIntermediateDim];
@@ -399,10 +519,16 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
             _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
     }
     const auto lut = _mm_load_si128(reinterpret_cast<const __m128i*>(table));
+    uint64_t phase_begin = timings ? nf4_q8_phase_ns() : 0;
     for (int t = 0; t < tokens; ++t)
         quantize_bf16_q8(x + t * kHiddenDim, kHiddenDim, input + t * kHiddenDim, input_scales + t * (kHiddenDim / 32));
+    if (timings) {
+        const uint64_t now = nf4_q8_phase_ns();
+        timings->quantize_ns = now - phase_begin;
+        phase_begin = now;
+    }
     constexpr int gate_tile = 16, down_tile = 32;
-    tbb::parallel_for(tbb::blocked_range<int>(0, count * (kIntermediateDim / gate_tile), 1),
+    const int gate_chunks = nf4_q8_parallel_tiles(count * (kIntermediateDim / gate_tile),
         [&](const tbb::blocked_range<int>& range) {
             for (int tile = range.begin(); tile < range.end(); ++tile) {
                 const int c = tile / (kIntermediateDim / gate_tile);
@@ -410,7 +536,39 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                 const auto& slot = tasks[c].slot;
                 const auto* values = input + tasks[c].token * kHiddenDim;
                 const auto* scales = input_scales + tasks[c].token * (kHiddenDim / 32);
-                for (int row = begin; row < begin + gate_tile; ++row) {
+                if (row4) {
+                    for (int row = begin; row < begin + gate_tile; row += 2) {
+                        float dots[4];
+                        nf4_q8_dot_rows4<kHiddenDim>(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
+                            row, row + kIntermediateDim, row + 1, row + 1 + kIntermediateDim,
+                            values, scales, lut, lut_scale, dots);
+#if defined(__clang__)
+                        // Preserve H8's scalar expf. With fast-math, merging
+                        // these two rows selects SVML vector exp and can cross
+                        // a BF16 rounding boundary on real model weights.
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+                        for (int r = 0; r < 2; ++r) {
+                            const float gate = dots[r * 2], up = dots[r * 2 + 1];
+                            const float denominator = 1.0f + std::exp(-gate);
+                            const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+                            h[c * kIntermediateDim + row + r] = bf16(silu * up);
+                        }
+                    }
+                } else if (block64) {
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+                    for (int row = begin; row < begin + gate_tile; ++row) {
+                        const float gate = nf4_q8_dot_block64<kHiddenDim>(slot.gate_up_packed, slot.gate_up_absmax,
+                            slot.gate_up_nested, row, values, scales, lut, lut_scale);
+                        const float up = nf4_q8_dot_block64<kHiddenDim>(slot.gate_up_packed, slot.gate_up_absmax,
+                            slot.gate_up_nested, row + kIntermediateDim, values, scales, lut, lut_scale);
+                        const float denominator = 1.0f + std::exp(-gate);
+                        const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+                        h[c * kIntermediateDim + row] = bf16(silu * up);
+                    }
+                } else for (int row = begin; row < begin + gate_tile; ++row) {
                     const float gate = nf4_q8_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
                         row, values, scales, kHiddenDim, lut, lut_scale);
                     const float up = nf4_q8_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
@@ -421,23 +579,49 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                 }
             }
         });
+    if (timings) {
+        const uint64_t now = nf4_q8_phase_ns();
+        timings->gate_up_ns = now - phase_begin;
+        timings->gate_chunks = gate_chunks;
+        phase_begin = now;
+    }
     // Gate tiles are 16 rows, while quantization scales span 32. Quantize only
     // after the stage barrier, so no worker reads another tile's unfinished h.
     for (int c = 0; c < count; ++c)
         quantize_bf16_q8(h + c * kIntermediateDim, kIntermediateDim,
             intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32));
-    tbb::parallel_for(tbb::blocked_range<int>(0, count * (kHiddenDim / down_tile), 1),
+    if (timings) {
+        const uint64_t now = nf4_q8_phase_ns();
+        timings->quantize_ns += now - phase_begin;
+        phase_begin = now;
+    }
+    const int down_chunks = nf4_q8_parallel_tiles(count * (kHiddenDim / down_tile),
         [&](const tbb::blocked_range<int>& range) {
             for (int tile = range.begin(); tile < range.end(); ++tile) {
                 const int c = tile / (kHiddenDim / down_tile);
                 const int begin = tile % (kHiddenDim / down_tile) * down_tile;
                 const auto& slot = tasks[c].slot;
-                for (int row = begin; row < begin + down_tile; ++row)
+                if (row4) {
+                    for (int row = begin; row < begin + down_tile; row += 4)
+                        nf4_q8_dot_rows4<kIntermediateDim>(slot.down_packed, slot.down_absmax, slot.down_nested,
+                            row, row + 1, row + 2, row + 3,
+                            intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32),
+                            lut, lut_scale, out + c * kHiddenDim + row);
+                } else if (block64) {
+                    for (int row = begin; row < begin + down_tile; ++row)
+                        out[c * kHiddenDim + row] = nf4_q8_dot_block64<kIntermediateDim>(slot.down_packed,
+                            slot.down_absmax, slot.down_nested, row, intermediate + c * kIntermediateDim,
+                            intermediate_scales + c * (kIntermediateDim / 32), lut, lut_scale);
+                } else for (int row = begin; row < begin + down_tile; ++row)
                     out[c * kHiddenDim + row] = nf4_q8_dot(slot.down_packed, slot.down_absmax, slot.down_nested,
                         row, intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32),
                         kIntermediateDim, lut, lut_scale);
             }
         });
+    if (timings) {
+        timings->down_ns = nf4_q8_phase_ns() - phase_begin;
+        timings->down_chunks = down_chunks;
+    }
 }
 
 static void gpu_order_gate_up(const MoeExpertSlotHost& slot, const bf16* x, bf16* h,
@@ -900,7 +1084,9 @@ void cpu_expert_forward_tbb_avx2(
 // =========================================================================
 
 void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
-    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map, CpuKernelBackend backend) {
+    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map, CpuKernelBackend backend,
+    CpuExpertPhaseTimings* timings) {
+    if (timings) *timings = {};
     if (count < 0 || count > kMaxExpertBatchTasks || tokens < 1 || tokens > 4)
         throw std::invalid_argument("CPU expert batch exceeds m=4/tasks=40 capacity");
     if (count == 0) return;
@@ -909,8 +1095,10 @@ void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
         if (tasks[c].token < 0 || tasks[c].token >= tokens || !tasks[c].slot.gate_up_packed || !tasks[c].slot.down_packed)
             throw std::invalid_argument("Invalid CPU expert batch task");
 #if defined(__AVX2__)
-    if (backend == CpuKernelBackend::Nf4Q8Avx2) {
-        nf4_q8_batch_forward(tasks, count, x, tokens, h, out, resolve_quant_map(quant_map));
+    if (backend == CpuKernelBackend::Nf4Q8Avx2 || backend == CpuKernelBackend::Nf4Q8Row4Avx2 ||
+        backend == CpuKernelBackend::Nf4Q8Block64Avx2) {
+        nf4_q8_batch_forward(tasks, count, x, tokens, h, out, resolve_quant_map(quant_map),
+            backend == CpuKernelBackend::Nf4Q8Row4Avx2, backend == CpuKernelBackend::Nf4Q8Block64Avx2, timings);
         return;
     }
     alignas(64) float input[4 * kHiddenDim];
@@ -985,6 +1173,8 @@ void cpu_expert_gate_up_swiglu(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::Nf4Q8Block64Avx2:
+        case CpuKernelBackend::Nf4Q8Row4Avx2:
         case CpuKernelBackend::Nf4Q8Avx2:
         case CpuKernelBackend::GpuOrderPreparedAvx2:
             throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");
@@ -1022,6 +1212,8 @@ void cpu_expert_down(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::Nf4Q8Block64Avx2:
+        case CpuKernelBackend::Nf4Q8Row4Avx2:
         case CpuKernelBackend::Nf4Q8Avx2:
         case CpuKernelBackend::GpuOrderPreparedAvx2:
             throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");
@@ -1064,6 +1256,8 @@ void cpu_expert_forward(
     int blocksize,
     CpuKernelBackend backend) {
     switch (backend) {
+        case CpuKernelBackend::Nf4Q8Block64Avx2:
+        case CpuKernelBackend::Nf4Q8Row4Avx2:
         case CpuKernelBackend::Nf4Q8Avx2:
         case CpuKernelBackend::GpuOrderPreparedAvx2:
             throw std::invalid_argument("GpuOrderPreparedAvx2 requires cpu_expert_batch_forward");

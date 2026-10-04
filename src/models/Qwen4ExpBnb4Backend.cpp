@@ -1071,10 +1071,49 @@ void Qwen4ExpBnb4Backend::DenseLinear(
     linear.forward(ctx, input, output, count);
 }
 
+Qwen4ExpBnb4Backend::DecodePendingMlpResidual::~DecodePendingMlpResidual() noexcept {
+    // On a host exception, enqueue the residual while its buffers still exist.
+    // A failed device queue cannot promise materialization, just as on the old path.
+    try { Materialize(); } catch (...) {}
+}
+
+void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::Defer() {
+    if (pending) throw std::logic_error("MLP residual already pending");
+    pending = true;
+    ++deferred;
+}
+
+void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::Materialize() {
+    if (!pending) return;
+    ops::hc_inject_add(ctx, hidden, y, inject, 1, hiddenSize, 4);
+    pending = false;
+    ++materialized;
+}
+
+void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::ConsumeNorm(
+    const float* normWeight, float eps, bf16* normalized) {
+    if (!pending) throw std::logic_error("No pending MLP residual to normalize");
+    if (!ops::try_hc_decode_inject_add_and_grouped_rms_norm(ctx, hidden, y, inject,
+        normWeight, eps, normalized, hiddenSize, true)) {
+        // Clear residual ownership after its submit, before the norm submit can
+        // throw. The non-vec path keeps both original kernels unchanged.
+        Materialize();
+        ops::grouped_rms_norm(ctx, hidden, normWeight, eps, normalized, 1, 4, hiddenSize, true);
+        return;
+    }
+    // Clear immediately after norm submission, before subsequent HC submissions
+    // can throw. Unwinding must never inject a successfully consumed residual twice.
+    pending = false;
+    ++consumedNorm;
+}
+
 void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
-    const bf16* pending_y, const float* pending_inj) {
-    if (pending_y && pending_inj) {
+    const bf16* pending_y, const float* pending_inj, DecodePendingMlpResidual* pending_mlp) {
+    if (pending_mlp && pending_mlp->pending) {
+        pending_mlp->ConsumeNorm(hc.hc_norm_weight->data_as<float>(), cfg_.rms_norm_eps,
+            buf_.hc_N.data_as<bf16>());
+    } else if (pending_y && pending_inj) {
         ops::hc_inject_add_and_grouped_rms_norm(
             ctx, static_cast<bf16*>(buf_.hidden4.data()),
             pending_y, pending_inj,
@@ -1094,14 +1133,21 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
 
     static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
     static const bool s_small_rows_hc = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_HC", false);
+    static const int s_hc_down_wg = [] {
+        const int value = aila::env::read_int_raw("AILA_Q4E_HC_DECODE_DOWN_WG", 256);
+        return value == 64 || value == 128 ? value : 256;
+    }();
+    static const bool s_hc_up_streams = aila::env::read_flag("AILA_Q4E_HC_DECODE_UP_STREAMS", false);
+    const int hc_down_wg = decodeHcReferenceForTest_ ? 256 : s_hc_down_wg;
+    const bool hc_up_streams = !decodeHcReferenceForTest_ && s_hc_up_streams;
     if (s_small_rows_hc && s_fused_hc && count >= 2 && count <= 4 &&
         hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
         ops::hc_decode_down_inject_rows(ctx, buf_.hc_N.data_as<bf16>(),
             hc.mix_down_w->data_as<bf16>(), with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
             buf_.hc_mix_down.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(),
-            lowrank, hidden_size_, 4, count);
+            lowrank, hidden_size_, 4, count, hc_down_wg);
         ops::hc_decode_up_mix_rows(ctx, buf_.hc_mix_down.data_as<bf16>(), hc.mix_up_w->data_as<bf16>(),
-            buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(), lowrank, hidden_size_, 4, count);
+            buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(), lowrank, hidden_size_, 4, count, hc_up_streams);
         return;
     }
     if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
@@ -1110,12 +1156,12 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
                                    with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
                                    static_cast<bf16*>(buf_.hc_mix_down.data()),
                                    static_cast<float*>(buf_.hc_inject_f32.data()),
-                                   lowrank, hidden_size_, 4);
+                                   lowrank, hidden_size_, 4, hc_down_wg);
         ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
                               hc.mix_up_w->data_as<bf16>(),
                               static_cast<const bf16*>(buf_.hc_N.data()),
                               static_cast<bf16*>(buf_.x.data()),
-                              lowrank, hidden_size_, 4);
+                              lowrank, hidden_size_, 4, hc_up_streams);
         return;
     }
 
@@ -1309,7 +1355,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool decode_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_DECODE", true);
     static const bool prefill_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_PREFILL", true);
     const bool is_prefill = options.prefill_remaining >= 0 || count > 1;
+    static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", false);
+    const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp && count == 1 && !is_prefill && !interior;
+    DecodePendingMlpResidual pending_mlp(ctx, buf_.hidden4.data_as<bf16>(),
+        buf_.y.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(), hidden_size_);
     const bool s_prefetch = configured_prefetch && (is_prefill ? prefill_prefetch : decode_prefetch);
+    static const bool s_router_resident_fused = aila::env::read_flag("AILA_Q4E_ROUTER_RESIDENT_FUSED", false);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
@@ -1335,6 +1386,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // 2.0. PLE on Layer 1 (Epilogue Residual Fused via P0 PleTicket)
         if (L == 1) {
+            // PLE reads the residual stack before this layer's HC norm.
+            pending_mlp.Materialize();
             if (!ple_ticket_.valid || ple_ticket_.session_ptr != &session ||
                 ple_ticket_.generation != session.generation() || ple_ticket_.start_pos != start_pos) {
                 ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
@@ -1349,7 +1402,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStagePle);
 
         // 2.1. Attn Hyper-Connection
-        RunHyperConnection(ctx, layer.attn_hc, count, true);
+        if (pending_mlp.pending)
+            RunHyperConnectionCombined(ctx, layer.attn_hc, 1, true, nullptr, nullptr, &pending_mlp);
+        else
+            RunHyperConnection(ctx, layer.attn_hc, count, true);
         stage(kStageHc);
 
         // Attention tiles advance this layer's state before routing the whole window.
@@ -1380,15 +1436,27 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
                     count, cfg_.num_experts, hidden_size_);
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
-        sycl::event actual_route_event = ops::router_softmax_topk_device(
-            ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
-            resident_epoch ? resident_route_ids_.data_as<int>() : router_host_ids_,
-            resident_epoch ? resident_weights_.data_as<float>() : router_host_weights_,
-            count, cfg_.num_experts, top_k, true);
+        sycl::event actual_route_event;
+        if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512) {
+            actual_route_event = ops::router_softmax_topk_resident(
+                ctx, buf_.router_scores.data_as<bf16>(), nullptr,
+                resident_route_ids_.data_as<int>(), resident_weights_.data_as<float>(),
+                expert_cache_.resident_layer_table(L), resident_selected_.data_as<int>(),
+                router_host_ids_, router_host_weights_, resident_selected_host_,
+                cfg_.num_experts, top_k, true);
+        } else {
+            actual_route_event = ops::router_softmax_topk_device(
+                ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
+                resident_epoch ? resident_route_ids_.data_as<int>() : router_host_ids_,
+                resident_epoch ? resident_weights_.data_as<float>() : router_host_weights_,
+                count, cfg_.num_experts, top_k, true);
+            if (resident_epoch) {
+                actual_route_event = ops::moe_resident_classify(ctx, resident_route_ids_.data_as<int>(), resident_weights_.data_as<float>(),
+                    expert_cache_.resident_layer_table(L), resident_selected_.data_as<int>(), router_host_ids_, router_host_weights_,
+                    resident_selected_host_, top_k, cfg_.num_experts);
+            }
+        }
         if (resident_epoch) {
-            actual_route_event = ops::moe_resident_classify(ctx, resident_route_ids_.data_as<int>(), resident_weights_.data_as<float>(),
-                expert_cache_.resident_layer_table(L), resident_selected_.data_as<int>(), router_host_ids_, router_host_weights_,
-                resident_selected_host_, top_k, cfg_.num_experts);
             const int64_t submit_begin = expert_cache_.tracing() ? Qwen4ExpCacheTrace::NowNs() : 0;
             if(cold_mode_==2 && expert_cache_.frozen())expert_executor_.StageResidentInput(buf_.x.data_as<bf16>());
             ops::moe_resident_gate_up(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
@@ -2221,10 +2289,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         // 2.6. MLP Residual Add
-        ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
-                           static_cast<const bf16*>(buf_.y.data()),
-                           static_cast<const float*>(buf_.hc_inject_f32.data()),
-                           count, hidden_size_, 4);
+        if (decode_pending_mlp) {
+            pending_mlp.Defer();
+            // Per-layer observers and serial stage profiling require a complete
+            // hidden stack here. Ordinary decode consumes it in the next norm.
+            if (!s_dump_dir.empty() || s_stages) pending_mlp.Materialize();
+        } else {
+            ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
+                               static_cast<const bf16*>(buf_.y.data()),
+                               static_cast<const float*>(buf_.hc_inject_f32.data()),
+                               count, hidden_size_, 4);
+        }
         stage(kStageShared);
 
         if (!s_dump_dir.empty()) {
@@ -2240,7 +2315,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
     if (options.need_logits) {
         // 3. Final Hyper-Connection Mixer
-        RunHyperConnection(ctx, mixer_, count, false);
+        if (pending_mlp.pending)
+            RunHyperConnectionCombined(ctx, mixer_, 1, false, nullptr, nullptr, &pending_mlp);
+        else
+            RunHyperConnection(ctx, mixer_, count, false);
 
         if (!s_dump_dir.empty()) {
             std::string mixer_path = s_dump_dir + "/mixer.bin";
@@ -2269,6 +2347,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
     }
 
+    // No-logits forwards must also leave a materialized stack before snapshot,
+    // state publication or return. This is a no-op after the final mixer.
+    pending_mlp.Materialize();
     expert_cache_.wait_prefetch();
     if (moe_compact_tile_ && count > 4) {
         int invalid=0;ctx.memcpy_d2h(&invalid,buf_.moe_compact_invalid.data(),sizeof(invalid));
@@ -2314,9 +2395,32 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
     if (s_work_summary) {
+        if (decode_pending_mlp) {
+            AILA_LOG_INFO("[Q4E PendingMlp] pos=%d count=%d deferred=%llu fused=%llu materialized=%llu",
+                start_pos, count, (unsigned long long)pending_mlp.deferred,
+                (unsigned long long)pending_mlp.consumedNorm, (unsigned long long)pending_mlp.materialized);
+        }
         const auto& after = expert_cache_.stats();
         if(cold_mode_ || resident_prefill_) {
             const auto& cpu=expert_executor_.stats();
+            if(cpu.cpu_verify_batches>cold_stats0.cpu_verify_batches) {
+                AILA_LOG_INFO("[Q4E CpuVerify] pos=%d count=%d batches=%llu bitwise=1",
+                    start_pos,count,(unsigned long long)(cpu.cpu_verify_batches-cold_stats0.cpu_verify_batches));
+            }
+            if(cpu.cpu_diagnostic_batches>cold_stats0.cpu_diagnostic_batches) {
+                AILA_LOG_INFO("[Q4E CpuDiagnostic] pos=%d count=%d batches=%llu failures=%llu process_faults=%llu process_user_ns=%llu process_kernel_ns=%llu gate_up_ns=%llu quantize_ns=%llu down_ns=%llu gate_chunks=%llu down_chunks=%llu",
+                    start_pos,count,
+                    (unsigned long long)(cpu.cpu_diagnostic_batches-cold_stats0.cpu_diagnostic_batches),
+                    (unsigned long long)(cpu.cpu_diagnostic_failures-cold_stats0.cpu_diagnostic_failures),
+                    (unsigned long long)(cpu.cpu_process_faults-cold_stats0.cpu_process_faults),
+                    (unsigned long long)(cpu.cpu_process_user_ns-cold_stats0.cpu_process_user_ns),
+                    (unsigned long long)(cpu.cpu_process_kernel_ns-cold_stats0.cpu_process_kernel_ns),
+                    (unsigned long long)(cpu.cpu_gate_up_ns-cold_stats0.cpu_gate_up_ns),
+                    (unsigned long long)(cpu.cpu_quantize_ns-cold_stats0.cpu_quantize_ns),
+                    (unsigned long long)(cpu.cpu_down_ns-cold_stats0.cpu_down_ns),
+                    (unsigned long long)(cpu.cpu_gate_chunks-cold_stats0.cpu_gate_chunks),
+                    (unsigned long long)(cpu.cpu_down_chunks-cold_stats0.cpu_down_chunks));
+            }
             AILA_LOG_INFO("[Q4E Cold] pos=%d count=%d mode=%d prefill_direct=%d hot_slots=%d cpu_tasks=%llu eligible=%llu budget_rejected=%llu compute_ns=%llu join_ns=%llu queue_ns=%llu activation_ns=%llu result_bytes=%llu direct=%llu cold=%llu acquire_calls=%llu mapped_tasks=%llu source_prefetch_ns=%llu source_prefetch_calls=%llu source_prefetch_ranges=%llu source_prefetch_bytes=%llu source_prefetch_failures=%llu source_touch_ns=%llu source_touch_pages=%llu",
                 start_pos,count,cold_mode_,int(resident_prefill_),expert_cache_.frozen_slots(),
                 (unsigned long long)(cpu.cpu_tasks_completed-cold_stats0.cpu_tasks_completed),
