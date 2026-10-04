@@ -55,6 +55,8 @@ void compute_expert(const ops::MoeExpertSlotHost& slot, const bf16* x, bf16* h, 
 struct Qwen4ExpExpertExecutor::CpuWorker {
     struct Job {
         std::array<ops::cpu::CpuExpertTask, ops::cpu::kMaxExpertBatchTasks> tasks;
+        // Optional diagnostic refs owned by the coordinator until collect().
+        const ops::cpu::CpuExpertTask* reference_tasks = nullptr;
         int count = 0, hidden = 0, intermediate = 0, tokens = 0;
         const bf16* x = nullptr;
         bf16* h = nullptr;
@@ -226,7 +228,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                                       : ops::cpu::CpuKernelBackend::Avx2,
                             diagnostic ? &completed.phases : nullptr);
                         if (verify_q8 && current.resident_prepared && nf4_q8) {
-                            ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count,
+                            ops::cpu::cpu_expert_batch_forward(current.reference_tasks ? current.reference_tasks : current.tasks.data(), current.count,
                                 current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
                                 ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
                             if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)) ||
@@ -267,7 +269,7 @@ Qwen4ExpExpertExecutor::~Qwen4ExpExpertExecutor() {
 
 void Qwen4ExpExpertExecutor::cleanup() {
     cpu_worker_.reset();
-    cold_source_slots_={}; cold_count_=0; cold_mapped_count_=0;
+    cold_source_slots_={}; cold_count_=0; cold_mapped_count_=0; cold_cached_count_=0;
     if (ctx_) {
         try { ctx_->synchronize(); } catch (...) {}
     }
@@ -373,7 +375,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         throw std::logic_error("Invalid resident CPU cold service");
     if (prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
     prev_cpu_h2d_ev_={}; active_cpu_leases_.clear(); cold_layer_=route.layer;
-    cold_source_slots_={}; cold_mapped_count_=0;
+    cold_source_slots_={}; cold_mapped_count_=0; cold_cached_count_=0;
     int gpu_count=0;
     std::array<bool, ops::cpu::kMaxExpertBatchTasks> mapped_tasks{};
     const bool retry=cold_policy_==2 && (++cold_batches_seen_%32==0);
@@ -381,6 +383,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         std::array<HostExpertLease,16> chosen;
         std::array<ops::MoeExpertSlotHost,16> chosen_sources{};
         std::array<bool,16> mapped{};
+        std::array<bool,16> cached{};
         int selected=0;
         static const bool low_rank=aila::env::read_flag("AILA_Q4E_COLD_LOW_RANK",false);
         for(int scan=0;scan<route.cold_count;++scan) {
@@ -392,7 +395,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
             const auto residency=cache_->query_residency(route.layer,e);
             if (!residency.gpu_ready && !residency.gpu_copying) {
                 const auto source=!residency.host_ready && cpu_mmap_cold_
-                    ? cache_->MappedExpertHostSource(route.layer,e) : ops::MoeExpertSlotHost{};
+                    ? cache_->CpuExpertHostSource(route.layer,e,&cached[i]) : ops::MoeExpertSlotHost{};
                 if (!residency.host_ready && !source.gate_up_packed) continue;
                 ++stats_.cold_eligible;
                 if(selected<std::min(16,max_cpu_credits_) &&
@@ -400,7 +403,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
                     if (residency.host_ready) {
                         auto lease=cache_->acquire_host_lease(route.layer,e);
                         if (lease.is_valid()) {chosen_sources[i]=lease.slot_host(); chosen[i]=std::move(lease); ++selected;}
-                    } else {chosen_sources[i]=source; mapped[i]=true; ++selected;}
+                    } else {chosen_sources[i]=source; mapped[i]=!cached[i]; ++selected;}
                 } else ++stats_.cold_budget_rejected;
             }
         }
@@ -412,6 +415,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
                 cold_ranks_[cold_count_]=rank;cold_ids_[cold_count_++]=e;
                 if (chosen[i].is_valid()) active_cpu_leases_.push_back(std::move(chosen[i]));
                 cold_mapped_count_+=mapped[i];
+                cold_cached_count_+=cached[i];
             } else {route.cold_ids[gpu_count]=e;route.cold_ranks[gpu_count++]=rank;}
         }
         route.cold_count=gpu_count;
@@ -422,10 +426,20 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
             ctx_->queue().memcpy(x_host_,x_dev,size_t(hidden_size_)*sizeof(bf16));
         for(int c=0;c<cold_count_;++c)job.tasks[c]={cold_source_slots_[c],0};
+        if(cpu_worker_->verify_q8 && cold_cached_count_) {
+            for(int c=0;c<cold_count_;++c) {
+                const auto original=cache_->MappedExpertHostSource(cold_layer_,cold_ids_[c]);
+                if(!original.gate_up_packed || !original.down_packed)
+                    throw std::logic_error("Cached CPU source has no valid original shadow reference");
+                cold_reference_tasks_[c]={original,0};
+            }
+            job.reference_tasks=cold_reference_tasks_.data();
+        }
         cold_submit_ns_=steady_ns();cpu_worker_->submit(job);
         cache_->TraceColdCpu(cold_layer_,cold_ids_.data(),cold_ranks_.data(),cold_count_);
         stats_.cpu_tasks_dispatched+=cold_count_;
         stats_.cpu_mapped_tasks_dispatched+=cold_mapped_count_;
+        stats_.cpu_cached_tasks_dispatched+=cold_cached_count_;
         if(cache_->tracing())cache_->trace_host_interval("cold_cpu_submit",cold_layer_,cold_submit_ns_,steady_ns());
         return cold_count_;
     } catch(...) {AbortResidentCold();throw;}
@@ -492,15 +506,16 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     }
     stats_.cpu_tasks_completed+=cold_count_;++stats_.cpu_async_layers;
     stats_.cpu_mapped_tasks_completed+=cold_mapped_count_;
+    stats_.cpu_cached_tasks_completed+=cold_cached_count_;
     stats_.cpu_max_batch_tasks=std::max(stats_.cpu_max_batch_tasks,uint64_t(cold_count_));
-    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;
+    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;cold_cached_count_=0;
     return prev_cpu_h2d_ev_;
 }
 
 void Qwen4ExpExpertExecutor::AbortResidentCold() noexcept {
     if(cpu_worker_)cpu_worker_->drain();
     try {if(ctx_)ctx_->synchronize();}catch(...){}
-    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;
+    active_cpu_leases_.clear();cold_source_slots_={};cold_count_=0;cold_mapped_count_=0;cold_cached_count_=0;
 }
 
 LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(

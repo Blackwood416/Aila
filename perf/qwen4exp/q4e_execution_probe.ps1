@@ -44,6 +44,8 @@ param(
     [ValidateSet(-1,64,128,256)][int]$HcDownWorkGroup=-1,
     [ValidateSet(-1,0,1)][int]$HcUpParallelStreams=-1,
     [switch]$HcReferenceCanary,
+    [ValidateRange(-1,8192)][int]$CpuPackedCacheMB=-1,
+    [ValidateSet(-1,0,1)][int]$CpuPackedCachePrompt=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapCold=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapPrefetch=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapTouch=-1,
@@ -105,6 +107,7 @@ if ($GpuMemoryDiagnostic -and ($Vtune -or $VtuneInstructions)) {
     throw 'GpuMemoryDiagnostic requires a direct Aila launch; VTune launches have a different process ID.'
 }
 if($HcReferenceCanary -and !$ColdQuality){throw 'HcReferenceCanary requires ColdQuality; it changes the test reference arm.'}
+if($CpuPackedCachePrompt -eq 1 -and $CpuPackedCacheMB -le 0){throw 'CpuPackedCachePrompt requires a positive CpuPackedCacheMB.'}
 . (Join-Path $PSScriptRoot "../PerfCommon.ps1")
 $repo=Get-AilaRepoRoot
 $cfg=Get-AilaOneApiStackConfig -RepoRoot $repo -Path "perf/oneapi-stacks.json"
@@ -140,6 +143,8 @@ if($DecodePendingMlpResidual -ge 0) {$overrides.AILA_Q4E_DECODE_PENDING_MLP_RESI
 if($HcDownWorkGroup -ge 0) {$overrides.AILA_Q4E_HC_DECODE_DOWN_WG=[string]$HcDownWorkGroup}
 if($HcUpParallelStreams -ge 0) {$overrides.AILA_Q4E_HC_DECODE_UP_STREAMS=[string]$HcUpParallelStreams}
 if($HcReferenceCanary) {$overrides.AILA_Q4E_COLD_TEST_HC_REFERENCE='1'}
+if($CpuPackedCacheMB -ge 0) {$overrides.AILA_Q4E_CPU_PACKED_CACHE_MB=[string]$CpuPackedCacheMB}
+if($CpuPackedCachePrompt -ge 0) {$overrides.AILA_Q4E_CPU_PACKED_CACHE_PROMPT=[string]$CpuPackedCachePrompt}
 if($CpuMmapCold -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_COLD=[string]$CpuMmapCold}
 if($CpuMmapPrefetch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_PREFETCH=[string]$CpuMmapPrefetch}
 if($CpuMmapTouch -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_TOUCH=[string]$CpuMmapTouch}

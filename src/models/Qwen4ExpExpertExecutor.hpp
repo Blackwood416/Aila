@@ -65,6 +65,7 @@ struct HeteroExecutionStats {
     uint64_t cpu_tasks_dispatched = 0;
     uint64_t cpu_tasks_completed = 0;
     uint64_t cpu_mapped_tasks_dispatched = 0, cpu_mapped_tasks_completed = 0;
+    uint64_t cpu_cached_tasks_dispatched = 0, cpu_cached_tasks_completed = 0;
     uint64_t cpu_straggler_count = 0;
     uint64_t cpu_overlapped_count = 0;
     uint64_t cpu_compute_ns = 0;
@@ -246,9 +247,11 @@ private:
     sycl::event resident_input_event_{};
     std::array<int, 16> cold_ranks_{}, cold_ids_{};
     std::array<ops::MoeExpertSlotHost, 16> cold_source_slots_{};
+    std::array<ops::cpu::CpuExpertTask,16> cold_reference_tasks_{};
     std::array<double, 17> cold_cost_ns_{};
     int cold_count_ = 0, cold_layer_ = -1;
     int cold_mapped_count_ = 0;
+    int cold_cached_count_ = 0;
     uint64_t cold_submit_ns_ = 0;
     double cold_budget_ns_ = 1000000.0;
     int cold_policy_ = 0; // 0 C1 budget, 1 all host-Ready cold, 2 recoverable budget, 3 Strata PCIe fraction

@@ -31,6 +31,8 @@ param(
     [ValidateSet(0,1)][int]$DecodePendingMlpResidual = 0,
     [ValidateSet(64,128,256)][int]$HcDownWorkGroup = 256,
     [ValidateSet(0,1)][int]$HcUpParallelStreams = 0,
+    [ValidateRange(0,8192)][int]$CpuPackedCacheMB = 0,
+    [ValidateSet(0,1)][int]$CpuPackedCachePrompt = 0,
     [ValidateRange(0,16384)][int]$ExpertCacheMB = 0,
     [ValidateSet(0,1)][int]$CpuMmapCold = 0,
     [ValidateSet(0,1)][int]$CpuMmapPrefetch = 0,
@@ -46,6 +48,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($CpuNf4Q8Row4 -and $CpuNf4Q8Block64) { throw 'Choose row4 or block64 CPU decoding.' }
+if ($CpuPackedCachePrompt -and !$CpuPackedCacheMB) { throw 'CpuPackedCachePrompt requires a positive CpuPackedCacheMB.' }
 # Explicit parameters can override individual knobs for a separate experiment.
 if ($Heterogeneous) {
     if (-not $PSBoundParameters.ContainsKey('HostRamMB')) { $HostRamMB = 0 }
@@ -106,6 +109,8 @@ $candidate = @{
     AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL = [string]$DecodePendingMlpResidual
     AILA_Q4E_HC_DECODE_DOWN_WG = [string]$HcDownWorkGroup
     AILA_Q4E_HC_DECODE_UP_STREAMS = [string]$HcUpParallelStreams
+    AILA_Q4E_CPU_PACKED_CACHE_MB = [string]$CpuPackedCacheMB
+    AILA_Q4E_CPU_PACKED_CACHE_PROMPT = [string]$CpuPackedCachePrompt
     AILA_Q4E_COLD_TEST_HC_REFERENCE = '0'
     AILA_Q4E_EXPERT_CACHE_MB = [string]$ExpertCacheMB
     AILA_Q4E_CPU_DIAGNOSTIC = '0'; AILA_Q4E_CPU_Q8_VERIFY = '0'
@@ -152,6 +157,7 @@ try {
     Write-Host "GPU expert-cache=${ExpertCacheMB}MiB (0=automatic)"
     Write-Host "Decode pending MLP residual=$DecodePendingMlpResidual"
     Write-Host "HC down work group=$HcDownWorkGroup up parallel streams=$HcUpParallelStreams"
+    Write-Host "CPU packed source cache=$CpuPackedCacheMB MiB prompt-refresh=$CpuPackedCachePrompt (pageable, separate from host pool)"
     Write-Host "Cold policy=$ColdPolicy PCIe fraction=$ColdPcieNum/256"
     Write-Host "Profile: $profile"
     if ($DryRun) {

@@ -1378,6 +1378,72 @@ void test_short_demand_parts(Context& ctx) {
     std::cout<<"[SHORT FILL PARTS PASS] exact_payload=1 odd_partitions=1 threshold=1 disabled_default=1 maintenance_global=1 prefetch_global=1 move=1 generation=1 reader_fence=1 host_and_staging=1\n";
 }
 
+void test_cpu_packed_source_cache(Context& ctx) {
+    SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    expect(cache.init(ctx,weights,2,4*32768,8,256,64,64,&error,true),"CPU packed fixture init: "+error);
+    cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);
+    const size_t bytes=synth.gu_packed_per_exp+synth.dn_packed_per_exp;
+    const auto device_count=ctx.device_allocation_count(),host_count=ctx.pinned_host_allocation_count();
+    bool cached=true;auto original=cache.MappedExpertHostSource(0,3);
+    cache.CpuExpertHostSource(0,3,&cached);expect(!cached,"Disabled CPU source cache reported a hit");
+    cache.BuildCpuPackedSourceCache(bytes+bytes/2,{3,1});
+    expect(cache.cpu_packed_source_bytes()==bytes && cache.cpu_packed_source_slots()==1,"CPU packed budget floor");
+    auto source=cache.CpuExpertHostSource(0,3,&cached);expect(cached,"Selected CPU source not cached");
+    expect(source.gate_up_packed!=original.gate_up_packed && source.down_packed!=original.down_packed,"CPU packed source must own copies");
+    expect(!std::memcmp(source.gate_up_packed,original.gate_up_packed,synth.gu_packed_per_exp) &&
+        !std::memcmp(source.down_packed,original.down_packed,synth.dn_packed_per_exp),"CPU packed byte identity");
+    expect(source.gate_up_nested.codes==original.gate_up_nested.codes && source.down_nested.nested_absmax==original.down_nested.nested_absmax &&
+        source.gate_up_nested.nested_quant_map==original.gate_up_nested.nested_quant_map && source.down_nested.offset==original.down_nested.offset,"CPU packed metadata must retain original nested layout");
+    const auto stored=source.gate_up_packed;
+    for(const auto& keys:std::vector<std::vector<int>>{{3,3},{-1},{16},{8}}) {
+        bool rejected=false;try{cache.BuildCpuPackedSourceCache(2*bytes,keys);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cache.CpuExpertHostSource(0,3).gate_up_packed==stored,"Invalid replacement changed prior CPU cache");
+    }
+    cache.CpuExpertHostSource(0,1,&cached);expect(!cached,"Budget-excluded source reported cached");
+    expect(!cache.CpuExpertHostSource(-1,0,&cached).gate_up_packed && !cached,"Invalid CPU source lookup");
+    expect(ctx.device_allocation_count()==device_count && ctx.pinned_host_allocation_count()==host_count,"CPU packed initial build allocated USM");
+    Qwen4ExpExpertCache moved(std::move(cache));cache=std::move(moved);
+    expect(cache.CpuExpertHostSource(0,3,&cached).gate_up_packed==stored && cached,"CPU cache move lost immutable byte ownership");
+    auto rebound=synth.gu_ref;auto changed=synth.gu_packed_host;changed[3*synth.gu_packed_per_exp]^=0x81;
+    rebound.packed_weight.ptr=changed.data();cache.set_layer_expert_ref(0,rebound,synth.dn_ref);
+    source=cache.CpuExpertHostSource(0,3,&cached);
+    expect(!cached && source.gate_up_packed==changed.data()+3*synth.gu_packed_per_exp,"Ref replacement consumed stale copied weights");
+    cache.set_layer_expert_ref(0,synth.gu_ref,synth.dn_ref);
+    const auto stable_device_count=ctx.device_allocation_count(),stable_host_count=ctx.pinned_host_allocation_count();
+    cache.BuildCpuPackedSourceCache(2*bytes,{1,3});
+    for(int id:{1,3}) {
+        original=cache.MappedExpertHostSource(0,id);source=cache.CpuExpertHostSource(0,id,&cached);
+        expect(cached && !std::memcmp(source.gate_up_packed,original.gate_up_packed,synth.gu_packed_per_exp) &&
+            !std::memcmp(source.down_packed,original.down_packed,synth.dn_packed_per_exp),"Multi-slot CPU packed offsets");
+        std::vector<bf16> x(256),h0(64),h1(64);std::vector<float> y0(256),y1(256);
+        for(int i=0;i<256;++i)x[i]=bf16(float(i%23-11)*.03125f);
+        ops::cpu::cpu_expert_forward(original,x.data(),y0.data(),1,h0.data(),nullptr,1,false,256,64,256,64,ops::cpu::CpuKernelBackend::Avx2);
+        ops::cpu::cpu_expert_forward(source,x.data(),y1.data(),1,h1.data(),nullptr,1,false,256,64,256,64,ops::cpu::CpuKernelBackend::Avx2);
+        expect(!std::memcmp(h0.data(),h1.data(),64*sizeof(bf16)) && !std::memcmp(y0.data(),y1.data(),256*sizeof(float)),"CPU packed compute bitwise");
+    }
+    const auto retained=cache.CpuExpertHostSource(0,3).gate_up_packed;
+    expect(cache.RefreshCpuPackedSourceCache({3,1})==0 && cache.CpuExpertHostSource(0,3).gate_up_packed==retained,"CPU packed refresh must reuse retained keys");
+    expect(cache.RefreshCpuPackedSourceCache({3,5})==bytes && cache.CpuExpertHostSource(0,3).gate_up_packed==retained,"CPU packed refresh copied retained source");
+    source=cache.CpuExpertHostSource(0,5,&cached);original=cache.MappedExpertHostSource(0,5);
+    expect(cached && !std::memcmp(source.gate_up_packed,original.gate_up_packed,synth.gu_packed_per_exp) &&
+        !std::memcmp(source.down_packed,original.down_packed,synth.dn_packed_per_exp),"CPU packed refresh source bytes");
+    cache.CpuExpertHostSource(0,1,&cached);expect(!cached,"CPU packed refresh retained unselected key");
+    for(const auto& keys:std::vector<std::vector<int>>{{5,5},{-1},{16},{8}}) {
+        bool rejected=false;try{cache.RefreshCpuPackedSourceCache(keys);}catch(const std::invalid_argument&){rejected=true;}
+        expect(rejected && cache.CpuExpertHostSource(0,3).gate_up_packed==retained,"Invalid CPU refresh changed published source");
+    }
+    expect(cache.RefreshCpuPackedSourceCache({3})==0 && cache.cpu_packed_source_bytes()==2*bytes,"CPU packed refresh changed arena budget");
+    cache.CpuExpertHostSource(0,5,&cached);expect(!cached,"CPU packed short refresh retained old key");
+    expect(cache.RefreshCpuPackedSourceCache({})==0,"CPU packed empty refresh copied bytes");
+    cache.CpuExpertHostSource(0,3,&cached);expect(!cached,"CPU packed empty refresh did not clear keys");
+    expect(cache.RefreshCpuPackedSourceCache({1,3})==2*bytes,"CPU packed refresh after empty selection");
+    cache.BuildCpuPackedSourceCache(0,{});
+    expect(cache.cpu_packed_source_bytes()==0 && cache.cpu_packed_source_slots()==0 &&
+        cache.CpuExpertHostSource(0,3,&cached).gate_up_packed==cache.MappedExpertHostSource(0,3).gate_up_packed && !cached,"CPU packed disable must release/fall back");
+    expect(ctx.device_allocation_count()==stable_device_count && ctx.pinned_host_allocation_count()==stable_host_count,"CPU packed cache allocated USM");
+    std::cout<<"[CPU PACKED SOURCE CACHE PASS] original_bytes=1 nested_metadata=1 budget_floor=1 invalid_atomic=1 move=1 ref_rebind=1 exact_compute=1 no_usm=1 disabled_release=1\n";
+}
+
 void test_mapped_expert_source(Context& ctx) {
     SyntheticExpertWeights synth; ModelWeights weights;
     for (bool compact : {false,true}) {
@@ -1711,6 +1777,7 @@ int main() {
         test_ready_adoption(ctx);
         test_host_complement(ctx);
         test_mapped_expert_source(ctx);
+        test_cpu_packed_source_cache(ctx);
         test_host_ram_zero(ctx);
         test_short_demand_parts(ctx);
         test_mapped_resident_cold(ctx);

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next / A770：P2 之后的异构执行与数据路径设计
 
-**2026-10-04 实施更新：** H8 的原始 mapped NF4、CPU NF4-Q8、零 host pool 已完成实模验收；H9 正在该固定配置上验证 CPU 解包、HC 并行及跨层残差融合。最新结果与失败记录见 [H9 实验报告](qwen3.8-flash-next-heterogeneous-h9-results-2026-10-04.md)。以下保留 9 月的设计与测量背景，不能据此判断当前配置的速度或默认开关；20 tok/s 目标仍未达到。
+**2026-10-04 实施更新：** H8 的原始 mapped NF4、CPU NF4-Q8、零 host pool 与 H9 单独 pending 残差融合已完成实模验收。最新 [H10 CPU packed cache/prompt 重填报告](qwen3.8-flash-next-heterogeneous-h10-results-2026-10-04.md)记录两个不推广的负结果，默认保留 [H9 配置](qwen3.8-flash-next-heterogeneous-h9-results-2026-10-04.md)。以下保留 9 月的设计与测量背景，不能据此判断当前配置的速度或默认开关；20 tok/s 目标仍未达到。
 
 日期：2026-09-27。代码基线：`f24dd34e735c38d95009ce909fd85e38335fb58e`，开始/结束勘察时 HEAD 相同。面向 Windows、A770、BNB NF4；本轮没有构建、GPU benchmark、运行模型或修改运行时代码。
 

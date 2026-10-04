@@ -1,5 +1,7 @@
 # Qwen3.8 Flash Next 原始 NF4 异构推理 H9 结果（2026-10-04）
 
+后续 [H10 有界 CPU NF4 缓存及 prompt 重填实验](qwen3.8-flash-next-heterogeneous-h10-results-2026-10-04.md)已完成，两个方案均不推广；本文的 H9 pending 融合仍是实验入口默认。
+
 状态：Stage1–7 已完成验收与测量，实验入口启用单独的跨层融合，HC 并行保持关闭。本文按保存的 JSON、原始日志及源码快照记录结果，不合并不同 EXE 的测量。
 
 H9 尚未达到 20 tok/s。CPU row4、静态 chunks、resident router fusion、block64、HC 并行及缩小 GPU 专家缓存均没有获得可推广的端到端收益。单独 pending MLP residual 在两个独立的同 EXE 三轮活动中分别改善 0.64%（Stage6）和 0.42%（Stage7），不合并不同 EXE 的样本。最新 Stage7 五请求总耗时中位数从 51.398 s 降到 51.181 s，返回长文 decode 从 13.6 到 14.0 tok/s。实验入口启用单独融合；这些是小幅改善，尚不足以完成目标。

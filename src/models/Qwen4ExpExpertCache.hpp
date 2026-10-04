@@ -322,6 +322,10 @@ public:
     void TraceDeviceEvent(const char* label,int layer,sycl::event event);
     void ConfigureHotset();
     void BeginHotsetForward(int position, int rows,int prefill_remaining=-1);
+    bool CpuPackedPromptRefreshPending(int position,int rows,int prefill_remaining) const {
+        return cpu_packed_prompt_ && adaptive_hotset_ && hotset_prompt_ && rows==1 && position>0 &&
+            prefill_remaining<0 && hotset_policy_.collecting_prompt;
+    }
     void ObserveHotsetRoute(int layer,const int* ids,int rows,int topk);
     void EndHotsetForward(int rows,int prefill_remaining=-1);
     void PublishHotsetPending(bool wait);
@@ -460,6 +464,15 @@ public:
     // synthetic refs) must outlive the cache and every CPU executor using it.
     // Returns an empty view for invalid geometry, dtype or metadata bounds.
     ops::MoeExpertSlotHost MappedExpertHostSource(int layer, int expert_id) const;
+    // Coordinator-only before CPU work starts, or after every CPU reader drains.
+    // Owns a bounded immutable copy of packed NF4 bytes; nested metadata still
+    // borrows ModelWeights. This is separate from the expanded host/GPU pool.
+    void BuildCpuPackedSourceCache(size_t budget_bytes, const std::vector<int>& ordered_keys);
+    // Same arena, only missing packed sources copied. Every CPU reader must drain.
+    uint64_t RefreshCpuPackedSourceCache(const std::vector<int>& ordered_keys);
+    ops::MoeExpertSlotHost CpuExpertHostSource(int layer, int expert_id, bool* cached = nullptr) const;
+    size_t cpu_packed_source_bytes() const { return cpu_packed_source_data_.size(); }
+    size_t cpu_packed_source_slots() const { return cpu_packed_source_originals_.size(); }
     static constexpr int kMaxHostPrepareTasks = 40;
     // Coordinator-only. Pins ready inputs, fills distinct cold experts on the
     // demand pool, then returns leases. Unavailable slots yield empty leases.
@@ -591,6 +604,10 @@ private:
         bool valid = false;
     };
     std::vector<LayerWeights> layer_weights_;
+    std::vector<uint8_t> cpu_packed_source_data_;
+    std::vector<int> cpu_packed_source_indices_;
+    std::vector<std::array<const uint8_t*,2>> cpu_packed_source_originals_;
+    bool cpu_packed_prompt_ = false;
 
     inline int expert_flat_index(int layer, int expert_id) const {
         return layer * num_experts_per_layer_ + expert_id;

@@ -1199,6 +1199,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
     expert_cache_.SetDemandForwardRows(count);
     int start_pos = session.currentLength_;
+    if(expert_cache_.CpuPackedPromptRefreshPending(start_pos,count,options.prefill_remaining))
+        expert_executor_.AbortResidentCold(); // drains CPU readers before rewriting their source arena
     if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining);
     int cached_len = start_pos + count;
     if (cached_len > max_seq_len_) {
@@ -2421,7 +2423,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     (unsigned long long)(cpu.cpu_gate_chunks-cold_stats0.cpu_gate_chunks),
                     (unsigned long long)(cpu.cpu_down_chunks-cold_stats0.cpu_down_chunks));
             }
-            AILA_LOG_INFO("[Q4E Cold] pos=%d count=%d mode=%d prefill_direct=%d hot_slots=%d cpu_tasks=%llu eligible=%llu budget_rejected=%llu compute_ns=%llu join_ns=%llu queue_ns=%llu activation_ns=%llu result_bytes=%llu direct=%llu cold=%llu acquire_calls=%llu mapped_tasks=%llu source_prefetch_ns=%llu source_prefetch_calls=%llu source_prefetch_ranges=%llu source_prefetch_bytes=%llu source_prefetch_failures=%llu source_touch_ns=%llu source_touch_pages=%llu",
+            AILA_LOG_INFO("[Q4E Cold] pos=%d count=%d mode=%d prefill_direct=%d hot_slots=%d cpu_tasks=%llu eligible=%llu budget_rejected=%llu compute_ns=%llu join_ns=%llu queue_ns=%llu activation_ns=%llu result_bytes=%llu direct=%llu cold=%llu acquire_calls=%llu mapped_tasks=%llu cpu_cache_tasks=%llu source_prefetch_ns=%llu source_prefetch_calls=%llu source_prefetch_ranges=%llu source_prefetch_bytes=%llu source_prefetch_failures=%llu source_touch_ns=%llu source_touch_pages=%llu",
                 start_pos,count,cold_mode_,int(resident_prefill_),expert_cache_.frozen_slots(),
                 (unsigned long long)(cpu.cpu_tasks_completed-cold_stats0.cpu_tasks_completed),
                 (unsigned long long)(cpu.cold_eligible-cold_stats0.cold_eligible),
@@ -2435,6 +2437,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 (unsigned long long)(after.cold_request_entries-prof_stats0.cold_request_entries),
                 (unsigned long long)(after.acquire_calls-prof_stats0.acquire_calls),
                 (unsigned long long)(cpu.cpu_mapped_tasks_completed-cold_stats0.cpu_mapped_tasks_completed),
+                (unsigned long long)(cpu.cpu_cached_tasks_completed-cold_stats0.cpu_cached_tasks_completed),
                 (unsigned long long)(cpu.cpu_mmap_prefetch_ns-cold_stats0.cpu_mmap_prefetch_ns),
                 (unsigned long long)(cpu.cpu_mmap_prefetch_calls-cold_stats0.cpu_mmap_prefetch_calls),
                 (unsigned long long)(cpu.cpu_mmap_prefetch_ranges-cold_stats0.cpu_mmap_prefetch_ranges),

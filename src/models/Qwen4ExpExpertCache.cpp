@@ -359,6 +359,10 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     last_dma_event_ = std::move(other.last_dma_event_);
 
     layer_weights_ = std::move(other.layer_weights_);
+    cpu_packed_source_data_ = std::move(other.cpu_packed_source_data_);
+    cpu_packed_source_indices_ = std::move(other.cpu_packed_source_indices_);
+    cpu_packed_source_originals_ = std::move(other.cpu_packed_source_originals_);
+    cpu_packed_prompt_ = other.cpu_packed_prompt_; other.cpu_packed_prompt_=false;
     lru_list_ = std::move(other.lru_list_);
     slot_iters_ = std::move(other.slot_iters_);
     layer_expert_to_slot_ = std::move(other.layer_expert_to_slot_);
@@ -467,6 +471,12 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
 }
 
 void Qwen4ExpExpertCache::cleanup() {
+    // As with borrowed mapped sources, the owning executor must drain CPU work
+    // before cache cleanup. These bytes are never submitted as a GPU DMA source.
+    decltype(cpu_packed_source_data_){}.swap(cpu_packed_source_data_);
+    decltype(cpu_packed_source_indices_){}.swap(cpu_packed_source_indices_);
+    decltype(cpu_packed_source_originals_){}.swap(cpu_packed_source_originals_);
+    cpu_packed_prompt_=false;
     try { PublishHotsetPending(true); } catch (...) {
         if(copy_q_)try {copy_q_->wait();} catch (...) {}
     }
@@ -1415,7 +1425,13 @@ GpuReadyLease Qwen4ExpExpertCache::BindReady(int layer, const int* ids, int coun
 }
 
 void Qwen4ExpExpertCache::ConfigureHotset() {
+    static const int cpu_packed_mb = std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_PACKED_CACHE_MB",0),0,8192);
+    static const bool cpu_packed_prompt=aila::env::read_flag("AILA_Q4E_CPU_PACKED_CACHE_PROMPT",false);
+    cpu_packed_prompt_=cpu_packed_prompt;
+    if(cpu_packed_prompt_ && !cpu_packed_mb)throw std::invalid_argument("Prompt CPU packed cache requires a positive CPU packed budget");
     const auto profile=aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","");
+    if(cpu_packed_mb && (profile.empty() || host_pool_enabled_ || !aila::env::read_flag("AILA_Q4E_CPU_MMAP_COLD",false)))
+        throw std::invalid_argument("CPU packed source cache requires an explicit hotset profile, mapped CPU cold source and zero expanded host pool");
     hotset_export_=aila::env::read_string("AILA_Q4E_HOTSET_EXPORT","");
     if(profile.empty() && hotset_export_.empty())return;
     hotset_policy_.Init(num_layers_,num_experts_per_layer_);
@@ -1445,6 +1461,7 @@ void Qwen4ExpExpertCache::ConfigureHotset() {
     hotset_adopt_ready_=aila::env::read_flag("AILA_Q4E_HOTSET_ADOPT_READY",false);
     hotset_adopt_limit_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_ADOPT_LIMIT",96),0,4096);
     hotset_prompt_=hotset_prompt_ || hotset_prompt_prefill_ || hotset_adopt_ready_;
+    if(cpu_packed_prompt_ && !hotset_prompt_)throw std::invalid_argument("Prompt CPU packed cache requires prompt route collection");
     hotset_prompt_swaps_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_PROMPT_SWAPS",1024),0,num_slots_-1);
     hotset_ring_=aila::env::read_flag("AILA_Q4E_HOTSET_RING",true);
     hotset_cold_policy_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_COLD_QUEUE",hotset_ring_?2:0),0,2);
@@ -1453,6 +1470,23 @@ void Qwen4ExpExpertCache::ConfigureHotset() {
     hotset_keys_.assign(hotset_policy_.ranking.begin(),hotset_policy_.ranking.begin()+capacity);
     hotset_pending_.reserve(hotset_swaps_); adaptive_hotset_=true;
     InstallHotset(hotset_keys_);
+    if(cpu_packed_mb) {
+        // Independent offline ordering only; no current decode labels. Exclude
+        // the initial GPU tier. Later ready adoption may overlap this CPU copy,
+        // so actual cache hit counters, not oracle coverage, decide its value.
+        std::vector<bool> gpu_keys(size_t(num_layers_)*num_experts_per_layer_,false);
+        for(int key:hotset_keys_)gpu_keys[key]=true;
+        std::vector<int> cpu_keys;cpu_keys.reserve(gpu_keys.size()-hotset_keys_.size());
+        for(int key:hotset_policy_.ranking)if(!gpu_keys[key])cpu_keys.push_back(key);
+        const auto begin=std::chrono::steady_clock::now();
+        BuildCpuPackedSourceCache(size_t(cpu_packed_mb)<<20,cpu_keys);
+        if(cpu_packed_prompt_ && !cpu_packed_source_slots())throw std::invalid_argument("Prompt CPU packed budget must fit an expert");
+        AILA_LOG_INFO("[Q4E CpuPackedCache] requested_mb=%d slots=%llu packed_slot_bytes=%llu bytes=%llu init_ms=%.3f selection=offline-profile-exclude-initial-gpu pageable=1",
+            cpu_packed_mb,(unsigned long long)cpu_packed_source_slots(),
+            (unsigned long long)(gu_packed_bytes_+dn_packed_bytes_),
+            (unsigned long long)cpu_packed_source_bytes(),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
+    }
     AILA_LOG_INFO("[Q4E Hotset] profile=%s identity=%s slots=%d interval=%d swaps=%d decay=0.7 min_usage=2 gain=1.5 borrow=%d",
         profile.c_str(),hotset_identity_.c_str(),capacity,hotset_interval_,hotset_swaps_,int(hotset_borrow_));
 }
@@ -1622,6 +1656,22 @@ void Qwen4ExpExpertCache::HandoffPromptHotset() {
     const auto bytes0=stats_.epoch_refill_bytes,ns0=stats_.epoch_refill_ns;
     if(hotset_borrowed_ || !swaps.empty())InstallHotset(hotset_keys_);
     hotset_borrowed_=false;
+    if(cpu_packed_prompt_) {
+        // Route statistics from the completed prefill only. Exclude every actual
+        // Ready/Copying GPU key after handoff, including ready adoption. This
+        // boundary is preceded by executor drain; no decode job sees mutation.
+        std::vector<int> keys;keys.reserve(hotset_policy_.ranking.size());
+        for(int key:hotset_policy_.ranking) {
+            const auto r=query_residency(key/num_experts_per_layer_,key%num_experts_per_layer_);
+            if(!r.gpu_ready && !r.gpu_copying)keys.push_back(key);
+        }
+        std::stable_sort(keys.begin(),keys.end(),[&](int a,int b){return hotset_policy_.prompt_usage[a]>hotset_policy_.prompt_usage[b];});
+        const auto start=std::chrono::steady_clock::now();
+        const auto copied=RefreshCpuPackedSourceCache(keys);
+        AILA_LOG_INFO("[Q4E CpuPackedPrompt] rows=%d copied_bytes=%llu capacity_bytes=%llu refresh_ms=%.3f selection=past-prefill-exclude-ready pageable=1",
+            hotset_policy_.prompt_rows,(unsigned long long)copied,(unsigned long long)cpu_packed_source_bytes(),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
+    }
     AILA_LOG_INFO("[Q4E PromptHotset] rows=%d similarity=%.6f budget=%d swaps=%d refill_bytes=%llu refill_ns=%llu",
         hotset_policy_.prompt_rows,similarity,budget,int(swaps.size()),
         (unsigned long long)(stats_.epoch_refill_bytes-bytes0),(unsigned long long)(stats_.epoch_refill_ns-ns0));
@@ -3264,6 +3314,94 @@ ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_slot_host(int hslot) const {
         slot.down_absmax = reinterpret_cast<const float*>(base + dn_absmax_offset_);
     }
     return slot;
+}
+
+void Qwen4ExpExpertCache::BuildCpuPackedSourceCache(size_t budget_bytes,const std::vector<int>& ordered_keys) {
+    if(!initialized_ || faulted_ || budget_bytes>(size_t(8192)<<20))
+        throw std::invalid_argument("Invalid CPU packed source cache budget/state");
+    const size_t key_count=size_t(num_layers_)*num_experts_per_layer_;
+    std::vector<bool> seen(key_count,false);
+    for(int key:ordered_keys) {
+        if(key<0 || size_t(key)>=key_count || seen[key])throw std::invalid_argument("Invalid/duplicate CPU packed source key");
+        seen[key]=true;
+    }
+    const size_t packed_bytes=gu_packed_bytes_+dn_packed_bytes_;
+    if(!packed_bytes)throw std::invalid_argument("Invalid CPU packed source geometry");
+    const size_t slots=std::min(ordered_keys.size(),budget_bytes/packed_bytes);
+    // Validate selected refs before allocation/publication. Failed replacement
+    // leaves the previous immutable cache intact.
+    std::vector<ops::MoeExpertSlotHost> sources;sources.reserve(slots);
+    for(size_t s=0;s<slots;++s) {
+        const int key=ordered_keys[s];auto source=MappedExpertHostSource(key/num_experts_per_layer_,key%num_experts_per_layer_);
+        if(!source.gate_up_packed || !source.down_packed)throw std::invalid_argument("CPU packed source key has invalid original NF4 metadata");
+        sources.push_back(source);
+    }
+    std::vector<uint8_t> data(slots*packed_bytes);
+    std::vector<int> indices(slots?key_count:0,-1);
+    std::vector<std::array<const uint8_t*,2>> originals;originals.reserve(slots);
+    for(size_t s=0;s<slots;++s) {
+        std::memcpy(data.data()+s*packed_bytes,sources[s].gate_up_packed,gu_packed_bytes_);
+        std::memcpy(data.data()+s*packed_bytes+gu_packed_bytes_,sources[s].down_packed,dn_packed_bytes_);
+        originals.push_back({sources[s].gate_up_packed,sources[s].down_packed});
+        indices[ordered_keys[s]]=int(s);
+    }
+    cpu_packed_source_data_.swap(data);cpu_packed_source_indices_.swap(indices);cpu_packed_source_originals_.swap(originals);
+}
+
+uint64_t Qwen4ExpExpertCache::RefreshCpuPackedSourceCache(const std::vector<int>& ordered_keys) {
+    if(!initialized_ || faulted_ || cpu_packed_source_indices_.empty())
+        throw std::invalid_argument("CPU packed refresh requires an initialized arena");
+    const size_t key_count=size_t(num_layers_)*num_experts_per_layer_,capacity=cpu_packed_source_slots();
+    const size_t count=std::min(capacity,ordered_keys.size()),packed_bytes=gu_packed_bytes_+dn_packed_bytes_;
+    std::vector<bool> seen(key_count,false),used(capacity,false);
+    for(int key:ordered_keys) {
+        if(key<0 || size_t(key)>=key_count || seen[key])throw std::invalid_argument("Invalid/duplicate CPU packed refresh key");
+        seen[key]=true;
+    }
+    std::vector<ops::MoeExpertSlotHost> sources; sources.reserve(count);
+    for(size_t i=0;i<count;++i) {
+        const int key=ordered_keys[i];auto source=MappedExpertHostSource(key/num_experts_per_layer_,key%num_experts_per_layer_);
+        if(!source.gate_up_packed || !source.down_packed)throw std::invalid_argument("Invalid original CPU packed refresh source");
+        sources.push_back(source);
+    }
+    // Prepare all metadata before mutation. Copying is non-throwing, and retains
+    // the one original arena: no second multi-GB allocation at a prompt boundary.
+    std::vector<int> indices(key_count,-1);
+    auto originals=cpu_packed_source_originals_;
+    for(size_t i=0;i<count;++i) {
+        const int key=ordered_keys[i],slot=cpu_packed_source_indices_[key];
+        if(slot>=0 && originals[slot][0]==sources[i].gate_up_packed && originals[slot][1]==sources[i].down_packed) {
+            indices[key]=slot;used[slot]=true;
+        }
+    }
+    size_t next=0;uint64_t copied=0;
+    for(size_t i=0;i<count;++i) {
+        const int key=ordered_keys[i];if(indices[key]>=0)continue;
+        while(used[next])++next;
+        const size_t slot=next++;used[slot]=true;
+        auto* dst=cpu_packed_source_data_.data()+slot*packed_bytes;
+        std::memcpy(dst,sources[i].gate_up_packed,gu_packed_bytes_);
+        std::memcpy(dst+gu_packed_bytes_,sources[i].down_packed,dn_packed_bytes_);
+        originals[slot]={sources[i].gate_up_packed,sources[i].down_packed};indices[key]=int(slot);copied+=packed_bytes;
+    }
+    cpu_packed_source_indices_.swap(indices);cpu_packed_source_originals_.swap(originals);
+    return copied;
+}
+
+ops::MoeExpertSlotHost Qwen4ExpExpertCache::CpuExpertHostSource(int layer,int expert_id,bool* cached) const {
+    if(cached)*cached=false;
+    auto source=MappedExpertHostSource(layer,expert_id);
+    if(!source.gate_up_packed || cpu_packed_source_indices_.empty())return source;
+    const int slot=cpu_packed_source_indices_[size_t(layer)*num_experts_per_layer_+expert_id];
+    if(slot<0)return source;
+    const auto& original=cpu_packed_source_originals_[slot];
+    // A synthetic ref replacement must not accidentally consume old copied
+    // weights. Metadata is revalidated by the original accessor above.
+    if(original[0]!=source.gate_up_packed || original[1]!=source.down_packed)return source;
+    const uint8_t* base=cpu_packed_source_data_.data()+size_t(slot)*(gu_packed_bytes_+dn_packed_bytes_);
+    source.gate_up_packed=base;source.down_packed=base+gu_packed_bytes_;
+    if(cached)*cached=true;
+    return source;
 }
 
 ops::MoeExpertSlotHost Qwen4ExpExpertCache::MappedExpertHostSource(int layer, int expert_id) const {
