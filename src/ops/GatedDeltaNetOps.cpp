@@ -75,7 +75,7 @@ void run_linear_delta_decode_gpu_impl(
     const bf16* z_ptr,
     const bf16* a_ptr,
     const bf16* b_ptr,
-    bf16* out_ptr) {
+    bf16* out_ptr, bool defer_grouped_history = false) {
     const int qkv_dim = geom.qkv_dim;
     const int z_dim = geom.z_dim;
     const int q_dim = geom.q_dim;
@@ -259,7 +259,7 @@ void run_linear_delta_decode_gpu_impl(
                     }
                 });
         });
-        if (grouped_heads) {
+        if (grouped_heads && !defer_grouped_history) {
             commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
                                        qkv_dim, conv_rows, conv_head, 1);
         }
@@ -420,13 +420,13 @@ void run_linear_delta_decode_gpu(
     const bf16* z_ptr,
     const bf16* a_ptr,
     const bf16* b_ptr,
-    bf16* out_ptr) {
+    bf16* out_ptr, bool defer_grouped_history) {
     if (geom.gate_act == GateActivation::Sigmoid) {
         run_linear_delta_decode_gpu_impl<GateActivation::Sigmoid>(
-            ctx, geom, weights, state, qkv_ptr, z_ptr, a_ptr, b_ptr, out_ptr);
+            ctx, geom, weights, state, qkv_ptr, z_ptr, a_ptr, b_ptr, out_ptr, defer_grouped_history);
     } else {
         run_linear_delta_decode_gpu_impl<GateActivation::Silu>(
-            ctx, geom, weights, state, qkv_ptr, z_ptr, a_ptr, b_ptr, out_ptr);
+            ctx, geom, weights, state, qkv_ptr, z_ptr, a_ptr, b_ptr, out_ptr, defer_grouped_history);
     }
 }
 
@@ -681,7 +681,18 @@ void run_linear_delta_prefill_gpu_batched(
     DeltaNetState& state,
     const bf16* fused_ptr,
     bf16* out_ptr,
-    int seq_len) {
+    int seq_len, bool decode_order) {
+    if (decode_order && seq_len >= 1 && seq_len <= 4) {
+        // Reuse the actual decode kernel: matching the source-level sum grouping
+        // alone did not produce bitwise recurrent trajectories on DG2.
+        for (int r = 0; r < seq_len; ++r) {
+            const bf16* row = fused_ptr + size_t(r) * geom.all_dim;
+            run_linear_delta_decode_gpu(ctx, geom, weights, state, row, row + geom.qkv_dim,
+                row + geom.qkv_dim + geom.z_dim, row + geom.qkv_dim + geom.z_dim + geom.v_heads,
+                out_ptr + size_t(r) * geom.kv_dim);
+        }
+        return;
+    }
     if (geom.gate_act == GateActivation::Sigmoid) {
         run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid>(
             ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);

@@ -18,50 +18,21 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 // ============================================================
 
 inline uint8_t float_to_fp8_e4m3fn(float x) {
-    union { float f; uint32_t u; } val;
-    val.f = x;
-    uint32_t sign = (val.u >> 31) & 1;
-    uint32_t abs_u = val.u & 0x7FFFFFFF;
-
-    if (abs_u > 0x7F800000) {
-        return 0x7F; // NaN
+    const uint32_t bits = sycl::bit_cast<uint32_t>(x);
+    const uint32_t sign = (bits >> 24) & 0x80;
+    const uint32_t magnitude = bits & 0x7fffffff;
+    if (magnitude > 0x7f800000) return 0x7f; // canonical NaN
+    if (magnitude >= 0x43e00000) return uint8_t(sign | 0x7e); // finite saturation at 448, including Inf
+    if (magnitude < 0x3c800000) { // below 2^-6: subnormal step is 2^-9
+        const float scaled = sycl::bit_cast<float>(magnitude) * 512.0f;
+        const uint32_t lower = uint32_t(scaled);
+        const float fraction = scaled - float(lower);
+        const uint32_t rounded = lower + (fraction > 0.5f || (fraction == 0.5f && (lower & 1)));
+        return uint8_t(sign | rounded); // rounded=8 carries into the smallest normal
     }
-    if (abs_u >= 0x7F800000) {
-        return (sign << 7) | 0x7E; // Inf -> 224.0
-    }
-    if (abs_u > 0x43600000) {
-        return (sign << 7) | 0x7E; // Clamp to max positive val 224.0 (0x43600000 is 224.0f)
-    }
-
-    if (abs_u < 0x3b800000) {
-        // subnormal numbers (2^-9 = 0x3b800000)
-        if (abs_u < 0x39000000) { // 2^-13
-            return sign << 7; // 0
-        }
-        float scaled = val.f * (sign ? -1024.0f : 1024.0f);
-        int m = static_cast<int>(scaled + 0.5f);
-        if (m > 7) m = 7;
-        return (sign << 7) | m;
-    }
-
-    int exp_f = (abs_u >> 23) & 0xFF;
-    int e_fp8 = exp_f - 119;
-    
-    uint32_t mant_f = abs_u & 0x7FFFFF;
-    uint32_t round_bit = 1 << 19;
-    uint32_t rounded_mant = mant_f + round_bit;
-
-    if (rounded_mant & 0x800000) {
-        e_fp8 += 1;
-        rounded_mant = 0;
-    }
-
-    if (e_fp8 >= 15) {
-        return (sign << 7) | 0x7E;
-    }
-
-    uint8_t m_fp8 = (rounded_mant >> 20) & 7;
-    return (sign << 7) | (e_fp8 << 3) | m_fp8;
+    // Keep three fraction bits, round to nearest even, and rebase exponent 127 -> 7.
+    const uint32_t rounded = magnitude + 0x7ffff + ((magnitude >> 20) & 1);
+    return uint8_t(sign | ((rounded - 0x3c000000) >> 20));
 }
 
 inline float fp8_e4m3fn_to_float(uint8_t val) {
@@ -75,12 +46,12 @@ inline float fp8_e4m3fn_to_float(uint8_t val) {
             res.u = sign << 31;
         } else {
             float sign_val = sign ? -1.0f : 1.0f;
-            return sign_val * static_cast<float>(m) * 0.0009765625f;
+            return sign_val * static_cast<float>(m) * 0.001953125f;
         }
     } else if (e == 15 && m == 7) {
         res.u = 0x7FC00000; // NaN
     } else {
-        res.u = (sign << 31) | ((e + 119) << 23) | (m << 20);
+        res.u = (sign << 31) | ((e + 120) << 23) | (m << 20);
     }
     return res.f;
 }

@@ -199,7 +199,8 @@ public:
         chat.maxPromptTokens = std::min<uint32_t>(4096, this->options.contextTokens);
         chat.maxNewTokens = this->options.maxNewTokens;
         chat.maxOutputBytes = this->options.maxOutputBytes;
-        chat.family = this->options.backend == "qwen3_nf4" ? ModelFamily::Qwen3Dense : ModelFamily::Qwen35Hybrid;
+        chat.family = this->options.backend == "qwen3_nf4" ? ModelFamily::Qwen3Dense
+            : this->options.backend == "qwen4exp_nf4" ? ModelFamily::Qwen4Exp : ModelFamily::Qwen35Hybrid;
     }
     ~Service() { StopMemorySampling(); }
 
@@ -852,7 +853,9 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     std::shared_ptr<host::InferenceModel> model;
     if (options.backend == "qwen3_nf4") model = client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
     else if (options.backend == "qwen35_nf4") model = client->LoadQwen35(options.modelDirectory.u8string(), modelOptions);
-    else model = client->LoadQwen35Bf16(options.modelDirectory.u8string(), modelOptions);
+    else if (options.backend == "qwen35_bf16") model = client->LoadQwen35Bf16(options.modelDirectory.u8string(), modelOptions);
+    else if (options.backend == "qwen4exp_nf4") model = client->LoadQwen4Exp(options.modelDirectory.u8string(), modelOptions);
+    else throw std::invalid_argument("Unsupported server model backend: " + options.backend);
     if (tokenizer->vocab_size() <= 0 || static_cast<uint32_t>(tokenizer->vocab_size()) > model->Info().vocabSize)
         throw std::runtime_error("Tokenizer vocabulary does not fit the loaded model");
     auto service = std::make_shared<Service>(options, client, model, tokenizer);

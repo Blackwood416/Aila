@@ -135,6 +135,35 @@ void TestAllocationBudget() {
     budget.Release((std::numeric_limits<size_t>::max)());
 }
 
+void TestQwen4ExpSessionMemory() {
+    Qwen4ExpTextConfig config; // default constructor is the supported 48-layer geometry
+    const auto fixed = aila::memory::qwen4exp_session_memory(config, 2048, 0);
+    Expect(fixed.deviceBytes == 176234496 && fixed.hostBytes == 117669888,
+           "Qwen4Exp device payload or IPC host mirror differs from the fixed geometry");
+    const auto snapshots = aila::memory::qwen4exp_session_memory(config, 2048, 4);
+    Expect(snapshots.deviceBytes == fixed.deviceBytes && snapshots.hostBytes == 589824000,
+           "Qwen4Exp snapshots must add one PLE copy each without changing the device payload");
+    const auto longer = aila::memory::qwen4exp_session_memory(config, 4096, 0);
+    Expect(longer.deviceBytes > fixed.deviceBytes && longer.hostBytes == fixed.hostBytes,
+           "Longer Qwen4Exp context must grow Full KV/indexer, not the recurrent host mirror");
+
+    // The Session builder hardcodes the 4:1 interval and these head shapes, so
+    // a differing config must be rejected before any device reservation.
+    Qwen4ExpTextConfig wrongInterval;
+    wrongInterval.full_attention_interval = 3;
+    ExpectInvalid([&] { aila::memory::qwen4exp_session_memory(wrongInterval, 2048, 0); });
+    Qwen4ExpTextConfig wrongPlan;
+    wrongPlan.layer_types.assign(48, "linear_attention");
+    ExpectInvalid([&] { aila::memory::qwen4exp_session_memory(wrongPlan, 2048, 0); });
+    Qwen4ExpTextConfig unsupported;
+    unsupported.num_hidden_layers = 24;
+    ExpectInvalid([&] { aila::memory::qwen4exp_session_memory(unsupported, 2048, 0); });
+    ExpectInvalid([&] { aila::memory::qwen4exp_session_memory(config, 0, 0); });
+    ExpectInvalid([&] {
+        aila::memory::qwen4exp_session_memory(config, 2048, (std::numeric_limits<size_t>::max)());
+    });
+}
+
 } // namespace
 
 int main() {
@@ -143,6 +172,7 @@ int main() {
         TestLayerTypesAndConvolution();
         TestInvalidAndOverflow();
         TestAllocationBudget();
+        TestQwen4ExpSessionMemory();
         std::cout << "Session memory reservation tests passed (known models, layer plans, overflow, allocation budgets).\n";
         return 0;
     } catch (const std::exception& error) {

@@ -342,6 +342,9 @@ void TestModelCapabilities() {
     current.emplace_back("allocation_limits_v1");
     const auto nf4Only = current;
     current.emplace_back("qwen35_bf16_bf16_kv");
+    // A Worker that offers both Hybrid storages but not Qwen4Exp must still
+    // reject a Qwen4Exp requirement rather than silently accepting it.
+    const auto withoutQwen4Exp = current;
     current.emplace_back("thinking_budget_v1");
     current.emplace_back("session_context_v1");
     current.emplace_back("prefill_only_v1");
@@ -352,13 +355,16 @@ void TestModelCapabilities() {
     current.emplace_back("worker_log_control_v1");
     current.emplace_back("runtime_memory_v1");
     current.emplace_back("continuous_batching_v1");
+    current.emplace_back("qwen4exp_nf4_bf16_kv");
     Expect(wire::supported_capabilities() == current, "Worker capabilities omitted a backend or changed Qwen3");
     Expect(wire::model_capability("qwen3_nf4") == "qwen3_nf4_bf16_kv" &&
            wire::model_capability("qwen35_nf4", "bf16") == "qwen35_nf4_bf16_kv" &&
-           wire::model_capability("qwen35_bf16", "bf16") == "qwen35_bf16_bf16_kv",
+           wire::model_capability("qwen35_bf16", "bf16") == "qwen35_bf16_bf16_kv" &&
+           wire::model_capability("qwen4exp_nf4", "bf16") == "qwen4exp_nf4_bf16_kv",
            "Backend capability mapping was incorrect");
     Expect(wire::model_capability("qwen35_nf4", "fp8").empty() &&
            wire::model_capability("qwen35_bf16", "fp8").empty() &&
+           wire::model_capability("qwen4exp_nf4", "fp8").empty() &&
            wire::model_capability("qwen3_nf4", "BF16").empty() &&
            wire::model_capability("future_nf4").empty(), "Unknown backend or KV type was advertised");
 
@@ -372,7 +378,10 @@ void TestModelCapabilities() {
            error.code == wire::ErrorCode::UnsupportedCapability, "NF4 Worker accepted BF16 weights");
     Success(wire::negotiate({}, nf4Only, {}, current, selected, error), error);
     Success(wire::negotiate({}, {"qwen35_bf16_bf16_kv"}, {}, current, selected, error), error);
-    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+    Expect(!wire::negotiate({}, {"qwen4exp_nf4_bf16_kv"}, {}, withoutQwen4Exp, selected, error) &&
+           error.code == wire::ErrorCode::UnsupportedCapability, "Worker without Qwen4Exp accepted a Qwen4Exp requirement");
+    Success(wire::negotiate({}, {"qwen4exp_nf4_bf16_kv"}, {}, current, selected, error), error);
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
         auto command = Command(wire::Method::ModelLoad);
         command.backend = backend;
         Frame sent = Make(command);
@@ -622,7 +631,7 @@ void TestResponsesAndHandshake() {
     busy.session.contextLength = 10;
     Expect(!wire::make_response(busy, frame, error), "Busy session reported an exact length");
 
-    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
         auto result = Result(wire::Method::ModelLoad);
         result.model.capabilities = {std::string(wire::model_capability(backend))};
         Success(wire::make_response(result, frame, error), error);

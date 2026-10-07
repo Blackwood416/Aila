@@ -66,7 +66,7 @@ def case_name(settings):
 
 def validate_run(run):
     meta, env = run['metadata'], run['metadata']['env_overrides']
-    if meta.get('diagnostic_only') or meta.get('gpu_memory_sha256') or any(str(env.get(k, '0')) != '0' for k in ('AILA_Q4E_CPU_DIAGNOSTIC','AILA_Q4E_CPU_Q8_VERIFY','AILA_Q4E_COLD_TEST_HC_REFERENCE')):
+    if meta.get('diagnostic_only') or meta.get('gpu_memory_sha256') or any(str(env.get(k, '0')) != '0' for k in ('AILA_Q4E_CPU_DIAGNOSTIC','AILA_Q4E_CPU_Q8_VERIFY','AILA_Q4E_CPU_A64_VERIFY','AILA_Q4E_COLD_TEST_HC_REFERENCE')):
         raise ValueError(f'{run["prefix"]}: diagnostic samples are not performance comparisons')
     if meta.get('exit_code') != 0 or meta.get('watchdog_stop') or meta.get('memory_pressure', False):
         raise ValueError(f'{run["prefix"]}: failed or memory-pressure sample')

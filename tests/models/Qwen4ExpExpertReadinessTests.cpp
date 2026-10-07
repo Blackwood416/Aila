@@ -12,8 +12,21 @@
 #include <future>
 #include <cstring>
 #include <thread>
+#include <limits>
 
 struct Qwen4ExpResidentTestAccess {
+    static void GpuMappedDma(Qwen4ExpExpertCache& cache,bool enabled) {
+        cache.gpu_mmap_dma_enabled_=enabled;
+        if(enabled) {
+            cache.gpu_mmap_dma_first_events_.reserve(cache.num_experts_per_layer_);
+            cache.batch_dma_events_.reserve(size_t(cache.num_experts_per_layer_)*2);
+        }
+    }
+    static sycl::event HoldCopyQueue(Qwen4ExpExpertCache& cache,std::shared_future<void> signal) {
+        return cache.copy_q_->submit([&](sycl::handler& cgh) {
+            cgh.host_task([signal] {signal.wait_for(std::chrono::seconds(10));});
+        });
+    }
     static sycl::event MaintenanceAcquire(Qwen4ExpExpertCache& cache,int layer,const int* ids,int count,int* slots) {
         return cache.acquire_impl(layer,ids,count,slots,false);
     }
@@ -197,6 +210,8 @@ void test_query_residency_and_gpu_tickets(Context& ctx) {
     expect(!r0.gpu_resident, "expected unallocated GPU slot for expert 0");
     expect(!r0.gpu_ready, "expected unready GPU state for expert 0");
     expect(!r0.host_resident, "expected non-resident host state for expert 0");
+    expect(!cache.HasGpuRouteSource(0,0), "Missing expert excluded from CPU route");
+    expect(!cache.HasGpuRouteSource(-1,0) && !cache.HasGpuRouteSource(0,8), "Invalid GPU route query");
 
     // Test prepare_host for expert (0, 3)
     FillTicket ft3 = cache.prepare_host(0, 3);
@@ -211,6 +226,7 @@ void test_query_residency_and_gpu_tickets(Context& ctx) {
     expect(r3.host_ready, "expert 3 should be host ready");
     expect(r3.host_slot == ft3.hslot, "host slot match");
     expect(!r3.gpu_resident, "expert 3 should not yet be GPU resident");
+    expect(!cache.HasGpuRouteSource(0,3), "Host-only expert excluded from CPU route");
 
     // Test ensure_gpu for expert (0, 3)
     GpuExpertTicket gt3 = cache.ensure_gpu(0, 3);
@@ -223,6 +239,7 @@ void test_query_residency_and_gpu_tickets(Context& ctx) {
 
     // Now expert 3 must be GPU ready
     ExpertResidency r3_gpu = cache.query_residency(0, 3);
+    expect(cache.HasGpuRouteSource(0,3) == (r3_gpu.gpu_ready || r3_gpu.gpu_copying), "Light GPU placement differs from original query");
     expect(r3_gpu.gpu_resident, "expert 3 should be GPU resident");
     expect(r3_gpu.gpu_ready, "expert 3 should be GPU ready");
     expect(r3_gpu.gpu_slot == gt3.gpu_slot, "GPU slot match");
@@ -496,6 +513,52 @@ void test_expert_executor_planning_and_ready_subset(Context& ctx) {
     }
 
     std::cout << "  Passed Qwen4ExpExpertExecutor planning and ready subset test.\n";
+}
+
+void test_cpu_packet_ordered_merge(Context& ctx) {
+    for (int H : {257, 2560}) for (bool shared : {false, true}) for (int cpu_count : {0, 3, 16}) {
+        constexpr int K = 16;
+        std::vector<float> canonical(K * H), scattered(K * H), weights(K);
+        std::vector<uint8_t> packet(16 * sizeof(int) + K * H * sizeof(float));
+        std::array<int, 16> cpu_ranks;
+        std::fill_n(cpu_ranks.data(), 16, -1);
+        for (int k = 0; k < K; ++k) {
+            weights[k] = float(k - 7) / 31.0f;
+            for (int r = 0; r < H; ++r) canonical[k * H + r] = float((k * 37 + r * 13) % 101 - 50) / 19.0f;
+        }
+        scattered = canonical;
+        for (int c = 0; c < cpu_count; ++c) {
+            const int rank = (c * 5) % K;
+            cpu_ranks[rank] = cpu_count - c - 1;
+            std::memcpy(packet.data() + 16 * sizeof(int) + cpu_ranks[rank] * H * sizeof(float), canonical.data() + rank * H, H * sizeof(float));
+            std::fill_n(scattered.data() + rank * H, H, std::numeric_limits<float>::quiet_NaN());
+        }
+        std::memcpy(packet.data(), cpu_ranks.data(), 16 * sizeof(int));
+        std::vector<bf16> shared_host(H, bf16(0.25f)), baseline(H), actual(H);
+        bf16 gate = bf16(-0.5f);
+        auto* down = static_cast<float*>(ctx.alloc_device(K * H * sizeof(float)));
+        auto* w = static_cast<float*>(ctx.alloc_device(K * sizeof(float)));
+        auto* p = ctx.alloc_device(packet.size());
+        auto* s = static_cast<bf16*>(ctx.alloc_device(H * sizeof(bf16)));
+        auto* g = static_cast<bf16*>(ctx.alloc_device(sizeof(bf16)));
+        auto* y = static_cast<bf16*>(ctx.alloc_device(H * sizeof(bf16)));
+        ctx.queue().memcpy(w, weights.data(), K * sizeof(float));
+        ctx.queue().memcpy(s, shared_host.data(), H * sizeof(bf16));
+        ctx.queue().memcpy(g, &gate, sizeof(bf16));
+        ctx.queue().memcpy(down, canonical.data(), K * H * sizeof(float));
+        ops::moe_ordered_accumulate_down_rows(ctx, down, w, y, 1, K, H, shared ? s : nullptr, shared ? g : nullptr);
+        ctx.queue().memcpy(baseline.data(), y, H * sizeof(bf16)).wait_and_throw();
+        ctx.queue().memcpy(down, scattered.data(), K * H * sizeof(float));
+        ctx.queue().memcpy(p, packet.data(), packet.size());
+        ops::moe_ordered_accumulate_down_rows(ctx, down, w, y, 1, K, H, shared ? s : nullptr, shared ? g : nullptr, nullptr, p);
+        ctx.queue().memcpy(actual.data(), y, H * sizeof(bf16)).wait_and_throw();
+        expect(std::memcmp(actual.data(), baseline.data(), H * sizeof(bf16)) == 0, "CPU packet merge changed ordered BF16 output");
+        bool rejected = false;
+        try { ops::moe_ordered_accumulate_down_rows(ctx, down, w, y, 2, K, H, nullptr, nullptr, nullptr, p); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "CPU packet accepted multiple tokens");
+        ctx.free_device(down); ctx.free_device(w); ctx.free_device(p); ctx.free_device(s); ctx.free_device(g); ctx.free_device(y);
+    }
 }
 
 void test_h2b_down_to_rank_and_ordered_merge(Context& ctx) {
@@ -1087,6 +1150,7 @@ void test_direct_ready_lease(Context& ctx) {
         expect(!cache.ValidateReadyBinding(0,id,snapshot.gpu_slot,old_gen),"Old generation accepted for a rebound slot");
         std::promise<void> release;auto signal=release.get_future().share();
         Qwen4ExpResidentTestAccess::HoldCopy(cache,snapshot.gpu_slot,signal);
+        expect(cache.HasGpuRouteSource(0,id), "Copying expert admitted to CPU route");
         auto lease=cache.BindReady(0,&id,1);
         const bool copying_rejected=lease.ready_count==0 && lease.cold_count==1;
         release.set_value();
@@ -1163,7 +1227,7 @@ void test_adaptive_hotset(Context& ctx) {
     const auto identity=cache.FrozenIdentity();
     cache.BeginHotsetForward(0,12);expect(cache.frozen_slots()==0,"Prefill did not borrow tier");
     int ids[4]={3,4,5,6},slots[4];cache.acquire(1,ids,4,slots).wait_and_throw();
-    cache.BeginHotsetForward(12,1);
+    cache.BeginHotsetForward(12,2,-1,true);
     expect(cache.FrozenIdentity()==identity && cache.IsDirectReady(0,2),"Prefill handoff failed to restore evolved tier");
     const auto& policy=cache.hotset_policy();
     expect(policy.decode[2]==2 && policy.prefill[2]==0 && policy.unique[2]==2,"Frequency accounting changed with placement");
@@ -1205,10 +1269,23 @@ void test_prompt_prefill(Context& ctx) {
     cache.EndHotsetForward(1,0);
     expect(cache.frozen_slots()==4 && cache.hotset_policy().decode[5]==0 && cache.hotset_policy().prompt_rows==5,
         "Single-row prefill tail was misclassified as decode");
-    cache.BeginHotsetForward(5,1);
+    // The first decode operation can verify several tokens at once. It must
+    // finish prompt handoff, then retain the decode tier on later windows.
+    cache.BeginHotsetForward(5,4,-1,true);
     // Expert 0 is a valid victim in both layers; expert 1 is outside this
     // two-swap budget and must survive the temporary prefill tier.
     expect(cache.frozen_slots()==8 && cache.IsDirectReady(1,1),"Prefill overwrote logical decode tier");
+    const auto decode_refill=cache.stats().epoch_refill_bytes;
+    const auto prompt_rows=cache.hotset_policy().prompt_rows;
+    for (int rows : {2,3,4,1}) {
+        cache.BeginHotsetForward(9,rows,-1,true);
+        expect(cache.frozen_slots()==8 && !cache.hotset_policy().collecting_prompt &&
+            cache.hotset_policy().prompt_rows==prompt_rows && cache.stats().epoch_refill_bytes==decode_refill,
+            "Decode verification borrowed slots or started a new prompt");
+    }
+    cache.BeginHotsetForward(9,4,0);
+    expect(cache.frozen_slots()==4 && cache.hotset_policy().collecting_prompt,
+        "An explicit follow-up prefill no longer borrows its tier");
     std::cout<<"[H5 PREFILL PASS] chunk_admission=1 final_chunk_skip=1 decode_tier_preserved=1\n";
 }
 
@@ -1318,6 +1395,143 @@ void test_host_ram_zero(Context& ctx) {
         expect(cache.host_contains(0,id)==enabled,"Disabled Host RAM acquire populated host pool");
     }
     std::cout<<"[HOST RAM ZERO PASS] zero_disabled=1 negative_disabled=1 positive_enabled=1 default_enabled=1 mapped_source=1 exact_payload=1\n";
+}
+
+void test_gpu_mapped_cold_dma(Context& ctx) {
+    struct EnvScope {
+        const std::array<const char*,3> keys={"AILA_Q4E_HOT_RAM_MB","AILA_TEST_Q4E_HOST_POOL","AILA_TEST_Q4E_HOST_SLOTS"};
+        std::array<std::string,3> previous;
+        EnvScope() {
+            for(size_t i=0;i<keys.size();++i) {
+                if(const char* value=std::getenv(keys[i]))previous[i]=value;
+                _putenv_s(keys[i],"0");
+            }
+        }
+        ~EnvScope(){for(size_t i=0;i<keys.size();++i)_putenv_s(keys[i],previous[i].c_str());}
+    } env_scope;
+    SyntheticExpertWeights synth;ModelWeights weights;
+    const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    auto init=[&](Qwen4ExpExpertCache& cache,int slots,bool enabled) {
+        std::string err;
+        expect(cache.init(ctx,weights,2,size_t(slots)*bytes,8,256,64,64,&err,true),"GPU mapped fixture init: "+err);
+        expect(!cache.host_pool_enabled(),"GPU mapped fixture requires HostRam0");
+        for(int l=0;l<2;++l)cache.set_layer_expert_ref(l,synth.gu_ref,synth.dn_ref);
+        cache.set_reader_type(aila::ExpertReaderType::Mmap);
+        Qwen4ExpResidentTestAccess::GpuMappedDma(cache,enabled);
+        int hot=0,slot=-1;cache.acquire(0,&hot,1,&slot).wait_and_throw();cache.FreezeReady(1);
+        cache.SetDemandForwardRows(1);
+    };
+    auto payload=[&](Qwen4ExpExpertCache& cache,int slot,int id) {
+        const auto desc=cache.get_slot_dev(slot);
+        std::vector<uint8_t> expected(bytes),actual(bytes);size_t offset=0;
+        auto append=[&](const std::vector<uint8_t>& source,size_t per) {
+            std::memcpy(expected.data()+offset,source.data()+size_t(id)*per,per);offset+=per;
+        };
+        append(synth.gu_packed_host,synth.gu_packed_per_exp);append(synth.gu_absmax_codes,synth.gu_absmax_per_exp);
+        append(synth.dn_packed_host,synth.dn_packed_per_exp);append(synth.dn_absmax_codes,synth.dn_absmax_per_exp);
+        ctx.memcpy_d2h(actual.data(),desc.gate_up_packed,bytes);
+        expect(actual==expected,"GPU mapped four-segment payload changed expert identity");
+        expect(desc.gate_up_nested.codes==desc.gate_up_packed+synth.gu_packed_per_exp &&
+            desc.down_packed==desc.gate_up_nested.codes+synth.gu_absmax_per_exp &&
+            desc.down_nested.codes==desc.down_packed+synth.dn_packed_per_exp,
+            "GPU mapped descriptor offsets changed");
+        expect(desc.gate_up_nested.blocksize==256 && desc.down_nested.blocksize==256 &&
+            desc.gate_up_nested.offset==synth.gu_ref.quant_state.nested_offset &&
+            desc.down_nested.offset==synth.dn_ref.quant_state.nested_offset,"GPU mapped descriptor quantization changed");
+        float gu_scale=0,dn_scale=0;
+        ctx.memcpy_d2h(&gu_scale,desc.gate_up_nested.nested_absmax,sizeof(float));
+        ctx.memcpy_d2h(&dn_scale,desc.down_nested.nested_absmax,sizeof(float));
+        expect(gu_scale==synth.gu_nested_absmax[size_t(id)*synth.gu_absmax_per_exp/256] &&
+            dn_scale==synth.dn_nested_absmax[size_t(id)*synth.dn_absmax_per_exp/256],"GPU mapped nested expert metadata changed");
+    };
+    for(bool enabled:{false,true}) {
+        Qwen4ExpExpertCache cache;init(cache,3,enabled);const auto identity=cache.FrozenIdentity();
+        const auto before=cache.stats();const auto reads=cache.reader()->stats().read_count;
+        int ids[3]={0,3,6},slots[2]={-1,-1};auto route=cache.BindReady(0,ids,3);
+        expect(route.ready_count==1 && route.cold_count==2,"GPU mapped route rank changed");
+        auto done=cache.AcquireCold(route,slots);done.wait_and_throw();
+        for(int c=0;c<2;++c)payload(cache,slots[c],ids[route.cold_ranks[c]]);
+        const auto a=cache.get_slot_dev(slots[0]),b=cache.get_slot_dev(slots[1]);
+        expect(b.gate_up_nested.nested_absmax-a.gate_up_nested.nested_absmax==
+            (6-3)*ptrdiff_t(synth.gu_absmax_per_exp/256),"GPU mapped GU descriptor lost expert identity");
+        expect(b.down_nested.nested_absmax-a.down_nested.nested_absmax==
+            (6-3)*ptrdiff_t(synth.dn_absmax_per_exp/256),"GPU mapped down descriptor lost expert identity");
+        expect(cache.stats().gpu_mmap_dma_experts-before.gpu_mmap_dma_experts==uint64_t(enabled?2:0) &&
+            cache.stats().gpu_mmap_dma_copies-before.gpu_mmap_dma_copies==uint64_t(enabled?8:0) &&
+            cache.stats().gpu_mmap_dma_bytes-before.gpu_mmap_dma_bytes==uint64_t(enabled?2*bytes:0),"GPU mapped DMA counters changed");
+        expect(cache.stats().total_transferred_bytes-before.total_transferred_bytes==2*bytes &&
+            cache.dma_timing_stats().last_memcpy_count==uint32_t(enabled?8:2) &&
+            cache.dma_timing_stats().last_batch_bytes==2*bytes,"GPU mapped DMA count multiplied payload bytes");
+        expect(enabled ? cache.reader()->stats().read_count==reads : cache.reader()->stats().read_count>reads,
+            "GPU mapped candidate failed to bypass reader or changed opt-out");
+        expect(cache.FrozenIdentity()==identity,"GPU mapped DMA changed hot placement");
+        cache.DiscardTransient(slots,2);route.Finish(done);
+        // Ordinary acquire and multi-row cold service retain the old reader.
+        const auto mapped=cache.stats().gpu_mmap_dma_experts;
+        const auto ordinary_reads=cache.reader()->stats().read_count;
+        int id=2,slot=-1;cache.acquire(0,&id,1,&slot).wait_and_throw();
+        expect(cache.stats().gpu_mmap_dma_experts==mapped && cache.reader()->stats().read_count>ordinary_reads,
+            "GPU mapped DMA escaped explicit cold service");
+        const auto old_reads=cache.reader()->stats().read_count;
+        cache.SetDemandForwardRows(2);id=7;
+        {auto fallback=cache.BindReady(0,&id,1);auto ev=cache.AcquireCold(fallback,&slot);ev.wait_and_throw();fallback.Finish(ev);}
+        expect(cache.stats().gpu_mmap_dma_experts==mapped && cache.reader()->stats().read_count>old_reads,
+            "GPU mapped DMA escaped single-row cold service");
+        cache.SetDemandForwardRows(1);
+        auto invalid=synth.gu_ref;invalid.quant_state.shape={7,128,256};
+        Qwen4ExpResidentTestAccess::MappedRefs(cache,0,invalid,synth.dn_ref);
+        id=4;
+        {auto fallback=cache.BindReady(0,&id,1);auto ev=cache.AcquireCold(fallback,&slot);ev.wait_and_throw();fallback.Finish(ev);}
+        expect(cache.stats().gpu_mmap_dma_experts==mapped,"GPU mapped invalid original geometry failed to fall back");
+        payload(cache,slot,id);
+    }
+    {
+        Qwen4ExpExpertCache cache;init(cache,2,true);const auto identity=cache.FrozenIdentity();
+        std::promise<void> release;auto signal=release.get_future().share();
+        auto held=Qwen4ExpResidentTestAccess::HoldCopyQueue(cache,signal);
+        int id=3,slot=-1;auto route=cache.BindReady(0,&id,1);
+        auto done=cache.AcquireCold(route,&slot);
+        const auto resident=cache.query_residency(0,id);
+        const bool pending=resident.gpu_copying && !resident.gpu_ready &&
+            done.get_info<sycl::info::event::command_execution_status>()!=sycl::info::event_command_status::complete;
+        const auto generation=cache.get_slot_generation(slot);
+        cache.DiscardTransient(&slot,1);route.Finish({});
+        int next_id=6,next_slot=-1;auto next=cache.BindReady(0,&next_id,1);
+        auto reuse=std::async(std::launch::async,[&] {return cache.AcquireCold(next,&next_slot);});
+        const bool dma_blocked=reuse.wait_for(std::chrono::milliseconds(50))==std::future_status::timeout;
+        release.set_value();held.wait_and_throw();auto next_done=reuse.get();next_done.wait_and_throw();
+        expect(pending && dma_blocked,"GPU mapped slot was consumed or overwritten before four-segment DMA completion");
+        expect(next_slot==slot && cache.get_slot_generation(next_slot)>generation &&
+            !cache.ValidateReadyBinding(0,3,slot,generation),"GPU mapped reuse accepted stale generation");
+        payload(cache,next_slot,next_id);next.Finish(next_done);
+        // A pending GPU consumer survives logical invalidation and blocks the
+        // next physical write, independently of the already completed DMA.
+        std::promise<void> reader_release;auto reader_signal=reader_release.get_future().share();
+        auto reader=ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.host_task([reader_signal]{reader_signal.wait_for(std::chrono::seconds(10));});
+        });
+        cache.record_consumer_reader_fences(&next_slot,1,reader);cache.DiscardTransient(&next_slot,1);
+        int final_id=7,final_slot=-1;auto final_route=cache.BindReady(0,&final_id,1);
+        auto writer=std::async(std::launch::async,[&] {return cache.AcquireCold(final_route,&final_slot);});
+        const bool reader_blocked=writer.wait_for(std::chrono::milliseconds(50))==std::future_status::timeout;
+        reader_release.set_value();reader.wait_and_throw();auto final_done=writer.get();final_done.wait_and_throw();
+        expect(reader_blocked && final_slot==next_slot,"GPU mapped reuse dropped prior consumer fence");
+        payload(cache,final_slot,final_id);final_route.Finish(final_done);
+        expect(cache.FrozenIdentity()==identity && !cache.is_faulted(),"GPU mapped fenced reuse poisoned hot identity");
+    }
+    {
+        auto cache=std::make_unique<Qwen4ExpExpertCache>();init(*cache,2,true);
+        std::promise<void> release;auto signal=release.get_future().share();
+        auto held=Qwen4ExpResidentTestAccess::HoldCopyQueue(*cache,signal);
+        int id=5,slot=-1;auto route=cache->BindReady(0,&id,1);
+        auto done=cache->AcquireCold(route,&slot);route.Finish({});
+        auto cleanup=std::async(std::launch::async,[owned=std::move(cache)]()mutable {owned.reset();});
+        const bool blocked=cleanup.wait_for(std::chrono::milliseconds(50))==std::future_status::timeout;
+        release.set_value();held.wait_and_throw();cleanup.get();
+        expect(blocked && done.get_info<sycl::info::event::command_execution_status>()==sycl::info::event_command_status::complete,
+            "GPU mapped cleanup released allocations before copy queue drained");
+    }
+    std::cout<<"[GPU MAPPED DMA PASS] four_segments=1 original_nf4=1 descriptors=1 expert_identity=1 opt_out=1 reader_bypass=1 count_bytes=1 cold_single_row_only=1 invalid_fallback=1 pending_not_ready=1 dma_reuse_fence=1 consumer_fence=1 generation=1 frozen_identity=1 cleanup_drain=1\n";
 }
 
 void test_short_demand_parts(Context& ctx) {
@@ -1765,6 +1979,7 @@ int main() {
         test_mixed_ready_copying_and_cancellation(ctx);
         test_expert_executor_planning_and_ready_subset(ctx);
         test_h2b_down_to_rank_and_ordered_merge(ctx);
+        test_cpu_packet_ordered_merge(ctx);
         test_h2b_h3_cpu_expert_dispatch_and_credit_bounds(ctx);
         test_h3_straggler_monitoring_and_penalty(ctx);
         test_h2b_multi_token_and_large_task_dispatch(ctx);
@@ -1779,6 +1994,7 @@ int main() {
         test_mapped_expert_source(ctx);
         test_cpu_packed_source_cache(ctx);
         test_host_ram_zero(ctx);
+        test_gpu_mapped_cold_dma(ctx);
         test_short_demand_parts(ctx);
         test_mapped_resident_cold(ctx);
 

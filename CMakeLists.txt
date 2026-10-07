@@ -197,6 +197,8 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertCache.cpp
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
+    src/models/Qwen4ExpMtpDraft.cpp
+    src/models/Qwen4ExpMtpRuntime.cpp
     src/models/Qwen4ExpPrefill.cpp
     src/models/Qwen4ExpExpertExecutor.cpp
     src/models/Qwen4ExpExpertReader.cpp
@@ -575,6 +577,14 @@ set_tests_properties(AilaQwen35SessionTests AilaQwen35Bf16SessionTests PROPERTIE
     LABELS "gpu;inference" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
     SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+add_executable(AilaQwen4ExpSessionTests tests/inference/Qwen4ExpSessionTests.cpp)
+target_compile_definitions(AilaQwen4ExpSessionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_link_libraries(AilaQwen4ExpSessionTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpSessionTests COMMAND AilaQwen4ExpSessionTests)
+set_tests_properties(AilaQwen4ExpSessionTests PROPERTIES
+    LABELS "gpu;inference;qwen4exp" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu
+    SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 add_executable(AilaQwen35GroupedBf16Tests tests/inference/Qwen35GroupedBf16Tests.cpp)
 target_compile_definitions(AilaQwen35GroupedBf16Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 if(MSVC)
@@ -805,6 +815,22 @@ else()
 endif()
 add_test(NAME AilaQwen4ExpCpuExpertTests COMMAND AilaQwen4ExpCpuExpertTests)
 set_tests_properties(AilaQwen4ExpCpuExpertTests PROPERTIES LABELS "gpu;ops;qwen4exp;h2a" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpGpuQ8Tests tests/ops/Qwen4ExpGpuQ8Tests.cpp)
+target_compile_definitions(AilaQwen4ExpGpuQ8Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpGpuQ8Tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpGpuQ8Tests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpGpuQ8Tests COMMAND AilaQwen4ExpGpuQ8Tests)
+set_tests_properties(AilaQwen4ExpGpuQ8Tests PROPERTIES
+    LABELS "gpu;ops;qwen4exp;q8" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 120)
+add_test(NAME AilaQwen4ExpGpuQ8FastTests COMMAND AilaQwen4ExpGpuQ8Tests)
+set_tests_properties(AilaQwen4ExpGpuQ8FastTests PROPERTIES
+    ENVIRONMENT "AILA_Q4E_GPU_Q8_FAST_RTE=1"
+    LABELS "gpu;ops;qwen4exp;q8" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 add_executable(AilaQwen4ExpExpertReaderTests
     tests/models/Qwen4ExpExpertReaderTests.cpp

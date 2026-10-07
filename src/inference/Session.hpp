@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -47,6 +49,18 @@ struct ExecutionResult {
     std::vector<float> logits; // Populated only when explicitly requested.
 };
 
+// A single-sequence two-position window. The incoming pending token is always
+// consumed. An accepted first output may also be cached; the bonus never is.
+// The selector runs synchronously before prefix commit, under execution locks.
+struct DecodeWindowResult {
+    int tokenId = -1;
+    std::optional<int> bonusTokenId;
+    int consumedInputs = 1;
+    int cacheLength = 0;
+    bool firstTokenCached = false;
+};
+using DecodeWindowSelector = std::function<bool(int)>;
+
 inline constexpr size_t MaxDecodeBatchSize = 4;
 
 class SessionBackend;
@@ -82,6 +96,9 @@ public:
     // A null key explicitly disables grouping; matching model paths/families
     // alone are insufficient. The key remains stable for this backend's life.
     virtual const void* DecodeBatchKey() const noexcept { return nullptr; }
+    virtual bool SupportsDecodeWindow() const noexcept { return false; }
+    virtual std::optional<DecodeWindowResult> ForwardWindow(int pendingToken,
+        const DecodeWindowSelector& acceptFirst) { return std::nullopt; }
     virtual std::vector<ExecutionResult> ForwardDecodeBatch(
         const std::vector<BackendDecodeInput>& rows);
 };
@@ -110,6 +127,7 @@ public:
     size_t CacheBytes() const noexcept { return cacheBytes; }
     const void* DecodeBatchKey() const noexcept { return backend->DecodeBatchKey(); }
     bool Busy() const noexcept { return busy.load(); }
+    bool SupportsDecodeWindow() const noexcept { return backend->SupportsDecodeWindow(); }
 
     void Reset();
     int Truncate(int length);
@@ -125,6 +143,9 @@ private:
     friend class RequestState;
     void Acquire();
     void Release() noexcept;
+    std::optional<DecodeWindowResult> ExecuteWindow(int pendingToken,
+        const DecodeWindowSelector& acceptFirst);
+    void ResetCancelledWindow();
     ExecutionResult Execute(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
                             bool captureLogits = false);

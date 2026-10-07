@@ -539,7 +539,8 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         RequireReady();
         if (liveModels >= limits.maxLoadedModels) throw CommandFailure(wire::ErrorCode::ResourceLimit, "Loaded model limit reached");
         if (wire::model_capability(command.backend).empty())
-            throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Worker supports Qwen3 NF4 and Qwen3.5 Hybrid NF4/BF16");
+            throw CommandFailure(wire::ErrorCode::UnsupportedModel,
+                                 "Worker supports Qwen3 NF4, Qwen3.5 Hybrid NF4/BF16 and Qwen4Exp NF4");
         const auto capability = wire::model_capability(command.backend, command.kvType);
         if (capability.empty())
             throw CommandFailure(wire::ErrorCode::InvalidArgument, "Shared inference requires BF16 KV");
@@ -567,6 +568,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
                     if (backend == "qwen3_nf4") record->model = self->factory->LoadQwen3(directory, options);
                     else if (backend == "qwen35_nf4") record->model = self->factory->LoadQwen35(directory, options);
                     else if (backend == "qwen35_bf16") record->model = self->factory->LoadQwen35Bf16(directory, options);
+                    else if (backend == "qwen4exp_nf4") record->model = self->factory->LoadQwen4Exp(directory, options);
                     else throw CommandFailure(wire::ErrorCode::UnsupportedModel, "Unsupported model backend");
                     self->CheckLifecycleFault();
                     self->RequireReady();

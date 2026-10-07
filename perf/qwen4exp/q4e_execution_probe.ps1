@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("story","generation","resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","memory","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp")][string]$Workload="story",
+    [ValidateSet("story","generation","resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","memory","supply","front_graph","head","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp")][string]$Workload="story",
     [ValidateSet("","qwen38-a770")][string]$PerformancePreset="",
     [switch]$RuntimeDefaults,
     [switch]$IntegerDeviceProfile,
@@ -29,7 +29,7 @@ param(
     [switch]$ColdDeviceProfile,
     [switch]$ReverseCold,
     [ValidateSet(-1,0,1)][int]$ColdQualityH3=-1,
-    [ValidateRange(1,12)][int]$ColdThreads=4,
+    [ValidateRange(1,18)][int]$ColdThreads=4,
     [ValidateRange(1,10)][int]$ColdCredits=2,
     [ValidateRange(100,10000)][int]$ColdBudgetUs=1000,
     [ValidateSet(-1,0,1)][int]$CpuNf4Q8=-1,
@@ -38,12 +38,54 @@ param(
     [ValidateRange(-1,8)][int]$CpuQ8Chunks=-1,
     [switch]$CpuDiagnostic,
     [switch]$CpuVerify,
+    [switch]$CpuA64Verify,
+    [ValidateSet(0,2,4)][int]$VerifyCpuRows=0,
+    [ValidateSet(0,2,4)][int]$VerifyGpuReuse=0,
+    [ValidateSet(0,1,2,4)][int]$MtpLiveWidth=0,
+    [ValidateSet(0,1)][int]$MtpStateOnlyReplay=0,
+    [ValidateSet(640,2048)][int]$MtpMaxContext=640,
+    [switch]$MtpLiveCompareWidths,
+    [ValidateSet(0,1)][int]$MtpSmallRowsDecode=1,
+    [switch]$MtpLiveProfile,
+    [ValidateSet(0,1)][int]$VerifyDecodeAttention=0,
+    [ValidateSet(0,1)][int]$VerifyAttentionPair=0,
+    [ValidateSet(0,1)][int]$VerifyAsyncRoute=0,
+    [switch]$ProfileComponents,
+    [ValidateSet(0,1,2,3)][int]$VerifyLinearReuse=0,
+    [ValidateSet(0,1)][int]$VerifyDecodePrepare=0,
+    [ValidateSet(0,1)][int]$VerifyGdnOrder=0,
+    [int]$MtpShadowPosition=-1,
+    [switch]$MtpDraftMargins,
+    [switch]$MtpSelectProfile,
+    [ValidateSet(0,1)][int]$MtpGpuGreedy=0,
+    [ValidateSet(0,1)][int]$MtpGreedyRows=0,
+    [ValidateSet(0,1)][int]$MtpSkipDraftTail=0,
+    [ValidateSet(0,1)][int]$MtpHiddenReuse=0,
     [switch]$GpuMemoryDiagnostic,
     [ValidateSet(-1,0,1)][int]$RouterResidentFused=-1,
     [ValidateSet(-1,0,1)][int]$DecodePendingMlpResidual=-1,
     [ValidateSet(-1,64,128,256)][int]$HcDownWorkGroup=-1,
     [ValidateSet(-1,0,1)][int]$HcUpParallelStreams=-1,
     [switch]$HcReferenceCanary,
+    [switch]$GpuQ8ReferenceCanary,
+    [ValidateSet(-1,0,1)][int]$GpuNf4Q8=-1,
+    [ValidateSet(-1,0,1)][int]$GpuQ8FastRte=-1,
+    [ValidateSet(-1,0,1)][int]$MoeFrontFused=-1,
+    [ValidateSet(-1,0,1)][int]$AttentionNf4Q8=-1,
+    [ValidateSet(-1,0,1)][int]$GdnHistoryFused=-1,
+    [ValidateRange(-1,5000)][int]$CpuHandoffSpinUs=-1,
+    [ValidateSet(-1,0,1)][int]$CpuResultHostRead=-1,
+    [ValidateSet(-1,0,1)][int]$LmHeadQ8=-1,
+    [ValidateSet(-1,0,1)][int]$BnbGemvInputPrefetchOff=-1,
+    [ValidateRange(-1,4096)][int]$VramReserveMB=-1,
+    [ValidateSet(-1,0,1)][int]$CpuPerExpertDag=-1,
+    [ValidateSet(-1,0,1)][int]$CpuTilePool=-1,
+    [ValidateSet(-1,0,1)][int]$CpuLightRoute=-1,
+    [ValidateSet(-1,0,1)][int]$CpuScaleRegister=-1,
+    [ValidateSet(-1,0,1)][int]$CpuDeferArenaWait=-1,
+    [ValidateSet(-1,0,1)][int]$CpuByteShuffle=-1,
+    [string]$ColdReferenceExport="",
+    [string]$ColdReferenceImport="",
     [ValidateRange(-1,8192)][int]$CpuPackedCacheMB=-1,
     [ValidateSet(-1,0,1)][int]$CpuPackedCachePrompt=-1,
     [ValidateSet(-1,0,1)][int]$CpuMmapCold=-1,
@@ -60,10 +102,26 @@ param(
     [ValidateSet(-1,0,1)][int]$InlineCheckpoint=-1,
     [ValidateSet(-1,0,1,2,3,4)][int]$QsaSelector=-1,
     [ValidateSet(-1,0,1)][int]$ImmediateLists=-1,
+    [ValidateSet(-1,0,1)][int]$LevelZeroV2=-1,
+    [ValidateSet(-1,0,1)][int]$CpuEarlyStart=-1,
+    [ValidateSet(-1,0,1)][int]$CpuResultPacket=-1,
+    [ValidateSet(-1,0,1)][int]$CpuAsyncRoute=-1,
+    # HC reuse failed the real-model exact reference and has been removed.
+    [ValidateSet(-1,0)][int]$HcReuseActivation=-1,
+    [ValidateSet(-1,0,1)][int]$CpuScaleShift=-1,
+    [ValidateSet(-1,0,1)][int]$CpuQ8Activation64=-1,
+    [ValidateSet(-1,0,1)][int]$GpuMmapDma=-1,
+    [ValidateRange(-1,2048)][int]$CpuScaleCacheMB=-1,
+    [ValidateSet(-1,0,1)][int]$CpuA64Specialize=-1,
+    [ValidateSet(-1,0,1)][int]$CpuA64Row2=-1,
+    [ValidateRange(-1,4096)][int]$DecodeTrimCap=-1,
+    [ValidateSet(-1,128,256,512)][int]$BnbGemvWorkGroup=-1,
+    [ValidateSet(-1,0,1,2)][int]$LevelZeroDeviceEvents=-1,
+    [ValidateRange(-1,256)][int]$LevelZeroBatchSize=-1,
     [ValidateSet(30,512)][int]$DecodePromptTokens=30,
     [ValidateSet(1,2,4)][int]$VerifyRows=1,
     [ValidateRange(2,8)][int]$DecodeRepeats=4,
-    [ValidateRange(1,60)][int]$MtpAnchors=60,
+    [ValidateRange(1,124)][int]$MtpAnchors=60,
     [ValidateSet(64,512)][int]$MtpSlots=64,
     [ValidateRange(1,4)][int]$MtpRepeats=3,
     [ValidateRange(0,4)][int]$MtpVerifyPasses=3,
@@ -103,10 +161,13 @@ param(
     [string]$ModelDir="C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2"
 )
 $ErrorActionPreference="Stop"
+if(($ColdReferenceImport -or $ColdReferenceExport) -and !$ColdQuality){throw 'Reference import/export requires ColdQuality.'}
+if($ColdReferenceImport -and $ColdReferenceExport){throw 'Choose reference import or export.'}
 if ($GpuMemoryDiagnostic -and ($Vtune -or $VtuneInstructions)) {
     throw 'GpuMemoryDiagnostic requires a direct Aila launch; VTune launches have a different process ID.'
 }
 if($HcReferenceCanary -and !$ColdQuality){throw 'HcReferenceCanary requires ColdQuality; it changes the test reference arm.'}
+if($GpuQ8ReferenceCanary -and (!$ColdQuality -or ($GpuNf4Q8 -ne 1 -and $AttentionNf4Q8 -ne 1))){throw 'GpuQ8ReferenceCanary requires ColdQuality and a GPU Q8 candidate enabled.'}
 if($CpuPackedCachePrompt -eq 1 -and $CpuPackedCacheMB -le 0){throw 'CpuPackedCachePrompt requires a positive CpuPackedCacheMB.'}
 . (Join-Path $PSScriptRoot "../PerfCommon.ps1")
 $repo=Get-AilaRepoRoot
@@ -128,6 +189,14 @@ if($RuntimeDefaults) {
     if($PSBoundParameters.ContainsKey('HostRamMB')) {$overrides.AILA_Q4E_HOT_RAM_MB=[string]$HostRamMB}
 }
 if($ExpertCacheMB -gt 0) {$overrides.AILA_Q4E_EXPERT_CACHE_MB=[string]$ExpertCacheMB}
+if($VramReserveMB -ge 0) {$overrides.AILA_Q4E_VRAM_RESERVE_MB=[string]$VramReserveMB}
+if($BnbGemvInputPrefetchOff -ge 0) {$overrides.AILA_BNB4_GEMV_INPUT_PREFETCH_OFF=[string]$BnbGemvInputPrefetchOff}
+if($CpuPerExpertDag -ge 0) {$overrides.AILA_Q4E_CPU_PER_EXPERT_DAG=[string]$CpuPerExpertDag}
+if($CpuTilePool -ge 0) {$overrides.AILA_Q4E_CPU_TILE_POOL=[string]$CpuTilePool}
+if($CpuLightRoute -ge 0) {$overrides.AILA_Q4E_CPU_LIGHT_ROUTE=[string]$CpuLightRoute}
+if($CpuScaleRegister -ge 0) {$overrides.AILA_Q4E_CPU_SCALE_REGISTER=[string]$CpuScaleRegister}
+if($CpuDeferArenaWait -ge 0) {$overrides.AILA_Q4E_CPU_DEFER_ARENA_WAIT=[string]$CpuDeferArenaWait}
+if($CpuByteShuffle -ge 0) {$overrides.AILA_Q4E_CPU_BYTE_SHUFFLE=[string]$CpuByteShuffle}
 if($InlineCheckpoint -ge 0) {$overrides.AILA_Q4E_INLINE_CHECKPOINT=[string]$InlineCheckpoint}
 if($WorkSummary) {$overrides.AILA_Q4E_WORK_SUMMARY="1"}
 if($DecodePrefetch -ge 0) {$overrides.AILA_Q4E_PREFETCH_DECODE=[string]$DecodePrefetch}
@@ -138,11 +207,44 @@ if($CpuNf4Q8Row4 -ge 0) {$overrides.AILA_Q4E_CPU_NF4_Q8_ROW4=[string]$CpuNf4Q8Ro
 if($CpuQ8Chunks -ge 0) {$overrides.AILA_Q4E_CPU_Q8_CHUNKS=[string]$CpuQ8Chunks}
 if($CpuDiagnostic) {$overrides.AILA_Q4E_CPU_DIAGNOSTIC='1'}
 if($CpuVerify) {$overrides.AILA_Q4E_CPU_Q8_VERIFY='1'}
+if($CpuA64Verify) {$overrides.AILA_Q4E_CPU_A64_VERIFY='1'}
+$overrides.AILA_Q4E_VERIFY_CPU_ROWS=[string]$VerifyCpuRows
+$overrides.AILA_Q4E_VERIFY_GPU_REUSE=[string]$VerifyGpuReuse
+$overrides.AILA_Q4E_MTP_LIVE_WIDTH=[string]$MtpLiveWidth
+$overrides.AILA_Q4E_MTP_STATE_ONLY_REPLAY=[string]$MtpStateOnlyReplay
+$overrides.AILA_Q4E_MTP_MAX_CONTEXT=[string]$MtpMaxContext
+$overrides.AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS=[string][int][bool]$MtpLiveCompareWidths
+$overrides.AILA_Q4E_MTP_LIVE_PROFILE=[string][int][bool]$MtpLiveProfile
+$overrides.AILA_Q4E_VERIFY_DECODE_ATTN=[string]$VerifyDecodeAttention
+$overrides.AILA_Q4E_VERIFY_ASYNC_ROUTE=[string]$VerifyAsyncRoute
+$overrides.AILA_Q4E_PROFILE_COMPONENTS=[string][int][bool]$ProfileComponents
+$overrides.AILA_Q4E_VERIFY_LINEAR_REUSE=[string]$VerifyLinearReuse
+$overrides.AILA_Q4E_VERIFY_DECODE_PREPARE=[string]$VerifyDecodePrepare
+$overrides.AILA_Q4E_VERIFY_GDN_ORDER=[string]$VerifyGdnOrder
+$overrides.AILA_Q4E_MTP_SHADOW_POSITION=[string]$MtpShadowPosition
+$overrides.AILA_Q4E_MTP_DRAFT_MARGINS=[string][int][bool]$MtpDraftMargins
+$overrides.AILA_Q4E_MTP_SELECT_PROFILE=[string][int][bool]$MtpSelectProfile
+$overrides.AILA_Q4E_MTP_GPU_GREEDY=[string]$MtpGpuGreedy
+$overrides.AILA_Q4E_MTP_GREEDY_ROWS=[string]$MtpGreedyRows
+$overrides.AILA_Q4E_MTP_SKIP_DRAFT_TAIL=[string]$MtpSkipDraftTail
+$overrides.AILA_Q4E_VERIFY_ATTN_PAIR=[string]$VerifyAttentionPair
+$overrides.AILA_Q4E_MTP_HIDDEN_REUSE=[string]$MtpHiddenReuse
 if($RouterResidentFused -ge 0) {$overrides.AILA_Q4E_ROUTER_RESIDENT_FUSED=[string]$RouterResidentFused}
 if($DecodePendingMlpResidual -ge 0) {$overrides.AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL=[string]$DecodePendingMlpResidual}
 if($HcDownWorkGroup -ge 0) {$overrides.AILA_Q4E_HC_DECODE_DOWN_WG=[string]$HcDownWorkGroup}
 if($HcUpParallelStreams -ge 0) {$overrides.AILA_Q4E_HC_DECODE_UP_STREAMS=[string]$HcUpParallelStreams}
 if($HcReferenceCanary) {$overrides.AILA_Q4E_COLD_TEST_HC_REFERENCE='1'}
+if($GpuQ8ReferenceCanary) {$overrides.AILA_Q4E_COLD_TEST_GPU_Q8_REFERENCE='1'}
+if($GpuNf4Q8 -ge 0) {$overrides.AILA_Q4E_GPU_NF4_Q8=[string]$GpuNf4Q8}
+if($GpuQ8FastRte -ge 0) {$overrides.AILA_Q4E_GPU_Q8_FAST_RTE=[string]$GpuQ8FastRte}
+if($MoeFrontFused -ge 0) {$overrides.AILA_Q4E_MOE_FRONT_FUSED=[string]$MoeFrontFused}
+if($AttentionNf4Q8 -ge 0) {$overrides.AILA_Q4E_ATTN_NF4_Q8=[string]$AttentionNf4Q8}
+if($GdnHistoryFused -ge 0) {$overrides.AILA_Q4E_GDN_HISTORY_FUSED=[string]$GdnHistoryFused}
+if($CpuHandoffSpinUs -ge 0) {$overrides.AILA_Q4E_CPU_HANDOFF_SPIN_US=[string]$CpuHandoffSpinUs}
+if($CpuResultHostRead -ge 0) {$overrides.AILA_Q4E_CPU_RESULT_HOST_READ=[string]$CpuResultHostRead}
+if($LmHeadQ8 -ge 0) {$overrides.AILA_Q4E_LM_HEAD_Q8=[string]$LmHeadQ8}
+if($ColdReferenceExport) {$overrides.AILA_Q4E_COLD_REFERENCE_EXPORT=$ColdReferenceExport}
+if($ColdReferenceImport) {$overrides.AILA_Q4E_COLD_REFERENCE_IMPORT=(Resolve-Path -LiteralPath $ColdReferenceImport).Path}
 if($CpuPackedCacheMB -ge 0) {$overrides.AILA_Q4E_CPU_PACKED_CACHE_MB=[string]$CpuPackedCacheMB}
 if($CpuPackedCachePrompt -ge 0) {$overrides.AILA_Q4E_CPU_PACKED_CACHE_PROMPT=[string]$CpuPackedCachePrompt}
 if($CpuMmapCold -ge 0) {$overrides.AILA_Q4E_CPU_MMAP_COLD=[string]$CpuMmapCold}
@@ -187,6 +289,27 @@ if($QsaSelector -ge 0) {$overrides.AILA_QSA_SELECTOR=[string]$QsaSelector}
 if($ImmediateLists -ge 0) {
     $overrides.UR_L0_USE_IMMEDIATE_COMMANDLISTS=[string]$ImmediateLists
     $overrides.SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=[string]$ImmediateLists
+}
+if($LevelZeroV2 -ge 0) {$overrides.SYCL_UR_USE_LEVEL_ZERO_V2=[string]$LevelZeroV2}
+if($CpuEarlyStart -ge 0) {$overrides.AILA_Q4E_CPU_EARLY_START=[string]$CpuEarlyStart}
+if($CpuResultPacket -ge 0) {$overrides.AILA_Q4E_CPU_RESULT_PACKET=[string]$CpuResultPacket}
+if($CpuAsyncRoute -ge 0) {$overrides.AILA_Q4E_CPU_ASYNC_ROUTE=[string]$CpuAsyncRoute}
+if($HcReuseActivation -ge 0) {$overrides.AILA_Q4E_HC_REUSE_ACTIVATION=[string]$HcReuseActivation}
+if($CpuScaleShift -ge 0) {$overrides.AILA_Q4E_CPU_SCALE_SHIFT=[string]$CpuScaleShift}
+if($CpuQ8Activation64 -ge 0) {$overrides.AILA_Q4E_CPU_Q8_ACTIVATION64=[string]$CpuQ8Activation64}
+if($GpuMmapDma -ge 0) {$overrides.AILA_Q4E_GPU_MMAP_DMA=[string]$GpuMmapDma}
+if($CpuScaleCacheMB -ge 0) {$overrides.AILA_Q4E_CPU_SCALE_CACHE_MB=[string]$CpuScaleCacheMB}
+if($CpuA64Specialize -ge 0) {$overrides.AILA_Q4E_CPU_A64_SPECIALIZE=[string]$CpuA64Specialize}
+if($CpuA64Row2 -ge 0) {$overrides.AILA_Q4E_CPU_A64_ROW2=[string]$CpuA64Row2}
+if($DecodeTrimCap -ge 0) {$overrides.AILA_Q4E_DECODE_TRIM_CAP=[string]$DecodeTrimCap}
+if($BnbGemvWorkGroup -ge 0) {$overrides.AILA_BNB4_GEMV_WG=[string]$BnbGemvWorkGroup}
+if($LevelZeroDeviceEvents -ge 0) {
+    $overrides.SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS=[string]$LevelZeroDeviceEvents
+    $overrides.UR_L0_DEVICE_SCOPE_EVENTS=[string]$LevelZeroDeviceEvents
+}
+if($LevelZeroBatchSize -ge 0) {
+    $overrides.SYCL_PI_LEVEL_ZERO_BATCH_SIZE=[string]$LevelZeroBatchSize
+    $overrides.UR_L0_BATCH_SIZE=[string]$LevelZeroBatchSize
 }
 if($Vtune -or $VtuneInstructions) {
     $overrides.AILA_Q4E_CACHE_TRACE="$prefix.cache.jsonl"
@@ -334,6 +457,12 @@ if($Workload -eq "front_graph") {
     $arguments=@("--front-graph-model",$ModelDir)
     $inputIdentity=@{kind="real_layer0_decode_front";source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpFrontGraphProbe.hpp")).Hash}
 }
+if($Workload -eq "head") {
+    $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
+    $arguments=@("--head-kernel-model",$ModelDir)
+    $overrides.AILA_Q4E_HOT_RAM_MB="0"
+    $inputIdentity=@{kind="real_bf16_lm_head_only";source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpHeadProbe.hpp")).Hash}
+}
 if($Workload -eq "mtp") {
     $exe=Join-Path $repo "build-refactor/AilaQwen4ExpToleranceTests.exe"
     $arguments=@("--mtp-model",$ModelDir)
@@ -348,9 +477,9 @@ if($Workload -eq "mtp") {
     if($MtpPromptFile) {$overrides.AILA_Q4E_MTP_PROMPT_FILE=(Resolve-Path -LiteralPath $MtpPromptFile).Path}
     $overrides.AILA_Q4E_MTP_OUTPUT=$prefix
     $overrides.AILA_Q4E_VRAM_RESERVE_MB=$(if($MtpSlots -eq 64){"3008"}else{"4096"})
-    $overrides.AILA_Q4E_SMALL_ROWS_DECODE="1"
+    $overrides.AILA_Q4E_SMALL_ROWS_DECODE=[string]$MtpSmallRowsDecode
     $overrides.AILA_Q4E_SMALL_ROWS_HC="1"
-    $overrides.AILA_PROFILE_Q4E_DECODE="0"
+    $overrides.AILA_PROFILE_Q4E_DECODE=$(if($Profile){"1"}else{"0"})
     $inputIdentity=@{kind="mtp_greedy_conditional_three_draft_probe";prompt_tokens=$DecodePromptTokens;anchors=$MtpAnchors;repeats=$MtpRepeats;source_sha256=(Get-FileHash (Join-Path $repo "tests/models/Qwen4ExpMtpAcceptance.hpp")).Hash}
     if($MtpPromptFile) {$inputIdentity.prompt_file=$overrides.AILA_Q4E_MTP_PROMPT_FILE;$inputIdentity.prompt_sha256=(Get-FileHash $MtpPromptFile).Hash}
 }
@@ -400,11 +529,17 @@ $meta=[ordered]@{
     exe_sha256=(Get-FileHash $exe).Hash;model_config_sha256=(Get-FileHash "$ModelDir/config.json").Hash
     stack=(Get-AilaOneApiStackMetadata -Stack $stack)
     gpu=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion)
-    diagnostic_only=[bool]($GpuMemoryDiagnostic -or $CpuVerify -or $CpuDiagnostic -or $Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
+    diagnostic_only=[bool]($GpuMemoryDiagnostic -or $CpuVerify -or $CpuA64Verify -or $CpuDiagnostic -or $Trace -or $Vtune -or $VtuneInstructions -or $Profile -or $Stages -or $Workload -in @("resident","preset","window","mature","integer_quality","integer_state","dpas","integer","compact","tile","supply","front_graph","head","decode","projection","hc","qsa","qsa_tests","qsa_batches","qsa_profile","mtp"));watchdog_stop=$false
 }
 $launcher=$exe
 if($HotsetProfile) {$meta.hotset_profile=@{path=(Resolve-Path -LiteralPath $HotsetProfile).Path;sha256=(Get-FileHash -LiteralPath $HotsetProfile).Hash}}
 if($ColdQuality) {$meta.diagnostic_only=$true;$meta.workload="cold_quality"}
+if($ColdReferenceImport) {
+    $referenceInfo=Get-Content -LiteralPath ($overrides.AILA_Q4E_COLD_REFERENCE_IMPORT+'.meta.json') -Raw | ConvertFrom-Json
+    $referenceHash=(Get-FileHash -LiteralPath $overrides.AILA_Q4E_COLD_REFERENCE_IMPORT).Hash
+    if($referenceInfo.reference_sha256 -ne $referenceHash -or $referenceInfo.model_config_sha256 -ne $meta.model_config_sha256 -or !$referenceInfo.original_bf16_teacher){throw 'Original reference integrity/model mismatch.'}
+    $meta.original_reference=@{path=$overrides.AILA_Q4E_COLD_REFERENCE_IMPORT;sha256=$referenceHash;source_run=$referenceInfo.source_run;source_exe_sha256=$referenceInfo.source_exe_sha256}
+}
 if($ColdBench) {$meta.workload="cold_bench"}
 if($Vtune -or $VtuneInstructions) {
     $launcher="C:/Program Files (x86)/Intel/oneAPI/vtune/latest/bin64/vtune.exe"
@@ -456,6 +591,12 @@ try {
     $proc.WaitForExit()
 }
 $meta.exit_code=$proc.ExitCode
+if($ColdReferenceExport -and $proc.ExitCode -eq 0 -and !$meta.watchdog_stop) {
+    $referenceExportHash=(Get-FileHash -LiteralPath $ColdReferenceExport).Hash
+    @{original_bf16_teacher=$true;reference_sha256=$referenceExportHash;model_config_sha256=$meta.model_config_sha256;source_run=$prefix;source_exe_sha256=$meta.exe_sha256} |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath ($ColdReferenceExport+'.meta.json') -Encoding utf8
+    $meta.exported_original_reference=@{path=$ColdReferenceExport;sha256=$referenceExportHash}
+}
 if($HotsetExport -and (Test-Path -LiteralPath $HotsetExport)) {$meta.hotset_export=@{path=$HotsetExport;sha256=(Get-FileHash -LiteralPath $HotsetExport).Hash}}
 if($samples.Count) {
     $meta.peak_working_set_bytes=($samples | Measure-Object working_set_bytes -Maximum).Maximum

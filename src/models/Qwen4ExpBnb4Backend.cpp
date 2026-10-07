@@ -1,5 +1,7 @@
 #include "Qwen4ExpBnb4Backend.hpp"
+#include "../memory/SessionMemory.hpp"
 #include "../ops/QsaIndexerOps.hpp"
+#include "../ops/Qwen4ExpAttentionPair.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
@@ -255,6 +257,16 @@ Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     if (resident_selected_host_) context_->free_host(resident_selected_host_);
 }
 
+void Qwen4ExpBnb4Backend::PrepareDecodeVerification(Context& ctx) {
+    if (context_ != &ctx) {
+        throw std::invalid_argument("Qwen4ExpBnb4Backend: verification requires the model Context");
+    }
+    // Called under the execution-domain lock before verification, never in its hot loop.
+    // Keep the bundle alive until backend teardown has drained this Context.
+    if (!verification_attention_pair_bundle_)
+        verification_attention_pair_bundle_.emplace(ops::prepare_q4e_attention_pair(ctx));
+}
+
 void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (!context_) return;
     context_->synchronize();
@@ -444,12 +456,39 @@ bool Qwen4ExpBnb4Backend::load(
         embed_weight_ = &weights.upload(embed_name, ctx);
     }
 
+    static const bool s_lm_head_q8 = aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", false);
+    lm_head_host_ = weights.has_host("lm_head.weight") ? weights.host_view("lm_head.weight") : HostTensorView{};
+    const bool use_q8_head = s_lm_head_q8 && hidden_size_ == 2560 && cfg_.vocab_size == 248320 &&
+        lm_head_host_.valid() && lm_head_host_.dtype == DT_BF16 && lm_head_host_.shape.size() == 2 &&
+        lm_head_host_.shape[0] == cfg_.vocab_size && lm_head_host_.shape[1] == hidden_size_ &&
+        ops::bf16_q8_head_supported(ctx, hidden_size_, cfg_.vocab_size);
     Tensor& raw_lm_head = weights.upload("lm_head.weight", ctx);
-    lm_head_weight_transposed_ = Tensor::allocate(ctx, {hidden_size_, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
-    ops::transpose(ctx, raw_lm_head, lm_head_weight_transposed_);
-    ctx.synchronize();
-    weights.erase("lm_head.weight");
-    lm_head_.init(ctx, lm_head_weight_transposed_, hidden_size_, cfg_.vocab_size, /*preprocessed=*/true, /*prepare_gemv=*/false);
+    if (use_q8_head) {
+        if (raw_lm_head.context() != &ctx || raw_lm_head.dtype() != dnnl::memory::data_type::bf16 ||
+            raw_lm_head.ndim() != 2 || raw_lm_head.shape(0) != cfg_.vocab_size || raw_lm_head.shape(1) != hidden_size_)
+            throw std::runtime_error("Qwen4Exp Q8 head requires raw BF16 [248320,2560] in model Context");
+        lm_head_q8_weight_ = Tensor::allocate(ctx, {cfg_.vocab_size, hidden_size_}, dnnl::memory::data_type::u8);
+        lm_head_q8_scale_ = Tensor::allocate(ctx, {cfg_.vocab_size, hidden_size_ / 64}, dnnl::memory::data_type::f32);
+        lm_head_q8_input_ = Tensor::allocate(ctx, {hidden_size_}, dnnl::memory::data_type::u8);
+        lm_head_q8_input_scale_ = Tensor::allocate(ctx, {hidden_size_ / 64}, dnnl::memory::data_type::f32);
+        ops::quantize_bf16_weights_q8_64(ctx, raw_lm_head, lm_head_q8_weight_, lm_head_q8_scale_);
+        ctx.synchronize(); // Raw BF16 cannot be freed until conversion drains.
+        weights.erase("lm_head.weight"); // Keeps host mmap; no transposed BF16 or oneDNN head.
+        lmHeadQ8Enabled_ = true;
+        AILA_LOG_INFO("[Q4E LM Head Q8 Load] actual_enabled=1 hidden=%d vocab=%d block=64 weight_bytes=%llu scale_bytes=%llu saved_head_bytes=%llu host_original_bf16=1 experimental=1",
+            hidden_size_, cfg_.vocab_size,
+            static_cast<unsigned long long>(lm_head_q8_weight_.size_bytes()),
+            static_cast<unsigned long long>(lm_head_q8_scale_.size_bytes()),
+            static_cast<unsigned long long>(size_t(hidden_size_) * cfg_.vocab_size * sizeof(bf16) -
+                lm_head_q8_weight_.size_bytes() - lm_head_q8_scale_.size_bytes()));
+    } else {
+        if (s_lm_head_q8) AILA_LOG_INFO("[Q4E LM Head Q8 Load] requested=1 actual_enabled=0 unsupported_shape_or_context=1");
+        lm_head_weight_transposed_ = Tensor::allocate(ctx, {hidden_size_, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
+        ops::transpose(ctx, raw_lm_head, lm_head_weight_transposed_);
+        ctx.synchronize();
+        weights.erase("lm_head.weight");
+        lm_head_.init(ctx, lm_head_weight_transposed_, hidden_size_, cfg_.vocab_size, /*preprocessed=*/true, /*prepare_gemv=*/false);
+    }
 
     // Hyper-Connection Mixer
     AILA_LOG_INFO("[Qwen4Exp] Loading hyper_connection_mixer...");
@@ -663,6 +702,7 @@ bool Qwen4ExpBnb4Backend::load(
         AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d dynamic_ready=1 fixed_hot_slots=0", resident_decode_mode_);
     }
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
+    expert_executor_.PrepareAsyncResidentSources(cfg_.num_hidden_layers, cfg_.num_experts);
     expert_cache_.ConfigureHotset();
     // Batched prefill acquire needs every unique expert of a layer resident at once.
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
@@ -817,6 +857,18 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 
     // Linear Attention buffers
     buf_.linear_all = phase({attn_cap, linear_all_dim_}, dnnl::memory::data_type::bf16);
+    static const bool s_attention_nf4_q8 = aila::env::read_flag("AILA_Q4E_ATTN_NF4_Q8", false);
+    attentionNf4Q8Enabled_ = s_attention_nf4_q8;
+    if (attentionNf4Q8Enabled_) {
+        const int projection_input = std::max({hidden_size_, linear_kv_dim_, full_q_dim_});
+        const int quantized_capacity = ((projection_input + 63) / 64) * 64;
+        if (!buf_.attn_xq.valid() || buf_.attn_xq.numel() < quantized_capacity) {
+            // Shared by successive decode projections on the in-order queue;
+            // retain these fixed-size banks through prefill growth and trimming.
+            buf_.attn_xq = Tensor::allocate(ctx, {quantized_capacity}, dnnl::memory::data_type::u8);
+            buf_.attn_xs = Tensor::allocate(ctx, {quantized_capacity / 64}, dnnl::memory::data_type::f32);
+        }
+    }
     if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
         gdn_chunk_scratch_.Reserve(ctx, attn_cap, linear_kv_heads_);
 
@@ -845,6 +897,19 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
     }
     buf_.moe_h = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
+    static const bool s_gpu_nf4_q8 = aila::env::read_flag("AILA_Q4E_GPU_NF4_Q8", false);
+    moeFrontFusedGpu_ = ctx.queue().get_device().is_gpu();
+    gpuNf4Q8Supported_ = s_gpu_nf4_q8 && hidden_size_ == 2560 && cfg_.moe_intermediate_size == 640 &&
+        cfg_.num_experts_per_tok >= 1 && cfg_.num_experts_per_tok <= 16 &&
+        ctx.queue().get_device().get_info<sycl::info::device::max_work_group_size>() >= 1024;
+    if (gpuNf4Q8Supported_ && !buf_.moe_x_q8.valid()) {
+        // Independent of the prefill capacity: these tiny buffers persist through
+        // prompt growth/trim and introduce no steady-state decode allocations.
+        buf_.moe_x_q8 = Tensor::allocate(ctx, {hidden_size_}, dnnl::memory::data_type::u8);
+        buf_.moe_x_q8_scale = Tensor::allocate(ctx, {hidden_size_ / 64}, dnnl::memory::data_type::f32);
+        buf_.moe_h_q8 = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::u8);
+        buf_.moe_h_q8_scale = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, cfg_.moe_intermediate_size / 64}, dnnl::memory::data_type::f32);
+    }
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
     buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
     buf_.shared_inter_buf = Tensor::allocate(ctx, {cap, 640}, dnnl::memory::data_type::bf16);
@@ -890,13 +955,49 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // Forward Implementation
 // ============================================================================
 
-sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease) {
+void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
+    static const int trim_cap = aila::env::read_int_raw("AILA_Q4E_DECODE_TRIM_CAP", 0);
+    if (trim_cap == 0) return;
+    if (trim_cap < 64)
+        throw std::invalid_argument("AILA_Q4E_DECODE_TRIM_CAP requires 0 or a capacity of at least 64");
+    if (runtime_seq_capacity_ <= trim_cap) return;
+
+    // This boundary follows the last explicit prefill forward, including its
+    // logits/checkpoint consumers. Keep KV, recurrent state, weights, logits,
+    // oneDNN scratch and resident tables; replace only capacity-sized runtime
+    // scratch and its host mirrors. The next large prefill grows normally.
+    expert_executor_.AbortResidentCold();
+    ctx.synchronize();
+    const int old_cap = runtime_seq_capacity_;
+    const uint64_t bytes_before = ctx.current_allocated_bytes();
+    runtime_seq_capacity_ = 0;
+    ensure_runtime_buffers(ctx, trim_cap);
+    const uint64_t bytes_after = ctx.current_allocated_bytes();
+    AILA_LOG_INFO("[Q4E DecodeTrim] cap_before=%d cap_after=%d bytes_before=%llu bytes_after=%llu freed_bytes=%llu boundary=end_prefill",
+        old_cap, runtime_seq_capacity_, (unsigned long long)bytes_before,
+        (unsigned long long)bytes_after,
+        (unsigned long long)(bytes_before > bytes_after ? bytes_before - bytes_after : 0));
+}
+
+Qwen4ExpBnb4Backend::ResidentColdWork::~ResidentColdWork() noexcept {
+    if (active) executor.AbortResidentCold();
+}
+
+sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared,
+    GpuReadyLease* device_lease, ResidentColdWork* early_cold) {
     constexpr int kMaxTopK = 16;
     const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
     const bool nested = expert_cache_.uses_nested_codes();
     auto lease = device_lease ? std::move(*device_lease) : expert_cache_.BindReady(layer, router_host_ids_, top_k);
-    struct ColdGuard {aila::Qwen4ExpExpertExecutor& executor; bool active=false;
-        ~ColdGuard(){if(active)executor.AbortResidentCold();}} cold_guard{expert_executor_};
+    ResidentColdWork cold_guard{expert_executor_};
+    const bool cpu_collected = early_cold && early_cold->completed;
+    const bool cpu_started = cpu_collected || (early_cold && early_cold->active);
+    if (early_cold && early_cold->active) {
+        // The local guard is destroyed before the moved route lease. Transfer
+        // ownership without leaving the CPU job unguarded or starting it twice.
+        cold_guard.active = true;
+        early_cold->active = false;
+    }
     const int64_t ready_begin = expert_cache_.tracing() ? Qwen4ExpCacheTrace::NowNs() : 0;
     std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{}, cold{};
     auto* h = buf_.moe_h.data_as<bf16>();
@@ -914,7 +1015,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         if (expert_cache_.tracing()) expert_cache_.trace_host_interval("resident_submit", layer, ready_begin, Qwen4ExpCacheTrace::NowNs());
     }
     std::array<int, kMaxTopK> cold_slots{};
-    if(cold_mode_==2 && expert_cache_.frozen() && lease.cold_count) {
+    if(!cpu_started && cold_mode_==2 && expert_cache_.frozen() && lease.cold_count) {
         cold_guard.active=true;
         expert_executor_.StartResidentCold(lease,buf_.x.data_as<bf16>());
     }
@@ -931,12 +1032,23 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         expert_cache_.record_consumer_reader_fences(cold_slots.data(), lease.cold_count, last);
         expert_cache_.DiscardTransient(cold_slots.data(),lease.cold_count);
     }
-    if(cold_guard.active) {expert_executor_.JoinResidentCold(down);cold_guard.active=false;}
+    const void* cpu_result_packet = cpu_collected ? expert_executor_.ResidentCpuResultPacket() : nullptr;
+    if(cold_guard.active) {
+        expert_executor_.JoinResidentCold(down);
+        cpu_result_packet = expert_executor_.ResidentCpuResultPacket();
+        cold_guard.active=false;
+    }
     if (!device_lease) ctx.queue().memcpy(resident_weights_.data(), router_host_weights_, top_k * sizeof(float));
-    auto merge = ops::moe_ordered_accumulate_down_rows(ctx, down, resident_weights_.data_as<float>(),
+    const auto* cpu_host_rows = expert_executor_.ResidentCpuHostRows();
+    auto merge = cpu_host_rows ? ops::moe_ordered_accumulate_cpu_host_rows(ctx, down, resident_weights_.data_as<float>(),
+        buf_.y.data_as<bf16>(), 1, top_k, hidden_size_, *cpu_host_rows,
+        fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
+        fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last)
+        : ops::moe_ordered_accumulate_down_rows(ctx, down, resident_weights_.data_as<float>(),
         buf_.y.data_as<bf16>(), 1, top_k, hidden_size_,
         fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
-        fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last);
+        fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last, cpu_result_packet);
+    expert_executor_.FinishResidentCpuRead(merge);
     lease.Finish(merge); // in-order merge covers both reader subsets and metadata uploads
     if(resident_probe_)resident_probe_(resident_probe_data_,*this,layer);
     expert_cache_.TraceDeviceEvent("resident_hot_down",layer,device_lease?resident_hot_reader_:sycl::event{});
@@ -1068,7 +1180,15 @@ void Qwen4ExpBnb4Backend::DenseLinear(
                             out_features, in_features);
         return;
     }
+    const int component = component_profile_active_for_test_ && count == 2 && in_features == hidden_size_
+        ? (out_features == cfg_.num_experts ? 3 : out_features == 1 ? 4 : -1) : -1;
+    if (component >= 0) ctx.synchronize();
+    const auto begin = component >= 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     linear.forward(ctx, input, output, count);
+    if (component >= 0) {
+        ctx.synchronize();
+        component_profile_ms_for_test_[component] += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+    }
 }
 
 Qwen4ExpBnb4Backend::DecodePendingMlpResidual::~DecodePendingMlpResidual() noexcept {
@@ -1196,12 +1316,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
+    static const bool profile_components = aila::env::read_flag("AILA_Q4E_PROFILE_COMPONENTS", false);
+    component_profile_active_for_test_ = profile_components && options.decode_verification && count == 2;
+    component_profile_ms_for_test_.fill(0);
+    if (options.decode_verification && options.prefill_remaining >= 0)
+        throw std::invalid_argument("Decode verification cannot be a prefill slice");
 
     expert_cache_.SetDemandForwardRows(count);
     int start_pos = session.currentLength_;
-    if(expert_cache_.CpuPackedPromptRefreshPending(start_pos,count,options.prefill_remaining))
+    if(expert_cache_.CpuPackedPromptRefreshPending(start_pos,count,options.prefill_remaining,options.decode_verification))
         expert_executor_.AbortResidentCold(); // drains CPU readers before rewriting their source arena
-    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining);
+    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining,options.decode_verification);
     int cached_len = start_pos + count;
     if (cached_len > max_seq_len_) {
         throw std::runtime_error("Qwen4ExpBnb4Backend: context length " +
@@ -1356,13 +1481,18 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // decoding to stop speculative file fills while retaining prefill overlap.
     static const bool decode_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_DECODE", true);
     static const bool prefill_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_PREFILL", true);
-    const bool is_prefill = options.prefill_remaining >= 0 || count > 1;
+    const bool is_prefill = !options.decode_verification && (options.prefill_remaining >= 0 || count > 1);
     static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", false);
     const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp && count == 1 && !is_prefill && !interior;
     DecodePendingMlpResidual pending_mlp(ctx, buf_.hidden4.data_as<bf16>(),
         buf_.y.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(), hidden_size_);
     const bool s_prefetch = configured_prefetch && (is_prefill ? prefill_prefetch : decode_prefetch);
     static const bool s_router_resident_fused = aila::env::read_flag("AILA_Q4E_ROUTER_RESIDENT_FUSED", false);
+    static const bool s_moe_front_fused = aila::env::read_flag("AILA_Q4E_MOE_FRONT_FUSED", false);
+    static const bool s_front_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
+    static const bool s_cpu_early_start = aila::env::read_flag("AILA_Q4E_CPU_EARLY_START", false);
+    static const bool s_cpu_async_route = aila::env::read_flag("AILA_Q4E_CPU_ASYNC_ROUTE", false);
+    static const int s_hotset_swaps = aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS", 96);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
     // Router top-k output is sorted by probability; only the most confident guesses are prefetched.
@@ -1411,7 +1541,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStageHc);
 
         // Attention tiles advance this layer's state before routing the whole window.
-        RunAttentionWindow(ctx, session, L, count, start_pos, interior, checkpoint_after);
+        RunAttentionWindow(ctx, session, L, count, start_pos, interior, checkpoint_after, !is_prefill);
 
         stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
 
@@ -1431,12 +1561,51 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStageHc);
 
         // 2.5. MoE Computation
+        static const int s_verify_cpu_rows = aila::env::read_int("AILA_Q4E_VERIFY_CPU_ROWS", 0);
+        const bool verify_cpu_rows = options.decode_verification && count <= s_verify_cpu_rows &&
+            cold_mode_ == 2 && !decodeHcReferenceForTest_ && expert_executor_.CanExecuteVerifyRows(count, top_k);
         std::optional<GpuResidentLayerLease> resident_epoch;
         std::optional<GpuReadyLease> resident_binding;
+        ResidentColdWork early_cold{expert_executor_}; // drain CPU before either route lease is released
         if (resident_decode_mode_ == 2 && count == 1)
             resident_epoch.emplace(expert_cache_.BeginResidentLayer(L));
-        DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
-                    count, cfg_.num_experts, hidden_size_);
+        const bool cpu_async_route = s_cpu_async_route && !decodeHcReferenceForTest_ && resident_epoch &&
+            cold_mode_ == 2 && !is_prefill && !s_prefetch &&
+            (!expert_cache_.adaptive_hotset() || s_hotset_swaps == 0) && expert_executor_.CanStartAsyncResidentRoute(L);
+        const bool cpu_early_start = !cpu_async_route && s_cpu_early_start && resident_epoch &&
+            cold_mode_ == 2 && expert_cache_.frozen() && !is_prefill;
+        static const bool s_verify_async_route = aila::env::read_flag("AILA_Q4E_VERIFY_ASYNC_ROUTE", false);
+        // The four-row screen regressed; keep this measured overlap path at T2.
+        const bool cpu_verify_async = s_verify_async_route && count == 2 && verify_cpu_rows && !s_prefetch &&
+            (!expert_cache_.adaptive_hotset() || s_hotset_swaps == 0) && expert_executor_.CanStartAsyncResidentRoute(L);
+        // Place the activation copy ahead of the router so waiting for the
+        // route also makes CPU input ready, before resident/shared GPU work.
+        if (cpu_early_start || cpu_async_route || cpu_verify_async) expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+        const bool gpu_nf4_q8 = resident_epoch && gpuNf4Q8Supported_ && !gpuNf4Q8ReferenceForTest_ &&
+            !decodeHcReferenceForTest_ && count == 1 && !is_prefill && resident_decode_mode_ == 2;
+        const bool moe_front_fused = s_moe_front_fused && s_front_native_gemv && moeFrontFusedGpu_ &&
+            !decodeHcReferenceForTest_ && !gpuNf4Q8ReferenceForTest_ && count == 1 && !is_prefill &&
+            hidden_size_ == 2560 && cfg_.num_experts == 512 && layer.router_w && layer.shared_expert_gate_w &&
+            layer.router_w->dtype() == dnnl::memory::data_type::bf16 &&
+            layer.shared_expert_gate_w->dtype() == dnnl::memory::data_type::bf16 &&
+            layer.router_w->numel() == int64_t(512) * hidden_size_ && layer.shared_expert_gate_w->numel() == hidden_size_;
+        if (moe_front_fused) {
+            ops::bf16_moe_front_fused(ctx, layer.router_w->data_as<bf16>(), layer.shared_expert_gate_w->data_as<bf16>(),
+                buf_.x.data_as<bf16>(), buf_.router_scores.data_as<bf16>(), buf_.shared_gate_buf.data_as<bf16>(),
+                gpu_nf4_q8 ? buf_.moe_x_q8.data_as<int8_t>() : nullptr,
+                gpu_nf4_q8 ? buf_.moe_x_q8_scale.data_as<float>() : nullptr, hidden_size_, cfg_.num_experts);
+            if (!moeFrontFusedLogged_) {
+                AILA_LOG_INFO("[Q4E MoE Front Fused] actual_enabled=1 hidden=%d experts=%d shared_gate=1 q8_input=%d launches_saved_per_layer=%d",
+                    hidden_size_, cfg_.num_experts, int(gpu_nf4_q8), gpu_nf4_q8 ? 2 : 1);
+                moeFrontFusedLogged_ = true;
+            }
+        } else {
+            DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
+                        count, cfg_.num_experts, hidden_size_);
+        }
+        if (verification_router_inputs_for_test_ && options.decode_verification && count == 2)
+            ctx.queue().memcpy(verification_router_inputs_for_test_ + size_t(L) * 2 * hidden_size_,
+                buf_.x.data(), size_t(2) * hidden_size_ * sizeof(bf16));
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
         sycl::event actual_route_event;
         if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512) {
@@ -1458,13 +1627,64 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     resident_selected_host_, top_k, cfg_.num_experts);
             }
         }
+        auto bind_actual_route = [&] {
+            if (cold_epoch_enabled_) expert_cache_.ObserveHotsetRoute(L, router_host_ids_, count, top_k);
+            if (resident_epoch)
+                resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
+            if (expert_cache_.tracing()) expert_cache_.trace_router(L, router_host_ids_, count, top_k);
+        };
+        auto wait_actual_route = [&] {
+            const auto begin = prof_clock::now();
+            actual_route_event.wait_and_throw();
+            bind_actual_route();
+            const auto end = prof_clock::now();
+            prof_router_sync_ms += prof_ms(begin, end);
+            if (expert_cache_.tracing()) {
+                expert_cache_.trace_host_interval("router_wait", L,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
+            }
+        };
+        if (cpu_verify_async) {
+            early_cold.active = true;
+            expert_executor_.StartAsyncVerifyRoute(L, count, router_host_ids_, actual_route_event);
+        } else if (cpu_async_route) {
+            early_cold.active = true;
+            expert_executor_.StartAsyncResidentRoute(L, router_host_ids_, resident_selected_host_, actual_route_event);
+        } else if (cpu_early_start) {
+            wait_actual_route();
+            if (resident_binding->cold_count) {
+                early_cold.active = true;
+                expert_executor_.StartResidentCold(*resident_binding, buf_.x.data_as<bf16>());
+            }
+        }
         if (resident_epoch) {
             const int64_t submit_begin = expert_cache_.tracing() ? Qwen4ExpCacheTrace::NowNs() : 0;
-            if(cold_mode_==2 && expert_cache_.frozen())expert_executor_.StageResidentInput(buf_.x.data_as<bf16>());
-            ops::moe_resident_gate_up(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
-                buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
-            resident_hot_reader_ = ops::moe_resident_down(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
-                buf_.moe_h.data_as<bf16>(), resident_down_.data_as<float>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+            if(!cpu_early_start && !cpu_async_route && cold_mode_==2 && expert_cache_.frozen())expert_executor_.StageResidentInput(buf_.x.data_as<bf16>());
+            if (gpu_nf4_q8) {
+                // The in-order queue preserves router publication -> quantized
+                // resident projections -> shared work -> ordered rank merge.
+                if (!moe_front_fused)
+                    ops::quantize_moe_input_q8_64(ctx, buf_.x.data_as<bf16>(),
+                        buf_.moe_x_q8.data_as<int8_t>(), buf_.moe_x_q8_scale.data_as<float>(), hidden_size_);
+                ops::moe_resident_gate_up_q8_64(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                    buf_.moe_x_q8.data_as<int8_t>(), buf_.moe_x_q8_scale.data_as<float>(),
+                    buf_.moe_h.data_as<bf16>(), buf_.moe_h_q8.data_as<int8_t>(), buf_.moe_h_q8_scale.data_as<float>(),
+                    top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+                resident_hot_reader_ = ops::moe_resident_down_q8_64(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                    buf_.moe_h_q8.data_as<int8_t>(), buf_.moe_h_q8_scale.data_as<float>(), resident_down_.data_as<float>(),
+                    top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+                if (!gpuNf4Q8Logged_) {
+                    AILA_LOG_INFO("[Q4E GPU NF4Q8] actual_enabled=1 hidden=%d intermediate=%d top_k=%d nested=%d activation_block=64",
+                        hidden_size_, cfg_.moe_intermediate_size, top_k, int(expert_cache_.uses_nested_codes()));
+                    gpuNf4Q8Logged_ = true;
+                }
+            } else {
+                ops::moe_resident_gate_up(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                    buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+                resident_hot_reader_ = ops::moe_resident_down(ctx, expert_cache_.resident_descriptors(), resident_selected_.data_as<int>(),
+                    buf_.moe_h.data_as<bf16>(), resident_down_.data_as<float>(), top_k, hidden_size_, cfg_.moe_intermediate_size, expert_cache_.uses_nested_codes());
+            }
             if (expert_cache_.tracing()) expert_cache_.trace_host_interval("resident_gpu_submit", L, submit_begin, Qwen4ExpCacheTrace::NowNs());
         }
         const auto cur_cache_stats = expert_cache_.stats();
@@ -1495,8 +1715,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
         // concurrently while the host fills missed routed experts and sets up dispatch.
-        DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
-                    count, 1, hidden_size_);
+        if (!moe_front_fused)
+            DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
+                        count, 1, hidden_size_);
         if (count == 1) {
             bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
                 ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
@@ -1523,18 +1744,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
         };
 
-        const auto prof_router_t0 = prof_clock::now();
         // B2: Decoupled route synchronization - wait ONLY for actual router, allowing concurrent prediction
-        actual_route_event.wait_and_throw();
-        if(cold_epoch_enabled_)expert_cache_.ObserveHotsetRoute(L,router_host_ids_,count,top_k);
-        if (resident_epoch) resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
-        const auto prof_router_t1 = prof_clock::now();
-        if (expert_cache_.tracing()) {
-            expert_cache_.trace_host_interval("router_wait", L,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_router_t0.time_since_epoch()).count(),
-                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_router_t1.time_since_epoch()).count());
-            expert_cache_.trace_router(L, router_host_ids_, count, top_k);
-        }
+        if (cpu_async_route) {
+            // The worker waits for route publication and computes mapped cold
+            // experts while these resident/shared kernels are already queued.
+            expert_executor_.JoinResidentCold(resident_down_.data_as<float>());
+            bind_actual_route();
+            expert_executor_.RetireAsyncResidentRoute(*resident_binding);
+            early_cold.active=false;early_cold.completed=true;
+        } else if (!cpu_early_start) wait_actual_route();
         if (have_pred && s_predict_stats && count == 1) {
             for (int k = 0; k < top_k; ++k) {
                 const int e = router_host_ids_[k];
@@ -1548,7 +1766,6 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             pred_total_ += top_k;
         }
         have_pred = predict_next && (count == 1);
-        prof_router_sync_ms += prof_ms(prof_router_t0, prof_router_t1);
         stage(kStageRouter);
         // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
         // instead of a blocking round trip per token), then map slots back per token.
@@ -1556,13 +1773,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         static const bool s_cpu_expert_dispatch = aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false);
         static const bool s_cpu_small_m = aila::env::read_flag("AILA_Q4E_CPU_SMALL_M", false);
         const bool cpu_small_m = s_cpu_expert_dispatch && s_cpu_small_m && count > 1 && count <= 4;
-        const bool can_batch = count > 1 && !cpu_small_m && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
+        const bool can_batch = count > 1 && !cpu_small_m && !verify_cpu_rows && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
         bool batch_acquire = false;
         sycl::event batch_dma_event{};
         static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
         static const bool s_prefill_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
         static const int configured_microbatch = aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0);
-        const int s_demand_microbatch = resident_prefill_ ? std::min(cfg_.num_experts,configured_microbatch>0?configured_microbatch:cfg_.num_experts) : configured_microbatch;
+        int s_demand_microbatch = resident_prefill_ ? std::min(cfg_.num_experts,configured_microbatch>0?configured_microbatch:cfg_.num_experts) : configured_microbatch;
+        if (options.decode_verification && resident_prefill_ && expert_cache_.frozen())
+            s_demand_microbatch = std::min(s_demand_microbatch,
+                std::max(1,expert_cache_.num_slots()-expert_cache_.frozen_slots()));
         const bool use_microbatch_pipeline = can_batch && s_expert_major_prefill && count > 1 && (s_demand_microbatch > 0);
         auto acquire_group = [&](int offset,int n,std::optional<GpuReadyLease>& binding) {
             auto* assigned=prefill_unique_slots_.data()+offset;
@@ -1644,7 +1864,23 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const bool compact_moe = moe_compact_tile_ && count > 4;
         if (compact_moe && (!batch_acquire || !use_microbatch_pipeline || grouped))
             throw std::runtime_error("Compact MoE needs a complete ALU microbatch route");
-        if (batch_acquire && s_expert_major_prefill && count > 1 && grouped) {
+        if (verify_cpu_rows) {
+            if (expert_histogram_enabled_) {
+                std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
+                for (int i = 0; i < count * top_k; ++i) ++prefill_expert_uses_[router_host_ids_[i]];
+                for (int e = 0; e < cfg_.num_experts; ++e) if (const int n = prefill_expert_uses_[e]) {
+                    const int bucket = n <= 2 ? n - 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : 5;
+                    auto& bin = expert_histogram_[bucket];
+                    ++bin[0]; bin[1] += n;
+                    ++bin[expert_cache_.IsDirectReady(L, e) ? 2 : 3];
+                }
+            }
+            expert_executor_.ExecuteVerifyRows(ctx, L, router_host_ids_, router_host_weights_,
+                buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), buf_.y.data_as<bf16>(), count, top_k,
+                s_fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
+                s_fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr);
+            if (cpu_verify_async) { early_cold.active=false; early_cold.completed=true; }
+        } else if (batch_acquire && s_expert_major_prefill && count > 1 && grouped) {
             int ready_boundary=0;
             if (use_microbatch_pipeline) {
                 ready_boundary=int(std::stable_partition(prefill_unique_.begin(), prefill_unique_.end(),
@@ -2169,7 +2405,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             bool hetero_executed = false;
             if (resident_decode_mode_ && count == 1 && !batch_acquire) {
                 const auto acq_before = expert_cache_.stats().direct_cold_acquire_ns;
-                RunResidentDecode(ctx, L, s_fuse_shared, resident_binding ? &*resident_binding : nullptr);
+                RunResidentDecode(ctx, L, s_fuse_shared, resident_binding ? &*resident_binding : nullptr,
+                    cpu_early_start || cpu_async_route ? &early_cold : nullptr);
                 prof_acquire_ms += (expert_cache_.stats().direct_cold_acquire_ns - acq_before) * 1e-6;
                 if (s_prefetch && predict_next) {
                     ensure_prediction_ready();
@@ -2328,16 +2565,27 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         // 4. LM Head (Compute for last token)
+        auto forward_head = [&](Tensor& input, int rows) {
+            if (lmHeadQ8Enabled_) {
+                ops::bf16_q8_head_forward(ctx, lm_head_q8_weight_, lm_head_q8_scale_, input, buf_.logits,
+                    lm_head_q8_input_, lm_head_q8_input_scale_, rows, hidden_size_, cfg_.vocab_size);
+                ++lmHeadQ8ForwardCount_;
+                lmHeadQ8RowCount_ += static_cast<uint64_t>(rows);
+                if (lmHeadQ8ForwardCount_ == 1)
+                    AILA_LOG_INFO("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1 experimental=1",
+                        rows, hidden_size_, cfg_.vocab_size);
+            } else lm_head_.forward(ctx, input, buf_.logits, rows);
+        };
         if (lastTokenOnly) {
             const bf16* last_x = static_cast<const bf16*>(buf_.x.data()) + static_cast<size_t>(count - 1) * hidden_size_;
             Tensor x_last_view = Tensor::view(ctx, const_cast<bf16*>(last_x), {1, hidden_size_});
-            lm_head_.forward(ctx, x_last_view, buf_.logits, 1);
+            forward_head(x_last_view, 1);
             lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {1, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
         } else {
             if (buf_.logits.shape(0) < count) {
                 buf_.logits = Tensor::allocate(ctx, {count, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
             }
-            lm_head_.forward(ctx, buf_.x, buf_.logits, count);
+            forward_head(buf_.x, count);
             lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
         }
 
@@ -2378,6 +2626,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
     expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
     if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count,options.prefill_remaining);
+    // An explicit remaining=0 is the final prefill slice. Trim after all
+    // checkpoint/logit work is submitted and before the first decode call;
+    // steady-state decode never allocates or frees this workspace.
+    if (options.prefill_remaining == 0) TrimDecodeRuntimeBuffers(ctx);
     if(expert_cache_.adaptive_hotset()) {const auto& hs=expert_cache_.stats();
         AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu ready_adoptions=%llu ready_adoption_ns=%llu",
             start_pos,count,expert_cache_.frozen_slots(),(unsigned long long)hs.epoch_swaps,
@@ -2405,9 +2657,28 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const auto& after = expert_cache_.stats();
         if(cold_mode_ || resident_prefill_) {
             const auto& cpu=expert_executor_.stats();
+            if (cpu.cpu_scale_cache_bytes) {
+                AILA_LOG_INFO("[Q4E CpuScaleCache] pos=%d count=%d bytes=%llu hits=%llu misses=%llu fills=%llu evictions=%llu fallbacks=%llu prepare_ns=%llu",
+                    start_pos,count,(unsigned long long)cpu.cpu_scale_cache_bytes,
+                    (unsigned long long)(cpu.cpu_scale_cache_hits-cold_stats0.cpu_scale_cache_hits),
+                    (unsigned long long)(cpu.cpu_scale_cache_misses-cold_stats0.cpu_scale_cache_misses),
+                    (unsigned long long)(cpu.cpu_scale_cache_fills-cold_stats0.cpu_scale_cache_fills),
+                    (unsigned long long)(cpu.cpu_scale_cache_evictions-cold_stats0.cpu_scale_cache_evictions),
+                    (unsigned long long)(cpu.cpu_scale_cache_fallbacks-cold_stats0.cpu_scale_cache_fallbacks),
+                    (unsigned long long)(cpu.cpu_scale_cache_prepare_ns-cold_stats0.cpu_scale_cache_prepare_ns));
+            }
+            if(cpu.cpu_route_async_layers>cold_stats0.cpu_route_async_layers) {
+                AILA_LOG_INFO("[Q4E AsyncRoute] pos=%d count=%d layers=%llu worker_route_wait_ns=%llu",
+                    start_pos,count,(unsigned long long)(cpu.cpu_route_async_layers-cold_stats0.cpu_route_async_layers),
+                    (unsigned long long)(cpu.cpu_route_wait_ns-cold_stats0.cpu_route_wait_ns));
+            }
             if(cpu.cpu_verify_batches>cold_stats0.cpu_verify_batches) {
                 AILA_LOG_INFO("[Q4E CpuVerify] pos=%d count=%d batches=%llu bitwise=1",
                     start_pos,count,(unsigned long long)(cpu.cpu_verify_batches-cold_stats0.cpu_verify_batches));
+            }
+            if(cpu.cpu_a64_verify_batches>cold_stats0.cpu_a64_verify_batches) {
+                AILA_LOG_INFO("[Q4E CpuA64Verify] pos=%d count=%d batches=%llu bitwise=1 reference=original_a64",
+                    start_pos,count,(unsigned long long)(cpu.cpu_a64_verify_batches-cold_stats0.cpu_a64_verify_batches));
             }
             if(cpu.cpu_diagnostic_batches>cold_stats0.cpu_diagnostic_batches) {
                 AILA_LOG_INFO("[Q4E CpuDiagnostic] pos=%d count=%d batches=%llu failures=%llu process_faults=%llu process_user_ns=%llu process_kernel_ns=%llu gate_up_ns=%llu quantize_ns=%llu down_ns=%llu gate_chunks=%llu down_chunks=%llu",
@@ -2467,6 +2738,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             static_cast<unsigned long long>(after.host_complement_scans - prof_stats0.host_complement_scans),
             static_cast<unsigned long long>(after.host_complement_searches - prof_stats0.host_complement_searches),
             static_cast<unsigned long long>(after.demand_short_part_fills - prof_stats0.demand_short_part_fills));
+    }
+    if (component_profile_active_for_test_) {
+        const auto& p = component_profile_ms_for_test_;
+        AILA_LOG_INFO("[Q4E Components] pos=%d count=%d linear_in=%.4f gdn=%.4f linear_out=%.4f router=%.4f shared_gate=%.4f ms serialized=1",
+            start_pos,count,p[0],p[1],p[2],p[3],p[4]);
+        component_profile_active_for_test_=false;
     }
     if (s_profile) {
         ctx.synchronize();
@@ -2729,6 +3006,19 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
     Context& ctx, std::size_t maxSnapshots) {
     auto session = std::unique_ptr<Session>(new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots));
     ple_.init_state(ctx, session->ple_state_);
+    // Exact device payload of the tensors this Session owns, matching
+    // qwen4exp_session_memory's device reservation. Model weights, expert
+    // cache and shared execution scratch are budgeted elsewhere.
+    size_t cacheBytes = 0;
+    for (const auto& cache : session->layerCaches_) {
+        for (const Tensor* tensor : {&cache.k, &cache.v, &cache.indexer_k,
+                                     &cache.indexer_compressed_k, &cache.linear_state,
+                                     &cache.linear_conv_state}) {
+            cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
+        }
+    }
+    session->cacheBytes_ = aila::memory::checked_memory_sum(
+        cacheBytes, session->ple_state_.conv_state.size_bytes());
     for (auto& snapshot : session->snapshots_) {
         snapshot.layers.resize(layers_.size());
         for (size_t i = 0; i < layers_.size(); ++i) {

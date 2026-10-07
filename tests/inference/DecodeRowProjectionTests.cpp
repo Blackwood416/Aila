@@ -356,6 +356,7 @@ int main(int argc, char** argv) {
                 Shape{"q4e-linear-all", 2560, 16480}, Shape{"q4e-attention-out", 6144, 2560},
                 Shape{"q4e-qkv", 2560, 13312}, Shape{"q4e-shared-gate-up", 2560, 1280},
                 Shape{"q4e-shared-down", 640, 2560},
+                Shape{"q4e-mtp-hidden", 2560, 2560},
                 Shape{"small-k", 128, 17, true}, Shape{"non-packed-geometry", 96, 17, true},
                 Shape{"lora-and-validation", 512, 17, true, true}}) {
             CheckShape(context, shape);

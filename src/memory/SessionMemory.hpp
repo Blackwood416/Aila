@@ -83,4 +83,94 @@ inline SessionMemoryReservation qwen35_session_memory(
             checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots))};
 }
 
+// Qwen4Exp (Qwen3.8-Flash-Next) is a fixed 48-layer architecture with a
+// 12 Full / 36 Linear Attention split. The shared Session allocates its
+// exclusive caches from hardcoded tile shapes (Qwen4ExpBnb4Backend::Session),
+// so an unsupported geometry is rejected before any device reservation rather
+// than reserving a cache the kernels could not index consistently.
+//
+// Device payload mirrors the per-session tensors: Full K/V plus QSA indexer
+// and 4:1 compressed indexer keys (BF16), the DeltaNet recurrent matrix and
+// convolution history (F32), and the PLE convolution state (F32). The host
+// payload is the persistent DeltaNet mirror plus retained snapshots; the PLE
+// convolution state is device-only but every snapshot keeps a float copy.
+inline SessionMemoryReservation qwen4exp_session_memory(
+    const Qwen4ExpTextConfig& config, int capacity, size_t maxSnapshots) {
+    if (!is_exact_qwen4exp_text_spec(config)) {
+        throw std::invalid_argument("Unsupported Qwen4Exp text dimensions");
+    }
+    const size_t layers = positive_memory_dimension(config.num_hidden_layers);
+    positive_memory_dimension(capacity);
+
+    // The Session builder hardcodes these tile shapes instead of reading them
+    // from config; a differing config would allocate a mismatched cache.
+    constexpr int kIndexerHeadDim = 128;
+    constexpr int kIndexerCompressRatio = 4;
+    constexpr int kPleConvStateLen = 9;     // (kernel 4 - 1) * dilation 3
+    constexpr int kPleConvChannels = 10240; // hc_count 4 * hidden_size 2560
+    if (config.full_attention_interval != 4 ||
+        config.indexer_kv_heads != 1 ||
+        config.indexer_head_dim != kIndexerHeadDim ||
+        config.indexer_compress_ratio != kIndexerCompressRatio ||
+        config.linear_num_key_heads != 16 ||
+        config.linear_num_value_heads != 48 ||
+        config.linear_key_head_dim != 128 ||
+        config.linear_value_head_dim != 128 ||
+        config.linear_conv_kernel_dim != 4) {
+        throw std::invalid_argument("Unsupported Qwen4Exp attention geometry");
+    }
+    if (!config.layer_types.empty()) {
+        if (config.layer_types.size() > layers) {
+            throw std::invalid_argument("Qwen4Exp has more layer types than decoder layers");
+        }
+        for (size_t i = 0; i < config.layer_types.size(); ++i) {
+            const char* expected = ((i + 1) % 4 == 0) ? "full_attention" : "linear_attention";
+            if (config.layer_types[i] != expected) {
+                throw std::invalid_argument("Qwen4Exp layer types must match the fixed 4-layer interval");
+            }
+        }
+    }
+    const size_t fullLayers = layers / kIndexerCompressRatio;
+    const size_t linearLayers = layers - fullLayers;
+
+    const auto kvHeads = positive_memory_dimension(config.num_key_value_heads);
+    const auto headDim = positive_memory_dimension(config.head_dim);
+    const auto cached = positive_memory_dimension(capacity);
+
+    size_t fullBytes = 4; // K and V, each BF16.
+    fullBytes = checked_memory_product(fullBytes, checked_memory_product(kvHeads, headDim));
+    fullBytes = checked_memory_product(fullBytes, checked_memory_product(cached, fullLayers));
+
+    const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
+    size_t indexerBytes = checked_memory_product(
+        checked_memory_product(checked_memory_sum(cached, compressed),
+                               static_cast<size_t>(kIndexerHeadDim)), size_t{2});
+    indexerBytes = checked_memory_product(indexerBytes, fullLayers);
+
+    const auto keyHeads = positive_memory_dimension(config.linear_num_key_heads);
+    const auto valueHeads = positive_memory_dimension(config.linear_num_value_heads);
+    const auto keyDim = positive_memory_dimension(config.linear_key_head_dim);
+    const auto valueDim = positive_memory_dimension(config.linear_value_head_dim);
+    const auto convRows = positive_memory_dimension(config.linear_conv_kernel_dim) - 1;
+    const auto stateElements = checked_memory_product(checked_memory_product(valueHeads, keyDim), valueDim);
+    const auto convChannels = checked_memory_sum(
+        checked_memory_product(2, checked_memory_product(keyHeads, keyDim)),
+        checked_memory_product(valueHeads, valueDim));
+    const auto recurrentElements = checked_memory_sum(stateElements, checked_memory_product(convRows, convChannels));
+    const auto recurrentBytes = checked_memory_product(
+        checked_memory_product(recurrentElements, sizeof(float)), linearLayers);
+
+    const auto pleBytes = checked_memory_product(
+        checked_memory_product(static_cast<size_t>(kPleConvStateLen),
+                               static_cast<size_t>(kPleConvChannels)), sizeof(float));
+
+    const size_t deviceBytes = checked_memory_sum(
+        checked_memory_sum(fullBytes, indexerBytes),
+        checked_memory_sum(recurrentBytes, pleBytes));
+    const size_t hostBytes = checked_memory_sum(
+        checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots)),
+        checked_memory_product(pleBytes, maxSnapshots));
+    return {deviceBytes, hostBytes};
+}
+
 } // namespace aila::memory

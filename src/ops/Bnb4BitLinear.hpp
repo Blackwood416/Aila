@@ -9,6 +9,35 @@
 #include <unordered_map>
 #include <vector>
 
+namespace ops {
+// Experimental BF16 block64 -> signed Q8 LM head. GPU SG16/WG256,
+// H divisible by 64 and V divisible by 16; the current backend additionally
+// gates the measured model shape. Caller owns every Tensor in this Context.
+bool bf16_q8_head_supported(Context& ctx, int hidden, int vocab);
+// Converts raw row-major BF16 [V,H] once. q8 [V,H] uses u8 storage for
+// signed codes, scales [V,H/64] are f32. Caller must drain before freeing raw.
+sycl::event quantize_bf16_weights_q8_64(Context& ctx, Tensor& raw,
+                                      Tensor& q8, Tensor& scales);
+// Queues activation quantization and GEMV for every row; one-row xq[H] and
+// xs[H/64] scratch is reused only on the in-order queue. No USM allocations,
+// oneDNN descriptors, or synchronization. Disjoint spans must stay alive until
+// work drains. This changes the original BF16 head arithmetic.
+sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
+    Tensor& input, Tensor& output, Tensor& xq, Tensor& xs,
+    int rows, int hidden, int vocab);
+// Independent consumers of one decode activation. The optional Q8 outputs
+// must either both be supplied or both be null. No weight concatenation or
+// change to router top-k arithmetic is involved.
+void bf16_moe_front_fused(
+    Context& ctx,
+    const sycl::ext::oneapi::bfloat16* router_weight,
+    const sycl::ext::oneapi::bfloat16* shared_gate_weight,
+    const sycl::ext::oneapi::bfloat16* input,
+    sycl::ext::oneapi::bfloat16* router_scores,
+    sycl::ext::oneapi::bfloat16* shared_gate,
+    int8_t* optional_xq, float* optional_xs, int hidden, int experts);
+}
+
 struct LoraAttachment {
     Tensor lora_a;         // (r, in_features) bf16 GPU
     Tensor lora_b;         // (rows, r) bf16 GPU
@@ -70,6 +99,26 @@ public:
                            Tensor& input,
                            Tensor& output,
                            int rows);
+    // Experimental one-row NF4/Q8 projection. K must be a positive multiple
+    // of 64, M a positive multiple of 16, metadata NF4/block64, and live packed
+    // weights, F32 codebook/expanded scales, with no LoRA. Uses the actual
+    // normalized NF4 codebook rounded to signed Q8; dequant weights do not
+    // pass through the original BF16 rounding boundary. This is approximate.
+    bool SupportsDecodeQ8() const;
+    // xq[K], xs[K/64], output[M] are caller-owned, disjoint raw USM spans in
+    // this Context. Their lifetime and the weights extend until compute work
+    // drains. Input quantization is separate; no allocation or descriptor
+    // rebinding occurs here. False means no kernel was submitted. On success
+    // the projection is queued on the engine's in-order compute queue.
+    bool TryForwardDecodeQ8(Context& ctx, const int8_t* xq, const float* xs,
+                            sycl::ext::oneapi::bfloat16* output);
+    // Original packed one-row BF16 arithmetic, with disjoint workgroups
+    // copying BF16 historyInput[channels] to history[ringRow,channels].
+    // Must follow the completed in-order GDN reader. Returns false without
+    // submitting work if unsupported; caller then commits history separately.
+    bool TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, Tensor& output,
+        const sycl::ext::oneapi::bfloat16* historyInput, float* history,
+        int channels, int ringRow);
     static bool try_forward_decode_gate_up_swiglu(Context& ctx,
                                                   Bnb4BitLinear& fused_gate_up,
                                                   Tensor& input,

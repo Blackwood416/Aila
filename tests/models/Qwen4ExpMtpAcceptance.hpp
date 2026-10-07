@@ -5,15 +5,17 @@ void test_mtp_probe(const std::string& directory) {
     const int anchorsRequested=aila::env::read_int("AILA_Q4E_MTP_ANCHORS",60);
     const int repeats=aila::env::read_int("AILA_Q4E_MTP_REPEATS",3);
     const int verifyPasses=aila::env::read_int_raw("AILA_Q4E_MTP_VERIFY_PASSES",3);
+    const int capacity=aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT",640);
     const bool compareKv=aila::env::read_flag("AILA_Q4E_MTP_COMPARE_KV",false);
     const bool windowSweep=aila::env::read_flag("AILA_Q4E_MTP_WINDOW_SWEEP",false);
     const bool compareResident=aila::env::read_flag("AILA_Q4E_MTP_COMPARE_RESIDENT",false);
     const std::string promptFile=aila::env::read_string("AILA_Q4E_MTP_PROMPT_FILE","");
     const std::string prefix=aila::env::read_string("AILA_Q4E_MTP_OUTPUT","");
-    expect((promptCount==30 || promptCount==512) && anchorsRequested>=1 && anchorsRequested<=60 &&
+    expect((promptCount==30 || promptCount==512) && anchorsRequested>=1 && anchorsRequested<=124 &&
            repeats>=1 && repeats<=4 && verifyPasses>=0 && verifyPasses<=4,"Invalid MTP probe options");
     InferenceEngine engine;
-    expect(engine.init(directory,640),"MTP target init failed");
+    expect(capacity==640 || capacity==2048,"MTP context must be 640 or 2048");
+    expect(engine.init(directory,capacity),"MTP target init failed");
     auto& ctx=Access::Ctx(engine); auto& target=Access::Backend(engine);
     Tokenizer tokenizer; expect(tokenizer.load(directory),"MTP tokenizer failed");
     std::vector<int> tokens;
@@ -30,7 +32,7 @@ void test_mtp_probe(const std::string& directory) {
         expect(formatter.render_text(engine.make_chat_format_input(request),true,rendered,&error),error.c_str());
         tokens=tokenizer.encode(rendered.text);
         if(promptFile.empty())expect(tokens.size()==30,"MTP prompt identity changed");
-        else {expect(tokens.size()>0 && tokens.size()<=512,"MTP corpus prompt exceeds 512 token budget");promptCount=int(tokens.size());}
+        else {expect(tokens.size()>0 && tokens.size()+anchorsRequested+4<=size_t(capacity),"MTP corpus prompt exceeds context budget");promptCount=int(tokens.size());}
     } else {
         std::string text;
         while (tokenizer.encode(text).size()<size_t(promptCount))
@@ -38,11 +40,11 @@ void test_mtp_probe(const std::string& directory) {
         tokens=tokenizer.encode(text); tokens.resize(promptCount);
     }
     const int maxNew=anchorsRequested+4;
-    Tensor ids=Tensor::allocate(ctx,{640},dnnl::memory::data_type::s32);
+    Tensor ids=Tensor::allocate(ctx,{capacity},dnnl::memory::data_type::s32);
     Tensor targetHidden=Tensor::allocate(ctx,{promptCount+maxNew,10240},dnnl::memory::data_type::bf16);
     Tensor draftHidden=Tensor::allocate(ctx,{1,10240},dnnl::memory::data_type::bf16);
     Access::ReserveVerifyLogits(engine,4);
-    Qwen4ExpMtpProbe draft(engine,640);
+    Qwen4ExpMtpProbe draft(engine,capacity);
     struct Drain { Context& c; ~Drain(){try{c.synchronize();}catch(...){}} } drain{ctx};
     auto dump=[&](const std::string& suffix,const void* data,size_t bytes) {
         if(prefix.empty())return;
@@ -231,5 +233,10 @@ void test_mtp_probe(const std::string& directory) {
         std::vector<int> continuation(tokens.begin()+promptCount,tokens.end());
         if(continuation.size()>=6)draft.CheckTargetRollback(engine,prompt,continuation);
     }
-    std::cout<<"[MTP END] conditional_greedy_probe=1 production_speculative_decode=0 accepted_prefix_commit=0\n";
+    const int liveWidth = aila::env::read_int_raw("AILA_Q4E_MTP_LIVE_WIDTH", 0);
+    const bool liveCompare = aila::env::read_flag("AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS", false);
+    if (liveCompare) {
+        for (int width : {1, 2, 4}) draft.RunLive(engine, prompt, tokens, maxNew, width, ids, targetHidden, draftHidden);
+    } else if (liveWidth) draft.RunLive(engine, prompt, tokens, maxNew, liveWidth, ids, targetHidden, draftHidden);
+    std::cout<<"[MTP END] conditional_greedy_probe=1 production_speculative_decode=0 accepted_prefix_commit="<<int(liveWidth>0 || liveCompare)<<"\n";
 }

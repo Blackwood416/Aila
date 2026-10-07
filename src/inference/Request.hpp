@@ -73,7 +73,8 @@ struct RequestProgress {
 };
 
 // Low-level token request: appends the supplied prompt to the session cache.
-// One Step submits at most one prefill chunk or one decode token. Chat
+// One Step publishes at most one token. A decode window may consume two
+// positions and retain an uncached, unpublished bonus for the next Step. Chat
 // formatting and stream parsing belong to the caller. Thinking budgets require
 // explicit tokenizer metadata. Forced close tokens consume generation slots
 // and KV positions, but no sampling RNG; insufficient room for the complete
@@ -90,7 +91,7 @@ public:
     RequestState(const RequestState&) = delete;
     RequestState& operator=(const RequestState&) = delete;
 
-    StepResult Step();
+    StepResult Step(size_t outputSlots = 2);
     // Stable model identity; null means this backend has no decode-batch path.
     // Does not wait for an executing step or inspect mutable request state.
     const void* DecodeBatchKey() const noexcept { return session->DecodeBatchKey(); }
@@ -111,7 +112,7 @@ private:
     StepResult Finish(RequestStatus status, std::string_view error = {},
                       std::optional<ErrorCode> errorCode = std::nullopt,
                       RequestEndReason endReason = RequestEndReason::None);
-    StepResult StepLocked();
+    StepResult StepLocked(size_t outputSlots);
     bool PrepareThinkingClose();
     StepResult PublishSample(ExecutionResult result, bool closeExceedsRemaining);
 
@@ -124,6 +125,10 @@ private:
     std::atomic<bool> cancelRequested{false};
     RequestSnapshot snapshot;
     int pendingToken = -1;
+    // Verified but unpublished and uncached. The preceding output was already
+    // committed by ExecuteWindow, so it must never be forwarded a second time.
+    std::optional<int> verifiedBonus;
+    bool usedDecodeWindow = false;
     bool ownsSession = false;
     bool insideThinking = false;
     size_t thinkingTokensUsed = 0;

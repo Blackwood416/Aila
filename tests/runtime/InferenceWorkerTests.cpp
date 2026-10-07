@@ -53,7 +53,7 @@ struct Counters {
     Gate memory;
     std::atomic<bool> memoryInitialized{false}, memoryBusy{false};
     std::atomic<int> models{0}, sessions{0};
-    std::atomic<int> qwen3Loads{0}, qwen35Loads{0}, qwen35Bf16Loads{0};
+    std::atomic<int> qwen3Loads{0}, qwen35Loads{0}, qwen35Bf16Loads{0}, qwen4ExpLoads{0};
     std::atomic<bool> failSession{false};
     std::atomic<bool> faultSession{false};
     std::atomic<bool> faultContext{false};
@@ -148,6 +148,11 @@ public:
     std::shared_ptr<aila::worker::InferenceModel> LoadQwen35Bf16(const std::string& directory,
                                                              aila::worker::InferenceModelOptions options) override {
         ++counters->qwen35Bf16Loads;
+        return Load(directory, options);
+    }
+    std::shared_ptr<aila::worker::InferenceModel> LoadQwen4Exp(const std::string& directory,
+                                                            aila::worker::InferenceModelOptions options) override {
+        ++counters->qwen4ExpLoads;
         return Load(directory, options);
     }
 private:
@@ -507,7 +512,7 @@ void TestBackendValidationAndLoadRecovery(const std::string& backend) {
                rejected.errorCode == (invalidBackend ? wire::ErrorCode::UnsupportedModel : wire::ErrorCode::InvalidArgument),
                "unsupported backend or KV type was not rejected locally");
         Expect(h.Query().accepting && h.counters->qwen3Loads == 0 && h.counters->qwen35Loads == 0 &&
-               h.counters->qwen35Bf16Loads == 0,
+               h.counters->qwen35Bf16Loads == 0 && h.counters->qwen4ExpLoads == 0,
                "invalid model options reached the factory or poisoned the Worker");
     }
     load.modelDirectory = "bad-model";
@@ -516,7 +521,8 @@ void TestBackendValidationAndLoadRecovery(const std::string& backend) {
     const auto model = h.Load();
     Expect(h.counters->qwen3Loads == (backend == "qwen3_nf4" ? 2 : 0) &&
            h.counters->qwen35Loads == (backend == "qwen35_nf4" ? 2 : 0) &&
-           h.counters->qwen35Bf16Loads == (backend == "qwen35_bf16" ? 2 : 0),
+           h.counters->qwen35Bf16Loads == (backend == "qwen35_bf16" ? 2 : 0) &&
+           h.counters->qwen4ExpLoads == (backend == "qwen4exp_nf4" ? 2 : 0),
            "model backend reached the wrong factory dispatch");
     const auto session = h.Create(model);
     const auto request = h.Submit(session, 3);
@@ -895,7 +901,7 @@ void TestUnknownCommandAndLogLimitReduction() {
 
 int main() {
     try {
-        for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+        for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
             TestConcurrentControlAndParentLifetime(backend);
             TestBackpressureAndRetainedReservations(backend);
             TestAdmissionRollbackAndStaleEpoch(backend);

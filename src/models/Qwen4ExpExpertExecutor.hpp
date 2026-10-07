@@ -70,15 +70,22 @@ struct HeteroExecutionStats {
     uint64_t cpu_overlapped_count = 0;
     uint64_t cpu_compute_ns = 0;
     uint64_t cpu_activation_wait_ns = 0;
+    // Worker route-event wait, not a coordinator stall or exposed GPU tail.
+    uint64_t cpu_route_wait_ns = 0, cpu_route_async_layers = 0;
     // Advisory call duration and requested ranges/bytes, not physical I/O or residency.
     uint64_t cpu_mmap_prefetch_ns = 0, cpu_mmap_prefetch_calls = 0;
     uint64_t cpu_mmap_prefetch_ranges = 0, cpu_mmap_prefetch_bytes = 0, cpu_mmap_prefetch_failures = 0;
     // Single-thread in-span page visits; not unique resident pages or OS faults.
     uint64_t cpu_mmap_touch_ns = 0, cpu_mmap_touch_pages = 0;
+    // Worker-only bounded F32 scale metadata cache; packed weights stay mapped.
+    uint64_t cpu_scale_cache_bytes = 0, cpu_scale_cache_hits = 0, cpu_scale_cache_misses = 0;
+    uint64_t cpu_scale_cache_fills = 0, cpu_scale_cache_evictions = 0, cpu_scale_cache_fallbacks = 0;
+    uint64_t cpu_scale_cache_prepare_ns = 0;
     // Opt-in process-wide diagnostic counters sampled around CPU compute.
     // Faults include soft and hard faults from all process threads.
     uint64_t cpu_diagnostic_batches = 0, cpu_diagnostic_failures = 0;
     uint64_t cpu_verify_batches = 0; // diagnostic H8 shadow comparisons, mismatch throws
+    uint64_t cpu_a64_verify_batches = 0; // original A64 shadow, specialize/row2 disabled; mismatch throws
     uint64_t cpu_process_faults = 0, cpu_process_user_ns = 0, cpu_process_kernel_ns = 0;
     uint64_t cpu_gate_up_ns = 0, cpu_quantize_ns = 0, cpu_down_ns = 0;
     uint64_t cpu_gate_chunks = 0, cpu_down_chunks = 0;
@@ -97,7 +104,7 @@ struct HeteroExecutionStats {
     uint64_t cpu_result_copies = 0;
     uint64_t cpu_result_bytes = 0;
     uint64_t cpu_result_submit_ns = 0;
-    // Submit-to-compute interval minus activation wait; includes source prefetch/touch.
+    // Submit-to-compute minus activation/route waits; includes source prefetch/touch and scale-cache preparation.
     uint64_t cold_eligible = 0, cold_budget_rejected = 0, cold_queue_ns = 0;
 
     void reset() {
@@ -175,9 +182,26 @@ public:
     // entries (or opt-in immutable mapped sources) from the cold subset; caller
     // submits remaining GPU work before Join. ModelWeights must outlive executor.
     int StartResidentCold(GpuReadyLease& route, const bf16* x_dev);
-    void StageResidentInput(const bf16* x_dev);
+    // Init-only immutable mapped views; no cache operation runs on the worker.
+    void PrepareAsyncResidentSources(int layers, int experts);
+    bool CanStartAsyncResidentRoute(int layer) const;
+    void StartAsyncResidentRoute(int layer, const int* ids, const int* selected, const sycl::event& route_event);
+    void RetireAsyncResidentRoute(GpuReadyLease& route);
+    void StageResidentInput(const bf16* x_dev, int rows = 1);
     sycl::event JoinResidentCold(float* rank_output);
+    const void* ResidentCpuResultPacket() const { return cpu_result_packet_active_ ? cpu_result_packet_dev_ : nullptr; }
+    const ops::MoeCpuHostDownRows* ResidentCpuHostRows() const { return cpu_host_result_active_ ? &cpu_host_rows_ : nullptr; }
+    // Register the actual GPU reader before admitting another CPU output writer.
+    void FinishResidentCpuRead(const sycl::event& merge);
     void AbortResidentCold() noexcept;
+
+    // Opt-in 2..4-row verification: frozen GPU hotset plus immutable mapped
+    // CPU cold sources. Reuses the worker and existing 40-task scratch arena.
+    bool CanExecuteVerifyRows(int rows, int top_k) const;
+    void StartAsyncVerifyRoute(int layer, int rows, const int* ids, const sycl::event& route_event);
+    sycl::event ExecuteVerifyRows(Context& ctx, int layer, const int* ids,
+        const float* weights, const bf16* x, bf16* h, bf16* y, int rows, int top_k,
+        const bf16* shared_out = nullptr, const bf16* shared_gate = nullptr);
 
     int max_cpu_credits() const { return max_cpu_credits_; }
     void set_max_cpu_credits(int credits) { max_cpu_credits_ = std::clamp(credits, 0, ops::cpu::kMaxExpertBatchTasks); }
@@ -228,6 +252,12 @@ private:
     // Preallocated pinned host and device buffers for zero dynamic allocation on hot path
     bf16* x_host_ = nullptr;         // [max_cpu_tokens * hidden_size] pinned host bf16
     float* cpu_out_host_ = nullptr;  // [max_cpu_credits * hidden_size] pinned host float
+    void* cpu_result_packet_host_ = nullptr;
+    void* cpu_result_packet_dev_ = nullptr;
+    bool cpu_result_packet_active_ = false;
+    bool cpu_result_host_read_ = false;
+    bool cpu_host_result_active_ = false;
+    ops::MoeCpuHostDownRows cpu_host_rows_{};
     bf16* scratch_h_ = nullptr;      // [max_cpu_tokens * intermediate_size] pinned host bf16
 
     ops::MoeExpertSlotDev* gpu_slots_host_ = nullptr;
@@ -244,7 +274,16 @@ private:
     std::vector<int> pending_experts_buf_;
     std::vector<int> assigned_slots_buf_;
     sycl::event prev_cpu_h2d_ev_{};
+    sycl::event cpu_output_reader_event_{};
     sycl::event resident_input_event_{};
+    std::vector<ops::MoeExpertSlotHost> async_route_sources_;
+    int async_route_experts_ = 0;
+    bool async_route_pending_ = false;
+    bool async_route_logged_ = false;
+    bool async_route_collected_ = false;
+    std::array<int,16> async_route_ranks_{}, async_route_ids_{};
+    int async_route_count_ = 0;
+    int verify_async_rows_ = 0, verify_async_layer_ = -1;
     std::array<int, 16> cold_ranks_{}, cold_ids_{};
     std::array<ops::MoeExpertSlotHost, 16> cold_source_slots_{};
     std::array<ops::cpu::CpuExpertTask,16> cold_reference_tasks_{};

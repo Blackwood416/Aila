@@ -154,6 +154,36 @@ ExecutionResult SessionState::Execute(const std::vector<int>& tokenIds,
     return result;
 }
 
+std::optional<DecodeWindowResult> SessionState::ExecuteWindow(
+    int pendingToken, const DecodeWindowSelector& acceptFirst) {
+    std::lock_guard<std::mutex> lock(operationMutex);
+    const int before = CheckedContextLength(*backend, capacity);
+    if (pendingToken < 0 || pendingToken >= vocabSize)
+        throw Error(ErrorCode::InvalidArgument, "Invalid pending token for decode window");
+    if (capacity - before < 2) return std::nullopt;
+    auto result = backend->ForwardWindow(pendingToken, acceptFirst);
+    const int after = CheckedContextLength(*backend, capacity);
+    if (!result) {
+        if (after != before) throw Error(ErrorCode::RuntimeFault, "Declined decode window changed cache");
+        return result;
+    }
+    const auto& r = *result;
+    if (r.tokenId < 0 || r.tokenId >= vocabSize ||
+        (r.bonusTokenId && (*r.bonusTokenId < 0 || *r.bonusTokenId >= vocabSize)) ||
+        r.consumedInputs != (r.firstTokenCached ? 2 : 1) ||
+        r.firstTokenCached != r.bonusTokenId.has_value() ||
+        r.cacheLength != after || after != before + r.consumedInputs)
+        throw Error(ErrorCode::RuntimeFault, "Invalid decode window prefix commit");
+    return result;
+}
+
+void SessionState::ResetCancelledWindow() {
+    std::lock_guard<std::mutex> lock(operationMutex);
+    backend->Reset();
+    if (CheckedContextLength(*backend, capacity) != 0)
+        throw Error(ErrorCode::RuntimeFault, "Cancelled decode window did not reset");
+}
+
 std::vector<ExecutionResult> SessionState::ExecuteDecodeBatch(
     const std::vector<SessionDecodeInput>& rows) {
     if (rows.empty() || rows.size() > MaxDecodeBatchSize) {

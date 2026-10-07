@@ -3,6 +3,7 @@
 #include "../utils/DeviceException.hpp"
 #include "../utils/EnvUtils.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/math.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1350,14 +1351,82 @@ bool can_use_packed_decode_fastpath(const Bnb4BitWeightRef& weight,
            (in_features % blocksize) == 0;
 }
 
-void packed_nf4_gemv_bf16(Context& ctx,
+inline int32_t dense_nf4_q8_dot_acc(int32_t packed_a, int32_t packed_b, int32_t acc) {
+    // Keep the signed-byte DP4A idiom local: oneAPI dot_product.hpp supplies
+    // non-inline external definitions and is also included by prototype tests.
+    const int8_t* a = reinterpret_cast<const int8_t*>(&packed_a);
+    const int8_t* b = reinterpret_cast<const int8_t*>(&packed_b);
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] + acc;
+}
+
+template <typename QuantMap>
+inline int32_t dense_nf4_q8_pack_half(uint32_t packed, int half, const QuantMap& qmap) {
+    const uint32_t bytes = packed >> (half * 16);
+    const uint32_t p0 = static_cast<uint32_t>(qmap[(bytes >> 4) & 15]) & 255u;
+    const uint32_t p1 = static_cast<uint32_t>(qmap[bytes & 15]) & 255u;
+    const uint32_t p2 = static_cast<uint32_t>(qmap[(bytes >> 12) & 15]) & 255u;
+    const uint32_t p3 = static_cast<uint32_t>(qmap[(bytes >> 8) & 15]) & 255u;
+    return sycl::bit_cast<int32_t>(p0 | (p1 << 8) | (p2 << 16) | (p3 << 24));
+}
+
+void packed_nf4_decode_q8_64(Context& ctx, const uint8_t* packed,
+    const float* quant_map, const float* absmax, const int8_t* xq,
+    const float* xs, bf16* output, int input_features, int output_features) {
+    constexpr int wg = 256, sg_size = 16, rows_per_group = wg / sg_size;
+    constexpr float lut_scale = 1.0f / 127.0f;
+    const int bytes_per_row = input_features / 2;
+    const int blocks_per_row = input_features / 64;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int32_t, 1> qmap(sycl::range<1>(16), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(output_features / rows_per_group) * wg, wg),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int lane = lid % sg_size;
+                const int row = static_cast<int>(item.get_group(0)) * rows_per_group + lid / sg_size;
+                if (lid < 16) {
+                    const uint32_t bits = reinterpret_cast<const uint32_t*>(quant_map)[lid];
+                    // Metadata guarantees an NF4 normalized codebook. Keep
+                    // its Q8 conversion bounded even for malformed LUT values.
+                    const float code = (bits & 0x7f800000u) == 0x7f800000u ? 0.0f : sycl::bit_cast<float>(bits);
+                    qmap[lid] = static_cast<int32_t>(sycl::rint(sycl::clamp(code * 127.0f, -127.0f, 127.0f)));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                const auto sg = item.get_sub_group();
+                const size_t byte_base = size_t(row) * bytes_per_row;
+                const size_t block_base = size_t(row) * blocks_per_row;
+                float acc = 0.0f;
+                for (int byte_offset = lane * 4; byte_offset < bytes_per_row; byte_offset += sg_size * 4) {
+                    const uint32_t weights = *reinterpret_cast<const uint32_t*>(packed + byte_base + byte_offset);
+                    const int block = byte_offset / 32;
+                    const float scale_leader = (lane == 0 || lane == 8) ? absmax[block_base + block] : 0.0f;
+                    const float scale0 = sycl::group_broadcast(sg, scale_leader, 0);
+                    const float scale8 = sycl::group_broadcast(sg, scale_leader, 8);
+                    const float weight_scale = lane < 8 ? scale0 : scale8;
+                    const int8_t* input = xq + byte_offset * 2;
+                    const int32_t x0 = *reinterpret_cast<const int32_t*>(input);
+                    const int32_t x1 = *reinterpret_cast<const int32_t*>(input + 4);
+                    const int32_t dot = dense_nf4_q8_dot_acc(dense_nf4_q8_pack_half(weights, 0, qmap), x0, 0)
+                        + dense_nf4_q8_dot_acc(dense_nf4_q8_pack_half(weights, 1, qmap), x1, 0);
+                    acc = sycl::fma(static_cast<float>(dot), (weight_scale * lut_scale) * xs[block], acc);
+                }
+                const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0) output[row] = bf16(sum);
+            });
+    });
+}
+
+template <bool CommitHistory, bool PrefetchInput>
+void packed_nf4_gemv_bf16_impl(Context& ctx,
                           const Bnb4BitWeightRef& weight,
                           Tensor& absmax_f32,
                           Tensor& input,
                           Tensor& output,
                           int in_features,
                           int out_features,
-                          const bf16* add_residual = nullptr) {
+                          const bf16* add_residual = nullptr,
+                          const bf16* history_input = nullptr,
+                          float* history = nullptr, int history_channels = 0,
+                          int history_row = 0) {
     const uint8_t* packed_ptr = static_cast<const uint8_t*>(weight.packed_weight->data());
     const float* quant_map_ptr = static_cast<const float*>(weight.quant_map->data());
     const float* absmax_ptr = static_cast<const float*>(absmax_f32.data());
@@ -1418,12 +1487,25 @@ void packed_nf4_gemv_bf16(Context& ctx,
     const size_t num_sub_groups = wg_size / sub_group_size;
     const size_t rows_per_group = num_sub_groups;
     const size_t num_groups = (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
+    const size_t history_groups = CommitHistory ?
+        (static_cast<size_t>(history_channels) + wg_size - 1) / wg_size : 0;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+        cgh.parallel_for(sycl::nd_range<1>((num_groups + history_groups) * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
+            if constexpr (CommitHistory) {
+                // Uniform across the entire workgroup, before any barrier.
+                // Projection groups preserve the original reduction order.
+                if (item.get_group(0) >= num_groups) {
+                    const size_t channel = (item.get_group(0) - num_groups) * wg_size + lid;
+                    if (channel < static_cast<size_t>(history_channels))
+                        history[static_cast<size_t>(history_row) * history_channels + channel] =
+                            static_cast<float>(history_input[channel]);
+                    return;
+                }
+            }
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
             const int group_row_base = static_cast<int>(item.get_group(0)) * static_cast<int>(rows_per_group);
@@ -1446,8 +1528,10 @@ void packed_nf4_gemv_bf16(Context& ctx,
                     if (byte_offset + stride + 3 < packed_bytes_per_row) {
                         sycl::ext::oneapi::experimental::prefetch(
                             packed_ptr + row_byte_base + byte_offset + stride);
-                        sycl::ext::oneapi::experimental::prefetch(
-                            input_ptr + (byte_offset + stride) * 2);
+                        if constexpr (PrefetchInput) {
+                            sycl::ext::oneapi::experimental::prefetch(
+                                input_ptr + (byte_offset + stride) * 2);
+                        }
                     }
                     const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
                         packed_ptr + row_byte_base + byte_offset);
@@ -1501,9 +1585,40 @@ void packed_nf4_gemv_bf16(Context& ctx,
     });
 }
 
+bool packed_nf4_gemv_input_prefetch_off() {
+    static const bool enabled = aila::env::read_flag("AILA_BNB4_GEMV_INPUT_PREFETCH_OFF", false);
+    return enabled;
+}
+
+template <bool CommitHistory = false>
+void packed_nf4_gemv_bf16(Context& ctx,
+                          const Bnb4BitWeightRef& weight,
+                          Tensor& absmax_f32,
+                          Tensor& input,
+                          Tensor& output,
+                          int in_features,
+                          int out_features,
+                          const bf16* add_residual = nullptr,
+                          const bf16* history_input = nullptr,
+                          float* history = nullptr, int history_channels = 0,
+                          int history_row = 0) {
+    // Experimental single-variable route. Dispatch on the host so removing
+    // redundant activation prefetch sends adds no device branch or flag live
+    // range. Packed-weight prefetch, FMA/reduction order and history copying
+    // are identical in both specializations; small-K has no input prefetch.
+    if (in_features >= 512 && packed_nf4_gemv_input_prefetch_off()) {
+        packed_nf4_gemv_bf16_impl<CommitHistory, false>(ctx, weight, absmax_f32, input, output,
+            in_features, out_features, add_residual, history_input, history, history_channels, history_row);
+    } else {
+        packed_nf4_gemv_bf16_impl<CommitHistory, true>(ctx, weight, absmax_f32, input, output,
+            in_features, out_features, add_residual, history_input, history, history_channels, history_row);
+    }
+}
+
 // Each sequence owns its own padded output-row grid. Keeping one SG16 per
 // output and the original vec8/FMA reduction order makes B2..4 decode match
 // B1, without dequantizing a whole weight matrix for a prefill GEMM.
+template<bool ReuseTwo = false>
 void packed_nf4_decode_rows_bf16(Context& ctx,
                                 const Bnb4BitWeightRef& weight,
                                 Tensor& absmax_f32,
@@ -1527,7 +1642,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
     const size_t rows_per_group = wg_size / sub_group_size;
     const size_t groups_per_sequence =
         (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
-    const size_t num_groups = static_cast<size_t>(rows) * groups_per_sequence;
+    const size_t num_groups = static_cast<size_t>(ReuseTwo ? rows / 2 : rows) * groups_per_sequence;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
@@ -1536,7 +1651,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
             const int lid = static_cast<int>(item.get_local_id(0));
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
-            const size_t sequence = item.get_group(0) / groups_per_sequence;
+            const size_t sequence = (item.get_group(0) / groups_per_sequence) * (ReuseTwo ? 2 : 1);
             const int group_row_base = static_cast<int>(item.get_group(0) % groups_per_sequence) *
                                        static_cast<int>(rows_per_group);
             const int row = group_row_base + sg_id;
@@ -1549,6 +1664,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
             item.barrier(sycl::access::fence_space::local_space);
 
             float partial = 0.0f;
+            float partial_second = 0.0f;
             if (row < out_features) {
                 using vec8 = sycl::vec<bf16, 8>;
                 const int row_byte_base = row * packed_bytes_per_row;
@@ -1572,6 +1688,28 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
                     const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
                     const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
+                    if constexpr (ReuseTwo) {
+                        // One output channel per subgroup, two input tokens.
+                        // Reuse dequantization; each token retains vec8 FMA order.
+                        const float w0 = float(bf16(quant_map_cache[b0 >> 4] * am));
+                        const float w1 = float(bf16(quant_map_cache[b0 & 15] * am));
+                        const float w2 = float(bf16(quant_map_cache[b1 >> 4] * am));
+                        const float w3 = float(bf16(quant_map_cache[b1 & 15] * am));
+                        const float w4 = float(bf16(quant_map_cache[b2 >> 4] * am));
+                        const float w5 = float(bf16(quant_map_cache[b2 & 15] * am));
+                        const float w6 = float(bf16(quant_map_cache[b3 >> 4] * am));
+                        const float w7 = float(bf16(quant_map_cache[b3 & 15] * am));
+#pragma unroll
+                        for (int t = 0; t < 2; ++t) {
+                            const vec8 v = *reinterpret_cast<const vec8*>(input_ptr + size_t(t) * in_features + ib);
+                            float a = t == 0 ? partial : partial_second;
+                            a = sycl::fma(float(v[0]),w0,a); a = sycl::fma(float(v[1]),w1,a);
+                            a = sycl::fma(float(v[2]),w2,a); a = sycl::fma(float(v[3]),w3,a);
+                            a = sycl::fma(float(v[4]),w4,a); a = sycl::fma(float(v[5]),w5,a);
+                            a = sycl::fma(float(v[6]),w6,a); a = sycl::fma(float(v[7]),w7,a);
+                            if (t == 0) partial = a; else partial_second = a;
+                        }
+                    } else {
                     const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
                     // Inline dequant into FMA: eliminates 8 float temporaries,
                     // giving the compiler freedom to schedule and reuse registers.
@@ -1591,6 +1729,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                         static_cast<float>(bf16(quant_map_cache[b3 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[7]),
                         static_cast<float>(bf16(quant_map_cache[b3 & 0xF] * am)), partial);
+                    }
                 }
                 for (; byte_offset < packed_bytes_per_row;
                      byte_offset += static_cast<int>(sub_group_size)) {
@@ -1598,6 +1737,12 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const float am = absmax_ptr[row_block_base +
                         (byte_offset / packed_bytes_per_block)];
                     const int ii = byte_offset * 2;
+                    if constexpr (ReuseTwo) {
+                        partial_second = sycl::fma(float(input_ptr[in_features + ii]),
+                            float(bf16(quant_map_cache[(pb >> 4) & 15] * am)), partial_second);
+                        partial_second = sycl::fma(float(input_ptr[in_features + ii + 1]),
+                            float(bf16(quant_map_cache[pb & 15] * am)), partial_second);
+                    }
                     partial = sycl::fma(static_cast<float>(input_ptr[ii]),
                         static_cast<float>(bf16(
                             quant_map_cache[(pb >> 4) & 0xF] * am)), partial);
@@ -1610,6 +1755,10 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
             float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
             if (sg_lane == 0 && row < out_features) {
                 out_ptr[row] = bf16(sum);
+            }
+            if constexpr (ReuseTwo) {
+                const float second = sycl::reduce_over_group(item.get_sub_group(), partial_second, sycl::plus<>());
+                if (sg_lane == 0 && row < out_features) out_ptr[out_features + row] = bf16(second);
             }
         });
     });
@@ -1990,6 +2139,29 @@ void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_bf16_view) {
     });
 }
 
+bool Bnb4BitLinear::SupportsDecodeQ8() const {
+    if (in_features_ <= 0 || in_features_ % 64 || out_features_ <= 0 || out_features_ % 16 ||
+        weight_.quant_state.blocksize != 64 || weight_.quant_state.quant_type != "nf4" ||
+        !lora_attachments_.empty() || !weight_.packed_weight || !weight_.packed_weight->valid() ||
+        !weight_.quant_map || !weight_.quant_map->valid() || !absmax_f32_.valid()) return false;
+    if (weight_.packed_weight->dtype() != dnnl::memory::data_type::u8 ||
+        weight_.quant_map->dtype() != dnnl::memory::data_type::f32 ||
+        absmax_f32_.dtype() != dnnl::memory::data_type::f32 || weight_.quant_map->numel() < 16) return false;
+    const int64_t elements = int64_t(in_features_) * out_features_;
+    return weight_.packed_weight->numel() >= elements / 2 && absmax_f32_.numel() >= elements / 64;
+}
+
+bool Bnb4BitLinear::TryForwardDecodeQ8(Context& ctx, const int8_t* xq,
+    const float* xs, bf16* output) {
+    if (!SupportsDecodeQ8() || !xq || !xs || !output ||
+        weight_.packed_weight->context() != &ctx || weight_.quant_map->context() != &ctx ||
+        absmax_f32_.context() != &ctx) return false;
+    packed_nf4_decode_q8_64(ctx, weight_.packed_weight->data_as<uint8_t>(),
+        weight_.quant_map->data_as<float>(), absmax_f32_.data_as<float>(),
+        xq, xs, output, in_features_, out_features_);
+    return true;
+}
+
 bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
                                                       Bnb4BitLinear& fused_gate_up,
                                                       Tensor& input,
@@ -2181,8 +2353,17 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
         return;
     }
 
-    packed_nf4_decode_rows_bf16(ctx, weight_, absmax_f32_, input, output,
-                               in_features_, out_features_, rows);
+    static const int verify_reuse = aila::env::read_int_raw("AILA_Q4E_VERIFY_LINEAR_REUSE", 0);
+    static const bool draft_reuse = aila::env::read_flag("AILA_Q4E_MTP_HIDDEN_REUSE", false);
+    const bool reuse_shape = (verify_reuse > 0 && in_features_ == 2560 && out_features_ == 16480) ||
+        (verify_reuse >= 2 && in_features_ == 6144 && out_features_ == 2560) ||
+        (verify_reuse >= 3 && in_features_ == 2560 && out_features_ == 13312);
+    // Four MTP hidden streams form two independent pairs; still two accumulators.
+    if ((rows == 2 && reuse_shape) ||
+        (draft_reuse && rows == 4 && in_features_ == 2560 && out_features_ == 2560))
+        packed_nf4_decode_rows_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+    else
+        packed_nf4_decode_rows_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
     if (!lora_attachments_.empty()) {
         // The in-order queue safely reuses the retained single-row adapter
         // intermediate, including attachments with different ranks/overlaps.
@@ -2196,6 +2377,18 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
             apply_lora_decode(ctx, row_input, row_output);
         }
     }
+}
+
+bool Bnb4BitLinear::TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, Tensor& output,
+    const bf16* historyInput, float* history, int channels, int ringRow) {
+    if (!can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1) ||
+        has_lora() || in_features_ < 512 || !historyInput || !history || channels <= 0 || ringRow < 0 ||
+        !input.valid() || !output.valid() || input.context() != &ctx || output.context() != &ctx ||
+        input.dtype() != dnnl::memory::data_type::bf16 || output.dtype() != dnnl::memory::data_type::bf16 ||
+        input.numel() < in_features_ || output.numel() < out_features_) return false;
+    packed_nf4_gemv_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_,
+        nullptr, historyInput, history, channels, ringRow);
+    return true;
 }
 
 void Bnb4BitLinear::forward(Context& ctx,
@@ -2428,6 +2621,247 @@ void Bnb4BitLinear::forward(Context& ctx,
 // Uses contiguous vec8 load from both weight and input.
 // ============================================================
 namespace ops {
+
+namespace {
+// Keep these two helpers identical to the Q8 helpers in MoeExpertOps.cpp.
+// They are copied because that implementation has translation-unit scope.
+inline bool moe_front_q8_isfinite(float value) {
+    return (sycl::bit_cast<uint32_t>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline int8_t quantize_moe_front_q8_value(float value, float maximum, bool fast_rte) {
+    if (!moe_front_q8_isfinite(value) || !(maximum > 0.0f) || !moe_front_q8_isfinite(maximum)) return 0;
+    if (fast_rte && maximum > 0x1p-110f && maximum <= 0x1p120f) {
+        // Approximate reciprocal supplies a candidate integer. BF16 values
+        // times these small integers are exact in f32; scaled half-thresholds
+        // repair the candidate and preserve the exact rational RTE decision.
+        // The range keeps reciprocal/threshold arithmetic away from FTZ and
+        // overflow; extreme blocks retain the correctly rounded division.
+        int magnitude = static_cast<int>(sycl::rint(sycl::clamp(sycl::fabs(value) * (127.0f / maximum), 0.0f, 127.0f)));
+        const float numerator = sycl::fma(sycl::fabs(value), 254.0f / 256.0f, 0.0f);
+        const float lower = sycl::fma(maximum, static_cast<float>(2 * magnitude - 1) / 256.0f, 0.0f);
+        const float upper = sycl::fma(maximum, static_cast<float>(2 * magnitude + 1) / 256.0f, 0.0f);
+        if (numerator > upper || (numerator == upper && (magnitude & 1))) ++magnitude;
+        else if (numerator < lower || (numerator == lower && (magnitude & 1))) --magnitude;
+        return static_cast<int8_t>(value < 0.0f ? -magnitude : magnitude);
+    }
+    // BF16 * 127 is exact in f32. Preserve correctly rounded division and
+    // the original power-of-two scaling for very large finite BF16 values.
+    const float ratio = maximum > 0x1p120f
+        ? sycl::ext::intel::math::fdiv_rn(sycl::fma(value, 127.0f / 256.0f, 0.0f), maximum / 256.0f)
+        : sycl::ext::intel::math::fdiv_rn(value * 127.0f, maximum);
+    const float rounded = sycl::rint(sycl::clamp(ratio, -127.0f, 127.0f));
+    return static_cast<int8_t>(rounded);
+}
+
+inline int32_t bf16_head_signed_dot4(int32_t packed_a, int32_t packed_b) {
+    // Local compiler idiom avoids dot_product.hpp's external definitions.
+    const int8_t* a = reinterpret_cast<const int8_t*>(&packed_a);
+    const int8_t* b = reinterpret_cast<const int8_t*>(&packed_b);
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+
+sycl::event quantize_bf16_head_blocks(Context& ctx, const bf16* input,
+    int8_t* quantized, float* scales, size_t blocks) {
+    constexpr int wg = 128, sg_size = 16, blocks_per_group = wg / sg_size;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>((blocks + blocks_per_group - 1) / blocks_per_group * wg, wg),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t block = item.get_global_linear_id() / sg_size;
+                const int lane = static_cast<int>(item.get_local_linear_id() % sg_size);
+                if (block >= blocks) return; // Uniform subgroup exit; no WG barrier.
+                sycl::vec<float, 4> values;
+                float maximum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    uint16_t bits = reinterpret_cast<const uint16_t*>(input)[block * 64 + lane * 4 + j];
+                    if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
+                    values[j] = static_cast<float>(sycl::bit_cast<bf16>(bits));
+                    maximum = sycl::max(maximum, sycl::fabs(values[j]));
+                }
+                maximum = sycl::reduce_over_group(item.get_sub_group(), maximum, sycl::maximum<float>());
+                if (lane == 0) scales[block] = maximum / 127.0f;
+                sycl::vec<int8_t, 4> codes;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    codes[j] = quantize_moe_front_q8_value(values[j], maximum, true);
+                *reinterpret_cast<sycl::vec<int8_t, 4>*>(quantized + block * 64 + lane * 4) = codes;
+            });
+    });
+}
+
+bool bf16_head_tensor_matches(Context& ctx, const Tensor& tensor,
+    dnnl::memory::data_type dtype, int64_t elements) {
+    const uintptr_t alignment = dtype == dnnl::memory::data_type::bf16 ? 2u : 4u;
+    return tensor.valid() && tensor.context() == &ctx && tensor.dtype() == dtype && elements > 0 &&
+        tensor.numel() >= elements && reinterpret_cast<uintptr_t>(tensor.data()) % alignment == 0;
+}
+
+bool bf16_head_tensors_overlap(const Tensor& a, const Tensor& b) {
+    const auto begin_a = reinterpret_cast<uintptr_t>(a.data());
+    const auto begin_b = reinterpret_cast<uintptr_t>(b.data());
+    return begin_a <= begin_b ? begin_b - begin_a < a.size_bytes() : begin_a - begin_b < b.size_bytes();
+}
+}
+
+bool bf16_q8_head_supported(Context& ctx, int hidden, int vocab) {
+    if (hidden <= 0 || hidden % 64 != 0 || vocab <= 0 || vocab % 16 != 0 ||
+        !ctx.queue().has_property<sycl::property::queue::in_order>()) return false;
+    // Cache capabilities per submitting thread/device, never allocate/query
+    // subgroup vectors repeatedly in the token loop.
+    const auto device = ctx.queue().get_device();
+    static thread_local sycl::device cached_device = device;
+    static thread_local bool cached_valid = false;
+    static thread_local bool supported = false;
+    if (!cached_valid || cached_device != device) {
+        cached_device = device;
+        const auto sizes = device.get_info<sycl::info::device::sub_group_sizes>();
+        supported = device.is_gpu() && device.has(sycl::aspect::usm_device_allocations) &&
+            device.get_info<sycl::info::device::max_work_group_size>() >= 256 &&
+            std::find(sizes.begin(), sizes.end(), size_t(16)) != sizes.end();
+        cached_valid = true;
+    }
+    return supported;
+}
+
+sycl::event quantize_bf16_weights_q8_64(Context& ctx, Tensor& raw,
+    Tensor& q8, Tensor& scales) {
+    if (raw.ndim() != 2 || raw.shape(0) > std::numeric_limits<int>::max() ||
+        raw.shape(1) > std::numeric_limits<int>::max() ||
+        !bf16_q8_head_supported(ctx, static_cast<int>(raw.shape(1)), static_cast<int>(raw.shape(0))) ||
+        !bf16_head_tensor_matches(ctx, raw, dnnl::memory::data_type::bf16, raw.numel()) ||
+        !bf16_head_tensor_matches(ctx, q8, dnnl::memory::data_type::u8, raw.numel()) ||
+        !bf16_head_tensor_matches(ctx, scales, dnnl::memory::data_type::f32, raw.numel() / 64) ||
+        bf16_head_tensors_overlap(raw, q8) || bf16_head_tensors_overlap(raw, scales) || bf16_head_tensors_overlap(q8, scales))
+        throw std::invalid_argument("quantize_bf16_weights_q8_64: unsupported Context, shape or tensors");
+    return quantize_bf16_head_blocks(ctx, raw.data_as<bf16>(), q8.data_as<int8_t>(),
+                                    scales.data_as<float>(), static_cast<size_t>(raw.numel() / 64));
+}
+
+sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
+    Tensor& input, Tensor& output, Tensor& xq, Tensor& xs, int rows, int hidden, int vocab) {
+    const int64_t weight_elements = int64_t(hidden) * vocab;
+    if (rows <= 0 || !bf16_q8_head_supported(ctx, hidden, vocab) ||
+        !bf16_head_tensor_matches(ctx, q8, dnnl::memory::data_type::u8, weight_elements) ||
+        !bf16_head_tensor_matches(ctx, scales, dnnl::memory::data_type::f32, weight_elements / 64) ||
+        !bf16_head_tensor_matches(ctx, input, dnnl::memory::data_type::bf16, int64_t(rows) * hidden) ||
+        !bf16_head_tensor_matches(ctx, output, dnnl::memory::data_type::bf16, int64_t(rows) * vocab) ||
+        !bf16_head_tensor_matches(ctx, xq, dnnl::memory::data_type::u8, hidden) ||
+        !bf16_head_tensor_matches(ctx, xs, dnnl::memory::data_type::f32, hidden / 64))
+        throw std::invalid_argument("bf16_q8_head_forward: unsupported Context, shape or tensors");
+    const Tensor* tensors[] = {&q8, &scales, &input, &output, &xq, &xs};
+    for (int a = 0; a < 6; ++a) for (int b = a + 1; b < 6; ++b) {
+        if (bf16_head_tensors_overlap(*tensors[a], *tensors[b]))
+            throw std::invalid_argument("bf16_q8_head_forward: overlapping tensors");
+    }
+    constexpr int wg = 256, sg_size = 16, rows_per_group = wg / sg_size;
+    const int blocks_per_row = hidden / 64;
+    const int8_t* weights = q8.data_as<int8_t>();
+    const float* weight_scales = scales.data_as<float>();
+    int8_t* input_codes = xq.data_as<int8_t>();
+    float* input_scales = xs.data_as<float>();
+    sycl::event last;
+    for (int token = 0; token < rows; ++token) {
+        quantize_bf16_head_blocks(ctx, input.data_as<bf16>() + size_t(token) * hidden,
+                                 input_codes, input_scales, size_t(blocks_per_row));
+        bf16* destination = output.data_as<bf16>() + size_t(token) * vocab;
+        last = ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(size_t(vocab / rows_per_group) * wg, wg),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int lane = static_cast<int>(item.get_local_linear_id() % sg_size);
+                    const int row = static_cast<int>(item.get_group(0)) * rows_per_group
+                        + static_cast<int>(item.get_local_linear_id() / sg_size);
+                    const int8_t* w = weights + size_t(row) * hidden;
+                    const float* ws = weight_scales + size_t(row) * blocks_per_row;
+                    float acc = 0.0f;
+                    for (int k = lane * 8; k < hidden; k += sg_size * 8) {
+                        const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
+                        const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
+                        const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + k);
+                        const int32_t x1 = *reinterpret_cast<const int32_t*>(input_codes + k + 4);
+                        const int32_t dot = bf16_head_signed_dot4(w0, x0) + bf16_head_signed_dot4(w1, x1);
+                        acc = sycl::fma(static_cast<float>(dot), ws[k / 64] * input_scales[k / 64], acc);
+                    }
+                    const float sum = sycl::reduce_over_group(item.get_sub_group(), acc, sycl::plus<float>());
+                    if (lane == 0) destination[row] = bf16(sum);
+                });
+        });
+    }
+    return last;
+}
+
+void bf16_moe_front_fused(Context& ctx, const bf16* router_weight,
+    const bf16* shared_gate_weight, const bf16* input, bf16* router_scores,
+    bf16* shared_gate, int8_t* optional_xq, float* optional_xs, int hidden, int experts) {
+    if (hidden != 2560 || experts != 512 || !router_weight || !shared_gate_weight ||
+        !input || !router_scores || !shared_gate || bool(optional_xq) != bool(optional_xs)) {
+        throw std::invalid_argument("bf16_moe_front_fused: unsupported decode shape or buffers");
+    }
+    using vec8 = sycl::vec<bf16, 8>;
+    constexpr int SG = 16;
+    constexpr int WG = 256;
+    const int K = hidden;
+    const int K8 = K / 8;
+    const int rows_per_group = WG / SG;
+    const int projection_groups = (experts + 1 + rows_per_group - 1) / rows_per_group;
+    const int quantization_groups = optional_xq ? hidden / 64 : 0;
+    static const bool s_fast_rte = aila::env::read_flag("AILA_Q4E_GPU_Q8_FAST_RTE", false);
+    const bool fast_rte = s_fast_rte;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(projection_groups + quantization_groups) * WG, WG),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                const int group = static_cast<int>(item.get_group(0));
+                if (group >= projection_groups) {
+                    // One WG owns one original 64-value block. The extra lanes
+                    // supply zero to max; sanitization ensures nonnegative,
+                    // finite magnitudes, so the maximum remains bit-identical.
+                    const int block = group - projection_groups;
+                    const int lid = static_cast<int>(item.get_local_id(0));
+                    const size_t index = static_cast<size_t>(block) * 64 + lid;
+                    uint16_t bits = lid < 64 ? reinterpret_cast<const uint16_t*>(input)[index] : 0;
+                    if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
+                    const float value = static_cast<float>(sycl::bit_cast<bf16>(bits));
+                    const float magnitude = sycl::fabs(value);
+                    const float maximum = sycl::reduce_over_group(item.get_group(), magnitude, sycl::maximum<float>());
+                    const float scale = maximum / 127.0f;
+                    if (lid == 0) optional_xs[block] = scale;
+                    if (lid < 64) optional_xq[index] = quantize_moe_front_q8_value(value, maximum, fast_rte);
+                    return;
+                }
+
+                // Preserve bf16_gemv_bf16's SG16/vec8 accumulation, scalar
+                // tail, subgroup reduction, and final BF16 storage boundary.
+                auto sg = item.get_sub_group();
+                int sg_id = sg.get_group_linear_id();
+                int lane = sg.get_local_linear_id();
+                int row = group * rows_per_group + sg_id;
+                float acc = 0.0f;
+                if (row <= experts) {
+                    const bf16* w_row = row < experts ? router_weight + row * K : shared_gate_weight;
+                    for (int k8 = lane; k8 < K8; k8 += SG) {
+                        int k = k8 * 8;
+                        const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
+                        const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
+#pragma unroll
+                        for (int v = 0; v < 8; v++) {
+                            acc += static_cast<float>(w_vec[v]) *
+                                   static_cast<float>(x_vec[v]);
+                        }
+                    }
+                    int tail_start = K8 * 8;
+                    for (int k = tail_start + lane; k < K; k += SG) {
+                        acc += static_cast<float>(w_row[k]) *
+                               static_cast<float>(input[k]);
+                    }
+                }
+                float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                if (lane == 0 && row < experts) router_scores[row] = bf16(total);
+                if (lane == 0 && row == experts) shared_gate[0] = bf16(total);
+            });
+    });
+}
 
 void bf16_gemv_bf16(Context& ctx,
                     Tensor& weight,

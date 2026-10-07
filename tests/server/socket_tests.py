@@ -5,7 +5,7 @@ server shutdown, waits a bounded interval, and only then kills that exact child.
 Fake mode writes a byte-BPE tokenizer under the output directory. It exercises
 network backpressure with roughly 4 KiB per generated token; GPU mode uses the
 provided checkpoint and does not claim to exercise that artificial byte limit.
-Both modes accept --backend qwen3_nf4|qwen35_nf4|qwen35_bf16. A --case selection keeps every
+Both modes accept --backend qwen3_nf4|qwen35_nf4|qwen35_bf16|qwen4exp_nf4. A --case selection keeps every
 assertion of the selected cases and the final resource/transport cleanup gate;
 the report explicitly lists cases excluded from a partial run.
 """
@@ -30,7 +30,8 @@ import traceback
 import uuid
 from pathlib import Path
 
-MODEL_IDS = {"qwen3_nf4": "qwen3", "qwen35_nf4": "qwen3.5", "qwen35_bf16": "qwen3.5"}
+MODEL_IDS = {"qwen3_nf4": "qwen3", "qwen35_nf4": "qwen3.5", "qwen35_bf16": "qwen3.5",
+             "qwen4exp_nf4": "qwen4exp"}
 COMMON_CASES = (
     "health_models_parameters", "incremental_utf8_json_sse", "concurrent_1_2_4_fixed_seed",
     "multiturn_text_thinking_json_sse", "connection_close_expect_continue", "same_socket_reuse_pipeline",

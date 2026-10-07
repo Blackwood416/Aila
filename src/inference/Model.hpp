@@ -59,12 +59,12 @@ struct ModelOptions {
     // Hybrid host mirrors plus bounded recurrent snapshot payloads. Zero uses
     // the session-count bound alone; STL/allocator overhead is not included.
     size_t maxSessionHostBytes = 0;
-    // Qwen3.5 only: keep the latest N recurrent checkpoints; zero disables
+    // Hybrid models: keep the latest N recurrent checkpoints; zero disables
     // snapshots. Truncate may restore an earlier checkpoint or reset to zero.
     size_t maxRecurrentSnapshots = 4;
 };
 
-// Shared-model text execution supports Qwen3 NF4 and Qwen3.5 Hybrid NF4/BF16. Other
+// Shared text execution supports Qwen3 NF4, Qwen3.5 NF4/BF16 and Qwen4Exp NF4. Other
 // model/storage capabilities continue through the existing Engine facade.
 // Weights and fused projections are loaded once. Their mutable oneDNN
 // bindings/activations stay in one execution slot, guarded by DeviceRuntime.
@@ -79,6 +79,10 @@ public:
         const std::string& modelDirectory,
         ModelOptions options = {});
     static std::shared_ptr<LoadedModel> LoadQwen35Bf16(
+        std::shared_ptr<DeviceRuntime> runtime,
+        const std::string& modelDirectory,
+        ModelOptions options = {});
+    static std::shared_ptr<LoadedModel> LoadQwen4ExpNf4(
         std::shared_ptr<DeviceRuntime> runtime,
         const std::string& modelDirectory,
         ModelOptions options = {});

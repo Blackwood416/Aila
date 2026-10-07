@@ -41,6 +41,10 @@ public:
         const std::string& directory, InferenceModelOptions options) override {
         return Load(directory, options, inference::LoadedModel::LoadQwen35Bf16);
     }
+    std::shared_ptr<InferenceModel> LoadQwen4Exp(
+        const std::string& directory, InferenceModelOptions options) override {
+        return Load(directory, options, inference::LoadedModel::LoadQwen4ExpNf4);
+    }
 
     std::string RuntimeFaultMessage() const override {
         return runtime ? runtime->FaultMessage().value_or(std::string{}) : std::string{};

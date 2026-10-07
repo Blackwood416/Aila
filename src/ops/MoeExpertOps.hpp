@@ -140,6 +140,24 @@ sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descripto
 sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested);
 
+// Experimental resident NF4/Q8 decode. Packed NF4 descriptors retain their
+// original row-major format and block-64 nested scales. Only activations and
+// the default NF4 codebook are approximated with signed Q8/RTE. Input buffers
+// are xq[hidden], xs[hidden/64]; expert buffers are h/hq[top_k,intermediate]
+// and hs[top_k,intermediate/64]. Quantization observes the BF16 h boundary.
+// Nonfinite values quantize to zero and do not contribute to a block maximum;
+// zero blocks have scale zero. Negative selected slots leave expert buffers
+// untouched. All arenas and descriptors must live until the last event drains.
+// Caller provides dependencies through the engine's in-order compute queue.
+sycl::event quantize_moe_input_q8_64(Context& ctx, const bf16* x,
+    int8_t* xq, float* xs, int hidden);
+sycl::event moe_resident_gate_up_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const int8_t* xq, const float* xs, bf16* h,
+    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested);
+sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const int8_t* hq, const float* hs, float* down,
+    int top_k, int hidden, int intermediate, bool nested);
+
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
 sycl::event moe_decode_gate_up_swiglu_grouped(
@@ -419,6 +437,15 @@ sycl::event moe_expert_major_prefill_down_4token(
     const sycl::event* dep_event = nullptr,
     bool use_nested = false);
 
+// Single-token CPU output in this queue's USM host context. The caller keeps
+// values immutable until the returned merge event completes. The rank map is
+// copied into the kernel arguments, so it needs no device allocation or fence.
+struct MoeCpuHostDownRows {
+    const float* values = nullptr;
+    int rows = 0;
+    std::array<int, 16> rank_to_row{};
+};
+
 sycl::event moe_ordered_accumulate_down_rows(
     Context& ctx,
     const float* down_acc,
@@ -429,6 +456,15 @@ sycl::event moe_ordered_accumulate_down_rows(
     int out_features = 2560,
     const bf16* shared_out = nullptr,
     const bf16* shared_gate = nullptr,
+    const sycl::event* dep_event = nullptr,
+    const void* cpu_result_packet = nullptr);
+
+// Separate kernel/interface: the default device/packet kernel captures no host
+// pointer or rank map. Host rows and result packets cannot be combined here.
+sycl::event moe_ordered_accumulate_cpu_host_rows(
+    Context& ctx, const float* down_acc, const float* weights, bf16* y,
+    int tokens, int top_k, int out_features, const MoeCpuHostDownRows& cpu_host_rows,
+    const bf16* shared_out = nullptr, const bf16* shared_gate = nullptr,
     const sycl::event* dep_event = nullptr);
 
 } // namespace ops

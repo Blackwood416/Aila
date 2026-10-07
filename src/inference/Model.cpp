@@ -7,6 +7,9 @@
 #include "models/Qwen3Bnb4Backend.hpp"
 #include "models/Qwen35HybridBnb4Backend.hpp"
 #include "models/Qwen35HybridTextBackend.hpp"
+#include "models/Qwen4ExpBnb4Backend.hpp"
+#include "models/Qwen4ExpMtpRuntime.hpp"
+#include "ops/GreedyOps.hpp"
 #include "ops/Ops.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
@@ -66,6 +69,8 @@ struct DeviceState {
 struct ExecutionWorkspace {
     Tensor tokenIds;
     Tensor sampledId;
+    Tensor greedyPartials;
+    Tensor greedyResult;
     size_t tokenCapacity = 0;
 
     void Ensure(Context& context, size_t count) {
@@ -95,6 +100,7 @@ struct LoadedModelState {
     std::unique_ptr<ModelWeights> weights;
     std::unique_ptr<IModelBackend> backend;
     std::unique_ptr<ExecutionWorkspace> workspace;
+    std::unique_ptr<Qwen4ExpMtpRuntime> mtp;
 
     ~LoadedModelState() {
         if (!device) return;
@@ -102,6 +108,7 @@ struct LoadedModelState {
         ExecutionScope stage(device->trace.get(), ExecutionStage::ModelDestroy, {traceModelId});
         device->DrainNoThrow();
         workspace.reset();
+        mtp.reset();
         backend.reset();
         weights.reset();
         if (registeredModel) --device->loadedModels;
@@ -127,6 +134,7 @@ public:
         std::lock_guard<std::mutex> lock(model->device->mutex);
         ExecutionScope stage(model->device->trace.get(), ExecutionStage::SessionDestroy, TraceFields());
         model->device->DrainNoThrow();
+        mtpState.reset();
         cache.reset();
         --model->activeSessions;
         stage.Complete();
@@ -157,6 +165,7 @@ public:
             } else {
                 initializedCache = ModelBackend().CreateSession(model->device->context);
             }
+            if (model->mtp) mtpState = model->mtp->CreateState();
         }, [&] { model->device->context.synchronize(); });
         // Count only a fully initialized, drained session. A failed final drain
         // must not leave a cache whose destructor decrements an unheld credit.
@@ -175,7 +184,29 @@ public:
     }
     int Capacity() const override { return model->options.maxSequenceLength; }
     int VocabSize() const override { return model->vocabSize; }
-    size_t CacheBytes() const override { return cache->CacheBytes(); }
+    size_t CacheBytes() const override {
+        return cache->CacheBytes() + (model->mtp ? Qwen4ExpMtpRuntime::SessionBytes(Capacity()) : 0);
+    }
+    bool SupportsDecodeWindow() const noexcept override { return model->mtp != nullptr; }
+    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector) override {
+        if constexpr (!std::is_same_v<Backend, Qwen4ExpBnb4Backend>) return std::nullopt;
+        else {
+            auto& device = *model->device;
+            std::lock_guard<std::mutex> lock(device.mutex);
+            device.CheckUsable();
+            if (!model->mtp || !mtpState->valid || mtpState->length != cache->CurrentLength() ||
+                cache->CurrentLength() < 1 || cache->CurrentLength() + 2 > Capacity()) return std::nullopt;
+            try {
+                return model->mtp->ForwardWindow(*cache, *mtpState, pending, selector);
+            } catch (const std::exception& error) {
+                device.RecordFaultNoThrow(error.what()); device.DrainNoThrow();
+                throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
+            } catch (...) {
+                device.RecordFaultNoThrow("Unknown MTP execution failure"); device.DrainNoThrow();
+                throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
+            }
+        }
+    }
     const void* DecodeBatchKey() const noexcept override {
         if (!ModelBackend().SupportsDecodeBatch()) return nullptr;
         return model.get();
@@ -186,6 +217,7 @@ public:
         model->device->CheckUsable();
         ExecutionScope stage(model->device->trace.get(), ExecutionStage::SessionReset, TraceFields());
         MutateCache([&] { ModelBackend().Reset(*cache); });
+        if (mtpState) { mtpState->length = 0; mtpState->valid = true; }
         stage.Complete();
         model->device->CheckUsable();
     }
@@ -198,6 +230,9 @@ public:
         ExecutionScope stage(model->device->trace.get(), ExecutionStage::SessionTruncate, fields);
         int restored = 0;
         MutateCache([&] { restored = ModelBackend().Truncate(*cache, length); });
+        if (mtpState && restored != mtpState->length) {
+            mtpState->length = restored; mtpState->valid = restored == 0;
+        }
         stage.Complete();
         model->device->CheckUsable();
         return restored;
@@ -246,6 +281,8 @@ public:
             Tensor& logits = *forwardedLogits;
 
             auto result = ReadOutput(logits, sampling, captureLogits);
+            if (model->mtp) model->mtp->AfterForward(*mtpState,
+                cache->CurrentLength() - static_cast<int>(tokenIds.size()), tokenIds);
             // No device work may still refer to borrowed input or mutable
             // bindings when the caller destroys/switches the session.
             context.synchronize();
@@ -288,87 +325,91 @@ public:
         if (!DecodeBatchKey()) {
             throw Error(ErrorCode::UnsupportedModel, "Loaded model configuration does not support decode batching");
         }
-        std::vector<ModelSessionBackend*> members;
-        std::vector<typename Backend::Session*> caches;
-        std::vector<int> tokens;
-        members.reserve(rows.size());
-        caches.reserve(rows.size());
-        tokens.reserve(rows.size());
-        for (const auto& row : rows) {
-            auto* member = dynamic_cast<ModelSessionBackend*>(row.backend);
-            if (!member || member->model.get() != model.get() ||
-                std::find(members.begin(), members.end(), member) != members.end()) {
-                throw Error(ErrorCode::InvalidArgument, "Decode batch requires distinct sessions of the same loaded model");
+        if constexpr (std::is_same_v<Backend, Qwen4ExpBnb4Backend>) {
+            throw Error(ErrorCode::UnsupportedModel, "Qwen4Exp does not support cross-session decode batching");
+        } else {
+            std::vector<ModelSessionBackend*> members;
+            std::vector<typename Backend::Session*> caches;
+            std::vector<int> tokens;
+            members.reserve(rows.size());
+            caches.reserve(rows.size());
+            tokens.reserve(rows.size());
+            for (const auto& row : rows) {
+                auto* member = dynamic_cast<ModelSessionBackend*>(row.backend);
+                if (!member || member->model.get() != model.get() ||
+                    std::find(members.begin(), members.end(), member) != members.end()) {
+                    throw Error(ErrorCode::InvalidArgument, "Decode batch requires distinct sessions of the same loaded model");
+                }
+                if (row.tokenId < 0 || row.tokenId >= VocabSize() ||
+                    member->cache->CurrentLength() >= member->Capacity()) {
+                    throw Error(ErrorCode::InvalidArgument, "Invalid decode batch token or session capacity");
+                }
+                members.push_back(member);
+                caches.push_back(member->cache.get());
+                tokens.push_back(row.tokenId);
             }
-            if (row.tokenId < 0 || row.tokenId >= VocabSize() ||
-                member->cache->CurrentLength() >= member->Capacity()) {
-                throw Error(ErrorCode::InvalidArgument, "Invalid decode batch token or session capacity");
-            }
-            members.push_back(member);
-            caches.push_back(member->cache.get());
-            tokens.push_back(row.tokenId);
-        }
-        std::vector<ExecutionResult> results(rows.size());
-        aila::ScopedLogDeferral deferLogs;
-        auto& device = *model->device;
-        std::lock_guard<std::mutex> lock(device.mutex);
-        device.CheckUsable();
-        auto& context = device.context;
-        auto& slot = *model->workspace;
-        ExecutionFields fields{model->traceModelId};
-        fields.phase = ExecutionPhase::Decode;
-        fields.tokenCount = static_cast<int64_t>(rows.size());
-        ExecutionScope stage(device.trace.get(), ExecutionStage::DecodeBatch, fields);
-        try {
-            slot.Ensure(context, rows.size());
-            context.memcpy_h2d_async(slot.tokenIds.data(), tokens.data(), tokens.size() * sizeof(int));
-            Tensor* logits = nullptr;
-            {
-                ExecutionScope submitted(device.trace.get(), ExecutionStage::BackendForward);
-                logits = &ModelBackend().ForwardDecodeBatch(context, caches, slot.tokenIds.data_as<int>());
-                submitted.Complete();
-            }
-            if (!logits->valid() || logits->dtype() != dnnl::memory::data_type::bf16 ||
-                logits->ndim() != 2 || logits->shape(0) != static_cast<int64_t>(rows.size()) ||
-                logits->shape(1) != VocabSize()) {
-                throw std::runtime_error("Backend returned an invalid dense decode batch logits layout");
-            }
-            using bf16 = sycl::ext::oneapi::bfloat16;
-            for (size_t i = 0; i < rows.size(); ++i) {
-                Tensor rowLogits = Tensor::view(context,
-                    logits->template data_as<bf16>() + i * static_cast<size_t>(VocabSize()),
-                    {1, static_cast<int64_t>(VocabSize())}, logits->dtype());
-                auto rowFields = members[i]->TraceFields();
-                rowFields.phase = ExecutionPhase::Decode;
-                rowFields.position = members[i]->cache->CurrentLength() - 1;
-                rowFields.tokenCount = 1;
-                results[i] = ReadOutput(rowLogits, rows[i].sampling, rows[i].captureLogits, rowFields);
-            }
-            context.synchronize();
-            stage.Complete();
+            std::vector<ExecutionResult> results(rows.size());
+            aila::ScopedLogDeferral deferLogs;
+            auto& device = *model->device;
+            std::lock_guard<std::mutex> lock(device.mutex);
             device.CheckUsable();
-            return results;
-        } catch (const aila::memory::AllocationLimitExceeded& error) {
-            // A projection allocation can fail after some rows/layers updated
-            // state. Reset every selected session only after the queue drains.
-            // Nonmembers remain usable and keep their KV/recurrent history.
-            device.DrainNoThrow();
-            device.CheckUsable();
-            for (auto* member : members) {
-                ExecutionScope reset(device.trace.get(), ExecutionStage::SessionReset, member->TraceFields());
-                member->MutateCache([&] { member->ModelBackend().Reset(*member->cache); });
-                reset.Complete();
+            auto& context = device.context;
+            auto& slot = *model->workspace;
+            ExecutionFields fields{model->traceModelId};
+            fields.phase = ExecutionPhase::Decode;
+            fields.tokenCount = static_cast<int64_t>(rows.size());
+            ExecutionScope stage(device.trace.get(), ExecutionStage::DecodeBatch, fields);
+            try {
+                slot.Ensure(context, rows.size());
+                context.memcpy_h2d_async(slot.tokenIds.data(), tokens.data(), tokens.size() * sizeof(int));
+                Tensor* logits = nullptr;
+                {
+                    ExecutionScope submitted(device.trace.get(), ExecutionStage::BackendForward);
+                    logits = &ModelBackend().ForwardDecodeBatch(context, caches, slot.tokenIds.data_as<int>());
+                    submitted.Complete();
+                }
+                if (!logits->valid() || logits->dtype() != dnnl::memory::data_type::bf16 ||
+                    logits->ndim() != 2 || logits->shape(0) != static_cast<int64_t>(rows.size()) ||
+                    logits->shape(1) != VocabSize()) {
+                    throw std::runtime_error("Backend returned an invalid dense decode batch logits layout");
+                }
+                using bf16 = sycl::ext::oneapi::bfloat16;
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    Tensor rowLogits = Tensor::view(context,
+                        logits->template data_as<bf16>() + i * static_cast<size_t>(VocabSize()),
+                        {1, static_cast<int64_t>(VocabSize())}, logits->dtype());
+                    auto rowFields = members[i]->TraceFields();
+                    rowFields.phase = ExecutionPhase::Decode;
+                    rowFields.position = members[i]->cache->CurrentLength() - 1;
+                    rowFields.tokenCount = 1;
+                    results[i] = ReadOutput(rowLogits, rows[i].sampling, rows[i].captureLogits, rowFields);
+                }
+                context.synchronize();
+                stage.Complete();
+                device.CheckUsable();
+                return results;
+            } catch (const aila::memory::AllocationLimitExceeded& error) {
+                // A projection allocation can fail after some rows/layers updated
+                // state. Reset every selected session only after the queue drains.
+                // Nonmembers remain usable and keep their KV/recurrent history.
+                device.DrainNoThrow();
+                device.CheckUsable();
+                for (auto* member : members) {
+                    ExecutionScope reset(device.trace.get(), ExecutionStage::SessionReset, member->TraceFields());
+                    member->MutateCache([&] { member->ModelBackend().Reset(*member->cache); });
+                    reset.Complete();
+                }
+                device.CheckUsable();
+                throw Error(ErrorCode::ResourceLimit, error.what());
+            } catch (const std::exception& error) {
+                device.RecordFaultNoThrow(error.what());
+                device.DrainNoThrow();
+                throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
+            } catch (...) {
+                device.RecordFaultNoThrow("Unknown batched device execution failure");
+                device.DrainNoThrow();
+                throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
             }
-            device.CheckUsable();
-            throw Error(ErrorCode::ResourceLimit, error.what());
-        } catch (const std::exception& error) {
-            device.RecordFaultNoThrow(error.what());
-            device.DrainNoThrow();
-            throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
-        } catch (...) {
-            device.RecordFaultNoThrow("Unknown batched device execution failure");
-            device.DrainNoThrow();
-            throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
         }
     }
 
@@ -385,8 +426,19 @@ private:
         if (sampling) {
             ExecutionScope sampled(device.trace.get(), ExecutionStage::Sampling, fields);
             if (!sampling->config.do_sample) {
-                ops::argmax(context, logits, VocabSize(), slot.sampledId.data_as<int>());
-                context.memcpy_d2h(&result.tokenId, slot.sampledId.data(), sizeof(int));
+                if constexpr (std::is_same_v<Backend, Qwen4ExpBnb4Backend>) {
+                    ops::greedy_bf16(context, logits.data_as<sycl::ext::oneapi::bfloat16>(),
+                        VocabSize(), slot.greedyPartials.data_as<ops::GreedyResult>(),
+                        slot.greedyResult.data_as<ops::GreedyResult>());
+                    ops::GreedyResult selected{};
+                    context.memcpy_d2h(&selected, slot.greedyResult.data(), sizeof(selected));
+                    if (selected.nonfinite || selected.index < 0 || selected.index >= VocabSize())
+                        throw std::runtime_error("Qwen4Exp returned nonfinite or invalid greedy logits");
+                    result.tokenId = selected.index;
+                } else {
+                    ops::argmax(context, logits, VocabSize(), slot.sampledId.data_as<int>());
+                    context.memcpy_d2h(&result.tokenId, slot.sampledId.data(), sizeof(int));
+                }
             } else if (!sampling->forceHost && ops::can_use_device_sampling(VocabSize(), sampling->config)) {
                 std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
                 ops::sample_with_config_device(context, logits, VocabSize(), sampling->config,
@@ -434,6 +486,7 @@ private:
     std::shared_ptr<LoadedModelState> model;
     uint64_t traceSessionId = 0;
     std::unique_ptr<typename Backend::Session> cache;
+    std::unique_ptr<Qwen4ExpMtpRuntime::State> mtpState;
 };
 
 } // namespace detail
@@ -522,6 +575,11 @@ std::shared_ptr<LoadedModel> LoadedModel::LoadQwen35Bf16(
     return Load(std::move(runtime), modelDirectory, options, ModelFamily::Qwen35Hybrid, true);
 }
 
+std::shared_ptr<LoadedModel> LoadedModel::LoadQwen4ExpNf4(
+    std::shared_ptr<DeviceRuntime> runtime, const std::string& modelDirectory, ModelOptions options) {
+    return Load(std::move(runtime), modelDirectory, options, ModelFamily::Qwen4Exp);
+}
+
 std::shared_ptr<LoadedModel> LoadedModel::Load(
     std::shared_ptr<DeviceRuntime> runtime,
     const std::string& modelDirectory,
@@ -531,12 +589,16 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         throw Error(ErrorCode::InvalidArgument, "Runtime, model directory and positive model limits are required");
     }
     const bool hybrid = family == ModelFamily::Qwen35Hybrid;
+    const bool qwen4exp = family == ModelFamily::Qwen4Exp;
+    static const bool requestedMtp = aila::env::read_flag("AILA_Q4E_SERVER_MTP", false);
+    bool enableMtp = qwen4exp && requestedMtp;
     const bool quantizedCache = hybrid
         ? aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")
         : aila::env::read_flag("AILA_KV_QUANT", false);
     if (quantizedCache) {
         throw Error(ErrorCode::InvalidArgument,
                     hybrid ? "Qwen3.5 shared sessions require BF16 KV; set AILA_VLM_KV_QUANT=0"
+                           : qwen4exp ? "Qwen4Exp shared sessions require BF16 KV; set AILA_KV_QUANT=0"
                            : "Qwen3 shared sessions require BF16 KV; set AILA_KV_QUANT=0");
     }
     auto loaded = std::make_shared<detail::LoadedModelState>();
@@ -553,6 +615,7 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         throw Error(ErrorCode::UnsupportedModel,
                     denseWeights ? "This shared-model loader requires unquantized Qwen3.5 Hybrid BF16"
                     : hybrid ? "This shared-model loader requires Qwen3.5 Hybrid NF4"
+                    : qwen4exp ? "This shared-model loader requires Qwen4Exp NF4"
                            : "This shared-model loader requires Qwen3 NF4");
     }
     aila::memory::SessionMemoryReservation reservation;
@@ -567,6 +630,16 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
             }
             options.maxSequenceLength = std::min(options.maxSequenceLength, config.max_position_embeddings);
             reservation = aila::memory::qwen35_session_memory(
+                config, options.maxSequenceLength, options.maxRecurrentSnapshots);
+            loaded->vocabSize = config.vocab_size;
+        } else if (qwen4exp) {
+            const auto& config = spec.qwen4exp_text;
+            if (!is_exact_qwen4exp_text_spec(config))
+                throw Error(ErrorCode::UnsupportedModel, "Unsupported Qwen4Exp dimensions");
+            if (config.vocab_size <= 0 || config.max_position_embeddings <= 0)
+                throw Error(ErrorCode::InvalidArgument, "Invalid Qwen4Exp vocabulary or context capacity");
+            options.maxSequenceLength = std::min(options.maxSequenceLength, config.max_position_embeddings);
+            reservation = aila::memory::qwen4exp_session_memory(
                 config, options.maxSequenceLength, options.maxRecurrentSnapshots);
             loaded->vocabSize = config.vocab_size;
         } else {
@@ -585,6 +658,13 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         throw Error(ErrorCode::InvalidArgument, error.what());
     }
     loaded->options = options;
+    enableMtp = enableMtp && options.maxSequenceLength >= 2 && options.maxSequenceLength <= 2048 &&
+        aila::env::read_int("AILA_Q4E_GDN_CHUNK_MODE", 0) == 0 &&
+        !aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", false);
+    if (enableMtp) {
+        reservation.deviceBytes = aila::memory::checked_memory_sum(reservation.deviceBytes,
+            Qwen4ExpMtpRuntime::SessionBytes(options.maxSequenceLength));
+    }
     loaded->sessionReservationBytes = reservation.deviceBytes;
     loaded->sessionHostReservationBytes = reservation.hostBytes;
     // Declare the lock after loaded: a failed load frees resources only after
@@ -594,7 +674,11 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
     auto& context = loaded->device->context;
     ExecutionScope stage(loaded->device->trace.get(), ExecutionStage::ModelLoad, {loaded->traceModelId});
     detail::RunDeviceLifecycle<sycl::exception, dnnl::error>(loaded->device->fault, [&] {
-        loaded->weights = std::make_unique<ModelWeights>(LoadModelWeightsFromDir(modelDirectory, context));
+        // Q4E keeps MoE/PLE tables in the mmap; its backend uploads static
+        // projections and populates the bounded expert cache on demand.
+        loaded->weights = std::make_unique<ModelWeights>(qwen4exp
+            ? LoadModelWeightsLazy(modelDirectory, context)
+            : LoadModelWeightsFromDir(modelDirectory, context));
         if (denseWeights) {
             for (const auto& name : loaded->weights->names()) {
                 const auto& tensor = loaded->weights->get(name);
@@ -605,11 +689,23 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
             }
             loaded->backend = std::make_unique<Qwen35HybridTextBackend>();
         } else if (hybrid) loaded->backend = std::make_unique<Qwen35HybridBnb4Backend>();
+        else if (qwen4exp) loaded->backend = std::make_unique<Qwen4ExpBnb4Backend>();
         else loaded->backend = std::make_unique<Qwen3Bnb4Backend>();
         if (!loaded->backend->load(context, *loaded->weights, spec, options.maxSequenceLength, &error)) {
             throw Error(ErrorCode::UnsupportedModel, error);
         }
+        if (enableMtp) loaded->mtp = std::make_unique<Qwen4ExpMtpRuntime>(context,
+            static_cast<Qwen4ExpBnb4Backend&>(*loaded->backend), *loaded->weights, options.maxSequenceLength);
         loaded->workspace = std::make_unique<detail::ExecutionWorkspace>();
+        if (qwen4exp) {
+            // Shared execution scratch is owned and budgeted once, before decode.
+            loaded->workspace->Ensure(context, options.maxSequenceLength);
+            loaded->workspace->greedyPartials = Tensor::allocate(context,
+                {ops::GreedyGroups * static_cast<int64_t>(sizeof(ops::GreedyResult))},
+                dnnl::memory::data_type::u8);
+            loaded->workspace->greedyResult = Tensor::allocate(context,
+                {static_cast<int64_t>(sizeof(ops::GreedyResult))}, dnnl::memory::data_type::u8);
+        }
     }, [&] { context.synchronize(); });
     ++loaded->device->loadedModels;
     loaded->registeredModel = true;
@@ -627,6 +723,10 @@ std::shared_ptr<SessionState> LoadedModel::CreateSession() {
         return std::make_shared<SessionState>(std::move(backend));
     } else if (state->spec.family == ModelFamily::Qwen35Hybrid) {
         auto backend = std::make_unique<detail::ModelSessionBackend<Qwen35HybridBnb4Backend>>(state);
+        backend->Initialize();
+        return std::make_shared<SessionState>(std::move(backend));
+    } else if (state->spec.family == ModelFamily::Qwen4Exp) {
+        auto backend = std::make_unique<detail::ModelSessionBackend<Qwen4ExpBnb4Backend>>(state);
         backend->Initialize();
         return std::make_shared<SessionState>(std::move(backend));
     } else {

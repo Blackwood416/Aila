@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -125,11 +126,18 @@ struct Qwen4ExpBuffers {
 
     // Linear Attention
     Tensor linear_all;    // [max_seq, 16480]
+    Tensor attn_xq;       // decode-only [max attention projection input] signed bytes
+    Tensor attn_xs;       // decode-only [max attention projection input / 64] f32
 
     // MoE
     Tensor router_scores;      // [max_seq, 512]
 
     Tensor moe_h;              // [10, 640]
+    // Decode-only NF4/Q8 activation scratch; allocated before the first forward.
+    Tensor moe_x_q8;           // [hidden] signed bytes in u8 storage
+    Tensor moe_x_q8_scale;     // [hidden / 64] f32
+    Tensor moe_h_q8;           // [top_k, intermediate] signed bytes in u8 storage
+    Tensor moe_h_q8_scale;     // [top_k, intermediate / 64] f32
     Tensor shared_gate_buf;    // [max_seq, 1]
     Tensor shared_gate_up_buf; // [max_seq, 1280]
     Tensor shared_inter_buf;   // [max_seq, 640]
@@ -171,6 +179,10 @@ public:
         int Capacity() const { return capacity_; }
         uint64_t generation() const { return generation_; }
         void bump_generation() { ++generation_; }
+        // Exact device payload of the tensors this Session owns (Full K/V,
+        // QSA indexer keys, DeltaNet state/conv history, PLE conv state).
+        // Excludes model weights, expert cache and shared execution scratch.
+        std::size_t CacheBytes() const { return cacheBytes_; }
 
         const std::vector<StateSnapshot>& snapshot_slots_for_testing() const { return snapshots_; }
         const StateSnapshot* snapshot_for_testing(int length) const {
@@ -186,6 +198,7 @@ public:
     private:
         friend class Qwen4ExpBnb4Backend;
         friend struct Qwen4ExpMtpProbe;
+        friend class Qwen4ExpMtpRuntime;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
                 std::size_t maxSnapshots);
@@ -194,6 +207,7 @@ public:
         std::shared_ptr<const SessionOwner> owner_;
         int currentLength_ = 0;
         int capacity_ = 0;
+        std::size_t cacheBytes_ = 0;
         uint64_t generation_ = 1;
         int consecutive_no_miss_layers_ = 0;
 
@@ -228,6 +242,9 @@ public:
     ModelFamily family() const override { return ModelFamily::Qwen4Exp; }
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
+    // Qwen4Exp has no cross-session decode batch path; the Model session
+    // backend also excludes ForwardDecodeBatch at compile time.
+    bool SupportsDecodeBatch() const noexcept { return false; }
     Tensor& Forward(Context& ctx, Session& session,
                     const int* tokenIdsDevice, int count,
                     const ForwardOptions& options = {});
@@ -235,6 +252,7 @@ public:
                                 const int* tokenIdsDevice, int count);
     void Reset(Session& session);
     int Truncate(Session& session, int newLength);
+    void PrepareDecodeVerification(Context& ctx);
 
     void init_for_testing(Context& ctx, int num_layers = 4, int max_seq_len = 64) {
         context_ = &ctx;
@@ -299,14 +317,47 @@ public:
     }
 
     const aila::HeteroExecutionStats& hetero_stats() const { return expert_executor_.stats(); }
+    bool LmHeadQ8Enabled() const { return lmHeadQ8Enabled_; }
+    uint64_t LmHeadQ8ForwardCount() const { return lmHeadQ8ForwardCount_; }
+    uint64_t LmHeadQ8RowCount() const { return lmHeadQ8RowCount_; }
     aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
     void SetColdEpochEnabled(bool enabled) { cold_epoch_enabled_=enabled; }
     // Cold acceptance reference only. Drain GPU/CPU work and stop forwards
     // before changing this hook; it is false throughout normal runtime use.
     void SetDecodeHcReferenceForTest(bool enabled) { decodeHcReferenceForTest_ = enabled; }
+    // Forces original resident and attention GPU projection arithmetic. Drain
+    // work before toggling this hook; normal execution leaves it false.
+    void SetGpuNf4Q8ReferenceForTest(bool enabled) { gpuNf4Q8ReferenceForTest_ = enabled; }
+    uint64_t GdnHistoryFusionCount() const { return gdnHistoryFusionCount_; }
+    // Actual submitted projections, ordered linear_all, linear_o, full_qkv, full_o.
+    const std::array<uint64_t, 4>& AttentionNf4Q8ProjectionCounts() const { return attentionNf4Q8ProjectionCounts_; }
+    uint64_t AttentionNf4Q8ProjectionCount() const {
+        return attentionNf4Q8ProjectionCounts_[0] + attentionNf4Q8ProjectionCounts_[1] +
+            attentionNf4Q8ProjectionCounts_[2] + attentionNf4Q8ProjectionCounts_[3];
+    }
 
 private:
     bool decodeHcReferenceForTest_ = false;
+    bool gpuNf4Q8ReferenceForTest_ = false;
+    bool gpuNf4Q8Supported_ = false;
+    bool gpuNf4Q8Logged_ = false;
+    bool attentionNf4Q8Enabled_ = false;
+    uint64_t gdnHistoryFusionCount_ = 0;
+    bool attentionNf4Q8Logged_ = false;
+    std::array<uint64_t, 4> attentionNf4Q8ProjectionCounts_{};
+    bool moeFrontFusedGpu_ = false;
+    bool moeFrontFusedLogged_ = false;
+    // Owns the resident CPU job until Join, including exceptions between its
+    // early submission and the later GPU/cold merge. Declare after route leases.
+    struct ResidentColdWork {
+        aila::Qwen4ExpExpertExecutor& executor;
+        bool active = false;
+        bool completed = false;
+        explicit ResidentColdWork(aila::Qwen4ExpExpertExecutor& value) : executor(value) {}
+        ResidentColdWork(const ResidentColdWork&) = delete;
+        ResidentColdWork& operator=(const ResidentColdWork&) = delete;
+        ~ResidentColdWork() noexcept;
+    };
     // One forward owns this ticket. y/inject remain in their existing buffers
     // until the next HC norm consumes them on the in-order compute queue.
     struct DecodePendingMlpResidual {
@@ -337,9 +388,9 @@ private:
         int pairs, int quads, const sycl::event& ready);
     void RunAttentionLayerTile(Context& ctx, Session& session, int layer,
         Tensor& input, Tensor& output, int count, int startPos,
-        StateSnapshot* interior, int checkpointAfter);
+        StateSnapshot* interior, int checkpointAfter, bool allowQ8 = false);
     void RunAttentionWindow(Context& ctx, Session& session, int layer, int count,
-        int startPos, StateSnapshot* interior, int checkpointAfter);
+        int startPos, StateSnapshot* interior, int checkpointAfter, bool allowQ8 = false);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
@@ -347,7 +398,10 @@ private:
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     friend struct Qwen4ExpMtpProbe;
+    friend class Qwen4ExpMtpDraft;
+    friend class Qwen4ExpMtpRuntime;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
+    void TrimDecodeRuntimeBuffers(Context& ctx);
     void free_pinned_host_buffers();
     sycl::event RunGroupedExperts(Context& ctx, int layer, int count,
         int firstUnique, int numUnique, int& actStart, int& tileStart,
@@ -373,6 +427,13 @@ private:
     int linear_q_heads_ = 16, linear_kv_heads_ = 48, linear_head_dim_ = 128;
     int linear_q_dim_ = 2048, linear_kv_dim_ = 6144, linear_qkv_dim_ = 10240;
     int linear_z_dim_ = 6144, linear_all_dim_ = 16480;
+    // Borrowed MTP window scratch: [layers,4,linear_all_dim]. The runtime or
+    // diagnostic caller owns it through verification and prefix replay.
+    bf16* verification_linear_inputs_for_test_ = nullptr;
+    bf16* verification_router_inputs_for_test_ = nullptr;
+    std::optional<sycl::kernel_bundle<sycl::bundle_state::executable>> verification_attention_pair_bundle_;
+    bool component_profile_active_for_test_ = false;
+    std::array<double, 5> component_profile_ms_for_test_{};
     int qsa_query_tile_ = 64;
 
     Context* context_ = nullptr;
@@ -394,7 +455,8 @@ private:
     sycl::event resident_hot_reader_{};
     void* resident_probe_data_ = nullptr;
     void (*resident_probe_)(void*,Qwen4ExpBnb4Backend&,int) = nullptr;
-    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease = nullptr);
+    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease = nullptr,
+                                  ResidentColdWork* early_cold = nullptr);
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0
     // Otherwise rows are gathered from the mmap per forward: decode needs one 5 KB row, and the
@@ -404,6 +466,15 @@ private:
     uint8_t* embed_host_rows_ = nullptr; // pinned [runtime_seq_capacity_, hidden] bf16
     Tensor lm_head_weight_transposed_;
     Linear lm_head_;
+    // Experimental head replacement. Original host mmap remains owned by the
+    // model weights; no resident BF16 head/oneDNN head exists when enabled.
+    HostTensorView lm_head_host_{};
+    Tensor lm_head_q8_weight_;
+    Tensor lm_head_q8_scale_;
+    Tensor lm_head_q8_input_;
+    Tensor lm_head_q8_input_scale_;
+    bool lmHeadQ8Enabled_ = false;
+    uint64_t lmHeadQ8ForwardCount_ = 0, lmHeadQ8RowCount_ = 0;
     Tensor lastTokenLogits_;
     Tensor unusedLogits_; // Invalid output for forwards that only advance cached state.
 

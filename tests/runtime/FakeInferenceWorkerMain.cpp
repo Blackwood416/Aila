@@ -294,6 +294,14 @@ public:
                                                         worker::InferenceModelOptions options) override {
         return Load(directory, options, true);
     }
+    std::shared_ptr<worker::InferenceModel> LoadQwen4Exp(const std::string& directory,
+                                                      worker::InferenceModelOptions options) override {
+        // Qwen4Exp shares the Hybrid-style CPU fixture: the pipe harness names
+        // its non-Qwen3 directory "fake-pipe-hybrid-model", which this factory
+        // accepts only on the hybrid branch. "fake-pipe-model" is accepted on
+        // either branch, so this also covers the socket fixture.
+        return Load(directory, options, true);
+    }
 private:
     std::shared_ptr<worker::InferenceModel> Load(const std::string& directory,
                                                worker::InferenceModelOptions options, bool hybrid) {

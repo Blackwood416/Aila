@@ -240,6 +240,7 @@ struct ExpertCacheStats {
     uint64_t direct_route_entries = 0;
     uint64_t direct_cold_acquire_ns = 0;
     uint64_t resident_metadata_bytes = 0;
+    uint64_t gpu_mmap_dma_experts = 0, gpu_mmap_dma_copies = 0, gpu_mmap_dma_bytes = 0;
     uint64_t cpu_cold_entries = 0;
     uint64_t epoch_refill_bytes = 0, epoch_swaps = 0, epoch_refill_ns = 0, epoch_publishes = 0;
     uint64_t ready_adoptions = 0, ready_adoption_ns = 0;
@@ -321,9 +322,9 @@ public:
     void TraceColdCpu(int layer,const int* ids,const int* ranks,int count);
     void TraceDeviceEvent(const char* label,int layer,sycl::event event);
     void ConfigureHotset();
-    void BeginHotsetForward(int position, int rows,int prefill_remaining=-1);
-    bool CpuPackedPromptRefreshPending(int position,int rows,int prefill_remaining) const {
-        return cpu_packed_prompt_ && adaptive_hotset_ && hotset_prompt_ && rows==1 && position>0 &&
+    void BeginHotsetForward(int position, int rows,int prefill_remaining=-1,bool decode_verification=false);
+    bool CpuPackedPromptRefreshPending(int position,int rows,int prefill_remaining,bool decode_verification=false) const {
+        return cpu_packed_prompt_ && adaptive_hotset_ && hotset_prompt_ && (rows==1 || decode_verification) && position>0 &&
             prefill_remaining<0 && hotset_policy_.collecting_prompt;
     }
     void ObserveHotsetRoute(int layer,const int* ids,int rows,int topk);
@@ -451,6 +452,9 @@ public:
     size_t host_pool_bytes() const { return host_pool_bytes_; }
 
     ExpertResidency query_residency(int layer, int expert_id) const;
+    // GPU-only placement predicate for coordinator route publication. Avoid
+    // copying SYCL events and unrelated host-pool metadata for every expert.
+    bool HasGpuRouteSource(int layer, int expert_id) const;
     HostExpertLease acquire_host_lease(int layer, int expert_id);
     void release_host_lease(int hslot, uint64_t gen);
     ops::MoeExpertSlotHost get_slot_host(int hslot) const;
@@ -499,7 +503,7 @@ private:
     void ReleaseResidentLayer(GpuResidentLayerLease& lease, bool drain);
     GpuReadyLease BindReadyImpl(int layer, const int* ids, int count, const int* selected_slots);
     sycl::event acquire_impl(int layer, const int* expert_ids, int count,
-                             int* out_slots, bool touch_hits, bool demand = false);
+                             int* out_slots, bool touch_hits, bool demand = false, bool cold_service = false);
     void cleanup();
     FillTicket reserve_host_preparation(int layer, int expert_id, bool& needs_fill);
     void invalidate_host_preparation(const FillTicket& ticket);
@@ -532,6 +536,11 @@ private:
     size_t dn_absmax_offset_ = 0;
     size_t slot_bytes_ = 0;
     bool compact_nested_ = false;
+    bool gpu_mmap_dma_enabled_ = false;
+    bool gpu_mmap_dma_logged_ = false;
+    // Init-only capacity. First segment bounds the full four-copy profiling span;
+    // slot records retain the fourth event as the payload-completion fence.
+    std::vector<sycl::event> gpu_mmap_dma_first_events_;
 
     int num_slots_ = 0;
     size_t dev_pool_bytes_ = 0;

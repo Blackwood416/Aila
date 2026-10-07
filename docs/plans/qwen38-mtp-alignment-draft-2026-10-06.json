@@ -1,0 +1,879 @@
+{
+  "date": "2026-10-06",
+  "device": "Intel Arc A770",
+  "oneapi": "2026.1",
+  "driver": "32.0.101.9033",
+  "scope": "single-run rapid screens, original 1833-token prompt, 128 outputs; not production acceptance",
+  "results": {
+    "mtp-prepare-shadow128": {
+      "prefix": "tmp/mtp-prepare-shadow128",
+      "exit_code": 0,
+      "input": {
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B",
+        "repeats": 1,
+        "prompt_tokens": 30,
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "anchors": 124,
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json"
+      },
+      "env": {
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-prepare-shadow128",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "0",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "1954",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 17.58415619,
+          "target_prompt_ms": 11627.7612,
+          "draft_kv_init_ms": 1239.6151,
+          "prompt_to_output_ms": 20146.6795,
+          "loop_ms": 7279.2802,
+          "first_cycle_ms": 272.003,
+          "confidence_gate": 0,
+          "diagnostic_shadow": true,
+          "post_first_tps": 17.981462140045736,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.319276056338028,
+            "verify_ms": 88.53860704225352,
+            "replay_ms": 1.014450704225352,
+            "cycle_ms": 97.87301267605633
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "22F460ACD557C3CDE56FE65BBCBEBEDF96034D5AC06A537F5CCC70CB6F5C014A"
+    },
+    "mtp-prepare-live128": {
+      "prefix": "tmp/mtp-prepare-live128",
+      "exit_code": 0,
+      "input": {
+        "repeats": 1,
+        "anchors": 124,
+        "prompt_tokens": 30,
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B",
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json"
+      },
+      "env": {
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-prepare-live128",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.58959089,
+          "target_prompt_ms": 11625.123,
+          "draft_kv_init_ms": 1239.7169,
+          "prompt_to_output_ms": 19750.429,
+          "loop_ms": 6885.5738,
+          "first_cycle_ms": 268.4987,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 19.04180863329912,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.377152112676056,
+            "verify_ms": 82.90564788732394,
+            "replay_ms": 1.0156859154929578,
+            "cycle_ms": 92.29912535211268
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "22F460ACD557C3CDE56FE65BBCBEBEDF96034D5AC06A537F5CCC70CB6F5C014A"
+    },
+    "mtp-prepare-control128": {
+      "prefix": "tmp/mtp-prepare-control128",
+      "exit_code": 0,
+      "input": {
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "anchors": 124,
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B",
+        "prompt_tokens": 30,
+        "repeats": 1,
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81"
+      },
+      "env": {
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "0",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-prepare-control128",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.47896493,
+          "target_prompt_ms": 11631.7423,
+          "draft_kv_init_ms": 1275.3139,
+          "prompt_to_output_ms": 19833.8731,
+          "loop_ms": 6926.7949,
+          "first_cycle_ms": 281.2669,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 18.960291641788807,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.340202816901408,
+            "verify_ms": 83.34316901408451,
+            "replay_ms": 1.0102957746478873,
+            "cycle_ms": 92.69442816901409
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "22F460ACD557C3CDE56FE65BBCBEBEDF96034D5AC06A537F5CCC70CB6F5C014A"
+    },
+    "mtp-gdn-decode-live128": {
+      "prefix": "tmp/mtp-gdn-decode-live128",
+      "exit_code": 0,
+      "input": {
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "anchors": 124,
+        "prompt_tokens": 30,
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "repeats": 1,
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B"
+      },
+      "env": {
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_MTP_DRAFT_MARGINS": "1",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-gdn-decode-live128",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.38502731,
+          "target_prompt_ms": 11635.2456,
+          "draft_kv_init_ms": 1248.1013,
+          "prompt_to_output_ms": 19845.5428,
+          "loop_ms": 6962.1871,
+          "first_cycle_ms": 273.4444,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 18.837781539054824,
+          "full_width_warm_cycles": 72,
+          "means": {
+            "advance": 1.7361111111111112,
+            "draft_ms": 8.507976388888888,
+            "verify_ms": 82.67195833333334,
+            "replay_ms": 0.8165152777777778,
+            "cycle_ms": 91.9971375
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "053AE596ADD0C368F8A309717204879964523B3132741636EBF8699A414C520D"
+    },
+    "mtp-confidence-live128": {
+      "prefix": "tmp/mtp-confidence-live128",
+      "exit_code": 0,
+      "input": {
+        "anchors": 124,
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "prompt_tokens": 30,
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "repeats": 1,
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B"
+      },
+      "env": {
+        "AILA_Q4E_MTP_DRAFT_MARGINS": "0",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-confidence-live128",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_MTP_CONFIDENCE_GATE": "1.5",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.78234911,
+          "target_prompt_ms": 11614.2238,
+          "draft_kv_init_ms": 1239.7657,
+          "prompt_to_output_ms": 19668.9181,
+          "loop_ms": 6814.909,
+          "first_cycle_ms": 268.6937,
+          "confidence_gate": 1.5,
+          "diagnostic_shadow": false,
+          "post_first_tps": 19.247983132167466,
+          "full_width_warm_cycles": 52,
+          "means": {
+            "advance": 1.8846153846153846,
+            "draft_ms": 8.698959615384615,
+            "verify_ms": 82.47852307692308,
+            "replay_ms": 0.5032019230769231,
+            "cycle_ms": 91.68149230769231
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "6F737C39E90B6A90B0EB57E9D60066011CD1575A2056A9596A1085AD510A3792"
+    },
+    "mtp-confidence-control128": {
+      "prefix": "tmp/mtp-confidence-control128",
+      "exit_code": 0,
+      "input": {
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "prompt_tokens": 30,
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "repeats": 1,
+        "anchors": 124,
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B"
+      },
+      "env": {
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "0",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_MTP_CONFIDENCE_GATE": "0",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_MTP_DRAFT_MARGINS": "1",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-confidence-control128",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.59689723,
+          "target_prompt_ms": 11645.3607,
+          "draft_kv_init_ms": 1243.3171,
+          "prompt_to_output_ms": 19771.5679,
+          "loop_ms": 6882.8686,
+          "first_cycle_ms": 284.5817,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 19.0960517155029,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.547532394366197,
+            "verify_ms": 82.47184225352113,
+            "replay_ms": 1.0050830985915493,
+            "cycle_ms": 92.02532957746479
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "6F737C39E90B6A90B0EB57E9D60066011CD1575A2056A9596A1085AD510A3792"
+    },
+    "mtp-hidden-pairs-live128": {
+      "prefix": "tmp/mtp-hidden-pairs-live128",
+      "exit_code": 0,
+      "input": {
+        "repeats": 1,
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "anchors": 124,
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B",
+        "prompt_tokens": 30,
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json"
+      },
+      "env": {
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-hidden-pairs-live128",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_MTP_CONFIDENCE_GATE": "0",
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_MTP_DRAFT_MARGINS": "0",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_PROMPT": "30",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.72591644,
+          "target_prompt_ms": 11641.4777,
+          "draft_kv_init_ms": 1203.7498,
+          "prompt_to_output_ms": 19680.6934,
+          "loop_ms": 6835.4465,
+          "first_cycle_ms": 276.0672,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 19.209355724612116,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.307398591549296,
+            "verify_ms": 82.16468732394367,
+            "replay_ms": 1.0042140845070422,
+            "cycle_ms": 91.47712253521127
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "8F749EE188270F17D44C5FBC49C22A4EB4B63342312C7B6F9E9AF842273464D1"
+    },
+    "mtp-hidden-pairs-control128": {
+      "prefix": "tmp/mtp-hidden-pairs-control128",
+      "exit_code": 0,
+      "input": {
+        "prompt_tokens": 30,
+        "repeats": 1,
+        "prompt_sha256": "5B60CB328AFFC2CFB8925D704086621450FA6CB9F2A6EEAFE5FC0782152F587B",
+        "source_sha256": "875EA3DE512610E47130F391A7A77E6828FFB0944F775749275882CF5C67AF81",
+        "kind": "mtp_greedy_conditional_three_draft_probe",
+        "prompt_file": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "anchors": 124
+      },
+      "env": {
+        "AILA_Q4E_MTP_MAX_CONTEXT": "2048",
+        "AILA_Q4E_MTP_REPEATS": "1",
+        "AILA_Q4E_MTP_SLOTS": "64",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_MTP_LIVE_WIDTH": "2",
+        "AILA_Q4E_MTP_COMPARE_RESIDENT": "0",
+        "AILA_Q4E_MTP_WINDOW_SWEEP": "1",
+        "AILA_Q4E_MTP_LIVE_COMPARE_WIDTHS": "0",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_MTP_SHADOW_POSITION": "-1",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_MTP_DRAFT_MARGINS": "0",
+        "AILA_Q4E_MTP_OUTPUT": "E:\\RiderProjects\\Aila\\tmp\\mtp-hidden-pairs-control128",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_MTP_VERIFY_PASSES": "0",
+        "AILA_Q4E_MTP_ANCHORS": "124",
+        "AILA_Q4E_MTP_STATE_ONLY_REPLAY": "1",
+        "AILA_Q4E_MTP_LIVE_PROFILE": "0",
+        "AILA_Q4E_MTP_COMPARE_KV": "0",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_MTP_CONFIDENCE_GATE": "0",
+        "AILA_Q4E_MTP_PROMPT_FILE": "E:\\RiderProjects\\Aila\\tmp\\mtp-archive-cli-system.json",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "0",
+        "AILA_Q4E_MTP_PROMPT": "30"
+      },
+      "live": [
+        {
+          "width": 2,
+          "tokens": 128,
+          "tps": 18.75372611,
+          "target_prompt_ms": 11659.0091,
+          "draft_kv_init_ms": 1239.965,
+          "prompt_to_output_ms": 19724.3002,
+          "loop_ms": 6825.3103,
+          "first_cycle_ms": 270.4121,
+          "confidence_gate": 0,
+          "diagnostic_shadow": false,
+          "post_first_tps": 19.22246619328852,
+          "full_width_warm_cycles": 71,
+          "means": {
+            "advance": 1.7605633802816902,
+            "draft_ms": 8.315639436619719,
+            "verify_ms": 82.09134647887323,
+            "replay_ms": 1.000556338028169,
+            "cycle_ms": 91.4084014084507
+          },
+          "mismatches": [
+            123,
+            124,
+            125,
+            126,
+            127
+          ],
+          "hotset_first": "7625625710176325289",
+          "hotset_last": "7625625710176325289"
+        }
+      ],
+      "stages": {},
+      "cold": {},
+      "actual_prompt_tokens": 1833,
+      "exe_sha256": "8F749EE188270F17D44C5FBC49C22A4EB4B63342312C7B6F9E9AF842273464D1"
+    }
+  },
+  "pairs": [
+    {
+      "candidate": "mtp-prepare-live128",
+      "control": "mtp-prepare-control128",
+      "same_exe": true,
+      "same_generated": true,
+      "same_advance": true,
+      "gain_pct": 0.5986588557262973,
+      "loop_saved_ms": 41.22109999999975,
+      "draft_init_saved_ms": 35.59700000000021,
+      "prompt_to_output_saved_ms": 83.44410000000062
+    },
+    {
+      "candidate": "mtp-confidence-live128",
+      "control": "mtp-confidence-control128",
+      "same_exe": true,
+      "same_generated": true,
+      "same_advance": false,
+      "gain_pct": 0.9972194700352155,
+      "loop_saved_ms": 67.95960000000014,
+      "draft_init_saved_ms": 3.551400000000058,
+      "prompt_to_output_saved_ms": 102.64979999999923
+    },
+    {
+      "candidate": "mtp-hidden-pairs-live128",
+      "control": "mtp-hidden-pairs-control128",
+      "same_exe": true,
+      "same_generated": true,
+      "same_advance": true,
+      "gain_pct": -0.14828877118543415,
+      "loop_saved_ms": -10.136199999999917,
+      "draft_init_saved_ms": 36.21519999999987,
+      "prompt_to_output_saved_ms": 43.606800000001385
+    }
+  ],
+  "shadow": [
+    {
+      "position": 1954,
+      "row": 0,
+      "logit_different": 229120,
+      "max_abs": 0.265625,
+      "b2_top": 1902,
+      "b1_top": 1902,
+      "b2_margin": 1.125,
+      "b1_margin": 1,
+      "b2_1118": 11.4375,
+      "b2_1870": 13.0625,
+      "b1_1118": 11.3125,
+      "b1_1870": 13.0625
+    },
+    {
+      "position": 1955,
+      "row": 1,
+      "logit_different": 198982,
+      "max_abs": 0.125,
+      "b2_top": 1118,
+      "b1_top": 1118,
+      "b2_margin": 0,
+      "b1_margin": 0,
+      "b2_1118": 19.625,
+      "b2_1870": 19.625,
+      "b1_1118": 19.625,
+      "b1_1870": 19.625
+    },
+    {
+      "layer": 0,
+      "different": 123948,
+      "max_abs": 1.341104507e-07
+    },
+    {
+      "layer": 1,
+      "different": 785938,
+      "max_abs": 0.0005595460534
+    },
+    {
+      "layer": 2,
+      "different": 786169,
+      "max_abs": 0.0007044821978
+    },
+    {
+      "layer": 4,
+      "different": 786357,
+      "max_abs": 0.0006323605776
+    },
+    {
+      "layer": 5,
+      "different": 786379,
+      "max_abs": 0.001321092248
+    },
+    {
+      "layer": 6,
+      "different": 786331,
+      "max_abs": 0.001097269356
+    },
+    {
+      "layer": 8,
+      "different": 786367,
+      "max_abs": 0.001016952097
+    },
+    {
+      "layer": 9,
+      "different": 786367,
+      "max_abs": 0.001164183021
+    },
+    {
+      "layer": 10,
+      "different": 786376,
+      "max_abs": 0.001433657482
+    },
+    {
+      "layer": 12,
+      "different": 786362,
+      "max_abs": 0.0007214331999
+    },
+    {
+      "layer": 13,
+      "different": 786415,
+      "max_abs": 0.0007139742374
+    },
+    {
+      "layer": 14,
+      "different": 786382,
+      "max_abs": 0.0006975233555
+    },
+    {
+      "layer": 16,
+      "different": 786400,
+      "max_abs": 0.003287695348
+    },
+    {
+      "layer": 17,
+      "different": 786414,
+      "max_abs": 0.003098636866
+    },
+    {
+      "layer": 18,
+      "different": 786359,
+      "max_abs": 0.002875823528
+    },
+    {
+      "layer": 20,
+      "different": 786404,
+      "max_abs": 0.002348512411
+    },
+    {
+      "layer": 21,
+      "different": 786396,
+      "max_abs": 0.002495706081
+    },
+    {
+      "layer": 22,
+      "different": 786221,
+      "max_abs": 0.002470191568
+    },
+    {
+      "layer": 24,
+      "different": 786408,
+      "max_abs": 0.004143163562
+    },
+    {
+      "layer": 25,
+      "different": 786395,
+      "max_abs": 0.008386629634
+    },
+    {
+      "layer": 26,
+      "different": 786395,
+      "max_abs": 0.007931828499
+    },
+    {
+      "layer": 28,
+      "different": 786414,
+      "max_abs": 0.003491163254
+    },
+    {
+      "layer": 29,
+      "different": 786430,
+      "max_abs": 0.003085792065
+    },
+    {
+      "layer": 30,
+      "different": 786420,
+      "max_abs": 0.006087922491
+    },
+    {
+      "layer": 32,
+      "different": 786419,
+      "max_abs": 0.01111623645
+    },
+    {
+      "layer": 33,
+      "different": 786429,
+      "max_abs": 0.008218359202
+    },
+    {
+      "layer": 34,
+      "different": 786390,
+      "max_abs": 0.005442753434
+    },
+    {
+      "layer": 36,
+      "different": 786420,
+      "max_abs": 0.001917628571
+    },
+    {
+      "layer": 37,
+      "different": 786412,
+      "max_abs": 0.002583503723
+    },
+    {
+      "layer": 38,
+      "different": 786334,
+      "max_abs": 0.009214520454
+    },
+    {
+      "layer": 40,
+      "different": 786346,
+      "max_abs": 0.003608345985
+    },
+    {
+      "layer": 41,
+      "different": 786393,
+      "max_abs": 0.003545515239
+    },
+    {
+      "layer": 42,
+      "different": 786422,
+      "max_abs": 0.002427875996
+    },
+    {
+      "layer": 44,
+      "different": 786385,
+      "max_abs": 0.003620892763
+    },
+    {
+      "layer": 45,
+      "different": 786418,
+      "max_abs": 0.0009013563395
+    },
+    {
+      "layer": 46,
+      "different": 786417,
+      "max_abs": 0.002486465499
+    }
+  ],
+  "limits": [
+    "All measured multirow variants retain output mismatch at indices 123..127 against T1",
+    "Shadow timing is polluted and excluded from speed conclusions",
+    "Threshold selected from one sample; no holdout evidence",
+    "T1 probe request totals include unnecessary draft KV initialization",
+    "No GRF/spill measurements or production scheduler integration"
+  ]
+}

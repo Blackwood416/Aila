@@ -1211,6 +1211,11 @@ std::shared_ptr<InferenceModel> InferenceClient::LoadQwen35Bf16(
     return LoadModel("qwen35_bf16", directory, options, timeout);
 }
 
+std::shared_ptr<InferenceModel> InferenceClient::LoadQwen4Exp(
+    const std::string& directory, InferenceModelOptions options, std::chrono::milliseconds timeout) {
+    return LoadModel("qwen4exp_nf4", directory, options, timeout);
+}
+
 std::shared_ptr<InferenceModel> InferenceClient::LoadModel(
     const std::string& backend, const std::string& directory, InferenceModelOptions options,
     std::chrono::milliseconds timeout) {

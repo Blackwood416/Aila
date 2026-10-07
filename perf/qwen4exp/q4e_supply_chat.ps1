@@ -2,7 +2,9 @@
 .SYNOPSIS
 Run the experimental Qwen3.8 A770 supply candidate in a single-session CLI.
 .DESCRIPTION
-Screening scope: representative 41/47/1833-token inputs and 48 output tokens.
+Screening scope: representative 41/47/1833-token inputs; latest long decode
+screen uses 128 outputs and reached 17.6 tok/s on a warmed request with the
+lightweight asynchronous CPU route eligibility query.
 This is an opt-in experiment, not a validated production dispatch. Real expert
 demand loading remains enabled independently of speculative prefetch.
 Heterogeneous enables mapped NF4-Q8 CPU supply, the zero host pool, short fills
@@ -24,6 +26,17 @@ param(
     [ValidateSet(0,1)][int]$DecodePrefetch = 0,
     [ValidateSet(0,1)][int]$PrefillPrefetch = 0,
     [ValidateSet(0,1)][int]$CpuNf4Q8 = 0,
+    [ValidateRange(1,18)][int]$CpuThreads = 12,
+    [ValidateSet(0,1)][int]$CpuQ8Activation64 = 0,
+    [ValidateSet(0,1)][int]$CpuScaleShift = 0,
+    [ValidateSet(0,1)][int]$CpuA64Specialize = 0,
+    [ValidateSet(0,1)][int]$CpuA64Row2 = 0,
+    [ValidateSet(0,1)][int]$CpuAsyncRoute = 0,
+    [ValidateSet(0,1)][int]$CpuLightRoute = 0,
+    [ValidateSet(0,1)][int]$GdnHistoryFused = 0,
+    [ValidateSet(0,1)][int]$CpuResultHostRead = 0,
+    [ValidateSet(0,1)][int]$LmHeadQ8 = 0,
+    [ValidateRange(0,512)][int]$HotsetPromptSwaps = 0,
     [ValidateSet(0,1)][int]$CpuNf4Q8Row4 = 0,
     [ValidateSet(0,1)][int]$CpuNf4Q8Block64 = 0,
     [ValidateRange(0,8)][int]$CpuQ8Chunks = 0,
@@ -56,6 +69,11 @@ if ($Heterogeneous) {
     if (-not $PSBoundParameters.ContainsKey('CpuMmapCold')) { $CpuMmapCold = 1 }
     if (-not $PSBoundParameters.ContainsKey('FillShortParts')) { $FillShortParts = 1 }
     if (-not $PSBoundParameters.ContainsKey('DecodePendingMlpResidual')) { $DecodePendingMlpResidual = 1 }
+    if (-not $PSBoundParameters.ContainsKey('CpuThreads')) { $CpuThreads = 18 }
+    foreach ($knob in @('CpuQ8Activation64','CpuScaleShift','CpuA64Specialize','CpuA64Row2','CpuAsyncRoute','CpuLightRoute','GdnHistoryFused')) {
+        if (-not $PSBoundParameters.ContainsKey($knob)) { Set-Variable -Name $knob -Value 1 }
+    }
+    if (-not $PSBoundParameters.ContainsKey('HotsetPromptSwaps')) { $HotsetPromptSwaps = 512 }
 }
 . (Join-Path $PSScriptRoot '../PerfCommon.ps1')
 $repo = Get-AilaRepoRoot
@@ -94,17 +112,35 @@ $candidate = @{
     AILA_Q4E_HOTSET_PROFILE = $profile; AILA_Q4E_HOTSET_INTERVAL = '4'
     AILA_Q4E_HOTSET_SWAPS = [string]$HotsetSwaps; AILA_Q4E_HOTSET_BORROW = '1'
     AILA_Q4E_HOTSET_COLD_QUEUE = '2'; AILA_Q4E_HOTSET_RING = '1'
-    AILA_Q4E_HOTSET_PROMPT = '1'; AILA_Q4E_HOTSET_PROMPT_SWAPS = '0'
+    AILA_Q4E_HOTSET_PROMPT = '1'; AILA_Q4E_HOTSET_PROMPT_SWAPS = [string]$HotsetPromptSwaps
     AILA_Q4E_HOTSET_PROMPT_PREFILL = '0'; AILA_Q4E_HOTSET_ADOPT_READY = '1'
     AILA_Q4E_HOTSET_ADOPT_LIMIT = '4096'; AILA_Q4E_RESIDENT_PREFILL = '1'
     AILA_Q4E_RESIDENT_DECODE = '2'; AILA_Q4E_COLD_MODE = '2'
     AILA_Q4E_COLD_POLICY = [string]$ColdPolicy; AILA_Q4E_CPU_MAX_EXPERTS = '10'
     AILA_Q4E_COLD_PCIE_NUM = [string]$ColdPcieNum; AILA_Q4E_COLD_BUDGET_US = '1000'
-    AILA_Q4E_CPU_THREADS = '12'; AILA_Q4E_COLD_LOW_RANK = '0'
+    AILA_Q4E_CPU_THREADS = [string]$CpuThreads; AILA_Q4E_COLD_LOW_RANK = '0'
     AILA_Q4E_CPU_NF4_Q8 = [string]$CpuNf4Q8; AILA_Q4E_CPU_MMAP_COLD = [string]$CpuMmapCold
     AILA_Q4E_CPU_NF4_Q8_ROW4 = [string]$CpuNf4Q8Row4
     AILA_Q4E_CPU_NF4_Q8_BLOCK64 = [string]$CpuNf4Q8Block64
     AILA_Q4E_CPU_Q8_CHUNKS = [string]$CpuQ8Chunks
+    AILA_Q4E_CPU_Q8_ACTIVATION64 = [string]$CpuQ8Activation64
+    AILA_Q4E_CPU_SCALE_SHIFT = [string]$CpuScaleShift
+    AILA_Q4E_CPU_A64_SPECIALIZE = [string]$CpuA64Specialize
+    AILA_Q4E_CPU_A64_ROW2 = [string]$CpuA64Row2
+    AILA_Q4E_CPU_ASYNC_ROUTE = [string]$CpuAsyncRoute
+    AILA_Q4E_CPU_LIGHT_ROUTE = [string]$CpuLightRoute
+    AILA_Q4E_CPU_PER_EXPERT_DAG = '0'; AILA_Q4E_CPU_TILE_POOL = '0'; AILA_Q4E_CPU_SCALE_REGISTER = '0'
+    AILA_BNB4_GEMV_INPUT_PREFETCH_OFF = '0'; AILA_Q4E_VRAM_RESERVE_MB = '2560'
+    AILA_Q4E_GDN_HISTORY_FUSED = [string]$GdnHistoryFused
+    AILA_Q4E_CPU_RESULT_HOST_READ = [string]$CpuResultHostRead
+    AILA_Q4E_LM_HEAD_Q8 = [string]$LmHeadQ8
+    AILA_Q4E_MOE_FRONT_FUSED = '0'; AILA_Q4E_GPU_NF4_Q8 = '0'; AILA_Q4E_ATTN_NF4_Q8 = '0'
+    AILA_Q4E_CPU_HANDOFF_SPIN_US = '0'; AILA_Q4E_CPU_RESULT_PACKET = '0'
+    AILA_Q4E_GPU_MMAP_DMA = '0'; AILA_Q4E_CPU_SCALE_CACHE_MB = '0'; AILA_Q4E_DECODE_TRIM_CAP = '0'
+    AILA_BNB4_GEMV_WG = '256'
+    UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'; SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
+    SYCL_UR_USE_LEVEL_ZERO_V2 = '0'; UR_L0_DEVICE_SCOPE_EVENTS = '0'; SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS = '0'
+    UR_L0_BATCH_SIZE = '0'; SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '0'
     AILA_Q4E_ROUTER_RESIDENT_FUSED = [string]$RouterResidentFused
     AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL = [string]$DecodePendingMlpResidual
     AILA_Q4E_HC_DECODE_DOWN_WG = [string]$HcDownWorkGroup
@@ -154,6 +190,7 @@ try {
     Write-Host "Experimental supply: chunk=$PrefillChunk swaps=$HotsetSwaps prefetch(decode/prefill)=$DecodePrefetch/$PrefillPrefetch Ready-adopt=4096 host-pool=${HostRamMB}MiB"
     Write-Host "CPU NF4-Q8=$CpuNf4Q8 mapped-cold=$CpuMmapCold source-prefetch=$CpuMmapPrefetch source-touch=$CpuMmapTouch complementary-host=$HostComplement fill-parts=$FillParts short-parts=$FillShortParts"
     Write-Host "CPU row4=$CpuNf4Q8Row4 block64=$CpuNf4Q8Block64 chunks=$CpuQ8Chunks resident-router-fused=$RouterResidentFused"
+    Write-Host "Decode: CPU threads=$CpuThreads A64=$CpuQ8Activation64 specialize=$CpuA64Specialize row2=$CpuA64Row2 async=$CpuAsyncRoute light-route=$CpuLightRoute GDN-history=$GdnHistoryFused host-read=$CpuResultHostRead head-Q8=$LmHeadQ8"
     Write-Host "GPU expert-cache=${ExpertCacheMB}MiB (0=automatic)"
     Write-Host "Decode pending MLP residual=$DecodePendingMlpResidual"
     Write-Host "HC down work group=$HcDownWorkGroup up parallel streams=$HcUpParallelStreams"

@@ -1,6 +1,8 @@
 #include "Qwen4ExpBnb4Backend.hpp"
 #include "../ops/QsaIndexerOps.hpp"
+#include "../ops/Qwen4ExpAttentionPair.hpp"
 #include "../utils/EnvUtils.hpp"
+#include "../profile/Profiling.hpp"
 #include <algorithm>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -11,7 +13,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 // until ForwardImpl completes the window. KV/GDN state is always session-owned.
 void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
     Context& ctx, Session& session, int L, Tensor& input, Tensor& output,
-    int count, int start_pos, StateSnapshot* interior, int checkpoint_after) {
+    int count, int start_pos, StateSnapshot* interior, int checkpoint_after, bool allowQ8) {
     auto& layer = layers_[L];
     auto& cache = session.layerCaches_[L];
     const int cached_len = start_pos + count;
@@ -21,6 +23,28 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
     auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& x, Tensor& y) {
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, x, y, count);
         else projection.forward(ctx, linear_scratch_, x, y, count);
+    };
+    const bool attention_q8 = allowQ8 && count == 1 && !interior && attentionNf4Q8Enabled_ &&
+        !gpuNf4Q8ReferenceForTest_ && !decodeHcReferenceForTest_;
+    auto project_decode = [&](Bnb4BitLinear& projection, Tensor& x, Tensor& y, int kind) {
+        const int features = projection.in_features();
+        if (attention_q8 && projection.SupportsDecodeQ8() && features > 0 && features % 64 == 0 &&
+            buf_.attn_xq.valid() && buf_.attn_xs.valid() &&
+            buf_.attn_xq.numel() >= features && buf_.attn_xs.numel() >= features / 64) {
+            ops::quantize_moe_input_q8_64(ctx, x.data_as<bf16>(), buf_.attn_xq.data_as<int8_t>(),
+                buf_.attn_xs.data_as<float>(), features);
+            if (projection.TryForwardDecodeQ8(ctx, buf_.attn_xq.data_as<int8_t>(),
+                buf_.attn_xs.data_as<float>(), y.data_as<bf16>())) {
+                ++attentionNf4Q8ProjectionCounts_[kind];
+                if (!attentionNf4Q8Logged_) {
+                    AILA_LOG_INFO("[Q4E Attention NF4Q8] actual_enabled=1 layer=%d projection=%d input=%d output=%d activation_block=64",
+                        L, kind, features, projection.out_features());
+                    attentionNf4Q8Logged_ = true;
+                }
+                return;
+            }
+        }
+        projection.ForwardDecodeRows(ctx, linear_scratch_, x, y, 1);
     };
     // 2.2. Attention Computation
     if (layer.is_linear) {
@@ -37,20 +61,50 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         d_state.device_state_dirty = cache.device_state_dirty;
 
         if (count == 1) {
-            layer.linear_all_proj.ForwardDecodeRows(ctx, linear_scratch_, input, buf_.linear_all, 1);
+            project_decode(layer.linear_all_proj, input, buf_.linear_all, 0);
             bf16* linear_all_ptr = static_cast<bf16*>(buf_.linear_all.data());
             const bf16* qkv_ptr = linear_all_ptr;
             const bf16* z_ptr = linear_all_ptr + linear_qkv_dim_;
             const bf16* a_ptr = linear_all_ptr + linear_qkv_dim_ + linear_z_dim_;
             const bf16* b_ptr = linear_all_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_;
 
+            static const bool s_gdn_history_fused = aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", false);
+            const bool defer_history = s_gdn_history_fused && allowQ8 && !attention_q8 && !interior &&
+                !gpuNf4Q8ReferenceForTest_ && !decodeHcReferenceForTest_ &&
+                ops::supports_default_grouped_linear_delta_fastpath(layer.geom.q_heads, layer.geom.v_heads,
+                    layer.geom.head_k_dim, layer.geom.head_v_dim, layer.geom.kernel, layer.geom.conv_rows);
+            const int history_row = layer.geom.conv_rows > 0 ? d_state.conv_head % layer.geom.conv_rows : 0;
             ops::run_linear_delta_decode_gpu(ctx, layer.geom, d_weights, d_state,
                                              qkv_ptr, z_ptr, a_ptr, b_ptr,
-                                             static_cast<bf16*>(buf_.attn_out.data()));
+                                             static_cast<bf16*>(buf_.attn_out.data()), defer_history);
 
-            layer.linear_o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, output, 1);
+            if (defer_history && layer.linear_o_proj.TryForwardDecodeCommitHistory(ctx, buf_.attn_out, output,
+                qkv_ptr, d_state.conv_state, layer.geom.qkv_dim, history_row)) {
+                if (gdnHistoryFusionCount_++ == 0)
+                    AILA_LOG_INFO("[Q4E GDN History Fused] actual_enabled=1 layer=%d channels=%d original_projection_math=1", L, layer.geom.qkv_dim);
+            } else {
+                // Includes LoRA/nonpacked fallback: the deferred ring write
+                // still completes exactly once, before any subsequent reader.
+                if (defer_history) ops::commit_linear_conv_history(ctx, qkv_ptr, layer.geom.qkv_dim,
+                    d_state.conv_state, layer.geom.qkv_dim, layer.geom.conv_rows, history_row, 1);
+                project_decode(layer.linear_o_proj, buf_.attn_out, output, 1);
+            }
         } else {
+            auto component_begin = [&] {
+                if (!component_profile_active_for_test_) return std::chrono::steady_clock::time_point{};
+                ctx.synchronize(); return std::chrono::steady_clock::now();
+            };
+            auto component_end = [&](int index, auto begin) {
+                if (!component_profile_active_for_test_) return;
+                ctx.synchronize();
+                component_profile_ms_for_test_[index] += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+            };
+            auto component_start = component_begin();
             project_prefill(layer.linear_all_proj, input, buf_.linear_all);
+            component_end(0,component_start);
+            if (verification_linear_inputs_for_test_ && allowQ8 && count <= 4 && !interior)
+                ctx.queue().memcpy(verification_linear_inputs_for_test_ + size_t(L) * 4 * linear_all_dim_,
+                    buf_.linear_all.data(), size_t(count) * linear_all_dim_ * sizeof(bf16));
             const auto run_range = [&](int offset, int length) {
                 const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
                 bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
@@ -59,10 +113,12 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         gdn_chunk_scratch_, input, output, length, gdn_chunk_mode_ == 2)) {
                     ++gdn_chunk_calls_;
                 } else {
+                    static const bool verify_gdn_order = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
                     ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
-                                                             input, output, length);
+                        input, output, length, verify_gdn_order && allowQ8 && count <= 4 && !interior);
                 }
             };
+            component_start = component_begin();
             if (interior) {
                 run_range(0, checkpoint_after);
                 auto& snapshot = interior->layers[L];
@@ -76,13 +132,16 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             } else {
                 run_range(0, count);
             }
+            component_end(1,component_start);
+            component_start = component_begin();
             project_prefill(layer.linear_o_proj, buf_.attn_out, output);
+            component_end(2,component_start);
         }
         cache.linear_conv_head = d_state.conv_head;
         cache.device_state_dirty = d_state.device_state_dirty;
     } else {
         if (count == 1) {
-            layer.qkv_proj.ForwardDecodeRows(ctx, linear_scratch_, input, buf_.full_qkv, 1);
+            project_decode(layer.qkv_proj, input, buf_.full_qkv, 2);
             bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
             Tensor q_gate_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
             Tensor k_view = Tensor::view(ctx, fused_ptr + full_q_proj_dim_, {1, (int64_t)full_kv_dim_});
@@ -190,7 +249,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 &buf_.decode_attn_partials, &buf_.z, active_indices, num_active_tokens,
                 active_blocks, num_active_blocks);
 
-            layer.o_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.attn_out, output, 1);
+            project_decode(layer.o_proj, buf_.attn_out, output, 3);
         } else {
             const bool has_qsa_indexer = layer.index_qk_weight && layer.index_q_norm_weight &&
                                          layer.index_k_norm_weight && cache.indexer_k.valid();
@@ -220,24 +279,48 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             }
 
             project_prefill(layer.qkv_proj, input, buf_.full_qkv);
-            ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
-                            full_q_heads_, full_kv_heads_, full_head_dim_);
+            static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", false);
+            if (verify_decode_prepare && allowQ8 && !interior && count == 2 && start_pos > 0 && !sparse_prefill) {
+                // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode.
+                // Reuse the packed projection and existing output banks; no USM scratch.
+                for (int r = 0; r < count; ++r) {
+                    bf16* packed = buf_.full_qkv.data_as<bf16>() + size_t(r) * (full_q_proj_dim_ + 2 * full_kv_dim_);
+                    const int q_dim = full_q_heads_ * full_head_dim_;
+                    auto qg = Tensor::view(ctx, packed, {1, full_q_proj_dim_});
+                    auto k = Tensor::view(ctx, packed + full_q_proj_dim_, {1, full_kv_dim_});
+                    auto v = Tensor::view(ctx, packed + full_q_proj_dim_ + full_kv_dim_, {1, full_kv_dim_});
+                    auto q = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(r) * q_dim, {1, q_dim});
+                    auto z = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(r) * q_dim, {1, q_dim});
+                    ops::decode_prepare_qgkv_packed_partial(
+                        ctx, qg, k, v, q, z, *layer.q_norm_weight, *layer.k_norm_weight,
+                        cache.k, cache.v, start_pos + r, full_q_heads_, full_kv_heads_, full_head_dim_,
+                        cfg_.rms_norm_eps, full_rotary_dim, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                        (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                        (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                        (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                        session.mropePromptLength_, session.mropeTextPositionDelta_,
+                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                }
+            } else {
+                ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
+                                full_q_heads_, full_kv_heads_, full_head_dim_);
 
-            ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight, cfg_.rms_norm_eps, count, full_q_heads_, full_head_dim_);
-            ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight, cfg_.rms_norm_eps, count, full_kv_heads_, full_head_dim_);
+                ops::head_rms_norm(ctx, buf_.q, *layer.q_norm_weight, cfg_.rms_norm_eps, count, full_q_heads_, full_head_dim_);
+                ops::head_rms_norm(ctx, buf_.k, *layer.k_norm_weight, cfg_.rms_norm_eps, count, full_kv_heads_, full_head_dim_);
 
-            ops::apply_rope_partial(ctx, buf_.q, buf_.k, count, start_pos,
-                                    full_q_heads_, full_kv_heads_, full_head_dim_, full_rotary_dim,
-                                    cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
-                                    (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr), (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr), (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
-                                    session.mropePromptLength_, session.mropeTextPositionDelta_,
-                                    cfg_.rope.mrope_section[0],
-                                    cfg_.rope.mrope_section[1],
-                                    cfg_.rope.mrope_section[2]);
+                ops::apply_rope_partial(ctx, buf_.q, buf_.k, count, start_pos,
+                                        full_q_heads_, full_kv_heads_, full_head_dim_, full_rotary_dim,
+                                        cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                                        (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr), (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr), (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                                        session.mropePromptLength_, session.mropeTextPositionDelta_,
+                                        cfg_.rope.mrope_section[0],
+                                        cfg_.rope.mrope_section[1],
+                                        cfg_.rope.mrope_section[2]);
 
-            if (count > 1) {
-                ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
-                ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
+                if (count > 1) {
+                    ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
+                    ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
+                }
             }
 
             if (sparse_prefill) {
@@ -390,7 +473,37 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         cache.num_compressed_blocks = total_complete_blocks;
                     }
                 }
-                if (start_pos == 0) {
+                static const bool verify_decode_attention = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", false);
+                static const bool verify_attention_pair = aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR", false);
+                static const int decode_window = aila::env::read_int_raw("AILA_ATTN_DECODE_WINDOW", 0);
+                static const int decode_sink = aila::env::read_int_raw("AILA_ATTN_DECODE_SINK", 0);
+                if (verify_decode_attention && verify_attention_pair && allowQ8 && count == 2 &&
+                    start_pos+1 >= 1024 && !interior && decode_window <= 0 && decode_sink <= 0 &&
+                    cache.k.dtype()==dnnl::memory::data_type::bf16 &&
+                    buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272) {
+                    static const bool logged=[] {
+                        AILA_LOG_INFO("[Q4E VerifyAttentionPair] active=1 rows=2 bf16_kv_reuse=1 phase_scratch_reuse=1");
+                        return true;
+                    }();
+                    (void)logged;
+                    ops::q4e_attention_decode_pair(ctx,buf_.q,cache.k,cache.v,buf_.attn_out,
+                        buf_.incr_scores,start_pos+1,buf_.z,
+                        verification_attention_pair_bundle_ ? &*verification_attention_pair_bundle_ : nullptr);
+                } else if (verify_decode_attention && allowQ8 && count <= 4 && !interior &&
+                    decode_window <= 0 && decode_sink <= 0) {
+                    // Verification queries share KV storage but each sees only its
+                    // own causal prefix. Reuse decode's exact-merge and fused gate;
+                    // the in-order queue safely reuses the single-row scratch.
+                    const int q_dim = full_q_heads_ * full_head_dim_;
+                    for (int row = 0; row < count; ++row) {
+                        auto q_row = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        auto z_row = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        auto out_row = Tensor::view(ctx, buf_.attn_out.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        ops::attention_decode(ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
+                            full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + row + 1,
+                            &buf_.decode_attn_partials, &z_row);
+                    }
+                } else if (start_pos == 0) {
                     ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
                 } else {
                     ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
@@ -403,10 +516,10 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
 
 void Qwen4ExpBnb4Backend::RunAttentionWindow(
     Context& ctx, Session& session, int layer, int count, int start_pos,
-    StateSnapshot* interior, int checkpoint_after) {
+    StateSnapshot* interior, int checkpoint_after, bool allowQ8) {
     if (prefill_attention_tile_ == 0 || count <= prefill_attention_tile_) {
         RunAttentionLayerTile(ctx, session, layer, buf_.x, buf_.y,
-                              count, start_pos, interior, checkpoint_after);
+                              count, start_pos, interior, checkpoint_after, allowQ8);
         return;
     }
     for (int offset = 0; offset < count;) {
@@ -417,7 +530,7 @@ void Qwen4ExpBnb4Backend::RunAttentionWindow(
         Tensor output = Tensor::view(ctx, buf_.y.data_as<bf16>() + size_t(offset)*hidden_size_, {rows, hidden_size_});
         const bool capture = interior && checkpoint_after > offset && checkpoint_after <= offset + rows;
         RunAttentionLayerTile(ctx, session, layer, input, output, rows, start_pos + offset,
-                              capture ? interior : nullptr, capture ? checkpoint_after - offset : 0);
+                              capture ? interior : nullptr, capture ? checkpoint_after - offset : 0, false);
         offset += rows;
     }
 }

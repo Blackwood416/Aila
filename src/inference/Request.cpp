@@ -167,6 +167,7 @@ StepResult RequestState::Finish(RequestStatus status, std::string_view error,
     snapshot.error.clear();
     if (errorSize) snapshot.error.assign(error.data(), errorSize);
     pendingToken = -1;
+    verifiedBonus.reset();
     if (ownsSession) {
         ownsSession = false;
         session->Release();
@@ -174,7 +175,7 @@ StepResult RequestState::Finish(RequestStatus status, std::string_view error,
     return {status, std::nullopt, true};
 }
 
-StepResult RequestState::Step() {
+StepResult RequestState::Step(size_t outputSlots) {
     // A deferred log callback may release the caller's last request handle.
     // Keep this object alive until the step flag and all other guards unwind.
     auto keepAlive = shared_from_this();
@@ -190,7 +191,7 @@ StepResult RequestState::Step() {
     aila::ScopedLogDeferral deferLogs;
     std::lock_guard<std::mutex> lock(stepMutex);
 
-    return StepLocked();
+    return StepLocked(outputSlots);
 }
 
 bool RequestState::PrepareThinkingClose() {
@@ -241,16 +242,16 @@ StepResult RequestState::PublishSample(ExecutionResult result, bool closeExceeds
     return {snapshot.status, result.tokenId, false};
 }
 
-StepResult RequestState::StepLocked() {
+StepResult RequestState::StepLocked(size_t outputSlots) {
 
     if (IsTerminal(snapshot.status)) {
         return {snapshot.status, std::nullopt, false};
     }
-    if (cancelRequested.load(std::memory_order_acquire)) {
-        return Finish(RequestStatus::Cancelled);
-    }
-
     try {
+        if (cancelRequested.load(std::memory_order_acquire)) {
+            if (usedDecodeWindow) session->ResetCancelledWindow();
+            return Finish(RequestStatus::Cancelled);
+        }
         ExecutionResult result;
         SamplingInput sampling{options.generation, snapshot.generatedIds, rng,
                                options.forceHostSampling, options.legacyPrefillLogits};
@@ -277,9 +278,41 @@ StepResult RequestState::StepLocked() {
                 return Finish(RequestStatus::Completed, {}, std::nullopt, RequestEndReason::Length);
             }
         } else if (snapshot.status == RequestStatus::Decode) {
+            if (verifiedBonus) {
+                result.tokenId = *verifiedBonus;
+                verifiedBonus.reset();
+                return PublishSample(std::move(result), false);
+            }
+            const auto& g = options.generation;
+            const bool eligible = outputSlots >= 2 && session->SupportsDecodeWindow() && !g.do_sample &&
+                g.repetition_penalty == 1.0f && g.presence_penalty == 0.0f && g.frequency_penalty == 0.0f &&
+                !options.thinkingBudget && !options.forceHostSampling && !options.legacyPrefillLogits &&
+                size_t(g.max_new_tokens) - snapshot.generatedIds.size() >= 2;
+            if (eligible) {
+                auto window = session->ExecuteWindow(pendingToken, [&](int first) {
+                    return !cancelRequested.load(std::memory_order_acquire) &&
+                        std::find(options.stopTokenIds.begin(), options.stopTokenIds.end(), first) == options.stopTokenIds.end();
+                });
+                if (window) {
+                    usedDecodeWindow = true;
+                    pendingToken = -1;
+                    if (cancelRequested.load(std::memory_order_acquire)) {
+                        session->ResetCancelledWindow();
+                        return Finish(RequestStatus::Cancelled);
+                    }
+                    result.tokenId = window->tokenId;
+                    auto published = PublishSample(std::move(result), false);
+                    if (window->firstTokenCached && !IsTerminal(published.status)) {
+                        pendingToken = -1;
+                        verifiedBonus = window->bonusTokenId;
+                    }
+                    return published;
+                }
+            }
             result = session->Execute({pendingToken}, nextSample);
             pendingToken = -1;
             if (cancelRequested.load(std::memory_order_acquire)) {
+                if (usedDecodeWindow) session->ResetCancelledWindow();
                 return Finish(RequestStatus::Cancelled);
             }
         } else if (snapshot.status == RequestStatus::Finalizing) {
@@ -287,6 +320,8 @@ StepResult RequestState::StepLocked() {
             // completed session is ready for an appended prompt without replay.
             session->Execute({pendingToken}, nullptr);
             pendingToken = -1;
+            if (usedDecodeWindow && cancelRequested.load(std::memory_order_acquire))
+                session->ResetCancelledWindow();
             return Finish(cancelRequested.load(std::memory_order_acquire)
                               ? RequestStatus::Cancelled
                               : RequestStatus::Completed, {}, std::nullopt, RequestEndReason::Length);

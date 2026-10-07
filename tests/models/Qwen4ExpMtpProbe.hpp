@@ -1,6 +1,7 @@
 #include "ops/QsaIndexerOps.hpp"
+#include "Qwen4ExpGreedyProbe.hpp"
 
-// Diagnostic only: checkpoint-backed Q4E MTP, dense-QSA range (positions < 640).
+// Diagnostic only: checkpoint-backed Q4E MTP, guarded dense-QSA range.
 // Semantics source: vLLM qwen4_exp/nvidia/mtp.py, residual_linear_shared,
 // scheme A. Target/draft share embedding and LM head, but never KV state.
 struct Qwen4ExpMtpProbe {
@@ -67,7 +68,8 @@ struct Qwen4ExpMtpProbe {
     }
     explicit Qwen4ExpMtpProbe(InferenceEngine& engine,int cap)
         :ctx(Access::Ctx(engine)),target(Access::Backend(engine)),weights(Access::Weights(engine)),capacity(cap) {
-        Require(cap>0 && cap<=640,"MTP probe only supports dense-QSA text positions <=640");
+        Require(cap>0 && cap<=2048 && cap<=target.cfg_.indexer_budget,
+            "MTP probe requires dense-QSA text positions within the model indexer budget");
         const auto before=ctx.current_allocated_bytes(), hostBefore=ctx.current_pinned_host_bytes();
         normEmbedding=Norm("mtp.pre_fc_norm_embedding.weight");
         normHidden=Norm("mtp.pre_fc_norm_hidden.weight");
@@ -312,4 +314,421 @@ struct Qwen4ExpMtpProbe {
         std::cout<<"[MTP STATE] {\"bytes\":"<<size<<",\"copies_per_direction\":"<<spans.size()<<",\"anchor\":"<<length<<",\"capture_ms\":";
         print(capMs);std::cout<<",\"restore_ms\":";print(restoreMs);std::cout<<",\"replay_bitwise\":true,\"transport_only\":true,\"live_usm_delta\":0}\n";
     }
+    void RunLive(InferenceEngine& engine, const std::vector<int>& prompt, const std::vector<int>& tokens,
+        int maxNew, int liveWidth, Tensor& ids, Tensor& targetHidden, Tensor& draftHidden) {
+        auto& draft = *this;
+        const int promptCount = int(prompt.size());
+        const bool liveProfile = aila::env::read_flag("AILA_Q4E_MTP_LIVE_PROFILE", false);
+        const bool selectProfile = liveProfile || aila::env::read_flag("AILA_Q4E_MTP_SELECT_PROFILE", false);
+        static const bool verifyGdnOrder = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
+        const int shadowPosition = aila::env::read_int("AILA_Q4E_MTP_SHADOW_POSITION", -1);
+        const bool draftMargins = aila::env::read_flag("AILA_Q4E_MTP_DRAFT_MARGINS", false);
+        const bool gpuGreedy = aila::env::read_flag("AILA_Q4E_MTP_GPU_GREEDY", false);
+        const bool greedyRows = aila::env::read_flag("AILA_Q4E_MTP_GREEDY_ROWS", false);
+        const bool skipDraftTail = aila::env::read_flag("AILA_Q4E_MTP_SKIP_DRAFT_TAIL", false);
+        Require(!greedyRows || gpuGreedy, "Batched greedy needs GPU greedy");
+        Require(!gpuGreedy || (!draftMargins && shadowPosition < 0), "GPU greedy probe excludes margin and shadow diagnostics");
+        double lastDraftMargin = -1;
+        double selectCopyMs = 0, selectCpuMs = 0;
+        std::vector<bf16> hostLogits(target.vocab_size());
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto elapsed = [&](auto start) { return std::chrono::duration<double,std::milli>(now()-start).count(); };
+        auto printInts = [](const auto& v) { std::cout << '['; for(size_t i=0;i<v.size();++i) { if(i)std::cout<<','; std::cout<<v[i]; } std::cout<<']'; };
+        Require(liveWidth == 1 || liveWidth == 2 || liveWidth == 4, "MTP live width must be 1, 2 or 4");
+        // Bounded end-to-end experiment: real proposals, greedy verification,
+        // and snapshot/replay of a rejected suffix. No scheduler integration.
+        auto& session = Access::Session(engine);
+        struct Span { void* runtime; size_t offset, bytes; };
+        std::vector<Span> spans; size_t stateBytes = 0;
+        for (auto& cache : session.layerCaches_) for (auto* t : {&cache.linear_state, &cache.linear_conv_state})
+            if (t->valid()) {spans.push_back({t->data(),stateBytes,t->size_bytes()});stateBytes+=t->size_bytes();}
+        spans.push_back({session.ple_state_.conv_state.data(), stateBytes, session.ple_state_.conv_state.size_bytes()});
+        stateBytes += session.ple_state_.conv_state.size_bytes();
+        auto checkpoint = Tensor::allocate(ctx, {int64_t(stateBytes)}, dnnl::memory::data_type::u8);
+        const bool stateOnly = aila::env::read_flag("AILA_Q4E_MTP_STATE_ONLY_REPLAY", false);
+        uint64_t checkpointCopyBytes=0;
+        Tensor linearInputs, plePrefix, routerInputs, greedyPartials, greedyResult;
+        if (gpuGreedy) {
+            greedyPartials = Tensor::allocate(ctx,{4 * mtp_probe::GreedyGroups * int64_t(sizeof(mtp_probe::GreedyResult))},dnnl::memory::data_type::u8);
+            greedyResult = Tensor::allocate(ctx,{4 * int64_t(sizeof(mtp_probe::GreedyResult))},dnnl::memory::data_type::u8);
+        }
+        if (shadowPosition > 0)
+            routerInputs = Tensor::allocate(ctx, {int64_t(target.layers_.size()), 2, target.hidden_size_}, dnnl::memory::data_type::bf16);
+        if (stateOnly) {
+            linearInputs = Tensor::allocate(ctx, {int64_t(target.layers_.size()), 4, target.linear_all_dim_}, dnnl::memory::data_type::bf16);
+            plePrefix = Tensor::allocate(ctx, {4, 10240}, dnnl::memory::data_type::f32);
+        }
+        // Declared after storage: drain queued copies before its destructor.
+        struct LiveDrain { Context& ctx; ~LiveDrain() { try { ctx.synchronize(); } catch (...) {} } } liveDrain{ctx};
+        Require(!stateOnly || target.gdn_chunk_mode_ == 0, "MTP state-only replay requires the batched GDN path");
+        std::vector<int> convHeads(session.layerCaches_.size()), blocks(convHeads.size());
+        std::array<int, 2> pleTokens{}; int pleHead = 0, length = 0, noMiss = 0;
+        auto capture = [&] {
+            length = session.currentLength_; noMiss = session.consecutive_no_miss_layers_;
+            pleTokens = session.ple_state_.prev_tokens; pleHead = session.ple_state_.conv_head;
+            for (size_t i = 0; i < convHeads.size(); ++i) {
+                convHeads[i] = session.layerCaches_[i].linear_conv_head;
+                blocks[i] = session.layerCaches_[i].num_compressed_blocks;
+            }
+            for (const auto& s : spans) ctx.queue().memcpy(checkpoint.data_as<uint8_t>() + s.offset,s.runtime,s.bytes);
+            checkpointCopyBytes+=stateBytes;
+        };
+        auto restore = [&] {
+            for (const auto& s : spans) ctx.queue().memcpy(s.runtime, checkpoint.data_as<uint8_t>() + s.offset, s.bytes);
+            session.currentLength_ = length; session.consecutive_no_miss_layers_ = noMiss;
+            session.ple_state_.prev_tokens = pleTokens; session.ple_state_.conv_head = pleHead;
+            for (size_t i = 0; i < convHeads.size(); ++i) {
+                auto& c = session.layerCaches_[i]; c.linear_conv_head = convHeads[i]; c.num_compressed_blocks = blocks[i];
+                if (c.linear_state.valid()) c.device_state_dirty = true;
+            }
+        };
+        // Same lowest-index tie rule as the diagnostic argmax, without hashing
+        // every logit inside the measured generation loop.
+        auto select = [&](int row = 0, bool isDraft = false) {
+            const auto copyStart = now();
+            if (gpuGreedy) {
+                mtp_probe::Greedy(ctx, Access::Logits(target).data_as<bf16>()+size_t(row)*target.vocab_size(), target.vocab_size(),
+                    static_cast<mtp_probe::GreedyResult*>(greedyPartials.data()), static_cast<mtp_probe::GreedyResult*>(greedyResult.data()));
+                mtp_probe::GreedyResult picked{};
+                ctx.memcpy_d2h(&picked,greedyResult.data(),sizeof(picked));
+                if (selectProfile) selectCopyMs += elapsed(copyStart); // GPU reduce + small result readback
+                Require(!picked.nonfinite && picked.index>=0 && picked.index<target.vocab_size(),"Live MTP nonfinite/invalid greedy result");
+                return picked.index;
+            }
+            ctx.memcpy_d2h(hostLogits.data(), Access::Logits(target).data_as<bf16>() + size_t(row) * target.vocab_size(), hostLogits.size() * sizeof(bf16));
+            const auto cpuStart = now();
+            if (selectProfile) selectCopyMs += std::chrono::duration<double,std::milli>(cpuStart-copyStart).count();
+            int best = 0, second = -1;
+            for (int i = 0; i < target.vocab_size(); ++i) {
+                if (!std::isfinite(float(hostLogits[i]))) Require(false, "Live MTP nonfinite logits");
+                if (float(hostLogits[i]) > float(hostLogits[best])) { second = best; best = i; }
+                else if (draftMargins && isDraft && i != best &&
+                    (second < 0 || float(hostLogits[i]) > float(hostLogits[second]))) second = i;
+            }
+            if (draftMargins && isDraft) lastDraftMargin = float(hostLogits[best]) - float(hostLogits[second]);
+            if (selectProfile) selectCpuMs += elapsed(cpuStart);
+            return best;
+        };
+        const auto requestStart = now();
+        engine.reset_context();
+        double pairPrepareMs=0;
+        const bool pairPrepared=liveWidth==2 && aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR",false);
+        if(pairPrepared) {
+            const auto start=now();target.PrepareDecodeVerification(ctx);
+            pairPrepareMs=elapsed(start);
+        }
+        ctx.memcpy_h2d(ids.data(), prompt.data(), prompt.size() * sizeof(int));
+        Access::MtpTargetPrompt(engine, ids.data_as<int>(), promptCount);
+        ctx.queue().memcpy(targetHidden.data(), Access::FrontHidden(target).data(), size_t(promptCount) * 10240 * sizeof(bf16));
+        int liveNext = select();
+        const double promptMs = elapsed(requestStart);
+        const auto draftInitStart = now();
+        if (liveWidth > 1) {
+            draft.Reset();
+            for (int p = 0; p < promptCount - 1; ++p)
+                draft.AppendTargetKv(targetHidden.data_as<bf16>() + size_t(p) * 10240, prompt[p + 1], p);
+            ctx.synchronize();
+        }
+        const double draftInitMs = liveWidth > 1 ? elapsed(draftInitStart) : 0.0;
+        const auto draftStatsStart = draft.experts.stats();
+        const auto targetStatsStart = target.expert_executor_.stats();
+        const auto liveAlloc = ctx.device_allocation_count(), livePinned = ctx.pinned_host_allocation_count();
+        std::vector<int> actual = prompt, advances, acceptedLive;
+        actual.reserve(promptCount + maxNew); advances.reserve(maxNew); acceptedLive.reserve(maxNew);
+        std::vector<double> cycleMs, draftMs, verifyMs, commitMs;
+        std::vector<double> firstDraftMargins; firstDraftMargins.reserve(maxNew);
+        std::vector<int> verifiedWidths; verifiedWidths.reserve(maxNew);
+        std::vector<double> checkpointMs, forwardMs, verifyCopyMs, verifyCpuMs;
+        std::vector<double> draftCopyMs, draftCpuMs;
+        draftCopyMs.reserve(maxNew); draftCpuMs.reserve(maxNew);
+        checkpointMs.reserve(maxNew); forwardMs.reserve(maxNew); verifyCopyMs.reserve(maxNew); verifyCpuMs.reserve(maxNew);
+        cycleMs.reserve(maxNew); draftMs.reserve(maxNew); verifyMs.reserve(maxNew); commitMs.reserve(maxNew);
+        int lastCorrect = promptCount - 2, rejected = 0;
+        uint64_t firstHotset = 0;
+        const auto loopStart = now();
+        while (int(actual.size()) < promptCount + maxNew) {
+            const auto cycleStart = now();
+            const int startPos = session.currentLength_, p = startPos - 1;
+            const int width = std::min(liveWidth, promptCount + maxNew - int(actual.size()));
+            for (int r = lastCorrect + 1; r < p; ++r)
+                draft.AppendTargetKv(targetHidden.data_as<bf16>() + size_t(r) * 10240, actual[r + 1], r);
+            std::array<int, 4> proposal{}, verified{}; proposal[0] = liveNext;
+            const bf16* hidden = targetHidden.data_as<bf16>() + size_t(p) * 10240;
+            double firstDraftMargin = -1;
+            selectCopyMs = 0; selectCpuMs = 0;
+            for (int d = 0; d < width - 1; ++d) {
+                draft.Step(hidden, proposal[d], p + d);
+                proposal[d + 1] = select(0, true);
+                if (d == 0) firstDraftMargin = lastDraftMargin;
+                if (!skipDraftTail || d + 1 < width - 1) {
+                    ctx.queue().memcpy(draftHidden.data(), Access::FrontHidden(target).data(), 10240 * sizeof(bf16));
+                    hidden = draftHidden.data_as<bf16>();
+                }
+            }
+            // The last blocking select has completed all work when no tail copy remains.
+            if (!skipDraftTail || width == 1) ctx.synchronize();
+            draftMs.push_back(elapsed(cycleStart));
+            if (selectProfile) { draftCopyMs.push_back(selectCopyMs); draftCpuMs.push_back(selectCpuMs); }
+            if (draftMargins) firstDraftMargins.push_back(firstDraftMargin);
+            verifiedWidths.push_back(width);
+            lastCorrect = p;
+            const auto verifyStart = now();
+            const bool shadowWindow = startPos == shadowPosition && (width == 2 || liveWidth == 1) &&
+                startPos + 1 < int(tokens.size());
+            if (width > 1 || shadowWindow) capture();
+            ctx.memcpy_h2d(ids.data(), proposal.data(), size_t(width) * sizeof(int));
+            if (shadowWindow) {
+                // Diagnostic only: identical incoming checkpoint and token inputs.
+                // Re-run the real B2 below after restoring; these timings are polluted.
+                if (liveWidth == 1) ctx.memcpy_h2d(ids.data(), tokens.data() + startPos, 2 * sizeof(int));
+                std::vector<bf16> batched(size_t(2) * target.vocab_size());
+                std::vector<std::vector<float>> batchedState(target.layers_.size());
+                {
+                    struct RouterCapture {
+                        Qwen4ExpBnb4Backend& target;
+                        ~RouterCapture() { target.verification_router_inputs_for_test_ = nullptr; }
+                    } captureRouter{target};
+                    target.verification_router_inputs_for_test_ = routerInputs.data_as<bf16>();
+                    Access::VerifyRows(engine, ids.data_as<int>(), 2);
+                }
+                ctx.memcpy_d2h(batched.data(), Access::Logits(target).data(), batched.size() * sizeof(bf16));
+                // Head-only comparison on the exact final B2 mixer input.
+                Require(!target.lmHeadQ8Enabled_, "Same-input head shadow requires BF16 head");
+                for (int r = 0; r < 2; ++r) {
+                    auto x = Tensor::view(ctx, target.buf_.x.data_as<bf16>() + size_t(r) * target.hidden_size_, {1,target.hidden_size_});
+                    auto y = Tensor::view(ctx, target.buf_.logits.data_as<bf16>() + size_t(r) * target.vocab_size(), {1,target.vocab_size()});
+                    target.lm_head_.forward(ctx,x,y,1);
+                    ctx.memcpy_d2h(hostLogits.data(),y.data(),hostLogits.size()*sizeof(bf16));
+                    const bf16* b = batched.data() + size_t(r) * target.vocab_size();
+                    size_t different=0; float maxAbs=0;
+                    for (int i=0;i<target.vocab_size();++i) {
+                        different += std::memcmp(b+i,hostLogits.data()+i,sizeof(bf16))!=0;
+                        maxAbs=std::max(maxAbs,std::abs(float(b[i])-float(hostLogits[i])));
+                    }
+                    std::cout << "[MTP HEAD SHADOW] {\"position\":" << startPos+r << ",\"different\":" << different
+                        << ",\"max_abs\":" << maxAbs << ",\"b2_1118\":" << float(b[1118]) << ",\"b2_1870\":" << float(b[1870])
+                        << ",\"b1_1118\":" << float(hostLogits[1118]) << ",\"b1_1870\":" << float(hostLogits[1870]) << "}\n";
+                }
+                const int experts=target.cfg_.num_experts, topk=target.cfg_.num_experts_per_tok;
+                std::vector<bf16> scores(2*experts), singleScores(2*experts);
+                std::vector<int> routeIds(2*topk);
+                std::vector<float> routeWeights(2*topk);
+                for (size_t l=0;l<target.layers_.size();++l) {
+                    auto& layer=target.layers_[l];
+                    auto x=Tensor::view(ctx,routerInputs.data_as<bf16>()+l*2*target.hidden_size_,{2,target.hidden_size_});
+                    target.DenseLinear(ctx,layer.router_gate,layer.router_w,x,target.buf_.router_scores,2,experts,target.hidden_size_);
+                    auto route=[&] { ops::router_softmax_topk_device(ctx,target.buf_.router_scores.data_as<bf16>(),nullptr,
+                        target.router_host_ids_,target.router_host_weights_,2,experts,topk,true).wait_and_throw(); };
+                    route();
+                    ctx.memcpy_d2h(scores.data(),target.buf_.router_scores.data(),scores.size()*sizeof(bf16));
+                    std::copy_n(target.router_host_ids_,2*topk,routeIds.data());
+                    std::copy_n(target.router_host_weights_,2*topk,routeWeights.data());
+                    for (int r=0;r<2;++r) {
+                        auto xr=Tensor::view(ctx,x.data_as<bf16>()+size_t(r)*target.hidden_size_,{1,target.hidden_size_});
+                        auto yr=Tensor::view(ctx,target.buf_.router_scores.data_as<bf16>()+size_t(r)*experts,{1,experts});
+                        target.DenseLinear(ctx,layer.router_gate,layer.router_w,xr,yr,1,experts,target.hidden_size_);
+                    }
+                    route();
+                    ctx.memcpy_d2h(singleScores.data(),target.buf_.router_scores.data(),scores.size()*sizeof(bf16));
+                    size_t different=0, idsDifferent=0; float maxAbs=0, weightDiff=0;
+                    for (size_t i=0;i<scores.size();++i) {
+                        different+=std::memcmp(&scores[i],&singleScores[i],sizeof(bf16))!=0;
+                        maxAbs=std::max(maxAbs,std::abs(float(scores[i])-float(singleScores[i])));
+                    }
+                    for (size_t i=0;i<routeIds.size();++i) {
+                        idsDifferent+=routeIds[i]!=target.router_host_ids_[i];
+                        weightDiff=std::max(weightDiff,std::abs(routeWeights[i]-target.router_host_weights_[i]));
+                    }
+                    std::cout << "[MTP ROUTER SHADOW] {\"position\":" << startPos << ",\"layer\":" << l
+                        << ",\"scores_different\":" << different << ",\"max_abs\":" << maxAbs
+                        << ",\"ids_different\":" << idsDifferent << ",\"weight_max_abs\":" << weightDiff << "}\n";
+                }
+                for (size_t l = 0; l < batchedState.size(); ++l) {
+                    auto& state = session.layerCaches_[l].linear_state;
+                    if (!state.valid()) continue;
+                    batchedState[l].resize(state.numel());
+                    ctx.memcpy_d2h(batchedState[l].data(), state.data(), state.size_bytes());
+                }
+                restore();
+                for (int r = 0; r < 2; ++r) {
+                    Access::VerifyRows(engine, ids.data_as<int>() + r, 1);
+                    select();
+                    const auto* b = batched.data() + size_t(r) * target.vocab_size();
+                    auto topTwo = [&](const bf16* x) {
+                        std::array<int, 2> top{0, 1};
+                        if (float(x[1]) > float(x[0])) std::swap(top[0], top[1]);
+                        for (int i = 2; i < target.vocab_size(); ++i) {
+                            if (float(x[i]) > float(x[top[0]])) { top[1] = top[0]; top[0] = i; }
+                            else if (float(x[i]) > float(x[top[1]])) top[1] = i;
+                        }
+                        return top;
+                    };
+                    const auto bt = topTwo(b), st = topTwo(hostLogits.data());
+                    size_t different = 0; float maxAbs = 0;
+                    for (int i = 0; i < target.vocab_size(); ++i) {
+                        different += std::memcmp(b + i, hostLogits.data() + i, sizeof(bf16)) != 0;
+                        maxAbs = std::max(maxAbs, std::abs(float(b[i]) - float(hostLogits[i])));
+                    }
+                    std::cout << "[MTP SHADOW] {\"position\":" << startPos + r << ",\"row\":" << r
+                        << ",\"incoming_width\":" << liveWidth
+                        << ",\"logit_different\":" << different << ",\"max_abs\":" << maxAbs
+                        << ",\"b2_top\":" << bt[0] << ",\"b1_top\":" << st[0]
+                        << ",\"b2_margin\":" << float(b[bt[0]]) - float(b[bt[1]])
+                        << ",\"b1_margin\":" << float(hostLogits[st[0]]) - float(hostLogits[st[1]])
+                        << ",\"b2_1118\":" << float(b[1118]) << ",\"b2_1870\":" << float(b[1870])
+                        << ",\"b1_1118\":" << float(hostLogits[1118]) << ",\"b1_1870\":" << float(hostLogits[1870]) << "}\n";
+                }
+                for (size_t l = 0; l < batchedState.size(); ++l) {
+                    if (batchedState[l].empty()) continue;
+                    std::vector<float> single(batchedState[l].size());
+                    ctx.memcpy_d2h(single.data(), session.layerCaches_[l].linear_state.data(), single.size() * sizeof(float));
+                    size_t different = 0; float maxAbs = 0;
+                    for (size_t i = 0; i < single.size(); ++i) {
+                        different += std::memcmp(&single[i], &batchedState[l][i], sizeof(float)) != 0;
+                        maxAbs = std::max(maxAbs, std::abs(single[i] - batchedState[l][i]));
+                    }
+                    std::cout << "[MTP SHADOW STATE] {\"layer\":" << l << ",\"different\":" << different << ",\"max_abs\":" << maxAbs << "}\n";
+                }
+                restore();
+                ctx.memcpy_h2d(ids.data(), proposal.data(), size_t(width) * sizeof(int));
+            }
+            // The existing blocking proposal upload already completes checkpoint copies.
+            if (selectProfile) checkpointMs.push_back(elapsed(verifyStart));
+            const auto forwardStart = now();
+            {
+                struct CaptureInputs {
+                    Qwen4ExpBnb4Backend& target;
+                    ~CaptureInputs() {
+                        target.verification_linear_inputs_for_test_ = nullptr;
+                    }
+                } captureInputs{target};
+                if (stateOnly && width > 1) target.verification_linear_inputs_for_test_ = linearInputs.data_as<bf16>();
+                Access::VerifyRows(engine, ids.data_as<int>(), width);
+            }
+            if (liveProfile) { ctx.synchronize(); forwardMs.push_back(elapsed(forwardStart)); }
+            ctx.queue().memcpy(targetHidden.data_as<bf16>() + size_t(startPos) * 10240,
+                Access::FrontHidden(target).data(), size_t(width) * 10240 * sizeof(bf16));
+            selectCopyMs = 0; selectCpuMs = 0;
+            if (gpuGreedy && greedyRows && width > 1) {
+                const auto begin = now();
+                mtp_probe::Greedy(ctx,Access::Logits(target).data_as<bf16>(),target.vocab_size(),
+                    static_cast<mtp_probe::GreedyResult*>(greedyPartials.data()),static_cast<mtp_probe::GreedyResult*>(greedyResult.data()),width);
+                std::array<mtp_probe::GreedyResult,4> picked{};
+                ctx.memcpy_d2h(picked.data(),greedyResult.data(),size_t(width)*sizeof(picked[0]));
+                if (selectProfile) selectCopyMs += elapsed(begin);
+                for (int r=0;r<width;++r) {
+                    Require(!picked[r].nonfinite && picked[r].index>=0 && picked[r].index<target.vocab_size(),"Live MTP nonfinite/invalid greedy row");
+                    verified[r]=picked[r].index;
+                }
+            } else for (int r = 0; r < width; ++r) verified[r] = select(r);
+            if (selectProfile) { verifyCopyMs.push_back(selectCopyMs); verifyCpuMs.push_back(selectCpuMs); }
+            verifyMs.push_back(elapsed(verifyStart));
+            int advance = 1;
+            while (advance < width && proposal[advance] == verified[advance - 1]) ++advance;
+            liveNext = verified[advance - 1];
+            const auto commitStart = now();
+            if (advance < width) {
+                ++rejected;
+                if (stateOnly) {
+                    // A <=4-token window cannot write the same PLE ring row
+                    // twice. Preserve accepted writes before restoring state.
+                    for (int r = 0; r < advance; ++r)
+                        ctx.queue().memcpy(plePrefix.data_as<float>() + size_t(r) * 10240,
+                            session.ple_state_.conv_state.data_as<float>() + size_t((pleHead + r) % 9) * 10240,
+                            10240 * sizeof(float));
+                    restore();
+                    for (size_t l = 0; l < target.layers_.size(); ++l) {
+                        auto& layer = target.layers_[l]; auto& cache = session.layerCaches_[l];
+                        if (!layer.is_linear) {
+                            cache.num_compressed_blocks = (startPos + advance) / std::max(1, target.cfg_.indexer_compress_ratio);
+                            continue;
+                        }
+                        ops::DeltaNetWeights weights{layer.linear_conv1d_weight->data_as<bf16>(),
+                            layer.linear_norm_weight->data_as<float>(), layer.linear_A_log->data_as<float>(),
+                            layer.linear_dt_bias->data_as<bf16>()};
+                        ops::DeltaNetState state{cache.linear_state.data_as<float>(), cache.linear_conv_state.data_as<float>(),
+                            cache.linear_conv_head, true};
+                        ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, weights, state,
+                            linearInputs.data_as<bf16>() + l * 4 * target.linear_all_dim_,
+                            target.buf_.attn_out.data_as<bf16>(), advance, verifyGdnOrder);
+                        cache.linear_conv_head = state.conv_head; cache.device_state_dirty = state.device_state_dirty;
+                    }
+                    for (int r = 0; r < advance; ++r)
+                        ctx.queue().memcpy(session.ple_state_.conv_state.data_as<float>() + size_t((pleHead + r) % 9) * 10240,
+                            plePrefix.data_as<float>() + size_t(r) * 10240, 10240 * sizeof(float));
+                    session.ple_state_.conv_head = (pleHead + advance) % 9;
+                    std::array<int64_t, 64> ngrams{};
+                    std::array<int, 2> prev{};
+                    target.ple_.compute_ngram_ids_pure(session.ple_state_, proposal.data(), advance, ngrams.data(), prev);
+                    session.ple_state_.prev_tokens = prev;
+                    session.currentLength_ = startPos + advance;
+                    session.consecutive_no_miss_layers_ = 0;
+                } else {
+                    restore();
+                    Access::VerifyRows(engine, ids.data_as<int>(), advance);
+                    ctx.queue().memcpy(targetHidden.data_as<bf16>() + size_t(startPos) * 10240,
+                        Access::FrontHidden(target).data(), size_t(advance) * 10240 * sizeof(bf16));
+                    liveNext = select(advance - 1);
+                }
+            }
+            bool eos = false;
+            for (int r = 0; r < advance; ++r) {
+                actual.push_back(proposal[r]);
+                if (proposal[r] == 248044 || proposal[r] == 248046) { eos = true; break; }
+            }
+            ctx.synchronize(); commitMs.push_back(elapsed(commitStart));
+            advances.push_back(advance); acceptedLive.push_back(advance - 1); cycleMs.push_back(elapsed(cycleStart));
+            if (advances.size() == 1) firstHotset = Access::Cache(engine).FrozenIdentity();
+            if (eos) break;
+        }
+        const double wallMs = elapsed(loopStart);
+        const double promptToOutputMs = elapsed(requestStart);
+        Require(ctx.device_allocation_count() == liveAlloc && ctx.pinned_host_allocation_count() == livePinned, "Live MTP grew USM allocations");
+        std::vector<int> mismatch;
+        for (size_t i = promptCount; i < std::min(actual.size(), tokens.size()); ++i)
+            if (actual[i] != tokens[i]) mismatch.push_back(int(i) - promptCount);
+        std::vector<int> generated(actual.begin() + promptCount, actual.end());
+        std::cout << "[MTP LIVE] {\"width\":" << liveWidth << ",\"tokens\":" << generated.size()
+                  << ",\"state_only_replay\":" << (stateOnly ? "true" : "false")
+                  << ",\"diagnostic_shadow\":" << (shadowPosition > 0 ? "true" : "false")
+                  << ",\"gpu_greedy\":" << (gpuGreedy ? "true" : "false")
+                  << ",\"greedy_rows\":" << (greedyRows ? "true" : "false")
+                  << ",\"skip_draft_tail\":" << (skipDraftTail ? "true" : "false")
+                  << ",\"checkpoint_copy_bytes\":" << checkpointCopyBytes
+                  << ",\"target_kv_fp8\":" << (session.layerCaches_[3].k.dtype()==dnnl::memory::data_type::f8_e4m3 ? "true" : "false")
+                  << ",\"pair_prepare\":" << (pairPrepared ? "true" : "false")
+                  << ",\"pair_prepare_ms\":" << pairPrepareMs
+                  << ",\"draft_loop_misses\":" << draft.experts.stats().miss_count - draftStatsStart.miss_count
+                  << ",\"draft_loop_transfer_bytes\":" << draft.experts.stats().total_transferred_bytes - draftStatsStart.total_transferred_bytes
+                  << ",\"target_loop_cpu_tasks\":" << target.expert_executor_.stats().cpu_tasks_completed - targetStatsStart.cpu_tasks_completed
+                  << ",\"target_loop_cpu_compute_ns\":" << target.expert_executor_.stats().cpu_compute_ns - targetStatsStart.cpu_compute_ns
+                  << ",\"target_loop_cpu_join_ns\":" << target.expert_executor_.stats().cpu_join_wait_ns - targetStatsStart.cpu_join_wait_ns
+                  << ",\"wall_ms\":" << wallMs << ",\"tokens_s\":" << generated.size() * 1000.0 / wallMs
+                  << ",\"target_prompt_ms\":" << promptMs << ",\"draft_kv_init_ms\":" << draftInitMs
+                  << ",\"prompt_to_output_ms\":" << promptToOutputMs
+                  << ",\"rejected_cycles\":" << rejected << ",\"advance\":"; printInts(advances);
+        std::cout << ",\"accepted_prefix\":"; printInts(acceptedLive);
+        std::cout << ",\"verified_width\":"; printInts(verifiedWidths);
+        std::cout << ",\"cycle_ms\":"; printInts(cycleMs);
+        std::cout << ",\"draft_ms\":"; printInts(draftMs);
+        std::cout << ",\"verify_ms\":"; printInts(verifyMs);
+        std::cout << ",\"replay_ms\":"; printInts(commitMs);
+        if (draftMargins) { std::cout << ",\"first_draft_margin\":"; printInts(firstDraftMargins); }
+        if (liveProfile) {
+            std::cout << ",\"profile_serialized\":true";
+            std::cout << ",\"forward_ms\":"; printInts(forwardMs);
+        }
+        if (selectProfile) {
+            std::cout << ",\"checkpoint_input_ms\":"; printInts(checkpointMs);
+            std::cout << ",\"select_copy_ms\":"; printInts(verifyCopyMs);
+            std::cout << ",\"select_cpu_ms\":"; printInts(verifyCpuMs);
+            std::cout << ",\"draft_select_copy_ms\":"; printInts(draftCopyMs);
+            std::cout << ",\"draft_select_cpu_ms\":"; printInts(draftCpuMs);
+        }
+        std::cout << ",\"generated\":"; printInts(generated);
+        std::cout << ",\"hotset_first\":\"" << firstHotset << "\",\"hotset_last\":\"" << Access::Cache(engine).FrozenIdentity() << "\"";
+        std::cout << ",\"single_row_target_mismatches\":"; printInts(mismatch);
+        std::cout << ",\"live_usm_delta\":0,\"accepted_prefix_commit\":true,\"production\":false}\n";
+    }
+
 };

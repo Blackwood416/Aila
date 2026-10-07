@@ -591,6 +591,7 @@ std::vector<std::string> supported_capabilities() {
     capabilities.emplace_back("worker_log_control_v1");
     capabilities.emplace_back("runtime_memory_v1");
     capabilities.emplace_back("continuous_batching_v1");
+    capabilities.emplace_back("qwen4exp_nf4_bf16_kv");
     return capabilities;
 }
 std::string_view model_capability(std::string_view backend, std::string_view kvType) noexcept {
@@ -598,6 +599,7 @@ std::string_view model_capability(std::string_view backend, std::string_view kvT
     if (backend == "qwen3_nf4") return "qwen3_nf4_bf16_kv";
     if (backend == "qwen35_nf4") return "qwen35_nf4_bf16_kv";
     if (backend == "qwen35_bf16") return "qwen35_bf16_bf16_kv";
+    if (backend == "qwen4exp_nf4") return "qwen4exp_nf4_bf16_kv";
     return {};
 }
 
@@ -1039,7 +1041,8 @@ bool parse_command(const Frame& frame, Command& command, ValidationError& error,
                 !Unsigned(object, "maxSessionCacheBytes", parsed.maxSessionCacheBytes, error, code) ||
                 !ReadOptionalAllocationLimits(object, parsed.allocationLimits, error, code)) return false;
             if (model_capability(parsed.backend).empty())
-                return Fail(error, ErrorCode::UnsupportedModel, "The v2 token API supports qwen3_nf4, qwen35_nf4 and qwen35_bf16");
+                return Fail(error, ErrorCode::UnsupportedModel,
+                            "The v2 token API supports qwen3_nf4, qwen35_nf4, qwen35_bf16 and qwen4exp_nf4");
             if (model_capability(parsed.backend, parsed.kvType).empty() || parsed.modelDirectory.empty() || parsed.maxSequenceLength == 0 ||
                 parsed.maxSequenceLength > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)()) ||
                 parsed.maxSessions == 0 || parsed.maxSessions > limits.maxSessions ||

@@ -183,6 +183,11 @@ public:
     std::shared_ptr<InferenceModel> LoadQwen35Bf16(
         const std::string& modelDirectory, InferenceModelOptions options = {},
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    // Qwen4Exp NF4 text execution. Uses BF16 KV and the same Session lifecycle
+    // and allocation limits. Cross-session decode batching is not offered.
+    std::shared_ptr<InferenceModel> LoadQwen4Exp(
+        const std::string& modelDirectory, InferenceModelOptions options = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     wire::WorkerInfo Query(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     // Optional runtime_memory_v1. One bounded RPC; a busy execution domain is
     // reported as Busy, never as a zero or previously cached allocation count.

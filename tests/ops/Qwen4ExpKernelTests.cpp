@@ -6,7 +6,9 @@
 #include "ops/QsaIndexerOps.hpp"
 #include "ops/Bnb4BitLinear.hpp"
 #include "ops/Ops.hpp"
+#include "ops/Qwen4ExpAttentionPair.hpp"
 #include "utils/EnvUtils.hpp"
+#include "../models/Qwen4ExpGreedyProbe.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -306,7 +308,7 @@ static void run_hc_inject_add_and_grouped_rms_norm_test(Context& ctx, int rows) 
     ctx.memcpy_d2h(out_sep_h.data(), out_sep_dev.data(), total_H * sizeof(bf16));
     ctx.memcpy_d2h(out_fused_h.data(), out_fused_dev.data(), total_H * sizeof(bf16));
 
-    // Verify bit-exact equality on H (allowing at most 1 ULP for vector vs scalar tie rounding)
+    // Generic scalar fusion permits 1 ULP; this is not a bitwise assertion.
     int h_ulp_diffs = 0;
     for (size_t i = 0; i < total_H; ++i) {
         uint16_t b_sep = *reinterpret_cast<const uint16_t*>(&H_sep_h[i]);
@@ -322,7 +324,7 @@ static void run_hc_inject_add_and_grouped_rms_norm_test(Context& ctx, int rows) 
         }
     }
 
-    // Verify bit-exact equality on out_N (allowing at most 1 ULP for vector vs scalar tie rounding)
+    // The same generic 1-ULP bound for normalized output.
     int out_ulp_diffs = 0;
     for (size_t i = 0; i < total_H; ++i) {
         uint16_t b_sep = *reinterpret_cast<const uint16_t*>(&out_sep_h[i]);
@@ -3784,6 +3786,10 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
 }
 
 #include "Qwen4ExpQsaProbe.hpp"
+#include "Qwen4ExpGdnDecodeOrder.hpp"
+#include "Qwen4ExpGreedyTests.hpp"
+#include "Qwen4ExpKvFp8Tests.hpp"
+#include "Qwen4ExpAttentionPairTests.hpp"
 
 } // namespace
 
@@ -3801,6 +3807,32 @@ int main(int argc, char** argv) {
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("HC test teardown USM leak");
             std::cout << "HC-only tests PASSED; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--gdn-order-only") {
+            test_gated_delta_net_sigmoid(ctx);
+            test_gdn_decode_order(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("GDN test teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--mtp-greedy-only") {
+            test_mtp_greedy(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())throw std::runtime_error("Greedy teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--kv-fp8-only") {
+            test_q4e_kv_fp8(ctx);
+            ctx.synchronize();ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())throw std::runtime_error("FP8 teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--attention-pair-only") {
+            test_q4e_attention_pair(ctx);
+            ctx.synchronize();ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())throw std::runtime_error("Pair teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-probe") {

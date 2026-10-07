@@ -68,7 +68,9 @@ struct Qwen4ExpGenerationTestAccess {
     static ModelWeights& Weights(InferenceEngine& e) { return *e.weights_; }
     static Tensor& VerifyRows(InferenceEngine& e, const int* ids, int count) {
         auto& b = Backend(e);
-        return b.ForwardImpl(Ctx(e), Session(e), ids, count, false, {SnapshotPolicy::None, true});
+        ForwardOptions options{SnapshotPolicy::None, true};
+        options.decode_verification = true;
+        return b.ForwardImpl(Ctx(e), Session(e), ids, count, false, options);
     }
     static void ReserveVerifyLogits(InferenceEngine& e, int rows) {
         auto& b = Backend(e);
@@ -591,6 +593,7 @@ void test_real_model_tolerance(const std::string& model_dir) {
 #include "Qwen4ExpGdnChunkAcceptance.hpp"
 #include "Qwen4ExpFrontGraphProbe.hpp"
 #include "Qwen4ExpDecodeProbe.hpp"
+#include "Qwen4ExpHeadProbe.hpp"
 #include "Qwen4ExpMtpAcceptance.hpp"
 
 } // namespace
@@ -674,6 +677,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--front-graph-model") {
             test_front_graph(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--head-kernel-model") {
+            test_head_kernel(argv[2]);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--decode-model") {

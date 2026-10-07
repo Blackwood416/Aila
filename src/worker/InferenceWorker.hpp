@@ -40,6 +40,11 @@ public:
         const std::string& directory, InferenceModelOptions options) = 0;
     virtual std::shared_ptr<InferenceModel> LoadQwen35Bf16(
         const std::string& directory, InferenceModelOptions options) = 0;
+    // Qwen4Exp NF4 text execution. Pure: the Worker advertises qwen4exp_nf4 in
+    // its global capability set, so a factory that omits this would otherwise
+    // fail only at load time behind a default throw.
+    virtual std::shared_ptr<InferenceModel> LoadQwen4Exp(
+        const std::string& directory, InferenceModelOptions options) = 0;
     // Called on the lifecycle executor after resource destruction. A recorded
     // asynchronous error must propagate even when a destructor could not throw.
     virtual std::string RuntimeFaultMessage() const { return {}; }

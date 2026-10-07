@@ -1189,6 +1189,7 @@ std::shared_ptr<InferenceModel> LoadModel(const std::shared_ptr<InferenceClient>
     if (backend == "qwen3_nf4") return client->LoadQwen3("C:\\fake-qwen3", options);
     if (backend == "qwen35_nf4") return client->LoadQwen35("C:\\fake-hybrid", options);
     if (backend == "qwen35_bf16") return client->LoadQwen35Bf16("C:\\fake-hybrid-bf16", options);
+    if (backend == "qwen4exp_nf4") return client->LoadQwen4Exp("C:\\fake-qwen4exp", options);
     throw std::invalid_argument("Unknown fixture backend");
 }
 
@@ -1272,7 +1273,7 @@ void HybridModelNegotiationAndLoading(bool bf16) {
 }
 
 void ModelCapabilityMismatchAndConfigureConsistency() {
-    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
         auto hello = Hello();
         hello.capabilities = wire::supported_capabilities();
         auto transport = std::make_shared<ControlledTransport>(hello);

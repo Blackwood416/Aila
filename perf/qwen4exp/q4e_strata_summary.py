@@ -1,4 +1,4 @@
-"""S1/S2 conditional MTP costs. Does not measure a production generation loop."""
+"""Conditional MTP costs and optional actual snapshot/replay probe results."""
 import argparse
 from collections import Counter
 import hashlib
@@ -75,7 +75,8 @@ def read_run(prefix):
                      verify_demand_bytes=[v['demand_bytes'] for v in vv])
             if width > 1 and vv[0].get('union_counts'):
                 s['mean_union_per_layer'] = st.mean(vv[-1]['union_counts'])/48
-                s['ready_fraction_at_router'] = sum(vv[-1]['ready_counts'])/sum(vv[-1]['union_counts'])
+            union = sum(vv[-1].get('union_counts', []))
+            s['ready_fraction_at_router'] = sum(vv[-1].get('ready_counts', []))/union if union else None
             if vv[0].get('top1'):
                 actual = vv[0]['top1']
                 reference = tokens[p+1:p+1+len(actual)]
@@ -84,7 +85,7 @@ def read_run(prefix):
                 for v in vv: assert v['top1'] == actual
         summaries.append(s)
     return dict(prefix=prefix, metadata=meta, target=target, passes=passes, cycles=cycles,
-                verify=verify, equivalence=rec('MTP KV EQUIVALENCE'), state=rec('MTP STATE'),
+                verify=verify, equivalence=rec('MTP KV EQUIVALENCE'), state=rec('MTP STATE'), live=rec('MTP LIVE'),
                 accepted_histogram=dict(Counter(passes[0]['accepted_prefix'])), summaries=summaries)
 
 
@@ -93,8 +94,9 @@ if __name__ == '__main__':
     ap.add_argument('prefixes', nargs='+'); ap.add_argument('--output', required=True)
     args = ap.parse_args(); runs = [read_run(p) for p in args.prefixes]
     result = dict(runs=runs, limitations=[
-        'Costs from separately measured draft cycles and target trajectory blocks; not interleaved generation throughput.',
-        'Excludes target prefix commit/replay, sampling/IPC, reject-path target input changes and cache interference.',
+        'Conditional summaries combine separate draft cycles and target trajectory blocks; not interleaved throughput.',
+        'Conditional summaries exclude prefix commit/replay, sampling/IPC and reject-path input/cache changes.',
+        'Optional live results include actual proposals, argmax, checkpoint and rejected-prefix replay; exclude prompt/draft KV initialization and server IPC. They remain diagnostic runs within the configured dense-QSA capacity (640 or 2048).',
         'Conditional acceptance uses single-row target decisions. Multi-row decision differences are reported separately.',
         'Prior whole-step CPU numeric reference failures remain unresolved; local KV equivalence does not replace them.',
         'Union counts are sums across 48 layers. Ready is cache residency at routing, not completed DMA.'],
@@ -103,5 +105,7 @@ if __name__ == '__main__':
     Path(args.output).write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
     for r in runs:
         print(r['prefix'], r['accepted_histogram'])
+        for live in r['live']:
+            print('live', {k: live[k] for k in ('width', 'tokens', 'tokens_s', 'rejected_cycles', 'single_row_target_mismatches')})
         for s in r['summaries']: print({k:v for k,v in s.items() if k in ['width','kv_only','mean_advance','draft_median_pass_mean_ms','verify_ms','conditional_tokens_s','commit_budget_for_20_ms','known_target_top1_mismatches','mean_union_per_layer','ready_fraction_at_router']})
     print(result['memory'])

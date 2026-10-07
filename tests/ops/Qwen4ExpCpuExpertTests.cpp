@@ -2,6 +2,7 @@
 #include "core/Tensor.hpp"
 #include "ops/MoeExpertOps.hpp"
 #include "ops/Qwen4ExpCpuExpertOps.hpp"
+#include "ops/CpuTilePool.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -13,7 +14,10 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+#include <future>
+#include <immintrin.h>
 #include <tbb/task_arena.h>
 
 namespace {
@@ -257,6 +261,421 @@ void test_nf4_q8_batch(bool row4 = false, unsigned case_seed = 20261003, bool bl
     std::cout << "[PASS] NF4Q8" << (block64 ? " block64 H8-bitwise," : row4 ? " row4 H8-bitwise," : "")
               << " zero, mixed 4-token/max40-task batch, nested/flat scales, 1/4/12 threads, batch/single partition parity, NRMSE="
               << nrmse << " seed=" << case_seed << " (<0.03; full-model teacher KL gate remains separate)\n";
+}
+
+// Independent scalar A64 oracle. It decodes each NF4 nibble individually and
+// adds eight signed integer products per lane; no packed SIMD dot operations.
+int a64_reference_nearest_even(float value) {
+    const float magnitude = std::abs(value);
+    const int lower = static_cast<int>(std::floor(magnitude));
+    const float fraction = magnitude - static_cast<float>(lower);
+    const int rounded = lower + (fraction > 0.5f || (fraction == 0.5f && (lower & 1)) ? 1 : 0);
+    return value < 0.0f ? -rounded : rounded;
+}
+
+bf16 a64_reference_bf16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint16_t rounded = static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+    bf16 result;
+    std::memcpy(&result, &rounded, sizeof(rounded));
+    return result;
+}
+
+void a64_reference_quantize(const bf16* input, int columns, std::vector<int8_t>& codes, std::vector<float>& scales) {
+    codes.resize(columns); scales.resize(columns / 64);
+    for (int begin = 0; begin < columns; begin += 64) {
+        float maximum = 0.0f;
+        for (int i = 0; i < 64; ++i) maximum = std::max(maximum, std::abs(static_cast<float>(input[begin + i])));
+        scales[begin / 64] = maximum / 127.0f;
+        const float inverse = maximum > 0.0f ? 127.0f / maximum : 0.0f;
+        for (int i = 0; i < 64; ++i) {
+            volatile float normalized = static_cast<float>(input[begin + i]) * inverse;
+            codes[begin + i] = static_cast<int8_t>(std::clamp(a64_reference_nearest_even(normalized), -127, 127));
+        }
+    }
+}
+
+float a64_reference_dot(const uint8_t* packed, const float* absmax, const ops::MoeNestedScaleHost& nested,
+                        int row, int columns, const std::vector<int8_t>& activation,
+                        const std::vector<float>& activation_scales, const int8_t* lut, float lut_scale) {
+    volatile float lanes[8] = {};
+    for (int block = 0; block < columns / 64; ++block) {
+        const size_t scale_index = size_t(row) * (columns / 64) + block;
+        float scale = absmax ? absmax[scale_index] : 1.0f;
+        if (nested.codes) {
+            const int bs = nested.blocksize > 0 ? nested.blocksize : 256;
+            volatile float product = nested.nested_quant_map[nested.codes[scale_index]] *
+                nested.nested_absmax[scale_index / bs];
+            scale = product + nested.offset;
+        }
+        volatile float first_factor = scale * activation_scales[block];
+        const float factor = first_factor * lut_scale;
+        for (int lane = 0; lane < 8; ++lane) {
+            int integer_dot = 0;
+            for (int half = 0; half < 2; ++half) {
+                for (int j = 0; j < 4; ++j) {
+                    const int col = block * 64 + half * 32 + lane * 4 + j;
+                    const uint8_t byte = packed[size_t(row) * (columns / 2) + col / 2];
+                    const int code = col % 2 == 0 ? byte >> 4 : byte & 15;
+                    integer_dot += int(lut[code]) * int(activation[col]);
+                }
+            }
+            expect(std::abs(integer_dot) <= 129032, "A64 integer lane dot exceeds its int32 contract");
+            lanes[lane] = std::fma(static_cast<float>(integer_dot), factor, lanes[lane]);
+        }
+    }
+    // Explicit scalar tree matches eight-lane hsum, with each addition rounded.
+    volatile float s0 = lanes[0] + lanes[4], s1 = lanes[1] + lanes[5];
+    volatile float s2 = lanes[2] + lanes[6], s3 = lanes[3] + lanes[7];
+    volatile float even = s0 + s2, odd = s1 + s3;
+    return even + odd;
+}
+
+void a64_reference_forward(const ops::MoeExpertSlotHost& slot, const bf16* input,
+                           const float* quant_map, bf16* h, float* out) {
+    constexpr int H = ops::cpu::kHiddenDim, I = ops::cpu::kIntermediateDim;
+    float maximum = 0.0f;
+    for (int i = 0; i < 16; ++i) maximum = std::max(maximum, std::abs(quant_map[i]));
+    const float lut_scale = maximum / 127.0f;
+    int8_t lut[16];
+    for (int i = 0; i < 16; ++i) {
+        volatile float normalized = maximum > 0.0f ? quant_map[i] * (127.0f / maximum) : 0.0f;
+        lut[i] = static_cast<int8_t>(a64_reference_nearest_even(normalized));
+    }
+    std::vector<int8_t> activation;
+    std::vector<float> activation_scales;
+    a64_reference_quantize(input, H, activation, activation_scales);
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+    for (int row = 0; row < I; ++row) {
+        const float gate = a64_reference_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
+            row, H, activation, activation_scales, lut, lut_scale);
+        const float up = a64_reference_dot(slot.gate_up_packed, slot.gate_up_absmax, slot.gate_up_nested,
+            row + I, H, activation, activation_scales, lut, lut_scale);
+        const float denominator = 1.0f + std::exp(-gate);
+        // Scalar division intrinsic prevents test fast-math from substituting
+        // an approximate reciprocal; the independent dot oracle stays scalar.
+        const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+        volatile float value = silu * up;
+        h[row] = a64_reference_bf16(value);
+    }
+    a64_reference_quantize(h, I, activation, activation_scales);
+    for (int row = 0; row < H; ++row)
+        out[row] = a64_reference_dot(slot.down_packed, slot.down_absmax, slot.down_nested,
+            row, I, activation, activation_scales, lut, lut_scale);
+}
+
+void test_nf4_q8_activation64() {
+    std::cout << "[Test] NF4Q8 A64 independent scalar/integer reference...\n";
+    constexpr int H = ops::cpu::kHiddenDim, I = ops::cpu::kIntermediateDim;
+    constexpr int count = ops::cpu::kMaxExpertBatchTasks;
+    constexpr auto backend = ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2;
+    expect(a64_reference_nearest_even(0.5f) == 0 && a64_reference_nearest_even(-0.5f) == 0 &&
+        a64_reference_nearest_even(1.5f) == 2 && a64_reference_nearest_even(-2.5f) == -2 &&
+        a64_reference_nearest_even(126.5f) == 126, "A64 oracle nearest-even tie contract");
+    for (const auto boundary : {std::pair<float, uint16_t>{1.00390625f, 0x3f80},
+                               {1.01171875f, 0x3f82}, {-1.00390625f, 0xbf80}}) {
+        const bf16 value = a64_reference_bf16(boundary.first);
+        uint16_t bits = 0; std::memcpy(&bits, &value, sizeof(bits));
+        expect(bits == boundary.second, "A64 oracle BF16 nearest-even boundary contract");
+    }
+    SyntheticExpertData expert(7319);
+    std::mt19937 rng(20261004);
+    std::uniform_real_distribution<float> scale_dist(0.013f, 0.087f);
+    std::normal_distribution<float> input_dist(0.0f, 1.0f);
+    std::vector<bf16> x(4 * H), reference_h(4 * I), actual_h(count * I), flat_h(count * I);
+    std::vector<float> reference_out(4 * H), actual_out(count * H), flat_out(count * H);
+    constexpr float tie_values[] = {127.0f, -127.0f, 0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f, 126.5f, -126.5f};
+    for (int col = 0; col < H; ++col) {
+        x[col] = bf16(tie_values[col % 10]);
+        x[H + col] = bf16(0.0f);
+        x[2 * H + col] = bf16(0.03125f * input_dist(rng));
+        x[3 * H + col] = bf16(col % 64 < 32 ? input_dist(rng) : 4.0f * input_dist(rng));
+    }
+    // Each 64-block has max127 and exact quantization ties. All-positive and
+    // all-negative weight rows force worst-case signed maddubs pairs; remaining
+    // random rows exercise every NF4 code and lane order.
+    for (int block = 0; block < H / 64; ++block) {
+        for (int half = 0; half < 2; ++half) {
+            for (int j = 0; j < 4; ++j) {
+                x[block * 64 + half * 32 + j] = bf16(127.0f);
+                x[block * 64 + half * 32 + 4 + j] = bf16(-127.0f);
+            }
+        }
+    }
+    std::fill(expert.gu_packed.begin(), expert.gu_packed.begin() + H / 2, uint8_t(0xff));
+    std::fill(expert.gu_packed.begin() + H / 2, expert.gu_packed.begin() + H, uint8_t(0x00));
+    for (const int bs : {256, 255}) {
+        auto prepare = [&](ops::MoeNestedScaleHost& nested, std::vector<float>& scales, std::vector<float>& flat) {
+            scales.resize((flat.size() + bs - 1) / bs);
+            for (float& value : scales) value = scale_dist(rng);
+            nested.nested_absmax = scales.data(); nested.blocksize = bs;
+            for (size_t index = 0; index < flat.size(); ++index) {
+                volatile float product = nested.nested_quant_map[nested.codes[index]] * scales[index / bs];
+                flat[index] = product + nested.offset;
+            }
+        };
+        prepare(expert.host_slot_nested.gate_up_nested, expert.gu_nested_absmax, expert.gu_absmax_unnested);
+        prepare(expert.host_slot_nested.down_nested, expert.dn_nested_absmax, expert.dn_absmax_unnested);
+        for (int token = 0; token < 4; ++token)
+            a64_reference_forward(expert.host_slot_nested, x.data() + token * H, expert.qmap.data(),
+                reference_h.data() + token * I, reference_out.data() + token * H);
+        for (const int tokens : {1, 2, 3, 4}) {
+            ops::cpu::CpuExpertTask tasks[count], flat_tasks[count];
+            for (int c = 0; c < count; ++c) {
+                tasks[c] = {expert.host_slot_nested, c % tokens};
+                flat_tasks[c] = {expert.host_slot_unnested, c % tokens};
+            }
+            for (const int threads : {1, 4, 12}) {
+                tbb::task_arena arena(threads);
+                for (const bool shift : {false, true}) for (const bool specialize : {false, true})
+                    for (const bool row2 : {false, true}) {
+                    arena.execute([&] {
+                        ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), tokens, actual_h.data(),
+                            actual_out.data(), expert.qmap.data(), backend, nullptr, shift, specialize, row2);
+                        ops::cpu::cpu_expert_batch_forward(flat_tasks, count, x.data(), tokens, flat_h.data(),
+                            flat_out.data(), expert.qmap.data(), backend, nullptr, shift, specialize, row2);
+                    });
+                    for (int c = 0; c < count; ++c) {
+                        const int token = c % tokens;
+                        expect(std::memcmp(actual_h.data() + c * I, reference_h.data() + token * I, I * sizeof(bf16)) == 0,
+                            "A64 BF16 h differs from scalar oracle: bs=" + std::to_string(bs) + " task=" + std::to_string(c));
+                        expect(std::memcmp(actual_out.data() + c * H, reference_out.data() + token * H, H * sizeof(float)) == 0,
+                            "A64 F32 out differs from scalar oracle: bs=" + std::to_string(bs) + " task=" + std::to_string(c));
+                    }
+                    expect(std::memcmp(actual_h.data(), flat_h.data(), actual_h.size() * sizeof(bf16)) == 0 &&
+                        std::memcmp(actual_out.data(), flat_out.data(), actual_out.size() * sizeof(float)) == 0,
+                        "A64 nested/flat scale arithmetic differs bitwise");
+                }
+            }
+        }
+        for (int row = 0; row < I; ++row) expect(float(reference_h[I + row]) == 0.0f, "A64 zero reference h nonzero");
+        for (int row = 0; row < H; ++row) expect(reference_out[H + row] == 0.0f, "A64 zero reference out nonzero");
+    }
+    std::cout << "[PASS] A64 all h/out scalar-bitwise, 1..4 tokens/40 tasks, 1/4/12 threads, signed/ties/saturation/zero, bs256/255, shift/specialization/row2 independently on/off.\n";
+}
+
+void test_nf4_q8_per_expert_dag() {
+    constexpr int H=ops::cpu::kHiddenDim,I=ops::cpu::kIntermediateDim,Guard=11;
+    constexpr auto Backend=ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2;
+    SyntheticExpertData expert0(73011),expert1(73129);
+    // A non-power-of-two nested block exercises the generic scale path while
+    // expert0 exercises Nested256 and flat entries exercise FlatF32.
+    auto prepare_generic=[](ops::MoeNestedScaleHost& nested,std::vector<float>& scales,
+                            std::vector<float>& flat) {
+        nested.blocksize=255;scales.resize((flat.size()+254)/255);
+        for(size_t j=0;j<scales.size();++j)scales[j]=0.021f+float(j%19)*0.0007f;
+        nested.nested_absmax=scales.data();
+        for(size_t j=0;j<flat.size();++j) {
+            volatile float product=nested.nested_quant_map[nested.codes[j]]*scales[j/255];
+            flat[j]=product+nested.offset;
+        }
+    };
+    prepare_generic(expert1.host_slot_nested.gate_up_nested,expert1.gu_nested_absmax,expert1.gu_absmax_unnested);
+    prepare_generic(expert1.host_slot_nested.down_nested,expert1.dn_nested_absmax,expert1.dn_absmax_unnested);
+    std::vector<bf16> x(4*H);
+    std::mt19937 rng(20261005);
+    for(auto& value:x)value=bf16(float(int(rng()%2049)-1024)/256.0f);
+    std::fill_n(x.data()+H,H,bf16(0.0f));
+    constexpr float ties[]={127.0f,-127.0f,0.5f,-0.5f,1.5f,-2.5f,126.5f};
+    for(int row=0;row<H;++row)x[row]=bf16(ties[row%7]);
+    for(int block=0;block<H/64;++block)x[block*64]=bf16(127.0f);
+    const auto immutableX=x;
+    std::vector<ops::cpu::CpuExpertTask> tasks(40);
+    for(int c=0;c<40;++c)tasks[c]={c%3==0?expert0.host_slot_nested:
+        c%3==1?expert0.host_slot_unnested:expert1.host_slot_nested,(c*3+1)%4};
+    struct Buffers {
+        std::vector<bf16> h;
+        std::vector<float> out;
+        explicit Buffers(int count):h(count*I+2*Guard,bf16(-98.5f)),out(count*H+2*Guard,-9876.5f){}
+    };
+    auto forward=[&](Buffers& output,int count,bool dag,bool specialize,bool row2,bool shift,
+                     const ops::cpu::CpuExpertDagTestHooks* hooks=nullptr,
+                     ops::cpu::CpuExpertPhaseTimings* timings=nullptr) {
+        ops::cpu::cpu_expert_batch_forward(tasks.data(),count,x.data(),4,output.h.data()+Guard,
+            output.out.data()+Guard,nullptr,Backend,timings,shift,specialize,row2,dag,hooks);
+    };
+    auto matched=[](const Buffers& baseline,const Buffers& candidate) {
+        expect(std::memcmp(baseline.h.data(),candidate.h.data(),baseline.h.size()*sizeof(bf16))==0,
+            "per-expert DAG changed BF16 h or canaries");
+        expect(std::memcmp(baseline.out.data(),candidate.out.data(),baseline.out.size()*sizeof(float))==0,
+            "per-expert DAG changed FP32 down or canaries");
+    };
+    for(int count:{1,3,10,40})for(bool specialize:{false,true})for(bool row2:{false,true})for(bool shift:{false,true}) {
+        Buffers baseline(count);
+        tbb::task_arena referenceArena(1);
+        referenceArena.execute([&] {forward(baseline,count,false,specialize,row2,shift);});
+        for(int threads:{1,4,18}) {
+            Buffers candidate(count);
+            std::atomic<int> active{0};
+            ops::cpu::CpuExpertDagTestHooks hooks{-1,&active};
+            tbb::task_arena arena(threads);
+            arena.execute([&] {forward(candidate,count,true,specialize,row2,shift,&hooks);});
+            expect(active.load()==0,"per-expert DAG returned with an active descendant");
+            matched(baseline,candidate);
+            for(int j=0;j<Guard;++j) {
+                expect(float(candidate.h[j])==-98.5f && float(candidate.h[Guard+count*I+j])==-98.5f,
+                    "per-expert DAG h canary changed");
+                expect(candidate.out[j]==-9876.5f && candidate.out[Guard+count*H+j]==-9876.5f,
+                    "per-expert DAG output canary changed");
+            }
+        }
+    }
+    // Reentrant batches share immutable input/weights, but no counters, scratch
+    // or cancellation context. Inject an asynchronous error in just one batch.
+    constexpr int Count=10;
+    Buffers expected(Count),good(Count),failed(Count);
+    tbb::task_arena referenceArena(1);
+    referenceArena.execute([&] {forward(expected,Count,false,true,true,true);});
+    std::atomic<int> goodActive{0},failedActive{0};
+    ops::cpu::CpuExpertDagTestHooks goodHooks{-1,&goodActive},failureHooks{79,&failedActive};
+    auto survivor=std::async(std::launch::async,[&] {
+        tbb::task_arena arena(4);arena.execute([&] {forward(good,Count,true,true,true,true,&goodHooks);});
+    });
+    auto faulted=std::async(std::launch::async,[&] {
+        tbb::task_arena arena(4);arena.execute([&] {forward(failed,Count,true,true,true,true,&failureHooks);});
+    });
+    bool faultObserved=false;
+    try {faulted.get();}catch(const std::runtime_error& error) {
+        faultObserved=std::string(error.what())=="Injected CPU expert DAG gate failure";
+    }
+    survivor.get();
+    expect(faultObserved,"per-expert DAG did not propagate descendant failure");
+    expect(goodActive.load()==0 && failedActive.load()==0,"per-expert DAG exception did not drain descendants");
+    matched(expected,good);
+    // Reuse the failed call's buffers immediately: no old task may write them.
+    tbb::task_arena recoveryArena(18);
+    recoveryArena.execute([&] {forward(failed,Count,true,true,true,true,&goodHooks);});
+    matched(expected,failed);
+    // Serial diagnostic fields retain their original semantics and deliberately
+    // select the old path, even when the DAG flag/override requests the candidate.
+    ops::cpu::CpuExpertPhaseTimings phases;
+    Buffers diagnostic(Count);
+    recoveryArena.execute([&] {forward(diagnostic,Count,true,true,true,true,&failureHooks,&phases);});
+    matched(expected,diagnostic);
+    expect(phases.gate_up_ns>0 && phases.down_ns>0,"DAG diagnostic fallback lost serial phase timings");
+    // The opt-in must leave every non-A64 Q8 backend on its original path.
+    for(auto backend:{ops::cpu::CpuKernelBackend::Nf4Q8Avx2,
+                      ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2,
+                      ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2}) {
+        Buffers baseline(3),candidate(3);
+        auto nonA64=[&](Buffers& output,bool dag) {
+            ops::cpu::cpu_expert_batch_forward(tasks.data(),3,x.data(),4,output.h.data()+Guard,
+                output.out.data()+Guard,nullptr,backend,nullptr,true,true,true,dag,&failureHooks);
+        };
+        referenceArena.execute([&] {nonA64(baseline,false);});
+        recoveryArena.execute([&] {nonA64(candidate,true);});
+        matched(baseline,candidate);
+    }
+    expect(std::memcmp(x.data(),immutableX.data(),x.size()*sizeof(bf16))==0,"per-expert DAG changed shared inputs");
+    for (int threads : {1, 4, 18}) {
+        ops::cpu::CpuTilePool pool(threads);
+        for (int pass = 0; pass < 100; ++pass) {
+            std::array<std::atomic<int>, 93> visits{};
+            const int tiles = 1 + pass % 93;
+            pool.ParallelFor(tiles, [&](int first, int last) {
+                for (int tile = first; tile < last; ++tile) ++visits[tile];
+            });
+            for (int tile = 0; tile < 93; ++tile)
+                expect(visits[tile] == int(tile < tiles), "tile pool missed or repeated a tile");
+        }
+        bool injected = false;
+        std::atomic<int> active{0};
+        try {
+            pool.ParallelFor(93, [&](int first, int last) {
+                struct Guard { std::atomic<int>& n; Guard(std::atomic<int>& v) : n(v) { ++n; } ~Guard() { --n; } } guard(active);
+                if (first <= 44 && last > 44) throw std::runtime_error("pool test fault");
+            });
+        } catch (const std::runtime_error& error) { injected = std::string(error.what()) == "pool test fault"; }
+        expect(injected && active == 0, "tile pool did not propagate and drain failure");
+        for (int count : {1, 3, 10, 40}) {
+            Buffers baseline(count), candidate(count);
+            referenceArena.execute([&] { forward(baseline, count, false, true, true, true); });
+            ops::cpu::CpuTilePoolScope scope(&pool);
+            forward(candidate, count, false, true, true, true);
+            matched(baseline, candidate);
+        }
+    }
+    std::cout << "[PASS] Persistent tile pool exact coverage, 100 generations, exception drain/reuse, 1/4/18 threads and A64 h/out bits.\n";
+    std::cout<<"[PASS] Per-expert A64 DAG old-path h/out bits, flat/nested256/generic255, row2/spec/shift independently on/off, 1/3/10/40 tasks, 1/4/18 threads, canaries, reentrancy, exception drain, immediate reuse and non-A64 fallback.\n";
+}
+
+void test_nf4_q8_scale_shift() {
+    std::cout << "[Test] NF4Q8 scale shift: explicit on/off BF16/F32 bitwise shadows...\n";
+    constexpr int H = ops::cpu::kHiddenDim, I = ops::cpu::kIntermediateDim;
+    constexpr int count = ops::cpu::kMaxExpertBatchTasks;
+    SyntheticExpertData expert0(2307), expert1(7619);
+    SyntheticExpertData* experts[] = {&expert0, &expert1};
+    std::mt19937 rng(20261004);
+    std::uniform_real_distribution<float> scale_dist(0.013f, 0.087f);
+    std::uniform_real_distribution<float> map_dist(-1.0f, 1.0f);
+    std::normal_distribution<float> input_dist(0.0f, 1.0f);
+    std::vector<bf16> x(4 * H), baseline_h(count * I), shifted_h(count * I), flat_h(count * I);
+    std::vector<float> baseline_out(count * H), shifted_out(count * H), flat_out(count * H);
+    for (int token = 0; token < 4; ++token) {
+        constexpr float amplitudes[4] = {0.03125f, 0.125f, 1.0f, 4.0f};
+        for (int col = 0; col < H; ++col) x[token * H + col] = bf16(amplitudes[token] * input_dist(rng));
+    }
+    // Non-power-of-two, other powers-of-two, and nonpositive metadata (effective
+    // default 256). Different gate/down sizes exercise independent slot fields.
+    for (const int blocksize : {256, 255, 128, 512, 0, -7}) {
+        for (int e = 0; e < 2; ++e) {
+            auto& expert = *experts[e];
+            const int down_blocksize = e == 0 ? blocksize : 255;
+            auto prepare = [&](ops::MoeNestedScaleHost& nested, std::vector<float>& scales,
+                               std::vector<float>& map, std::vector<float>& flat, int bs) {
+                const size_t effective_bs = bs > 0 ? static_cast<size_t>(bs) : 256;
+                scales.resize((flat.size() + effective_bs - 1) / effective_bs);
+                for (float& value : scales) value = scale_dist(rng);
+                for (float& value : map) value = map_dist(rng);
+                nested.nested_absmax = scales.data();
+                nested.nested_quant_map = map.data();
+                nested.blocksize = bs;
+                for (size_t index = 0; index < flat.size(); ++index) {
+                    volatile float product = map[nested.codes[index]] * scales[index / effective_bs];
+                    flat[index] = product + nested.offset;
+                }
+            };
+            prepare(expert.host_slot_nested.gate_up_nested, expert.gu_nested_absmax,
+                    expert.gu_nested_qmap, expert.gu_absmax_unnested, blocksize);
+            prepare(expert.host_slot_nested.down_nested, expert.dn_nested_absmax,
+                    expert.dn_nested_qmap, expert.dn_absmax_unnested, down_blocksize);
+        }
+        ops::cpu::CpuExpertTask tasks[count], flat_tasks[count];
+        for (int c = 0; c < count; ++c) {
+            const int e = c % 2, token = (c / 2) % 4;
+            tasks[c] = {experts[e]->host_slot_nested, token};
+            flat_tasks[c] = {experts[e]->host_slot_unnested, token};
+        }
+        for (const auto backend : {ops::cpu::CpuKernelBackend::Nf4Q8Avx2,
+                                   ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2,
+                                   ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2}) {
+            tbb::task_arena baseline_arena(1);
+            baseline_arena.execute([&] {
+                // Omitted bool retains the division path for Executor shadows.
+                ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4,
+                    baseline_h.data(), baseline_out.data(), nullptr, backend);
+            });
+            for (const int threads : {1, 4, 12}) {
+                tbb::task_arena arena(threads);
+                arena.execute([&] {
+                    ops::cpu::cpu_expert_batch_forward(tasks, count, x.data(), 4,
+                        shifted_h.data(), shifted_out.data(), nullptr, backend, nullptr, true);
+                    ops::cpu::cpu_expert_batch_forward(flat_tasks, count, x.data(), 4,
+                        flat_h.data(), flat_out.data(), nullptr, backend, nullptr, true);
+                });
+                const bool matched = std::memcmp(baseline_h.data(), shifted_h.data(), baseline_h.size() * sizeof(bf16)) == 0 &&
+                    std::memcmp(baseline_out.data(), shifted_out.data(), baseline_out.size() * sizeof(float)) == 0 &&
+                    std::memcmp(baseline_h.data(), flat_h.data(), baseline_h.size() * sizeof(bf16)) == 0 &&
+                    std::memcmp(baseline_out.data(), flat_out.data(), baseline_out.size() * sizeof(float)) == 0;
+                expect(matched, "NF4Q8 scale shift changes BF16/F32 bits: blocksize=" + std::to_string(blocksize) +
+                    " backend=" + std::to_string(static_cast<int>(backend)) + " threads=" + std::to_string(threads));
+            }
+        }
+    }
+    std::cout << "[PASS] NF4Q8 scale shift/default division/expanded scales, mixed40 tasks, three Q8 backends, 1/4/12 threads.\n";
 }
 
 void test_batch_scale(bool benchmark) {
@@ -941,10 +1360,25 @@ int main(int argc, char** argv) {
             test_batch_scale(true);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--nf4-q8-scale-shift") {
+            test_nf4_q8_scale_shift();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--nf4-q8-activation64") {
+            test_nf4_q8_activation64();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--nf4-q8-dag") {
+            test_nf4_q8_per_expert_dag();
+            return 0;
+        }
         test_batch_scale(false);
         test_nf4_q8_batch();
         for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(true, seed);
         for (unsigned seed : {20261003u, 20261004u, 20261005u}) test_nf4_q8_batch(false, seed, true);
+        test_nf4_q8_scale_shift();
+        test_nf4_q8_activation64();
+        test_nf4_q8_per_expert_dag();
         test_edge_cases_and_robustness();
         test_nested_rounding_contract();
         test_cpu_self_consistency();

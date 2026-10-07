@@ -573,6 +573,10 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     const bool hasToolHistory = std::any_of(renderRequest.messages.begin(), renderRequest.messages.end(),
         [](const chat::ChatMessage& message) { return !message.tool_calls.empty() || message.role == chat::ChatRole::Tool; });
     const bool useToolFallback = hasToolHistory || (!renderRequest.tools.empty() && renderRequest.tool_choice != chat::ToolChoice::None);
+    // Qwen4Exp requires its checkpoint template; there is no service fallback.
+    if (settings.family == ModelFamily::Qwen4Exp && tokenizer.chat_template().empty())
+        throw ApiError(500, "invalid_server_configuration",
+                       "Qwen4Exp requires the checkpoint chat_template; the service has no Qwen4Exp fallback");
     renderRequest.template_options.template_override_text = !tokenizer.chat_template().empty() ? tokenizer.chat_template()
         : settings.family == ModelFamily::Qwen35Hybrid ? chat::qwen35_fixed_chat_template()
         : useToolFallback ? ToolFallbackTemplate() : FallbackTemplate();

@@ -1,0 +1,706 @@
+{
+  "phase": "conditional_probe_only",
+  "production_mtp": false,
+  "goal_20_achieved": false,
+  "runs": [
+    {
+      "prefix": "tmp/mtp-current-code-screen",
+      "exe_sha256": "4DA170F7E5A0CE2542FB0CD7CFC66BED849DD8E4BAAEA53E698D2093B1AFDC6A",
+      "exit_code": 0,
+      "prompt_tokens": 121,
+      "anchors": 28,
+      "accepted_histogram": {
+        "3": 23,
+        "2": 2,
+        "1": 1,
+        "0": 2
+      },
+      "summaries": [
+        {
+          "width": 1,
+          "kv_only": true,
+          "cycle_count": 28,
+          "committed": 28,
+          "mean_advance": 1.0,
+          "draft_pass_mean_ms": [
+            0.02032142857142857
+          ],
+          "draft_median_pass_mean_ms": 0.02032142857142857,
+          "draft_cycles_ms": {
+            "n": 28,
+            "mean": 0.02032142857142857,
+            "median": 0.0169,
+            "p10": 0.0162,
+            "p90": 0.0182,
+            "cv": 0.8301495225034214
+          },
+          "catchup_ms": {
+            "n": 28,
+            "mean": 0.02032142857142857,
+            "median": 0.0169,
+            "p10": 0.0162,
+            "p90": 0.0182,
+            "cv": 0.8301495225034214
+          },
+          "demand_bytes": [
+            0
+          ],
+          "misses": [
+            0
+          ],
+          "verify_pass_mean_ms": [
+            61.68341875
+          ],
+          "verify_ms": 61.68341875,
+          "conditional_tokens_s": 16.206473012916025,
+          "free_draft_tokens_s": 16.21181218980344,
+          "commit_budget_for_20_ms": -11.70374017857143,
+          "verify_block_ms": {
+            "n": 32,
+            "mean": 61.68341875,
+            "median": 55.9408,
+            "p10": 54.2786,
+            "p90": 58.3797,
+            "cv": 0.4991665302163831
+          },
+          "verify_demand_bytes": [
+            0
+          ],
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 2,
+          "kv_only": true,
+          "cycle_count": 15,
+          "committed": 29,
+          "mean_advance": 1.9333333333333333,
+          "draft_pass_mean_ms": [
+            7.054713333333334
+          ],
+          "draft_median_pass_mean_ms": 7.054713333333334,
+          "draft_cycles_ms": {
+            "n": 15,
+            "mean": 7.054713333333334,
+            "median": 7.154,
+            "p10": 5.5875,
+            "p90": 8.4115,
+            "cv": 0.12966007025649443
+          },
+          "catchup_ms": {
+            "n": 15,
+            "mean": 0.71174,
+            "median": 0.7954,
+            "p10": 0.0185,
+            "p90": 0.8812,
+            "cv": 0.38606221421077414
+          },
+          "demand_bytes": [
+            146995200
+          ],
+          "misses": [
+            58
+          ],
+          "verify_pass_mean_ms": [
+            218.22393125
+          ],
+          "verify_ms": 218.22393125,
+          "conditional_tokens_s": 8.581964512921994,
+          "free_draft_tokens_s": 8.859401085202169,
+          "commit_budget_for_20_ms": -128.61197791666666,
+          "verify_block_ms": {
+            "n": 16,
+            "mean": 218.22393125,
+            "median": 220.48555,
+            "p10": 202.6569,
+            "p90": 236.3004,
+            "cv": 0.061802042278081136
+          },
+          "verify_demand_bytes": [
+            14413132800
+          ],
+          "mean_union_per_layer": 16.09765625,
+          "ready_fraction_at_router": 0.5399983822696757,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 3,
+          "kv_only": true,
+          "cycle_count": 10,
+          "committed": 29,
+          "mean_advance": 2.9,
+          "draft_pass_mean_ms": [
+            14.373850000000001
+          ],
+          "draft_median_pass_mean_ms": 14.373850000000001,
+          "draft_cycles_ms": {
+            "n": 10,
+            "mean": 14.373850000000001,
+            "median": 14.30655,
+            "p10": 13.5749,
+            "p90": 15.9837,
+            "cv": 0.0632923565904944
+          },
+          "catchup_ms": {
+            "n": 10,
+            "mean": 1.30712,
+            "median": 1.4562,
+            "p10": 0.7759,
+            "p90": 1.7282,
+            "cv": 0.3790772698207382
+          },
+          "demand_bytes": [
+            223027200
+          ],
+          "misses": [
+            88
+          ],
+          "verify_pass_mean_ms": [
+            262.26479
+          ],
+          "verify_ms": 262.26479,
+          "conditional_tokens_s": 10.48298965032506,
+          "free_draft_tokens_s": 11.057527013061875,
+          "commit_budget_for_20_ms": -131.63864,
+          "verify_block_ms": {
+            "n": 10,
+            "mean": 262.26479,
+            "median": 264.0732,
+            "p10": 235.8451,
+            "p90": 291.0101,
+            "cv": 0.07667103355118217
+          },
+          "verify_demand_bytes": [
+            11503641600
+          ],
+          "mean_union_per_layer": 19.997916666666665,
+          "ready_fraction_at_router": 0.5271382435670382,
+          "known_target_top1_rows": 30,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 4,
+          "kv_only": true,
+          "cycle_count": 8,
+          "committed": 31,
+          "mean_advance": 3.875,
+          "draft_pass_mean_ms": [
+            20.5259625
+          ],
+          "draft_median_pass_mean_ms": 20.5259625,
+          "draft_cycles_ms": {
+            "n": 8,
+            "mean": 20.5259625,
+            "median": 20.48085,
+            "p10": 18.8753,
+            "p90": 22.5574,
+            "cv": 0.0591232434825308
+          },
+          "catchup_ms": {
+            "n": 8,
+            "mean": 1.8425,
+            "median": 2.1795,
+            "p10": 0.0192,
+            "p90": 2.2862,
+            "cv": 0.39251472891087147
+          },
+          "demand_bytes": [
+            207820800
+          ],
+          "misses": [
+            82
+          ],
+          "verify_pass_mean_ms": [
+            316.1601
+          ],
+          "verify_ms": 316.1601,
+          "conditional_tokens_s": 11.50923792694864,
+          "free_draft_tokens_s": 12.256448552489704,
+          "commit_budget_for_20_ms": -142.9360625,
+          "verify_block_ms": {
+            "n": 8,
+            "mean": 316.1601,
+            "median": 320.4948,
+            "p10": 280.288,
+            "p90": 350.6018,
+            "cv": 0.08512864880329522
+          },
+          "verify_demand_bytes": [
+            11706393600
+          ],
+          "mean_union_per_layer": 24.354166666666668,
+          "ready_fraction_at_router": 0.5060949529512404,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        }
+      ]
+    },
+    {
+      "prefix": "tmp/mtp-phase-cap-code-screen",
+      "exe_sha256": "741D5EE2084D65B19257F871C4F8D8000B5EE7FABC73C345870C94314413EDD0",
+      "exit_code": 0,
+      "prompt_tokens": 121,
+      "anchors": 28,
+      "accepted_histogram": {
+        "3": 23,
+        "2": 2,
+        "1": 1,
+        "0": 2
+      },
+      "summaries": [
+        {
+          "width": 1,
+          "kv_only": true,
+          "cycle_count": 28,
+          "committed": 28,
+          "mean_advance": 1.0,
+          "draft_pass_mean_ms": [
+            0.016742857142857143
+          ],
+          "draft_median_pass_mean_ms": 0.016742857142857143,
+          "draft_cycles_ms": {
+            "n": 28,
+            "mean": 0.016742857142857143,
+            "median": 0.0167,
+            "p10": 0.0161,
+            "p90": 0.0171,
+            "cv": 0.02919161330129011
+          },
+          "catchup_ms": {
+            "n": 28,
+            "mean": 0.016742857142857143,
+            "median": 0.0167,
+            "p10": 0.0161,
+            "p90": 0.0171,
+            "cv": 0.02919161330129011
+          },
+          "demand_bytes": [
+            0
+          ],
+          "misses": [
+            0
+          ],
+          "verify_pass_mean_ms": [
+            61.701934375
+          ],
+          "verify_ms": 61.701934375,
+          "conditional_tokens_s": 16.202550748757844,
+          "free_draft_tokens_s": 16.206947320685195,
+          "commit_budget_for_20_ms": -11.718677232142857,
+          "verify_block_ms": {
+            "n": 32,
+            "mean": 61.701934375,
+            "median": 56.0109,
+            "p10": 53.6056,
+            "p90": 58.4343,
+            "cv": 0.5044491031573032
+          },
+          "verify_demand_bytes": [
+            0
+          ],
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 2,
+          "kv_only": true,
+          "cycle_count": 15,
+          "committed": 29,
+          "mean_advance": 1.9333333333333333,
+          "draft_pass_mean_ms": [
+            7.156553333333333
+          ],
+          "draft_median_pass_mean_ms": 7.156553333333333,
+          "draft_cycles_ms": {
+            "n": 15,
+            "mean": 7.156553333333333,
+            "median": 7.0063,
+            "p10": 5.5894,
+            "p90": 8.0905,
+            "cv": 0.1328828400494288
+          },
+          "catchup_ms": {
+            "n": 15,
+            "mean": 0.73612,
+            "median": 0.7833,
+            "p10": 0.0188,
+            "p90": 1.0768,
+            "cv": 0.4198065638648238
+          },
+          "demand_bytes": [
+            146995200
+          ],
+          "misses": [
+            58
+          ],
+          "verify_pass_mean_ms": [
+            241.55556875
+          ],
+          "verify_ms": 241.55556875,
+          "conditional_tokens_s": 7.7733779806902685,
+          "free_draft_tokens_s": 8.003679415622386,
+          "commit_budget_for_20_ms": -152.04545541666667,
+          "verify_block_ms": {
+            "n": 16,
+            "mean": 241.55556875,
+            "median": 234.75385,
+            "p10": 210.7197,
+            "p90": 258.0518,
+            "cv": 0.14306206036823801
+          },
+          "verify_demand_bytes": [
+            16052889600
+          ],
+          "mean_union_per_layer": 16.09765625,
+          "ready_fraction_at_router": 0.48766480627679365,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 3,
+          "kv_only": true,
+          "cycle_count": 10,
+          "committed": 29,
+          "mean_advance": 2.9,
+          "draft_pass_mean_ms": [
+            14.57512
+          ],
+          "draft_median_pass_mean_ms": 14.57512,
+          "draft_cycles_ms": {
+            "n": 10,
+            "mean": 14.57512,
+            "median": 14.472000000000001,
+            "p10": 13.9798,
+            "p90": 15.7798,
+            "cv": 0.05127532899225119
+          },
+          "catchup_ms": {
+            "n": 10,
+            "mean": 1.27942,
+            "median": 1.4544,
+            "p10": 0.8065,
+            "p90": 1.7518,
+            "cv": 0.37198461375091013
+          },
+          "demand_bytes": [
+            223027200
+          ],
+          "misses": [
+            88
+          ],
+          "verify_pass_mean_ms": [
+            304.80739
+          ],
+          "verify_ms": 304.80739,
+          "conditional_tokens_s": 9.080021319890058,
+          "free_draft_tokens_s": 9.514205019766745,
+          "commit_budget_for_20_ms": -174.38251,
+          "verify_block_ms": {
+            "n": 10,
+            "mean": 304.80739,
+            "median": 294.94845,
+            "p10": 252.3507,
+            "p90": 414.0158,
+            "cv": 0.14590013892204456
+          },
+          "verify_demand_bytes": [
+            12996403200
+          ],
+          "mean_union_per_layer": 19.997916666666665,
+          "ready_fraction_at_router": 0.46577768517553914,
+          "known_target_top1_rows": 30,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 4,
+          "kv_only": true,
+          "cycle_count": 8,
+          "committed": 31,
+          "mean_advance": 3.875,
+          "draft_pass_mean_ms": [
+            20.361150000000002
+          ],
+          "draft_median_pass_mean_ms": 20.361150000000002,
+          "draft_cycles_ms": {
+            "n": 8,
+            "mean": 20.361150000000002,
+            "median": 20.231650000000002,
+            "p10": 18.9556,
+            "p90": 22.05,
+            "cv": 0.051343129767711666
+          },
+          "catchup_ms": {
+            "n": 8,
+            "mean": 1.8040875,
+            "median": 2.11415,
+            "p10": 0.0186,
+            "p90": 2.3558,
+            "cv": 0.3969505557781674
+          },
+          "demand_bytes": [
+            207820800
+          ],
+          "misses": [
+            82
+          ],
+          "verify_pass_mean_ms": [
+            373.2281
+          ],
+          "verify_ms": 373.2281,
+          "conditional_tokens_s": 9.845289219662376,
+          "free_draft_tokens_s": 10.382390822127274,
+          "commit_budget_for_20_ms": -199.83925,
+          "verify_block_ms": {
+            "n": 8,
+            "mean": 373.2281,
+            "median": 369.3693,
+            "p10": 298.1388,
+            "p90": 481.6935,
+            "cv": 0.1443530646484441
+          },
+          "verify_demand_bytes": [
+            13001472000
+          ],
+          "mean_union_per_layer": 24.354166666666668,
+          "ready_fraction_at_router": 0.4514542343883661,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        }
+      ]
+    },
+    {
+      "prefix": "tmp/mtp-phase-cap-zh-screen",
+      "exe_sha256": "741D5EE2084D65B19257F871C4F8D8000B5EE7FABC73C345870C94314413EDD0",
+      "exit_code": 0,
+      "prompt_tokens": 122,
+      "anchors": 28,
+      "accepted_histogram": {
+        "2": 5,
+        "3": 4,
+        "0": 10,
+        "1": 9
+      },
+      "summaries": [
+        {
+          "width": 1,
+          "kv_only": true,
+          "cycle_count": 28,
+          "committed": 28,
+          "mean_advance": 1.0,
+          "draft_pass_mean_ms": [
+            0.02227857142857143
+          ],
+          "draft_median_pass_mean_ms": 0.02227857142857143,
+          "draft_cycles_ms": {
+            "n": 28,
+            "mean": 0.02227857142857143,
+            "median": 0.0224,
+            "p10": 0.0193,
+            "p90": 0.0233,
+            "cv": 0.07490131717546691
+          },
+          "catchup_ms": {
+            "n": 28,
+            "mean": 0.02227857142857143,
+            "median": 0.0224,
+            "p10": 0.0193,
+            "p90": 0.0233,
+            "cv": 0.07490131717546691
+          },
+          "demand_bytes": [
+            0
+          ],
+          "misses": [
+            0
+          ],
+          "verify_pass_mean_ms": [
+            58.491659375
+          ],
+          "verify_ms": 58.491659375,
+          "conditional_tokens_s": 17.089945320643654,
+          "free_draft_tokens_s": 17.09645461738108,
+          "commit_budget_for_20_ms": -8.51393794642857,
+          "verify_block_ms": {
+            "n": 32,
+            "mean": 58.491659375,
+            "median": 52.4853,
+            "p10": 50.8331,
+            "p90": 55.1303,
+            "cv": 0.5549511491622627
+          },
+          "verify_demand_bytes": [
+            0
+          ],
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 2,
+          "kv_only": true,
+          "cycle_count": 18,
+          "committed": 29,
+          "mean_advance": 1.6111111111111112,
+          "draft_pass_mean_ms": [
+            6.736894444444444
+          ],
+          "draft_median_pass_mean_ms": 6.736894444444444,
+          "draft_cycles_ms": {
+            "n": 18,
+            "mean": 6.736894444444444,
+            "median": 6.8461,
+            "p10": 5.9921,
+            "p90": 7.351,
+            "cv": 0.07444300196578474
+          },
+          "catchup_ms": {
+            "n": 18,
+            "mean": 0.45055555555555554,
+            "median": 0.77925,
+            "p10": 0.0184,
+            "p90": 0.8093,
+            "cv": 0.8502344421111264
+          },
+          "demand_bytes": [
+            154598400
+          ],
+          "misses": [
+            61
+          ],
+          "verify_pass_mean_ms": [
+            202.88178125
+          ],
+          "verify_ms": 202.88178125,
+          "conditional_tokens_s": 7.685913985353027,
+          "free_draft_tokens_s": 7.941132521533947,
+          "commit_budget_for_20_ms": -129.06312013888888,
+          "verify_block_ms": {
+            "n": 16,
+            "mean": 202.88178125,
+            "median": 190.53285,
+            "p10": 164.089,
+            "p90": 221.7995,
+            "cv": 0.25628487458236043
+          },
+          "verify_demand_bytes": [
+            11681049600
+          ],
+          "mean_union_per_layer": 16.6484375,
+          "ready_fraction_at_router": 0.6395276083216017,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 3,
+          "kv_only": true,
+          "cycle_count": 14,
+          "committed": 29,
+          "mean_advance": 2.0714285714285716,
+          "draft_pass_mean_ms": [
+            13.469485714285714
+          ],
+          "draft_median_pass_mean_ms": 13.469485714285714,
+          "draft_cycles_ms": {
+            "n": 14,
+            "mean": 13.469485714285714,
+            "median": 13.2132,
+            "p10": 12.92,
+            "p90": 14.2482,
+            "cv": 0.05735337736272153
+          },
+          "catchup_ms": {
+            "n": 14,
+            "mean": 0.8028785714285714,
+            "median": 0.8651,
+            "p10": 0.02,
+            "p90": 1.5166,
+            "cv": 0.7897616951048213
+          },
+          "demand_bytes": [
+            248371200
+          ],
+          "misses": [
+            98
+          ],
+          "verify_pass_mean_ms": [
+            267.78347
+          ],
+          "verify_ms": 267.78347,
+          "conditional_tokens_s": 7.365001964753954,
+          "free_draft_tokens_s": 7.735460935764897,
+          "commit_budget_for_20_ms": -177.6815271428572,
+          "verify_block_ms": {
+            "n": 10,
+            "mean": 267.78347,
+            "median": 248.25549999999998,
+            "p10": 222.2004,
+            "p90": 433.6181,
+            "cv": 0.22153903330268798
+          },
+          "verify_demand_bytes": [
+            10517760000
+          ],
+          "mean_union_per_layer": 22.870833333333334,
+          "ready_fraction_at_router": 0.6219712151575879,
+          "known_target_top1_rows": 30,
+          "known_target_top1_mismatches": []
+        },
+        {
+          "width": 4,
+          "kv_only": true,
+          "cycle_count": 14,
+          "committed": 29,
+          "mean_advance": 2.0714285714285716,
+          "draft_pass_mean_ms": [
+            19.3789
+          ],
+          "draft_median_pass_mean_ms": 19.3789,
+          "draft_cycles_ms": {
+            "n": 14,
+            "mean": 19.3789,
+            "median": 19.50815,
+            "p10": 17.5184,
+            "p90": 21.0544,
+            "cv": 0.06500993314998398
+          },
+          "catchup_ms": {
+            "n": 14,
+            "mean": 0.8039571428571429,
+            "median": 0.78935,
+            "p10": 0.0193,
+            "p90": 1.6087,
+            "cv": 0.8054907941579443
+          },
+          "demand_bytes": [
+            370022400
+          ],
+          "misses": [
+            146
+          ],
+          "verify_pass_mean_ms": [
+            327.5245875
+          ],
+          "verify_ms": 327.5245875,
+          "conditional_tokens_s": 5.971195580524602,
+          "free_draft_tokens_s": 6.324497917056599,
+          "commit_budget_for_20_ms": -243.33205892857143,
+          "verify_block_ms": {
+            "n": 8,
+            "mean": 327.5245875,
+            "median": 311.9003,
+            "p10": 278.5633,
+            "p90": 482.8618,
+            "cv": 0.18947264991260696
+          },
+          "verify_demand_bytes": [
+            10652083200
+          ],
+          "mean_union_per_layer": 28.223958333333332,
+          "ready_fraction_at_router": 0.6121978224764717,
+          "known_target_top1_rows": 31,
+          "known_target_top1_mismatches": []
+        }
+      ]
+    }
+  ]
+}

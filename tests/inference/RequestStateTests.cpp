@@ -74,6 +74,9 @@ struct FakeState {
     bool failAfterForward = false;
     bool throwUnknown = false;
     bool incompleteConsume = false;
+    bool windowEnabled = false;
+    bool windowAccepts = true;
+    int windows = 0;
     bool invalidLogitsSize = false;
     std::function<void()> duringForward;
 };
@@ -94,6 +97,19 @@ public:
     }
     const void* DecodeBatchKey() const noexcept override {
         return model->batchEnabled ? model.get() : nullptr;
+    }
+    bool SupportsDecodeWindow() const noexcept override { return state->windowEnabled; }
+    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector) override {
+        ++state->windows;
+        state->context.push_back(pending);
+        const int first = state->samples.at(state->samplesTaken++);
+        if (state->duringForward) state->duringForward();
+        if (state->windowAccepts && selector(first)) {
+            state->context.push_back(first);
+            const int bonus = state->samples.at(state->samplesTaken++);
+            return DecodeWindowResult{first, bonus, 2, int(state->context.size()), true};
+        }
+        return DecodeWindowResult{first, std::nullopt, 1, int(state->context.size()), false};
     }
     std::vector<ExecutionResult> ForwardDecodeBatch(const std::vector<BackendDecodeInput>& rows) override {
         std::vector<ExecutionResult> results;
@@ -1314,10 +1330,48 @@ void TestSessionBatchLogitsAndAdmission() {
            "Diagnostic B=1 did not use the original scalar Forward path");
 }
 
+void TestDecodeWindowCommit() {
+    for (bool accepts : {false, true}) for (int maximum : {1, 2, 3, 4, 5}) {
+        auto f = MakeFixture(); f.state->windowEnabled = true; f.state->windowAccepts = accepts;
+        f.state->samples = {10, 11, 12, 13, 14, 15};
+        auto options = Options(maximum); options.generation.do_sample = false;
+        auto request = RequestState::Create(f.session, {1, 2}, options);
+        const auto generated = Complete(request);
+        Expect(generated == std::vector<int>(f.state->samples.begin(), f.state->samples.begin() + maximum), "Window output order");
+        std::vector<int> expected{1, 2}; expected.insert(expected.end(), generated.begin(), generated.end());
+        Expect(f.state->context == expected, "Window consumed a token twice or retained a suffix");
+        Expect((f.state->windows == 0) == (maximum < 3), "Window used at short output tail");
+    }
+    for (int stop : {11, 12}) {
+        auto f = MakeFixture(); f.state->windowEnabled = true; f.state->samples = {10, 11, 12, 13};
+        auto options = Options(4); options.generation.do_sample = false; options.stopTokenIds = {stop};
+        auto request = RequestState::Create(f.session, {1, 2}, options);
+        const auto generated = Complete(request);
+        Expect(generated.size() == size_t(stop - 10), "Window stop publication");
+        std::vector<int> expected{1, 2}; expected.insert(expected.end(), generated.begin(), generated.end());
+        Expect(f.state->context == expected, "Window stop cached an unpublished token");
+    }
+    for (bool during : {false, true}) {
+        auto f = MakeFixture(); f.state->windowEnabled = true; f.state->samples = {10, 11, 12, 13};
+        auto options = Options(4); options.generation.do_sample = false;
+        auto request = RequestState::Create(f.session, {1, 2}, options);
+        request->Step();
+        if (during) f.state->duringForward = [&] { request->Cancel(); };
+        request->Step(); request->Cancel(); request->Step();
+        Expect(f.state->context.empty() && request->Progress().status == RequestStatus::Cancelled, "Cancelled MTP session not reset");
+    }
+    auto f = MakeFixture(); f.state->windowEnabled = true; f.state->samples = {10, 11, 12, 13};
+    auto options = Options(4); options.generation.do_sample = false;
+    auto request = RequestState::Create(f.session, {1, 2}, options);
+    request->Step(); request->Step(1);
+    Expect(f.state->windows == 0, "Window ignored output backpressure budget");
+}
+
 } // namespace
 
 int main() {
     const std::vector<std::pair<const char*, void (*)()>> tests{
+        {"decode window prefix, stop, tail and cancellation", TestDecodeWindowCommit},
         {"session mutations and actual truncate length", TestSessionMutations},
         {"prefill without sampling, capacity and cancelled replay", TestPrefillOnlyAndCancelledReplay},
         {"thinking budget closes, accounts and continues", TestThinkingBudgetClosesAndAccounts},

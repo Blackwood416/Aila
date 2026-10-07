@@ -9,9 +9,21 @@ void test_cold_model(const std::string& directory,bool benchmark) {
     auto& ctx=Access::Ctx(engine);auto& backend=Access::Backend(engine);auto& cache=Access::Cache(engine);
     auto& session=Access::Session(engine);
     const bool hc_reference=aila::env::read_flag("AILA_Q4E_COLD_TEST_HC_REFERENCE",false);
+    const bool gpu_q8_reference=aila::env::read_flag("AILA_Q4E_COLD_TEST_GPU_Q8_REFERENCE",false);
+    const bool attention_q8=aila::env::read_flag("AILA_Q4E_ATTN_NF4_Q8",false);
+    const bool gdn_history_fused=aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED",false);
+    const bool lm_head_q8=aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8",false);
+    const auto reference_import=aila::env::read_string("AILA_Q4E_COLD_REFERENCE_IMPORT","");
+    const auto reference_export=aila::env::read_string("AILA_Q4E_COLD_REFERENCE_EXPORT","");
+    expect(reference_import.empty() || reference_export.empty(),"Choose reference import or export");
+    expect(!lm_head_q8 || benchmark || (!reference_import.empty() && !hc_reference),
+        "Q8 head quality requires separate original BF16 teacher import");
+    expect(reference_export.empty() || (!benchmark && !lm_head_q8),"Export requires original BF16 head");
+    expect(!gpu_q8_reference || aila::env::read_flag("AILA_Q4E_GPU_NF4_Q8",false) || attention_q8,"GPU Q8 reference requires candidate enabled");
     // Switching the test hook requires every submitted forward to be drained.
     auto set_hc_reference=[&](bool enabled){ctx.synchronize();backend.SetDecodeHcReferenceForTest(enabled);};
-    struct RestoreHcReference{Context& ctx;Qwen4ExpBnb4Backend& backend;~RestoreHcReference(){try{ctx.synchronize();backend.SetDecodeHcReferenceForTest(false);}catch(...){}}}restore_hc{ctx,backend};
+    auto set_gpu_q8_reference=[&](bool enabled){ctx.synchronize();backend.SetGpuNf4Q8ReferenceForTest(enabled);};
+    struct RestoreHcReference{Context& ctx;Qwen4ExpBnb4Backend& backend;~RestoreHcReference(){try{ctx.synchronize();backend.SetDecodeHcReferenceForTest(false);backend.SetGpuNf4Q8ReferenceForTest(false);}catch(...){}}}restore_hc{ctx,backend};
     const bool adaptive=cache.adaptive_hotset();
     if(adaptive)cache.RestartHotsetForTesting(false);
     Access::ColdMode(backend,0,false);
@@ -37,11 +49,53 @@ void test_cold_model(const std::string& directory,bool benchmark) {
     auto prefill=[&]{backend.reset();expect(engine.forward_prompt_tokens(prompt,0,int(prompt.size()),int(prompt.size())-4)!=nullptr,"Cold prefill");ctx.synchronize();};
     std::vector<std::vector<float>> reference;
     if(!benchmark) {
-        set_hc_reference(hc_reference);
-        prefill();
-        for(int step=0;step<48;++step) {reference.push_back(extract_bf16_to_f32(ctx,Access::Logits(backend)));backend.forward(ctx,ids.data_as<int>()+step,1,{SnapshotPolicy::None,true});}
+        constexpr uint32_t ReferenceMagic=0x51445231, ReferenceRows=48, ReferenceVocab=248320;
+        const std::array<uint32_t,4> header={ReferenceMagic,ReferenceRows,ReferenceVocab,uint32_t(prompt.size())};
+        if(!reference_import.empty()) {
+            std::ifstream source(reference_import,std::ios::binary);
+            expect(bool(source),"Original reference file missing");
+            std::array<uint32_t,4> imported{};
+            source.read(reinterpret_cast<char*>(imported.data()),sizeof(imported));
+            expect(bool(source) && imported==header,"Original reference header mismatch");
+            std::vector<int> imported_prompt(prompt.size()),imported_targets(48);
+            source.read(reinterpret_cast<char*>(imported_prompt.data()),imported_prompt.size()*sizeof(int));
+            source.read(reinterpret_cast<char*>(imported_targets.data()),48*sizeof(int));
+            expect(bool(source) && imported_prompt==prompt &&
+                std::equal(imported_targets.begin(),imported_targets.end(),targets.begin()),"Original reference token identity mismatch");
+            reference.resize(48,std::vector<float>(ReferenceVocab));
+            for(auto& row:reference) {
+                source.read(reinterpret_cast<char*>(row.data()),row.size()*sizeof(float));
+                expect(bool(source),"Original reference truncated logits");
+                for(float value:row) {
+                    uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));
+                    expect((bits&0x7f800000u)!=0x7f800000u,"Original reference nonfinite logits");
+                }
+            }
+            expect(source.peek()==std::char_traits<char>::eof(),"Original reference unexpected trailing bytes");
+            std::cout<<"[COLD REFERENCE IMPORT] rows=48 vocab="<<ReferenceVocab<<" prompt="<<prompt.size()<<" exact_token_identity=1 original_bf16_head=1\n";
+        } else {
+            // Export always records the original GPU arithmetic and BF16 head.
+            set_hc_reference(hc_reference || !reference_export.empty());
+            set_gpu_q8_reference(gpu_q8_reference || !reference_export.empty());
+            prefill();
+            for(int step=0;step<48;++step) {reference.push_back(extract_bf16_to_f32(ctx,Access::Logits(backend)));backend.forward(ctx,ids.data_as<int>()+step,1,{SnapshotPolicy::None,true});}
+            if(!reference_export.empty()) {
+                std::ofstream destination(reference_export,std::ios::binary|std::ios::trunc);
+                expect(bool(destination),"Original reference output cannot be opened");
+                destination.write(reinterpret_cast<const char*>(header.data()),sizeof(header));
+                destination.write(reinterpret_cast<const char*>(prompt.data()),prompt.size()*sizeof(int));
+                destination.write(reinterpret_cast<const char*>(targets.data()),48*sizeof(int));
+                for(const auto& row:reference) {
+                    expect(row.size()==ReferenceVocab,"Original reference vocab mismatch");
+                    destination.write(reinterpret_cast<const char*>(row.data()),row.size()*sizeof(float));
+                }
+                destination.flush();expect(bool(destination),"Original reference write failed");
+                std::cout<<"[COLD REFERENCE EXPORT] rows=48 vocab="<<ReferenceVocab<<" prompt="<<prompt.size()<<" original_gpu_arithmetic=1 original_bf16_head=1\n";
+            }
+        }
     }
     set_hc_reference(false);
+    set_gpu_q8_reference(false);
     // Rebuild from prompt demand before freezing. Calibration time is reported.
     const auto calibration_begin=std::chrono::steady_clock::now();
     if(adaptive)cache.RestartHotsetForTesting(true);
@@ -123,13 +177,22 @@ void test_cold_model(const std::string& directory,bool benchmark) {
         const auto pre_stats=cache.stats();prefill();h3_direct+=h3?cache.stats().direct_entries-pre_stats.direct_entries:0;
         const auto before=cache.stats();const auto cpu0=backend.hetero_stats();
         const auto device_count=ctx.device_allocation_count(),host_count=ctx.pinned_host_allocation_count();
+        const auto attention_q8_before=backend.AttentionNf4Q8ProjectionCount();
+        const auto gdn_history_before=backend.GdnHistoryFusionCount();
+        const auto head_q8_rows_before=backend.LmHeadQ8RowCount();
         CheckpointMetrics metrics;int exact=0;const int anchor=int(prompt.size())+24;
         for(int step=0;step<48;++step) {
             const auto values=extract_bf16_to_f32(ctx,Access::Logits(backend));metrics.add(reference[step],values,targets[step]);exact+=same_bits(reference[step],values);
             backend.forward(ctx,ids.data_as<int>()+step,1,{step==23?SnapshotPolicy::ReusablePrefix:SnapshotPolicy::None,true,step==23});
         }
         const auto after=cache.stats();const auto cpu=backend.hetero_stats();cpu_total+=cpu.cpu_tasks_completed-cpu0.cpu_tasks_completed;
+        const auto attention_q8_decode=backend.AttentionNf4Q8ProjectionCount()-attention_q8_before;
+        const auto gdn_history_decode=backend.GdnHistoryFusionCount()-gdn_history_before;
+        const auto head_q8_rows_decode=backend.LmHeadQ8RowCount()-head_q8_rows_before;
         metrics.report("C1_H3_teacher48");
+        if(attention_q8)expect(attention_q8_decode==48ULL*96,"Attention Q8 actual projection coverage");
+        if(gdn_history_fused && !attention_q8)expect(gdn_history_decode==48ULL*36,"GDN history fused actual layer coverage");
+        if(lm_head_q8)expect(backend.LmHeadQ8Enabled() && head_q8_rows_decode==48,"Q8 head actual decode row coverage");
         // The original tolerance plan defines +.01 nat/token as an alert,
         // not a calibrated universal pass threshold. Keep the alert visible.
         nll_warning=nll_warning || metrics.nll_delta/metrics.rows>.01;
@@ -153,6 +216,11 @@ void test_cold_model(const std::string& directory,bool benchmark) {
         }
         std::cout<<"[COLD MODEL] mode="<<mode<<" h3="<<h3<<" exact_rows="<<exact<<" cpu_tasks="<<cpu.cpu_tasks_completed-cpu0.cpu_tasks_completed
             <<" hc_original_reference="<<hc_reference
+            <<" gpu_q8_original_reference="<<gpu_q8_reference
+            <<" attention_q8_projections="<<attention_q8_decode
+            <<" gdn_history_fused_layers="<<gdn_history_decode
+            <<" lm_head_q8="<<lm_head_q8<<" imported_original_reference="<<!reference_import.empty()
+            <<" lm_head_q8_rows="<<head_q8_rows_decode
             <<" identity="<<identity<<" replay=1 checkpoint=1 live_usm_delta=0\n";
     }
     expect(cpu_total>0,"C1 ran no CPU tasks");if(h3_filter!=0)expect(h3_direct>0,"H3 ran no direct batches");

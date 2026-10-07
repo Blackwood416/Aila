@@ -684,6 +684,27 @@ ChatSettings HybridSettings(const Fixture& fixture) {
     return settings;
 }
 
+ChatSettings Qwen4ExpSettings(const Fixture& fixture) {
+    auto settings = fixture.settings;
+    settings.family = ModelFamily::Qwen4Exp;
+    return settings;
+}
+
+void Qwen4ExpTemplateRequirement(const Fixture& fixture) {
+    const auto settings = Qwen4ExpSettings(fixture);
+    // A trusted checkpoint template is accepted and used verbatim.
+    const auto body = Request();
+    const auto trusted = PrepareChat(Serialize(body), fixture.tokenizer, settings);
+    Expect(!trusted.promptIds.empty(), "Qwen4Exp trusted template produced no prompt tokens");
+    // Without a checkpoint template there is no Qwen4Exp fallback; the request
+    // must fail instead of silently rendering as Qwen3.5 Hybrid or ChatML.
+    Expect(fixture.hybrid.chat_template().empty(), "Qwen4Exp rejection fixture unexpectedly has a template");
+    const auto error = ExpectError([&] { PrepareChat(Serialize(body), fixture.hybrid, settings); },
+                                   500, "invalid_server_configuration");
+    Expect(std::string(error.what()).find("chat_template") != std::string::npos,
+           "Qwen4Exp missing-template diagnostic did not name the chat template");
+}
+
 std::string HybridGenerationPrompt(bool thinking) {
     return std::string("<|im_start|>assistant\n") + (thinking ? "<think>\n" : "<think>\n</think>\n");
 }
@@ -1677,6 +1698,7 @@ int main() {
             {"Hybrid prepared JSON and SSE parity", [&] { HybridPreparedOutputParity(fixture); }},
             {"Hybrid vision metadata and text-only boundary", [&] { HybridVisionTextBoundary(fixture); }},
             {"Hybrid limits and template failures", [&] { HybridLimitsAndTemplateFailures(fixture); }},
+            {"Qwen4Exp trusted template and missing-template rejection", [&] { Qwen4ExpTemplateRequirement(fixture); }},
             {"nonstream and SSE schema", NonstreamAndSseSchema},
             {"fragmentation and reasoning channels", FragmentationAndReasoning},
             {"tool definitions and call choices", [&] { ToolDefinitionsAndChoice(fixture); }},

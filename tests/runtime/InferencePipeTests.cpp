@@ -185,7 +185,7 @@ public:
         Expect(model->Epoch() == client->Snapshot().epoch && wire::valid_epoch(model->Epoch()),
                "Model was not bound to the negotiated epoch");
         const auto& capabilities = model->Info().capabilities;
-        for (const char* candidate : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+        for (const char* candidate : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
             const bool advertised = std::find(capabilities.begin(), capabilities.end(), wire::model_capability(candidate)) != capabilities.end();
             Expect(advertised == (backend == candidate), "Loaded model capabilities do not match the selected backend");
         }
@@ -202,7 +202,8 @@ public:
         options.maxSessionCacheBytes = limits.maxSessionCacheBytes;
         if (backend == "qwen3_nf4") return client->LoadQwen3(modelDirectory, options, 3s);
         if (backend == "qwen35_nf4") return client->LoadQwen35(modelDirectory, options, 3s);
-        return client->LoadQwen35Bf16(modelDirectory, options, 3s);
+        if (backend == "qwen35_bf16") return client->LoadQwen35Bf16(modelDirectory, options, 3s);
+        return client->LoadQwen4Exp(modelDirectory, options, 3s);
     }
     void ExpectBounds() const {
         const auto local = client->Snapshot();
@@ -297,7 +298,7 @@ void ExpectCompleted(const Captured& captured, const std::vector<int32_t>& expec
 }
 
 void TestPrefillOnlyReplay() {
-    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+    for (const std::string backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
         Run run(ClientOptions(), backend);
         const auto a = run.model->CreateSession();
         const auto b = run.model->CreateSession();
@@ -355,7 +356,7 @@ void ConcurrentSessions(const std::string& backend) {
 }
 
 void TestSessionContext() {
-    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16"}) {
+    for (const char* backend : {"qwen3_nf4", "qwen35_nf4", "qwen35_bf16", "qwen4exp_nf4"}) {
         Run run(ClientOptions(), backend);
         auto session = run.model->CreateSession(), reference = run.model->CreateSession();
         const std::vector<int32_t> prompt{21, 22, 23};

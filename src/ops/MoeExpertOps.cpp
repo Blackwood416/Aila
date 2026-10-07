@@ -1,4 +1,6 @@
 #include "MoeExpertOps.hpp"
+#include <sycl/ext/intel/math.hpp>
+#include "utils/EnvUtils.hpp"
 
 namespace ops {
 
@@ -414,6 +416,251 @@ inline float load_expert_absmax(const float* absmax_f32,
     } else {
         return absmax_f32[index];
     }
+}
+
+// These kernels intentionally approximate NF4 arithmetic. They keep the
+// resident descriptor layout, nested-scale reconstruction and BF16 SwiGLU
+// storage boundary, while replacing eight floating multiplies with two
+// signed packed dot products. The default NF4 codebook has max(abs)=1.
+inline bool moe_q8_isfinite(float value) {
+    // The engine builds with -ffast-math. Inspect exponent bits so its
+    // finite-math assumption cannot erase the quantizer's sanitization.
+    return (sycl::bit_cast<uint32_t>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline int32_t moe_q8_dot_acc(int32_t packed_a, int32_t packed_b, int32_t acc) {
+    // Same signed-byte multiply/add idiom as oneAPI dot_acc(int32,int32,int32).
+    // The vendor header defines non-inline external overloads, so including
+    // it in both this runtime TU and the prototype tests violates ODR.
+    const int8_t* a = reinterpret_cast<const int8_t*>(&packed_a);
+    const int8_t* b = reinterpret_cast<const int8_t*>(&packed_b);
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] + acc;
+}
+
+bool moe_q8_fast_rte_enabled() {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_GPU_Q8_FAST_RTE", false);
+    return enabled;
+}
+
+inline int8_t quantize_moe_q8_value(float value, float maximum, bool fast_rte) {
+    if (!moe_q8_isfinite(value) || !(maximum > 0.0f) || !moe_q8_isfinite(maximum)) return 0;
+    if (fast_rte && maximum > 0x1p-110f && maximum <= 0x1p120f) {
+        // Approximate reciprocal supplies a candidate integer. BF16 values
+        // times these small integers are exact in f32; scaled half-thresholds
+        // repair the candidate and preserve the exact rational RTE decision.
+        // The range keeps reciprocal/threshold arithmetic away from FTZ and
+        // overflow; extreme blocks retain the correctly rounded division.
+        int magnitude = static_cast<int>(sycl::rint(sycl::clamp(sycl::fabs(value) * (127.0f / maximum), 0.0f, 127.0f)));
+        const float numerator = sycl::fma(sycl::fabs(value), 254.0f / 256.0f, 0.0f);
+        const float lower = sycl::fma(maximum, static_cast<float>(2 * magnitude - 1) / 256.0f, 0.0f);
+        const float upper = sycl::fma(maximum, static_cast<float>(2 * magnitude + 1) / 256.0f, 0.0f);
+        if (numerator > upper || (numerator == upper && (magnitude & 1))) ++magnitude;
+        else if (numerator < lower || (numerator == lower && (magnitude & 1))) --magnitude;
+        return static_cast<int8_t>(value < 0.0f ? -magnitude : magnitude);
+    }
+    // BF16 * 127 is exact in f32. Correctly rounded division prevents the
+    // engine's fast-math reciprocal from moving exact half-way RTE ties.
+    // Scale large BF16 inputs by a power of two first to keep v*127 finite.
+    const float ratio = maximum > 0x1p120f
+        ? sycl::ext::intel::math::fdiv_rn(sycl::fma(value, 127.0f / 256.0f, 0.0f), maximum / 256.0f)
+        : sycl::ext::intel::math::fdiv_rn(value * 127.0f, maximum);
+    const float rounded = sycl::rint(sycl::clamp(ratio, -127.0f, 127.0f));
+    return static_cast<int8_t>(rounded);
+}
+
+template <typename QuantMap>
+inline int32_t pack_moe_nf4_q8_half(uint32_t packed, int half, const QuantMap& qmap) {
+    const uint32_t bytes = packed >> (half * 16);
+    // NF4 packs the first logical element into each byte's HIGH nibble.
+    const uint32_t p0 = static_cast<uint32_t>(qmap[(bytes >> 4) & 15]) & 255u;
+    const uint32_t p1 = static_cast<uint32_t>(qmap[bytes & 15]) & 255u;
+    const uint32_t p2 = static_cast<uint32_t>(qmap[(bytes >> 12) & 15]) & 255u;
+    const uint32_t p3 = static_cast<uint32_t>(qmap[(bytes >> 8) & 15]) & 255u;
+    return sycl::bit_cast<int32_t>(p0 | (p1 << 8) | (p2 << 16) | (p3 << 24));
+}
+
+size_t moe_q8_max_work_group_size(Context& ctx) {
+    const sycl::device device = ctx.queue().get_device();
+    // One cached device per submitting thread. Distinct Context objects may
+    // share a device; switching devices refreshes the physical capability.
+    thread_local sycl::device cached_device = device;
+    thread_local size_t cached_max = cached_device.get_info<sycl::info::device::max_work_group_size>();
+    if (device != cached_device) {
+        cached_device = device;
+        cached_max = device.get_info<sycl::info::device::max_work_group_size>();
+    }
+    return cached_max;
+}
+
+// A complete work-group owns one rank/block; masked ranks exit uniformly
+// before any work-group collective. This is also the non-WG1024 fallback.
+sycl::event launch_moe_quantize_q8_64(Context& ctx, const bf16* input,
+    int8_t* quantized, float* scales, int ranks, int features, const int* selected) {
+    constexpr int wg = 64;
+    const int blocks = features / 64;
+    const bool fast_rte = moe_q8_fast_rte_enabled();
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(size_t(ranks) * blocks * wg, wg),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t block = item.get_group(0);
+                const int rank = static_cast<int>(block / blocks);
+                if (selected && selected[rank] < 0) return;
+                const size_t index = block * 64 + item.get_local_id(0);
+                uint16_t bits = reinterpret_cast<const uint16_t*>(input)[index];
+                if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
+                const float value = static_cast<float>(sycl::bit_cast<bf16>(bits));
+                const float magnitude = sycl::fabs(value);
+                const float maximum = sycl::reduce_over_group(item.get_group(), magnitude, sycl::maximum<float>());
+                const float scale = maximum / 127.0f;
+                if (item.get_local_id(0) == 0) scales[block] = scale;
+                quantized[index] = quantize_moe_q8_value(value, maximum, fast_rte);
+            });
+    });
+}
+
+template <bool UseNested, int WorkGroup>
+sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
+    const MoeExpertSlotDev* descriptors, const int* selected,
+    const int8_t* xq, const float* xs, bf16* h, int8_t* hq, float* hs,
+    int top_k, int hidden, int intermediate) {
+    constexpr int sg_size = 16;
+    constexpr int rows_per_group = WorkGroup / sg_size;
+    const int groups_per_rank = intermediate / rows_per_group;
+    const int packed_per_row = hidden / 2;
+    const int blocks_per_row = hidden / 64;
+    constexpr float lut_scale = 1.0f / 127.0f;
+    const bool fast_rte = moe_q8_fast_rte_enabled();
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int32_t, 1> qmap(sycl::range<1>(16), cgh);
+        sycl::local_accessor<float, 1> h_block(sycl::range<1>(64), cgh);
+        sycl::local_accessor<float, 1> h_scale(sycl::range<1>(1), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(top_k) * groups_per_rank * WorkGroup, WorkGroup),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int rank = static_cast<int>(item.get_group(0) / groups_per_rank);
+                const int tile = static_cast<int>(item.get_group(0) % groups_per_rank);
+                const int slot_index = selected[rank];
+                // I%64 and rows_per_group|64 ensure the ENTIRE WG shares rank.
+                if (slot_index < 0) return;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sg_size;
+                const int lane = lid % sg_size;
+                const int row = tile * rows_per_group + sg_id;
+                if (lid < 16) qmap[lid] = static_cast<int32_t>(sycl::rint(kDefaultNf4QuantMap[lid] * 127.0f));
+                item.barrier(sycl::access::fence_space::local_space);
+                const auto sg = item.get_sub_group();
+                const auto& slot = descriptors[slot_index];
+                const size_t gate_bytes = size_t(row) * packed_per_row;
+                const size_t up_bytes = size_t(row + intermediate) * packed_per_row;
+                const size_t gate_blocks = size_t(row) * blocks_per_row;
+                const size_t up_blocks = size_t(row + intermediate) * blocks_per_row;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+                for (int byte_offset = lane * 4; byte_offset < packed_per_row; byte_offset += sg_size * 4) {
+                    const uint32_t g4 = *reinterpret_cast<const uint32_t*>(slot.gate_up_packed + gate_bytes + byte_offset);
+                    const uint32_t u4 = *reinterpret_cast<const uint32_t*>(slot.gate_up_packed + up_bytes + byte_offset);
+                    const int input_block = byte_offset / 32;
+                    const float ga_leader = (lane == 0 || lane == 8)
+                        ? load_expert_absmax<UseNested>(slot.gate_up_absmax, slot.gate_up_nested, gate_blocks + input_block) : 0.0f;
+                    const float ua_leader = (lane == 0 || lane == 8)
+                        ? load_expert_absmax<UseNested>(slot.gate_up_absmax, slot.gate_up_nested, up_blocks + input_block) : 0.0f;
+                    const float ga0 = sycl::group_broadcast(sg, ga_leader, 0);
+                    const float ga8 = sycl::group_broadcast(sg, ga_leader, 8);
+                    const float ua0 = sycl::group_broadcast(sg, ua_leader, 0);
+                    const float ua8 = sycl::group_broadcast(sg, ua_leader, 8);
+                    const float ga = lane < 8 ? ga0 : ga8;
+                    const float ua = lane < 8 ? ua0 : ua8;
+                    const int8_t* input = xq + byte_offset * 2;
+                    const int32_t x0 = *reinterpret_cast<const int32_t*>(input);
+                    const int32_t x1 = *reinterpret_cast<const int32_t*>(input + 4);
+                    const int32_t gate_dot = moe_q8_dot_acc(pack_moe_nf4_q8_half(g4, 0, qmap), x0, 0)
+                        + moe_q8_dot_acc(pack_moe_nf4_q8_half(g4, 1, qmap), x1, 0);
+                    const int32_t up_dot = moe_q8_dot_acc(pack_moe_nf4_q8_half(u4, 0, qmap), x0, 0)
+                        + moe_q8_dot_acc(pack_moe_nf4_q8_half(u4, 1, qmap), x1, 0);
+                    const float input_scale = xs[input_block];
+                    gate_acc = sycl::fma(static_cast<float>(gate_dot), (ga * lut_scale) * input_scale, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(up_dot), (ua * lut_scale) * input_scale, up_acc);
+                }
+                const float gate = sycl::reduce_over_group(sg, gate_acc, sycl::plus<float>());
+                const float up = sycl::reduce_over_group(sg, up_acc, sycl::plus<float>());
+                if (lane == 0) {
+                    const float silu_gate = gate / (1.0f + sycl::native::exp(-gate));
+                    const bf16 rounded = bf16(silu_gate * up);
+                    h[size_t(rank) * intermediate + row] = rounded;
+                    if constexpr (WorkGroup == 1024) {
+                        uint16_t bits = sycl::bit_cast<uint16_t>(rounded);
+                        if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
+                        h_block[sg_id] = static_cast<float>(sycl::bit_cast<bf16>(bits));
+                    }
+                }
+                if constexpr (WorkGroup == 1024) {
+                    item.barrier(sycl::access::fence_space::local_space);
+                    if (sg_id == 0) {
+                        float magnitude = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float value = h_block[lane + j * sg_size];
+                            magnitude = sycl::max(magnitude, sycl::fabs(value));
+                        }
+                        const float maximum = sycl::reduce_over_group(sg, magnitude, sycl::maximum<float>());
+                        if (lane == 0) {
+                            h_scale[0] = maximum;
+                            hs[size_t(rank) * (intermediate / 64) + tile] = maximum / 127.0f;
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    if (lane == 0) hq[size_t(rank) * intermediate + row] = quantize_moe_q8_value(h_block[sg_id], h_scale[0], fast_rte);
+                }
+            });
+    });
+}
+
+template <bool UseNested>
+sycl::event launch_moe_resident_down_q8_64(Context& ctx,
+    const MoeExpertSlotDev* descriptors, const int* selected,
+    const int8_t* hq, const float* hs, float* down,
+    int top_k, int hidden, int intermediate) {
+    constexpr int wg = 256, sg_size = 16, rows_per_group = wg / sg_size;
+    constexpr float lut_scale = 1.0f / 127.0f;
+    const int groups_per_rank = hidden / rows_per_group;
+    const int packed_per_row = intermediate / 2;
+    const int blocks_per_row = intermediate / 64;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int32_t, 1> qmap(sycl::range<1>(16), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(top_k) * groups_per_rank * wg, wg),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int rank = static_cast<int>(item.get_group(0) / groups_per_rank);
+                const int slot_index = selected[rank];
+                if (slot_index < 0) return;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int lane = lid % sg_size;
+                const int row = static_cast<int>(item.get_group(0) % groups_per_rank) * rows_per_group + lid / sg_size;
+                if (lid < 16) qmap[lid] = static_cast<int32_t>(sycl::rint(kDefaultNf4QuantMap[lid] * 127.0f));
+                item.barrier(sycl::access::fence_space::local_space);
+                const auto sg = item.get_sub_group();
+                const auto& slot = descriptors[slot_index];
+                const size_t bytes_base = size_t(row) * packed_per_row;
+                const size_t blocks_base = size_t(row) * blocks_per_row;
+                const int8_t* input = hq + size_t(rank) * intermediate;
+                const float* scales = hs + size_t(rank) * blocks_per_row;
+                float acc = 0.0f;
+                for (int byte_offset = lane * 4; byte_offset < packed_per_row; byte_offset += sg_size * 4) {
+                    const uint32_t d4 = *reinterpret_cast<const uint32_t*>(slot.down_packed + bytes_base + byte_offset);
+                    const int input_block = byte_offset / 32;
+                    const float da_leader = (lane == 0 || lane == 8)
+                        ? load_expert_absmax<UseNested>(slot.down_absmax, slot.down_nested, blocks_base + input_block) : 0.0f;
+                    const float da0 = sycl::group_broadcast(sg, da_leader, 0);
+                    const float da8 = sycl::group_broadcast(sg, da_leader, 8);
+                    const float da = lane < 8 ? da0 : da8;
+                    const int32_t x0 = *reinterpret_cast<const int32_t*>(input + byte_offset * 2);
+                    const int32_t x1 = *reinterpret_cast<const int32_t*>(input + byte_offset * 2 + 4);
+                    const int32_t dot = moe_q8_dot_acc(pack_moe_nf4_q8_half(d4, 0, qmap), x0, 0)
+                        + moe_q8_dot_acc(pack_moe_nf4_q8_half(d4, 1, qmap), x1, 0);
+                    acc = sycl::fma(static_cast<float>(dot), (da * lut_scale) * scales[input_block], acc);
+                }
+                const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0) down[size_t(rank) * hidden + row] = sum;
+            });
+    });
 }
 
 template <bool UseNested>
@@ -2322,6 +2569,44 @@ sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
     return launch_moe_decode_down_to_rank_f32_dev<false,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
 }
 
+sycl::event quantize_moe_input_q8_64(Context& ctx, const bf16* x,
+    int8_t* xq, float* xs, int hidden) {
+    if (hidden <= 0 || hidden % 64 || !x || !xq || !xs)
+        throw std::invalid_argument("Resident Q8 input shape or arena");
+    return launch_moe_quantize_q8_64(ctx, x, xq, xs, 1, hidden, nullptr);
+}
+
+sycl::event moe_resident_gate_up_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const int8_t* xq, const float* xs, bf16* h,
+    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested) {
+    if (top_k < 1 || top_k > 16 || hidden <= 0 || hidden % 64 ||
+        intermediate <= 0 || intermediate % 64 || !descriptors || !selected ||
+        !xq || !xs || !h || !hq || !hs)
+        throw std::invalid_argument("Resident Q8 gate/up shape or arena");
+    // A770 provides WG1024. Keep a portable fallback for devices whose
+    // physical work-group limit is smaller; it quantizes rounded h separately.
+    const size_t max_group = moe_q8_max_work_group_size(ctx);
+    if (max_group >= 1024) {
+        if (nested) return launch_moe_resident_gate_up_q8_64<true,1024>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+        return launch_moe_resident_gate_up_q8_64<false,1024>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+    }
+    if (max_group < 256) throw std::invalid_argument("Resident Q8 gate/up needs work-group size >=256");
+    if (nested) launch_moe_resident_gate_up_q8_64<true,256>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+    else launch_moe_resident_gate_up_q8_64<false,256>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+    return launch_moe_quantize_q8_64(ctx, h, hq, hs, top_k, intermediate, selected);
+}
+
+sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
+    const int* selected, const int8_t* hq, const float* hs, float* down,
+    int top_k, int hidden, int intermediate, bool nested) {
+    if (top_k < 1 || top_k > 16 || hidden <= 0 || hidden % 64 ||
+        intermediate <= 0 || intermediate % 64 || !descriptors || !selected ||
+        !hq || !hs || !down)
+        throw std::invalid_argument("Resident Q8 down shape or arena");
+    if (nested) return launch_moe_resident_down_q8_64<true>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
+    return launch_moe_resident_down_q8_64<false>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
+}
+
 sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2693,14 +2978,13 @@ sycl::event moe_expert_major_prefill_gate_up(
     int num_quads) {
     if (total_acts <= 0) return {};
     if (num_quads <= 0 && num_pairs <= 0) {
-        if (use_nested) {
-            return launch_moe_expert_major_prefill_gate_up<true>(
+        auto ev = use_nested ? launch_moe_expert_major_prefill_gate_up<true>(
                 ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
-                in_features, intermediate_size, blocksize, dep_event);
-        }
-        return launch_moe_expert_major_prefill_gate_up<false>(
+                in_features, intermediate_size, blocksize, dep_event)
+            : launch_moe_expert_major_prefill_gate_up<false>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
             in_features, intermediate_size, blocksize, dep_event);
+        return ev;
     }
 
     int remaining_acts = total_acts;
@@ -2947,11 +3231,17 @@ sycl::event moe_ordered_accumulate_down_rows(
     int out_features,
     const bf16* shared_out,
     const bf16* shared_gate,
-    const sycl::event* dep_event) {
+    const sycl::event* dep_event,
+    const void* cpu_result_packet) {
+    if (cpu_result_packet && (tokens != 1 || top_k > 16)) {
+        throw std::invalid_argument("CPU result packet requires one token and at most 16 ranks");
+    }
     if (tokens <= 0 || out_features <= 0) return {};
     constexpr size_t wg_size = 256;
     const size_t total_elements = static_cast<size_t>(tokens) * out_features;
     const size_t num_wgs = (total_elements + wg_size - 1) / wg_size;
+    const auto* cpu_ranks = static_cast<const int*>(cpu_result_packet);
+    const auto* cpu_down = cpu_ranks ? reinterpret_cast<const float*>(cpu_ranks + 16) : nullptr;
 
     return ctx.queue().submit([&](sycl::handler& cgh) {
         if (dep_event && *dep_event != sycl::event{}) {
@@ -2969,7 +3259,9 @@ sycl::event moe_ordered_accumulate_down_rows(
                     const size_t token_base = static_cast<size_t>(token) * top_k;
                     for (int k = 0; k < top_k; ++k) {
                         const float w_exp = weights[token_base + k];
-                        const float val = down_acc[(token_base + k) * out_features + row];
+                        const int cpu_row = cpu_ranks ? cpu_ranks[k] : -1;
+                        const float val = cpu_row >= 0 ? cpu_down[size_t(cpu_row) * out_features + row]
+                                                       : down_acc[(token_base + k) * out_features + row];
                         total_val += w_exp * val;
                     }
 
@@ -2983,6 +3275,44 @@ sycl::event moe_ordered_accumulate_down_rows(
                         y[gid] = routed;
                     }
                 }
+            });
+    });
+}
+
+sycl::event moe_ordered_accumulate_cpu_host_rows(
+    Context& ctx, const float* down_acc, const float* weights, bf16* y,
+    int tokens, int top_k, int out_features, const MoeCpuHostDownRows& cpu_host_rows,
+    const bf16* shared_out, const bf16* shared_gate, const sycl::event* dep_event) {
+    if (tokens != 1 || top_k <= 0 || top_k > 16 || out_features <= 0 ||
+        !cpu_host_rows.values || cpu_host_rows.rows <= 0 || cpu_host_rows.rows > 16)
+        throw std::invalid_argument("CPU host rows require one token and at most 16 ranks");
+    for (int k = 0; k < top_k; ++k)
+        if (cpu_host_rows.rank_to_row[k] < -1 || cpu_host_rows.rank_to_row[k] >= cpu_host_rows.rows)
+            throw std::invalid_argument("CPU host row mapping is out of range");
+    constexpr size_t wg_size = 256;
+    const size_t num_wgs = (static_cast<size_t>(out_features) + wg_size - 1) / wg_size;
+    const MoeCpuHostDownRows host_rows = cpu_host_rows;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) cgh.depends_on(*dep_event);
+        cgh.parallel_for(sycl::nd_range<1>(num_wgs * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                const size_t row = item.get_global_id(0);
+                if (row >= static_cast<size_t>(out_features)) return;
+                float total_val = 0.0f;
+                for (int k = 0; k < top_k; ++k) {
+                    const float w_exp = weights[k];
+                    const int cpu_row = host_rows.rank_to_row[k];
+                    const float val = cpu_row >= 0 ? host_rows.values[size_t(cpu_row) * out_features + row]
+                                                   : down_acc[size_t(k) * out_features + row];
+                    total_val += w_exp * val;
+                }
+                const bf16 routed = bf16(total_val);
+                if (shared_out && shared_gate) {
+                    const float gate = static_cast<float>(shared_gate[0]);
+                    const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                    y[row] = bf16(static_cast<float>(routed) +
+                                  gate_act * static_cast<float>(shared_out[row]));
+                } else y[row] = routed;
             });
     });
 }

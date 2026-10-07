@@ -317,7 +317,12 @@ struct SchedulerState : std::enable_shared_from_this<SchedulerState> {
         try {
             size_t processed = 0;
             auto request = PrepareOne(entry, processed);
-            const auto step = request->Step();
+            size_t outputSlots = 0;
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                outputSlots = entry->buffer.size() - entry->buffered;
+            }
+            const auto step = request->Step(outputSlots);
             return PublishOne(entry, request, step, request->Progress());
         } catch (const Error& error) {
             if (error.Code() == ErrorCode::RuntimeFault) Fault(error.what());

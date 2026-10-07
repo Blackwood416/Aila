@@ -94,7 +94,10 @@ void run_linear_delta_decode_gpu(
     const bf16* z_ptr,
     const bf16* a_ptr,
     const bf16* b_ptr,
-    bf16* out_ptr);
+    bf16* out_ptr,
+    // Only grouped fastpath may defer; caller must commit the old ring row
+    // after this kernel completes, before a subsequent decode/checkpoint.
+    bool defer_grouped_history = false);
 
 void run_linear_delta_prefill_gpu_batched(
     Context& ctx,
@@ -103,6 +106,8 @@ void run_linear_delta_prefill_gpu_batched(
     DeltaNetState& state,
     const bf16* fused_ptr,
     bf16* out_ptr,
-    int seq_len);
+    int seq_len,
+    // Small verifier reference windows may reuse the actual decode kernels.
+    bool decode_order = false);
 
 } // namespace ops

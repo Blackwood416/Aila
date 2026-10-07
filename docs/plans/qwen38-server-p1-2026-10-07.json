@@ -1,0 +1,320 @@
+{
+  "date": "2026-10-07",
+  "stage": "P1: Qwen4Exp NF4 shared T1 through Worker IPC and HTTP/SSE",
+  "mtp_in_server": false,
+  "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+  "backend": "qwen4exp_nf4",
+  "kv_type": "bf16",
+  "max_decode_batch_size": 1,
+  "subagents": [
+    "commandcode/deepseek-deepseek-v4.1-flash: session memory and backend contract",
+    "commandcode/deepseek-deepseek-v4.1-flash: Worker, IPC, client, HTTP wiring"
+  ],
+  "worker_environment": {
+    "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+    "AILA_Q4E_PHASE_SCRATCH": "1",
+    "AILA_Q4E_VRAM_RESERVE_MB": "3008",
+    "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0",
+    "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+    "AILA_Q4E_INLINE_CHECKPOINT": "1",
+    "AILA_Q4E_CPU_A64_ROW2": "1",
+    "AILA_Q4E_CPU_TILE_POOL": "0",
+    "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+    "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+    "AILA_Q4E_FILL_THREADS": "8",
+    "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+    "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+    "AILA_Q4E_COLD_BUDGET_US": "1000",
+    "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+    "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+    "AILA_Q4E_HOTSET_SWAPS": "0",
+    "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+    "AILA_Q4E_HOST_COMPLEMENT": "0",
+    "AILA_Q4E_PREFETCH_DECODE": "0",
+    "AILA_Q4E_CPU_MMAP_COLD": "1",
+    "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+    "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+    "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+    "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+    "AILA_Q4E_DEMAND_MICROBATCH": "32",
+    "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+    "AILA_Q4E_COLD_POLICY": "1",
+    "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+    "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+    "AILA_Q4E_GDN_CHUNK_MODE": "0",
+    "AILA_Q4E_CPU_EARLY_START": "0",
+    "AILA_Q4E_COLD_PCIE_NUM": "141",
+    "AILA_Q4E_SMALL_ROWS_HC": "1",
+    "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+    "AILA_Q4E_PREFILL_XMX": "1",
+    "AILA_Q4E_HOTSET_PROMPT": "1",
+    "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+    "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+    "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+    "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+    "AILA_Q35_PREFILL_CHUNK": "2048",
+    "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+    "AILA_Q4E_GPU_NF4_Q8": "0",
+    "AILA_Q4E_FILL_PARTS": "8",
+    "AILA_Q4E_STATIC_PINNING": "0",
+    "AILA_Q4E_LM_HEAD_Q8": "0",
+    "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+    "AILA_Q4E_CPU_RESULT_PACKET": "0",
+    "AILA_Q4E_DECODE_TRIM_CAP": "0",
+    "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+    "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+    "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+    "AILA_Q4E_COLD_MODE": "2",
+    "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+    "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+    "AILA_Q4E_MOE_FRONT_FUSED": "0",
+    "AILA_Q4E_HOT_RAM_MB": "0",
+    "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+    "AILA_Q4E_PROFILE_COMPONENTS": "0",
+    "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+    "AILA_Q4E_GPU_MMAP_DMA": "0",
+    "AILA_Q4E_EXPERT_READER": "readfile",
+    "AILA_Q4E_RESIDENT_PREFILL": "1",
+    "AILA_Q4E_CPU_THREADS": "18",
+    "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+    "AILA_Q4E_HOTSET_INTERVAL": "4",
+    "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+    "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+    "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+    "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+    "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+    "AILA_Q4E_HOTSET_BORROW": "1",
+    "AILA_Q4E_CPU_NF4_Q8": "1",
+    "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+    "AILA_Q4E_ATTN_NF4_Q8": "0",
+    "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+    "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+    "AILA_Q4E_PREFETCH_PREFILL": "0",
+    "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+    "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+    "AILA_Q4E_FILL_SHORT_PARTS": "1",
+    "AILA_PROFILE_Q4E_DECODE": "0",
+    "UR_L0_BATCH_SIZE": "0",
+    "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+    "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+    "AILA_KV_QUANT": "0"
+  },
+  "validation": {
+    "shared_session": "tmp/q4e-server-p1-session2.log",
+    "shared_session_capacity": 128,
+    "shared_session_snapshots": 0,
+    "explicit_usm_after_teardown": 0,
+    "greedy": "tmp/q4e-server-p1-greedy.log",
+    "cpu_runtime": "tmp/q4e-server-p1-cpu2.log",
+    "cpu_server": "tmp/q4e-server-p1-server-cpu.log",
+    "pipe_final": "tmp/q4e-server-p1-pipe-final.log",
+    "real_http": "tmp/q4e-server-p1-http-real/result.json",
+    "fake_http": "tmp/q4e-server-p1-http-fake/result.json",
+    "real_http_passed": true,
+    "real_http_capacity": 512,
+    "json_sse": {
+      "reference": {
+        "id": "chatcmpl-c88578b8fb88-8",
+        "status": 200,
+        "seconds": 38.945579800001724,
+        "bytes": 401,
+        "content_sha256": "39b47c270a6118e384b290a63d4d797b48f3ee1b7737cd4287699c2e39c03bda",
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "usage": {
+          "completion_tokens": 24,
+          "prompt_tokens": 20,
+          "total_tokens": 44
+        }
+      },
+      "stream": {
+        "id": "chatcmpl-c88578b8fb88-9",
+        "headers_seconds": 0.07718840000234195,
+        "first_content_seconds": 0.7895692000020063,
+        "duration_seconds": 2.2237376000011864,
+        "started_at": 22159.7383772,
+        "first_content_at": 22160.5279464,
+        "done_at": 22161.9621148,
+        "frames": 28,
+        "content_frames": 24,
+        "read_fragments": 28,
+        "wire_payload_bytes": 5381,
+        "receive_buffer": 65536,
+        "finish_reason": "length",
+        "usage": {
+          "completion_tokens": 24,
+          "prompt_tokens": 20,
+          "total_tokens": 44
+        },
+        "errors": [],
+        "content_sha256": "39b47c270a6118e384b290a63d4d797b48f3ee1b7737cd4287699c2e39c03bda",
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "tool_call_count": 0,
+        "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "artifact": "E:\\RiderProjects\\Aila\\tmp\\q4e-server-p1-http-real\\responses\\incremental.sse"
+      },
+      "active_at_first_content": 1,
+      "retained": {
+        "generated_tokens": 24,
+        "id": "chatcmpl-c88578b8fb88-9",
+        "pause_ticks": 0,
+        "peak_pending_bytes": 0,
+        "status": "completed"
+      },
+      "usage_disabled": {
+        "id": "chatcmpl-c88578b8fb88-10",
+        "headers_seconds": 0.06019409999862546,
+        "first_content_seconds": 0.990341199998511,
+        "duration_seconds": 2.563055300000997,
+        "started_at": 22161.9919038,
+        "first_content_at": 22162.982245,
+        "done_at": 22164.5549591,
+        "frames": 11,
+        "content_frames": 8,
+        "read_fragments": 11,
+        "wire_payload_bytes": 1876,
+        "receive_buffer": 65536,
+        "finish_reason": "length",
+        "usage": null,
+        "errors": [],
+        "content_sha256": "8a17fc0dc61e8520bdbe3a735b000358a6476cbe9f0e3d86c54a51cf26b5d009",
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "tool_call_count": 0,
+        "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "artifact": "E:\\RiderProjects\\Aila\\tmp\\q4e-server-p1-http-real\\responses\\usage_disabled.sse"
+      }
+    },
+    "service_final": {
+      "active_requests": 0,
+      "backend": "qwen4exp_nf4",
+      "connections": {
+        "accepted": 28,
+        "active": 0,
+        "closed": 28,
+        "max_send_buffer": 16384,
+        "min_send_buffer": 16384,
+        "reused_rejected": 0,
+        "socket_option_callbacks": 28,
+        "socket_option_failures": 0
+      },
+      "counters": {
+        "admitted": 10,
+        "cancelled": 0,
+        "completed": 3,
+        "disconnect_cancellations": 0,
+        "failed": 7,
+        "rejected": 0,
+        "slow_client_cancellations": 0
+      },
+      "ipc": {
+        "epoch": "c88578b8fb88333534d8d8f935cfa544",
+        "outstanding_requests": 0,
+        "pending_commands": 0,
+        "status": "closed"
+      },
+      "max_decode_batch_size": 1,
+      "memory": {
+        "max_device_bytes": 0,
+        "max_pinned_host_bytes": 0,
+        "max_session_host_bytes": 0,
+        "model_resident_device_bytes_at_load": 13467173506,
+        "session_device_reservation_bytes": 132587520,
+        "session_host_reservation_bytes": 117669888
+      },
+      "model": "qwen4exp",
+      "recent_requests": [
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-1",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-2",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-3",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-4",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-5",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-6",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": null,
+          "id": "chatcmpl-c88578b8fb88-7",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "failed"
+        },
+        {
+          "generated_tokens": 24,
+          "id": "chatcmpl-c88578b8fb88-8",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "completed"
+        },
+        {
+          "generated_tokens": 24,
+          "id": "chatcmpl-c88578b8fb88-9",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "completed"
+        },
+        {
+          "generated_tokens": 8,
+          "id": "chatcmpl-c88578b8fb88-10",
+          "pause_ticks": 0,
+          "peak_pending_bytes": 0,
+          "status": "completed"
+        }
+      ],
+      "shutdown": {
+        "graceful": true,
+        "idle": true
+      },
+      "status": "closed",
+      "transport": {
+        "frame_limit_bytes": 16384,
+        "pause_ticks": 0,
+        "peak_handoff_bytes": 213,
+        "peak_pending_bytes": 0,
+        "stream_limit_bytes": 65536
+      }
+    }
+  },
+  "reservation_capacity_2048": {
+    "device_bytes": 176234496,
+    "host_bytes_snapshots_0": 117669888,
+    "host_bytes_snapshots_4": 589824000
+  },
+  "limitations": [
+    "No MTP draft/verify/commit path in Request or Server yet.",
+    "The previous 20.59289022 tok/s result belongs to the standalone MTP probe, not this T1 service.",
+    "This is focused functional acceptance, not a throughput benchmark or broad concurrency certification."
+  ]
+}
