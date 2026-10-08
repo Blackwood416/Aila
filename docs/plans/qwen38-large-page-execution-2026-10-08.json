@@ -1,0 +1,759 @@
+{
+  "date": "2026-10-08",
+  "model": "Qwen3.8-Flash-Next / Qwen4Exp BNB NF4",
+  "model_path": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+  "hardware": {
+    "gpu": "Intel Arc A770 16 GiB",
+    "driver": "32.0.101.8724",
+    "cpu": "Xeon E5-2696 v3 18C/18T",
+    "ram_gib": 63.91
+  },
+  "toolchain": "oneAPI 2026.1.0 / oneDNN 3.11.2 / Release",
+  "strata_reference": "tmp/Strata; bounded transfer ring and coordinator submission",
+  "default_changes": {
+    "prefill_slots": [
+      512,
+      64
+    ],
+    "gpu_only_experts": [
+      2312,
+      2760
+    ],
+    "ram_experts": [
+      22264,
+      21816
+    ],
+    "ram_payload_bytes": [
+      56425881600,
+      55290470400
+    ],
+    "native_large_page_bytes": [
+      57776537600,
+      56732155904
+    ],
+    "staging_bytes": 162201600,
+    "large_page_chunk_limit_mib": 128,
+    "capacity_gate": "RESIDENT_PREFILL=1, EXPERT_MAJOR_PREFILL=1, DEMAND_MICROBATCH>0; two demand microbatches, bounded to 16..experts_per_layer",
+    "pipeline_default": false
+  },
+  "measurement_scope": "single stream; full prefill repeats; prefix reuse disabled; no OS cache flush; one final same-binary pair, sequential requests, diagnostics disabled",
+  "profile": "docs/plans/qwen38-server-mtp-2026-10-07.json; resident=1, MTP=0, reserve=3584 MiB",
+  "fixture": {
+    "directory": "tmp/q4e-agent-corpus-v1",
+    "context": {
+      "target": 6000,
+      "file": "context-6000.txt",
+      "tokens": 5932,
+      "sha256": "6437d29f146179e55e71c0d08da55dfd905c0e672dbfd9fb3bfe9310735221be",
+      "token_sha256": "7f12af8ca2e23eb7ff2c16ec94846d2675ab5f49f5c9850dfa0dd70cd97206ba"
+    },
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "measured_binary_sha256": {
+    "build-refactor-server\\AilaServer.exe": "396b00e514398d6e2a1c1c21b084469aaae247d53ddb87bee60677735f010595",
+    "build-refactor\\AilaWorker.exe": "10dd71e23809476185f84cba717eb2a56b7f197c3373ffb9205e87e1985ee646"
+  },
+  "delivered_worker_sha256": "4661413e9bd59df7209b74cdeb428d16d4f1f863181009eab94bba2985212faa",
+  "post_measurement_change": "Only change to execution code after final pair: LARGE_PAGE_PIPELINE default true -> false. Both probes set the flag explicitly.",
+  "worker_environment": {
+    "AILA_Q4E_LARGE_PAGE_PIPELINE": "0",
+    "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+    "AILA_Q4E_PHASE_SCRATCH": "1",
+    "AILA_Q4E_VRAM_RESERVE_MB": "3584",
+    "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0",
+    "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+    "AILA_Q4E_INLINE_CHECKPOINT": "1",
+    "AILA_Q4E_CPU_A64_ROW2": "1",
+    "AILA_Q4E_CPU_TILE_POOL": "0",
+    "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+    "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+    "AILA_Q4E_FILL_THREADS": "8",
+    "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+    "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+    "AILA_Q4E_COLD_BUDGET_US": "1000",
+    "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+    "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+    "AILA_Q4E_HOTSET_SWAPS": "0",
+    "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+    "AILA_Q4E_HOST_COMPLEMENT": "0",
+    "AILA_Q4E_PREFETCH_DECODE": "0",
+    "AILA_Q4E_CPU_MMAP_COLD": "1",
+    "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+    "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+    "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+    "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+    "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+    "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+    "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+    "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+    "AILA_Q4E_DEMAND_MICROBATCH": "32",
+    "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+    "AILA_Q4E_COLD_POLICY": "1",
+    "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+    "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+    "AILA_Q4E_GDN_CHUNK_MODE": "0",
+    "AILA_Q4E_CPU_EARLY_START": "0",
+    "AILA_Q4E_COLD_PCIE_NUM": "141",
+    "AILA_Q4E_SMALL_ROWS_HC": "1",
+    "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+    "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+    "AILA_Q4E_PREFILL_XMX": "1",
+    "AILA_Q4E_HOTSET_PROMPT": "1",
+    "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+    "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+    "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+    "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+    "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+    "AILA_Q35_PREFILL_CHUNK": "2048",
+    "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+    "AILA_Q4E_GPU_NF4_Q8": "0",
+    "AILA_Q4E_FILL_PARTS": "8",
+    "AILA_Q4E_STATIC_PINNING": "0",
+    "AILA_Q4E_LM_HEAD_Q8": "0",
+    "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+    "AILA_Q4E_CPU_RESULT_PACKET": "0",
+    "AILA_Q4E_DECODE_TRIM_CAP": "0",
+    "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+    "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+    "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+    "AILA_Q4E_COLD_MODE": "2",
+    "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+    "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+    "AILA_Q4E_MOE_FRONT_FUSED": "0",
+    "AILA_Q4E_HOT_RAM_MB": "0",
+    "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+    "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+    "AILA_Q4E_GPU_MMAP_DMA": "0",
+    "AILA_Q4E_EXPERT_READER": "readfile",
+    "AILA_Q4E_RESIDENT_PREFILL": "1",
+    "AILA_Q4E_CPU_THREADS": "18",
+    "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+    "AILA_Q4E_HOTSET_INTERVAL": "4",
+    "AILA_Q4E_VERIFY_ATTN_PAIR": "1",
+    "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+    "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+    "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+    "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+    "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+    "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+    "AILA_Q4E_HOTSET_BORROW": "1",
+    "AILA_Q4E_CPU_NF4_Q8": "1",
+    "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+    "AILA_Q4E_ATTN_NF4_Q8": "0",
+    "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+    "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+    "AILA_Q4E_PREFETCH_PREFILL": "0",
+    "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+    "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+    "AILA_Q4E_FILL_SHORT_PARTS": "1",
+    "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+    "UR_L0_BATCH_SIZE": "0",
+    "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+    "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+    "AILA_Q4E_SERVER_MTP": "0",
+    "AILA_KV_QUANT": "0",
+    "AILA_Q4E_LARGE_PAGE_RESIDENT": "1"
+  },
+  "environment_difference": {
+    "AILA_Q4E_LARGE_PAGE_PIPELINE": [
+      "0",
+      "1"
+    ]
+  },
+  "final_baseline": {
+    "artifact": "tmp/q4e-largepage-execution-a3/result.json",
+    "passed": true,
+    "startup_s": 83.29388640000252,
+    "worker_exit_code": 0,
+    "cleanup": {
+      "pid": 15616,
+      "shutdown_file_written": true,
+      "forced_kill": false,
+      "interrupted_during_shutdown": false,
+      "exit_code": 0,
+      "seconds": 2.9549819999992906,
+      "report_path": "E:\\RiderProjects\\Aila\\tmp\\q4e-largepage-execution-a3\\report.json",
+      "framework_errors": [],
+      "report": {
+        "active_requests": 0,
+        "backend": "qwen4exp_nf4",
+        "connections": {
+          "accepted": 11,
+          "active": 0,
+          "closed": 11,
+          "max_send_buffer": 16384,
+          "min_send_buffer": 16384,
+          "reused_rejected": 0,
+          "socket_option_callbacks": 11,
+          "socket_option_failures": 0
+        },
+        "context_tokens": 32768,
+        "counters": {
+          "admitted": 2,
+          "cancelled": 0,
+          "completed": 2,
+          "disconnect_cancellations": 0,
+          "failed": 0,
+          "rejected": 0,
+          "slow_client_cancellations": 0
+        },
+        "ipc": {
+          "epoch": "971940f1368cec9cd3a38eedb68725a1",
+          "outstanding_requests": 0,
+          "pending_commands": 0,
+          "status": "closed"
+        },
+        "max_body_bytes": 4194304,
+        "max_decode_batch_size": 1,
+        "max_new_tokens": 256,
+        "memory": {
+          "max_device_bytes": 0,
+          "max_pinned_host_bytes": 0,
+          "max_session_host_bytes": 0,
+          "model_resident_device_bytes_at_load": 11999345682,
+          "session_device_reservation_bytes": 1049174016,
+          "session_host_reservation_bytes": 117669888
+        },
+        "model": "qwen4exp",
+        "prefill_chunk_size": 4096,
+        "prefix_cache": {
+          "enabled": false,
+          "hits": 0,
+          "idle_sessions": 0,
+          "reused_tokens": 0
+        },
+        "recent_requests": [
+          {
+            "cached_prompt_tokens": 0,
+            "generated_tokens": 64,
+            "id": "chatcmpl-971940f1368c-1",
+            "pause_ticks": 0,
+            "peak_pending_bytes": 0,
+            "status": "completed"
+          },
+          {
+            "cached_prompt_tokens": 0,
+            "generated_tokens": 64,
+            "id": "chatcmpl-971940f1368c-2",
+            "pause_ticks": 0,
+            "peak_pending_bytes": 0,
+            "status": "completed"
+          }
+        ],
+        "shutdown": {
+          "graceful": true,
+          "idle": true
+        },
+        "status": "closed",
+        "transport": {
+          "frame_limit_bytes": 16384,
+          "pause_ticks": 0,
+          "peak_handoff_bytes": 213,
+          "peak_pending_bytes": 0,
+          "stream_limit_bytes": 65536
+        }
+      }
+    },
+    "requests": [
+      {
+        "label": "1-context-6000",
+        "ttft_s": 73.67803920000006,
+        "total_s": 78.5043368000006,
+        "after_first_content_tokens_s": 13.05348431062206,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 5968,
+          "total_tokens": 6032
+        },
+        "cached_tokens": 0,
+        "min_available_gib": 5.375385284423828,
+        "physical_disk_read_bytes": {
+          "0 C: D:": 7083205120,
+          "1": 0,
+          "2 E:": 16628736,
+          "3 F:": 0,
+          "_Total": 7099833856
+        },
+        "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+        "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+      },
+      {
+        "label": "2-context-6000",
+        "ttft_s": 32.22596290000001,
+        "total_s": 36.301411200001894,
+        "after_first_content_tokens_s": 15.458422083276318,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 5968,
+          "total_tokens": 6032
+        },
+        "cached_tokens": 0,
+        "min_available_gib": 5.50701904296875,
+        "physical_disk_read_bytes": {
+          "0 C: D:": 16949248,
+          "1": 0,
+          "2 E:": 16384,
+          "3 F:": 0,
+          "_Total": 16965632
+        },
+        "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+        "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+      }
+    ]
+  },
+  "final_candidate": {
+    "artifact": "tmp/q4e-largepage-execution-c3/result.json",
+    "passed": true,
+    "startup_s": 79.14985249999881,
+    "worker_exit_code": 0,
+    "cleanup": {
+      "pid": 12384,
+      "shutdown_file_written": true,
+      "forced_kill": false,
+      "interrupted_during_shutdown": false,
+      "exit_code": 0,
+      "seconds": 2.5554851000015333,
+      "report_path": "E:\\RiderProjects\\Aila\\tmp\\q4e-largepage-execution-c3\\report.json",
+      "framework_errors": [],
+      "report": {
+        "active_requests": 0,
+        "backend": "qwen4exp_nf4",
+        "connections": {
+          "accepted": 10,
+          "active": 0,
+          "closed": 10,
+          "max_send_buffer": 16384,
+          "min_send_buffer": 16384,
+          "reused_rejected": 0,
+          "socket_option_callbacks": 10,
+          "socket_option_failures": 0
+        },
+        "context_tokens": 32768,
+        "counters": {
+          "admitted": 2,
+          "cancelled": 0,
+          "completed": 2,
+          "disconnect_cancellations": 0,
+          "failed": 0,
+          "rejected": 0,
+          "slow_client_cancellations": 0
+        },
+        "ipc": {
+          "epoch": "163981025d8691572eda87e9ecb1a248",
+          "outstanding_requests": 0,
+          "pending_commands": 0,
+          "status": "closed"
+        },
+        "max_body_bytes": 4194304,
+        "max_decode_batch_size": 1,
+        "max_new_tokens": 256,
+        "memory": {
+          "max_device_bytes": 0,
+          "max_pinned_host_bytes": 0,
+          "max_session_host_bytes": 0,
+          "model_resident_device_bytes_at_load": 11999345682,
+          "session_device_reservation_bytes": 1049174016,
+          "session_host_reservation_bytes": 117669888
+        },
+        "model": "qwen4exp",
+        "prefill_chunk_size": 4096,
+        "prefix_cache": {
+          "enabled": false,
+          "hits": 0,
+          "idle_sessions": 0,
+          "reused_tokens": 0
+        },
+        "recent_requests": [
+          {
+            "cached_prompt_tokens": 0,
+            "generated_tokens": 64,
+            "id": "chatcmpl-163981025d86-1",
+            "pause_ticks": 0,
+            "peak_pending_bytes": 0,
+            "status": "completed"
+          },
+          {
+            "cached_prompt_tokens": 0,
+            "generated_tokens": 64,
+            "id": "chatcmpl-163981025d86-2",
+            "pause_ticks": 0,
+            "peak_pending_bytes": 0,
+            "status": "completed"
+          }
+        ],
+        "shutdown": {
+          "graceful": true,
+          "idle": true
+        },
+        "status": "closed",
+        "transport": {
+          "frame_limit_bytes": 16384,
+          "pause_ticks": 0,
+          "peak_handoff_bytes": 213,
+          "peak_pending_bytes": 0,
+          "stream_limit_bytes": 65536
+        }
+      }
+    },
+    "requests": [
+      {
+        "label": "1-context-6000",
+        "ttft_s": 75.53074209999977,
+        "total_s": 80.57663370000228,
+        "after_first_content_tokens_s": 12.48540495796,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 5968,
+          "total_tokens": 6032
+        },
+        "cached_tokens": 0,
+        "min_available_gib": 5.311145782470703,
+        "physical_disk_read_bytes": {
+          "0 C: D:": 7034446848,
+          "1": 0,
+          "2 E:": 17828864,
+          "3 F:": 0,
+          "_Total": 7052275712
+        },
+        "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+        "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+      },
+      {
+        "label": "2-context-6000",
+        "ttft_s": 32.23284169999897,
+        "total_s": 36.398659399997996,
+        "after_first_content_tokens_s": 15.12308135807641,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 5968,
+          "total_tokens": 6032
+        },
+        "cached_tokens": 0,
+        "min_available_gib": 5.283809661865234,
+        "physical_disk_read_bytes": {
+          "0 C: D:": 16199168,
+          "1": 0,
+          "2 E:": 851968,
+          "3 F:": 0,
+          "_Total": 17051136
+        },
+        "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+        "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+      }
+    ]
+  },
+  "rejected_full_half_fill": {
+    "baseline": {
+      "artifact": "tmp/q4e-largepage-execution-a2/result.json",
+      "passed": true,
+      "startup_s": 70.1760076999999,
+      "worker_exit_code": 0,
+      "cleanup": {
+        "pid": 3920,
+        "shutdown_file_written": true,
+        "forced_kill": false,
+        "interrupted_during_shutdown": false,
+        "exit_code": 0,
+        "seconds": 2.9935985000010987,
+        "report_path": "E:\\RiderProjects\\Aila\\tmp\\q4e-largepage-execution-a2\\report.json",
+        "framework_errors": [],
+        "report": {
+          "active_requests": 0,
+          "backend": "qwen4exp_nf4",
+          "connections": {
+            "accepted": 11,
+            "active": 0,
+            "closed": 11,
+            "max_send_buffer": 16384,
+            "min_send_buffer": 16384,
+            "reused_rejected": 0,
+            "socket_option_callbacks": 11,
+            "socket_option_failures": 0
+          },
+          "context_tokens": 32768,
+          "counters": {
+            "admitted": 2,
+            "cancelled": 0,
+            "completed": 2,
+            "disconnect_cancellations": 0,
+            "failed": 0,
+            "rejected": 0,
+            "slow_client_cancellations": 0
+          },
+          "ipc": {
+            "epoch": "412ec7df1c6140de86b5988c90b738ab",
+            "outstanding_requests": 0,
+            "pending_commands": 0,
+            "status": "closed"
+          },
+          "max_body_bytes": 4194304,
+          "max_decode_batch_size": 1,
+          "max_new_tokens": 256,
+          "memory": {
+            "max_device_bytes": 0,
+            "max_pinned_host_bytes": 0,
+            "max_session_host_bytes": 0,
+            "model_resident_device_bytes_at_load": 11999345682,
+            "session_device_reservation_bytes": 1049174016,
+            "session_host_reservation_bytes": 117669888
+          },
+          "model": "qwen4exp",
+          "prefill_chunk_size": 4096,
+          "prefix_cache": {
+            "enabled": false,
+            "hits": 0,
+            "idle_sessions": 0,
+            "reused_tokens": 0
+          },
+          "recent_requests": [
+            {
+              "cached_prompt_tokens": 0,
+              "generated_tokens": 64,
+              "id": "chatcmpl-412ec7df1c61-1",
+              "pause_ticks": 0,
+              "peak_pending_bytes": 0,
+              "status": "completed"
+            },
+            {
+              "cached_prompt_tokens": 0,
+              "generated_tokens": 64,
+              "id": "chatcmpl-412ec7df1c61-2",
+              "pause_ticks": 0,
+              "peak_pending_bytes": 0,
+              "status": "completed"
+            }
+          ],
+          "shutdown": {
+            "graceful": true,
+            "idle": true
+          },
+          "status": "closed",
+          "transport": {
+            "frame_limit_bytes": 16384,
+            "pause_ticks": 0,
+            "peak_handoff_bytes": 213,
+            "peak_pending_bytes": 0,
+            "stream_limit_bytes": 65536
+          }
+        }
+      },
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 72.19530939999822,
+          "total_s": 76.95298729999922,
+          "after_first_content_tokens_s": 13.241753923691801,
+          "usage": {
+            "completion_tokens": 64,
+            "prompt_tokens": 5968,
+            "total_tokens": 6032
+          },
+          "cached_tokens": 0,
+          "min_available_gib": 5.367687225341797,
+          "physical_disk_read_bytes": {
+            "0 C: D:": 7206152704,
+            "1": 0,
+            "2 E:": 33294336,
+            "3 F:": 0,
+            "_Total": 7239447040
+          },
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 32.275579500001186,
+          "total_s": 36.35623570000098,
+          "after_first_content_tokens_s": 15.43869341406492,
+          "usage": {
+            "completion_tokens": 64,
+            "prompt_tokens": 5968,
+            "total_tokens": 6032
+          },
+          "cached_tokens": 0,
+          "min_available_gib": 5.288669586181641,
+          "physical_disk_read_bytes": {
+            "0 C: D:": 6841856,
+            "1": 0,
+            "2 E:": 65536,
+            "3 F:": 0,
+            "_Total": 6907392
+          },
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+        }
+      ]
+    },
+    "candidate": {
+      "artifact": "tmp/q4e-largepage-execution-b2/result.json",
+      "passed": true,
+      "startup_s": 88.69117259999985,
+      "worker_exit_code": 0,
+      "cleanup": {
+        "pid": 12076,
+        "shutdown_file_written": true,
+        "forced_kill": false,
+        "interrupted_during_shutdown": false,
+        "exit_code": 0,
+        "seconds": 2.4952153000012913,
+        "report_path": "E:\\RiderProjects\\Aila\\tmp\\q4e-largepage-execution-b2\\report.json",
+        "framework_errors": [],
+        "report": {
+          "active_requests": 0,
+          "backend": "qwen4exp_nf4",
+          "connections": {
+            "accepted": 11,
+            "active": 0,
+            "closed": 11,
+            "max_send_buffer": 16384,
+            "min_send_buffer": 16384,
+            "reused_rejected": 0,
+            "socket_option_callbacks": 11,
+            "socket_option_failures": 0
+          },
+          "context_tokens": 32768,
+          "counters": {
+            "admitted": 2,
+            "cancelled": 0,
+            "completed": 2,
+            "disconnect_cancellations": 0,
+            "failed": 0,
+            "rejected": 0,
+            "slow_client_cancellations": 0
+          },
+          "ipc": {
+            "epoch": "e1e5ffe9c9059f5fb248cfce4b1d5894",
+            "outstanding_requests": 0,
+            "pending_commands": 0,
+            "status": "closed"
+          },
+          "max_body_bytes": 4194304,
+          "max_decode_batch_size": 1,
+          "max_new_tokens": 256,
+          "memory": {
+            "max_device_bytes": 0,
+            "max_pinned_host_bytes": 0,
+            "max_session_host_bytes": 0,
+            "model_resident_device_bytes_at_load": 11999345682,
+            "session_device_reservation_bytes": 1049174016,
+            "session_host_reservation_bytes": 117669888
+          },
+          "model": "qwen4exp",
+          "prefill_chunk_size": 4096,
+          "prefix_cache": {
+            "enabled": false,
+            "hits": 0,
+            "idle_sessions": 0,
+            "reused_tokens": 0
+          },
+          "recent_requests": [
+            {
+              "cached_prompt_tokens": 0,
+              "generated_tokens": 64,
+              "id": "chatcmpl-e1e5ffe9c905-1",
+              "pause_ticks": 0,
+              "peak_pending_bytes": 0,
+              "status": "completed"
+            },
+            {
+              "cached_prompt_tokens": 0,
+              "generated_tokens": 64,
+              "id": "chatcmpl-e1e5ffe9c905-2",
+              "pause_ticks": 0,
+              "peak_pending_bytes": 0,
+              "status": "completed"
+            }
+          ],
+          "shutdown": {
+            "graceful": true,
+            "idle": true
+          },
+          "status": "closed",
+          "transport": {
+            "frame_limit_bytes": 16384,
+            "pause_ticks": 0,
+            "peak_handoff_bytes": 213,
+            "peak_pending_bytes": 0,
+            "stream_limit_bytes": 65536
+          }
+        }
+      },
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 73.77109779999955,
+          "total_s": 78.805823900002,
+          "after_first_content_tokens_s": 12.513093810598637,
+          "usage": {
+            "completion_tokens": 64,
+            "prompt_tokens": 5968,
+            "total_tokens": 6032
+          },
+          "cached_tokens": 0,
+          "min_available_gib": 5.258319854736328,
+          "physical_disk_read_bytes": {
+            "0 C: D:": 7215501312,
+            "1": 0,
+            "2 E:": 27438080,
+            "3 F:": 0,
+            "_Total": 7242939392
+          },
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 32.77003210000112,
+          "total_s": 36.951625599998806,
+          "after_first_content_tokens_s": 15.066026862734223,
+          "usage": {
+            "completion_tokens": 64,
+            "prompt_tokens": 5968,
+            "total_tokens": 6032
+          },
+          "cached_tokens": 0,
+          "min_available_gib": 5.269382476806641,
+          "physical_disk_read_bytes": {
+            "0 C: D:": 23105536,
+            "1": 0,
+            "2 E:": 24576,
+            "3 F:": 0,
+            "_Total": 23130112
+          },
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "615ae6806d0714b12a0eaa68df2cc0d02edc7c76304ba58a0e5e45aaf11a6a72"
+        }
+      ]
+    }
+  },
+  "startup_failures": [
+    {
+      "artifact": "tmp/q4e-largepage-execution-before",
+      "reason": "Old 512-slot complement: native 256 MiB chunk rejected with Win32 1450"
+    },
+    {
+      "artifact": "tmp/q4e-largepage-execution-a",
+      "reason": "Old 512-slot complement: native 128 MiB chunk rejected with Win32 1450"
+    },
+    {
+      "artifact": "tmp/q4e-largepage-execution-a64",
+      "reason": "Old complement plus 64 MiB chunk alignment exceeds available memory minus 2 GiB runtime room"
+    }
+  ],
+  "validation": {
+    "existing_modes_passed": [
+      "--large-pages-only",
+      "--large-page-handoff-only",
+      "--large-page-async-cpu-only"
+    ],
+    "coverage": "Native page bit, adjusted ledger, full expert-ID ownership handoff, original-vs-resident async CPU output bitwise equality, move/cleanup",
+    "full_suite_run": false,
+    "rebuilt_default_path_check": {
+      "mode": "--large-pages-only",
+      "pipeline": 0,
+      "passed": true,
+      "artifact": "tmp/q4e-largepage-execution-default-check.log"
+    }
+  },
+  "conclusion": "No measured pipeline speedup. Keep producer/coordinator path opt-in. Default capacity refactor saves payload and native large-page memory; no isolated speed claim against the old capacity because its current full-model load failed."
+}

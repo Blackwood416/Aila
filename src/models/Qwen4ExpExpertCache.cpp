@@ -356,6 +356,9 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     pinned_staging_ptr_ = other.pinned_staging_ptr_;
     prefetch_staging_ptr_ = other.prefetch_staging_ptr_;
     prefetch_staging_slots_ = other.prefetch_staging_slots_;
+    resident_staging_pipeline_enabled_ = other.resident_staging_pipeline_enabled_;
+    resident_staging_cursor_ = 0;
+    resident_staging_half_fences_ = {};
     prefetch_items_ = std::move(other.prefetch_items_);
     prefetch_in_flight_ = other.prefetch_in_flight_;
     copy_q_ = std::move(other.copy_q_);
@@ -406,6 +409,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     resident_data_ = other.resident_data_;
     resident_bytes_ = other.resident_bytes_;
     resident_gpu_only_count_ = other.resident_gpu_only_count_;
+    resident_prefill_slots_ = other.resident_prefill_slots_;
     resident_chunks_ = std::move(other.resident_chunks_);
     resident_slot_bases_ = std::move(other.resident_slot_bases_);
     resident_host_slots_ = std::move(other.resident_host_slots_);
@@ -414,6 +418,7 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     other.resident_data_ = nullptr;
     other.resident_bytes_ = 0;
     other.resident_gpu_only_count_ = 0;
+    other.resident_prefill_slots_ = 0;
     other.resident_exchange_bytes_ = 0;
     cost_aware_eviction_ = other.cost_aware_eviction_;
     host_complement_ = other.host_complement_;
@@ -468,6 +473,8 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     other.pinned_staging_ptr_ = nullptr;
     other.prefetch_staging_ptr_ = nullptr;
     other.prefetch_staging_slots_ = 0;
+    other.resident_staging_pipeline_enabled_ = false;
+    other.ResetResidentStagingPipelineState();
     other.prefetch_in_flight_ = false;
     other.last_dma_event_ = sycl::event{};
     other.initialized_ = false;
@@ -518,6 +525,7 @@ void Qwen4ExpExpertCache::cleanup() {
         if (copy_q_) {
             try { copy_q_->wait_and_throw(); } catch (...) {}
         }
+        ResetResidentStagingPipelineState();
         for (auto* chunk : resident_chunks_) ctx_->free_host(chunk);
         for (uint8_t* meta : layer_meta_allocs_) {
             if (meta) ctx_->free_device(meta);
@@ -541,6 +549,7 @@ void Qwen4ExpExpertCache::cleanup() {
     resident_data_ = nullptr;
     resident_bytes_ = 0;
     resident_gpu_only_count_ = 0;
+    resident_prefill_slots_ = 0;
     resident_chunks_.clear();
     resident_slot_bases_.clear();
     resident_host_slots_.clear();
@@ -611,6 +620,8 @@ void Qwen4ExpExpertCache::cleanup() {
     batch_dma_events_.clear();
     dma_timing_stats_ = {};
     new_dma_batch_pending_ = false;
+    resident_staging_pipeline_enabled_ = false;
+    ResetResidentStagingPipelineState();
     if (copy_q_) {
         try {
             copy_q_->wait();
@@ -641,6 +652,10 @@ bool Qwen4ExpExpertCache::init(Context& ctx,
     blocksize_ = blocksize;
     static const bool gpu_mmap_dma=aila::env::read_flag("AILA_Q4E_GPU_MMAP_DMA",false);
     gpu_mmap_dma_enabled_=gpu_mmap_dma;
+    // Same-binary 6K probes did not show a throughput win; keep the
+    // producer/coordinator path opt-in while tuning resident execution.
+    static const bool resident_staging_pipeline = aila::env::read_flag("AILA_Q4E_LARGE_PAGE_PIPELINE", false);
+    resident_staging_pipeline_enabled_ = resident_staging_pipeline;
 
     // Expert geometry:
     // gate_up: 2 * intermediate_size rows, in_features cols
@@ -1652,7 +1667,8 @@ void Qwen4ExpExpertCache::BeginHotsetForward(int position,int rows,int prefill_r
         HandoffPromptHotset();
     if(hotset_borrow_ && prefill && !hotset_borrowed_) {
         PublishHotsetPending(true);ctx_->synchronize();
-        const int retain=std::min<int>(int(hotset_keys_.size()),std::max(0,num_slots_-num_experts_per_layer_));
+        const int prefill_slots=resident_data_?static_cast<int>(resident_prefill_slots_):num_experts_per_layer_;
+        const int retain=std::min<int>(int(hotset_keys_.size()),std::max(0,num_slots_-prefill_slots));
         std::vector<int> lent;
         for(size_t i=retain;i<hotset_keys_.size();++i) {const int s=layer_expert_to_slot_[hotset_keys_[i]];
             if(s>=0 && frozen_slots_[s]){frozen_slots_[s]=false;--frozen_count_;lent.push_back(s);}}
@@ -1715,7 +1731,8 @@ void Qwen4ExpExpertCache::HandoffPromptHotset() {
         Qwen4ExpCacheTrace::Ints(out,hotset_keys_.data(),int(hotset_keys_.size()));cache_trace_->End();}
 }
 void Qwen4ExpExpertCache::RebalancePromptPrefill() {
-    const int retain=hotset_borrow_?std::min<int>(int(hotset_keys_.size()),num_slots_-num_experts_per_layer_):int(hotset_keys_.size());
+    const int prefill_slots=resident_data_?static_cast<int>(resident_prefill_slots_):num_experts_per_layer_;
+    const int retain=hotset_borrow_?std::min<int>(int(hotset_keys_.size()),std::max(0,num_slots_-prefill_slots)):int(hotset_keys_.size());
     if(retain<=0 || hotset_policy_.prompt_rows==0 || hotset_prompt_swaps_==0)return;
     // Separate temporary prefill residency from the learned decode tier. A long
     // prompt may need different experts in different chunks, without destroying
@@ -2381,7 +2398,8 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
     }
 
     // Phase 3: Fine-grained DMA transfers
-    if (!host_pool_enabled_ && last_dma_event_ != sycl::event{}) {
+    const bool resident_staging_pipeline = resident_data_ && resident_staging_pipeline_enabled_;
+    if (!host_pool_enabled_ && !resident_staging_pipeline && last_dma_event_ != sycl::event{}) {
         try { last_dma_event_.wait_and_throw(); } catch (...) {}
     }
 
@@ -2603,6 +2621,77 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
                 std::chrono::steady_clock::now() - t0).count());
             stats_.fill_ns += fill_ns_elapsed;
             stats_.demand_exposed_wait_ns += fill_ns_elapsed;
+        } else if (resident_staging_pipeline && !to_fill_scratch_.empty()) {
+            const size_t staging_capacity = std::max<size_t>(1, staging_buffer_bytes_ / slot_bytes_);
+            const size_t half_capacity = std::max<size_t>(1, staging_capacity / 2);
+            for (size_t m = 0; m < to_fill_scratch_.size();) {
+                const int half = static_cast<int>(resident_staging_cursor_ & 1u);
+                auto& half_fence = resident_staging_half_fences_[half];
+                if (half_fence != sycl::event{}) {
+                    const auto t_sync = std::chrono::steady_clock::now();
+                    half_fence.wait_and_throw();
+                    stats_.dma_wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t_sync).count());
+                    half_fence = sycl::event{};
+                }
+
+                const size_t chunk_size = std::min(half_capacity, to_fill_scratch_.size() - m);
+                uint8_t* chunk_base = pinned_staging_ptr_ + static_cast<size_t>(half) * half_capacity * slot_bytes_;
+                for (size_t c = 0; c < chunk_size; ++c) {
+                    const auto& miss = to_fill_scratch_[m + c];
+                    const int key = expert_flat_index(miss.layer, miss.expert_id);
+                    if (key < 0 || static_cast<size_t>(key) >= resident_host_slots_.size())
+                        throw std::logic_error("Large-page staging miss has an invalid expert key");
+                    const int host_slot = resident_host_slots_[key];
+                    if (host_slot < 0 || static_cast<size_t>(host_slot) >= resident_slot_bases_.size() ||
+                        !resident_slot_bases_[host_slot])
+                        throw std::logic_error("Large-page staging miss has no RAM owner");
+                }
+
+                const auto t0 = std::chrono::steady_clock::now();
+                struct ResidentFillJob {
+                    Qwen4ExpExpertCache* cache;
+                    size_t first_miss;
+                    uint8_t* staging_base;
+                    void Fill(int task) {
+                        const auto& miss = cache->to_fill_scratch_[first_miss + size_t(task)];
+                        const int key = cache->expert_flat_index(miss.layer, miss.expert_id);
+                        const int host_slot = cache->resident_host_slots_[key];
+                        std::memcpy(staging_base + size_t(task) * cache->slot_bytes_,
+                                    cache->resident_slot_bases_[host_slot], cache->slot_bytes_);
+                        cache->parts_left_scratch_[task].store(1, std::memory_order_release);
+                    }
+                } fill_job{this, m, chunk_base};
+                for (size_t c = 0; c < chunk_size; ++c)
+                    parts_left_scratch_[c].store(0, std::memory_order_relaxed);
+                // Resident mode has no speculative source prefetch. Reuse its
+                // workers as producers while the coordinator submits ready slots.
+                fill_pool_->start_prefetch(static_cast<int>(chunk_size) - 1, [&fill_job](int task) {
+                    fill_job.Fill(task + 1);
+                });
+                fill_job.Fill(0);
+                try {
+                    for (size_t c = 0; c < chunk_size; ++c) {
+                        while (!parts_left_scratch_[c].load(std::memory_order_acquire))
+                            std::this_thread::yield();
+                        const auto& miss = to_fill_scratch_[m + c];
+                        copy_to_slot(miss.slot_id, chunk_base + c * slot_bytes_);
+                    }
+                } catch (...) {
+                    fill_pool_->wait(); // Producers borrow fill_job until joined.
+                    throw;
+                }
+                fill_pool_->wait();
+                const auto fill_ns_elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+                stats_.fill_ns += fill_ns_elapsed;
+                stats_.demand_exposed_wait_ns += fill_ns_elapsed;
+                stats_.total_transferred_bytes += static_cast<uint64_t>(chunk_size) * slot_bytes_;
+
+                half_fence = copy_q_->ext_oneapi_submit_barrier();
+                resident_staging_cursor_ = (resident_staging_cursor_ + 1) & 1u;
+                m += chunk_size;
+            }
         } else if (!to_fill_scratch_.empty()) {
             // Double-buffered staging: while one half DMAs, the other half is being filled.
             const int staging_capacity = std::max(1, static_cast<int>(staging_buffer_bytes_ / slot_bytes_));
@@ -3425,12 +3514,41 @@ void Qwen4ExpExpertCache::InitializeLargePageResidency(HostTensorView* embedding
     cancel_prefetch();
     ctx_->synchronize();
     copy_q_->wait_and_throw();
+    if (fill_pool_) fill_pool_->wait();
+    static const int demand_microbatch = aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0);
+    const bool resident_prefill = aila::env::read_flag("AILA_Q4E_RESIDENT_PREFILL", false);
+    const bool expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
+    resident_prefill_slots_ = static_cast<size_t>(num_experts_per_layer_);
+    int staging_slots = 0;
+    if (resident_prefill && expert_major_prefill && demand_microbatch > 0) {
+        const int64_t requested_slots = int64_t(demand_microbatch) * 2;
+        const int64_t expert_limit = num_experts_per_layer_;
+        const int64_t clamped_slots = std::clamp<int64_t>(
+            std::min(requested_slots, expert_limit), std::min<int64_t>(16, expert_limit), expert_limit);
+        resident_prefill_slots_ = static_cast<size_t>(clamped_slots);
+        staging_slots = static_cast<int>(std::min<int64_t>(requested_slots, clamped_slots));
+    }
+    if (prefetch_staging_ptr_) {
+        ctx_->free_host(prefetch_staging_ptr_);
+        prefetch_staging_ptr_ = nullptr;
+        prefetch_staging_slots_ = 0;
+    }
+    const size_t desired_staging_bytes = static_cast<size_t>(staging_slots) * slot_bytes_;
+    if (desired_staging_bytes > staging_buffer_bytes_) {
+        if (pinned_staging_ptr_) {
+            ctx_->free_host(pinned_staging_ptr_);
+            pinned_staging_ptr_ = nullptr;
+        }
+        staging_buffer_bytes_ = 0;
+        pinned_staging_ptr_ = static_cast<uint8_t*>(ctx_->alloc_host(desired_staging_bytes));
+        staging_buffer_bytes_ = desired_staging_bytes;
+    }
     const auto start = std::chrono::steady_clock::now();
     const size_t total = size_t(num_layers_) * num_experts_per_layer_;
     // Keep the initial prefill lending region backed in RAM. Only the retained
     // GPU core is excluded; later hotset changes exchange ownership on eviction.
     const size_t gpu_only = hotset_borrow_
-        ? std::min(hotset_keys_.size(), size_t(std::max(1, num_slots_ - num_experts_per_layer_)))
+        ? std::min(hotset_keys_.size(), size_t(std::max(1, num_slots_ - static_cast<int>(resident_prefill_slots_))))
         : hotset_keys_.size();
     std::vector<int> host_slots(total, 0);
     for (size_t i = 0; i < gpu_only; ++i) {
@@ -3455,7 +3573,8 @@ void Qwen4ExpExpertCache::InitializeLargePageResidency(HostTensorView* embedding
     const size_t embedding_offset = (metadata_bytes + 63) / 64 * 64;
     const size_t embedding_bytes = embedding && embedding->valid() ? embedding->bytes : 0;
     const size_t metadata_allocation_bytes = aila::memory::LargePageAllocationSize(embedding_offset + embedding_bytes);
-    const int slots_per_chunk = std::max(1, int((size_t(256) << 20) / slot_bytes_));
+    const int chunk_mb = std::clamp(aila::env::read_int("AILA_Q4E_LARGE_PAGE_CHUNK_MB", 128), 16, 256);
+    const int slots_per_chunk = std::max(1, int((size_t(chunk_mb) << 20) / slot_bytes_));
     size_t bytes = metadata_allocation_bytes;
     for (int first = 0; first < host_count; first += slots_per_chunk)
         bytes += aila::memory::LargePageAllocationSize(size_t(std::min(slots_per_chunk, host_count - first)) * slot_bytes_);
@@ -3469,15 +3588,17 @@ void Qwen4ExpExpertCache::InitializeLargePageResidency(HostTensorView* embedding
     if (bytes > memory.ullAvailPhys || memory.ullAvailPhys - bytes < runtime_room)
         throw std::runtime_error("Complete large-page complement needs " + std::to_string(bytes) +
             " bytes plus 2 GiB runtime room; available=" + std::to_string(memory.ullAvailPhys));
-    AILA_LOG_INFO("[Q4E LargePages] allocating_bytes=%llu available_bytes=%llu gpu_only=%zu host_experts=%d lend_backed=%zu",
-        (unsigned long long)bytes, (unsigned long long)memory.ullAvailPhys, gpu_only, host_count, hotset_keys_.size() - gpu_only);
+    AILA_LOG_INFO("[Q4E LargePages] allocating_bytes=%llu available_bytes=%llu gpu_only=%zu prefill_slots=%zu staging_bytes=%llu pipeline=%d host_experts=%d lend_backed=%zu",
+        (unsigned long long)bytes, (unsigned long long)memory.ullAvailPhys, gpu_only, resident_prefill_slots_,
+        (unsigned long long)staging_buffer_bytes_, int(resident_staging_pipeline_enabled_), host_count,
+        hotset_keys_.size() - gpu_only);
     auto release = [this](uint8_t* ptr) { ctx_->free_host(ptr); };
     using Chunk = std::unique_ptr<uint8_t, decltype(release)>;
     std::vector<Chunk> chunks;chunks.reserve((host_count + slots_per_chunk - 1) / slots_per_chunk + 1);
     std::vector<uint8_t*> bases(host_count);
     resident_chunks_.reserve(chunks.capacity());
     // Fragmented physical memory can reject even a 1 GiB request with 1450.
-    // This machine accepts the full capacity in 256 MiB large-page chunks.
+    // Keep each request bounded even after repeated load/unload fragments RAM.
     // Allocate contiguous embedding/metadata first; experts never straddle an
     // allocation. Every chunk is MEM_LARGE_PAGES, with no pageable fallback.
     chunks.emplace_back(static_cast<uint8_t*>(ctx_->alloc_large_host(metadata_allocation_bytes)), release);
@@ -3535,10 +3656,16 @@ void Qwen4ExpExpertCache::InitializeLargePageResidency(HostTensorView* embedding
     reader_.reset(); // No expert file-reader fallback once residency is published.
     SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));
     GlobalMemoryStatusEx(&memory);
-    AILA_LOG_INFO("[Q4E LargePagesReady] bytes=%llu payload_bytes=%llu metadata_bytes=%llu embedding_bytes=%llu available_bytes=%llu preload_ms=%.3f backing=MEM_LARGE_PAGES",
+    AILA_LOG_INFO("[Q4E LargePagesReady] bytes=%llu payload_bytes=%llu metadata_bytes=%llu embedding_bytes=%llu available_bytes=%llu prefill_slots=%zu staging_bytes=%llu pipeline=%d preload_ms=%.3f backing=MEM_LARGE_PAGES",
         (unsigned long long)bytes, (unsigned long long)payload_bytes, (unsigned long long)metadata_bytes,
-        (unsigned long long)embedding_bytes, (unsigned long long)memory.ullAvailPhys,
+        (unsigned long long)embedding_bytes, (unsigned long long)memory.ullAvailPhys, resident_prefill_slots_,
+        (unsigned long long)staging_buffer_bytes_, int(resident_staging_pipeline_enabled_),
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+void Qwen4ExpExpertCache::ResetResidentStagingPipelineState() noexcept {
+    resident_staging_half_fences_ = {};
+    resident_staging_cursor_ = 0;
 }
 
 void Qwen4ExpExpertCache::BindResidentSource(int key, int host_slot) {
@@ -3563,6 +3690,8 @@ bool Qwen4ExpExpertCache::ExchangeResidentVictim(int gpu_slot, int incoming_key)
     // Reuse the existing staging allocation. Neither the previous H2D nor the
     // victim's final GPU reader may overlap its reuse or the ownership change.
     if (last_dma_event_ != sycl::event{}) last_dma_event_.wait_and_throw();
+    last_dma_event_ = sycl::event{};
+    ResetResidentStagingPipelineState();
     if (record.consumer_fence != sycl::event{}) record.consumer_fence.wait_and_throw();
     auto* host = resident_slot_bases_[host_slot];
     std::memcpy(pinned_staging_ptr_, host, slot_bytes_);
@@ -3592,6 +3721,8 @@ void Qwen4ExpExpertCache::ExchangeResidentOwnership(int incoming_key, int outgoi
         gpu_slot_records_[outgoing_slot].direct_leases)
         throw std::logic_error("Invalid resident ownership exchange");
     if (last_dma_event_ != sycl::event{}) last_dma_event_.wait_and_throw();
+    last_dma_event_ = sycl::event{};
+    ResetResidentStagingPipelineState();
     auto& outgoing = gpu_slot_records_[outgoing_slot];
     if (outgoing.consumer_fence != sycl::event{}) outgoing.consumer_fence.wait_and_throw();
     // acquire's aggregate barrier above covers every H2D, including the

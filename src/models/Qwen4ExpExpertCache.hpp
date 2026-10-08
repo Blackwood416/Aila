@@ -525,6 +525,7 @@ private:
     bool ExchangeResidentVictim(int gpu_slot, int incoming_key);
     void ExchangeResidentOwnership(int incoming_key, int outgoing_slot);
     void NormalizeResidentCore(const std::vector<int>& keys);
+    void ResetResidentStagingPipelineState() noexcept;
     // Fills part [part, nparts) of every slot segment for one expert.
     void load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
                                 int part = 0, int nparts = 1, uint64_t slot_gen = 0);
@@ -566,6 +567,9 @@ private:
     uint8_t* pinned_staging_ptr_ = nullptr;
     uint8_t* prefetch_staging_ptr_ = nullptr; // prefetch_staging_slots_ slots
     int prefetch_staging_slots_ = 0;
+    bool resident_staging_pipeline_enabled_ = false;
+    size_t resident_staging_cursor_ = 0;
+    std::array<sycl::event, 2> resident_staging_half_fences_{};
 
     // Immediate-submission in-order queue for miss DMA (see acquire()).
     std::unique_ptr<sycl::queue> copy_q_;
@@ -630,6 +634,7 @@ private:
     uint8_t* resident_data_ = nullptr;
     size_t resident_bytes_ = 0;
     size_t resident_gpu_only_count_ = 0;
+    size_t resident_prefill_slots_ = 0;
     std::vector<uint8_t*> resident_chunks_;
     std::vector<uint8_t*> resident_slot_bases_;
     std::vector<int> resident_host_slots_; // -1: the GPU owns the only payload

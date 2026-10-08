@@ -24,6 +24,9 @@ struct Qwen4ExpResidentTestAccess {
         cache.hotset_keys_=keys;cache.InstallHotset(keys);
     }
     static uint8_t* ResidentData(Qwen4ExpExpertCache& cache) { return cache.resident_data_; }
+    static size_t StagingBytes(const Qwen4ExpExpertCache& cache) {
+        return cache.staging_buffer_bytes_ + size_t(cache.prefetch_staging_slots_) * cache.slot_bytes_;
+    }
     static void GpuMappedDma(Qwen4ExpExpertCache& cache,bool enabled) {
         cache.gpu_mmap_dma_enabled_=enabled;
         if(enabled) {
@@ -1974,8 +1977,10 @@ void test_large_page_residency(Context& ctx) {
         for(int layer=0;layer<2;++layer)cache.set_layer_expert_ref(layer,synth.gu_ref,synth.dn_ref);
         Qwen4ExpResidentTestAccess::Adaptive(cache,{0,1,2,3,8,9,10,11});
         const auto before=ctx.current_pinned_host_bytes();
+        const auto staging_before=Qwen4ExpResidentTestAccess::StagingBytes(cache);
         Qwen4ExpResidentTestAccess::LargePages(cache);
-        expect(ctx.current_pinned_host_bytes()==before+cache.resident_bytes(),"Large-page ledger omitted rounded bytes");
+        expect(ctx.current_pinned_host_bytes()==before-staging_before+
+            Qwen4ExpResidentTestAccess::StagingBytes(cache)+cache.resident_bytes(),"Large-page ledger omitted rounded bytes");
         auto* arena=Qwen4ExpResidentTestAccess::ResidentData(cache);
         PSAPI_WORKING_SET_EX_INFORMATION page{};page.VirtualAddress=arena;
         expect(QueryWorkingSetEx(GetCurrentProcess(),&page,sizeof(page)) && page.VirtualAttributes.Valid &&
